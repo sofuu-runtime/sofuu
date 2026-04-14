@@ -1,24 +1,22 @@
 # ⚡ Sofuu (素風)
 
-> *A simple, fast JavaScript runtime built natively in C for the AI era.*
+> *A fast, private JavaScript runtime built in C — designed from day one for AI-era workloads.*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20NC%201.0.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0--alpha-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
-> ⚠️ **Experimental:** Sofuu is a research-grade runtime under active development. APIs may change.
+> ⚠️ **Alpha software.** Sofuu is under active development. APIs may change before a stable release.
 
 ---
 
 ## What is Sofuu?
 
-Sofuu is a **server-side JavaScript runtime** — think Node.js, but built entirely in C using QuickJS instead of V8. It has no browser API, no DOM, and no renderer. It is purpose-built for:
+Sofuu is a **server-side JavaScript runtime** — the kind of thing you'd use to run your AI backend, your API server, or your edge automation script. It has no browser API, no DOM, and no renderer.
 
-- **AI backends** — stream LLM responses from any provider with zero npm installs
-- **Edge & embedded scripting** — runs on hardware where Node.js can't
-- **Lightweight microservices** — native HTTP server with a ~1MB binary
+What makes it different from Node.js, Deno, or Bun is that all the things you normally have to install separately — LLM streaming, vector math, MCP client/server, HTTP — are just built in at the C level. No npm packages needed for any of it.
 
-You build your frontend (React, Next.js, plain HTML) separately. Sofuu powers the backend logic.
+You build your frontend (React, Next.js, plain HTML — whatever you like) completely separately. Sofuu runs the server side.
 
 ---
 
@@ -28,10 +26,10 @@ You build your frontend (React, Next.js, plain HTML) separately. Sofuu powers th
 curl -fsSL https://sofuu.xyz/install | sh
 ```
 
-Or build from source:
+Or build it yourself from source:
 
 ```bash
-git clone https://github.com/sofuu/sofuu
+git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
 make
 ./sofuu version
@@ -39,16 +37,16 @@ make
 
 ---
 
-## 30-Second Demo
+## Quick Start
 
-**Stream an LLM response — no npm, no SDK, just Sofuu:**
+**Stream an AI response — no packages to install, no SDK to configure:**
 
 ```js
 // server.js
 const server = sofuu.http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
 
-  const stream = sofuu.ai.stream("Explain SIMD in one sentence.", {
+  const stream = sofuu.ai.stream("Explain how SIMD works.", {
     provider: "ollama",
     model: "llama3",
   });
@@ -61,122 +59,138 @@ const server = sofuu.http.createServer(async (req, res) => {
 });
 
 server.listen(3000, "0.0.0.0");
-console.log("Sofuu AI server running on port 3000");
+console.log("Server running on port 3000");
 ```
 
 ```bash
 sofuu run server.js
 ```
 
-**TypeScript — no compiler, no config:**
+**TypeScript works out of the box — no tsconfig, no compiler step:**
 
 ```typescript
 interface Message { role: string; content: string; }
 const greet = (msg: Message): string => `[${msg.role}] ${msg.content}`;
-console.log(greet({ role: 'user', content: 'Hello Sofuu!' }));
+console.log(greet({ role: "user", content: "Hello, Sofuu!" }));
 ```
 
 ```bash
-sofuu run hello.ts   # works out of the box
-```
-
-**Vector similarity — hardware SIMD, no npm packages:**
-
-```js
-const a = new Float32Array([0.1, 0.9, 0.4]);
-const b = new Float32Array([0.2, 0.8, 0.5]);
-
-// Executes on CPU NEON/AVX2 vector registers directly
-const score = sofuu.ai.similarity(a, b);
-console.log(score); // 0.998...
+sofuu run hello.ts
 ```
 
 ---
 
 ## Why Sofuu?
 
-| Feature | Node.js | Deno | Bun | **Sofuu** |
+| | Node.js | Deno | Bun | **Sofuu** |
 |---|---|---|---|---|
-| Binary size | ~100MB | ~80MB | ~60MB | **~1.1MB** |
-| Startup time | ~50ms | ~30ms | ~7ms | **~3ms** |
-| LLM streaming | npm install | npm install | npm install | **Native C** |
-| Vector SIMD ops | npm install | npm install | npm install | **Native NEON/AVX2** |
-| HTTP server | npm install | built-in | built-in | **Native C** |
-| NPM Packages | ✅ | via import map | ✅ | **`sofuu add` + CJS shim** |
-| TypeScript | tsc / swc | built-in | built-in | **Built-in C stripper** |
-| Embeddable in C | ❌ | ❌ | ❌ | **✅** |
+| Binary size | ~100 MB | ~80 MB | ~60 MB | **~1.1 MB** |
+| Startup time | ~50 ms | ~30 ms | ~7 ms | **~3 ms** |
+| LLM streaming | npm install | npm install | npm install | **Built in (C)** |
+| MCP client + server | npm install | npm install | npm install | **Built in (C)** |
+| SIMD vector math | npm install | npm install | npm install | **Built in (NEON/AVX2)** |
+| TypeScript support | Separate compiler | Built in | Built in | **Built in (C type stripper)** |
+| Embeddable in C apps | ❌ | ❌ | ❌ | **✅** |
 
 ---
 
-## CLI
+## CLI Reference
 
 ```bash
-sofuu                        # Start interactive REPL
+sofuu                        # Start an interactive REPL
 sofuu run <file.js>          # Run a JavaScript file
 sofuu run <file.ts>          # Run a TypeScript file (auto-transpiled)
-sofuu eval "<code>"          # Evaluate JS inline
-sofuu bundle <entry.js>      # Bundle to single distributable file
+sofuu eval "<code>"          # Evaluate a JS expression inline
+sofuu bundle <entry.js>      # Bundle everything into one distributable file
 sofuu bundle <entry.js> -o <out.js>
-sofuu install                # Install from package.json
-sofuu add <pkg>              # Install npm package
-sofuu version                # Print version and exit
-sofuu help                   # Print this help
+sofuu install                # Install packages from package.json
+sofuu add <package>          # Add and install an npm package
+sofuu version                # Print version information
+sofuu help                   # Print usage help
 ```
 
 ---
 
 ## API Reference
 
-### `sofuu.ai`
+### `sofuu.ai` — LLM Streaming & Vector Math
 
 ```js
-// Streaming — background C-thread over libuv, zero blocking
-const stream = sofuu.ai.stream("Explain gravity.", {
-  provider: "ollama",  // 'openai' | 'anthropic' | 'gemini' | 'ollama'
+// Stream tokens as they arrive — non-blocking, C-backed
+const stream = sofuu.ai.stream("What is the speed of light?", {
+  provider: "ollama",   // "openai" | "anthropic" | "gemini" | "ollama"
   model: "llama3",
 });
 for await (const chunk of stream) {
   process.stdout.write(chunk.text);
 }
 
-// Completion
-const result = await sofuu.ai.complete("What is 2+2?", { provider: "openai" });
+// One-shot completion
+const result = await sofuu.ai.complete("What is 2 + 2?", { provider: "openai" });
 console.log(result.text);    // "4"
 console.log(result.tokens);  // { input: 12, output: 1 }
-```
 
-### SIMD Vector Math
-
-```js
-// All functions accept Float32Array (zero-copy) or plain Array
-sofuu.ai.similarity(a, b)   // Cosine similarity  → [-1, 1]
+// SIMD-accelerated vector similarity (runs on CPU vector registers directly)
+// Accepts Float32Array (zero-copy) or plain Array
+sofuu.ai.similarity(a, b)   // Cosine similarity  → number in [-1, 1]
 sofuu.ai.dot(a, b)           // Dot product        → number
 sofuu.ai.l2(a, b)            // Euclidean distance → number
 ```
 
-### `sofuu.http`
+### `sofuu.mcp` — Model Context Protocol
 
 ```js
-// Native HTTP server — no Express, no frameworks needed
+// Connect your script to any MCP-compatible tool server
+const client = await sofuu.mcp.connect("npx @modelcontextprotocol/server-filesystem /tmp");
+const tools   = await client.listTools();
+const result  = await client.call("read_file", { path: "/tmp/notes.txt" });
+client.disconnect();
+
+// Build your own MCP tool server to expose tools to AI agents
+const server = sofuu.mcp.serve();
+
+server.tool("get_weather", {
+  description: "Returns the weather for a given city.",
+  schema: {
+    type: "object",
+    properties: { city: { type: "string" } },
+    required: ["city"],
+  },
+}, async ({ city }) => {
+  const res  = await fetch(`https://wttr.in/${city}?format=3`);
+  return await res.text();
+});
+
+server.start(); // Listens over stdio — works with Claude, any MCP client
+```
+
+### `sofuu.http` — HTTP Server & Client
+
+```js
+// Native HTTP server — no Express or other frameworks needed
 const server = sofuu.http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "online" }));
+  res.end(JSON.stringify({ status: "ok" }));
 });
 server.listen(8080, "0.0.0.0");
+
+// Standard fetch API
+const res  = await fetch("https://api.example.com/data");
+const json = await res.json();
 ```
 
-### `sofuu.fs`
+### `sofuu.fs` — File System
 
 ```js
-const data = await sofuu.fs.readFile('./data.json', 'utf8');
-await sofuu.fs.writeFile('./out.txt', 'Hello Sofuu!');
-const entries = await sofuu.fs.readdir('./src');
+const text    = await sofuu.fs.readFile("./data.json", "utf8");
+await sofuu.fs.writeFile("./output.txt", "Hello from Sofuu!");
+const entries = await sofuu.fs.readdir("./src");
 ```
 
-### `sofuu.spawn`
+### `sofuu.spawn` — OS Processes
 
 ```js
-const proc = sofuu.spawn("python3", ["script.py"]);
+const proc = sofuu.spawn("python3", ["process_data.py"]);
 proc.stdout.on("data", (chunk) => console.log(chunk));
 await proc.wait();
 ```
@@ -184,14 +198,17 @@ await proc.wait();
 ### Globals
 
 ```js
-// Standard globals available everywhere
+// Standard globals available everywhere — no imports needed
 setTimeout(() => console.log("done"), 1000);
 setInterval(() => console.log("tick"), 500);
-await sleep(500);          // Native C sleep (no Promise overhead)
-process.env.OPENAI_KEY     // environment variables
-process.argv               // CLI arguments
-process.cwd()              // current directory
-console.log / warn / error // full console support
+await sleep(500);             // Native non-blocking sleep
+
+process.env.API_KEY           // Read environment variables
+process.argv                  // CLI argument array
+process.cwd()                 // Current working directory
+process.exit(0)               // Exit the process
+
+console.log / warn / error    // Full console support
 ```
 
 ---
@@ -201,18 +218,19 @@ console.log / warn / error // full console support
 ```
 sofuu run agent.ts
        ↓
-  [TS type stripper]   — pure C, zero deps, in-process
+  [TypeScript stripper]   — pure C, in-process, no subprocess
        ↓
-  [QuickJS engine]     — ES2023, ESM modules
+  [QuickJS engine]        — ES2023, native ESM module support
        ↓
-  [libuv event loop]   — async I/O, timers, subprocess
+  [libuv event loop]      — non-blocking I/O, timers, subprocess
        ↓
   Native C modules:
-    ├── sofuu.http      (HTTP server + fetch client)
-    ├── sofuu.ai        (LLM streaming + SIMD vector math)
-    ├── sofuu.fs        (async file I/O)
-    ├── sofuu.spawn     (OS process control)
-    └── sofuu.os        (process, env, timers)
+    ├── sofuu.ai          (LLM streaming, completions, SIMD vector math)
+    ├── sofuu.mcp         (MCP client + server, JSON-RPC 2.0 over stdio)
+    ├── sofuu.http        (HTTP/HTTPS server + fetch client)
+    ├── sofuu.fs          (async file I/O)
+    ├── sofuu.spawn       (OS process control)
+    └── sofuu.os          (process, env, timers, signals)
 ```
 
 ---
@@ -220,33 +238,21 @@ sofuu run agent.ts
 ## Build from Source
 
 ```bash
-# Prerequisites: clang, make, libcurl
-git clone https://github.com/sofuu/sofuu
+# Requirements: clang and make. libcurl is needed for HTTP client features.
+git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
-make           # auto-detects arm64 (NEON) or x86_64 (AVX2)
-make test      # run full test suite
-make install   # copy to /usr/local/bin
+make
+make install   # copies binary to /usr/local/bin
 ```
-
----
-
-## Roadmap
-
-- [x] Phase 1 — QuickJS core (ESM, console, process)
-- [x] Phase 2 — libuv event loop (timers, fs, subprocess)
-- [x] Phase 3 — Networking (fetch, HTTP server, SSE)
-- [x] Phase 4 — AI modules (ai.complete, ai.stream)
-- [x] Phase 5 — SIMD vectors (NEON / AVX2)
-- [x] Phase 6 — npm resolver (`sofuu add <pkg>`) + CJS shim
-- [x] Phase 7 — TypeScript (built-in C type stripper)
-- [x] Phase 8 — Interactive REPL
-- [ ] Phase 9 — MCP client + server (`mcp.connect()`, `mcp.serve()`)
-- [ ] Phase 10 — Agent runtime (`new Agent({ tools, model })`)
-- [ ] Phase 11 — Cross-compilation (macOS → Linux → Windows)
-- [ ] Phase 12 — Stable `sofuu.xyz` install script + docs
 
 ---
 
 ## License
 
-MIT © Sofuu Contributors
+Sofuu is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+This means you can use it freely for personal projects, learning, academic research, and open-source work. Commercial use requires a separate license.
+
+See [LICENSE](LICENSE) for the full terms or contact [hello@sofuu.xyz](mailto:hello@sofuu.xyz) to discuss commercial licensing.
+
+© 2026 Priyanshu Boruah

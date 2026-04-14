@@ -37,8 +37,8 @@ CFLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter \
           -DCONFIG_VERSION=\"$(QJS_VERSION)\"
 
 # Feature Flags
-SOFUU_MEMORY ?= 1
-SOFUU_LLM    ?= 1
+SOFUU_MEMORY ?= 0
+SOFUU_LLM    ?= 0
 
 ifeq ($(SOFUU_MEMORY),1)
     CFLAGS += -DSOFUU_MEMORY=1
@@ -47,10 +47,6 @@ endif
 ifeq ($(SOFUU_LLM),1)
     CFLAGS += -DSOFUU_LLM=1
 endif
-
-# QTSQ (Black Hole Disk) linkage
-QTSQ_DIR = black-hole-disk
-CFLAGS  += -I$(QTSQ_DIR)/include
 
 # macOS-specific
 UNAME := $(shell uname -s)
@@ -112,6 +108,8 @@ SOFUU_SRCS = \
     $(SIMD_SRC) \
     deps/http-parser/http_parser.c
 
+# Memory and LLM modules are disabled by default (require local C library)
+# Enable with: make SOFUU_MEMORY=1 SOFUU_LLM=1
 ifeq ($(SOFUU_MEMORY),1)
     SOFUU_SRCS += src/memory/qtsq_adapter.c \
                   src/memory/hnsw.c \
@@ -131,6 +129,7 @@ UV_LIB   = $(UV_DIR)/build/libuv.a
 LDFLAGS = -lpthread -lm -lcurl
 
 ifeq ($(SOFUU_MEMORY),1)
+    QTSQ_DIR = black-hole-disk
     LDFLAGS += -L$(QTSQ_DIR) -lqtsq -lz
 endif
 

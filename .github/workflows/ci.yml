@@ -8,24 +8,22 @@ on:
 
 jobs:
   build-and-test:
-    name: Build & Test (${{ matrix.os }})
+    name: Build & Test (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            label: macOS arm64
+            label: macOS-arm64
           - os: ubuntu-22.04
-            label: Linux x86_64
+            label: Linux-x86_64
           - os: ubuntu-22.04-arm
-            label: Linux arm64
+            label: Linux-arm64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies (Ubuntu)
         if: runner.os == 'Linux'

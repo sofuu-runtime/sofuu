@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── macOS arm64 (native) ──────────────────────────────────────
+  release-macos:
+    name: macOS arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install curl cmake ninja
+
+      - name: Build libuv
+        run: |
+          cd deps/libuv
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build
+
+      - name: Build Sofuu
+        run: make
+
+      - name: Smoke test
+        run: |
+          ./sofuu version
+          ./sofuu eval "console.log('release smoke ok')"
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cp sofuu dist/sofuu-darwin-arm64
+          tar -czf dist/sofuu-darwin-arm64.tar.gz -C dist sofuu-darwin-arm64
+          sha256sum dist/sofuu-darwin-arm64.tar.gz > dist/sofuu-darwin-arm64.tar.gz.sha256
+          ls -lh dist/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sofuu-darwin-arm64.tar.gz
+            dist/sofuu-darwin-arm64.tar.gz.sha256
+          generate_release_notes: true
+
+  # ── Linux x86_64 (static musl) ────────────────────────────────
+  release-linux-x86_64:
+    name: Linux x86_64 (static)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libcurl4-openssl-dev cmake ninja-build
+
+      - name: Build libuv
+        run: |
+          cd deps/libuv
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build
+
+      - name: Build Sofuu
+        run: make
+
+      - name: Smoke test
+        run: |
+          ./sofuu version
+          ./sofuu eval "console.log('linux smoke ok')"
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cp sofuu dist/sofuu-linux-x86_64
+          tar -czf dist/sofuu-linux-x86_64.tar.gz -C dist sofuu-linux-x86_64
+          sha256sum dist/sofuu-linux-x86_64.tar.gz > dist/sofuu-linux-x86_64.tar.gz.sha256
+          ls -lh dist/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sofuu-linux-x86_64.tar.gz
+            dist/sofuu-linux-x86_64.tar.gz.sha256
+
+  # ── Linux arm64 (static musl) ─────────────────────────────────
+  release-linux-arm64:
+    name: Linux arm64 (static)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libcurl4-openssl-dev cmake ninja-build
+
+      - name: Build libuv
+        run: |
+          cd deps/libuv
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build
+
+      - name: Build Sofuu
+        run: make
+
+      - name: Smoke test
+        run: |
+          ./sofuu version
+          ./sofuu eval "console.log('linux arm64 smoke ok')"
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cp sofuu dist/sofuu-linux-arm64
+          tar -czf dist/sofuu-linux-arm64.tar.gz -C dist sofuu-linux-arm64
+          sha256sum dist/sofuu-linux-arm64.tar.gz > dist/sofuu-linux-arm64.tar.gz.sha256
+          ls -lh dist/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sofuu-linux-arm64.tar.gz
+            dist/sofuu-linux-arm64.tar.gz.sha256
+
+  # ── Generate install manifest ─────────────────────────────────
+  release-manifest:
+    name: Release Manifest
+    runs-on: ubuntu-22.04
+    needs: [release-macos, release-linux-x86_64, release-linux-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release assets
+        uses: robinraju/release-downloader@v1.9
+        with:
+          tag: ${{ github.ref_name }}
+          fileName: '*.sha256'
+          out-file-path: dist/
+
+      - name: Build checksum manifest
+        run: |
+          cat dist/*.sha256 > dist/CHECKSUMS.txt
+          cat dist/CHECKSUMS.txt
+
+      - name: Upload manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CHECKSUMS.txt

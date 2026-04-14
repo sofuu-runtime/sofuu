@@ -1,0 +1,56 @@
+# ── Build output ──────────────────────────────────
+sofuu
+dist/
+build/
+bin/
+tools/
+*.o
+*.a
+*.dylib
+*.so
+*.out
+
+# ── Old test memory outputs (not part of the runtime) ──
+*.qtsq
+*_kv/
+chatbot_mind.qtsq
+stress_test.qtsq
+my_test.qtsq
+real_agent.qtsq
+think_demo.qtsq
+test_agent.mind.qtsq
+
+# ── Scratch / temp files ──────────────────────────
+test_loop.c
+Makefile.bak
+context.md
+build.log
+compile_commands.json
+
+# ── Research archive (not part of this repo) ─────
+black-hole-disk/
+
+# ── Dependencies (checked in separately via submodule) ──
+deps/quickjs/
+deps/libuv/
+node_modules/
+
+# ── macOS system files ────────────────────────────
+.DS_Store
+.AppleDouble
+.Spotlight-V100
+*.swp
+
+# ── IDE ───────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+.clangd
+.cache/
+
+# ── Landing page (separate repo) ─────────────────
+sofuu-landing/
+
+# ── Font assets (belong in landing repo) ─────────
+Nunito_Complete/
+ascii-art.png

@@ -1,0 +1,96 @@
+# Quantum Tensor Sequence Proprietary License (QTSPL) v1.0
+
+**Copyright (c) 2026 Haruhito. All Rights Reserved.**
+
+This license governs the use of the QTSQ file format specification and its
+associated data structures as embedded within the Sofuu JavaScript Runtime.
+
+---
+
+## 1. Definitions
+
+- **"Format"** refers to the .qtsq (Quantum Tensor Sequence) and .qtsw (Event Wave)
+  binary file format specifications, including their five-layer architecture,
+  structural layout, encoding rules, and all associated algorithms.
+- **"Author"** refers to Haruhito, the sole creator and copyright holder
+  of the Format.
+- **"Marks"** refers to the names "Quantum Tensor Sequence", ".qtsq", ".qtsw",
+  "QTSQ", and all associated branding and terminology.
+- **"Runtime"** refers to the Sofuu JavaScript Runtime which embeds and uses
+  this Format.
+
+---
+
+## 2. Grant of Rights
+
+You are granted a limited, non-exclusive, non-transferable, revocable license
+to **use** the Format as embedded in the Sofuu Runtime strictly for
+**free non-commercial personal, educational, and academic research purposes**,
+subject to the conditions set forth in this license.
+
+All other rights are strictly reserved by the Author.
+
+---
+
+## 3. Restrictions
+
+Except for the permitted uses in Section 2, you may NOT, without prior written
+authorization from the Author:
+
+### 3.1 Commercial Use
+- Use the Format, in whole or in part, for any commercial or for-profit purpose.
+- Incorporate the Format into any commercial software, product, or service.
+
+### 3.2 Modify the Format
+- Modify, adapt, reverse engineer, or create derivative works based on the
+  Format specification itself.
+- Alter the Format's encoding rules, binary structure, or layer architecture.
+
+### 3.3 Redistribute the Format
+- Distribute, publish, sublicense, or otherwise transfer the Format specification
+  or any portion thereof outside the context of the Sofuu Runtime.
+
+### 3.4 Competing Implementations
+- Develop, produce, or distribute any software, tool, or library that reads,
+  writes, or processes .qtsq or .qtsw files **outside** of the Sofuu Runtime,
+  without a separate written commercial license from the Author.
+- Create any file format that is substantially similar to or derived from the Format.
+
+### 3.5 Branding
+- Use any of the Marks in any product name, service, domain, or marketing material
+  without written consent from the Author.
+
+---
+
+## 4. Attribution
+
+For all permitted free uses, you must:
+- Retain all copyright notices referencing the Author and this Format.
+- Academic or research publications using this Format must cite the Author
+  (Priyanshu Boruah) and the Quantum Tensor Sequence project.
+
+---
+
+## 5. Commercial Licensing
+
+To obtain a commercial license for the Format (e.g., to build and distribute
+a product that reads/writes .qtsq files), contact the Author directly.
+Licensing terms are determined solely at the Author's discretion.
+
+---
+
+## 6. No Warranty
+
+THE FORMAT IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. IN NO EVENT SHALL
+THE AUTHOR BE LIABLE FOR ANY CLAIM OR DAMAGES ARISING FROM ITS USE.
+
+---
+
+## 7. Governing Law
+
+This license is governed by the laws of India.
+
+---
+
+**QTSPL v1.0 — Effective Date: 2026**
+**Copyright (c) 2026 Haruhito. All Rights Reserved.**

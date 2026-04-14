@@ -54,13 +54,16 @@ ifeq ($(UNAME), Darwin)
     CFLAGS += -D__APPLE__
 endif
 
-# Architecture-specific flags (SIMD intrinsics are auto-detected via #ifdef in each .c file)
+# Architecture-specific SIMD flags
 ifeq ($(ARCH), arm64)
     CFLAGS  += -march=armv8-a
+    SIMD_SRC = $(SRC_DIR)/simd/neon.c
+else ifeq ($(ARCH), x86_64)
+    CFLAGS  += -mavx2 -mfma
+    SIMD_SRC = $(SRC_DIR)/simd/avx.c
+else
+    SIMD_SRC = $(SRC_DIR)/simd/neon.c   # scalar fallback
 endif
-
-# Always compile both SIMD implementations; each file self-guards with #ifdef
-SIMD_SRC = $(SRC_DIR)/simd/neon.c $(SRC_DIR)/simd/avx.c
 
 
 # Optional: readline for REPL

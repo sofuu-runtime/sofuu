@@ -1,0 +1,1852 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/opt/homebrew/bin/uname"
+      - "/usr/local/bin/uname"
+      - "/Users/priyanshuboruah/.opencode/bin/uname"
+      - "/Users/priyanshuboruah/.cargo/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineSystem.cmake:207 (message)"
+      - "CMakeLists.txt:10 (project)"
+    message: |
+      The target system is: Linux -  - aarch64
+      The host system is: Darwin - 24.6.0 - arm64
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeUnixFindMake.cmake:5 (find_program)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_MAKE_PROGRAM"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "gmake"
+      - "make"
+      - "smake"
+    candidate_directories:
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/opt/homebrew/bin/gmake"
+      - "/usr/local/bin/gmake"
+      - "/Users/priyanshuboruah/.opencode/bin/gmake"
+      - "/Users/priyanshuboruah/.cargo/bin/gmake"
+      - "/usr/bin/gmake"
+      - "/bin/gmake"
+      - "/usr/sbin/gmake"
+      - "/sbin/gmake"
+      - "/Users/priyanshuboruah/.foundry/bin/gmake"
+      - "/opt/homebrew/bin/make"
+      - "/usr/local/bin/make"
+      - "/Users/priyanshuboruah/.opencode/bin/make"
+      - "/Users/priyanshuboruah/.cargo/bin/make"
+    found: "/usr/bin/make"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:462 (find_file)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:500 (CMAKE_DETERMINE_COMPILER_ID_WRITE)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:8 (CMAKE_DETERMINE_COMPILER_ID_BUILD)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "file"
+    variable: "src_in"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "CMakeCCompilerId.c.in"
+    candidate_directories:
+      - "/opt/homebrew/share/cmake/Modules/"
+    found: "/opt/homebrew/share/cmake/Modules/CMakeCCompilerId.c.in"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:10 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc;-target;aarch64-linux-musl
+      Build flags: -target;aarch64-linux-musl
+      Id flags:  
+      
+      The output was:
+      0
+      In file included from /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/musl/crt/rcrt1.c:3:
+      /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/musl/crt/../ldso/dlstart.c:146:20: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a subsequent definition [-Wdeprecated-non-prototype]
+        146 |         GETFUNCSYM(&dls2, __dls2, base+dyn[DT_PLTGOT]);
+            |                           ^
+      /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/musl/crt/rcrt1.c:11:13: note: conflicting prototype is here
+         11 | hidden void __dls2(unsigned char *base, size_t *sp)
+            |             ^
+      1 warning generated.
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
+      
+      The C compiler identification is Clang, found in:
+        /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/4.2.3/CompilerIdC/a.out
+      
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_AR"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-ar"
+      - "ar"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ar"
+      - "/opt/homebrew/bin/llvm-ar"
+      - "/usr/local/bin/llvm-ar"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ar"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ar"
+      - "/usr/bin/llvm-ar"
+      - "/bin/llvm-ar"
+      - "/usr/sbin/llvm-ar"
+      - "/sbin/llvm-ar"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ar"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/ar"
+      - "/opt/homebrew/bin/ar"
+      - "/usr/local/bin/ar"
+      - "/Users/priyanshuboruah/.opencode/bin/ar"
+      - "/Users/priyanshuboruah/.cargo/bin/ar"
+    found: "/usr/bin/ar"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_RANLIB"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-ranlib"
+      - "ranlib"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ranlib"
+      - "/opt/homebrew/bin/llvm-ranlib"
+      - "/usr/local/bin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ranlib"
+      - "/usr/bin/llvm-ranlib"
+      - "/bin/llvm-ranlib"
+      - "/usr/sbin/llvm-ranlib"
+      - "/sbin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ranlib"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/ranlib"
+      - "/opt/homebrew/bin/ranlib"
+      - "/usr/local/bin/ranlib"
+      - "/Users/priyanshuboruah/.opencode/bin/ranlib"
+      - "/Users/priyanshuboruah/.cargo/bin/ranlib"
+    found: "/usr/bin/ranlib"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_STRIP"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-strip"
+      - "strip"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-strip"
+      - "/opt/homebrew/bin/llvm-strip"
+      - "/usr/local/bin/llvm-strip"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-strip"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-strip"
+      - "/usr/bin/llvm-strip"
+      - "/bin/llvm-strip"
+      - "/usr/sbin/llvm-strip"
+      - "/sbin/llvm-strip"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-strip"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/strip"
+      - "/opt/homebrew/bin/strip"
+      - "/usr/local/bin/strip"
+      - "/Users/priyanshuboruah/.opencode/bin/strip"
+      - "/Users/priyanshuboruah/.cargo/bin/strip"
+    found: "/usr/bin/strip"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_LINKER"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "ld.lld"
+      - "ld"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/ld.lld"
+      - "/opt/homebrew/bin/ld.lld"
+      - "/usr/local/bin/ld.lld"
+      - "/Users/priyanshuboruah/.opencode/bin/ld.lld"
+      - "/Users/priyanshuboruah/.cargo/bin/ld.lld"
+      - "/usr/bin/ld.lld"
+      - "/bin/ld.lld"
+      - "/usr/sbin/ld.lld"
+      - "/sbin/ld.lld"
+      - "/Users/priyanshuboruah/.foundry/bin/ld.lld"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/ld"
+      - "/opt/homebrew/bin/ld"
+      - "/usr/local/bin/ld"
+      - "/Users/priyanshuboruah/.opencode/bin/ld"
+      - "/Users/priyanshuboruah/.cargo/bin/ld"
+    found: "/usr/bin/ld"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_NM"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-nm"
+      - "nm"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-nm"
+      - "/opt/homebrew/bin/llvm-nm"
+      - "/usr/local/bin/llvm-nm"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-nm"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-nm"
+      - "/usr/bin/llvm-nm"
+      - "/bin/llvm-nm"
+      - "/usr/sbin/llvm-nm"
+      - "/sbin/llvm-nm"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-nm"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/nm"
+      - "/opt/homebrew/bin/nm"
+      - "/usr/local/bin/nm"
+      - "/Users/priyanshuboruah/.opencode/bin/nm"
+      - "/Users/priyanshuboruah/.cargo/bin/nm"
+    found: "/usr/bin/nm"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_OBJDUMP"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-objdump"
+      - "objdump"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-objdump"
+      - "/opt/homebrew/bin/llvm-objdump"
+      - "/usr/local/bin/llvm-objdump"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-objdump"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-objdump"
+      - "/usr/bin/llvm-objdump"
+      - "/bin/llvm-objdump"
+      - "/usr/sbin/llvm-objdump"
+      - "/sbin/llvm-objdump"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-objdump"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/objdump"
+      - "/opt/homebrew/bin/objdump"
+      - "/usr/local/bin/objdump"
+      - "/Users/priyanshuboruah/.opencode/bin/objdump"
+      - "/Users/priyanshuboruah/.cargo/bin/objdump"
+    found: "/usr/bin/objdump"
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_OBJCOPY"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-objcopy"
+      - "objcopy"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-objcopy"
+      - "/opt/homebrew/bin/llvm-objcopy"
+      - "/usr/local/bin/llvm-objcopy"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-objcopy"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-objcopy"
+      - "/usr/bin/llvm-objcopy"
+      - "/bin/llvm-objcopy"
+      - "/usr/sbin/llvm-objcopy"
+      - "/sbin/llvm-objcopy"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-objcopy"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/objcopy"
+      - "/opt/homebrew/bin/objcopy"
+      - "/usr/local/bin/objcopy"
+      - "/Users/priyanshuboruah/.opencode/bin/objcopy"
+      - "/Users/priyanshuboruah/.cargo/bin/objcopy"
+      - "/usr/bin/objcopy"
+      - "/bin/objcopy"
+      - "/usr/sbin/objcopy"
+      - "/sbin/objcopy"
+      - "/Users/priyanshuboruah/.foundry/bin/objcopy"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_READELF"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-readelf"
+      - "readelf"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-readelf"
+      - "/opt/homebrew/bin/llvm-readelf"
+      - "/usr/local/bin/llvm-readelf"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-readelf"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-readelf"
+      - "/usr/bin/llvm-readelf"
+      - "/bin/llvm-readelf"
+      - "/usr/sbin/llvm-readelf"
+      - "/sbin/llvm-readelf"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-readelf"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/readelf"
+      - "/opt/homebrew/bin/readelf"
+      - "/usr/local/bin/readelf"
+      - "/Users/priyanshuboruah/.opencode/bin/readelf"
+      - "/Users/priyanshuboruah/.cargo/bin/readelf"
+      - "/usr/bin/readelf"
+      - "/bin/readelf"
+      - "/usr/sbin/readelf"
+      - "/sbin/readelf"
+      - "/Users/priyanshuboruah/.foundry/bin/readelf"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_DLLTOOL"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-dlltool"
+      - "dlltool"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-dlltool"
+      - "/opt/homebrew/bin/llvm-dlltool"
+      - "/usr/local/bin/llvm-dlltool"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-dlltool"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-dlltool"
+      - "/usr/bin/llvm-dlltool"
+      - "/bin/llvm-dlltool"
+      - "/usr/sbin/llvm-dlltool"
+      - "/sbin/llvm-dlltool"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-dlltool"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/dlltool"
+      - "/opt/homebrew/bin/dlltool"
+      - "/usr/local/bin/dlltool"
+      - "/Users/priyanshuboruah/.opencode/bin/dlltool"
+      - "/Users/priyanshuboruah/.cargo/bin/dlltool"
+      - "/usr/bin/dlltool"
+      - "/bin/dlltool"
+      - "/usr/sbin/dlltool"
+      - "/sbin/dlltool"
+      - "/Users/priyanshuboruah/.foundry/bin/dlltool"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_ADDR2LINE"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-addr2line"
+      - "addr2line"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-addr2line"
+      - "/opt/homebrew/bin/llvm-addr2line"
+      - "/usr/local/bin/llvm-addr2line"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-addr2line"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-addr2line"
+      - "/usr/bin/llvm-addr2line"
+      - "/bin/llvm-addr2line"
+      - "/usr/sbin/llvm-addr2line"
+      - "/sbin/llvm-addr2line"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-addr2line"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/addr2line"
+      - "/opt/homebrew/bin/addr2line"
+      - "/usr/local/bin/addr2line"
+      - "/Users/priyanshuboruah/.opencode/bin/addr2line"
+      - "/Users/priyanshuboruah/.cargo/bin/addr2line"
+      - "/usr/bin/addr2line"
+      - "/bin/addr2line"
+      - "/usr/sbin/addr2line"
+      - "/sbin/addr2line"
+      - "/Users/priyanshuboruah/.foundry/bin/addr2line"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeFindBinUtils.cmake:243 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:200 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_TAPI"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "tapi"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/tapi"
+      - "/opt/homebrew/bin/tapi"
+      - "/usr/local/bin/tapi"
+      - "/Users/priyanshuboruah/.opencode/bin/tapi"
+      - "/Users/priyanshuboruah/.cargo/bin/tapi"
+      - "/usr/bin/tapi"
+      - "/bin/tapi"
+      - "/usr/sbin/tapi"
+      - "/sbin/tapi"
+      - "/Users/priyanshuboruah/.foundry/bin/tapi"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Compiler/Clang-FindBinUtils.cmake:26 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:201 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_C_COMPILER_AR"
+    description: "LLVM archiver"
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-ar-18.1"
+      - "llvm-ar-18"
+      - "llvm-ar18"
+      - "llvm-ar"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ar-18.1"
+      - "/opt/homebrew/bin/llvm-ar-18.1"
+      - "/usr/local/bin/llvm-ar-18.1"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ar-18.1"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ar-18.1"
+      - "/usr/bin/llvm-ar-18.1"
+      - "/bin/llvm-ar-18.1"
+      - "/usr/sbin/llvm-ar-18.1"
+      - "/sbin/llvm-ar-18.1"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ar-18.1"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ar-18"
+      - "/opt/homebrew/bin/llvm-ar-18"
+      - "/usr/local/bin/llvm-ar-18"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ar-18"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ar-18"
+      - "/usr/bin/llvm-ar-18"
+      - "/bin/llvm-ar-18"
+      - "/usr/sbin/llvm-ar-18"
+      - "/sbin/llvm-ar-18"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ar-18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ar18"
+      - "/opt/homebrew/bin/llvm-ar18"
+      - "/usr/local/bin/llvm-ar18"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ar18"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ar18"
+      - "/usr/bin/llvm-ar18"
+      - "/bin/llvm-ar18"
+      - "/usr/sbin/llvm-ar18"
+      - "/sbin/llvm-ar18"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ar18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ar"
+      - "/opt/homebrew/bin/llvm-ar"
+      - "/usr/local/bin/llvm-ar"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ar"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ar"
+      - "/usr/bin/llvm-ar"
+      - "/bin/llvm-ar"
+      - "/usr/sbin/llvm-ar"
+      - "/sbin/llvm-ar"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ar"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Compiler/Clang-FindBinUtils.cmake:38 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:201 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_C_COMPILER_RANLIB"
+    description: "Generate index for LLVM archive"
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "llvm-ranlib-18.1"
+      - "llvm-ranlib-18"
+      - "llvm-ranlib18"
+      - "llvm-ranlib"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ranlib-18.1"
+      - "/opt/homebrew/bin/llvm-ranlib-18.1"
+      - "/usr/local/bin/llvm-ranlib-18.1"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ranlib-18.1"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ranlib-18.1"
+      - "/usr/bin/llvm-ranlib-18.1"
+      - "/bin/llvm-ranlib-18.1"
+      - "/usr/sbin/llvm-ranlib-18.1"
+      - "/sbin/llvm-ranlib-18.1"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ranlib-18.1"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ranlib-18"
+      - "/opt/homebrew/bin/llvm-ranlib-18"
+      - "/usr/local/bin/llvm-ranlib-18"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ranlib-18"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ranlib-18"
+      - "/usr/bin/llvm-ranlib-18"
+      - "/bin/llvm-ranlib-18"
+      - "/usr/sbin/llvm-ranlib-18"
+      - "/sbin/llvm-ranlib-18"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ranlib-18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ranlib18"
+      - "/opt/homebrew/bin/llvm-ranlib18"
+      - "/usr/local/bin/llvm-ranlib18"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ranlib18"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ranlib18"
+      - "/usr/bin/llvm-ranlib18"
+      - "/bin/llvm-ranlib18"
+      - "/usr/sbin/llvm-ranlib18"
+      - "/sbin/llvm-ranlib18"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ranlib18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/llvm-ranlib"
+      - "/opt/homebrew/bin/llvm-ranlib"
+      - "/usr/local/bin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.opencode/bin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.cargo/bin/llvm-ranlib"
+      - "/usr/bin/llvm-ranlib"
+      - "/bin/llvm-ranlib"
+      - "/usr/sbin/llvm-ranlib"
+      - "/sbin/llvm-ranlib"
+      - "/Users/priyanshuboruah/.foundry/bin/llvm-ranlib"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Compiler/Clang-FindBinUtils.cmake:50 (find_program)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:201 (include)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_C_COMPILER_CLANG_SCAN_DEPS"
+    description: "`clang-scan-deps` dependency scanner"
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "clang-scan-deps-18.1"
+      - "clang-scan-deps-18"
+      - "clang-scan-deps18"
+      - "clang-scan-deps"
+    candidate_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/"
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+    searched_directories:
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/clang-scan-deps-18.1"
+      - "/opt/homebrew/bin/clang-scan-deps-18.1"
+      - "/usr/local/bin/clang-scan-deps-18.1"
+      - "/Users/priyanshuboruah/.opencode/bin/clang-scan-deps-18.1"
+      - "/Users/priyanshuboruah/.cargo/bin/clang-scan-deps-18.1"
+      - "/usr/bin/clang-scan-deps-18.1"
+      - "/bin/clang-scan-deps-18.1"
+      - "/usr/sbin/clang-scan-deps-18.1"
+      - "/sbin/clang-scan-deps-18.1"
+      - "/Users/priyanshuboruah/.foundry/bin/clang-scan-deps-18.1"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/clang-scan-deps-18"
+      - "/opt/homebrew/bin/clang-scan-deps-18"
+      - "/usr/local/bin/clang-scan-deps-18"
+      - "/Users/priyanshuboruah/.opencode/bin/clang-scan-deps-18"
+      - "/Users/priyanshuboruah/.cargo/bin/clang-scan-deps-18"
+      - "/usr/bin/clang-scan-deps-18"
+      - "/bin/clang-scan-deps-18"
+      - "/usr/sbin/clang-scan-deps-18"
+      - "/sbin/clang-scan-deps-18"
+      - "/Users/priyanshuboruah/.foundry/bin/clang-scan-deps-18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/clang-scan-deps18"
+      - "/opt/homebrew/bin/clang-scan-deps18"
+      - "/usr/local/bin/clang-scan-deps18"
+      - "/Users/priyanshuboruah/.opencode/bin/clang-scan-deps18"
+      - "/Users/priyanshuboruah/.cargo/bin/clang-scan-deps18"
+      - "/usr/bin/clang-scan-deps18"
+      - "/bin/clang-scan-deps18"
+      - "/usr/sbin/clang-scan-deps18"
+      - "/sbin/clang-scan-deps18"
+      - "/Users/priyanshuboruah/.foundry/bin/clang-scan-deps18"
+      - "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/clang-scan-deps"
+      - "/opt/homebrew/bin/clang-scan-deps"
+      - "/usr/local/bin/clang-scan-deps"
+      - "/Users/priyanshuboruah/.opencode/bin/clang-scan-deps"
+      - "/Users/priyanshuboruah/.cargo/bin/clang-scan-deps"
+      - "/usr/bin/clang-scan-deps"
+      - "/bin/clang-scan-deps"
+      - "/usr/sbin/clang-scan-deps"
+      - "/sbin/clang-scan-deps"
+      - "/Users/priyanshuboruah/.foundry/bin/clang-scan-deps"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:83 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:10 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-KmEs5J"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-KmEs5J"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-KmEs5J'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_3d23b/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_3d23b.dir/build.make CMakeFiles/cmTC_3d23b.dir/build
+        Building C object CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl   -target aarch64-linux-musl    -v -MD -MT CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o -MF CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o.d -o CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o -c /opt/homebrew/share/cmake/Modules/CMakeCCompilerABI.c
+        clang version 18.1.6 (https://github.com/ziglang/zig-bootstrap 98bc6bf4fc4009888d33941daf6b600d20a42a56)
+        Target: aarch64-unknown-linux-musl
+        Thread model: posix
+        InstalledDir: /usr/bin
+         (in-process)
+         "/Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig" -cc1 -triple aarch64-unknown-linux-musl -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -pic-is-pie -mframe-pointer=non-leaf -ffp-contract=on -fno-rounding-math -mconstructor-aliases -funwind-tables=2 -target-cpu generic -target-feature +v8a -target-feature +fp-armv8 -target-feature +neon -target-abi aapcs -debug-info-kind=constructor -dwarf-version=4 -debugger-tuning=gdb -gdwarf32 -fdebug-compilation-dir=/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-KmEs5J -v -fcoverage-compilation-dir=/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-KmEs5J -nostdsysteminc -nobuiltininc -resource-dir /Users/priyanshuboruah/ai-native-js-runtime/tools/lib/clang/18 -dependency-file CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o.d -MT CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o -sys-header-deps -isystem /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/include -isystem /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/aarch64-linux-musl -isystem /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/generic-musl -isystem /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/aarch64-linux-any -isystem /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/any-linux-any -D _DEBUG -O0 -ferror-limit 19 -fsanitize=alignment,array-bounds,bool,builtin,enum,float-cast-overflow,integer-divide-by-zero,nonnull-attribute,null,pointer-overflow,return,returns-nonnull-attribute,shift-base,shift-exponent,signed-integer-overflow,unreachable,vla-bound -fsanitize-trap=alignment,array-bounds,bool,builtin,enum,float-cast-overflow,integer-divide-by-zero,nonnull-attribute,null,pointer-overflow,return,returns-nonnull-attribute,shift-base,shift-exponent,signed-integer-overflow,unreachable,vla-bound -fno-sanitize-memory-param-retval -fno-sanitize-address-use-odr-indicator -stack-protector 2 -stack-protector-buffer-size 4 -fno-signed-char -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fno-spell-checking -target-cpu generic -target-feature -a510 -target-feature -a520 -target-feature -a65 -target-feature -a710 -target-feature -a720 -target-feature -a76 -target-feature -a78 -target-feature -a78c -target-feature -addr-lsl-fast -target-feature -aes -target-feature -aggressive-fma -target-feature -alternate-sextload-cvt-f32-pattern -target-feature -altnzcv -target-feature -alu-lsl-fast -target-feature -am -target-feature -amvs -target-feature -arith-bcc-fusion -target-feature -arith-cbz-fusion -target-feature -ascend-store-address -target-feature -b16b16 -target-feature -balance-fp-ops -target-feature -bf16 -target-feature -brbe -target-feature -bti -target-feature -call-saved-x10 -target-feature -call-saved-x11 -target-feature -call-saved-x12 -target-feature -call-saved-x13 -target-feature -call-saved-x14 -target-feature -call-saved-x15 -target-feature -call-saved-x18 -target-feature -call-saved-x8 -target-feature -call-saved-x9 -target-feature -ccdp -target-feature -ccidx -target-feature -ccpp -target-feature -chk -target-feature -clrbhb -target-feature -cmp-bcc-fusion -target-feature -complxnum -target-feature -CONTEXTIDREL2 -target-feature -cortex-r82 -target-feature -cpa -target-feature -crc -target-feature -crypto -target-feature -cssc -target-feature -d128 -target-feature -disable-latency-sched-heuristic -target-feature -disable-ldp -target-feature -disable-stp -target-feature -dit -target-feature -dotprod -target-feature -ecv -target-feature -el2vmsa -target-feature -el3 -target-feature +enable-select-opt -target-feature +ete -target-feature -exynos-cheap-as-move -target-feature -f32mm -target-feature -f64mm -target-feature -faminmax -target-feature -fgt -target-feature -fix-cortex-a53-835769 -target-feature -flagm -target-feature -fmv -target-feature -force-32bit-jump-tables -target-feature -fp16fml -target-feature -fp8 -target-feature -fp8dot2 -target-feature -fp8dot4 -target-feature -fp8fma -target-feature +fp-armv8 -target-feature -fpmr -target-feature -fptoint -target-feature -fullfp16 -target-feature -fuse-address -target-feature -fuse-addsub-2reg-const1 -target-feature +fuse-adrp-add -target-feature +fuse-aes -target-feature -fuse-arith-logic -target-feature -fuse-crypto-eor -target-feature -fuse-csel -target-feature -fuse-literals -target-feature -gcs -target-feature -harden-sls-blr -target-feature -harden-sls-nocomdat -target-feature -harden-sls-retbr -target-feature -hbc -target-feature -hcx -target-feature -i8mm -target-feature -ite -target-feature -jsconv -target-feature -ldp-aligned-only -target-feature -lor -target-feature -ls64 -target-feature -lse -target-feature -lse128 -target-feature -lse2 -target-feature -lut -target-feature -mec -target-feature -mops -target-feature -mpam -target-feature -mte -target-feature +neon -target-feature -nmi -target-feature -no-bti-at-return-twice -target-feature -no-neg-immediates -target-feature -no-sve-fp-ld1r -target-feature -no-zcz-fp -target-feature -nv -target-feature -outline-atomics -target-feature -pan -target-feature -pan-rwv -target-feature -pauth -target-feature -pauth-lr -target-feature -perfmon -target-feature -predictable-select-expensive -target-feature -predres -target-feature -prfm-slc-target -target-feature -rand -target-feature -ras -target-feature -rasv2 -target-feature -rcpc -target-feature -rcpc3 -target-feature -rcpc-immo -target-feature -rdm -target-feature -reserve-x1 -target-feature -reserve-x10 -target-feature -reserve-x11 -target-feature -reserve-x12 -target-feature -reserve-x13 -target-feature -reserve-x14 -target-feature -reserve-x15 -target-feature -reserve-x18 -target-feature -reserve-x2 -target-feature -reserve-x20 -target-feature -reserve-x21 -target-feature -reserve-x22 -target-feature -reserve-x23 -target-feature -reserve-x24 -target-feature -reserve-x25 -target-feature -reserve-x26 -target-feature -reserve-x27 -target-feature -reserve-x28 -target-feature -reserve-x3 -target-feature -reserve-x30 -target-feature -reserve-x4 -target-feature -reserve-x5 -target-feature -reserve-x6 -target-feature -reserve-x7 -target-feature -reserve-x9 -target-feature -rme -target-feature -sb -target-feature -sel2 -target-feature -sha2 -target-feature -sha3 -target-feature -slow-misaligned-128store -target-feature -slow-paired-128 -target-feature -slow-strqro-store -target-feature -sm4 -target-feature -sme -target-feature -sme2 -target-feature -sme2p1 -target-feature -sme-f16f16 -target-feature -sme-f64f64 -target-feature -sme-f8f16 -target-feature -sme-f8f32 -target-feature -sme-fa64 -target-feature -sme-i16i64 -target-feature -sme-lutv2 -target-feature -spe -target-feature -spe-eef -target-feature -specres2 -target-feature -specrestrict -target-feature -ssbs -target-feature -ssve-fp8dot2 -target-feature -ssve-fp8dot4 -target-feature -ssve-fp8fma -target-feature -store-pair-suppress -target-feature -stp-aligned-only -target-feature -strict-align -target-feature -sve -target-feature -sve2 -target-feature -sve2-aes -target-feature -sve2-bitperm -target-feature -sve2-sha3 -target-feature -sve2-sm4 -target-feature -sve2p1 -target-feature -tagged-globals -target-feature -the -target-feature -tlb-rmi -target-feature -tlbiw -target-feature -tme -target-feature -tpidr-el1 -target-feature -tpidr-el2 -target-feature -tpidr-el3 -target-feature -tpidrro-el0 -target-feature -tracev8.4 -target-feature +trbe -target-feature -uaops -target-feature -use-experimental-zeroing-pseudos -target-feature +use-postra-scheduler -target-feature -use-reciprocal-square-root -target-feature -use-scalar-inc-vl -target-feature -v8.1a -target-feature -v8.2a -target-feature -v8.3a -target-feature -v8.4a -target-feature -v8.5a -target-feature -v8.6a -target-feature -v8.7a -target-feature -v8.8a -target-feature -v8.9a -target-feature -v8a -target-feature -v8r -target-feature -v9.1a -target-feature -v9.2a -target-feature -v9.3a -target-feature -v9.4a -target-feature -v9.5a -target-feature -v9a -target-feature -vh -target-feature -wfxt -target-feature -xs -target-feature -zcm -target-feature -zcz -target-feature -zcz-fp-workaround -target-feature -zcz-gp -target-feature -fmv -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o -x c /opt/homebrew/share/cmake/Modules/CMakeCCompilerABI.c
+        clang -cc1 version 18.1.6 based upon LLVM 18.1.6 default target aarch64-darwin24.6.0
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/include
+         /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/aarch64-linux-musl
+         /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/generic-musl
+         /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/aarch64-linux-any
+         /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/lib/libc/include/any-linux-any
+        End of search list.
+        Linking C executable cmTC_3d23b
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_3d23b.dir/link.txt --verbose=1
+        error: unsupported linker arg: -v
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static -v -Wl,-v CMakeFiles/cmTC_3d23b.dir/CMakeCCompilerABI.c.o -o cmTC_3d23b
+        make[2]: *** [cmTC_3d23b] Error 1
+        make[1]: *** [cmTC_3d23b/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CMakeTestCCompiler.cmake:56 (try_compile)"
+      - "CMakeLists.txt:10 (project)"
+    checks:
+      - "Check for working C compiler: /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-uWwLxs"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-uWwLxs"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+    buildResult:
+      variable: "CMAKE_C_COMPILER_WORKS"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-uWwLxs'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_09b69/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_09b69.dir/build.make CMakeFiles/cmTC_09b69.dir/build
+        Building C object CMakeFiles/cmTC_09b69.dir/testCCompiler.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl   -target aarch64-linux-musl  -MD -MT CMakeFiles/cmTC_09b69.dir/testCCompiler.c.o -MF CMakeFiles/cmTC_09b69.dir/testCCompiler.c.o.d -o CMakeFiles/cmTC_09b69.dir/testCCompiler.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-uWwLxs/testCCompiler.c
+        Linking C executable cmTC_09b69
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_09b69.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_09b69.dir/testCCompiler.c.o -o cmTC_09b69
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:108 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_W4"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Pz6uol"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Pz6uol"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_W4"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Pz6uol'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_39b4a/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_39b4a.dir/build.make CMakeFiles/cmTC_39b4a.dir/build
+        Building C object CMakeFiles/cmTC_39b4a.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_W4  -target aarch64-linux-musl  -std=gnu11   /W4 -MD -MT CMakeFiles/cmTC_39b4a.dir/src.c.o -MF CMakeFiles/cmTC_39b4a.dir/src.c.o.d -o CMakeFiles/cmTC_39b4a.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Pz6uol/src.c
+        ld.lld: error: cannot open /W4: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_39b4a.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_39b4a/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:109 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_UNUSED_PARAMETER_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jn2uVs"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jn2uVs"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_UNUSED_PARAMETER_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jn2uVs'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_df10a/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_df10a.dir/build.make CMakeFiles/cmTC_df10a.dir/build
+        Building C object CMakeFiles/cmTC_df10a.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_UNUSED_PARAMETER_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4100 -MD -MT CMakeFiles/cmTC_df10a.dir/src.c.o -MF CMakeFiles/cmTC_df10a.dir/src.c.o.d -o CMakeFiles/cmTC_df10a.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jn2uVs/src.c
+        ld.lld: error: cannot open /wd4100: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_df10a.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_df10a/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:110 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_CONDITIONAL_CONSTANT_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jl8wYL"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jl8wYL"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_CONDITIONAL_CONSTANT_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jl8wYL'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_0aae4/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_0aae4.dir/build.make CMakeFiles/cmTC_0aae4.dir/build
+        Building C object CMakeFiles/cmTC_0aae4.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_CONDITIONAL_CONSTANT_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4127 -MD -MT CMakeFiles/cmTC_0aae4.dir/src.c.o -MF CMakeFiles/cmTC_0aae4.dir/src.c.o.d -o CMakeFiles/cmTC_0aae4.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Jl8wYL/src.c
+        ld.lld: error: cannot open /wd4127: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_0aae4.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_0aae4/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:111 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_NONSTANDARD_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-gkE7V2"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-gkE7V2"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_NONSTANDARD_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-gkE7V2'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5c9da/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_5c9da.dir/build.make CMakeFiles/cmTC_5c9da.dir/build
+        Building C object CMakeFiles/cmTC_5c9da.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_NONSTANDARD_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4201 -MD -MT CMakeFiles/cmTC_5c9da.dir/src.c.o -MF CMakeFiles/cmTC_5c9da.dir/src.c.o.d -o CMakeFiles/cmTC_5c9da.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-gkE7V2/src.c
+        ld.lld: error: cannot open /wd4201: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_5c9da.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_5c9da/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:112 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_NONSTANDARD_EMPTY_TU_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Se7kDX"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Se7kDX"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_NONSTANDARD_EMPTY_TU_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Se7kDX'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_1a03a/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_1a03a.dir/build.make CMakeFiles/cmTC_1a03a.dir/build
+        Building C object CMakeFiles/cmTC_1a03a.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_NONSTANDARD_EMPTY_TU_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4206 -MD -MT CMakeFiles/cmTC_1a03a.dir/src.c.o -MF CMakeFiles/cmTC_1a03a.dir/src.c.o.d -o CMakeFiles/cmTC_1a03a.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-Se7kDX/src.c
+        ld.lld: error: cannot open /wd4206: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_1a03a.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_1a03a/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:113 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_NONSTANDARD_FILE_SCOPE_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-C1CJjF"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-C1CJjF"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_NONSTANDARD_FILE_SCOPE_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-C1CJjF'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_ee9da/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_ee9da.dir/build.make CMakeFiles/cmTC_ee9da.dir/build
+        Building C object CMakeFiles/cmTC_ee9da.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_NONSTANDARD_FILE_SCOPE_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4210 -MD -MT CMakeFiles/cmTC_ee9da.dir/src.c.o -MF CMakeFiles/cmTC_ee9da.dir/src.c.o.d -o CMakeFiles/cmTC_ee9da.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-C1CJjF/src.c
+        ld.lld: error: cannot open /wd4210: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_ee9da.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_ee9da/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:114 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_NONSTANDARD_NONSTATIC_DLIMPORT_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-RoyMFH"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-RoyMFH"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_NONSTANDARD_NONSTATIC_DLIMPORT_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-RoyMFH'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_aa2c3/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_aa2c3.dir/build.make CMakeFiles/cmTC_aa2c3.dir/build
+        Building C object CMakeFiles/cmTC_aa2c3.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_NONSTANDARD_NONSTATIC_DLIMPORT_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4232 -MD -MT CMakeFiles/cmTC_aa2c3.dir/src.c.o -MF CMakeFiles/cmTC_aa2c3.dir/src.c.o.d -o CMakeFiles/cmTC_aa2c3.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-RoyMFH/src.c
+        ld.lld: error: cannot open /wd4232: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_aa2c3.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_aa2c3/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:115 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_HIDES_LOCAL"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-9JQzYL"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-9JQzYL"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_HIDES_LOCAL"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-9JQzYL'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_f760c/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_f760c.dir/build.make CMakeFiles/cmTC_f760c.dir/build
+        Building C object CMakeFiles/cmTC_f760c.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_HIDES_LOCAL  -target aarch64-linux-musl  -std=gnu11   /wd4456 -MD -MT CMakeFiles/cmTC_f760c.dir/src.c.o -MF CMakeFiles/cmTC_f760c.dir/src.c.o.d -o CMakeFiles/cmTC_f760c.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-9JQzYL/src.c
+        ld.lld: error: cannot open /wd4456: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_f760c.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_f760c/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:116 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_HIDES_PARAM"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-D1jmsF"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-D1jmsF"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_HIDES_PARAM"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-D1jmsF'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_4ccf9/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_4ccf9.dir/build.make CMakeFiles/cmTC_4ccf9.dir/build
+        Building C object CMakeFiles/cmTC_4ccf9.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_HIDES_PARAM  -target aarch64-linux-musl  -std=gnu11   /wd4457 -MD -MT CMakeFiles/cmTC_4ccf9.dir/src.c.o -MF CMakeFiles/cmTC_4ccf9.dir/src.c.o.d -o CMakeFiles/cmTC_4ccf9.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-D1jmsF/src.c
+        ld.lld: error: cannot open /wd4457: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_4ccf9.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_4ccf9/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:117 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_HIDES_GLOBAL"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-tHH4yM"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-tHH4yM"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_HIDES_GLOBAL"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-tHH4yM'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_36e21/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_36e21.dir/build.make CMakeFiles/cmTC_36e21.dir/build
+        Building C object CMakeFiles/cmTC_36e21.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_HIDES_GLOBAL  -target aarch64-linux-musl  -std=gnu11   /wd4459 -MD -MT CMakeFiles/cmTC_36e21.dir/src.c.o -MF CMakeFiles/cmTC_36e21.dir/src.c.o.d -o CMakeFiles/cmTC_36e21.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-tHH4yM/src.c
+        ld.lld: error: cannot open /wd4459: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_36e21.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_36e21/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:118 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_CONDITIONAL_ASSIGNMENT_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-FHTvKp"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-FHTvKp"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_CONDITIONAL_ASSIGNMENT_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-FHTvKp'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_74e27/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_74e27.dir/build.make CMakeFiles/cmTC_74e27.dir/build
+        Building C object CMakeFiles/cmTC_74e27.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_CONDITIONAL_ASSIGNMENT_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4706 -MD -MT CMakeFiles/cmTC_74e27.dir/src.c.o -MF CMakeFiles/cmTC_74e27.dir/src.c.o.d -o CMakeFiles/cmTC_74e27.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-FHTvKp/src.c
+        ld.lld: error: cannot open /wd4706: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_74e27.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_74e27/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:119 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_UNSAFE_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BNDTfF"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BNDTfF"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_UNSAFE_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BNDTfF'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_d77de/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_d77de.dir/build.make CMakeFiles/cmTC_d77de.dir/build
+        Building C object CMakeFiles/cmTC_d77de.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_UNSAFE_MSVC  -target aarch64-linux-musl  -std=gnu11   /wd4996 -MD -MT CMakeFiles/cmTC_d77de.dir/src.c.o -MF CMakeFiles/cmTC_d77de.dir/src.c.o.d -o CMakeFiles/cmTC_d77de.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BNDTfF/src.c
+        ld.lld: error: cannot open /wd4996: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_d77de.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_d77de/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:121 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_WALL"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-vUAJ5g"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-vUAJ5g"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_WALL"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-vUAJ5g'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_ddb24/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_ddb24.dir/build.make CMakeFiles/cmTC_ddb24.dir/build
+        Building C object CMakeFiles/cmTC_ddb24.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_WALL  -target aarch64-linux-musl  -std=gnu11   -Wall -MD -MT CMakeFiles/cmTC_ddb24.dir/src.c.o -MF CMakeFiles/cmTC_ddb24.dir/src.c.o.d -o CMakeFiles/cmTC_ddb24.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-vUAJ5g/src.c
+        Linking C executable cmTC_ddb24
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ddb24.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_ddb24.dir/src.c.o -o cmTC_ddb24
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:124 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_NO_UNUSED_PARAMETER"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BAmJuI"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BAmJuI"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_NO_UNUSED_PARAMETER"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BAmJuI'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_2b2df/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_2b2df.dir/build.make CMakeFiles/cmTC_2b2df.dir/build
+        Building C object CMakeFiles/cmTC_2b2df.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_NO_UNUSED_PARAMETER  -target aarch64-linux-musl  -std=gnu11   -Wno-unused-parameter -MD -MT CMakeFiles/cmTC_2b2df.dir/src.c.o -MF CMakeFiles/cmTC_2b2df.dir/src.c.o.d -o CMakeFiles/cmTC_2b2df.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-BAmJuI/src.c
+        Linking C executable cmTC_2b2df
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_2b2df.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_2b2df.dir/src.c.o -o cmTC_2b2df
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:125 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_STRICT_PROTOTYPES"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-P3rZ7P"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-P3rZ7P"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_STRICT_PROTOTYPES"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-P3rZ7P'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_e26c6/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_e26c6.dir/build.make CMakeFiles/cmTC_e26c6.dir/build
+        Building C object CMakeFiles/cmTC_e26c6.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_STRICT_PROTOTYPES  -target aarch64-linux-musl  -std=gnu11   -Wstrict-prototypes -MD -MT CMakeFiles/cmTC_e26c6.dir/src.c.o -MF CMakeFiles/cmTC_e26c6.dir/src.c.o.d -o CMakeFiles/cmTC_e26c6.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-P3rZ7P/src.c
+        Linking C executable cmTC_e26c6
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_e26c6.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_e26c6.dir/src.c.o -o cmTC_e26c6
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:126 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_EXTRA"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-TCQQWH"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-TCQQWH"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_EXTRA"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-TCQQWH'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_48452/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_48452.dir/build.make CMakeFiles/cmTC_48452.dir/build
+        Building C object CMakeFiles/cmTC_48452.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_EXTRA  -target aarch64-linux-musl  -std=gnu11   -Wextra -MD -MT CMakeFiles/cmTC_48452.dir/src.c.o -MF CMakeFiles/cmTC_48452.dir/src.c.o.d -o CMakeFiles/cmTC_48452.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-TCQQWH/src.c
+        Linking C executable cmTC_48452
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_48452.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_48452.dir/src.c.o -o cmTC_48452
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:128 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_LINT_UTF8_MSVC"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-5LSYWi"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-5LSYWi"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_LINT_UTF8_MSVC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-5LSYWi'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_8d873/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_8d873.dir/build.make CMakeFiles/cmTC_8d873.dir/build
+        Building C object CMakeFiles/cmTC_8d873.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_LINT_UTF8_MSVC  -target aarch64-linux-musl  -std=gnu11   /utf-8 -MD -MT CMakeFiles/cmTC_8d873.dir/src.c.o -MF CMakeFiles/cmTC_8d873.dir/src.c.o.d -o CMakeFiles/cmTC_8d873.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-5LSYWi/src.c
+        ld.lld: error: cannot open /utf-8: No such file or directory
+        make[2]: *** [CMakeFiles/cmTC_8d873.dir/src.c.o] Error 1
+        make[1]: *** [cmTC_8d873/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:104 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/share/cmake/Modules/CheckCCompilerFlag.cmake:105 (cmake_check_compiler_flag)"
+      - "CMakeLists.txt:167 (check_c_compiler_flag)"
+    checks:
+      - "Performing Test UV_F_STRICT_ALIASING"
+    directories:
+      source: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-1ur3FP"
+      binary: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-1ur3FP"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "-target aarch64-linux-musl"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: "-target aarch64-linux-musl -static"
+      CMAKE_MODULE_PATH: "/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/cmake"
+    buildResult:
+      variable: "UV_F_STRICT_ALIASING"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-1ur3FP'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_b2aa3/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_b2aa3.dir/build.make CMakeFiles/cmTC_b2aa3.dir/build
+        Building C object CMakeFiles/cmTC_b2aa3.dir/src.c.o
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -DUV_F_STRICT_ALIASING  -target aarch64-linux-musl  -std=gnu11   -fno-strict-aliasing -MD -MT CMakeFiles/cmTC_b2aa3.dir/src.c.o -MF CMakeFiles/cmTC_b2aa3.dir/src.c.o.d -o CMakeFiles/cmTC_b2aa3.dir/src.c.o -c /Users/priyanshuboruah/ai-native-js-runtime/deps/libuv/build-linux-arm64/CMakeFiles/CMakeScratch/TryCompile-1ur3FP/src.c
+        Linking C executable cmTC_b2aa3
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_b2aa3.dir/link.txt --verbose=1
+        /Users/priyanshuboruah/ai-native-js-runtime/tools/zig/zig cc -target aarch64-linux-musl -target aarch64-linux-musl  -target aarch64-linux-musl -static  CMakeFiles/cmTC_b2aa3.dir/src.c.o -o cmTC_b2aa3
+        
+      exitCode: 0
+  -
+    kind: "find-v1"
+    backtrace:
+      - "CMakeLists.txt:837 (find_program)"
+    mode: "program"
+    variable: "CLANG_TIDY_EXE"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "clang-tidy"
+    candidate_directories:
+      - "/opt/homebrew/bin/"
+      - "/usr/local/bin/"
+      - "/Users/priyanshuboruah/.opencode/bin/"
+      - "/Users/priyanshuboruah/.cargo/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/Users/priyanshuboruah/.foundry/bin/"
+      - "/usr/local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/"
+      - "/usr/bin/"
+      - "/usr/sbin/"
+      - "/usr/"
+      - "/bin/"
+      - "/sbin/"
+      - "/opt/homebrew/bin/"
+      - "/opt/homebrew/sbin/"
+      - "/opt/homebrew/"
+      - "/usr/X11R6/bin/"
+      - "/usr/X11R6/sbin/"
+      - "/usr/X11R6/"
+      - "/usr/pkg/bin/"
+      - "/usr/pkg/sbin/"
+      - "/usr/pkg/"
+      - "/opt/bin/"
+      - "/opt/sbin/"
+      - "/opt/"
+    searched_directories:
+      - "/opt/homebrew/bin/clang-tidy"
+      - "/usr/local/bin/clang-tidy"
+      - "/Users/priyanshuboruah/.opencode/bin/clang-tidy"
+      - "/Users/priyanshuboruah/.cargo/bin/clang-tidy"
+      - "/usr/bin/clang-tidy"
+      - "/bin/clang-tidy"
+      - "/usr/sbin/clang-tidy"
+      - "/sbin/clang-tidy"
+      - "/Users/priyanshuboruah/.foundry/bin/clang-tidy"
+      - "/usr/local/bin/clang-tidy"
+      - "/usr/local/sbin/clang-tidy"
+      - "/usr/local/clang-tidy"
+      - "/usr/bin/clang-tidy"
+      - "/usr/sbin/clang-tidy"
+      - "/usr/clang-tidy"
+      - "/bin/clang-tidy"
+      - "/sbin/clang-tidy"
+      - "/opt/homebrew/bin/clang-tidy"
+      - "/opt/homebrew/sbin/clang-tidy"
+      - "/opt/homebrew/clang-tidy"
+      - "/usr/X11R6/bin/clang-tidy"
+      - "/usr/X11R6/sbin/clang-tidy"
+      - "/usr/X11R6/clang-tidy"
+      - "/usr/pkg/bin/clang-tidy"
+      - "/usr/pkg/sbin/clang-tidy"
+      - "/usr/pkg/clang-tidy"
+      - "/opt/bin/clang-tidy"
+      - "/opt/sbin/clang-tidy"
+      - "/opt/clang-tidy"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/Users/priyanshuboruah/.opencode/bin"
+        - "/Users/priyanshuboruah/.cargo/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/Users/priyanshuboruah/.foundry/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "/usr/local"
+        - "/usr"
+        - "/"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr/X11R6"
+        - "/usr/pkg"
+        - "/opt"
+...

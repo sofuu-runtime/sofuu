@@ -30,9 +30,7 @@ compile_commands.json
 # ── Research archive (not part of this repo) ─────
 black-hole-disk/
 
-# ── Dependencies (checked in separately via submodule) ──
-deps/quickjs/
-deps/libuv/
+# ── Dependencies ──────────────────────────────────
 node_modules/
 
 # ── macOS system files ────────────────────────────

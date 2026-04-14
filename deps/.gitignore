@@ -1,0 +1,4 @@
+# Ignore local build directories — CI builds these fresh
+libuv/build/
+libuv/build-linux-arm64/
+libuv/build-linux-x86_64/

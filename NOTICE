@@ -10,12 +10,12 @@ Copyright (c) 2026 Haruhito. All Rights Reserved.
 The Quantum Tensor Sequence (QTSQ) binary file format embedded in this runtime
 is a proprietary format designed and owned solely by the Author. It is governed
 by the Quantum Tensor Sequence Proprietary License (QTSPL) v1.0, which is
-separate and distinct from the PolyForm Noncommercial License covering the
+separate and distinct from the MIT License covering the
 Sofuu runtime source code.
 
 See: LICENSES/QTSQ-FORMAT.txt for the full QTSQ format license terms.
 
-Key restrictions specific to the QTSQ Format (not covered by PolyForm NC):
+Key restrictions specific to the QTSQ Format (not covered by the MIT License):
   - You may NOT modify the .qtsq/.qtsw format specification.
   - You may NOT build competing tools that read/write .qtsq files outside
     of the Sofuu Runtime without a separate commercial license.

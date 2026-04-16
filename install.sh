@@ -3,7 +3,7 @@
 # Usage: curl -fsSL https://sofuu.dev/install | sh
 set -e
 
-REPO="sofuu/sofuu"
+REPO="sofuu-runtime/sofuu"
 INSTALL_DIR="${SOFUU_INSTALL_DIR:-/usr/local/bin}"
 BINARY="sofuu"
 
@@ -85,7 +85,7 @@ echo "✅ Sofuu ${LATEST} installed successfully!"
 echo ""
 "${INSTALL_DIR}/${BINARY}" version
 echo ""
-echo "   Docs: https://sofuu.dev"
+echo "   Docs: https://sofuu.xyz"
 echo "   Run:  sofuu run app.js"
 echo "   REPL: sofuu"
 echo ""

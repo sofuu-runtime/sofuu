@@ -103,6 +103,7 @@ SOFUU_SRCS=(
     "$SRC/npm/resolver.c"
     "$SRC/npm/cjs.c"
     "$SRC/repl/repl.c"
+    "$SRC/bundler/bundler.c"
     "$SRC/simd/avx.c"        # x86_64 — AVX2
     "deps/http-parser/http_parser.c"
 )
@@ -124,6 +125,7 @@ CFLAGS=(
     -I"$SRC/simd"
     -I"$SRC/npm"
     -I"$SRC/repl"
+    -I"$SRC/bundler"
     -I"$CURL_INC"
     -Ideps/http-parser
     -D_GNU_SOURCE

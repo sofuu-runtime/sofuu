@@ -7,6 +7,11 @@ CC      = cc
 TARGET  = sofuu
 ARCH   := $(shell uname -m)
 
+# Ubuntu/Linux arm64 reports as 'aarch64'
+ifeq ($(ARCH), aarch64)
+    ARCH = arm64
+endif
+
 # ---- Directories ----
 SRC_DIR   = src
 DEPS_DIR  = deps
@@ -133,9 +138,9 @@ ifeq ($(SOFUU_MEMORY),1)
     LDFLAGS += -L$(QTSQ_DIR) -lqtsq -lz
 endif
 
-# macOS has no need for -ldl, Linux does
+# macOS has no need for -ldl/-lrt/-latomic, Linux does
 ifneq ($(UNAME), Darwin)
-    LDFLAGS += -ldl
+    LDFLAGS += -ldl -lrt -latomic
 endif
 
 # ──────────────────────────────────────────────────────────────────

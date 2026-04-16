@@ -88,6 +88,7 @@ CFLAGS=(
     -I"$SRC" -I"$SRC/engine" -I"$SRC/modules" -I"$SRC/io"
     -I"$SRC/http" -I"$SRC/mcp" -I"$SRC/ts"
     -I"$SRC/simd" -I"$SRC/npm" -I"$SRC/repl"
+    -I"$SRC/bundler"
     -I"$CURL_INC" -Ideps/http-parser
     -D_GNU_SOURCE -DCONFIG_VERSION="\"$QJS_VERSION\""
     -Wno-unused-parameter -Wno-sign-compare -Wno-cast-function-type

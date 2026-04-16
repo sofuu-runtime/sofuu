@@ -2,7 +2,7 @@
 
 > *A fast, private JavaScript runtime built in C — designed from day one for AI-era workloads.*
 
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20NC%201.0.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0--alpha-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
@@ -249,10 +249,15 @@ make install   # copies binary to /usr/local/bin
 
 ## License
 
-Sofuu is licensed under the **PolyForm Noncommercial License 1.0.0**.
+The main execution runtime of Sofuu is open-source and licensed under the **MIT License**.
 
-This means you can use it freely for personal projects, learning, academic research, and open-source work. Commercial use requires a separate license.
+This means you can use, modify, and distribute it freely for both commercial and non-commercial projects.
 
-See [LICENSE](LICENSE) for the full terms or contact [hello@sofuu.xyz](mailto:hello@sofuu.xyz) to discuss commercial licensing.
+> ⚠️ **IMPORTANT NOTE ON QTSQ FORMAT:**
+> The MIT License applies **only** to the execution runtime codebase of Sofuu. It DOES NOT apply to the design, mathematics, or specification of the **QTSQ tensor format**, nor to the associated QTSQ quantization models. The QTSQ mathematical format and specifications remain proprietary. 
+> 
+> Please refer to [LICENSES/QTSQ-FORMAT.txt](LICENSES/QTSQ-FORMAT.txt) for specific licensing terms regarding the QTSQ infrastructure.
+
+See [LICENSE](LICENSE) for the full terms.
 
 © 2026 Priyanshu Boruah

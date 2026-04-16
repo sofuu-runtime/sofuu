@@ -23,7 +23,4 @@ SOFTWARE.
 ------------------------------------------------------------------------------
 Note on QTSQ Format:
 The MIT License applies only to the execution runtime codebase of Sofuu. 
-It DOES NOT apply to the design, mathematics, or specification of the QTSQ 
-tensor format, nor the QTSQ quantization models. Please refer to 
-`LICENSES/QTSQ-FORMAT.txt` for specific licensing terms regarding the QTSQ 
-infrastructure.
+It DOES NOT apply to the design, mathematics, or specification of the QTSQ tensor format. Please refer to `LICENSES/QTSQ-FORMAT.txt`for specific licensing terms regarding the QTSQ infrastructure.

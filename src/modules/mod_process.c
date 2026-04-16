@@ -164,9 +164,9 @@ static uv_pipe_t g_stdin_pipe;
 static int       g_stdin_pipe_open = 0;
 
 static JSContext *g_stdin_ctx    = NULL;
-static JSValue    g_stdin_on_data  = JS_UNDEFINED;
-static JSValue    g_stdin_on_end   = JS_UNDEFINED;
-static JSValue    g_stdin_on_error = JS_UNDEFINED;
+static JSValue    g_stdin_on_data;
+static JSValue    g_stdin_on_end;
+static JSValue    g_stdin_on_error;
 
 static void stdin_alloc_cb(uv_handle_t *h, size_t sug, uv_buf_t *buf) {
     (void)h;

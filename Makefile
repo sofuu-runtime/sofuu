@@ -131,7 +131,7 @@ ALL_SRCS = $(QJS_SRCS) $(SOFUU_SRCS)
 UV_LIB   = $(UV_DIR)/build/libuv.a
 
 # ---- Link flags ----
-LDFLAGS = -lpthread -lm -lcurl
+LDFLAGS += -lpthread -lm -lcurl
 
 ifeq ($(SOFUU_MEMORY),1)
     QTSQ_DIR = black-hole-disk

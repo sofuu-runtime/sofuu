@@ -35,7 +35,7 @@ CHECKSUM_NAME="${ARCHIVE_NAME}.sha256"
 
 # ── Fetch latest version tag ──────────────────────────────────
 echo "→ Detecting latest release..."
-LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
 
 if [ -z "$LATEST" ]; then

@@ -1018,26 +1018,32 @@ fn print_help() {
 /// with the tail pinned at the same spot; only the EYES change in place
 /// (open → blink → happy → blink). Row 1 is also 7 cells so the title
 /// text column aligns across all three rows.
+// Mascot tiles are ASCII-only on purpose: the previous art used U+25xx
+// geometric glyphs (░▒█●▸◕) and U+203E, which are East-Asian
+// ambiguous-width — terminals that render them 2 cells wide broke the
+// panel's right-border alignment on exactly the mascot rows. Every
+// character here is 1 cell in every terminal. Frames animate the eyes:
+// open (o) → blink (-) → happy (^) → blink (-).
 const SHIMA_FRAMES: [[&str; 3]; 4] = [
     [
-        "\x1b[38;5;231m \u{2591}\u{2592}\u{2591}\u{2592}\u{2591} \x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;16m●\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;16m●\x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m▸\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
+        "\x1b[38;5;231m ~v~v~ \x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
     ],
     [
-        "\x1b[38;5;231m \u{2591}\u{2592}\u{2591}\u{2592}\u{2591} \x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;16m‾\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;16m‾\x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m▸\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
+        "\x1b[38;5;231m ~v~v~ \x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
     ],
     [
-        "\x1b[38;5;231m \u{2591}\u{2592}\u{2591}\u{2592}\u{2591} \x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;214m◕\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m◕\x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m▸\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
+        "\x1b[38;5;231m ~v~v~ \x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
     ],
     [
-        "\x1b[38;5;231m \u{2591}\u{2592}\u{2591}\u{2592}\u{2591} \x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;16m‾\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;16m‾\x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
-        "\x1b[38;5;231m█\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m▸\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m█\x1b[0m\x1b[38;5;219m│\x1b[0m",
+        "\x1b[38;5;231m ~v~v~ \x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
+        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
     ],
 ];
 
@@ -1239,7 +1245,6 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     rows.push(format!("\x1b[2;35m╰{dash}╯\x1b[0m"));
 
     rows.push(String::new());
-    rows.push("  \x1b[1;35m✦\x1b[0m \x1b[2mStreaming, memory, MCP and web search are built in — nothing to install.\x1b[0m".into());
     if session.is_empty() {
         rows.push("  \x1b[90mNo session here yet — one starts with your first message.\x1b[0m".into());
     }

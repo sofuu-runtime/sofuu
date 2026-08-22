@@ -10,6 +10,10 @@ tools/
 *.so
 *.out
 
+# ── Rust build artifacts ──────────────────────────
+target/
+# Cargo.lock is COMMITTED for this application workspace (reproducible builds)
+
 # ── Old test memory outputs (not part of the runtime) ──
 *.qtsq
 *_kv/
@@ -29,6 +33,9 @@ compile_commands.json
 
 # ── Research archive (not part of this repo) ─────
 black-hole-disk/
+# The stale in-tree QTSQ snapshot is proprietary and was never committed —
+# keep it that way (the live checkout lives outside the repo).
+black-hole-disk-for-sofuu-runtime/
 
 # ── Dependencies ──────────────────────────────────
 node_modules/
@@ -52,3 +59,17 @@ sofuu-landing/
 # ── Font assets (belong in landing repo) ─────────
 Nunito_Complete/
 ascii-art.png
+
+# ── Session mesh state (per-project, machine-local) ──
+.sofuu/
+
+# ── Agent/CLI tool state (machine-local) ──────────
+.commandcode/
+.zcode/
+.mimosa/
+
+# ── Excluded research dir (not part of this repo) ─
+new-model-arch./
+
+# ── Legacy debug binary ───────────────────────────
+sofuu-sym

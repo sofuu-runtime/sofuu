@@ -1,0 +1,21 @@
+[package]
+name = "sofuu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sofuu Rust core — CLI, chat UI, HTTP, MCP, memory, AI client"
+
+[lib]
+name = "sofuu_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sofuu"
+path = "src/main.rs"
+
+[dependencies]
+sofuu-ffi = { path = "../sofuu-ffi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"

@@ -1,0 +1,2028 @@
+// rt/memory.rs — Memory subsystem (PLAN-RUST-MIGRATION M9).
+//
+// Port of the deleted `src/memory/{mod_memory.c, mod_kv.c, mod_agent.c,
+// qtsq_adapter.c}` (506 + 585 + 159 + 292 lines), semantics verbatim:
+//   sofuu.memory.open(path, vec_dim) → CMA (JS shell over the Rust Cma —
+//   the same object ffi_exports.rs's sofuu_cma_* hand to C; here the shell
+//   calls crate::memory::cma::Cma directly, no FFI round-trip)
+//   cma.remember/rememberEntity/recall/kvHints/forget/flush/decayTick/
+//   consolidate/count/markPositive
+//   sofuu.kv.open(path, cfg) → KVStore (QTSQ-backed page store, 2-page RAM
+//   LRU, streams kv_%08u_K / kv_%08u_V, index.json with %g-formatted 64-dim
+//   k_summary signatures — cross-restart search ranks real pages)
+//   sofuu.agent.create(name, cma, kv) → agent.prefetch(query, topK)
+//
+// C symbols replaced: `mod_memory_register`, `mod_kv_register`,
+// `mod_agent_register` (engine.c calls them unchanged under its
+// SOFUU_QTSQ_PRESENT guard). The exports exist UNCONDITIONALLY; only the
+// QTSQ-backed bodies are `#[cfg(has_qtsq)]` (sofuu-core/build.rs mirrors
+// the sofuu-ffi probe). Without QTSQ they are no-ops, matching the C build
+// where engine.c simply never calls them — JS sees no sofuu.memory/kv/agent.
+//
+// The brain-file format (two QTSQ streams: "memories" f32 tensor + "metadata"
+// JSON) and the KV page format (quantized K/V tensors, stream names
+// kv_%08u_{K,V}) are unchanged — files written by the retired C adapter load
+// as before, and vice versa. The deterministic local vault password
+// ("sofuu-kv-local-v1", qtsq_adapter.c:23) avoids macOS Keychain prompts on
+// every launch; encryption is an at-rest obfuscation layer.
+//
+// Safety notes (deviations from the C, all crash-avoidance only):
+//   - C segfaulted (strncpy/memcpy from NULL) on non-string args; here they
+//     fail gracefully (init errors / -1 results).
+//   - C read vec_dim floats from caller buffers that could be shorter
+//     (recall/kvHints/prefetch); here a short vector is a TypeError/empty
+//     result instead of an out-of-bounds read.
+//   - C's kv_page_save memcpy'd `count` floats from JS arrays without
+//     checking their length; here a short K/V array refuses the save.
+
+use sofuu_ffi::qjs::JSContext;
+
+#[cfg(has_qtsq)]
+mod impl_qtsq {
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::ptr;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
+    use sofuu_ffi::qtsq::{self, QtsqContext};
+
+    // SIMD kernels stay C (src/simd/{neon,avx}.c) — called over FFI, same
+    // as rt/ai.rs does.
+    extern "C" {
+        fn sofuu_cosine_f32(a: *const f32, b: *const f32, n: usize) -> f32;
+    }
+
+    const KV_SUMMARY_DIM: usize = 64; // formats.h KV_SUMMARY_DIM
+    const QTSQ_OK: c_int = qtsq::QTSQ_OK;
+
+    /// Deterministic local vault password — deliberately no OS keystore
+    /// (qtsq_adapter.c:23-41: an unsigned binary would trigger a macOS
+    /// Keychain prompt on EVERY launch; brain files are machine-local
+    /// at-rest obfuscation, so a fixed password avoids all prompts).
+    const SOFUU_QTSQ_LOCAL_PASSWORD: &str = "sofuu-kv-local-v1";
+
+    unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
+        if p.is_null() {
+            None
+        } else {
+            std::ffi::CStr::from_ptr(p).to_str().ok().map(|s| s.to_string())
+        }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * QTSQ adapter (port of src/memory/qtsq_adapter.c)
+     * ══════════════════════════════════════════════════════════════ */
+
+    unsafe fn qtsq_adapter_encrypt(ctx: *mut QtsqContext) -> c_int {
+        let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap_or_default();
+        qtsq::qtsq_vault_encrypt_password(ctx, pw.as_ptr())
+    }
+
+    /// Decrypt a context loaded with qtsq_read when its header says encrypted.
+    unsafe fn qtsq_adapter_decrypt(ctx: *mut QtsqContext) -> c_int {
+        if !(*ctx).is_encrypted() {
+            return QTSQ_OK;
+        }
+        let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap_or_default();
+        qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr())
+    }
+
+    /// cma_qtsq_save — write the "memories" f32 tensor + "metadata" JSON
+    /// streams, then pack → encrypt → fail-closed write.
+    unsafe fn cma_qtsq_save(
+        path: &str,
+        vecs: Option<&[f32]>,
+        n_memories: usize,
+        vec_dim: usize,
+        metadata_json: &str,
+    ) -> c_int {
+        let ctmp = CString::new(format!("{path}.tmp")).unwrap_or_default();
+        let container = qtsq::qtsq_ctx_alloc();
+        if container.is_null() {
+            return qtsq::QTSQ_ERR_ALLOC;
+        }
+        let mut r = qtsq::qtsq_container_create(container);
+        if r == QTSQ_OK {
+            /* Stream 1: memory vectors (lossless f32, flat table) */
+            if let Some(vecs) = vecs {
+                if !vecs.is_empty() && vec_dim > 0 {
+                    let sub = qtsq::qtsq_ctx_alloc();
+                    qtsq::qtsq_init(sub);
+                    let dims: [u32; 2] = [n_memories as u32, vec_dim as u32];
+                    r = qtsq::qtsq_compress_tensor(sub, vecs.as_ptr(), n_memories * vec_dim, dims.as_ptr(), 2);
+                    if r == QTSQ_OK {
+                        r = qtsq::qtsq_container_add_stream(container, sub, c"memories".as_ptr());
+                    }
+                    qtsq::qtsq_free(sub);
+                    qtsq::qtsq_ctx_free(sub);
+                    if r != QTSQ_OK {
+                        qtsq::qtsq_free(container);
+                        qtsq::qtsq_ctx_free(container);
+                        return r;
+                    }
+                }
+            }
+
+            /* Stream 2: metadata JSON */
+            if !metadata_json.is_empty() {
+                let cmeta = CString::new(metadata_json).unwrap_or_default();
+                let sub = qtsq::qtsq_ctx_alloc();
+                qtsq::qtsq_init(sub);
+                r = qtsq::qtsq_compress_json(sub, cmeta.as_ptr(), cmeta.as_bytes().len());
+                if r == QTSQ_OK {
+                    r = qtsq::qtsq_container_add_stream(container, sub, c"metadata".as_ptr());
+                }
+                qtsq::qtsq_free(sub);
+                qtsq::qtsq_ctx_free(sub);
+                if r != QTSQ_OK {
+                    qtsq::qtsq_free(container);
+                    qtsq::qtsq_ctx_free(container);
+                    return r;
+                }
+            }
+
+            /* Pack → encrypt → fail-closed write. Write to a .tmp sibling
+             * and atomically rename over the real path so a crash mid-write
+             * can never corrupt the existing brain file. */
+            r = qtsq::qtsq_container_pack(container);
+            if r == QTSQ_OK {
+                r = qtsq_adapter_encrypt(container);
+            }
+            if r == QTSQ_OK {
+                r = qtsq::qtsq_write(container, ctmp.as_ptr());
+            }
+        }
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+        if r == QTSQ_OK {
+            /* Atomic publish: rename tmp → real. On failure the tmp file
+             * remains (never wipe a good brain with a partial write). */
+            if std::fs::rename(format!("{path}.tmp"), path).is_err() {
+                r = qtsq::QTSQ_ERR_FORMAT;
+            }
+        } else {
+            let _ = std::fs::remove_file(format!("{path}.tmp"));
+        }
+        r
+    }
+
+    struct BrainData {
+        vecs: Vec<f32>,
+        n: usize,
+        dim: usize,
+        meta: Option<String>,
+        found_memories: bool, /* the "memories" stream was present */
+    }
+
+    /// cma_qtsq_load — read + decrypt a container, extract the "memories"
+    /// tensor (n/dim from its schema) and the "metadata" JSON stream.
+    unsafe fn cma_qtsq_load(path: &str) -> Result<BrainData, c_int> {
+        let cpath = CString::new(path).unwrap_or_default();
+        let container = qtsq::qtsq_ctx_alloc();
+        if container.is_null() {
+            return Err(qtsq::QTSQ_ERR_ALLOC);
+        }
+        let mut r = qtsq::qtsq_init(container);
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_read(container, cpath.as_ptr());
+        }
+        if r == QTSQ_OK {
+            r = qtsq_adapter_decrypt(container);
+        }
+        if r == QTSQ_OK && (*container).data_type() != qtsq::QTSQ_TYPE_CONTAINER {
+            r = qtsq::QTSQ_ERR_TYPE;
+        }
+        let mut num_streams: u32 = 0;
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_container_get_count(container, &mut num_streams);
+        }
+
+        let mut vecs: Vec<f32> = Vec::new();
+        let mut n = 0usize;
+        let mut dim = 0usize;
+        let mut meta: Option<String> = None;
+        let mut found_memories = false;
+        let mut i: u32 = 0;
+        while i < num_streams && r == QTSQ_OK {
+            let sub = qtsq::qtsq_ctx_alloc();
+            if sub.is_null() {
+                r = qtsq::QTSQ_ERR_ALLOC;
+                break;
+            }
+            let mut name_buf = [0u8; 256];
+            r = qtsq::qtsq_container_get_stream(
+                container,
+                i,
+                sub,
+                name_buf.as_mut_ptr() as *mut c_char,
+                name_buf.len(),
+            );
+            if r != QTSQ_OK {
+                /* The library only qtsq_init()s out_ctx on SUCCESS — freeing
+                 * an uninitialized context here would free garbage pointers.
+                 * Drop just the storage block (zeros — safe). */
+                qtsq::qtsq_ctx_free(sub);
+                break;
+            }
+            let name = CStr::from_ptr(name_buf.as_ptr() as *const c_char).to_bytes();
+            if name == b"memories" && vecs.is_empty() {
+                found_memories = true;
+                let mut data: *mut f32 = ptr::null_mut();
+                let mut count: usize = 0;
+                if qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count) == QTSQ_OK {
+                    let slice = std::slice::from_raw_parts(data, count);
+                    vecs = slice.to_vec();
+                    libc::free(data as *mut c_void);
+                    if (*sub).schema_num_dims() >= 2 {
+                        n = (*sub).schema_dim(0) as usize;
+                        dim = (*sub).schema_dim(1) as usize;
+                    } else {
+                        n = count;
+                        dim = 1;
+                    }
+                }
+            } else if name == b"metadata" && meta.is_none() {
+                let mut raw: *mut u8 = ptr::null_mut();
+                let mut raw_size: usize = 0;
+                if qtsq::qtsq_decompress_horizon(sub, &mut raw, &mut raw_size) == QTSQ_OK {
+                    let bytes = std::slice::from_raw_parts(raw, raw_size);
+                    meta = Some(String::from_utf8_lossy(bytes).into_owned());
+                    libc::free(raw as *mut c_void);
+                }
+            }
+            qtsq::qtsq_free(sub);
+            qtsq::qtsq_ctx_free(sub);
+            i += 1;
+        }
+
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+
+        if r != QTSQ_OK {
+            return Err(r);
+        }
+        Ok(BrainData { vecs, n, dim, meta, found_memories })
+    }
+
+    /// kv_qtsq_save_page — quantized K/V tensors as kv_%08u_{K,V} streams.
+    /// Returns the first failing rc, or QTSQ_OK (=== 0) for count==0 — the
+    /// C returned bare 0 for an empty page and the caller continued.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn kv_qtsq_save_page(
+        container: *mut QtsqContext,
+        k: *const f32,
+        v: *const f32,
+        n_layers: usize,
+        n_heads: usize,
+        n_tokens: usize,
+        head_dim: usize,
+        page_id: u32,
+        k_precision: qtsq::QtsqTensorPrecision,
+        v_precision: qtsq::QtsqTensorPrecision,
+    ) -> c_int {
+        if container.is_null() || k.is_null() || v.is_null() {
+            return -1;
+        }
+        let count = n_layers
+            .wrapping_mul(n_heads)
+            .wrapping_mul(n_tokens)
+            .wrapping_mul(head_dim);
+        if count == 0 {
+            return 0;
+        }
+
+        let dims: [u32; 4] = [
+            n_layers as u32,
+            n_heads as u32,
+            n_tokens as u32,
+            head_dim as u32,
+        ];
+
+        /* 1. K tensor */
+        let ctx_k = qtsq::qtsq_ctx_alloc();
+        if ctx_k.is_null() {
+            return qtsq::QTSQ_ERR_ALLOC;
+        }
+        qtsq::qtsq_init(ctx_k);
+        let name_k = format!("kv_{:08}_K", page_id);
+        let cname_k = CString::new(name_k).unwrap_or_default();
+        let mut r = qtsq::qtsq_compress_tensor_quantized(ctx_k, k, count, dims.as_ptr(), 4, k_precision);
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_container_add_stream(container, ctx_k, cname_k.as_ptr());
+        }
+        qtsq::qtsq_free(ctx_k);
+        qtsq::qtsq_ctx_free(ctx_k);
+        if r != QTSQ_OK {
+            return r;
+        }
+
+        /* 2. V tensor */
+        let ctx_v = qtsq::qtsq_ctx_alloc();
+        if ctx_v.is_null() {
+            return qtsq::QTSQ_ERR_ALLOC;
+        }
+        qtsq::qtsq_init(ctx_v);
+        let name_v = format!("kv_{:08}_V", page_id);
+        let cname_v = CString::new(name_v).unwrap_or_default();
+        r = qtsq::qtsq_compress_tensor_quantized(ctx_v, v, count, dims.as_ptr(), 4, v_precision);
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_container_add_stream(container, ctx_v, cname_v.as_ptr());
+        }
+        qtsq::qtsq_free(ctx_v);
+        qtsq::qtsq_ctx_free(ctx_v);
+
+        r
+    }
+
+    /// kv_qtsq_load_page — decompress one page's K/V tensors. The K schema
+    /// is [layers, heads, tokens, dim] — layers/tokens are read from it.
+    unsafe fn kv_qtsq_load_page(
+        kv_file: &str,
+        page_id: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>, usize, usize), c_int> {
+        let cpath = CString::new(kv_file).unwrap_or_default();
+        let container = qtsq::qtsq_ctx_alloc();
+        if container.is_null() {
+            return Err(qtsq::QTSQ_ERR_ALLOC);
+        }
+        let mut r = qtsq::qtsq_init(container);
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_read(container, cpath.as_ptr());
+        }
+        if r == QTSQ_OK {
+            /* V3: files are written encrypted (fail-closed) — decrypt in place. */
+            r = qtsq_adapter_decrypt(container);
+        }
+        let mut num_streams: u32 = 0;
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_container_get_count(container, &mut num_streams);
+        }
+
+        let name_k = format!("kv_{:08}_K", page_id);
+        let name_v = format!("kv_{:08}_V", page_id);
+        let cname_k = CString::new(name_k).unwrap_or_default();
+        let cname_v = CString::new(name_v).unwrap_or_default();
+
+        let mut k_data: Vec<f32> = Vec::new();
+        let mut v_data: Vec<f32> = Vec::new();
+        let mut n_layers: usize = 0;
+        let mut n_tokens: usize = 0;
+
+        if r == QTSQ_OK {
+            for i in 0..num_streams {
+                let sub = qtsq::qtsq_ctx_alloc();
+                if sub.is_null() {
+                    r = qtsq::QTSQ_ERR_ALLOC;
+                    break;
+                }
+                let mut name_buf = [0u8; 256];
+                if qtsq::qtsq_container_get_stream(
+                    container,
+                    i,
+                    sub,
+                    name_buf.as_mut_ptr() as *mut c_char,
+                    name_buf.len(),
+                ) == QTSQ_OK
+                {
+                    let name = CStr::from_ptr(name_buf.as_ptr() as *const c_char).to_bytes();
+                    if name == cname_k.as_bytes() {
+                        let mut data: *mut f32 = ptr::null_mut();
+                        let mut count: usize = 0;
+                        if qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count) == QTSQ_OK {
+                            k_data = std::slice::from_raw_parts(data, count).to_vec();
+                            libc::free(data as *mut c_void);
+                            if (*sub).schema_num_dims() >= 3 {
+                                n_layers = (*sub).schema_dim(0) as usize;
+                                n_tokens = (*sub).schema_dim(2) as usize; /* [l, h, tok, d] */
+                            }
+                        }
+                    } else if name == cname_v.as_bytes() {
+                        let mut data: *mut f32 = ptr::null_mut();
+                        let mut count: usize = 0;
+                        if qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count) == QTSQ_OK {
+                            v_data = std::slice::from_raw_parts(data, count).to_vec();
+                            libc::free(data as *mut c_void);
+                        }
+                    }
+                    qtsq::qtsq_free(sub);
+                }
+                qtsq::qtsq_ctx_free(sub);
+            }
+        }
+
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+
+        if r != QTSQ_OK {
+            return Err(r);
+        }
+        if !k_data.is_empty() && !v_data.is_empty() && k_data.len() == v_data.len() {
+            return Ok((k_data, v_data, n_layers, n_tokens));
+        }
+        Err(qtsq::QTSQ_ERR_FORMAT) /* Page not fully found or corrupted */
+    }
+
+    /// kv_qtsq_flush — pack the container (streams → singularity), encrypt
+    /// (fail-closed gate), then write atomically (tmp + rename).
+    unsafe fn kv_qtsq_flush(container: *mut QtsqContext, path: &str) -> c_int {
+        let ctmp = CString::new(format!("{path}.tmp")).unwrap_or_default();
+        let mut r = qtsq::qtsq_container_pack(container);
+        if r == QTSQ_OK {
+            r = qtsq_adapter_encrypt(container);
+        }
+        if r == QTSQ_OK {
+            r = qtsq::qtsq_write(container, ctmp.as_ptr());
+        }
+        if r == QTSQ_OK {
+            if std::fs::rename(format!("{path}.tmp"), path).is_err() {
+                r = qtsq::QTSQ_ERR_FORMAT;
+            }
+        } else {
+            let _ = std::fs::remove_file(format!("{path}.tmp"));
+        }
+        r
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * CMA shell (port of src/memory/mod_memory.c)
+     * ══════════════════════════════════════════════════════════════ */
+
+    // All memory state lives in crate::memory::cma::Cma; this shell owns the
+    // mind-file path and the vector dim (i.e. the C cma_t minus its vestigial
+    // ctx/obj fields, which the retired C shell never read back).
+    struct CmaShell {
+        mind_path: String,
+        vec_dim: usize,
+        cma: crate::memory::cma::Cma,
+    }
+
+    static CMA_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn cma_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) {
+        let cma = qjs::JS_GetOpaque(val, CMA_CLASS_ID.load(Ordering::Relaxed)) as *mut CmaShell;
+        if !cma.is_null() {
+            /* Do NOT call cma.flush here — the JS context may already be
+             * freed. JS code must call cma.flush() explicitly. (C comment,
+             * kept verbatim.) */
+            drop(Box::from_raw(cma));
+        }
+    }
+
+    const CMA_CLASS_DEF: qjs::JSClassDef = qjs::JSClassDef {
+        class_name: c"CMA".as_ptr(),
+        finalizer: Some(cma_finalizer),
+        gc_mark: ptr::null_mut(),
+        call: ptr::null_mut(),
+        exotic: ptr::null_mut(),
+    };
+
+    /// cma_open — validate dims, build the Rust CMA, hydrate from the QTSQ
+    /// brain file (vectors + metadata JSON). None when the open fails.
+    unsafe fn cma_open(path: &str, vec_dim: usize) -> Option<Box<CmaShell>> {
+        if vec_dim == 0 || vec_dim > 8192 {
+            eprintln!("[sofuu/cma] invalid vector dim {}", vec_dim);
+            return None;
+        }
+
+        let mut shell = Box::new(CmaShell {
+            mind_path: path.to_string(),
+            vec_dim,
+            cma: crate::memory::cma::Cma::new(vec_dim),
+        });
+
+        /* Hydrate from the QTSQ brain file (vectors + metadata JSON). */
+        if let Ok(brain) = cma_qtsq_load(path) {
+            if !brain.vecs.is_empty() && brain.n > 0 {
+                /* Guard against dimension mismatch between saved file and
+                 * the caller's vec_dim — same behavior as the C. */
+                if brain.dim != vec_dim {
+                    eprintln!(
+                        "[sofuu/cma] dimension mismatch: file has {}, requested {} — \
+                         ignoring saved vectors and starting fresh.",
+                        brain.dim, vec_dim
+                    );
+                } else if let Some(meta) = &brain.meta {
+                    if !shell.cma.hydrate(&brain.vecs, brain.n, brain.dim, meta) {
+                        eprintln!("[sofuu/cma] brain file metadata unreadable — starting fresh");
+                    }
+                }
+            } else if std::path::Path::new(path).exists() && !brain.found_memories {
+                /* The file exists but is unusable (empty container, missing
+                 * "memories" stream). Back it up BEFORE the next flush would
+                 * silently overwrite it — never wipe a brain silently. */
+                let bak = format!("{path}.bak");
+                let _ = std::fs::copy(path, &bak);
+                eprintln!(
+                    "[sofuu/cma] brain file {} is empty/corrupt (no memories stream) — \
+                     backed up to {} and starting fresh",
+                    path, bak
+                );
+            }
+        }
+        Some(shell)
+    }
+
+    /// cma_flush — dump vectors + records JSON, write via the QTSQ adapter
+    /// (same stream layout as before — brain files stay compatible).
+    unsafe fn cma_flush(shell: &mut CmaShell) -> c_int {
+        let n = shell.cma.vectors.len();
+        let dim = shell.cma.vec_dim;
+        let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
+        for v in &shell.cma.vectors {
+            flat.extend_from_slice(v);
+        }
+        let vecs = if n == 0 { None } else { Some(flat.as_slice()) };
+        let meta = shell.cma.records_json();
+        let r = cma_qtsq_save(&shell.mind_path, vecs, n, dim, &meta);
+        if r == QTSQ_OK {
+            0
+        } else {
+            -1
+        }
+    }
+
+    unsafe fn cma_remember(
+        shell: &mut CmaShell,
+        vec: &[f32],
+        text: Option<&str>,
+        role: Option<&str>,
+        kv_page_id: u32,
+    ) -> c_int {
+        let Some(text) = text else {
+            return -1;
+        };
+        shell.cma.remember(vec, text, role.unwrap_or("unknown"), kv_page_id)
+    }
+
+    /// recall → JSON array string (same shape ffi_exports.rs documents:
+    /// [{id, distance, score, role, text, tier, strength, entity}] —
+    /// `entity` is the namespace for TIER_ENTITY records (agent memory
+    /// scopes), null for ordinary memories).
+    unsafe fn cma_recall_json(shell: &mut CmaShell, query: &[f32], top_k: usize) -> String {
+        let hits = shell.cma.recall(query, top_k);
+        let arr: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.id,
+                    "distance": h.distance,
+                    "score": h.score,
+                    "role": h.role,
+                    "text": h.text,
+                    "tier": h.tier,
+                    "strength": h.strength,
+                    "entity": h.entity,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+    }
+
+    unsafe fn cma_remember_entity(
+        shell: &mut CmaShell,
+        vec: &[f32],
+        text: Option<&str>,
+        entity_name: Option<&str>,
+        entity_type: Option<&str>,
+    ) -> c_int {
+        let (Some(text), Some(name)) = (text, entity_name) else {
+            return -1;
+        };
+        shell
+            .cma
+            .remember_entity(vec, text, name, entity_type.unwrap_or("unknown"))
+    }
+
+    /* Extract a Float32Array arg → borrowed float pointer + element count.
+     * Null pointer on error (exception already thrown). */
+    unsafe fn cma_vec_arg(ctx: *mut JSContext, v: JSValueConst) -> (*const f32, usize) {
+        let mut byte_length: usize = 0;
+        let mut byte_offset: usize = 0;
+        let ab = qjs::JS_GetTypedArrayBuffer(ctx, v, &mut byte_offset, &mut byte_length, ptr::null_mut());
+        if qjs::is_exception(ab) {
+            return (ptr::null(), 0);
+        }
+        let mut ab_size: usize = 0;
+        let buf = qjs::JS_GetArrayBuffer(ctx, &mut ab_size, ab);
+        qjs::sofuu_js_free_value(ctx, ab);
+        if buf.is_null() {
+            return (ptr::null(), 0);
+        }
+        let p = (buf as *const u8).add(byte_offset) as *const f32;
+        (p, byte_length / std::mem::size_of::<f32>())
+    }
+
+    unsafe extern "C" fn js_cma_open(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected path and vector dimension".as_ptr());
+        }
+        let path = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let mut dim: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut dim, *argv.add(1));
+
+        let shell = cstr_opt(path).and_then(|p| cma_open(&p, dim as usize));
+        if !path.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, path);
+        }
+        let Some(shell) = shell else {
+            return qjs::JS_ThrowInternalError(ctx, c"Failed to initialize CMA".as_ptr());
+        };
+        let shell = Box::into_raw(shell);
+
+        let obj = qjs::JS_NewObjectClass(ctx, CMA_CLASS_ID.load(Ordering::Relaxed) as c_int);
+        qjs::JS_SetOpaque(obj, shell as *mut c_void);
+        obj
+    }
+
+    /// Mirrors the C's JS_GetOpaque2 + null check → JS_EXCEPTION.
+    unsafe fn shell_from_this<'a>(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+    ) -> Option<&'a mut CmaShell> {
+        let p = qjs::JS_GetOpaque2(ctx, this_val, CMA_CLASS_ID.load(Ordering::Relaxed))
+            as *mut CmaShell;
+        if p.is_null() {
+            None
+        } else {
+            Some(&mut *p)
+        }
+    }
+
+    unsafe extern "C" fn js_cma_remember(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 4 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vec(Float32Array), text, role, kv_page_id".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen != cma.vec_dim {
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+
+        let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        let role = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let mut page_id: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+
+        let idx = cma_remember(
+            cma,
+            std::slice::from_raw_parts(vec, vlen),
+            cstr_opt(text).as_deref(),
+            cstr_opt(role).as_deref(),
+            page_id,
+        );
+
+        if !text.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, text);
+        }
+        if !role.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, role);
+        }
+        qjs::sofuu_js_new_int32(ctx, idx)
+    }
+
+    unsafe extern "C" fn js_cma_remember_entity(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 4 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vec, text, entityName, entityType".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen != cma.vec_dim {
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+
+        let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        let entity_name = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let entity_type = qjs::sofuu_js_to_cstring(ctx, *argv.add(3));
+
+        let idx = cma_remember_entity(
+            cma,
+            std::slice::from_raw_parts(vec, vlen),
+            cstr_opt(text).as_deref(),
+            cstr_opt(entity_name).as_deref(),
+            cstr_opt(entity_type).as_deref(),
+        );
+
+        if !text.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, text);
+        }
+        if !entity_name.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, entity_name);
+        }
+        if !entity_type.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, entity_type);
+        }
+        qjs::sofuu_js_new_int32(ctx, idx)
+    }
+
+    unsafe extern "C" fn js_cma_recall(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected queryVec(Float32Array) and topK".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen < cma.vec_dim {
+            /* Short vectors would out-of-bounds read in the C — refuse. */
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+
+        let mut top_k: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut top_k, *argv.add(1));
+        /* Clamp: an unbounded top_k would size the HNSW candidate heap
+         * (ef = top_k*3) and OOM on a hostile/accidental huge value. */
+        if top_k > 1024 {
+            top_k = 1024;
+        }
+
+        let json = cma_recall_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize);
+        let cj = CString::new(json).unwrap_or_default();
+        let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
+        if qjs::is_exception(arr) {
+            qjs::sofuu_js_get_exception(ctx);
+            arr = qjs::JS_NewArray(ctx);
+        }
+        arr
+    }
+
+    unsafe extern "C" fn js_cma_kv_hints(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected queryVec(Float32Array) and n_hints".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen < cma.vec_dim {
+            /* Short vectors would out-of-bounds read in the C — refuse. */
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+
+        let mut n_hints: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut n_hints, *argv.add(1));
+        if n_hints > 1024 {
+            n_hints = 1024;
+        }
+
+        let ids = cma.cma.kv_hints(std::slice::from_raw_parts(vec, cma.vec_dim), n_hints as usize);
+        let arr = qjs::JS_NewArray(ctx);
+        for (i, id) in ids.iter().enumerate() {
+            qjs::JS_SetPropertyUint32(ctx, arr, i as u32, qjs::sofuu_js_new_uint32(ctx, *id));
+        }
+        arr
+    }
+
+    unsafe extern "C" fn js_cma_mark_positive(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected Array of ids".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        if qjs::JS_IsArray(ctx, *argv) == 0 {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument must be Array".as_ptr());
+        }
+        let len_val = qjs::sofuu_js_get_property_str(ctx, *argv, c"length".as_ptr());
+        let mut len: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut len, len_val);
+        qjs::sofuu_js_free_value(ctx, len_val);
+
+        let mut ids: Vec<u32> = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let id_val = qjs::JS_GetPropertyUint32(ctx, *argv, i);
+            let mut id: u32 = 0;
+            qjs::sofuu_js_to_uint32(ctx, &mut id, id_val);
+            qjs::sofuu_js_free_value(ctx, id_val);
+            ids.push(id);
+        }
+        let marked = cma.cma.mark_positive(&ids);
+        qjs::sofuu_js_new_uint32(ctx, marked)
+    }
+
+    unsafe extern "C" fn js_cma_decay_tick(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected dt_seconds".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let mut dt: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut dt, *argv);
+        cma.cma.decay_tick(dt);
+        qjs::sofuu_js_undefined()
+    }
+
+    /// M3 (PLAN-MEMORY-TOKENS): physical prune of dead records. Returns the
+    /// number dropped. Turn-boundary contract documented on Cma::retain.
+    unsafe extern "C" fn js_cma_retain(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let dropped = cma.cma.retain();
+        qjs::sofuu_js_new_uint32(ctx, dropped as u32)
+    }
+
+    unsafe extern "C" fn js_cma_forget(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected vector_index".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let mut v_idx: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut v_idx, *argv);
+        let ok = cma.cma.forget(v_idx);
+        qjs::sofuu_js_new_bool(ctx, if ok { 1 } else { 0 })
+    }
+
+    unsafe extern "C" fn js_cma_consolidate(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let n = cma.cma.consolidate() as c_int;
+        qjs::sofuu_js_new_int32(ctx, n)
+    }
+
+    unsafe extern "C" fn js_cma_count(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        qjs::sofuu_js_new_uint32(ctx, cma.cma.len() as u32)
+    }
+
+    unsafe extern "C" fn js_cma_flush(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let r = cma_flush(cma);
+        qjs::sofuu_js_new_bool(ctx, if r == 0 { 1 } else { 0 })
+    }
+
+    thread_local! {
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 11] = [
+            cfunc_entry(c"remember", 4, js_cma_remember),
+            cfunc_entry(c"rememberEntity", 4, js_cma_remember_entity),
+            cfunc_entry(c"recall", 2, js_cma_recall),
+            cfunc_entry(c"kvHints", 2, js_cma_kv_hints),
+            cfunc_entry(c"forget", 1, js_cma_forget),
+            cfunc_entry(c"flush", 0, js_cma_flush),
+            cfunc_entry(c"decayTick", 1, js_cma_decay_tick),
+            cfunc_entry(c"retain", 0, js_cma_retain),
+            cfunc_entry(c"consolidate", 0, js_cma_consolidate),
+            cfunc_entry(c"count", 0, js_cma_count),
+            cfunc_entry(c"markPositive", 1, js_cma_mark_positive),
+        ];
+        static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 1] =
+            [cfunc_entry(c"open", 2, js_cma_open)];
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * KV page store (port of src/memory/mod_kv.c)
+     * ══════════════════════════════════════════════════════════════ */
+
+    struct PageSummary {
+        page_id: u32,
+        k_summary: [f32; KV_SUMMARY_DIM],
+        strength: f32,
+        created_at: u32,
+    }
+
+    impl Default for PageSummary {
+        fn default() -> Self {
+            Self {
+                page_id: 0,
+                k_summary: [0.0; KV_SUMMARY_DIM],
+                strength: 0.0,
+                created_at: 0,
+            }
+        }
+    }
+
+    /// An active decompressed page held in RAM (qtsq_decompress_tensor
+    /// output, kept whole). We hold at most `max_active` of these.
+    /// (The tensor fields mirror the C's active_kv_page_t: the C only ever
+    /// freed them — the resident data itself had no consumer yet either.
+    /// #[allow(dead_code)] keeps the mirror faithful without lint noise.)
+    #[allow(dead_code)]
+    struct ActivePage {
+        page_id: u32,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        n_layers: usize,
+        n_tokens: usize,
+        last_accessed: u32, /* for LRU eviction */
+    }
+
+    struct Kvs {
+        file_path: String,
+        n_layers: usize,
+        n_heads: usize,
+        head_dim: usize,
+        /* Memory capacities / limits (max_size_gb mirrors the C field — the
+         * C also stored it without ever reading it back) */
+        #[allow(dead_code)]
+        max_size_gb: usize,
+        k_precision: qtsq::QtsqTensorPrecision,
+        v_precision: qtsq::QtsqTensorPrecision,
+        /* In-memory index of all pages (very fast to search) */
+        pages: Vec<PageSummary>,
+        /* In-memory LRU cache of decompressed tensors */
+        active: Vec<ActivePage>,
+        max_active: usize,
+        access_counter: u32,
+        ctx: *mut JSContext,
+    }
+
+    static KV_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn kv_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) {
+        let kv = qjs::JS_GetOpaque(val, KV_CLASS_ID.load(Ordering::Relaxed)) as *mut Kvs;
+        if kv.is_null() {
+            return;
+        }
+        /* Do NOT call kv_store_close here: it runs kv_flush, which builds JS
+         * objects via kv->ctx — ctx may already be freed when a GC finalizer
+         * runs (the exact use-after-free cma_finalizer documents and avoids).
+         * Free only Rust resources; JS code must flush() explicitly. */
+        drop(Box::from_raw(kv));
+    }
+
+    const KV_CLASS_DEF: qjs::JSClassDef = qjs::JSClassDef {
+        class_name: c"KVStore".as_ptr(),
+        finalizer: Some(kv_finalizer),
+        gc_mark: ptr::null_mut(),
+        call: ptr::null_mut(),
+        exotic: ptr::null_mut(),
+    };
+
+    fn ensure_dir(path: &str) {
+        if std::fs::metadata(path).is_err() {
+            let _ = std::fs::create_dir(path);
+        }
+    }
+
+    fn now_u32() -> u32 {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        (secs & 0xFFFF_FFFF) as u32
+    }
+
+    /// evict_lru_page — drop the least-recently-accessed active page
+    /// (excluding `exclude`), shifting the array down (C semantics).
+    fn evict_lru_page(kv: &mut Kvs, exclude: Option<usize>) {
+        if kv.active.is_empty() {
+            return;
+        }
+        let mut oldest_acc: u32 = u32::MAX;
+        let mut oldest_idx: Option<usize> = None;
+        for (i, page) in kv.active.iter().enumerate() {
+            if exclude == Some(i) {
+                continue;
+            }
+            if page.last_accessed < oldest_acc {
+                oldest_acc = page.last_accessed;
+                oldest_idx = Some(i);
+            }
+        }
+        if let Some(idx) = oldest_idx {
+            kv.active.remove(idx);
+        }
+    }
+
+    /// Mean-pool the page's K tensor across (layers, heads, tokens) into a
+    /// fixed-dim summary vector (the index's cosine-search signature).
+    /// The K layout is [layer][head][token][head_dim], and the pooled vector
+    /// always ends up L2-normalized so kv_search's cosine is well-defined.
+    fn compute_k_summary(
+        p: &mut PageSummary,
+        k: &[f32],
+        n_layers: usize,
+        n_heads: usize,
+        n_tokens: usize,
+        head_dim: usize,
+    ) {
+        p.k_summary.fill(0.0);
+        if k.is_empty() {
+            return;
+        }
+
+        if n_tokens == 0 {
+            p.k_summary[0] = 1.0; /* unit vector on zero length (norm stays valid) */
+            return;
+        }
+
+        /* Mean-pool across COMPONENTS: the K layout is
+         * [layer][head][token][head_dim]; each page's summary is the
+         * average of all its head_dim-wide slices, so the index signature
+         * is a distributed vector (matches the C-era index.json files).
+         * (The first port pooled into a single slot (t % 64) which made
+         * every summary degenerate to [1,0,0,...] after normalization —
+         * all pages tied at rank 1.) */
+        let pool = (n_layers.wrapping_mul(n_heads).wrapping_mul(n_tokens)).max(1);
+        let mut sums = [0.0f32; KV_SUMMARY_DIM];
+        let stride = head_dim.max(1);
+        for l in 0..n_layers {
+            for h in 0..n_heads {
+                for t in 0..n_tokens {
+                    let base = ((l * n_heads + h) * n_tokens + t) * stride;
+                    if base + head_dim > k.len() {
+                        continue; /* defensive — C read OOB here */
+                    }
+                    for j in 0..head_dim {
+                        let slot = j % KV_SUMMARY_DIM;
+                        sums[slot] += k[base + j] / pool as f32;
+                    }
+                }
+            }
+        }
+        for (dst, src) in p.k_summary.iter_mut().zip(sums.iter()) {
+            *dst = *src;
+        }
+
+        /* Normalize the pooled vector (guards empty pages + zero-norm
+         * degenerates) */
+        let mut norm = 0.0f32;
+        for i in 0..KV_SUMMARY_DIM {
+            norm += p.k_summary[i] * p.k_summary[i];
+        }
+        if norm > 0.0 {
+            let inv = 1.0f32 / norm.sqrt();
+            for v in p.k_summary.iter_mut() {
+                *v *= inv;
+            }
+        } else {
+            p.k_summary[0] = 1.0;
+        }
+    }
+
+    /// Serialize one page's k_summary as a JSON float array using C `%g`
+    /// formatting (via snprintf) so index.json stays byte-identical to the
+    /// files the retired C kv_flush wrote.
+    fn json_floats(vals: &[f32]) -> Option<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::with_capacity(vals.len() * 16 + 8);
+        out.push(b'[');
+        for (i, v) in vals.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let mut buf = [0u8; 64];
+            // SAFETY: snprintf writes at most 63 bytes + NUL into buf.
+            let n = unsafe {
+                libc::snprintf(
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                    c"%g".as_ptr(),
+                    *v as f64,
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        out.push(b']');
+        Some(out)
+    }
+
+    /// Parse a JSON float array (from the persisted index) back into `out`.
+    /// Returns 0 on success, -1 when missing/malformed (C parse_float_array).
+    unsafe fn parse_float_array(
+        ctx: *mut JSContext,
+        item: JSValueConst,
+        key: &CStr,
+        out: &mut [f32],
+    ) -> c_int {
+        let arr = qjs::sofuu_js_get_property_str(ctx, item, key.as_ptr());
+        if qjs::JS_IsArray(ctx, arr) == 0 {
+            qjs::sofuu_js_free_value(ctx, arr);
+            return -1;
+        }
+        let mut len: u32 = 0;
+        let lv = qjs::sofuu_js_get_property_str(ctx, arr, c"length".as_ptr());
+        qjs::sofuu_js_to_uint32(ctx, &mut len, lv);
+        qjs::sofuu_js_free_value(ctx, lv);
+        let take = (len as usize).min(out.len());
+        for i in 0..take {
+            let el = qjs::JS_GetPropertyUint32(ctx, arr, i as u32);
+            let mut d: f64 = 0.0;
+            qjs::JS_ToFloat64(ctx, &mut d, el);
+            out[i] = d as f32;
+            qjs::sofuu_js_free_value(ctx, el);
+        }
+        if take < out.len() {
+            out[take..].fill(0.0);
+        }
+        qjs::sofuu_js_free_value(ctx, arr);
+        0
+    }
+
+    /// kv_store_open — load the index if it exists (JS-parsed, exactly like
+    /// the C), else start with an empty summary index.
+    unsafe fn kv_store_open(
+        ctx: *mut JSContext,
+        path: &str,
+        n_layers: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Option<Box<Kvs>> {
+        ensure_dir(path);
+
+        let mut kv = Box::new(Kvs {
+            file_path: path.to_string(),
+            n_layers,
+            n_heads,
+            head_dim,
+            max_size_gb: 256,
+            k_precision: qtsq::QTSQ_TENSOR_F8,
+            v_precision: qtsq::QTSQ_TENSOR_F16,
+            pages: Vec::new(),
+            active: Vec::new(),
+            max_active: 2, /* Extremely strict by default: hold at most 2 decompressed pages to protect RAM */
+            access_counter: 1,
+            ctx,
+        });
+
+        let idx_path = format!("{}/index.json", path);
+        if let Ok(data) = std::fs::read(&idx_path) {
+            if !data.is_empty() {
+                let mut json_buf = data.to_vec();
+                json_buf.push(0);
+                let meta_obj = qjs::JS_ParseJSON(
+                    ctx,
+                    json_buf.as_ptr() as *const c_char,
+                    data.len(),
+                    c"index.json".as_ptr(),
+                );
+                if !qjs::is_exception(meta_obj) {
+                    let pages_arr = qjs::sofuu_js_get_property_str(ctx, meta_obj, c"pages".as_ptr());
+                    if qjs::JS_IsArray(ctx, pages_arr) != 0 {
+                        let mut arr_len: u32 = 0;
+                        let len_val = qjs::sofuu_js_get_property_str(ctx, pages_arr, c"length".as_ptr());
+                        qjs::sofuu_js_to_uint32(ctx, &mut arr_len, len_val);
+                        qjs::sofuu_js_free_value(ctx, len_val);
+
+                        kv.pages.reserve(arr_len as usize + 256);
+
+                        for i in 0..arr_len {
+                            let item = qjs::JS_GetPropertyUint32(ctx, pages_arr, i);
+                            let mut p = PageSummary::default();
+
+                            let v_id = qjs::sofuu_js_get_property_str(ctx, item, c"page_id".as_ptr());
+                            qjs::sofuu_js_to_uint32(ctx, &mut p.page_id, v_id);
+                            qjs::sofuu_js_free_value(ctx, v_id);
+
+                            let v_str = qjs::sofuu_js_get_property_str(ctx, item, c"strength".as_ptr());
+                            let mut st: f64 = 1.0;
+                            qjs::JS_ToFloat64(ctx, &mut st, v_str);
+                            p.strength = st as f32;
+                            qjs::sofuu_js_free_value(ctx, v_str);
+
+                            let v_time = qjs::sofuu_js_get_property_str(ctx, item, c"created_at".as_ptr());
+                            qjs::sofuu_js_to_uint32(ctx, &mut p.created_at, v_time);
+                            qjs::sofuu_js_free_value(ctx, v_time);
+
+                            /* Restore the persisted 64-dim K summary. Older
+                             * index files (or a zeroed entry) leave it
+                             * zeroed, exactly as before — such pages just
+                             * rank as neutral. */
+                            if parse_float_array(ctx, item, c"k_summary", &mut p.k_summary) != 0 {
+                                p.k_summary.fill(0.0);
+                            }
+
+                            qjs::sofuu_js_free_value(ctx, item);
+                            kv.pages.push(p);
+                        }
+                    }
+                    qjs::sofuu_js_free_value(ctx, pages_arr);
+                }
+                qjs::sofuu_js_free_value(ctx, meta_obj);
+            }
+        }
+        Some(kv)
+    }
+
+    /// kv_page_save — compress and append a page; updates index K-summary.
+    /// Returns the new page id (0 on failure).
+    unsafe fn kv_page_save(kv: &mut Kvs, k: &[f32], v: &[f32], n_tokens: usize, strength: f32) -> u32 {
+        let count = kv
+            .n_layers
+            .wrapping_mul(kv.n_heads)
+            .wrapping_mul(n_tokens)
+            .wrapping_mul(kv.head_dim);
+        /* The C memcpy'd `count` floats from the caller's buffers without
+         * checking their length — refuse short arrays (OOB-read fix). */
+        if k.len() < count || v.len() < count {
+            return 0;
+        }
+
+        let new_id = kv.pages.len() as u32 + 1;
+        let page_path = format!("{}/page_{:08}.qtsq", kv.file_path, new_id);
+
+        /* Create a mini container just for this single KV page to keep file
+         * sizes small and GC easy. C ignored qtsq_init/container_create rc —
+         * a failure surfaces via the save step below, same net result. */
+        let container = qtsq::qtsq_ctx_alloc();
+        if container.is_null() {
+            return 0;
+        }
+        qtsq::qtsq_init(container);
+        let _ = qtsq::qtsq_container_create(container);
+
+        let mut r = kv_qtsq_save_page(
+            container,
+            k.as_ptr(),
+            v.as_ptr(),
+            kv.n_layers,
+            kv.n_heads,
+            n_tokens,
+            kv.head_dim,
+            new_id,
+            kv.k_precision,
+            kv.v_precision,
+        );
+        if r == QTSQ_OK {
+            r = kv_qtsq_flush(container, &page_path);
+        }
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+
+        if r != QTSQ_OK {
+            return 0;
+        }
+
+        let mut p = PageSummary {
+            page_id: new_id,
+            strength,
+            created_at: now_u32(),
+            k_summary: [0.0; KV_SUMMARY_DIM],
+        };
+        compute_k_summary(&mut p, k, kv.n_layers, kv.n_heads, n_tokens, kv.head_dim);
+        kv.pages.push(p);
+
+        /* Also load it into RAM cache immediately since it was just generated */
+        if kv.active.len() >= kv.max_active {
+            evict_lru_page(kv, None);
+        }
+        kv.active.push(ActivePage {
+            page_id: new_id,
+            k: k[..count].to_vec(),
+            v: v[..count].to_vec(),
+            n_layers: kv.n_layers,
+            n_tokens,
+            last_accessed: kv.access_counter,
+        });
+        kv.access_counter = kv.access_counter.wrapping_add(1);
+
+        new_id
+    }
+
+    /// kv_get_page — find in the LRU cache, else load from SSD. Returns
+    /// true when the page is (now) resident.
+    unsafe fn kv_get_page(kv: &mut Kvs, page_id: u32) -> bool {
+        if page_id == 0 {
+            return false;
+        }
+
+        /* Check cache */
+        for page in kv.active.iter_mut() {
+            if page.page_id == page_id {
+                page.last_accessed = kv.access_counter;
+                kv.access_counter = kv.access_counter.wrapping_add(1);
+                return true;
+            }
+        }
+
+        /* Load from SSD */
+        let page_path = format!("{}/page_{:08}.qtsq", kv.file_path, page_id);
+        let Ok((k, v, l, tok)) = kv_qtsq_load_page(&page_path, page_id) else {
+            return false; /* Error or page missing */
+        };
+
+        if kv.active.len() >= kv.max_active {
+            evict_lru_page(kv, None);
+        }
+        kv.active.push(ActivePage {
+            page_id,
+            k,
+            v,
+            n_layers: l,
+            n_tokens: tok,
+            last_accessed: kv.access_counter,
+        });
+        kv.access_counter = kv.access_counter.wrapping_add(1);
+
+        true
+    }
+
+    /// kv_search — naive linear scan over the small summary index (64-float
+    /// signatures, thousands scanned in <1ms with the SIMD cosine kernel).
+    fn kv_search(kv: &mut Kvs, query_summary_64: &[f32], n_hints: usize) -> Vec<u32> {
+        if kv.pages.is_empty() || query_summary_64.len() < KV_SUMMARY_DIM || n_hints == 0 {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<(u32, f32)> = Vec::with_capacity(kv.pages.len());
+        for p in &kv.pages {
+            // SAFETY: the SIMD kernel reads exactly 64 floats from both sides.
+            let mut sim = unsafe { sofuu_cosine_f32(query_summary_64.as_ptr(), p.k_summary.as_ptr(), KV_SUMMARY_DIM) };
+            /* Apply decay/strength weighting */
+            sim *= p.strength;
+            matches.push((p.page_id, sim));
+        }
+
+        /* Sort matches, simplest way for small counts is insertion for top N */
+        let mut top_ids: Vec<u32> = Vec::with_capacity(n_hints);
+        for _k in 0..n_hints.min(kv.pages.len()) {
+            let mut best_sim: f32 = -2.0;
+            let mut best_idx: usize = 0;
+            for (i, m) in matches.iter().enumerate() {
+                if m.1 > best_sim {
+                    best_sim = m.1;
+                    best_idx = i;
+                }
+            }
+            if best_sim == -2.0 {
+                break;
+            }
+            top_ids.push(matches[best_idx].0);
+            matches[best_idx].1 = -3.0; /* Exclude from next pass */
+        }
+        top_ids
+    }
+
+    /// kv_flush — write the summary index to index.json (JS-stringified,
+    /// same object shape + %g numbers as the C).
+    unsafe fn kv_flush(kv: &mut Kvs) -> c_int {
+        let idx_path = format!("{}/index.json", kv.file_path);
+
+        let root = qjs::sofuu_js_new_object(kv.ctx);
+        let arr = qjs::JS_NewArray(kv.ctx);
+
+        for (i, p) in kv.pages.iter().enumerate() {
+            let item = qjs::sofuu_js_new_object(kv.ctx);
+            qjs::sofuu_js_set_property_str(
+                kv.ctx,
+                item,
+                c"page_id".as_ptr(),
+                qjs::sofuu_js_new_uint32(kv.ctx, p.page_id),
+            );
+            qjs::sofuu_js_set_property_str(
+                kv.ctx,
+                item,
+                c"strength".as_ptr(),
+                qjs::sofuu_js_new_float64(kv.ctx, p.strength as f64),
+            );
+            qjs::sofuu_js_set_property_str(
+                kv.ctx,
+                item,
+                c"created_at".as_ptr(),
+                qjs::sofuu_js_new_uint32(kv.ctx, p.created_at),
+            );
+            if let Some(j) = json_floats(&p.k_summary) {
+                let cj = CString::new(j).unwrap_or_default();
+                let jv = qjs::JS_ParseJSON(kv.ctx, cj.as_ptr(), cj.as_bytes().len(), c"<k_summary>".as_ptr());
+                if !qjs::is_exception(jv) {
+                    qjs::sofuu_js_set_property_str(kv.ctx, item, c"k_summary".as_ptr(), jv);
+                } else {
+                    qjs::sofuu_js_get_exception(kv.ctx); /* clear; persist page without summary */
+                    qjs::sofuu_js_free_value(kv.ctx, jv);
+                }
+            }
+            qjs::JS_SetPropertyUint32(kv.ctx, arr, i as u32, item);
+        }
+        qjs::sofuu_js_set_property_str(kv.ctx, root, c"pages".as_ptr(), arr);
+
+        let str_val = qjs::JS_JSONStringify(kv.ctx, root, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
+        let json_c = qjs::sofuu_js_to_cstring(kv.ctx, str_val);
+        if json_c.is_null() {
+            /* Stringify threw — free what we hold and report failure instead
+             * of writing nothing (mirrors the C null-check). */
+            qjs::sofuu_js_free_value(kv.ctx, str_val);
+            qjs::sofuu_js_free_value(kv.ctx, root);
+            return -1;
+        }
+
+        let bytes = CStr::from_ptr(json_c).to_bytes();
+        let _ = std::fs::write(&idx_path, bytes);
+
+        qjs::sofuu_js_free_cstring(kv.ctx, json_c);
+        qjs::sofuu_js_free_value(kv.ctx, str_val);
+        qjs::sofuu_js_free_value(kv.ctx, root);
+
+        0
+    }
+
+    unsafe fn kv_from_this<'a>(ctx: *mut JSContext, this_val: JSValueConst) -> Option<&'a mut Kvs> {
+        let p = qjs::JS_GetOpaque2(ctx, this_val, KV_CLASS_ID.load(Ordering::Relaxed)) as *mut Kvs;
+        if p.is_null() {
+            None
+        } else {
+            Some(&mut *p)
+        }
+    }
+
+    unsafe extern "C" fn js_kv_open(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected path and config object".as_ptr());
+        }
+        let path = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let cfg = *argv.add(1);
+
+        let v_mod = qjs::sofuu_js_get_property_str(ctx, cfg, c"modelId".as_ptr());
+        let model_id = qjs::sofuu_js_to_cstring(ctx, v_mod);
+
+        let mut n_l: u32 = 0;
+        let mut n_h: u32 = 0;
+        let mut h_d: u32 = 0;
+        let v_nl = qjs::sofuu_js_get_property_str(ctx, cfg, c"nLayers".as_ptr());
+        qjs::sofuu_js_to_uint32(ctx, &mut n_l, v_nl);
+        qjs::sofuu_js_free_value(ctx, v_nl);
+        let v_nh = qjs::sofuu_js_get_property_str(ctx, cfg, c"nHeads".as_ptr());
+        qjs::sofuu_js_to_uint32(ctx, &mut n_h, v_nh);
+        qjs::sofuu_js_free_value(ctx, v_nh);
+        let v_hd = qjs::sofuu_js_get_property_str(ctx, cfg, c"headDim".as_ptr());
+        qjs::sofuu_js_to_uint32(ctx, &mut h_d, v_hd);
+        qjs::sofuu_js_free_value(ctx, v_hd);
+
+        let kv = cstr_opt(path).and_then(|p| {
+            kv_store_open(ctx, &p, n_l as usize, n_h as usize, h_d as usize)
+        });
+
+        if !model_id.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, model_id);
+        }
+        qjs::sofuu_js_free_value(ctx, v_mod);
+        if !path.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, path);
+        }
+
+        let Some(kv) = kv else {
+            return qjs::JS_ThrowInternalError(ctx, c"Failed to initialize KV".as_ptr());
+        };
+        let kv = Box::into_raw(kv);
+
+        let obj = qjs::JS_NewObjectClass(ctx, KV_CLASS_ID.load(Ordering::Relaxed) as c_int);
+        qjs::JS_SetOpaque(obj, kv as *mut c_void);
+        obj
+    }
+
+    unsafe extern "C" fn js_kv_save(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 3 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected K(Float32Array), V(Float32Array), n_tokens".as_ptr(),
+            );
+        }
+        let Some(kv) = kv_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (k_ptr, k_len) = cma_vec_arg(ctx, *argv);
+        if k_ptr.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"K must be Float32Array".as_ptr());
+        }
+        let (v_ptr, v_len) = cma_vec_arg(ctx, *argv.add(1));
+        if v_ptr.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"V must be Float32Array".as_ptr());
+        }
+
+        let mut n_tok: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut n_tok, *argv.add(2));
+
+        let k = std::slice::from_raw_parts(k_ptr, k_len);
+        let v = std::slice::from_raw_parts(v_ptr, v_len);
+        let pid = kv_page_save(kv, k, v, n_tok as usize, 1.0);
+        qjs::sofuu_js_new_uint32(ctx, pid)
+    }
+
+    unsafe extern "C" fn js_kv_search(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected query(Float32Array[64]) and n_hints".as_ptr(),
+            );
+        }
+        let Some(kv) = kv_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let (q_ptr, q_len) = cma_vec_arg(ctx, *argv);
+        if q_ptr.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Query must be Float32Array".as_ptr());
+        }
+
+        let mut n_hints: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut n_hints, *argv.add(1));
+
+        let query = std::slice::from_raw_parts(q_ptr, q_len);
+        let hints = kv_search(kv, query, n_hints as usize);
+
+        let arr = qjs::JS_NewArray(ctx);
+        for (i, id) in hints.iter().enumerate() {
+            qjs::JS_SetPropertyUint32(ctx, arr, i as u32, qjs::sofuu_js_new_uint32(ctx, *id));
+        }
+        arr
+    }
+
+    unsafe extern "C" fn js_kv_flush(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(kv) = kv_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let r = kv_flush(kv);
+        qjs::sofuu_js_new_int32(ctx, r)
+    }
+
+    thread_local! {
+        static KV_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
+            cfunc_entry(c"save", 3, js_kv_save),
+            cfunc_entry(c"search", 2, js_kv_search),
+            cfunc_entry(c"flush", 0, js_kv_flush),
+        ];
+        static KV_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 1] =
+            [cfunc_entry(c"open", 2, js_kv_open)];
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * Agent façade (port of src/memory/mod_agent.c)
+     * ══════════════════════════════════════════════════════════════ */
+
+    struct Agent {
+        cma: *mut CmaShell, /* Cognitive Memory Architecture reference */
+        kv: *mut Kvs,       /* SSD KV cache reference */
+    }
+
+    static AGENT_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn agent_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) {
+        let agent = qjs::JS_GetOpaque(val, AGENT_CLASS_ID.load(Ordering::Relaxed)) as *mut Agent;
+        if !agent.is_null() {
+            /* agent_destroy — only the Agent itself; the underlying CMA/KV
+             * stay owned by their own JS objects. */
+            drop(Box::from_raw(agent));
+        }
+    }
+
+    const AGENT_CLASS_DEF: qjs::JSClassDef = qjs::JSClassDef {
+        class_name: c"Agent".as_ptr(),
+        finalizer: Some(agent_finalizer),
+        gc_mark: ptr::null_mut(),
+        call: ptr::null_mut(),
+        exotic: ptr::null_mut(),
+    };
+
+    /// agent_prefetch_context — the CMA finds the top-n nearest memories,
+    /// returns their distinct kv_page_ids; each page is pulled into the KV
+    /// RAM LRU cache. Returns the number of pages prefetched.
+    unsafe fn agent_prefetch_context(agent: *mut Agent, query: &[f32], n_memories: usize) -> c_int {
+        if agent.is_null() || (*agent).cma.is_null() || (*agent).kv.is_null() {
+            return -1;
+        }
+        let cma = &mut *(*agent).cma;
+        if query.len() < cma.vec_dim {
+            return 0; /* short vectors would out-of-bounds read in the C */
+        }
+        let hints = cma.cma.kv_hints(&query[..cma.vec_dim], n_memories);
+        let mut prefetched: u32 = 0;
+        for &id in &hints {
+            let kv = &mut *(*agent).kv;
+            if kv_get_page(kv, id) {
+                prefetched += 1;
+            }
+        }
+        prefetched as c_int
+    }
+
+    unsafe extern "C" fn js_agent_create(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 3 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected name, cma_obj, kv_obj".as_ptr());
+        }
+        let name = qjs::sofuu_js_to_cstring(ctx, *argv);
+
+        /* The C grabbed the opaques blindly (class ids are module globals —
+         * js_agent_create trusts the JS layer to pass CMA/KV objects). */
+        let cma = qjs::JS_GetOpaque(*argv.add(1), CMA_CLASS_ID.load(Ordering::Relaxed)) as *mut CmaShell;
+        let kv = qjs::JS_GetOpaque(*argv.add(2), KV_CLASS_ID.load(Ordering::Relaxed)) as *mut Kvs;
+
+        let agent = Box::new(Agent { cma, kv });
+        if !name.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, name);
+        }
+
+        let agent = Box::into_raw(agent);
+        let obj = qjs::JS_NewObjectClass(ctx, AGENT_CLASS_ID.load(Ordering::Relaxed) as c_int);
+        qjs::JS_SetOpaque(obj, agent as *mut c_void);
+
+        /* Attach Cma/KV objects so they don't get GC'd */
+        let prop_cma = qjs::sofuu_js_dup_value(ctx, *argv.add(1));
+        let prop_kv = qjs::sofuu_js_dup_value(ctx, *argv.add(2));
+        qjs::sofuu_js_set_property_str(ctx, obj, c"memory".as_ptr(), prop_cma);
+        qjs::sofuu_js_set_property_str(ctx, obj, c"kv".as_ptr(), prop_kv);
+
+        obj
+    }
+
+    unsafe extern "C" fn js_agent_prefetch(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected query(Float32Array), topK".as_ptr());
+        }
+        let agent = qjs::JS_GetOpaque2(ctx, this_val, AGENT_CLASS_ID.load(Ordering::Relaxed))
+            as *mut Agent;
+        if agent.is_null() {
+            return qjs::sofuu_js_exception();
+        }
+
+        let (q_ptr, q_len) = cma_vec_arg(ctx, *argv);
+        if q_ptr.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Query must be Float32Array".as_ptr());
+        }
+
+        let mut top_k: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut top_k, *argv.add(1));
+        if top_k > 1024 {
+            top_k = 1024;
+        }
+
+        let query = std::slice::from_raw_parts(q_ptr, q_len);
+        let n = agent_prefetch_context(agent, query, top_k as usize);
+        qjs::sofuu_js_new_int32(ctx, n)
+    }
+
+    thread_local! {
+        static AGENT_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 1] =
+            [cfunc_entry(c"prefetch", 2, js_agent_prefetch)];
+        static AGENT_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 1] =
+            [cfunc_entry(c"create", 3, js_agent_create)];
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * Registration (port of the three mod_*_register functions)
+     * ══════════════════════════════════════════════════════════════ */
+
+    /// JS_CFUNC_DEF(name, length, func) entry — magic=0, cproto=0
+    /// (JSCFunctionListEntry is 32 bytes: name, prop_flags, def_type,
+    /// magic, u:{length, cproto, _pad[6], cfunc}).
+    const fn cfunc_entry(
+        name: &'static std::ffi::CStr,
+        length: u8,
+        cfunc: qjs::JSCFunction,
+    ) -> qjs::JSCFunctionListEntry {
+        qjs::JSCFunctionListEntry {
+            name: name.as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc {
+                length,
+                cproto: 0,
+                _pad: [0; 6],
+                cfunc,
+            },
+        }
+    }
+
+    /// Get (or create) the global `sofuu` namespace object (the C register
+    /// functions each repeat this dance inline).
+    unsafe fn sofuu_namespace(ctx: *mut JSContext) -> JSValue {
+        let global_obj = qjs::sofuu_js_get_global_object(ctx);
+        let mut sofuu_obj = qjs::sofuu_js_get_property_str(ctx, global_obj, c"sofuu".as_ptr());
+        if qjs::is_undefined(sofuu_obj) {
+            qjs::sofuu_js_free_value(ctx, sofuu_obj); /* undefined — no-op (C leaked it) */
+            let fresh = qjs::sofuu_js_new_object(ctx);
+            qjs::sofuu_js_set_property_str(ctx, global_obj, c"sofuu".as_ptr(), fresh);
+            sofuu_obj = qjs::sofuu_js_get_property_str(ctx, global_obj, c"sofuu".as_ptr());
+        }
+        qjs::sofuu_js_free_value(ctx, global_obj);
+        sofuu_obj
+    }
+
+    unsafe fn register_class(
+        ctx: *mut JSContext,
+        class_def: &'static qjs::JSClassDef,
+        class_id: &AtomicU32,
+        proto_funcs: *const qjs::JSCFunctionListEntry,
+        proto_len: c_int,
+    ) {
+        /* JS_NewClassID allocates only when *pclass_id == 0 — pass a fresh
+         * zero local and store the assigned id (C kept a zeroed global). */
+        let mut id: u32 = 0;
+        qjs::JS_NewClassID(&mut id);
+        class_id.store(id, Ordering::Relaxed);
+        let rt = qjs::JS_GetRuntime(ctx);
+        qjs::JS_NewClass(rt, id, class_def);
+        let proto = qjs::sofuu_js_new_object(ctx);
+        qjs::JS_SetPropertyFunctionList(ctx, proto, proto_funcs, proto_len);
+        qjs::JS_SetClassProto(ctx, id, proto);
+    }
+
+    /// mod_memory_register — sofuu.memory.open + the CMA class.
+    pub(crate) unsafe fn memory_register(ctx: *mut JSContext) {
+        register_class(
+            ctx,
+            &CMA_CLASS_DEF,
+            &CMA_CLASS_ID,
+            CMA_PROTO_FUNCS.with(|t| t.as_ptr()),
+            CMA_PROTO_FUNCS.with(|t| t.len() as c_int),
+        );
+        let sofuu_obj = sofuu_namespace(ctx);
+        let mem_obj = qjs::sofuu_js_new_object(ctx);
+        qjs::JS_SetPropertyFunctionList(
+            ctx,
+            mem_obj,
+            CMA_MODULE_FUNCS.with(|t| t.as_ptr()),
+            CMA_MODULE_FUNCS.with(|t| t.len() as c_int),
+        );
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"memory".as_ptr(), mem_obj);
+        qjs::sofuu_js_free_value(ctx, sofuu_obj);
+    }
+
+    /// mod_kv_register — sofuu.kv.open + the KVStore class.
+    pub(crate) unsafe fn kv_register(ctx: *mut JSContext) {
+        register_class(
+            ctx,
+            &KV_CLASS_DEF,
+            &KV_CLASS_ID,
+            KV_PROTO_FUNCS.with(|t| t.as_ptr()),
+            KV_PROTO_FUNCS.with(|t| t.len() as c_int),
+        );
+        let sofuu_obj = sofuu_namespace(ctx);
+        let kv_mod = qjs::sofuu_js_new_object(ctx);
+        qjs::JS_SetPropertyFunctionList(
+            ctx,
+            kv_mod,
+            KV_MODULE_FUNCS.with(|t| t.as_ptr()),
+            KV_MODULE_FUNCS.with(|t| t.len() as c_int),
+        );
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"kv".as_ptr(), kv_mod);
+        qjs::sofuu_js_free_value(ctx, sofuu_obj);
+    }
+
+    /// mod_agent_register — sofuu.agent.create + the Agent class.
+    pub(crate) unsafe fn agent_register(ctx: *mut JSContext) {
+        register_class(
+            ctx,
+            &AGENT_CLASS_DEF,
+            &AGENT_CLASS_ID,
+            AGENT_PROTO_FUNCS.with(|t| t.as_ptr()),
+            AGENT_PROTO_FUNCS.with(|t| t.len() as c_int),
+        );
+        let sofuu_obj = sofuu_namespace(ctx);
+        let agent_mod = qjs::sofuu_js_new_object(ctx);
+        qjs::JS_SetPropertyFunctionList(
+            ctx,
+            agent_mod,
+            AGENT_MODULE_FUNCS.with(|t| t.as_ptr()),
+            AGENT_MODULE_FUNCS.with(|t| t.len() as c_int),
+        );
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"agent".as_ptr(), agent_mod);
+        qjs::sofuu_js_free_value(ctx, sofuu_obj);
+    }
+
+    /* ── pure-Rust unit tests (no JS context needed) ──────────────── */
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn json_floats_matches_c_g() {
+            // Spot-check C "%g" output (6 significant digits, trimmed):
+            // 0.5 -> "0.5", 1.0 -> "1", 0.1f32 -> "0.1", 0.30000001 -> "0.3",
+            // 123456.0 -> "123456", 1e7 -> "1e+07", 1e-5 -> "1e-05".
+            let cases: [(&[f32], &str); 6] = [
+                (&[0.5], "[0.5]"),
+                (&[1.0, 2.0], "[1,2]"),
+                (&[0.1], "[0.1]"),
+                (&[0.30000001], "[0.3]"),
+                (&[123456.0], "[123456]"),
+                (&[1e7, 1e-5], "[1e+07,1e-05]"),
+            ];
+            for (vals, expect) in cases {
+                let out = json_floats(vals).unwrap();
+                assert_eq!(String::from_utf8_lossy(&out), expect);
+            }
+        }
+
+        #[test]
+        fn compute_k_summary_normalizes() {
+            // 1 layer, 1 head, 1 token, dim 4 → the row is mean-pooled
+            // ACROSS the 4 head_dim slots (the M9 fix — the first port
+            // pooled every component into slot 0, degenerating every page
+            // to [1,0,0,…]), then L2-normalized.
+            let k = [1.0f32, 1.0, 1.0, 3.0]; // sums [1,1,1,3], norm √12
+            let mut p = PageSummary::default();
+            compute_k_summary(&mut p, &k, 1, 1, 1, 4);
+            let inv = 1.0f32 / 12.0f32.sqrt();
+            assert!((p.k_summary[0] - inv).abs() < 1e-6);
+            assert!((p.k_summary[1] - inv).abs() < 1e-6);
+            assert!((p.k_summary[2] - inv).abs() < 1e-6);
+            assert!((p.k_summary[3] - 3.0 * inv).abs() < 1e-6);
+            assert!(p.k_summary.iter().skip(4).all(|v| *v == 0.0));
+            // zero-norm degenerate → unit on first slot
+            let mut p2 = PageSummary::default();
+            compute_k_summary(&mut p2, &[0.0f32; 4], 1, 1, 1, 4);
+            assert_eq!(p2.k_summary[0], 1.0);
+        }
+
+        #[test]
+        fn evict_lru_drops_oldest() {
+            let mut kv = Kvs {
+                file_path: String::new(),
+                n_layers: 1,
+                n_heads: 1,
+                head_dim: 1,
+                max_size_gb: 256,
+                k_precision: qtsq::QTSQ_TENSOR_F8,
+                v_precision: qtsq::QTSQ_TENSOR_F16,
+                pages: Vec::new(),
+                active: vec![
+                    ActivePage { page_id: 1, k: vec![], v: vec![], n_layers: 1, n_tokens: 1, last_accessed: 5 },
+                    ActivePage { page_id: 2, k: vec![], v: vec![], n_layers: 1, n_tokens: 1, last_accessed: 2 },
+                    ActivePage { page_id: 3, k: vec![], v: vec![], n_layers: 1, n_tokens: 1, last_accessed: 9 },
+                ],
+                max_active: 2,
+                access_counter: 10,
+                ctx: ptr::null_mut(),
+            };
+            evict_lru_page(&mut kv, None);
+            assert_eq!(kv.active.len(), 2);
+            assert!(kv.active.iter().all(|p| p.page_id != 2));
+            // exclude keeps the excluded slot; the oldest of the rest goes
+            evict_lru_page(&mut kv, Some(0));
+            assert_eq!(kv.active.len(), 1);
+            assert_eq!(kv.active[0].page_id, 1);
+        }
+    }
+}
+
+// ── unconditional exports (linker contract with engine.c) ──────────
+// engine.c declares these externs and calls them under
+// `#if SOFUU_MEMORY && defined(SOFUU_QTSQ_PRESENT)` — the C compile sets
+// that define exactly when sofuu-ffi's build.rs finds libqtsq.a, which is
+// the same condition has_qtsq mirrors for this crate.
+
+/// Register the sofuu.memory.* JS surface (C symbol mod_memory_register).
+///
+/// # Safety
+/// `ctx` must be a live QuickJS context (engine.c passes its engine ctx).
+#[no_mangle]
+pub unsafe extern "C" fn mod_memory_register(ctx: *mut JSContext) {
+    #[cfg(has_qtsq)]
+    unsafe {
+        impl_qtsq::memory_register(ctx)
+    }
+    #[cfg(not(has_qtsq))]
+    let _ = ctx; /* QTSQ absent: engine.c's guard never calls us — JS sees
+                  * no sofuu.memory, the same observable absence as the C */
+}
+
+/// Register the sofuu.kv.* JS surface (C symbol mod_kv_register).
+///
+/// # Safety
+/// `ctx` must be a live QuickJS context.
+#[no_mangle]
+pub unsafe extern "C" fn mod_kv_register(ctx: *mut JSContext) {
+    #[cfg(has_qtsq)]
+    unsafe {
+        impl_qtsq::kv_register(ctx)
+    }
+    #[cfg(not(has_qtsq))]
+    let _ = ctx;
+}
+
+/// Register the sofuu.agent.* JS surface (C symbol mod_agent_register).
+///
+/// # Safety
+/// `ctx` must be a live QuickJS context.
+#[no_mangle]
+pub unsafe extern "C" fn mod_agent_register(ctx: *mut JSContext) {
+    #[cfg(has_qtsq)]
+    unsafe {
+        impl_qtsq::agent_register(ctx)
+    }
+    #[cfg(not(has_qtsq))]
+    let _ = ctx;
+}

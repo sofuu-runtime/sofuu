@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sofuu-core",
+    "crates/sofuu-ffi",
+    "crates/sofuu-capi",
+]
+
+[workspace.package]
+version = "0.2.0-beta"
+edition = "2021"
+license = "MIT"
+
+# ── Size-optimized release profile (target: ~5MB max binary) ──────
+# opt-level "z" = optimize for size; lto fat + codegen-units 1 = whole-program
+# strip = symbols stripped; panic = abort = no unwind tables.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Debug builds stay fast to compile.
+[profile.dev]
+opt-level = 1

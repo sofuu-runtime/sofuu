@@ -1,0 +1,24 @@
+[package]
+name = "sofuu-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "libsofuu — the embeddable Sofuu C ABI (PLAN-HEADLESS H1)"
+
+# staticlib + cdylib: `make libsofuu` ships target/release/libsofuu.{a,dylib}
+# + include/sofuu_embed.h. The core crates stay binary-first; this crate owns
+# the exported symbol list (see the export list in src/lib.rs).
+[lib]
+name = "sofuu_capi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+sofuu-core = { path = "../sofuu-core" }
+sofuu-ffi = { path = "../sofuu-ffi" }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+libc = "0.2"
+
+# NOTE: nothing may depend on sofuu-capi (no dev-dependency cycle back into
+# it) — the same fat-LTO "symbol multiply defined" lesson as sofuu-ffi's
+# Cargo.toml. Its tests live in-crate (#[cfg(test)]) and link each dependency
+# exactly once.

@@ -1,0 +1,24 @@
+[package]
+name = "sofuu-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe FFI bindings to the Sofuu C core (QuickJS, libuv, SIMD, QTSQ)"
+
+[lib]
+name = "sofuu_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+
+# M10: NO dev-dependency on sofuu-core. The lib tests used to link it to
+# exercise SofuuRuntime (sofuu_init + the bridge); with the engine now in
+# Rust, sofuu-ffi defines the no_mangle sofuu_js_* / sofuu_uv_* shims, and
+# a dev-dep cycle would link sofuu-ffi twice in the test binary (harness +
+# through sofuu-core) — fatal under fat LTO ("symbol multiply defined").
+# The runtime test moved to sofuu-core (ffi_runtime_test in lib.rs), which
+# links each crate exactly once.
+
+[build-dependencies]
+cc = "1"

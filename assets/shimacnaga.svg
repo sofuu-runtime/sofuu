@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Shima-enaga mascot — round fluffy white body, black bead eyes,
+       tiny orange beak, long pink tail. The body NEVER moves; only the
+       eyes blink and the tail sways subtly in place. -->
+
+  <defs>
+    <radialGradient id="bodyGrad" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="70%" stop-color="#f2f2f7"/>
+      <stop offset="100%" stop-color="#e4e4ee"/>
+    </radialGradient>
+    <radialGradient id="cheekGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffd9e8" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#ffd9e8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ── Tail (fixed anchor at the body, sways gently in place) ── -->
+  <g>
+    <animateTransform attributeName="transform" type="rotate"
+      values="2 150 120; -2 150 120; 2 150 120" dur="2.4s" repeatCount="indefinite"/>
+    <path d="M 148 118 C 168 92, 178 84, 186 78
+             C 182 96, 176 106, 166 118 Z"
+          fill="#ff9ecb"/>
+    <path d="M 146 122 C 162 104, 170 98, 178 94
+             C 174 110, 166 120, 156 126 Z"
+          fill="#ffb8d8"/>
+  </g>
+
+  <!-- ── Body: round fluffy ball (fixed position) ── -->
+  <ellipse cx="95" cy="118" rx="62" ry="58" fill="url(#bodyGrad)"
+           stroke="#e0e0ec" stroke-width="2"/>
+
+  <!-- Fluffy head top -->
+  <ellipse cx="95" cy="72" rx="34" ry="26" fill="url(#bodyGrad)"
+           stroke="#e0e0ec" stroke-width="2"/>
+
+  <!-- Cheeks -->
+  <circle cx="72" cy="128" r="13" fill="url(#cheekGrad)"/>
+  <circle cx="118" cy="128" r="13" fill="url(#cheekGrad)"/>
+
+  <!-- ── Eyes: the only thing that animates (blink) ── -->
+  <g>
+    <!-- Left eye -->
+    <g>
+      <animate attributeName="opacity" values="1;1;0;0;1" dur="3.2s" repeatCount="indefinite"/>
+      <circle cx="78" cy="88" r="7" fill="#1a1a1a"/>
+      <circle cx="80" cy="86" r="2.2" fill="#ffffff"/>
+    </g>
+    <!-- Right eye -->
+    <g>
+      <animate attributeName="opacity" values="1;1;0;0;1" dur="3.2s" repeatCount="indefinite"/>
+      <circle cx="112" cy="88" r="7" fill="#1a1a1a"/>
+      <circle cx="114" cy="86" r="2.2" fill="#ffffff"/>
+    </g>
+    <!-- Blink lids (appear when eyes fade) -->
+    <g>
+      <animate attributeName="opacity" values="0;0;1;1;0" dur="3.2s" repeatCount="indefinite"/>
+      <path d="M 68 88 Q 78 94 88 88 L 88 92 Q 78 98 68 92 Z" fill="#1a1a1a"/>
+      <path d="M 102 88 Q 112 94 122 88 L 122 92 Q 112 98 102 92 Z" fill="#1a1a1a"/>
+    </g>
+  </g>
+
+  <!-- Beak -->
+  <path d="M 95 94 L 101 102 L 95 108 L 89 102 Z" fill="#ff9d3c"/>
+
+  <!-- Tiny feet -->
+  <g stroke="#ff9d3c" stroke-width="3" stroke-linecap="round">
+    <path d="M 84 172 L 84 180 M 84 180 L 78 184 M 84 180 L 90 184"/>
+    <path d="M 106 172 L 106 180 M 106 180 L 100 184 M 106 180 L 112 184"/>
+  </g>
+
+  <!-- Wing hint -->
+  <path d="M 60 118 Q 74 128 88 122" stroke="#dcdce8" stroke-width="3"
+        fill="none" stroke-linecap="round"/>
+</svg>

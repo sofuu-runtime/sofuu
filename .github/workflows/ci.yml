@@ -44,8 +44,22 @@ jobs:
             -DBUILD_TESTING=OFF
           cmake --build build
 
-      - name: Build Sofuu
-        run: make
+      - name: Build Sofuu (Rust-first)
+        # QTSQ is a proprietary local checkout — CI builds without it
+        # (build.rs degrades gracefully: no brain persistence / sessions).
+        env:
+          SOFUU_QTSQ_DIR: /tmp/sofuu-no-qtsq
+        run: |
+          mkdir -p /tmp/sofuu-no-qtsq
+          make
+
+      - name: Rust unit tests
+        env:
+          SOFUU_QTSQ_DIR: /tmp/sofuu-no-qtsq
+        run: cargo test --release
+
+      - name: Size cap
+        run: make size-check
 
       - name: Print binary info
         run: |
@@ -53,8 +67,18 @@ jobs:
           file sofuu
           ./sofuu version
 
-      - name: Run test suite
+      - name: Run JS test suite
         run: make test
+
+      # ── H6: Headless CI gates ─────────────────────────────────────
+      - name: Build libsofuu (embeddable library)
+        run: make libsofuu
+
+      - name: Headless embedding test (compile + run c_embed.c)
+        run: make headless-test
+
+      - name: ABI symbol guard
+        run: make abi-check
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

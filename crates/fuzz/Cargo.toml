@@ -1,0 +1,60 @@
+[package]
+name = "sofuu-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# cargo-fuzz convention: the fuzz crate is its own workspace so the harness
+# can pin the nightly toolchain without touching the main build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sofuu-core = { path = "../sofuu-core" }
+sofuu-capi = { path = "../sofuu-capi" }
+serde_json = "1"
+
+[[bin]]
+name = "sse"
+path = "fuzz_targets/sse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jsonrpc"
+path = "fuzz_targets/jsonrpc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "npm_spec"
+path = "fuzz_targets/npm_spec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ts_strip"
+path = "fuzz_targets/ts_strip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rlm_snippet"
+path = "fuzz_targets/rlm_snippet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rlm_reply"
+path = "fuzz_targets/rlm_reply.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "capi_call"
+path = "fuzz_targets/capi_call.rs"
+test = false
+doc = false

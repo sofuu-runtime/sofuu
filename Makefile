@@ -1,9 +1,16 @@
 # ──────────────────────────────────────────────────────────────────
 #  Sofuu (素風) — AI-Native JS Runtime
-#  Build System: simple Make, no CMake required
+#  Build System: cargo-first (the only maintained build since M10)
 # ──────────────────────────────────────────────────────────────────
+#
+# `make`           → Rust-first build (cargo; build.rs compiles the C
+#                    engine layer: QuickJS + SIMD + http-parser)
+# `make test`      → JS parity suite
+# `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5MB)
+# `make c-only`    → REMOVED in M10 (the pure-C binary died; see
+#                    PLAN-RUST-MIGRATION.md) — prints an error
+# `make linux`     → cross-compile via scripts/cross (cargo + zig)
 
-CC      = cc
 TARGET  = sofuu
 ARCH   := $(shell uname -m)
 
@@ -12,149 +19,75 @@ ifeq ($(ARCH), aarch64)
     ARCH = arm64
 endif
 
-# ---- Directories ----
-SRC_DIR   = src
-DEPS_DIR  = deps
-QJS_DIR   = $(DEPS_DIR)/quickjs
-UV_DIR    = $(DEPS_DIR)/libuv
-
-# ---- Compiler flags ----
-QJS_VERSION := $(shell cat $(QJS_DIR)/VERSION 2>/dev/null || echo "2024-01-13")
-
-CFLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter \
-          -Wno-sign-compare \
-          -Wno-cast-function-type \
-          -I$(QJS_DIR) \
-          -I$(UV_DIR)/include \
-          -I$(SRC_DIR) \
-          -I$(SRC_DIR)/engine \
-          -I$(SRC_DIR)/modules \
-          -I$(SRC_DIR)/io \
-          -I$(SRC_DIR)/http \
-          -I$(SRC_DIR)/mcp \
-          -Ideps/http-parser \
-          -I$(SRC_DIR)/ts \
-          -I$(SRC_DIR)/simd \
-          -I$(SRC_DIR)/npm \
-          -I$(SRC_DIR)/repl \
-          -I$(SRC_DIR)/bundler \
-          -D_GNU_SOURCE \
-          -DCONFIG_VERSION=\"$(QJS_VERSION)\"
-
-# Feature Flags
-SOFUU_MEMORY ?= 0
-SOFUU_LLM    ?= 0
-
-ifeq ($(SOFUU_MEMORY),1)
-    CFLAGS += -DSOFUU_MEMORY=1
-endif
-
-ifeq ($(SOFUU_LLM),1)
-    CFLAGS += -DSOFUU_LLM=1
-endif
-
-# macOS-specific
-UNAME := $(shell uname -s)
-ifeq ($(UNAME), Darwin)
-    CFLAGS += -D__APPLE__
-endif
-
-# Architecture-specific SIMD flags
-ifeq ($(ARCH), arm64)
-    CFLAGS  += -march=armv8-a
-    SIMD_SRC = $(SRC_DIR)/simd/neon.c
-else ifeq ($(ARCH), x86_64)
-    CFLAGS  += -mavx2 -mfma
-    SIMD_SRC = $(SRC_DIR)/simd/avx.c
-else
-    SIMD_SRC = $(SRC_DIR)/simd/neon.c   # scalar fallback
-endif
-
-
-# Optional: readline for REPL
-READLINE := $(shell pkg-config --libs readline 2>/dev/null)
-ifneq ($(READLINE),)
-    CFLAGS  += -DSOFUU_HAVE_READLINE
-    LDFLAGS += $(READLINE)
-endif
-
-# ---- Source files ----
-# QuickJS core (we compile it as part of our build — no separate lib step)
-QJS_SRCS = \
-    $(QJS_DIR)/quickjs.c \
-    $(QJS_DIR)/quickjs-libc.c \
-    $(QJS_DIR)/libregexp.c \
-    $(QJS_DIR)/libunicode.c \
-    $(QJS_DIR)/cutils.c \
-    $(QJS_DIR)/libbf.c
-
-# Our runtime sources
-SOFUU_SRCS = \
-    $(SRC_DIR)/main.c \
-    $(SRC_DIR)/sofuu.c \
-    $(SRC_DIR)/engine/engine.c \
-    $(SRC_DIR)/modules/mod_console.c \
-    $(SRC_DIR)/modules/mod_process.c \
-    $(SRC_DIR)/modules/mod_ai.c \
-    $(SRC_DIR)/io/promises.c \
-    $(SRC_DIR)/io/loop.c \
-    $(SRC_DIR)/io/timer.c \
-    $(SRC_DIR)/io/fs.c \
-    $(SRC_DIR)/io/subprocess.c \
-    $(SRC_DIR)/http/client.c \
-    $(SRC_DIR)/http/server.c \
-    $(SRC_DIR)/http/sse.c \
-    $(SRC_DIR)/mcp/mcp.c \
-    $(SRC_DIR)/ts/stripper.c \
-    $(SRC_DIR)/npm/resolver.c \
-    $(SRC_DIR)/npm/cjs.c \
-    $(SRC_DIR)/repl/repl.c \
-    $(SRC_DIR)/bundler/bundler.c \
-    $(SIMD_SRC) \
-    deps/http-parser/http_parser.c
-
-# Memory and LLM modules are disabled by default (require local C library)
-# Enable with: make SOFUU_MEMORY=1 SOFUU_LLM=1
-ifeq ($(SOFUU_MEMORY),1)
-    SOFUU_SRCS += src/memory/qtsq_adapter.c \
-                  src/memory/hnsw.c \
-                  src/memory/mod_memory.c \
-                  src/memory/mod_kv.c \
-                  src/memory/mod_agent.c
-endif
-
-ifeq ($(SOFUU_LLM),1)
-    SOFUU_SRCS += src/llm/llm_local.c
-endif
-
-ALL_SRCS = $(QJS_SRCS) $(SOFUU_SRCS)
-UV_LIB   = $(UV_DIR)/build/libuv.a
-
-# ---- Link flags ----
-LDFLAGS += -lpthread -lm -lcurl
-
-ifeq ($(SOFUU_MEMORY),1)
-    QTSQ_DIR = black-hole-disk
-    LDFLAGS += -L$(QTSQ_DIR) -lqtsq -lz
-endif
-
-# macOS has no need for -ldl/-lrt/-latomic, Linux does
-ifneq ($(UNAME), Darwin)
-    LDFLAGS += -ldl -lrt -latomic
-endif
+# QTSQ codec checkout (proprietary, optional). The cargo build reads
+# SOFUU_QTSQ_DIR; point at a checkout to enable brain persistence +
+# session store, or leave unset for a degraded build (CI does the same).
+QTSQ_DIR ?= /Users/priyanshuboruah/projects/black-hole-disk
 
 # ──────────────────────────────────────────────────────────────────
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test bench
+.PHONY: all clean install test bench c-only size-check cargo-build \
+        libsofuu zig-install linux linux-x86_64 linux-arm64 release-archives dist \
+        headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all
+
+SIZE_LIMIT ?= 5242880   # 5 MB hard cap (bytes)
 
 all: $(TARGET)
 
-$(TARGET): $(ALL_SRCS) $(UV_LIB)
-	@echo "  \033[36mCC\033[0m  $@  [arch=$(ARCH)]"
-	$(CC) $(CFLAGS) -o $@ $(ALL_SRCS) $(UV_LIB) $(LDFLAGS)
+# ── Rust-first build (default and only maintained build) ────────
+cargo-build:
+	cargo build --release
+
+$(TARGET): cargo-build
+	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"
+	@cp target/release/$(TARGET) $(TARGET)
+	@if [ "$$(uname -s)" = "Darwin" ]; then codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
 	@echo "  \033[32mBuilt:\033[0m ./$(TARGET) ($(shell du -sh $(TARGET) | cut -f1))"
+
+# ── Legacy pure-C build ─────────────────────────────────────────
+# REMOVED in M10: every src/*.c glue file is retired (the runtime is Rust
+# over the C engine layer — QuickJS/libuv/SIMD/http-parser). The C files
+# the old ALL_SRCS referenced no longer exist.
+c-only:
+	@echo "  \033[31m✗ make c-only was removed in M10 (PLAN-RUST-MIGRATION.md).\033[0m"
+	@echo "    The runtime is fully Rust (crates/) over the C engine layer;"
+	@echo "    run \`make\` (cargo-first) instead."
+	@exit 1
+
+# ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
+size-check: $(TARGET)
+	@SIZE=$$(stat -f%z $(TARGET) 2>/dev/null || stat -c%s $(TARGET) 2>/dev/null); \
+	if [ "$$SIZE" -gt "$(SIZE_LIMIT)" ]; then \
+		echo "  \033[31m✗ Size $$SIZE bytes exceeds cap $(SIZE_LIMIT) bytes\033[0m"; \
+		exit 1; \
+	else \
+		echo "  \033[32m✓ Size $$SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
+	fi
+
+# ── libsofuu: embeddable library (PLAN-HEADLESS H1) ──────────────
+# Builds the capi crate as staticlib + cdylib, copies artifacts to dist/.
+# Usage:  make libsofuu
+# Output: dist/libsofuu.a  dist/libsofuu.dylib  dist/sofuu_embed.h
+libsofuu:
+	@echo "  \033[36mCARGO\033[0m  libsofuu  [arch=$(ARCH)]"
+	cargo build --release -p sofuu-capi
+	@mkdir -p dist
+	@cp target/release/libsofuu_capi.a dist/libsofuu.a 2>/dev/null || \
+		cp target/release/libsofuu.a dist/libsofuu.a 2>/dev/null || true
+	@cp target/release/libsofuu_capi.dylib dist/libsofuu.dylib 2>/dev/null || \
+		cp target/release/libsofuu.dylib dist/libsofuu.dylib 2>/dev/null || \
+		cp target/release/libsofuu_capi.so dist/libsofuu.so 2>/dev/null || \
+		cp target/release/libsofuu.so dist/libsofuu.so 2>/dev/null || true
+	@cp include/sofuu_embed.h dist/sofuu_embed.h
+	@echo "  \033[32mBuilt:\033[0m"
+	@ls -lh dist/libsofuu.* dist/sofuu_embed.h 2>/dev/null
+	@echo ""
+	@echo "  Symbol exports:"
+	@nm dist/libsofuu.a 2>/dev/null | grep ' T _sofuu_' | sort || \
+		nm -gU dist/libsofuu.dylib 2>/dev/null | grep ' T _sofuu_' | sort || \
+		echo "  (nm not available — run manually)"
 
 install: $(TARGET)
 	@echo "  Installing sofuu to /usr/local/bin/"
@@ -164,38 +97,25 @@ install: $(TARGET)
 clean:
 	@echo "  Cleaning..."
 	rm -f $(TARGET)
+	cargo clean 2>/dev/null || true
 
 test: $(TARGET)
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
-	@echo "\033[36m--- Priority 1: fetch/GC/rejection ---\033[0m"
-	./$(TARGET) run examples/priority1_test.js
-	@echo ""
-	@echo "\033[36m--- Priority 2: process/signals/stdin ---\033[0m"
-	./$(TARGET) run examples/priority2_test.js
-	@echo ""
-	@echo "\033[36m--- TypeScript stripper ---\033[0m"
-	./$(TARGET) run examples/ts_test.ts
-	@echo ""
-	@echo "\033[36m--- SIMD vectors ---\033[0m"
-	./$(TARGET) run examples/simd_test.js
-	@echo ""
-	@echo "\033[32m=== All tests passed! ===\033[0m"
-	@echo ""
+	@bash tests/run_js_tests.sh
 
 bench: $(TARGET)
 	@bash bench/run_bench.sh
 
-# ─── Cross-compilation targets ───────────────────────────────────────────────
+# ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).
 # First run:  make zig-install
 # Then:       make linux  OR  make linux-x86_64  OR  make linux-arm64
+# NOTE: cross builds are QTSQ-free (the local checkout is macOS-only).
 
 ZIG_INSTALL = scripts/cross/install_zig.sh
 CROSS_SCRIPT = scripts/cross/cross_compile.sh
-
-.PHONY: zig-install linux linux-x86_64 linux-arm64 release-archives dist
 
 zig-install:
 	@bash $(ZIG_INSTALL)
@@ -217,6 +137,67 @@ dist: all linux
 	@mkdir -p dist
 	@cp $(TARGET) dist/sofuu-darwin-arm64
 	@tar -czf dist/sofuu-darwin-arm64.tar.gz -C dist sofuu-darwin-arm64
-	@echo "  [32m✓[0m dist/sofuu-darwin-arm64.tar.gz"
+	@echo "  \033[32m✓\033[0m dist/sofuu-darwin-arm64.tar.gz"
 	@ls -lh dist/*.tar.gz
 
+# ── H4: Platform packs (libsofuu for macOS, Linux, iOS, Android) ───
+# Each produces dist/libsofuu-<platform>.{a,dylib/so} + dist/sofuu_embed.h.
+# Run `make dist-all` to build every platform available on this host.
+dist-macos:
+	@bash scripts/dist/macos.sh all
+
+dist-linux:
+	@bash scripts/dist/linux.sh all
+
+dist-ios:
+	@bash scripts/dist/ios.sh all
+
+dist-android:
+	@bash scripts/dist/android.sh all
+
+dist-all:
+	@bash scripts/dist/all.sh
+
+# ── H6: Headless CI gates ──────────────────────────────────────────
+# `make headless-test`: build libsofuu + compile c_embed.c + c_rlm.c + c_agent.c + run all.
+# `make abi-check`: diff exported symbols against the checked-in baseline.
+headless-test: libsofuu
+	@echo ""
+	@echo "\033[1m=== Headless embedding test (H6) ===\033[0m"
+	@echo ""
+	@echo "\033[36m--- Compile c_embed.c against libsofuu ---\033[0m"
+	@cc examples/headless/c_embed.c -Idist -Ldist -lsofuu -o examples/headless/c_embed \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_embed against the library ---\033[0m"
+	@examples/headless/c_embed
+	@echo ""
+	@echo "\033[36m--- Compile c_rlm.c against libsofuu ---\033[0m"
+	@cc examples/headless/c_rlm.c -Idist -Ldist -lsofuu -o examples/headless/c_rlm \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_rlm)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_rlm against the library ---\033[0m"
+	@examples/headless/c_rlm
+	@echo ""
+	@echo "\033[36m--- Compile c_agent.c against libsofuu ---\033[0m"
+	@cc examples/headless/c_agent.c -Idist -Ldist -lsofuu -o examples/headless/c_agent \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_agent)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_agent against the library ---\033[0m"
+	@examples/headless/c_agent
+	@echo ""
+	@echo "\033[32m✓ Headless tests passed\033[0m"
+	@echo ""
+
+abi-check: libsofuu
+	@# Use the dylib/.so (public symbols are resolved at link time, not in the .a archive).
+	@if [ -f dist/libsofuu.dylib ]; then LIB=dist/libsofuu.dylib; \
+	 elif [ -f dist/libsofuu.so ]; then LIB=dist/libsofuu.so; \
+	 else echo "\033[31m✗ No shared lib in dist/\033[0m"; exit 1; fi; \
+	bash scripts/check_abi.sh $$LIB

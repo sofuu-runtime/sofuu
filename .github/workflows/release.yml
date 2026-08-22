@@ -36,12 +36,28 @@ jobs:
           ./sofuu version
           ./sofuu eval "console.log('release smoke ok')"
 
+      - name: Build libsofuu (embeddable library)
+        run: make libsofuu
+
+      - name: Headless embedding test
+        run: make headless-test
+
+      - name: ABI symbol guard
+        run: make abi-check
+
       - name: Create archive
         run: |
           mkdir -p dist
           cp sofuu dist/sofuu-darwin-arm64
           tar -czf dist/sofuu-darwin-arm64.tar.gz -C dist sofuu-darwin-arm64
           sha256sum dist/sofuu-darwin-arm64.tar.gz > dist/sofuu-darwin-arm64.tar.gz.sha256
+          # libsofuu tarball (header + static lib + dylib)
+          mkdir -p dist/libsofuu-darwin-arm64
+          cp dist/libsofuu.a dist/libsofuu-darwin-arm64/ 2>/dev/null || true
+          cp dist/libsofuu.dylib dist/libsofuu-darwin-arm64/ 2>/dev/null || true
+          cp dist/sofuu_embed.h dist/libsofuu-darwin-arm64/ 2>/dev/null || true
+          tar -czf dist/libsofuu-darwin-arm64.tar.gz -C dist libsofuu-darwin-arm64
+          sha256sum dist/libsofuu-darwin-arm64.tar.gz > dist/libsofuu-darwin-arm64.tar.gz.sha256
           ls -lh dist/
 
       - name: Upload to Release
@@ -50,6 +66,8 @@ jobs:
           files: |
             dist/sofuu-darwin-arm64.tar.gz
             dist/sofuu-darwin-arm64.tar.gz.sha256
+            dist/libsofuu-darwin-arm64.tar.gz
+            dist/libsofuu-darwin-arm64.tar.gz.sha256
           generate_release_notes: true
 
   # ── Linux x86_64 (static musl) ────────────────────────────────
@@ -81,12 +99,25 @@ jobs:
           ./sofuu version
           ./sofuu eval "console.log('linux smoke ok')"
 
+      - name: Build libsofuu (embeddable library)
+        run: make libsofuu
+
+      - name: Headless embedding test
+        run: make headless-test
+
       - name: Create archive
         run: |
           mkdir -p dist
           cp sofuu dist/sofuu-linux-x86_64
           tar -czf dist/sofuu-linux-x86_64.tar.gz -C dist sofuu-linux-x86_64
           sha256sum dist/sofuu-linux-x86_64.tar.gz > dist/sofuu-linux-x86_64.tar.gz.sha256
+          # libsofuu tarball
+          mkdir -p dist/libsofuu-linux-x86_64
+          cp dist/libsofuu.a dist/libsofuu-linux-x86_64/ 2>/dev/null || true
+          cp dist/libsofuu.so dist/libsofuu-linux-x86_64/ 2>/dev/null || true
+          cp dist/sofuu_embed.h dist/libsofuu-linux-x86_64/ 2>/dev/null || true
+          tar -czf dist/libsofuu-linux-x86_64.tar.gz -C dist libsofuu-linux-x86_64
+          sha256sum dist/libsofuu-linux-x86_64.tar.gz > dist/libsofuu-linux-x86_64.tar.gz.sha256
           ls -lh dist/
 
       - name: Upload to Release
@@ -95,6 +126,8 @@ jobs:
           files: |
             dist/sofuu-linux-x86_64.tar.gz
             dist/sofuu-linux-x86_64.tar.gz.sha256
+            dist/libsofuu-linux-x86_64.tar.gz
+            dist/libsofuu-linux-x86_64.tar.gz.sha256
 
   # ── Linux arm64 (static musl) ─────────────────────────────────
   release-linux-arm64:
@@ -125,12 +158,25 @@ jobs:
           ./sofuu version
           ./sofuu eval "console.log('linux arm64 smoke ok')"
 
+      - name: Build libsofuu (embeddable library)
+        run: make libsofuu
+
+      - name: Headless embedding test
+        run: make headless-test
+
       - name: Create archive
         run: |
           mkdir -p dist
           cp sofuu dist/sofuu-linux-arm64
           tar -czf dist/sofuu-linux-arm64.tar.gz -C dist sofuu-linux-arm64
           sha256sum dist/sofuu-linux-arm64.tar.gz > dist/sofuu-linux-arm64.tar.gz.sha256
+          # libsofuu tarball
+          mkdir -p dist/libsofuu-linux-arm64
+          cp dist/libsofuu.a dist/libsofuu-linux-arm64/ 2>/dev/null || true
+          cp dist/libsofuu.so dist/libsofuu-linux-arm64/ 2>/dev/null || true
+          cp dist/sofuu_embed.h dist/libsofuu-linux-arm64/ 2>/dev/null || true
+          tar -czf dist/libsofuu-linux-arm64.tar.gz -C dist libsofuu-linux-arm64
+          sha256sum dist/libsofuu-linux-arm64.tar.gz > dist/libsofuu-linux-arm64.tar.gz.sha256
           ls -lh dist/
 
       - name: Upload to Release
@@ -139,6 +185,8 @@ jobs:
           files: |
             dist/sofuu-linux-arm64.tar.gz
             dist/sofuu-linux-arm64.tar.gz.sha256
+            dist/libsofuu-linux-arm64.tar.gz
+            dist/libsofuu-linux-arm64.tar.gz.sha256
 
   # ── Generate install manifest ─────────────────────────────────
   release-manifest:

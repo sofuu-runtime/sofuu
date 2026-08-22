@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # scripts/cross/build_linux_arm64.sh
-# Cross-compile Sofuu for Linux arm64 (aarch64) from macOS arm64 using Zig.
-# Output: dist/sofuu-linux-arm64
+#
+# Cross-compile Sofuu for Linux arm64 (aarch64) from macOS using Zig as CC.
+#
+# M10: the runtime is Rust (crates/) over the C engine layer, so this now
+# runs a cargo cross-build: rustc links with zig (static musl), the cc
+# crate compiles QuickJS/SIMD/http-parser with `zig cc`, and libuv +
+# libcurl are prebuilt for the target (dist/). QTSQ is skipped — the
+# proprietary checkout is macOS-only; CI covers the same degraded build.
+#
+# Usage:
+#   bash scripts/cross/install_zig.sh     # once
+#   bash scripts/cross/build_linux_arm64.sh
+#
+# Output: dist/sofuu-linux-arm64  (statically linked)
+#
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
@@ -15,6 +28,7 @@ if [ ! -x "$ZIG" ]; then
 fi
 
 TARGET="aarch64-linux-musl"
+RUST_TARGET="aarch64-unknown-linux-musl"
 OUT="$DIST/sofuu-linux-arm64"
 
 echo ""
@@ -25,6 +39,12 @@ echo ""
 
 mkdir -p "$DIST"
 cd "$REPO_ROOT"
+
+# ── rustup target (std for musl) ─────────────────────────────────
+if ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
+    echo "→ Adding rustup target ${RUST_TARGET}..."
+    rustup target add "$RUST_TARGET"
+fi
 
 # ── Build libuv for aarch64-linux-musl ─────────────────────────
 echo "→ Building libuv for ${TARGET}..."
@@ -52,64 +72,30 @@ echo "✓ libuv built: $UV_LIB"
 echo "→ Building static libcurl for ${TARGET}..."
 bash "$REPO_ROOT/scripts/cross/build_libcurl_static.sh" "$TARGET"
 CURL_INSTALL="$DIST/libcurl-$TARGET"
-CURL_LIB="$CURL_INSTALL/lib/libcurl.a"
-CURL_INC="$CURL_INSTALL/include"
+CURL_LIB="$CURL_INSTALL/lib"
 
-QJS_DIR="deps/quickjs"
-SRC="src"
-QJS_VERSION=$(cat "$QJS_DIR/VERSION" 2>/dev/null || echo "2024-01-13")
+# ── Cargo cross-build (compiles QuickJS/SIMD/http-parser via zig cc) ──
+echo "→ cargo build --release --target ${RUST_TARGET}"
+echo "   (cc crate → zig cc; linker → zig; QTSQ-free; see PLAN-RUST-MIGRATION M10)"
+export CC="$ZIG cc -target $TARGET"
+export CXX="$ZIG c++ -target $TARGET"
+export AR="$ZIG ar"
+export RANLIB="$ZIG ranlib"
+export SOFUU_UV_DIR="$UV_BUILD"
+export SOFUU_CURL_STATIC_DIR="$CURL_LIB"
+# QTSQ is macOS-only — point at an empty dir so the probe fails cleanly.
+mkdir -p "$DIST/no-qtsq"
+export SOFUU_QTSQ_DIR="$DIST/no-qtsq"
+export RUSTFLAGS="-C linker=$ZIG -C link-arg=cc -C link-arg=-target -C link-arg=$TARGET"
 
-QJS_SRCS=(
-    "$QJS_DIR/quickjs.c"
-    "$QJS_DIR/libregexp.c"
-    "$QJS_DIR/libunicode.c"
-    "$QJS_DIR/cutils.c"
-    "$QJS_DIR/libbf.c"
-    "$QJS_DIR/quickjs-libc.c"
-)
+cargo build --release --target "$RUST_TARGET" 2>&1 | tail -20
 
-SOFUU_SRCS=(
-    "$SRC/main.c" "$SRC/sofuu.c" "$SRC/engine/engine.c"
-    "$SRC/modules/mod_console.c" "$SRC/modules/mod_process.c" "$SRC/modules/mod_ai.c"
-    "$SRC/io/promises.c" "$SRC/io/loop.c" "$SRC/io/timer.c"
-    "$SRC/io/fs.c" "$SRC/io/subprocess.c"
-    "$SRC/http/client.c" "$SRC/http/server.c" "$SRC/http/sse.c"
-    "$SRC/mcp/mcp.c"
-    "$SRC/ts/stripper.c"
-    "$SRC/npm/resolver.c" "$SRC/npm/cjs.c"
-    "$SRC/repl/repl.c"
-    "$SRC/simd/neon.c"          # arm64 — NEON
-    "deps/http-parser/http_parser.c"
-)
-
-CFLAGS=(
-    -O2 -target "$TARGET"
-    -I"$QJS_DIR" -I"deps/libuv/include"
-    -I"$SRC" -I"$SRC/engine" -I"$SRC/modules" -I"$SRC/io"
-    -I"$SRC/http" -I"$SRC/mcp" -I"$SRC/ts"
-    -I"$SRC/simd" -I"$SRC/npm" -I"$SRC/repl"
-    -I"$SRC/bundler"
-    -I"$CURL_INC" -Ideps/http-parser
-    -D_GNU_SOURCE -DCONFIG_VERSION="\"$QJS_VERSION\""
-    -Wno-unused-parameter -Wno-sign-compare -Wno-cast-function-type
-)
-
-echo "→ Compiling..."
-ALL_OBJS=()
-for f in "${QJS_SRCS[@]}" "${SOFUU_SRCS[@]}"; do
-    obj="/tmp/sofa64_$(echo "$f" | tr '/' '_').o"
-    "$ZIG" cc "${CFLAGS[@]}" -c "$f" -o "$obj"
-    ALL_OBJS+=("$obj")
-done
-
-echo "→ Linking..."
-"$ZIG" cc "${CFLAGS[@]}" -o "$OUT" \
-    "${ALL_OBJS[@]}" \
-    -target "$TARGET" -static \
-    "$UV_LIB" "$CURL_LIB" -lm -lpthread -ldl
+cp "target/${RUST_TARGET}/release/sofuu" "$OUT"
+chmod +x "$OUT"
 
 SIZE=$(du -sh "$OUT" 2>/dev/null | cut -f1)
 echo ""
 echo "✅ Built: $OUT ($SIZE)"
-echo "   Target: Linux arm64 (musl static)"
+echo "   Target: $TARGET (static musl, runs on Graviton / RPi / Oracle ARM)"
+echo "   (QTSQ-free — the codec checkout is macOS-only)"
 echo ""

@@ -302,9 +302,11 @@ mod tests {
     use super::*;
 
     /// The byte-offset accessors must stay pinned to the C header even if
-    /// a checkout bumps the layout (SOFUU_QTSQ_DIR). This test asserts the
-    /// offsets this module hard-codes, so a layout change fails loudly
-    /// instead of reading garbage fields and corrupting brain files.
+    /// a checkout bumps the layout (SOFUU_QTSQ_DIR). This test guards the
+    /// Rust-side constants against accidental edits; the REAL check against
+    /// the live checkout is the build-time `_Static_assert` guard that
+    /// sofuu-ffi/build.rs compiles against qtsq_format.h — a checkout that
+    /// changes the layout fails the build, not just this module's tests.
     #[test]
     fn context_layout_offsets_match_vendored_header() {
         // (the header probe printed: data_type=10, schema=112,

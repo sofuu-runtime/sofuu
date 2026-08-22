@@ -22,6 +22,8 @@ fn main() {
         env::var("SOFUU_QTSQ_DIR")
             .unwrap_or_else(|_| "/Users/priyanshuboruah/projects/black-hole-disk".to_string()),
     );
+    let qtsq_lib = qtsq_dir.join("libqtsq.a");
+    let has_qtsq = qtsq_lib.exists();
 
     // ── Compiler flags ──────────────────────────────────────────
     // M10: the only C left in this build is the engine layer itself —
@@ -119,12 +121,18 @@ fn main() {
     // Proprietary / local checkout. CI and third-party builds don't have it:
     // degrade gracefully (no session store / memory persistence) instead of
     // failing the build. Set SOFUU_QTSQ_DIR to a checkout to enable it.
-    if qtsq_dir.join("libqtsq.a").exists() {
+    if has_qtsq {
         println!("cargo:rustc-link-search=native={}", qtsq_dir.display());
         println!("cargo:rustc-link-lib=static=qtsq");
         println!("cargo:rustc-link-lib=z");
         println!("cargo:rustc-check-cfg=cfg(has_qtsq)");
         println!("cargo:rustc-cfg=has_qtsq");
+        // Rebuild when the checkout's artifacts change — without these a
+        // refreshed libqtsq.a silently keeps the stale probe cfg and (until
+        // some downstream crate edits) the stale link inputs.
+        println!("cargo:rerun-if-changed={}", qtsq_lib.display());
+        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq_format.h").display());
+        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq.h").display());
     } else {
         println!(
             "cargo:warning=libqtsq.a not found at {} — building WITHOUT QTSQ \
@@ -154,7 +162,7 @@ fn main() {
     // (LTO) prune those objects, but debug/test links pull them → link
     // fails without it. Add it when pkg-config finds it — only in QTSQ
     // builds (a host pkg-config result would poison a cross build).
-    if qtsq_dir.join("libqtsq.a").exists() {
+    if has_qtsq {
         if let Ok(out) = std::process::Command::new("pkg-config")
             .args(["--libs", "opus"])
             .output()
@@ -169,6 +177,48 @@ fn main() {
                     }
                 }
             }
+        }
+    }
+
+    // ── QTSQ layout guard (regression) ────────────────────────────
+    // Compiles a C file of _Static_asserts against the checkout's
+    // qtsq_format.h — syntax-only, nothing is executed (arg-list Command,
+    // no shell), so cross builds are covered too. A checkout that changes
+    // sizeof/offsets fails the BUILD here instead of silently corrupting
+    // brain files at runtime. Bump these expected values together with
+    // the Rust mirrors in crates/sofuu-ffi/src/qtsq.rs.
+    if has_qtsq {
+        let guard_src = out_dir.join("qtsq_layout_guard.c");
+        std::fs::write(
+            &guard_src,
+            r#"#include <stddef.h>
+#include "qtsq_format.h"
+_Static_assert(sizeof(qtsq_context_t) == 5016, "QTSQ_CONTEXT_SIZE drifted");
+_Static_assert(offsetof(qtsq_context_t, header.data_type) == 10, "OFF_HEADER_DATA_TYPE drifted");
+_Static_assert(offsetof(qtsq_context_t, schema) == 112, "OFF_SCHEMA drifted");
+_Static_assert(offsetof(qtsq_schema_t, dimensions) == 68, "OFF_SCHEMA_DIMENSIONS drifted");
+_Static_assert(offsetof(qtsq_schema_t, num_dims) == 100, "OFF_SCHEMA_NUM_DIMS drifted");
+_Static_assert(offsetof(qtsq_context_t, is_encrypted) == 4908, "OFF_IS_ENCRYPTED drifted");
+"#,
+        )
+        .expect("write qtsq layout guard");
+        let compiled = std::process::Command::new("cc")
+            .arg("-fsyntax-only")
+            .arg("-I")
+            .arg(qtsq_dir.join("include"))
+            .arg(&guard_src)
+            .output();
+        let ok = compiled.as_ref().map(|o| o.status.success()).unwrap_or(false);
+        if !ok {
+            let stderr = compiled
+                .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            panic!(
+                "QTSQ layout guard failed: the checkout's qtsq_context_t no \
+                 longer matches the Rust mirrors in qtsq.rs (sizeof=5016, \
+                 offsets 10/112/68/100/4908). Update the mirrors and this \
+                 guard together.\n{stderr}"
+            );
         }
     }
 

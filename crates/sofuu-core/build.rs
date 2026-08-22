@@ -21,6 +21,12 @@ fn main() {
     );
     if qtsq_dir.join("libqtsq.a").exists() {
         println!("cargo:rustc-cfg=has_qtsq");
+        // Mirror sofuu-ffi: rebuild when the checkout's artifacts change,
+        // so a refreshed libqtsq.a re-runs this probe instead of keeping a
+        // stale cfg.
+        println!("cargo:rerun-if-changed={}", qtsq_dir.join("libqtsq.a").display());
+        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq_format.h").display());
+        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq.h").display());
     } else {
         println!(
             "cargo:warning=libqtsq.a not found at {} — building WITHOUT QTSQ \

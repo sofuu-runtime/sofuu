@@ -62,6 +62,9 @@ if command -v sha256sum > /dev/null 2>&1; then
 elif command -v shasum > /dev/null 2>&1; then
     # Convert format: sha256sum uses "hash  file" but shasum -a 256 expects same
     shasum -a 256 -c "${CHECKSUM_NAME}"
+else
+    echo "✗ No checksum tool (sha256sum/shasum) found — refusing to install an unverified binary." >&2
+    exit 1
 fi
 cd -
 

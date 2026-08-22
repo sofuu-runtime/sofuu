@@ -715,6 +715,44 @@ async function main() {
       const after = b.count();
       check("A3 memory:off writes nothing (" + before + " → " + after + ")", after === before);
     }
+
+    /* ── Consolidation cadence (now wired into brainDecayTick): a brain
+     *    with ≥24 weak-old episodic records consolidates at the turn
+     *    boundary (event + persisted semantic records + shrunken count),
+     *    and is rate-limited — a second run inside the interval does
+     *    nothing. Eligibility gate: episodic, strength < 0.25, age > 1d. */
+    {
+      const TMP_CON = "/tmp/sofuu_agent_test_con_" + Date.now() + ".qtsq";
+      const dim = sofuu.ai.embedLocal("").length;
+      const cb = sofuu.memory.open(TMP_CON, dim);
+      for (let i = 0; i < 30; i++) {
+        const t = "consol episode " + i + " about the project alpha migration " + (i % 2 ? "database" : "api");
+        cb.remember(new Float32Array(sofuu.ai.embedLocal(t)), t, "user", 0);
+      }
+      cb.decayTick(Math.floor(1.5 * 86400)); /* strength ≈ 0.22 — weak but above the retain floor */
+      cb.flush();
+      const before = cb.count();
+      sofuu.agent.define({ name: "conso", system: "AGENT=mem", memory: "shared", brainPath: TMP_CON,
+        rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+      const ev = [];
+      await sofuu.agent.run("conso", "tell me about project alpha", { onStep: e => ev.push(e) });
+      const conEv = ev.find(e => e.kind === "consolidated");
+      check("consolidation fires at the turn boundary (event, ≥1 cluster)", !!conEv && (conEv.payload.clusters || 0) >= 1);
+      const rb = sofuu.memory.open(TMP_CON, dim);
+      const tiers = {};
+      rb.recall(new Float32Array(sofuu.ai.embedLocal("project alpha migration")), 32)
+        .forEach(h => { tiers[h.tier] = (tiers[h.tier] || 0) + 1; });
+      check("semantic (tier 2) records exist and persisted", (tiers[2] || 0) >= 1);
+      const ev2 = [];
+      await sofuu.agent.run("conso", "one more question for the interval probe", { onStep: e => ev2.push(e) });
+      check("consolidation rate-limited inside the interval", !ev2.some(e => e.kind === "consolidated"));
+      /* Consolidation tombstones the originals; the NEXT turn boundary's
+       * retain() physically prunes them (decay→retain→consolidate order),
+       * so the shrunken count is observable after the second run. */
+      const rb2 = sofuu.memory.open(TMP_CON, dim);
+      check("merged originals pruned (count " + before + " → " + rb2.count() + ")", rb2.count() < before);
+      try { sofuu.fs.rm(TMP_CON); } catch (e) {}
+    }
   }
 
   /* ── A8: loadDir + list ─────────────────────────────────────────── */

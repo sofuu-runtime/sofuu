@@ -317,7 +317,7 @@
     if (BRAINS[path] !== undefined) return BRAINS[path];
     var entry = null;
     try {
-      entry = { cma: sofuu.memory.open(path, vecDim()), lastDecay: Date.now() };
+      entry = { cma: sofuu.memory.open(path, vecDim()), lastDecay: Date.now(), lastConsolidate: 0 };
     } catch (e) { entry = null; }
     BRAINS[path] = entry;
     return entry;
@@ -326,16 +326,40 @@
    * brain, then physically prune dead records (retain is a no-op when the
    * binding is missing on older builds). Called at the turn boundary —
    * survivors renumber ids, which is safe because no caller holds ids
-   * across turns. */
+   * across turns. Returns the number of clusters consolidated this tick
+   * (0 = nothing due). */
   function brainDecayTick(entry) {
-    if (!entry || !entry.cma || typeof entry.cma.decayTick !== 'function') return;
+    if (!entry || !entry.cma || typeof entry.cma.decayTick !== 'function') return 0;
+    var consolidated = 0;
     try {
       var nowMs = Date.now();
       var dt = Math.floor((nowMs - entry.lastDecay) / 1000);
       if (dt > 0) entry.cma.decayTick(Math.min(dt, 7 * 86400));
       entry.lastDecay = nowMs;
       if (typeof entry.cma.retain === 'function') entry.cma.retain();
+      consolidated = brainConsolidateIfDue(entry);
     } catch (e) {}
+    return consolidated;
+  }
+  /* Consolidation cadence: cluster weak-old episodic memories into
+   * semantic records (the README's "k-means consolidation" — previously
+   * callable only from scripts). Conservative by design: rate-limited to
+   * once per brain per interval, and thresholded so small brains never
+   * pay a k-means pass. A run that consolidates flushes immediately so
+   * the merge survives a crash. */
+  var CONSOLIDATE_INTERVAL_MS = 6 * 3600 * 1000;
+  var CONSOLIDATE_MIN_RECORDS = 24;
+  function brainConsolidateIfDue(entry) {
+    if (!entry || !entry.cma || typeof entry.cma.consolidate !== 'function') return 0;
+    try {
+      var now = Date.now();
+      if (entry.lastConsolidate && (now - entry.lastConsolidate) < CONSOLIDATE_INTERVAL_MS) return 0;
+      if (entry.cma.count() < CONSOLIDATE_MIN_RECORDS) return 0;
+      entry.lastConsolidate = now;
+      var n = entry.cma.consolidate() || 0;
+      if (n > 0) { try { entry.cma.flush(); } catch (e2) {} }
+      return n;
+    } catch (e) { return 0; }
   }
   function scopeRecall(d, cma, vec, topK) {
     if (!vec) return [];
@@ -675,7 +699,10 @@
       var recallBlock = '';
       if (cma) {
         await rememberIdentity(d, cma);
-        brainDecayTick(brainEntry); /* M3: decay + prune at the turn boundary */
+        var consolidatedN = brainDecayTick(brainEntry); /* M3: decay + prune + consolidate at the turn boundary */
+        if (consolidatedN > 0) {
+          emit('consolidated', { clusters: consolidatedN, scope: d.memory });
+        }
         try {
           var qvec = await embedTextFor(d, String(task));
           var hits = scopeRecall(d, cma, qvec, 15);

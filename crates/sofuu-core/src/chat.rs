@@ -949,7 +949,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
 }
 
 fn print_help() {
-    let h = |s: &str| chat_out(&format!("\x1b[1;36m{s}\x1b[0m")); // section header
+    let h = |s: &str| chat_out(&format!("\n\x1b[1;36m{s}\x1b[0m")); // section header
     let c = |cmd: &str, desc: &str| {
         // aligned command column + dim description
         chat_out(&format!("    \x1b[1m{cmd:<20}\x1b[0m\x1b[2m— {desc}\x1b[0m"));
@@ -973,11 +973,13 @@ fn print_help() {
     h("  Brain & memory");
     c("/remember <fact>", "pin a fact directly to the brain");
     c("/why", "which memories shaped the last answer");
-    c("/share [path]", "export brain as an encrypted card");
+    c("/share [path]", "export a brain card (metadata + pointers)");
     c("/import <path>", "import + merge a brain card");
     c("/resume [id]", "browse + resume a past session");
+    c("/serve", "brain-server quick info (sofuu serve --brain)");
     h("  Context & tools");
     c("@file[:start-end]", "attach file contents to a prompt");
+    c("@name <task>", "run a loaded agent directly (@agent:name too)");
     c("/watch <path>", "watch a directory for changes in context");
     c("/cost", "token usage + spend breakdown + budget");
     c("/ghost [on|off]", "toggle ghost prompt completion");
@@ -1208,13 +1210,21 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     } else {
         format!("{}/{}{}", cfg.provider, cfg.model, effort)
     };
-    let labels: [(String, String); 4] = [
+    let labels: [(String, String); 5] = [
         ("Directory:".into(), trunc_cells(dir, inner.saturating_sub(14))),
         (
             "Session:".into(),
             if session.is_empty() { "none".into() } else { session.into() },
         ),
         ("Model:".into(), model),
+        (
+            "Memory:".into(),
+            if cfg.brain {
+                "on — memories persist across sessions".to_string()
+            } else {
+                "off — /brain on to enable".to_string()
+            },
+        ),
         ("Version:".into(), env!("CARGO_PKG_VERSION").into()),
     ];
     for (label, value) in labels {
@@ -2815,7 +2825,7 @@ const DRIVER: &str = r#"
     try {
       if (!sofuu.fs || typeof sofuu.fs.readFile !== 'function') return;
       let code;
-      try { code = sofuu.fs.readFile(hooksPath, 'utf8'); }
+      try { code = await sofuu.fs.readFile(hooksPath, 'utf8'); }
       catch (e) { return; } /* file doesn't exist — no hooks, zero overhead */
       if (!code || typeof code !== 'string' || code.trim().length === 0) return;
       /* Wrap in a function that returns the pre/post exports. */
@@ -3274,6 +3284,18 @@ const DRIVER: &str = r#"
             /* F1/P2: /why reports exactly what gating let through this turn
              * (hits already thresholded, deduped, budget-cut by agent.js). */
             try { __chat_set_recall(JSON.stringify(Array.isArray(p.hits) ? p.hits : [])); } catch (e2) {}
+            /* Brain feedback: one dim line so a recalled context is visible
+             * (and the brain being ON is observable), never the contents. */
+            if (p && p.count > 0) {
+              out('\x1b[90m  ⏺ brain · ' + p.count + ' memor' + (p.count === 1 ? 'y' : 'ies') +
+                  ' recalled (/why to inspect)\x1b[0m');
+            }
+          } else if (e.kind === 'consolidated') {
+            /* Brain housekeeping (rare, rate-limited): weak-old episodic
+             * memories were merged into semantic clusters. */
+            out('\x1b[90m  ⏳ brain · consolidated ' + (p.clusters || 1) +
+                ' cluster' + ((p.clusters || 1) === 1 ? '' : 's') +
+                ' — old memories merged\x1b[0m');
           } else if (e.kind === 'tool_result') {
             if (TTY && p.result) {
               /* Compact one-row result: embedded newlines become " · " so
@@ -3557,6 +3579,9 @@ const DRIVER: &str = r#"
     } else {
       ctxMet = 'ctx 0/' + fmtTk(win);
     }
+    /* Brain state rides the ctx metric — the footer stays clean when the
+     * brain is off. */
+    if (cfg.brain) { ctxMet = ctxMet + dim(' · brain'); }
     let ramMet = '';
     try {
       if (typeof __chat_rss === 'function') {

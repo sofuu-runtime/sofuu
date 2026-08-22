@@ -8,6 +8,42 @@
 
 ---
 
+## ✅ Completed — consolidation wiring + TUI polish + F9 hooks fix (2026-08-22)
+
+### Consolidation is real now (was script-only)
+- ✅ `brainConsolidateIfDue` in `src/js/agent.js`: called from the existing
+  `brainDecayTick` turn-boundary cadence — rate-limited (once per brain per
+  6h) and thresholded (≥24 records). A consolidating run flushes
+  immediately; emits a `consolidated {clusters}` trace event.
+- ✅ Chat renders it: dim `⏳ brain · consolidated N clusters` line, plus a
+  new dim `⏺ brain · N memories recalled (/why to inspect)` line on recall
+  (brain activity is now observable in the TUI).
+- ✅ E2E in `tests/agent_test.js`: fires at the turn boundary, semantic
+  (tier-2) records persist, originals tombstone then prune on the next
+  boundary (30 → 6 observed), rate-limited on the second run.
+
+### F9 hooks.js was dead-on-arrival — fixed
+- ✅ `loadHooks` called the promise-based `sofuu.fs.readFile` WITHOUT
+  `await`: a missing hooks.js (the default) leaked a red
+  `UnhandledPromiseRejection: no such file or directory` on every fresh
+  install's first turn, and a PRESENT hooks.js never loaded (the Promise
+  failed the string check). Both fixed (one `await`). Verified by pty
+  capture: no rejection with the file missing; "⏺ hooks.js loaded" + the
+  post-hook transforming the stored answer with it present.
+
+### TUI polish
+- ✅ Welcome panel: new `Memory:` row (on — memories persist across
+  sessions / off — /brain on to enable).
+- ✅ Footer: `ctx X/Y · brain` indicator when the brain is on (row 2 left).
+- ✅ `/help`: blank-line section spacing, added `/serve` and `@name <task>`
+  entries, honest `/share` wording (metadata card, not "encrypted").
+
+Verified: cargo test 186 green · agent_test ALL PASSED (5 new checks) ·
+make test 19/19 · size 2,125,632 ≤ 5MB · pty captures show the panel row,
+recall/consolidated lines, footer indicator, and zero rejections.
+
+---
+
 ## ✅ Completed — 2026-08-22 full audit + P0 fix pass
 
 Full-codebase audit (wiring/dead code, FFI/unsafe correctness, security,

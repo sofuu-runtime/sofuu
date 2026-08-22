@@ -1147,7 +1147,7 @@ unsafe fn extract_stream_think_qjs(ctx: *mut JSContext, p: Provider, data: &[u8]
     }
 
     let data_c = CString::new(data).unwrap_or_default();
-    let ev = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data.len(), c"<sse_think>".as_ptr());
+    let ev = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data_c.as_bytes().len(), c"<sse_think>".as_ptr());
     if qjs::is_exception(ev) {
         qjs::sofuu_js_get_exception(ctx);
         return None;
@@ -1224,7 +1224,7 @@ unsafe fn extract_stream_delta_qjs(ctx: *mut JSContext, p: Provider, data: &[u8]
     }
 
     let data_c = CString::new(data).unwrap_or_default();
-    let ev = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data.len(), c"<sse>".as_ptr());
+    let ev = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data_c.as_bytes().len(), c"<sse>".as_ptr());
     if qjs::is_exception(ev) {
         qjs::sofuu_js_get_exception(ctx);
         return None;
@@ -1800,7 +1800,7 @@ unsafe extern "C" fn stream_write_cb(
             /* Try to extract token usage from this chunk (may appear on any chunk) */
             {
                 let data_c = CString::new(data).unwrap_or_default();
-                let ev_use = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data.len(), c"<sse_use>".as_ptr());
+                let ev_use = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data_c.as_bytes().len(), c"<sse_use>".as_ptr());
                 if !qjs::is_exception(ev_use) {
                     let mut use_v = qjs::sofuu_js_get_property_str(ctx, ev_use, c"usage".as_ptr());
                     if qjs::is_undefined(use_v) || qjs::is_null(use_v) {
@@ -1901,7 +1901,7 @@ unsafe extern "C" fn stream_write_cb(
             if qjs::JS_IsFunction(ctx, (*req).tool_calls_fn) != 0 {
                 if (*req).provider == Provider::Anthropic {
                     let data_c2 = CString::new(data).unwrap_or_default();
-                    let ev2 = qjs::JS_ParseJSON(ctx, data_c2.as_ptr(), data.len(), c"<sse_tc>".as_ptr());
+                    let ev2 = qjs::JS_ParseJSON(ctx, data_c2.as_ptr(), data_c2.as_bytes().len(), c"<sse_tc>".as_ptr());
                     if !qjs::is_exception(ev2) {
                         if let Some(tc) = anthropic_tool_fragments(ctx, ev2) {
                             let ret = qjs::JS_Call(ctx, (*req).tool_calls_fn, qjs::sofuu_js_undefined(), 1, &tc);
@@ -1915,7 +1915,7 @@ unsafe extern "C" fn stream_write_cb(
                     }
                 } else {
                     let data_c2 = CString::new(data).unwrap_or_default();
-                    let ev2 = qjs::JS_ParseJSON(ctx, data_c2.as_ptr(), data.len(), c"<sse_tc>".as_ptr());
+                    let ev2 = qjs::JS_ParseJSON(ctx, data_c2.as_ptr(), data_c2.as_bytes().len(), c"<sse_tc>".as_ptr());
                     if !qjs::is_exception(ev2) {
                         let choices2 = qjs::sofuu_js_get_property_str(ctx, ev2, c"choices".as_ptr());
                         if qjs::JS_IsArray(ctx, choices2) != 0 {
@@ -2162,7 +2162,7 @@ unsafe fn ai_check_multi() {
                             // Fallback: truncated raw body.
                             let parsed_msg = {
                                 let c = CString::new(raw.clone()).unwrap_or_default();
-                                let v = qjs::JS_ParseJSON(ctx, c.as_ptr(), raw.len(), c"<err>".as_ptr());
+                                let v = qjs::JS_ParseJSON(ctx, c.as_ptr(), c.as_bytes().len(), c"<err>".as_ptr());
                                 let mut out: Option<String> = None;
                                 if !qjs::is_exception(v) {
                                     let err = qjs::sofuu_js_get_property_str(ctx, v, c"error".as_ptr());

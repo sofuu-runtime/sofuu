@@ -41,6 +41,12 @@ struct SpawnReq {
     on_stderr: JSValue,
     on_exit: JSValue,
 
+    /* Dup'd ref to the JS Subprocess object: the close-callback fence frees
+     * the request before the object is necessarily GC'd, so the fence must
+     * be able to null the object's opaque (post-exit write()/kill() would
+     * otherwise dereference freed memory). Released in spawn_free. */
+    self_obj: JSValue,
+
     command: CString,
     args: Vec<CString>,
     args_ptr: Vec<*mut c_char>,
@@ -56,7 +62,17 @@ struct SpawnReq {
 }
 
 unsafe fn spawn_free(req: *mut SpawnReq) {
+    // The JS object may still be referenced by user code — null its opaque
+    // so a post-exit write()/kill() sees the NULL guard instead of this
+    // freed request, then drop our keeping reference.
+    if !qjs::is_undefined((*req).self_obj) {
+        qjs::JS_SetOpaque((*req).self_obj, ptr::null_mut());
+        qjs::sofuu_js_free_value((*req).ctx, (*req).self_obj);
+        (*req).self_obj = qjs::sofuu_js_undefined();
+    }
     // All 4 handles are closed by now — release their storages.
+    // (On the uv_spawn failure path `process` was already freed directly and
+    // nulled — free(NULL) is a no-op there.)
     libc::free((*req).process as *mut c_void);
     libc::free((*req).stdin_pipe as *mut c_void);
     libc::free((*req).stdout_pipe as *mut c_void);
@@ -186,8 +202,13 @@ unsafe extern "C" fn js_subprocess_finalizer(_rt: *mut qjs::JSRuntime, val: JSVa
     }
     let req = req as *mut SpawnReq;
     /* NEVER free req here — see the C comment: the close-callback fence in
-     * on_process_exit owns the memory. Only detach the JS callback refs. */
+     * on_process_exit owns the memory. Only detach the JS callback refs
+     * (freeing the old values — on_process_exit frees the undefined
+     * replacements as a no-op, so without this they would leak). */
     if (*req).done == 0 {
+        qjs::sofuu_js_free_value((*req).ctx, (*req).on_stdout);
+        qjs::sofuu_js_free_value((*req).ctx, (*req).on_stderr);
+        qjs::sofuu_js_free_value((*req).ctx, (*req).on_exit);
         (*req).on_stdout = qjs::sofuu_js_undefined();
         (*req).on_stderr = qjs::sofuu_js_undefined();
         (*req).on_exit = qjs::sofuu_js_undefined();
@@ -195,14 +216,14 @@ unsafe extern "C" fn js_subprocess_finalizer(_rt: *mut qjs::JSRuntime, val: JSVa
 }
 
 unsafe extern "C" fn js_subprocess_kill(
-    _ctx: *mut JSContext,
+    ctx: *mut JSContext,
     this_val: JSValueConst,
     _argc: c_int,
     _argv: *const JSValueConst,
 ) -> JSValue {
     let req = qjs::JS_GetOpaque(this_val, SUBPROCESS_CLASS_ID.load(Ordering::Relaxed));
     if req.is_null() {
-        return qjs::sofuu_js_exception();
+        return qjs::JS_ThrowTypeError(ctx, c"process already exited".as_ptr());
     }
     let req = req as *mut SpawnReq;
     uv::uv_process_kill((*req).process, 15); /* SIGTERM */
@@ -233,7 +254,7 @@ unsafe extern "C" fn js_subprocess_write(
     }
     let req = qjs::JS_GetOpaque(this_val, SUBPROCESS_CLASS_ID.load(Ordering::Relaxed));
     if req.is_null() {
-        return qjs::sofuu_js_exception();
+        return qjs::JS_ThrowTypeError(ctx, c"process already exited".as_ptr());
     }
     let req = req as *mut SpawnReq;
 
@@ -341,6 +362,7 @@ unsafe extern "C" fn js_sofuu_spawn(
         on_stdout: qjs::sofuu_js_undefined(),
         on_stderr: qjs::sofuu_js_undefined(),
         on_exit: qjs::sofuu_js_undefined(),
+        self_obj: qjs::sofuu_js_undefined(),
         command,
         args: Vec::new(),
         args_ptr: Vec::new(),
@@ -419,6 +441,9 @@ unsafe extern "C" fn js_sofuu_spawn(
     *(stderr_pipe as *mut *mut SpawnReq) = &mut *req;
 
     req.args_ptr = req.args.iter().map(|a| a.as_ptr() as *mut c_char).collect();
+    /* execvpe/posix_spawn walk argv until NULL — without the terminator
+     * they read past the Vec (EFAULT, heap-layout dependent). */
+    req.args_ptr.push(ptr::null_mut());
     req.opts.file = req.command.as_ptr();
     req.opts.args = req.args_ptr.as_mut_ptr();
     req.opts.env = ptr::null_mut();
@@ -463,19 +488,28 @@ unsafe extern "C" fn js_sofuu_spawn(
 
     let r = uv::uv_spawn(loop_, process, &(*req_ptr).opts);
     if r != 0 {
-        /* Cleanup on failure: release the JS callback refs, close the three
-         * pipes, and free the un-spawned process handle. The pipes close
-         * with the spawn_close_cb fence so the LAST close frees the req Box
-         * (with command/args/cwd) AND all four handle storages — no leak,
-         * no dangling pipe->data. */
+        /* Cleanup on failure: release the JS callback refs and close all
+         * four handles with the spawn_close_cb fence — the LAST close
+         * frees the req Box AND all four handle storages. The process
+         * handle MUST go through uv_close too: uv_spawn already queued it
+         * in loop->handle_queue (the dequeue-on-error path is #if 0'd in
+         * the vendored libuv), so freeing its storage directly would
+         * leave a dangling entry that uv_walk visits later. */
         qjs::sofuu_js_free_value(ctx, (*req_ptr).on_stdout);
         qjs::sofuu_js_free_value(ctx, (*req_ptr).on_stderr);
         qjs::sofuu_js_free_value(ctx, (*req_ptr).on_exit);
-        (*req_ptr).closing = 3; /* three pipes; the process handle is freed here */
+        (*req_ptr).on_stdout = qjs::sofuu_js_undefined();
+        (*req_ptr).on_stderr = qjs::sofuu_js_undefined();
+        (*req_ptr).on_exit = qjs::sofuu_js_undefined();
+        (*req_ptr).closing = 4;
+        /* The process handle's data must point at the req BEFORE its close
+         * callback runs (spawn_close_cb reads it) — the success path sets
+         * it after uv_spawn, which we never reach here. */
+        *(process as *mut *mut SpawnReq) = req_ptr;
         uv::uv_close(stdin_pipe as *mut UvHandle, Some(spawn_close_cb));
         uv::uv_close(stdout_pipe as *mut UvHandle, Some(spawn_close_cb));
         uv::uv_close(stderr_pipe as *mut UvHandle, Some(spawn_close_cb));
-        libc::free(process as *mut c_void);
+        uv::uv_close(process as *mut UvHandle, Some(spawn_close_cb));
         return qjs::JS_ThrowTypeError(ctx, c"spawn failed: %s".as_ptr(), uv::uv_strerror(r));
     }
 
@@ -488,6 +522,9 @@ unsafe extern "C" fn js_sofuu_spawn(
 
     let obj = qjs::JS_NewObjectClass(ctx, SUBPROCESS_CLASS_ID.load(Ordering::Relaxed) as c_int);
     qjs::JS_SetOpaque(obj, req_ptr as *mut c_void);
+    /* Keep the object alive until the fence frees the request: spawn_free
+     * needs a valid JSValue to null the opaque through. */
+    (*req_ptr).self_obj = qjs::sofuu_js_dup_value(ctx, obj);
 
     /* The argv/cwd buffers must stay valid until exit_cb — they live in
      * the Box, which the close-callback fence frees. */
@@ -732,6 +769,8 @@ unsafe extern "C" fn js_sofuu_exec(
     uv::uv_pipe_init(loop_, stderr_pipe, 0);
 
     req.argv_ptr = req.argv.iter().map(|a| a.as_ptr() as *mut c_char).collect();
+    /* Same NULL terminator requirement as sofuu.spawn (execvpe walks argv). */
+    req.argv_ptr.push(ptr::null_mut());
     req.opts.file = req.command.as_ptr();
     req.opts.args = req.argv_ptr.as_mut_ptr();
     req.opts.cwd = req.cwd.as_ref().map_or(ptr::null(), |c| c.as_ptr());
@@ -760,9 +799,15 @@ unsafe extern "C" fn js_sofuu_exec(
     let r = uv::uv_spawn(loop_, process, &(*req_ptr).opts);
     if r != 0 {
         sofuu_promise_reject((*req_ptr).promise, qjs::sofuu_js_new_string(ctx, uv::uv_strerror(r)));
-        (*req_ptr).closing = 2;
+        /* All three handles go through uv_close (the process handle too —
+         * uv_spawn queued it even though it failed; see js_sofuu_spawn). */
+        (*req_ptr).closing = 3;
+        /* exec_close_cb reads handle->data — set it for the process handle
+         * (the success path does this after uv_spawn). */
+        *(process as *mut *mut ExecReq) = req_ptr;
         uv::uv_close(stdout_pipe as *mut UvHandle, Some(exec_close_cb));
         uv::uv_close(stderr_pipe as *mut UvHandle, Some(exec_close_cb));
+        uv::uv_close(process as *mut UvHandle, Some(exec_close_cb));
         return promise;
     }
 
@@ -818,5 +863,109 @@ pub unsafe extern "C" fn mod_subprocess_register(ctx: *mut JSContext) {
     );
     qjs::sofuu_js_set_property_str(ctx, global, c"sofuu".as_ptr(), sofuu_obj);
     qjs::sofuu_js_free_value(ctx, global);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sofuu_ffi::qjs::{self, CtxPtr};
+
+    /// Audit P0-2 regression: a failed uv_spawn must throw a TypeError and
+    /// tear down cleanly — the old code freed the process storage directly
+    /// AND again in spawn_free via the pipe-close fence (double free).
+    /// Also covers P0-6: after a normal exit, write()/kill() on the kept
+    /// JS object must throw "process already exited" instead of touching
+    /// the freed request.
+    #[test]
+    fn spawn_failure_and_post_exit_use_are_clean() {
+        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        // SAFETY: standalone runtime + context (M0 pattern).
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        let ctp = unsafe { CtxPtr::new(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        // SAFETY: registers the Subprocess class + sofuu.spawn/exec.
+        unsafe { mod_subprocess_register(ctx) };
+
+        let script = c"var phase1 = 'no-throw', exited = false, after = 'none'; \
+try { sofuu.spawn({ command: 'sofuu_no_such_binary_zzz', args: [] }); } \
+catch (e) { phase1 = (e && e.message) ? e.message : String(e); } \
+var proc = sofuu.spawn({ command: '/bin/sleep', args: ['0.05'], \
+onExit: function () { exited = true; } });";
+        let r = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                script.as_ptr(),
+                script.to_bytes().len(),
+                c"<spawn-audit>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        if unsafe { qjs::is_exception(r) } {
+            unsafe { qjs::js_std_dump_error(ctx) };
+        }
+        assert!(!unsafe { qjs::is_exception(r) }, "spawn setup must not throw");
+        unsafe { qjs::sofuu_js_free_value(ctx, r) };
+
+        // Drain: the failed spawn's pipes close (fence → spawn_free — this
+        // is where the old code double-freed), then sleep exits.
+        // SAFETY: ctx live on this thread.
+        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+
+        let global = unsafe { qjs::global_object(ctp) };
+        let phase1 = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"phase1".as_ptr()) };
+        let phase1_s = unsafe { qjs::sofuu_js_to_cstring(ctx, phase1) };
+        let msg = if phase1_s.is_null() {
+            String::new()
+        } else {
+            // SAFETY: phase1_s is a live CString from QuickJS.
+            unsafe { std::ffi::CStr::from_ptr(phase1_s).to_string_lossy().into_owned() }
+        };
+        unsafe { qjs::sofuu_js_free_cstring(ctx, phase1_s) };
+        unsafe { qjs::sofuu_js_free_value(ctx, phase1) };
+        assert!(
+            msg.starts_with("spawn failed"),
+            "failed spawn must throw a TypeError naming the failure, got: {msg}"
+        );
+
+        let exited = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"exited".as_ptr()) };
+        assert!(unsafe { qjs::JS_ToBool(ctx, exited) } == 1, "onExit must have fired");
+        unsafe { qjs::sofuu_js_free_value(ctx, exited) };
+
+        // Post-exit write(): the fence already freed the request and nulled
+        // the opaque — this must be a clean TypeError, not a UAF.
+        let post = c"try { proc.write('x'); after = 'no-throw'; } \
+catch (e) { after = (e && e.message) ? e.message : 'caught'; }";
+        let r2 = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                post.as_ptr(),
+                post.to_bytes().len(),
+                c"<spawn-audit-2>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        assert!(!unsafe { qjs::is_exception(r2) });
+        unsafe { qjs::sofuu_js_free_value(ctx, r2) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+
+        let after = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"after".as_ptr()) };
+        let after_s = unsafe { qjs::sofuu_js_to_cstring(ctx, after) };
+        let after_msg = if after_s.is_null() {
+            String::new()
+        } else {
+            // SAFETY: after_s is a live CString from QuickJS.
+            unsafe { std::ffi::CStr::from_ptr(after_s).to_string_lossy().into_owned() }
+        };
+        unsafe { qjs::sofuu_js_free_cstring(ctx, after_s) };
+        unsafe { qjs::sofuu_js_free_value(ctx, after) };
+        assert_eq!(after_msg, "process already exited", "post-exit write must throw cleanly");
+
+        unsafe { qjs::sofuu_js_free_value(ctx, global) };
+        // SAFETY: teardown AFTER the loop is closed (M0/M1 discipline).
+        unsafe { crate::rt::event_loop::sofuu_loop_close() };
+        unsafe { qjs::JS_FreeContext(ctx) };
+        unsafe { qjs::JS_FreeRuntime(rt) };
+    }
 }
 

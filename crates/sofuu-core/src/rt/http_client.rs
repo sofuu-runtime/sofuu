@@ -133,9 +133,11 @@ static RESPONSE_CLASS_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 
 unsafe fn response_text_impl(ctx: *mut JSContext, r: *mut ResponseData) -> JSValue {
     let data = (*r).body.clone();
-    let len = data.len();
     let c = CString::new(data).unwrap_or_default();
-    let str_v = qjs::JS_NewStringLen(ctx, c.as_ptr(), len);
+    // Length must come from the CString: if the body contained a NUL the
+    // CString truncates there, and passing the original length would make
+    // QuickJS read past the (1-byte) buffer.
+    let str_v = qjs::JS_NewStringLen(ctx, c.as_ptr(), c.as_bytes().len());
 
     /* Wrap in a pre-resolved promise (spec says .text() returns Promise) */
     let mut resolvers: [JSValue; 2] = [std::mem::zeroed(); 2];
@@ -397,7 +399,7 @@ unsafe extern "C" fn headers_get(
                     vlen -= 1;
                 }
                 let c = CString::new(&p[vstart..vstart + vlen]).unwrap_or_default();
-                result = qjs::JS_NewStringLen(ctx, c.as_ptr(), vlen);
+                result = qjs::JS_NewStringLen(ctx, c.as_ptr(), c.as_bytes().len());
                 break;
             }
         }

@@ -488,33 +488,57 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         i += 1;
     }
 
-    // Default brain path.
-    if brain_path.is_empty() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        brain_path = format!("{}/.sofuu_brain.qtsq", home);
+    /// HOME-derived paths must stay inside the home directory — reject any
+    /// `..` component so a hostile HOME cannot redirect writes elsewhere.
+    fn home_checked() -> Option<String> {
+        let home = std::env::var("HOME").ok()?;
+        if home.is_empty() || home.split('/').any(|seg| seg == "..") {
+            return None;
+        }
+        Some(home)
     }
 
-    // Generate a token if none supplied.
+    // Default brain path.
+    if brain_path.is_empty() {
+        let home = home_checked().unwrap_or_else(|| ".".into());
+        brain_path = format!("{home}/.sofuu_brain.qtsq");
+    }
+
+    // Generate a token if none supplied. 16 bytes from /dev/urandom — a
+    // timestamp-derived token (the old scheme) had ~10^6/second of entropy
+    // and was brute-forceable by any local process that could bound the
+    // server start time.
+    let mut auto_token = false;
     if token.is_empty() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros())
-            .unwrap_or(0);
-        token = format!("sofuu-{:016x}", now);
-        // Persist the token to ~/.sofuu/serve_token
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let token_path = format!("{}/.sofuu/serve_token", home);
-        let _ = std::fs::create_dir_all(format!("{}/.sofuu", home));
-        let _ = std::fs::write(&token_path, &token);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        auto_token = true;
+        let mut entropy = [0u8; 16];
+        let read = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut entropy));
+        if let Err(e) = read {
+            eprintln!("\x1b[31mError:\x1b[0m cannot read /dev/urandom to generate a token: {e}");
+            return 1;
+        }
+        token = format!("sofuu-{}", entropy.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        // Persist the token to ~/.sofuu/serve_token (0600).
+        if let Some(home) = home_checked() {
+            let dir = format!("{home}/.sofuu");
+            let _ = std::fs::create_dir_all(&dir);
+            let token_path = format!("{dir}/serve_token");
+            let _ = std::fs::write(&token_path, &token);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &token_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         }
     }
 
-    // Remote binding requires an explicit token (security).
-    if (host != "127.0.0.1" && host != "localhost") && token.starts_with("sofuu-") {
+    // Remote binding requires a user-chosen token (security). The old
+    // prefix check ("sofuu-") let any --token sofuu-anything through.
+    if (host != "127.0.0.1" && host != "localhost") && auto_token {
         eprintln!("\x1b[31mError:\x1b[0m remote binding requires an explicit --token");
         eprintln!("  Use: sofuu serve --host {} --token <your-secret>\n", host);
         return 1;
@@ -550,9 +574,22 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
   if (sofuu.memory && typeof sofuu.memory.open === 'function') {{
     try {{ brain = sofuu.memory.open(brainPath, 768); }} catch (e) {{ console.error('brain open: ' + e); }}
   }}
+  /* Pin the brain + server to globals: their JS objects' reachability
+   * controls native lifetime (the finalizer closes the handle) — locals
+   * inside this async IIFE die at resolution and would kill the server. */
+  g.__sofuu_serve_brain = brain;
+  g.__sofuu_serve_server = null;
   var server = sofuu.http.createServer(async function (req, res) {{
-    var auth = req.headers && req.headers.authorization;
-    if (auth !== 'Bearer ' + token) {{
+    /* Constant-time comparison — a plain !== compare leaks the matching
+     * prefix length to a local timing attacker. */
+    function ctEq(a, b) {{
+      if (typeof a !== 'string' || a.length !== b.length) return false;
+      var d = 0;
+      for (var i = 0; i < b.length; i++) d |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+      return d === 0;
+    }}
+    var auth = (req.headers && req.headers.authorization) || '';
+    if (!ctEq(auth, 'Bearer ' + token)) {{
       res.writeHead(401, {{ 'Content-Type': 'application/json' }});
       res.end(JSON.stringify({{ ok: false, error: 'unauthorized' }}));
       return;
@@ -566,9 +603,9 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
       return;
     }}
     if (req.method === 'POST' && path === '/remember') {{
-      var body = '';
-      for await (var chunk of req.body || []) {{ body += chunk; }}
-      if (!body) {{ body = ''; }}
+      /* req.body is a fully-buffered string — iterating it as chunks would
+       * concatenate one character per round (O(n^2)). */
+      var body = typeof req.body === 'string' ? req.body : '';
       try {{
         var data = JSON.parse(body || '{{}}');
         if (!data.text) {{
@@ -625,6 +662,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     res.writeHead(404, {{ 'Content-Type': 'application/json' }});
     res.end(JSON.stringify({{ ok: false, error: 'not found' }}));
   }});
+  g.__sofuu_serve_server = server;
   server.listen(port, host);
   console.log('brain server listening on http://' + host + ':' + port);
 }})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});

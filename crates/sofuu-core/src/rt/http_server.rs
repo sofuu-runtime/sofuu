@@ -26,6 +26,8 @@ use crate::rt::event_loop::sofuu_loop_get;
 
 const MAX_REQ_URL: usize = 8 * 1024;
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
+const MAX_REQ_HEADERS: usize = 32 * 1024; /* total name+value bytes */
+const MAX_REQ_HEADER_COUNT: usize = 128;
 
 static RES_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 static SRV_CLASS_ID: AtomicU32 = AtomicU32::new(0);
@@ -46,6 +48,11 @@ struct Client {
     /* request accumulation */
     url: Vec<u8>,
     body: Vec<u8>,
+    /* header accumulation (http-parser fragments names/values across reads) */
+    hdr_field: Vec<u8>,
+    hdr_value: Vec<u8>,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    hdr_bytes: usize,
     /* response state */
     status: c_int,
     ctype: RefCell<Vec<u8>>,
@@ -83,6 +90,10 @@ impl Client {
             },
             url: Vec::new(),
             body: Vec::new(),
+            hdr_field: Vec::new(),
+            hdr_value: Vec::new(),
+            headers: Vec::new(),
+            hdr_bytes: 0,
             status: 0,
             ctype: RefCell::new(Vec::new()),
             headers_set: 0,
@@ -344,6 +355,53 @@ unsafe extern "C" fn js_res_send(
 
 // ── http_parser callbacks ───────────────────────────────────────────
 
+/// Commits the pending (field, value) pair if one is complete.
+unsafe fn client_commit_header(c: *mut Client) -> c_int {
+    if (*c).hdr_field.is_empty() {
+        return 0;
+    }
+    if (*c).headers.len() + 1 > MAX_REQ_HEADER_COUNT {
+        return 1; /* → parser error → close */
+    }
+    let f = std::mem::take(&mut (*c).hdr_field);
+    let v = std::mem::take(&mut (*c).hdr_value);
+    (*c).headers.push((f, v));
+    0
+}
+
+unsafe extern "C" fn cb_header_field(p: *mut HttpParser, at: *const c_char, len: usize) -> c_int {
+    let c = (*p).data as *mut Client;
+    /* A new field name starting means the previous pair is complete. */
+    if !(*c).hdr_value.is_empty() {
+        let rc = client_commit_header(c);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    if (*c).hdr_bytes + len > MAX_REQ_HEADERS {
+        return 1; /* cap, no OOM */
+    }
+    (*c).hdr_bytes += len;
+    (*c).hdr_field.extend_from_slice(std::slice::from_raw_parts(at as *const u8, len));
+    0
+}
+
+unsafe extern "C" fn cb_header_value(p: *mut HttpParser, at: *const c_char, len: usize) -> c_int {
+    let c = (*p).data as *mut Client;
+    if (*c).hdr_bytes + len > MAX_REQ_HEADERS {
+        return 1; /* cap, no OOM */
+    }
+    (*c).hdr_bytes += len;
+    (*c).hdr_value.extend_from_slice(std::slice::from_raw_parts(at as *const u8, len));
+    0
+}
+
+unsafe extern "C" fn cb_headers_complete(p: *mut HttpParser) -> c_int {
+    let c = (*p).data as *mut Client;
+    /* Commit the final pending pair. Return 0 = keep parsing the body. */
+    client_commit_header(c)
+}
+
 unsafe extern "C" fn cb_url(p: *mut HttpParser, at: *const c_char, len: usize) -> c_int {
     let c = (*p).data as *mut Client;
     if (*c).url.len() + len + 1 > MAX_REQ_URL {
@@ -394,9 +452,39 @@ unsafe extern "C" fn cb_message_complete(p: *mut HttpParser) -> c_int {
             ctx,
             (*c).req_val.get(),
             c"body".as_ptr(),
-            qjs::JS_NewStringLen(ctx, body_c.as_ptr(), (*c).body.len()),
+            qjs::JS_NewStringLen(ctx, body_c.as_ptr(), body_c.as_bytes().len()),
         );
     }
+    if !(*c).headers.is_empty() {
+        /* req.headers: lowercased names; duplicates comma-joined (HTTP list
+         * semantics). The brain server's bearer auth reads
+         * req.headers.authorization. */
+        let hdr_obj = qjs::sofuu_js_new_object(ctx);
+        let mut merged: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        for (name, value) in (*c).headers.iter() {
+            let mut lower = name.clone();
+            lower.make_ascii_lowercase();
+            if let Some(entry) = merged.iter_mut().find(|(n, _)| *n == lower) {
+                entry.1.push(value.clone());
+            } else {
+                merged.push((lower, vec![value.clone()]));
+            }
+        }
+        for (name, values) in merged {
+            let joined = values.join(&b", "[..]);
+            let name_c = CString::new(name).unwrap_or_default();
+            let val_c = CString::new(joined).unwrap_or_default();
+            let val_v = qjs::JS_NewStringLen(ctx, val_c.as_ptr(), val_c.as_bytes().len());
+            qjs::sofuu_js_set_property_str(ctx, hdr_obj, name_c.as_ptr(), val_v);
+        }
+        qjs::sofuu_js_set_property_str(ctx, (*c).req_val.get(), c"headers".as_ptr(), hdr_obj);
+    }
+    /* Connections are Connection: close, but reset anyway in case that
+     * ever changes (keep-alive would otherwise append to stale state). */
+    (*c).url.clear();
+    (*c).body.clear();
+    (*c).headers.clear();
+    (*c).hdr_bytes = 0;
 
     (*c).res_val.set(qjs::JS_NewObjectClass(ctx, RES_CLASS_ID.load(Ordering::Relaxed) as c_int));
     qjs::JS_SetOpaque((*c).res_val.get(), c as *mut c_void);
@@ -443,9 +531,9 @@ thread_local! {
         on_message_begin: None,
         on_url: Some(cb_url),
         on_status: None,
-        on_header_field: None,
-        on_header_value: None,
-        on_headers_complete: None,
+        on_header_field: Some(cb_header_field),
+        on_header_value: Some(cb_header_value),
+        on_headers_complete: Some(cb_headers_complete),
         on_body: Some(cb_body),
         on_message_complete: Some(cb_message_complete),
         on_chunk_header: None,

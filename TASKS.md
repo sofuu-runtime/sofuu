@@ -8,6 +8,79 @@
 
 ---
 
+## ✅ Completed — 2026-08-22 full audit + P0 fix pass
+
+Full-codebase audit (wiring/dead code, FFI/unsafe correctness, security,
+JS-driver logic — see `AUDIT-2026-08-22.md`), the tree committed to git
+(e6979e256, first commit of the Rust codebase), and every P0 memory-safety
+finding fixed + verified. Verified after fixes: `cargo test` **186 green**
+(was 185; +1 new regression test) · `make test` 19 green · size 2,125,632
+bytes ≤ 5MB · brain server E2E (401/401/200 auth matrix, /remember,
+/recall, CSPRNG token, remote-bind guard) ✓.
+
+### P0 fixes
+- ✅ **P0-1 git:** entire Rust implementation was untracked → committed
+  (snapshot commit e6979e256: 212 files, +60,244/−11,239). Note: two files
+  remain unstaged (the security hook blocks `git add` on them — stage
+  manually: the installer script and the memory-verify script).
+- ✅ **P0-2 spawn double-free:** failure path freed the process storage
+  directly AND via the fence (`spawn_free`). Now all four handles close via
+  `spawn_close_cb` (closing=4). Regression test:
+  `rt::process_spawn::tests::spawn_failure_and_post_exit_use_are_clean`.
+- ✅ **P0-3 mcp.connect UAF:** `uv_close(pipe, None)` + immediate `free` —
+  libuv's closing pass touches freed storages. Storages now freed in the
+  close callback (`free_pipe_cb`); also fixed `write_str_dup` ignoring the
+  `uv_write` rc (per-call leak on EPIPE).
+- ✅ **P0-4 NUL over-read:** 8 sites passed the original length to
+  QuickJS after `CString::new(...).unwrap_or_default()` collapsed to a
+  1-byte buffer (fetch `.text()`, `headers.get`, 6× SSE/JSON parse in
+  `rt/ai.rs`). All now use the CString's byte length.
+- ✅ **P0-5 brain server was nonfunctional end-to-end:** (a) native HTTP
+  server never parsed headers → `req.headers` undefined → every request
+  401; now wired (on_header_field/value/headers_complete, 32KB/128-header
+  caps, lowercase keys, comma-joined duplicates); (b) auto-token was
+  epoch micros (zero entropy) → now 16 bytes from /dev/urandom
+  (`sofuu-<32hex>`, persisted 0600); (c) remote-bind guard prefix-sniffed
+  `sofuu-` (bypassable with `--token sofuu-anything`) → now a real
+  auto-generated flag; (d) auth compare is constant-time (XOR-accumulate
+  in the serve script); (e) `/remember` read `req.body` (a String) as a
+  chunk stream (O(n²)) → uses it directly; (f) HOME-derived paths
+  validated against `..` components.
+- ✅ **P0-6 stale subprocess opaque:** the fence freed `SpawnReq` while
+  the JS object's opaque still pointed at it (post-exit `.write()`/`.kill()`
+  = UAF). `SpawnReq` now holds a dup'd `self_obj`; `spawn_free` nulls the
+  opaque before freeing; `kill`/`write` throw `process already exited`.
+  Also fixed the finalizer leaking the three callback refs.
+
+### NEW P0s found BY the fix pass (not in the original audit)
+- ✅ **argv not NULL-terminated** in `sofuu.spawn`/`sofuu.exec` (execvpe
+  walks argv until NULL — EFAULT when the byte after the Vec wasn't zero;
+  only ever "worked" by heap-layout luck; exposed deterministically by the
+  new regression test). Both sites now push `NULL`.
+- ✅ **Failed-spawn process handle left in `loop->handle_queue`:** the
+  vendored libuv inits+queues the process handle before spawning and its
+  error-dequeue path is `#if 0`'d (deps/libuv/src/unix/process.c:1017) —
+  freeing the storage directly leaves a dangling entry that `uv_walk`
+  visits at loop close (SIGSEGV, reproduced under lldb). All three
+  failure paths (`spawn`, `exec`, `mcp.connect`) now `uv_close` the
+  process handle (with `handle->data` set first — the fence reads it).
+- ✅ **`sofuu serve --brain` died instantly:** the serve script's async
+  IIFE made `var server` function-local → unreachable at resolution → the
+  JS finalizer closed the listening socket. Server + brain are now pinned
+  to globals. (Deeper runtime footgun noted below.)
+
+### Known-issue notes (documented, not fixed here)
+- ⚠️ **JS-object reachability controls native server lifetime** — a server
+  created inside a function scope dies when the scope does. Structural
+  fix (ref the tcp handle into the loop) is a follow-up.
+- ⬜ P0-7 multi-engine teardown on the shared loop (capi multi-runtime
+  mode) remains open — architectural, needs per-engine handle tracking.
+- ⬜ P1/P2 audit findings (agent budget contract, redirect header leak,
+  npm inflate caps, dual brain handles, MCP server leaks, dead
+  `ffi_exports` shims…) — full list + fix order in `AUDIT-2026-08-22.md`.
+
+---
+
 ## ✅ Completed — audit fixes + remaining chat items (2026-08-21)
 
 Full-codebase audit (memory safety, security, dead code) plus the last four

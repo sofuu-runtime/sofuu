@@ -135,7 +135,22 @@ unsafe fn write_str_dup(stream: *mut UvStream, msg: &[u8]) {
         base: copy,
         len: msg.len(),
     };
-    uv::uv_write(req, stream, &buf, 1, Some(on_mcp_write_done));
+    let rc = uv::uv_write(req, stream, &buf, 1, Some(on_mcp_write_done));
+    if rc < 0 {
+        /* Synchronous failure (EPIPE/EBADF after child death): libuv will
+         * NOT call on_write_done — free here or the req + payload leak. */
+        libc::free(copy as *mut c_void);
+        libc::free(req as *mut c_void);
+        drop(Box::from_raw(wr));
+    }
+}
+
+/// Frees a bare pipe storage once libuv is fully done with it. uv_close is
+/// asynchronous — libuv's closing-handles pass still reads the handle (and
+/// its close_cb slot) on later loop iterations, so the storage must not be
+/// freed directly after uv_close.
+unsafe extern "C" fn free_pipe_cb(handle: *mut UvHandle) {
+    libc::free(handle as *mut c_void);
 }
 
 unsafe fn mcp_client_send(client: *mut McpClient, msg: &[u8]) {
@@ -660,13 +675,16 @@ unsafe extern "C" fn js_mcp_connect(
          * free(client) and this explicit free() double-frees. */
         qjs::JS_SetOpaque((*client_ptr).self_val, ptr::null_mut());
         qjs::sofuu_js_free_value(ctx, (*client_ptr).self_val);
-        uv::uv_close(stdin_pipe as *mut UvHandle, None);
-        uv::uv_close(stdout_pipe as *mut UvHandle, None);
-        uv::uv_close(stderr_pipe as *mut UvHandle, None);
-        libc::free(process as *mut c_void);
-        libc::free(stdin_pipe as *mut c_void);
-        libc::free(stdout_pipe as *mut c_void);
-        libc::free(stderr_pipe as *mut c_void);
+        /* The pipe storages are freed from the close callbacks — freeing
+         * them here would race libuv's closing-handles pass (UAF). The
+         * process handle also goes through uv_close: uv_spawn queued it
+         * in loop->handle_queue even though it failed (the vendored
+         * libuv's error-dequeue is #if 0'd), so a direct free would leave
+         * a dangling entry for uv_walk. */
+        uv::uv_close(stdin_pipe as *mut UvHandle, Some(free_pipe_cb));
+        uv::uv_close(stdout_pipe as *mut UvHandle, Some(free_pipe_cb));
+        uv::uv_close(stderr_pipe as *mut UvHandle, Some(free_pipe_cb));
+        uv::uv_close(process as *mut UvHandle, Some(free_pipe_cb));
         drop(Box::from_raw(client_ptr));
         return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), uv::uv_strerror(r));
     }

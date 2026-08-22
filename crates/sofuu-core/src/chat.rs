@@ -1018,33 +1018,21 @@ fn print_help() {
 /// with the tail pinned at the same spot; only the EYES change in place
 /// (open → blink → happy → blink). Row 1 is also 7 cells so the title
 /// text column aligns across all three rows.
-// Mascot tiles are ASCII-only on purpose: the previous art used U+25xx
+// Mascot mark — ASCII-only on purpose. The previous art used U+25xx
 // geometric glyphs (░▒█●▸◕) and U+203E, which are East-Asian
-// ambiguous-width — terminals that render them 2 cells wide broke the
-// panel's right-border alignment on exactly the mascot rows. Every
-// character here is 1 cell in every terminal. Frames animate the eyes:
-// open (o) → blink (-) → happy (^) → blink (-).
-const SHIMA_FRAMES: [[&str; 3]; 4] = [
-    [
-        "\x1b[38;5;231m ~v~v~ \x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-    ],
-    [
-        "\x1b[38;5;231m ~v~v~ \x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-    ],
-    [
-        "\x1b[38;5;231m ~v~v~ \x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-    ],
-    [
-        "\x1b[38;5;231m ~v~v~ \x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-        "\x1b[38;5;231m[\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m \x1b[0m\x1b[38;5;231m]\x1b[0m\x1b[38;5;219m|\x1b[0m",
-    ],
+// ambiguous-width: terminals that render them 2 cells wide broke the
+// panel's right-border alignment on exactly the mascot rows. The mark is
+// a compact one-line bird whose eyes animate: open (o) → blink (-) →
+// happy (^) → blink (-) — every character is 1 cell in every terminal.
+const SHIMA_MARKS: [&str; 4] = [
+    // open eyes
+    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
+    // blink
+    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
+    // happy
+    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
+    // blink
+    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
 ];
 
 /// The current logo frame (0-3) — rotated by the JS animation loop.
@@ -1149,8 +1137,10 @@ fn clip_cells(s: &str, max: usize) -> String {
 fn panel_row(content: &str, width: usize) -> String {
     let inner = width.saturating_sub(4);
     let clipped;
+    // ASCII "..." (not the ambiguous-width ellipsis) so a clipped row's
+    // right border stays put on every terminal.
     let content = if cell_w(content) > inner {
-        clipped = format!("{}…", clip_cells(content, inner.saturating_sub(1)));
+        clipped = format!("{}...", clip_cells(content, inner.saturating_sub(3)));
         &clipped
     } else {
         content
@@ -1163,9 +1153,9 @@ fn panel_row(content: &str, width: usize) -> String {
     )
 }
 
-/// The 3 welcome-panel rows that contain the mascot (bird rows 1-3 with
-/// the title/subtitle text and borders) for a GIVEN frame. Used both by the
-/// initial panel build and by the animation overlay, so the bird swaps
+/// The 2 welcome-panel rows that contain the mascot (mark + title, then
+/// the subtitle aligned under the title) for a GIVEN frame. Used both by
+/// the initial panel build and by the animation overlay, so the eyes swap
 /// frames WITHOUT moving or erasing the surrounding text/borders.
 fn welcome_bird_rows(
     _cfg: &ChatConfig,
@@ -1174,22 +1164,17 @@ fn welcome_bird_rows(
     w: usize,
     frame: usize,
 ) -> Vec<String> {
-    let tile = |i: usize| SHIMA_FRAMES[frame][i].to_string();
-    let mut rows = Vec::with_capacity(3);
-    rows.push(panel_row(
-        &format!("{}   \x1b[1;35mWelcome to Sofuu!\x1b[0m", tile(0)),
-        w,
-    ));
-    rows.push(panel_row(
-        &format!(
-            "{}   \x1b[2mAsk anything — {} for the command list.\x1b[0m",
-            tile(1),
-            "/help"
+    let mark = SHIMA_MARKS[frame % SHIMA_MARKS.len()];
+    vec![
+        panel_row(
+            &format!("{}   \x1b[1;35mWelcome to Sofuu!\x1b[0m", mark),
+            w,
         ),
-        w,
-    ));
-    rows.push(panel_row(&tile(2), w));
-    rows
+        panel_row(
+            "       \x1b[2mAsk anything (/help for the command list)\x1b[0m",
+            w,
+        ),
+    ]
 }
 
 /// The full welcome panel, one String per display row, for a terminal
@@ -1197,19 +1182,18 @@ fn welcome_bird_rows(
 fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) -> Vec<String> {
     let w = width.clamp(40, 400);
     let inner = w - 4;
-    let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_FRAMES.len();
-    let mut rows = Vec::with_capacity(16);
+    let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_MARKS.len();
+    let mut rows = Vec::with_capacity(12);
 
     let dash = "─".repeat(w - 2);
     rows.push(format!("\x1b[2;35m╭{dash}╮\x1b[0m"));
-    rows.push(panel_row("", w));
     rows.extend(welcome_bird_rows(cfg, session, dir, w, frame));
     rows.push(panel_row("", w));
 
     let effort = if cfg.effort.is_empty() {
         String::new()
     } else {
-        format!(" · effort {}", cfg.effort)
+        format!(" - effort {}", cfg.effort)
     };
     let model = if cfg.provider.is_empty() || cfg.model.is_empty() {
         "not configured · run /provider to pick one".to_string()
@@ -1226,9 +1210,9 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
         (
             "Memory:".into(),
             if cfg.brain {
-                "on — memories persist across sessions".to_string()
+                "on (persists across sessions)".to_string()
             } else {
-                "off — /brain on to enable".to_string()
+                "off (/brain on to enable)".to_string()
             },
         ),
         ("Version:".into(), env!("CARGO_PKG_VERSION").into()),
@@ -1241,7 +1225,6 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
             w,
         ));
     }
-    rows.push(panel_row("", w));
     rows.push(format!("\x1b[2;35m╰{dash}╯\x1b[0m"));
 
     rows.push(String::new());
@@ -2019,9 +2002,9 @@ unsafe extern "C" fn js_chat_refresh(
 }
 
 /// `__chat_logo()` — advance to the next animation frame and overlay the
-/// 3 mascot rows (bird + title/subtitle text + borders, full width) over
-/// the welcome panel at fixed screen rows 3-5. The bird swaps frames in
-/// place: nothing moves and no text is erased.
+/// 2 mascot rows (mark + title, subtitle) over the welcome panel at fixed
+/// screen rows 2-3. The eyes swap frames in place: nothing moves and no
+/// text is erased.
 unsafe extern "C" fn js_chat_logo(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -2029,7 +2012,7 @@ unsafe extern "C" fn js_chat_logo(
     _argv: *const JSValueConst,
 ) -> JSValue {
     let next = LOGO_FRAME.load(Ordering::Relaxed).wrapping_add(1);
-    LOGO_FRAME.store(next % SHIMA_FRAMES.len(), Ordering::Relaxed);
+    LOGO_FRAME.store(next % SHIMA_MARKS.len(), Ordering::Relaxed);
     if sofuu_ffi::tui_active() {
         let cfg = CFG
             .lock()
@@ -2044,7 +2027,7 @@ unsafe extern "C" fn js_chat_logo(
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".into());
         let w = sofuu_ffi::tui_width();
-        let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_FRAMES.len();
+        let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_MARKS.len();
         // Match js_chat_welcome: rows are logged GUTTER-indented at a
         // GUTTER-narrower width, so the overlay must use the same shape.
         let gutter = sofuu_core::rt::tui::GUTTER;
@@ -2053,7 +2036,7 @@ unsafe extern "C" fn js_chat_logo(
             .iter()
             .enumerate()
         {
-            sofuu_ffi::tui_overlay_row(3 + i as i32, &format!("{pad}{row}"));
+            sofuu_ffi::tui_overlay_row(2 + i as i32, &format!("{pad}{row}"));
         }
     }
     js_new_bool(ctx, true)
@@ -4405,7 +4388,7 @@ mod tests {
         assert!(dir_row.contains("/tmp/work"));
         assert!(sess_row.contains("s-ab12"));
         assert_eq!(sess_row.matches("s-ab12").count(), 1);
-        assert!(model_row.contains("test-prov/tm-1 · effort high"));
+        assert!(model_row.contains("test-prov/tm-1 - effort high"));
         assert!(ver_row.contains(env!("CARGO_PKG_VERSION")));
         let col = dir_row.find("/tmp/work").unwrap();
         assert_eq!(sess_row.find("s-ab12").unwrap(), col, "session col");

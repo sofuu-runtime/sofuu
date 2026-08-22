@@ -2405,6 +2405,17 @@ const DRIVER: &str = r#"
         names[t.name] = 1;
       }
     }
+    /* Built-in coding tools (read/write/edit/grep/glob/list_dir/bash) —
+     * the chat is a coding agent, so the "code" group ships by default.
+     * SOFUU_NO_SHELL strips bash inside the tool itself. */
+    if (sofuu.tools && sofuu.tools.TOOLS && !process.env.SOFUU_NO_TOOLS) {
+      for (const k of (sofuu.tools.GROUP || [])) {
+        const t = sofuu.tools.TOOLS[k];
+        if (!t) continue;
+        defs.push({ name: t.name, description: t.description, parameters: t.parameters, execute: t.execute });
+        names[t.name] = 1;
+      }
+    }
     for (const t of mcpTools) {
       if (names[t.name]) {
         out('\x1b[33m  ⚠ MCP tool ' + t.name + ' (' + t.server + ') shadowed by a built-in tool\x1b[0m');

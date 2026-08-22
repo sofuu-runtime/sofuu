@@ -197,6 +197,7 @@
       inlineTools: [],
       mcpSets: [],
       webTools: [],
+      codeTools: [],
       toolTimeoutMs: (def.toolTimeoutMs | 0) || TOOL_TIMEOUT_MS,
     };
     var b = def.budget && typeof def.budget === 'object' ? def.budget : {};
@@ -212,6 +213,7 @@
     for (var i = 0; i < tools.length; i++) {
       var t = tools[i];
       if (t === 'web') { d.webTools = ['web_search', 'web_open']; continue; }
+      if (t === 'code' && sofuu.tools && sofuu.tools.GROUP) { d.codeTools = sofuu.tools.GROUP.slice(); continue; }
       if (t && typeof t === 'object' && Array.isArray(t.mcp)) {
         for (var j = 0; j < t.mcp.length; j++) {
           var s = t.mcp[j];
@@ -224,6 +226,8 @@
         var bn = String(t.builtin);
         if (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[bn]) {
           if (d.webTools.indexOf(bn) < 0) d.webTools.push(bn);
+        } else if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[bn]) {
+          if (d.codeTools.indexOf(bn) < 0) d.codeTools.push(bn);
         } else {
           throw new Error("agent.define: unknown builtin tool '" + bn + "'");
         }
@@ -448,6 +452,13 @@
       if (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[bn]) {
         var bt = sofuu.web.TOOLS[bn];
         add({ name: bt.name, description: bt.description, parameters: bt.parameters }, bt.execute);
+      }
+    }
+    for (var ct = 0; ct < d.codeTools.length; ct++) {
+      var cn = d.codeTools[ct];
+      if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[cn]) {
+        var cd = sofuu.tools.TOOLS[cn];
+        add({ name: cd.name, description: cd.description, parameters: cd.parameters }, cd.execute);
       }
     }
     for (var m = 0; m < d.mcpSets.length; m++) {
@@ -1121,7 +1132,7 @@
         system: clip(d.system, 80),
         provider: d.provider, model: d.model,
         memory: d.memory,
-        tools: d.inlineTools.length + d.webTools.length,
+        tools: d.inlineTools.length + d.webTools.length + d.codeTools.length,
         mcpServers: d.mcpSets.length,
         agents: d.agents.slice(),
         runs24h: (RUN_COUNTS[name] && RUN_COUNTS[name].n) || 0,

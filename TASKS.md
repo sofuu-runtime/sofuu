@@ -8,6 +8,40 @@
 
 ---
 
+## ✅ Completed — built-in coding tools (2026-08-22, evening)
+
+The chat and agents are now coding agents: `src/js/tools.js` ships seven
+model-facing tools over the native `sofuu.fs`/`sofuu.spawn` primitives,
+registered on the same seam as web.js (`sofuu.tools.TOOLS`, group
+`tools: ["code"]`, individual names or `{builtin:"grep"}`).
+
+- ✅ **read_file** — cat -n numbered lines (so exact text can be quoted
+  into edits), start/end windows, 60k char cap.
+- ✅ **write_file** — full write, parents created, **jailed to cwd**
+  (lexical `..`/absolute escape rejection).
+- ✅ **edit_file** — exact-match replacement: unique match required
+  (ambiguous → refuses + asks for context), replace_all opt-in,
+  not-found errors name the file. Jailed to cwd.
+- ✅ **grep** — JS regex over the project (skips .git/node_modules/
+  target/dist, binary-skip), path:line: output, 50-match cap.
+- ✅ **glob** — `**`/`*`/`?` patterns, 200-result cap. **list_dir**.
+- ✅ **bash** — /bin/sh -c with hard timeout (60s default, 180s max)
+  that KILLS the child (spawn + SIGTERM), stdout/stderr caps,
+  exit-code reporting; `SOFUU_NO_SHELL=1` strips it entirely.
+- ✅ Chat: the whole group is active by default (before MCP, so built-ins
+  win name clashes); `SOFUU_NO_TOOLS=1` opts out.
+- ✅ agent.js: `tools:["code"]` group, `{builtin}` lookup across both
+  registries, tool counts updated. Inline tools still win clashes.
+- ✅ E2E in tests/agent_test.js: a mock-driven agent runs
+  write→read→edit→grep→bash and its final answer asserts every tool's
+  actual result strings; a second agent drives the rails (ambiguous edit
+  refusal, not-found error, jail escape rejection, bash timeout kill).
+
+Verified: agent battery ALL PASSED (+3 checks), cargo test 186, JS suite
+19/19, size 2,125,632 ≤ 5MB.
+
+---
+
 ## ✅ Completed — consolidation wiring + TUI polish + F9 hooks fix (2026-08-22)
 
 ### Consolidation is real now (was script-only)

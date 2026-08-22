@@ -28,6 +28,8 @@ use sofuu_ffi::qjs;
 pub const AGENT_JS: &str = include_str!("../../../src/js/agent.js");
 /// The web-search driver — single source of truth is src/js/web.js.
 pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
+/// The coding-tools driver — single source of truth is src/js/tools.js.
+pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —

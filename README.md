@@ -99,12 +99,13 @@ sofuu run hello.ts
 **Run an AI agent that searches the web — still zero packages:**
 
 ```js
-// research.js — an agent with the built-in web tools (no API key needed
-// for search; the duckduckgo engine is keyless by default)
+// research.js — an agent with the built-in coding + web tools (no API key
+// needed for search; the duckduckgo engine is keyless by default)
 sofuu.agent.define({
   name: "researcher",
   system: "You research precisely. Search first, then answer with sources.",
-  tools: ["web"],               // web_search + web_open
+  tools: ["code", "web"],       // code: read/write/edit/grep/glob/list_dir/bash
+                                 // web: web_search + web_open
   memory: "agent",              // private long-term memory per agent
 });
 
@@ -479,6 +480,16 @@ Agent definitions live in `~/.sofuu/agents/*.js` (plain scripts that call
 `sofuu.agent.define({...})` — trusted like any user script). Run them from
 a shell with `sofuu agent run`, or headless from any script. Design + status:
 [`PLAN-AGENTS.md`](PLAN-AGENTS.md).
+
+**Built-in coding tools** (`tools: ["code"]`, also active in every chat
+turn): `read_file` (cat -n style, so exact text can be quoted into edits),
+`write_file`, `edit_file` (exact unique-match replacement — refuses
+ambiguous edits and asks for more context), `grep` (regex over the project,
+skips .git/node_modules/target), `glob`, `list_dir`, and `bash` (timeout +
+output caps, killed on expiry). Rails: writes are jailed to the project
+directory; `SOFUU_NO_SHELL=1` strips `bash` entirely; every tool result is
+additionally capped by the loop's truncation. Pick individual tools with
+`tools: ["read_file", "edit_file", ...]`, or `{ builtin: "grep" }`.
 
 ### `sofuu.web` — Web Search & Page Reading
 

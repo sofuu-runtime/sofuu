@@ -163,6 +163,36 @@ function decide(body) {
       (txt.indexOf("HEADMARKER") >= 0 ? "+head" : "-nohead") +
       (txt.indexOf("-TAILMARKER") >= 0 ? "+tail" : "-notail") + "]" };
   }
+  if (sys.indexOf("AGENT=codetool") >= 0) {
+    /* Built-in coding tools E2E: write → read → edit → grep → bash, then a
+     * final answer that reflects exactly what each tool returned. */
+    if (tc === 0) return { tool: { name: "write_file", args: { path: "src/app.js", content: "const A = 1;\nconst B = 2;\n" } } };
+    if (tc === 1) return { tool: { name: "read_file", args: { path: "src/app.js" } } };
+    if (tc === 2) return { tool: { name: "edit_file", args: { path: "src/app.js", old_string: "const B = 2;", new_string: "const B = 20;" } } };
+    if (tc === 3) return { tool: { name: "grep", args: { pattern: "B = 20", path: "." } } };
+    if (tc === 4) return { tool: { name: "bash", args: { command: "cat src/app.js" } } };
+    return { text: "codetool-final[" +
+      (txt.indexOf("created src/app.js") >= 0 ? "+write" : "-nowrite") +
+      (txt.indexOf("2 lines") >= 0 ? "+read" : "-noread") +
+      (txt.indexOf("1 replacement") >= 0 ? "+edit" : "-noedit") +
+      (txt.indexOf("src/app.js:2:") >= 0 ? "+grep" : "-nogrep") +
+      (txt.indexOf("[exit 0]") >= 0 && txt.indexOf("const B = 20;") >= 0 ? "+bash" : "-nobash") + "]" };
+  }
+  if (sys.indexOf("AGENT=coderail") >= 0) {
+    /* Rails + error paths, asserted from the tool-error strings the loop
+     * feeds back to the model: ambiguity, not-found, jail escape, and the
+     * bash timeout kill. */
+    if (tc === 0) return { tool: { name: "write_file", args: { path: "dup.txt", content: "same\nsame\n" } } };
+    if (tc === 1) return { tool: { name: "edit_file", args: { path: "dup.txt", old_string: "same", new_string: "x" } } };
+    if (tc === 2) return { tool: { name: "edit_file", args: { path: "src/app.js", old_string: "NO-SUCH-TEXT", new_string: "x" } } };
+    if (tc === 3) return { tool: { name: "write_file", args: { path: "../escape.js", content: "x" } } };
+    if (tc === 4) return { tool: { name: "bash", args: { command: "sleep 5", timeout_ms: 1200 } } };
+    return { text: "coderail-final[" +
+      (txt.indexOf("matches 2 places") >= 0 ? "+ambiguous" : "-noambiguous") +
+      (txt.indexOf("not found") >= 0 ? "+notfound" : "-nonotfound") +
+      (/escapes the project directory|jailed/.test(txt) ? "+jailed" : "-nojail") +
+      (txt.indexOf("timed out") >= 0 ? "+timeout" : "-notimeout") + "]" };
+  }
   if (sys.indexOf("AGENT=slow") >= 0) {
     /* delayed response — drives the concurrency probe */
     return { text: "slow-done", delay: 350 };
@@ -753,6 +783,37 @@ async function main() {
       check("merged originals pruned (count " + before + " → " + rb2.count() + ")", rb2.count() < before);
       try { sofuu.fs.rm(TMP_CON); } catch (e) {}
     }
+  }
+
+  /* ── Built-in coding tools (src/js/tools.js) ──────────────────── */
+  {
+    check("code tools registered (7 builtins)",
+      sofuu.tools && sofuu.tools.TOOLS &&
+      ["read_file", "write_file", "edit_file", "grep", "glob", "list_dir", "bash"]
+        .every(n => sofuu.tools.TOOLS[n]));
+    const CTD = "/tmp/sofuu_codetools_" + Date.now();
+    await sofuu.fs.mkdir(CTD, { recursive: true });
+    const prevCwd = process.cwd();
+    process.chdir(CTD);
+    try {
+      sofuu.agent.define({ name: "coder", system: "AGENT=codetool", tools: ["code"],
+        rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model,
+        api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+        budget: { maxSteps: 8 } });
+      const r = await sofuu.agent.run("coder", "build the thing", {});
+      check("coder ran all 5 tool rounds",
+        r.trace.filter(e => e.kind === "tool").length === 5);
+      check("coder E2E write/read/edit/grep/bash verified via results",
+        r.answer === "codetool-final[+write+read+edit+grep+bash]");
+
+      sofuu.agent.define({ name: "coderail", system: "AGENT=coderail", tools: ["code"],
+        rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model,
+        api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+        budget: { maxSteps: 8 } });
+      const rr = await sofuu.agent.run("coderail", "try the rails", {});
+      check("rails: ambiguous edit refuses, not-found errors, jail holds, bash timeout kills",
+        rr.answer === "coderail-final[+ambiguous+notfound+jailed+timeout]");
+    } finally { process.chdir(prevCwd); }
   }
 
   /* ── A8: loadDir + list ─────────────────────────────────────────── */

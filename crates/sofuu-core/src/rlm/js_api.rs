@@ -517,6 +517,7 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             "<agent-driver>",
         );
         crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::WEB_JS, "<web-driver>");
+        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::TOOLS_JS, "<tools-driver>");
     }
 }
 

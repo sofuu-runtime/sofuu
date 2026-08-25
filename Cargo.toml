@@ -4,6 +4,15 @@ members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
+    "crates/ml-train",
+]
+# PLAN-ML-GATES §9: ml-train is a DEV-ONLY trainer — `make` / `cargo build`
+# never touch it, the shipped binary is untouched. Reproduce weights with
+# `cargo run -p ml-train --release -- freshness`.
+default-members = [
+    "crates/sofuu-core",
+    "crates/sofuu-ffi",
+    "crates/sofuu-capi",
 ]
 
 [workspace.package]

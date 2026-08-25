@@ -195,7 +195,7 @@ struct AiEmbedConfig {
  * so provider payloads are always valid JSON and cannot smuggle JSON control
  * or escape sequences. Iterates chars(), never bytes, so non-ASCII text
  * (é, 中文, emoji) round-trips intact. */
-fn json_escape(s: Option<&str>) -> String {
+pub(crate) fn json_escape(s: Option<&str>) -> String {
     let mut out = String::with_capacity(s.map_or(0, |s| s.len() * 2) + 16);
     for c in s.unwrap_or("").chars() {
         match c {
@@ -714,7 +714,7 @@ fn murmur3_fmix32(mut h: u32) -> u32 {
  * This is a hashing-trick TF-IDF with char trigrams.
  * It captures subword morphology and is robust for most languages.
  */
-fn sofuu_tfidf_embed(text: &[u8], out_vec: &mut [f32], dim: usize) {
+pub(crate) fn sofuu_tfidf_embed(text: &[u8], out_vec: &mut [f32], dim: usize) {
     if dim == 0 {
         return;
     }

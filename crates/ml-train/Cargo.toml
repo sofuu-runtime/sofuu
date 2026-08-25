@@ -1,0 +1,18 @@
+[package]
+name = "ml-train"
+version = "0.2.0-beta"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# PLAN-ML-GATES §9: dev-only trainer for the four context-economy models.
+# Excluded from workspace default-members — never built by `make`, never
+# linked into the shipped binary. Depends on sofuu-core so training and
+# inference run the SAME feature extractors (no train/serve skew).
+
+[dependencies]
+sofuu-core = { path = "../sofuu-core" }
+
+[[bin]]
+name = "ml-train"
+path = "src/main.rs"

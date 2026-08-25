@@ -70,6 +70,7 @@ mod ffi_runtime_test {
 pub mod http;
 pub mod mcp;
 pub mod memory;
+pub mod ml; // PLAN-ML-GATES: context-economy models + the in-memory working set
 pub mod modules; // M2: console shell (more land in later phases)
 pub mod npm;
 pub mod rlm;

@@ -124,6 +124,18 @@ fn main() {
     if has_qtsq {
         println!("cargo:rustc-link-search=native={}", qtsq_dir.display());
         println!("cargo:rustc-link-lib=static=qtsq");
+        // The checkout's libqtsq.a references the qtc compression core
+        // (qtc_decompress_*) that lives in its own archive — link it
+        // AFTER qtsq so the static resolver sees the definitions.
+        let qtc_lib = qtsq_dir.join("compressor/libqtc.a");
+        if qtc_lib.exists() {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                qtsq_dir.join("compressor").display()
+            );
+            println!("cargo:rustc-link-lib=static=qtc");
+            println!("cargo:rerun-if-changed={}", qtc_lib.display());
+        }
         println!("cargo:rustc-link-lib=z");
         println!("cargo:rustc-check-cfg=cfg(has_qtsq)");
         println!("cargo:rustc-cfg=has_qtsq");
@@ -193,7 +205,7 @@ fn main() {
             &guard_src,
             r#"#include <stddef.h>
 #include "qtsq_format.h"
-_Static_assert(sizeof(qtsq_context_t) == 5016, "QTSQ_CONTEXT_SIZE drifted");
+_Static_assert(sizeof(qtsq_context_t) == 5024, "QTSQ_CONTEXT_SIZE drifted");
 _Static_assert(offsetof(qtsq_context_t, header.data_type) == 10, "OFF_HEADER_DATA_TYPE drifted");
 _Static_assert(offsetof(qtsq_context_t, schema) == 112, "OFF_SCHEMA drifted");
 _Static_assert(offsetof(qtsq_schema_t, dimensions) == 68, "OFF_SCHEMA_DIMENSIONS drifted");
@@ -215,7 +227,7 @@ _Static_assert(offsetof(qtsq_context_t, is_encrypted) == 4908, "OFF_IS_ENCRYPTED
                 .unwrap_or_else(|e| e.to_string());
             panic!(
                 "QTSQ layout guard failed: the checkout's qtsq_context_t no \
-                 longer matches the Rust mirrors in qtsq.rs (sizeof=5016, \
+                 longer matches the Rust mirrors in qtsq.rs (sizeof=5024, \
                  offsets 10/112/68/100/4908). Update the mirrors and this \
                  guard together.\n{stderr}"
             );

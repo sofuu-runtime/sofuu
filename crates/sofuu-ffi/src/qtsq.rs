@@ -5,7 +5,7 @@
 // (src/memory/qtsq_adapter.c) declared `qtsq_context_t ctx;` on its stack
 // and let the library initialize it in place; Rust cannot see the struct
 // layout, so this module:
-//   - allocates the context's exact storage (sizeof = 5016, align = 8 in
+//   - allocates the context's exact storage (sizeof = 5024, align = 8 in
 //     the vendored checkout — qtsq_format.h, verified with an offsetof
 //     probe while porting) via calloc and hands the pointer to libqtsq;
 //   - reads the few fields the adapter pokes directly (header.data_type,
@@ -52,7 +52,7 @@ pub struct QtsqContext {
 }
 
 /// `sizeof(qtsq_context_t)` in the vendored checkout (qtsq_format.h).
-pub const QTSQ_CONTEXT_SIZE: usize = 5016;
+pub const QTSQ_CONTEXT_SIZE: usize = 5024;
 
 // Field offsets verified against qtsq_format.h with a C offsetof probe
 // while porting M9 (the packed 112-byte qtsq_header_t leads the struct).
@@ -311,13 +311,13 @@ mod tests {
     fn context_layout_offsets_match_vendored_header() {
         // (the header probe printed: data_type=10, schema=112,
         //  schema.dimensions=68, schema.num_dims=100, is_encrypted=4908,
-        //  sizeof=5016 align=8 — a future checkout may change these)
+        //  sizeof=5024 align=8 — a future checkout may change these)
         assert_eq!(OFF_HEADER_DATA_TYPE, 10);
         assert_eq!(OFF_SCHEMA, 112);
         assert_eq!(OFF_SCHEMA_DIMENSIONS, 68);
         assert_eq!(OFF_SCHEMA_NUM_DIMS, 100);
         assert_eq!(OFF_IS_ENCRYPTED, 4908);
-        assert_eq!(QTSQ_CONTEXT_SIZE, 5016);
+        assert_eq!(QTSQ_CONTEXT_SIZE, 5024);
     }
 
     #[test]

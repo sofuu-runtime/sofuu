@@ -147,7 +147,7 @@ struct AiRequestConfig {
     system_prompt: Option<String>,
     response_format: Option<String>, /* "json" → trigger JSON mode; None → default */
     effort: Option<String>,          /* "low" | "medium" | "high" | "max" | None → omit */
-    max_tokens: i32,                 // default: 4096 (for anthropic)
+    max_tokens: i32,                 // explicit override; 0 = model's max output (model_caps)
     temperature: f64,                // default: -1.0 (omit)
     top_p: f64,                      // default: -1.0 (omit)
     stream: bool,
@@ -338,19 +338,68 @@ fn append_tools_anthropic(body: &mut String, cfg: &AiRequestConfig) {
     body.push(']');
 }
 
+/// The effective per-response output cap: an explicit config value wins;
+/// otherwise the MODEL's published maximum from the capability registry.
+/// For the OpenAI wire unknown models omit the field (provider default);
+/// Anthropic wire's fallback is endpoint-driven (see build_anthropic).
+fn effective_max_output(cfg: &AiRequestConfig) -> i32 {
+    if cfg.max_tokens > 0 {
+        cfg.max_tokens
+    } else {
+        crate::rt::model_caps::lookup(cfg.model.as_deref()).max_output
+    }
+}
+
+/// Dynamic fallback for unknown models on the Anthropic wire where
+/// max_tokens is REQUIRED. Derived from the endpoint's 64k thinking
+/// ceiling plus room, not a flat 16k — so any model on Anthropic can
+/// actually use the full thinking budget.
+fn anthropic_fallback_max_tokens() -> i32 {
+    let t = crate::rt::model_caps::ANTHROPIC_MAX_THINKING;
+    // Need max_tokens > 64k to host 64k thinking + 10% room for answer
+    let room = ((t as f64 * 0.12).ceil() as i32).max(1);
+    t + room
+}
+
 fn build_openai_body_v2(cfg: &AiRequestConfig) -> String {
+    build_openai_body_inner(cfg, true)
+}
+
+/// `emit_max=false` is used by the local-server wrapper, which carries the
+/// output cap in `options.num_predict` instead of a top-level field.
+fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
     /* model may be NULL when the user passed a non-string — never emit
      * "(null)" or crash; an empty model is rejected by the provider. */
     let mut body = format!("{{\"model\":\"{}\"", cfg.model.as_deref().unwrap_or(""));
+
+    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
+
+    /* Dynamic output cap: explicit config wins, else the MODEL's published
+     * max output (model_caps). Never a flat constant. Unknown models omit
+     * the field entirely so the endpoint applies its own default. */
+    if emit_max {
+        let max_out = effective_max_output(cfg);
+        if max_out > 0 {
+            /* Param name keyed by MODEL family, not endpoint host: the
+             * reasoning ladder families (o-series/gpt-5) REJECT
+             * `max_tokens` on modern gateways, and every gateway that
+             * hosts those names accepts `max_completion_tokens`. All
+             * other models — including Claude/deepseek/qwen served over
+             * THIS endpoint by third-party providers — keep the widely
+             * compatible `max_tokens`. */
+            if matches!(caps.thinking, crate::rt::model_caps::Thinking::Effort(_)) {
+                body.push_str(&format!(",\"max_completion_tokens\":{}", max_out));
+            } else {
+                body.push_str(&format!(",\"max_tokens\":{}", max_out));
+            }
+        }
+    }
 
     if cfg.temperature >= 0.0 {
         body.push_str(&format!(",\"temperature\":{:.2}", cfg.temperature));
     }
     if cfg.top_p >= 0.0 {
         body.push_str(&format!(",\"top_p\":{:.2}", cfg.top_p));
-    }
-    if cfg.max_tokens > 0 {
-        body.push_str(&format!(",\"max_tokens\":{}", cfg.max_tokens));
     }
 
     /* JSON structured output — OpenAI/Ollama: response_format field */
@@ -359,11 +408,16 @@ fn build_openai_body_v2(cfg: &AiRequestConfig) -> String {
         body.push_str(",\"response_format\":{\"type\":\"json_object\"}");
     }
 
-    /* Reasoning effort — OpenAI o-series / OpenRouter reasoning models */
-    if let Some(effort) = cfg.effort.as_deref() {
-        if !effort.is_empty() {
-            body.push_str(&format!(",\"reasoning_effort\":\"{}\"", effort));
-        }
+    /* Reasoning effort — OpenAI o-series / GPT-5 style ladders.
+     * Capability-aware: unsupported levels fall back to the HIGHEST level
+     * the model supports ("max" on a low/medium/high ladder → "high");
+     * models without any reasoning support omit the field entirely
+     * instead of triggering a provider 400. */
+    if let Some(effort) = crate::rt::model_caps::resolve_openai_effort(
+        &caps,
+        cfg.effort.as_deref(),
+    ) {
+        body.push_str(&format!(",\"reasoning_effort\":\"{}\"", effort));
     }
 
     body.push_str(&format!(
@@ -413,7 +467,16 @@ fn build_openai_body_v2(cfg: &AiRequestConfig) -> String {
 }
 
 fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
-    let max_tokens = if cfg.max_tokens > 0 { cfg.max_tokens } else { 4096 };
+    /* Dynamic output cap (model_caps): explicit config → model's published
+     * max output → documented floor for unknown models. The old flat
+     * `4096` fallback truncated every answer regardless of model. */
+    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
+    let max_tokens = effective_max_output(cfg);
+    let max_tokens = if max_tokens > 0 {
+        max_tokens
+    } else {
+        anthropic_fallback_max_tokens()
+    };
     let mut body = format!(
         "{{\"model\":\"{}\",\"max_tokens\":{},\"stream\":{}",
         cfg.model.as_deref().unwrap_or(""),
@@ -421,7 +484,31 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
         if cfg.stream { "true" } else { "false" }
     );
 
-    if cfg.temperature >= 0.0 {
+    /* Reasoning effort → Anthropic extended thinking.
+     * max_tokens is OUTPUT-ONLY (caps.maxOutput, strictly output limit).
+     * Thinking lives inside the total context window (caps.ctxWindow) per
+     * effort fraction, not inside max_output — so thinking does not define
+     * output limit. API requires budget < max_tokens, so budget is capped
+     * to max_tokens-10% only to satisfy the wire, otherwise thinking is
+     * context-derived and output stays independent. */
+    let thinking_budget: Option<i32> = match cfg.effort.as_deref() {
+        Some(effort) if !effort.is_empty() && effort != "off" => {
+            let mut b = crate::rt::model_caps::resolve_thinking_budget(&caps, effort);
+            // Wire requires budget < max_tokens; cap only to satisfy it, keep thinking context-derived
+            if let Some(bv) = b {
+                let room = ((max_tokens as f64 * 0.10).ceil() as i32).max(1);
+                if bv >= max_tokens {
+                    b = Some((max_tokens - room).max(1));
+                }
+            }
+            b
+        }
+        _ => None,
+    };
+
+    if cfg.temperature >= 0.0 && thinking_budget.is_none() {
+        /* Temperature is skipped when extended thinking rides along —
+         * the API rejects temperature ≠ 1 on thinking requests. */
         body.push_str(&format!(",\"temperature\":{:.2}", cfg.temperature));
     }
     if cfg.top_p >= 0.0 {
@@ -466,30 +553,11 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
         ));
     }
 
-    /* Reasoning effort → Anthropic extended thinking.
-     * budget_tokens must be < max_tokens, so clamp below it. Also clamp to
-     * Anthropic's per-request thinking ceiling (16384 for sonnet/opus) —
-     * "max" (32k) would otherwise be rejected by the API. */
-    if let Some(effort) = cfg.effort.as_deref() {
-        if !effort.is_empty() {
-            let mut budget = match effort {
-                "low" => 1024,
-                "medium" => 4096,
-                "high" => 16384,
-                "max" => 32768,
-                _ => 4096, /* unknown effort → sensible default */
-            };
-            if budget > 16384 {
-                budget = 16384; /* anthropic thinking ceiling */
-            }
-            if budget >= max_tokens {
-                budget = if max_tokens > 1024 { max_tokens / 2 } else { 1024 };
-            }
-            body.push_str(&format!(
-                ",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{}}}",
-                budget
-            ));
-        }
+    if let Some(budget) = thinking_budget {
+        body.push_str(&format!(
+            ",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{}}}",
+            budget
+        ));
     }
 
     /* Anthropic requires strictly alternating user/assistant turns. The agent
@@ -604,19 +672,23 @@ fn build_ollama_body_v2(cfg: &AiRequestConfig) -> String {
        num_predict (max output) and num_ctx (context window) are explicit. */
     let json_mode = cfg.response_format.as_deref() == Some("json");
 
-    /* Build with the OpenAI builder first (clears response_format if json) */
+    /* Build with the OpenAI builder first (clears response_format if json);
+     * suppress its top-level max field — the local wire carries the cap
+     * in options.num_predict below. */
     let mut tmp = cfg.clone();
     if json_mode {
         tmp.response_format = None; /* we'll add format:json ourselves */
     }
-    let base = build_openai_body_v2(&tmp);
+    let base = build_openai_body_inner(&tmp, false);
 
-    /* Build options + optional json format patch */
-    let patch: String = if cfg.max_tokens > 0 {
+    /* Build options + optional json format patch — num_predict uses the
+     * same dynamic cap (explicit config → model's published max output). */
+    let num_predict = effective_max_output(cfg);
+    let patch: String = if num_predict > 0 {
         if json_mode {
-            format!(",\"options\":{{\"num_predict\":{}}},\"format\":\"json\"}}", cfg.max_tokens)
+            format!(",\"options\":{{\"num_predict\":{}}},\"format\":\"json\"}}", num_predict)
         } else {
-            format!(",\"options\":{{\"num_predict\":{}}}}}", cfg.max_tokens)
+            format!(",\"options\":{{\"num_predict\":{}}}}}", num_predict)
         }
     } else if json_mode {
         ",\"format\":\"json\"}".to_string()
@@ -1291,6 +1363,78 @@ unsafe fn extract_stream_delta_qjs(ctx: *mut JSContext, p: Provider, data: &[u8]
     result
 }
 
+/// Capture WHY the provider ended the stream, per wire:
+///   OpenAI:  choices[0].finish_reason ("stop" | "length" | "tool_calls" | …)
+///   Anthropic: delta.stop_reason (message_delta event)
+///   Local: (none)
+/// Written into `req.finish_reason` — surfaced in the done() usage stats so
+/// an EMPTY stream (no text, no tool calls) is diagnosable instead of
+/// silently becoming "(no response)".
+unsafe fn capture_finish_reason(ctx: *mut JSContext, p: Provider, req: *mut AiStreamReq, data: &[u8]) {
+    if data == b"[DONE]" || (*req).finish_len > 0 {
+        return; /* already captured, or end-of-stream marker */
+    }
+    let data_c = CString::new(data).unwrap_or_default();
+    let ev = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data_c.as_bytes().len(), c"<sse_fr>".as_ptr());
+    if qjs::is_exception(ev) {
+        qjs::sofuu_js_get_exception(ctx);
+        return;
+    }
+    let fr = if p == Provider::Anthropic {
+        let delta = qjs::sofuu_js_get_property_str(ctx, ev, c"delta".as_ptr());
+        let v = if qjs::is_object(delta) {
+            qjs::sofuu_js_get_property_str(ctx, delta, c"stop_reason".as_ptr())
+        } else {
+            qjs::sofuu_js_undefined()
+        };
+        if !qjs::is_undefined(delta) && !qjs::is_null(delta) {
+            qjs::sofuu_js_free_value(ctx, delta);
+        }
+        v
+    } else {
+        let choices = qjs::sofuu_js_get_property_str(ctx, ev, c"choices".as_ptr());
+        let mut v = qjs::sofuu_js_undefined();
+        if qjs::JS_IsArray(ctx, choices) != 0 {
+            let ch0 = qjs::JS_GetPropertyUint32(ctx, choices, 0);
+            if qjs::is_object(ch0) {
+                v = qjs::sofuu_js_get_property_str(ctx, ch0, c"finish_reason".as_ptr());
+            }
+            qjs::sofuu_js_free_value(ctx, ch0);
+        }
+        qjs::sofuu_js_free_value(ctx, choices);
+        v
+    };
+    if qjs::sofuu_js_is_string(fr) != 0 {
+        let s = qjs::sofuu_js_to_cstring(ctx, fr);
+        if !s.is_null() {
+            let bytes = CStr::from_ptr(s).to_bytes();
+            if !bytes.is_empty() {
+                let n = bytes.len().min(24);
+                (&mut (*req).finish_reason)[..n].copy_from_slice(&bytes[..n]);
+                (*req).finish_len = n;
+            }
+        }
+        if !s.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, s);
+        }
+    }
+    qjs::sofuu_js_free_value(ctx, fr);
+    qjs::sofuu_js_free_value(ctx, ev);
+}
+
+/// Append `finishReason` to the done() usage stats (empty string when the
+/// provider never reported one — itself the diagnostic signature).
+unsafe fn set_stream_finish(ctx: *mut JSContext, stats: JSValue, req: *mut AiStreamReq) {
+    let fr = (&(*req).finish_reason)[..(*req).finish_len].to_vec();
+    let c = CString::new(fr).unwrap_or_default();
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        stats,
+        c"finishReason".as_ptr(),
+        qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+    );
+}
+
 /// F4b: Anthropic streamed `tool_use` accumulation. `content_block_start`
 /// (block type "tool_use") opens a tool call (id + name); each
 /// `content_block_delta` of type `input_json_delta` appends `partial_json`
@@ -1396,10 +1540,229 @@ const REQ_TAG_EMBED: c_int = 3;
  * misbehaving endpoint cannot grow the heap without bound. */
 const AI_MAX_RESPONSE: usize = 64 * 1024 * 1024;
 
+/* How long a model may stay completely silent — no byte at all, whether
+ * waiting for the first one (TTFB) or between chunks — before we give up
+ * with a clear error. Shared-pool thinking models can legitimately sit for
+ * minutes before the first token, so the window is generous (5 min, any
+ * provider/model). This replaces the old flat 120s TOTAL timeout, which
+ * killed long thinking generations mid-stream while still hanging long
+ * enough on dead ones. An ACTIVE stream is never capped. Env override
+ * (seconds) exists so tests can shrink it. */
+const AI_STALL_TIMEOUT_SECS: c_long = 300;
+fn ai_stall_timeout_secs() -> c_long {
+    std::env::var("SOFUU_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<c_long>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(AI_STALL_TIMEOUT_SECS)
+}
+
+/// Friendly message for a libcurl-side timeout (code 28). With the stall
+/// watchdog in place this path is reached for connect-phase timeouts (the
+/// 30s CONNECTTIMEOUT — cheap to auto-retry) or a caller-set total cap.
+fn ai_timeout_message(http_code: c_long, _stall_secs: c_long) -> String {
+    if http_code > 0 {
+        /* Headers arrived: a caller-capped total timeout fired mid-transfer.
+         * Worded to stay OUT of the agent's transient-retry regex. */
+        String::from("request exceeded its time budget — the model is unresponsive (retry, or switch models)")
+    } else {
+        /* Never reached: connect-phase timeout. Cheap to retry. */
+        String::from("connection timed out — provider unreachable (check the endpoint URL; retrying may help)")
+    }
+}
+
+/// HTTP status seen so far on an easy handle (0 = headers never arrived).
+unsafe fn easy_http_code(easy: *mut Curl) -> c_long {
+    let mut http_code: c_long = 0;
+    curl::curl_easy_getinfo(easy, curl::CURLINFO_RESPONSE_CODE, &mut http_code as *mut c_long);
+    http_code
+}
+
+/// Apply the provider-patience options shared by complete/stream/embed:
+/// a bounded connect phase, and the caller's explicit total cap ONLY when
+/// asked (opts.timeout_ms). Silence after that is policed by the stall
+/// watchdog (libcurl's LOW_SPEED check never self-wakes in the socket-API
+/// multi setup — verified empirically), not by curl.
+unsafe fn ai_set_patience(easy: *mut Curl, timeout_ms: c_long) {
+    curl::curl_easy_setopt(easy, curl::CURLOPT_CONNECTTIMEOUT, 30 as c_long);
+    curl::curl_easy_setopt(easy, curl::CURLOPT_TIMEOUT_MS, if timeout_ms > 0 { timeout_ms } else { 0 });
+}
+
+/* ------------------------------------------------------------------ */
+/* Stall watchdog                                                      */
+/* ------------------------------------------------------------------ */
+
+/// Common prefix of AiCompleteReq / AiStreamReq / AiEmbedReq — all three
+/// keep these fields at identical offsets, so any in-flight request can
+/// be walked as this header (intrusive list + last-byte timestamp).
+#[repr(C)]
+struct AiReqHdr {
+    tag: c_int,
+    wd_next: *mut c_void,
+    last_rx: std::time::Instant,
+}
+
+/// Message when the watchdog aborts a request the model never answered.
+/// Deliberately NOT matched by the agent's transient-retry regex: another
+/// 5-minute silent wait is not what "wait up to 5 minutes" means.
+fn ai_stall_message(stall_secs: c_long) -> String {
+    format!(
+        "provider sent no data for {}s — the model is unresponsive (retry, or switch models)",
+        stall_secs
+    )
+}
+
+unsafe fn active_link(req: *mut c_void) {
+    let hdr = req as *mut AiReqHdr;
+    let head = G_ACTIVE.with(|a| a.get());
+    (*hdr).wd_next = head;
+    G_ACTIVE.with(|a| a.set(req));
+    ai_watchdog_arm();
+    /* REF the watchdog for every in-flight request (unref'd in
+     * active_unlink): libuv computes the poll timeout from REF'D timers
+     * only, so an unref'd watchdog would never tick while the loop sits
+     * in epoll_wait on the silent provider socket — the exact hang this
+     * guard exists to break. */
+    let wd = G_WATCHDOG.with(|w| w.get());
+    uv::uv_ref(wd as *mut UvHandle);
+}
+
+unsafe fn active_unlink(req: *mut c_void) {
+    let after = (*(req as *mut AiReqHdr)).wd_next;
+    G_ACTIVE.with(|a| {
+        let head = a.get();
+        if head == req {
+            a.set(after);
+            return;
+        }
+        let mut p = head;
+        while !p.is_null() {
+            let hdr = p as *mut AiReqHdr;
+            if (*hdr).wd_next == req {
+                (*hdr).wd_next = after;
+                return;
+            }
+            p = (*hdr).wd_next;
+        }
+    });
+    /* Balanced with the uv_ref in active_link: when the last request
+     * leaves, the watchdog stops pinning the event loop. */
+    let wd = G_WATCHDOG.with(|w| w.get());
+    if !wd.is_null() {
+        uv::uv_unref(wd as *mut UvHandle);
+    }
+}
+
+/// Create the watchdog once (neutral ref count — active_link/active_unlink
+/// hold one ref per in-flight request) and keep it repeating every second.
+unsafe fn ai_watchdog_arm() {
+    let wd = G_WATCHDOG.with(|w| w.get());
+    if !wd.is_null() {
+        return;
+    }
+    let timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
+    G_WATCHDOG.with(|w| w.set(timer));
+    uv::uv_timer_init(sofuu_loop_get(), timer);
+    uv::uv_unref(timer as *mut UvHandle); /* init starts ref'd; neutralize */
+    uv::uv_timer_start(timer, Some(ai_watchdog_cb), 1000, 1000);
+}
+
+/// Abort one stalled request. Runs from the uv timer callback — outside
+/// the curl stack, so remove_handle + JS calls are safe (same pattern as
+/// stream_abort_one / ai_flush_check_cb).
+unsafe fn stall_abort(req: *mut c_void, tag: c_int) {
+    let stall = ai_stall_timeout_secs();
+    match tag {
+        REQ_TAG_STREAM => {
+            let r = req as *mut AiStreamReq;
+            let ctx = (*r).ctx;
+            if (*r).done_called == 0 {
+                (*r).done_called = 1;
+                if qjs::JS_IsFunction(ctx, (*r).error_fn) != 0 {
+                    let m = CString::new(ai_stall_message(stall)).unwrap_or_default();
+                    let e = qjs::sofuu_js_new_string(ctx, m.as_ptr());
+                    let ret = qjs::JS_Call(ctx, (*r).error_fn, qjs::sofuu_js_undefined(), 1, &e);
+                    if qjs::is_exception(ret) {
+                        qjs::js_std_dump_error(ctx);
+                    }
+                    qjs::sofuu_js_free_value(ctx, ret);
+                    qjs::sofuu_js_free_value(ctx, e);
+                }
+            }
+            /* done_called == 1: [DONE] already delivered the answer but the
+             * provider never closed the connection — end it quietly. */
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            stream_req_destroy(ctx, r);
+        }
+        REQ_TAG_COMPLETE => {
+            let r = req as *mut AiCompleteReq;
+            let ctx = (*r).ctx;
+            let m = CString::new(ai_stall_message(stall)).unwrap_or_default();
+            let err = qjs::sofuu_js_new_string(ctx, m.as_ptr());
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
+        REQ_TAG_EMBED => {
+            let r = req as *mut AiEmbedReq;
+            let ctx = (*r).ctx;
+            let m = CString::new(ai_stall_message(stall)).unwrap_or_default();
+            let err = qjs::sofuu_js_new_string(ctx, m.as_ptr());
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "C" fn ai_watchdog_cb(_t: *mut UvTimer) {
+    let stall = ai_stall_timeout_secs();
+    let now = std::time::Instant::now();
+    let mut p = G_ACTIVE.with(|a| a.get());
+    while !p.is_null() {
+        let hdr = p as *mut AiReqHdr;
+        /* Capture BEFORE stall_abort: it destroys the node (and the JS it
+         * runs may even enqueue fresh requests at the list head). */
+        let next = (*hdr).wd_next;
+        let tag = (*hdr).tag;
+        if now.duration_since((*hdr).last_rx).as_secs() as c_long >= stall {
+            stall_abort(p, tag);
+        }
+        p = next;
+    }
+}
+
 thread_local! {
     static G_MULTI: Cell<*mut CurlM> = const { Cell::new(ptr::null_mut()) };
     static G_TIMER: Cell<*mut UvTimer> = const { Cell::new(ptr::null_mut()) };
     static G_INIT_DONE: Cell<c_int> = const { Cell::new(0) };
+    /* Stall watchdog: repeating unref'd timer + the registry of in-flight
+     * AI requests (chained through the AiReqHdr prefix). libcurl's own
+     * LOW_SPEED check never self-wakes under the socket-API multi setup,
+     * so silence is enforced here instead. */
+    static G_WATCHDOG: Cell<*mut UvTimer> = const { Cell::new(ptr::null_mut()) };
+    static G_ACTIVE: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
     /* Deferred stream-flush: one-shot check handle that runs JS microtasks
      * OUTSIDE the curl write callback (see ai_flush_defer). */
     static G_FLUSH_CHECK: Cell<*mut UvCheck> = const { Cell::new(ptr::null_mut()) };
@@ -1411,10 +1774,15 @@ thread_local! {
 }
 
 /* ai.complete() / ai.embed() request — tag is the FIRST field so the
- * CURLINFO_PRIVATE pointer can be tag-dispatched like C's req_base_t. */
+ * CURLINFO_PRIVATE pointer can be tag-dispatched like C's req_base_t.
+ * wd_next + last_rx (the AiReqHdr prefix) are shared by the stall
+ * watchdog; complete_write_cb is shared with AiEmbedReq, so both structs
+ * MUST keep the prefix field order identical. */
 #[repr(C)]
 struct AiCompleteReq {
     tag: c_int,
+    wd_next: *mut c_void,
+    last_rx: std::time::Instant,
     ctx: *mut JSContext,
     promise: *mut PromiseHandle,
     provider: Provider,
@@ -1427,6 +1795,8 @@ struct AiCompleteReq {
 #[repr(C)]
 struct AiEmbedReq {
     tag: c_int,
+    wd_next: *mut c_void,
+    last_rx: std::time::Instant,
     ctx: *mut JSContext,
     promise: *mut PromiseHandle,
     provider: Provider,
@@ -1586,6 +1956,9 @@ unsafe extern "C" fn complete_write_cb(
 ) -> usize {
     let n = size * nmemb;
     let req = ud as *mut AiCompleteReq;
+    /* Any byte resets the stall watchdog (shared cb: AiEmbedReq keeps the
+     * AiReqHdr prefix at identical offsets). */
+    (*(req as *mut AiReqHdr)).last_rx = std::time::Instant::now();
     if (*req).response_body.len() + n + 1 > AI_MAX_RESPONSE {
         return 0; /* → curl write error */
     }
@@ -1602,6 +1975,8 @@ unsafe extern "C" fn complete_write_cb(
 #[repr(C)]
 struct AiStreamReq {
     tag: c_int, /* must be first — REQ_TAG_STREAM */
+    wd_next: *mut c_void,
+    last_rx: std::time::Instant,
     ctx: *mut JSContext,
     provider: Provider,
     push_fn: JSValue,
@@ -1621,9 +1996,21 @@ struct AiStreamReq {
     cache_read_tokens: i32,
     cache_write_tokens: i32,
     done_called: c_int, /* done_fn fired exactly once */
+    /// Why the provider ended the stream (OpenAI `choices[0].finish_reason`,
+    /// Anthropic `delta.stop_reason`): "stop" | "length" | "tool_calls" |
+    /// "content_filter" | … Empty when the provider never said (a stream
+    /// that ends with NO finish_reason and NO output is the "(no response)"
+    /// signature — surfaced in usage so the agent loop can react).
+    finish_reason: [u8; 24],
+    finish_len: usize,
     /// First bytes of the response body (used to surface provider JSON
     /// `error.message` when status >=400 — avoids bare "HTTP 429").
     error_body: Vec<u8>,
+    /// In-stream SSE error frame (`data: {"error": ...}` inside an HTTP 200
+    /// stream — OpenRouter's shape when the upstream fails AFTER headers
+    /// were sent). Stashed by the write callback, which aborts the transfer;
+    /// the DONE path surfaces this instead of the generic curl write-error.
+    stream_err: Option<String>,
     /* Abort support: streams register here until they finish, so a
      * global __ai_abort(sid) (Esc in the chat) can stop them mid-flight. */
     sid: i64,
@@ -1652,6 +2039,7 @@ unsafe fn stream_unlink(req: *mut AiStreamReq) {
  * caller handles the curl side (DONE path removes+cleans; abort too). */
 unsafe fn stream_req_destroy(ctx: *mut JSContext, req: *mut AiStreamReq) {
     stream_unlink(req);
+    active_unlink(req as *mut c_void);
     qjs::sofuu_js_free_value(ctx, (*req).push_fn);
     qjs::sofuu_js_free_value(ctx, (*req).done_fn);
     qjs::sofuu_js_free_value(ctx, (*req).error_fn);
@@ -1705,6 +2093,7 @@ unsafe fn stream_abort_one(req: *mut AiStreamReq) {
             let stats = qjs::sofuu_js_new_object(ctx);
             set_stream_stats(ctx, stats, (*req).prompt_tokens, (*req).completion_tokens,
                              (*req).cache_read_tokens, (*req).cache_write_tokens);
+            set_stream_finish(ctx, stats, req);
             let ret = qjs::JS_Call(ctx, (*req).done_fn, qjs::sofuu_js_undefined(), 1, &stats);
             if qjs::is_exception(ret) {
                 qjs::js_std_dump_error(ctx);
@@ -1733,6 +2122,8 @@ unsafe extern "C" fn stream_write_cb(
     let n = size * nmemb;
     let req = ud as *mut AiStreamReq;
     let ctx = (*req).ctx;
+    /* Any byte (even an SSE comment/heartbeat) resets the stall watchdog. */
+    (*(req as *mut AiReqHdr)).last_rx = std::time::Instant::now();
 
     /* Cap the SSE buffer: a never-terminated "data:" line must not grow
      * the heap forever. Returning 0 aborts the transfer with a curl error. */
@@ -1786,6 +2177,7 @@ unsafe extern "C" fn stream_write_cb(
                     let stats = qjs::sofuu_js_new_object(ctx);
                     set_stream_stats(ctx, stats, (*req).prompt_tokens, (*req).completion_tokens,
                                      (*req).cache_read_tokens, (*req).cache_write_tokens);
+                    set_stream_finish(ctx, stats, req);
                     let ret = qjs::JS_Call(ctx, (*req).done_fn, qjs::sofuu_js_undefined(), 1, &stats);
                     if qjs::is_exception(ret) {
                         qjs::js_std_dump_error(ctx);
@@ -1795,6 +2187,66 @@ unsafe extern "C" fn stream_write_cb(
                 }
                 head = nl + 1;
                 continue;
+            }
+
+            /* In-stream error frame: gateways (OpenRouter et al.) can return
+             * HTTP 200 and then report the upstream failure as a
+             * `data: {"error": {...}}` SSE frame. Without this check the
+             * stream completes with zero chunks and the caller silently sees
+             * "(no response)". Stash the message and abort the transfer —
+             * the DONE path surfaces it via error_fn, same as a >=400 body.
+             * Skip once done was signalled: content already delivered. */
+            if (*req).done_called == 0 {
+                let data_c = CString::new(data).unwrap_or_default();
+                let ev_err = qjs::JS_ParseJSON(ctx, data_c.as_ptr(), data_c.as_bytes().len(), c"<sse_err>".as_ptr());
+                if qjs::is_exception(ev_err) {
+                    /* Non-JSON data line — clear the pending exception and
+                     * let the delta/usage extractors ignore it as before. */
+                    qjs::sofuu_js_get_exception(ctx);
+                } else {
+                    let err = qjs::sofuu_js_get_property_str(ctx, ev_err, c"error".as_ptr());
+                    let mut emsg: Option<String> = None;
+                    let mut ecode: i32 = 0;
+                    let had_err = qjs::is_object(err);
+                    if had_err {
+                        let m = qjs::sofuu_js_get_property_str(ctx, err, c"message".as_ptr());
+                        if let Some(s) = cstr_opt(ctx, m) {
+                            if !s.is_empty() { emsg = Some(s); }
+                        }
+                        qjs::sofuu_js_free_value(ctx, m);
+                        let cp = qjs::sofuu_js_get_property_str(ctx, err, c"code".as_ptr());
+                        if !qjs::is_undefined(cp) && !qjs::is_null(cp) {
+                            qjs::JS_ToInt32(ctx, &mut ecode, cp);
+                        }
+                        qjs::sofuu_js_free_value(ctx, cp);
+                    } else if !qjs::is_undefined(err) && !qjs::is_null(err) {
+                        /* Some gateways send "error": "<string>" */
+                        if let Some(s) = cstr_opt(ctx, err) {
+                            if !s.is_empty() && s != "undefined" { emsg = Some(s); }
+                        }
+                    }
+                    qjs::sofuu_js_free_value(ctx, err);
+                    qjs::sofuu_js_free_value(ctx, ev_err);
+                    if emsg.is_none() && had_err {
+                        /* Error object without a message — keep the raw frame
+                         * so SOMETHING reaches the user. */
+                        emsg = Some(String::from_utf8_lossy(data).chars().take(200).collect());
+                    }
+                    if let Some(m) = emsg {
+                        let mut ebuf = if ecode >= 400 {
+                            format!("HTTP {}", ecode)
+                        } else {
+                            String::from("stream error")
+                        };
+                        ebuf.push_str(" — ");
+                        ebuf.push_str(&m);
+                        if ecode == 429 {
+                            ebuf.push_str(" (rate limited — retry after a moment or check your quota)");
+                        }
+                        (*req).stream_err = Some(ebuf);
+                        return 0; /* abort → CURLMSG_DONE with the stashed message */
+                    }
+                }
             }
 
             /* Try to extract token usage from this chunk (may appear on any chunk) */
@@ -1891,6 +2343,7 @@ unsafe extern "C" fn stream_write_cb(
              * the pushed chunk carries it. */
             let think = extract_stream_think_qjs(ctx, (*req).provider, data);
             let delta = extract_stream_delta_qjs(ctx, (*req).provider, data);
+            capture_finish_reason(ctx, (*req).provider, req, data);
             /* Streamed tool-call deltas: surface them via setToolCalls so
              * the driver can run its tool loop even when the model streams
              * the tool call instead of returning it in a single complete()
@@ -2089,10 +2542,19 @@ unsafe fn ai_check_multi() {
                     qjs::sofuu_js_free_value(ctx, result);
                 }
             } else {
-                let err = qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code));
+                let err = if code == curl::CURLE_OPERATION_TIMEDOUT {
+                    let m = CString::new(
+                        ai_timeout_message(easy_http_code(easy), ai_stall_timeout_secs()),
+                    )
+                    .unwrap_or_default();
+                    qjs::sofuu_js_new_string(ctx, m.as_ptr())
+                } else {
+                    qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code))
+                };
                 sofuu_promise_reject((*req).promise, err);
             }
 
+            active_unlink(req as *mut c_void);
             if !(*req).headers.is_null() {
                 curl::curl_slist_free_all((*req).headers);
             }
@@ -2122,10 +2584,19 @@ unsafe fn ai_check_multi() {
                     }
                 }
             } else {
-                let err = qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code));
+                let err = if code == curl::CURLE_OPERATION_TIMEDOUT {
+                    let m = CString::new(
+                        ai_timeout_message(easy_http_code(easy), ai_stall_timeout_secs()),
+                    )
+                    .unwrap_or_default();
+                    qjs::sofuu_js_new_string(ctx, m.as_ptr())
+                } else {
+                    qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code))
+                };
                 sofuu_promise_reject((*req).promise, err);
             }
 
+            active_unlink(req as *mut c_void);
             if !(*req).headers.is_null() {
                 curl::curl_slist_free_all((*req).headers);
             }
@@ -2136,7 +2607,22 @@ unsafe fn ai_check_multi() {
 
             if code != curl::CURLE_OK {
                 if qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
-                    let e = qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code));
+                    /* An aborted-by-us transfer (in-stream error frame)
+                     * carries the real provider message; a timeout gets the
+                     * stall/connect explanation; anything else the plain
+                     * curl error string. */
+                    let timeout_msg = if code == curl::CURLE_OPERATION_TIMEDOUT {
+                        Some(ai_timeout_message(easy_http_code(easy), ai_stall_timeout_secs()))
+                    } else {
+                        None
+                    };
+                    let e = match (*req).stream_err.as_deref().map(|s| s.to_string()).or(timeout_msg) {
+                        Some(m) => {
+                            let cm = CString::new(m).unwrap_or_default();
+                            qjs::sofuu_js_new_string(ctx, cm.as_ptr())
+                        }
+                        None => qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code)),
+                    };
                     let r = qjs::JS_Call(ctx, (*req).error_fn, qjs::sofuu_js_undefined(), 1, &e);
                     qjs::sofuu_js_free_value(ctx, e); /* JS_Call does not consume args */
                     qjs::sofuu_js_free_value(ctx, r);
@@ -2206,6 +2692,7 @@ unsafe fn ai_check_multi() {
                         let stats = qjs::sofuu_js_new_object(ctx);
                         set_stream_stats(ctx, stats, (*req).prompt_tokens, (*req).completion_tokens,
                                          (*req).cache_read_tokens, (*req).cache_write_tokens);
+                        set_stream_finish(ctx, stats, req);
                         let r = qjs::JS_Call(ctx, (*req).done_fn, qjs::sofuu_js_undefined(), 1, &stats);
                         if qjs::is_exception(r) {
                             qjs::js_std_dump_error(ctx);
@@ -2642,6 +3129,8 @@ unsafe extern "C" fn js_ai_complete(
 
     let mut req = Box::new(AiCompleteReq {
         tag: REQ_TAG_COMPLETE,
+        wd_next: ptr::null_mut(),
+        last_rx: std::time::Instant::now(),
         ctx,
         promise: ptr::null_mut(),
         provider: eff,
@@ -2663,15 +3152,11 @@ unsafe extern "C" fn js_ai_complete(
     curl::curl_easy_setopt(easy, curl::CURLOPT_WRITEDATA, &mut *req as *mut AiCompleteReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_PRIVATE, &mut *req as *mut AiCompleteReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_SSL_VERIFYPEER, 1 as c_long);
-    /* A remote endpoint must never hang the CLI forever: default to a
-     * generous 120s request timeout (matching the C original) so long
-     * reasoning/thinking streams aren't killed mid-thought. Callers may
-     * set opts.timeout_ms to raise/lower it. */
-    curl::curl_easy_setopt(
-        easy,
-        curl::CURLOPT_TIMEOUT_MS,
-        if cfg.timeout_ms > 0 { cfg.timeout_ms } else { 120000 },
-    );
+    /* A remote endpoint must never hang the CLI forever — but an active
+     * generation must never be killed mid-thought either: stall guard
+     * (5 min of silence → abort with a clear error), bounded connect
+     * phase, no total cap unless the caller opts in (opts.timeout_ms). */
+    ai_set_patience(easy, cfg.timeout_ms);
     curl::curl_easy_setopt(easy, curl::CURLOPT_MAXFILESIZE, AI_MAX_RESPONSE as c_long);
 
     // SAFETY: promise handle written into our still-owned Box.
@@ -2693,6 +3178,7 @@ unsafe extern "C" fn js_ai_complete(
         drop(Box::from_raw(req_ptr));
         return promise;
     }
+    active_link(req_ptr as *mut c_void); /* stall watchdog registry */
 
     let mut running: c_int = 0;
     curl::curl_multi_socket_action(g_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
@@ -2848,6 +3334,8 @@ unsafe extern "C" fn js_ai_stream(
     });
     let mut req = Box::new(AiStreamReq {
         tag: REQ_TAG_STREAM,
+        wd_next: ptr::null_mut(),
+        last_rx: std::time::Instant::now(),
         ctx,
         provider: eff,
         push_fn: qjs::sofuu_js_dup_value(ctx, push_fn),
@@ -2865,6 +3353,9 @@ unsafe extern "C" fn js_ai_stream(
         cache_write_tokens: 0,
         done_called: 0,
         error_body: Vec::new(),
+        finish_reason: [0u8; 24],
+        finish_len: 0usize,
+        stream_err: None,
         sid,
         next: ptr::null_mut(),
     });
@@ -2886,15 +3377,11 @@ unsafe extern "C" fn js_ai_stream(
     curl::curl_easy_setopt(easy, curl::CURLOPT_WRITEDATA, &mut *req as *mut AiStreamReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_PRIVATE, &mut *req as *mut AiStreamReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_SSL_VERIFYPEER, 1 as c_long);
-    /* A remote endpoint must never hang the CLI forever: default to a
-     * generous 120s request timeout (matching the C original) so long
-     * reasoning/thinking streams aren't killed mid-thought. Callers may
-     * set opts.timeout_ms to raise/lower it. */
-    curl::curl_easy_setopt(
-        easy,
-        curl::CURLOPT_TIMEOUT_MS,
-        if cfg.timeout_ms > 0 { cfg.timeout_ms } else { 120000 },
-    );
+    /* A remote endpoint must never hang the CLI forever — but an active
+     * generation must never be killed mid-thought either: stall guard
+     * (5 min of silence → abort with a clear error), bounded connect
+     * phase, no total cap unless the caller opts in (opts.timeout_ms). */
+    ai_set_patience(easy, cfg.timeout_ms);
     curl::curl_easy_setopt(easy, curl::CURLOPT_MAXFILESIZE, AI_MAX_RESPONSE as c_long);
 
     ai_ensure_init();
@@ -2918,6 +3405,9 @@ unsafe extern "C" fn js_ai_stream(
     let req_ptr = Box::into_raw(req);
     (*req_ptr).next = G_STREAMS.with(|s| s.get());
     G_STREAMS.with(|s| s.set(req_ptr));
+    /* Stall watchdog registry: a silent provider must surface an error at
+     * the patience cap, not hang the turn forever. */
+    active_link(req_ptr as *mut c_void);
     qjs::sofuu_js_set_property_str(ctx, iterator, c"_sid".as_ptr(), qjs::sofuu_js_new_int64(ctx, sid));
 
     let mut running: c_int = 0;
@@ -2971,6 +3461,8 @@ unsafe extern "C" fn js_ai_embed(
 
     let mut req = Box::new(AiEmbedReq {
         tag: REQ_TAG_EMBED,
+        wd_next: ptr::null_mut(),
+        last_rx: std::time::Instant::now(),
         ctx,
         promise: ptr::null_mut(),
         provider: cfg.provider,
@@ -3019,7 +3511,9 @@ unsafe extern "C" fn js_ai_embed(
     curl::curl_easy_setopt(easy, curl::CURLOPT_WRITEDATA, &mut *req as *mut AiEmbedReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_PRIVATE, &mut *req as *mut AiEmbedReq as *mut c_void);
     curl::curl_easy_setopt(easy, curl::CURLOPT_SSL_VERIFYPEER, 1 as c_long);
-    curl::curl_easy_setopt(easy, curl::CURLOPT_TIMEOUT_MS, 0 as c_long); /* embeddings may be slow */
+    /* Same patience as complete/stream: embeddings may be slow, but a
+     * silent one must not hang the brain forever. */
+    ai_set_patience(easy, 0);
     curl::curl_easy_setopt(easy, curl::CURLOPT_MAXFILESIZE, AI_MAX_RESPONSE as c_long);
 
     // SAFETY: promise handle written into our still-owned Box.
@@ -3040,6 +3534,7 @@ unsafe extern "C" fn js_ai_embed(
         drop(Box::from_raw(req_ptr));
         return promise;
     }
+    active_link(req_ptr as *mut c_void); /* stall watchdog registry */
 
     let mut running: c_int = 0;
     curl::curl_multi_socket_action(g_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
@@ -3192,6 +3687,32 @@ unsafe extern "C" fn js_ai_estimate_tokens(
 }
 
 /* ------------------------------------------------------------------ */
+/* sofuu.ai.modelCaps(model) → JSON string                               */
+/* Per-model capability registry lookup (rt/model_caps.rs): context      */
+/* window, max output tokens, thinking kind + ceiling + effort levels.   */
+/* Returns a JSON STRING (parse on the JS side — cheap, one object).     */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ai_model_caps(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let model: Option<String> = if argc >= 1 && qjs::sofuu_js_is_string(*argv) != 0 {
+        cstr_opt(ctx, *argv)
+    } else {
+        None
+    };
+    let caps = crate::rt::model_caps::lookup(model.as_deref());
+    let json = caps.to_json(model.as_deref().unwrap_or(""));
+    match CString::new(json) {
+        Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+        Err(_) => qjs::sofuu_js_new_string(ctx, c"{}".as_ptr()),
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* sofuu.ai.embedLocal(text, dim?) → Float32Array                       */
 /* Pure-Rust offline TF-IDF fallback (trigrams → MurmurHash3 → L2-norm).*/
 /* Returns a unit vector of `dim` floats (default 768).                */
@@ -3281,7 +3802,7 @@ unsafe extern "C" fn js_ai_embed_local(
 
 thread_local! {
     // JS_CFUNC_DEF(name, length, func): magic=0, u.func = { length, generic, func }.
-      static AI_FUNCS: [qjs::JSCFunctionListEntry; 8] = [
+      static AI_FUNCS: [qjs::JSCFunctionListEntry; 9] = [
         qjs::JSCFunctionListEntry {
             name: c"complete".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -3337,6 +3858,13 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_estimate_tokens },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"modelCaps".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_model_caps },
         },
     ];
 }
@@ -3815,13 +4343,15 @@ mod tests {
         }
     }
 
-    /// Anthropic thinking budget: explicit per-effort budgets, clamped to
-    /// the 16k ceiling and always below max_tokens.
+    /// Anthropic thinking budgets are CAPABILITY-SCALED (model_caps): a
+    /// 64k sonnet-class model gets real proportional budgets, unknown
+    /// models derive capacity from max_tokens, and non-thinking models
+    /// never emit a thinking block.
     #[test]
     fn anthropic_thinking_budget_mapping() {
-        let base = |effort: &str, max_tokens: i32| AiRequestConfig {
+        let base = |effort: &str, model: &str, max_tokens: i32| AiRequestConfig {
             provider: Provider::Anthropic,
-            model: Some("claude".into()),
+            model: Some(model.into()),
             api_key: None,
             base_url: None,
             profile: None,
@@ -3836,21 +4366,128 @@ mod tests {
             messages: vec![],
             tools: vec![],
         };
-        let b = build_anthropic_body_v2(&base("low", 4096));
-        assert!(b.contains("\"budget_tokens\":1024"), "low: {b}");
-        let b = build_anthropic_body_v2(&base("medium", 4096));
-        assert!(b.contains("\"budget_tokens\":2048"), "medium must clamp below max_tokens: {b}");
-        let b = build_anthropic_body_v2(&base("high", 4096));
-        assert!(b.contains("\"budget_tokens\":2048"), "high must clamp below max_tokens: {b}");
-        let b = build_anthropic_body_v2(&base("max", 4096));
-        assert!(b.contains("\"budget_tokens\":2048"), "max must clamp below max_tokens: {b}");
-        /* With a large max_tokens, max clamps to the 16k anthropic ceiling. */
-        let b = build_anthropic_body_v2(&base("max", 32000));
-        assert!(b.contains("\"budget_tokens\":16384"), "max must clamp to 16k ceiling: {b}");
-        let b = build_anthropic_body_v2(&base("medium", 32000));
-        assert!(b.contains("\"budget_tokens\":4096"), "medium explicit 4k: {b}");
-        let b = build_anthropic_body_v2(&base("high", 32000));
-        assert!(b.contains("\"budget_tokens\":16384"), "high explicit 16k: {b}");
+        // sonnet: thinking from ctx 200k*0.30=60k, max 90% => 54000, output stays 64k (output-only)
+        let b = build_anthropic_body_v2(&base("max", "claude-sonnet-4-6", 0));
+        assert!(b.contains("\"max_tokens\":64000"), "dynamic max_tokens from caps: {b}");
+        assert!(b.contains("\"budget_tokens\":54000"), "ctx-derived max budget (60000*0.9): {b}");
+        let b = build_anthropic_body_v2(&base("low", "claude-sonnet-4-6", 0));
+        assert!(b.contains("\"budget_tokens\":3750"), "ctx-derived low budget (60000/16): {b}");
+
+        // Explicit /maxout wins but thinking still ctx-derived, capped to max-10% to satisfy wire
+        let b = build_anthropic_body_v2(&base("max", "claude-sonnet-4-6", 8_192));
+        assert!(b.contains("\"max_tokens\":8192"), "explicit override: {b}");
+        assert!(b.contains("\"budget_tokens\":7372"), "ctx-derived 54000 capped to max-10% (7372): {b}");
+
+        // Unknown model: required max_tokens is endpoint-driven 64k+room (~71680) so any model can use 64k thinking
+        let b = build_anthropic_body_v2(&base("high", "weird-model-9000", 0));
+        assert!(b.contains("\"max_tokens\":71680"), "unknown-model endpoint-driven max: {b}");
+        assert!(b.contains("\"budget_tokens\":32000"), "high = 50% of 64k endpoint cap: {b}");
+
+        // Any model on Anthropic can use thinking now (endpoint-driven 64k, not per-family)
+        for effort in ["low", "medium", "high", "max"] {
+            let b = build_anthropic_body_v2(&base(effort, "claude-3-5-haiku", 0));
+            assert!(b.contains("\"thinking\":"), "{effort} on Anthropic now allowed for any model: {b}");
+        }
+
+        // effort off → no thinking block even on thinking models.
+        let b = build_anthropic_body_v2(&base("off", "claude-sonnet-4-6", 0));
+        assert!(!b.contains("\"thinking\":"), "off omits thinking: {b}");
+    }
+
+    /// OpenAI wire: reasoning_effort is capability-aware — unsupported
+    /// levels fall back to the highest supported level ("max" → "high"),
+    /// non-reasoning models omit it, and reasoning families carry
+    /// `max_completion_tokens` instead of `max_tokens`.
+    #[test]
+    fn openai_effort_and_output_param_wiring() {
+        let cfg = |model: &str, effort: Option<&str>| AiRequestConfig {
+            provider: Provider::OpenAi,
+            model: Some(model.into()),
+            api_key: None,
+            base_url: None,
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: effort.map(Into::into),
+            max_tokens: 0,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            messages: vec![],
+            tools: vec![],
+        };
+        let b = build_openai_body_v2(&cfg("gpt-5", Some("max")));
+        assert!(b.contains("\"reasoning_effort\":\"high\""), "max falls back to high: {b}");
+        assert!(b.contains("\"max_completion_tokens\":128000"), "reasoning family param name + dynamic cap: {b}");
+        assert!(!b.contains("\"max_tokens\":"), "no legacy field on reasoning families: {b}");
+
+        let b = build_openai_body_v2(&cfg("gpt-4o", Some("max")));
+        assert!(!b.contains("reasoning_effort"), "non-reasoning model omits effort: {b}");
+        assert!(b.contains("\"max_tokens\":16384"), "dynamic cap via legacy name: {b}");
+
+        let b = build_openai_body_v2(&cfg("o3", Some("medium")));
+        assert!(b.contains("\"reasoning_effort\":\"medium\""), "supported level passes through: {b}");
+        assert!(b.contains("\"max_completion_tokens\":100000"), "{b}");
+
+        // Unknown model + no explicit config → omit the output cap and effort entirely
+        // (the endpoint applies its own default; nothing is hardcoded, no assumption).
+        let b = build_openai_body_v2(&cfg("mystery-model", Some("high")));
+        assert!(!b.contains("\"max_tokens\":"), "{b}");
+        assert!(!b.contains("max_completion_tokens"), "{b}");
+        assert!(!b.contains("reasoning_effort"), "unknown on OpenAI omits effort: {b}");
+    }
+
+    /// Wires and model families are ORTHOGONAL: the openai endpoint
+    /// carries most providers' non-OpenAI models, and an anthropic-format
+    /// endpoint may serve non-Claude models. The builders must produce a
+    /// sane body for ANY (wire × family) combination — limits from the
+    /// registry, syntax from the wire.
+    #[test]
+    fn wires_and_model_families_are_orthogonal() {
+        let cfg = |model: &str, profile: Provider, effort: Option<&str>| AiRequestConfig {
+            provider: profile,
+            model: Some(model.into()),
+            api_key: None,
+            base_url: None,
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: effort.map(Into::into),
+            max_tokens: 0,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            messages: vec![],
+            tools: vec![],
+        };
+
+        // A NON-OpenAI model over the OpenAI endpoint (the common case):
+        // dynamic cap via the legacy param name; effort folded to high.
+        let b = build_openai_body_v2(&cfg("deepseek-chat", Provider::OpenAi, Some("max")));
+        assert!(b.contains("\"max_tokens\":8192"), "{b}");
+        assert!(!b.contains("max_completion_tokens"), "{b}");
+
+        // A Claude model over the OpenAI endpoint (gateway-served): no
+        // anthropic-style thinking block leaks through; effort passes as
+        // the ladder-style parameter with max→high folding.
+        let b = build_openai_body_v2(&cfg("claude-sonnet-4-6", Provider::Custom, Some("max")));
+        assert!(b.contains("\"reasoning_effort\":\"high\""), "{b}");
+        assert!(!b.contains("\"thinking\":"), "{b}");
+        assert!(b.contains("\"max_tokens\":64000"), "claude caps still apply: {b}");
+
+        // A non-Claude model over the Anthropic-format endpoint: syntax is
+        // the wire's (budget block + required max_tokens), endpoint-driven 64k
+        let b = build_anthropic_body_v2(&cfg("my-gateway-model", Provider::Custom, Some("high")));
+        assert!(b.contains("\"max_tokens\":71680"), "anthropic endpoint-driven max for unknown: {b}");
+        assert!(b.contains("\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":32000}"), "{b}");
+
+        // A reasoning-family name on the Anthropic-format endpoint: budget
+        // syntax wins (it's the wire's), capacity derived from max_tokens.
+        let b = build_anthropic_body_v2(&cfg("gpt-5", Provider::Custom, Some("medium")));
+        assert!(b.contains("\"thinking\":{\"type\":\"enabled\""), "{b}");
+        assert!(!b.contains("reasoning_effort"), "{b}");
     }
 
     /// json_escape: escapes controls/JS line separators and NEVER corrupts

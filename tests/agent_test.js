@@ -48,6 +48,8 @@ const REQ_LOG = [];       // {start, end?} per request — concurrency probe
 let REQ_N = 0;
 let RLM_SYS = "";         // last RLM-driver system prompt (tool docs probe)
 let LAST_OPENAI_RAW = ""; // P6: openai bodies must stay cache_control-free
+let PARTIAL429_HITS = 0;  // retry-policy probes (A5): request counts
+let EARLY429_HITS = 0;
 
 function sysOf(msgs) {
   for (let i = 0; i < msgs.length; i++) {
@@ -133,7 +135,25 @@ function decide(body) {
     return { text: "capB-done" };
   }
   if (sys.indexOf("AGENT=loopy") >= 0) {
+    /* A request WITHOUT tools is the breach salvage round (agent.js spends
+     * one final no-tool call summarizing progress) — answer it. */
+    if (!body.tools || !body.tools.length) return { text: "loopy-salvage-summary" };
     return { tool: { name: "get_weather", args: { city: "X" } } };
+  }
+  /* Retry-policy probes (A5): raw SSE frame sequences that don't fit the
+   * {text}/{tool} verdict shape — the handler writes d.frames verbatim. */
+  if (sys.indexOf("AGENT=partial429") >= 0) {
+    PARTIAL429_HITS++;
+    return { frames: [
+      { choices: [{ delta: { content: "partial-text" } }] },
+      { error: { message: "upstream died mid-stream", code: 429 } },
+    ] };
+  }
+  if (sys.indexOf("AGENT=early429") >= 0) {
+    EARLY429_HITS++;
+    return { frames: [
+      { error: { message: "upstream died before tokens", code: 429 } },
+    ] };
   }
   if (sys.indexOf("AGENT=tooly") >= 0) {
     if (tc === 0) return { tool: { name: "slow_tool", args: {} } };
@@ -193,6 +213,40 @@ function decide(body) {
       (/escapes the project directory|jailed/.test(txt) ? "+jailed" : "-nojail") +
       (txt.indexOf("timed out") >= 0 ? "+timeout" : "-notimeout") + "]" };
   }
+  if (sys.indexOf("AGENT=mlrep") >= 0) {
+    /* ML gates: the model repeats the EXACT same call — the supervisor's
+     * dup-call rule must attach a nudge to the second result. */
+    if (tc === 0) return { tool: { name: "get_weather", args: { city: "Oslo" } } };
+    if (tc === 1) return { tool: { name: "get_weather", args: { city: "Oslo" } } };
+    return { text: "mlrep-final[" + (txt.indexOf("identical call already made") >= 0 ? "+nudge" : "-nonudge") + "]" };
+  }
+  if (sys.indexOf("AGENT=mlreread") >= 0) {
+    /* ML gates: re-reading an unchanged file with DIFFERENT args (so the
+     * dup-call rule doesn't fire first) — the re-read rule must fire. */
+    if (tc === 0) return { tool: { name: "read_file", args: { path: "a.txt" } } };
+    if (tc === 1) return { tool: { name: "read_file", args: { path: "a.txt", offset: 1 } } };
+    return { text: "mlreread-final[" + (txt.indexOf("already read at step") >= 0 ? "+reread" : "-noread") + "]" };
+  }
+  if (sys.indexOf("AGENT=mlfreshclean") >= 0) {
+    /* Control: fresh material must NOT produce a freshness notice.
+     * (Checked BEFORE the mlfresh branch — its marker is a substring.) */
+    if (tc === 0) return { tool: { name: "fetch_docs", args: { topic: "rivermesh" } } };
+    return { text: "mlfreshclean-final[" + (txt.indexOf("[freshness]") >= 0 ? "+fresh" : "-clean") + "]" };
+  }
+  if (sys.indexOf("AGENT=mlfresh") >= 0) {
+    /* ML freshness: the tool returns old-dated deprecated material — the
+     * gate must put one evidence-carrying notice on the next context
+     * boundary, which this mock reports having seen. */
+    if (tc === 0) return { tool: { name: "fetch_docs", args: { topic: "zephyr" } } };
+    return { text: "mlfresh-final[" + (txt.indexOf("[freshness]") >= 0 ? "+fresh" : "-nofresh") + "]" };
+  }
+  if (sys.indexOf("AGENT=mlrel") >= 0) {
+    /* ML relevance: recalled memory mixes one on-task record with one
+     * one-word wrong-topic trap — the pre-retrieval advisor must render a
+     * [relevance] guidance notice on the ephemeral context message, which
+     * this mock reports having seen. */
+    return { text: "mlrel-final[" + (txt.indexOf("[relevance]") >= 0 ? "+rel" : "-norel") + "]" };
+  }
   if (sys.indexOf("AGENT=slow") >= 0) {
     /* delayed response — drives the concurrency probe */
     return { text: "slow-done", delay: 350 };
@@ -233,6 +287,14 @@ function handler(req, res) {
   REQ_LOG.push(entry);
   const finish = () => { entry.end = Date.now(); };
   vlog("  mock req #" + REQ_N + " stream=" + !!body.stream + " tools=" + (body.tools || []).length);
+  if (d.frames) {
+    /* Raw SSE frame sequences (e.g. in-stream error frames) — data frames
+     * only; the terminating [DONE] is appended by sseEnd. */
+    sseOpen(res);
+    for (const f of d.frames) sseData(res, f);
+    sseEnd(res);
+    return;
+  }
   if (d.delay) {
     setTimeout(() => { finish(); sseText(res, d.text); }, d.delay);
     return;
@@ -500,7 +562,8 @@ async function main() {
   });
   {
     const r = await sofuu.agent.run("loopy", "loop forever", {});
-    check("A5 budget_steps stop", r.stopped === "budget_steps" && r.steps === 3);
+    check("A5 budget_steps stop + salvage answer", r.stopped === "budget_steps" && r.steps === 3 &&
+          r.answer === "loopy-salvage-summary");
   }
   sofuu.agent.define({
     name: "loopyTk", system: "AGENT=loopy",
@@ -510,7 +573,71 @@ async function main() {
   });
   {
     const r = await sofuu.agent.run("loopyTk", "loop forever", {});
-    check("A5 budget_tokens stop", r.stopped === "budget_tokens" && r.usage.llmCalls === 1);
+    /* 1 tool round (48 mock tokens > 10 budget) + 1 salvage call. */
+    check("A5 budget_tokens stop + salvage answer", r.stopped === "budget_tokens" &&
+          r.usage.llmCalls === 2 && r.answer === "loopy-salvage-summary");
+  }
+
+  /* Retry-policy classifier — every libcurl transport-error wording must be
+   * transient (HTTP/2 stream resets, connection cuts), HTTP 429/5xx and
+   * rate-limit phrases too; permanent failures (auth, empty stream, stall)
+   * must NOT be retried. */
+  {
+    const TRANSIENT = [
+      "Stream error in the HTTP/2 framing layer",             /* CURLE_HTTP2_STREAM (92), libcurl 8.7.1 */
+      "HTTP/2 stream error",                                  /* CURLE_HTTP2_STREAM, older curl */
+      "Error in the HTTP2 framing layer",                     /* CURLE_HTTP2 (16), libcurl 8.7.1 */
+      "HTTP/2 framing layer error",                           /* CURLE_HTTP2, older wording */
+      "Transferred a partial file",                           /* CURLE_PARTIAL_FILE (18), libcurl 8.7.1 */
+      "Transfer closed with outstanding read data remaining", /* CURLE_PARTIAL_FILE, older wording */
+      "Server returned nothing (no headers, no data)",        /* CURLE_GOT_NOTHING (52), libcurl 8.7.1 */
+      "Empty reply from server",                              /* CURLE_GOT_NOTHING, older wording */
+      "Failure when receiving data from the peer",            /* CURLE_RECV_ERROR (56) */
+      "Failed sending data to the peer",                      /* CURLE_SEND_ERROR (55) */
+      "HTTP 429 — rate limited",
+      "HTTP 502 — gateway error",
+      "Recv failure: Connection reset by peer",
+      "Couldn't connect to server",
+      "connection timed out",
+      "ETIMEDOUT",
+      "upstream temporarily overloaded",
+    ];
+    for (const m of TRANSIENT) check("A5 transient classified: " + m, sofuu.agent.isTransientProviderError(m));
+    const PERMANENT = [
+      "HTTP 401 — invalid api key",
+      "HTTP 404 — model not found",
+      "provider returned an empty stream (finish_reason: stop)",
+      "provider sent no data for 300s — the model is unresponsive (retry, or switch models)",
+      "no such tool: xyz",
+    ];
+    for (const m of PERMANENT) check("A5 permanent NOT classified: " + m, !sofuu.agent.isTransientProviderError(m));
+  }
+
+  /* Retry gate: transient errors are retried ONLY while nothing has been
+   * forwarded to the UI yet — a mid-stream failure after content was shown
+   * must fail loudly instead of duplicating text by re-streaming. */
+  sofuu.agent.define({
+    name: "partial429", system: "AGENT=partial429", memory: "off", rlm: "off",
+    budget: { maxSteps: 4 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const before = PARTIAL429_HITS;
+    let err = null;
+    try { await sofuu.agent.run("partial429", "hi", {}); } catch (e) { err = e; }
+    check("A5 mid-stream 429 after content: NO retry, cause surfaced",
+          !!err && String(err.message).indexOf("HTTP 429") >= 0 && PARTIAL429_HITS === before + 1);
+  }
+  sofuu.agent.define({
+    name: "early429", system: "AGENT=early429", memory: "off", rlm: "off",
+    budget: { maxSteps: 4 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const before = EARLY429_HITS;
+    let err = null;
+    try { await sofuu.agent.run("early429", "hi", {}); } catch (e) { err = e; }
+    /* 1 initial attempt + 2 backoff retries (1.5s + 4s) = 3 requests. */
+    check("A5 429 before content: retried (3 attempts), cause surfaced",
+          !!err && String(err.message).indexOf("HTTP 429") >= 0 && EARLY429_HITS === before + 3);
   }
 
   sofuu.agent.define({
@@ -840,7 +967,7 @@ async function main() {
     check("CTX claude-sonnet-4-5 → 200000", sofuu.agent.contextWindow("claude-sonnet-4-5") === 200000);
     check("CTX gpt-4o → 128000", sofuu.agent.contextWindow("gpt-4o") === 128000);
     check("CTX gpt-4.1 → 1000000", sofuu.agent.contextWindow("gpt-4.1") === 1000000);
-    check("CTX gemini-1.5-pro → 2000000", sofuu.agent.contextWindow("gemini-1.5-pro") === 2000000);
+    check("CTX grok-4 → 256000", sofuu.agent.contextWindow("grok-4") === 256000);
     check("CTX llama3 → 8192", sofuu.agent.contextWindow("llama3") === 8192);
     check("CTX openrouter-prefixed model matches ('openai/gpt-4o')",
       sofuu.agent.contextWindow("openai/gpt-4o") === 128000);
@@ -964,6 +1091,335 @@ async function main() {
       r.trace[0].kind === "start" && r.trace[0].payload !== undefined);
     check("M4 freshest event keeps its payload",
       r.trace[r.trace.length - 1].payload !== undefined);
+  }
+
+  /* ═══ PLAN-ML-GATES phase 1: date fix + sofuu.ml surface + the
+   * rule-based supervisor subset (dup calls, re-reads of unchanged
+   * files) ═══════════════════════════════════════════════════════════ */
+  {
+    /* §7: today's date enters the wire request in the EPHEMERAL user-role
+     * context message — never in the byte-stable system prompt. */
+    sofuu.agent.define({ name: "mldate", memory: "off", rlm: "off",
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+    await sofuu.agent.run("mldate", "what day is it", {});
+    let dateMsgs = null;
+    try { dateMsgs = JSON.parse(LAST_OPENAI_RAW).messages; } catch (e) {}
+    const dateUser = !!dateMsgs && dateMsgs.find(m => m.role === "user" &&
+      /Current date: \d{4}-\d{2}-\d{2}\./.test(String(m.content || "")));
+    const dateSys = !!dateMsgs && String((dateMsgs.find(m => m.role === "system") || {}).content || "");
+    check("ML date fix: 'Current date: YYYY-MM-DD' rides a user message", !!dateUser);
+    check("ML date fix: system prompt stays date-free (byte-stable, P1/P6)",
+      !!dateMsgs && dateSys.indexOf("Current date") < 0);
+  }
+  if (sofuu.ml && typeof sofuu.ml.track === "function") {
+    check("ML surface: sofuu.ml.{track,workset,info,feedback,supervisor.check,supervisor.loop} present",
+      typeof sofuu.ml.workset === "function" && typeof sofuu.ml.info === "function" &&
+      typeof sofuu.ml.feedback === "function" &&
+      !!sofuu.ml.supervisor && typeof sofuu.ml.supervisor.check === "function" &&
+      typeof sofuu.ml.supervisor.loop === "function");
+    let info = null;
+    try { info = JSON.parse(sofuu.ml.info()); } catch (e) {}
+    check("ML info(): version + gate states reported (supervisor trained = 'on')",
+      !!info && info.version === 1 && info.gates && info.gates.supervisor === "on");
+    check("ML info(): online-learning block reported (off by default, §13)",
+      !!info && !!info.online && info.online.enabled === false &&
+      typeof info.online.examples === "number");
+
+    /* §5: the trained freshness gate — direct API shape + verdicts on
+     * hand-held material (same cases as the committed-weights fixtures). */
+    check("ML surface: sofuu.ml.freshness.score present",
+      !!sofuu.ml.freshness && typeof sofuu.ml.freshness.score === "function");
+    check("ML info(): freshness gate reports 'on'",
+      !!info && info.gates.freshness === "on");
+    const STALE_DOC = "Zephyr-db administration guide. Updated on March 4, 2019. " +
+      "This package is deprecated and no longer maintained; the repository was " +
+      "archived after support ended in 2020.";
+    let fStale = null, fTimeless = null, fTL = null;
+    try {
+      fStale = JSON.parse(sofuu.ml.freshness.score(STALE_DOC,
+        "what is the current recommended way to administer a Zephyr-db cluster?",
+        JSON.stringify({ kind: "web" })));
+      fTimeless = JSON.parse(sofuu.ml.freshness.score(
+        "A B-tree is a fundamental data structure used in systems programming. " +
+        "This article explains the invariants, the core operations, and the " +
+        "classic trade-offs of the B-tree. Complexity analysis included.",
+        "what is the latest best practice for B-tree page splitting?",
+        JSON.stringify({ kind: "web" })));
+      fTL = JSON.parse(sofuu.ml.freshness.score(STALE_DOC,
+        "summarize the writing style of this documentation page",
+        JSON.stringify({ kind: "web" })));
+    } catch (e) {}
+    check("ML freshness: old deprecated doc + time-sensitive task → stale with evidence",
+      !!fStale && fStale.stale === true && typeof fStale.score === "number" &&
+      String(fStale.reason || "").length > 0);
+    check("ML freshness: timeless content stays quiet",
+      !!fTimeless && fTimeless.stale === false);
+    check("ML freshness: stale doc + timeless task stays quiet (the interaction)",
+      !!fTL && fTL.stale === false);
+
+    /* §6: the trained relevance gate — direct API shape + a realistic
+     * pre-retrieval menu (same construction as the committed-weights
+     * fixtures; payments domain is absent from every training family).
+     * Advise-only: plan() returns use/skip ids + scores, never mutates the
+     * menu. Indices: 0 definition site (use); 1 off-topic note; 2 license;
+     * 3 call-site mention; 4 near-dup of the kept 0; 5 one-word trap — all
+     * of 1..5 must be advised skip. */
+    check("ML surface: sofuu.ml.relevance.plan present",
+      !!sofuu.ml.relevance && typeof sofuu.ml.relevance.plan === "function");
+    check("ML info(): relevance gate reports 'on'",
+      !!info && info.gates.relevance === "on");
+    const REL_TASK = "fix the verify_signature function in the payment webhook handler";
+    const REL_DEF = "fn verify_signature checks the payment webhook payload against " +
+      "the shared secret and rejects the delivery when the digest does not match";
+    const REL_CANDS = [
+      { text: REL_DEF, kind: "file", strength: 0, role: 0, path: "src/payments/webhook.rs" },
+      { text: "meeting notes from the design review: the palette choices stay as discussed, follow up next week", kind: "other", strength: 0, role: 0, path: "" },
+      { text: "permission is hereby granted, free of charge, to any person obtaining a copy of this software. the software is provided as is, without warranty of any kind. all rights reserved.", kind: "file", strength: 0, role: 0, path: "" },
+      { text: "the billing exporter calls verify_signature once at startup and otherwise only formats the csv rows", kind: "file", strength: 0, role: 0, path: "src/billing/export.rs" },
+      { text: REL_DEF, kind: "file", strength: 0, role: 0, path: "src/payments/webhook.rs" },
+      { text: "facilities notice: the payment for the new office plants is due; the delivery of the ferns is scheduled for monday", kind: "other", strength: 0, role: 0, path: "" },
+    ];
+    let relPlan = null;
+    try {
+      relPlan = JSON.parse(sofuu.ml.relevance.plan(
+        JSON.stringify({ task: REL_TASK, recent: "", candidates: REL_CANDS }),
+        JSON.stringify({ kept: [0] })));
+    } catch (e) {}
+    check("ML relevance: definition site use; off-topic/license/mention/dup/trap skip",
+      !!relPlan && Array.isArray(relPlan.use) && Array.isArray(relPlan.skip) &&
+      relPlan.use.indexOf(0) >= 0 &&
+      [1, 2, 3, 4, 5].every(i => relPlan.skip.indexOf(i) >= 0));
+    check("ML relevance: use advice best-first + one score per candidate",
+      !!relPlan && relPlan.use[0] === 0 &&
+      Array.isArray(relPlan.scores) && relPlan.scores.length === REL_CANDS.length);
+    let relPlan2 = null;
+    try {
+      relPlan2 = JSON.parse(sofuu.ml.relevance.plan(
+        JSON.stringify({ task: REL_TASK, recent: "", candidates: REL_CANDS }),
+        JSON.stringify({ kept: [0] })));
+    } catch (e) {}
+    check("ML relevance: plan is deterministic for a fixed menu",
+      !!relPlan && !!relPlan2 &&
+      JSON.stringify(relPlan.scores) === JSON.stringify(relPlan2.scores) &&
+      JSON.stringify(relPlan.use) === JSON.stringify(relPlan2.use) &&
+      JSON.stringify(relPlan.skip) === JSON.stringify(relPlan2.skip));
+
+    /* §5/§16 E2E: stale tool material → ONE notice on the next context
+     * boundary (the mock model reports seeing it); fresh material → silence. */
+    const freshTool = [{ name: "fetch_docs", description: "fetch docs",
+      parameters: { type: "object", properties: { topic: { type: "string" } } },
+      execute: async (a) => a.topic === "zephyr"
+        ? STALE_DOC
+        : "Just shipped: the latest release rolled out this week and is now " +
+          "available. Announced today; actively developed with weekly releases. " +
+          "Updated March 4, 2026." }];
+    sofuu.agent.define({
+      name: "mlfresh", system: "AGENT=mlfresh", memory: "off", rlm: "off", tools: freshTool,
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const rf = await sofuu.agent.run("mlfresh",
+      "what is the current recommended way to administer a Zephyr-db cluster?", {});
+    check("ML freshness E2E: notice reached the model (answer saw it)",
+      rf.answer.indexOf("+fresh") >= 0);
+    const gateF = rf.trace.find(e => e.kind === "mlgate" && e.payload.rule === "freshness");
+    check("ML freshness E2E: mlgate event labelled freshness", !!gateF);
+
+    sofuu.agent.define({
+      name: "mlfreshclean", system: "AGENT=mlfreshclean", memory: "off", rlm: "off", tools: freshTool,
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const rc = await sofuu.agent.run("mlfreshclean",
+      "what is the current state of the Rivermesh gateway?", {});
+    check("ML freshness E2E: fresh material stays quiet",
+      rc.answer.indexOf("-clean") >= 0 &&
+      !rc.trace.some(e => e.kind === "mlgate" && e.payload.rule === "freshness"));
+
+    /* §6/§16 E2E: the pre-retrieval relevance advisor over recalled memory.
+     * A brain seeded with on-task records + high-lexical-overlap wrong-topic
+     * traps recalls a mixed menu; the advisor must render ONE [relevance]
+     * guidance notice on the ephemeral context message (the mock reports
+     * seeing it) + an mlgate event. Advise-only — the recall block itself is
+     * untouched. Needs QTSQ (sofuu.memory); auto-skips otherwise. */
+    if (sofuu.memory && sofuu.memory.open && sofuu.ai && sofuu.ai.embedLocal) {
+      const REL_BRAIN = "/tmp/sofuu_agent_test_rel_" + Date.now() + ".qtsq";
+      const relDim = sofuu.ai.embedLocal("").length;
+      const rb2 = sofuu.memory.open(REL_BRAIN, relDim);
+      const relSeed = [
+        /* on-task: dense overlap with the run task below */
+        "the database migration script rewrites the storage schema and rebuilds every index before the database is swapped live",
+        "to fix the migration, check the schema rewrite step in the database script that applies each table change",
+        /* wrong-topic traps: share the task's keywords in a different sense */
+        "the database migration lunch was catered by the new vendor and the menu plus delivery time for the team were confirmed",
+        "the migration of the office plants to the new floor was scheduled by facilities and the database of lunch orders was updated",
+      ];
+      for (const t of relSeed) rb2.remember(new Float32Array(sofuu.ai.embedLocal(t)), t, "user", 0);
+      rb2.flush();
+      sofuu.agent.define({
+        name: "mlrel", system: "AGENT=mlrel", memory: "shared", brainPath: REL_BRAIN, rlm: "off",
+        provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+      });
+      const rrel = await sofuu.agent.run("mlrel",
+        "fix the database migration script that rewrites the schema", {});
+      check("ML relevance E2E: guidance notice reached the model (answer saw it)",
+        rrel.answer.indexOf("+rel") >= 0);
+      const gateRel = rrel.trace.find(e => e.kind === "mlgate" && e.payload.rule === "relevance");
+      check("ML relevance E2E: mlgate event labelled relevance with use/skip counts",
+        !!gateRel && typeof gateRel.payload.use === "number" && typeof gateRel.payload.skip === "number" &&
+        gateRel.payload.skip >= 1);
+    } else {
+      skip("ML relevance E2E", "sofuu.memory unavailable (no-QTSQ build)");
+    }
+
+    /* §11 rule subset — exact repeat call: the second identical call gets
+     * an in-band nudge on its tool result + an mlgate trace event. The
+     * call still RUNS (advisors never block). */
+    sofuu.agent.define({
+      name: "mlrep", system: "AGENT=mlrep", memory: "off", rlm: "off",
+      tools: [{ name: "get_weather", description: "w",
+                parameters: { type: "object", properties: { city: { type: "string" } } },
+                execute: async (a) => "WEATHER-" + a.city }],
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const r1 = await sofuu.agent.run("mlrep", "weather check", {});
+    check("ML dup-call: nudge reached the model (answer saw it)",
+      r1.answer.indexOf("+nudge") >= 0);
+    const gate1 = r1.trace.find(e => e.kind === "mlgate");
+    check("ML dup-call: mlgate event emitted with rule label",
+      !!gate1 && gate1.payload.rule === "dup_call" && gate1.payload.step === 2);
+    const tr1 = r1.trace.filter(e => e.kind === "tool_result");
+    check("ML dup-call: first result clean, second carries [supervisor:]",
+      tr1.length === 2 &&
+      String(tr1[0].payload.result).indexOf("[supervisor:") < 0 &&
+      String(tr1[1].payload.result).indexOf("[supervisor:") >= 0);
+
+    /* §11 rule subset — re-reading an unchanged file (different args so
+     * the dup rule stays quiet). */
+    sofuu.agent.define({
+      name: "mlreread", system: "AGENT=mlreread", memory: "off", rlm: "off",
+      tools: [{ name: "read_file", description: "r",
+                parameters: { type: "object", properties: { path: { type: "string" }, offset: { type: "number" } } },
+                execute: async (a) => "FILE-CONTENT " + a.path }],
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const r2 = await sofuu.agent.run("mlreread", "read the file", {});
+    check("ML reread: nudge reached the model (answer saw it)",
+      r2.answer.indexOf("+reread") >= 0);
+    const gate2 = r2.trace.find(e => e.kind === "mlgate");
+    check("ML reread: mlgate event labelled reread_unchanged",
+      !!gate2 && gate2.payload.rule === "reread_unchanged");
+
+    /* ml:'off' disables every gate for the def — same scripted repeat,
+     * no nudge, no mlgate events. */
+    sofuu.agent.define({
+      name: "mloff", system: "AGENT=mlrep", memory: "off", rlm: "off", ml: "off",
+      tools: [{ name: "get_weather", description: "w",
+                parameters: { type: "object", properties: { city: { type: "string" } } },
+                execute: async (a) => "WEATHER-" + a.city }],
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const r3 = await sofuu.agent.run("mloff", "weather check again", {});
+    check("ML off: no nudge injected when ml:'off'",
+      r3.answer.indexOf("-nonudge") >= 0 && !r3.trace.some(e => e.kind === "mlgate"));
+
+    /* ═══ PLAN-ML-GATES phase 5: the trained supervisor (§11) + the
+     * online-learning surface (§13). Direct API checks here — seeded
+     * through the same check→track flow the agent loop uses. ═══════ */
+    const SUP_TASK = "calibrate the weather station sensors before the storm season";
+    const SUP_P0 = "src/weather/calibrate.rs";
+    const SUP_P1 = "src/weather/sensors.rs";
+    function supCheck(run, step, tool, sig, target, extra) {
+      return JSON.parse(sofuu.ml.supervisor.check(JSON.stringify(Object.assign({
+        run: run, step: step, tool: tool, sig: sig, target: target,
+        argsText: "", skipTargets: [], budget: 20, task: SUP_TASK,
+      }, extra || {}))));
+    }
+    /* Seed a run the way agent.js does: run_start, then per call
+     * supervisor.check BEFORE and ml.track(tool_result) AFTER. */
+    function supSeed(run, calls) {
+      sofuu.ml.track(JSON.stringify({ kind: "run_start", run: run, task: SUP_TASK }));
+      const verdicts = [];
+      for (let i = 0; i < calls.length; i++) {
+        const c = calls[i];
+        verdicts.push(supCheck(run, i + 1, c.tool, c.sig, c.target, c.extra));
+        sofuu.ml.track(JSON.stringify({ kind: "tool_result", run: run, step: i + 1,
+          tool: c.tool, target: c.target, chars: c.chars || 500, error: false }));
+      }
+      return verdicts;
+    }
+    const readSig = (p) => 'read_file:{"path":"' + p + '"}';
+
+    /* §11 layering: the rule layer speaks first — an exact repeat is
+     * flagged with source "rule", and the verdict carries the full
+     * shape (ok/reason/nudge/score/source). */
+    supSeed("e2e-sup-rule", [{ tool: "read_file", sig: readSig(SUP_P0), target: SUP_P0, chars: 1200 }]);
+    const vDup = supCheck("e2e-sup-rule", 2, "read_file", readSig(SUP_P0), SUP_P0);
+    check("supervisor check: exact repeat flagged by the RULE layer (dup_call)",
+      vDup.ok === false && vDup.reason === "dup_call" && vDup.source === "rule" &&
+      typeof vDup.nudge === "string" && vDup.nudge.length > 0 &&
+      typeof vDup.score === "number" && vDup.score >= 0 && vDup.score <= 1);
+
+    /* §11: where the rules are silent, the NET speaks — a first call
+     * that echoes nothing of the task is off-task waste. */
+    sofuu.ml.track(JSON.stringify({ kind: "run_start", run: "e2e-sup-model", task: SUP_TASK }));
+    const vOff = supCheck("e2e-sup-model", 1, "read_file",
+      readSig("docs/office_snack_poll.md"), "docs/office_snack_poll.md");
+    check("supervisor check: zero-echo first call flagged by the MODEL layer",
+      vOff.ok === false && vOff.source === "model" && vOff.reason === "off_task" &&
+      vOff.score >= 0.82);
+
+    /* §11: the clean side — the task's core file as the first call
+     * passes silently (advisors must not nag at real work). */
+    sofuu.ml.track(JSON.stringify({ kind: "run_start", run: "e2e-sup-clean", task: SUP_TASK }));
+    const vClean = supCheck("e2e-sup-clean", 1, "read_file", readSig(SUP_P0), SUP_P0);
+    check("supervisor check: on-task first call passes (ok, no nudge)",
+      vClean.ok === true && vClean.nudge === null);
+
+    /* §11 loop boundary: a run hammering one file with offset reads and
+     * no writes gets flagged at the boundary; a read→grep→edit run with
+     * progress stays silent. */
+    const spins = [];
+    for (let k = 0; k < 4; k++) {
+      spins.push({ tool: "read_file", target: SUP_P1, chars: 40,
+        sig: 'read_file:{"offset":' + (k * 50) + ',"path":"' + SUP_P1 + '"}' });
+    }
+    supSeed("e2e-sup-loop", spins);
+    const vLoop = JSON.parse(sofuu.ml.supervisor.loop(
+      JSON.stringify({ run: "e2e-sup-loop", step: 5, budget: 20 })));
+    check("supervisor loop: spinning run flagged at the boundary (loop_*)",
+      vLoop.ok === false && vLoop.source === "model" &&
+      String(vLoop.reason).indexOf("loop_") === 0);
+    supSeed("e2e-sup-loop-ok", [
+      { tool: "read_file", sig: readSig(SUP_P0), target: SUP_P0, chars: 1200 },
+      { tool: "grep", sig: 'grep:{"pattern":"sensor_offset"}', target: "sensor_offset", chars: 500 },
+      { tool: "edit_file", sig: 'edit_file:{"path":"' + SUP_P0 + '"}', target: SUP_P0, chars: 60 },
+    ]);
+    const vLoopOk = JSON.parse(sofuu.ml.supervisor.loop(
+      JSON.stringify({ run: "e2e-sup-loop-ok", step: 4, budget: 20 })));
+    check("supervisor loop: healthy read→grep→edit run stays silent",
+      vLoopOk.ok === true);
+
+    /* §13 surface: outcome labels land via sofuu.ml.feedback; unknown
+     * (run,step) pairs are refused, and info() counts the example. */
+    const fb1 = JSON.parse(sofuu.ml.feedback(JSON.stringify(
+      { kind: "outcome", model: "supervisor", run: "e2e-sup-rule", step: 2, wasted: true })));
+    check("ml.feedback: outcome label for an observed call accepted", fb1.ok === true);
+    const fb2 = JSON.parse(sofuu.ml.feedback(JSON.stringify(
+      { kind: "outcome", model: "supervisor", run: "no-such-run", step: 99, wasted: false })));
+    check("ml.feedback: label for an unknown call refused", fb2.ok === false);
+    let info2 = null;
+    try { info2 = JSON.parse(sofuu.ml.info()); } catch (e) {}
+    check("ml.info(): labeled example counted (online learning stays off until /ml)",
+      !!info2 && !!info2.online && info2.online.enabled === false &&
+      info2.online.examples >= 1 && info2.online.observations >= 1);
+
+    /* §8: the working set accumulated the runs above. */
+    let ws = null;
+    try { ws = JSON.parse(sofuu.ml.workset()); } catch (e) {}
+    check("ML workset: runs and calls accumulated (" +
+      (ws ? ws.runs + " runs, " + ws.calls + " calls" : "unparsable") + ")",
+      !!ws && ws.runs >= 3 && ws.calls >= 6);
+  } else {
+    skip("ML gates", "sofuu.ml not registered (SOFUU_NO_ML set?)");
   }
 
   console.log(failures === 0

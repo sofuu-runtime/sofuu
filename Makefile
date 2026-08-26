@@ -30,7 +30,8 @@ QTSQ_DIR ?= /Users/priyanshuboruah/projects/black-hole-disk
 
 .PHONY: all clean install test bench c-only size-check cargo-build \
         libsofuu zig-install linux linux-x86_64 linux-arm64 release-archives dist \
-        headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all
+        headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
+        desktop desktop-dev desktop-clean
 
 SIZE_LIMIT ?= 5242880   # 5 MB hard cap (bytes)
 
@@ -65,6 +66,24 @@ size-check: $(TARGET)
 	else \
 		echo "  \033[32m✓ Size $$SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
 	fi
+
+# ── Sofuu Desktop (PLAN-DESKTOP) ─────────────────────────────────
+# Tauri v2 macOS app: Rust backend links sofuu-core in-process, the
+# React/TS frontend is strictly UI. The 5 MB cap above is CLI-only —
+# the .app bundle is expected to be ~30–60 MB and has NO size gate.
+DESKTOP_DIR = sofuu-desktop
+
+desktop:
+	@echo "  \033[36mTAURI\033[0m  sofuu-desktop (release .app/.dmg)"
+	cd $(DESKTOP_DIR) && npm install --no-audit --no-fund && npm run tauri build
+	@echo "  \033[32m✓\033[0m bundle: target/release/bundle/ (src-tauri is a workspace member)"
+
+desktop-dev:
+	@echo "  \033[36mTAURI\033[0m  sofuu-desktop (dev)"
+	cd $(DESKTOP_DIR) && npm install --no-audit --no-fund && npm run tauri dev
+
+desktop-clean:
+	rm -rf $(DESKTOP_DIR)/dist
 
 # ── libsofuu: embeddable library (PLAN-HEADLESS H1) ──────────────
 # Builds the capi crate as staticlib + cdylib, copies artifacts to dist/.

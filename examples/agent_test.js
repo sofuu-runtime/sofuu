@@ -741,7 +741,7 @@ async function main() {
     check("CTX claude-sonnet-4-5 → 200000", sofuu.agent.contextWindow("claude-sonnet-4-5") === 200000);
     check("CTX gpt-4o → 128000", sofuu.agent.contextWindow("gpt-4o") === 128000);
     check("CTX gpt-4.1 → 1000000", sofuu.agent.contextWindow("gpt-4.1") === 1000000);
-    check("CTX gemini-1.5-pro → 2000000", sofuu.agent.contextWindow("gemini-1.5-pro") === 2000000);
+    check("CTX grok-4 → 256000", sofuu.agent.contextWindow("grok-4") === 256000);
     check("CTX llama3 → 8192", sofuu.agent.contextWindow("llama3") === 8192);
     check("CTX openrouter-prefixed model matches ('openai/gpt-4o')",
       sofuu.agent.contextWindow("openai/gpt-4o") === 128000);

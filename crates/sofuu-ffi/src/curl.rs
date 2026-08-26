@@ -51,6 +51,11 @@ pub const CURLOPT_POSTFIELDSIZE: c_int = 60;
 pub const CURLOPT_SSL_VERIFYPEER: c_int = 64;
 pub const CURLOPT_MAXFILESIZE: c_int = 114;
 pub const CURLOPT_TIMEOUT_MS: c_int = 155;
+// Patience guard (curl.h: CONNECTTIMEOUT=LONG+78) + the timeout result
+// code (curlcode.h). Silence AFTER connect is policed by the app-level
+// stall watchdog in rt/ai.rs, not by curl options.
+pub const CURLOPT_CONNECTTIMEOUT: c_int = 78;
+pub const CURLE_OPERATION_TIMEDOUT: c_int = 28;
 
 pub const CURLINFO_EFFECTIVE_URL: c_int = 0x100001; /* STRING + 1 */
 pub const CURLINFO_RESPONSE_CODE: c_int = 0x200002; /* LONG + 2 */

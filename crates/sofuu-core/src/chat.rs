@@ -19,7 +19,6 @@ use sofuu_ffi::SofuuRuntime;
 use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::session;
@@ -43,12 +42,16 @@ pub struct ProviderEntry {
     pub profile: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ChatConfig {
     pub provider: String,
     pub model: String,
     pub effort: String,
     pub brain: bool,
+    /// PLAN-ML-GATES: the context-economy gates (date fix, supervisor rule
+    /// nudges, later the four tiny models). Default ON; /ml on|off.
+    /// SOFUU_NO_ML=1 unregisters sofuu.ml entirely regardless of this flag.
+    pub ml: bool,
     pub sync: bool,
     /// API key for the CURRENT (active) provider, persisted in ~/.sofuu/config.json.
     /// An env var (e.g. OPENAI_API_KEY) still takes precedence at request
@@ -94,8 +97,21 @@ pub struct ChatConfig {
     /// 0 = default (0.30, agent.js RECALL_MIN_SCORE).
     pub recall_min: f64,
     /// P2 (PLAN-MEMORY-TOKENS): recall block token budget for the chat brain.
-    /// 0 = default (1024, agent.js RECALL_BUDGET_TOK).
+    /// 0 = default (scales with the model's context window, agent.js).
     pub recall_budget: i64,
+    /// Models this session learned cannot think: the provider rejected a
+    /// thinking/reasoning parameter for them. The effort picker reports
+    /// "does not support thinking" and turns run without effort for these
+    /// (auto-detected once from the API error text; persisted).
+    pub no_think_models: Vec<String>,
+}
+
+impl Default for ChatConfig {
+    /* One source of truth for "fresh config" — the derived Default would
+     * silently disagree with defaults() (e.g. ml must be ON by default). */
+    fn default() -> Self {
+        Self::defaults()
+    }
 }
 
 impl ChatConfig {
@@ -138,13 +154,12 @@ impl ChatConfig {
         pricing.insert("anthropic/claude-sonnet-4-6".into(), [3.00, 15.00]);
         pricing.insert("anthropic/claude-opus-4-1".into(), [15.00, 75.00]);
         pricing.insert("anthropic/claude-haiku-3-5".into(), [0.80, 4.00]);
-        pricing.insert("gemini/gemini-1.5-pro".into(), [1.25, 5.00]);
-        pricing.insert("gemini/gemini-2.0-flash".into(), [0.10, 0.40]);
         Self {
             provider: String::new(),
             model: String::new(),
             effort: "high".into(),
             brain: false,
+            ml: true,
             sync: true,
             api_key: String::new(),
             base_url: String::new(),
@@ -163,6 +178,7 @@ impl ChatConfig {
             rss_warn_mb: 1024,
             recall_min: 0.0,
             recall_budget: 0,
+            no_think_models: Vec::new(),
         }
     }
 
@@ -270,6 +286,7 @@ impl ChatConfig {
         }
         if let Some(s) = v.get("effort").and_then(|x| x.as_str()) { cfg.effort = s.to_string(); }
         if let Some(b) = v.get("brain").and_then(|x| x.as_bool()) { cfg.brain = b; }
+        if let Some(b) = v.get("ml").and_then(|x| x.as_bool()) { cfg.ml = b; }
         if let Some(b) = v.get("sync").and_then(|x| x.as_bool()) { cfg.sync = b; }
         if let Some(s) = v.get("rlm").and_then(|x| x.as_str()) { cfg.rlm = s.to_string(); }
         if let Some(s) = v.get("embed_provider").and_then(|x| x.as_str()) { cfg.embed_provider = s.to_string(); }
@@ -292,6 +309,13 @@ impl ChatConfig {
         if let Some(n) = v.get("rss_warn_mb").and_then(|x| x.as_i64()) { cfg.rss_warn_mb = n; }
         if let Some(n) = v.get("recall_min").and_then(|x| x.as_f64()) { cfg.recall_min = n; }
         if let Some(n) = v.get("recall_budget").and_then(|x| x.as_i64()) { cfg.recall_budget = n; }
+        if let Some(arr) = v.get("no_think_models").and_then(|x| x.as_array()) {
+            cfg.no_think_models = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_string())
+                .collect();
+        }
         // Validate active still points at an entry; if not, fall back to first provider.
         if !cfg.active.is_empty() && !cfg.providers.iter().any(|p| p.name == cfg.active) {
             cfg.active = cfg.providers.first().map(|p| p.name.clone()).unwrap_or_default();
@@ -323,6 +347,7 @@ impl ChatConfig {
                 "model": flat_model,
                 "effort": self.effort,
                 "brain": self.brain,
+                "ml": self.ml,
                 "sync": self.sync,
                 "api_key": flat_key,
                 "base_url": flat_base,
@@ -339,6 +364,7 @@ impl ChatConfig {
                 "rss_warn_mb": self.rss_warn_mb,
                 "recall_min": self.recall_min,
                 "recall_budget": self.recall_budget,
+                "no_think_models": self.no_think_models,
             })
             .to_string();
             let tmp = dir.join("config.json.tmp");
@@ -369,9 +395,9 @@ const MAX_CTX_WINDOW: i64 = 1_000_000;
 /// model's real ceiling and the error surfaces.
 const MAX_OUTPUT_TOKENS: i64 = 384_000;
 
-/// Per-provider default context windows (tokens), used when ctx_window is 0.
-/// Kept deliberately tiny (current mainstream limits); users on bigger-window
-/// models raise it with /ctx or --ctx-window.
+/// Legacy per-provider fallback context windows — used ONLY when neither
+/// /ctx nor the model capability registry (rt/model_caps.rs) knows better.
+/// The registry is the primary source; this map is the last resort.
 fn default_ctx_window(provider: &str) -> i64 {
     match provider {
         "openai" | "anthropic" => 128_000,
@@ -409,7 +435,7 @@ fn clamp_max_output(n: i64) -> i64 {
 
 /// Every slash command — the single source of truth for the C readline's
 /// TAB completion (`__chat_complete`) and for "did you mean" suggestions.
-const ALL_COMMANDS: [&str; 32] = [
+const ALL_COMMANDS: [&str; 33] = [
     "/help",
     "/version",
     "/model",
@@ -418,6 +444,7 @@ const ALL_COMMANDS: [&str; 32] = [
     "/compact",
     "/clear",
     "/brain",
+    "/ml",
     "/rlm",
     "/ctx",
     "/maxout",
@@ -462,13 +489,14 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/version", "Print the runtime version", ""),
     ("/model", "Switch the model", "<name>  (bare = interactive picker)"),
     ("/provider", "Manage providers / run setup wizard", "(bare = your providers + add)"),
-    ("/effort", "Set the thinking/reasoning effort", "off | low | medium | high | max"),
+    ("/effort", "Set the thinking/reasoning effort", "off | low | medium | high | max  (unsupported levels fall back to the model's highest; budgets scale with the model)"),
     ("/compact", "Summarize the conversation into context", ""),
     ("/clear", "Reset this session (keep settings)", ""),
     ("/brain", "Toggle the memory/brain integration", "on | off"),
+    ("/ml", "ML context-economy gates + online learning", "on | off | learn | reset | wrong | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
-    ("/ctx", "View/set the context window in tokens", "<tokens> | default  (max 1M)"),
-    ("/maxout", "View/set max output tokens per response", "<tokens> | default  (max 384k)"),
+    ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 1M)"),
+    ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
     ("/tools", "List connected MCP servers + tools", ""),
     ("/agents", "List agent definitions (+ ~/.sofuu/agents/*.js)", ""),
     ("/sessions", "List sessions on this project", ""),
@@ -720,7 +748,15 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             } else {
                 cfg.effort = arg.to_string();
                 cfg.save();
-                chat_out(&format!("  ✓ Effort → {}\n", cfg.effort));
+                /* Capability-aware confirmation: what the model will get. */
+                let caps = sofuu_core::rt::model_caps::lookup(Some(cfg.model.as_str()));
+                let note = match caps.thinking {
+                    sofuu_core::rt::model_caps::Thinking::None => {
+                        " — note: this model has no reasoning mode; the field is omitted".to_string()
+                    }
+                    _ => String::new(),
+                };
+                chat_out(&format!("  ✓ Effort → {}{}\n", cfg.effort, note));
             }
             "ok"
         }
@@ -742,6 +778,77 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 "ok"
             } else {
                 chat_out("  Usage: /brain [on|off]\n");
+                "ok"
+            }
+        }
+        "/ml" => {
+            // PLAN-ML-GATES: the context-economy gates. on|off toggles the
+            // advise-only layer; learn|reset|wrong|info drive the online
+            // adaptation of the supervisor (§13, off by default).
+            if arg.is_empty() {
+                let state = if cfg.ml { "on" } else { "off" };
+                let (on_enabled, _obs, on_examples, on_adapted, on_adaptations) =
+                    sofuu_core::ml::online::status();
+                chat_out(&format!(
+                    "  ML gates: {}  --  /ml on|off | learn|reset|wrong|info  (SOFUU_NO_ML=1 disables entirely)\n",
+                    state
+                ));
+                chat_out(&format!(
+                    "  online learning: {}, {} labeled example(s), adapted: {} ({} adaptation(s))\n",
+                    if on_enabled { "on" } else { "off" },
+                    on_examples,
+                    if on_adapted { "yes" } else { "no" },
+                    on_adaptations
+                ));
+                "ok"
+            } else if arg == "off" {
+                cfg.ml = false;
+                cfg.save();
+                chat_out("  ML gates disabled\n");
+                "ok"
+            } else if arg == "on" {
+                cfg.ml = true;
+                cfg.save();
+                chat_out("  ML gates enabled\n");
+                "ok"
+            } else if arg == "learn" {
+                let r = sofuu_core::ml::online::learn();
+                chat_out(&format!("  /ml learn: {}\n", r.detail));
+                "ok"
+            } else if arg == "reset" {
+                sofuu_core::ml::online::reset();
+                chat_out("  online adaptation cleared -- the pretrained supervisor is back in charge\n");
+                "ok"
+            } else if arg == "wrong" {
+                if sofuu_core::ml::online::label_wrong() {
+                    chat_out("  marked the most recent supervisor flag as wrong -- /ml learn to apply\n");
+                } else {
+                    chat_out("  no recent supervisor flag to mark wrong\n");
+                }
+                "ok"
+            } else if arg == "info" {
+                let (on_enabled, obs, on_examples, on_adapted, on_adaptations) =
+                    sofuu_core::ml::online::status();
+                let (runs, calls, segs, seg_tokens) = sofuu_core::ml::context::summary();
+                chat_out(&format!(
+                    "  supervisor: trained (baked weights), threshold {:.2}, online layer: {}\n",
+                    sofuu_core::ml::supervisor::model::THRESHOLD,
+                    if on_adapted { "adopted" } else { "pretrained" }
+                ));
+                chat_out(&format!(
+                    "  online: {}, {} observation(s) awaiting labels, {} labeled example(s), {} adaptation(s)\n",
+                    if on_enabled { "on" } else { "off" },
+                    obs,
+                    on_examples,
+                    on_adaptations
+                ));
+                chat_out(&format!(
+                    "  working set: {} run(s), {} call(s), {} segment(s), {} segment token(s)\n",
+                    runs, calls, segs, seg_tokens
+                ));
+                "ok"
+            } else {
+                chat_out("  Usage: /ml [on|off|learn|reset|wrong|info]\n");
                 "ok"
             }
         }
@@ -964,6 +1071,7 @@ fn print_help() {
     c("/compact", "summarize the conversation into context");
     c("/clear", "reset this session (keep settings)");
     c("/brain [on|off]", "toggle memory/brain integration");
+    c("/ml [on|off|learn|reset|wrong|info]", "ML context-economy gates + supervisor online learning");
     c("/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c("/ctx [<tokens>]", "view/set the context window (max 1M)");
     c("/maxout [<tokens>]", "view/set max output tokens (max 384k)");
@@ -1008,35 +1116,9 @@ fn print_help() {
 }
 
 // ── Welcome panel ────────────────────────────────────────────────
-// The bordered box shown at the top of the TUI: logo tile + title, then
+// The bordered box shown at the top of the TUI: title, then
 // column-aligned session facts. Built in Rust (testable), rendered by the
 // C conversation area line by line.
-
-/// Shima-enaga (long-tailed tit) mascot — a round fluffy white bird with
-/// black bead eyes, a tiny orange beak and a fixed long pink tail. The
-/// mascot NEVER moves: every frame is exactly 7 cells wide (body 6 + tail)
-/// with the tail pinned at the same spot; only the EYES change in place
-/// (open → blink → happy → blink). Row 1 is also 7 cells so the title
-/// text column aligns across all three rows.
-// Mascot mark — ASCII-only on purpose. The previous art used U+25xx
-// geometric glyphs (░▒█●▸◕) and U+203E, which are East-Asian
-// ambiguous-width: terminals that render them 2 cells wide broke the
-// panel's right-border alignment on exactly the mascot rows. The mark is
-// a compact one-line bird whose eyes animate: open (o) → blink (-) →
-// happy (^) → blink (-) — every character is 1 cell in every terminal.
-const SHIMA_MARKS: [&str; 4] = [
-    // open eyes
-    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231mo\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
-    // blink
-    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
-    // happy
-    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;214m^\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
-    // blink
-    "\x1b[38;5;231m(\x1b[0m\x1b[38;5;231m-\x1b[0m\x1b[38;5;214m>\x1b[0m\x1b[38;5;231m)\x1b[0m",
-];
-
-/// The current logo frame (0-3) — rotated by the JS animation loop.
-static LOGO_FRAME: AtomicUsize = AtomicUsize::new(0);
 
 /// Display width in terminal cells: skips ANSI CSI sequences; wide chars
 /// (CJK/emoji) count 2 cells like a real terminal. Kept in sync with
@@ -1153,25 +1235,14 @@ fn panel_row(content: &str, width: usize) -> String {
     )
 }
 
-/// The 2 welcome-panel rows that contain the mascot (mark + title, then
-/// the subtitle aligned under the title) for a GIVEN frame. Used both by
-/// the initial panel build and by the animation overlay, so the eyes swap
-/// frames WITHOUT moving or erasing the surrounding text/borders.
-fn welcome_bird_rows(
-    _cfg: &ChatConfig,
-    _session: &str,
-    _dir: &str,
-    w: usize,
-    frame: usize,
-) -> Vec<String> {
-    let mark = SHIMA_MARKS[frame % SHIMA_MARKS.len()];
+/// The 2 welcome-panel heading rows (title, then the subtitle aligned
+/// under it). No mascot — the animated Shima-enaga mark was removed; the
+/// title now stands alone at a fixed 2-cell indent.
+fn welcome_bird_rows(_cfg: &ChatConfig, _session: &str, _dir: &str, w: usize) -> Vec<String> {
     vec![
+        panel_row("  \x1b[1;35mWelcome to Sofuu!\x1b[0m", w),
         panel_row(
-            &format!("{}   \x1b[1;35mWelcome to Sofuu!\x1b[0m", mark),
-            w,
-        ),
-        panel_row(
-            "       \x1b[2mAsk anything (/help for the command list)\x1b[0m",
+            "  \x1b[2mAsk anything (/help for the command list)\x1b[0m",
             w,
         ),
     ]
@@ -1182,12 +1253,11 @@ fn welcome_bird_rows(
 fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) -> Vec<String> {
     let w = width.clamp(40, 400);
     let inner = w - 4;
-    let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_MARKS.len();
     let mut rows = Vec::with_capacity(12);
 
     let dash = "─".repeat(w - 2);
     rows.push(format!("\x1b[2;35m╭{dash}╮\x1b[0m"));
-    rows.extend(welcome_bird_rows(cfg, session, dir, w, frame));
+    rows.extend(welcome_bird_rows(cfg, session, dir, w));
     rows.push(panel_row("", w));
 
     let effort = if cfg.effort.is_empty() {
@@ -1447,6 +1517,7 @@ unsafe extern "C" fn js_chat_getcfg(
             "model": cfg.model,
             "effort": cfg.effort,
             "brain": cfg.brain,
+            "ml": cfg.ml,
             "sync": cfg.sync,
             "api_key": cfg.api_key,
             "base_url": cfg.base_url,
@@ -1513,6 +1584,29 @@ unsafe extern "C" fn js_chat_apply_provider(
         }
     }
     js_new_bool(ctx, true)
+}
+
+/// Runtime thinking-support detection: mark the model as "cannot think"
+/// after the provider rejected a reasoning parameter for it. Persisted so
+/// the picker reports it and turns skip effort for this model.
+unsafe extern "C" fn js_chat_no_think(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 { return js_new_bool(ctx, false); }
+    let Some(model) = js_to_string(ctx, *argv) else { return js_new_bool(ctx, false); };
+    if model.is_empty() { return js_new_bool(ctx, false); }
+    if let Ok(mut guard) = CFG.lock() {
+        let cfg = guard.get_or_insert_with(ChatConfig::defaults);
+        if !cfg.no_think_models.iter().any(|m| m == &model) {
+            cfg.no_think_models.push(model);
+            cfg.save();
+        }
+        return js_new_bool(ctx, true);
+    }
+    js_new_bool(ctx, false)
 }
 
 unsafe extern "C" fn js_chat_select_provider(
@@ -2001,47 +2095,6 @@ unsafe extern "C" fn js_chat_refresh(
     js_new_bool(ctx, true)
 }
 
-/// `__chat_logo()` — advance to the next animation frame and overlay the
-/// 2 mascot rows (mark + title, subtitle) over the welcome panel at fixed
-/// screen rows 2-3. The eyes swap frames in place: nothing moves and no
-/// text is erased.
-unsafe extern "C" fn js_chat_logo(
-    ctx: *mut JSContext,
-    _this: JSValueConst,
-    _argc: c_int,
-    _argv: *const JSValueConst,
-) -> JSValue {
-    let next = LOGO_FRAME.load(Ordering::Relaxed).wrapping_add(1);
-    LOGO_FRAME.store(next % SHIMA_MARKS.len(), Ordering::Relaxed);
-    if sofuu_ffi::tui_active() {
-        let cfg = CFG
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .unwrap_or_default();
-        let sess = SESS
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| s.short_id().to_string()));
-        let dir = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".into());
-        let w = sofuu_ffi::tui_width();
-        let frame = LOGO_FRAME.load(Ordering::Relaxed) % SHIMA_MARKS.len();
-        // Match js_chat_welcome: rows are logged GUTTER-indented at a
-        // GUTTER-narrower width, so the overlay must use the same shape.
-        let gutter = sofuu_core::rt::tui::GUTTER;
-        let pad = " ".repeat(gutter);
-        for (i, row) in welcome_bird_rows(&cfg, sess.as_deref().unwrap_or(""), &dir, w.saturating_sub(gutter), frame)
-            .iter()
-            .enumerate()
-        {
-            sofuu_ffi::tui_overlay_row(2 + i as i32, &format!("{pad}{row}"));
-        }
-    }
-    js_new_bool(ctx, true)
-}
-
 /// `__chat_phase(line)` — paint the agent-activity indicator ("Thinking",
 /// "Coding", …) on the gap row directly above the input box. The JS driver
 /// owns the label/animation math (see `phaseForStep`/the `PHASE_*` timer in
@@ -2238,10 +2291,10 @@ fn register_bridge(rt: &SofuuRuntime) {
         register_global_fn(ctx, "__chat_command_info", js_chat_command_info as JSCFunction);
         register_global_fn(ctx, "__chat_apply_provider", js_chat_apply_provider as JSCFunction);
         register_global_fn(ctx, "__chat_select_provider", js_chat_select_provider as JSCFunction);
+        register_global_fn(ctx, "__chat_no_think", js_chat_no_think as JSCFunction);
         register_global_fn(ctx, "__chat_remove_provider", js_chat_remove_provider as JSCFunction);
         register_global_fn(ctx, "__chat_past_turns", js_chat_past_turns as JSCFunction);
         register_global_fn(ctx, "__chat_welcome", js_chat_welcome as JSCFunction);
-        register_global_fn(ctx, "__chat_logo", js_chat_logo as JSCFunction);
         register_global_fn(ctx, "__chat_phase", js_chat_phase as JSCFunction);
         register_global_fn(ctx, "__chat_rss", js_chat_rss as JSCFunction);
         register_global_fn(ctx, "__chat_gc", js_chat_gc as JSCFunction);
@@ -2270,7 +2323,20 @@ const DRIVER: &str = r#"
   let cfg = JSON.parse(__chat_getcfg());
   let history = [];
   let lastShared = '';
-  let totalTk = 0;    /* cumulative session tokens (footer metric) */
+  /* Footer meter = CURRENT context usage (what the next request's prompt
+   * will be), not a lifetime total: it grows as history grows and drops
+   * when /compact (or auto-compaction) folds history, exactly like the
+   * context meters in other CLIs. Calibrated against the FIRST LLM request
+   * of a turn — its prompt is system + history + tools + ephemeral, i.e.
+   * the context size, before any tool results re-count it. Falls back to
+   * the budget logic's own estimator when a provider reports no usage. */
+  let usedCtx = 0;
+  let ctxOverhead = -1;   /* −1 = not calibrated (history estimate only) */
+  function ctxMeter() {
+    const h = historyTokens();
+    return ctxOverhead >= 0 ? h + ctxOverhead : h;
+  }
+  let lastChip = '';  /* last per-turn usage chip, so /compact can refresh the footer without clearing it */
   let rssWarned = false; /* M6: one-time RAM tripwire notice */
   /* ── MCP tool wiring (zero-config via ~/.sofuu/mcp.json) ────────
    * OPTIONAL and LAZY: servers are NOT connected at chat startup — a slow
@@ -2588,13 +2654,16 @@ const DRIVER: &str = r#"
       history.push({ role: 'user', content: t.prompt });
       history.push({ role: 'assistant', content: t.answer });
     }
+    usedCtx = ctxMeter(); /* meter reflects the resumed history immediately */
     const short = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
     out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' +
         (capped ? ' (partial — kept most recent 30)' : '') + '\x1b[0m\n');
   }
 
   /* ── F3: @file mentions ──────────────────────────────────────────── */
-  const ATTACH_TOKEN_BUDGET = 8192;
+  /* Total attachment budget scales with the model's context window
+   * (attachTokenBudget below) — not a flat constant. */
+  const ATTACH_TOKEN_BUDGET_FALLBACK = 8192;
   async function expandMentions(text) {
     const mentions = [];
     /* Tokenize @path or @path:start-end (allow quoted paths with spaces). */
@@ -2655,8 +2724,9 @@ const DRIVER: &str = r#"
           content = sliced.join('\n');
         }
         const tok = estTok(content);
-        if (totalTokens + tok > ATTACH_TOKEN_BUDGET) {
-          const remaining = ATTACH_TOKEN_BUDGET - totalTokens;
+        const attachBudget = attachTokenBudget();
+        if (totalTokens + tok > attachBudget) {
+          const remaining = attachBudget - totalTokens;
           if (remaining > 0) {
             const lines = content.split('\n');
             let kept = 0;
@@ -2945,11 +3015,36 @@ const DRIVER: &str = r#"
   const COMPACT_KEEP_TURNS = 4;   /* verbatim turns kept by auto-compaction */
   let autoCompactArmed = true;    /* one shot per threshold crossing */
 
+  /* Capability lookup for the active model (native registry, rt/model_caps).
+   * Returns null for unknown models — callers apply their own fallback. */
+  function modelCaps() {
+    try {
+      if (sofuu.ai && typeof sofuu.ai.modelCaps === 'function') {
+        const c = JSON.parse(sofuu.ai.modelCaps(cfg.model || ''));
+        return (c && c.known) ? c : null;
+      }
+    } catch (e) {}
+    return null;
+  }
+
   function ctxBudget() {
+    /* Dynamic: explicit /ctx override → model's published window →
+     * per-endpoint fallback map. Never a flat constant. */
     const win = cfg.ctx_window > 0
       ? cfg.ctx_window
-      : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768);
+      : ((modelCaps() || {}).ctxWindow > 0
+        ? modelCaps().ctxWindow
+        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
     return Math.floor(win * 0.85);
+  }
+  /* @file mention attachments scale with the same window (~25% of it). */
+  function attachTokenBudget() {
+    const win = cfg.ctx_window > 0
+      ? cfg.ctx_window
+      : ((modelCaps() || {}).ctxWindow > 0
+        ? modelCaps().ctxWindow
+        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
+    return Math.min(65536, Math.max(2048, Math.floor(win * 0.25)));
   }
   function estTok(s) {
     if (sofuu.ai && typeof sofuu.ai.estimateTokens === 'function') {
@@ -2987,19 +3082,100 @@ const DRIVER: &str = r#"
     const budget = ctxBudget();
     /* Re-arm one-shot compaction once usage drains back below half. */
     if (!autoCompactArmed && historyTokens() < budget * 0.5) autoCompactArmed = true;
-    /* P5: auto-compaction — summarize instead of silently dropping. */
-    if (autoCompactArmed && historyTokens() > budget * COMPACT_AT && history.length > COMPACT_KEEP_TURNS * 2) {
+    /* PLAN-ML-GATES §12: ML compaction gate — opportunistic passes that
+     * free MECHANICAL junk (duplicates, boilerplate, re-fetchable reads)
+     * before the one-shot cliff ever fires. Runs while usage is past
+     * half the budget. The net SELECTS — only free-tier segments are
+     * dropped here, no LLM calls. History stays strictly alternating,
+     * so a turn goes only when BOTH its user prompt and assistant
+     * answer are flagged; one-sided junk waits for the cliff. Turns go
+     * oldest-first until usage drains below half the budget (the pass
+     * budget is the whole flagged set — the drain target is what keeps
+     * passes small). System summaries are never candidates. The cliff
+     * below + the drop-oldest guard remain the safety nets; with the
+     * gate off (/ml off or SOFUU_NO_ML=1) behaviour is exactly as
+     * before. */
+    if (cfg.ml && history.length > 4 && historyTokens() > budget * 0.5) {
+      try {
+        if (sofuu.ml && sofuu.ml.compaction && typeof sofuu.ml.compaction.plan === 'function') {
+          const segs = [], segHist = [];
+          for (let i = 0; i < history.length; i++) {
+            const m = history[i];
+            if (m.role !== 'user' && m.role !== 'assistant') continue;
+            const text = String(m.content || '');
+            segs.push({ text: text, tokens: estTok(text), age: 0,
+                        kind: m.role === 'user' ? 0 : 1,
+                        retrievable: false, compacted: false });
+            segHist.push(i);
+          }
+          for (let j = 0; j < segs.length; j++) segs[j].age = segs.length - 1 - j;
+          if (segs.length > 4) {
+            let task = '';
+            for (let i = history.length - 1; i >= 0; i--) {
+              if (history[i].role === 'user') { task = String(history[i].content || ''); break; }
+            }
+            const recentTxt = history.slice(-4).map(m => String(m.content || '')).join('\n');
+            const plan = JSON.parse(sofuu.ml.compaction.plan(JSON.stringify({
+              task: task, summary: '', recent: recentTxt, segments: segs,
+            }), JSON.stringify({ budget: historyTokens() })), '{}');
+            const compact = plan.compact || [], tiers = plan.tiers || [];
+            const flaggedFree = new Set();
+            for (let c = 0; c < compact.length; c++) {
+              const t = tiers[c];
+              if (t !== 'dup' && t !== 'boilerplate' && t !== 'retrievable') continue;
+              const hi = segHist[compact[c]];
+              if (hi !== undefined) flaggedFree.add(hi);
+            }
+            /* Complete turns only (user+assistant both flagged), never
+             * the newest turn; oldest first, until usage drains below
+             * half the budget. */
+            const pairStarts = [];
+            for (let i = 0; i + 1 < history.length && i < history.length - 2; i++) {
+              if (history[i].role === 'user' && history[i + 1].role === 'assistant'
+                  && flaggedFree.has(i) && flaggedFree.has(i + 1)) {
+                pairStarts.push(i);
+                i++;
+              }
+            }
+            let freed = 0, droppedTurns = 0;
+            for (let p = 0; p < pairStarts.length && historyTokens() > budget * 0.5; p++) {
+              const pi = pairStarts[p] - droppedTurns * 2;
+              freed += estTok(String(history[pi].content || ''))
+                     + estTok(String(history[pi + 1].content || ''));
+              history.splice(pi, 2);
+              droppedTurns++;
+            }
+            if (droppedTurns > 0) {
+              out('\x1b[90m  ml-compaction freed ' + fmtTk(freed) + ' tk (' +
+                  droppedTurns + ' junk turn' + (droppedTurns === 1 ? '' : 's') +
+                  ': dup/boilerplate/re-fetchable)\x1b[0m');
+            }
+          }
+        }
+      } catch (e) { /* the gate advises — any failure falls through to the cliff */ }
+    }
+    /* P5: auto-compaction — when the 1M (or model) window is nearly full,
+     * summarize the whole context and reset usage to near-zero so the
+     * session can continue indefinitely. Per-answer 32k thinking / 64k
+     * output are *not* session caps — total thinking+output across many
+     * turns can exceed them, only the per-answer limit is enforced. */
+    if (autoCompactArmed && historyTokens() > budget * COMPACT_AT && history.length > 2) {
       autoCompactArmed = false;
       const savedTk = historyTokens();
       try {
-        if (await summarizeHistory(COMPACT_KEEP_TURNS)) {
+        // Summarize *all* turns and keep only the summary → window → ~0
+        if (await summarizeHistory(0)) {
+          const m0 = Math.max(0, savedTk + (ctxOverhead >= 0 ? ctxOverhead : 0));
+          usedCtx = ctxMeter();
           out('\x1b[90m  ⚙ auto-compacted → summary (' +
-              fmtTk(Math.max(0, savedTk - historyTokens())) + ' tk saved)\x1b[0m');
+              fmtTk(Math.max(0, savedTk - historyTokens())) + ' tk saved, meter ' +
+              fmtTk(m0) + '→' + fmtTk(usedCtx) + ')\x1b[0m');
         }
       } catch (e) { /* summarizer failed — the drop loop below still guards */ }
     }
     /* Drop-oldest guard: still over budget after compaction (or compaction
-     * failed)? Shed oldest pairs — always keep at least the last turn. */
+     * failed)? Shed oldest pairs — always keep at least the last turn.
+     * With the new summarize-all policy this rarely fires. */
     let droppedTurns = 0;
     while (history.length > 2 && historyTokens() > budget) {
       history.splice(0, 2);
@@ -3196,6 +3372,12 @@ const DRIVER: &str = r#"
       ? watchChangesPending.map(c => '- ' + c.path + ' (' + c.kind + ')').join('\n')
       : '';
     watchChangesPending.length = 0;
+    /* Strict effort: the CLI follows EXACTLY what the user picked.
+     * `off`/empty → no thinking on ANY endpoint (never auto-injects).
+     * The thinking block is only sent when cfg.effort is low/medium/high/max.
+     * Models detected as thinking-incapable at runtime (no_think_models)
+     * also never get an effort parameter. */
+    let noThink = (cfg.no_think_models || []).indexOf(cfg.model) >= 0;
     const def = {
       name: 'chat',
       /* P1: the byte-stable shared core prompt. lastShared mesh notes no
@@ -3205,14 +3387,8 @@ const DRIVER: &str = r#"
       tools: chatToolDefs(),
       agents: subAgentNames.length ? subAgentNames : undefined,
       provider: cfg.provider, model: cfg.model,
-      /* Effort OFF still thinks UNDER THE HOOD: Anthropic omits its
-       * thinking block entirely when no effort is sent, so map off →
-       * 'low' (minimal budget) for the anthropic wire format. OpenAI-
-       * compatible endpoints keep the omission (their default already
-       * reasons, and forcing the field can error on non-reasoning
-       * models). */
-      effort: cfg.effort ||
-        ((cfg.profile === 'anthropic' || cfg.provider === 'anthropic') ? 'low' : undefined),
+      /* strict: only what the user selected, never more; off → undefined */
+      effort: noThink ? undefined : (cfg.effort && cfg.effort !== 'off' ? cfg.effort : undefined),
       api_key: cfg.api_key || undefined,
       base_url: cfg.base_url || undefined,
       profile: cfg.profile || undefined,
@@ -3220,14 +3396,24 @@ const DRIVER: &str = r#"
       embed_provider: cfg.embed_provider || undefined,
       embed_model: cfg.embed_model || undefined,
       memory: cfg.brain ? 'shared' : 'off',
+      /* PLAN-ML-GATES: context-economy gates for this turn ('off' skips
+       * every gate in agent.js; SOFUU_NO_ML=1 unregisters sofuu.ml too). */
+      ml: cfg.ml ? 'on' : 'off',
       rlm: cfg.rlm === 'on' ? 'on' : (cfg.rlm === 'auto' ? 'auto' : 'off'),
       ctx_window: cfg.ctx_window > 0 ? cfg.ctx_window : undefined,
       /* P2: config-level recall gating knobs (0 = agent.js defaults). */
       recallMin: cfg.recall_min > 0 ? cfg.recall_min : undefined,
       recallBudget: cfg.recall_budget > 0 ? cfg.recall_budget : undefined,
-      /* Chat historically has no budgets beyond the 8-step tool cap and
-       * the 200k answer cap (both enforced inside agent.js). */
-      budget: { maxSteps: 8, maxDepth: 1, maxTokens: 1e9, maxWallMs: 1e9 },
+      /* Chat historically has no budgets beyond the step cap and the 200k
+       * answer cap (both enforced inside agent.js). The step cap is
+       * deliberately generous: real coding turns routinely need 10-30
+       * rounds (read → read sections → grep → edit → verify), and the old
+       * flat 8 made long tool-using turns die in a bare "(no response)"
+       * (AUDIT-NO-RESPONSE-2026-08-24 cause b). On the rare breach the
+       * agent spends one salvage round summarizing progress (agent.js) and
+       * the driver prints why it stopped. SOFUU_CHAT_MAX_STEPS is a test
+       * seam, not a user knob. */
+      budget: { maxSteps: (parseInt(env('SOFUU_CHAT_MAX_STEPS'), 10) || 200), maxDepth: 1, maxTokens: 1e9, maxWallMs: 1e9 },
     };
     /* Streaming render state — same UX as the pre-migration driver:
      * spinner + growing line in the TUI, plain writes when piped. */
@@ -3242,8 +3428,14 @@ const DRIVER: &str = r#"
     /* The phase indicator is started at turn entry and always torn down in
      * the `finally` below, mirroring stopAnim(). One onStep renderer for
      * both paths (chat loop + direct @agent mention run). */
+    let firstPromptTk = 0;  /* first LLM request's prompt = current context size */
     const onStep = function (e) {
           const p = (e.payload === undefined || e.payload === null) ? {} : e.payload;
+          /* Meter capture: the first LLM request's prompt size. */
+          if (!firstPromptTk && e.kind === 'llm' && e.payload && e.payload.usage &&
+              e.payload.usage.promptTokens > 0) {
+            firstPromptTk = e.payload.usage.promptTokens;
+          }
           const ph = phaseForStep(e.kind, p);
           if (ph !== null && ph !== CURRENT_PHASE) {
             CURRENT_PHASE = ph;
@@ -3295,6 +3487,12 @@ const DRIVER: &str = r#"
             out('\x1b[90m  ⏳ brain · consolidated ' + (p.clusters || 1) +
                 ' cluster' + ((p.clusters || 1) === 1 ? '' : 's') +
                 ' — old memories merged\x1b[0m');
+          } else if (e.kind === 'mlgate') {
+            /* PLAN-ML-GATES: a supervisor rule gate flagged waste (repeat
+             * call / re-read of an unchanged file). One dim ASCII-only line;
+             * the advisory nudge itself rides the tool result in-band. */
+            stopAnim();
+            out('\x1b[90m  ~ ml · ' + p.rule + ' · ' + p.tool + ' (step ' + p.step + ')\x1b[0m');
           } else if (e.kind === 'tool_result') {
             if (TTY && p.result) {
               /* Compact one-row result: embedded newlines become " · " so
@@ -3335,10 +3533,23 @@ const DRIVER: &str = r#"
         if (sawThink) out('');          /* seal a think-only answer */
         outLast(answer);                /* final line, no spinner */
       } else {
+        /* Piped mode renders only answer_delta chunks — a turn with zero
+         * deltas would print nothing at all, so emit the final answer
+         * (e.g. "(no response)") when nothing streamed. */
+        if (!acc && answer) out(answer);
         out('\n');
       }
     }
     if (res && res.stopped === 'cancelled') out('\x1b[90m  ⏹ stopped (esc)\x1b[0m');
+    else if (res && res.stopped && String(res.stopped).indexOf('budget_') === 0) {
+      /* Budget breach (steps/wall/tokens): the agent attempted a salvage
+       * summary before stopping; say WHY it stopped so a breach is never
+       * mistaken for a dead provider (AUDIT-NO-RESPONSE-2026-08-24 b). */
+      const why = res.stopped === 'budget_steps'
+        ? 'step budget' + (agentMention ? '' : ' (' + def.budget.maxSteps + ' rounds)')
+        : (res.stopped === 'budget_wall' ? 'wall-clock budget' : 'token budget');
+      out('\x1b[90m  ⏹ stopped: ' + why + ' reached\x1b[0m');
+    }
     if (agentMention && res) {
       /* @agent mention: compact run summary under the answer. */
       const u = res.usage || {};
@@ -3347,7 +3558,23 @@ const DRIVER: &str = r#"
     }
     const ctxTk = (res && res.usage && res.usage.promptTokens) || 0;
     const outTk = (res && res.usage && res.usage.completionTokens) || 0;
-    totalTk += ctxTk + outTk;
+    /* Meter calibration on a REAL request size: prefer the first LLM
+     * request of this turn; a single-LLM-call turn's aggregate is that
+     * same number. Multi-round tool turns are never used as-is — their
+     * aggregate re-counts tool results and would balloon the meter.
+     * Overhead = system prompt + tool schemas + ephemeral context: the
+     * request's prompt minus the history it carries and minus this
+     * turn's own text, so historyTokens() + overhead stays equal to the
+     * request size and never double-counts the turn. */
+    const histAtReq = historyTokens();
+    const turnTk = estTok(text);
+    if (firstPromptTk > 0) {
+      usedCtx = firstPromptTk;
+      ctxOverhead = Math.max(0, firstPromptTk - histAtReq - turnTk);
+    } else if (ctxTk > 0 && ((res && res.usage && res.usage.llmCalls) || 0) <= 1) {
+      usedCtx = ctxTk;
+      ctxOverhead = Math.max(0, ctxTk - histAtReq - turnTk);
+    }
     let tk = (ctxTk > 0 || outTk > 0) ? (ctxTk + '→' + outTk + ' tk') : '';
     /* F6: report usage → compute cost + persist. Cache token slots (P6.4)
      * ride along so /cost can show prefix-cache hits when non-zero. */
@@ -3372,6 +3599,9 @@ const DRIVER: &str = r#"
     const histText = manifest ? text + ' [' + manifest + ']' : text;
     history.push({ role: 'user', content: histText }, { role: 'assistant', content: answer });
     await trimHistory();
+    /* Meter: re-estimate for the NEXT request — grows with this turn's
+     * history, drops when compaction/drop-oldest just shrank it. */
+    usedCtx = ctxMeter();
     /* M2: one full GC per completed turn — bounds JS garbage to a single
      * turn's worth instead of accumulating against the heap cap. */
     try { __chat_gc(); } catch (e) {}
@@ -3534,7 +3764,11 @@ const DRIVER: &str = r#"
         out('\x1b[90m  [Nothing older than one turn to fold — history unchanged]\x1b[0m\n');
         return;
       }
-      out('\x1b[90m  [Compacted → context (' + fmtTk(Math.max(0, before - historyTokens())) + ' tk saved)]\x1b[0m\n');
+      const m0 = Math.max(0, before + (ctxOverhead >= 0 ? ctxOverhead : 0));
+      usedCtx = ctxMeter();
+      out('\x1b[90m  [Compacted → context (' + fmtTk(Math.max(0, before - historyTokens())) +
+          ' tk saved, meter ' + fmtTk(m0) + '→' + fmtTk(usedCtx) + ')]\x1b[0m\n');
+      refreshStatus(lastChip); /* meter drops visibly right away */
     } catch (e) { out('\x1b[31m  [Compact failed: ' + String(e.message || e) + ']\x1b[0m\n'); }
   }
   // Output routing: in the full-screen TUI everything lands in the
@@ -3551,6 +3785,7 @@ const DRIVER: &str = r#"
     return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n);
   }
   function refreshStatus(tk) {
+    lastChip = tk;
     if (typeof __chat_status !== 'function') return;
     const dim = (s) => '\x1b[2m' + s + '\x1b[0m';
     let s = 'sofuu ' + dim('·') + ' \x1b[35m' + (cfg.model || '(no model)') + '\x1b[0m';
@@ -3566,8 +3801,10 @@ const DRIVER: &str = r#"
      * right = real-time RAM of the sofuu process. */
     const win = cfg.ctx_window > 0
       ? cfg.ctx_window
-      : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768);
-    const used = totalTk;
+      : ((modelCaps() || {}).ctxWindow > 0
+        ? modelCaps().ctxWindow
+        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
+    const used = usedCtx;
     const pct = used > 0 ? Math.round(used / win * 100) : 0;
     /* Percent only once it is meaningful (≥1%) — "ctx 0.2k/128k (0%)"
      * reads like a bug. Turns amber past 80% of the window. */
@@ -3836,16 +4073,63 @@ const DRIVER: &str = r#"
     try { __chat_refresh(); } catch (e) {}
   }
   async function pickEffort() {
-    /* Budgets mirror the C mapping (Anthropic thinking.budget_tokens). */
-    const notes = { off: 'provider default', low: '1k thinking budget',
-                    medium: '4k thinking budget', high: '16k thinking budget',
-                    max: '32k thinking budget' };
-    const order = ['off', 'low', 'medium', 'high', 'max'];
+    /* Capability-aware picker (rt/model_caps via sofuu.ai.modelCaps):
+     * notes show the REAL budgets this model will get; models that
+     * cannot think say so instead of offering a fake ladder. */
+    const caps = modelCaps();
+    const fmt = n => n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+    const runtimeNoThink = (cfg.no_think_models || []).indexOf(cfg.model) >= 0;
+    const isAnthropicWire = (cfg.profile === 'anthropic' || cfg.provider === 'anthropic');
+    if (runtimeNoThink) {
+      out('\x1b[33m  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
+      return;
+    }
+    // Anthropic endpoint: 64k thinking is endpoint property, any model on it can use it
+    // OpenAI endpoint: per-model ladder, generic for unknown models, none only for known non-reasoning
+    if (!isAnthropicWire && caps && caps.thinking === 'none') {
+      out('\x1b[33m  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
+      return;
+    }
+    let order, notes;
+    if (!isAnthropicWire && caps && caps.thinking === 'effort') {
+      /* Discrete ladder model (OpenAI style): only its real levels.
+       * Selecting an unsupported level falls back to the highest one.
+       * OpenAI endpoint is generic — any provider's models can appear here. */
+      order = ['off'].concat(caps.efforts || []);
+      notes = { off: 'strict off — no thinking' };
+      for (const l of (caps.efforts || [])) {
+        notes[l] = l === caps.efforts[caps.efforts.length - 1]
+          ? 'highest this model supports'
+          : l + ' reasoning';
+      }
+      if (cfg.effort === 'max') notes.currentNote = "max → falls back to '" + caps.efforts[caps.efforts.length - 1] + "'";
+    } else if (isAnthropicWire) {
+      /* Anthropic wire: 64k is thinking budget (not context window), endpoint-driven, any model */
+      order = ['off', 'low', 'medium', 'high', 'max'];
+      const cap = 64000;
+      notes = { off: 'strict off — no thinking',
+                low: '≈' + fmt(Math.ceil(cap * 0.0625)) + ' tk',
+                medium: '≈' + fmt(Math.ceil(cap * 0.25)) + ' tk',
+                high: '≈' + fmt(Math.ceil(cap * 0.5)) + ' tk',
+                max: '≈' + fmt(Math.ceil(cap * 0.9)) + ' tk (of ' + fmt(cap) + ' thinking)' };
+    } else {
+      /* Budget-style unknown on OpenAI generic endpoint or fallback */
+      order = ['off', 'low', 'medium', 'high', 'max'];
+      notes = { off: 'strict off — no thinking',
+                low: '~6% thinking budget', medium: '~25%', high: '~50%', max: '~90% (uses the full ceiling)' };
+      if (caps && caps.maxThinkingBudget > 0) {
+        const cap = caps.maxThinkingBudget;
+        notes.low = '≈' + fmt(Math.ceil(cap * 0.0625)) + ' tk';
+        notes.medium = '≈' + fmt(Math.ceil(cap * 0.25)) + ' tk';
+        notes.high = '≈' + fmt(Math.ceil(cap * 0.5)) + ' tk';
+        notes.max = '≈' + fmt(Math.ceil(cap * 0.9)) + ' tk (of ' + fmt(cap) + ')';
+      }
+    }
     const it = await selectMenu({
-      title: 'Thinking effort',
+      title: 'Thinking effort' + (cfg.model ? ' — ' + cfg.model : ''),
       hint: '↑↓/←→ move · enter apply · esc cancel',
       tabs: [],
-      items: order.map(l => ({ id: l, label: l, tab: '', note: notes[l] })),
+      items: order.map(l => ({ id: l, label: l, tab: '', note: notes[l] || '' })),
       currentId: cfg.effort || 'off',
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
@@ -3871,9 +4155,11 @@ const DRIVER: &str = r#"
     try { __chat_refresh(); } catch (e) {}
   }
   async function pickCtx() {
-    const eff = (cfg.ctx_window > 0 ? cfg.ctx_window : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
+    const mc = modelCaps();
+    const eff = (cfg.ctx_window > 0 ? cfg.ctx_window
+      : (mc && mc.ctxWindow > 0 ? mc.ctxWindow : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768)));
     const presets = [
-      { id: '0', label: 'default', note: 'provider default (' + fmtTk(eff) + ')' },
+      { id: '0', label: 'default', note: (mc ? 'model default (' + fmtTk(mc.ctxWindow) + ')' : 'provider default (' + fmtTk(eff) + ')') },
       { id: '32768', label: '32k', note: '32,768 tokens' },
       { id: '131072', label: '128k', note: '131,072 tokens' },
       { id: '1048576', label: '1M', note: '1,048,576 tokens' },
@@ -3892,8 +4178,11 @@ const DRIVER: &str = r#"
     try { __chat_refresh(); } catch (e) {}
   }
   async function pickMaxout() {
+    const mc = modelCaps();
     const presets = [
-      { id: '0', label: 'default', note: 'provider default' },
+      { id: '0', label: 'default', note: mc && mc.maxOutput > 0
+          ? "model's max output (" + fmtTk(mc.maxOutput) + ')'
+          : 'provider default' },
       { id: '4096', label: '4k', note: '4,096 tokens' },
       { id: '32768', label: '32k', note: '32,768 tokens' },
       { id: '131072', label: '128k', note: '131,072 tokens' },
@@ -3964,14 +4253,8 @@ const DRIVER: &str = r#"
     if (TTY) {
       /* Full-screen interface: take over the terminal. */
       try { __tui_on(); } catch (e) {}
-      /* Bordered welcome panel (logo + session facts) — built in Rust. */
+      /* Bordered welcome panel (title + session facts) — built in Rust. */
       try { __chat_welcome(); } catch (e) {}
-      /* Shima-enaga logo animation: cycle the bird frames in place (rows
-       * 3-5 overlay). Stops on the first user input. */
-      let logoAnim = setInterval(function() {
-        try { __chat_logo(); } catch (e) {}
-      }, 500);
-      const stopLogo = () => { try { clearInterval(logoAnim); } catch (e) {} };
       /* Re-open the previous transcript (persisted in the session .qtsq). */
       try {
         const past = JSON.parse(__chat_past_turns());
@@ -3981,9 +4264,6 @@ const DRIVER: &str = r#"
         }
         if (past.length) out('');
       } catch (e) {}
-      /* Stop the animation on the first input (readline arming). */
-      const stopLogoOnce = function() { stopLogo(); };
-      globalThis.__logo_stop = stopLogoOnce;
     } else {
       /* Compact two-line banner (built in Rust, same content as the panel). */
       try { __chat_welcome(); } catch (e) {}
@@ -4029,8 +4309,6 @@ const DRIVER: &str = r#"
         }
       } catch (e) {}
       const inp = await __readline('\x1b[1;35m❯\x1b[0m ');
-      /* First user input: freeze the logo animation. */
-      try { if (globalThis.__logo_stop) { globalThis.__logo_stop(); globalThis.__logo_stop = null; } } catch (e) {}
       if (inp === null || inp === undefined) { requestExit(); break; }
       const t = inp.trim();
       if (t === '') continue;
@@ -4041,7 +4319,7 @@ const DRIVER: &str = r#"
         try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
         /* Any command that can change settings re-renders the welcome panel
          * so the header (model/provider/effort) updates instantly. */
-        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/rlm', '/sync'];
+        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync'];
         const changed = cfgCmds.some(c => t === c || t.indexOf(c + ' ') === 0);
         if (changed) { try { __chat_refresh(); } catch (e) {} }
         if (r === 'pick_model') {
@@ -4089,12 +4367,28 @@ const DRIVER: &str = r#"
       }
       /* A failed turn must never kill the chat: print the error and loop
        * back to the prompt. (Without this, an API/config exception rejects
-       * the driver's main() promise and the CLI exits immediately.) */
+       * the driver's main() promise and the CLI exits immediately.)
+       *
+       * Thinking-support runtime detection: when the provider rejects a
+       * reasoning parameter for this model, remember it (persisted), tell
+       * the user, and retry the turn once WITHOUT effort. */
+      const THINK_ERR_RE = /thinking|reasoning_effort|extended.?thinking|reasoning/i;
+      let turnErr = null;
       try {
         await turn(t);
       } catch (e) {
-        out('\x1b[31m  ✗ ' + String((e && e.message) || e) + '\x1b[0m\n');
+        turnErr = e;
+        const msg = String((e && e.message) || e);
+        if (THINK_ERR_RE.test(msg) && cfg.effort && cfg.model &&
+            !(cfg.no_think_models || []).includes(cfg.model)) {
+          try { __chat_no_think(cfg.model); } catch (eNT) {}
+          out('\x1b[33m  ⓘ ' + cfg.model + ' rejected thinking (' + msg.slice(0, 160) +
+              ') — disabling effort for this model and retrying.\x1b[0m\n');
+          turnErr = null;
+          try { await turn(t); } catch (e2) { turnErr = e2; }
+        }
       }
+      if (turnErr) out('\x1b[31m  ✗ ' + String((turnErr && turnErr.message) || turnErr) + '\x1b[0m\n');
     }
     /* Brain flush happens per-store inside sofuu.agent.run (agent.js). */
     /* Disconnect every MCP server: their child processes hold ref'd libuv
@@ -4179,6 +4473,8 @@ mod tests {
         assert!(d.embed_model.is_empty());
         // Default thinking effort is high (a fresh config thinks hard).
         assert_eq!(d.effort, "high");
+        // PLAN-ML-GATES: the ML context-economy gates default to ON.
+        assert!(d.ml);
     }
 
     #[test]
@@ -4197,7 +4493,7 @@ mod tests {
         // Write the file directly (save() is a no-op in tests).
         std::fs::write(
             tmp.join("config.json"),
-            "{\n  \"provider\": \"openai\",\n  \"model\": \"gpt-4o\",\n  \"effort\": \"high\",\n  \"brain\": true,\n  \"ctx_window\": 1000000,\n  \"max_output\": 384000\n}\n",
+            "{\n  \"provider\": \"openai\",\n  \"model\": \"gpt-4o\",\n  \"effort\": \"high\",\n  \"brain\": true,\n  \"ml\": false,\n  \"ctx_window\": 1000000,\n  \"max_output\": 384000\n}\n",
         )
         .unwrap();
 
@@ -4206,6 +4502,7 @@ mod tests {
         assert_eq!(l.model, "gpt-4o");
         assert_eq!(l.effort, "high");
         assert!(l.brain);
+        assert!(!l.ml, "ml flag round-trips from config.json");
         assert_eq!(l.ctx_window, 1_000_000);
         assert_eq!(l.max_output, 384_000);
 
@@ -4241,6 +4538,15 @@ mod tests {
         assert_eq!(handle_slash(&mut c, "/brain"), "pick_brain");
         assert_eq!(handle_slash(&mut c, "/brain on"), "ok");
         assert!(c.brain);
+        // /ml: bare prints status (no picker); on/off persist.
+        assert!(c.ml, "ml defaults on");
+        assert_eq!(handle_slash(&mut c, "/ml"), "ok");
+        assert_eq!(handle_slash(&mut c, "/ml off"), "ok");
+        assert!(!c.ml);
+        assert_eq!(handle_slash(&mut c, "/ml bogus"), "ok");
+        assert!(!c.ml, "bad /ml arg must not change state");
+        assert_eq!(handle_slash(&mut c, "/ml on"), "ok");
+        assert!(c.ml);
         // /rlm: bare opens panel; on/auto/off persist (off stores "").
         assert_eq!(handle_slash(&mut c, "/rlm"), "pick_rlm");
         assert_eq!(handle_slash(&mut c, "/rlm auto"), "ok");

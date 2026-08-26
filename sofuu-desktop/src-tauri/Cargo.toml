@@ -1,0 +1,35 @@
+[package]
+name = "sofuu-desktop"
+version = "0.1.0"
+description = "Sofuu Desktop — the sofuu runtime as a first-class macOS app"
+edition = "2021"
+license = "MIT"
+
+# PLAN-DESKTOP: the backend LINKS sofuu-core in-process (no sidecar, no
+# daemon). Never add sofuu-capi here — its duplicate no_mangle symbols are
+# fatal under the workspace's fat LTO.
+[lib]
+name = "sofuu_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+window-vibrancy = "0.6"
+sofuu-core = { path = "../../crates/sofuu-core" }
+sofuu-ffi = { path = "../../crates/sofuu-ffi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

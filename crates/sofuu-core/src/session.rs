@@ -29,6 +29,7 @@ const EVENT_CAP: usize = 300;
 const STALE_AFTER_SECS: u64 = 180; // no heartbeat for 3 min → stale
 const PRUNE_AFTER_SECS: u64 = 7 * 24 * 3600; // ended sessions kept 7 days
 const MAX_NOTICES_PER_POLL: usize = 8;
+const MAX_SHARED_PEERS: usize = 8;
 
 // ── Data shapes (registry + the .qtsq session payload) ─────────────
 
@@ -572,22 +573,28 @@ impl PeerWatch {
 pub fn shared_context(project: &Path, own_id: &str) -> String {
     let now = unix();
     let reg = Registry::read(project);
+    // Only report sessions whose heartbeat is FRESH. The old code listed
+    // every never-ended session in the registry and then separately said
+    // "N other session(s), M active" — with a day of accumulated sessions
+    // that injected ~7k tokens of near-empty detail into EVERY request. A
+    // stale session (no heartbeat for STALE_AFTER_SECS) is not doing
+    // anything the model could sync with.
     let peers: Vec<&SessionInfo> = reg
         .sessions
         .iter()
-        .filter(|s| s.id != own_id && !s.ended)
+        .filter(|s| {
+            s.id != own_id
+                && !s.ended
+                && now.saturating_sub(s.last_seen) < STALE_AFTER_SECS
+        })
+        .take(MAX_SHARED_PEERS)
         .collect();
     if peers.is_empty() {
         return String::new();
     }
 
-    let active = peers
-        .iter()
-        .filter(|s| now.saturating_sub(s.last_seen) < STALE_AFTER_SECS)
-        .count();
-
     let mut lines = vec![format!(
-        "[Shared project context — {} other session(s), {active} active]",
+        "[Shared project context — {} active session(s)]",
         peers.len()
     )];
     for s in peers {
@@ -606,14 +613,12 @@ pub fn shared_context(project: &Path, own_id: &str) -> String {
             age_s,
             s.host
         );
-        if now.saturating_sub(s.last_seen) < STALE_AFTER_SECS {
-            if let Some(data) = load_session_data(project, &s.id) {
-                if let Some(last) = data.events.iter().rev().find(|e| e.kind == "prompt") {
-                    ent.push_str(&format!(
-                        " · last activity: {}",
-                        truncate(&sanitize_peer_text(&last.text), 120)
-                    ));
-                }
+        if let Some(data) = load_session_data(project, &s.id) {
+            if let Some(last) = data.events.iter().rev().find(|e| e.kind == "prompt") {
+                ent.push_str(&format!(
+                    " · last activity: {}",
+                    truncate(&sanitize_peer_text(&last.text), 120)
+                ));
             }
         }
         lines.push(ent);

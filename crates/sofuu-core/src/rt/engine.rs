@@ -36,6 +36,7 @@ use crate::modules::{
     process::{mod_process_cleanup, mod_process_register, process_dispatch_uncaught},
 };
 use crate::rlm::js_api::sofuu_rust_register_engine_js;
+use crate::ml::mod_ml_register;
 use crate::rt::{
     ai::mod_ai_register,
     cjs::{cjs_to_esm, is_cjs, mod_cjs_register},
@@ -225,8 +226,16 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         mod_http_server_register(ctx);
         mod_http_sse_register(ctx);
         mod_ai_register(ctx);
+        mod_ml_register(ctx); /* PLAN-ML-GATES: sofuu.ml.* (after ai — reuses its patterns) */
         mod_mcp_register(ctx);
         mod_cjs_register(ctx);
+        // PLAN-DESKTOP A: the cross-thread poke handle (unref'd — inert for
+        // hosts that never send one; the desktop uses it for cancel +
+        // approvals while a turn's blocking eval is running).
+        crate::rt::host_poke::sofuu_host_poke_init(ctx);
+        // PLAN-DESKTOP C: sync session-mesh primitives for the shipped
+        // chat.js turn engine (qtsq codec + sync registry file I/O).
+        crate::rt::session_js::mod_session_js_register(ctx);
     }
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the
@@ -748,6 +757,9 @@ unsafe fn engine_destroy(eng: *mut SofuuEngine) {
     }
     // SAFETY: eng is live for the whole teardown sequence.
     unsafe { sofuu_rt_report_pending_rejections((*eng).ctx) };
+    // PLAN-DESKTOP A: close the poke handle before the loop walk so the
+    // close callback frees its storage (the walk skips closing handles).
+    unsafe { crate::rt::host_poke::sofuu_host_poke_shutdown() };
     unsafe { sofuu_loop_close() };
     unsafe { mod_process_cleanup((*eng).ctx) };
     unsafe { qjs::JS_RunGC((*eng).rt) };

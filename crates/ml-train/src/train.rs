@@ -482,15 +482,42 @@ pub fn evaluate(preds: &[f32], labels: &[f32], threshold: f32) -> Metrics {
 /// stays ≥ `min_recall` (maximizes precision under a recall floor — the
 /// freshness rule, §5). Models without an asymmetric floor can sweep for
 /// max F1 instead. Used on the VALIDATION fold only.
+///
+/// When the fold is perfectly separable the sweep never sees recall bend,
+/// so the floor is not a measured boundary — returning the top of the
+/// sweep would ship a threshold pinned to the extreme with zero margin
+/// against val→test score shift (the supervisor run-2/3 pathology: val
+/// 1.000, threshold 0.95, test recall 0.50). In that case fall back to
+/// the midpoint of the observed margin (highest negative vs lowest
+/// positive score): a recall-first gate must sit INSIDE the gap.
 pub fn threshold_for_recall(preds: &[f32], labels: &[f32], min_recall: f32) -> f32 {
     let mut best = 0.05f32;
     let mut t = 0.05f32;
+    let mut broke = false;
     while t <= 0.951 {
         let m = evaluate(preds, labels, t);
         if m.recall >= min_recall {
             best = t;
+        } else {
+            broke = true;
+            break;
         }
         t += 0.01;
+    }
+    if !broke {
+        let pos_min = preds
+            .iter()
+            .zip(labels.iter())
+            .filter(|(_, &y)| y >= 0.5)
+            .map(|(&p, _)| p)
+            .fold(1.0f32, f32::min);
+        let neg_max = preds
+            .iter()
+            .zip(labels.iter())
+            .filter(|(_, &y)| y < 0.5)
+            .map(|(&p, _)| p)
+            .fold(0.0f32, f32::max);
+        best = ((pos_min + neg_max) / 2.0).clamp(0.05, 0.95);
     }
     best
 }

@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Sofuu Desktop main window capabilities","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-title","core:window:allow-set-focus","core:window:allow-start-dragging","dialog:default","notification:default"]}}

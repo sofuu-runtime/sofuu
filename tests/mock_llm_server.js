@@ -10,13 +10,17 @@
 // Run:  ./sofuu run tests/mock_llm_server.js 18699
 
 const PORT = parseInt(process.argv[process.argv.length - 1] || "18699", 10);
+let curPtk = 12; /* set per-request; kept in scope for sse/jsonReply */
 
+// Token accounting: the mock reports its real request size (chars/4 of
+// every message) instead of a fixed usage — a provider that always
+// reports prompt_tokens=12 makes the chat footer meter useless in E2E.
 function sse(res, text) {
   res.writeHead(200, { "Content-Type": "text/event-stream" });
   const mid = Math.max(1, Math.ceil(text.length / 2));
   res.write("data: " + JSON.stringify({ choices: [{ delta: { content: text.slice(0, mid) } }] }) + "\n\n");
   res.write("data: " + JSON.stringify({ choices: [{ delta: { content: text.slice(mid) } }] }) + "\n\n");
-  res.write("data: " + JSON.stringify({ usage: { prompt_tokens: 12, completion_tokens: 6 } }) + "\n\n");
+  res.write("data: " + JSON.stringify({ usage: { prompt_tokens: curPtk, completion_tokens: Math.max(1, Math.ceil(text.length / 4)) } }) + "\n\n");
   res.write("data: [DONE]\n\n");
   res.end();
 }
@@ -25,7 +29,7 @@ function jsonReply(res, text) {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.send(JSON.stringify({
     choices: [{ message: { role: "assistant", content: text } }],
-    usage: { prompt_tokens: 12, completion_tokens: 6 },
+    usage: { prompt_tokens: curPtk, completion_tokens: Math.max(1, Math.ceil(text.length / 4)) },
   }));
 }
 
@@ -39,13 +43,14 @@ const server = sofuu.http.createServer((req, res) => {
     all += " " + c;
     if (String(msgs[i].role) === "system") sys += " " + c;
   }
+  curPtk = Math.max(1, Math.ceil(all.length / 4));
   let reply;
   if (sys.indexOf("AGENT=helper") >= 0) reply = "HELPER-RAN-OK";
   else if (all.indexOf("(file not found or empty)") >= 0 ||
            all.indexOf("(error:") >= 0) reply = "SAW-MISSING-MARKER";
   else if (all.indexOf("FILE-CONTENT-CANARY-8321") >= 0) reply = "SAW-FILE-CONTENT";
   else reply = "PLAIN-OK";
-  console.log("MOCK-LLM: reply=" + reply);
+  console.log("MOCK-LLM: reply=" + reply + " ptk=" + curPtk + " msgs=" + msgs.length + " bytes=" + all.length + " sizes=" + msgs.map(function (m) { return (m.role || "?").slice(0, 4) + ":" + String(m.content || "").length; }).join(",") + " heads=" + msgs.map(function (m) { return String(m.content || "").slice(0, 100).replace(/\n/g, "\\n"); }).join(" |"));
   if (parsed.stream) sse(res, reply); else jsonReply(res, reply);
 });
 /* Hold the server reference for the process lifetime — an unreferenced

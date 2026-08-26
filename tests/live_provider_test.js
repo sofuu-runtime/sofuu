@@ -27,7 +27,6 @@ const PROVIDER = process.env.SOFUU_LIVE_PROVIDER || "";
 const KEYS = [
   ["openai", "OPENAI_API_KEY", "gpt-4o-mini"],
   ["anthropic", "ANTHROPIC_API_KEY", "claude-3-5-haiku-latest"],
-  ["gemini", "GEMINI_API_KEY", "gemini-1.5-flash"],
   ["openrouter", "OPENROUTER_API_KEY", "openai/gpt-4o-mini"],
 ];
 

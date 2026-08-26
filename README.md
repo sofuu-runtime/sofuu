@@ -37,6 +37,24 @@ make
 
 ---
 
+## Sofuu Desktop (macOS)
+
+A native Tauri app wrapping the same engine — same turn engine
+(`src/js/chat.js`), same session mesh, same agents; API keys live in the
+macOS Keychain. Design + build details: `PLAN-DESKTOP.md`.
+
+```bash
+cd sofuu-desktop
+npm install
+npm run tauri dev      # dev window
+npm run tauri build    # → target/release/bundle/macos/Sofuu.app (+ .dmg)
+```
+
+The desktop app adds a permission gate: read-only tools run automatically;
+anything that writes or executes asks first (allow / deny / always-allow).
+
+---
+
 ## Quick Start
 
 **Pick a provider on first launch — there is no default model:**
@@ -46,16 +64,28 @@ sofuu        # first run: guided setup asks for provider + model (+ key)
              # later: /provider to switch, /model to change model
 ```
 
-All providers are equal citizens — settings persist in `~/.sofuu/config.json`:
+Sofuu speaks three ENDPOINT formats (a "provider" is just a saved endpoint +
+key + format). Settings persist in `~/.sofuu/config.json`:
 
-| `provider`    | example `model`            | API key                          |
-|---------------|----------------------------|----------------------------------|
-| `"openai"`    | `"gpt-4o"`                 | `OPENAI_API_KEY`                 |
-| `"anthropic"` | `"claude-sonnet-4-6"`      | `ANTHROPIC_API_KEY`              |
-| `"gemini"`    | `"gemini-1.5-pro"`         | `GEMINI_API_KEY`                 |
-| `"openrouter"`| `"google/gemma-3-27b-it:free"` | `OPENROUTER_API_KEY`         |
-| `"ollama"`    | `"llama3"`                 | none (local server)              |
-| `"custom"`    | any                        | any OpenAI-compatible endpoint   |
+| wire (endpoint format)        | example provider | example `model`   | API key              |
+|-------------------------------|------------------|-------------------|----------------------|
+| OpenAI (`/chat/completions`)  | `"openai"`       | `"gpt-5"`         | `OPENAI_API_KEY`     |
+| OpenAI (`/chat/completions`)  | `"openrouter"`   | `"z-ai/glm-4.6"`  | `OPENROUTER_API_KEY` |
+| Anthropic (`/v1/messages`)    | `"anthropic"`    | `"claude-sonnet-4-6"` | `ANTHROPIC_API_KEY` |
+| local server (`/api/chat`)    | `"ollama"`       | `"llama3"`        | none                 |
+
+Any other host with an OpenAI-compatible or Anthropic endpoint works too —
+add it with `/provider` (the wire format is auto-detected from the URL).
+
+**Endpoints are formats, not companies.** The OpenAI endpoint
+(`/chat/completions`) is what MOST providers speak — deepseek, qwen, grok,
+llama, mistral and countless gateways serve their own models through it; it
+is not limited to OpenAI models. The Anthropic endpoint (`/v1/messages`) is
+named for where it originated but any provider/model may use it. Sofuu keeps
+these orthogonal: request SYNTAX comes from the endpoint, limits (context
+window, max output, thinking) come from the model's capability registry — so
+a Claude model behind an OpenAI-format gateway, or a non-Claude model behind
+an Anthropic-format one, both just work.
 
 **Stream an AI response — no packages to install, no SDK to configure:**
 
@@ -184,18 +214,36 @@ sofuu help                   # Print usage help
 /hooks              # Show ~/.sofuu/hooks.js user middleware info
 /resume [id]        # Browse + resume a past session
 /serve              # Info on serving the brain over HTTP
+/ml [on|off|learn|reset|wrong|info]  # Context-economy gates + supervisor online learning
 
 # Session mesh (same project shares context in real time)
 /sessions           # List sessions on this project
 /context [id]       # Show a session's full context
-/ctx [<tokens>]     # View/set the context window (max 1M)
-/maxout [<tokens>]  # View/set max output tokens (max 384k)
+/ctx [<tokens>]     # View/set the context window (default = the model's real window)
+/maxout [<tokens>]  # View/set max output tokens (default = the model's real max output)
 /work <desc>        # Announce what you are working on
 /done               # Clear your current task
 /note <msg>         # Record a personal note (peers see it)
 /notify <msg>       # Broadcast a critical notice to all sessions
 /sync [on|off]      # Toggle session-mesh polling
 ```
+
+### Dynamic limits & reasoning effort (per-model, not hardcoded)
+
+Sofuu resolves every limit from a per-model capability registry
+(`sofuu.ai.modelCaps(model)`) — never from flat constants:
+
+- **Max output (output-only)** — `max_tokens`/`max_completion_tokens` is strictly output limit per model
+  (e.g. 64k for `claude-sonnet-4.x`, 128k for `gpt-5`, 100k for o-series).
+  Unknown models on OpenAI omit the field (provider default); Anthropic unknown gets endpoint-driven `~71k` so any model can use thinking. `/maxout <n>` overrides; 384k is the config ceiling. Output limit never defines thinking.
+- **Context window (total `input + thinking + output`)** — e.g. `1M` total. History budgeting, `@file` attachment budgets, recall budgets and tool-result caps all scale with `ctxWindow`. `/ctx <n>` overrides. **Per-answer limits are not session caps:** `32k` thinking and `64k` output are *per-answer* limits (how much the model can think/output in one answer). Across many turns inside the `1M` window you can think `≫32k` and output `≫64k` cumulatively — each turn's `thinking+output` just appends to `history` until the window fills. When the window is nearly full (`70%` of `ctxBudget`), CLI **auto-compresses** by summarizing the whole context into one system message and resetting usage to `~0` so you can continue indefinitely.
+- **Thinking effort** — `/effort low|medium|high|max` is strictly what you picked (`off` → no thinking on any wire, never more than selected):
+  - **Anthropic wire (`/v1/messages`) `64k` is *thinking* max, not context window** (`200k`/`1M` etc). It is endpoint-driven — any model on that endpoint can use it (not only Claude). Budget = fraction of `ctxWindow*0.30` capped at `64k` (`low 6%`, `medium 25%`, `high 50%`, `max 90%`). E.g. `200k` ctx → `60k` thinking cap → `max` `54k` thinking. Thinking lives inside total context, does not define output limit (`max_output` stays output-only).
+  - **OpenAI wire (`/chat/completions`) is generic** — hosts almost all providers/models, not only OpenAI's `gpt-5.5` etc. Models with a discrete ladder (`o-series`, `GPT‑5` → `minimal/low/medium/high`) accept only their supported levels; picking `max` (Anthropic-only) **falls back to `high`** strictly, never more than selected. Non-reasoning models omit the field; `off` → no thinking on any wire.
+  - If a model rejects thinking at runtime anyway (undocumented endpoint),
+    sofuu detects it from the API error, marks the model as non-thinking
+    (persisted), tells you, and retries the turn once without effort. The
+    `/effort` picker then reports: *this model does not support thinking*.
 
 Settings (provider, model, effort, brain) persist in `~/.sofuu/config.json` —
 the file is written on first setup (the first-run wizard), there's no
@@ -238,8 +286,8 @@ word-agreement diff (>95% = ✓ verified; mismatches are surfaced inline).
 
 **File mentions** (`@file` or `@file:start-end`): type `@path` in a prompt to
 attach file contents. Paths resolve against cwd; `..` escapes are rejected.
-Attachments are token-budgeted (default 8192 tokens, configurable via
-`attach_budget`). History stores only the manifest — follow-up turns don't
+The attachment budget scales with the model's context window (~25% of it,
+2048–65536 tokens). History stores only the manifest — follow-up turns don't
 re-send files.
 
 **Agent mentions** (`@name <task>` or `@agent:name <task>`): run a loaded
@@ -248,11 +296,13 @@ run with the agent's system prompt, tools and memory scope; no chat history
 is injected. Agents win over same-named files; unknown names fall through to
 the `@file` path. Esc stops the run like any turn.
 
-**Per-model context windows**: RLM routing (`/rlm auto`, the default) derives
-the model's context window from a built-in per-model table (GPT/Claude/
-Gemini/Llama/Qwen/…), so oversized turns route correctly instead of assuming
-a flat 32k window. An explicit `/ctx <tokens>` override always wins.
-`sofuu.agent.contextWindow(model)` exposes the lookup read-only.
+**Per-model capability registry**: context windows, max output tokens,
+thinking support and effort ladders come from a built-in per-model table
+(`rt/model_caps.rs`, exposed as `sofuu.ai.modelCaps(model)`). RLM routing
+(`/rlm auto`) uses the real window (GPT/Claude/Llama/Qwen/Grok/…) so
+oversized turns route correctly; output requests default to the model's
+real max output instead of a flat constant. Explicit `/ctx` and `/maxout`
+overrides always win.
 
 **Directory watching** (`/watch <path>`): watches a directory for changes
 (mtime + size poll on the 1s tick, 2k file cap, skips `.git`/`node_modules`/
@@ -343,12 +393,18 @@ for the full embedding contract. Design + status: [`PLAN-HEADLESS.md`](PLAN-HEAD
 ```js
 // Stream tokens as they arrive — non-blocking, C-backed
 const stream = sofuu.ai.stream("What is the speed of light?", {
-  provider: "openai",   // "anthropic" | "gemini" | "ollama" | "openrouter" | "custom"
-  model: "gpt-4o",      // required — there is no default model
+  provider: "openai",   // endpoint format: "openai" | "anthropic" | "local"
+                        // (any other name = a custom OpenAI-compatible host)
+  model: "gpt-5",       // required — there is no default model
 });
 for await (const chunk of stream) {
   process.stdout.write(chunk.text);
 }
+
+// Per-model capability registry (powers the dynamic limits)
+JSON.parse(sofuu.ai.modelCaps("claude-sonnet-4-6"))
+// → { known: true, ctxWindow: 200000, maxOutput: 64000,
+//     thinking: "budget", maxThinkingBudget: 64000, efforts: [] }
 
 // One-shot completion
 const result = await sofuu.ai.complete("What is 2 + 2?", { provider: "openai", model: "gpt-4o" });
@@ -490,6 +546,123 @@ output caps, killed on expiry). Rails: writes are jailed to the project
 directory; `SOFUU_NO_SHELL=1` strips `bash` entirely; every tool result is
 additionally capped by the loop's truncation. Pick individual tools with
 `tools: ["read_file", "edit_file", ...]`, or `{ builtin: "grep" }`.
+
+### `sofuu.ml` — Context-Economy Gates (PLAN-ML-GATES)
+
+Tiny on-device models (~8.5k params each — offline, deterministic,
+zero-API) that ADVISE the agent loop: they never filter, cap, reorder, or
+delete anything on the data path. Guidance rides the ephemeral context
+message or the tool result; the LLM decides. `/ml off` (persisted) or
+`SOFUU_NO_ML=1` disables everything; every call is try/catch-guarded so a
+gate failure can never break a turn.
+
+```js
+// Freshness — is this material current for this task? (trained, baked
+// weights: 28→112→48→1, threshold tuned for recall; §5/§10 of the plan)
+const v = JSON.parse(sofuu.ml.freshness.score(text, task,
+  JSON.stringify({ kind: "web" })));   // kind: web|memory|tool|file
+// → {"score":0.99,"stale":true,"years":6.0,"reason":"dated 2020"}
+
+// Supervisor — is this NEXT call worth making? (trained, baked weights:
+// 33→104→44→1, threshold 0.82; §11 of the plan). Mechanical rules (exact
+// repeat calls, re-reads of unchanged files) speak first; where they are
+// silent, the net speaks. Advise only — the call still runs; the nudge
+// rides the tool result ("[supervisor: …]").
+const c = JSON.parse(sofuu.ml.supervisor.check(JSON.stringify(
+  { run, step, tool, sig, target, argsText, task, skipTargets: [], budget: 20 })));
+// → {"ok":false,"reason":"dup_call","source":"rule","score":1.0,
+//    "nudge":"identical call already made at step 1 …"}
+
+// Loop-boundary checkpoint — is the RUN itself spinning/stalled/over
+// budget? (the "__loop__" pseudo-action; silent under 3 recorded calls)
+const l = JSON.parse(sofuu.ml.supervisor.loop(JSON.stringify(
+  { run, step, budget: 20 })));
+// → {"ok":false,"reason":"loop_spinning","source":"model","nudge":"…"}
+
+// Online-learning feedback (§13, off by default — see /ml learn below)
+sofuu.ml.feedback(JSON.stringify(
+  { kind: "outcome", model: "supervisor", run, step, wasted: true }));
+
+// Compaction — which history segments are mechanical junk? (trained,
+// baked weights: 33→104→44→1; §12 of the plan). The net SELECTS; the
+// caller acts. Free tiers (dup/boilerplate/retrievable) are safe to drop
+// without an LLM; "summarize" segments need one.
+const p = JSON.parse(sofuu.ml.compaction.plan(JSON.stringify(
+  { task, summary, recent, segments }), JSON.stringify({ budget: 1200 })));
+// segments: [{ text, tokens, age, kind, retrievable, compacted }]
+// → {"compact":[2,4,5,3],"keep":[0,1,6,7],"freeable":1018,
+//    "tiers":["dup","dup","dup","dup"],"scores":[...]}
+
+// Relevance — within a fixed budget, which candidates deserve the space?
+// (trained, baked weights: 37→104→44→1, threshold 0.95 recall-first; §6 of
+// the plan). Pre-retrieval ADVISOR: it scores a menu of candidates against
+// the task and returns use/skip advice — it never mutates the menu.
+const r = JSON.parse(sofuu.ml.relevance.plan(JSON.stringify(
+  { task, recent, candidates }), JSON.stringify({ kept: [0] })));
+// candidates: [{ text, kind: "file|memory|web|other", strength, role, path }]
+// → {"use":[0],"skip":[1,2,3,4,5],"scores":[...]}  (use ordered best-first)
+
+sofuu.ml.info();     // gate states + working-set counters (JSON)
+sofuu.ml.track(json) // feed the in-memory context working set
+```
+
+When the freshness gate fires, the turn gets ONE evidence-carrying notice
+(`[freshness] … dated 2019 … verify its currency …`) on the next context
+boundary. Acceptance bar (held-out construction families, measured once):
+accuracy 0.997, precision 1.000, recall 0.990 — beating logistic
+regression (0.976) on identical features; committed weights re-verified by
+`cargo test` fixtures on every build.
+
+Chat uses the compaction model as an opportunistic gate in front of the
+one-shot cliff: while usage is past half the context budget, each pass
+drops the oldest turns whose user prompt AND assistant answer are both
+free-tier junk (verbatim dups, boilerplate, re-fetchable reads) — never
+the newest turn, never a half-flagged turn, zero LLM calls. Measured on
+the repeated-prompt E2E (`tests/chat_compact_e2e.sh`): the gate frees the
+junk a turn at a time, keeps usage below the 70% cliff, and makes exactly
+one provider request per turn; with `SOFUU_NO_ML=1` the cliff alone still
+fires exactly as before. Compaction acceptance bar (held-out families):
+test accuracy 1.000, precision 1.000, recall 1.000 (8,201 params,
+threshold 0.41 = margin midpoint); a deterministic dedupe rule (cosine
+≥ 0.95) sits below the model so exact repeats are caught even when the
+recent window is full of similar junk.
+
+The agent uses the relevance model as a pre-retrieval advisor over the
+recalled-memory menu: before the turn it scores the candidates against the
+task and renders ONE `[relevance] … likely on-task: …; likely tangential: …
+Advisory only` notice on the ephemeral context message — nothing is
+filtered, capped, or dropped; the LLM decides what to rely on. Two
+deterministic rules sit below the model (a near-verbatim repeat of an
+already-kept candidate, and the never-use class). Relevance acceptance bar
+(held-out construction families): test accuracy 0.962, precision 1.000,
+recall 0.924 (8,617 params, threshold 0.95) — beating logistic regression
+(0.934) on identical features; the model leans on BM25 over the candidate
+set plus a 5-char stem channel to catch morphological echoes
+(migrates↔migration) that a flat cosine/overlap threshold misses.
+
+The agent runs the supervisor as a per-call pre-check AND a loop-boundary
+checkpoint: before each tool call, `check()` layers the trained net over
+the certain rules (exact repeat calls, re-reads of unchanged files) and the
+nudge rides the tool result in-band (`[supervisor: …]`); at each loop
+boundary the `__loop__` pseudo-action asks whether the RUN itself is
+spinning, stalled, or over budget (one notice per class per run — no
+nagging). A write invalidates prior reads of that file, so a re-read after
+an edit is never flagged. Supervisor acceptance bar (held-out construction
+families): test accuracy 1.000, precision 1.000, recall 1.000 (8,201
+params, threshold 0.82 = margin midpoint of the val fold) — beating
+logistic regression (0.945) on identical features.
+
+Online learning (§13) is the escape hatch for messiness the synthetic
+training set cannot foresee — and it is OFF by default. `/ml learn` adapts
+ONLY the supervisor's output layer from labeled runtime examples, under
+four guardrails: a trust region (‖Δw‖ ≤ 0.25·‖w₀‖, projected), replay
+anchors (8 canonical fixtures in every batch), a batch floor (16 examples
+or it refuses), and an adoption gate (the new layer is adopted only if
+every fixture stays correct at the baked threshold). Adopted deltas persist
+separately (`~/.sofuu/ml/supervisor_online.f32`), keyed to the pretrained
+blob's hash so a re-bake invalidates them. `/ml reset` clears the
+adaptation, `/ml wrong` marks the most recent flag as a mistake, `/ml info`
+reports threshold + online state + working set.
 
 ### `sofuu.web` — Web Search & Page Reading
 

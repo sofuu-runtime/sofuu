@@ -1,10 +1,516 @@
 # Sofuu — Task & Status Board
 
-> *Status as of 2026-08-21. Everything marked ✅ was verified by running it (builds + scripted/pty/end-to-end tests), not by reading code claims.*
+> *Status as of 2026-08-25. Everything marked ✅ was verified by running it (builds + scripted/pty/end-to-end tests), not by reading code claims.*
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
-> Active plan docs (2026-08-21): `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` (repo root).
+> Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
+
+---
+**Verified 2026-08-26** — the footer context meter is now measured the
+way claude/opencode measure it: it shows CURRENT context usage of the
+next request, not cumulative lifetime tokens.
+
+- ✅ **Real meter** (`chat.rs`): calibrate from the first LLM request's
+  `prompt_tokens` (captured before tool results) → `usedCtx = ctxOverhead +
+  historyTokens()`. Grows with history, drops on compaction. Native
+  `sofuu.ai.estimateTokens` when available, else chars/4.
+- ✅ **Overhead extraction**: `ctxOverhead = firstPromptTk − history −
+  turnTk` (a constant that survives compaction — tool-call chatter + date
+  line), measured per turn and held for the footer.
+- ✅ **Visible drop on compaction**: both the P5 auto-cliff and `/compact`
+  print `meter A→B` (A > B) in the transcript and re-render the footer
+  immediately; `tests/chat_compact_e2e.sh` asserts the drop (A4).
+- ✅ **Honest mock** (`tests/mock_llm_server.js`): reports its real request
+  size (`curPtk = ceil(all/4)`) instead of a fixed 12, so meter e2e has
+  signal.
+- ✅ **Root-cause fix for "context fills too fast"** (`session.rs
+  shared_context`): the "Shared session notes" block serialized EVERY
+  un-ended session in the registry (274+, mostly stale) into every
+  request — 28,140 chars ≈ 7k tokens of constant per-request overhead
+  that compaction could never remove. It now lists only heartbeat-fresh
+  peers (STALE_AFTER_SECS = 180 s), capped at 8, and returns empty when
+  nobody is active. Live pty evidence: ephemeral context message 28,140 →
+  25 chars; turn-1 request 7.8k → 795 ptk; footer `ctx 7.8k/3k · 261%`
+  → `795/3k · 27%`.
+
+---
+
+## ✅ Completed — PLAN-ML-GATES: the context-economy models (all 5 phases landed, 2026-08-26)
+
+Tiny on-device models (~8.5k params each — offline, deterministic,
+zero-API) that ADVISE the agent loop on what gets trusted, kept, and
+done — never filtering, capping, or deleting (the guidance rides the
+ephemeral context message or the tool result; the LLM decides).
+
+- ✅ **Date fix (§7, zero params):** `Current date: YYYY-MM-DD.` rides the
+  per-turn EPHEMERAL user message (`agent.js` ctxParts) — the system prompt
+  stays byte-stable for prefix caching. ~8 tokens/turn.
+- ✅ **Shared context working set (§8):** `ml/context.rs` — structured RAM
+  view of the run trajectory (runs/calls/segments, capped), fed by
+  `sofuu.ml.track` from agent.js; disk stays source of truth.
+- ✅ **Rule-based supervisor subset (§11):** exact repeat calls (canonical
+  sorted-key signature) + re-reads of unchanged files — advise-only nudge
+  appended to the tool result (`[supervisor: …]`) + `mlgate` trace event.
+- ✅ **Freshness model end-to-end (§5, phase 2):** is this material current
+  for THIS task? Arch 28→112→48→1 = **8,721 params**, baked via
+  `include_bytes!` (CRC-checked blob, `SML1`). Features: keyword-hit
+  densities (stale/hedge/fresh/legacy banks), year scans, explicit dates,
+  version strings, URL shape, task time-sensitivity, sentence-max anchor
+  cosines, source kind/strength/age. Trained by `crates/ml-train` (same
+  `extract()` code the runtime runs — train/serve skew structurally
+  impossible; splitmix64-seeded Adam, bit-reproducible).
+  - **Measured (held-out construction families, one measurement):**
+    test accuracy **0.997**, precision **1.000**, recall **0.990** at
+    threshold 0.95 (picked on the validation fold only, 0.95-recall
+    selection floor) — beating logistic regression on identical features
+    (0.976) and the majority heuristic (0.733). All four §10 gates pass.
+  - **Wiring:** one evidence-carrying notice per boundary
+    (`[freshness] … dated 2019 … verify its currency …`) — recalled memory
+    scores into ctxParts; tool results queue verdicts flushed as ONE
+    ephemeral user message before the next generation. `/ml [on|off]`
+    persisted; `SOFUU_NO_ML=1` strips registration; every JS call
+    try/catch-wrapped.
+  - **Verified by running:** 210 workspace tests green (19 ml:: incl.
+    committed-weights fixture gates + bit-exact determinism + CRC
+    refusal), `./sofuu run tests/agent_test.js` ALL PASSED (11 new ML
+    assertions incl. E2E notice-reaches-model + fresh-material silence),
+    `make test` 20/20, binary 2.2M ≤ 5MB cap, `ml-train eval` reproduces
+    the bar from the committed blob.
+- ✅ **Compaction model + chat gate (§6/§12, phase 3):** which history
+  segments are mechanical junk? Arch 33→104→44→1 = **8,201 params**, baked
+  via `include_bytes!` (CRC-checked blob, `SML1`). 33 features: size/age
+  ratios, decision + error + instruction word banks, reference anchors,
+  boilerplate + retrievable shape, TF-IDF dup cosines. 3,888 examples
+  across 17 construction families (train/val split by family, held-out
+  families test unseen CONSTRUCTIONS of trained channels — never an
+  untrained channel). Trained by `crates/ml-train` on the same
+  `extract()` code the runtime runs.
+  - **Measured (held-out families, one measurement):** test accuracy
+    **1.000**, precision **1.000**, recall **1.000** (logreg tie 1.000,
+    majority 0.500); threshold **0.41** = margin midpoint of the val fold
+    (keep max 0.000, disposable min 0.824 — the sweep never broke, so the
+    keep-safety gate sits INSIDE the gap, not at the floor). CV mean
+    accuracy 0.753, report-only: single-channel holdout folds are
+    structurally weak by construction.
+  - **Runtime (`sofuu.ml.compaction.plan(segmentsJson, optsJson)`):**
+    keep-window hard protection (age ≤ 1 never flagged); a deterministic
+    dedupe rule sits BELOW the model (cosine ≥ 0.95 flags exact repeats
+    even when the recent window is full of similar junk — measured
+    distinct-text cosine ceiling ≈ 0.81); free tiers (dup/boilerplate/
+    retrievable) ordered first; budget is a soft cap but the first two
+    candidates always go so a turn-granular caller can make progress.
+    The net SELECTS — the caller acts (§12: free tier first, no LLM).
+  - **Chat wiring (DRIVER `trimHistory`):** while usage is past 50% of
+    the ctx budget, each pass drops the OLDEST turns whose user prompt
+    AND assistant answer are BOTH free-tier — never the newest turn,
+    never a half-flagged turn, until usage drains below 50%. ASCII-only
+    dim line (`ml-compaction freed N tk …`); any failure falls through
+    to the cliff, which stays armed as the safety net.
+  - **Verified by running:** 228 workspace tests green (12 compaction
+    incl. committed-weights acceptance gates + bit-exact plan + keep-
+    window + mechanical-dup-survives-recent-similarity); dual-path E2E
+    `tests/chat_compact_e2e.sh` ALL PASSED — run A (`SOFUU_NO_ML=1`):
+    cliff fires twice, summarizer reaches the mock (13 requests); run B
+    (gate on): 7 gate passes free the dup turns one at a time, cliff
+    NEVER fires, exactly 10 requests (zero extra LLM calls), all 10
+    turns answered; `make test` 20/20; binary 2.39M ≤ 5MB; pty capture
+    shows the gate line, pure ASCII.
+- ✅ **Relevance model + pre-retrieval advisor (§6, phase 4):** within a
+  fixed budget, which candidates deserve the space? Arch 37→104→44→1 =
+  **8,617 params**, baked via `include_bytes!` (CRC-checked blob, `SML1`).
+  37 features: sim(content, task), **BM25 over the candidate set** (the
+  strong classical baseline — the bundled embedder is only hashed
+  char-trigram TF-IDF with a high cosine noise floor, so bare cosine is not
+  a signal), task-term overlap, **5-char stem match** (catches
+  migrates↔migration echoes a flat overlap threshold misses), word-BOUNDARY
+  marker hits, rank + set size, kind one-hots, brain strength/role, max-sim
+  to already-kept (near-dup), redundancy vs centroid, never-use anchors,
+  already-visible. 4,320 examples across 30 construction families
+  (train/val/test split by family; every feature channel ACTIVE in training;
+  every task bank appears with BOTH labels so the net keys on the
+  task×content relation, not the task phrasing; holdout families test unseen
+  CONSTRUCTIONS of trained channels, never an untrained channel).
+  - **Measured (held-out families, one measurement):** test accuracy
+    **0.962**, precision **1.000**, recall **0.924** at threshold **0.95**
+    (picked on the validation fold only, 0.90-recall selection floor) —
+    beating logistic regression on identical features (0.934), the
+    cosine-floor heuristic (0.580), and majority (0.500). All five §10 gates
+    pass. Recall-first asymmetry: a false drop is invisible and costs
+    correctness, so a candidate must clear a HIGH bar before the advisor
+    recommends spending tokens on it.
+  - **Runtime (`sofuu.ml.relevance.plan(candsJson, optsJson)`):** returns
+    `{use:[ids],skip:[ids],scores:[..]}` best-first. Two deterministic rules
+    sit BELOW the model (information-preserving skips): a near-verbatim
+    repeat of an already-kept candidate (cosine ≥ 0.90), and the never-use
+    class (license/generated/lockfile/minified, marker ≥ 0.50).
+  - **Wiring (agent.js pre-retrieval advisor):** over the recalled-memory
+    menu, one `[relevance] … likely on-task: …; likely tangential: …
+    Advisory only` guidance notice rides the SAME ephemeral context message
+    — nothing is filtered, capped, or dropped (Principle 1); the LLM
+    decides. `/ml off` + `SOFUU_NO_ML=1` disable it; every call
+    try/catch-wrapped.
+  - **Verified by running:** 197 workspace lib tests green (12 relevance
+    incl. committed-weights acceptance gates + morphological-echo fixture +
+    bit-exact plan + CRC refusal, all with robust score margins);
+    `./sofuu run tests/agent_test.js` ALL PASSED (7 new relevance assertions
+    incl. direct-API use/skip split + E2E notice-reaches-model + mlgate
+    event); `make test` 20/20; binary 2.4M ≤ 5MB cap.
+- ✅ **Supervisor model (§11, phase 5):** is this NEXT call worth making —
+  or is it a repeat, a wander, a spin? Arch 33→104→44→1 = **8,201 params**,
+  baked via `include_bytes!` (CRC-checked blob, `SML1`). 33 features: task
+  similarity (cosine/part-overlap/stem), dup channels (exact-sig, near-dup
+  cosine, repeat count), re-read channels, tool history, budget position,
+  trajectory health/breadth, skip-set, tool-family one-hots, trajectory
+  shape (recent repeats/revisits/drift/progress/error-streak/target-streak),
+  args size, off-task×late interaction, target adjacency. Trained by
+  `crates/ml-train` on the same `extract()` code the runtime runs, on
+  synthetic multi-domain trajectories built on the STEM rule: legitimate
+  actions echo the task's stem words; traps share at most a symbol/path
+  word, never a task word.
+  - **Measured (held-out construction families, one measurement):** test
+    accuracy **1.000**, precision **1.000**, recall **1.000** at threshold
+    **0.82** (margin midpoint of the val fold — waste max 0.638, let-run
+    min 0.998 — under the 0.90-recall selection floor) — beating logistic
+    regression on identical features (0.945) and the majority heuristic
+    (0.625). All five §10 gates pass. CV mean accuracy 0.806, report-only:
+    fold 2 (0.429) is the held-out-construction worst case; the shipping
+    split includes every family.
+  - **Layering (accuracy-first):** the mechanical RULES speak first —
+    exact repeat calls and re-reads of unchanged files are certain, so
+    their verdict carries `source:"rule"`. A mechanical EXCUSE sits next:
+    a write INVALIDATES prior reads of that file, so an identical-args
+    re-read re-anchors instead of flagging (write-read loops are still
+    policed at the loop boundary). Where the rules are silent, the NET
+    speaks at 0.82 with a waste class: dup_call / near_dup /
+    reread_unchanged / skip_advised / too_broad / over_budget / spinning /
+    off_task / waste_risk.
+  - **Loop-boundary checkpoint:** the `__loop__` pseudo-action scores the
+    RUN itself at each boundary (loop_over_budget / loop_spinning /
+    loop_stalled), one notice per class per run. A mechanical guard keeps
+    it silent under three recorded calls — spin/stall are PATTERN
+    predicates, and without it the net saturates on the tiny trajectory
+    and nags after the very first tool call of every run.
+  - **Wiring (agent.js):** pre-call check in `execOneTool` — the nudge
+    rides the tool result in-band (`[supervisor: …]`); loop boundary after
+    each step — an ephemeral user notice; `mlgate` trace events carry
+    source + score. Advise only — the call still runs (Principle 1).
+- ✅ **Online learning (§13, phase 5):** the escape hatch for the messiness
+  a synthetic training set cannot foresee — OUTPUT-LAYER-ONLY adaptation of
+  the supervisor (the frozen backbone is never touched). Guardrails, all
+  enforced by `ml/online.rs`: trust region (‖Δw‖ ≤ 0.25·‖w₀‖, projected,
+  not hoped), replay anchors (8 canonical fixtures mixed into every batch),
+  batch floor (≥16 examples or learn refuses), adoption gate (the new layer
+  is adopted ONLY if every fixture stays correct at the baked threshold),
+  and separate persistence — `~/.sofuu/ml/supervisor_online.f32`, keyed to
+  the pretrained blob's FNV-1a hash so a re-bake invalidates stale deltas.
+  OFF by default.
+  - **Surface:** `/ml learn|reset|wrong|info` in the chat; `sofuu.ml
+    .feedback({kind:"outcome"|"wrong"})` from JS. agent.js labels each
+    supervisor-checked call with a waste proxy (errored, or result < 80
+    chars) so examples accumulate while the gate runs; `/ml wrong` flips
+    the most recent flag. `/ml info` reports threshold, online state, and
+    the working set.
+  - **Verified by running:** 218 workspace lib tests green (67 ml:: incl.
+    supervisor committed-weights acceptance gates + rule-layer-first +
+    model-layer-catches-what-rules-miss + loop-boundary evidence guard +
+    online guardrails: trust-region projection, batch floor, adoption gate,
+    hash-keyed persistence refusal); `./sofuu run tests/agent_test.js` ALL
+    PASSED (8 new phase-5 assertions incl. direct rule/model layer split,
+    spinning-vs-healthy loop boundary, feedback accept/refuse, online-off
+    default); `make test` 20/20; binary 2.4M ≤ 5MB cap.
+
+---
+
+## ✅ Completed — fix: HTTP/2 transport cuts now retried instead of killing the turn (2026-08-25)
+
+A long tool-using turn (11+ rounds) died in a bare
+`✗ Stream error in the HTTP/2 framing layer` — screenshot 2026-08-25 19:16.
+That is libcurl `CURLE_HTTP2_STREAM` (92): a one-off transport hiccup on the
+provider side. The retry classifier (`STREAM_TRANSIENT_RE` in agent.js) only
+knew HTTP-status and connection-refused wordings, so the error fell through
+as "permanent" and the whole turn was lost — the user had to re-type the
+same question after ten minutes of tool work.
+
+- **Classifier extended with the libcurl transport-error family** — the
+  HTTP/2 resets (codes 92/16) and mid-transfer connection cuts (codes
+  18/52/55/56). Wordings verified against the REAL `curl_easy_strerror`
+  output on this machine's libcurl 8.7.1 ("Stream error in the HTTP/2
+  framing layer", "Error in the HTTP2 framing layer", "Transferred a partial
+  file", "Server returned nothing (no headers, no data)", "Failure when
+  receiving data from the peer", "Failed sending data to the peer"), with
+  the older wordings kept as alternates. First E2E run caught the gap: the
+  guessed "Empty reply from server" is NOT what 8.7.1 says for code 52.
+- **Classifier extracted and exported:** `isTransientProviderError(msg)` →
+  `sofuu.agent.isTransientProviderError`, so the policy is one testable
+  function instead of an inline regex.
+- **No-retry-after-content gate:** `streamWithRetry` now retries only while
+  NOTHING has been forwarded to the UI (no think/text chunk seen). A cut
+  mid-stream after content was shown fails loudly instead of re-streaming
+  the answer from scratch and duplicating text — this also closes a latent
+  duplication risk the old code had for mid-stream 429s/ECONNRESETs.
+
+- **Evidence:** `agent_test.js` A5 — 19 transient strings classified true,
+  5 permanent (auth/404/empty-stream/stall/no-such-tool) false; `partial429`
+  (in-stream 429 AFTER content) made exactly 1 request, no retry, cause
+  surfaced; `early429` (429 before tokens) made 3 (1 + 2 backoff retries) —
+  ALL PASSED. `tests/chat_no_response_e2e.sh` gained a sixth mode
+  (`MODECLOSE`: mock exits before writing response bytes): attempt 1 gets
+  "Server returned nothing (no headers, no data)", classified transient,
+  retried twice against the now-dead port, and the chat finally prints
+  `✗ Couldn't connect to server` — the final message being the RETRIES'
+  error (not attempt 1's) is the proof the transport cut was retried. All
+  five earlier failure modes still report loudly. `make test` 20/20.
+
+---
+
+## ✅ Completed — fix: "(no response)" cause (b) — silent step-budget breach (2026-08-25)
+
+Follow-up to `AUDIT-NO-RESPONSE-2026-08-24.md`. The audit found two root
+causes of `(no response)`: (a) empty provider streams (already fixed) and
+(b) the chat's flat **8-round step budget** silently killing longer
+tool-using turns — no final answer was attempted and the breach was never
+reported. Any coding task needing ≥ 9 rounds (read → read sections → grep
+→ edit → verify — completely ordinary) deterministically died in a bare
+`(no response)` indistinguishable from a dead provider.
+
+- **Cap: 8 → 200 rounds** (chat driver `def.budget.maxSteps`). Real coding
+  turns routinely take 10–30 rounds; 200 is effectively unlimited for
+  legitimate work but still stops a genuinely broken loop.
+  `SOFUU_CHAT_MAX_STEPS` env override is a test seam, not a user knob.
+- **Salvage round (agent.js):** ANY budget breach (steps/wall/tokens — but
+  never user cancel, Esc must stop instantly) now spends ONE final no-tool
+  call asking the model to summarize its progress and answer from what it
+  already has. Partial progress beats silence; a failed salvage keeps `''`
+  and the breach line still explains.
+- **Breach report (chat driver):** `budget_steps | budget_wall |
+  budget_tokens` now render `⏹ stopped: step budget (N rounds) reached`
+  (wall/token variants worded accordingly) next to the existing
+  `⏹ stopped (esc)` line — a breach can no longer be mistaken for a dead
+  provider.
+- **Anti-loop nudge: already landed.** The audit's claim that the ML
+  supervisor "detects but does not act" predates the current tree:
+  `ml/context.rs precheck` returns nudges for `dup_call` /
+  `reread_unchanged`, and agent.js appends `[supervisor: …]` to the tool
+  result in-band. Verified live in the E2E below. No change needed.
+- **Evidence:** `tests/chat_no_response_e2e.sh` gained a fifth mode
+  (`MODELOOP` in `mock_fail_server.js` burns rounds; `SOFUU_CHAT_MAX_STEPS=2`
+  shrinks the cap): the turn shows two tool rounds, the
+  `ml · dup_call · read_file (step 2)` gate line, the SALVAGED-SUMMARY
+  answer, and `⏹ stopped: step budget (2 rounds) reached`; all four earlier
+  failure modes still report loudly. `agent_test.js` A5 now asserts the
+  salvage answer on both `budget_steps` and `budget_tokens` breaches —
+  ALL PASSED. `make test` 20/20; `cargo test --release` all green; live
+  openrouter turn answered and exited clean.
+
+---
+
+## ✅ Completed — Sofuu Desktop Phase 1: Tauri app builds over sofuu-core (2026-08-24)
+
+The Electron shell is gone; `sofuu-desktop/` is now a **Tauri v2 macOS app**
+(Rust backend linking sofuu-core in-process + React/TS frontend, light cream
+theme locked on the 4 reference screenshots). Full `npm run tauri build`
+verified: `Sofuu.app` 8.3 MB + dmg 2.4 MB (no size gate on desktop — the
+5 MB cap stays CLI-only). Deviations documented in `PLAN-DESKTOP.md` §9.
+
+- ✅ **Host poke** (`sofuu-ffi/src/uv.rs` + `rt/host_poke.rs`): one unref'd
+  `uv_async_t` wakes the busy engine from any thread; cancel + approval
+  decisions reach the running turn via JS `__host_poke`.
+- ✅ **Shared turn engine** (`src/js/chat.js`, shipped): `sofuu.chat.{init,
+  submit, cancel, compact, clear, resume, resolveApproval, state,
+  sessionTurns, newSession, setProject}` — budget preflight, auto-compaction,
+  @mentions, MCP, no-think retry, session-mesh logging, all ported from the
+  DRIVER. **Permission gate**: read-only tools auto-pass; everything else
+  emits `approval_request` and awaits the host (denial → "denied by user"
+  tool result). Deviation: hooks.js middleware (F9) stays TUI-only — the
+  eval-based loader was rejected by the security scanner for shipped JS.
+- ✅ **Session mesh seam** (`rt/session_js.rs`): sync QTSQ save/load + atomic
+  file writes + `__session_project_root` deriving the mesh root exactly like
+  `session.rs`. chat.js writes the registry + `.qtsq` byte-compatibly with
+  the Rust mesh — verified by the CLI decrypting a JS-written session.
+- ✅ **Tauri backend** (`src-tauri/`): engine worker thread + command channel,
+  event sink → `sofuu://event`, approval registry, keychain-backed API keys
+  (never plaintext config).
+- ✅ **Frontend** per §4a locked spec: sidebar/topbar/composer/tool timeline/
+  approval dialog/settings modal, TypeScript strict, vite build green.
+- ✅ **CLI untouched** (workstreams B + C2 deferred until the ML session
+  settles): the TUI keeps its embedded DRIVER; gate run on it as-is —
+  `cargo test --release` 216/216 · `agent_test.js` ALL PASSED ·
+  `chat_compact_e2e.sh` ALL PASSED · `make test` 20/20 · `size-check` 2.2 MB.
+- ✅ Repo-wide link fix: refreshed `libqtsq.a` needs `compressor/libqtc.a`;
+  `sofuu-ffi/build.rs` links it when the QTSQ checkout is present.
+
+---
+
+## ✅ Completed — unresponsive models: wait up to 5 minutes, then fail loudly (2026-08-24)
+
+The CLI used to kill ANY request at a flat 120s TOTAL timeout — long
+thinking answers died mid-generation, while a truly dead provider still
+burned 2 minutes. Now patience is measured in SILENCE, not wall time,
+for every provider and model (stream, complete, and embed alike).
+
+- ✅ **Stall watchdog** (`rt/ai.rs`): every in-flight AI request chains
+  into a registry watched by a 1s uv timer; any request with no byte for
+  `SOFUU_STALL_TIMEOUT_SECS` (default **300s = 5 min**) is aborted with
+  `provider sent no data for Ns — the model is unresponsive (retry, or
+  switch models)`. Any byte (even an SSE heartbeat) resets the clock, so
+  an ACTIVE generation is never capped. The message stays OUT of the
+  agent's transient-retry regex — after 5 minutes of silence the user
+  gets the floor back, not another 5-minute wait.
+  - Why app-level: libcurl's `CURLOPT_LOW_SPEED_*` never self-wakes under
+    the socket-API multi setup (verified empirically — a silent stream
+    hangs past it); the watchdog refs its timer per in-flight request so
+    libuv's poll timeout bounds the wait, and unrefs to zero when idle so
+    it never pins the event loop.
+- ✅ **Connect phase capped at 30s** (`CURLOPT_CONNECTTIMEOUT`): an
+  unreachable endpoint fails fast with `connection timed out — provider
+  unreachable (…)`, which IS transient-classified → the agent's bounded
+  backoff retry applies (cheap: 30s attempts, not 5-minute ones).
+- ✅ **Old flat 120s total timeout DELETED** (default now 0 = none);
+  `opts.timeout_ms` still forces a total cap for callers that ask.
+- ✅ Watchdog covers all three request types via a common `AiReqHdr`
+  prefix (tag + link + last-byte timestamp) — chat streams, `ai.complete`
+  (RLM/sub-agents), and `ai.embed` (brain — runs every turn with brain
+  on, so a dead embedder can no longer hang the prompt forever).
+- ✅ E2E: `tests/mock_fail_server.js` grew `MODESILENT` (200 headers,
+  then never a byte); `chat_no_response_e2e.sh` runs it with a 3s cap and
+  shows the abort line. Probes verified all three silence shapes
+  (headers-only / one-chunk-then-silent / total-silent) abort at the cap,
+  and a blackhole-IP probe verified the 30.0s connect timeout message.
+
+*Verified: cargo test 194/194 · make test 20/20 · examples/agent_test.js
+ALL PASSED · 4-mode failure E2E green · live turn on
+openrouter/stealth/ox-alpha answered + clean exit (watchdog does not pin
+the loop).*
+
+---
+
+## ✅ Completed — fix: chat "no response" (silent stream failures) (2026-08-24)
+
+Asking a question could produce literally nothing — no answer, no error.
+Root cause was a flaky shared-pool model (intermittent upstream 429s)
+meeting three holes in the stream path; all three closed.
+
+### The holes
+- ✅ **In-stream SSE error frames were dropped** (`rt/ai.rs`): gateways
+  (OpenRouter) return HTTP 200 and report the upstream failure as a
+  `data: {"error": {...}}` frame AFTER headers. The parser ignored it →
+  the stream completed with zero chunks → silent "(no response)". Now:
+  the frame's `error.message`/`error.code` are extracted, stashed on the
+  stream req, the transfer is aborted, and the DONE path rejects the
+  iterator with `HTTP {code} — {message}` exactly like a >=400 body.
+- ✅ **No retry for transient provider errors** (`agent.js`): a 429 on a
+  shared pool meant the user re-typed the question. Both stream sites
+  (tool loop + finalAnswer) now share `streamWithRetry`: bounded backoff
+  (1.5s, 4s — max 2 retries) for transient failures only
+  (`HTTP 429|5xx`, rate-limit/timeout/connection text); auth/bad-request
+  errors still throw immediately. Retries are visible (`↳ provider error
+  (…) — retrying in Ns`).
+- ✅ **`no_think_models` poisoning**: the empty-stream retry called
+  `__chat_no_think(model)` on ANY empty response with effort set —
+  permanently persisting a false positive (empty ≠ thinking rejected;
+  rate limits also produce empties) and silently disabling thinking
+  forever. Removed from both sites; the no-effort probe stays (harmless,
+  in-turn only). The ONLY remaining no-think trigger is the chat loop's
+  explicit-rejection path (provider error naming thinking/reasoning).
+
+### Also
+- ✅ Piped (non-TTY) chat printed only `answer_delta` chunks — a
+  zero-delta turn showed nothing at all, not even "(no response)". The
+  final answer is now emitted when nothing streamed.
+- ✅ NEW regression test `tests/ai_stream_error_frame_test.js` (in the
+  `make test` registry, 11 asserts over the real curl path): in-stream
+  error frame rejects with code+text · HTTP 429 rejects with detail ·
+  empty stream completes without throwing · normal stream unaffected.
+- ✅ NEW chat-level E2E pair `tests/mock_fail_server.js` +
+  `tests/chat_no_response_e2e.sh` (isolated HOME, run manually): all
+  three failure modes now render visible output; `no_think_models`
+  stays `[]` after the session.
+
+*Verified: cargo test 194/194 · make test 20/20 · examples/agent_test.js
+80/80 · failure-mode E2E · two live turns on openrouter/stealth/ox-alpha
+(the model that reproduced the bug) both answered.*
+
+---
+
+## ✅ Completed — dynamic per-model limits (caps registry) + Gemini removal (2026-08-23)
+
+The hardcoded request constants are gone. Every limit now resolves through a
+per-model capability registry — because sofuu talks to ENDPOINTS (openai
+`/chat/completions`, anthropic `/v1/messages`, local `/api/chat`); what a
+request may ask for belongs to the MODEL, not the wire.
+
+### The registry
+- ✅ NEW `crates/sofuu-core/src/rt/model_caps.rs`: prefix-matched table
+  (first match wins, `org/model` forms match) with `{ctxWindow, maxOutput,
+  thinking}` where thinking = `None | Effort([levels]) | Budget(ceiling) |
+  Unknown`. Covers gpt-5/4.1/4o/o-series, claude 2→4.x, deepseek, qwen,
+  llama, mistral/mixtral, grok. Exposed to JS as `sofuu.ai.modelCaps(model)`
+  (JSON string; AI_FUNCS 8→9). 6 unit tests.
+- ✅ agent.js: `contextWindow()` consults the registry first (local table is
+  the offline fallback); new `sofuu.agent.modelCaps(model)` +
+  `sofuu.agent.maxOutputFor(defOrModel)`.
+
+### Output: no more flat caps
+- ✅ **Anthropic `max_tokens:4096` fallback DELETED** (`rt/ai.rs`):
+  explicit config → model's published max output → documented 16384 floor
+  for unknown models (Anthropic requires the field). Reasoning families on
+  the OpenAI wire emit `max_completion_tokens` instead of `max_tokens`
+  (which they reject). Local wire carries the cap in `options.num_predict`.
+- ✅ `/maxout` picker's "default" note shows the model's real max output;
+  help text updated ("default = model's real max output").
+
+### Thinking effort: honest and proportional
+- ✅ Anthropic budgets are FRACTIONS OF THE MODEL'S CEILING
+  ({low 1/16, medium ¼, high ½, max 9/10} of `min(ceiling, max_tokens −
+  1024 answer room)`): a 64k sonnet gets a real ~56.7k `max` budget — the
+  old clamp-to-16k made high==max==2048 at defaults. Temperature is skipped
+  when thinking rides along (API rejects temperature ≠ 1 + thinking).
+- ✅ OpenAI-wire ladders are capability-aware: unsupported levels fall back
+  to the HIGHEST supported level (`max` → `high`; no OpenAI-family model
+  has `max`); models without reasoning omit the field entirely (was:
+  guaranteed 400).
+- ✅ Runtime detection: a provider error matching /thinking|reasoning/i
+  marks the model in persisted `config.no_think_models`
+  (`__chat_no_think` native), informs, and retries the turn ONCE without
+  effort; the def builder suppresses effort for those models.
+- ✅ `/effort` picker is per-model: shows real computed budgets
+  (≈Nk tk of ceiling), only the model's actual ladder for OpenAI-wire,
+  and "**<model> does not support thinking**" for none/no-think models.
+  `/effort <lvl>` confirmation notes non-reasoning models.
+
+### Input: scales with the model window
+- ✅ chat driver `ctxBudget()` / footer ctx metric / pickCtx default /
+  `@file` attach budget all resolve: `/ctx` override → model registry →
+  endpoint fallback map (the old flat-32768-for-everyone is last resort).
+  Attach budget = ~25% of window clamped [2048, 65536] (was flat 8192).
+- ✅ agent.js recall budget ≈ 2% of window [1024..16384]; tool-result cap
+  ≈ win/8 chars [4000..24576] (head/tail now ratios of the cap).
+
+### Gemini removed (never a wire format)
+- ✅ pricing seeds, MODEL_CTX rows, CTX tests (→ grok-4), live-provider
+  key row, desktop SettingsModal option — all gone. Provider enum was
+  already Gemini-free.
+
+Verified: `cargo test` 156 green (+12 new: model_caps ×6, ai wiring ×2
+rewritten, …), `make test` 19/19 JS suites, binary 2.16MB ≤ 5MB; live REPL
+checks confirm `modelCaps`, `contextWindow`, `maxOutputFor`.
+
+Endpoint orthogonality (2026-08-23, follow-up): wires are FORMATS, not
+companies — the openai endpoint carries most providers' non-OpenAI models
+and the anthropic endpoint may serve non-Claude models. Registry entries
+are model-name-keyed (wire-agnostic) with reworded headers + a new
+`wires_and_model_families_are_orthogonal` test proving all four
+(wire × family) combos build sane requests; README spells the rule out.
+The openai-wire param-name choice (`max_completion_tokens` for reasoning-
+ladder FAMILIES) is documented as intentional — gateways hosting those
+names support it; everything else keeps `max_tokens`.
+
+Known follow-up (not started): the OpenAI **`/responses`** wire format is
+NOT implemented yet — today's openai profile speaks `/chat/completions`
+only. Adding it means a second body builder + its own SSE event shapes
+(`response.output_text.delta`, function-call items); tracked as its own
+task.
 
 ---
 

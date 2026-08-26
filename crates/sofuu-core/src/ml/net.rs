@@ -66,7 +66,19 @@ impl TinyMlp {
 
     /// Forward pass → sigmoid output in (0, 1). ~8.5k multiply-adds.
     /// Deterministic: scalar f32 in a fixed order, no SIMD reassociation.
+    ///
+    /// Implemented as forward_output(forward_hidden(x)) — the two halves
+    /// run the SAME accumulations in the SAME order, so the split is
+    /// bit-identical to the fused pass (asserted in tests). The split
+    /// exists for online learning (§13): the backbone (everything before
+    /// the output layer) stays frozen while only W3/b3 adapt.
     pub fn forward(&self, x: &[f32]) -> f32 {
+        self.forward_output(&self.forward_hidden(x))
+    }
+
+    /// Hidden pass → the h2 activations (tanh of layer 2). Everything the
+    /// output layer needs; the frozen-backbone half of an online update.
+    pub fn forward_hidden(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.in_dim as usize, "input width mismatch");
         let (in_dim, h1, h2) = (self.in_dim as usize, self.h1 as usize, self.h2 as usize);
         let w = &self.w;
@@ -93,14 +105,49 @@ impl TinyMlp {
             }
             a2[j] = acc.tanh();
         }
+        a2
+    }
 
-        // Output: sigmoid(W3 h2 + b3)
-        let w3 = w2 + h2 * h1 + h2;
-        let mut acc = w[w3 + h2];
-        for (i, &hi) in a2.iter().enumerate() {
-            acc += w[w3 + i] * hi;
+    /// Output pass: sigmoid(W3 h2 + b3) over precomputed h2 activations.
+    pub fn forward_output(&self, h2_acts: &[f32]) -> f32 {
+        let h2 = self.h2 as usize;
+        assert_eq!(h2_acts.len(), h2, "hidden width mismatch");
+        let os = self.out_start();
+        let w = &self.w;
+        let mut acc = w[os + h2];
+        for (i, &hi) in h2_acts.iter().enumerate() {
+            acc += w[os + i] * hi;
         }
         1.0 / (1.0 + (-acc).exp())
+    }
+
+    /// Output pass with an EXPLICIT output layer (the adapted weights from
+    /// online learning, §13): sigmoid(W3' h2 + b3'). Same scalar-f32 fixed
+    /// order as forward_output — bit-exact given the same layer.
+    pub fn forward_output_with(&self, out_layer: &[f32], h2_acts: &[f32]) -> f32 {
+        let h2 = self.h2 as usize;
+        assert_eq!(h2_acts.len(), h2, "hidden width mismatch");
+        assert_eq!(out_layer.len(), h2 + 1, "output layer must be W3 + b3");
+        let mut acc = out_layer[h2];
+        for (i, &hi) in h2_acts.iter().enumerate() {
+            acc += out_layer[i] * hi;
+        }
+        1.0 / (1.0 + (-acc).exp())
+    }
+
+    /// Start index of the output layer (W3 row) in the flat weight vector;
+    /// the output layer is `w[out_start..out_start + h2]` (W3) plus
+    /// `w[out_start + h2]` (b3). h2+1 params total — the ONLY slice an
+    /// online update may touch (§13 guardrail 1).
+    pub fn out_start(&self) -> usize {
+        let (in_dim, h1, h2) = (self.in_dim as usize, self.h1 as usize, self.h2 as usize);
+        h1 * in_dim + h1 + h2 * h1 + h2
+    }
+
+    /// The output layer as one flat slice: W3 then b3 (h2+1 values).
+    pub fn output_layer(&self) -> &[f32] {
+        let os = self.out_start();
+        &self.w[os..os + self.h2 as usize + 1]
     }
 
     /// Serialize with the header + CRC (the trainer emits this; the runtime
@@ -203,7 +250,7 @@ mod tests {
     fn param_counts_match_plan() {
         assert_eq!(param_count(28, 112, 48), 8721, "freshness");
         assert_eq!(param_count(36, 104, 44), 8513, "relevance");
-        assert_eq!(param_count(32, 104, 44), 8097, "supervisor/compaction");
+        assert_eq!(param_count(33, 104, 44), 8201, "supervisor/compaction");
     }
 
     #[test]
@@ -243,6 +290,21 @@ mod tests {
         // Exact regression value — any SIMD/reassociation change trips this.
         let expected = demo_net().forward(&x);
         assert_eq!(a.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn forward_split_is_bit_exact() {
+        // The hidden/output split (online learning, §13) must reproduce the
+        // fused forward bit-for-bit — same accumulations, same order.
+        let net = demo_net();
+        let x = [0.1f32, -0.4, 0.9, 0.3];
+        let fused = net.forward(&x);
+        let split = net.forward_output(&net.forward_hidden(&x));
+        assert_eq!(fused.to_bits(), split.to_bits());
+        // Output layer layout: W3 then b3, h2+1 params.
+        assert_eq!(net.output_layer().len(), net.h2 as usize + 1);
+        let os = net.out_start();
+        assert_eq!(net.output_layer(), &net.w[os..os + 3]);
     }
 
     #[test]

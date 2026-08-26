@@ -1,8 +1,8 @@
-// ml/context.rs — the shared in-memory context working set (PLAN-ML-GATES §8).
+// ml/context.rs -- the shared in-memory context working set (PLAN-ML-GATES §8).
 //
-// A structured representation of what the agent loop currently holds — the
+// A structured representation of what the agent loop currently holds -- the
 // per-run tool trajectory (calls, targets, outcomes) and history segments
-// (type/size/age) — that the four tiny models (§3) reason over. Today the
+// (type/size/age) -- that the four tiny models (§3) reason over. Today the
 // history is a flat {role, content} array with none of that metadata; this
 // is the metadata layer.
 //
@@ -30,17 +30,17 @@ pub struct CallRec {
     pub step: u32,
     pub tool: String,
     /// Canonical call signature (tool + sorted-key args JSON, computed
-    /// JS-side) — identity key for exact-repeat detection.
+    /// JS-side) -- identity key for exact-repeat detection.
     pub sig: String,
     /// Primary target of the call (path/pattern), "" when none.
     pub target: String,
     pub result_chars: u32,
     pub errored: bool,
-    /// postcall arrived — the result is accounted for.
+    /// postcall arrived -- the result is accounted for.
     pub done: bool,
 }
 
-/// One history segment — the unit compaction (phase 3) selects over.
+/// One history segment -- the unit compaction (phase 3) selects over.
 #[derive(Clone, Debug)]
 pub struct Segment {
     pub id: u32,
@@ -138,9 +138,9 @@ pub fn run_end(run_id: &str) {
 
 /// Pre-call rule check (PLAN-ML-GATES §11 rule subset). Detects the two most
 /// common token burns with no model at all:
-///   1. `dup_call` — an identical call (same tool, same canonical args) was
+///   1. `dup_call` -- an identical call (same tool, same canonical args) was
 ///      already made this run;
-///   2. `reread_unchanged` — read_file on a path already read this run with
+///   2. `reread_unchanged` -- read_file on a path already read this run with
 ///      no write/edit to it since.
 /// Advises only: the call is still recorded and still runs; the nudge rides
 /// the tool result back into the message array.
@@ -160,12 +160,24 @@ pub fn precheck(run_id: &str, step: u32, tool: &str, sig: &str, target: &str) ->
         if !sig.is_empty() {
             if let Some(&first) = r.sig_first.get(sig) {
                 if first < step {
-                    v.ok = false;
-                    v.reason = "dup_call".to_string();
-                    v.nudge = Some(format!(
-                        "identical call already made at step {} (same tool, same arguments) — reuse that result unless you expect different output",
-                        first
-                    ));
+                    // A read repeated with IDENTICAL args after a write to
+                    // its target is legitimate: the earlier result is stale
+                    // by construction, so "reuse it" would be wrong advice.
+                    // Re-anchor so the NEXT identical read is judged against
+                    // this (post-write) one.
+                    let read_after_write = tool == "read_file"
+                        && !target.is_empty()
+                        && r.writes.get(target).map(|&w| w > first).unwrap_or(false);
+                    if read_after_write {
+                        r.sig_first.insert(sig.to_string(), step);
+                    } else {
+                        v.ok = false;
+                        v.reason = "dup_call".to_string();
+                        v.nudge = Some(format!(
+                            "identical call already made at step {} (same tool, same arguments) -- reuse that result unless you expect different output",
+                            first
+                        ));
+                    }
                 }
             } else {
                 r.sig_first.insert(sig.to_string(), step);
@@ -185,7 +197,7 @@ pub fn precheck(run_id: &str, step: u32, tool: &str, sig: &str, target: &str) ->
                         v.ok = false;
                         v.reason = "reread_unchanged".to_string();
                         v.nudge = Some(format!(
-                            "this file was already read at step {} and has not been modified since — reuse the earlier content",
+                            "this file was already read at step {} and has not been modified since -- reuse the earlier content",
                             last
                         ));
                     }
@@ -266,6 +278,13 @@ pub fn track_segment(run_id: &str, kind: u8, chars: u32, tokens: u32, tool: &str
     });
 }
 
+/// Snapshot of one run for the supervisor model: the task and the calls
+/// recorded so far (oldest first), WITHOUT the candidate action -- the
+/// supervisor scores before precheck() records the new call.
+pub fn snapshot(run_id: &str) -> Option<(String, Vec<CallRec>)> {
+    with_ws(|ws| ws.runs.get(run_id).map(|r| (r.task.clone(), r.calls.clone())))
+}
+
 /// Aggregate counters for `sofuu.ml.workset()` / `/ml info`.
 pub fn summary() -> (usize, usize, usize, u64) {
     with_ws(|ws| {
@@ -306,7 +325,7 @@ mod tests {
         let v1 = precheck("t-reread", 1, "read_file", "read_file:{\"path\":\"a.rs\"}", "a.rs");
         assert!(v1.ok);
         let v2 = precheck("t-reread", 2, "read_file", "read_file:{\"path\":\"a.rs\"}", "a.rs");
-        // Same sig fires rule 1 first — the duplicate is the stronger signal.
+        // Same sig fires rule 1 first -- the duplicate is the stronger signal.
         assert_eq!(v2.reason, "dup_call");
         // Same file, different args (e.g. an offset read) → rule 2.
         let v3 = precheck(
@@ -333,6 +352,25 @@ mod tests {
             "b.rs",
         );
         assert!(v.ok, "a write after the last read makes re-reading legitimate");
+    }
+
+    #[test]
+    fn write_invalidates_identical_reread() {
+        run_start("t-dup-write", "task");
+        let v1 = precheck("t-dup-write", 1, "read_file", "read_file:{\"path\":\"c.rs\"}", "c.rs");
+        assert!(v1.ok);
+        precheck("t-dup-write", 2, "edit_file", "edit_file:{\"path\":\"c.rs\"}", "c.rs");
+        postcall("t-dup-write", 2, "edit_file", "c.rs", 60, false);
+        // Identical re-read after the write: the earlier result is stale by
+        // construction, so the dup rule stays silent...
+        let v3 = precheck("t-dup-write", 3, "read_file", "read_file:{\"path\":\"c.rs\"}", "c.rs");
+        assert!(v3.ok, "identical re-read after a write is legitimate");
+        // ...and the NEXT identical read (no write since) is a dup again,
+        // judged against the post-write read.
+        let v4 = precheck("t-dup-write", 4, "read_file", "read_file:{\"path\":\"c.rs\"}", "c.rs");
+        assert!(!v4.ok);
+        assert_eq!(v4.reason, "dup_call");
+        assert!(v4.nudge.unwrap().contains("step 3"));
     }
 
     #[test]

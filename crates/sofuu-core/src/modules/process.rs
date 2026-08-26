@@ -2359,9 +2359,6 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
         } else if LINE_BUF.with(|b| b.borrow().len()) < LINE_BUF_CAP - 1 {
             COMPLETE_SEL.with(|s| s.set(-1));
             LINE_BUF.with(|b| b.borrow_mut().push(c));
-            /* First keystroke freezes the logo animation (it must never
-             * fight the readline's cursor while the user types). */
-            call_ui_hook(ctx, "__logo_stop");
             /* TTY: redraw the live region after EVERY keystroke. */
             if STDIN_IS_TTY.with(|t| t.get()) != 0 {
                 tty_render_line_ui(ctx, 0);

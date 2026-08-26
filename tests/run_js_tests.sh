@@ -36,6 +36,7 @@ TESTS=(
     "npm_test.js|npm safety (spec validation/tar extraction)"
     "ai_complete_test.js|ai.complete (mock provider, tool calls)"
     "ai_stream_test.js|ai.stream (mock SSE streaming)"
+    "ai_stream_error_frame_test.js|ai.stream error surfacing (in-stream error frame, 429, empty)"
     "fetch_test.js|fetch() Response API (status/headers/text/json)"
     "mcp_client_test.js|MCP client (connect/tools/call)"
     "mcp_server_test.js|MCP server (tool registration/handling)"

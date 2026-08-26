@@ -35,6 +35,7 @@ pub type UvHandle = c_void;
 pub type UvStream = c_void;
 pub type UvTimer = c_void;
 pub type UvCheck = c_void;
+pub type UvAsync = c_void;
 pub type UvFs = c_void;
 pub type UvProcess = c_void;
 pub type UvSignal = c_void;
@@ -103,6 +104,14 @@ extern "C" {
     pub fn uv_check_init(loop_: *mut UvLoop, check: *mut UvCheck) -> c_int;
     pub fn uv_check_start(check: *mut UvCheck, cb: Option<unsafe extern "C" fn(*mut UvCheck)>) -> c_int;
     pub fn uv_check_stop(check: *mut UvCheck) -> c_int;
+
+    // ── host poke (PLAN-DESKTOP A): cross-thread wakeup of a blocked loop ──
+    pub fn uv_async_init(
+        loop_: *mut UvLoop,
+        async_: *mut UvAsync,
+        cb: Option<unsafe extern "C" fn(*mut UvAsync)>,
+    ) -> c_int;
+    pub fn uv_async_send(async_: *mut UvAsync) -> c_int;
 
     pub fn uv_fs_open(
         loop_: *mut UvLoop,
@@ -240,6 +249,7 @@ extern "C" {
 // uv_fs_get_result / uv_fs_get_statbuf — no layout guessing, no C.
 
 /// `uv_handle_type` values — enum order from UV_HANDLE_TYPE_MAP (uv.h).
+const UV_HANDLE_ASYNC: c_int = 1;
 const UV_HANDLE_CHECK: c_int = 2;
 const UV_HANDLE_NAMED_PIPE: c_int = 7;
 const UV_HANDLE_POLL: c_int = 8;
@@ -337,6 +347,13 @@ pub unsafe extern "C" fn sofuu_uv_poll_size() -> usize {
 pub unsafe extern "C" fn sofuu_uv_check_size() -> usize {
     // SAFETY: trivial getter.
     unsafe { uv_handle_size(UV_HANDLE_CHECK) }
+}
+
+/// `sizeof(uv_async_t)` — host poke handle (PLAN-DESKTOP A).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_uv_async_size() -> usize {
+    // SAFETY: trivial getter.
+    unsafe { uv_handle_size(UV_HANDLE_ASYNC) }
 }
 
 #[no_mangle]

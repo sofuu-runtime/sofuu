@@ -25,8 +25,11 @@ pub mod mcp; // M6: sofuu.mcp (client + stdio server)
 pub mod npm; // M7: npm_resolve + package installer (resolver.c)
 pub mod cjs; // M7: CommonJS shim (cjs.c)
 pub mod ai; // M8: sofuu.ai.* (mod_ai.c + tfidf_embed.c; SIMD kernels stay C)
+pub mod model_caps; // per-model capability registry (ctx/max-output/thinking)
 pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agent.c + qtsq_adapter.c)
 pub mod engine; // M10: engine.c + sofuu.c + repl.c (boot, loader, Sofuu aliases, eval, destroy)
+pub mod host_poke; // PLAN-DESKTOP A: thread-safe host→engine wakeup (uv_async poke)
+pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js
 pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
 
 /// Tests that drive the process-global libuv loop (m1/m2 proofs) must be

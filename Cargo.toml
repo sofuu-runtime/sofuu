@@ -4,6 +4,7 @@ members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
+    "sofuu-desktop/src-tauri",
     "crates/ml-train",
 ]
 # PLAN-ML-GATES §9: ml-train is a DEV-ONLY trainer — `make` / `cargo build`
@@ -13,6 +14,7 @@ default-members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
+    "sofuu-desktop/src-tauri",
 ]
 
 [workspace.package]

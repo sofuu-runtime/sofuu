@@ -518,6 +518,9 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
         );
         crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::WEB_JS, "<web-driver>");
         crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::TOOLS_JS, "<tools-driver>");
+        // PLAN-DESKTOP C: the chat turn engine (sofuu.chat.*) — last, since
+        // it builds on the agent/web/tools drivers above.
+        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::CHAT_JS, "<chat-driver>");
     }
 }
 

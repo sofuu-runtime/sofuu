@@ -30,6 +30,11 @@ pub const AGENT_JS: &str = include_str!("../../../src/js/agent.js");
 pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
 /// The coding-tools driver — single source of truth is src/js/tools.js.
 pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
+/// The chat turn engine — single source of truth is src/js/chat.js
+/// (PLAN-DESKTOP C). Eval'd LAST: it builds on sofuu.agent/web/tools and
+/// exposes sofuu.chat.* for embedded hosts (the desktop app). Hosts that
+/// never call sofuu.chat.init pay nothing — the module only defines state.
+pub const CHAT_JS: &str = include_str!("../../../src/js/chat.js");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —
@@ -84,10 +89,19 @@ mod tests {
         assert!(AGENT_JS.contains("A.mapContext = mapContext"));
         assert!(WEB_JS.contains("sofuu.web"));
         assert!(WEB_JS.contains("web_search"));
+        // the chat turn engine's exported API surface (desktop consumes it)
+        assert!(CHAT_JS.contains("sofuu.chat"));
+        assert!(CHAT_JS.contains("chat.submit"));
+        assert!(CHAT_JS.contains("chat.init"));
         // Balanced braces is a weak syntax smoke check — the real gate is
         // the engine evaluating both drivers on every boot (ffi_runtime_test
         // boots a full runtime, so a syntax error there fails the suite).
-        for (name, src) in [("agent.js", AGENT_JS), ("web.js", WEB_JS)] {
+        for (name, src) in [
+            ("agent.js", AGENT_JS),
+            ("web.js", WEB_JS),
+            ("tools.js", TOOLS_JS),
+            ("chat.js", CHAT_JS),
+        ] {
             let open = src.matches('{').count();
             let close = src.matches('}').count();
             assert_eq!(open, close, "{name}: unbalanced braces");

@@ -8,18 +8,23 @@
 // Phase 1 surface: the shared in-memory context working set (context.rs)
 // + the rule-based supervisor subset (exact repeat calls, re-reads of
 // unchanged files). Phase 2 added the trained freshness gate under
-// freshness/ (baked weights, advise-only notices); Phase 3 adds the
+// freshness/ (baked weights, advise-only notices); Phase 3 added the
 // trained compaction gate under compaction/ (scored, budgeted passes —
-// the model selects, the caller acts). relevance/ supervisor/ land in
-// later phases.
+// the model selects, the caller acts); Phase 4 added the trained
+// relevance gate under relevance/ (pre-retrieval use/skip advice);
+// Phase 5 added the trained supervisor under supervisor/ (pre-call +
+// loop-boundary checkpoints layered over the Phase-1 rules).
 //
 // JS surface (registered by mod_ml_register, wired in rt/engine.rs):
 //   sofuu.ml.track(eventJson)          — feed the working set
 //   sofuu.ml.workset()                 — aggregate counters (JSON string)
 //   sofuu.ml.info()                    — models + working set state (JSON)
-//   sofuu.ml.supervisor.check(json)    — pre-call rule verdict (JSON)
+//   sofuu.ml.feedback(json)            — outcome/wrong labels (§13 online)
+//   sofuu.ml.supervisor.check(json)    — pre-call checkpoint (rules + net)
+//   sofuu.ml.supervisor.loop(json)     — loop-boundary checkpoint (net)
 //   sofuu.ml.freshness.score(text, task, optsJson?) — staleness verdict
 //   sofuu.ml.compaction.plan(segmentsJson, optsJson?) — compaction pass
+//   sofuu.ml.relevance.plan(candsJson, optsJson?) — pre-retrieval advice
 //
 // Everything returns JSON STRINGS parsed on the JS side (same contract as
 // sofuu.ai.modelCaps). SOFUU_NO_ML=1 skips registration entirely; every JS
@@ -29,6 +34,9 @@ pub mod compaction;
 pub mod context;
 pub mod freshness;
 pub mod net;
+pub mod online;
+pub mod relevance;
+pub mod supervisor;
 
 use std::ffi::{CStr, CString, c_int};
 
@@ -145,8 +153,7 @@ unsafe extern "C" fn js_ml_workset(
 
 /* ------------------------------------------------------------------ */
 /* sofuu.ml.info() → per-model state + working set counters             */
-/* freshness reports "on" (trained, baked weights); the remaining       */
-/* models report "absent" until their phases land.                      */
+/* All four gates report "on" (trained, baked weights).                 */
 /* ------------------------------------------------------------------ */
 
 unsafe extern "C" fn js_ml_info(
@@ -156,19 +163,25 @@ unsafe extern "C" fn js_ml_info(
     _argv: *const JSValueConst,
 ) -> JSValue {
     let (runs, calls, segs, seg_tokens) = context::summary();
+    let (on_enabled, on_obs, on_examples, on_adapted, on_adaptations) = online::status();
     ret_json(
         ctx,
         format!(
-            "{{\"version\":1,\"gates\":{{\"freshness\":\"on\",\"relevance\":\"absent\",\"supervisor\":\"rules\",\"compaction\":\"on\"}},\"workset\":{{\"runs\":{runs},\"calls\":{calls},\"segments\":{segs},\"segTokens\":{seg_tokens}}}}}"
+            "{{\"version\":1,\"gates\":{{\"freshness\":\"on\",\"relevance\":\"on\",\"supervisor\":\"on\",\"compaction\":\"on\"}},\"online\":{{\"enabled\":{on_enabled},\"observations\":{on_obs},\"examples\":{on_examples},\"adapted\":{on_adapted},\"adaptations\":{on_adaptations}}},\"workset\":{{\"runs\":{runs},\"calls\":{calls},\"segments\":{segs},\"segTokens\":{seg_tokens}}}}}"
         ),
     )
 }
 
 /* ------------------------------------------------------------------ */
-/* sofuu.ml.supervisor.check(json) — pre-call rule verdict              */
-/* in:  {"run","step","tool","sig","target"}                            */
-/* out: {"ok":bool,"reason":"dup_call"|"reread_unchanged"|"",           */
-/*       "nudge":".."|null}                                             */
+/* sofuu.ml.supervisor.check(json) — pre-call checkpoint                */
+/* in:  {"run","step","tool","sig","target","argsText",                */
+/*       "skipTargets":[...],"budget","task"}                          */
+/* out: {"ok":bool,"reason":"dup_call"|"reread_unchanged"|            */
+/*       "near_dup"|"too_broad"|"off_task"|"spinning"|                */
+/*       "over_budget"|"skip_advised"|"waste_risk"|"",                */
+/*       "nudge":".."|null,"score":0.123,"source":"rule"|"model"|""}  */
+/* The rule layer (context.rs) speaks first; where it is silent the    */
+/* trained net speaks at THRESHOLD. Advise-only: the call still runs.  */
 /* ------------------------------------------------------------------ */
 
 unsafe extern "C" fn js_ml_supervisor_check(
@@ -178,15 +191,24 @@ unsafe extern "C" fn js_ml_supervisor_check(
     argv: *const JSValueConst,
 ) -> JSValue {
     if argc < 1 {
-        return ret_json(ctx, "{\"ok\":true,\"reason\":\"\",\"nudge\":null}".to_string());
+        return ret_json(ctx, "{\"ok\":true,\"reason\":\"\",\"nudge\":null,\"score\":0,\"source\":\"\"}".to_string());
     }
     let v = parse_obj(&arg_str(ctx, *argv));
-    let verdict = context::precheck(
+    let skip: Vec<String> = v
+        .get("skipTargets")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let verdict = supervisor::model::check(
         &s(&v, "run"),
         n(&v, "step"),
         &s(&v, "tool"),
         &s(&v, "sig"),
         &s(&v, "target"),
+        &s(&v, "argsText"),
+        &skip,
+        n(&v, "budget"),
+        &s(&v, "task"),
     );
     let nudge = match &verdict.nudge {
         Some(t) => format!("\"{}\"", json_escape(Some(t))),
@@ -195,12 +217,77 @@ unsafe extern "C" fn js_ml_supervisor_check(
     ret_json(
         ctx,
         format!(
-            "{{\"ok\":{},\"reason\":\"{}\",\"nudge\":{}}}",
+            "{{\"ok\":{},\"reason\":\"{}\",\"nudge\":{},\"score\":{:.4},\"source\":\"{}\"}}",
             verdict.ok,
             json_escape(Some(&verdict.reason)),
-            nudge
+            nudge,
+            verdict.score,
+            verdict.source
         ),
     )
+}
+
+/* ------------------------------------------------------------------ */
+/* sofuu.ml.supervisor.loop(json) — loop-boundary checkpoint            */
+/* in:  {"run","step","budget"}                                         */
+/* out: same shape as check(); reasons carry the loop_ prefix           */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ml_supervisor_loop(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return ret_json(ctx, "{\"ok\":true,\"reason\":\"\",\"nudge\":null,\"score\":0,\"source\":\"\"}".to_string());
+    }
+    let v = parse_obj(&arg_str(ctx, *argv));
+    let verdict = supervisor::model::loop_check(&s(&v, "run"), n(&v, "step"), n(&v, "budget"));
+    let nudge = match &verdict.nudge {
+        Some(t) => format!("\"{}\"", json_escape(Some(t))),
+        None => "null".to_string(),
+    };
+    ret_json(
+        ctx,
+        format!(
+            "{{\"ok\":{},\"reason\":\"{}\",\"nudge\":{},\"score\":{:.4},\"source\":\"{}\"}}",
+            verdict.ok,
+            json_escape(Some(&verdict.reason)),
+            nudge,
+            verdict.score,
+            verdict.source
+        ),
+    )
+}
+
+/* ------------------------------------------------------------------ */
+/* sofuu.ml.feedback(json) — outcome/feedback labels for online learning */
+/* (§13). kinds:                                                        */
+/*   outcome {model:"supervisor", run, step, wasted}                    */
+/*   wrong   {model:"supervisor"}  — the most recent flag was a mistake */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ml_feedback(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return ret_json(ctx, "{\"ok\":false}".to_string());
+    }
+    let v = parse_obj(&arg_str(ctx, *argv));
+    let ok = if s(&v, "model") == "supervisor" {
+        match s(&v, "kind").as_str() {
+            "outcome" => online::label_outcome(&s(&v, "run"), n(&v, "step"), b(&v, "wasted")),
+            "wrong" => online::label_wrong(),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    ret_json(ctx, format!("{{\"ok\":{ok}}}"))
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,7 +295,7 @@ unsafe extern "C" fn js_ml_supervisor_check(
 /* ------------------------------------------------------------------ */
 
 thread_local! {
-    static ML_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
+    static ML_FUNCS: [qjs::JSCFunctionListEntry; 4] = [
         qjs::JSCFunctionListEntry {
             name: c"track".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -230,14 +317,28 @@ thread_local! {
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_ml_info },
         },
+        qjs::JSCFunctionListEntry {
+            name: c"feedback".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ml_feedback },
+        },
     ];
-    static SUPERVISOR_FUNCS: [qjs::JSCFunctionListEntry; 1] = [
+    static SUPERVISOR_FUNCS: [qjs::JSCFunctionListEntry; 2] = [
         qjs::JSCFunctionListEntry {
             name: c"check".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ml_supervisor_check },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"loop".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ml_supervisor_loop },
         },
     ];
 }
@@ -277,6 +378,9 @@ pub unsafe extern "C" fn mod_ml_register(ctx: *mut JSContext) {
 
     /* Compaction gate (§12): trained net, baked weights — plan(segments). */
     compaction::model::register(ctx, ml_obj);
+
+    /* Relevance gate (§6): trained net, baked weights — plan(candidates). */
+    relevance::model::register(ctx, ml_obj);
 
     qjs::sofuu_js_set_property_str(ctx, sofuu, c"ml".as_ptr(), ml_obj);
 

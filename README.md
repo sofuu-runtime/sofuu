@@ -674,6 +674,30 @@ blob's hash so a re-bake invalidates them. `/ml reset` clears the
 adaptation, `/ml info` reports threshold + online state + pending flag +
 working set.
 
+The 5th model, `alloc` (§14), is the model-aware config allocator +
+pre-flight guard for the context window — it fixes the class of failures
+where fixed allocations (one budget ratio, one compaction cliff, one tool
+cap for every model) send a request the selected model cannot accept. It
+fetches the selected model's details FIRST — the capability registry
+(context window, max output, thinking kind), then limits learned from the
+provider's own error messages, then conservative defaults — and allocates
+against them. Three layers: a mechanical output guard on the wire (outgoing
+max_tokens is always clamped to the model's cap; the unknown-model fallback
+is a conservative 4,096, not a fixed 71,680); a pre-flight fit check at
+every request-build point (agent tool loop, toolless answer path, chat
+driver, RLM) with a corrective ladder — re-cap tool results, clamp the
+output reserve, drop oldest plain messages, truncate the largest — so the
+request that goes out always fits, each correction printed as an `allocgate`
+line; and error learning — if a provider still 400s with a limit error, the
+real limit is parsed from the message, cached per model, and the turn
+retries once per kind. On top sits a tiny net (24→96→40→1, 6,321 params,
+threshold 0.51; test accuracy 0.986 vs majority 0.810 / logistic regression
+0.969, recall 0.994) producing one scalar — context pressure — that a
+deterministic clamped policy turns into the per-turn allocation: when to
+compact (0.70 of window slack → 0.50 tight), how much tool result to keep,
+recall and attachment budgets, and the output reserve. Advise-only within
+the mechanical bounds; `/ml off` restores the old fixed ratios exactly.
+
 ### `sofuu.web` — Web Search & Page Reading
 
 Provider-neutral web access over the runtime's own `fetch` — **no API key

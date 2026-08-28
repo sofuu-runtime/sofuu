@@ -3067,6 +3067,11 @@ const DRIVER: &str = r#"
   }
   /* @file mention attachments scale with the same window (~25% of it). */
   function attachTokenBudget() {
+    /* alloc gate (§14): the plan's attachment budget comes first — tight
+     * sessions attach less, slack sessions attach more. Legacy ratio when
+     * ML is off. */
+    const planA = attachPlanCache();
+    if (planA && planA.attachBudgetTok > 0) return planA.attachBudgetTok;
     const win = cfg.ctx_window > 0
       ? cfg.ctx_window
       : ((modelCaps() || {}).ctxWindow > 0
@@ -3074,6 +3079,68 @@ const DRIVER: &str = r#"
         : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
     return Math.min(65536, Math.max(2048, Math.floor(win * 0.25)));
   }
+  /* ── alloc gate (PLAN-ML-GATES §14): model-aware config allocation ──
+   * Layer 2: a tiny net measures context pressure from this session's live
+   * state — the CALIBRATED overhead meter (ctxOverhead) is its best
+   * feature — and a deterministic clamped policy maps it to per-turn
+   * config: compactAt (replaces the fixed cliff), attach budget, output
+   * reserve. The model's capabilities are resolved INSIDE Rust (registry →
+   * learned limits → conservative defaults); JS never supplies caps.
+   * Returns null when ML is off (/ml off, SOFUU_NO_ML=1) or unavailable —
+   * every consumer keeps the legacy ratios exactly as before. */
+  function allocPlanChat(taskTk, attachTk) {
+    if (!cfg.ml) return null;
+    try {
+      if (!sofuu.ml || !sofuu.ml.alloc || typeof sofuu.ml.alloc.plan !== 'function') return null;
+      const sizes = [];
+      let histTk = 0;
+      for (const m of history) {
+        const t = estTok(String(m.content || ''));
+        sizes.push(t); histTk += t;
+      }
+      let growthTk = 0, accel = 0;
+      if (sizes.length >= 2) {
+        const last3 = sizes.slice(-3);
+        growthTk = last3.reduce((a, b) => a + b, 0) / last3.length;
+        if (sizes.length >= 4) {
+          const half = Math.floor(sizes.length / 2);
+          const m1 = sizes.slice(0, half).reduce((a, b) => a + b, 0) / half;
+          const m2 = sizes.slice(half).reduce((a, b) => a + b, 0) / (sizes.length - half);
+          if (m1 > 0) accel = m2 / m1;
+        }
+      }
+      const p = JSON.parse(sofuu.ml.alloc.plan(JSON.stringify({
+        model: cfg.model || '',
+        cfgWindow: cfg.ctx_window > 0 ? cfg.ctx_window : 0,
+        cfgMaxOutput: cfg.max_output > 0 ? cfg.max_output : 0,
+        overheadTk: ctxOverhead >= 0 ? ctxOverhead : 0,
+        calibrated: ctxOverhead >= 0,
+        historyTk: histTk,
+        turns: Math.floor(history.length / 2),
+        /* Chat history carries no tool transcripts between turns — 0. */
+        toolFrac: 0,
+        summary: history.length > 0 && history[0].role === 'system' &&
+          String(history[0].content || '').indexOf('Prior conversation summary') === 0,
+        growthTk: growthTk, growthAccel: accel,
+        taskTk: taskTk || 0, attachTk: attachTk || 0,
+        /* Chat turns always offer the full tool set. */
+        toolHeavy: true,
+        writing: false,
+      })));
+      return (p && p.window > 0) ? p : null;
+    } catch (e) { return null; }
+  }
+  /* expandMentions calls attachTokenBudget per mention parse — cache ONE
+   * plan per turn (invalidated at turn entry) instead of re-running the
+   * net per @file. */
+  let allocTurnPlan = null, allocPlanValid = false;
+  function attachPlanCache() {
+    if (!allocPlanValid) { allocTurnPlan = allocPlanChat(0, 0); allocPlanValid = true; }
+    return allocTurnPlan;
+  }
+  /* Allocation notes already shown this session (deduped — a clamped
+   * /maxout note prints once, not every turn). */
+  const allocNotedNotes = {};
   function estTok(s) {
     if (sofuu.ai && typeof sofuu.ai.estimateTokens === 'function') {
       try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) {}
@@ -3108,6 +3175,11 @@ const DRIVER: &str = r#"
       history.splice(0, history.length - MAX_HISTORY_ENTRIES);
     }
     const budget = ctxBudget();
+    /* alloc gate (§14): the compaction cliff moves with context pressure —
+     * 0.70 of budget when the session is slack, down to 0.50 when the net
+     * sees overflow coming within ~3 turns. Fixed cliff when ML is off. */
+    const planC = allocPlanChat(0, 0);
+    const compactAt = (planC && planC.compactAt > 0) ? planC.compactAt : COMPACT_AT;
     /* Re-arm one-shot compaction once usage drains back below half. */
     if (!autoCompactArmed && historyTokens() < budget * 0.5) autoCompactArmed = true;
     /* PLAN-ML-GATES §12: ML compaction gate — opportunistic passes that
@@ -3187,7 +3259,7 @@ const DRIVER: &str = r#"
      * session can continue indefinitely. Per-answer 32k thinking / 64k
      * output are *not* session caps — total thinking+output across many
      * turns can exceed them, only the per-answer limit is enforced. */
-    if (autoCompactArmed && historyTokens() > budget * COMPACT_AT && history.length > 2) {
+    if (autoCompactArmed && historyTokens() > budget * compactAt && history.length > 2) {
       autoCompactArmed = false;
       const savedTk = historyTokens();
       try {
@@ -3221,6 +3293,13 @@ const DRIVER: &str = r#"
     if (cfg.base_url) o.base_url = cfg.base_url;
     if (cfg.profile) o.profile = cfg.profile;
     if (cfg.max_output > 0) o.max_tokens = cfg.max_output;
+    else {
+      /* alloc gate (§14): explicit /maxout wins; otherwise the plan's
+       * feasibility-checked output reserve (never above the model's hard
+       * cap — resolved inside Rust). */
+      const planM = allocPlanChat(0, 0);
+      if (planM && planM.maxOutput > 0) o.max_tokens = planM.maxOutput;
+    }
     return o;
   }
   async function complete(messages, opts) {
@@ -3384,7 +3463,8 @@ const DRIVER: &str = r#"
     }
     if (agentMention) text = agentMention.task;
     /* F3: expand @file mentions (on the remainder — the task itself may
-     * attach files). */
+     * attach files). Fresh alloc plan for this turn (attachment budget). */
+    allocPlanValid = false;
     const expanded = await expandMentions(text);
     const turnText = expanded.text;
     const manifest = expanded.manifest;
@@ -3443,6 +3523,20 @@ const DRIVER: &str = r#"
        * seam, not a user knob. */
       budget: { maxSteps: (parseInt(env('SOFUU_CHAT_MAX_STEPS'), 10) || 200), maxDepth: 1, maxTokens: 1e9, maxWallMs: 1e9 },
     };
+    /* alloc gate (§14): surface allocation notes BEFORE the request goes
+     * out — config clamped to the model's caps, a learned limit applied,
+     * unknown-model conservative defaults. One dim ASCII line each,
+     * deduped per session; silent when ML is off. */
+    try {
+      const planN = allocPlanChat(estTok(turnText), manifest ? estTok(String(manifest)) : 0);
+      if (planN && Array.isArray(planN.notes)) {
+        for (const n of planN.notes) {
+          if (allocNotedNotes[n]) continue;
+          allocNotedNotes[n] = true;
+          out('\x1b[90m  ~ alloc · ' + n + '\x1b[0m');
+        }
+      }
+    } catch (e) {}
     /* Streaming render state — same UX as the pre-migration driver:
      * spinner + growing line in the TUI, plain writes when piped. */
     let acc = '', anim = null, si2 = 0, sawThink = false, capped = false;
@@ -3521,6 +3615,17 @@ const DRIVER: &str = r#"
              * the advisory nudge itself rides the tool result in-band. */
             stopAnim();
             out('\x1b[90m  ~ ml · ' + p.rule + ' · ' + p.tool + ' (step ' + p.step + ')\x1b[0m');
+          } else if (e.kind === 'allocgate') {
+            /* alloc gate (§14): the pre-flight fit check corrected the
+             * request (re-capped tool results / clamped output / dropped
+             * old messages), or error learning picked up a provider limit.
+             * One dim ASCII line — allocation stays observable. */
+            stopAnim();
+            out('\x1b[90m  ~ alloc · ' +
+                (p.action ? p.action + (p.model ? ' · ' + p.model : '') +
+                            (p.error ? ' · ' + clip1(p.error, 80) : '')
+                          : 'fit ' + String(p.fit || '') + ' · ' + String(p.actions || '')) +
+                '\x1b[0m');
           } else if (e.kind === 'tool_result') {
             if (TTY && p.result) {
               /* Compact one-row result: embedded newlines become " · " so

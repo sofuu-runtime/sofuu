@@ -7,6 +7,73 @@
 > Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
 
 ---
+**Verified 2026-08-28** — the 5th tiny model landed: `alloc` —
+model-aware config allocation + a pre-flight guard for the context
+window (PLAN-ML-GATES §14). Fixes three verified failure classes:
+oversized input reaching the provider and killing the turn (the
+provider's 400 was the only check), oversized output config sent
+verbatim (no clamp against the model's real max output; the Anthropic
+unknown-model fallback was a fixed 71,680), and fixed allocation
+amounts (one budget ratio, one 0.70 cliff, win/8 tool cap, 0.25
+attach for every model) that ignore what the selected model can
+actually take. The allocator fetches the selected model's details
+FIRST — registry caps → limits learned from provider errors →
+conservative defaults — then allocates against them.
+
+- ✅ **Layer 0 — mechanical output guard** (Rust wire, always on, no
+  ML needed): every outgoing request resolves the model through the
+  capability registry (context window, max output, thinking kind —
+  providers expose names only, never capabilities) → outgoing
+  max_tokens is clamped to min(requested, cap) when known, and the
+  unknown-model fallback is now a conservative 4,096 instead of
+  71,680. Hard guarantee: the output config never exceeds the
+  selected model.
+- ✅ **Layer 1 — pre-flight fit check** (JS, at every request-build
+  chokepoint: agent tool loop, agent toolless/final-answer path,
+  chat driver, RLM): estimate the final prompt → if prompt + reserved
+  output > window, run a corrective ladder until it fits: re-cap tool
+  results → clamp the output reserve → drop oldest PLAIN messages
+  (never the system prompt, never the last message, never tool
+  pairs) → truncate the largest message with margin. The request that
+  goes out always fits; every correction emits a visible ASCII
+  `allocgate` line. **Error learning**: if the provider still returns
+  a limit 400 (estimator wrong), the real limit is parsed from the
+  error text (OpenAI context + output shapes, Anthropic shape),
+  cached per model, and the turn retries once per kind
+  (context/output separately) — next time it is prevented outright.
+- ✅ **Layer 2 — the tiny net** (24→96→40→1 = 6,321 params, threshold
+  0.51): one scalar, context pressure p∈[0,1], from 24 features
+  (caps first, measured overhead, history state + growth, task shape,
+  output history). A deterministic clamped policy maps (p, caps) to
+  the per-turn allocation: compactAt 0.70 slack → 0.50 tight,
+  toolCapChars win/5→win/12 clamped [4000, 32768], recallBudgetTok
+  win×0.03→0.01 clamped [1024, 16384], attachBudgetTok win×0.30→0.15
+  clamped [2048, 65536], and a feasibility-checked output reserve.
+  Advise-only within the Layer 0/1 bounds; `/ml off` / `SOFUU_NO_ML=1`
+  restores today's ratios exactly; `/ctx` `/maxout` still win but are
+  clamped to the strictest of registry + learned limits with a
+  visible note.
+- ✅ **Trainer + gates**: 4,810 synthetic session trajectories (24
+  families — window tiers × overhead regimes × growth regimes × task
+  kinds; labels mechanical: simulate 3 future turns → overflow or
+  not; channel-coverage split so val/test families never leak into
+  train). Test accuracy 0.986 vs majority 0.810 and vs logistic
+  regression 0.969 on identical features; recall 0.994, precision
+  0.988 at threshold 0.51 (chosen on val at recall ≥ 0.92, seed
+  sweep 1–4). 18 committed-weights cargo gates including the property
+  test: no plan ever exceeds the resolved model's hard limits.
+- ✅ **Verified by running:** enforcing-mock E2E (a mock provider that
+  400s like a real one when prompt > 8,192 or max_tokens > 2,048) —
+  alloc learns the 2,048 output cap from the first 400, then the
+  8,192 window, fits the turn at 5,996/8,192 and completes; the
+  NO_ML control run fails with the provider error, proving the guard
+  is what saves the turn. `./sofuu run tests/agent_test.js` ALL
+  PASSED (171 checks, 21 of them alloc: per-model allocation differs
+  for 8k vs 1M models, clamps hold, noteLimit kinds, learned limits
+  feed later plans); chat dual-path E2E 8/8; `make test` 20/20;
+  release binary 2.5M, codesigned.
+
+---
 **Verified 2026-08-28** — hardened the supervisor's online learning
 (§13): the three weak points from the guardrail audit are closed —
 noisy labels, narrow adoption gate, mechanical adoption. Still

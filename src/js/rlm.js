@@ -44,6 +44,61 @@
     return o;
   }
 
+  /* alloc gate (PLAN-ML-GATES §14): RLM asks must fit the selected model
+   * too. Resolves the plan from the ask's own shape (caps come from the
+   * registry/learned limits inside Rust), takes the feasibility-checked
+   * output reserve, and truncates the largest message when the prompt
+   * still does not fit. ML off → returns the options untouched. */
+  function allocFit(o) {
+    if (!sofuu.ml || !sofuu.ml.alloc || typeof sofuu.ml.alloc.plan !== 'function') return o;
+    try {
+      var ms = o.messages || [];
+      var tk = 0;
+      for (var i = 0; i < ms.length; i++) tk += Math.ceil(String(ms[i].content || '').length / 4);
+      var p = JSON.parse(sofuu.ml.alloc.plan(JSON.stringify({
+        model: o.model || '', cfgMaxOutput: o.max_tokens || 0,
+        historyTk: tk, turns: Math.floor(ms.length / 2), taskTk: tk,
+      })));
+      if (!p || !(p.window > 0)) return o;
+      var reserve = o.max_tokens > 0 ? o.max_tokens : Math.max(512, Math.floor(p.window * 0.05));
+      if (p.maxOutput > 0 && (o.max_tokens <= 0 || o.max_tokens > p.maxOutput)) {
+        o.max_tokens = p.maxOutput;
+        reserve = p.maxOutput;
+      }
+      if (tk + reserve <= p.window) return o;
+      /* Does not fit: clamp the reserve to what is left; if even that is
+       * gone, truncate the largest message so the ask goes out at all. */
+      var left = p.window - tk - Math.max(256, Math.floor(p.window * 0.02));
+      if (left >= 512) { o.max_tokens = Math.floor(left); return o; }
+      var big = -1, bigLen = 0;
+      for (var j = 0; j < ms.length; j++) {
+        var l = String(ms[j].content || '').length;
+        if (l > bigLen) { big = j; bigLen = l; }
+      }
+      if (big >= 0) {
+        var keep = Math.max(200, (p.window - 512) * 4);
+        if (bigLen > keep) {
+          ms[big] = Object.assign({}, ms[big], {
+            content: String(ms[big].content).slice(0, keep) +
+              '\n…[truncated by the alloc gate to fit the model window]…',
+          });
+        }
+      }
+      o.max_tokens = 512;
+      return o;
+    } catch (e) { return o; }
+  }
+  /* Layer 1 error learning (same mechanism as agent.js): returns the
+   * learned KIND ('context' | 'output') when the text parsed and the real
+   * limit is cached, '' otherwise. */
+  function allocNoteLimit(model, errText) {
+    if (!sofuu.ml || !sofuu.ml.alloc || typeof sofuu.ml.alloc.noteLimit !== 'function') return '';
+    try {
+      var k = sofuu.ml.alloc.noteLimit(String(model || ''), String(errText == null ? '' : errText));
+      return (k === 'context' || k === 'output') ? k : '';
+    } catch (e) { return ''; }
+  }
+
   /* ai.complete resolves to { text, usage, ... }; tolerate a bare string.
    * With opts.recurseVia = { agent: "name" } (PLAN-AGENTS A4.2), a
    * single-user-prompt sub-call (the resolve_llm recursion path) runs
@@ -58,12 +113,29 @@
   var ACTIVE_ASKS = [];   // { abort } per in-flight ask stream
 
   async function ask(opts, messages) {
+    /* alloc gate Layer 1 — error learning: if the provider rejects the
+     * ask over a limit, cache the real limit for this model and retry
+     * ONCE PER KIND (allocFit re-resolves it). */
+    var retriedKinds = {};
+    for (;;) {
+      try {
+        return await askOnce(opts, messages);
+      } catch (e) {
+        if (g.__rlm_aborted) return '';
+        var kind = allocNoteLimit(opts && opts.model, (e && e.message) || e);
+        if (kind && !retriedKinds[kind]) { retriedKinds[kind] = true; continue; }
+        throw e;
+      }
+    }
+  }
+
+  async function askOnce(opts, messages) {
     if (opts.recurseVia && messages.length === 1 && messages[0].role === 'user' &&
         g.sofuu && g.sofuu.agent && typeof g.sofuu.agent.run === 'function') {
       var r2 = await g.sofuu.agent.run(String(opts.recurseVia.agent), messages[0].content, { plain: true });
       return (r2 && r2.answer) ? r2.answer : '';
     }
-    var o = completeOpts(opts, messages);
+    var o = allocFit(completeOpts(opts, messages));
     if (sofuu.ai && typeof sofuu.ai.stream === 'function') {
       var st = sofuu.ai.stream(o);
       var entry = { abort: function () { try { st.abort(); } catch (eA) {} } };

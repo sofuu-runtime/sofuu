@@ -224,6 +224,54 @@
     return (caps && caps.maxOutput > 0) ? caps.maxOutput : 0;
   }
 
+  /* ── alloc gate (PLAN-ML-GATES §14): model-aware config allocation ──
+   * Layer 2 of the alloc gate: a tiny net measures context pressure and a
+   * deterministic clamped policy maps it to per-turn budgets (compactAt,
+   * tool-result cap, recall/attachment budgets, output reserve). The model's
+   * capabilities are resolved INSIDE Rust (registry → learned limits →
+   * conservative defaults) — JS never supplies or overrides caps. Returns
+   * null when ML is off (SOFUU_NO_ML / def.ml='off') or the call fails;
+   * every caller keeps today's ratios exactly in that case. */
+  function allocPlan(d, sess) {
+    if (!mlEnabled(d) || !sofuu.ml.alloc || typeof sofuu.ml.alloc.plan !== 'function') return null;
+    try {
+      var st = {
+        model: (d && d.model) || '',
+        cfgWindow: (d && d.ctxWindow) || 0,
+        cfgMaxOutput: (d && d.maxTokensOut) || 0,
+        overheadTk: (sess && sess.overheadTk) || 0,
+        calibrated: !!(sess && sess.calibrated),
+        historyTk: (sess && sess.historyTk) || 0,
+        turns: (sess && sess.turns) || 0,
+        toolFrac: (sess && sess.toolFrac) || 0,
+        summary: !!(sess && sess.summary),
+        growthTk: (sess && sess.growthTk) || 0,
+        growthAccel: (sess && sess.growthAccel) || 0,
+        taskTk: (sess && sess.taskTk) || 0,
+        attachTk: (sess && sess.attachTk) || 0,
+        toolHeavy: !!(sess && sess.toolHeavy),
+        writing: !!(sess && sess.writing),
+        meanAnswerTk: (sess && sess.meanAnswerTk) || 0,
+        maxAnswerTk: (sess && sess.maxAnswerTk) || 0,
+        sawLengthStop: !!(sess && sess.sawLengthStop),
+      };
+      var p = JSON.parse(sofuu.ml.alloc.plan(JSON.stringify(st)));
+      return (p && p.window > 0) ? p : null;
+    } catch (e) { return null; }
+  }
+  /* Layer 1 error learning: hand a provider limit-error to the alloc gate.
+   * Returns the learned KIND ('context' | 'output') when the text parsed
+   * and the real limit is now cached for this model (session-scoped) — the
+   * caller re-resolves the plan and retries ONCE PER KIND. '' = nothing
+   * learned. */
+  function allocNoteLimit(d, errText) {
+    if (!mlEnabled(d) || !sofuu.ml.alloc || typeof sofuu.ml.alloc.noteLimit !== 'function') return '';
+    try {
+      var k = sofuu.ml.alloc.noteLimit(String((d && d.model) || ''), String(errText == null ? '' : errText));
+      return (k === 'context' || k === 'output') ? k : '';
+    } catch (e) { return ''; }
+  }
+
   /* ── Definitions ───────────────────────────────────────────────── */
 
   function normalizeDef(def) {
@@ -818,7 +866,7 @@
     var chain = opts.chain || [d.name];
     var started = Date.now();
     var runId = 'ar' + (NEXT_RUN++);
-    var state = { cancelled: false, aborts: [] };
+    var state = { cancelled: false, aborts: [], allocRetriedKinds: {} };
     ACTIVE[runId] = state;
     ACTIVE_COUNT++;
     var cancelId = opts.signal || runId;
@@ -906,6 +954,161 @@
     var mlSkipTargets = [];
     var mlLoopNoticed = {};
 
+    /* ── alloc gate state for this run (§14) ─────────────────────────
+     * lastPlan is re-resolved before every LLM call: caps come from the
+     * registry/learned limits inside Rust, pressure from the live session
+     * shape below. null ⇒ ML off ⇒ every consumer falls back to the
+     * legacy ratios, exactly as before the gate existed. */
+    var lastPlan = null;
+    var allocMem = { sawLengthStop: false, maxAnswerTk: 0 };
+    function refreshPlan() {
+      if (!mlEnabled(d)) { lastPlan = null; return null; }
+      var hist = Array.isArray(opts.history) ? opts.history : [];
+      var histTk = 0, toolMsgs = 0, sizes = [];
+      for (var i = 0; i < hist.length; i++) {
+        var t = estTok(String((hist[i] && hist[i].content) || ''));
+        histTk += t; sizes.push(t);
+        if (hist[i] && hist[i].role === 'tool') toolMsgs++;
+      }
+      var growthTk = 0, accel = 0;
+      if (sizes.length >= 2) {
+        var lastSizes = sizes.slice(-3);
+        growthTk = lastSizes.reduce(function (a, b) { return a + b; }, 0) / lastSizes.length;
+        if (sizes.length >= 4) {
+          var half = Math.floor(sizes.length / 2);
+          var m1 = sizes.slice(0, half).reduce(function (a, b) { return a + b; }, 0) / half;
+          var m2 = sizes.slice(half).reduce(function (a, b) { return a + b; }, 0) / (sizes.length - half);
+          if (m1 > 0) accel = m2 / m1;
+        }
+      }
+      /* Fixed per-turn overhead: system prompt + tool schemas — the part
+       * of the request that never shrinks. (The chat driver measures its
+       * overhead with a calibrated meter; bare runs estimate it.) */
+      var overheadTk = estTok(String(d.system || ''));
+      if (tools && tools.length) {
+        try { overheadTk += estTok(JSON.stringify(tools)); } catch (eT) {}
+      }
+      lastPlan = allocPlan(d, {
+        overheadTk: overheadTk, calibrated: false,
+        historyTk: histTk,
+        turns: Math.floor(hist.length / 2) + steps,
+        toolFrac: hist.length ? toolMsgs / hist.length : 0,
+        summary: false,
+        growthTk: growthTk, growthAccel: accel,
+        taskTk: estTok(String(task == null ? '' : task)),
+        attachTk: estTok(String(opts.context || '')),
+        toolHeavy: !!(tools && tools.length),
+        writing: /\b(write|writing|essay|article|blog|story|draft|documentation|report)\b/i
+          .test(String(task == null ? '' : task)),
+        meanAnswerTk: own.llmCalls > 0 ? own.completionTokens / own.llmCalls : 0,
+        maxAnswerTk: allocMem.maxAnswerTk,
+        sawLengthStop: allocMem.sawLengthStop,
+      });
+      return lastPlan;
+    }
+    /* Budget consumers — plan first, legacy ratio fallback second. */
+    function allocToolCap() {
+      return (lastPlan && lastPlan.toolCapChars > 0) ? lastPlan.toolCapChars : toolResultCapChars(d);
+    }
+    function allocRecallBudget() {
+      return (lastPlan && lastPlan.recallBudgetTok > 0) ? lastPlan.recallBudgetTok : recallBudgetTok(d);
+    }
+    /* Layer 1 pre-flight fit check: estimate the assembled prompt, and if
+     * prompt + output reserve does not fit the resolved window, walk the
+     * corrective ladder until it does — (1) re-cap tool results in place,
+     * (2) clamp the output reserve to what is left, (3) drop the oldest
+     * PLAIN history messages (structured tool_use/tool_result pairs are
+     * never broken), (4) truncate the largest plain message. The request
+     * that goes out always fits; every correction emits a visible ASCII
+     * allocgate event. May mutate o.max_tokens; returns the (possibly
+     * trimmed) messages array. */
+    function fitGuard(o, msgs) {
+      var win = (lastPlan && lastPlan.window > 0) ? lastPlan.window
+              : (d.ctxWindow > 0 ? d.ctxWindow : contextWindow(d.model));
+      if (!(win > 0)) return msgs;
+      function promptTk(ms) {
+        var t = 0;
+        for (var i = 0; i < ms.length; i++) {
+          t += estTok(String(ms[i].content || ''));
+          if (ms[i].tool_calls) { try { t += estTok(JSON.stringify(ms[i].tool_calls)); } catch (eP) {} }
+        }
+        return t;
+      }
+      function isPlain(m) {
+        return !(m.tool_calls && m.tool_calls.length) && !m.tool_call_id && m.role !== 'tool';
+      }
+      var reserve = o.max_tokens > 0 ? o.max_tokens : Math.max(512, Math.floor(win * 0.05));
+      var est = promptTk(msgs);
+      if (est + reserve <= win) return msgs;
+      var out = msgs.slice();
+      var actions = [];
+      /* Rung 1 — re-cap tool results (the largest uncontrolled blobs). */
+      var cap = allocToolCap();
+      for (var r1 = 0; r1 < out.length; r1++) {
+        var m1 = out[r1];
+        if (m1.role === 'tool' && typeof m1.content === 'string' && m1.content.length > cap) {
+          out[r1] = Object.assign({}, m1, { content: capToolResult(cap, m1.content).text });
+        }
+      }
+      est = promptTk(out);
+      if (est + reserve > win) actions.push('tool results re-capped to ' + cap + ' chars');
+      /* Rung 2 — clamp the output reserve to what is actually left. */
+      if (est + reserve > win) {
+        var left = win - est - Math.max(256, Math.floor(win * 0.02));
+        if (left >= 512 && left < reserve) {
+          o.max_tokens = Math.floor(left);
+          reserve = o.max_tokens;
+          actions.push('output reserve clamped to ' + reserve + ' tokens');
+        }
+      }
+      /* Rung 3 — drop the oldest plain messages (never index 0 = system,
+       * never the LAST user message = the task; never structured pairs). */
+      var dropped = 0;
+      while (est + reserve > win) {
+        var victim = -1;
+        for (var r3 = 1; r3 < out.length - 1; r3++) {
+          if (isPlain(out[r3]) && out[r3].role !== 'system') { victim = r3; break; }
+        }
+        if (victim < 0) break;
+        est -= estTok(String(out[victim].content || ''));
+        out.splice(victim, 1);
+        dropped++;
+      }
+      if (dropped > 0) actions.push('dropped ' + dropped + ' oldest message(s)');
+      /* Rung 4 — still over: truncate the largest plain message. */
+      if (est + reserve > win) {
+        var big = -1, bigLen = 0;
+        for (var r4 = 1; r4 < out.length; r4++) {
+          var len4 = String(out[r4].content || '').length;
+          if (isPlain(out[r4]) && len4 > bigLen) { big = r4; bigLen = len4; }
+        }
+        if (big > 0) {
+          /* Leave a margin for estimator rounding (estTok ceils per message
+           * while providers bill the true count). */
+          var margin4 = Math.max(64, Math.floor(win * 0.02));
+          var keepChars = Math.max(200, (win - reserve - margin4) * 4 - Math.max(0, est * 4 - bigLen));
+          if (keepChars < bigLen) {
+            out[big] = Object.assign({}, out[big], {
+              content: String(out[big].content).slice(0, Math.floor(keepChars)) +
+                '\n…[truncated by the alloc gate to fit the model window]…',
+            });
+            actions.push('largest message truncated to ' + Math.floor(keepChars) + ' chars');
+          }
+        }
+      }
+      est = promptTk(out);
+      if (est + reserve > win) {
+        /* Nothing left to shed — send with the floor reserve; if the
+         * provider still rejects, error learning picks up the real limit. */
+        o.max_tokens = 512;
+        actions.push('still tight — sent with floor output reserve');
+      }
+      if (actions.length) {
+        emit('allocgate', { fit: est + '/' + win, actions: actions.join('; ') });
+      }
+      return out;
+    }
+
     /* Stream one generation, with bounded backoff retry on transient
      * provider errors (see STREAM_TRANSIENT_RE). Retries happen ONLY while
      * nothing has been forwarded to the UI yet: HTTP-status failures
@@ -964,7 +1167,13 @@
         try {
           var qvec = await embedTextFor(d, String(task));
           var hits = scopeRecall(d, cma, qvec, 15);
-          var gated = gateRecall(d, hits, String(task), opts.history || []);
+          /* alloc gate (§14): the recall block budget comes from the plan
+           * when ML is on (tight sessions recall less); an explicit
+           * def.recallBudget still wins. */
+          refreshPlan();
+          var gated = gateRecall(
+            Object.assign({}, d, { recallBudget: d.recallBudget > 0 ? d.recallBudget : allocRecallBudget() }),
+            hits, String(task), opts.history || []);
           if (gated.lines.length) {
             recalledIds = gated.ids;
             recalledHits = gated.hits;
@@ -1163,7 +1372,7 @@
         }
         /* P3: uniform cap at the boundary (delegate answers included — the
          * child already capped its own answer; no double truncation). */
-        var cappedR = capToolResult(toolResultCapChars(d), result);
+        var cappedR = capToolResult(allocToolCap(), result);
         if (mlNudge) cappedR.text += '\n[supervisor: ' + mlNudge + ']';
         emit('tool_result', { name: name, result: clip(cappedR.text, 200),
                               chars: cappedR.chars, kept: cappedR.text.length });
@@ -1279,7 +1488,22 @@
           break;
         }
         emit('plan', { step: steps + 1, tools: tools.map(function (t) { return t.name; }) });
+        /* alloc gate (§14): re-resolve the plan on live state, take its
+         * feasibility-checked output reserve when nothing explicit was set,
+         * then run the Layer-1 pre-flight fit check — the request that goes
+         * out always fits the selected model's window. */
+        refreshPlan();
         var so = aiOpts(d, opts, messages.concat(loopMsgs), tools);
+        /* The plan's output reserve is feasibility-checked against the
+         * resolved caps (registry → learned limits → conservative
+         * defaults): clamp DOWN to it — an explicit /maxout above the
+         * model's hard limit dies here, never at the provider. When
+         * nothing explicit was set, take it as the reserve. */
+        if (lastPlan && lastPlan.maxOutput > 0) {
+          if (so.max_tokens > 0 && so.max_tokens > lastPlan.maxOutput) so.max_tokens = lastPlan.maxOutput;
+          else if (!(so.max_tokens > 0)) so.max_tokens = lastPlan.maxOutput;
+        }
+        so.messages = fitGuard(so, so.messages);
         var sres;
         try {
           sres = await streamWithRetry(so,
@@ -1293,6 +1517,20 @@
             });
         } catch (eS) {
           if (state.cancelled) { stopped = 'cancelled'; break; }
+          /* alloc gate Layer 1 — error learning: the estimator can be
+           * wrong about an unregistered model; the provider's limit error
+           * is ground truth. Parse the real limit, cache it for this model
+           * (session-scoped), and retry ONCE PER KIND (a turn can breach
+           * the output cap and the window in sequence) — every later
+           * request is prevented outright. */
+          if (!state.allocRetriedKinds) state.allocRetriedKinds = {};
+          var learnedKind = allocNoteLimit(d, (eS && eS.message) || eS);
+          if (learnedKind && !state.allocRetriedKinds[learnedKind]) {
+            state.allocRetriedKinds[learnedKind] = true;
+            emit('allocgate', { action: 'learned_limit', kind: learnedKind, model: String(d.model || ''),
+                                error: clip(String((eS && eS.message) || eS), 160) });
+            continue;
+          }
           throw eS;
         }
         var st = sres.st;
@@ -1307,6 +1545,10 @@
         tree.cacheReadTokens += su.cacheReadTokens || 0;
         tree.cacheWriteTokens += su.cacheWriteTokens || 0;
         own.llmCalls++; tree.llmCalls++;
+        /* alloc gate output history: length-stops and answer sizes feed the
+         * next plan's pressure + output-reserve features. */
+        if (String(su.finishReason || '') === 'length') allocMem.sawLengthStop = true;
+        if ((su.completionTokens || 0) > allocMem.maxAnswerTk) allocMem.maxAnswerTk = su.completionTokens || 0;
         /* Per-request trace: the aggregates above re-count tool-result
          * growth across rounds, so consumers that need the TRUE context
          * size (the chat footer meter) take the FIRST request's prompt. */
@@ -1411,7 +1653,17 @@
       /* Final answer via ai.stream — emits answer_delta onStep events and
        * registers the stream's abort() so cancellation kills it mid-flight. */
       async function finalAnswer(msgs) {
+        /* alloc gate (§14): resolve the plan first so the clamp + fit
+         * check below see the selected model's real limits — finalAnswer
+         * is the plain no-tool path AND the salvage round, and both must
+         * fit exactly like the tool loop does. */
+        refreshPlan();
         var o = aiOpts(d, opts, msgs);
+        if (lastPlan && lastPlan.maxOutput > 0) {
+          if (o.max_tokens > 0 && o.max_tokens > lastPlan.maxOutput) o.max_tokens = lastPlan.maxOutput;
+          else if (!(o.max_tokens > 0)) o.max_tokens = lastPlan.maxOutput;
+        }
+        o.messages = fitGuard(o, o.messages);
         var onThink = function (t) { emit('think', { text: clip(t, 200) }); };
         var onDelta = function (tx) {
           if (opts.onStep) {
@@ -1420,7 +1672,29 @@
             catch (e2) {}
           }
         };
-        var sres = await streamWithRetry(o, onThink, onDelta);
+        /* alloc gate Layer 1 — error learning (same as the tool loop):
+         * a limit 400 teaches the real limit, retry once per kind. */
+        if (!state.allocRetriedKinds) state.allocRetriedKinds = {};
+        var sres;
+        for (;;) {
+          try { sres = await streamWithRetry(o, onThink, onDelta); break; }
+          catch (eF) {
+            if (state.cancelled) throw eF;
+            var lkF = allocNoteLimit(d, (eF && eF.message) || eF);
+            if (lkF && !state.allocRetriedKinds[lkF]) {
+              state.allocRetriedKinds[lkF] = true;
+              emit('allocgate', { action: 'learned_limit', kind: lkF, model: String(d.model || ''),
+                                  error: clip(String((eF && eF.message) || eF), 160) });
+              refreshPlan();
+              if (lastPlan && lastPlan.maxOutput > 0 && o.max_tokens > lastPlan.maxOutput) {
+                o.max_tokens = lastPlan.maxOutput;
+              }
+              o.messages = fitGuard(o, o.messages);
+              continue;
+            }
+            throw eF;
+          }
+        }
         var stream = sres.st;
         var parts = sres.parts;
         var u = stream.usage || {};

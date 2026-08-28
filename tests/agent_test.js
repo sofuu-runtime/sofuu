@@ -213,6 +213,11 @@ function decide(body) {
       (/escapes the project directory|jailed/.test(txt) ? "+jailed" : "-nojail") +
       (txt.indexOf("timed out") >= 0 ? "+timeout" : "-notimeout") + "]" };
   }
+  if (sys.indexOf("AGENT=alloctx") >= 0) {
+    /* alloc gate E2E: any request that survived the enforcing mock's limits
+     * gets a plain marker answer — completing at all is the assertion. */
+    return { text: "ALLOC-OK" };
+  }
   if (sys.indexOf("AGENT=mlrep") >= 0) {
     /* ML gates: the model repeats the EXACT same call — the supervisor's
      * dup-call rule must attach a nudge to the second result. */
@@ -284,10 +289,41 @@ function decide(body) {
   return { text: "sub-default" };
 }
 
+/* alloc gate E2E (§14): the ENFORCING mock behaves like a real provider —
+ * a request that exceeds the model's context window or output cap gets a
+ * 400 carrying the provider's limit text (the same shapes OpenAI /
+ * Anthropic return in the wild). Model "mock-tiny": 8192-token window,
+ * 2048-token max output. Prompt tokens are estimated the way providers
+ * bill them (≈ chars/4 over everything sent, tools included).
+ * Returns true when the request was rejected and the response sent. */
+const TINY_WIN = 8192, TINY_OUT = 2048;
+let TINY_REJECTS = 0;
+function enforceTiny(body, res) {
+  let chars = 0;
+  for (const m of (body.messages || [])) chars += String(m.content || "").length;
+  chars += JSON.stringify(body.tools || []).length;
+  const promptTk = Math.ceil(chars / 4);
+  const reqOut = body.max_tokens | 0;
+  if (reqOut <= TINY_OUT && promptTk <= TINY_WIN) {
+    vlog("  mock-tiny accept promptTk=" + promptTk + " max_tokens=" + reqOut);
+    return false;
+  }
+  TINY_REJECTS++;
+  vlog("  mock-tiny REJECT promptTk=" + promptTk + " max_tokens=" + reqOut);
+  const msg = reqOut > TINY_OUT
+    ? "max_tokens is too large: this model supports a maximum output of " + TINY_OUT + " tokens"
+    : "This model's maximum context length is " + TINY_WIN + " tokens. However, your messages resulted in " + promptTk + " tokens.";
+  res.writeHead(400, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: { message: msg } }));
+  return true;
+}
+
 function handler(req, res) {
   let body = {};
   try { body = JSON.parse(req.body || "{}"); } catch (e) {}
   LAST_OPENAI_RAW = req.body || "";
+  /* alloc gate E2E: mock-tiny enforces its limits like a real provider. */
+  if (String(body.model || "") === "mock-tiny" && enforceTiny(body, res)) return;
   const d = decide(body);
   REQ_N++;
   const entry = { n: REQ_N, start: Date.now(), end: 0 };
@@ -1040,8 +1076,12 @@ async function main() {
       seen3 === sofuu.agent.CORE_PROMPT);
   }
   {
-    /* P3: a 48k-char tool result enters context capped at ~4k with head +
-     * tail + recovery marker; trace records honest chars/kept counts. */
+    /* P3: a 48k-char tool result enters context capped with head + tail +
+     * recovery marker; trace records honest chars/kept counts. The cap
+     * itself scales with the model window: with ML on, the alloc gate's
+     * plan drives it inside [win/12, win/5] (a 32k window lands ~5.3k at
+     * neutral pressure); ML off falls back to the legacy win/8 ≈ 4096.
+     * Either way a 48k payload must shrink to a few thousand chars. */
     sofuu.agent.define({
       name: "bigtool", system: "AGENT=bigtool", memory: "off", rlm: "off",
       provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
@@ -1054,7 +1094,7 @@ async function main() {
       r.answer.indexOf("capped") >= 0 && r.answer.indexOf("+head") >= 0 && r.answer.indexOf("+tail") >= 0);
     const tr = r.trace.find(e => e.kind === "tool_result" && e.payload && e.payload.chars > 40000);
     check("P3 trace records chars/kept (" + (tr && tr.payload.chars) + "→" + (tr && tr.payload.kept) + ")",
-      !!tr && tr.payload.kept <= 4000 && tr.payload.kept > 3000);
+      !!tr && tr.payload.kept <= 6100 && tr.payload.kept > 3000);
   }
   {
     /* P4: one embed per turn for the task (recall-time vec reused at
@@ -1327,6 +1367,133 @@ async function main() {
     const r3 = await sofuu.agent.run("mloff", "weather check again", {});
     check("ML off: no nudge injected when ml:'off'",
       r3.answer.indexOf("-nonudge") >= 0 && !r3.trace.some(e => e.kind === "mlgate"));
+
+    /* ═══ alloc gate (§14): model-aware config allocation — the tiny
+     * pressure net + the mechanical layers around it. The model FETCHES
+     * the selected model's details first (registry → learned limits →
+     * conservative defaults), then allocates config to fit. ═════════ */
+    check("alloc surface: sofuu.ml.alloc.{plan,noteLimit} present",
+      !!sofuu.ml.alloc && typeof sofuu.ml.alloc.plan === "function" &&
+      typeof sofuu.ml.alloc.noteLimit === "function");
+
+    function allocPlanObj(model, extra) {
+      return JSON.parse(sofuu.ml.alloc.plan(JSON.stringify(Object.assign({
+        model: model, cfgWindow: 0, cfgMaxOutput: 0,
+        overheadTk: 0, calibrated: false, historyTk: 0, turns: 0,
+        toolFrac: 0, summary: false, growthTk: 0, growthAccel: 0,
+        taskTk: 100, attachTk: 0, toolHeavy: true, writing: false,
+        meanAnswerTk: 0, maxAnswerTk: 0, sawLengthStop: false,
+      }, extra || {}))));
+    }
+    /* Per-model allocation: an 8k model and a 1M model MUST get different
+     * configs — window, tool-result cap, recall/attach budgets all scale
+     * with the selected model instead of a fixed amount. */
+    const pTiny = allocPlanObj("gpt-4");      /* registry: 8192 window */
+    const pBig = allocPlanObj("gpt-4.1");     /* registry: 1M window */
+    check("alloc per-model: plan resolves the registry window (8k vs 1M)",
+      pTiny.window === 8192 && pBig.window === 1000000 && pTiny.known && pBig.known);
+    check("alloc per-model: budgets scale with the window " +
+          "(toolCap " + pTiny.toolCapChars + " vs " + pBig.toolCapChars +
+          ", recall " + pTiny.recallBudgetTok + " vs " + pBig.recallBudgetTok +
+          ", attach " + pTiny.attachBudgetTok + " vs " + pBig.attachBudgetTok + ")",
+      pBig.toolCapChars > pTiny.toolCapChars &&
+      pBig.recallBudgetTok > pTiny.recallBudgetTok &&
+      pBig.attachBudgetTok > pTiny.attachBudgetTok);
+    check("alloc clamps: tool/recall/attach caps stay within sane bands",
+      pBig.toolCapChars <= 32768 && pTiny.toolCapChars >= 4000 &&
+      pBig.recallBudgetTok <= 16384 && pTiny.recallBudgetTok >= 1024 &&
+      pBig.attachBudgetTok <= 65536 && pTiny.attachBudgetTok >= 2048);
+    /* Output config never exceeds the selected model: an explicit
+     * /maxout-style override above the model's hard cap is clamped DOWN. */
+    const pClamp = allocPlanObj("gpt-4", { cfgMaxOutput: 999999 });
+    check("alloc clamps: cfgMaxOutput 999999 on an 8k-output model → ≤ 8192 " +
+          "(got " + pClamp.maxOutput + ", notes: " + JSON.stringify(pClamp.notes) + ")",
+      pClamp.maxOutput > 0 && pClamp.maxOutput <= 8192 && pClamp.notes.length > 0);
+    const pBelow = allocPlanObj("gpt-4", { cfgMaxOutput: 1000 });
+    check("alloc clamps: below-cap explicit output is honoured (≤ 1000)",
+      pBelow.maxOutput > 0 && pBelow.maxOutput <= 1000);
+    /* Unknown model → conservative defaults, never endpoint-shaped guesses. */
+    const pUnk = allocPlanObj("totally-unknown-model-x");
+    check("alloc unknown: conservative window/output (32768/4096), known=false",
+      pUnk.window === 32768 && pUnk.maxOutput === 4096 && pUnk.known === false);
+    /* Pressure sanity: a nearly-full session raises pressure and tightens
+     * compactAt; a fresh session stays slack. */
+    const pFull = allocPlanObj("gpt-4.1", { historyTk: 900000, turns: 40, growthTk: 20000, growthAccel: 2 });
+    const pFresh = allocPlanObj("gpt-4.1", { historyTk: 1000, turns: 1 });
+    check("alloc pressure: near-full 1M session tightens compactAt " +
+          "(" + pFull.compactAt + " vs fresh " + pFresh.compactAt + ")",
+      pFull.pressure > pFresh.pressure && pFull.compactAt < pFresh.compactAt &&
+      pFull.compactAt >= 0.5 && pFresh.compactAt <= 0.7);
+    /* Error learning: provider limit texts parse to real limits, and the
+     * shim reports WHICH kind was learned (drives once-per-kind retry). */
+    check("alloc learn: OpenAI-style context error parses → kind 'context'",
+      sofuu.ml.alloc.noteLimit("learnprobe-ctx",
+        "This model's maximum context length is 16384 tokens. However, your messages resulted in 20000 tokens.") === "context");
+    check("alloc learn: parsed limit feeds the next plan",
+      allocPlanObj("learnprobe-ctx").window === 16384);
+    check("alloc learn: output-limit error parses → kind 'output'",
+      sofuu.ml.alloc.noteLimit("learnprobe-out",
+        "max_tokens is too large: this model supports a maximum output of 2048 tokens") === "output");
+    check("alloc learn: parsed output limit feeds the next plan",
+      allocPlanObj("learnprobe-out").maxOutput <= 2048);
+    check("alloc learn: unrelated errors parse to nothing",
+      sofuu.ml.alloc.noteLimit("learnprobe-none", "invalid api key") === "");
+
+    /* ── Enforcing-mock E2E: the provider 400s like a real one when the
+     * prompt exceeds its window or max_tokens its cap. WITH the alloc gate
+     * the turn must COMPLETE (learn the real limit → re-allocate → fit);
+     * the NO_ML control shows the old fatal failure. ───────────────── */
+    const TINY_PROV = { provider: PROV.provider, base_url: PROV.base_url, api_key: PROV.api_key };
+    /* alloctx carries a tool so the turn runs through the TOOL LOOP path
+     * (plan clamp + fitGuard + per-kind retry around streamWithRetry). */
+    sofuu.agent.define(Object.assign({
+      name: "alloctx", system: "AGENT=alloctx", memory: "off", rlm: "off", ml: "on",
+      model: "mock-tiny",
+      tools: [{ name: "noop", description: "does nothing",
+                parameters: { type: "object", properties: {} },
+                execute: async () => "ok" }],
+    }, TINY_PROV));
+    const rejectsBefore = TINY_REJECTS;
+    const rAlloc = await sofuu.agent.run("alloctx", "summarize this", { context: "x".repeat(60000) });
+    const allocGates = rAlloc.trace.filter(e => e.kind === "allocgate");
+    check("alloc E2E: oversized turn COMPLETES against the enforcing mock " +
+          "(answer=" + rAlloc.answer.slice(0, 20) + ")",
+      rAlloc.answer.indexOf("ALLOC-OK") >= 0);
+    check("alloc E2E: the mock rejected at least once before the gate learned the limit " +
+          "(" + (TINY_REJECTS - rejectsBefore) + " rejects)",
+      TINY_REJECTS > rejectsBefore);
+    check("alloc E2E: allocgate events visible in the trace (learned_limit)",
+      allocGates.length > 0 && allocGates.some(e => e.payload && e.payload.action === "learned_limit"));
+    check("alloc E2E: the learned window now shapes the plan for mock-tiny",
+      allocPlanObj("mock-tiny").window === 8192);
+
+    /* Output side: an explicit max_tokens far above the model's cap. This
+     * def is TOOLLESS on purpose — it exercises the PLAIN/finalAnswer
+     * path's clamp + error learning. (The context E2E above already
+     * learned both mock-tiny limits, so this turn is prevented outright.) */
+    sofuu.agent.define(Object.assign({
+      name: "allocout", system: "AGENT=alloctx", memory: "off", rlm: "off", ml: "on",
+      model: "mock-tiny", tools: [], max_tokens: 99999,
+    }, TINY_PROV));
+    const rOut = await sofuu.agent.run("allocout", "say hi", {});
+    check("alloc E2E: oversized /maxout turn COMPLETES (answer=" + rOut.answer.slice(0, 20) + ")",
+      rOut.answer.indexOf("ALLOC-OK") >= 0);
+    check("alloc E2E: learned output cap now shapes the plan for mock-tiny (≤ 2048)",
+      allocPlanObj("mock-tiny").maxOutput <= 2048);
+
+    /* NO_ML control: with the gate off nothing checks the request against
+     * the model — the provider 400 kills the turn (the old failure). */
+    sofuu.agent.define(Object.assign({
+      name: "alloctx-off", system: "AGENT=alloctx", memory: "off", rlm: "off", ml: "off",
+      model: "mock-tiny", tools: [],
+    }, TINY_PROV));
+    let ctlErr = null;
+    try {
+      await sofuu.agent.run("alloctx-off", "summarize this", { context: "x".repeat(60000) });
+    } catch (eCtl) { ctlErr = String((eCtl && eCtl.message) || eCtl); }
+    check("NO_ML control: same oversized turn FAILS without the gate (" +
+          (ctlErr ? ctlErr.slice(0, 60) : "no error") + ")",
+      !!ctlErr && /context length/i.test(ctlErr));
 
     /* ═══ PLAN-ML-GATES phase 5: the trained supervisor (§11) + the
      * online-learning surface (§13). Direct API checks here — seeded

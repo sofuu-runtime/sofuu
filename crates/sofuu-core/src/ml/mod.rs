@@ -25,11 +25,14 @@
 //   sofuu.ml.freshness.score(text, task, optsJson?) — staleness verdict
 //   sofuu.ml.compaction.plan(segmentsJson, optsJson?) — compaction pass
 //   sofuu.ml.relevance.plan(candsJson, optsJson?) — pre-retrieval advice
+//   sofuu.ml.alloc.plan(stateJson)     — model-aware context allocation
+//   sofuu.ml.alloc.noteLimit(model, errJson?) — learn a provider limit
 //
 // Everything returns JSON STRINGS parsed on the JS side (same contract as
 // sofuu.ai.modelCaps). SOFUU_NO_ML=1 skips registration entirely; every JS
 // caller wraps calls in try/catch so a gate failure can never break a turn.
 
+pub mod alloc;
 pub mod compaction;
 pub mod context;
 pub mod freshness;
@@ -397,6 +400,10 @@ pub unsafe extern "C" fn mod_ml_register(ctx: *mut JSContext) {
 
     /* Relevance gate (§6): trained net, baked weights — plan(candidates). */
     relevance::model::register(ctx, ml_obj);
+
+    /* Context allocator: model-aware limits + pressure — plan(state),
+     * noteLimit(model, err). Resolves the selected model's caps first. */
+    alloc::model::register(ctx, ml_obj);
 
     qjs::sofuu_js_set_property_str(ctx, sofuu, c"ml".as_ptr(), ml_obj);
 

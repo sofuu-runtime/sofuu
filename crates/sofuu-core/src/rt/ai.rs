@@ -342,23 +342,35 @@ fn append_tools_anthropic(body: &mut String, cfg: &AiRequestConfig) {
 /// otherwise the MODEL's published maximum from the capability registry.
 /// For the OpenAI wire unknown models omit the field (provider default);
 /// Anthropic wire's fallback is endpoint-driven (see build_anthropic).
+///
+/// Layer 0 of the alloc gate: an explicit value is clamped DOWN to the
+/// model's hard output limit when the registry knows it. Sending a
+/// max_tokens the model cannot honour is a provider 400 and a dead
+/// turn — the wire must never carry it, whatever the config says.
+/// User-facing notes for the clamp are emitted by the layers above
+/// (chat driver / agent plan), which run the same resolve ladder.
 fn effective_max_output(cfg: &AiRequestConfig) -> i32 {
+    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
     if cfg.max_tokens > 0 {
+        if caps.max_output > 0 && cfg.max_tokens > caps.max_output {
+            return caps.max_output;
+        }
         cfg.max_tokens
     } else {
-        crate::rt::model_caps::lookup(cfg.model.as_deref()).max_output
+        caps.max_output
     }
 }
 
-/// Dynamic fallback for unknown models on the Anthropic wire where
-/// max_tokens is REQUIRED. Derived from the endpoint's 64k thinking
-/// ceiling plus room, not a flat 16k — so any model on Anthropic can
-/// actually use the full thinking budget.
+/// Fallback for unknown models on the Anthropic wire where max_tokens is
+/// REQUIRED. Layer 0 of the alloc gate: conservative and WINDOW-DERIVED —
+/// the allocator's unknown-model window (32k) with an eighth reserved for
+/// output. The old endpoint-shaped constant (71,680) assumed every
+/// unknown model was Claude-class and 400'd on small models hosted
+/// behind Anthropic-shaped gateways — exactly the "config does not
+/// respect the selected model" failure the allocator exists to kill.
+/// Registry-known models never reach this path.
 fn anthropic_fallback_max_tokens() -> i32 {
-    let t = crate::rt::model_caps::ANTHROPIC_MAX_THINKING;
-    // Need max_tokens > 64k to host 64k thinking + 10% room for answer
-    let room = ((t as f64 * 0.12).ceil() as i32).max(1);
-    t + room
+    crate::ml::alloc::policy::UNKNOWN_MAX_OUTPUT as i32
 }
 
 fn build_openai_body_v2(cfg: &AiRequestConfig) -> String {
@@ -4378,10 +4390,19 @@ mod tests {
         assert!(b.contains("\"max_tokens\":8192"), "explicit override: {b}");
         assert!(b.contains("\"budget_tokens\":7372"), "ctx-derived 54000 capped to max-10% (7372): {b}");
 
-        // Unknown model: required max_tokens is endpoint-driven 64k+room (~71680) so any model can use 64k thinking
+        // Unknown model: required max_tokens is the alloc gate's
+        // conservative window-derived bound (4096), never an
+        // endpoint-shaped assumption; thinking is capped to max-10% to
+        // satisfy the wire.
         let b = build_anthropic_body_v2(&base("high", "weird-model-9000", 0));
-        assert!(b.contains("\"max_tokens\":71680"), "unknown-model endpoint-driven max: {b}");
-        assert!(b.contains("\"budget_tokens\":32000"), "high = 50% of 64k endpoint cap: {b}");
+        assert!(b.contains("\"max_tokens\":4096"), "unknown-model conservative max: {b}");
+        assert!(b.contains("\"budget_tokens\":3686"), "thinking capped to max-10% (3686): {b}");
+
+        // Layer 0: an explicit /maxout above the model's hard output cap
+        // is clamped DOWN to the cap — the wire never carries an
+        // oversized max_tokens.
+        let b = build_anthropic_body_v2(&base("max", "claude-sonnet-4-6", 999_999));
+        assert!(b.contains("\"max_tokens\":64000"), "override clamped to caps: {b}");
 
         // Any model on Anthropic can use thinking now (endpoint-driven 64k, not per-family)
         for effort in ["low", "medium", "high", "max"] {
@@ -4478,10 +4499,11 @@ mod tests {
         assert!(b.contains("\"max_tokens\":64000"), "claude caps still apply: {b}");
 
         // A non-Claude model over the Anthropic-format endpoint: syntax is
-        // the wire's (budget block + required max_tokens), endpoint-driven 64k
+        // the wire's (budget block + required max_tokens), conservative
+        // alloc bound for unknown models
         let b = build_anthropic_body_v2(&cfg("my-gateway-model", Provider::Custom, Some("high")));
-        assert!(b.contains("\"max_tokens\":71680"), "anthropic endpoint-driven max for unknown: {b}");
-        assert!(b.contains("\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":32000}"), "{b}");
+        assert!(b.contains("\"max_tokens\":4096"), "anthropic conservative max for unknown: {b}");
+        assert!(b.contains("\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":3686}"), "{b}");
 
         // A reasoning-family name on the Anthropic-format endpoint: budget
         // syntax wins (it's the wire's), capacity derived from max_tokens.

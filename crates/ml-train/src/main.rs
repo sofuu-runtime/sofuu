@@ -9,6 +9,7 @@
 // logistic regression on the identical features, recall-on-stale ≥ 0.90 on
 // the test fold, threshold picked on the validation fold only.
 
+mod data_alloc;
 mod data_compaction;
 mod data_freshness;
 mod data_relevance;
@@ -58,6 +59,15 @@ const SUPERVISOR_ARCH: (u32, u32, u32) = (33, 104, 44); // §11: 8,201 params
 const MIN_RECALL_S: f32 = 0.85;
 const MIN_PRECISION_S: f32 = 0.80;
 const SELECT_RECALL_S: f32 = 0.90; // selection margin on the val fold
+
+const ALLOC_ARCH: (u32, u32, u32) = (24, 96, 40); // 6,321 params
+/// Allocator asymmetry: a MISSED pressure event is exactly the provider
+/// 400 (oversized input/output) the model exists to prevent — recall is
+/// the hard floor. A false alarm only compacts a little early and stays
+/// visible; precision is the usefulness bar.
+const MIN_RECALL_A: f32 = 0.90;
+const MIN_PRECISION_A: f32 = 0.75;
+const SELECT_RECALL_A: f32 = 0.92; // selection margin on the val fold
 
 fn weights_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -987,6 +997,208 @@ fn supervisor_fixtures_path() -> PathBuf {
     p
 }
 
+fn alloc_weights_path() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("../sofuu-core/src/ml/alloc/weights_v1.f32");
+    p
+}
+
+fn train_alloc() {
+    println!("building alloc dataset…");
+    let data = data_alloc::build();
+    let pos = data.iter().filter(|e| e.y >= 0.5).count();
+    println!(
+        "  {} examples ({} pressured / {} slack)",
+        data.len(),
+        pos,
+        data.len() - pos
+    );
+    let (in_dim, h1, h2) = ALLOC_ARCH;
+    println!("arch: {in_dim} → {h1} → {h2} → 1 = {} params", param_count(in_dim, h1, h2));
+
+    /* Grouped 5-fold CV (report). Order spreads the pressure-bearing
+     * families so every fold holds out at least one of them. */
+    println!("\ngrouped 5-fold CV (whole construction families held out):");
+    let folds = grouped_kfold(
+        &data,
+        5,
+        Some(&[0, 5, 8, 16, 17, 23, 1, 4, 10, 13, 2, 6, 12, 14, 3, 7, 9, 11, 15, 18, 19, 20, 21, 22]),
+    );
+    let mut cv_acc = 0.0f32;
+    let mut cv_recall = 0.0f32;
+    for (fi, (tr, ho)) in folds.iter().enumerate() {
+        let mut net = TinyMlp::new(in_dim, h1, h2, vec![0.0; param_count(in_dim, h1, h2) as usize]);
+        let sp = Split { train: tr.clone(), val: ho.clone(), test: Vec::new() };
+        train_mlp(
+            &mut net,
+            &data,
+            &sp,
+            &TrainCfg { lr: 0.003, batch: 64, max_epochs: 400, patience: 60, min_epochs: 30, seed: 1, weight_decay: 1e-4 },
+        );
+        let preds: Vec<f32> = ho.iter().map(|&i| predict(&net, &data[i].x)).collect();
+        let labels: Vec<f32> = ho.iter().map(|&i| data[i].y).collect();
+        let thr = threshold_for_recall(&preds, &labels, MIN_RECALL_A);
+        let m = evaluate(&preds, &labels, thr);
+        print_metrics(&format!("fold {}", fi + 1), &m);
+        cv_acc += m.accuracy;
+        cv_recall += m.recall;
+    }
+    println!(
+        "  CV mean: acc={:.3} recall={:.3}",
+        cv_acc / folds.len() as f32,
+        cv_recall / folds.len() as f32
+    );
+
+    /* Final split — channel-coverage rule: every feature channel is
+     * active in training (burst A10, unknown caps A14, acceleration
+     * A12, output pressure A13, summary recovery A15, overhead A9,
+     * toolfrac A21, uncalibrated A22, writing A19). val {A11 burst at a
+     * NEW window, A16 boundary, A20 held-out chat} and test {A23
+     * near-brink multi-window sweep, A17 heavy on a TINY window} hold
+     * out CONSTRUCTIONS of trained channels, never an untrained
+     * channel. A16 gives threshold selection real boundary samples. */
+    let split = split_by_groups_explicit(
+        &data,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18, 19, 21, 22],
+        &[11, 16, 20],
+        &[17, 23],
+    );
+    println!(
+        "\nfinal split: train={} val={} test={}",
+        split.train.len(),
+        split.val.len(),
+        split.test.len()
+    );
+
+    /* Seed sweep — best val accuracy at the recall-floor threshold. */
+    let mut best: Option<(f32, TinyMlp, u64)> = None;
+    for seed in [1u64, 2, 3, 4] {
+        let mut net = TinyMlp::new(in_dim, h1, h2, vec![0.0; param_count(in_dim, h1, h2) as usize]);
+        let epochs = train_mlp(
+            &mut net,
+            &data,
+            &split,
+            &TrainCfg { lr: 0.003, batch: 64, max_epochs: 500, patience: 60, min_epochs: 30, seed, weight_decay: 1e-4 },
+        );
+        let vp: Vec<f32> = split.val.iter().map(|&i| predict(&net, &data[i].x)).collect();
+        let vy: Vec<f32> = split.val.iter().map(|&i| data[i].y).collect();
+        let thr = threshold_for_recall(&vp, &vy, SELECT_RECALL_A);
+        let m = evaluate(&vp, &vy, thr);
+        println!(
+            "  seed {seed}: {epochs} epochs → val acc={:.3} precision={:.3} recall={:.3}",
+            m.accuracy, m.precision, m.recall
+        );
+        let better = best.as_ref().map(|(a, _, _)| m.accuracy > *a).unwrap_or(true);
+        if better {
+            best = Some((m.accuracy, net, seed));
+        }
+    }
+    let (_, net, seed) = best.expect("training ran");
+    println!("  kept seed {seed}");
+
+    /* Threshold on the VALIDATION fold only, at the selection margin. */
+    let vp: Vec<f32> = split.val.iter().map(|&i| predict(&net, &data[i].x)).collect();
+    let vy: Vec<f32> = split.val.iter().map(|&i| data[i].y).collect();
+    let threshold = threshold_for_recall(&vp, &vy, SELECT_RECALL_A);
+    println!("  threshold (val, recall≥{SELECT_RECALL_A}): {threshold:.2}");
+    for g in [11u32, 16, 20] {
+        let scores: Vec<f32> = split
+            .val
+            .iter()
+            .filter(|&&i| data[i].group == g)
+            .map(|&i| predict(&net, &data[i].x))
+            .collect();
+        if !scores.is_empty() {
+            let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+            let lo = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!("    val A{g}: n={} mean={mean:.3} min={lo:.3} max={hi:.3}", scores.len());
+        }
+    }
+
+    /* ── Test fold — measured once ─────────────────────────────────── */
+    let tp: Vec<f32> = split.test.iter().map(|&i| predict(&net, &data[i].x)).collect();
+    let ty: Vec<f32> = split.test.iter().map(|&i| data[i].y).collect();
+    let m_net = evaluate(&tp, &ty, threshold);
+
+    let pos_rate = ty.iter().filter(|&&y| y >= 0.5).count() as f32 / ty.len().max(1) as f32;
+    let m_majority = evaluate(&tp, &ty, if pos_rate >= 0.5 { 0.0 } else { 1.01 });
+    let logreg = train_logreg(in_dim as usize, &data, &split, seed);
+    let lp: Vec<f32> = split.test.iter().map(|&i| logreg.predict(&data[i].x)).collect();
+    let l_thr = threshold_for_recall(&lp, &ty, MIN_RECALL_A);
+    let m_lr = evaluate(&lp, &ty, l_thr);
+
+    println!("\ntest fold (held-out construction families, one measurement):");
+    print_metrics("majority heuristic", &m_majority);
+    print_metrics("logistic regression", &m_lr);
+    print_metrics("tiny mlp (ours)", &m_net);
+
+    let tp2: Vec<f32> = split.test.iter().map(|&i| predict(&net, &data[i].x)).collect();
+    assert!(
+        tp.iter().zip(tp2.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "forward pass must be bit-exact"
+    );
+
+    println!("\ncalibration (test fold):");
+    print!("{}", calibration_report(&tp, &ty));
+
+    /* ── Acceptance gates ──────────────────────────────────────────── */
+    let mut ok = true;
+    let gate = |name: &str, pass: bool, ok: &mut bool| {
+        println!("  {} {name}", if pass { "PASS" } else { "FAIL" });
+        if !pass {
+            *ok = false;
+        }
+    };
+    println!("acceptance gates:");
+    gate(
+        &format!(
+            "beats majority heuristic ({:.3} → {:.3})",
+            m_majority.accuracy, m_net.accuracy
+        ),
+        m_net.accuracy > m_majority.accuracy,
+        &mut ok,
+    );
+    gate(
+        &format!("beats logistic regression ({:.3} → {:.3})", m_lr.accuracy, m_net.accuracy),
+        m_net.accuracy >= m_lr.accuracy - 1e-3,
+        &mut ok,
+    );
+    gate(
+        &format!("recall-pressure ≥ {MIN_RECALL_A} — no oversized request surprises ({:.3})", m_net.recall),
+        m_net.recall >= MIN_RECALL_A,
+        &mut ok,
+    );
+    gate(
+        &format!("precision ≥ {MIN_PRECISION_A} — alarms mean something ({:.3})", m_net.precision),
+        m_net.precision >= MIN_PRECISION_A,
+        &mut ok,
+    );
+
+    if !ok {
+        eprintln!("\ngray zone (0.05 < score < 0.95) on the test fold:");
+        for (&i, &p) in split.test.iter().zip(tp.iter()) {
+            if p > 0.05 && p < 0.95 {
+                let e = &data[i];
+                let task: String = e.task.chars().take(48).collect();
+                let text: String = e.text.chars().take(72).collect();
+                eprintln!("  score={p:.3} label={} group=A{} task={task:?} text={text:?}", e.y as u8, e.group);
+            }
+        }
+        eprintln!("\nGATES FAILED — weights NOT written.");
+        std::process::exit(1);
+    }
+
+    let blob = net.to_blob();
+    let path = alloc_weights_path();
+    std::fs::write(&path, &blob).expect("write weights");
+    println!(
+        "\nwrote {} ({} bytes; threshold {threshold:.2} — bake into alloc/model.rs)",
+        path.display(),
+        blob.len()
+    );
+}
+
 fn eval_committed() {
     let blob = std::fs::read(weights_path()).expect("committed weights present");
     let net = TinyMlp::from_blob(&blob).expect("committed weights load");
@@ -1204,12 +1416,13 @@ fn main() {
         "compaction" => train_compaction(),
         "relevance" => train_relevance(),
         "supervisor" => train_supervisor(),
+        "alloc" => train_alloc(),
         "eval" => eval_committed(),
         "diagnose" => diagnose(),
         "diagnose-relevance" => diagnose_relevance(),
         "diagnose-supervisor" => diagnose_supervisor(),
         _ => {
-            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | eval | diagnose | diagnose-relevance | diagnose-supervisor");
+            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | alloc | eval | diagnose | diagnose-relevance | diagnose-supervisor");
             std::process::exit(2);
         }
     }

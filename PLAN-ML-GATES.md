@@ -388,6 +388,16 @@ per-item and each item's outcome is separately observable in the trace:
    modified. `/ml reset` restores pretrained instantly. Off until `/ml learn on`; every adoption and
    rejection is logged for audit.
 
+> **Shipped note (2026-08-28):** the supervisor implementation tightened this design.
+> The trust region is relative 0.25 and every `learn()` re-fits FROM the pretrained layer,
+> so drift can never accumulate across rounds. Labels are confidence-weighted with an
+> abstention band (the agent sends no label at all on ambiguous results), and explicit
+> `/ml wrong` / `/ml wasted` gold labels outweigh proxies. The adoption gate runs over 31
+> fixtures (8 hand-written anchors + 23 margin-filtered per-family representatives baked
+> from the training distribution). Adoption is TWO-STEP: `/ml learn` holds the candidate
+> pending in memory (never persisted unadopted) until `/ml adopt` applies it or
+> `/ml discard` drops it. The verified shipped state is documented in TASKS.md.
+
 ---
 
 ## 14. Runtime surface — `sofuu.ml`
@@ -460,7 +470,7 @@ crates/ml-train/            dev-only crate, excluded from default-members
 - **Compaction:** replaces the `COMPACT_AT` cliff with model-driven incremental passes (§12);
   drop-oldest guard kept as the final net.
 - **Chat config:** `ChatConfig.ml: bool` (default on) persisted like `brain` (`chat.rs:276/336`);
-  `/ml [on|off]`, `/ml learn [on|off]`, `/ml reset`, `/ml wrong`, `/ml info` mirroring the
+  `/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]` mirroring the
   `/brain` arm (`chat.rs:749`); `mlgate` branch in `onStep` (`chat.rs:3317`) rendering dim
   **ASCII-only** lines (TUI rule). `SOFUU_NO_ML=1` and `ml:'off'` disable everything; every call
   is in try/catch so a gate failure can never break a turn.

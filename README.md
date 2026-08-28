@@ -579,9 +579,11 @@ const l = JSON.parse(sofuu.ml.supervisor.loop(JSON.stringify(
   { run, step, budget: 20 })));
 // → {"ok":false,"reason":"loop_spinning","source":"model","nudge":"…"}
 
-// Online-learning feedback (§13, off by default — see /ml learn below)
+// Online-learning feedback (§13, off by default — see /ml learn below).
+// conf (optional, default 1.0) is the label's confidence and becomes its
+// weight; the agent abstains on ambiguous results rather than guess.
 sofuu.ml.feedback(JSON.stringify(
-  { kind: "outcome", model: "supervisor", run, step, wasted: true }));
+  { kind: "outcome", model: "supervisor", run, step, wasted: true, conf: 0.6 }));
 
 // Compaction — which history segments are mechanical junk? (trained,
 // baked weights: 33→104→44→1; §12 of the plan). The net SELECTS; the

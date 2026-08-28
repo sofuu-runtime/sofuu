@@ -269,8 +269,13 @@ unsafe extern "C" fn js_ml_supervisor_loop(
 /* ------------------------------------------------------------------ */
 /* sofuu.ml.feedback(json) — outcome/feedback labels for online learning */
 /* (§13). kinds:                                                        */
-/*   outcome {model:"supervisor", run, step, wasted}                    */
+/*   outcome {model:"supervisor", run, step, wasted, conf?}             */
+/*           conf (default 1.0) is the proxy's confidence; it becomes   */
+/*           the example weight — the agent abstains (no call) on       */
+/*           ambiguous results rather than send a coin-flip label       */
 /*   wrong   {model:"supervisor"}  — the most recent flag was a mistake */
+/*   wasted  {model:"supervisor"}  — the most recent call was waste     */
+/* wrong/wasted are GOLD labels (weight 2.0, outweigh proxies)          */
 /* ------------------------------------------------------------------ */
 
 unsafe extern "C" fn js_ml_feedback(

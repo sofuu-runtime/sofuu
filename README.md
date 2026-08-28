@@ -674,7 +674,7 @@ blob's hash so a re-bake invalidates them. `/ml reset` clears the
 adaptation, `/ml info` reports threshold + online state + pending flag +
 working set.
 
-The 5th model, `alloc` (§14), is the model-aware config allocator +
+The 5th model, `alloc` (§21), is the model-aware config allocator +
 pre-flight guard for the context window — it fixes the class of failures
 where fixed allocations (one budget ratio, one compaction cliff, one tool
 cap for every model) send a request the selected model cannot accept. It

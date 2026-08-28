@@ -410,6 +410,8 @@ sofuu.ml.supervisor.check(action, ctx)       // {"ok":bool,"nudge":".."|null}
 sofuu.ml.compaction.plan(segments, budget)   // {"compact":[ids..],"keep":[ids..],"freeable":tok}
 sofuu.ml.info()                              // per-model params, arch, weights hash, calls, online state
 sofuu.ml.feedback(model, verdict)            // explicit label from /ml wrong
+sofuu.ml.alloc.plan(stateJson)               // model-aware allocation: cfgWindow/maxOutput/compactAt/toolCap/budgets
+sofuu.ml.alloc.noteLimit(model, errText)     // "context"|"output"|""  — learn a real limit from a provider error
 ```
 
 Registered as a nested object per model under `sofuu.ml`, following `mod_ai_register`
@@ -537,3 +539,72 @@ Each model can ship or be rejected on its own. The date fix ships regardless of 
   are not).
 - `TASKS.md` — a new section with the measured report (accuracy, ablations, tokens-per-task),
   plus the online-learning rules as a stated contract.
+
+---
+
+## 21. Model 5 — alloc: model-aware config allocation + the context pre-flight guard (shipped 2026-08-28)
+
+> **Shipped note (2026-08-28):** designed and shipped after the four-gate plan above; this
+> section records it as built and verified. Sections 1–20 are unchanged.
+
+The failure classes it fixes (all verified in code before the build): oversized input
+reaching the provider and killing the turn (the provider's 400 was the only check);
+oversized output config sent verbatim (`effective_max_output` passed `/maxout` overrides
+straight through; the Anthropic unknown-model fallback was a fixed 71,680); and fixed
+allocation amounts (one budget ratio, one 0.70 cliff, win/8 tool cap, 0.25 attach — the
+same for every model) that ignore what the selected model can actually take.
+
+Fetch-the-model-details-first ladder: capability registry (`rt/model_caps.rs`: ctxWindow,
+maxOutput, thinking kind — providers expose names only, never capabilities) → limits
+learned from provider error messages (parsed from the OpenAI context/output 400 shapes
+and Anthropic "X tokens > Y maximum", cached per model) → conservative defaults
+(32,768 window / 4,096 output). Config is clamped to the strictest of registry + learned.
+
+Three layers:
+
+- **Layer 0 — mechanical output guard** (Rust wire, always on): outgoing max_tokens
+  clamped to min(requested, caps.maxOutput); thinking-vs-max_tokens wire rules fixed;
+  unknown-model fallback 4,096.
+- **Layer 1 — pre-flight fit check** (JS, at every request-build chokepoint: agent tool
+  loop, toolless finalAnswer path, chat driver streamOpts, rlm completeOpts): estimate the
+  final prompt; if prompt + reserved output > window, run the corrective ladder in order —
+  re-cap tool results → clamp the output reserve → drop oldest PLAIN messages (never the
+  system prompt, the last message, or tool pairs) → truncate the largest with margin
+  max(64, win×0.02). The request that goes out always fits; every correction emits a
+  visible ASCII `allocgate` event. Error learning: a surviving limit 400 is parsed, cached
+  per model, and the turn retries ONCE PER KIND (context/output separately — a single
+  retry flag died on sequential output→context 400s).
+- **Layer 2 — the tiny net** (advise-only within the Layer 0/1 bounds): one scalar context
+  pressure p∈[0,1] from 24 features (caps first, measured overhead, history state +
+  growth, task shape, output history). A deterministic clamped policy maps (p, caps) to
+  the per-turn allocation: compactAt 0.70 slack → 0.50 tight, toolCapChars win/5→win/12
+  clamped [4000, 32768], recallBudgetTok win×0.03→0.01 clamped [1024, 16384],
+  attachBudgetTok win×0.30→0.15 clamped [2048, 65536], and a feasibility-checked output
+  reserve. `/ml off` / `SOFUU_NO_ML=1` restores the old fixed ratios exactly; `/ctx`
+  `/maxout` still win but are clamped to the model's hard limits with a visible note.
+
+Trainer (`ml-train alloc`): 4,810 synthetic session trajectories, 24 construction
+families (window tiers × overhead × growth × task kinds), mechanical labels (simulate 3
+future turns → overflow or not), channel-coverage split so val/test families never leak.
+Test accuracy 0.986 vs majority 0.810 / logistic regression 0.969 on identical features;
+recall 0.994, precision 0.988 at threshold 0.51 (chosen on val at recall ≥ 0.92, seed
+sweep 1–4). 18 committed-weights cargo gates including the property: no plan ever
+exceeds the resolved model's hard limits.
+
+File layout:
+
+```
+crates/sofuu-core/src/ml/alloc/
+  features.rs             24 features (train/serve shared, bit-exact f32 order)
+  policy.rs               resolve ladder, strictest(), corrective ladder, limit parsing
+  model.rs                24 -> 96 -> 40 -> 1 = 6,321 params (~25 KiB), JS shims
+  weights_v1.f32          baked blob (SML1 header, CRC-checked)
+  eval.rs                 committed-weights gates + hard-limit property test
+crates/ml-train/src/data_alloc.rs   dataset + mechanical labels
+```
+
+Verified by running: enforcing-mock E2E (a mock provider that 400s like a real one when
+prompt > 8,192 or max_tokens > 2,048) — alloc learns the 2,048 output cap, then the
+8,192 window, fits the turn at 5,996/8,192 and completes; the NO_ML control run fails
+with the provider error. Runtime JS suite 171 checks ALL PASSED (21 alloc), chat
+dual-path E2E 8/8, make test 20/20, release binary 2.5M.

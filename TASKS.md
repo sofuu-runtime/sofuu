@@ -9,7 +9,7 @@
 ---
 **Verified 2026-08-28** — the 5th tiny model landed: `alloc` —
 model-aware config allocation + a pre-flight guard for the context
-window (PLAN-ML-GATES §14). Fixes three verified failure classes:
+window (PLAN-ML-GATES §21). Fixes three verified failure classes:
 oversized input reaching the provider and killing the turn (the
 provider's 400 was the only check), oversized output config sent
 verbatim (no clamp against the model's real max output; the Anthropic

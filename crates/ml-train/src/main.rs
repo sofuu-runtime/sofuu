@@ -893,6 +893,98 @@ fn train_supervisor() {
         path.display(),
         blob.len()
     );
+
+    /* ── Adoption-gate fixtures (§13) ──────────────────────────────── */
+    emit_supervisor_fixtures(&net, &data, &split, threshold);
+}
+
+/// Adoption-gate fixture blob for online learning (§13). Picks one
+/// representative per TRAINING construction family — the first example the
+/// trained net separates with margin ≥ 0.05 around the threshold — and
+/// writes `supervisor_fixtures.f32`:
+///
+///   magic "SFX1" | version u32 | count u32 | crc32 u32 | (y f32 + 33×f32)·count
+///
+/// The runtime bakes these and requires any online-adapted output layer to
+/// classify ALL of them correctly at the shipped threshold before adoption,
+/// so the gate spans the whole trained distribution instead of only the
+/// hand-written out-of-domain anchors. Deterministic: the dataset build and
+/// the train-split order are seeded, so a re-run writes identical bytes.
+fn emit_supervisor_fixtures(net: &TinyMlp, data: &[Example], split: &Split, threshold: f32) {
+    const FIXTURE_MAGIC: u32 = u32::from_le_bytes(*b"SFX1");
+    const FIXTURE_VERSION: u32 = 1;
+    const MARGIN: f32 = 0.05;
+    const MAX_TRIES_PER_FAMILY: usize = 50;
+    const MIN_FIXTURES: usize = 18;
+    // Training families only. The held-out groups (16/24/25/26) stay out of
+    // the gate: the runtime's hand-written OOD fixtures already cover the
+    // transfer regime, and gating on held-out material would demand what
+    // the pretrained net was never asked to learn.
+    let families: Vec<u32> = (0..=15).chain(17..=23).collect();
+
+    let mut chosen: Vec<&Example> = Vec::new();
+    for g in &families {
+        let mut tries = 0usize;
+        for &i in split.train.iter() {
+            let e = &data[i];
+            if e.group != *g {
+                continue;
+            }
+            tries += 1;
+            if tries > MAX_TRIES_PER_FAMILY {
+                break;
+            }
+            let p = predict(net, &e.x);
+            let ok = if e.y >= 0.5 {
+                p >= threshold + MARGIN
+            } else {
+                p <= threshold - MARGIN
+            };
+            if ok {
+                chosen.push(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        chosen.len() >= MIN_FIXTURES,
+        "only {} of {} families yielded a margin-separated fixture (need ≥ {MIN_FIXTURES})",
+        chosen.len(),
+        families.len()
+    );
+
+    let mut payload = Vec::with_capacity(chosen.len() * 34 * 4);
+    for e in &chosen {
+        assert_eq!(e.x.len(), 33, "supervisor features are 33-dim");
+        payload.extend_from_slice(&e.y.to_le_bytes());
+        for v in &e.x {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let crc = sofuu_core::ml::net::crc32_ieee(&payload);
+    let mut blob = Vec::with_capacity(16 + payload.len());
+    for v in [FIXTURE_MAGIC, FIXTURE_VERSION, chosen.len() as u32, crc] {
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    blob.extend_from_slice(&payload);
+
+    let path = supervisor_fixtures_path();
+    std::fs::write(&path, &blob).expect("write fixtures");
+    let waste = chosen.iter().filter(|e| e.y >= 0.5).count();
+    println!(
+        "wrote {} ({} bytes; {} fixtures: {} waste / {} clean, margin ≥ {MARGIN} around {threshold:.2})",
+        path.display(),
+        blob.len(),
+        chosen.len(),
+        waste,
+        chosen.len() - waste
+    );
+}
+
+fn supervisor_fixtures_path() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("../sofuu-core/src/ml/supervisor/fixtures_v1.f32");
+    p
 }
 
 fn eval_committed() {

@@ -1169,19 +1169,31 @@
                               chars: cappedR.chars, kept: cappedR.text.length });
         /* Supervisor checkpoint 2 — AFTER the result returns: account the
          * outcome in the working set (trajectory + write tracking for the
-         * re-read rule), then report the outcome label for online learning
-         * (§13): errored or near-empty results are the waste proxy — the
-         * same criterion the trainer's useless-result channel uses. */
+         * re-read rule), then report a confidence-banded outcome label for
+         * online learning (§13) — see the banding below. */
         if (mlEnabled(d)) {
           try { sofuu.ml.track(JSON.stringify({ kind: 'tool_result', run: String(runId),
                                                 step: own.toolCalls, tool: name, target: mlTarget(args),
                                                 chars: cappedR.chars, error: errored })); }
           catch (eMl2) {}
           if (mlVerdict && sofuu.ml.feedback && typeof sofuu.ml.feedback === 'function') {
-            try { sofuu.ml.feedback(JSON.stringify({ kind: 'outcome', model: 'supervisor',
-                                                     run: String(runId), step: own.toolCalls,
-                                                     wasted: errored || cappedR.chars < 80 })); }
-            catch (eMl3) {}
+            /* Outcome label for online learning (§13) — confidence-banded
+             * proxies, with abstention in the ambiguous middle: a wrong
+             * label teaches worse than none. errored = certain waste;
+             * near-empty = probably waste, but a one-line result can be
+             * THE answer, so down-weight; 80–319 chars = coin flip, no
+             * label; a large clean result = probably useful (large ERROR
+             * dumps took the errored branch already). */
+            var mlWasted = null, mlConf = 0;
+            if (errored) { mlWasted = true; mlConf = 1.0; }
+            else if (cappedR.chars < 80) { mlWasted = true; mlConf = 0.6; }
+            else if (cappedR.chars >= 320) { mlWasted = false; mlConf = 0.8; }
+            if (mlWasted !== null) {
+              try { sofuu.ml.feedback(JSON.stringify({ kind: 'outcome', model: 'supervisor',
+                                                       run: String(runId), step: own.toolCalls,
+                                                       wasted: mlWasted, conf: mlConf })); }
+              catch (eMl3) {}
+            }
           }
         }
         /* Freshness gate checkpoint 2 (§5): collected material is scored

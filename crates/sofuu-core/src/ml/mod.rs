@@ -19,7 +19,7 @@
 //   sofuu.ml.track(eventJson)          — feed the working set
 //   sofuu.ml.workset()                 — aggregate counters (JSON string)
 //   sofuu.ml.info()                    — models + working set state (JSON)
-//   sofuu.ml.feedback(json)            — outcome/wrong labels (§13 online)
+//   sofuu.ml.feedback(json)            — outcome{conf}/wrong/wasted labels (§13)
 //   sofuu.ml.supervisor.check(json)    — pre-call checkpoint (rules + net)
 //   sofuu.ml.supervisor.loop(json)     — loop-boundary checkpoint (net)
 //   sofuu.ml.freshness.score(text, task, optsJson?) — staleness verdict
@@ -61,6 +61,10 @@ fn n(v: &serde_json::Value, key: &str) -> u32 {
 
 fn b(v: &serde_json::Value, key: &str) -> bool {
     v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn f(v: &serde_json::Value, key: &str, default: f32) -> f32 {
+    v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(default)
 }
 
 /// Read a JS string argument into an owned String ("" when not a string).
@@ -163,11 +167,12 @@ unsafe extern "C" fn js_ml_info(
     _argv: *const JSValueConst,
 ) -> JSValue {
     let (runs, calls, segs, seg_tokens) = context::summary();
-    let (on_enabled, on_obs, on_examples, on_adapted, on_adaptations) = online::status();
+    let (on_enabled, on_obs, on_examples, on_adapted, on_adaptations, on_pending) =
+        online::status();
     ret_json(
         ctx,
         format!(
-            "{{\"version\":1,\"gates\":{{\"freshness\":\"on\",\"relevance\":\"on\",\"supervisor\":\"on\",\"compaction\":\"on\"}},\"online\":{{\"enabled\":{on_enabled},\"observations\":{on_obs},\"examples\":{on_examples},\"adapted\":{on_adapted},\"adaptations\":{on_adaptations}}},\"workset\":{{\"runs\":{runs},\"calls\":{calls},\"segments\":{segs},\"segTokens\":{seg_tokens}}}}}"
+            "{{\"version\":1,\"gates\":{{\"freshness\":\"on\",\"relevance\":\"on\",\"supervisor\":\"on\",\"compaction\":\"on\"}},\"online\":{{\"enabled\":{on_enabled},\"observations\":{on_obs},\"examples\":{on_examples},\"adapted\":{on_adapted},\"adaptations\":{on_adaptations},\"pending\":{on_pending}}},\"workset\":{{\"runs\":{runs},\"calls\":{calls},\"segments\":{segs},\"segTokens\":{seg_tokens}}}}}"
         ),
     )
 }
@@ -280,8 +285,14 @@ unsafe extern "C" fn js_ml_feedback(
     let v = parse_obj(&arg_str(ctx, *argv));
     let ok = if s(&v, "model") == "supervisor" {
         match s(&v, "kind").as_str() {
-            "outcome" => online::label_outcome(&s(&v, "run"), n(&v, "step"), b(&v, "wasted")),
+            "outcome" => online::label_outcome(
+                &s(&v, "run"),
+                n(&v, "step"),
+                b(&v, "wasted"),
+                f(&v, "conf", 1.0),
+            ),
             "wrong" => online::label_wrong(),
+            "wasted" => online::label_wasted(),
             _ => false,
         }
     } else {

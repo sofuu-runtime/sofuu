@@ -133,6 +133,7 @@ fn committed_weights_meet_the_acceptance_gates() {
 
 #[test]
 fn rule_layer_speaks_first() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     // The mechanical rules are certain — when they fire, the verdict must
     // carry their label and source, not the net's.
     let run = "sup-eval-rule-dup";
@@ -156,6 +157,7 @@ fn rule_layer_speaks_first() {
 
 #[test]
 fn model_layer_catches_what_rules_miss() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     // Where the rules are silent, the net speaks: off-task wander, broad
     // search, skip-advised target, zero-echo first call.
     let cases: &[(&str, &str, &str, &str, &[&str])] = &[
@@ -181,6 +183,7 @@ fn model_layer_catches_what_rules_miss() {
 
 #[test]
 fn loop_boundary_checkpoint() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     // Spinning: the run hammers one file with offset reads and no writes —
     // the boundary check must flag the RUN, not any single call.
     let run = "sup-eval-loop-spin";
@@ -217,6 +220,7 @@ fn loop_boundary_checkpoint() {
 
 #[test]
 fn loop_boundary_needs_evidence() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     // Spin/stall are pattern predicates: with one or two recorded calls
     // the net saturates on the tiny trajectory (score 1.0 "stalled"), so
     // the boundary must stay silent until a pattern is even possible --
@@ -240,6 +244,7 @@ fn loop_boundary_needs_evidence() {
 
 #[test]
 fn forward_pass_is_bit_exact() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     let run_a = "sup-eval-det-a";
     let run_b = "sup-eval-det-b";
     for run in [run_a, run_b] {
@@ -267,6 +272,7 @@ fn blob_integrity_and_architecture() {
 
 #[test]
 fn flagged_verdicts_carry_ascii_nudges() {
+    let _g = crate::ml::online::TEST_LOCK.lock().unwrap();
     // The nudge rides in-band (tool result / ephemeral notice); a flag
     // without a reason the LLM can act on is wasted tokens, and the TUI
     // renders ASCII only.

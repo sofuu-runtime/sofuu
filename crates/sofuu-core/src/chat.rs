@@ -493,7 +493,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/compact", "Summarize the conversation into context", ""),
     ("/clear", "Reset this session (keep settings)", ""),
     ("/brain", "Toggle the memory/brain integration", "on | off"),
-    ("/ml", "ML context-economy gates + online learning", "on | off | learn | reset | wrong | info"),
+    ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
     ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 1M)"),
     ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
@@ -783,22 +783,24 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         }
         "/ml" => {
             // PLAN-ML-GATES: the context-economy gates. on|off toggles the
-            // advise-only layer; learn|reset|wrong|info drive the online
-            // adaptation of the supervisor (§13, off by default).
+            // advise-only layer; learn|adopt|discard|reset|wrong|wasted|info
+            // drive the online adaptation of the supervisor (§13, off by
+            // default; two-step: learn trains a candidate, adopt applies it).
             if arg.is_empty() {
                 let state = if cfg.ml { "on" } else { "off" };
-                let (on_enabled, _obs, on_examples, on_adapted, on_adaptations) =
+                let (on_enabled, _obs, on_examples, on_adapted, on_adaptations, on_pending) =
                     sofuu_core::ml::online::status();
                 chat_out(&format!(
-                    "  ML gates: {}  --  /ml on|off | learn|reset|wrong|info  (SOFUU_NO_ML=1 disables entirely)\n",
+                    "  ML gates: {}  --  /ml on|off | learn|adopt|discard|reset|wrong|wasted|info  (SOFUU_NO_ML=1 disables entirely)\n",
                     state
                 ));
                 chat_out(&format!(
-                    "  online learning: {}, {} labeled example(s), adapted: {} ({} adaptation(s))\n",
+                    "  online learning: {}, {} labeled example(s), adapted: {} ({} adaptation(s)){}\n",
                     if on_enabled { "on" } else { "off" },
                     on_examples,
                     if on_adapted { "yes" } else { "no" },
-                    on_adaptations
+                    on_adaptations,
+                    if on_pending { " -- candidate PENDING: /ml adopt or /ml discard" } else { "" }
                 ));
                 "ok"
             } else if arg == "off" {
@@ -815,6 +817,24 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 let r = sofuu_core::ml::online::learn();
                 chat_out(&format!("  /ml learn: {}\n", r.detail));
                 "ok"
+            } else if arg == "adopt" {
+                let (adopted, persisted) = sofuu_core::ml::online::adopt();
+                if adopted {
+                    chat_out(&format!(
+                        "  candidate adopted -- the adapted supervisor is now in charge ({})\n",
+                        if persisted { "persisted" } else { "in-memory only, will not survive a restart" }
+                    ));
+                } else {
+                    chat_out("  no pending candidate to adopt -- /ml learn first\n");
+                }
+                "ok"
+            } else if arg == "discard" {
+                if sofuu_core::ml::online::discard() {
+                    chat_out("  pending candidate discarded -- the previous supervisor stays in charge\n");
+                } else {
+                    chat_out("  no pending candidate to discard\n");
+                }
+                "ok"
             } else if arg == "reset" {
                 sofuu_core::ml::online::reset();
                 chat_out("  online adaptation cleared -- the pretrained supervisor is back in charge\n");
@@ -826,8 +846,15 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                     chat_out("  no recent supervisor flag to mark wrong\n");
                 }
                 "ok"
+            } else if arg == "wasted" {
+                if sofuu_core::ml::online::label_wasted() {
+                    chat_out("  marked the most recent call as waste -- /ml learn to apply\n");
+                } else {
+                    chat_out("  no recent call to mark wasted\n");
+                }
+                "ok"
             } else if arg == "info" {
-                let (on_enabled, obs, on_examples, on_adapted, on_adaptations) =
+                let (on_enabled, obs, on_examples, on_adapted, on_adaptations, on_pending) =
                     sofuu_core::ml::online::status();
                 let (runs, calls, segs, seg_tokens) = sofuu_core::ml::context::summary();
                 chat_out(&format!(
@@ -836,11 +863,12 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                     if on_adapted { "adopted" } else { "pretrained" }
                 ));
                 chat_out(&format!(
-                    "  online: {}, {} observation(s) awaiting labels, {} labeled example(s), {} adaptation(s)\n",
+                    "  online: {}, {} observation(s) awaiting labels, {} labeled example(s), {} adaptation(s){}\n",
                     if on_enabled { "on" } else { "off" },
                     obs,
                     on_examples,
-                    on_adaptations
+                    on_adaptations,
+                    if on_pending { ", candidate pending (/ml adopt|discard)" } else { "" }
                 ));
                 chat_out(&format!(
                     "  working set: {} run(s), {} call(s), {} segment(s), {} segment token(s)\n",
@@ -848,7 +876,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 ));
                 "ok"
             } else {
-                chat_out("  Usage: /ml [on|off|learn|reset|wrong|info]\n");
+                chat_out("  Usage: /ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]\n");
                 "ok"
             }
         }
@@ -1071,7 +1099,7 @@ fn print_help() {
     c("/compact", "summarize the conversation into context");
     c("/clear", "reset this session (keep settings)");
     c("/brain [on|off]", "toggle memory/brain integration");
-    c("/ml [on|off|learn|reset|wrong|info]", "ML context-economy gates + supervisor online learning");
+    c("/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
     c("/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c("/ctx [<tokens>]", "view/set the context window (max 1M)");
     c("/maxout [<tokens>]", "view/set max output tokens (max 384k)");

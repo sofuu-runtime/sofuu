@@ -227,6 +227,13 @@ function decide(body) {
     if (tc === 1) return { tool: { name: "read_file", args: { path: "a.txt", offset: 1 } } };
     return { text: "mlreread-final[" + (txt.indexOf("already read at step") >= 0 ? "+reread" : "-noread") + "]" };
   }
+  if (sys.indexOf("AGENT=mlabstain") >= 0) {
+    /* §13 hardening: one tool call whose result lands in the AMBIGUOUS
+     * band (80–319 chars) — the agent must observe the call but send NO
+     * outcome label (a coin-flip label is worse than none). */
+    if (tc === 0) return { tool: { name: "get_weather", args: { city: "Oslo" } } };
+    return { text: "mlabstain-final" };
+  }
   if (sys.indexOf("AGENT=mlfreshclean") >= 0) {
     /* Control: fresh material must NOT produce a freshness notice.
      * (Checked BEFORE the mlfresh branch — its marker is a substring.) */
@@ -1411,6 +1418,39 @@ async function main() {
     check("ml.info(): labeled example counted (online learning stays off until /ml)",
       !!info2 && !!info2.online && info2.online.enabled === false &&
       info2.online.examples >= 1 && info2.online.observations >= 1);
+    check("ml.info(): pending-candidate flag reported (two-step adoption, none pending)",
+      !!info2 && info2.online.pending === false);
+
+    /* §13 hardening: confidence-banded labels + the gold "wasted" mirror.
+     * conf rides the outcome label; wasted consumes the most recent call. */
+    sofuu.ml.track(JSON.stringify({ kind: "run_start", run: "e2e-sup-conf", task: SUP_TASK }));
+    supCheck("e2e-sup-conf", 1, "read_file", readSig(SUP_P0), SUP_P0);
+    sofuu.ml.track(JSON.stringify({ kind: "tool_result", run: "e2e-sup-conf", step: 1,
+      tool: "read_file", target: SUP_P0, chars: 1200, error: false }));
+    const fb3 = JSON.parse(sofuu.ml.feedback(JSON.stringify(
+      { kind: "outcome", model: "supervisor", run: "e2e-sup-conf", step: 1,
+        wasted: false, conf: 0.8 })));
+    check("ml.feedback: confidence-banded outcome label accepted", fb3.ok === true);
+    const fb4 = JSON.parse(sofuu.ml.feedback(JSON.stringify(
+      { kind: "wasted", model: "supervisor" })));
+    check("ml.feedback: 'wasted' gold label consumes the most recent call", fb4.ok === true);
+
+    /* §13 hardening: abstention E2E — an ambiguous result (80–319 chars)
+     * observes the call but labels nothing; the example count must not
+     * move across the run. */
+    sofuu.agent.define({
+      name: "mlabstain", system: "AGENT=mlabstain", memory: "off", rlm: "off",
+      tools: [{ name: "get_weather", description: "w",
+                parameters: { type: "object", properties: { city: { type: "string" } } },
+                execute: async (a) => "WEATHER-" + a.city + "-" + "x".repeat(190) }],
+      provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url,
+    });
+    const onlineBefore = JSON.parse(sofuu.ml.info()).online;
+    await sofuu.agent.run("mlabstain", "weather check oslo", {});
+    const onlineAfter = JSON.parse(sofuu.ml.info()).online;
+    check("online abstention: ambiguous ~200-char result observes but labels nothing",
+      onlineAfter.observations >= onlineBefore.observations + 1 &&
+      onlineAfter.examples === onlineBefore.examples);
 
     /* §8: the working set accumulated the runs above. */
     let ws = null;

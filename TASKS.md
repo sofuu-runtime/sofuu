@@ -7,6 +7,53 @@
 > Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
 
 ---
+**Verified 2026-08-28** — hardened the supervisor's online learning
+(§13): the three weak points from the guardrail audit are closed —
+noisy labels, narrow adoption gate, mechanical adoption. Still
+advise-only, still OFF by default, still deterministic.
+
+- ✅ **Confidence-weighted labels + abstention** (`ml/online.rs`,
+  `agent.js`): the waste proxy is now a 4-band scheme instead of a
+  coin-flip boolean — errored → wasted (conf 1.0); result < 80 chars →
+  wasted (conf 0.6); 80–319 chars → ABSTAIN (no label at all — better
+  none than a coin-flip); ≥ 320 chars → clean (conf 0.8). Examples carry
+  the weight `w`; the SGD gradient is `g = w·(p − y)`, so a 0.6 label
+  moves the candidate half as much as a certain one.
+- ✅ **Gold labels weigh 2.0**: explicit user corrections outweigh proxy
+  labels — `/ml wrong` (existing) and the new `/ml wasted` (mark the
+  most recent call as missed waste); `sofuu.ml.feedback` accepts
+  `{kind:"wasted"}` and optional `conf` from JS.
+- ✅ **Adoption gate 8 → 31 fixtures**: the trainer now emits a second
+  artifact, `supervisor_fixtures.f32` (SFX1 blob, CRC-checked) — one
+  margin-filtered representative per training family (23 families,
+  margin ≥ 0.05 around the baked threshold), baked into the runtime via
+  `include_bytes!`. Adoption requires ALL 23 baked + 8 hand-written
+  fixtures to stay correct at the baked threshold; a build-time test
+  asserts the pretrained net separates both sets, and the baked set
+  stays OUT of the training batch so replay anchors don't dilute live
+  examples. Weights re-bake came out bit-identical (dataset/split
+  untouched).
+- ✅ **Two-step adoption (human in the loop)**: `/ml learn` no longer
+  auto-applies — it trains the candidate, runs the 31-fixture gate, and
+  holds it PENDING (in-memory only, never persisted unadopted), printing
+  examples used, gate result, and whether the trust region clamped.
+  `/ml adopt` applies + persists; `/ml discard` drops it. `sofuu.ml
+  .info()` reports the pending flag.
+- ✅ **Test-race fix**: the process-global ONLINE state is now guarded
+  by one shared lock across the online tests AND the supervisor eval
+  tests (check()/loop_check() record observations into the same deque,
+  and score against whatever output layer is live). One
+  scheduling-dependent failure was reproduced and root-caused before the
+  fix; the suite then ran green 11× consecutively.
+- ✅ **Verified by running:** 222 workspace lib tests green (8 online.rs
+  tests incl. zero-weight gradient, pending→adopt→persist flow,
+  baked-blob parse + separation, weighted roundtrip); `./sofuu run
+  tests/agent_test.js` ALL PASSED (4 new assertions: pending flag,
+  confidence-banded label accepted, wasted gold label consumes the most
+  recent call, ambiguous ~200-char result observes but labels nothing);
+  `make test` 20/20.
+
+---
 **Verified 2026-08-26** — the footer context meter is now measured the
 way claude/opencode measure it: it shows CURRENT context usage of the
 next request, not cumulative lifetime tokens.

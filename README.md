@@ -214,7 +214,7 @@ sofuu help                   # Print usage help
 /hooks              # Show ~/.sofuu/hooks.js user middleware info
 /resume [id]        # Browse + resume a past session
 /serve              # Info on serving the brain over HTTP
-/ml [on|off|learn|reset|wrong|info]  # Context-economy gates + supervisor online learning
+/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]  # Context-economy gates + supervisor online learning
 
 # Session mesh (same project shares context in real time)
 /sessions           # List sessions on this project
@@ -654,15 +654,23 @@ logistic regression (0.945) on identical features.
 
 Online learning (§13) is the escape hatch for messiness the synthetic
 training set cannot foresee — and it is OFF by default. `/ml learn` adapts
-ONLY the supervisor's output layer from labeled runtime examples, under
-four guardrails: a trust region (‖Δw‖ ≤ 0.25·‖w₀‖, projected), replay
-anchors (8 canonical fixtures in every batch), a batch floor (16 examples
-or it refuses), and an adoption gate (the new layer is adopted only if
-every fixture stays correct at the baked threshold). Adopted deltas persist
+ONLY the supervisor's output layer from labeled runtime examples, under six
+guardrails: confidence-weighted labels (the agent's waste proxy is a
+4-band scheme — errored → wasted conf 1.0, tiny result → wasted conf 0.6,
+large result → clean conf 0.8, and ambiguous 80–319-char results ABSTAIN
+rather than send a coin-flip label; explicit `/ml wrong` / `/ml wasted`
+gold labels weigh 2.0), a trust region (‖Δw‖ ≤ 0.25·‖w₀‖, projected),
+replay anchors (8 canonical fixtures in every batch), a batch floor (16
+examples or it refuses), an adoption gate over 31 fixtures (the 8 anchors
+plus 23 margin-filtered representatives of the training families, baked
+into the binary — the candidate passes only if every one stays correct at
+the baked threshold), and two-step adoption: `/ml learn` holds the
+candidate PENDING in memory (never persisted unadopted) until `/ml adopt`
+applies + persists it or `/ml discard` drops it. Adopted deltas persist
 separately (`~/.sofuu/ml/supervisor_online.f32`), keyed to the pretrained
 blob's hash so a re-bake invalidates them. `/ml reset` clears the
-adaptation, `/ml wrong` marks the most recent flag as a mistake, `/ml info`
-reports threshold + online state + working set.
+adaptation, `/ml info` reports threshold + online state + pending flag +
+working set.
 
 ### `sofuu.web` — Web Search & Page Reading
 

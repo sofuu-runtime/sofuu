@@ -11,9 +11,19 @@
 
 mod data_alloc;
 mod data_compaction;
+mod data_embedding;
 mod data_freshness;
 mod data_relevance;
 mod data_supervisor;
+mod data_embedding_gen;
+mod embedding_eval;
+mod embedding_stress;
+mod embedding_teacher;
+mod embedding_train;
+mod embedding_v2;
+mod embedding_verify;
+mod embedding_diag;
+mod embedding_anchor;
 mod train;
 
 use std::path::PathBuf;
@@ -1417,12 +1427,17 @@ fn main() {
         "relevance" => train_relevance(),
         "supervisor" => train_supervisor(),
         "alloc" => train_alloc(),
+        "embedding" => embedding_train::train_embedding(),
+        "embed-eval" => std::process::exit(embedding_eval::run_eval()),
+        "embed-stress" => std::process::exit(embedding_stress::run_stress()),
+        "embed-verify" => std::process::exit(embedding_verify::run_verify()),
+        "embed-diag" => std::process::exit(embedding_diag::run_diag()),
         "eval" => eval_committed(),
         "diagnose" => diagnose(),
         "diagnose-relevance" => diagnose_relevance(),
         "diagnose-supervisor" => diagnose_supervisor(),
         _ => {
-            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | alloc | eval | diagnose | diagnose-relevance | diagnose-supervisor");
+            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | alloc | embedding | embed-eval | embed-stress | embed-verify | eval | diagnose | diagnose-relevance | diagnose-supervisor");
             std::process::exit(2);
         }
     }

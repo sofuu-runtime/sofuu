@@ -7,6 +7,409 @@
 > Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
 
 ---
+**Verified 2026-09-07 (round 9, Path B)** — SEMANTIC EMBEDDER v2
+FEATURE CONTRACT (learned word-embedding table, SEM2, 1024×16 int8
+buckets + 768-trigram tower H=16, 30,032 params, artifact
+`dffb00185d090662`, 30,636 B ≤ 32 KiB budget exact, val 0.949/+0.2220,
+soup kept seed 47, MINING=0) graded ONCE, pre-registered: **fused
+OVERALL 0.917** (hash 0.870, +4.7pp) — best honest number, first >0.9
+with margin G5 + G2 + G4 all PASS; round 8's G3-code failure FIXED
+(fused code 1.000). Still FAIL: G1 paraphrase 0.750 — identical to
+rounds 6–8 while the sem channel itself rose 0.740→0.807 (the synonym
+bridge does not reach the §10 hand-written families at this size);
+G3-paths 0.667 (sem channel 0.542 drags fusion under the 1pp band);
+G6 3/8 wins. Budgets §10.3 all PASS (init 0.17 ms, p95 0.167 ms).
+Generalization: fused unseen 0.558 ±0.029 (matches rounds 6–8), stress
+PASS, OOD fused 0.995 best-ever. VERDICT per §10: candidate stays
+OFFLINE, hash-v1 shipped, baked blob untouched. Pre-registered
+conclusion: G1 is a BUDGET finding (32 KiB cannot carry a generalizing
+synonym bridge), not a training finding — no round 10 against these
+numbers; next move is the user's plan-level decision (lift payload
+budget vs Path A additive-layer trade). Full record in the plan's
+round-9 section.
+
+**Verified 2026-09-07 (round 8)** — SEMANTIC EMBEDDER OVERALL > 0.9
+ACHIEVED (honestly, one pass): anchor-lens sem channel (K=32 w=0.6,
+pairwise+QAT, mining OFF, artifact `65916267223628cb`, val 0.958)
+fused with hash-768 via the round-6 RRF rule → **fused OVERALL 0.901**
+(hash 0.870, +3.1pp) — first candidate to clear the user's target.
+G6 now PASSES (4 wins: doc +.292, paths +.042, errors +.042, versions
++.042); round 7's paths gate failure FIXED (0.625→0.750). Still FAIL:
+G1 (paraphrase 0.750 < 0.933 — unreachable under the constraints,
+reconfirmed 3rd time) and G3-code (0.917 < 0.990, 1-query gap).
+Generalization: fused unseen 0.558 ±0.032 (seen 0.541), stress PASS,
+p95 1.30 ms; scale probe 0.338 (correlated-channel risk, pre-
+registered). VERDICT per §10: candidate stays OFFLINE, hash-v1 shipped.
+Fusion family EXHAUSTED (round-8 pre-registration): next move is a
+plan-level decision (output budget / v2 features / per-task recall),
+not round 9. Full record in the plan's round-8 section.
+
+**Verified 2026-09-07 (rounds 6–7)** — SEMANTIC EMBEDDER TWO-CHANNEL
+FUSION (Tier-3 route, reinterpreted as parallel voting, not rerank):
+channel S = pure sem64 tower (pairwise+QAT, mining off, H=32, artifact
+`af0ffb7d4104fa16`, val R@5 0.940), channel H = hash-v1 768 recomputed
+from stored raw text (zero params/features), fused by RRF
+1/(10+rank_S)+1/(10+rank_H), top-20 each, final top-5. Graded ONCE per
+round, pre-registered: **fused OVERALL 0.896 both rounds** (hash 0.870,
++2.6pp) — FAIL gates G1 (paraphrase 0.750), G3 (paths 0.625), G6 (3/8
+wins). Round 7's pre-registered sem-only admission cap (≤2 slots) was
+INERT on §10: the displacement is consensus/sem-supported wrong votes,
+not sem-only sweeps — prediction reported wrong. Generalization proof
+strong both rounds: fused unseen R@5 0.553/0.557 beats BOTH channels
+(sem 0.337, hash 0.277) on 8 fresh-seed corpora, seen≈unseen, stress
+PASS, p95 ~1.3 ms. Diagnosis → round 8 (in flight): sem channel's §10
+unreliability (0.740 despite val 0.940) is the weak link; retrain S
+with the round-4 frozen anchor lens (K=32 w=0.6, zero params) so its
+votes are lexical-confirmed. Runtime unchanged: hash-v1 stays shipped,
+blob sha1 `45272c1f56c678ce9b510176000b89b2525bb4a1` untouched. Full
+record in the plan's round-6/7 sections.
+
+**Verified 2026-09-07 (round 5)** — SEMANTIC EMBEDDER TIER-1 LEVERS
+(SOUP + LISTWISE SOFTMAX + QAT) IMPLEMENTED, RAN, ATTRIBUTED: R7
+regressed to **0.682** (§10 FAIL, 7 gates); two-seed ablations pin the
+LISTWISE LOSS as the culprit (softmax under-weights moderate negatives;
+the pairwise hinge's hard 0.10 gate is what §10's P@5/contamination
+metrics need) and QAT as mildly BENEFICIAL under the known-good loss —
+A2 (pairwise+QAT) = **0.818**, the new best neural candidate, still
+failing the same 7 gates. Key negative result: trainer val (0.944, best
+ever) DIVERGED from §10 (0.682, worst ever) — the val proxy is no
+longer predictive under these levers; soup degenerated to 1/8 kept
+(averaged weights land between int8 grid points). Tier-1 EXHAUSTED:
+third independent confirmation that single-stage 64-dim retrieval
+cannot pass gates 1/3 at any lever setting; the structural route under
+the no-new-params / no-new-features constraint is **Tier 3: two-stage
+recall** (sem64 candidates + hash768 rerank from stored raw text).
+Runtime unchanged: hash-v1 stays, blob sha1
+`45272c1f56c678ce9b510176000b89b2525bb4a1` untouched, sofuu-core
+285/285 default-env (fake-quant mirror test added), in-tree embed-eval
+FAIL exit 1 reproduced. Full record in the plan's round-5 section.
+
+**Verified 2026-09-06 (round 4)** — SEMANTIC EMBEDDER FAILURE ROOT-CAUSED
++ HYBRID ANCHOR+TOWER: best candidate 0.781 → **0.807**, hash-v1 stays
+(full evidence + trade-off law in the plan's round-4 shipped note).
+New: `embed-diag` (per-query margin evidence in raw-hash vs candidate
+space + anchor-floor probes) proved **34 of 35** hash-right/candidate-
+wrong misses had POSITIVE input margin — the trained projector DESTROYED
+signal the 768-dim features already carried (corrects the round-1..3
+"input-contract ceiling" read: the features suffice; the learned
+projector was the destroyer). Fix: frozen zero-blob Rademacher anchor
+channel blended with the tower (`embedding_anchor.rs`, env K/w/kind,
+trainer trains THROUGH the lens; §10 eval applies the same blend).
+Trade-off law measured: anchor width buys exact-token (code 0.417→0.833
+from K=32→56) at the direct expense of paraphrase (0.708→0.625) — the
+skills compete for the same 64 dims. Best: R6-K32 w=0.6, artifact
+`87ecff58154aa89b` — first candidate to WIN categories hash loses
+(documentation 1.000, paths 0.833) + stress PASS + beats hash on
+randomized verify (0.353/0.316 vs 0.293/0.298). Still FAILS §10: gate 1
+(paraphrase 0.933) unreachable over these features, gate 3 cannot hold
+at any single K. Runtime unchanged: blob 2c624b85c910cf72 untouched,
+H=16 default, sofuu-core 284/284, in-tree FAIL exit 1 reproduced. A
+shippable gain now needs a plan-level decision: more output budget,
+v2 input features, or per-task recall paths.
+
+**Verified 2026-09-06 (round 3)** — SEMANTIC EMBEDDER, HIGHER-QUALITY
+RANDOMIZED DATASET + INTENSIVE RETRAIN: still FAIL — hash-v1 stays (full
+record in the plan's round-3 shipped note). Dataset upgrade: SUBJ 72→140,
+PARA_MECH/DET 20→59/61, NEW mechanism-only families (queries share ZERO
+anchor tokens with memories — the eval's hardest skill, directly
+targeted), hand-written ASSOC families 24→39 (+ val 6→10, short 10→14),
+BASE 20→26 train families per category → 364 families / 2,510 anchors
+(mining run: 418/2,883), all uniqueness assertions green; SOFUU_EMB_CORPUS
+hex + SOFUU_EMB_CORPUS_SEED knobs. Intensive runs: R4 H=32 0.693 / R4
+H=48 0.745 / R5 mining-boosted H=32 **0.781** (paraphrase 0.667 = the
+round-1 ceiling, errors 0.292) — every candidate FAILS §10 gate 1 (needs
+0.933). Extreme + randomized testing on R5: stress hard gates PASS
+(hostile, determinism, 8-KiB p95 0.14 ms, OOD 0.917, 4-KiB); embed-verify
+over 8 fresh corpora — sem beats hash on unseen recall (0.349 vs 0.298)
+and separation (+0.013 vs −0.174) but paraphrase 0.083 / errors 0.117:
+the same signature. Three rounds now triangulate the ceiling from every
+side (data, width, teacher, mining): the binding constraint is the
+768-hash INPUT contract; next lever = v2 feature-contract decision
+(subword/char n-grams or a real encoder in the feature stage). Runtime
+unchanged: consts at H=16 default, blob 2c624b85c910cf72 untouched,
+in-tree embed-eval FAIL exit 1 reproduced, sofuu-core 284/284.
+
+**Verified 2026-09-05 (round 2)** — SEMANTIC EMBEDDER, THREE QUALITY
+LEVERS: implemented, all candidates still FAIL — hash-v1 stays (full
+lever details + results table in the plan's round-2 shipped note). Built:
+(1) distillation teacher (`embedding_teacher.rs` — local PPMI-SVD over
+repo text + a JSONL cache format so a future API teacher drops in;
+trainer MSE weight knob) — teacher actively HURTS ranking separation at
+every width (R2 0.750 vs R2c 0.776); (2) width knob `SOFUU_EMB_H`
+(32..128 cfg ladder in build.rs) + `SOFUU_EMB_BUDGET_KIB` eval override —
+pure H=64 also overfits (R2c 0.776, paraphrase 0.458); (3) SEM1 v2
+sparse-weight format (top-K-per-row W1 + strict v2 parser; H=128/K=48 =
+28,160 B inside the ORIGINAL 32 KiB) with two-phase pruning — R3 0.745
+(paraphrase 0.542, code 0.333). Found+fixed a v2 writer/reader layout
+mismatch (interleaved vs blocked idx/val) via the trainer self-check;
+roundtrip test green. Extreme (`embed-stress`) + randomized
+(`embed-verify`, 8 fresh corpora) testing ran on R2c, R3 and iter2
+control: stress hard gates PASS everywhere (hostile inputs,
+determinism, 8-KiB p95 0.05–0.22 ms, OOD 0.92–0.97, multilingual 1.000,
+4-KiB queries); randomized unseen-family sem R@5 0.387–0.413 vs hash
+0.361 (sem wins raw recall) BUT paraphrase 0.08–0.11 and errors 0.06–0.09
+— the same signature as §10: the 768-hash input contract can't see what a
+paraphrase doesn't share lexically. Runtime unchanged: consts back at
+H=16, baked blob 2c624b85c910cf72 untouched, in-tree embed-eval FAIL
+exit 1 reproduced, sofuu-core 284/284. Next lever = v2 feature-contract
+decision (subword/char n-grams or real encoder in the feature stage).
+
+**Verified 2026-09-05** — SEMANTIC EMBEDDER RETRAIN ROUND: 7 iterations,
+STILL FAIL — hash-v1 stays (full iteration table + diagnostics in the
+plan's shipped note). Built: procedural corpus generator (11 categories,
+hundreds of randomized families + 34 hand-written associative families),
+trainer rewrite (SimCSE self-pairs, input dropout 0.4, b1 decay,
+per-category balanced sampling, held-out-family selection, failure
+mining), eval harness candidate override + per-query miss listing, and
+the `embed-stress` extreme suite (OOD 0.964, multilingual 1.000, scale
+p95 0.19 ms, hostile inputs/determinism PASS). Best candidate 0.839 vs
+hash 0.870 (iter2, H=32, artifact b678d78517910230, offline); every
+candidate fails §10 gate 1 (paraphrase ≥ hash+10pp on unseen families —
+best 0.667 vs required 0.933). Conclusion: capacity ceiling of the
+768→tanh→64 family within the 32 KiB budget; runtime consts REVERTED to
+the plan-frozen H=16 and the baked blob untouched (2c624b85c910cf72) —
+sofuu-core 293/0. A passing candidate needs a v2 payload-budget decision.
+
+**Verified 2026-09-04** — SEMANTIC EMBEDDER §10 VERDICT: FAIL —
+candidate rejected, hash-v1 stays (PLAN-TINY-SEMANTIC-EMBEDDER, full
+record in the plan's shipped note). Landed in this batch: §10.2
+correctness tests in `embedding::tests` (hostile inputs incl. 8 KiB+,
+raw-byte TF-IDF robustness, bit-stability, every blob-corruption class
+rejected, golden pins) 12/12; Phase-5 migration fault matrix in
+`rt::memory` (success w/ byte-identical hash-v1 backup + restart
+reopen + no sidecar litter; refuses on missing record text, hash-open
+of a semantic brain, stale artifact id, remote-provider vectors,
+read-only staging dir — original file byte-identical after every
+refusal) 10/10 — both with the real QTSQ build; and the §10 harness
+`cargo run -p ml-train --release -- embed-eval`
+(`embedding_eval.rs`: 8 Sofuu-shaped categories × 6 families, 152
+records / 192 queries through real `Cma::recall`, hard negatives =
+shared-template slot swaps). Result: semantic R@5 0.417 vs hash-v1
+0.849 overall (worst: code/versions −0.875), hard-negative precision
+0.127 vs 0.399, 0 of 8 category wins — FAIL on every §10.1 quality
+gate; §10.3 budgets all pass (13,988 B payload, init 0.62 ms, p95
+8-KiB forward 0.113 ms). Per plan §10: no cutover, no default change,
+migration machinery stays dormant-but-tested. Harness exit 1 = the
+durable record; rerun anytime.
+
+---
+**Verified 2026-09-03 (f)** — TUI chip renamed to "in N · out M" (user
+request): the per-turn usage chip in the footer METRIC row now labels
+its two numbers — `in 1.3k · out 2` (fmtTk-shaped, multi-round turns
+`in 30k · out 800 · 5 calls`, spend `· $0.0121` appended) — instead of
+the ambiguous bare `30k→800 tk`, which read as an unlabeled pair now
+that the same row also shows ctx. /cost's per-turn rows use the same
+`in X · out Y` naming; this matches the desktop's usage line
+(`N in · M out` in ChatPane). e2e chat_chip_e2e.sh updated for the new
+format (regex `in N · out M` + k-suffix-aware parse) — S1 chip persists
+past the 2s timer, S2 paste chip reads `in 1.3k`. Battery green
+(cargo 334/0, make test 27/0/1).
+
+---
+**Verified 2026-09-03 (e)** — Claude-style CONTEXT RETENTION: tool
+transcripts now PERSIST between turns (user decision: "we should do what
+claude does"). agent.js finish() returns res.transcript (the turn's
+assistant tool_calls + tool messages, plain copies; ML gate notices
+filtered out; depth-0 only; absent from agent_runs.jsonl), and BOTH
+drivers (chat.js + the TUI DRIVER in chat.rs) push it into history
+between the user text and the answer — user → assistant(tool_calls) →
+tool → … → assistant. The model keeps its tool context across turns
+(it can reference what it read/did last turn), and compaction — not a
+per-turn release — is what sheds old context, exactly Claude Code's
+design. History maintenance became TURN-BLOCK aware in both drivers:
+history is now a list of turn blocks, and the entry cap, the §12 ML
+compaction gate, the P5 auto-compact cliff (summarizeHistory folds
+whole blocks — fixed a latent bug where folding from index 0 was
+rejected), and the drop-oldest guard all move/remove whole blocks so a
+retained tool message can never be orphaned from its assistant
+tool_calls pair (a hard 400 at OpenAI-compatible providers; the
+Anthropic builder maps tool pairs to tool_use/tool_result blocks and
+was already safe). historyTokens() now counts the tool_calls JSON
+(the provider bills it), and the desktop ctx event switched from
+"first request's prompt" to calibrated-overhead + historyTokens()
+(the next request INCLUDES the retained transcript — the old formula
+under-counted); state() grew an OPT-IN {history:true} snapshot
+(desktop settings card polls it — full history would be serialization
+cost). The TUI settle line's "tool context … is released" wording is
+gone (no longer true) — plain "ctx meter settled N→M" only. Resume
+paths still rebuild prose pairs (fabricated call ids 400 at providers)
+— the .qtsq tools manifest + activity digest remain the resume story.
+Proof: NEW tests/chat_retention_e2e.sh (in make test) — 15 driver
+checks (transcript shape/snapshot, history block ordering, no orphans,
+plain turn's ON-WIRE request carries the prior tool result — mock
+forensics confirm) + a pty probe on ./sofuu chat (real TUI: tool turn
+then plain turn answered RETENTION-SAW-NEEDLE, footer steady, no
+settle line). Battery green (cargo 334/0, make test 27/0/1).
+
+---
+**Verified 2026-09-03 (d)** — TUI token display debugged: BOTH user
+reports traced to real defects. "ctx shows 30k during the conversation,
+2.4k after it completes": mid-turn the live meter anchors to each 'llm'
+event's REAL promptTokens — a tool-using turn's requests carry the
+per-round tool transcripts (loopMsgs: tool calls + results), so 30k was
+the true request size; at turn end those transcripts were released
+(they never persisted into driver history) and ctxMeter() settled to
+history+overhead ≈ 2.4k for the NEXT request. Correct math, but the
+jump was unexplained — a dim settle line now prints when the settle
+drops >20% and >1k tk. (Superseded 2026-09-03 (e): transcripts are now
+RETAINED, so the crater itself no longer happens on tool turns.)
+"tui wasn't showing input and output tokens": the chip
+("99→2 tk · $0.0001") DID render but (A) the 2s metricsTimer repainted
+refreshStatus('') which WIPED it 2s after every turn — now the timer
+repaints lastChip; (B) it lived in footer row 1, which shares its width
+with the hints column (80-col terminal leaves ~32 cells) — the chip was
+TRUNCATED away; my earlier longer hints text made this worse. The chip
+now rides the METRIC row ("ctx 2.4k/128k · brain · 99→2 tk · $…"),
+hints shortened to "/help · ⏎ · esc · ctrl-k copy", and multi-round
+turns annotate the aggregate ("30k→800 tk · 5 calls" — the in-number is
+the turn's TOTAL input bill across rounds, each round re-sends the
+context, not one request's size). e2e tests/chat_chip_e2e.sh (in make
+test): S1 small turn — chip appears AND survives 2 timer fires; S2 big
+paste — chip reflects the request's real ptk (1346, byte-matched against
+the mock's own log), no false settle line (a paste settles HIGHER).
+Battery green (cargo 334/0, make test 26/0/1).
+
+---
+**Verified 2026-09-03 (c)** — TUI text is now COPYABLE: mouse-drag
+selection + Ctrl-K clipboard copy. The TUI owns the alternate screen with
+mouse reporting on (1000/1002/1006), so the terminal's native click-drag
+never runs — selection must be app-managed. Implementation: left-press on
+a conversation row anchors a selection (SGR btn 0, process.rs state 9),
+drag extends it (btn 32), any repaint paints the selected rows
+inverse-video (render_rows folds in sel_range()); Ctrl-K (0x0b) copies
+the selected rows to the system clipboard — pbcopy via popen on macOS,
+OSC 52 elsewhere — with ANSI styling stripped and a transient "Copied N
+lines" notice on the phase row (h-6, uv-timer cleared). Wheel scroll
+clears the selection (rows map through G_SCROLL, so scrolling would
+silently move them). tui_selected_rows(r0,r1) maps screen rows back to
+G_LINES text mirroring render_rows math exactly (viewport height, scroll
+clamp, top anchor). Footer hints now read "/help · enter ⏎ · esc stop ·
+drag+Ctrl-K copy"; /help lists the Ctrl-K shortcut. e2e
+tests/chat_copy_e2e.sh drives a real pty: SGR drag sequence over welcome
+rows, Ctrl-K, then asserts inverse-video paint seen, clipboard is
+byte-identical to the app's write (SOFUU_SEL_DEBUG dump), ANSI stripped,
+UTF-8 intact. Gotcha found on the way: pbpaste run with a BARE env (no
+LC_CTYPE) transcodes the pasteboard to ASCII — every multibyte char
+reads back '?' — the probe must pass LC_CTYPE=en_US.UTF-8 (the app's
+write was always byte-perfect). Full battery green (cargo 334/0, make
+test 25/0/1 incl the new copy e2e).
+
+---
+**Verified 2026-09-03 (b)** — TUI ctx meter is now REAL-TIME during a
+running conversation. The footer used to freeze until the turn ENDED:
+usedCtx only calibrated from the turn's final result, so while the
+answer streamed and tool rounds stacked up (each request bigger than
+the last), the meter stayed at its last settled value. The agent emits
+an 'llm' event carrying that request's REAL promptTokens after every
+provider call — the chat DRIVER (chat.rs) now: (1) sets usedCtx from
+each 'llm' event mid-turn (each tool round re-anchors the meter to a
+real number); (2) calibrates ctxOverhead on the FIRST request of the
+turn (same formula as the old turn-end calibration, just earlier, so
+the history+overhead base is honest immediately); (3) between requests,
+estimated growth accumulates in liveCtxExtra (streamed answer deltas +
+fresh tool results, estTok ≈ chars/4) and refreshStatus adds it while
+the turn runs — the meter visibly climbs as the answer streams;
+(4) repaint is throttled to 1/s from onStep plus the existing 2s
+metricsTimer; (5) the turn's finally{} zeroes liveCtxExtra so the
+end-of-turn calibration (firstPromptTk + historyTokens()) takes over
+cleanly — compaction drops still render exactly as before (e2e A4).
+ctxMeter() folds liveCtxExtra in so every existing re-estimate site
+stays consistent mid-pipeline. Verified on a real pty against the
+scripted mock: turn-1 footer readings 0 → 1 → 100 live mid-turn (the
+mock's true ptk=100), settling at 102; turn-2 climbs 103 → 107 → 109
+(real ptk=107). Full battery green (cargo 334/0, make test 24/0/1 —
+compact e2e meter-drop assertions unchanged, paste e2e green).
+
+---
+**Verified 2026-09-03** — TUI large-paste input fixed: a big pasted
+prompt now lands whole and waits for Enter. Root cause (both symptoms
+the user reported): the readline never enabled bracketed paste
+(DECSET 2004), so the terminal delivered pasted CR/LF bytes as plain
+keystrokes — every newline hit the Enter-submit path, auto-submitting
+the paste line-by-line in batches ("take only few lines… start the
+conversation automatically"), and the 8 KiB line cap silently truncated
+anything large that survived. Fix (crates/sofuu-core/src/modules/
+process.rs, the raw-mode TTY read path): (1) the TTY open sequence now
+requests bracketed paste (`ESC[?2004h` alongside the mouse modes; off
+again on `__ttyNormal` + teardown so the shell inherits no stray mode);
+(2) the ESC-sequence state machine gained paste states — `ESC[200~`
+opens the body, every body byte (CR/LF included) appends as literal
+text and NEVER triggers submit, `ESC[201~` closes and redraws once
+(no per-byte redraw storms); a body ESC-sequence that is not the end
+marker is pushed back as text; Ctrl-C inside a paste aborts the paste
+state so a lost end-marker cannot eat the keyboard; (3) the line cap
+is 1 MiB; (4) the TUI input row shows a dim `[+N lines]` marker for
+multi-line buffers and the inline (non-TUI) box clamps to its last 6
+rows with a "…N more rows" notice. Debugging gotcha worth remembering:
+the first state machine had the end-marker accept `ESC[2 1 ~` while
+the real sequence is `ESC[2 0 1 ~` — the marker leaked as literal text
+AND the machine stayed stuck in the paste body (every later keystroke,
+including Enter, was eaten as paste text); found with a temporary
+`SOFUU_TTY_TRACE=1` byte/state dump driven through a python pty.
+Verified: tests/chat_paste_e2e.sh (new, wired into `make test`) drives
+the real binary on a pty — a 300-line / 29,400-byte wrapped paste makes
+ZERO requests before Enter, exactly ONE request after Enter carrying
+the whole payload (user msg 29,698B ≥ paste size), and a typed control
+line still submits normally; full battery green (cargo 334/0, make
+test 24/0/1, 5 e2e shell suites).
+
+---
+**Verified 2026-09-02** — long-horizon endurance: the agent finishes
+long tasks without rest. Six stop-conditions found and fixed, all in
+src/js/agent.js + tools.js (both chat drivers share the shipped agent
+runtime): (1) the transient-retry ladder was 2 steps / 5.5s total — a
+shared-pool 429 storm killed the turn; now 6 exponential steps to a 60s
+cap (~2.7 min backoff), env-tunable (`SOFUU_STREAM_RETRY_DELAYS`,
+`SOFUU_STREAM_RETRY_MAX_CONT`) and wall-budget-aware (retries refuse to
+sleep past the run's wall clock). (2) Mid-answer transport cuts allowed
+ONE continuation and its failure always threw; now up to 3 continuations
+loop back through the main ladder (fresh backoff each), overlap-deduped,
+usage absorbed. (3) Empty-stream recovery was a RUN-scoped allowance —
+two transient empties anywhere permanently disabled recovery for every
+later round; now per-round (tool loop) / per-invocation (finalAnswer).
+(4) Delegate children reset to the 12-step / 5-minute / 200k library
+defaults, killing real sub-tasks on multi-hour parents; now they inherit
+the parent's remaining wall + step budget and half the remaining token
+allowance (applied to a COPY — resolveDef returns the live registry
+object). (5) bash was wrapped in the outer 30s withTimeout while policing
+its own 60-180s timeout — the outer kill always won; bash is now
+self-timed (spec flag `selfTimed` bypasses withTimeout; the code-tool
+spec copy in resolveTools carries it) and the max is 10 minutes for real
+build/test pipelines. (6) fitGuard's drop-oldest could shed the ORIGINAL
+task message (mid-array in the tool loop, so the "last user message"
+guard missed it) — the task is now marked (`_sofuu_task`, non-enumerable
+so wire bytes stay identical) and rung 3 never drops it; rung 4 may still
+truncate it when it IS the largest blob (a huge opts.context rides it —
+the alloc gate's oversized-turn path depends on that). Plus: a transient
+provider failure that outlives the ladder on a run WITH real progress
+now stops gracefully (`stopped: 'provider_outage'` + an offline salvage
+summary) instead of throwing raw; zero-progress turns still throw loudly
+(P1-17). Verified: tests/long_horizon_test.js (7 scenarios / 13 checks —
+429 storm, 3 mid-answer cuts, per-round empty recovery, 25-round loop
+with task survival, 20-step delegate child, self-timed bash, wall+outage
+honesty) wired into `make test`; full battery green (cargo 334/0, make
+test 23/0/1, agent_test 181/0, 5 e2e shell suites).
+
+---
+**Verified 2026-08-30** — desktop: cross-workspace session pollution fixed
++ two destructive-action features. (1) Switching folders merged the OTHER
+folder's sessions into the strip ("Session - 49" = WorkBuddy's one chat
+renumbered inside the polluted union): the `"sessions"` reducer merge was
+workspace-blind. Now a workspace switch resets the strip immediately
+(`workspace_switch` action) and every `listSessions` reply carries the
+workspace it was fetched FOR — the reducer drops replies that raced a
+switch (the engine serializes queries, so an in-flight fetch can execute
+on either side of `setProjectDir`). (2) "Delete all chats in this folder"
+in the topbar history popover (two-step armed confirm): new
+`sofuu.chat.clearSessions()` empties the registry (qtsq + legacy
+plaintext), returns the ids, detaches if the live chat is among them; the
+Rust `clear_all_sessions` command removes each `sessions/<sid>/` folder +
+legacy flat file (path-safety-checked) so the SESSIONS_MAX cap recovers.
+(3) Sidebar folders get a hover-reveal × (two-step confirm) that removes
+the folder from the list only — disk untouched; removing the active folder
+switches to the next remaining one.
+
+---
 **Verified 2026-08-28** — the 5th tiny model landed: `alloc` —
 model-aware config allocation + a pre-flight guard for the context
 window (PLAN-ML-GATES §21). Fixes three verified failure classes:

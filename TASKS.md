@@ -7,6 +7,25 @@
 > Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
 
 ---
+**Verified 2026-09-08 (embedder line CLOSED)** — G1 TABLE PROBE
+(`ml-train embed-probe`, new dev tool) on the round-9 artifact
+SUPERSEDES the round-9 "BUDGET finding" reading: G1 is **DATA-bound**.
+Census over the exact train texts: 2,255 distinct tokens over 913 used
+buckets (avg load 2.5, max 9) — the 1024-bucket table is nearly EMPTY,
+collision blur impossible; 4 of 6 §10 synonym pairs have a word that
+never appears in training (payment/routine/pulled/toolchain/msvc,
+count 0); the 2 seen pairs sit unbridged in low-load buckets
+(codec↔compresses cos −0.322 @10th pctl, sign↔login +0.164 @73rd vs
+the 95th bridge bar) because the procedural families paraphrase with
+the SAME slot vocabulary — the table learned lexical co-occurrence, not
+synonym substitution. Both pre-registered next moves (lift payload
+budget / Path A) assumed capacity-bound → falsified; the only remaining
+lever (synonym-rich training data) is compromised by four rounds of
+§10-pair diagnosis, so per the no-cheat directive the embedder line
+CLOSES: hash-v1 stays shipped, the 0.917 candidate stays offline as
+the honest research result, baked blob untouched. Round-9 embedder
+work committed (b70a5bace).
+
 **Verified 2026-09-07 (round 9, Path B)** — SEMANTIC EMBEDDER v2
 FEATURE CONTRACT (learned word-embedding table, SEM2, 1024×16 int8
 buckets + 768-trigram tower H=16, 30,032 params, artifact

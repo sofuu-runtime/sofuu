@@ -1550,3 +1550,39 @@ numbers.** hash-v1 stays shipped; the baked blob (SHA1 45272c1f…) is
 untouched; the candidate stays an offline experiment. The next move is
 the user's plan-level decision: lift the payload budget, or accept the
 additive-layer trade.
+
+### Round 9 follow-up — G1 TABLE PROBE (2026-09-08): the budget reading is FALSIFIED; G1 is DATA-bound
+
+`embed-probe` (new dev tool, `crates/ml-train/src/embedding_probe.rs`)
+inspected the round-9 artifact's int8 table directly: token census over
+the exact train texts (`cat.train` memories + train queries + curated —
+verified identical to `build_train`'s gradient sources), per-bucket
+collision load, and synonym-row cosine against the distribution of all
+416,328 unrelated used-bucket pairs.  Result on the six §10 paraphrase
+bridges:
+
+- **The table is nearly EMPTY, not crowded**: 2,255 distinct train
+  tokens over 913 used buckets — avg load 2.5, max 9.  Collision blur
+  cannot be the mechanism; a bigger table has nothing to un-blur.
+- **4 of 6 pairs have a word that NEVER APPEARS in training**: payment,
+  routine, pulled, toolchain, msvc (count 0).  Their rows are init
+  noise; no capacity or architecture choice bridges an unseen word.
+- **The 2 seen pairs are unbridged despite low load**: codec↔compresses
+  cos −0.322 (10th pctl — anti-correlated), sign↔login +0.164 (73rd
+  pctl, below the 95th bridge bar).  Room and evidence existed; the
+  procedural corpus's paraphrase families reuse the SAME slot vocabulary
+  across members, so the table learned lexical co-occurrence, never
+  synonym substitution.
+
+**This supersedes the round-9 "BUDGET finding" sentence above.** The
+pre-registered next moves (lift payload budget / Path A additive layer)
+both assumed capacity-bound; the probe falsifies that.  The only lever
+the evidence leaves is training-data realism — synonym-rich families —
+and that lever is ethically compromised at this point: four rounds of
+diagnosis have put §10's exact synonym pairs in our notes, so any
+synonym-class corpus designed now cannot be cleanly separated from
+mining the eval.  Per the governing no-cheat directive, **the embedder
+line closes here**: hash-v1 stays shipped, the 0.917 candidate stays
+offline as the honest research result, and the baked blob is untouched.
+If a future round is ever authorized, it must pre-register a mechanical
+synonym-class rule fixed before grading, with the §10 pairs excluded.

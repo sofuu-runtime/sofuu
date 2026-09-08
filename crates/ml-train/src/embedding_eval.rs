@@ -751,7 +751,7 @@ fn artifact_path() -> PathBuf {
 /// Candidate-artifact override: SOFUU_EMBED_EVAL_ARTIFACT may point at a
 /// retrain candidate.  The path is canonicalized and allow-listed to /tmp or
 /// the workspace tree — an arbitrary filesystem read is not acceptable.
-fn resolve_artifact_path() -> Result<PathBuf, String> {
+pub(crate) fn resolve_artifact_path() -> Result<PathBuf, String> {
     let override_path = match std::env::var("SOFUU_EMBED_EVAL_ARTIFACT") {
         Ok(p) => p,
         Err(_) => return Ok(artifact_path()),

@@ -24,6 +24,7 @@ mod embedding_v2;
 mod embedding_verify;
 mod embedding_diag;
 mod embedding_anchor;
+mod embedding_probe;
 mod train;
 
 use std::path::PathBuf;
@@ -1432,12 +1433,13 @@ fn main() {
         "embed-stress" => std::process::exit(embedding_stress::run_stress()),
         "embed-verify" => std::process::exit(embedding_verify::run_verify()),
         "embed-diag" => std::process::exit(embedding_diag::run_diag()),
+        "embed-probe" => std::process::exit(embedding_probe::run_probe()),
         "eval" => eval_committed(),
         "diagnose" => diagnose(),
         "diagnose-relevance" => diagnose_relevance(),
         "diagnose-supervisor" => diagnose_supervisor(),
         _ => {
-            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | alloc | embedding | embed-eval | embed-stress | embed-verify | eval | diagnose | diagnose-relevance | diagnose-supervisor");
+            eprintln!("usage: ml-train freshness | compaction | relevance | supervisor | alloc | embedding | embed-eval | embed-stress | embed-verify | embed-diag | embed-probe | eval | diagnose | diagnose-relevance | diagnose-supervisor");
             std::process::exit(2);
         }
     }

@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn session_file_roundtrip_and_qtsq_degrade() {
         // The loop-global lock serializes with every other engine-booting test.
-        let _guard = TEST_LOOP_LOCK.lock().unwrap();
+        let _guard = crate::rt::test_loop_lock();
         let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
 
         let dir = std::env::temp_dir().join(format!("sofuu-session-js-{}", std::process::id()));

@@ -347,7 +347,7 @@ mod tests {
     fn m1_promise_resolved_from_uv_timer_fires_js_then() {
         // The process-global uv loop is shared — serialize loop-driving
         // tests (see rt/mod.rs TEST_LOOP_LOCK).
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 test pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };

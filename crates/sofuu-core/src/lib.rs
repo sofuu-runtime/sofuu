@@ -25,13 +25,13 @@ pub mod ffi_exports; // C-ABI exports consumed by the remaining C core (Track D3
 // under fat LTO). This module drives SofuuRuntime through the ffi wrapper.
 #[cfg(test)]
 mod ffi_runtime_test {
-    use crate::rt::TEST_LOOP_LOCK;
+    use crate::rt::test_loop_lock;
 
     #[test]
     fn runtime_and_bridge_work() {
         // The runtime owns the process-global libuv loop — serialize with
         // the rt tests that pump it, like every other loop-touching test.
-        let _guard = TEST_LOOP_LOCK.lock().unwrap();
+        let _guard = test_loop_lock();
 
         let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
 

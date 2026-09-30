@@ -298,7 +298,7 @@ mod tests {
     fn shutdown_engine_closes_only_that_ctx_armed_handles() {
         // The process-global uv loop is shared — serialize loop-driving
         // tests (see rt/mod.rs TEST_LOOP_LOCK).
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             sofuu_loop_init();
 

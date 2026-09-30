@@ -1053,7 +1053,7 @@ mod tests {
         done: &dyn Fn(*mut qjs::JSContext) -> bool,
         out: &mut String,
     ) -> Result<(), String> {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         let _dl_guard = DeadlineGuard(deadlines.map(|(h, i)| {
             (
                 HEADERS_TIMEOUT_MS.swap(h, Ordering::Relaxed),

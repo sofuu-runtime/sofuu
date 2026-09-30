@@ -1224,7 +1224,7 @@ mod tests {
     /// the freed request.
     #[test]
     fn spawn_failure_and_post_exit_use_are_clean() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1325,7 +1325,7 @@ catch (e) { after = (e && e.message) ? e.message : 'caught'; }";
     /// aborts in malloc before reaching the assertions.
     #[test]
     fn subprocess_write_delivers_payload() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1404,7 +1404,7 @@ p.write('second-line\\n');";
         // SAFETY: no other test reads this name; the process env write is
         // the same pattern the chat.rs config tests already use.
         std::env::set_var("SOFUU_P1_10_SECRET", "hunter2-secret-value");
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1495,7 +1495,7 @@ onExit: function (c) { exited = true; code = c; } });";
     /// under the same limit still resolves.
     #[test]
     fn exec_rejects_when_output_string_build_ooms() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1609,7 +1609,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
     /// must report stdoutTruncated === false.
     #[test]
     fn exec_flags_truncated_capture() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1696,7 +1696,7 @@ sofuu.exec('/bin/echo', ['small-pos']).then(function (r) { pres = r; });";
     #[test]
     #[cfg(unix)]
     fn subprocess_on_exit_reports_signal() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1753,7 +1753,7 @@ onExit: function (c, s) { exited = true; code = c; sig = s; } });";
     #[test]
     #[cfg(unix)]
     fn exec_timeout_kills_child() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };

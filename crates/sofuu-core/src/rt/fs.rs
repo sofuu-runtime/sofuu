@@ -890,7 +890,7 @@ mod tests {
         std::fs::write(&victim, b"safe").unwrap();
         std::os::unix::fs::symlink(&victim, proj.join("link")).unwrap();
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -978,7 +978,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
         std::fs::write(tmp.join("bin.dat"), &payload).unwrap();
         std::fs::write(tmp.join("empty.bin"), b"").unwrap();
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1047,7 +1047,7 @@ function (e) {{ gotEmpty = 'ERR:' + ((e && e.message) ? e.message : String(e)); 
     /// control proves ordinary reads under the same limit still resolve.
     #[test]
     fn read_rejects_when_string_build_ooms() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1147,7 +1147,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
             let _ = f.write_all(b"hello-fifo");
         });
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1215,7 +1215,7 @@ function (e) {{ err = (e && e.message) ? e.message : String(e); }});",
         f.set_len((1u64 << 28) + 1).unwrap(); // 256MB + 1 — over the cap
         drop(f);
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -1282,7 +1282,7 @@ function (e) {{ rejected = (e && e.message) ? e.message : String(e); }});",
         std::fs::create_dir_all(&tmp).unwrap();
         let target = tmp.join("nul.bin");
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };

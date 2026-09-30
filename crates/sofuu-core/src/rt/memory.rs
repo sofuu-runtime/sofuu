@@ -3091,7 +3091,7 @@ mod impl_qtsq {
 
         let dir = fresh_test_dir("kv-hints");
         let root = dir.join("kv");
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);

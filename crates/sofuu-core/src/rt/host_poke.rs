@@ -210,7 +210,7 @@ mod tests {
     fn host_poke_wakes_blocked_loop_cross_thread() {
         // The process-global uv loop is shared — serialize loop-driving
         // tests (see rt/mod.rs TEST_LOOP_LOCK).
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -296,7 +296,7 @@ globalThis.__wait = new Promise(function (r) { globalThis.__wake = r; });";
     /// Messages sent before `__host_poke` exists are re-queued, not dropped.
     #[test]
     fn host_poke_requeues_when_handler_missing() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };
         unsafe { sofuu_rt_install_rejection_tracker(rt) };

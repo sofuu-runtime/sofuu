@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn stream_error_path_does_not_retain_factory_objects() {
         unsafe {
-            let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+            let _loop_guard = crate::rt::test_loop_lock();
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
             let _ctx_guard = CtxPtr::new(ctx);

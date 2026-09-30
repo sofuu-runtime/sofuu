@@ -2437,7 +2437,7 @@ mod tests {
     /// unexpected sync throws — intentional sync throws are caught by the
     /// scripts themselves into globals).
     unsafe fn with_engine(script: &str, check: impl FnOnce(*mut qjs::JSContext)) -> Result<(), String> {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         let rt = qjs::JS_NewRuntime();
         let ctx = qjs::JS_NewContext(rt);
         let _ctx_guard = CtxPtr::new(ctx);
@@ -2830,7 +2830,7 @@ function go(f) {
             u = format!("http://127.0.0.1:{}", port)
         );
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
@@ -2881,7 +2881,7 @@ function go(f) {
     // both awaits hung forever (out1/out2 stay '').
     #[test]
     fn orphan_reclaim_rejects_armed_waiters() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
@@ -2986,7 +2986,7 @@ function go(f) {
     // Pre-fix: out stays '' (pends) and the req leaks.
     #[test]
     fn fetch_rejects_when_multi_add_fails() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
@@ -3032,7 +3032,7 @@ function go(f) {
     // down. Drives redirect_reissue directly against a null multi.
     #[test]
     fn redirect_reissue_errors_when_multi_add_fails() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
@@ -3407,7 +3407,7 @@ function go(f) {
             u = format!("http://127.0.0.1:{}", port)
         );
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);
@@ -3544,7 +3544,7 @@ function go(f) {
             u = format!("http://127.0.0.1:{}", port)
         );
 
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             let ctx = qjs::JS_NewContext(rt);

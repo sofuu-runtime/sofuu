@@ -366,7 +366,7 @@ mod tests {
     fn m2_timers_fire_and_clear_through_rust_loop() {
         // The process-global uv loop is shared — serialize loop-driving
         // tests (see rt/mod.rs TEST_LOOP_LOCK).
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone runtime + context (M0 pattern).
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };

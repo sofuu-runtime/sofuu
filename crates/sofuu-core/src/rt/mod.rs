@@ -39,3 +39,18 @@ pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
 /// timers on the wrong context. Acquire this lock around loop usage.
 #[cfg(test)]
 pub(crate) static TEST_LOOP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TEST_LOOP_LOCK`], tolerating poisoning.
+///
+/// A test that panics while holding this lock poisons it, and every LATER
+/// test that takes it then dies with `PoisonError` — turning one real
+/// failure into a cascade that hides the actual bug. That happened for real:
+/// a single arch-dependent golden vector made ~28 unrelated http/mcp/
+/// spawn tests report `PoisonError` in CI. The lock only serializes
+/// execution; the data it guards (the libuv loop) carries nothing between
+/// tests, so recovering the guard is safe and keeps the next failure
+/// legible.
+#[cfg(test)]
+pub(crate) fn test_loop_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOOP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

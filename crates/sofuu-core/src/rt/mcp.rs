@@ -1519,7 +1519,7 @@ mod tests {
     /// never reaches one free per disconnect, deterministically.
     #[test]
     fn mcp_disconnect_runs_the_close_fence() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         let base = TEST_MCP_CLIENT_FREES.load(Ordering::Relaxed);
         // SAFETY: standalone runtime + context (M0 pattern, as in the
         // P0-1 subprocess_write_delivers_payload test).
@@ -1712,7 +1712,7 @@ mod tests {
     /// deterministically (free while pending = delta 1, not 0).
     #[test]
     fn mcp_pending_tool_promise_keeps_server_alive_until_settle() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone harness per the P0-2 pattern.
         let (rt, ctx, srv, stdout_pipe, resp_rd, base) =
             unsafe { p1_server_harness(c"globalThis.srv = sofuu.mcp.serve(); globalThis.resolveIt = null; srv.tool('slow', {}, function () { return new Promise(function (res) { globalThis.resolveIt = res; }); });") };
@@ -1770,7 +1770,7 @@ mod tests {
     /// the client's pending slot (MAX_PENDING=64) leaked per rejection.
     #[test]
     fn mcp_rejected_tool_handler_still_answers_the_request() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone harness per the P0-2 pattern.
         let (rt, ctx, srv, stdout_pipe, resp_rd, _base) =
             unsafe { p1_server_harness(c"globalThis.srv = sofuu.mcp.serve(); srv.tool('boom', {}, function () { return Promise.reject(new Error('boom')); });") };
@@ -1801,7 +1801,7 @@ mod tests {
     /// libuv/src/unix/stream.c) — on_write_done will never run.
     #[test]
     fn mcp_sync_write_failure_settles_the_call_promise() {
-        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        let _loop_guard = crate::rt::test_loop_lock();
         // SAFETY: standalone harness per the P0-2 pattern.
         let rt = unsafe { qjs::JS_NewRuntime() };
         let ctx = unsafe { qjs::JS_NewContext(rt) };

@@ -3187,13 +3187,35 @@ function go(f) {
             let mut served = 0usize;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
+                /* DRAIN THE REQUEST FIRST. curl's request bytes were sitting
+                 * unread in this socket's receive queue, and closing a socket
+                 * that still has unread data makes Linux send RST instead of
+                 * FIN — which tore down the client mid-body and failed the
+                 * byte-count assertion on the Linux runners while passing on
+                 * macOS. Reading the request to its blank line is what a real
+                 * HTTP server does and it makes the close clean. */
+                let mut req = [0u8; 2048];
+                let mut seen = 0usize;
+                while seen < req.len() {
+                    match stream.read(&mut req[seen..]) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            seen += k;
+                            if req[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 /* A 16 MiB write can fail part-way if the peer stops reading;
                  * stop rather than loop on a broken socket. */
                 if stream.write_all(&raw).is_err() {
                     break;
                 }
                 let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                /* Half-close (Write) so the client sees a clean EOF. */
+                let _ = stream.shutdown(std::net::Shutdown::Write);
                 served += 1;
                 if served >= LEG_CONNECTIONS {
                     break;
@@ -3309,12 +3331,31 @@ function go(f) {
         let server = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
+                /* Drain the request first — see the long note in
+                 * stream_bulk_delivers_fast_ab. Leaving curl's request bytes
+                 * unread in the receive queue makes Linux close with RST
+                 * instead of FIN, truncating the body; this leg failed on the
+                 * Linux runners for that reason. */
+                let mut req = [0u8; 2048];
+                let mut seen = 0usize;
+                while seen < req.len() {
+                    match stream.read(&mut req[seen..]) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            seen += k;
+                            if req[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let _ = stream.write_all(&raw);
                 let _ = stream.flush();
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 let _ = stream.write_all(&rest);
                 let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                let _ = stream.shutdown(std::net::Shutdown::Write);
                 break; /* exactly one connection */
             }
         });

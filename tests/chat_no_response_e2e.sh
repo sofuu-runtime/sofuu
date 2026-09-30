@@ -66,7 +66,13 @@ grep -q "SALVAGED-SUMMARY" "$TMP/out"
 check "MODELOOP: salvage summary present at step-budget breach" $?
 grep -q "stopped: step budget (2 rounds) reached" "$TMP/out"
 check "MODELOOP: honest stop line (budget reached)" $?
-grep -q "Couldn't connect to server" "$TMP/out"
+# The transport-error wording comes from libcurl itself, and it is NOT stable
+# across curl versions or builds: this machine's curl says "Couldn't connect
+# to server" while the Homebrew curl on a GitHub macOS runner says "Could not
+# connect to server". Asserting one exact apostrophe made this leg fail on CI
+# with the runtime behaving CORRECTLY (the dead port did produce a loud
+# transport error). Match the part both versions agree on.
+grep -qE "Could ?n[o']t connect to server|Couldn.t connect to server" "$TMP/out"
 check "MODECLOSE: dead-port transport error after transient retries" $?
 ! grep -q "(no response)" "$TMP/out"
 check "no turn anywhere fell back to the bare (no response) placeholder" $?

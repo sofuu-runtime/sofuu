@@ -15,7 +15,8 @@
 //                    a response, so curl fails with a transport error
 //                    ("Empty reply from server" / connection reset). The
 //                    agent must classify it transient and retry; the retries
-//                    then hit a dead port ("Couldn't connect to server"), so
+//                    then hit a dead port (a "Couldn't/Could not connect to server"
+//                    transport error — libcurl wording varies by build), so
 //                    the turn ends in a loud ✗ after 3 attempts instead of
 //                    dying on the first cut. MUST be the LAST mode turn —
 //                    it kills this mock process.

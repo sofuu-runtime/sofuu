@@ -312,8 +312,21 @@ pub unsafe extern "C" fn sofuu_loop_close() {
     /* Walk all active handles and close them */
     uv::uv_walk(lp, Some(walk_close_cb), ptr::null_mut());
 
-    /* Run the loop briefly to let close callbacks fire */
-    uv::uv_run(lp, UV_RUN_DEFAULT);
+    /* Run the loop briefly to let close callbacks fire.
+     *
+     * UV_RUN_ONCE, not UV_RUN_DEFAULT. UV_RUN_DEFAULT blocks until the loop
+     * is completely idle, so a single handle that libuv refuses to finish
+     * closing (a socket mid-transfer, an unref'd handle a test leaked) wedges
+     * engine teardown forever. This is not a test-only hazard: the same call
+     * runs when a host destroys a SofuuRuntime, so a leaked handle there
+     * hangs the host's shutdown.
+     *
+     * The second UV_RUN_ONCE is intentional: uv_close defers finalization to
+     * a later loop turn, so one round can leave the loop non-idle. Two rounds
+     * drains the close callbacks the walk just queued, and stops after that
+     * regardless. */
+    uv::uv_run(lp, UV_RUN_ONCE);
+    uv::uv_run(lp, UV_RUN_ONCE);
 
     uv::uv_loop_close(lp); /* rc ignored — same as the retired C code */
 }

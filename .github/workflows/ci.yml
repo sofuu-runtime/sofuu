@@ -38,11 +38,20 @@ jobs:
       - name: Build libuv
         run: |
           cd deps/libuv
+          # BUILD_SHARED_LIBS=OFF is REQUIRED, not optional: crates/sofuu-ffi/build.rs
+          # links libuv STATICALLY (it looks for libuv.a and panics otherwise).
+          # Without this flag cmake produces libuv.1.dylib / libuv.so.1, the
+          # static lookup misses, and the test binary dies at dyld with
+          # "Library not loaded: @rpath/libuv.1.dylib". windows-build.yml and
+          # linux-build.yml already pass it; this job was the one that did not.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
             -DBUILD_TESTING=OFF
           cmake --build build
+          # Fail loudly here rather than at dyld 3 steps later.
+          ls -l build/libuv.a
 
       - name: Build Sofuu (Rust-first)
         # QTSQ is a proprietary local checkout that cannot be built here, so

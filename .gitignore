@@ -1,7 +1,13 @@
 # ── Build output ──────────────────────────────────
-sofuu
-dist/
-build/
+# Anchored to the repo root on purpose. A bare `sofuu` also matches the
+# DIRECTORY bindings/android/sofuu/ (the Android library module), which
+# silently excluded the entire JNI + Kotlin source tree from the v0.2.0
+# commit -- the JNI CI step then failed with "no such file or directory:
+# bindings/android/sofuu/src/main/cpp/jni_bridge.c". Root-anchored, and
+# trailing-slashed directories, so only build output is ignored.
+/sofuu
+/dist/
+/build/
 bin/
 tools/
 *.o

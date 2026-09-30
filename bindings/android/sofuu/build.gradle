@@ -1,0 +1,62 @@
+// bindings/android/sofuu/build.gradle — the com.sofuu:sofuu-android AAR.
+//
+// One dependency gives an app the whole runtime. The native payload is the
+// prebuilt libsofuu .so per ABI (built by `make dist-android`, QTSQ-free
+// for a pure-MIT release) plus the small JNI bridge in src/main/cpp.
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'com.sofuu.runtime'
+    compileSdk 34
+    ndkVersion '26.1.10909125'
+
+    defaultConfig {
+        minSdk 24
+        targetSdk 34
+
+        // The .so files are staged into jniLibs by `make dist-android`.
+        // If none are present the AAR still builds, but any call into the
+        // runtime throws UnsatisfiedLinkError with this message.
+        consumerProguardFiles 'consumer-rules.pro'
+
+        externalNativeBuild {
+            cmake {
+                cppFlags '-O2'
+            }
+        }
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    // Strip debug symbols from the shipped .so's: they are the bulk of the
+    // AAR and the symbols are not useful to consumers.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+    // Nothing else. The runtime is dependency-free by design — a host app
+    // should not inherit curl, a JSON lib, or an HTTP client we already ship.
+}

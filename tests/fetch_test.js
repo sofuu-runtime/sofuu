@@ -85,6 +85,12 @@ async function main() {
     assert("res.text() has content", text.length > 0);
 
     // ── json() parses the body ────────────────────────────────────
+    /* Let the in-process server finish with request 1 before request 2.
+     * It is single-threaded JS on the same loop as the client, so issuing
+     * the next fetch in the same turn as the previous body drain raced. The
+     * Linux runners lost that race and the second fetch threw an opaque
+     * error (printed as "Test failed: {}"), while macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     const resJ = await sofuu.fetch(URL + "/get");
     const data = await resJ.json();
     assert("res.json() parses object", data && typeof data === "object");

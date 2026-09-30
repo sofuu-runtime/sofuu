@@ -189,6 +189,11 @@ async function main() {
 
   /* ── duckduckgo ─────────────────────────────────────────────── */
   {
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     const r = await sofuu.web.search("rust vs zig", { count: 5 });
     check("ddg engine selected by default", r.engine === "duckduckgo");
     check("ddg query echoed", r.query === "rust vs zig");
@@ -203,16 +208,31 @@ async function main() {
     check("ddg ms recorded", typeof r.ms === "number" && r.ms >= 0);
   }
   {
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     const r = await sofuu.web.search("rust vs zig", { count: 1 });
     check("ddg count=1 truncates", r.results.length === 1);
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("ratelimited"); } catch (e) { err = String(e && e.message || e); }
     check("ddg HTTP error names the fallback engines", err.indexOf("503") >= 0 && err.indexOf("SOFUU_WEB_ENGINE") >= 0);
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("markupchange"); } catch (e) { err = String(e && e.message || e); }
     check("ddg unparsable markup errors loudly", err.indexOf("no parsable results") >= 0);
   }
@@ -221,6 +241,11 @@ async function main() {
   {
     let cap = null;
     FETCH_CAPTURE = (c) => { cap = c; };
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     const r = await sofuu.web.search("brave query", { engine: "brave", count: 2, api_key: "tok-123", endpoint: BRAVE });
     check("brave engine selected", r.engine === "brave");
     check("brave auth header sent (client-side capture)", !!cap &&
@@ -234,17 +259,32 @@ async function main() {
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("unauthorized", { engine: "brave", api_key: "k", endpoint: BRAVE }); } catch (e) { err = String(e && e.message || e); }
     check("brave 401 → invalid API key", err.indexOf("invalid API key") >= 0);
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("x", { engine: "brave", endpoint: BRAVE }); } catch (e) { err = String(e && e.message || e); }
     check("brave missing key is an actionable error", err.indexOf("brave") >= 0 && err.indexOf("BRAVE_API_KEY") >= 0);
   }
 
   /* ── tavily ─────────────────────────────────────────────────── */
   {
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     const r = await sofuu.web.search("tavily query", { engine: "tavily", count: 3, api_key: "tv-1", depth: "advanced", endpoint: TAVILY });
     check("tavily engine selected", r.engine === "tavily");
     check("tavily POST body shape", !!CAP.tavilyBody &&
@@ -257,11 +297,21 @@ async function main() {
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("x", { engine: "tavily", endpoint: TAVILY }); } catch (e) { err = String(e && e.message || e); }
     check("tavily missing key is an actionable error", err.indexOf("tavily") >= 0 && err.indexOf("TAVILY_API_KEY") >= 0);
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("x", { engine: "tavily", api_key: "bad-key", endpoint: TAVILY }); } catch (e) { err = String(e && e.message || e); }
     check("tavily 403 → invalid API key", err.indexOf("invalid API key") >= 0);
   }
@@ -299,11 +349,21 @@ async function main() {
   /* ── misc ───────────────────────────────────────────────────── */
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("x", { engine: "nope" }); } catch (e) { err = String(e && e.message || e); }
     check("unknown engine error lists the choices", err.indexOf("nope") >= 0 && err.indexOf("duckduckgo") >= 0);
   }
   {
     let err = "";
+    /* Settle: the mock servers are single-threaded JS on the same
+     * loop as the client, so back-to-back queries raced. The Linux
+     * runners lost that race (fetch threw, reported as an opaque
+     * 'FAIL exception'); macOS passed. */
+    await new Promise((r) => setTimeout(r, 30));
     try { await sofuu.web.search("   "); } catch (e) { err = String(e && e.message || e); }
     check("empty query rejected", err.indexOf("query required") >= 0);
   }

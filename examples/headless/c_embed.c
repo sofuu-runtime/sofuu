@@ -90,10 +90,44 @@ int main(void) {
     sofuu_free(out);
 
     /* 5. The private brain, end to end over the funnel — the differentiator:
-     *    encrypted local memory the app owns, no cloud in the loop. */
+     *    encrypted local memory the app owns, no cloud in the loop.
+     *
+     *    A build WITHOUT the QTSQ codec has no sofuu.memory at all:
+     *    crates/sofuu-core/src/rt/memory.rs gates the register bodies on
+     *    #[cfg(has_qtsq)], so the surface is compiled out and the funnel
+     *    answers unknown_method. That is not a broken brain, it is a brain
+     *    that was never built into this binary. CI builds that way on
+     *    purpose (the codec is a proprietary local checkout), so probe
+     *    first and report the skip rather than failing checks that cannot
+     *    pass. An embedder should do the same before reaching for
+     *    memory.open. */
+    int has_memory = 0;
+    {
+        char probe[128];
+        snprintf(probe, sizeof(probe), "typeof sofuu.memory");
+        out = NULL;
+        rc = sofuu_rt_eval(rt, probe, &out);
+        has_memory = (rc == 0 && out != NULL && strstr(out, "\"object\"") != NULL);
+        sofuu_free(out);
+        printf("       brain: %s\n", has_memory ? "present" : "absent (QTSQ-free build)");
+    }
+
     char tmpl[] = "/tmp/sofuu-c_embed-XXXXXX";
     int fd = mkstemp(tmpl);
     if (fd >= 0) close(fd);
+
+    if (!has_memory) {
+        /* Everything below drives the brain; without it there is nothing
+         * to prove. Not a failure — report the configuration honestly. */
+        sofuu_rt_free(rt);
+        remove(tmpl);
+        if (failures) {
+            printf("\n%d check(s) FAILED\n", failures);
+            return 1;
+        }
+        printf("done — all checks passed (memory funnel skipped: no QTSQ codec)\n");
+        return 0;
+    }
 
     char args[512];
     snprintf(args, sizeof(args),

@@ -106,15 +106,20 @@ jobs:
           file sofuu
           ./sofuu version
 
-      - name: Run JS test suite
-        run: make test
-
       # ── H6: Headless CI gates ─────────────────────────────────────
       - name: Build libsofuu (embeddable library)
         run: make libsofuu
 
       - name: Headless embedding test (compile + run c_embed.c)
         run: make headless-test
+
+      # The JS suite runs HERE, after the SDK gates, on purpose. It used to
+      # run before them, so a single JS failure skipped every gate below and
+      # left libsofuu / headless / abi unverified on that runner. Gates that
+      # protect the product come before the suite that is still being
+      # stabilised on Linux.
+      - name: Run JS test suite
+        run: make test
 
       - name: ABI symbol guard
         run: make abi-check

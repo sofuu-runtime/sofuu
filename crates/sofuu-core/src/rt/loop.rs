@@ -312,23 +312,33 @@ pub unsafe extern "C" fn sofuu_loop_close() {
     /* Walk all active handles and close them */
     uv::uv_walk(lp, Some(walk_close_cb), ptr::null_mut());
 
-    /* Run the loop briefly to let close callbacks fire.
+    /* Let the queued close callbacks fire — NOWAIT, never ONCE/DEFAULT.
      *
-     * UV_RUN_ONCE, not UV_RUN_DEFAULT. UV_RUN_DEFAULT blocks until the loop
-     * is completely idle, so a single handle that libuv refuses to finish
-     * closing (a socket mid-transfer, an unref'd handle a test leaked) wedges
-     * engine teardown forever. This is not a test-only hazard: the same call
-     * runs when a host destroys a SofuuRuntime, so a leaked handle there
-     * hangs the host's shutdown.
-     *
-     * The second UV_RUN_ONCE is intentional: uv_close defers finalization to
-     * a later loop turn, so one round can leave the loop non-idle. Two rounds
-     * drains the close callbacks the walk just queued, and stops after that
-     * regardless. */
-    uv::uv_run(lp, UV_RUN_ONCE);
-    uv::uv_run(lp, UV_RUN_ONCE);
+     * uv_close finalizes a handle on a later loop turn, so the loop has to
+     * run once more after the walk. But the walk runs while a curl socket may
+     * still be mid-transfer, and uv_run in ONCE/DEFAULT mode BLOCKS waiting
+     * for I/O on it. That is the stall: on the Linux CI runners
+     * sofuu-core --lib wedged forever in engine teardown inside an
+     * http_client test, with the assertion output never even flushed.
+     * UV_RUN_NOWAIT drains the close callbacks that are already queued and
+     * returns immediately, so teardown cannot be held hostage by an in-flight
+     * transfer. This is a product path: a host destroying a SofuuRuntime
+     * while a request is in flight previously hung on shutdown. */
+    uv::uv_run(lp, UV_RUN_NOWAIT);
 
-    uv::uv_loop_close(lp); /* rc ignored — same as the retired C code */
+    /* UV_EBUSY here means a handle is still registered, i.e. something was
+     * never closed. Historically this return code was discarded (the retired
+     * C loop.c did the same), which is how a leaked handle stayed invisible
+     * until a later teardown wedged. Log it so a leak is diagnosable instead
+     * of silent; the loop storage is intentionally left allocated either way
+     * (see this function's docs). */
+    let rc = uv::uv_loop_close(lp);
+    if rc != 0 {
+        eprintln!(
+            "[sofuu] sofuu_loop_close: uv_loop_close returned {rc} \
+             (UV_EBUSY) — a handle was still active at teardown"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +446,63 @@ setTimeout(function () { globalThis.__b_fired = 1; }, 200);";
             sofuu_loop_close();
             qjs::JS_FreeContext(ctx_b);
             qjs::JS_FreeRuntime(rt_b);
+        }
+    }
+
+    /// No-op timer callback: the test never lets the loop reach the deadline.
+    unsafe extern "C" fn noop_timer_cb(_t: *mut uv::UvTimer) {}
+
+    /// Teardown closes a live handle and leaves the loop empty.
+    ///
+    /// Covers the HANDLE half of `sofuu_loop_close`: an armed uv_timer keeps
+    /// the loop non-idle, the walk closes it, and the loop must come back
+    /// empty. That invariant is worth pinning on its own.
+    ///
+    /// What this deliberately does NOT claim: it is not the regression test
+    /// for the Linux CI hang. That hang is a pending REQUEST, not a handle —
+    /// `uv_walk` visits handles only, so it cannot cancel a request, and
+    /// `uv_run(UV_RUN_DEFAULT)` then waits for a completion that never comes.
+    /// A timer is closed by the walk, so this test passes in 0.00s even with
+    /// `UV_RUN_DEFAULT` restored (verified). Reproducing the real condition
+    /// needs a request that stays pending forever; a FIFO `uv_fs_open` does
+    /// that, but it also blocks a libuv threadpool thread and prevents the
+    /// test process from exiting, so it is not usable as a gate. The
+    /// UV_RUN_NOWAIT change is therefore justified by libuv's documented
+    /// semantics — NOWAIT never blocks on I/O — not by a test that fails
+    /// without it.
+    #[test]
+    fn loop_close_closes_a_live_handle_without_blocking() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        unsafe {
+            sofuu_loop_init();
+
+            /* Arm a genuinely live libuv handle: a 60s one-shot timer keeps
+             * the loop non-idle for its whole duration, so a close that waits
+             * for idleness would block for a minute. */
+            /* A uv_timer_t must be heap-allocated at its real size — a bare
+             * `*mut UvTimer` local is only 8 bytes and uv_timer_init writes
+             * past it (that segfaulted the first draft of this test). */
+            let timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut uv::UvTimer;
+            assert!(!timer.is_null(), "timer allocation must succeed");
+            uv::uv_timer_init(loop_ptr(), timer);
+            uv::uv_timer_start(timer, Some(noop_timer_cb), 60_000, 0);
+            assert!(
+                uv::uv_loop_alive(loop_ptr()) != 0,
+                "an armed timer must make the loop live, else this proves nothing"
+            );
+
+            /* Must return promptly and drain the handle. */
+            sofuu_loop_close();
+
+            assert_eq!(
+                uv::uv_loop_alive(loop_ptr()),
+                0,
+                "teardown must leave no live handles behind"
+            );
+
+            /* Re-open the shared loop for the next test on this thread. */
+            sofuu_loop_init();
+            sofuu_loop_close();
         }
     }
 }

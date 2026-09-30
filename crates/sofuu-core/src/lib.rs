@@ -78,3 +78,13 @@ pub mod rlm;
 pub mod rt; // M1: event loop + promise bridge (replaces src/io/loop.c + promises.c)
 pub mod shipped; // shipped JS drivers beyond RLM: agent.js + web.js (PLAN-AGENTS)
 pub mod ts;
+
+/// Whether THIS build linked the QTSQ brain/KV codec (sofuu-core/build.rs).
+///
+/// A QTSQ-free build is not a degraded `sofuu.memory` — the whole memory
+/// surface is compiled out (rt/memory.rs gates the register bodies on
+/// `#[cfg(has_qtsq)]`), so JS sees no `sofuu.memory` at all and the
+/// funnel answers `unknown_method`. Callers that must behave correctly in
+/// BOTH configurations (the libsofuu test suite, `sofuu doctor`, docs)
+/// branch on this rather than assuming a brain exists.
+pub const HAS_QTSQ: bool = cfg!(has_qtsq);

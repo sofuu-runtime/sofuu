@@ -170,9 +170,21 @@ unsafe fn eval_init_snippet(ctx: *mut qjs::JSContext, src: &CString, filename: &
 ///     the documented-but-nonexistent `http.serve.start`.)
 const MEMORY_FACADE_JS: &str = r#"
 (function () {
-  var M = globalThis.sofuu && globalThis.sofuu.memory;
-  if (!M || typeof M.open !== 'function') return;
-  if (M.__sofuu_facade) return;
+  /* The funnel facade. Each namespace is installed INDEPENDENTLY — an
+   * early `return` used to gate the whole IIFE on sofuu.memory, which meant
+   * that on a QTSQ-free build (no sofuu.memory at all) the mcp and http
+   * facades were skipped too, silently taking out tools that need no
+   * codec. Nothing noticed because that path only ever ran in CI. */
+  var S = globalThis.sofuu;
+  if (!S) return;
+  if (S.__sofuu_facade) return;
+  S.__sofuu_facade = true;
+
+  /* ── Memory. Only exists when the QTSQ codec is linked; a QTSQ-free
+   * build legitimately has no sofuu.memory, and the funnel answers
+   * unknown_method for it. ── */
+  var M = S.memory;
+  if (M && typeof M.open === 'function' && !M.__sofuu_facade) {
   var live = [];
   var realOpen = M.open;
 
@@ -237,6 +249,8 @@ const MEMORY_FACADE_JS: &str = r#"
     return true;
   };
   M.handles = function () { return live.length; };
+  M.__sofuu_facade = true;
+  } /* end memory block */
 
   /* ── MCP: the same dead-end, and the highest-value one after memory.
    * `mcp.connect` returns a client whose `call`/`listTools` are instance
@@ -302,8 +316,6 @@ const MEMORY_FACADE_JS: &str = r#"
     };
     H.__sofuu_serve_facade = true;
   }
-
-  M.__sofuu_facade = true;
 })();
 "#;
 
@@ -1420,6 +1432,28 @@ mod tests {
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Skip a memory-dependent test on a QTSQ-FREE build, and say why.
+    ///
+    /// A QTSQ-free build does not have a degraded `sofuu.memory` — the whole
+    /// surface is compiled out (sofuu-core/src/rt/memory.rs gates the
+    /// register bodies on `#[cfg(has_qtsq)]`), so there is no brain to open
+    /// and the funnel correctly answers `unknown_method`. CI builds this way
+    /// on purpose (QTSQ is a proprietary local checkout), and the JS suite
+    /// covers the brain through a mock server. Without this skip those tests
+    /// would fail in CI while passing locally — a gate that only ever runs on
+    /// one machine is not a gate.
+    macro_rules! require_qtsq {
+        () => {
+            if !sofuu_core::HAS_QTSQ {
+                eprintln!(
+                    "skipping: this build has no QTSQ codec, so sofuu.memory \
+                     does not exist (see sofuu_core::HAS_QTSQ)"
+                );
+                return;
+            }
+        };
+    }
+
     /// Call a funnel method and return the parsed envelope, asserting the
     /// call itself succeeded at the C level. Panics with the raw JSON on
     /// failure so a broken method names itself in the test output.
@@ -1597,18 +1631,32 @@ mod tests {
 
     /// A method that exists but throws must keep the generic `js_exception`
     /// code — the `unknown_method` marker must not leak onto real failures.
+    ///
+    /// On a QTSQ-free build `memory.*` genuinely does not exist, so the
+    /// correct answer there IS `unknown_method`. Asserting the wrong code
+    /// for the build would be a test that only ever runs on one machine, so
+    /// this asserts the honest answer for whichever build is under test —
+    /// and that is itself the contract: the code distinguishes "this build
+    /// lacks it" from "it exists and failed".
     #[test]
     fn a_throwing_method_is_not_reported_as_unknown_method() {
         let _g = lock();
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        // memory.count with a handle that was never opened throws inside the
-        // method (not during resolution) → js_exception, not unknown_method.
+        // memory.count with a handle that was never opened:
+        //  - QTSQ build  → the method exists and throws inside → js_exception
+        //  - QTSQ-free   → the method does not exist          → unknown_method
         let code = call_err(rt, "memory.count", r#"{"handle":99}"#);
+        let expected = if sofuu_core::HAS_QTSQ {
+            "js_exception"
+        } else {
+            "unknown_method"
+        };
         assert_eq!(
-            code, "js_exception",
-            "a method that exists but throws must report js_exception"
+            code, expected,
+            "a method that exists but throws must report js_exception, and a \
+             method absent from this build must report unknown_method"
         );
 
         unsafe { sofuu_rt_free(rt) };
@@ -2285,6 +2333,7 @@ mod tests {
 
     #[test]
     fn memory_funnel_open_remember_recall_count_round_trip() {
+        require_qtsq!();
         let _g = lock();
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
@@ -2346,6 +2395,7 @@ mod tests {
 
     #[test]
     fn memory_funnel_handles_isolate_two_brains() {
+        require_qtsq!();
         let _g = lock();
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
@@ -2381,18 +2431,25 @@ mod tests {
     }
 
     #[test]
-    fn memory_funnel_recall_before_open_is_a_clear_error() {        let _g = lock();
+    fn memory_funnel_recall_before_open_is_a_clear_error() {
+        let _g = lock();
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
         // No memory.open on this runtime → the facade's "call open first"
-        // error must surface as a normal error envelope, not a crash.
+        // error must surface as a normal error envelope, not a crash. The
+        // code differs by build for the reason above (absent vs throwing).
         let code = call_err(
             rt,
             "memory.count",
             r#"{"handle":99}"#,
         );
-        assert_eq!(code, "js_exception", "expected a clean error envelope");
+        let expected = if sofuu_core::HAS_QTSQ {
+            "js_exception"
+        } else {
+            "unknown_method"
+        };
+        assert_eq!(code, expected, "expected a clean error envelope");
         unsafe { sofuu_rt_free(rt) };
     }
 
@@ -2406,6 +2463,7 @@ mod tests {
     /// vectors: a silent dimension mismatch, not an error.
     #[test]
     fn default_embed_space_is_the_brain_space() {
+        require_qtsq!();
         let _g = lock();
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
@@ -2492,14 +2550,20 @@ mod tests {
 
         // The facade must have installed module-level methods. Reading them
         // as properties proves they are functions, not undefined.
+        //
+        // Each lookup must be null-safe: on a QTSQ-free build `sofuu.memory`
+        // is undefined, and a bare `sofuu.memory.remember` THROWS (TypeError),
+        // which would abort the whole eval and take the mcp/http assertions
+        // down with it. `__t` walks the path and reports "undefined" instead.
         let src = CString::new(
-            r#"JSON.stringify({
-                 mcpCall: typeof sofuu.mcp.call,
-                 mcpList: typeof sofuu.mcp.listTools,
-                 memRemember: typeof sofuu.memory.remember,
-                 memRecall: typeof sofuu.memory.recall,
-                 memCount: typeof sofuu.memory.count,
-                 httpServe: typeof sofuu.http.serve
+            r#"function __t(o, k){ return (o == null) ? "undefined" : typeof o[k]; }
+               JSON.stringify({
+                 mcpCall: __t(sofuu.mcp, "call"),
+                 mcpList: __t(sofuu.mcp, "listTools"),
+                 memRemember: __t(sofuu.memory, "remember"),
+                 memRecall: __t(sofuu.memory, "recall"),
+                 memCount: __t(sofuu.memory, "count"),
+                 httpServe: __t(sofuu.http, "serve")
                })"#,
         )
         .unwrap();
@@ -2508,6 +2572,10 @@ mod tests {
         assert_eq!(rc, 0);
         let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
         unsafe { sofuu_free(out as *mut c_void) };
+        assert!(
+            json.contains("\"ok\":true"),
+            "the shape probe must not throw: {json}"
+        );
 
         // The eval envelope nests a JSON *string* as `result`; parse both
         // layers rather than substring-matching the escaped blob.
@@ -2515,11 +2583,28 @@ mod tests {
         let inner: JsonValue =
             serde_json::from_str(env["result"].as_str().expect("result is a string"))
                 .expect("inner payload is JSON");
-        for m in ["mcpCall", "mcpList", "memRemember", "memRecall", "memCount", "httpServe"] {
+        // mcp + http are pure JS facades and must exist in every build. The
+        // memory methods come from sofuu-core's QTSQ-gated registration, so
+        // they are only required where the codec is actually linked.
+        for m in ["mcpCall", "mcpList", "httpServe"] {
             assert_eq!(
                 inner[m], "function",
                 "{m} should be registered as a function by the facade"
             );
+        }
+        for m in ["memRemember", "memRecall", "memCount"] {
+            if sofuu_core::HAS_QTSQ {
+                assert_eq!(
+                    inner[m], "function",
+                    "{m} should be registered as a function by the facade"
+                );
+            } else {
+                assert_eq!(
+                    inner[m], "undefined",
+                    "without QTSQ the memory surface is compiled out entirely, \
+                     so the facade must not invent it"
+                );
+            }
         }
         unsafe { sofuu_rt_free(rt) };
     }
@@ -2619,16 +2704,50 @@ mod tests {
         .expect("flag array is JSON");
 
         assert_eq!(flags.len(), methods.len(), "one flag per method");
-        let broken: Vec<&String> = methods
-            .iter()
-            .zip(flags.iter())
-            .filter(|(_, ok)| !**ok)
-            .map(|(m, _)| m)
-            .collect();
+
+        // Partition on the QTSQ boundary. `memory.*` is registered by
+        // sofuu-core under `#[cfg(has_qtsq)]`, so a QTSQ-free build (what CI
+        // runs) legitimately has none of it. Rather than skipping the test or
+        // weakening it, each build asserts the contract that is true for it:
+        //
+        //   QTSQ build  → every documented method resolves.
+        //   QTSQ-free   → every NON-memory method resolves, and the memory
+        //                 methods are uniformly ABSENT (catching a partial or
+        //                 half-registered facade, which a blanket "skip the
+        //                 memory rows" would hide).
+        //
+        // Doc drift in the memory rows is still caught on any QTSQ build, and
+        // the `>= 20` parse assertion above keeps the table itself honest in
+        // every build.
+        let mut broken: Vec<&String> = Vec::new();
+        let mut memory_resolved: Vec<&String> = Vec::new();
+        for (m, ok) in methods.iter().zip(flags.iter()) {
+            let is_memory = m.starts_with("memory.");
+            if !*ok {
+                if sofuu_core::HAS_QTSQ || !is_memory {
+                    broken.push(m);
+                }
+            } else if is_memory {
+                memory_resolved.push(m);
+            }
+        }
         assert!(
             broken.is_empty(),
             "docs/EMBEDDING.md documents funnel methods that do not resolve: {broken:?}"
         );
+        if sofuu_core::HAS_QTSQ {
+            assert!(
+                !memory_resolved.is_empty(),
+                "a QTSQ build must resolve the memory funnel"
+            );
+        } else {
+            assert!(
+                memory_resolved.is_empty(),
+                "a QTSQ-free build must expose NO memory methods (found {:?}) — \
+                 a partial registration means the no-QTSQ path is broken",
+                memory_resolved
+            );
+        }
 
         unsafe { sofuu_rt_free(rt) };
     }

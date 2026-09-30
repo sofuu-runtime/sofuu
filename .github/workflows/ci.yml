@@ -36,7 +36,14 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install curl cmake ninja
+        # libuv is installed because Homebrew's curl links it transitively
+        # (via libssh2). sofuu-ffi links that curl dynamically, so the
+        # resulting test binary records a load command for libuv.1.dylib even
+        # though libuv is ALSO linked statically into it. Without the dylib
+        # present the binary aborts at dyld before main(). Installing it
+        # satisfies the redundant transitive load; DYLD_LIBRARY_PATH (below)
+        # tells dyld where to find it.
+        run: brew install curl cmake ninja libuv
 
       - name: Build libuv
         run: |
@@ -71,15 +78,25 @@ jobs:
       - name: Rust unit tests
         env:
           SOFUU_ALLOW_NO_QTSQ: "1"
-        # --test-threads=1 is deliberate. The runtime has ONE process-global
-        # libuv loop, so the tests that pump it serialize on TEST_LOOP_LOCK.
-        # On Linux runners that serialization deadlocked: a sofuu-core test
-        # binary sat in "Rust unit tests" for 20+ minutes with 17 loop-locked
-        # tests (mcp / process_spawn / promise / timer / http_client) never
-        # started, while the capi binary right before it passed 36/36. Running
-        # the suite on one thread removes the cross-thread interleaving that
-        # the lock exists to manage, so the deadlock cannot form at all. It
-        # costs ~1s (376 tests in 2.8s locally).
+          # sofuu-ffi links the system/Homebrew libcurl dynamically (it is
+          # genuinely used — rt/http_client.rs drives it for fetch()). On a
+          # macOS runner that curl is Homebrew's, whose transitive deps
+          # (libssh2) pull in libuv.1.dylib, and the test binary then aborts
+          # at dyld: "Library not loaded: @rpath/libuv.1.dylib" — while
+          # libuv itself is linked STATICALLY into the same binary, so the
+          # dylib is a redundant transitive need with no rpath to find it.
+          # Point DYLD at Homebrew's libs so the transitive dylibs resolve.
+          # Only needed on macOS; harmless elsewhere.
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/libuv/lib:/opt/homebrew/opt/curl/lib:/opt/homebrew/lib
+          # --test-threads=1 is deliberate. The runtime has ONE process-global
+          # libuv loop, so the tests that pump it serialize on TEST_LOOP_LOCK.
+          # On Linux runners that serialization deadlocked: a sofuu-core test
+          # binary sat in "Rust unit tests" for 20+ minutes with 17 loop-locked
+          # tests (mcp / process_spawn / promise / timer / http_client) never
+          # started, while the capi binary right before it passed 36/36. Running
+          # the suite on one thread removes the cross-thread interleaving that
+          # the lock exists to manage, so the deadlock cannot form at all. It
+          # costs ~1s (376 tests in 2.8s locally).
         run: cargo test --release -- --test-threads=1
 
       - name: Size cap

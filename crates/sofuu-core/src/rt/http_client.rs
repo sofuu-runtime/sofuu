@@ -3161,6 +3161,9 @@ function go(f) {
     // the negative control is structural: the test fails if the fix regresses.
     #[test]
     fn stream_bulk_delivers_fast_ab() {
+        /* One fetch per leg below (legacy, then fixed), so the server thread
+         * must serve exactly this many connections. */
+        const LEG_CONNECTIONS: usize = 2;
         let n: usize = 1 << 24; /* 16 MiB per leg — per-byte crossings (~45ns)
                                  * scale linearly with bytes, transfer overhead
                                  * is shared, so the legs separate cleanly. */
@@ -3174,11 +3177,27 @@ function go(f) {
         .into_bytes();
         raw.extend_from_slice(&body);
         std::thread::spawn(move || {
+            /* Serve exactly LEG_CONNECTIONS connections — one per leg below.
+             * An unbounded `for stream in listener.incoming()` was the
+             * original shape and it was wrong twice over: it never
+             * terminated, and it re-sent 16 MiB to EVERY connection curl
+             * made. On the Linux runners that runaway detached thread starved
+             * the machine, the byte-count assertion failed, and the tests
+             * after this one never started. */
+            let mut served = 0usize;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let _ = stream.write_all(&raw);
+                /* A 16 MiB write can fail part-way if the peer stops reading;
+                 * stop rather than loop on a broken socket. */
+                if stream.write_all(&raw).is_err() {
+                    break;
+                }
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);
+                served += 1;
+                if served >= LEG_CONNECTIONS {
+                    break;
+                }
             }
         });
 

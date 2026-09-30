@@ -1256,7 +1256,7 @@ onExit: function () { exited = true; } });";
         // Drain: the failed spawn's pipes close (fence → spawn_free — this
         // is where the old code double-freed), then sleep exits.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let phase1 = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"phase1".as_ptr()) };
@@ -1293,7 +1293,7 @@ catch (e) { after = (e && e.message) ? e.message : 'caught'; }";
         };
         assert!(!unsafe { qjs::is_exception(r2) });
         unsafe { qjs::sofuu_js_free_value(ctx, r2) };
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let after = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"after".as_ptr()) };
         let after_s = unsafe { qjs::sofuu_js_to_cstring(ctx, after) };
@@ -1358,7 +1358,7 @@ p.write('second-line\\n');";
         // Drain: both writes flush, head echoes two lines and exits, the
         // close fence tears the request down (frees payload + req + Box).
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let chunks_v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"chunks".as_ptr()) };
@@ -1435,7 +1435,7 @@ onExit: function (c) { exited = true; code = c; } });";
 
         // Drain: env prints, child exits, close fence tears the req down.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let out_v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"envOut".as_ptr()) };
@@ -1545,7 +1545,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
         unsafe { qjs::JS_SetMemoryLimit(rt, 8 * 1024 * 1024) };
 
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let rejected = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"rejected".as_ptr()) };
@@ -1640,7 +1640,7 @@ sofuu.exec('/bin/echo', ['small-pos']).then(function (r) { pres = r; });";
 
         // Drain: head streams 70MB, both children exit, promises settle.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let err_v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"err".as_ptr()) };
@@ -1725,7 +1725,7 @@ onExit: function (c, s) { exited = true; code = c; sig = s; } });";
 
         // Drain: sh TERMs itself, the close fence tears the req down.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let exited_v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"exited".as_ptr()) };
@@ -1784,7 +1784,7 @@ function (e) { err = (e && e.message) ? e.message : String(e); });";
         // promise settles and the loop drains (pre-fix: blocked 30s here,
         // then resolved with signal=0 → the assertion below fails).
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::global_object(ctp) };
         let err_v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"err".as_ptr()) };

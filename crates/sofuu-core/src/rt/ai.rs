@@ -6640,7 +6640,7 @@ mod tests {
                                  c"<p1-1-warmup>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
             assert!(!qjs::is_exception(r), "warmup eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
             assert_eq!(read_global_i64(ctx, c"settled"), 2, "warmup streams must all settle");
 
             let before = gc_obj_count(rt);
@@ -6650,7 +6650,7 @@ mod tests {
                                  c"<p1-1-measure>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
             assert!(!qjs::is_exception(r), "measure eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
             assert_eq!(read_global_i64(ctx, c"settled"), 8, "measured streams must all settle");
 
             let after = gc_obj_count(rt);
@@ -6794,7 +6794,7 @@ mod tests {
                              c"<net11-drive>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
         assert!(!qjs::is_exception(r), "driver eval threw");
         qjs::sofuu_js_free_value(ctx, r);
-        crate::rt::event_loop::sofuu_loop_run(ctx);
+        crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
     }
 
     unsafe fn net11_close(rt: *mut qjs::JSRuntime, ctx: *mut JSContext) {

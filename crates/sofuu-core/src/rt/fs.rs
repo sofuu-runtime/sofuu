@@ -926,7 +926,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
 
         // Drain: both opens resolve/reject and their handlers run.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let rejected = read_str_global(ctx, global, c"rejected");
@@ -1014,7 +1014,7 @@ function (e) {{ gotEmpty = 'ERR:' + ((e && e.message) ? e.message : String(e)); 
 
         // Drain: both reads resolve and their handlers run.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let got = read_str_global(ctx, global, c"got");
@@ -1096,7 +1096,7 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
         unsafe { qjs::JS_SetMemoryLimit(rt, 8 * 1024 * 1024) };
 
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let rejected = read_str_global(ctx, global, c"rejected");
@@ -1181,7 +1181,7 @@ function (e) {{ err = (e && e.message) ? e.message : String(e); }});",
         // Drain: open unblocks, the chunk loop reads to EOF, promise
         // resolves (pre-fix: one 0-sized read → resolves "").
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
         writer.join().unwrap();
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
@@ -1247,7 +1247,7 @@ function (e) {{ rejected = (e && e.message) ? e.message : String(e); }});",
         unsafe { qjs::sofuu_js_free_value(ctx, r) };
 
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let rejected = read_str_global(ctx, global, c"rejected");
@@ -1314,7 +1314,7 @@ function (e) {{ err = (e && e.message) ? e.message : String(e); }});",
         unsafe { qjs::sofuu_js_free_value(ctx, r) };
 
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let err = read_str_global(ctx, global, c"err");

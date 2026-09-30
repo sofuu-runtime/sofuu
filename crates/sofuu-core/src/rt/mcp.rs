@@ -1566,7 +1566,7 @@ mod tests {
         unsafe { qjs::sofuu_js_free_value(ctx, r) };
 
         // Drain: exit + all four close callbacks run, fence reaches zero.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let frees = TEST_MCP_CLIENT_FREES.load(Ordering::Relaxed) - base;
         assert_eq!(

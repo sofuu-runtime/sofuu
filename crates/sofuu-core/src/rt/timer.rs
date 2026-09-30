@@ -399,7 +399,7 @@ sofuu.sleep(3).then(function () { slept = true; });";
         // Drain: all timers fire, the interval is cleared from its own
         // callback, and the sleep promise resolves.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         // SAFETY: global props are live; freed below.
         let global = unsafe { qjs::global_object(ctp) };

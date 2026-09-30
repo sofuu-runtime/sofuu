@@ -211,6 +211,30 @@ pub unsafe extern "C" fn sofuu_loop_get() -> *mut UvLoop {
 /// `ctx` must be the live runtime context (loop thread).
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_loop_run(ctx: *mut JSContext) {
+    sofuu_loop_run_bounded(ctx, None)
+}
+
+/// [`sofuu_loop_run`] with an optional wall-clock bound.
+///
+/// The unbounded loop can never give up on its own: it exits only when libuv
+/// reports no pending work AND no handle is still alive. A test that leaves a
+/// single handle open — or a transfer that never completes — therefore spins
+/// forever. That is exactly what happened on the Linux CI runners, where
+/// `cargo test` sat in one http_client test until the 35-minute job timeout
+/// killed it, while the same test passes in 2.8s locally.
+///
+/// `max` bounds the whole run. It is intentionally None for the product path
+/// (`sofuu_loop_run`): a long-lived server SHOULD keep serving, and the
+/// network layer has its own request deadlines. The bound exists for the
+/// test helper, where "hang forever" must be "fail with a message".
+///
+/// # Safety
+/// `ctx` must be the live runtime context (loop thread).
+pub(crate) unsafe fn sofuu_loop_run_bounded(
+    ctx: *mut JSContext,
+    max: Option<std::time::Duration>,
+) {
+    let started = max.map(|_| std::time::Instant::now());
     if loop_ptr().is_null() {
         return;
     }
@@ -230,6 +254,20 @@ pub unsafe extern "C" fn sofuu_loop_run(ctx: *mut JSContext) {
 
         if has_pending == 0 && uv::uv_loop_alive(loop_ptr()) == 0 {
             break;
+        }
+
+        /* Test-only escape hatch: a bound means a hang is reported as a
+         * failure instead of stalling the runner forever. */
+        if let (Some(t0), Some(limit)) = (started, max) {
+            if t0.elapsed() > limit {
+                eprintln!(
+                    "[sofuu] sofuu_loop_run_bounded: giving up after {:?} \
+                     (handles still alive — a test is leaking one, or a \
+                     transfer never completed)",
+                    limit
+                );
+                break;
+            }
         }
     }
 

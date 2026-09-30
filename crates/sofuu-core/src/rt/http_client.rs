@@ -2458,7 +2458,7 @@ mod tests {
             eval_err = Some("script eval threw".into());
         } else {
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
         }
 
         if eval_err.is_none() {
@@ -2845,7 +2845,7 @@ function go(f) {
                                  c"<p1-2>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
             assert!(!qjs::is_exception(r), "script eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
 
             let state = read_global(ctx, c"state");
             assert_eq!(
@@ -3011,7 +3011,7 @@ function go(f) {
             );
             assert!(!qjs::is_exception(r), "eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
 
             CURL_HANDLE.with(|c| c.set(saved));
 
@@ -3422,7 +3422,7 @@ function go(f) {
                                  c"<p1-4>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
             assert!(!qjs::is_exception(r), "script eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
 
             let state = read_global(ctx, c"state");
             // The chunk fulfillment is the FIRST Uint8Array construction in
@@ -3557,7 +3557,7 @@ function go(f) {
                                  c"<p1-5>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
             assert!(!qjs::is_exception(r), "script eval threw");
             qjs::sofuu_js_free_value(ctx, r);
-            crate::rt::event_loop::sofuu_loop_run(ctx);
+            crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60)));
 
             let state = read_global(ctx, c"state");
             let errmsg = read_global(ctx, c"errmsg");

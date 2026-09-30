@@ -396,7 +396,7 @@ mod tests {
 
         // Drain: timer fires → Rust resolve → JS .then runs.
         // SAFETY: ctx live on this thread.
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         // Read the resolved value back through the bindings.
         // SAFETY: global object + property are live; freed below.

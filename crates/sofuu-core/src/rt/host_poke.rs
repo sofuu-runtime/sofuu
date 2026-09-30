@@ -268,7 +268,7 @@ globalThis.__wait = new Promise(function (r) { globalThis.__wake = r; });";
         // Blocks until the cross-thread poke resolves the promise (the
         // keep-alive timer alone would hold it for 30s — the poke must
         // arrive first and clear it).
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
         sender.join().unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
@@ -320,7 +320,7 @@ setTimeout(function () { globalThis.__ticked = true; }, 20);";
         };
         assert!(!unsafe { qjs::is_exception(r) });
         unsafe { qjs::sofuu_js_free_value(ctx, r) };
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         // Now install the handler and poke again — BOTH messages must arrive
         // in order (the early one was re-queued).
@@ -349,7 +349,7 @@ setTimeout(function () { globalThis.__ticked = true; }, 20);";
         };
         assert!(!unsafe { qjs::is_exception(r) });
         unsafe { qjs::sofuu_js_free_value(ctx, r) };
-        unsafe { crate::rt::event_loop::sofuu_loop_run(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(60))) };
 
         let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
         let seen = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"__seen".as_ptr()) };

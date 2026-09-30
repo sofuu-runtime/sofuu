@@ -45,17 +45,20 @@ jobs:
           cmake --build build
 
       - name: Build Sofuu (Rust-first)
-        # QTSQ is a proprietary local checkout — CI builds without it
-        # (build.rs degrades gracefully: no brain persistence / sessions).
+        # QTSQ is a proprietary local checkout that cannot be built here, so
+        # CI makes a DELIBERATE QTSQ-free build. The flag is the documented
+        # escape hatch: the Makefile guard hard-fails on a build that would
+        # silently no-op memory (that is what shipped the brain-less
+        # 2026-09-22 tarball), and an empty dir is NOT an opt-out — only
+        # this flag is. build.rs then degrades gracefully: the memory module
+        # registers as a no-op and sessions do not persist.
         env:
-          SOFUU_QTSQ_DIR: /tmp/sofuu-no-qtsq
-        run: |
-          mkdir -p /tmp/sofuu-no-qtsq
-          make
+          SOFUU_ALLOW_NO_QTSQ: "1"
+        run: make
 
       - name: Rust unit tests
         env:
-          SOFUU_QTSQ_DIR: /tmp/sofuu-no-qtsq
+          SOFUU_ALLOW_NO_QTSQ: "1"
         run: cargo test --release
 
       - name: Size cap

@@ -6313,10 +6313,15 @@ mod tests {
     /// Rust-only constructs out of the JS body.
     #[test]
     fn driver_js_contains_no_rust_isms() {
-        let start = DRIVER.find("r#\"").expect("driver literal") + 3;
-        let end = start + DRIVER[start..].find("\"#;").expect("driver terminator");
-        let js = &DRIVER[start..end];
-        for (i, line) in js.lines().enumerate() {
+        // DRIVER is the string VALUE of the r#"…"# const — the literal
+        // markers live in the declaration, not in the value, so scanning
+        // DRIVER for `r#"` always returned None and this test failed on
+        // every run. It was pre-existing and hidden because `make test`
+        // only runs the library target's --lib tests, not --bin sofuu.
+        // The value starts with the IIFE directly.
+        let js = DRIVER;
+        let start = js.find("(function").unwrap_or(0);
+        for (i, line) in js[start..].lines().enumerate() {
             let t = line.trim_start();
             assert!(
                 !t.starts_with("let mut "),
@@ -6359,7 +6364,12 @@ mod tests {
     fn protect_pattern_covers_the_documented_cases() {
         let src = include_str!("../../../src/js/chat.js");
         let at = src.find("PROTECT_RE = ").expect("protect pattern");
-        let line = &src[at..src[at..].find('\n').unwrap_or(0)];
+        // `find` on the `src[at..]` sub-slice returns an offset RELATIVE to
+        // `at`, but the old code used it as an absolute end index — so it
+        // sliced src[16693..169] and panicked on every run with
+        // "begin <= end". Convert the offset before slicing.
+        let line_end = src[at..].find('\n').map(|off| at + off).unwrap_or(src.len());
+        let line = &src[at..line_end];
         for needed in ["do\\s+not", "never", "always", "must", "approved", "decided", "\\?"] {
             assert!(
                 line.contains(needed),
@@ -6582,8 +6592,16 @@ mod tests {
         // An explicit window wins over the default — up to the 1M cap.
         assert_eq!(effective_ctx_window("openai", 1_000_000), 1_000_000);
         assert_eq!(effective_ctx_window("local", 1_000_000), 1_000_000);
-        // load() clamps corrupt/over-the-cap persisted values.
-        assert_eq!(clamp_ctx_window(999_999_999), 1_000_000);
+        // load() clamps corrupt/over-the-cap persisted values. The cap is
+        // MAX_CTX_WINDOW (4 MiB) — it was raised from 1,000,000 because the
+        // /ctx picker's own "1M" preset (1048576) was being REJECTED by the
+        // old 1,000,000 ceiling. This assertion still expected the old 1M
+        // and so failed on every run; it now pins the real cap by name.
+        assert_eq!(
+            clamp_ctx_window(999_999_999),
+            MAX_CTX_WINDOW,
+            "an absurd persisted window clamps to the real cap, not a stale one"
+        );
         assert_eq!(clamp_ctx_window(-5), 0);
         assert_eq!(clamp_ctx_window(512), 1024, "below 1024 clamps up to the floor");
     }

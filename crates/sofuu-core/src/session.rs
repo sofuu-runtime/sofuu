@@ -1325,6 +1325,7 @@ mod tests {
 
     #[test]
     fn session_lifecycle_persists_qtsq() {
+        require_qtsq!();
         let proj = tmp_project("lifecycle");
         // Real .qtsq round-trip through the QTSQ codec (linked via FFI).
         let mut s1 = Session::join(&proj, "qwen:4b", "ollama");
@@ -1356,6 +1357,7 @@ mod tests {
 
     #[test]
     fn prompt_and_answer_persist_for_transcript_resume() {
+        require_qtsq!();
         // Regression: the chat driver must log BOTH sides of a turn; a
         // resumed session replays prompt + answer, never prompt-with-empty.
         let proj = tmp_project("resume");
@@ -1380,6 +1382,7 @@ mod tests {
 
     #[test]
     fn segmented_store_rotates_and_reads_recent_context() {
+        require_qtsq!();
         let proj = tmp_project("segmented");
         let mut session = Session::join(&proj, "m1", "openai");
         for i in 0..70 {
@@ -1408,6 +1411,7 @@ mod tests {
 
     #[test]
     fn legacy_flat_session_is_readable_and_migrates_without_deleting_source() {
+        require_qtsq!();
         let proj = tmp_project("legacy-migrate");
         let id = gen_session_id();
         let data = SessionData {
@@ -1463,6 +1467,7 @@ mod tests {
 
     #[test]
     fn repair_rebuilds_manifest_from_published_segments() {
+        require_qtsq!();
         let proj = tmp_project("repair");
         let mut session = Session::join(&proj, "m1", "openai");
         for i in 0..70 {
@@ -1484,6 +1489,7 @@ mod tests {
 
     #[test]
     fn peers_see_each_others_criticals() {
+        require_qtsq!();
         let proj = tmp_project("peers");
         let mut s1 = Session::join(&proj, "qwen:4b", "ollama");
         let mut s2 = Session::join(&proj, "qwen:4b", "ollama");
@@ -1526,6 +1532,7 @@ mod tests {
     // buffer; the next success trims it back.
     #[test]
     fn persist_failure_keeps_events_and_success_trims() {
+        require_qtsq!();
         use std::os::unix::fs::PermissionsExt;
         let proj = tmp_project("persist-cap");
         let mut s = Session::join(&proj, "qwen:4b", "ollama");

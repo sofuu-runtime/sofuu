@@ -13,6 +13,31 @@ use std::ffi::{CString, c_char, c_int};
 use std::process::ExitCode;
 
 use sofuu_ffi::SofuuRuntime;
+/// Skip a test that needs the QTSQ codec when this build has none.
+///
+/// Some binary-side features are wired THROUGH the codec rather than gated on
+/// it: `output_archive` hashes records with `qtsq_sha256_hex`, and the session
+/// store and chat persistence both call QTSQ-backed helpers. Without the codec
+/// those return `None`/`Err`, so a test that `unwrap()`s them fails. They are
+/// not testing a degraded path — they test real behaviour that only exists when
+/// the codec is linked.
+///
+/// CI builds QTSQ-free on purpose (the checkout is proprietary), so without
+/// this these 23 tests could only ever pass on one machine — a gate that runs
+/// in one place is not a gate.
+#[cfg(test)]
+macro_rules! require_qtsq {
+    () => {
+        if !sofuu_core::HAS_QTSQ {
+            eprintln!(
+                "skipping: this build has no QTSQ codec (see sofuu_core::HAS_QTSQ), \
+                 and the code under test is wired through it"
+            );
+            return;
+        }
+    };
+}
+
 
 mod chat;
 mod doctor;

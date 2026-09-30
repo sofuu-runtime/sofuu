@@ -1903,6 +1903,7 @@ mod tests {
 
     #[test]
     fn timestamp_and_id_are_stable_and_safe() {
+        require_qtsq!();
         assert_eq!(format_rfc3339_ms(1_735_689_930_481), "2025-01-01T00:05:30.481Z");
         let record = build_record(request("final", "hello"), 42, 1_735_689_930_481, 0).unwrap();
         assert!(valid_output_id(&record.id));
@@ -1911,6 +1912,7 @@ mod tests {
 
     #[test]
     fn write_list_get_and_search_use_index_then_payload() {
+        require_qtsq!();
         let project = tmp_project("index");
         let reference = write(&project, request("final", "The recovery output is useful"), &ArchivePolicy::default()).unwrap();
         let list: Value = serde_json::from_str(&list_json(&project, OutputQuery::default())).unwrap();
@@ -1925,6 +1927,7 @@ mod tests {
 
     #[test]
     fn redaction_happens_before_hash_and_storage() {
+        require_qtsq!();
         let project = tmp_project("redact");
         let mut req = request("error", "Authorization: Bearer super-secret-token-123456\npassword=top-secret-value");
         req.status = "failed".into();
@@ -1939,6 +1942,7 @@ mod tests {
 
     #[test]
     fn context_is_labeled_and_budgeted() {
+        require_qtsq!();
         let project = tmp_project("context");
         let mut req = request("error", &"failure details ".repeat(1000));
         req.status = "failed".into();
@@ -1961,6 +1965,7 @@ mod tests {
 
     #[test]
     fn corrupt_index_is_rebuilt_from_payloads() {
+        require_qtsq!();
         let project = tmp_project("rebuild");
         let reference = write(&project, request("final", "survives index loss"), &ArchivePolicy::default()).unwrap();
         let index = output_root(&project).join(INDEX_FILE);
@@ -1972,6 +1977,7 @@ mod tests {
 
     #[test]
     fn new_records_are_plaintext_and_follow_qtsq_size_policy() {
+        require_qtsq!();
         let project = tmp_project("codec-policy");
         let small = write(&project, request("final", "small payload"), &ArchivePolicy::default()).unwrap();
         let small_path = output_root(&project).join(&small.path);
@@ -1996,6 +2002,7 @@ mod tests {
 
     #[test]
     fn prune_is_visible_and_preserves_recovery_records() {
+        require_qtsq!();
         let project = tmp_project("prune");
         let final_ref = write(&project, request("final", "completed answer"), &ArchivePolicy::default()).unwrap();
         let mut error_request = request("error", "provider failed");
@@ -2062,6 +2069,7 @@ mod tests {
     /// and would have deleted the live session's archive).
     #[test]
     fn prune_refuses_corrupt_plaintext_registry() {
+        require_qtsq!();
         let project = tmp_project("prune-corrupt");
         let rec = write(&project, request("final", "live session answer"), &ArchivePolicy::default()).unwrap();
         let dir = session::sessions_dir(&project);
@@ -2091,6 +2099,7 @@ mod tests {
     /// REFUSE — this is the desktop driver's only registry.
     #[test]
     fn prune_refuses_corrupt_qtsq_registry() {
+        require_qtsq!();
         let project = tmp_project("prune-corrupt-qtsq");
         let rec = write(&project, request("final", "live session answer"), &ArchivePolicy::default()).unwrap();
         let dir = session::sessions_dir(&project);
@@ -2111,6 +2120,7 @@ mod tests {
     /// though it is older than the cutoff (protection, not just absence).
     #[test]
     fn prune_protects_active_session_across_both_registries() {
+        require_qtsq!();
         let project = tmp_project("prune-active-plain");
         let rec = write(&project, request("final", "live session answer"), &ArchivePolicy::default()).unwrap();
         let dir = session::sessions_dir(&project);
@@ -2132,6 +2142,7 @@ mod tests {
     /// Same protection via the qtsq registry (desktop driver path).
     #[test]
     fn prune_protects_active_session_in_qtsq_registry() {
+        require_qtsq!();
         let project = tmp_project("prune-active-qtsq");
         let rec = write(&project, request("final", "live session answer"), &ArchivePolicy::default()).unwrap();
         active_registry_qtsq(&project, "s-0000000000001-00001-0001");
@@ -2156,6 +2167,7 @@ mod tests {
     // equality was impossible pre-fix.
     #[test]
     fn show_and_context_do_not_rewrite_the_index() {
+        require_qtsq!();
         let project = tmp_project("read-only-index");
         let reference = write(&project, request("final", "plain read"), &ArchivePolicy::default()).unwrap();
         let index_path = output_root(&project).join(INDEX_FILE);
@@ -2194,6 +2206,7 @@ mod tests {
     // excluded from the index, but the rebuild report now counts it.
     #[test]
     fn rebuild_counts_deep_subtrees_as_skipped() {
+        require_qtsq!();
         let project = tmp_project("deep-skip");
         let reference = write(&project, request("final", "shallow survivor"), &ArchivePolicy::default()).unwrap();
         let deep = output_root(&project).join(RECORDS_DIR).join("a/b/c/d/e/f/g");

@@ -158,7 +158,11 @@ fn extract_features(
         sig: sig.to_string(),
         step,
     };
-    features::extract(&ctx)
+    let mut f = features::extract(&ctx);
+    // Phase 1.2: NaN must never reach the forward pass (the supervisor
+    // runs on every tool call — a NaN score would break the check JSON).
+    crate::ml::sanitize_features(&mut f);
+    f
 }
 
 /// Forward through the adopted online output layer when present, else the

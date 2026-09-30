@@ -10,11 +10,14 @@ members = [
 # PLAN-ML-GATES §9: ml-train is a DEV-ONLY trainer — `make` / `cargo build`
 # never touch it, the shipped binary is untouched. Reproduce weights with
 # `cargo run -p ml-train --release -- freshness`.
+# P1-14 (AUDIT-2026-09-01): sofuu-desktop/src-tauri is REMOVED from
+# default-members (still in `members`) — a bare `cargo test`/`cargo build`
+# used to compile the whole Tauri desktop stack + its system deps on CLI
+# runners. Build the desktop app explicitly with -p or from sofuu-desktop/.
 default-members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
-    "sofuu-desktop/src-tauri",
 ]
 
 [workspace.package]

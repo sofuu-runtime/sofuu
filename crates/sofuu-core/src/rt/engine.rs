@@ -542,7 +542,10 @@ pub unsafe extern "C" fn sofuu_module_loader(
     let mut src_ptr: *const c_char = source.as_ptr() as *const c_char;
     let mut need_free: *mut c_char = ptr::null_mut();
 
-    if path.contains(".ts") || path.contains(".mts") {
+    // P3 (AUDIT-2026-09-07): ends_with, matching the loader below —
+    // contains(".ts") also fired on names like "foo.types.js" and ran the
+    // TS stripper over plain JavaScript.
+    if path.ends_with(".ts") || path.ends_with(".mts") {
         // Rust stripper (sofuu_core::ts); on failure keep the original text.
         let stripped = unsafe { sofuu_ts_strip_rs(src_ptr, len, &mut len) };
         if !stripped.is_null() {
@@ -749,8 +752,9 @@ unsafe fn engine_run_jobs(eng: *mut SofuuEngine) {
     }
 }
 
-/// engine_destroy — the C teardown order: surface pending rejections,
-/// close the loop, process cleanup, GC, free context + runtime.
+/// engine_destroy — the C teardown order: surface pending rejections, close
+/// this engine's handles (F-2), close the loop, process cleanup, GC, free
+/// context + runtime.
 unsafe fn engine_destroy(eng: *mut SofuuEngine) {
     if eng.is_null() {
         return;
@@ -759,7 +763,15 @@ unsafe fn engine_destroy(eng: *mut SofuuEngine) {
     unsafe { sofuu_rt_report_pending_rejections((*eng).ctx) };
     // PLAN-DESKTOP A: close the poke handle before the loop walk so the
     // close callback frees its storage (the walk skips closing handles).
-    unsafe { crate::rt::host_poke::sofuu_host_poke_shutdown() };
+    // F-2: only if THIS engine owns it — a surviving engine still needs it.
+    unsafe { crate::rt::host_poke::sofuu_host_poke_shutdown_for((*eng).ctx) };
+    // F-2 (AUDIT-2026-09-01-CLI): with several engines sharing the
+    // process-global loop, a teardown must kill THIS engine's in-flight AI
+    // requests and close THIS engine's armed handles — a surviving engine's
+    // uv_run would otherwise fire them into the memory freed below. Both run
+    // while ctx is still live (close callbacks free JSValues with it).
+    unsafe { crate::rt::ai::ai_abort_requests_for_ctx((*eng).ctx) };
+    unsafe { crate::rt::event_loop::sofuu_loop_shutdown_engine((*eng).ctx) };
     unsafe { sofuu_loop_close() };
     unsafe { mod_process_cleanup((*eng).ctx) };
     unsafe { qjs::JS_RunGC((*eng).rt) };

@@ -1,5 +1,9 @@
 sofuu_destroy
 sofuu_embed_abi_version
+sofuu_embed_batch
+sofuu_embed_image
+sofuu_embed_info
+sofuu_embed_local
 sofuu_embed_set_log_cb
 sofuu_engine_ctx
 sofuu_eval_file
@@ -12,6 +16,7 @@ sofuu_loop_close
 sofuu_loop_get
 sofuu_loop_init
 sofuu_loop_run
+sofuu_loop_shutdown_engine
 sofuu_rt_call
 sofuu_rt_call_stream
 sofuu_rt_cancel
@@ -21,3 +26,5 @@ sofuu_rt_install_rejection_tracker
 sofuu_rt_new
 sofuu_rt_report_pending_rejections
 sofuu_run_jobs
+sofuu_voice_speak
+sofuu_voice_transcribe

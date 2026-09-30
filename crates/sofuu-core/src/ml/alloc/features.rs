@@ -72,6 +72,19 @@ fn log2_norm(v: f32, div: f32) -> f32 {
     (v.log2() / div).min(1.0)
 }
 
+/// i64 → f32 without the Inf blowup of a raw `as f32` on huge values
+/// (Phase 1.3: a JSON-side magnitude like 1e18 must saturate, not turn
+/// every ratio it touches into ±Inf/NaN).
+fn sat_f32(v: i64) -> f32 {
+    if v > (f32::MAX as i64) {
+        f32::INFINITY
+    } else if v < (f32::MIN as i64) {
+        f32::NEG_INFINITY
+    } else {
+        v as f32
+    }
+}
+
 fn ratio(part: f32, win: f32) -> f32 {
     if win <= 0.0 {
         return 0.0;
@@ -87,11 +100,11 @@ fn flag(b: bool) -> f32 {
 /// ml-train's data_alloc imports this function, so train/serve skew is
 /// structurally impossible (§10 bar 5).
 pub fn extract(inp: &AllocInput) -> [f32; ALLOC_FEATURES] {
-    let win = inp.ctx_window as f32;
-    let out = inp.max_output as f32;
-    let hist = inp.history_tk as f32;
-    let overhead = inp.overhead_tk as f32;
-    let attach = inp.attach_tk as f32;
+    let win = sat_f32(inp.ctx_window);
+    let out = sat_f32(inp.max_output);
+    let hist = sat_f32(inp.history_tk);
+    let overhead = sat_f32(inp.overhead_tk);
+    let attach = sat_f32(inp.attach_tk);
     let growth = inp.growth_tk.max(0.0);
 
     // Slack left for future turns if nothing changes: window minus what
@@ -125,12 +138,12 @@ pub fn extract(inp: &AllocInput) -> [f32; ALLOC_FEATURES] {
         ratio(overhead, win),                          // 6: measured overhead / window
         flag(inp.calibrated),                          // 7: overhead calibrated
         ratio(hist, win),                              // 8: history fill
-        log2_norm(inp.turns as f32 + 1.0, 8.0),        // 9: session length
+        log2_norm(sat_f32(inp.turns as i64) + 1.0, 8.0),        // 9: session length
         inp.tool_frac.clamp(0.0, 1.0),                 // 10: tool-transcript share
         flag(inp.summary_present),                     // 11: already compacted once
         ratio(growth, win),                            // 12: per-turn growth / window
         (inp.growth_accel.clamp(0.0, 3.0)) / 3.0,      // 13: growth acceleration
-        ratio(inp.task_tk as f32, win),                // 14: task size
+        ratio(sat_f32(inp.task_tk), win),                // 14: task size
         ratio(attach, win),                            // 15: attachment load
         flag(inp.tool_heavy),                          // 16: tool-heavy task
         flag(inp.writing),                             // 17: long-form task
@@ -191,5 +204,76 @@ mod tests {
         let v = extract(&inp);
         assert_eq!(v[1], 0.0, "known flag must be 0 for unknown caps");
         assert!(v.iter().all(|x| x.is_finite()));
+    }
+
+    /// Phase 1.3 (§5.3 "zero denominators and overflows"): every field
+    /// pushed to a hostile extreme — saturating window, huge history,
+    /// negative growth, oversized everything — must still yield a finite
+    /// vector in the feature band. No input, however wrong, may produce
+    /// NaN/Inf into the net.
+    #[test]
+    fn hostile_extremes_stay_finite_and_bounded() {
+        let hostile = AllocInput {
+            ctx_window: i64::MAX,          // saturates to f32::INFINITY
+            max_output: i64::MIN,          // → f32::NEG_INFINITY
+            thinking: THINK_UNKNOWN,
+            overhead_tk: i64::MAX,
+            calibrated: true,
+            history_tk: i64::MAX - 1,      // slack computed on saturated floats
+            turns: u32::MAX,
+            tool_frac: 9.9,                // beyond [0,1] — clamped by extract
+            summary_present: true,
+            growth_tk: 1.0e30,             // f32-finite but huge
+            growth_accel: -4.0,            // negative — clamped
+            task_tk: i64::MIN + 1,
+            attach_tk: i64::MAX - 2,
+            tool_heavy: true,
+            writing: true,
+            mean_answer_tk: f32::MAX,
+            max_answer_tk: f32::MAX,
+            saw_length_stop: true,
+        };
+        let v = extract(&hostile);
+        for (i, x) in v.iter().enumerate() {
+            assert!(x.is_finite(), "feature {i} not finite under hostile input: {x}");
+            assert!((-1.0..=2.0).contains(x), "feature {i} wildly out of band: {x}");
+        }
+        // A NaN-carrying input must survive the same way — sanitize is the
+        // last line before the net (Phase 1.2).
+        let mut nan_inp = hostile.clone();
+        nan_inp.tool_frac = f32::NAN;
+        nan_inp.growth_tk = f32::NAN;
+        let mut v2 = extract(&nan_inp);
+        crate::ml::sanitize_features(&mut v2);
+        assert!(v2.iter().all(|x| x.is_finite()), "sanitize must clear NaN features");
+    }
+
+    /// Zero magnitudes: zero-window, zero-history, zero-growth must not
+    /// divide by zero anywhere (§5.3).
+    #[test]
+    fn zero_magnitudes_never_diverge() {
+        let zero = AllocInput {
+            ctx_window: 0,
+            max_output: 0,
+            thinking: THINK_NONE,
+            overhead_tk: 0,
+            calibrated: false,
+            history_tk: 0,
+            turns: 0,
+            tool_frac: 0.0,
+            summary_present: false,
+            growth_tk: 0.0,
+            growth_accel: 0.0,
+            task_tk: 0,
+            attach_tk: 0,
+            tool_heavy: false,
+            writing: false,
+            mean_answer_tk: 0.0,
+            max_answer_tk: 0.0,
+            saw_length_stop: false,
+        };
+        let v = extract(&zero);
+        assert!(v.iter().all(|x| x.is_finite() && x >= &0.0), "zero state must be finite");
+        assert_eq!(v[21], 0.0, "no slack computable on a zero window");
     }
 }

@@ -12,6 +12,9 @@ publish = false
 
 [dependencies]
 sofuu-core = { path = "../sofuu-core" }
+# `bench` parses the public eval sets (JSONL) and emits a machine-readable
+# scoreboard. Dev-only crate — never linked into the shipped binary.
+serde_json = "1"
 
 [[bin]]
 name = "ml-train"

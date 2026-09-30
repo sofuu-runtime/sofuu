@@ -1,5 +1,7 @@
 // Popover.tsx — a small click-outside/Escape-aware dropdown. Render it next
-// to its trigger inside a positioned ancestor (.pop-anchor); it floats below.
+// to its trigger inside a positioned ancestor (.pop-anchor). place="down"
+// floats below the trigger (default); "up" floats above it, for controls
+// anchored near the bottom edge of the window.
 
 import { useEffect, useRef, type ReactNode } from "react";
 
@@ -7,10 +9,12 @@ interface Props {
   open: boolean;
   onClose: () => void;
   align?: "left" | "right";
+  place?: "down" | "up";
+  className?: string;
   children: ReactNode;
 }
 
-export function Popover({ open, onClose, align = "left", children }: Props) {
+export function Popover({ open, onClose, align = "left", place = "down", className, children }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -31,7 +35,15 @@ export function Popover({ open, onClose, align = "left", children }: Props) {
 
   if (!open) return null;
   return (
-    <div ref={ref} className={"popover" + (align === "right" ? " align-right" : "")}>
+    <div
+      ref={ref}
+      className={
+        "popover" +
+        (align === "right" ? " align-right" : "") +
+        (place === "up" ? " place-up" : "") +
+        (className ? ` ${className}` : "")
+      }
+    >
       {children}
     </div>
   );

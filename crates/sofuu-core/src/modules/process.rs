@@ -45,6 +45,7 @@ extern "C" {
     fn tui_conv_top() -> c_int;
     fn tui_conv_bottom() -> c_int;
     fn tui_box_top() -> c_int;
+    fn tui_phase_row() -> c_int;
     fn tui_input_row() -> c_int;
     fn tui_footer_row() -> c_int;
     fn tui_footer2_row() -> c_int;
@@ -57,6 +58,9 @@ extern "C" {
     fn tui_place_cursor(col: usize);
 }
 
+// Windows has no `environ` symbol (the CRT keeps the block internal);
+// the process.env builder below uses std::env::vars() there instead.
+#[cfg(not(target_os = "windows"))]
 extern "C" {
     /// The C environment block (like `extern char **environ`).
     static mut environ: *mut *mut c_char;
@@ -64,11 +68,20 @@ extern "C" {
 
 // ── module state (single-threaded runtime — C-stattic parity) ────────
 
-const LINE_BUF_CAP: usize = 8192; /* g_line_buf[8192] */
+/* Input buffer cap. Was 8 KiB (the C readline's g_line_buf), which silently
+ * truncated a large pasted prompt at half its size. One megabyte holds any
+ * realistic prompt/commit-diff/code paste with room to spare; the Vec grows
+ * on demand, so the raise costs nothing until it is used. */
+const LINE_BUF_CAP: usize = 1 << 20;
 const HIST_MAX: usize = 64;
 const HIST_LEN: usize = 512;
 const RL_QUEUE_MAX: usize = 64;
 const MAX_SUGG: usize = 8;
+/* Inline (non-TUI) input box: max rows drawn for one line buffer. A big
+ * multi-line paste can hold thousands of newlines; the box shows the LAST
+ * few rows (where the cursor is) plus a head count, instead of scrolling
+ * the whole conversation off-screen. */
+const MAX_BOX_ROWS: usize = 6;
 
 thread_local! {
     static ARGC: Cell<c_int> = const { Cell::new(0) };
@@ -94,6 +107,12 @@ thread_local! {
     static STDIN_ON_DATA: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
     static STDIN_ON_END: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
     static STDIN_ON_ERROR: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
+    /// F-2: the engine that stored the .on() handlers (first writer wins —
+    /// STDIN_CTX is only stamped when the pipe itself opens, but "end"/
+    /// "error" handlers can be registered without it). mod_process_cleanup
+    /// frees the handler values with the OWNER's ctx; freeing them with a
+    /// different engine's ctx is UB.
+    static STDIN_OWNER: Cell<*mut JSContext> = const { Cell::new(ptr::null_mut()) };
 
     // readline pre-buffer queue (ring of 63 usable slots, like C).
     static RL_QUEUE: RefCell<VecDeque<Vec<u8>>> = const { RefCell::new(VecDeque::new()) };
@@ -118,6 +137,8 @@ thread_local! {
     static ESC_TIMER: Cell<*mut UvTimer> = const { Cell::new(ptr::null_mut()) };
     static ESC_TIMER_INIT: Cell<c_int> = const { Cell::new(0) };
 
+
+
     // SIGWINCH watcher (TUI resize).
     static WINCH: Cell<*mut UvSignal> = const { Cell::new(ptr::null_mut()) };
     static WINCH_STARTED: Cell<c_int> = const { Cell::new(0) };
@@ -133,6 +154,15 @@ thread_local! {
     static FOCUS_WINDOW: Cell<c_int> = const { Cell::new(0) };
     static MOUSE_ENABLED: Cell<c_int> = const { Cell::new(0) };
     static MOUSE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+
+    // App-managed text selection (the TUI owns the alt screen + mouse, so
+    // the terminal's native click-drag never runs). Rows are SCREEN rows;
+    // tui.rs maps them to buffer text at copy time. -1 = no selection.
+    static SEL_ANCHOR: Cell<c_int> = const { Cell::new(-1) };
+    static SEL_END: Cell<c_int> = const { Cell::new(-1) };
+    // Transient "Copied N lines" notice: drawn on the phase row (h-6, a
+    // blank gap row) and cleared by a uv timer + on every selection change.
+    static SEL_NOTICE_MS: Cell<i64> = const { Cell::new(0) };
 }
 
 /// A zeroed JSValue for Cell initializers (never read before it is set to a
@@ -288,6 +318,9 @@ extern "C" fn posix_sigterm_handler(_sig: c_int) {
     GOT_SIGTERM.store(1, Ordering::SeqCst);
 }
 
+/* Windows has no POSIX sigaction; the CLI is console-app driven, so
+   signal callbacks are POSIX-only (dispatch still runs, flags stay 0). */
+#[cfg(not(target_os = "windows"))]
 unsafe fn install_sigaction(signum: c_int, handler: extern "C" fn(c_int)) {
     let mut sa: libc::sigaction = std::mem::zeroed();
     sa.sa_sigaction = handler as usize;
@@ -295,6 +328,9 @@ unsafe fn install_sigaction(signum: c_int, handler: extern "C" fn(c_int)) {
     sa.sa_flags = libc::SA_RESTART;
     libc::sigaction(signum, &sa, ptr::null_mut());
 }
+
+#[cfg(target_os = "windows")]
+unsafe fn install_sigaction(_signum: c_int, _handler: extern "C" fn(c_int)) {}
 
 /// Dispatch any SIGINT/SIGTERM that fired since the last check. C symbol
 /// replacement (sofuu_loop_run calls it after every UV_RUN_ONCE).
@@ -444,9 +480,12 @@ unsafe fn ensure_stdin_open(ctx: *mut JSContext) {
     let pipe = libc::malloc(uv::sofuu_uv_pipe_size()) as *mut UvPipe;
     STDIN_PIPE.with(|p| p.set(pipe));
     uv::uv_pipe_init(sofuu_loop_get(), pipe, 0);
-    uv::uv_pipe_open(pipe, 0); /* wrap fd 0 */
+    uv::uv_pipe_open(pipe, 0);
     STDIN_PIPE_OPEN.with(|o| o.set(1));
     /* The pipe IS reffed — it keeps the loop alive until EOF/close. */
+    /* F-2: armed per-ctx — a multi-engine teardown must close it
+     * (mod_process_cleanup closes it with None, same orphan cb). */
+    crate::rt::event_loop::track_handle(ctx, pipe as *mut UvHandle, None);
 }
 
 unsafe extern "C" fn js_stdin_on(
@@ -471,6 +510,11 @@ unsafe extern "C" fn js_stdin_on(
     }
 
     let fn_ = qjs::sofuu_js_dup_value(ctx, *argv.add(1));
+
+    /* F-2: first engine to store a handler owns the STDIN_ON_* values. */
+    if STDIN_OWNER.with(|o| o.get()).is_null() {
+        STDIN_OWNER.with(|o| o.set(ctx));
+    }
 
     match event.as_str() {
         "data" => {
@@ -601,11 +645,14 @@ fn rl_queue_empty() -> bool {
 }
 
 fn tty_width() -> c_int {
-    // SAFETY: ioctl on stdout with a zeroed winsize.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            return ws.ws_col as c_int;
+    #[cfg(not(target_os = "windows"))]
+    {
+        // SAFETY: ioctl on stdout with a zeroed winsize.
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return ws.ws_col as c_int;
+            }
         }
     }
     80
@@ -651,6 +698,27 @@ fn chat_history_load() {
 
 /// Append one entry to ~/.sofuu/chat_history (best-effort: a missing
 /// ~/.sofuu dir or unwritable file must never break the chat).
+///
+/// proc-11: the file is append-only forever, so it grows without bound
+/// (a heavy CLI user measured years of entries). When it passes the cap,
+/// rewrite it keeping the newest CHAT_HISTORY_KEEP lines.
+const CHAT_HISTORY_MAX: u64 = 4 * 1024 * 1024; /* 4MB */
+const CHAT_HISTORY_KEEP: usize = 2000;
+
+/// proc-11 helper (pure, unit-tested): from a whole chat-history file,
+/// keep the newest `keep` lines as a rewrite payload. Lines are
+/// newline-delimited; the trailing newline is normalized.
+fn chat_history_trimmed(text: &str, keep: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out = String::with_capacity(text.len() / 2);
+    for l in &lines[start..] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
 fn chat_history_append(line: &[u8]) {
     let dir = chat_history_path().parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
     let _ = std::fs::create_dir_all(&dir);
@@ -658,6 +726,18 @@ fn chat_history_append(line: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(chat_history_path()) {
         let _ = f.write_all(line);
         let _ = f.write_all(b"\n");
+        /* proc-11: enforce the cap after appending. A rewrite races only
+         * with the single-threaded history writer (this fn), and a failed
+         * trim is best-effort — the append already succeeded. */
+        if let Ok(meta) = f.metadata() {
+            if meta.len() > CHAT_HISTORY_MAX {
+                drop(f);
+                if let Ok(text) = std::fs::read_to_string(chat_history_path()) {
+                    let trimmed = chat_history_trimmed(&text, CHAT_HISTORY_KEEP);
+                    let _ = std::fs::write(chat_history_path(), trimmed);
+                }
+            }
+        }
     }
 }
 
@@ -717,11 +797,14 @@ fn fallback_complete(prefix: &[u8], out_count: &mut usize) -> Option<CString> {
 /// lives in exactly one place (chat.rs) — but a hardcoded fallback here
 /// guarantees suggestions ALWAYS work even if the JS bridge is missing or
 /// throws (the TUI must never silently lose the / menu).
+/* P3 (AUDIT-2026-09-07): pruned /models, /baseurl, /apikey — they were
+ * deliberately removed from ALL_COMMANDS (dispatch answers "unknown"; a
+ * test pins it), so the offline fallback must not suggest them either. */
 const FALLBACK_COMMANDS: &[&str] = &[
-    "/help", "/version", "/models", "/model", "/provider", "/baseurl",
+    "/help", "/version", "/model", "/provider",
     "/effort", "/compact", "/clear", "/brain", "/rlm", "/ctx", "/maxout",
     "/tools", "/sessions", "/context", "/work", "/done", "/note", "/notify",
-    "/sync", "/apikey", "/exit",
+    "/sync", "/exit",
 ];
 
 unsafe fn tty_complete_matches(
@@ -1035,15 +1118,34 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
         }
     }
 
-    /* 3. The box (accent borders): top border, input rows, bottom border. */
-    let input_rows = 1 + tty_newlines_in(&line);
+    /* 3. The box (accent borders): top border, input rows, bottom border.
+     * A multi-line buffer (Alt/Shift+Enter, pasted text) grows the box one
+     * row per newline — clamped to MAX_BOX_ROWS with a head count, so a
+     * large paste cannot scroll the whole conversation away. */
+    let total_rows = 1 + tty_newlines_in(&line) as usize;
+    let hidden_rows = if total_rows > MAX_BOX_ROWS { total_rows - MAX_BOX_ROWS } else { 0 };
+    let input_rows = (total_rows - hidden_rows) as c_int;
+    if hidden_rows > 0 {
+        let head = if hidden_rows > 1 { "rows" } else { "row" };
+        let _ = write!(out, "\x1b[2m… {hidden_rows} more {head} (↑ recall · Enter submits all)\x1b[0m\n");
+    }
     let _ = write!(out, "\x1b[2;35m╭");
     for _ in 0..(W - 2) {
         let _ = write!(out, "─");
     }
     let _ = write!(out, "╮\x1b[0m\n");
 
+    /* Render only the TAIL rows: skip past `hidden_rows` newlines first. */
     let mut pos = 0usize;
+    if hidden_rows > 0 {
+        let mut skipped = 0usize;
+        while pos < line.len() && skipped < hidden_rows {
+            if line[pos] == b'\n' {
+                skipped += 1;
+            }
+            pos += 1;
+        }
+    }
     for row in 0..input_rows {
         pos = render_box_row(row as usize, pos, input_rows, inner, &mut out);
     }
@@ -1062,7 +1164,11 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
         let _ = write!(out, "\n");
     }
 
-    UI_LINES.with(|l| l.set((shown + 2 + input_rows as usize + 1) as c_int));
+    /* UI_ROWS includes the top+bottom borders and the hidden-rows notice
+     * (1 line) so the erase math on the next render stays exact. */
+    UI_LINES.with(|l| {
+        l.set((shown + 2 + input_rows as usize + 1 + if hidden_rows > 0 { 1 } else { 0 }) as c_int)
+    });
     let _ = out.flush();
 }
 
@@ -1207,10 +1313,24 @@ unsafe fn tty_render_tui(
         /* single input row: show the LAST segment of a multiline buffer */
         let line = LINE_BUF.with(|b| b.borrow().clone());
         let mut seg = 0usize;
+        let mut newlines = 0usize;
         for (k, &b) in line.iter().enumerate() {
             if b == b'\n' {
                 seg = k + 1;
+                newlines += 1;
             }
+        }
+        /* multi-line buffer (pasted text / Alt+Enter): prefix a dim marker so
+         * the row reads as "more above" instead of a lone orphan line. */
+        if newlines > 0 {
+            let marker = if newlines > 1 {
+                format!("\x1b[2m[+{} lines]\x1b[0m", newlines)
+            } else {
+                "\x1b[2m[+1 line]\x1b[0m".to_string()
+            };
+            let _ = write!(out, "{}", marker);
+            /* "[+N lines]" cells = 2 + digits + 7; "[+1 line]" = 9. */
+            prow += if newlines > 1 { 9 + newlines.to_string().len() } else { 9 };
         }
         let row_len = line.len() - seg;
         let avail = if inner > prow as c_int { (inner - prow as c_int) as usize } else { 0 };
@@ -1263,7 +1383,10 @@ unsafe fn tty_render_tui(
     if !status.is_empty() {
         let avail = W - gutter - 1 - hints_w as c_int;
         if avail < 1 { /* no room */ } else {
-        let bl = tui_truncate_cells(status.as_ptr() as *const c_char, avail);
+        /* Bounded truncation: STATUS is a non-NUL-terminated Vec<u8>; the
+         * strlen-walking C-ABI variant used to read past its allocation
+         * and slice out of range (the 2026-09-09 abort). */
+        let bl = crate::rt::tui::truncate_cells(&status, avail as usize);
         let _ = write!(out, "\x1b[{};{}H", F, 1 + gutter);
         let _ = out.write_all(&status[..bl]);
         }
@@ -1291,7 +1414,10 @@ unsafe fn tty_render_tui(
     let metric_l = METRIC_LEFT.with(|m| m.borrow().clone());
     if !metric_l.is_empty() {
         let avail_l = W - gutter - 1 - if !metric.is_empty() { tui_disp_width(metric.as_ptr() as *const c_char, metric.len()) as c_int + 1 } else { 0 };
-        let bl_l = if avail_l > 0 { tui_truncate_cells(metric_l.as_ptr() as *const c_char, avail_l) } else { 0 };
+        /* METRIC_LEFT is likewise non-NUL-terminated — same bounded call
+         * as STATUS above (2026-09-09 abort was exactly this slice at
+         * 141 past an 80-byte buffer on a wide terminal). */
+        let bl_l = if avail_l > 0 { crate::rt::tui::truncate_cells(&metric_l, avail_l as usize) } else { 0 };
         if bl_l > 0 {
             let _ = write!(out, "\x1b[{};{}H\x1b[2m{}\x1b[0m", tui_footer2_row(), 1+gutter, String::from_utf8_lossy(&metric_l[..bl_l]));
         }
@@ -1394,6 +1520,8 @@ unsafe extern "C" fn on_winch(_handle: *mut UvSignal, _signum: c_int) {
     }
 }
 
+/* SIGWINCH is POSIX-only; Windows console resize arrives differently. */
+#[cfg(not(target_os = "windows"))]
 unsafe fn ensure_winch_watch() {
     if WINCH_STARTED.with(|w| w.get()) != 0 {
         return;
@@ -1405,6 +1533,9 @@ unsafe fn ensure_winch_watch() {
     uv::uv_signal_start(winch, Some(on_winch), libc::SIGWINCH);
     uv::uv_unref(winch as *mut UvHandle); /* never keep the loop alive for this */
 }
+
+#[cfg(target_os = "windows")]
+unsafe fn ensure_winch_watch() {}
 
 extern "C" {
     fn tui_clear_gap();
@@ -1785,11 +1916,295 @@ unsafe fn esc_timer_kick() {
     }
     let t = ESC_TIMER.with(|e| e.get());
     uv::uv_timer_start(t, Some(esc_timeout_cb), 250, 0);
+    /* F-2: armed per-ctx (the registered engine) — a multi-engine teardown
+     * must close it; orphan None, static storage like the cleanup path. */
+    let owner = CTX.with(|c| c.get());
+    if !owner.is_null() {
+        crate::rt::event_loop::track_handle(owner, t as *mut UvHandle, None);
+    }
 }
 
 unsafe fn esc_timer_cancel() {
     if ESC_TIMER_INIT.with(|i| i.get()) != 0 {
         uv::uv_timer_stop(ESC_TIMER.with(|e| e.get()));
+    }
+}
+
+// ── bracketed-paste body accumulation ─────────────────────────────────
+
+/// Append one literal byte to the line buffer while a bracketed paste is
+/// open. CR normalizes to LF (multi-line editor convention), the buffer cap
+/// is enforced with the same truncation flag as typed input, and the live
+/// region is NOT redrawn per byte — a large paste can be tens of thousands
+/// of bytes and the renderer would turn the paste into an O(n) redraw
+/// storm; one redraw happens when ESC[201~ closes the paste.
+unsafe fn paste_push(c: u8) {
+    let b = if c == b'\r' { b'\n' } else { c };
+    let len = LINE_BUF.with(|l| l.borrow().len());
+    if len < LINE_BUF_CAP - 1 {
+        LINE_BUF.with(|l| l.borrow_mut().push(b));
+    } else {
+        LINE_TRUNCATED.with(|t| t.set(1));
+    }
+}
+
+// ── app-managed text selection (mouse drag + Ctrl-K copy) ────────────
+// The TUI owns the alternate screen with mouse reporting on, so the
+// terminal's native click-drag selection never happens — selection must be
+// app-managed: left-drag over conversation rows highlights them, Ctrl-K
+// yanks the selected rows to the system clipboard (pbcopy on macOS, OSC 52
+// otherwise). Row math mirrors render_rows: viewport height, G_SCROLL
+// clamp, buffer index = start + (row - top).
+
+/// Repaint the conversation when the selection changed (screen rows are
+/// 1-based conversation rows; anything else clears it).
+unsafe fn sel_repaint(ctx: *mut JSContext) {
+    if ctx.is_null() {
+        return;
+    }
+    if tui_active() != 0 {
+        crate::rt::tui::tui_render_conversation();
+    }
+    tty_render_line_ui(ctx, 0);
+}
+
+/// Current selection as (anchor, end) screen rows; (-1, -1) = none.
+/// Read by rt::tui's renderer so the highlight survives every repaint.
+pub(crate) unsafe fn sel_range() -> (c_int, c_int) {
+    (SEL_ANCHOR.with(|s| s.get()), SEL_END.with(|s| s.get()))
+}
+
+/// Clamp a raw SGR row (already offset by 1 for the GUTTER) to the
+/// conversation viewport; returns -1 when outside it.
+unsafe fn sel_clamp_row(y: c_int) -> c_int {
+    let top = tui_conv_top();
+    let bottom = tui_conv_bottom();
+    if y < top {
+        return -1;
+    }
+    if y > bottom {
+        return -1;
+    }
+    y
+}
+
+/// Copy the selected rows (inclusive) to the system clipboard. SGR mouse
+/// coordinates are 1-based and the render adds a GUTTER, so the first
+/// selectable column is 1 + GUTTER; select the FULL row regardless of the
+/// click column — line-level selection is unambiguous on wrapped rows.
+pub(crate) unsafe fn sel_copy(ctx: *mut JSContext) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    let a = SEL_ANCHOR.with(|s| s.get());
+    let b = SEL_END.with(|s| s.get());
+    if a < 0 || b < 0 {
+        return false;
+    }
+    let (r0, r1) = if a <= b { (a, b) } else { (b, a) };
+    let p = crate::rt::tui::tui_selected_rows(r0, r1);
+    if p.is_null() {
+        return false;
+    }
+    /* CStr::from_ptr needs a NUL-terminated buffer — tui_selected_rows
+     * always NUL-terminates (CString::new). Empty result frees cleanly. */
+    let bytes = std::ffi::CStr::from_ptr(p).to_bytes().to_vec();
+    libc::free(p as *mut c_void);
+    if bytes.is_empty() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    /* Rows may embed SGR color codes (styled output) — strip them so the
+     * clipboard gets clean text. Plain rows pass through untouched. */
+    let plain = strip_ansi(&text);
+    /* SOFUU_SEL_DEBUG=<path>: dump the exact bytes that go to the
+     * clipboard — the e2e harness forensics hook (never set normally). */
+    if let Ok(p) = std::env::var("SOFUU_SEL_DEBUG") {
+        let _ = std::fs::write(&p, plain.as_bytes());
+        /* P3 (AUDIT-2026-09-07): this dump is clipboard exfiltration when
+         * the env var is set — announce it so it can never fire without a
+         * visible trace. The dump file itself stays byte-identical (the
+         * e2e harness compares it against the clipboard). */
+        eprintln!("[sofuu] SOFUU_SEL_DEBUG: clipboard copy dumped to {p}");
+    }
+    let n_lines = (r1 - r0 + 1) as usize;
+    let ok = clipboard_write(&plain);
+    if ok {
+        sel_show_notice(ctx, n_lines);
+    }
+    ok
+}
+
+/// Show a transient "Copied N lines" notice on the phase row (h-6, blank
+/// gap). A uv timer clears it; any repaint of that row replaces it too.
+unsafe fn sel_show_notice(ctx: *mut JSContext, n_lines: usize) {
+    if ctx.is_null() || tui_active() == 0 {
+        return;
+    }
+    let msg = format!("Copied {n_lines} line{} to clipboard", if n_lines == 1 { "" } else { "s" });
+    let row = tui_phase_row();
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\x1b[{};1H\x1b[K\x1b[2m  {}\x1b[0m", row, msg);
+        let _ = out.flush();
+    }
+    /* remember + arm the clearing timer */
+    SEL_NOTICE_MS.with(|s| s.set(now_ms()));
+    notice_timer_kick();
+}
+
+/// Remove ANSI/CSI escape sequences from a byte string (SGR colors etc.).
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        if b[i] == 0x1b {
+            // ESC [ … final byte in 0x40..=0x7E; also cover 2-char escapes.
+            i += 1;
+            if i < n && b[i] == b'[' {
+                i += 1;
+                while i < n && !(0x40..=0x7E).contains(&b[i]) {
+                    i += 1;
+                }
+                i += 1; /* consume the final byte */
+            } else if i < n {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Monotonic milliseconds (uv loop time — the cached coarse clock).
+unsafe fn now_ms() -> i64 {
+    uv::uv_now(sofuu_loop_get())
+}
+
+/// Write text to the system clipboard. macOS: pbcopy via popen (fonts-
+/// free, always present). Other hosts: OSC 52 — terminals that understand
+/// it (iTerm2, WezTerm, kitty, most Linux terms) write the clipboard
+/// themselves; tmux forwards it if set-clipboard is on.
+pub(crate) unsafe fn clipboard_write(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mode = CString::new("w").unwrap();
+        let cmd = CString::new("pbcopy").unwrap();
+        let f = libc::popen(cmd.as_ptr(), mode.as_ptr());
+        if !f.is_null() {
+            let mut off: usize = 0;
+            let bytes = text.as_bytes();
+            while off < bytes.len() {
+                let n = libc::fwrite(bytes.as_ptr().add(off) as *const c_void, 1,
+                                     bytes.len() - off, f);
+                if n == 0 {
+                    break;
+                }
+                off += n;
+            }
+            let _ = libc::fflush(f);
+            libc::pclose(f);
+            return true;
+        }
+        return false;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        /* OSC 52: ESC ] 52 ; c ; <base64> BEL. 100k payload cap — terminal
+         * emulators commonly reject larger writes, and a copy is exactly
+         * the kind of paste that then lands somewhere unwanted. */
+        const CAP: usize = 100_000;
+        let bytes: &[u8] = if text.len() > CAP { &text.as_bytes()[..CAP] } else { text.as_bytes() };
+        let mut out = String::with_capacity(bytes.len() / 3 * 4 + 32);
+        out.push_str("\x1b]52;c;");
+        out.push_str(&b64_encode(bytes));
+        out.push('\x07');
+        use std::io::Write;
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(out.as_bytes());
+        let _ = o.flush();
+        true
+    }
+}
+
+/// Standard base64 (RFC 4648) encode — small, allocation-simple, no
+/// external crates. OSC 52 needs it; kept next to its only caller.
+pub(crate) fn b64_encode(data: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push(TBL[(n >> 6) as usize & 63] as char);
+        out.push(TBL[n as usize & 63] as char);
+        i += 3;
+    }
+    let rem = data.len() - i;
+    if rem == 1 {
+        let n = (data[i] as u32) << 16;
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push(TBL[(n >> 6) as usize & 63] as char);
+        out.push('=');
+    }
+    out
+}
+
+// ── copy-notice timer (uv one-shot) ───────────────────────────────────
+
+unsafe extern "C" fn sel_notice_timer_cb(_t: *mut UvTimer) {
+    /* Only clear when no NEWER notice arrived since this timer was armed
+     * (a rapid second copy re-arms the timer; the first fire must not wipe
+     * the newer message). */
+    let armed = SEL_NOTICE_MS.with(|s| s.replace(0));
+    if armed == 0 {
+        return;
+    }
+    let _ = armed;
+    if tui_active() == 0 {
+        return;
+    }
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\x1b[{};1H\x1b[K", tui_phase_row());
+    let _ = out.flush();
+}
+
+thread_local! {
+    static SEL_NOTICE_TIMER: Cell<*mut UvTimer> = const { Cell::new(ptr::null_mut()) };
+}
+
+unsafe fn notice_timer_kick() {
+    let mut t = SEL_NOTICE_TIMER.with(|t| t.get());
+    if t.is_null() {
+        t = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
+        uv::uv_timer_init(sofuu_loop_get(), t);
+        uv::uv_unref(t as *mut UvHandle);
+        SEL_NOTICE_TIMER.with(|c| c.set(t));
+    }
+    uv::uv_timer_stop(t);
+    uv::uv_timer_start(t, Some(sel_notice_timer_cb), 1800, 0);
+    /* F-2: armed per-ctx (the registered engine) — a multi-engine teardown
+     * must close it; orphan None, static storage like the cleanup path. */
+    let owner = CTX.with(|c| c.get());
+    if !owner.is_null() {
+        crate::rt::event_loop::track_handle(owner, t as *mut UvHandle, None);
     }
 }
 
@@ -1884,8 +2299,9 @@ unsafe fn rl_submit(ctx: *mut JSContext) {
             let _ = write!(out, "\x1b[?25l");
             let _ = out.flush();
         }
-        let c = CString::new(line.clone()).unwrap_or_default();
-        let jline = qjs::sofuu_js_new_string(ctx, c.as_ptr());
+        /* proc-10: JS_NewStringLen — CString::new fails on an interior NUL
+         * (a pasted `\0` byte truncated the delivered line to ""). */
+        let jline = qjs::JS_NewStringLen(ctx, line.as_ptr() as *const c_char, line.len());
         sofuu_promise_resolve(p, jline);
         qjs::sofuu_js_free_value(ctx, jline);
     } else {
@@ -2004,7 +2420,134 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                     ESC_STATE.with(|s| s.set(11));
                     return 11;
                 }
+                b'2' => 20, /* bracketed paste: ESC[200~ opens, ESC[201~ closes */
                 _ => 0,   /* other: drop */
+            }
+        }
+        /* ── Bracketed paste (DECSET 2004) ──────────────────────────────
+         * A paste is wrapped by the terminal in ESC[200~ … ESC[201~ (we
+         * request 2004 when the TTY opens). While the body is open EVERY
+         * byte — including CR/LF — is appended to the line buffer as literal
+         * text: newlines inside a paste never reach the Enter-submit path,
+         * so a large multi-line paste lands as ONE prompt that waits for a
+         * real Enter.
+         * Idle side: ESC [ '2'(20) '0'(21) '0'(30) '~' → body opens | '1'(31)
+         * '~' → stray end marker, dropped. Body side: 23 →ESC(24) '['(25)
+         * '2'(26) '0'(27) '1'(28) '~' → closes. Any body ESC-sequence that
+         * is NOT the end marker is pushed back as literal text (pasted
+         * terminal output can legitimately contain ANSI colors). */
+        20 => {
+            if c == b'0' {
+                21
+            } else {
+                0
+            }
+        }
+        21 => {
+            if c == b'0' {
+                30
+            } else if c == b'1' {
+                31
+            } else {
+                0
+            }
+        }
+        30 => {
+            if c == b'~' {
+                /* ESC[200~ — paste body opens. */
+                23
+            } else {
+                0
+            }
+        }
+        31 => {
+            /* ESC[201~ with no open paste — inert. */
+            0
+        }
+        23 => {
+            if c == 0x03 {
+                /* Ctrl-C inside a paste: abort paste mode (a paste whose end
+                 * marker never arrives would otherwise eat every keystroke);
+                 * a second Ctrl-C takes the normal quit path. The already
+                 * pasted text stays in the buffer. */
+                0
+            } else if c == 0x1b {
+                24
+            } else {
+                paste_push(c);
+                23
+            }
+        }
+        24 => {
+            if c == b'[' {
+                25
+            } else {
+                paste_push(0x1b);
+                paste_push(c);
+                23
+            }
+        }
+        25 => {
+            if c == b'2' {
+                26
+            } else {
+                paste_push(0x1b);
+                paste_push(b'[');
+                paste_push(c);
+                23
+            }
+        }
+        26 => {
+            /* End-marker candidate ESC[2…: the next char splits — '0' walks
+             * toward ESC[201~ (state 27), anything else is literal body text. */
+            if c == b'0' {
+                27
+            } else if c == b'1' {
+                /* ESC[21~ is not a real marker; treat as literal text. */
+                paste_push(0x1b);
+                paste_push(b'[');
+                paste_push(b'2');
+                paste_push(b'1');
+                paste_push(c);
+                23
+            } else {
+                paste_push(0x1b);
+                paste_push(b'[');
+                paste_push(b'2');
+                paste_push(c);
+                23
+            }
+        }
+        27 => {
+            /* saw ESC[20 — '1' → state 28 (end candidate ESC[201…); a '0'
+             * here means ESC[200~ INSIDE the paste (a nested open marker,
+             * which terminals never send): keep it as literal text. */
+            if c == b'1' {
+                28
+            } else {
+                paste_push(0x1b);
+                paste_push(b'[');
+                paste_push(b'2');
+                paste_push(b'0');
+                paste_push(c);
+                23
+            }
+        }
+        28 => {
+            if c == b'~' {
+                /* ESC[201~ — paste closes: one redraw shows the tail. */
+                if !ctx.is_null() {
+                    tty_render_line_ui(ctx, 0);
+                }
+                0
+            } else {
+                paste_push(0x1b);
+                paste_push(b'[');
+                paste_push(b'2');
+                paste_push(b'0');
+                paste_push(b'1');
+                paste_push(c);
+                23
             }
         }
         9 => {
@@ -2023,23 +2566,49 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                     let btn: i32 = parts[0].parse().unwrap_or(0);
                     let y: i32 = parts[2].parse().unwrap_or(0);
                     if !pressed {
-                        // mouse up — ignore
+                        // mouse up — ends a drag; the selection is already final
                     } else if btn == 64 {
+                        // wheel up: selection rows map to buffer positions
+                        // through G_SCROLL — scrolling would silently move
+                        // them, so drop the selection on scroll.
+                        SEL_ANCHOR.with(|a| a.set(-1));
+                        SEL_END.with(|e| e.set(-1));
                         FOCUS_WINDOW.with(|f| f.set(1));
                         tui_scroll(3);
-                        tty_render_line_ui(ctx, 0);
+                        sel_repaint(ctx);
                     } else if btn == 65 {
+                        SEL_ANCHOR.with(|a| a.set(-1));
+                        SEL_END.with(|e| e.set(-1));
                         tui_scroll(-3);
                         if crate::rt::tui::tui_scroll_pos() == 0 { FOCUS_WINDOW.with(|f| f.set(0)); }
-                        tty_render_line_ui(ctx, 0);
+                        sel_repaint(ctx);
                     } else if btn == 0 {
-                        // left click — focus by row
+                        // left press — focus by row AND seed a selection:
+                        // drag then extends SEL_END (btn 32).
                         if y >= tui_conv_top() && y <= tui_conv_bottom() {
                             FOCUS_WINDOW.with(|f| f.set(1));
-                            tty_render_line_ui(ctx, 0);
-                        } else if y >= tui_box_top() && y <= tui_box_top() + 2 {
-                            FOCUS_WINDOW.with(|f| f.set(0));
-                            tty_render_line_ui(ctx, 0);
+                            SEL_ANCHOR.with(|a| a.set(y));
+                            SEL_END.with(|e| e.set(y));
+                            sel_repaint(ctx);
+                        } else {
+                            // press outside the conversation clears any
+                            // selection and keeps the old focus logic
+                            SEL_ANCHOR.with(|a| a.set(-1));
+                            SEL_END.with(|e| e.set(-1));
+                            if y >= tui_box_top() && y <= tui_box_top() + 2 {
+                                FOCUS_WINDOW.with(|f| f.set(0));
+                            }
+                            sel_repaint(ctx);
+                        }
+                    } else if btn == 32 {
+                        // left drag — extend the selection if one is open
+                        let a = SEL_ANCHOR.with(|s| s.get());
+                        if a >= 0 {
+                            let row = sel_clamp_row(y);
+                            if row >= 0 {
+                                SEL_END.with(|e| e.set(row));
+                                sel_repaint(ctx);
+                            }
                         }
                     }
                 }
@@ -2239,6 +2808,20 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
             rl_resolve_null(stream);
             continue;
         }
+        if c == 0x0b {
+            /* Ctrl-K: copy the mouse-selected conversation rows to the
+             * clipboard (app-managed selection — see sel_copy). */
+            if SEL_ANCHOR.with(|s| s.get()) >= 0 {
+                if !sel_copy(ctx) {
+                    /* nothing selected/copy failed — still clear the paint
+                     * so the stale highlight doesn't linger. */
+                    SEL_ANCHOR.with(|s| s.set(-1));
+                    SEL_END.with(|e| e.set(-1));
+                    sel_repaint(ctx);
+                }
+            }
+            continue;
+        }
         if c == 0x04 && STDIN_IS_TTY.with(|t| t.get()) != 0 {
             /* Ctrl-D: on an empty line this is EOF; with text it's ignored. */
             if LINE_BUF.with(|b| b.borrow().len()) == 0 {
@@ -2258,7 +2841,13 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
         }
         if c == b'\t' {
             /* TAB: slash-command completion inside the chat. If a highlight
-             * is active, accept it; otherwise render (or cycle) matches. */
+             * is active, accept it; otherwise render (or cycle) matches.
+             * On a non-slash line TAB is otherwise free, so it cycles the
+             * permission mode (full → edit → plan → full), like other CLIs
+             * bind Shift+Tab. The JS hook reuses the /mode path (Rust echoes
+             * + persists), so the inline box must be erased BEFORE the echo
+             * lands and redrawn after; the TUI logs into its own conversation
+             * region and needs no erase. */
             let line = LINE_BUF.with(|b| b.borrow().clone());
             if !line.is_empty() && line[0] == b'/' {
                 if COMPLETE_SEL.with(|s| s.get()) >= 0 {
@@ -2266,6 +2855,19 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                 } else {
                     tty_render_line_ui(ctx, 1);
                 }
+            } else {
+                if unsafe { tui_active() } == 0 {
+                    use std::io::Write;
+                    let ui_lines = UI_LINES.with(|l| l.get());
+                    if ui_lines > 0 {
+                        let mut out = std::io::stdout().lock();
+                        let _ = write!(out, "\x1b[{}A\x1b[J", ui_lines);
+                        let _ = out.flush();
+                        UI_LINES.with(|l| l.set(0));
+                    }
+                }
+                call_ui_hook(ctx, "__on_tab");
+                tty_render_line_ui(ctx, 0);
             }
             continue;
         }
@@ -2335,8 +2937,9 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                     let _ = write!(out, "\x1b[?25l");
                     let _ = out.flush();
                 }
-                let c = CString::new(line.clone()).unwrap_or_default();
-                let jline = qjs::sofuu_js_new_string(ctx, c.as_ptr());
+                /* proc-10: JS_NewStringLen — interior NUL must not truncate
+                 * the delivered line (same fix as the readline-promise path). */
+                let jline = qjs::JS_NewStringLen(ctx, line.as_ptr() as *const c_char, line.len());
                 sofuu_promise_resolve(p, jline);
                 qjs::sofuu_js_free_value(ctx, jline);
                 /* NOTE: do NOT call sofuu_flush_jobs here — inside libuv cb */
@@ -2364,7 +2967,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                 tty_render_line_ui(ctx, 0);
             }
         } else {
-            LINE_TRUNCATED.with(|t| t.set(1)); /* chars past 8191 dropped */
+            LINE_TRUNCATED.with(|t| t.set(1)); /* chars past LINE_BUF_CAP-1 (1 MiB) dropped — the old "8191" comment predated the cap raise */
         }
     }
 
@@ -2392,6 +2995,7 @@ unsafe fn ensure_tty_open(ctx: *mut JSContext) {
         uv::uv_tty_init(loop_, tty, 0, /*readable=*/1);
         /* RAW mode: the readline owns echo + editing. */
         uv::uv_tty_set_mode(tty, uv::UV_TTY_MODE_RAW);
+        #[cfg(not(target_os = "windows"))]
         {
             /* Belt & braces: make sure ECHO is off in raw mode too. */
             let mut tio: libc::termios = std::mem::zeroed();
@@ -2406,6 +3010,11 @@ unsafe fn ensure_tty_open(ctx: *mut JSContext) {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+            // Bracketed paste (DECSET 2004): the terminal wraps pasted text in
+            // ESC[200~ … ESC[201~, so a multi-line paste can be buffered as ONE
+            // inert unit instead of its embedded CR/LF bytes hitting the Enter
+            // path and auto-submitting line after line.
+            let _ = out.write_all(b"\x1b[?2004h");
             let _ = out.flush();
             MOUSE_ENABLED.with(|m| m.set(1));
         }
@@ -2418,6 +3027,17 @@ unsafe fn ensure_tty_open(ctx: *mut JSContext) {
         uv::uv_unref(pipe as *mut UvHandle);
     }
     TTY_OPEN.with(|o| o.set(1));
+    /* F-2: the readline stdin handle is armed per-ctx — a multi-engine
+     * teardown must close it (mod_process_cleanup closes with None, same
+     * orphan cb; TTY_CTX is the attribution cell). */
+    let h = if STDIN_IS_TTY.with(|t| t.get()) != 0 {
+        TTY_STDIN.with(|t| t.get()) as *mut UvHandle
+    } else {
+        STDIN_RL_PIPE.with(|p| p.get()) as *mut UvHandle
+    };
+    if !h.is_null() {
+        crate::rt::event_loop::track_handle(ctx, h as *mut UvHandle, None);
+    }
 }
 
 unsafe extern "C" fn js_tty_raw(
@@ -2441,6 +3061,13 @@ unsafe extern "C" fn js_tty_normal(
 ) -> JSValue {
     if STDIN_IS_TTY.with(|t| t.get()) != 0 && TTY_OPEN.with(|o| o.get()) != 0 {
         uv::uv_tty_set_mode(TTY_STDIN.with(|t| t.get()), uv::UV_TTY_MODE_NORMAL);
+        if MOUSE_ENABLED.with(|m| m.get()) != 0 {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(b"\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+            let _ = out.flush();
+            MOUSE_ENABLED.with(|m| m.set(0));
+        }
     }
     qjs::sofuu_js_undefined()
 }
@@ -2491,8 +3118,8 @@ unsafe extern "C" fn js_io_readline(
     /* Fast path: a line was already buffered (fast piped / pre-typed input) */
     if !rl_queue_empty() {
         if let Some(line) = rl_queue_pop() {
-            let c = CString::new(line).unwrap_or_default();
-            let jline = qjs::sofuu_js_new_string(ctx, c.as_ptr());
+            /* proc-10: same interior-NUL truncation as the callback paths. */
+            let jline = qjs::JS_NewStringLen(ctx, line.as_ptr() as *const c_char, line.len());
             sofuu_promise_resolve(prom, jline);
             qjs::sofuu_js_free_value(ctx, jline);
         } else {
@@ -2530,9 +3157,12 @@ unsafe extern "C" fn js_io_prompt(
         uv::uv_read_stop(stdin_rl_stream());
     }
 
-    /* Save terminal and switch to canonical + echo */
-    let mut saved: libc::termios = std::mem::zeroed();
+    /* Save terminal and switch to canonical + echo (POSIX termios; the
+     * Windows console path skips the mode dance). */
     let is_tty = libc::isatty(0);
+    #[cfg(not(target_os = "windows"))]
+    let mut saved: libc::termios = std::mem::zeroed();
+    #[cfg(not(target_os = "windows"))]
     if is_tty == 1 {
         libc::tcgetattr(0, &mut saved);
         let mut cooked = saved;
@@ -2541,6 +3171,8 @@ unsafe extern "C" fn js_io_prompt(
         cooked.c_iflag |= libc::ICRNL;
         libc::tcsetattr(0, libc::TCSANOW, &cooked);
     }
+    #[cfg(target_os = "windows")]
+    let _ = is_tty;
 
     if argc >= 1 {
         let label = qjs::sofuu_js_to_cstring(ctx, *argv);
@@ -2555,7 +3187,9 @@ unsafe extern "C" fn js_io_prompt(
 
     /* Read one line (canonical mode returns per line) — like fgets. */
     let mut buf = [0u8; 4096];
-    let n = libc::read(0, buf.as_mut_ptr() as *mut c_void, buf.len() - 1);
+    /* count is size_t on POSIX, c_uint on Windows — `as _` targets the
+       parameter type on each platform */
+    let n = libc::read(0, buf.as_mut_ptr() as *mut c_void, (buf.len() - 1) as _);
     let result = if n <= 0 {
         qjs::sofuu_js_null()
     } else {
@@ -2567,6 +3201,7 @@ unsafe extern "C" fn js_io_prompt(
         qjs::sofuu_js_new_string(ctx, c.as_ptr())
     };
 
+    #[cfg(not(target_os = "windows"))]
     if is_tty == 1 {
         libc::tcsetattr(0, libc::TCSANOW, &saved);
     }
@@ -2806,26 +3441,42 @@ pub unsafe extern "C" fn mod_process_register(ctx: *mut JSContext) {
 
     /* -- process.env -- */
     let env_obj = qjs::sofuu_js_new_object(ctx);
-    // SAFETY: environ is the process environment block.
-    if !environ.is_null() {
-        let mut i = 0;
-        loop {
-            let entry = *environ.add(i);
-            if entry.is_null() {
-                break;
+    #[cfg(not(target_os = "windows"))]
+    {
+        // SAFETY: environ is the process environment block.
+        if !environ.is_null() {
+            let mut i = 0;
+            loop {
+                let entry = *environ.add(i);
+                if entry.is_null() {
+                    break;
+                }
+                let entry_c = CStr::from_ptr(entry);
+                if let Some(eq) = entry_c.to_bytes().iter().position(|&b| b == b'=') {
+                    let key = CString::new(&entry_c.to_bytes()[..eq]).unwrap_or_default();
+                    let val = CStr::from_ptr(entry.add(eq + 1));
+                    qjs::sofuu_js_set_property_str(
+                        ctx,
+                        env_obj,
+                        key.as_ptr(),
+                        qjs::sofuu_js_new_string(ctx, val.as_ptr()),
+                    );
+                }
+                i += 1;
             }
-            let entry_c = CStr::from_ptr(entry);
-            if let Some(eq) = entry_c.to_bytes().iter().position(|&b| b == b'=') {
-                let key = CString::new(&entry_c.to_bytes()[..eq]).unwrap_or_default();
-                let val = CStr::from_ptr(entry.add(eq + 1));
-                qjs::sofuu_js_set_property_str(
-                    ctx,
-                    env_obj,
-                    key.as_ptr(),
-                    qjs::sofuu_js_new_string(ctx, val.as_ptr()),
-                );
-            }
-            i += 1;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for (k, v) in std::env::vars() {
+            let key = CString::new(k).unwrap_or_default();
+            let val = CString::new(v).unwrap_or_default();
+            qjs::sofuu_js_set_property_str(
+                ctx,
+                env_obj,
+                key.as_ptr(),
+                qjs::sofuu_js_new_string(ctx, val.as_ptr()),
+            );
         }
     }
     qjs::sofuu_js_set_property_str(ctx, process, c"env".as_ptr(), env_obj);
@@ -3081,40 +3732,134 @@ pub unsafe extern "C" fn mod_process_register(ctx: *mut JSContext) {
 /// `ctx` must be the live engine context (teardown path).
 #[no_mangle]
 pub unsafe extern "C" fn mod_process_cleanup(ctx: *mut JSContext) {
-    STDIN_ON_DATA.with(|d| qjs::sofuu_js_free_value(ctx, d.replace(qjs::sofuu_js_undefined())));
-    STDIN_ON_END.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
-    STDIN_ON_ERROR.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
+    /* F-2 (AUDIT-2026-09-01-CLI): several engines can share one thread
+     * (capi multi-instance). Every stdin/TUI static below belongs to the
+     * engine that armed it — a non-owner destroy must leave the owner's
+     * machinery alone: freeing its JSValues with the WRONG ctx is UB, and
+     * stopping its timers/rejecting its promises breaks the live TUI. A
+     * null cell means "nobody owns it" — the single-engine case, where
+     * everything is mine (identical to the pre-F-2 behavior). */
+    let on_owner = STDIN_OWNER.with(|o| o.get());
+    let tty_owner = TTY_CTX.with(|c| c.get());
+    let pipe_owner = STDIN_CTX.with(|c| c.get());
+    let mine_on = on_owner.is_null() || on_owner == ctx;
+    let mine_tty = tty_owner.is_null() || tty_owner == ctx;
+    let mine_pipe = pipe_owner.is_null() || pipe_owner == ctx;
+
+    if mine_on {
+        STDIN_ON_DATA.with(|d| qjs::sofuu_js_free_value(ctx, d.replace(qjs::sofuu_js_undefined())));
+        STDIN_ON_END.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
+        STDIN_ON_ERROR.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
+        STDIN_OWNER.with(|o| o.set(ptr::null_mut()));
+    }
     CTX.with(|c| c.set(ptr::null_mut()));
-    if ESC_TIMER_INIT.with(|i| i.get()) != 0 {
-        uv::uv_timer_stop(ESC_TIMER.with(|e| e.get()));
+    if mine_tty && ESC_TIMER_INIT.with(|i| i.get()) != 0 {
+        let t = ESC_TIMER.with(|e| e.get());
+        if uv::uv_is_closing(t as *const UvHandle) == 0 {
+            uv::uv_timer_stop(t);
+            /* C-host direct call (no loop teardown): close it here so a
+             * later uv_walk never visits a freed-storage handle. */
+            uv::uv_close(t as *mut UvHandle, None);
+            crate::rt::event_loop::untrack_handle(t as *mut UvHandle);
+        }
+        /* Reset the slot either way: shutdown_engine/loop_close may have
+         * already closed it, and a stale INIT flag would make the next
+         * engine's esc_timer_kick re-start a closed handle. */
+        ESC_TIMER.with(|e| e.set(ptr::null_mut()));
+        ESC_TIMER_INIT.with(|i| i.set(0));
     }
 
     /* Clean up async readline state */
-    if TTY_OPEN.with(|o| o.get()) != 0 {
+    if mine_tty && TTY_OPEN.with(|o| o.get()) != 0 {
         uv::uv_read_stop(stdin_rl_stream());
         if STDIN_IS_TTY.with(|t| t.get()) != 0 {
+            // Restore the terminal fully: cooked mode + bracketed-paste/mouse
+            // modes off, or the host shell inherits stray DECSET states.
+            if MOUSE_ENABLED.with(|m| m.get()) != 0 {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+                let _ = out.flush();
+                MOUSE_ENABLED.with(|m| m.set(0));
+            }
             uv::uv_tty_reset_mode();
             let tty = TTY_STDIN.with(|t| t.get());
             if uv::uv_is_closing(tty as *const UvHandle) == 0 {
                 uv::uv_close(tty as *mut UvHandle, None);
+                crate::rt::event_loop::untrack_handle(tty as *mut UvHandle);
             }
         } else {
             let pipe = STDIN_RL_PIPE.with(|p| p.get());
             if uv::uv_is_closing(pipe as *const UvHandle) == 0 {
                 uv::uv_close(pipe as *mut UvHandle, None);
+                crate::rt::event_loop::untrack_handle(pipe as *mut UvHandle);
             }
         }
         TTY_OPEN.with(|o| o.set(0));
     }
-    let rl = READLINE_PROMISE.with(|r| r.replace(ptr::null_mut()));
-    if !rl.is_null() {
-        /* A pending readline should not leak its promise handle at teardown. */
-        sofuu_promise_reject_str(rl, c"stdin closed".as_ptr());
+    /* P3 (AUDIT-2026-09-07): the process-API stdin pipe was never torn
+     * down — a script that opened stdin (stdin.on("data")/resume) leaked
+     * the malloc'd uv_pipe_t and left fd 0 in a started-read state at
+     * engine teardown. Same late-close pattern as the readline branch
+     * above: the loop storage outlives this call (see rt/loop.rs), and
+     * uv_is_closing guards a handle the loop walk already closed.
+     * F-2: only the engine that opened it (STDIN_CTX) may touch it. */
+    if mine_pipe && STDIN_PIPE_OPEN.with(|o| o.get()) != 0 {
+        let pipe = STDIN_PIPE.with(|p| p.get());
+        if !pipe.is_null() && uv::uv_is_closing(pipe as *const UvHandle) == 0 {
+            uv::uv_read_stop(pipe as *mut UvStream);
+            uv::uv_close(pipe as *mut UvHandle, None);
+            crate::rt::event_loop::untrack_handle(pipe as *mut UvHandle);
+        }
+        STDIN_PIPE.with(|p| p.set(ptr::null_mut()));
+        STDIN_PIPE_OPEN.with(|o| o.set(0));
+        STDIN_CTX.with(|c| c.set(ptr::null_mut()));
     }
-    let sel = SELECTOR_PROMISE.with(|s| s.replace(ptr::null_mut()));
-    if !sel.is_null() {
-        sofuu_promise_reject_str(sel, c"stdin closed".as_ptr());
+    /* The selection-notice timer (1800 ms) was missed when ESC_TIMER got
+     * its stop — it must not fire into a torn-down TUI. F-2: TUI-owner
+     * scoped, same stale-pointer reset as ESC_TIMER. */
+    if mine_tty {
+        let sel_t = SEL_NOTICE_TIMER.with(|t| t.get());
+        if !sel_t.is_null() {
+            if uv::uv_is_closing(sel_t as *const UvHandle) == 0 {
+                uv::uv_timer_stop(sel_t);
+                uv::uv_close(sel_t as *mut UvHandle, None);
+                crate::rt::event_loop::untrack_handle(sel_t as *mut UvHandle);
+            }
+            SEL_NOTICE_TIMER.with(|t| t.set(ptr::null_mut()));
+        }
+        let rl = READLINE_PROMISE.with(|r| r.replace(ptr::null_mut()));
+        if !rl.is_null() {
+            /* A pending readline should not leak its promise handle at teardown. */
+            sofuu_promise_reject_str(rl, c"stdin closed".as_ptr());
+        }
+        let sel = SELECTOR_PROMISE.with(|s| s.replace(ptr::null_mut()));
+        if !sel.is_null() {
+            sofuu_promise_reject_str(sel, c"stdin closed".as_ptr());
+        }
+        SELECTOR_ACTIVE.with(|a| a.set(0));
+        TTY_CTX.with(|c| c.set(ptr::null_mut()));
     }
-    SELECTOR_ACTIVE.with(|a| a.set(0));
-    TTY_CTX.with(|c| c.set(ptr::null_mut()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /* proc-11: the history file cap must keep the NEWEST lines when it
+     * rewrites, not the oldest. */
+    #[test]
+    fn chat_history_trimmed_keeps_newest_lines() {
+        let text = (0..10).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let out = chat_history_trimmed(&text, 4);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["line-6", "line-7", "line-8", "line-9"]);
+    }
+
+    #[test]
+    fn chat_history_trimmed_handles_short_and_empty() {
+        assert_eq!(chat_history_trimmed("a\nb\nc", 10), "a\nb\nc\n");
+        assert_eq!(chat_history_trimmed("", 5), "");
+        assert_eq!(chat_history_trimmed("only", 0), "");
+    }
 }

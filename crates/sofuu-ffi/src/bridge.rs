@@ -16,7 +16,7 @@ pub use crate::qjs::{
 };
 
 use crate::qjs;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 
 // ── Helpers ─────────────────────────────────────────────────────
 // These take raw QuickJS context pointers, so they are `unsafe fn` by
@@ -29,7 +29,10 @@ use std::ffi::{CStr, CString};
 /// # Safety
 /// `ctx` must be a valid QuickJS context; `func` must be `'static`.
 pub unsafe fn register_global_fn(ctx: *mut JSContext, name: &str, func: JSCFunction) {
-    let cname = CString::new(name).unwrap_or_default();
+    // P3 (AUDIT-2026-09-07): a NUL in `name` used to unwrap_or_default into
+    // an EMPTY registered name. The C API cannot express it — escape so the
+    // failure is visible, never silent.
+    let cname = CString::new(name.replace('\0', "\\0")).unwrap_or_default();
     // SAFETY: ctx is a valid QuickJS context; cname valid for the call.
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let v = unsafe { qjs::sofuu_js_new_cfunction(ctx, func, cname.as_ptr(), 1) };
@@ -67,9 +70,10 @@ pub unsafe fn js_to_string(ctx: *mut JSContext, val: JSValueConst) -> Option<Str
 /// # Safety
 /// `ctx` must be a valid QuickJS context.
 pub unsafe fn js_new_string(ctx: *mut JSContext, s: &str) -> JSValue {
-    let c = CString::new(s).unwrap_or_default();
-    // SAFETY: c is valid for the call.
-    unsafe { qjs::sofuu_js_new_string(ctx, c.as_ptr()) }
+    // P3 (AUDIT-2026-09-07): NULs used to be silently dropped (CString +
+    // unwrap_or_default → empty string). JS_NewStringLen takes the raw
+    // bytes, so the value matches the Rust string exactly.
+    unsafe { qjs::JS_NewStringLen(ctx, s.as_ptr() as *const c_char, s.len()) }
 }
 
 /// Create a JS boolean value.

@@ -135,7 +135,14 @@ pub fn log_decision_full(
     if let Some(c) = rlm_calls {
         line["rlm_calls"] = serde_json::json!(c);
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
     writeln!(f, "{line}")
 }
 

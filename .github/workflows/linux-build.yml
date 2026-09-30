@@ -1,0 +1,77 @@
+name: Linux Desktop
+
+# Builds the Sofuu Desktop app for Linux x64 (deb + AppImage) and uploads
+# them as artifacts. Same gate as the Windows workflow: cargo test --release
+# runs after the artifact upload so a test failure never hides the packages.
+#
+# QTSQ is a proprietary macOS-checked-out static lib that cannot be built
+# here — these builds degrade gracefully (no brain/memory persistence,
+# sessions are fail-closed). API keys persist via the freedesktop Secret
+# Service (keyring sync-secret-service), which needs libdbus-1-dev to build.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "sofuu-desktop/**"
+      - "crates/**"
+      - "deps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/linux-build.yml"
+
+jobs:
+  desktop-linux:
+    name: Sofuu Desktop (Linux x64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Tauri 2 prerequisites (webkit2gtk 4.1 line) plus what the engine
+      # and keyring need: libcurl4-openssl-dev for the system -lcurl link,
+      # libdbus-1-dev for the Secret Service keyring backend.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            libcurl4-openssl-dev libdbus-1-dev pkg-config
+          # AppImage tooling needs FUSE (libfuse2t64 on 24.04+).
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
+
+      # build.rs links deps/libuv/build/libuv.a by default — the Linux
+      # single-config cmake build produces exactly that path.
+      - name: Build libuv (static)
+        run: |
+          cd deps/libuv
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+          cmake --build build --config Release -j"$(nproc)"
+          ls build/libuv.a
+
+      - name: Build Sofuu Desktop (deb + AppImage)
+        run: |
+          cd sofuu-desktop
+          npm ci
+          npx tauri build --bundles deb,appimage
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: sofuu-desktop-linux-x64
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/sofuu-desktop
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Rust unit tests
+        run: cargo test --release

@@ -49,7 +49,9 @@ pub type UvConnectionCb = unsafe extern "C" fn(*mut UvStream, c_int);
 /// uv_poll_cb — (handle, status, events) (curl socket bridge, M4).
 pub type UvPollCb = unsafe extern "C" fn(*mut UvPoll, c_int, c_int);
 
-pub const UV_DISCONNECT: c_int = 0;
+/// uv_poll_cb event bits — must match deps/libuv/include/uv.h
+/// (UV_READABLE=1, UV_WRITABLE=2, UV_DISCONNECT=4).
+pub const UV_DISCONNECT: c_int = 4;
 pub const UV_READABLE: c_int = 1;
 pub const UV_WRITABLE: c_int = 2;
 
@@ -100,6 +102,9 @@ extern "C" {
         repeat: u64,
     ) -> c_int;
     pub fn uv_timer_stop(timer: *mut UvTimer) -> c_int;
+    /// Cached loop time in ms (updated by the loop between polls) — the
+    /// coarse clock for UI notice timers.
+    pub fn uv_now(loop_: *const UvLoop) -> i64;
 
     pub fn uv_check_init(loop_: *mut UvLoop, check: *mut UvCheck) -> c_int;
     pub fn uv_check_start(check: *mut UvCheck, cb: Option<unsafe extern "C" fn(*mut UvCheck)>) -> c_int;
@@ -235,11 +240,24 @@ extern "C" {
     // ── M5: HTTP server (uv_tcp) ────────────────────────────────
     pub fn uv_tcp_init(loop_: *mut UvLoop, tcp: *mut UvTcp) -> c_int;
     pub fn uv_tcp_bind(tcp: *mut UvTcp, addr: *const libc::sockaddr, flags: u32) -> c_int;
-    pub fn uv_ip4_addr(ip: *const c_char, port: c_int, addr: *mut libc::sockaddr_in) -> c_int;
+    pub fn uv_ip4_addr(ip: *const c_char, port: c_int, addr: *mut SockaddrIn) -> c_int;
     pub fn uv_listen(stream: *mut UvStream, backlog: c_int, cb: Option<UvConnectionCb>) -> c_int;
     pub fn uv_accept(server: *mut UvStream, client: *mut UvStream) -> c_int;
 
     pub fn uv_strerror(err: c_int) -> *const c_char;
+}
+
+/// IPv4 socket address, filled by `uv_ip4_addr` and consumed as a
+/// `*const libc::sockaddr` by `uv_tcp_bind`. The libc crate does not export
+/// `sockaddr_in` for windows-gnu, so we pin the (POSIX == winsock) 16-byte
+/// layout ourselves: family, port (network order), address, padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrIn {
+    pub sin_family: u16,
+    pub sin_port: u16,
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
 }
 
 // ── M10: the deleted src/ffi_shim.c size/field shims, now plain Rust ──
@@ -419,6 +437,9 @@ pub struct UvPipe {
 
 /// `uv_process_options_t` — stdio_count + stdio array + exit_cb.
 /// We mirror the fields the spawn path sets.
+/// P2-23 (AUDIT-2026-09-01): uid/gid are `uv_uid_t`/`uv_gid_t` — 4 bytes
+/// on Unix, but a full `unsigned int` on Windows where the spawn path
+/// never sets them. cfg-gated to keep the mirror honest per-platform.
 #[repr(C)]
 pub struct UvProcessOptions {
     pub exit_cb: Option<unsafe extern "C" fn(*mut UvProcess, i64, c_int)>,
@@ -429,7 +450,9 @@ pub struct UvProcessOptions {
     pub flags: u32,
     pub stdio_count: c_int,
     pub stdio: *mut UvStdioContainer,
+    #[cfg(unix)]
     pub uid: u32,
+    #[cfg(unix)]
     pub gid: u32,
 }
 
@@ -560,18 +583,50 @@ mod spawn_tests {
         while unsafe { (*m_ptr).done.load(std::sync::atomic::Ordering::SeqCst) } == 0 {
             unsafe { uv_run(lp.as_ptr(), UV_RUN_ONCE) };
         }
+        let close_rc;
         unsafe {
             uv_read_stop(out as *mut UvStream);
             uv_close(out as *mut UvHandle, None);
-            uv_loop_close(lp.as_ptr());
+            // P3 (AUDIT-2026-09-07): the process handle was never closed, so
+            // uv_loop_close returned EBUSY and the result was ignored — the
+            // test leaked the handle. Close it and drain the loop so the
+            // close callbacks run, then REQUIRE a clean close.
+            uv_close(proc as *mut UvHandle, None);
+            while uv_run(lp.as_ptr(), UV_RUN_ONCE) != 0 {}
+            close_rc = uv_loop_close(lp.as_ptr());
         }
-        let got = CStr::from_bytes_with_nul_unchecked(&(&(*m_ptr).got)[..(*m_ptr).got_len + 1])
-            .to_string_lossy()
-            .into_owned();
-        eprintln!("[mini] got={:?}", got);
+        // P3: from_bytes_with_nul_unchecked panicked if got_len hit the
+        // 64-byte cap with no terminator (index out of bounds) — read the
+        // buffer defensively instead.
+        let got_buf = &(*m_ptr).got;
+        let gl = ((*m_ptr).got_len as usize).min(got_buf.len());
+        let got = if gl < got_buf.len() {
+            CStr::from_bytes_with_nul(&got_buf[..=gl])
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&got_buf[..gl]).into_owned())
+        } else {
+            String::from_utf8_lossy(&got_buf[..gl]).into_owned()
+        };
+        eprintln!("[mini] close_rc={} got={:?}", close_rc, got);
+        assert_eq!(close_rc, 0, "loop must close cleanly once every handle is closed");
         assert!(got.contains("MINI-OK"), "child stdout must arrive: {got}");
         drop(Box::from_raw(m_ptr));
         libc::free(lp.as_ptr() as *mut c_void);
         }
+    }
+}
+
+// ffi-3 pin: these must mirror deps/libuv/include/uv.h (uv_poll_event bits).
+// UV_DISCONNECT was 0, which would make the first uv_poll consumer silently
+// never observe disconnects (libuv defines it as 4, uv.h:913).
+#[cfg(test)]
+mod poll_event_bits {
+    use super::*;
+
+    #[test]
+    fn uv_poll_event_bits_match_libuv() {
+        assert_eq!(UV_READABLE, 1);
+        assert_eq!(UV_WRITABLE, 2);
+        assert_eq!(UV_DISCONNECT, 4);
     }
 }

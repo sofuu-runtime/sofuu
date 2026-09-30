@@ -162,9 +162,33 @@ fn engine_main(
     unsafe { host::register_host_natives(ctx) };
 
     // 5a. Keychain keys → embedded provider keys (preferred over env).
-    for provider in ["openai", "anthropic"] {
-        if let Some(key) = keychain::get_key(provider) {
-            sofuu_core::embed_config::set_api_key(provider, key);
+    // Inject EVERY configured provider's key, not just the two built-ins:
+    // a custom provider's Keychain key was previously live after save but
+    // lost on restart (config-file key was the only fallback). Config-file
+    // keys stay as fallback for CLI-written entries.
+    {
+        let cfg = crate::config::get_config_redacted();
+        let mut names: Vec<String> = cfg
+            .get("providers")
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.get("name")?.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Always cover the built-ins even with no config yet.
+        for builtin in ["openai", "anthropic"] {
+            if !names.iter().any(|n| n == builtin) {
+                names.push(builtin.to_string());
+            }
+        }
+        for provider in names {
+            if let Some(key) = keychain::get_key(&provider) {
+                if !key.is_empty() {
+                    sofuu_core::embed_config::set_api_key(&provider, key);
+                }
+            }
         }
     }
 

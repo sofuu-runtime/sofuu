@@ -387,8 +387,11 @@ pub fn extract(inp: &FreshnessInput) -> [f32; FRESHNESS_FEATURES] {
     f[21] = oh[1];
     f[22] = oh[2];
     f[23] = oh[3];
-    f[24] = inp.strength.clamp(0.0, 1.0);
-    f[25] = (inp.age_days / 730.0).min(1.0);
+    // clamp() passes NaN through — a non-finite caller scalar must land
+    // at the neutral value, not propagate (Phase 1.3; §5.2 "reject or
+    // sanitize non-finite numeric values").
+    f[24] = if inp.strength.is_finite() { inp.strength.clamp(0.0, 1.0) } else { 0.0 };
+    f[25] = if inp.age_days.is_finite() { (inp.age_days.max(0.0) / 730.0).min(1.0) } else { 0.0 };
     f[26] = sentence_max_cosine(text, &STALE_VEC);
     f[27] = sentence_max_cosine(text, &HEDGING_VEC);
     f
@@ -439,6 +442,41 @@ mod tests {
         assert!(a[0] > 0.3, "stale keyword density fires on 'deprecated'");
         assert!(a[8] > 0.0, "explicit date found");
         assert!(a[15] > 0.3, "task markers fire on 'latest version'");
+    }
+
+    /// Phase 1.3 (§5.3): empty/whitespace-only, control chars, embedded
+    /// NULs, mixed Unicode, and path-like text must all yield finite,
+    /// in-band vectors — never panic, never NaN.
+    #[test]
+    fn hostile_text_stays_finite_and_bounded() {
+        let hostiles = [
+            "",
+            "   \t\n  ",
+            "\u{0}\u{0}\u{0}",
+            "配列のテスト😀🎉\u{2028}\u{2029}",
+            "a/b/c/d/e/f.rs::mod::path",
+            "!!!!!!!!!!!!!!!!!!!!",
+            &"deprecated ".repeat(500),
+            &"2020 ".repeat(200),
+        ];
+        for text in hostiles {
+            for task in ["", "latest version of the library", "\u{0}task\u{0}"] {
+                let f = extract(&FreshnessInput {
+                    text,
+                    task,
+                    kind: SourceKind::Tool,
+                    strength: f32::NAN, // sanitized upstream; extractor clamps
+                    age_days: f32::NEG_INFINITY,
+                    now_year: 2026,
+                });
+                for (i, x) in f.iter().enumerate() {
+                    assert!(x.is_finite(), "feature {i} NaN/Inf for {text:?} x {task:?}: {x}");
+                    assert!((-1.0..=2.0).contains(x), "feature {i} out of band: {x}");
+                }
+            }
+        }
+        // year scanning on NUL-heavy and digit-heavy text stays sane.
+        assert!(scan_years("\u{0}1234\u{0}56789").is_empty(), "maximal-run rule holds");
     }
 
     #[test]

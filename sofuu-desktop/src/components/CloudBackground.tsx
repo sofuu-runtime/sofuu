@@ -17,6 +17,7 @@ precision mediump float;
 
 uniform vec2 u_res;
 uniform float u_time;
+uniform float u_dark;
 
 vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
 vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
@@ -125,11 +126,13 @@ void main() {
   float edge = smoothstep(0.0, 0.10 * u_res.y, min(dEdge.x, dEdge.y));
 
   /* Light blue with gradient: pale wash -> periwinkle bodies ->
-     deeper sky blue in the dense patches -> near-white glow. */
-  vec3 c_gap  = vec3(0.882, 0.925, 0.973); /* #e1ecf8 */
-  vec3 c_mid  = vec3(0.663, 0.800, 0.945); /* #a9ccf1 */
-  vec3 c_deep = vec3(0.518, 0.702, 0.910); /* #84b3e8 */
-  vec3 c_glow = vec3(0.992, 0.996, 1.000);
+     deeper sky blue in the dense patches -> near-white glow.
+     Dark: warm-brown wisps on the dark app ground, same structure —
+     subtle contrast so the cloud reads as texture, not a spotlight. */
+  vec3 c_gap  = mix(vec3(0.882, 0.925, 0.973), vec3(0.129, 0.118, 0.102), u_dark); /* #e1ecf8 / #211e1a */
+  vec3 c_mid  = mix(vec3(0.663, 0.800, 0.945), vec3(0.196, 0.176, 0.149), u_dark); /* #a9ccf1 / #322d26 */
+  vec3 c_deep = mix(vec3(0.518, 0.702, 0.910), vec3(0.275, 0.247, 0.204), u_dark); /* #84b3e8 / #463f34 */
+  vec3 c_glow = mix(vec3(0.992, 0.996, 1.000), vec3(0.353, 0.314, 0.255), u_dark); /* near-white / #5a5041 */
   vec3 col = mix(c_gap, c_mid, smoothstep(0.05, 0.45, i));
   col = mix(col, c_deep, smoothstep(0.45, 0.80, i));
   col = mix(col, c_glow, smoothstep(0.85, 1.00, i));
@@ -140,8 +143,12 @@ void main() {
 }
 `;
 
-export function CloudBackground() {
+export function CloudBackground({ dark = false }: { dark?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  /* Animation clock lives outside the GL effect: a theme flip re-runs the
+     effect (new u_dark) but the field keeps drifting from where it was —
+     no reset, no replay. */
+  const timeRef = useRef(0);
 
   useEffect(() => {
     const canvas = ref.current;
@@ -186,6 +193,7 @@ export function CloudBackground() {
 
     const uRes = gl.getUniformLocation(prog, "u_res");
     const uTime = gl.getUniformLocation(prog, "u_time");
+    const uDark = gl.getUniformLocation(prog, "u_dark");
 
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     const resize = () => {
@@ -198,17 +206,17 @@ export function CloudBackground() {
     };
 
     let raf = 0;
-    let t = 0;
     let last = performance.now();
     const redraw = () => {
       gl.uniform2f(uRes, canvas.width, canvas.height);
-      gl.uniform1f(uTime, t);
+      gl.uniform1f(uTime, timeRef.current);
+      gl.uniform1f(uDark, dark ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     };
     const draw = () => {
       const now = performance.now();
       /* Clamp the leap so a backgrounded/unfocus pause doesn't jump. */
-      t += Math.min((now - last) / 1000, 0.05);
+      timeRef.current += Math.min((now - last) / 1000, 0.05);
       last = now;
       redraw();
       raf = requestAnimationFrame(draw);
@@ -235,7 +243,7 @@ export function CloudBackground() {
       gl.deleteShader(fs);
       gl.deleteProgram(prog);
     };
-  }, []);
+  }, [dark]);
 
   return <canvas ref={ref} className="cloud-bg" aria-hidden="true" />;
 }

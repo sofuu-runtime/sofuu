@@ -16,7 +16,7 @@
 // the sofuu.ai.* surface.
 
 use std::cell::Cell;
-use std::ffi::{CStr, CString, c_int, c_long, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 use std::ptr;
 
 use sofuu_ffi::curl::{self, Curl, CurlM, CurlSlist};
@@ -128,6 +128,27 @@ struct AiMessage {
      * JSON array, tool messages carry the tool_call_id they answer. */
     tool_calls: Option<String>,
     tool_call_id: Option<String>,
+    /* Multimodal (P2): user-message images as data URLs
+     * ("data:image/png;base64,…"). Empty = text-only message. */
+    images: Vec<String>,
+}
+
+/// Parse the JSON-stringified images array (["data:image/png;base64,…", …])
+/// into typed entries; caps count (8) and per-image size (6 MB) so a giant
+/// paste cannot balloon the wire. Non-`data:` entries are dropped — the
+/// wire builders only inline data URLs.
+fn parse_image_urls(json: Option<&str>) -> Vec<String> {
+    let Some(json) = json else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let Some(arr) = v.as_array() else { return Vec::new() };
+    const MAX_IMAGES: usize = 8;
+    const MAX_URL_CHARS: usize = 8 * 1024 * 1024; // ~6 MB binary per image
+    arr.iter()
+        .filter_map(|x| x.as_str())
+        .filter(|u| u.starts_with("data:image/") && u.len() <= MAX_URL_CHARS)
+        .take(MAX_IMAGES)
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -180,9 +201,11 @@ impl Default for AiRequestConfig {
 
 struct AiEmbedConfig {
     provider: Provider,
+    provider_explicit: bool, /* true when opts.provider was present */
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>, /* full endpoint override; None → built-in */
+    space: Option<String>,   /* local embedding space; None → default */
     inputs: Vec<String>,
 }
 
@@ -215,79 +238,6 @@ pub(crate) fn json_escape(s: Option<&str>) -> String {
     out
 }
 
-/// Byte index just past the closing brace of the object that starts at
-/// `s[0]` (assumed `{`), honoring nested braces/strings. Falls back to
-/// the full length when unbalanced.
-fn find_obj_end(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    if b.first() != Some(&b'{') {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut esc = false;
-    for (i, &c) in b.iter().enumerate() {
-        if in_str {
-            if esc {
-                esc = false;
-            } else if c == b'\\' {
-                esc = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Extract the top-level string value of `"key"` from a JSON object slice
-/// ("" when missing or not a string). Used for the tool-call round-trip.
-fn json_field(obj: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let mut rest = obj;
-    while let Some(at) = rest.find(&needle) {
-        let after = &rest[at + needle.len()..];
-        let after = after.trim_start();
-        let Some(colon_rest) = after.strip_prefix(':') else {
-            rest = after;
-            continue;
-        };
-        let colon_rest = colon_rest.trim_start();
-        if colon_rest.starts_with('"') {
-            let inner = &colon_rest[1..];
-            let mut out = String::new();
-            let mut esc = false;
-            for ch in inner.chars() {
-                if esc {
-                    out.push(ch);
-                    esc = false;
-                } else if ch == '\\' {
-                    esc = true;
-                } else if ch == '"' {
-                    return Some(out);
-                } else {
-                    out.push(ch);
-                }
-            }
-            return Some(out); /* unterminated — return what we have */
-        }
-        rest = colon_rest;
-    }
-    None
-}
-
 /* Appends "tools":[...] in the provider's specific wire format. */
 fn append_tools_openai(body: &mut String, cfg: &AiRequestConfig) {
     if cfg.tools.is_empty() {
@@ -299,7 +249,7 @@ fn append_tools_openai(body: &mut String, cfg: &AiRequestConfig) {
             body.push(',');
         }
         let d = json_escape(t.description.as_deref());
-        let n = t.name.as_deref().unwrap_or("");
+        let n = json_escape(t.name.as_deref());
         let p = t.parameters_json.as_deref().unwrap_or("{}");
         body.push_str(&format!(
             "{{\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"description\":\"{}\",\"parameters\":{}}}}}",
@@ -320,7 +270,7 @@ fn append_tools_anthropic(body: &mut String, cfg: &AiRequestConfig) {
             body.push(',');
         }
         let d = json_escape(t.description.as_deref());
-        let n = t.name.as_deref().unwrap_or("");
+        let n = json_escape(t.name.as_deref());
         let p = t.parameters_json.as_deref().unwrap_or("{}");
         body.push_str(&format!(
             "{{\"name\":\"{}\",\"description\":\"{}\",\"input_schema\":{}",
@@ -339,21 +289,39 @@ fn append_tools_anthropic(body: &mut String, cfg: &AiRequestConfig) {
 }
 
 /// The effective per-response output cap: an explicit config value wins;
-/// otherwise the MODEL's published maximum from the capability registry.
+/// otherwise the MODEL's published maximum. Capabilities resolve through
+/// the endpoint-aware ladder — registry → caps the endpoint itself
+/// published for this exact model (discovered store, keyed by cfg.base_url)
+/// — so a gateway hosting a known family at a smaller cap is honoured.
 /// For the OpenAI wire unknown models omit the field (provider default);
 /// Anthropic wire's fallback is endpoint-driven (see build_anthropic).
 ///
 /// Layer 0 of the alloc gate: an explicit value is clamped DOWN to the
-/// model's hard output limit when the registry knows it. Sending a
+/// model's hard output limit when ANY real source knows it. Sending a
 /// max_tokens the model cannot honour is a provider 400 and a dead
 /// turn — the wire must never carry it, whatever the config says.
 /// User-facing notes for the clamp are emitted by the layers above
 /// (chat driver / agent plan), which run the same resolve ladder.
 fn effective_max_output(cfg: &AiRequestConfig) -> i32 {
-    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
+    let caps = crate::rt::model_caps::lookup_for(cfg.model.as_deref(), cfg.base_url.as_deref());
     if cfg.max_tokens > 0 {
         if caps.max_output > 0 && cfg.max_tokens > caps.max_output {
             return caps.max_output;
+        }
+        /* Zero-evidence guard: a flat config cap (the 384k-global class)
+         * riding a model the registry, the endpoint's listing AND any
+         * learned-400 all know nothing about is a gamble that empties
+         * some gateways (200 + zero text). Omit and let the endpoint
+         * apply its own default. Once ANY evidence lands (a harvest, a
+         * learned limit), config rides again — clamped by it. */
+        if caps.max_output == 0
+            && caps.ctx_window == 0
+            && !crate::ml::alloc::policy::has_any_evidence(
+                cfg.model.as_deref(),
+                cfg.base_url.as_deref(),
+            )
+        {
+            return 0;
         }
         cfg.max_tokens
     } else {
@@ -384,11 +352,12 @@ fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
      * "(null)" or crash; an empty model is rejected by the provider. */
     let mut body = format!("{{\"model\":\"{}\"", cfg.model.as_deref().unwrap_or(""));
 
-    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
+    let caps = crate::rt::model_caps::lookup_for(cfg.model.as_deref(), cfg.base_url.as_deref());
 
     /* Dynamic output cap: explicit config wins, else the MODEL's published
-     * max output (model_caps). Never a flat constant. Unknown models omit
-     * the field entirely so the endpoint applies its own default. */
+     * max output (registry → endpoint-discovered). Never a flat constant.
+     * Unknown-to-everything models omit the field entirely so the
+     * endpoint applies its own default. */
     if emit_max {
         let max_out = effective_max_output(cfg);
         if max_out > 0 {
@@ -432,6 +401,19 @@ fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
         body.push_str(&format!(",\"reasoning_effort\":\"{}\"", effort));
     }
 
+    /* OpenAI chat-completions omits the final usage chunk unless this is
+     * sent (spec behavior since 2024-06; OpenRouter/vLLM also honor it,
+     * and strict gateways tolerate the extra field). Without it every
+     * OpenAI-family stream reports usage=0: budget_tokens can never fire,
+     * budget_usd never trips, and the ctx meter silently falls back to
+     * its estimator. Anthropic is unaffected — usage rides
+     * message_start/message_delta unconditionally. `emit_max=false` marks
+     * the local-server wrapper (Ollama native /api/chat), which ignores
+     * this option and returns usage unprompted. */
+    if cfg.stream && emit_max {
+        body.push_str(",\"stream_options\":{\"include_usage\":true}");
+    }
+
     body.push_str(&format!(
         ",\"stream\":{},\"messages\":[",
         if cfg.stream { "true" } else { "false" }
@@ -449,11 +431,26 @@ fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
         if !first {
             body.push(',');
         }
-        body.push_str(&format!(
-            "{{\"role\":\"{}\",\"content\":\"{}\"",
-            m.role.as_deref().unwrap_or(""),
-            es
-        ));
+        /* Multimodal (P2): user images inline as content parts —
+         * [{type:text},{type:image_url}] per the OpenAI chat shape. */
+        if !m.images.is_empty() {
+            body.push_str(&format!("{{\"role\":\"{}\",\"content\":[", m.role.as_deref().unwrap_or("")));
+            body.push_str(&format!("{{\"type\":\"text\",\"text\":\"{}\"}}", es));
+            for img in &m.images {
+                let eimg = json_escape(Some(img));
+                body.push_str(&format!(
+                    ",{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{}\"}}}}",
+                    eimg
+                ));
+            }
+            body.push(']');
+        } else {
+            body.push_str(&format!(
+                "{{\"role\":\"{}\",\"content\":\"{}\"",
+                m.role.as_deref().unwrap_or(""),
+                es
+            ));
+        }
         /* Assistant tool-call message: splice the tool_calls array. */
         if let Some(tc) = &m.tool_calls {
             if !tc.is_empty() {
@@ -479,10 +476,11 @@ fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
 }
 
 fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
-    /* Dynamic output cap (model_caps): explicit config → model's published
-     * max output → documented floor for unknown models. The old flat
-     * `4096` fallback truncated every answer regardless of model. */
-    let caps = crate::rt::model_caps::lookup(cfg.model.as_deref());
+    /* Dynamic output cap (registry → endpoint-discovered): explicit config →
+     * model's published max output → conservative floor for models nobody
+     * knows. The old flat `4096` fallback truncated every answer
+     * regardless of model. */
+    let caps = crate::rt::model_caps::lookup_for(cfg.model.as_deref(), cfg.base_url.as_deref());
     let max_tokens = effective_max_output(cfg);
     let max_tokens = if max_tokens > 0 {
         max_tokens
@@ -510,7 +508,15 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
             if let Some(bv) = b {
                 let room = ((max_tokens as f64 * 0.10).ceil() as i32).max(1);
                 if bv >= max_tokens {
-                    b = Some((max_tokens - room).max(1));
+                    // P3 (AUDIT-2026-09-07): with max_tokens=1 the old clamp
+                    // produced budget==max_tokens, which the wire REJECTS
+                    // (strict budget < max_tokens). Drop the budget instead
+                    // of emitting an invalid request.
+                    b = if max_tokens > 1 {
+                        Some((max_tokens - room).max(1))
+                    } else {
+                        None
+                    };
                 }
             }
             b
@@ -627,29 +633,40 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
             if !tc.is_empty() {
                 body.push_str(&format!("{{\"role\":\"{}\",\"content\":[", role));
                 let mut tc_first = true;
-                /* Parse the array minimally: {"id":..,"function":{"name":..,"arguments":..}} */
-                let mut seg = tc.as_str();
-                while let Some(st) = seg.find("\"id\"") {
-                    let before = &seg[..st];
-                    let obj_start = before.rfind('{');
-                    let Some(obj_start) = obj_start else { break };
-                    let obj = &seg[obj_start..];
-                    let Some(close) = find_obj_end(obj) else { break };
-                    let entry = &obj[..close];
-                    let id = json_field(entry, "id").unwrap_or_default();
-                    let fname = json_field(entry, "name").unwrap_or_default();
-                    let fargs = json_field(entry, "arguments").unwrap_or_default();
+                /* P3 (AUDIT-2026-09-07): parse with serde_json, not the old
+                 * find("\"id\"")/rfind('{') string-scan — a tool whose
+                 * arguments JSON contained its own "id" key made the scan
+                 * grab the INNER object and emit a corrupted tool_use block
+                 * on the Anthropic wire. The scan also only decoded
+                 * string-valued arguments; object-valued ones are now
+                 * re-serialized verbatim. */
+                let calls: Vec<serde_json::Value> =
+                    serde_json::from_str(tc).unwrap_or_default();
+                for call in calls {
+                    let id = call
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let fname = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let fargs = match call.get("function").and_then(|f| f.get("arguments")) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(o @ serde_json::Value::Object(_)) => o.to_string(),
+                        _ => String::new(),
+                    };
                     if !tc_first {
                         body.push(',');
                     }
                     body.push_str(&format!(
                         "{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}",
-                        json_escape(Some(&id)),
-                        json_escape(Some(&fname)),
+                        json_escape(Some(id)),
+                        json_escape(Some(fname)),
                         if fargs.is_empty() { "{}" } else { fargs.as_str() }
                     ));
                     tc_first = false;
-                    seg = &seg[st + close..];
                 }
                 body.push(']');
                 body.push('}');
@@ -668,6 +685,32 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
                 first = false;
                 continue;
             }
+        }
+        /* Multimodal (P2): images → Anthropic base64 image blocks
+         * [{type:image, source:{type:base64, media_type, data}}, …]
+         * (data URL "data:<mime>;base64,<b64>" split apart). */
+        if !m.images.is_empty() {
+            body.push_str(&format!("{{\"role\":\"{}\",\"content\":[", role));
+            body.push_str(&format!("{{\"type\":\"text\",\"text\":\"{}\"}}", es));
+            for img in &m.images {
+                // data:image/png;base64,AAAA → media_type + b64 payload
+                let (mime, b64) = match img.strip_prefix("data:") {
+                    Some(rest) => match rest.split_once(";base64,") {
+                        Some((m_, b_)) => (m_, b_),
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                let emime = json_escape(Some(mime));
+                let eb64 = json_escape(Some(b64));
+                body.push_str(&format!(
+                    ",{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"{}\",\"data\":\"{}\"}}}}",
+                    emime, eb64
+                ));
+            }
+            body.push_str("]}");
+            first = false;
+            continue;
         }
         body.push_str(&format!("{{\"role\":\"{}\",\"content\":\"{}\"}}", role, es));
         first = false;
@@ -1547,6 +1590,7 @@ unsafe fn anthropic_tool_fragments(ctx: *mut JSContext, ev: JSValue) -> Option<J
 const REQ_TAG_COMPLETE: c_int = 1;
 const REQ_TAG_STREAM: c_int = 2;
 const REQ_TAG_EMBED: c_int = 3;
+const REQ_TAG_AUDIO: c_int = 4;
 
 /* Hard cap on any single provider response (complete/stream/embed) so a
  * misbehaving endpoint cannot grow the heap without bound. */
@@ -1744,6 +1788,24 @@ unsafe fn stall_abort(req: *mut c_void, tag: c_int) {
             }
             drop(Box::from_raw(r));
         }
+        REQ_TAG_AUDIO => {
+            let r = req as *mut AiAudioReq;
+            let ctx = (*r).ctx;
+            let m = CString::new(ai_stall_message(stall)).unwrap_or_default();
+            let err = qjs::sofuu_js_new_string(ctx, m.as_ptr());
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            audio_req_free_mime(r);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
         _ => {}
     }
 }
@@ -1763,6 +1825,112 @@ unsafe extern "C" fn ai_watchdog_cb(_t: *mut UvTimer) {
         }
         p = next;
     }
+}
+
+/// F-2 teardown abort for ONE request: mirror stall_abort's cleanup WITHOUT
+/// running any user JS (engine_destroy must not let a stream error_fn or a
+/// promise .then enqueue fresh requests/handles after the shutdown pass).
+unsafe fn ai_teardown_abort(req: *mut c_void, tag: c_int) {
+    match tag {
+        REQ_TAG_STREAM => {
+            let r = req as *mut AiStreamReq;
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            /* Frees the JS refs (push/done/error/think/tool_calls fns) and
+             * the box — no user JS, safe with ctx still live. */
+            stream_req_destroy((*r).ctx, r);
+        }
+        REQ_TAG_COMPLETE => {
+            let r = req as *mut AiCompleteReq;
+            let m = c"engine shutting down".as_ptr();
+            let err = qjs::sofuu_js_new_string((*r).ctx, m);
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
+        REQ_TAG_EMBED => {
+            let r = req as *mut AiEmbedReq;
+            let m = c"engine shutting down".as_ptr();
+            let err = qjs::sofuu_js_new_string((*r).ctx, m);
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
+        REQ_TAG_AUDIO => {
+            let r = req as *mut AiAudioReq;
+            let m = c"engine shutting down".as_ptr();
+            let err = qjs::sofuu_js_new_string((*r).ctx, m);
+            sofuu_promise_reject((*r).promise, err);
+            if !(*r).easy.is_null() {
+                curl::curl_multi_remove_handle(g_multi(), (*r).easy);
+                curl::curl_easy_cleanup((*r).easy);
+                (*r).easy = ptr::null_mut();
+            }
+            active_unlink(req);
+            audio_req_free_mime(r);
+            if !(*r).headers.is_null() {
+                curl::curl_slist_free_all((*r).headers);
+            }
+            drop(Box::from_raw(r));
+        }
+        _ => {}
+    }
+}
+
+/// F-2 (AUDIT-2026-09-01-CLI): abort every in-flight AI request owned by
+/// `ctx`. engine_destroy calls this before the armed-handle shutdown pass —
+/// with several engines sharing the process-global loop, a dying engine's
+/// still-transferring request would otherwise fire its curl callbacks into
+/// freed Rust boxes/JS during a surviving engine's uv_run.
+///
+/// Promise rejects only enqueue jobs (they die with the context) and free
+/// the promise handle; streams get stream_req_destroy. The trailing
+/// CURL_SOCKET_TIMEOUT kick delivers curl's POLL_REMOVE, closing each
+/// request's per-socket poll handle (ai_poll_close_cb untracks it).
+///
+/// # Safety
+/// Loop thread, teardown path only — `ctx` must still be live and no JS may
+/// run after this.
+pub unsafe fn ai_abort_requests_for_ctx(ctx: *mut JSContext) {
+    let mut p = G_ACTIVE.with(|a| a.get());
+    while !p.is_null() {
+        let hdr = p as *mut AiReqHdr;
+        /* Capture BEFORE the abort: it destroys the node. */
+        let next = (*hdr).wd_next;
+        let tag = (*hdr).tag;
+        let mine = match tag {
+            REQ_TAG_STREAM => (*(p as *mut AiStreamReq)).ctx == ctx,
+            REQ_TAG_COMPLETE => (*(p as *mut AiCompleteReq)).ctx == ctx,
+            REQ_TAG_EMBED => (*(p as *mut AiEmbedReq)).ctx == ctx,
+            REQ_TAG_AUDIO => (*(p as *mut AiAudioReq)).ctx == ctx,
+            _ => false,
+        };
+        if mine {
+            ai_teardown_abort(p, tag);
+        }
+        p = next;
+    }
+    let mut running: c_int = 0;
+    curl::curl_multi_socket_action(g_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
 }
 
 thread_local! {
@@ -1790,6 +1958,9 @@ thread_local! {
  * wd_next + last_rx (the AiReqHdr prefix) are shared by the stall
  * watchdog; complete_write_cb is shared with AiEmbedReq, so both structs
  * MUST keep the prefix field order identical. */
+#[repr(C)]
+/// repr(C): complete_write_cb + the watchdog read the header prefix
+/// through AiCompleteReq/AiReqHdr casts — field order is load-bearing.
 #[repr(C)]
 struct AiCompleteReq {
     tag: c_int,
@@ -1819,12 +1990,177 @@ struct AiEmbedReq {
     num_inputs: usize,
 }
 
+/// M2: provider audio request (transcribe/speak). Same header prefix as
+/// AiEmbedReq so complete_write_cb + the watchdog work unchanged.
+/// `mime` owns the multipart body (transcribe); `post_body` the JSON body
+/// (speak). `audio` keeps upload bytes alive for the transfer.
+#[repr(C)]
+struct AiAudioReq {
+    tag: c_int, /* must be first — REQ_TAG_AUDIO */
+    wd_next: *mut c_void,
+    last_rx: std::time::Instant,
+    ctx: *mut JSContext,
+    promise: *mut PromiseHandle,
+    provider: Provider,
+    response_body: Vec<u8>,
+    headers: *mut CurlSlist,
+    post_body: Option<CString>,
+    mime: *mut curl::CurlMime,
+    audio: Vec<u8>,
+    kind: u8, /* 0 = transcribe (JSON {text}), 1 = speak (raw bytes) */
+    format: String, /* speak response label ("mp3"); empty for transcribe */
+    easy: *mut Curl,
+}
+
+/// Free the mime body (curl_easy_cleanup does NOT free it).
+unsafe fn audio_req_free_mime(r: *mut AiAudioReq) {
+    if !(*r).mime.is_null() {
+        curl::curl_mime_free((*r).mime);
+        (*r).mime = ptr::null_mut();
+    }
+}
+
+/// Parse a transcription body (`{"text": "..."}`) into `{text}`.
+/// Undefined on any shape failure (caller rejects).
+unsafe fn extract_transcript(ctx: *mut JSContext, raw: &[u8]) -> JSValue {
+    let c = match CString::new(raw) {
+        Ok(c) => c,
+        Err(_) => return qjs::sofuu_js_undefined(),
+    };
+    let v = qjs::JS_ParseJSON(ctx, c.as_ptr(), c.as_bytes().len(), c"<transcript>".as_ptr());
+    if qjs::is_exception(v) {
+        qjs::sofuu_js_get_exception(ctx);
+        return qjs::sofuu_js_undefined();
+    }
+    let t = qjs::sofuu_js_get_property_str(ctx, v, c"text".as_ptr());
+    let s = cstr_opt(ctx, t);
+    qjs::sofuu_js_free_value(ctx, t);
+    qjs::sofuu_js_free_value(ctx, v);
+    let text = match s {
+        Some(t) if !t.is_empty() => t,
+        _ => return qjs::sofuu_js_undefined(),
+    };
+    let obj = qjs::JS_NewObject(ctx);
+    if qjs::is_exception(obj) {
+        return obj;
+    }
+    let cs = CString::new(text).unwrap_or_default();
+    let sv = qjs::sofuu_js_new_string(ctx, cs.as_ptr());
+    qjs::sofuu_js_set_property_str(ctx, obj, c"text".as_ptr(), sv);
+    obj
+}
+
+/// Package raw audio bytes as `{audio: Uint8Array, format}`.
+/// Undefined when the buffer cannot be constructed.
+unsafe fn audio_bytes_result(ctx: *mut JSContext, raw: &[u8], format: &str) -> JSValue {
+    if raw.is_empty() || raw.len() > AI_MAX_RESPONSE {
+        return qjs::sofuu_js_undefined();
+    }
+    let ab = qjs::JS_NewArrayBufferCopy(ctx, raw.as_ptr(), raw.len());
+    if qjs::is_exception(ab) {
+        return ab;
+    }
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Uint8Array".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    let u8 = qjs::JS_CallConstructor(ctx, ctor, 1, &ab);
+    qjs::sofuu_js_free_value(ctx, ab);
+    qjs::sofuu_js_free_value(ctx, ctor);
+    if qjs::is_exception(u8) {
+        return u8;
+    }
+    let obj = qjs::JS_NewObject(ctx);
+    if qjs::is_exception(obj) {
+        qjs::sofuu_js_free_value(ctx, u8);
+        return obj;
+    }
+    qjs::sofuu_js_set_property_str(ctx, obj, c"audio".as_ptr(), u8);
+    let fc = CString::new(format).unwrap_or_default();
+    let fv = qjs::sofuu_js_new_string(ctx, fc.as_ptr());
+    qjs::sofuu_js_set_property_str(ctx, obj, c"format".as_ptr(), fv);
+    obj
+}
+
+/// Strict base64 decode (standard alphabet + `=` pad only; rejects
+/// whitespace/URL-safe variants). The headless bridge encoding — hosts
+/// base64 audio themselves (1 line in Swift/Kotlin), so the C ABI never
+/// touches raw bytes and the funnel stays JSON.
+fn b64_val(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'=' => Some(0),
+        _ => None,
+    }
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() % 4 != 0 {
+        return None;
+    }
+    // Padding (max 2) only in the final quantum.
+    for (i, &c) in b.iter().enumerate() {
+        let last_q = i / 4 == b.len() / 4 - 1;
+        if c == b'=' && !last_q {
+            return None;
+        }
+        b64_val(c)?;
+    }
+    // In the final quantum, pad may only trail (positions 2..3, and
+    // position 2 requires position 3).
+    let last = &b[b.len() - 4..];
+    if last[0] == b'=' || last[1] == b'=' || (last[2] == b'=' && last[3] != b'=') {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for q in b.chunks_exact(4) {
+        let n = ((b64_val(q[0])? as u32) << 18)
+            | ((b64_val(q[1])? as u32) << 12)
+            | ((b64_val(q[2])? as u32) << 6)
+            | (b64_val(q[3])? as u32);
+        out.push((n >> 16) as u8);
+        if q[2] != b'=' {
+            out.push((n >> 8) as u8);
+        }
+        if q[3] != b'=' {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Read a Uint8Array/ArrayBuffer argument into owned bytes.
+unsafe fn read_audio_bytes(ctx: *mut JSContext, val: JSValueConst) -> Result<Vec<u8>, JSValue> {
+    let err = || qjs::JS_ThrowTypeError(ctx, c"expected audio bytes (Uint8Array)".as_ptr());
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(ctx, val, &mut byte_offset, &mut byte_length, ptr::null_mut());
+    if qjs::is_exception(buf) {
+        qjs::sofuu_js_free_value(ctx, buf);
+        return Err(err());
+    }
+    let mut buf_size: usize = 0;
+    let p = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    if p.is_null() || byte_length == 0 || byte_offset + byte_length > buf_size {
+        qjs::sofuu_js_free_value(ctx, buf);
+        return Err(err());
+    }
+    let out = std::slice::from_raw_parts(p.add(byte_offset), byte_length).to_vec();
+    qjs::sofuu_js_free_value(ctx, buf);
+    Ok(out)
+}
+
 struct AiPollCtx {
     sockfd: c_int,
     poll: *mut UvPoll,
 }
 
 unsafe extern "C" fn ai_poll_close_cb(h: *mut UvHandle) {
+    crate::rt::event_loop::untrack_handle(h);
     // SAFETY: data set at creation (poll handle's own storage is separate,
     // same split as the M4 fetch port's CurlContext).
     let c = *(h as *mut *mut AiPollCtx);
@@ -2494,8 +2830,14 @@ unsafe fn ai_check_multi() {
                 let raw: &[u8] = &(*req).response_body;
 
                 if status >= 400 {
-                    let raw_c = CString::new(raw).unwrap_or_default();
-                    let err = qjs::sofuu_js_new_string(ctx, raw_c.as_ptr());
+                    /* P3 (AUDIT-2026-09-07): JS_NewStringLen — CString::new
+                     * fails on an interior NUL and unwrap_or_default() then
+                     * rejected the promise with an EMPTY error payload. */
+                    let err = qjs::JS_NewStringLen(
+                        ctx,
+                        raw.as_ptr() as *const c_char,
+                        raw.len(),
+                    );
                     sofuu_promise_reject((*req).promise, err);
                 } else {
                     /* extract_text returns the stripped answer + the think
@@ -2503,32 +2845,32 @@ unsafe fn ai_check_multi() {
                        think_buf (no shared global → no data race). */
                     let (text, think) = extract_text((*req).provider, raw);
                     let result = qjs::sofuu_js_new_object(ctx);
-                    let text_c = CString::new(text.as_slice()).unwrap_or_default();
-                    qjs::sofuu_js_set_property_str(
+                    /* P3 (AUDIT-2026-09-07): JS_NewStringLen — CString::new
+                     * fails on an interior NUL and unwrap_or_default() then
+                     * surfaced an EMPTY text (same class as proc-10). */
+                    let text_js = qjs::JS_NewStringLen(
                         ctx,
-                        result,
-                        c"text".as_ptr(),
-                        qjs::sofuu_js_new_string(ctx, text_c.as_ptr()),
+                        text.as_ptr() as *const c_char,
+                        text.len(),
                     );
+                    qjs::sofuu_js_set_property_str(ctx, result, c"text".as_ptr(), text_js);
 
                     /* native_think: Anthropic extended-thinking field */
                     let native_think = extract_json_field(raw, "thinking");
                     if !native_think.is_empty() {
-                        let nt_c = CString::new(native_think.as_slice()).unwrap_or_default();
-                        qjs::sofuu_js_set_property_str(
+                        let nt_js = qjs::JS_NewStringLen(
                             ctx,
-                            result,
-                            c"thinking".as_ptr(),
-                            qjs::sofuu_js_new_string(ctx, nt_c.as_ptr()),
+                            native_think.as_ptr() as *const c_char,
+                            native_think.len(),
                         );
+                        qjs::sofuu_js_set_property_str(ctx, result, c"thinking".as_ptr(), nt_js);
                     } else if !think.is_empty() {
-                        let th_c = CString::new(think.as_slice()).unwrap_or_default();
-                        qjs::sofuu_js_set_property_str(
+                        let th_js = qjs::JS_NewStringLen(
                             ctx,
-                            result,
-                            c"thinking".as_ptr(),
-                            qjs::sofuu_js_new_string(ctx, th_c.as_ptr()),
+                            think.as_ptr() as *const c_char,
+                            think.len(),
                         );
+                        qjs::sofuu_js_set_property_str(ctx, result, c"thinking".as_ptr(), th_js);
                     }
                     /* Attach tool_calls array if the model requested a function call */
                     let tool_calls = extract_tool_calls(ctx, (*req).provider, raw);
@@ -2543,13 +2885,15 @@ unsafe fn ai_check_multi() {
                         );
                     }
                     /* Expose the raw JSON response payload for advanced manual stat extraction */
-                    let raw_c = CString::new(raw).unwrap_or_default();
-                    qjs::sofuu_js_set_property_str(
+                    /* P3 (AUDIT-2026-09-07): JS_NewStringLen — CString::new
+                     * fails on an interior NUL and unwrap_or_default()
+                     * surfaced an EMPTY raw payload (same class as proc-10). */
+                    let raw_js = qjs::JS_NewStringLen(
                         ctx,
-                        result,
-                        c"raw".as_ptr(),
-                        qjs::sofuu_js_new_string(ctx, raw_c.as_ptr()),
+                        raw.as_ptr() as *const c_char,
+                        raw.len(),
                     );
+                    qjs::sofuu_js_set_property_str(ctx, result, c"raw".as_ptr(), raw_js);
                     sofuu_promise_resolve((*req).promise, result);
                     qjs::sofuu_js_free_value(ctx, result);
                 }
@@ -2581,8 +2925,17 @@ unsafe fn ai_check_multi() {
                 let raw: &[u8] = &(*req).response_body;
 
                 if status >= 400 {
-                    let raw_c = CString::new(raw).unwrap_or_default();
-                    sofuu_promise_reject((*req).promise, qjs::sofuu_js_new_string(ctx, raw_c.as_ptr()));
+                    /* P3 (AUDIT-2026-09-07): JS_NewStringLen — CString::new
+                     * fails on an interior NUL and unwrap_or_default() then
+                     * rejected with an EMPTY error payload. */
+                    sofuu_promise_reject(
+                        (*req).promise,
+                        qjs::JS_NewStringLen(
+                            ctx,
+                            raw.as_ptr() as *const c_char,
+                            raw.len(),
+                        ),
+                    );
                 } else {
                     let result = extract_embeddings(ctx, (*req).provider, raw, (*req).num_inputs);
                     if qjs::is_undefined(result) {
@@ -2613,12 +2966,77 @@ unsafe fn ai_check_multi() {
                 curl::curl_slist_free_all((*req).headers);
             }
             drop(Box::from_raw(req));
+        } else if tag == REQ_TAG_AUDIO {
+            let req = base as *mut AiAudioReq;
+            let ctx = (*req).ctx;
+
+            if code == curl::CURLE_OK {
+                let mut status: c_long = 0;
+                curl::curl_easy_getinfo(easy, curl::CURLINFO_RESPONSE_CODE, &mut status as *mut c_long);
+                let raw: &[u8] = &(*req).response_body;
+
+                if status >= 400 {
+                    sofuu_promise_reject(
+                        (*req).promise,
+                        qjs::JS_NewStringLen(
+                            ctx,
+                            raw.as_ptr() as *const c_char,
+                            raw.len(),
+                        ),
+                    );
+                } else if (*req).kind == 0 {
+                    // Transcribe: JSON {"text": "..."}.
+                    let result = extract_transcript(ctx, raw);
+                    if qjs::is_undefined(result) {
+                        sofuu_promise_reject(
+                            (*req).promise,
+                            qjs::sofuu_js_new_string(ctx, c"Failed to parse transcription.".as_ptr()),
+                        );
+                    } else {
+                        sofuu_promise_resolve((*req).promise, result);
+                        qjs::sofuu_js_free_value(ctx, result);
+                    }
+                } else {
+                    // Speak: raw audio bytes → {audio: Uint8Array, format}.
+                    let result = audio_bytes_result(ctx, raw, (*req).format.as_str());
+                    if qjs::is_undefined(result) {
+                        sofuu_promise_reject(
+                            (*req).promise,
+                            qjs::sofuu_js_new_string(ctx, c"Failed to package spoken audio.".as_ptr()),
+                        );
+                    } else {
+                        sofuu_promise_resolve((*req).promise, result);
+                        qjs::sofuu_js_free_value(ctx, result);
+                    }
+                }
+            } else {
+                let err = if code == curl::CURLE_OPERATION_TIMEDOUT {
+                    let m = CString::new(
+                        ai_timeout_message(easy_http_code(easy), ai_stall_timeout_secs()),
+                    )
+                    .unwrap_or_default();
+                    qjs::sofuu_js_new_string(ctx, m.as_ptr())
+                } else {
+                    qjs::sofuu_js_new_string(ctx, curl::curl_easy_strerror(code))
+                };
+                sofuu_promise_reject((*req).promise, err);
+            }
+
+            active_unlink(req as *mut c_void);
+            audio_req_free_mime(req);
+            if !(*req).headers.is_null() {
+                curl::curl_slist_free_all((*req).headers);
+            }
+            drop(Box::from_raw(req));
         } else if tag == REQ_TAG_STREAM {
             let req = base as *mut AiStreamReq;
             let ctx = (*req).ctx;
 
             if code != curl::CURLE_OK {
-                if qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
+                /* net-11: once [DONE] signalled, the turn is committed —
+                 * a late transfer error (e.g. CURLE_PARTIAL_FILE after the
+                 * answer) must not overlay it. Same rule as stall_abort. */
+                if (*req).done_called == 0 && qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
                     /* An aborted-by-us transfer (in-stream error frame)
                      * carries the real provider message; a timeout gets the
                      * stall/connect explanation; anything else the plain
@@ -2645,17 +3063,16 @@ unsafe fn ai_check_multi() {
                 let mut http_code: c_long = 0;
                 curl::curl_easy_getinfo(easy, curl::CURLINFO_RESPONSE_CODE, &mut http_code as *mut c_long);
                 if http_code >= 400 {
-                    if qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
+                    /* net-11: an exact-length 4xx/5xx body can itself carry
+                     * a `data: [DONE]` frame (the write callback parses
+                     * frames regardless of status) — done wins over the
+                     * status error. */
+                    if (*req).done_called == 0 && qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
                         let raw = (*req).error_body.clone();
                         let mut detail = String::new();
                         // Try JSON {error:{message,code}} or {message}
                         if !raw.is_empty() {
                             let body_str = String::from_utf8_lossy(&raw);
-                            // Lightweight: look for "message" field without a full JSON dep.
-                            {
-                                let v = extract_json_field(&raw, "message");
-                                if !v.is_empty() { /* exercised — real extraction below uses JS parse */ }
-                            }
                             // Try to parse as JSON via QuickJS for richer error.message extraction (when JS context is alive).
                             // Fallback: truncated raw body.
                             let parsed_msg = {
@@ -2694,23 +3111,54 @@ unsafe fn ai_check_multi() {
                         qjs::sofuu_js_free_value(ctx, r);
                     }
                 } else if (*req).done_called == 0 {
-                    /* Ensure done is called even if server omitted [DONE]
-                     * (Anthropic ends with message_stop, not [DONE]) — and
-                     * carry the usage collected so far, same as the [DONE]
-                     * path (calling done_fn with no argument would freeze
-                     * the factory's initial {0,0} usage object). */
-                    (*req).done_called = 1;
-                    if qjs::JS_IsFunction(ctx, (*req).done_fn) != 0 {
-                        let stats = qjs::sofuu_js_new_object(ctx);
-                        set_stream_stats(ctx, stats, (*req).prompt_tokens, (*req).completion_tokens,
-                                         (*req).cache_read_tokens, (*req).cache_write_tokens);
-                        set_stream_finish(ctx, stats, req);
-                        let r = qjs::JS_Call(ctx, (*req).done_fn, qjs::sofuu_js_undefined(), 1, &stats);
+                    /* OpenAI-wire providers (openai | custom): a clean EOF
+                     * with NO [DONE] and NO captured finish_reason is a
+                     * truncated transfer, not a complete answer — calling
+                     * done here made the factory return the partial text
+                     * as "success" and the retry/CONTINUE ladder never
+                     * fired (bench S3 rcut: partial text then abrupt
+                     * res.end()). Route it to error_fn with a
+                     * transient-classified message ("transfer closed") so
+                     * streamWithRetry retries or continues from the
+                     * partial. Anthropic ends with message_stop and Local
+                     * providers end without either marker — for them (and
+                     * when no error_fn exists, or a finish_reason WAS
+                     * captured) the original ensure-done path stands. */
+                    if matches!((*req).provider, Provider::OpenAi | Provider::Custom)
+                        && (*req).finish_len == 0
+                        && qjs::JS_IsFunction(ctx, (*req).error_fn) != 0
+                    {
+                        (*req).done_called = 1; /* committed: nothing re-fires */
+                        let emsg = CString::new(
+                            "stream ended without [DONE] (transfer closed) — possible truncation",
+                        )
+                        .unwrap_or_default();
+                        let e = qjs::sofuu_js_new_string(ctx, emsg.as_ptr());
+                        let r = qjs::JS_Call(ctx, (*req).error_fn, qjs::sofuu_js_undefined(), 1, &e);
                         if qjs::is_exception(r) {
                             qjs::js_std_dump_error(ctx);
                         }
+                        qjs::sofuu_js_free_value(ctx, e);
                         qjs::sofuu_js_free_value(ctx, r);
-                        qjs::sofuu_js_free_value(ctx, stats);
+                    } else {
+                        /* Ensure done is called even if server omitted [DONE]
+                         * (Anthropic ends with message_stop, not [DONE]) — and
+                         * carry the usage collected so far, same as the [DONE]
+                         * path (calling done_fn with no argument would freeze
+                         * the factory's initial {0,0} usage object). */
+                        (*req).done_called = 1;
+                        if qjs::JS_IsFunction(ctx, (*req).done_fn) != 0 {
+                            let stats = qjs::sofuu_js_new_object(ctx);
+                            set_stream_stats(ctx, stats, (*req).prompt_tokens, (*req).completion_tokens,
+                                             (*req).cache_read_tokens, (*req).cache_write_tokens);
+                            set_stream_finish(ctx, stats, req);
+                            let r = qjs::JS_Call(ctx, (*req).done_fn, qjs::sofuu_js_undefined(), 1, &stats);
+                            if qjs::is_exception(r) {
+                                qjs::js_std_dump_error(ctx);
+                            }
+                            qjs::sofuu_js_free_value(ctx, r);
+                            qjs::sofuu_js_free_value(ctx, stats);
+                        }
                     }
                 }
             }
@@ -2765,6 +3213,7 @@ unsafe fn parse_ai_args(
             content: cstr_opt(ctx, *argv),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }];
 
         if argc > 1 && qjs::is_object(*argv.add(1)) {
@@ -2823,13 +3272,36 @@ unsafe fn parse_ai_args(
                     };
                     let tid = qjs::sofuu_js_get_property_str(ctx, msg, c"tool_call_id".as_ptr());
                     let tool_call_id = if qjs::sofuu_js_is_string(tid) != 0 { cstr_opt(ctx, tid) } else { None };
+                    /* images: optional array of data-URL strings on user
+                     * messages — JSON-stringified like tool_calls so the
+                     * body builders can split it without re-parsing. */
+                    let imgs = qjs::sofuu_js_get_property_str(ctx, msg, c"images".as_ptr());
+                    let images = if qjs::JS_IsArray(ctx, imgs) != 0 {
+                        let json = qjs::JS_JSONStringify(
+                            ctx,
+                            imgs,
+                            qjs::sofuu_js_undefined(),
+                            qjs::sofuu_js_undefined(),
+                        );
+                        let s = if qjs::is_undefined(json) {
+                            None
+                        } else {
+                            let s = cstr_opt(ctx, json);
+                            qjs::sofuu_js_free_value(ctx, json);
+                            s
+                        };
+                        s
+                    } else {
+                        None
+                    };
                     qjs::sofuu_js_free_value(ctx, r);
                     qjs::sofuu_js_free_value(ctx, c);
                     qjs::sofuu_js_free_value(ctx, tc);
                     qjs::sofuu_js_free_value(ctx, tid);
-                    messages.push(AiMessage { role, content, tool_calls, tool_call_id });
+                    qjs::sofuu_js_free_value(ctx, imgs);
+                    messages.push(AiMessage { role, content, tool_calls, tool_call_id, images: parse_image_urls(images.as_deref()) });
                 } else {
-                    messages.push(AiMessage { role: None, content: None, tool_calls: None, tool_call_id: None });
+                    messages.push(AiMessage { role: None, content: None, tool_calls: None, tool_call_id: None, images: Vec::new() });
                 }
                 qjs::sofuu_js_free_value(ctx, msg);
             }
@@ -2998,8 +3470,25 @@ unsafe fn parse_ai_args(
     }
 
     cfg.provider = parse_provider(provider_str.as_deref());
-    /* No model substitution: missing model surfaces as an actionable error
-     * at the call sites (see require_model). */
+    /* E2: headless defaults. A host that set `provider`/`model`/`base_url` in
+     * sofuu_rt_new config (there is no interactive /model picker inside an
+     * app) gets them here — but ONLY when the call did not specify them, so
+     * an explicit per-call value always wins. Chat/CLI is unaffected: it
+     * never installs runtime settings, so these are always None there and
+     * the "no model configured" error still fires. */
+    if provider_str.is_none() {
+        if let Some(p) = crate::embed_config::default_provider() {
+            cfg.provider = parse_provider(Some(&p));
+        }
+    }
+    if cfg.model.is_none() {
+        cfg.model = crate::embed_config::default_model();
+    }
+    if cfg.base_url.is_none() {
+        cfg.base_url = crate::embed_config::default_base_url();
+    }
+    /* Still no silent model substitution: with no default configured either,
+     * a missing model surfaces as an actionable error (see require_model). */
 
     Ok(cfg)
 }
@@ -3011,9 +3500,11 @@ unsafe fn parse_embed_args(
 ) -> Result<AiEmbedConfig, ()> {
     let mut cfg = AiEmbedConfig {
         provider: Provider::OpenAi,
+        provider_explicit: false,
         model: None,
         api_key: None,
         base_url: None,
+        space: None,
         inputs: Vec::new(),
     };
 
@@ -3068,9 +3559,33 @@ unsafe fn parse_embed_args(
             cfg.base_url = cstr_opt(ctx, v);
         }
         qjs::sofuu_js_free_value(ctx, v);
+
+        /* H-E1: local embedding space ("sem2-64" default, "sem1-64",
+         * "hash-768"). Only meaningful on the local path. */
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"space".as_ptr());
+        if !qjs::is_undefined(v) {
+            cfg.space = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
     }
 
+    cfg.provider_explicit = provider_str.is_some();
     cfg.provider = parse_provider(provider_str.as_deref());
+    /* E2: same headless defaults as the completion path, applied only when
+     * the call omitted them. Lets a host pin one provider/model/endpoint for
+     * the whole embedded runtime (e.g. a local OpenAI-compatible server). */
+    if !cfg.provider_explicit {
+        if let Some(p) = crate::embed_config::default_provider() {
+            cfg.provider = parse_provider(Some(&p));
+            cfg.provider_explicit = true;
+        }
+    }
+    if cfg.model.is_none() {
+        cfg.model = crate::embed_config::default_model();
+    }
+    if cfg.base_url.is_none() {
+        cfg.base_url = crate::embed_config::default_base_url();
+    }
     /* No model substitution: missing model is an actionable error at
      * js_ai_embed (see require_model). */
 
@@ -3102,6 +3617,16 @@ unsafe extern "C" fn js_ai_complete(
         Ok(c) => c,
         Err(()) => return qjs::sofuu_js_exception(),
     };
+
+    /* P3 (AUDIT-2026-09-07): curl_easy_init() can return NULL (global init
+     * failure / OOM) — an unchecked handle made every setopt a silent no-op
+     * and the request die with an opaque curl error. Init here, before
+     * anything is allocated, so the failure path is a clean throw. */
+    let easy = curl::curl_easy_init();
+    if easy.is_null() {
+        qjs::JS_ThrowInternalError(ctx, c"ai.complete: curl init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
 
     let eff = effective_provider(&cfg);
     if !require_model(cfg.model.as_deref()) {
@@ -3152,7 +3677,6 @@ unsafe extern "C" fn js_ai_complete(
         easy: ptr::null_mut(),
     });
 
-    let easy = curl::curl_easy_init();
     req.easy = easy;
     let url_c = CString::new(url).unwrap_or_default();
     let body = req.post_body.as_ref().unwrap();
@@ -3286,6 +3810,16 @@ unsafe extern "C" fn js_ai_stream(
         Err(()) => return qjs::sofuu_js_exception(),
     };
 
+    /* P3 (AUDIT-2026-09-07): curl_easy_init() can return NULL (global init
+     * failure / OOM) — an unchecked handle made every setopt a silent no-op
+     * and the request die with an opaque curl error. Init here, before
+     * anything is allocated, so the failure path is a clean throw. */
+    let easy = curl::curl_easy_init();
+    if easy.is_null() {
+        qjs::JS_ThrowInternalError(ctx, c"ai.stream: curl init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
+
     let eff = effective_provider(&cfg);
     if !require_model(cfg.model.as_deref()) {
         return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
@@ -3376,8 +3910,8 @@ unsafe extern "C" fn js_ai_stream(
     qjs::sofuu_js_free_value(ctx, done_fn);
     qjs::sofuu_js_free_value(ctx, error_fn);
     qjs::sofuu_js_free_value(ctx, think_fn);
+    qjs::sofuu_js_free_value(ctx, tool_calls_fn);
 
-    let easy = curl::curl_easy_init();
     req.easy = easy;
     let url_c = CString::new(url).unwrap_or_default();
     let body = req.post_body.as_ref().unwrap();
@@ -3409,7 +3943,9 @@ unsafe extern "C" fn js_ai_stream(
         qjs::sofuu_js_free_value(ctx, req.done_fn);
         qjs::sofuu_js_free_value(ctx, req.error_fn);
         qjs::sofuu_js_free_value(ctx, req.think_fn);
+        qjs::sofuu_js_free_value(ctx, req.tool_calls_fn);
         drop(req);
+        qjs::sofuu_js_free_value(ctx, iterator);
         return qjs::sofuu_js_exception();
     }
 
@@ -3430,6 +3966,137 @@ unsafe extern "C" fn js_ai_stream(
 }
 
 /* ------------------------------------------------------------------ */
+/* H-E1: local embedding path for ai.embed / ai.embedBatch             */
+/* ------------------------------------------------------------------ */
+
+/// Space tag: 0 = SEM2-64 (default), 1 = SEM1-64, 2 = hash-768.
+unsafe fn check_embed_space(ctx: *mut JSContext, space: Option<&str>) -> Result<u8, JSValue> {
+    match space {
+        None | Some("") | Some("sem2-64") | Some("sem2") => Ok(0),
+        Some("sem1-64") | Some("sem1") => Ok(1),
+        Some("hash-768") | Some("hash") => Ok(2),
+        _ => Err(qjs::JS_ThrowTypeError(
+            ctx,
+            c"ai.embed: unknown space (\"sem2-64\" default, \"sem1-64\", \"hash-768\")".as_ptr(),
+        )),
+    }
+}
+
+unsafe fn embed_one_local(tag: u8, text: &str) -> Option<Vec<f32>> {
+    match tag {
+        0 => crate::embedding::semantic_v2::semantic_v2(text),
+        1 => crate::embedding::semantic_v1(text),
+        _ => {
+            let mut h = vec![0f32; crate::embedding::HASH_DIM];
+            crate::embedding::hash_v1_features_into(text, &mut h);
+            Some(h)
+        }
+    }
+}
+
+/// Build a Float32Array from Rust floats (fast typed-buffer path with a
+/// property fallback, mirroring js_ai_embed_local). Returns an exception
+/// value on failure.
+unsafe fn new_f32array(ctx: *mut JSContext, vals: &[f32]) -> JSValue {
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let f32_ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Float32Array".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    let len_arg = qjs::sofuu_js_new_int32(ctx, vals.len() as i32);
+    let arr = qjs::JS_CallConstructor(ctx, f32_ctor, 1, &len_arg);
+    qjs::sofuu_js_free_value(ctx, len_arg);
+    qjs::sofuu_js_free_value(ctx, f32_ctor);
+    if qjs::is_exception(arr) || vals.is_empty() {
+        return arr;
+    }
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(ctx, arr, &mut byte_offset, &mut byte_length, ptr::null_mut());
+    if qjs::is_exception(buf) {
+        qjs::sofuu_js_free_value(ctx, arr);
+        return qjs::sofuu_js_exception();
+    }
+    let mut buf_size: usize = 0;
+    let p = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    if p.is_null() || byte_offset + vals.len() * std::mem::size_of::<f32>() > buf_size {
+        qjs::sofuu_js_free_value(ctx, buf);
+        qjs::sofuu_js_free_value(ctx, arr);
+        return qjs::JS_ThrowTypeError(ctx, c"ai.embed: cannot access typed-array buffer".as_ptr());
+    }
+    let out = std::slice::from_raw_parts_mut(p.add(byte_offset) as *mut f32, vals.len());
+    out.copy_from_slice(vals);
+    qjs::sofuu_js_free_value(ctx, buf);
+    arr
+}
+
+/// Resolve the local path: embed `inputs` in `space` and return an
+/// already-resolved Promise (single Float32Array, or Array of them when
+/// `always_array` or more than one input). Unknown space throws (arg
+/// validation); a missing baked model rejects (runtime failure).
+unsafe fn resolve_local_embed(
+    ctx: *mut JSContext,
+    inputs: &[String],
+    space: Option<&str>,
+    always_array: bool,
+) -> JSValue {
+    let tag = match check_embed_space(ctx, space) {
+        Ok(t) => t,
+        Err(exc) => return exc,
+    };
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+    for t in inputs {
+        match embed_one_local(tag, t) {
+            Some(v) => vecs.push(v),
+            None => {
+                let mut h: *mut PromiseHandle = ptr::null_mut();
+                let p = sofuu_promise_new(ctx, &mut h);
+                if qjs::is_exception(p) {
+                    return p;
+                }
+                let e = qjs::sofuu_js_new_string(ctx, c"ai.embed: bundled embedding model unavailable".as_ptr());
+                sofuu_promise_reject(h, e);
+                return p;
+            }
+        }
+    }
+    let value = if !always_array && vecs.len() == 1 {
+        new_f32array(ctx, &vecs[0])
+    } else {
+        let arr = qjs::JS_NewArray(ctx);
+        if qjs::is_exception(arr) {
+            return arr;
+        }
+        let mut ok = true;
+        for (i, v) in vecs.iter().enumerate() {
+            let el = new_f32array(ctx, v);
+            if qjs::is_exception(el) {
+                qjs::sofuu_js_free_value(ctx, el);
+                ok = false;
+                break;
+            }
+            qjs::JS_SetPropertyUint32(ctx, arr, i as u32, el);
+        }
+        if !ok {
+            qjs::sofuu_js_free_value(ctx, arr);
+            return qjs::sofuu_js_exception();
+        }
+        arr
+    };
+    if qjs::is_exception(value) {
+        return value;
+    }
+    let mut h: *mut PromiseHandle = ptr::null_mut();
+    let p = sofuu_promise_new(ctx, &mut h);
+    if qjs::is_exception(p) {
+        qjs::sofuu_js_free_value(ctx, value);
+        return p;
+    }
+    // resolve frees the handle (promise.rs); the value ref transfers in.
+    sofuu_promise_resolve(h, value);
+    qjs::sofuu_js_free_value(ctx, value);
+    p
+}
+
+/* ------------------------------------------------------------------ */
 /* JS: sofuu.ai.embed(input, opts?)  → Promise<Float32Array|Array>     */
 /* ------------------------------------------------------------------ */
 
@@ -3444,16 +4111,30 @@ unsafe extern "C" fn js_ai_embed(
         Err(()) => return qjs::sofuu_js_exception(),
     };
 
+    /* P3 (AUDIT-2026-09-07): curl_easy_init() can return NULL (global init
+     * failure / OOM) — an unchecked handle made every setopt a silent no-op
+     * and the request die with an opaque curl error. Init here, before
+     * anything is allocated, so the failure path is a clean throw. */
+    let easy = curl::curl_easy_init();
+    if easy.is_null() {
+        qjs::JS_ThrowInternalError(ctx, c"ai.embed: curl init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
+
+    /* H-E1: bundled local embeddings. Explicit provider:"local" (incl.
+     * legacy "ollama") embeds offline, and so does a call naming no
+     * provider, model, key, or URL at all (local default — zero-key
+     * offline). Anything else takes the network path below. */
+    let want_local = cfg.provider == Provider::Local
+        || (!cfg.provider_explicit
+            && cfg.model.is_none()
+            && cfg.base_url.is_none()
+            && cfg.api_key.is_none());
+    if want_local {
+        return resolve_local_embed(ctx, &cfg.inputs, cfg.space.as_deref(), false);
+    }
     if !require_model(cfg.model.as_deref()) {
         return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
-    }
-    if cfg.provider == Provider::Local {
-        return qjs::JS_ThrowTypeError(
-            ctx,
-            c"provider \"local\" is not available yet: local inference is roadmap \
-              Track B. Use embedLocal() for offline embeddings, or a remote provider."
-                .as_ptr(),
-        );
     }
     if cfg.provider == Provider::Custom
         && !matches!(cfg.base_url.as_deref(), Some(u) if !u.is_empty())
@@ -3488,10 +4169,11 @@ unsafe extern "C" fn js_ai_embed(
         num_inputs: cfg.inputs.len(),
     });
 
+    /* H-E1: Provider::Local never reaches here — the local path returns
+     * above. (P3 AUDIT-2026-09-07: the old Local arm was dead code behind
+     * the Track-B reject; the reject is gone, the early return replaces it.) */
     let mut url: String = if cfg.provider == Provider::OpenAi {
         "https://api.openai.com/v1/embeddings".to_string()
-    } else if cfg.provider == Provider::Local {
-        "http://127.0.0.1:11434/api/embed".to_string()
     } else {
         provider_api_url(cfg.provider, cfg.model.as_deref())
     };
@@ -3511,7 +4193,6 @@ unsafe extern "C" fn js_ai_embed(
         }
     }
 
-    let easy = curl::curl_easy_init();
     req.easy = easy;
     let url_c = CString::new(url).unwrap_or_default();
     let body = req.post_body.as_ref().unwrap();
@@ -3553,6 +4234,530 @@ unsafe extern "C" fn js_ai_embed(
     ai_check_multi();
 
     promise
+}
+
+/* ------------------------------------------------------------------ */
+/* H-E1 JS: sofuu.ai.embedBatch(texts[], opts?) → Promise<Array>        */
+/* Local-only vectorized batch (single lock, no JSON). Remote callers   */
+/* keep ai.embed([...]) with an explicit provider.                      */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ai_embed_batch(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || qjs::JS_IsArray(ctx, *argv) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.embedBatch(string[]) expected an array of strings".as_ptr());
+    }
+    let cfg = match parse_embed_args(ctx, argc, argv) {
+        Ok(c) => c,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    /* Local-only: any remote signal (explicit non-local provider, model,
+     * URL, key) is a caller error — remote batching lives on ai.embed([...]).
+     * No provider named = local, mirroring ai.embed's default. */
+    let remote_signal = (cfg.provider_explicit && cfg.provider != Provider::Local)
+        || cfg.model.is_some()
+        || cfg.base_url.is_some()
+        || cfg.api_key.is_some();
+    if remote_signal {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"ai.embedBatch is local-only; use ai.embed([...], { provider, model }) for remote providers".as_ptr(),
+        );
+    }
+    resolve_local_embed(ctx, &cfg.inputs, cfg.space.as_deref(), true)
+}
+
+/* ------------------------------------------------------------------ */
+/* M1 JS: sofuu.ai.embedImage(bytes) → Float32Array (sync)              */
+/* Image bytes (Uint8Array, e.g. from sofuu.fs.readFileBytes) → 64-dim  */
+/* unit vector in img1-64 space (joint with sem2-64 text geometry).     */
+/* Throws on undecodable bytes or a missing baked model.               */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ai_embed_image(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.embedImage(bytes) expected a Uint8Array".as_ptr());
+    }
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(ctx, *argv, &mut byte_offset, &mut byte_length, ptr::null_mut());
+    if qjs::is_exception(buf) {
+        qjs::sofuu_js_free_value(ctx, buf);
+        return qjs::JS_ThrowTypeError(ctx, c"ai.embedImage(bytes) expected a Uint8Array".as_ptr());
+    }
+    let mut buf_size: usize = 0;
+    let p = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    if p.is_null() || byte_offset + byte_length > buf_size {
+        qjs::sofuu_js_free_value(ctx, buf);
+        return qjs::JS_ThrowTypeError(ctx, c"ai.embedImage: cannot access byte buffer".as_ptr());
+    }
+    let bytes = std::slice::from_raw_parts(p.add(byte_offset), byte_length).to_vec();
+    qjs::sofuu_js_free_value(ctx, buf);
+    match crate::embedding::image::semantic_img(&bytes) {
+        Some(v) => new_f32array(ctx, &v),
+        None => qjs::JS_ThrowTypeError(
+            ctx,
+            c"ai.embedImage: undecodable image (PNG/JPEG, 2x2..2048px) or IMG1 model unavailable".as_ptr(),
+        ),
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* M2: provider audio — ai.transcribe / ai.speak (OpenAI-compatible)    */
+/* ------------------------------------------------------------------ */
+
+/// M2: 32MB input cap (readFileBytes allows 256MB; audio endpoints don't
+/// want novels — fail fast with a TypeError, not a 413 mid-transfer).
+const AUDIO_MAX_INPUT: usize = 32 * 1024 * 1024;
+
+/// Auth headers WITHOUT Content-Type (multipart sets its own boundary).
+unsafe fn build_auth_headers(p: Provider, api_key: Option<&str>) -> *mut CurlSlist {
+    let mut h: *mut CurlSlist = ptr::null_mut();
+    if let Some(key) = api_key {
+        if key.contains('\r') || key.contains('\n') {
+            return h;
+        }
+        if p == Provider::Anthropic {
+            let buf = format!("x-api-key: {}", key);
+            let c = CString::new(buf).unwrap_or_default();
+            h = curl::curl_slist_append(h, c.as_ptr());
+            h = curl::curl_slist_append(h, c"anthropic-version: 2023-06-01".as_ptr());
+        } else {
+            let buf = format!("Authorization: Bearer {}", key);
+            let c = CString::new(buf).unwrap_or_default();
+            h = curl::curl_slist_append(h, c.as_ptr());
+        }
+    }
+    h
+}
+
+/// Derive an audio endpoint from a chat-style base URL:
+/// …/chat/completions → …/audio/<leaf>; otherwise append /audio/<leaf>.
+fn audio_url_from_base(base: &str, leaf: &str) -> String {
+    let b = base.trim_end_matches('/');
+    if let Some(root) = b.strip_suffix("/chat/completions") {
+        format!("{root}/audio/{leaf}")
+    } else {
+        format!("{b}/audio/{leaf}")
+    }
+}
+
+fn audio_default_url(provider: Provider, leaf: &str) -> String {
+    // Only OpenAi has a built-in audio endpoint; every other provider must
+    // supply base_url (enforced by check_audio_provider). The parameter
+    // stays so callers read uniformly.
+    let _ = provider;
+    format!("https://api.openai.com/v1/audio/{leaf}")
+}
+
+/// Guess a filename extension → (filename, mime). Providers sniff format
+/// off the extension, so never send extensionless parts.
+fn audio_part_name(filename: Option<&str>) -> (CString, CString) {
+    let name = filename.filter(|s| !s.trim().is_empty()).unwrap_or("audio.wav");
+    let lower = name.to_lowercase();
+    let mime = if lower.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if lower.ends_with(".m4a") || lower.ends_with(".mp4") {
+        "audio/mp4"
+    } else if lower.ends_with(".ogg") || lower.ends_with(".oga") {
+        "audio/ogg"
+    } else if lower.ends_with(".flac") {
+        "audio/flac"
+    } else if lower.ends_with(".webm") {
+        "audio/webm"
+    } else {
+        "audio/wav"
+    };
+    (
+        CString::new(name).unwrap_or_default(),
+        CString::new(mime).unwrap_or_default(),
+    )
+}
+
+/// Shared audio opts: provider/model/api_key/base_url (+ voice/format/
+/// language/filename per call). Returns Err(()) after throwing.
+struct AudioOpts {
+    provider: Provider,
+    model: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    extra: Option<String>, // language (transcribe) or voice (speak)
+    format: Option<String>,
+    filename: Option<String>,
+}
+
+unsafe fn parse_audio_opts(
+    ctx: *mut JSContext,
+    argc: c_int,
+    argv: *const JSValueConst,
+    what: &str,
+) -> Result<AudioOpts, ()> {
+    let mut o = AudioOpts {
+        provider: Provider::OpenAi,
+        model: None,
+        api_key: None,
+        base_url: None,
+        extra: None,
+        format: None,
+        filename: None,
+    };
+    if argc > 1 && qjs::is_object(*argv.add(1)) {
+        let opts = *argv.add(1);
+        let mut v = qjs::sofuu_js_get_property_str(ctx, opts, c"provider".as_ptr());
+        let provider_str = if !qjs::is_undefined(v) { cstr_opt(ctx, v) } else { None };
+        qjs::sofuu_js_free_value(ctx, v);
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"model".as_ptr());
+        if !qjs::is_undefined(v) {
+            o.model = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"api_key".as_ptr());
+        if !qjs::is_undefined(v) {
+            o.api_key = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"base_url".as_ptr());
+        if !qjs::is_undefined(v) {
+            o.base_url = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+        // Per-call knobs share two slots; the caller names them.
+        let (extra_key, fmt_key, file_key) = if what == "transcribe" {
+            ("language", "", "filename")
+        } else {
+            ("voice", "format", "")
+        };
+        v = qjs::sofuu_js_get_property_str(
+            ctx,
+            opts,
+            CString::new(extra_key).unwrap_or_default().as_ptr(),
+        );
+        if !qjs::is_undefined(v) {
+            o.extra = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+        if !fmt_key.is_empty() {
+            v = qjs::sofuu_js_get_property_str(
+                ctx,
+                opts,
+                CString::new(fmt_key).unwrap_or_default().as_ptr(),
+            );
+            if !qjs::is_undefined(v) {
+                o.format = cstr_opt(ctx, v);
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+        }
+        if !file_key.is_empty() {
+            v = qjs::sofuu_js_get_property_str(
+                ctx,
+                opts,
+                CString::new(file_key).unwrap_or_default().as_ptr(),
+            );
+            if !qjs::is_undefined(v) {
+                o.filename = cstr_opt(ctx, v);
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+        }
+        o.provider = parse_provider(provider_str.as_deref());
+    }
+    Ok(o)
+}
+
+/// Validate provider/model for audio (no local STT in-binary; Anthropic
+/// has no audio API; custom needs a base URL). Throws + Err on failure.
+unsafe fn check_audio_provider(
+    ctx: *mut JSContext,
+    o: &AudioOpts,
+    what: &str,
+) -> Result<(), ()> {
+    if o.provider == Provider::Local {
+        let msg = format!("ai.{what}: no bundled speech model — point provider at an OpenAI-compatible audio endpoint");
+        let c = CString::new(msg).unwrap_or_default();
+        qjs::JS_ThrowTypeError(ctx, c.as_ptr());
+        return Err(());
+    }
+    if o.provider == Provider::Anthropic {
+        let msg = format!("ai.{what}: Anthropic provides no audio API");
+        let c = CString::new(msg).unwrap_or_default();
+        qjs::JS_ThrowTypeError(ctx, c.as_ptr());
+        return Err(());
+    }
+    if !require_model(o.model.as_deref()) {
+        qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
+        return Err(());
+    }
+    if o.provider == Provider::Custom
+        && !matches!(o.base_url.as_deref(), Some(u) if !u.is_empty())
+    {
+        qjs::JS_ThrowTypeError(
+            ctx,
+            c"custom provider needs a base URL (use /provider wizard or /baseurl)".as_ptr(),
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Launch an audio request (mime or post_body pre-attached to `req`;
+/// caller sets the URL + body kind first). Returns the JS Promise.
+unsafe fn audio_launch(
+    ctx: *mut JSContext,
+    easy: *mut Curl,
+    mut req: Box<AiAudioReq>,
+    url: String,
+    is_mime: bool,
+) -> JSValue {
+    req.easy = easy;
+    let url_c = CString::new(url).unwrap_or_default();
+    curl::curl_easy_setopt(easy, curl::CURLOPT_URL, url_c.as_ptr());
+    curl::curl_easy_setopt(easy, curl::CURLOPT_HTTPHEADER, req.headers);
+    if is_mime {
+        curl::curl_easy_setopt(easy, curl::CURLOPT_MIMEPOST, req.mime);
+    } else if let Some(body) = req.post_body.as_ref() {
+        curl::curl_easy_setopt(easy, curl::CURLOPT_POSTFIELDS, body.as_ptr());
+        curl::curl_easy_setopt(
+            easy,
+            curl::CURLOPT_POSTFIELDSIZE,
+            body.as_bytes().len() as c_long,
+        );
+    }
+    curl::curl_easy_setopt(easy, curl::CURLOPT_WRITEFUNCTION, complete_write_cb as *const c_void);
+    curl::curl_easy_setopt(easy, curl::CURLOPT_WRITEDATA, &mut *req as *mut AiAudioReq as *mut c_void);
+    curl::curl_easy_setopt(easy, curl::CURLOPT_SSL_VERIFYPEER, 1 as c_long);
+    curl::curl_easy_setopt(easy, curl::CURLOPT_MAXFILESIZE, AI_MAX_RESPONSE as c_long);
+    curl::curl_easy_setopt(easy, curl::CURLOPT_PRIVATE, &mut *req as *mut AiAudioReq as *mut c_void);
+    ai_set_patience(easy, 0);
+    let promise = sofuu_promise_new(ctx, &mut req.promise);
+    let req_ptr = Box::into_raw(req);
+
+    ai_ensure_init();
+    let mcode = curl::curl_multi_add_handle(g_multi(), (*req_ptr).easy);
+    if mcode != curl::CURLM_OK {
+        curl::curl_easy_cleanup((*req_ptr).easy);
+        audio_req_free_mime(req_ptr);
+        if !(*req_ptr).headers.is_null() {
+            curl::curl_slist_free_all((*req_ptr).headers);
+        }
+        let err = qjs::sofuu_js_new_string(ctx, curl::curl_multi_strerror(mcode));
+        sofuu_promise_reject((*req_ptr).promise, err);
+        drop(Box::from_raw(req_ptr));
+        return promise;
+    }
+    active_link(req_ptr as *mut c_void);
+
+    let mut running: c_int = 0;
+    curl::curl_multi_socket_action(g_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
+    ai_check_multi();
+
+    promise
+}
+
+/* JS: sofuu.ai.transcribe(audioBytes, opts?) → Promise<{text}> */
+unsafe extern "C" fn js_ai_transcribe(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.transcribe(audioBytes, opts?) expected audio bytes".as_ptr());
+    }
+    // Headless bridge form: {audio_b64: "..."} (hosts base64 themselves;
+    // the funnel stays JSON). Otherwise a Uint8Array.
+    let audio = if qjs::is_object(*argv) {
+        let b = qjs::sofuu_js_get_property_str(ctx, *argv, c"audio_b64".as_ptr());
+        let is_b64 = !qjs::is_undefined(b) && qjs::sofuu_js_is_string(b) != 0;
+        let s = if is_b64 { cstr_opt(ctx, b) } else { None };
+        qjs::sofuu_js_free_value(ctx, b);
+        if !is_b64 {
+            match read_audio_bytes(ctx, *argv) {
+                Ok(bytes) => bytes,
+                Err(e) => return e,
+            }
+        } else {
+            match s.as_deref().and_then(b64_decode) {
+                Some(bytes) if !bytes.is_empty() => bytes,
+                _ => {
+                    return qjs::JS_ThrowTypeError(
+                        ctx,
+                        c"ai.transcribe: audio_b64 is not valid base64".as_ptr(),
+                    )
+                }
+            }
+        }
+    } else {
+        match read_audio_bytes(ctx, *argv) {
+            Ok(b) => b,
+            Err(e) => return e,
+        }
+    };
+    if audio.len() > AUDIO_MAX_INPUT {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.transcribe: audio over the 32MB input cap".as_ptr());
+    }
+    let o = match parse_audio_opts(ctx, argc, argv, "transcribe") {
+        Ok(o) => o,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    if check_audio_provider(ctx, &o, "transcribe").is_err() {
+        return qjs::sofuu_js_exception();
+    }
+    let easy = curl::curl_easy_init();
+    if easy.is_null() {
+        qjs::JS_ThrowInternalError(ctx, c"ai.transcribe: curl init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
+
+    // Multipart: file + model + response_format=json (+ language).
+    let mime = curl::curl_mime_init(easy);
+    if mime.is_null() {
+        curl::curl_easy_cleanup(easy);
+        qjs::JS_ThrowInternalError(ctx, c"ai.transcribe: mime init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
+    // From here every failure path must free the mime handle.
+    let fail = |ctx: *mut JSContext,
+                easy: *mut Curl,
+                mime: *mut curl::CurlMime,
+                msg: &std::ffi::CStr|
+     -> JSValue {
+        curl::curl_mime_free(mime);
+        curl::curl_easy_cleanup(easy);
+        qjs::JS_ThrowTypeError(ctx, msg.as_ptr());
+        qjs::sofuu_js_exception()
+    };
+    let model_c = CString::new(o.model.clone().unwrap_or_default()).unwrap_or_default();
+    let (fname_c, ftype_c) = audio_part_name(o.filename.as_deref());
+    // Already inside unsafe fn js_ai_transcribe — no nested block needed.
+    let mut ok: bool;
+    let p = curl::curl_mime_addpart(mime);
+    ok = !p.is_null()
+        && curl::curl_mime_name(p, c"file".as_ptr()) == 0
+        && curl::curl_mime_filename(p, fname_c.as_ptr()) == 0
+        && curl::curl_mime_type(p, ftype_c.as_ptr()) == 0
+        && curl::curl_mime_data(p, audio.as_ptr() as *const c_char, audio.len()) == 0;
+    if ok {
+        let p = curl::curl_mime_addpart(mime);
+        ok = !p.is_null()
+            && curl::curl_mime_name(p, c"model".as_ptr()) == 0
+            && curl::curl_mime_data(p, model_c.as_ptr(), model_c.as_bytes().len()) == 0;
+    }
+    if ok {
+        let p = curl::curl_mime_addpart(mime);
+        ok = !p.is_null()
+            && curl::curl_mime_name(p, c"response_format".as_ptr()) == 0
+            && curl::curl_mime_data(p, c"json".as_ptr(), 4) == 0;
+    }
+    if ok {
+        if let Some(lang) = o.extra.as_deref().filter(|s| !s.is_empty()) {
+            let lang_c = CString::new(lang).unwrap_or_default();
+            let p = curl::curl_mime_addpart(mime);
+            ok = !p.is_null()
+                && curl::curl_mime_name(p, c"language".as_ptr()) == 0
+                && curl::curl_mime_data(p, lang_c.as_ptr(), lang_c.as_bytes().len()) == 0;
+        }
+    }
+    if !ok {
+        return fail(ctx, easy, mime, c"ai.transcribe: failed to build multipart body");
+    }
+
+    let url = match o.base_url.as_deref().filter(|s| !s.is_empty()) {
+        Some(bu) => audio_url_from_base(bu, "transcriptions"),
+        None => audio_default_url(o.provider, "transcriptions"),
+    };
+    let req = Box::new(AiAudioReq {
+        tag: REQ_TAG_AUDIO,
+        wd_next: ptr::null_mut(),
+        last_rx: std::time::Instant::now(),
+        ctx,
+        promise: ptr::null_mut(),
+        provider: o.provider,
+        response_body: Vec::new(),
+        headers: build_auth_headers(
+            o.provider,
+            resolve_api_key(o.provider, o.api_key.as_deref()).as_deref(),
+        ),
+        post_body: None,
+        mime,
+        audio,
+        kind: 0,
+        format: String::new(),
+        easy: ptr::null_mut(),
+    });
+    // curl_mime_data copies the payload, but the Box owns the bytes anyway.
+    audio_launch(ctx, easy, req, url, true)
+}
+
+/* JS: sofuu.ai.speak(text, opts?) → Promise<{audio: Uint8Array, format}> */
+unsafe extern "C" fn js_ai_speak(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.speak(text, opts?) expected a string".as_ptr());
+    }
+    let text = cstr_opt(ctx, *argv).unwrap_or_default();
+    if text.trim().is_empty() {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.speak: text must not be empty".as_ptr());
+    }
+    let o = match parse_audio_opts(ctx, argc, argv, "speak") {
+        Ok(o) => o,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    if check_audio_provider(ctx, &o, "speak").is_err() {
+        return qjs::sofuu_js_exception();
+    }
+    let voice = o.extra.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("alloy");
+    let format = o.format.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("mp3");
+    if !matches!(format, "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm") {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.speak: format must be mp3|opus|aac|flac|wav|pcm".as_ptr());
+    }
+    let easy = curl::curl_easy_init();
+    if easy.is_null() {
+        qjs::JS_ThrowInternalError(ctx, c"ai.speak: curl init failed".as_ptr());
+        return qjs::sofuu_js_exception();
+    }
+    let body = serde_json::json!({
+        "model": o.model.as_deref().unwrap_or(""),
+        "input": text,
+        "voice": voice,
+        "response_format": format,
+    })
+    .to_string();
+    let url = match o.base_url.as_deref().filter(|s| !s.is_empty()) {
+        Some(bu) => audio_url_from_base(bu, "speech"),
+        None => audio_default_url(o.provider, "speech"),
+    };
+    let req = Box::new(AiAudioReq {
+        tag: REQ_TAG_AUDIO,
+        wd_next: ptr::null_mut(),
+        last_rx: std::time::Instant::now(),
+        ctx,
+        promise: ptr::null_mut(),
+        provider: o.provider,
+        response_body: Vec::new(),
+        headers: build_headers(
+            o.provider,
+            resolve_api_key(o.provider, o.api_key.as_deref()).as_deref(),
+        ),
+        post_body: Some(CString::new(body).unwrap_or_default()),
+        mime: ptr::null_mut(),
+        audio: Vec::new(),
+        kind: 1,
+        format: format.to_string(),
+        easy: ptr::null_mut(),
+    });
+    audio_launch(ctx, easy, req, url, false)
 }
 
 /* ------------------------------------------------------------------ */
@@ -3699,10 +4904,13 @@ unsafe extern "C" fn js_ai_estimate_tokens(
 }
 
 /* ------------------------------------------------------------------ */
-/* sofuu.ai.modelCaps(model) → JSON string                               */
-/* Per-model capability registry lookup (rt/model_caps.rs): context      */
-/* window, max output tokens, thinking kind + ceiling + effort levels.   */
-/* Returns a JSON STRING (parse on the JS side — cheap, one object).     */
+/* sofuu.ai.modelCaps(model, baseUrl?) → JSON string                    */
+/* Per-model capability resolution (rt/model_caps.rs + the discovered   */
+/* store): context window, max output tokens, thinking kind + ceiling  */
+/* + effort levels. `baseUrl` (optional) is the endpoint the request    */
+/* will hit — when present, caps the endpoint itself published for this */
+/* exact model (harvested from its model listing) override the static   */
+/* family table. Returns a JSON STRING (parse on the JS side).          */
 /* ------------------------------------------------------------------ */
 
 unsafe extern "C" fn js_ai_model_caps(
@@ -3716,8 +4924,101 @@ unsafe extern "C" fn js_ai_model_caps(
     } else {
         None
     };
-    let caps = crate::rt::model_caps::lookup(model.as_deref());
+    let base_url: Option<String> = if argc >= 2 && qjs::sofuu_js_is_string(*argv.add(1)) != 0 {
+        cstr_opt(ctx, *argv.add(1))
+    } else {
+        None
+    };
+    let caps =
+        crate::rt::model_caps::lookup_for(model.as_deref(), base_url.as_deref());
     let json = caps.to_json(model.as_deref().unwrap_or(""));
+    match CString::new(json) {
+        Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+        Err(_) => qjs::sofuu_js_new_string(ctx, c"{}".as_ptr()),
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* sofuu.ai.resolveCaps(model, baseUrl?, cfgWindow?, cfgMaxOutput?,   */
+/*                          explicit?) → JSON string                   */
+/*                                                                     */
+/* The SINGLE evidence-ladder resolve every budget consumer uses        */
+/* (ring denominator, compaction trigger, attachment budgets, output   */
+/* caps, fitGuard): learned-from-400s > endpoint-discovered > registry */
+/* > conservative default.                                              */
+/*                                                                     */
+/* An INHERITED config number (config.json, carried across models)     */
+/* shrinks to the strictest REAL evidence — a flat ctx_window=1M can   */
+/* never shadow a 262k model's real window again (the P0 ring bug).    */
+/* An EXPLICIT number (the 5th arg true — `/ctx 1000000` typed now) is */
+/* obeyed as given and merely ADVISED against, so an explicit raise     */
+/* never silently turns into a no-op. Returns a JSON STRING:            */
+/*   {"window":N,"maxOutput":N,"known":bool,"source":"...",            */
+/*    "clampedConfig":bool,"configExceedsEvidence":N|null,              */
+/*    "winSource":"...","maxSource":"...","thinking":"..."}             */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ai_resolve_caps(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let model: Option<String> = if argc >= 1 && qjs::sofuu_js_is_string(*argv) != 0 {
+        cstr_opt(ctx, *argv)
+    } else {
+        None
+    };
+    let base_url: Option<String> = if argc >= 2 && qjs::sofuu_js_is_string(*argv.add(1)) != 0 {
+        cstr_opt(ctx, *argv.add(1))
+    } else {
+        None
+    };
+    let cfg_window: i64 = if argc >= 3 && qjs::is_number(*argv.add(2)) {
+        let mut n: i64 = 0;
+        qjs::JS_ToInt64(ctx, &mut n, *argv.add(2));
+        n
+    } else {
+        0
+    };
+    let cfg_max_output: i64 = if argc >= 4 && qjs::is_number(*argv.add(3)) {
+        let mut n: i64 = 0;
+        qjs::JS_ToInt64(ctx, &mut n, *argv.add(3));
+        n
+    } else {
+        0
+    };
+
+    let explicit: bool = argc >= 5 && qjs::is_bool(*argv.add(4)) && qjs::JS_ToBool(ctx, *argv.add(4)) != 0;
+
+    let r = crate::ml::alloc::policy::resolve_explicit(
+        model.as_deref(),
+        cfg_window,
+        cfg_max_output,
+        base_url.as_deref(),
+        explicit,
+    );
+    let thinking = crate::rt::model_caps::lookup(model.as_deref()).thinking;
+    let t_kind = match thinking {
+        crate::rt::model_caps::Thinking::None => "none",
+        crate::rt::model_caps::Thinking::Effort(_) => "effort",
+        crate::rt::model_caps::Thinking::Budget(_) => "budget",
+        crate::rt::model_caps::Thinking::Unknown => "unknown",
+    };
+    let json = format!(
+        "{{\"window\":{},\"maxOutput\":{},\"known\":{},\"source\":\"{}\",\"clampedConfig\":{},\"configExceedsEvidence\":{},\"winSource\":\"{}\",\"maxSource\":\"{}\",\"thinking\":\"{}\"}}",
+        r.window,
+        r.max_output,
+        r.known,
+        r.source.as_str(),
+        r.clamped_config,
+        r.config_exceeds_evidence
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        r.win_source.as_str(),
+        r.max_source.as_str(),
+        t_kind
+    );
     match CString::new(json) {
         Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
         Err(_) => qjs::sofuu_js_new_string(ctx, c"{}".as_ptr()),
@@ -3809,12 +5110,199 @@ unsafe extern "C" fn js_ai_embed_local(
 }
 
 /* ------------------------------------------------------------------ */
+/* sofuu.ai.embedLocalSemantic(text) → Float32Array                    */
+/* The brain-facing compact learned projector.  The legacy embedLocal      */
+/* above remains unchanged so callers that request arbitrary dimensions   */
+/* keep their existing ABI.                                             */
+/* ------------------------------------------------------------------ */
+
+unsafe extern "C" fn js_ai_embed_local_semantic(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"ai.embedLocalSemantic(text) expected a string".as_ptr(),
+        );
+    }
+    let text = match cstr_opt(ctx, *argv) {
+        Some(t) => t,
+        None => return qjs::sofuu_js_exception(),
+    };
+    let Some(values) = crate::embedding::semantic_v1(&text) else {
+        return qjs::JS_ThrowInternalError(
+            ctx,
+            c"ai.embedLocalSemantic: baked model unavailable or invalid".as_ptr(),
+        );
+    };
+
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let f32_ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Float32Array".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    let len_arg = qjs::sofuu_js_new_int32(ctx, crate::embedding::SEMANTIC_DIM as i32);
+    let vec = qjs::JS_CallConstructor(ctx, f32_ctor, 1, &len_arg);
+    qjs::sofuu_js_free_value(ctx, len_arg);
+    qjs::sofuu_js_free_value(ctx, f32_ctor);
+    if qjs::is_exception(vec) {
+        return qjs::sofuu_js_exception();
+    }
+
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(
+        ctx,
+        vec,
+        &mut byte_offset,
+        &mut byte_length,
+        ptr::null_mut(),
+    );
+    if qjs::is_exception(buf) {
+        qjs::sofuu_js_free_value(ctx, vec);
+        return qjs::sofuu_js_exception();
+    }
+    let mut buf_size: usize = 0;
+    let ptr = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    if !ptr.is_null()
+        && byte_offset + values.len() * std::mem::size_of::<f32>() <= buf_size
+        && byte_length >= values.len() * std::mem::size_of::<f32>()
+    {
+        let out = std::slice::from_raw_parts_mut(
+            ptr.add(byte_offset) as *mut f32,
+            values.len(),
+        );
+        out.copy_from_slice(&values);
+        qjs::sofuu_js_free_value(ctx, buf);
+        return vec;
+    }
+    qjs::sofuu_js_free_value(ctx, buf);
+    for (i, &v) in values.iter().enumerate() {
+        qjs::JS_SetPropertyUint32(ctx, vec, i as u32, qjs::sofuu_js_new_float64(ctx, v as f64));
+    }
+    vec
+}
+
+/// `sofuu.ai.embedInfo()` — stable identity for memory backends.  The JS
+/// memory layer uses this before opening a brain so its dimension and model
+/// id are always paired.
+unsafe extern "C" fn js_ai_embed_info(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let json = crate::embedding::model_info_json();
+    match CString::new(json) {
+        Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+        Err(_) => qjs::sofuu_js_new_string(ctx, c"{}".as_ptr()),
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* sofuu.ai.embedLocalSemanticV2(text) → Float32Array                  */
+/* sofuu.ai.embedInfoV2() → JSON                                       */
+/* The round-9 SEM2 table embedder — the semantic channel of the       */
+/* fused brain.  Shipped alongside (never in place of) embedLocal       */
+/* (hash-v1) and embedLocalSemantic (SEM1 v1); the old two keep their   */
+/* exact semantics.  A missing/corrupt baked artifact throws — JS       */
+/* treats that as "v2 unavailable" and runs hash-only.                  */
+/* ------------------------------------------------------------------ */
+
+/// Pack an f32 slice into a fresh JS Float32Array (the typed-array fast
+/// path with the property-set fallback, mirroring embedLocalSemantic).
+unsafe fn js_new_f32_array(ctx: *mut JSContext, values: &[f32]) -> JSValue {
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let f32_ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Float32Array".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    let len_arg = qjs::sofuu_js_new_int32(ctx, values.len() as i32);
+    let vec = qjs::JS_CallConstructor(ctx, f32_ctor, 1, &len_arg);
+    qjs::sofuu_js_free_value(ctx, len_arg);
+    qjs::sofuu_js_free_value(ctx, f32_ctor);
+    if qjs::is_exception(vec) {
+        return qjs::sofuu_js_exception();
+    }
+
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(
+        ctx,
+        vec,
+        &mut byte_offset,
+        &mut byte_length,
+        ptr::null_mut(),
+    );
+    if qjs::is_exception(buf) {
+        qjs::sofuu_js_free_value(ctx, vec);
+        return qjs::sofuu_js_exception();
+    }
+    let mut buf_size: usize = 0;
+    let ptr = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    if !ptr.is_null()
+        && byte_offset + values.len() * std::mem::size_of::<f32>() <= buf_size
+        && byte_length >= values.len() * std::mem::size_of::<f32>()
+    {
+        let out = std::slice::from_raw_parts_mut(ptr.add(byte_offset) as *mut f32, values.len());
+        out.copy_from_slice(values);
+        qjs::sofuu_js_free_value(ctx, buf);
+        return vec;
+    }
+    qjs::sofuu_js_free_value(ctx, buf);
+    for (i, &v) in values.iter().enumerate() {
+        qjs::JS_SetPropertyUint32(ctx, vec, i as u32, qjs::sofuu_js_new_float64(ctx, v as f64));
+    }
+    vec
+}
+
+unsafe extern "C" fn js_ai_embed_local_semantic_v2(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"ai.embedLocalSemanticV2(text) expected a string".as_ptr(),
+        );
+    }
+    let text = match cstr_opt(ctx, *argv) {
+        Some(t) => t,
+        None => return qjs::sofuu_js_exception(),
+    };
+    let Some(values) = crate::embedding::semantic_v2::semantic_v2(&text) else {
+        return qjs::JS_ThrowInternalError(
+            ctx,
+            c"ai.embedLocalSemanticV2: baked SEM2 model unavailable or invalid".as_ptr(),
+        );
+    };
+    js_new_f32_array(ctx, &values)
+}
+
+/// `sofuu.ai.embedInfoV2()` — SEM2 space identity (id `semantic-table-v2`,
+/// dim 64, input `hash-v1`).  Separate from embedInfo() by design: one
+/// probe per space, never one ambiguous payload.
+unsafe extern "C" fn js_ai_embed_info_v2(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let json = crate::embedding::semantic_v2::model_info_json_v2();
+    match CString::new(json) {
+        Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+        Err(_) => qjs::sofuu_js_new_string(ctx, c"{}".as_ptr()),
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Module registration                                                   */
 /* ------------------------------------------------------------------ */
 
 thread_local! {
     // JS_CFUNC_DEF(name, length, func): magic=0, u.func = { length, generic, func }.
-      static AI_FUNCS: [qjs::JSCFunctionListEntry; 9] = [
+        static AI_FUNCS: [qjs::JSCFunctionListEntry; 18] = [
         qjs::JSCFunctionListEntry {
             name: c"complete".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -3837,11 +5325,67 @@ thread_local! {
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed },
         },
         qjs::JSCFunctionListEntry {
+            name: c"embedBatch".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_batch },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"embedImage".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_image },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"transcribe".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_transcribe },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"speak".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_speak },
+        },
+        qjs::JSCFunctionListEntry {
             name: c"embedLocal".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_local },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"embedLocalSemantic".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_local_semantic },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"embedInfo".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_info },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"embedLocalSemanticV2".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_local_semantic_v2 },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"embedInfoV2".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_ai_embed_info_v2 },
         },
         qjs::JSCFunctionListEntry {
             name: c"similarity".as_ptr(),
@@ -3876,7 +5420,18 @@ thread_local! {
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
-            u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_ai_model_caps },
+            /* P3 (AUDIT-2026-09-07): length is the JS `.length` metadata —
+             * modelCaps takes (model, baseUrl?), resolveCaps takes 4 args
+             * (model, baseUrl?, cfgWindow?, cfgMaxOutput?); the old values
+             * under-declared both. */
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_model_caps },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"resolveCaps".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 4, cproto: 0, _pad: [0; 6], cfunc: js_ai_resolve_caps },
         },
     ];
 }
@@ -3924,6 +5479,7 @@ const CURLMOPT_TIMERFUNCTION: c_int = 20004;
 mod tests {
     use super::*;
     use sofuu_ffi::bridge::{register_global_fn, JSCFunction};
+    use sofuu_ffi::qjs::CtxPtr;
 
     /// Eval `src` on a bare context and return Some(exception-text) when it
     /// throws. JSON/JS strings are NUL-terminated buffers (the QuickJS
@@ -3980,7 +5536,9 @@ mod tests {
                 ("complete empty model", r#"__ai_complete({ messages: [{ role: "user", content: "hi" }], provider: "openai", model: "" })"#),
                 ("complete whitespace model", r#"__ai_complete({ messages: [{ role: "user", content: "hi" }], provider: "ollama", model: "   " })"#),
                 ("stream no model", r#"__ai_stream({ messages: [{ role: "user", content: "hi" }], provider: "openai" })"#),
-                ("embed no model", r#"__ai_embed("hello", { provider: "ollama" })"#),
+                /* H-E1: provider:"ollama" is local now (embeds offline), so
+                 * the no-model throw moved to an explicit remote provider. */
+                ("embed no model", r#"__ai_embed("hello", { provider: "openai" })"#),
             ] {
                 let exc = eval_exc(ctx, call)
                     .unwrap_or_else(|| panic!("{name}: must throw, got success"));
@@ -3999,6 +5557,185 @@ mod tests {
             .expect("still throws (anthropic has no embeddings)");
             assert!(exc.contains("does not natively provide"), "{exc}");
             assert!(!exc.contains("No model configured"), "{exc}");
+
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+    }
+
+    /// H-E1: ai.embed defaults to bundled local (SEM2-64); explicit
+    /// provider:"local" too; ai.embedBatch batches locally; unknown space
+    /// throws; remote-without-model still throws the actionable error.
+    #[test]
+    fn embed_local_default_and_batch() {
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            assert!(!ctx.is_null());
+            register_global_fn(ctx, "__ai_embed", js_ai_embed as JSCFunction);
+            register_global_fn(ctx, "__ai_embedBatch", js_ai_embed_batch as JSCFunction);
+
+            let run = |src: &str| -> JSValue {
+                let c = CString::new(src).unwrap();
+                qjs::JS_Eval(
+                    ctx,
+                    c.as_ptr(),
+                    src.len(),
+                    c"<embed-h1>".as_ptr(),
+                    qjs::JS_EVAL_TYPE_GLOBAL,
+                )
+            };
+            let pump = || {
+                loop {
+                    let mut ctx1: *mut JSContext = ptr::null_mut();
+                    if qjs::JS_ExecutePendingJob(rt, &mut ctx1) <= 0 {
+                        break;
+                    }
+                }
+            };
+            let read_int = |name: &str| -> i32 {
+                let src = format!("globalThis.{name}");
+                let c = CString::new(src).unwrap();
+                let v = qjs::JS_Eval(
+                    ctx,
+                    c.as_ptr(),
+                    c.as_bytes().len(),
+                    c"<embed-h1>".as_ptr(),
+                    qjs::JS_EVAL_TYPE_GLOBAL,
+                );
+                let mut d: i32 = -999;
+                qjs::JS_ToInt32(ctx, &mut d, v);
+                qjs::sofuu_js_free_value(ctx, v);
+                d
+            };
+            let read_f64 = |name: &str| -> f64 {
+                let src = format!("globalThis.{name}");
+                let c = CString::new(src).unwrap();
+                let v = qjs::JS_Eval(
+                    ctx,
+                    c.as_ptr(),
+                    c.as_bytes().len(),
+                    c"<embed-h1>".as_ptr(),
+                    qjs::JS_EVAL_TYPE_GLOBAL,
+                );
+                let mut d: f64 = f64::NAN;
+                qjs::JS_ToFloat64(ctx, &mut d, v);
+                qjs::sofuu_js_free_value(ctx, v);
+                d
+            };
+
+            // 1. Bare call → local SEM2, 64 dims.
+            let r = run("globalThis.__r=null; __ai_embed('hello world').then(v=>{globalThis.__r=v.length});");
+            assert!(!qjs::is_exception(r), "bare ai.embed must not throw");
+            qjs::sofuu_js_free_value(ctx, r);
+            pump();
+            assert_eq!(read_int("__r"), 64, "default space is SEM2-64");
+
+            // 2. Explicit provider:"local" → same.
+            let r = run("globalThis.__r2=null; __ai_embed('hello world',{provider:'local'}).then(v=>{globalThis.__r2=v.length});");
+            assert!(!qjs::is_exception(r));
+            qjs::sofuu_js_free_value(ctx, r);
+            pump();
+            assert_eq!(read_int("__r2"), 64);
+
+            // 3. Deterministic: same text → identical first element.
+            let r = run("globalThis.__f1=null; globalThis.__f2=null; __ai_embed('same').then(v=>{globalThis.__f1=v[0];}); __ai_embed('same').then(v=>{globalThis.__f2=v[0];});");
+            qjs::sofuu_js_free_value(ctx, r);
+            pump();
+            assert_eq!(read_f64("__f1").to_bits(), read_f64("__f2").to_bits(), "local embeds are deterministic");
+
+            // 4. Space opt: hash-768 → 768 dims.
+            let r = run("globalThis.__h=null; __ai_embed('x',{space:'hash-768'}).then(v=>{globalThis.__h=v.length});");
+            assert!(!qjs::is_exception(r));
+            qjs::sofuu_js_free_value(ctx, r);
+            pump();
+            assert_eq!(read_int("__h"), 768);
+
+            // 5. Batch: 3 inputs → Array of 3 × 64-dim.
+            let r = run("globalThis.__n=null; globalThis.__d=null; __ai_embedBatch(['a','b','c']).then(v=>{globalThis.__n=v.length; globalThis.__d=v[0].length;});");
+            assert!(!qjs::is_exception(r));
+            qjs::sofuu_js_free_value(ctx, r);
+            pump();
+            assert_eq!(read_int("__n"), 3);
+            assert_eq!(read_int("__d"), 64);
+
+            // 6. Unknown space throws (arg validation, sync).
+            let exc = eval_exc(ctx, "__ai_embed('x',{space:'nope'})")
+                .expect("unknown space must throw");
+            assert!(exc.contains("unknown space"), "{exc}");
+
+            // 7. Remote without model still throws the actionable error.
+            let exc = eval_exc(ctx, "__ai_embed('x',{provider:'openai'})")
+                .expect("remote embed without model must throw");
+            assert!(exc.contains("No model configured"), "{exc}");
+
+            // 8. Batch rejects remote + non-array input.
+            let exc = eval_exc(ctx, "__ai_embedBatch(['a'],{provider:'openai',model:'m'})")
+                .expect("remote batch must throw");
+            assert!(exc.contains("local-only"), "{exc}");
+            let exc = eval_exc(ctx, "__ai_embedBatch('nope')")
+                .expect("non-array batch must throw");
+            assert!(exc.contains("array of strings"), "{exc}");
+
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+    }
+
+    /// M2: bridge base64 decoding (strict alphabet, pad rules).
+    #[test]
+    fn audio_b64_decode_vectors() {
+        assert_eq!(b64_decode("QUJD").as_deref(), Some(&[65u8, 66, 67][..]));
+        assert_eq!(b64_decode("QUJDRA==").as_deref(), Some(&[65u8, 66, 67, 68][..]));
+        assert_eq!(b64_decode("YWI=").as_deref(), Some(&[97u8, 98][..]));
+        assert_eq!(b64_decode("+/+/").as_deref(), Some(&[251u8, 255, 191][..]));
+        for bad in ["", "ABC", "AB=C", "A===", "AB C", "AB-C", "QUJD RQ==", "===="] {
+            assert!(b64_decode(bad).is_none(), "{bad:?} must refuse");
+        }
+    }
+
+    /// M2: transcribe/speak arg validation throws before any network work.
+    /// (Transfer paths are covered by tests/voice_test.js against a mock.)
+    #[test]
+    fn audio_arg_validation() {
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            assert!(!ctx.is_null());
+            register_global_fn(ctx, "__ai_transcribe", js_ai_transcribe as JSCFunction);
+            register_global_fn(ctx, "__ai_speak", js_ai_speak as JSCFunction);
+
+            for (name, call, want) in [
+                ("transcribe no args", "__ai_transcribe()", "expected audio bytes"),
+                ("transcribe non-bytes", "__ai_transcribe('nope')", "expected audio bytes"),
+                (
+                    "transcribe local",
+                    "__ai_transcribe(new Uint8Array([1,2,3]), {provider:'local', model:'m'})",
+                    "no bundled speech model",
+                ),
+                (
+                    "transcribe anthropic",
+                    "__ai_transcribe(new Uint8Array([1,2,3]), {provider:'anthropic', model:'m'})",
+                    "no audio API",
+                ),
+                (
+                    "transcribe remote no model",
+                    "__ai_transcribe(new Uint8Array([1,2,3]), {provider:'openai'})",
+                    "No model configured",
+                ),
+                ("speak no args", "__ai_speak()", "expected a string"),
+                ("speak empty", "__ai_speak('   ')", "must not be empty"),
+                ("speak bad format", "__ai_speak('hi', {provider:'openai', model:'m', base_url:'http://x/', format:'exe'})", "mp3|opus"),
+                (
+                    "speak remote no model",
+                    "__ai_speak('hi', {provider:'openai'})",
+                    "No model configured",
+                ),
+            ] {
+                let exc = eval_exc(ctx, call)
+                    .unwrap_or_else(|| panic!("{name}: must throw, got success"));
+                assert!(exc.contains(want), "{name}: want {want:?}, got: {exc}");
+            }
 
             qjs::JS_FreeContext(ctx);
             qjs::JS_FreeRuntime(rt);
@@ -4082,13 +5819,15 @@ mod tests {
                 content: None,
                 tool_calls: Some(tc_json.to_string()),
                 tool_call_id: None,
-            },
+            images: Vec::new()
+    },
             AiMessage {
                 role: Some("tool".into()),
                 content: Some("tool result".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
-            },
+            images: Vec::new()
+    },
         ];
         let mk = |provider: Provider| AiRequestConfig {
             provider,
@@ -4122,6 +5861,124 @@ mod tests {
         assert!(an.contains("mock_tool"), "anthropic body must carry the tool name: {an}");
     }
 
+    /// P2 multimodal: images on a user message become wire content parts —
+    /// OpenAI image_url parts, Anthropic base64 image blocks. Text-only
+    /// messages keep the plain-string shape byte-for-byte.
+    #[test]
+    fn image_parts_on_both_wires() {
+        let mk = |provider: Provider| AiRequestConfig {
+            provider,
+            model: Some("m".into()),
+            api_key: None,
+            base_url: None,
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: None,
+            max_tokens: 0,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            tools: vec![],
+            messages: vec![AiMessage {
+                role: Some("user".into()),
+                content: Some("what is this?".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                images: vec![
+                    "data:image/png;base64,AAAA".into(),
+                    "data:image/jpeg;base64,BBBB".into(),
+                ],
+            }],
+        };
+        let oa = build_openai_body_v2(&mk(Provider::OpenAi));
+        assert!(oa.contains("\"content\":[{\"type\":\"text\",\"text\":\"what is this?\"}"), "openai text part: {oa}");
+        assert!(oa.contains("\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAAA\"}"), "openai image part: {oa}");
+        assert!(oa.contains("data:image/jpeg;base64,BBBB"), "both images carried: {oa}");
+
+        let an = build_anthropic_body_v2(&mk(Provider::Anthropic));
+        assert!(an.contains("\"type\":\"text\",\"text\":\"what is this?\""), "anthropic text block: {an}");
+        assert!(an.contains("\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}"), "anthropic image block: {an}");
+        assert!(an.contains("\"media_type\":\"image/jpeg\""), "jpeg media type: {an}");
+
+        // Text-only messages stay plain-string content.
+        let mk_plain = |provider: Provider| {
+            let mut c = mk(provider);
+            c.messages[0].images = Vec::new();
+            c
+        };
+        let oa2 = build_openai_body_v2(&mk_plain(Provider::OpenAi));
+        assert!(oa2.contains("\"content\":\"what is this?\""), "plain shape preserved: {oa2}");
+        assert!(!oa2.contains("image_url"), "no image parts on text-only: {oa2}");
+    }
+
+    /// Zero-evidence guard: a flat config max_tokens on a model the
+    /// registry, the listing AND learned limits all know nothing about is
+    /// OMITTED (endpoint default) — the empty-gateway class. With evidence
+    /// (a listing entry), config rides clamped as usual.
+    #[test]
+    fn zero_evidence_model_omits_flat_config_max_tokens() {
+        /* Mutates the process-global learned/discovered stores: hold the
+         * shared ML test lock (the alloc-policy and discovered-caps tests
+         * clear/ingest the same stores) for the whole body. */
+        let _ml = crate::ml::TEST_LOCK.lock().unwrap();
+        crate::ml::alloc::policy::clear_learned();
+        crate::rt::model_caps_discovered::clear();
+        let mk = |provider: Provider| AiRequestConfig {
+            provider,
+            model: Some("totally/unknown-empty-model".into()),
+            api_key: None,
+            base_url: None,
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: None,
+            max_tokens: 384_000,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            tools: vec![],
+            messages: vec![AiMessage {
+                role: Some("user".into()),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                images: Vec::new(),
+            }],
+        };
+        let body = build_openai_body_v2(&mk(Provider::OpenAi));
+        assert!(!body.contains("\"max_tokens\""), "flat cap must be omitted for a zero-evidence model: {body}");
+        // With evidence (discovered listing), config rides — clamped.
+        let listing = serde_json::json!({
+            "data": [ { "id": "totally/unknown-empty-model",
+                        "context_length": 131072,
+                        "top_provider": { "max_completion_tokens": 8192 } } ]
+        });
+        crate::rt::model_caps_discovered::ingest_listing("https://gw-evidence.example/v1", &listing);
+        let mk_ev = |provider: Provider| {
+            let mut c = mk(provider);
+            c.base_url = Some("https://gw-evidence.example/v1".into());
+            c
+        };
+        let body2 = build_openai_body_v2(&mk_ev(Provider::OpenAi));
+        assert!(body2.contains("\"max_tokens\":8192"), "evidence-backed clamp applies: {body2}");
+        crate::rt::model_caps_discovered::clear();
+    }
+
+    /// parse_image_urls: data URLs only, capped count + size.
+    #[test]
+    fn image_parser_caps_and_filters() {
+        assert_eq!(parse_image_urls(None).len(), 0);
+        assert_eq!(parse_image_urls(Some("[]")).len(), 0);
+        let ok = "[\"data:image/png;base64,AA\",\"https://x/y.png\"]";
+        let v = parse_image_urls(Some(ok));
+        assert_eq!(v.len(), 1, "non-data URLs dropped: {v:?}");
+        let big = format!("[\"{}\"]", format!("data:image/png;base64,{}", "A".repeat(9 * 1024 * 1024)));
+        assert_eq!(parse_image_urls(Some(&big)).len(), 0, "oversized dropped");
+    }
+
     /// P6 (PLAN-MEMORY-TOKENS): the anthropic wire carries the stable
     /// prefix as a cacheable system content block + a marker on the LAST
     /// tool; a LEADING system message is hoisted into that block (the
@@ -4150,13 +6007,15 @@ mod tests {
                     content: Some("Sofuu coding agent.".into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
                 AiMessage {
                     role: Some("user".into()),
                     content: Some("hello".into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
             ],
             tools: vec![
                 AiToolDef {
@@ -4228,7 +6087,8 @@ mod tests {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
-        };
+        images: Vec::new()
+    };
 
         // ctx + task on an empty history → one merged user turn.
         let b = build_anthropic_body_v2(&mk(vec![
@@ -4265,13 +6125,15 @@ mod tests {
                 content: None,
                 tool_calls: Some(r#"[{"id":"c1","type":"function","function":{"name":"t","arguments":"{}"}}]"#.into()),
                 tool_call_id: None,
-            },
+            images: Vec::new()
+    },
             AiMessage {
                 role: Some("tool".into()),
                 content: Some("result".into()),
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
-            },
+            images: Vec::new()
+    },
         ]));
         assert!(b.contains("\"type\":\"tool_use\""), "{b}");
         assert!(b.contains("\"type\":\"tool_result\""), "{b}");
@@ -4303,25 +6165,29 @@ mod tests {
                     content: Some("Sofuu coding agent. Be direct and concise.".into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
                 AiMessage {
                     role: Some("user".into()),
                     content: Some("turn one question".into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
                 AiMessage {
                     role: Some("assistant".into()),
                     content: Some("turn one answer".into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
                 AiMessage {
                     role: Some("user".into()),
                     content: Some(task.into()),
                     tool_calls: None,
                     tool_call_id: None,
-                },
+                images: Vec::new()
+    },
             ],
             tools: vec![AiToolDef {
                 name: Some("read_file".into()),
@@ -4459,6 +6325,82 @@ mod tests {
         assert!(!b.contains("reasoning_effort"), "unknown on OpenAI omits effort: {b}");
     }
 
+    /// Layer 0 through the ENDPOINT-AWARE ladder: caps the endpoint itself
+    /// published for this exact model (discovered store, keyed by
+    /// base_url) clamp an oversized explicit config and supply unknown
+    /// models' numbers. The registry stays the fallback when nothing
+    /// was discovered. This is the exact "config does not respect the
+    /// selected model" failure class — an explicit max_tokens above the
+    /// endpoint's real cap must never reach the wire.
+    #[test]
+    fn openai_body_clamps_via_discovered_endpoint_caps() {
+        /* Same shared ML test lock — see the zero-evidence test above. */
+        let _ml = crate::ml::TEST_LOCK.lock().unwrap();
+        crate::rt::model_caps_discovered::clear();
+        let listing = serde_json::json!({
+            "data": [
+                { "id": "any/unknown-model:free",
+                  "context_length": 65536,
+                  "top_provider": { "max_completion_tokens": 8192 } },
+                { "id": "gpt-4o", "context_length": 32000, "max_tokens": 4096 }
+            ]
+        });
+        assert_eq!(
+            crate::rt::model_caps_discovered::ingest_listing("https://gw.example.com/v1", &listing),
+            2
+        );
+
+        let cfg = |model: &str, base_url: Option<&str>, max_tokens: i32| AiRequestConfig {
+            provider: Provider::Custom,
+            model: Some(model.into()),
+            api_key: None,
+            base_url: base_url.map(Into::into),
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: None,
+            max_tokens,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            messages: vec![],
+            tools: vec![],
+        };
+
+        // The liquid-400 class: unknown model + config maxout 384000 vs an
+        // endpoint that publishes 8192. The wire must carry 8192.
+        let b = build_openai_body_v2(&cfg(
+            "any/unknown-model:free",
+            Some("https://gw.example.com/v1/chat/completions"),
+            384_000,
+        ));
+        assert!(b.contains("\"max_tokens\":8192"), "oversized config clamped to the endpoint's real cap: {b}");
+
+        // Same model, NO explicit config → the discovered cap supplies it.
+        let b = build_openai_body_v2(&cfg(
+            "any/unknown-model:free",
+            Some("https://gw.example.com/v1"),
+            0,
+        ));
+        assert!(b.contains("\"max_tokens\":8192"), "discovered cap for an otherwise-unknown model: {b}");
+
+        // A KNOWN registry family the endpoint hosts smaller: the
+        // endpoint's numbers win over the name-keyed table.
+        let b = build_openai_body_v2(&cfg("gpt-4o", Some("https://gw.example.com/v1"), 0));
+        assert!(b.contains("\"max_tokens\":4096"), "gateway's real cap overrides the registry guess: {b}");
+
+        // Without discovery at that root the registry number stands.
+        let b = build_openai_body_v2(&cfg("gpt-4o", Some("https://other.example.com/v1"), 0));
+        assert!(b.contains("\"max_tokens\":16384"), "registry cap when nothing discovered: {b}");
+
+        // No base_url at all → historical registry behavior.
+        let b = build_openai_body_v2(&cfg("gpt-4o", None, 0));
+        assert!(b.contains("\"max_tokens\":16384"), "{b}");
+
+        crate::rt::model_caps_discovered::clear();
+    }
+
     /// Wires and model families are ORTHOGONAL: the openai endpoint
     /// carries most providers' non-OpenAI models, and an anthropic-format
     /// endpoint may serve non-Claude models. The builders must produce a
@@ -4524,6 +6466,51 @@ mod tests {
         assert_eq!(json_escape(Some("\u{01}ctrl")), "\\u0001ctrl");
     }
 
+    /// net-10 (AUDIT-2026-09-07): a quote/backslash in a tool NAME (MCP tool
+    /// names are external input) must not break the request JSON — both wire
+    /// formats escape the name exactly like the description.
+    #[test]
+    fn tool_names_escaped_in_wire_json() {
+        let evil = "evil\"name\\x";
+        let mut cfg = AiRequestConfig::default();
+        cfg.tools = vec![AiToolDef {
+            name: Some(evil.into()),
+            description: Some("d\"esc".into()),
+            parameters_json: Some("{\"type\":\"object\"}".into()),
+        }];
+
+        for (label, build) in [
+            ("openai", build_openai_body_v2 as fn(&AiRequestConfig) -> String),
+            ("anthropic", build_anthropic_body_v2 as fn(&AiRequestConfig) -> String),
+        ] {
+            let b = build(&cfg);
+            /* The full request body must still be well-formed JSON... */
+            let v: serde_json::Value = serde_json::from_str(&b)
+                .unwrap_or_else(|e| panic!("{label}: request body is not valid JSON ({e}): {b}"));
+            /* ...and the name must round-trip through a REAL parser
+             * (OpenAI nests it at tools[i].function.name, Anthropic at
+             * tools[i].name directly). */
+            let tools = v.get("tools").and_then(|t| t.as_array()).expect("tools array");
+            assert_eq!(tools.len(), 1, "{label}");
+            let node = if label == "openai" {
+                tools[0].get("function").unwrap_or_else(|| panic!("{label}: tools[0].function missing: {b}"))
+            } else {
+                &tools[0]
+            };
+            let parsed_name = node
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_else(|| panic!("{label}: tool name missing: {b}"));
+            assert_eq!(parsed_name, evil, "{label}: tool name must round-trip: {b}");
+            /* ...and the exact escaped rendering must be on the wire. */
+            let escaped = format!("\"name\":\"{}\"", json_escape(Some(evil)));
+            assert!(
+                b.contains(&escaped),
+                "{label}: escaped name form missing from wire: {b}"
+            );
+        }
+    }
+
     /// strip_think_tags: strips REAL reasoning tags and never corrupts
     /// plain text that merely contains the words "thinking"/"response".
     #[test]
@@ -4551,5 +6538,364 @@ mod tests {
         let (out, think) = strip_think_tags(b"answer<thinking>never closed", 65536);
         assert_eq!(String::from_utf8(out).unwrap(), "answer");
         assert!(think.len() > 0);
+    }
+
+    // ── P1-1: js_ai_stream must release every local ref it takes off the
+    // STREAM_FACTORY result on all paths. Before the fix, the setToolCalls
+    // local leaked per stream — and because QuickJS treats refcount>0
+    // objects as GC roots, that one ref pinned the whole factory closure
+    // (queue, _resolve, iterator, all method closures) for the life of the
+    // runtime. The request box's dups are freed by stream_req_destroy on
+    // the error path, so the ONLY per-stream residue is the leaked local.
+
+    #[repr(C)]
+    struct JSMemoryUsage {
+        malloc_size: i64, malloc_limit: i64, memory_used_size: i64,
+        malloc_count: i64,
+        memory_used_count: i64,
+        atom_count: i64, atom_size: i64,
+        str_count: i64, str_size: i64,
+        obj_count: i64, obj_size: i64,
+        prop_count: i64, prop_size: i64,
+        shape_count: i64, shape_size: i64,
+        js_func_count: i64, js_func_size: i64, js_func_code_size: i64,
+        js_func_pc2line_count: i64, js_func_pc2line_size: i64,
+        c_func_count: i64, array_count: i64,
+        fast_array_count: i64, fast_array_elements: i64,
+        binary_object_count: i64, binary_object_size: i64,
+    }
+
+    extern "C" {
+        fn JS_ComputeMemoryUsage(rt: *mut qjs::JSRuntime, s: *mut JSMemoryUsage);
+    }
+
+    unsafe fn gc_obj_count(rt: *mut qjs::JSRuntime) -> i64 {
+        qjs::JS_RunGC(rt);
+        let mut m: JSMemoryUsage = std::mem::zeroed();
+        JS_ComputeMemoryUsage(rt, &mut m);
+        m.obj_count
+    }
+
+    unsafe fn read_global_i64(ctx: *mut JSContext, name: &CStr) -> i64 {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let v = qjs::sofuu_js_get_property_str(ctx, global, name.as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        let mut out: i64 = -1;
+        qjs::JS_ToInt64(ctx, &mut out, v);
+        qjs::sofuu_js_free_value(ctx, v);
+        out
+    }
+
+    /// Read a string global ("" when missing or not a string).
+    unsafe fn read_global_str(ctx: *mut JSContext, name: &CStr) -> String {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let v = qjs::sofuu_js_get_property_str(ctx, global, name.as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        let mut out = String::new();
+        let p = qjs::sofuu_js_to_cstring(ctx, v);
+        if !p.is_null() {
+            out = CStr::from_ptr(p).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, p);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+        out
+    }
+
+    /// N streams against 127.0.0.1:1 (connect refused instantly) each settle
+    /// through error_fn → for-await throws → catch. Asserts every one settled
+    /// and returns after the loop has fully drained.
+    const STREAM_DRIVER: &str = r#"
+        globalThis.settled = 0;
+        async function drive(n) {
+          for (let i = 0; i < n; i++) {
+            try {
+              for await (const c of __ai_stream({
+                messages: [{ role: "user", content: "hi" }],
+                provider: "probe",
+                base_url: "http://127.0.0.1:1/v1/chat/completions",
+                model: "m",
+              })) { /* connect fails before any chunk */ }
+            } catch (e) { /* expected: connect error surfaces here */ }
+            globalThis.settled++;
+          }
+        }
+        drive(N_STREAMS);
+    "#;
+
+    #[test]
+    fn stream_error_path_does_not_retain_factory_objects() {
+        unsafe {
+            let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+            crate::rt::event_loop::sofuu_loop_init();
+            register_global_fn(ctx, "__ai_stream", js_ai_stream as JSCFunction);
+
+            // Warmup: settle 2 streams first so one-shot init (curl global,
+            // multi handle, factory eval, function objects) and the first
+            // poll/socket machinery are out of the measured window.
+            let src = CString::new(STREAM_DRIVER.replacen("N_STREAMS", "2", 1)).unwrap();
+            let r = qjs::JS_Eval(ctx, src.as_ptr(), src.as_bytes().len(),
+                                 c"<p1-1-warmup>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
+            assert!(!qjs::is_exception(r), "warmup eval threw");
+            qjs::sofuu_js_free_value(ctx, r);
+            crate::rt::event_loop::sofuu_loop_run(ctx);
+            assert_eq!(read_global_i64(ctx, c"settled"), 2, "warmup streams must all settle");
+
+            let before = gc_obj_count(rt);
+
+            let src = CString::new(STREAM_DRIVER.replacen("N_STREAMS", "8", 1)).unwrap();
+            let r = qjs::JS_Eval(ctx, src.as_ptr(), src.as_bytes().len(),
+                                 c"<p1-1-measure>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
+            assert!(!qjs::is_exception(r), "measure eval threw");
+            qjs::sofuu_js_free_value(ctx, r);
+            crate::rt::event_loop::sofuu_loop_run(ctx);
+            assert_eq!(read_global_i64(ctx, c"settled"), 8, "measured streams must all settle");
+
+            let after = gc_obj_count(rt);
+            // A settled stream retains nothing: the box dups die in
+            // stream_req_destroy and (with the fix) every local ref is
+            // freed. Pre-fix each stream leaked the setToolCalls ref, pinning
+            // the factory closure ≈ 10+ objects — 8 streams grew obj_count
+            // by ~80+. Allow small fixed noise, not per-stream growth.
+            assert!(
+                after - before < 10,
+                "stream objects retained across settled streams: {} → {} (delta {})",
+                before, after, after - before
+            );
+
+            crate::rt::event_loop::sofuu_loop_close();
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+    }
+
+    // ── net-11: error_fn must not fire after [DONE] ─────────────────────
+    // The turn is already committed; pre-fix the CURLMSG_DONE error and the
+    // HTTP ≥400 branches called error_fn even when done_fn had already
+    // delivered the answer. The factory's post-done error is invisible to
+    // its consumer (next() checks _done before _error), so the only
+    // observable is the `new Error(msg)` inside factory error() — counted
+    // via a globalThis.Error stub.
+    //
+    // Scenarios, each driven through js_ai_stream against a local server:
+    //   trunc  = 200 + overlong Content-Length, SSE body, then FIN
+    //            → curl CURLE_PARTIAL_FILE arrives after the body bytes.
+    //   0. trunc WITH a trailing `data: [DONE]` — done fires during the
+    //      write callback; the later PARTIAL_FILE error must be suppressed.
+    //   1. trunc WITHOUT [DONE] — done never fired, the error must STILL
+    //      surface through the iterator throw (the gate must not over-block).
+    //   2. HTTP 400 with an exact-length body containing `data: [DONE]` —
+    //      the write callback parses [DONE] regardless of status, so done
+    //      fires first; the ≥400 error_fn must be suppressed.
+
+    const NET11_DRIVER: &str = r#"
+        globalThis.__errs = 0;
+        globalThis.__errCaught = 0;
+        globalThis.__errMsg = '';
+        globalThis.__chunkText = '';
+        globalThis.__settled = 0;
+        async function drive() {
+          try {
+            for await (const c of __ai_stream({
+              messages: [{ role: "user", content: "hi" }],
+              provider: "probe",
+              base_url: "__BASE__",
+              model: "m",
+            })) { globalThis.__chunkText += c.text; }
+          } catch (e) {
+            globalThis.__errCaught = 1;
+            globalThis.__errMsg = String((e && e.message) || e);
+          }
+          globalThis.__settled = 1;
+        }
+        drive();
+    "#;
+
+    /// Serve one connection: `head` verbatim, then `body`, then FIN. The
+    /// head carries whatever Content-Length the caller declared — an
+    /// overlong one makes curl finish with CURLE_PARTIAL_FILE after the
+    /// body bytes were delivered. Replies are constant bytes (never echo
+    /// the request).
+    fn net11_spawn_server(head: String, body: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            // Drain the request head (and small JSON body) until the
+            // double CRLF terminator — then answer with constants.
+            loop {
+                match std::io::Read::read(&mut s, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&buf[..n]);
+                        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = std::io::Write::write_all(&mut s, head.as_bytes());
+            let _ = std::io::Write::write_all(&mut s, &body);
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            // Give curl a moment to read before the full teardown.
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            drop(s);
+        });
+        (port, t)
+    }
+
+    fn net11_head(status: &str, declared_len: usize) -> String {
+        format!(
+            "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// Runtime with `__ai_stream` registered and the counting Error stub
+    /// installed: factory error() does `new Error(msg)` and unqualified
+    /// `Error` resolves from the global at call time, so every error_fn
+    /// dispatch lands in the stub. Internal QuickJS errors (JS_Throw*)
+    /// never construct through the user-visible global, so the count is
+    /// exactly the factory error() calls.
+    unsafe fn net11_new_ctx() -> (*mut qjs::JSRuntime, *mut JSContext, CtxPtr<'static>) {
+        let rt = qjs::JS_NewRuntime();
+        let ctx = qjs::JS_NewContext(rt);
+        let guard = CtxPtr::new(ctx);
+        crate::rt::event_loop::sofuu_loop_init();
+        register_global_fn(ctx, "__ai_stream", js_ai_stream as JSCFunction);
+        let stub = CString::new(
+            r#"
+            globalThis.__RealError = globalThis.Error;
+            globalThis.Error = function (msg) {
+              globalThis.__errs++;
+              return new globalThis.__RealError(msg);
+            };
+            globalThis.Error.prototype = globalThis.__RealError.prototype;
+        "#,
+        )
+        .unwrap();
+        let r = qjs::JS_Eval(ctx, stub.as_ptr(), stub.as_bytes().len(),
+                             c"<net11-stub>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
+        assert!(!qjs::is_exception(r), "stub eval threw");
+        qjs::sofuu_js_free_value(ctx, r);
+        (rt, ctx, guard)
+    }
+
+    /// Eval the driver against `port` and pump the loop until it settles.
+    unsafe fn net11_drive(ctx: *mut JSContext, port: u16) {
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let src = CString::new(NET11_DRIVER.replacen("__BASE__", &url, 1)).unwrap();
+        let r = qjs::JS_Eval(ctx, src.as_ptr(), src.as_bytes().len(),
+                             c"<net11-drive>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL);
+        assert!(!qjs::is_exception(r), "driver eval threw");
+        qjs::sofuu_js_free_value(ctx, r);
+        crate::rt::event_loop::sofuu_loop_run(ctx);
+    }
+
+    unsafe fn net11_close(rt: *mut qjs::JSRuntime, ctx: *mut JSContext) {
+        crate::rt::event_loop::sofuu_loop_close();
+        qjs::JS_FreeContext(ctx);
+        qjs::JS_FreeRuntime(rt);
+    }
+
+    #[test]
+    fn stream_post_done_error_suppressed_after_truncation() {
+        let delta = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let mut body = delta.to_vec();
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        // Declare far more than we send; the FIN then lands as
+        // CURLE_PARTIAL_FILE — after done was already signalled.
+        let (port, srv) =
+            net11_spawn_server(net11_head("HTTP/1.1 200 OK", body.len() + 400), body);
+        unsafe {
+            // Poison-tolerant: an earlier net-11 test can panic while
+            // holding the lock (deliberate negative-control failures) —
+            // the loop state itself is per-test.
+            let _loop_guard = crate::rt::TEST_LOOP_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (rt, ctx, _g) = net11_new_ctx();
+            net11_drive(ctx, port);
+            let _ = srv.join();
+            assert_eq!(read_global_i64(ctx, c"__settled"), 1, "stream must settle");
+            assert_eq!(
+                read_global_i64(ctx, c"__errs"), 0,
+                "error_fn fired after [DONE] — the turn was already delivered"
+            );
+            assert_eq!(
+                read_global_i64(ctx, c"__errCaught"), 0,
+                "a clean [DONE] stream must not throw in the consumer"
+            );
+            assert_eq!(
+                read_global_str(ctx, c"__chunkText"), "hi",
+                "the delta before [DONE] must be delivered"
+            );
+            net11_close(rt, ctx);
+        }
+    }
+
+    #[test]
+    fn stream_truncation_without_done_still_errors() {
+        // Same truncation, but the body ends without [DONE]: done never
+        // fired, so the error must STILL surface (the gate must not
+        // over-block a genuine failure).
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec();
+        let (port, srv) =
+            net11_spawn_server(net11_head("HTTP/1.1 200 OK", body.len() + 400), body);
+        unsafe {
+            let _loop_guard = crate::rt::TEST_LOOP_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (rt, ctx, _g) = net11_new_ctx();
+            net11_drive(ctx, port);
+            let _ = srv.join();
+            assert_eq!(read_global_i64(ctx, c"__settled"), 1, "stream must settle");
+            assert_eq!(
+                read_global_i64(ctx, c"__errCaught"), 1,
+                "a truncated stream without [DONE] must still surface an error"
+            );
+            assert!(
+                read_global_i64(ctx, c"__errs") >= 1,
+                "the gate must not suppress a genuine pre-done failure"
+            );
+            assert_eq!(
+                read_global_str(ctx, c"__chunkText"), "hi",
+                "the delta delivered before the truncation must not be lost"
+            );
+            net11_close(rt, ctx);
+        }
+    }
+
+    #[test]
+    fn stream_post_done_error_suppressed_http_400() {
+        // HTTP 400 with an exact-length body containing `data: [DONE]` —
+        // the write callback parses [DONE] regardless of status, so done
+        // fires first and the ≥400 error_fn must be suppressed.
+        let body = b"data: [DONE]\n\n".to_vec();
+        let (port, srv) =
+            net11_spawn_server(net11_head("HTTP/1.1 400 Bad Request", body.len()), body);
+        unsafe {
+            let _loop_guard = crate::rt::TEST_LOOP_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (rt, ctx, _g) = net11_new_ctx();
+            net11_drive(ctx, port);
+            let _ = srv.join();
+            assert_eq!(read_global_i64(ctx, c"__settled"), 1, "stream must settle");
+            assert_eq!(
+                read_global_i64(ctx, c"__errs"), 0,
+                "the ≥400 error_fn fired after [DONE] — done already committed the turn"
+            );
+            assert_eq!(
+                read_global_i64(ctx, c"__errCaught"), 0,
+                "a stream that ended via [DONE] must not throw in the consumer"
+            );
+            net11_close(rt, ctx);
+        }
     }
 }

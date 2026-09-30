@@ -13,9 +13,15 @@ mod data_alloc;
 mod data_compaction;
 mod data_embedding;
 mod data_freshness;
+mod embedding_img_diag;
+mod data_image_gen;
 mod data_relevance;
 mod data_supervisor;
 mod data_embedding_gen;
+mod embedding_img_eval;
+mod embedding_img_train;
+mod embedding_bench;
+mod gate_eval;
 mod embedding_eval;
 mod embedding_stress;
 mod embedding_teacher;
@@ -336,9 +342,19 @@ fn train_compaction() {
      * channel. H16 gives threshold selection real boundary samples. */
     let split = split_by_groups_explicit(
         &data,
-        &[0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 14, 15],
+        /* TRAIN: the pure families PLUS the XOR conflict (25/26). The
+         * XOR has to be visible in training — a pattern held out of
+         * training entirely is not a generalization test, it is a test
+         * that no model can pass, network included. Training on it and
+         * testing on the held-out R/T/D disagreement families (17–24) is
+         * the fair question: can the architecture LEARN the interaction
+         * and then apply it to conflicts it has never seen? A logistic
+         * regression cannot learn the XOR at all, which is the point. */
+        &[
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 14, 15, 25, 26,
+        ],
         &[7, 12, 16],
-        &[11, 13],
+        &[17, 18, 19, 20, 21, 22, 23, 24],
     );
     println!(
         "\nfinal split: train={} val={} test={}",
@@ -1434,6 +1450,13 @@ fn main() {
         "embed-verify" => std::process::exit(embedding_verify::run_verify()),
         "embed-diag" => std::process::exit(embedding_diag::run_diag()),
         "embed-probe" => std::process::exit(embedding_probe::run_probe()),
+        "img-train" => embedding_img_train::train_img(),
+        "img-eval" => std::process::exit(embedding_img_eval::run_img_eval()),
+        "bench" => embedding_bench::run(),
+        "gate-eval" => gate_eval::run(),
+        "img-diag" => {
+            embedding_img_diag::run_img_diag();
+        }
         "eval" => eval_committed(),
         "diagnose" => diagnose(),
         "diagnose-relevance" => diagnose_relevance(),

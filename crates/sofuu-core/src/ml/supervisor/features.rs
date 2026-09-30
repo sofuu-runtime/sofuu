@@ -539,6 +539,48 @@ mod tests {
         }
     }
 
+    /// Phase 1.3 (§5.3): NUL/Unicode tools+targets, a huge trajectory,
+    /// u32::MAX steps against a zero budget, empty everything — the
+    /// extractor must stay finite and in band (budget division is guarded
+    /// by budget > 0; saturation handled by the clamps).
+    #[test]
+    fn hostile_contexts_stay_finite_and_bounded() {
+        let mut ctx = base_ctx();
+        ctx.task = "\u{0}配列😀task".to_string();
+        ctx.tool = "\u{0}to\u{0}ol".to_string();
+        ctx.target = String::new();
+        ctx.sig = String::new();
+        ctx.args_text = "x".repeat(100_000);
+        ctx.step = u32::MAX;
+        ctx.budget = 0; // over-budget division guard
+        ctx.skip_targets = vec![String::new(); 20];
+        // A long trajectory with repeated NUL-ish targets and huge chars.
+        ctx.calls = (0..40)
+            .map(|i| {
+                call(
+                    if i % 2 == 0 { "\u{0}grep" } else { "read_file" },
+                    &format!("sig-\u{0}-{i}"),
+                    if i % 3 == 0 { "" } else { "src/配列😀.rs" },
+                    u32::MAX - i,
+                    i % 5 == 0,
+                )
+            })
+            .collect();
+        let v = extract(&ctx);
+        for (j, x) in v.iter().enumerate() {
+            assert!(x.is_finite(), "feature {j} NaN/Inf: {x}");
+            assert!((-1.0..=2.0).contains(x), "feature {j} out of band: {x}");
+        }
+        // And the loop pseudo-action on the same hostile trajectory.
+        let mut loop_ctx = ctx.clone();
+        loop_ctx.tool = LOOP_TOOL.to_string();
+        loop_ctx.sig = String::new();
+        loop_ctx.args_text = String::new();
+        loop_ctx.target = String::new();
+        let lv = extract(&loop_ctx);
+        assert!(lv.iter().all(|x| x.is_finite()), "loop pseudo-action NaN/Inf");
+    }
+
     #[test]
     fn exact_duplicate_fires() {
         let mut ctx = base_ctx();

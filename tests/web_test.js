@@ -1,5 +1,7 @@
-// examples/web_test.js — self-contained engine-level battery for sofuu.web
+// tests/web_test.js — self-contained engine-level battery for sofuu.web
 // (search + open), over local mock endpoints. No network, no API keys.
+// (P2-28, AUDIT-2026-09-01: the examples/ fork of this file is deleted;
+// tests/ holds the real battery.)
 //
 // Covers the follow-up flagged in TASKS.md beyond agent_test.js's tool-path
 // check (which uses SOFUU_WEB_ENDPOINT with a DDG-shaped mock):
@@ -14,7 +16,11 @@
 //               passthrough, maxChars truncation, non-http rejection
 //   misc        unknown-engine error
 //
-// Run:  ./sofuu run examples/web_test.js
+// Run:  ./sofuu run tests/web_test.js
+// Every target here is a local loopback mock, so the SSRF guard's internal
+// opt-out is armed for this process only (P2-3 ships the guard itself).
+
+process.env.SOFUU_WEB_ALLOW_INTERNAL = "1";
 
 let failures = 0;
 let skips = 0;

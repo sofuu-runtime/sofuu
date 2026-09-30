@@ -4,6 +4,35 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Sofuu</title>
+    <script>
+      // Paint the saved theme before first render — no light flash on a
+      // dark launch. store.ts re-applies (and listens for macOS flips).
+      (function () {
+        try {
+          var t = localStorage.getItem("sofuu.theme") || "system";
+          var dark =
+            t === "dark" ||
+            (t === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.dataset.theme = "dark";
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {}
+      })();
+      // Platform flag before first paint: Windows and Linux have a normal
+      // titlebar, so the sidebar must not reserve the macOS traffic-light
+      // gutter (styles.css overrides padding-top under [data-platform]).
+      (function () {
+        try {
+          var ua = navigator.userAgent;
+          var plat = /Win/i.test(ua)
+            ? "windows"
+            : /Mac/i.test(ua)
+              ? "mac"
+              : "linux";
+          document.documentElement.dataset.platform = plat;
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

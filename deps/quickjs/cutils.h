@@ -31,11 +31,24 @@
 /* set if CPU is big endian */
 #undef WORDS_BIGENDIAN
 
+#if defined(_MSC_VER)
+/* MSVC: no __builtin_expect / __attribute__. The packed_u* structs below
+ * become un-packed — correct on x64, whose unaligned scalar loads are
+ * fine (and the accessors treat the fields as unaligned anyway). */
+#include <intrin.h>
+#define likely(x)       (x)
+#define unlikely(x)     (x)
+#define force_inline __forceinline
+#define no_inline
+#define __maybe_unused
+#define __attribute__(x)
+#else
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 #define force_inline inline __attribute__((always_inline))
 #define no_inline __attribute__((noinline))
 #define __maybe_unused __attribute__((unused))
+#endif
 
 #define xglue(x, y) x ## y
 #define glue(x, y) xglue(x, y)
@@ -115,28 +128,69 @@ static inline int64_t min_int64(int64_t a, int64_t b)
 }
 
 /* WARNING: undefined if a = 0 */
+#if defined(_MSC_VER)
+static __inline int clz32(unsigned int a)
+{
+    unsigned long i;
+    _BitScanReverse(&i, a);
+    return 31 - (int)i;
+}
+
+static __inline int clz64(uint64_t a)
+{
+#if defined(_WIN64)
+    unsigned long i;
+    _BitScanReverse64(&i, a);
+    return 63 - (int)i;
+#else
+    unsigned int hi = (unsigned int)(a >> 32);
+    if (hi != 0)
+        return clz32(hi);
+    return 32 + clz32((unsigned int)a);
+#endif
+}
+
+static __inline int ctz32(unsigned int a)
+{
+    unsigned long i;
+    _BitScanForward(&i, a);
+    return (int)i;
+}
+
+static __inline int ctz64(uint64_t a)
+{
+#if defined(_WIN64)
+    unsigned long i;
+    _BitScanForward64(&i, a);
+    return (int)i;
+#else
+    unsigned int lo = (unsigned int)a;
+    if (lo != 0)
+        return ctz32(lo);
+    return 32 + ctz32((unsigned int)(a >> 32));
+#endif
+}
+#else
 static inline int clz32(unsigned int a)
 {
     return __builtin_clz(a);
 }
 
-/* WARNING: undefined if a = 0 */
 static inline int clz64(uint64_t a)
 {
     return __builtin_clzll(a);
 }
 
-/* WARNING: undefined if a = 0 */
 static inline int ctz32(unsigned int a)
 {
     return __builtin_ctz(a);
 }
 
-/* WARNING: undefined if a = 0 */
 static inline int ctz64(uint64_t a)
 {
     return __builtin_ctzll(a);
 }
+#endif
 
 struct __attribute__((packed)) packed_u64 {
     uint64_t v;

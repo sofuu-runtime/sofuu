@@ -80,6 +80,50 @@ jobs:
       - name: ABI symbol guard
         run: make abi-check
 
+      # ── E1-6: the embeddable SDK's own gates ────────────────────
+      # The headless C samples assert their calls (make headless-test), and
+      # `cargo test --release` above already runs the sofuu-capi suite
+      # (funnel, memory handles, streaming, cancel, multi-instance). These
+      # two add the *typed binding* layers, which are otherwise never
+      # compiled by CI and rot silently.
+      - name: Swift bridge typecheck (iOS/macOS SDK surface)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # Typecheck the Swift bridge against the real C header, so a change
+          # to sofuu_embed.h that breaks the binding fails CI.
+          tmp="$(mktemp -d)"
+          cp include/sofuu_embed.h "$tmp/"
+          cat > "$tmp/module.modulemap" <<'EOF'
+          module SofuuBinary {
+              header "sofuu_embed.h"
+              export *
+          }
+          EOF
+          xcrun swiftc -typecheck -warnings-as-errors \
+            -I "$tmp" bindings/swift/Sources/SofuuBridge/SofuuBridge.swift
+
+      - name: JNI bridge syntax check (Android SDK surface)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          JH="$(/usr/libexec/java_home)"
+          cc -fsyntax-only \
+            -I "$JH/include" -I "$JH/include/darwin" -I include \
+            bindings/android/sofuu/src/main/cpp/jni_bridge.c
+
+      - name: Package manifests are valid (SwiftPM + podspec)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # `swift package dump-package` parses Package.swift fully — it
+          # catches a malformed manifest, which is otherwise a broken install
+          # for every consumer and never shows up in a Rust build.
+          swift package dump-package > /dev/null
+          # The podspec is not Rust/C/JS, so no other gate sees it — check it
+          # explicitly with the minimal Pod::Spec shim.
+          ruby scripts/check_podspec.rb
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:

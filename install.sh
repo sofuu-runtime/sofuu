@@ -1,9 +1,12 @@
 #!/usr/bin/env sh
-# Sofuu install script — https://sofuu.dev/install
-# Usage: curl -fsSL https://sofuu.dev/install | sh
+# Sofuu install script — https://sofuu.xyz/install
+# Usage: curl -fsSL https://sofuu.xyz/install | sh
+#
+# Prefer a package manager? The same binary installs via:
+#   npm install -g sofuu      (or: npx sofuu)
+#   https://sofuu.xyz/downloads  (tarball + .sha256, any platform)
 set -e
 
-REPO="sofuu-runtime/sofuu"
 INSTALL_DIR="${SOFUU_INSTALL_DIR:-/usr/local/bin}"
 BINARY="sofuu"
 
@@ -33,24 +36,18 @@ ASSET_NAME="sofuu-${PLATFORM}-${ARCH}"
 ARCHIVE_NAME="${ASSET_NAME}.tar.gz"
 CHECKSUM_NAME="${ARCHIVE_NAME}.sha256"
 
-# ── Fetch latest version tag ──────────────────────────────────
-echo "→ Detecting latest release..."
-LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
-
-if [ -z "$LATEST" ]; then
-    echo "Could not determine latest release."
-    echo "Visit: https://github.com/${REPO}/releases"
-    exit 1
-fi
-
-BASE_URL="https://github.com/${REPO}/releases/download/${LATEST}"
+# ── Download location (served straight from sofuu.xyz) ──────
+BASE_URL="https://sofuu.xyz/downloads"
 ARCHIVE_URL="${BASE_URL}/${ARCHIVE_NAME}"
 CHECKSUM_URL="${BASE_URL}/${CHECKSUM_NAME}"
 
-echo "→ Downloading sofuu ${LATEST} (${PLATFORM}/${ARCH})..."
+echo "→ Downloading sofuu (${PLATFORM}/${ARCH})..."
 TMP_DIR=$(mktemp -d)
-curl -fsSL "$ARCHIVE_URL" -o "${TMP_DIR}/${ARCHIVE_NAME}"
+if ! curl -fsSL "$ARCHIVE_URL" -o "${TMP_DIR}/${ARCHIVE_NAME}"; then
+    echo "✗ No pre-built binary for ${PLATFORM}/${ARCH} yet." >&2
+    echo "  Published builds live at https://sofuu.xyz/downloads" >&2
+    exit 1
+fi
 
 # ── Verify checksum ───────────────────────────────────────────
 echo "→ Verifying checksum..."
@@ -68,9 +65,39 @@ else
 fi
 cd -
 
+# ── Sanity-check archive members ──────────────────────────────
+# P3 (AUDIT-2026-09-07): extraction used to run on whatever the tarball
+# contained. A compromised or MITM'd archive could carry `../` or
+# absolute-path members that escape the temp dir while extracting. The
+# checksum above already ties the tarball to the release; this refuses
+# any member that would write outside $TMP_DIR regardless.
+if tar -tzf "${TMP_DIR}/${ARCHIVE_NAME}" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+    echo "✗ Archive contains path-traversal members — refusing to extract." >&2
+    exit 1
+fi
+
 # ── Extract ───────────────────────────────────────────────────
 tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "$TMP_DIR"
 chmod +x "${TMP_DIR}/${ASSET_NAME}"
+
+# P3 (AUDIT-2026-09-07): the checksum above covers the tarball only. If the
+# checksums file also lists the raw binary, verify the extracted file
+# directly — a packing mistake (or a tampered extraction) is caught here.
+# When the release ships only the archive's hash, this is a no-op.
+BIN_LINE=$(grep -E "[[:space:]]\*?${ASSET_NAME}\$" "${TMP_DIR}/${CHECKSUM_NAME}" 2>/dev/null | head -1 || true)
+if [ -n "$BIN_LINE" ]; then
+    EXPECTED_HASH=$(printf '%s\n' "$BIN_LINE" | cut -d' ' -f1)
+    if command -v sha256sum > /dev/null 2>&1; then
+        ACTUAL_HASH=$(sha256sum "${TMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)
+    else
+        ACTUAL_HASH=$(shasum -a 256 "${TMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)
+    fi
+    if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+        echo "✗ Extracted binary checksum mismatch — refusing to install." >&2
+        exit 1
+    fi
+    echo "→ Extracted binary checksum verified."
+fi
 
 # ── Install ───────────────────────────────────────────────────
 echo "→ Installing to ${INSTALL_DIR}/${BINARY}..."
@@ -84,7 +111,7 @@ rm -rf "$TMP_DIR"
 
 # ── Verify ────────────────────────────────────────────────────
 echo ""
-echo "✅ Sofuu ${LATEST} installed successfully!"
+echo "✅ Sofuu installed successfully!"
 echo ""
 "${INSTALL_DIR}/${BINARY}" version
 echo ""

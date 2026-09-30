@@ -34,6 +34,19 @@ function jsonReply(res, text) {
 }
 
 const server = sofuu.http.createServer((req, res) => {
+  // Model-catalog route for the /model picker E2E (chat_models_e2e.sh):
+  // an OpenAI-style listing so wizardFetchModels has something to fetch.
+  if (String(req.url || "").indexOf("/models") >= 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    /* live-alpha publishes real caps (detect-on-select: /model must report
+     * the detected window); live-beta/gamma deliberately publish none, so
+     * the "endpoint publishes no limits" branch has a fixture too. */
+    res.send(JSON.stringify({ object: "list", data: [
+      { id: "live-alpha", context_length: 1048576, max_completion_tokens: 65536 },
+      { id: "live-beta" }, { id: "live-gamma" },
+    ] }));
+    return;
+  }
   let parsed = {};
   try { parsed = JSON.parse(req.body || "{}"); } catch (e) {}
   const msgs = parsed.messages || [];
@@ -49,8 +62,9 @@ const server = sofuu.http.createServer((req, res) => {
   else if (all.indexOf("(file not found or empty)") >= 0 ||
            all.indexOf("(error:") >= 0) reply = "SAW-MISSING-MARKER";
   else if (all.indexOf("FILE-CONTENT-CANARY-8321") >= 0) reply = "SAW-FILE-CONTENT";
+  else if (all.indexOf("REMEMBER-CANARY") >= 0) reply = "RECALL-HIT-QZ77";
   else reply = "PLAIN-OK";
-  console.log("MOCK-LLM: reply=" + reply + " ptk=" + curPtk + " msgs=" + msgs.length + " bytes=" + all.length + " sizes=" + msgs.map(function (m) { return (m.role || "?").slice(0, 4) + ":" + String(m.content || "").length; }).join(",") + " heads=" + msgs.map(function (m) { return String(m.content || "").slice(0, 100).replace(/\n/g, "\\n"); }).join(" |"));
+  console.log("MOCK-LLM: reply=" + reply + " ptk=" + curPtk + " msgs=" + msgs.length + " bytes=" + all.length + " sizes=" + msgs.map(function (m) { return (m.role || "?").slice(0, 4) + ":" + String(m.content || "").length; }).join(",") + " heads=" + msgs.map(function (m) { return String(m.content || "").slice(0, 100).replace(/\n/g, "\\n"); }).join(" |") + (all.indexOf("REMEMBER-CANARY") >= 0 ? " RECALL-HIT" : ""));
   if (parsed.stream) sse(res, reply); else jsonReply(res, reply);
 });
 /* Hold the server reference for the process lifetime — an unreferenced

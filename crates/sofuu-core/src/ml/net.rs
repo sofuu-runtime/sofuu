@@ -175,7 +175,9 @@ impl TinyMlp {
     }
 
     /// Parse + verify a blob. Any mismatch (magic, version, dims, param
-    /// count, CRC) is an error — the caller refuses to load.
+    /// count, CRC, finiteness, trailing data) is an error — the caller
+    /// refuses to load; a corrupted bake must never become a silent wrong
+    /// answer.
     pub fn from_blob(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() < HEADER_LEN {
             return Err("blob too short");
@@ -204,10 +206,14 @@ impl TinyMlp {
         if crc32_ieee(weight_bytes) != crc {
             return Err("crc mismatch");
         }
-        let w = weight_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut w = Vec::with_capacity(params as usize);
+        for c in weight_bytes.chunks_exact(4) {
+            let v = f32::from_le_bytes(c.try_into().unwrap());
+            if !v.is_finite() {
+                return Err("non-finite weight");
+            }
+            w.push(v);
+        }
         Ok(Self { in_dim, h1, h2, w })
     }
 }
@@ -226,8 +232,19 @@ pub fn clamp_trust_region(w: &mut [f32], w0: &[f32], rel: f32) -> bool {
         n2 += b * b;
     }
     let r_max = rel * n2.sqrt();
-    if d2.sqrt() <= r_max || r_max <= 0.0 {
+    if d2.sqrt() <= r_max {
         return false;
+    }
+    if r_max <= 0.0 {
+        // P3 (AUDIT-2026-09-07): a degenerate all-zero pretrained layer has
+        // a radius-0 trust region — the only in-region point is w0 itself.
+        // The old early-return suspended the projection entirely, so a
+        // (theoretical) zero output layer let the online layer drift
+        // unbounded, contradicting "bounded by construction". Snap to w0.
+        for (a, b) in w.iter_mut().zip(w0.iter()) {
+            *a = *b;
+        }
+        return true;
     }
     let scale = r_max / d2.sqrt();
     for (a, b) in w.iter_mut().zip(w0.iter()) {
@@ -280,6 +297,37 @@ mod tests {
     }
 
     #[test]
+    fn blob_trailing_data_refused() {
+        // Extra bytes after the weight block: either a truncated second
+        // blob or a corrupted bake — both refuse to load (Phase 1.4).
+        let mut blob = demo_net().to_blob();
+        blob.extend_from_slice(&[0u8; 4]);
+        assert_eq!(TinyMlp::from_blob(&blob).unwrap_err(), "truncated weights");
+    }
+
+    #[test]
+    fn blob_non_finite_weight_refused() {
+        // NaN/Inf in the weight block (a corrupted bake, not a runtime
+        // condition): the blob refuses to load rather than producing
+        // garbage scores. The CRC is recomputed so only the finiteness
+        // check can reject it.
+        let net = demo_net();
+        let mut blob = net.to_blob();
+        let weight_start = HEADER_LEN;
+        let mut bad = f32::NAN.to_le_bytes();
+        blob[weight_start..weight_start + 4].swap_with_slice(&mut bad);
+        // Restore a valid CRC over the mutated weights.
+        let crc = crc32_ieee(&blob[HEADER_LEN..]);
+        blob[6 * 4..7 * 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(TinyMlp::from_blob(&blob).unwrap_err(), "non-finite weight");
+        let inf = f32::INFINITY.to_le_bytes();
+        blob[weight_start..weight_start + 4].copy_from_slice(&inf);
+        let crc = crc32_ieee(&blob[HEADER_LEN..]);
+        blob[6 * 4..7 * 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(TinyMlp::from_blob(&blob).unwrap_err(), "non-finite weight");
+    }
+
+    #[test]
     fn forward_is_deterministic_and_bounded() {
         let net = demo_net();
         let x = [0.1f32, -0.4, 0.9, 0.3];
@@ -323,5 +371,11 @@ mod tests {
         let mut w2 = vec![1.05f32, 0.0, 0.0, 0.0];
         assert!(!clamp_trust_region(&mut w2, &w0, 0.1));
         assert_eq!(w2[0], 1.05);
+        // P3 (AUDIT-2026-09-07): all-zero pretrained layer → radius-0 region.
+        // The only in-region point is w0, so any deviation must snap back —
+        // never leave the layer unprojected (unbounded drift).
+        let mut w3 = vec![0.7f32, -0.2, 0.9, 0.0];
+        assert!(clamp_trust_region(&mut w3, &[0.0f32; 4], 0.1));
+        assert_eq!(w3, vec![0.0f32, 0.0, 0.0, 0.0]);
     }
 }

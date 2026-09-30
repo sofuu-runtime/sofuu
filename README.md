@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
 
 > ⚠️ **Beta software.** Sofuu is under active development. APIs may change before a stable release.
 
@@ -16,14 +16,25 @@ Sofuu is a **server-side JavaScript runtime** — the kind of thing you'd use to
 
 What makes it different from Node.js, Deno, or Bun is that all the things you normally have to install separately — LLM streaming, vector math, MCP client/server, HTTP — are just built in at the C level. No npm packages needed for any of it.
 
+Beyond that, it ships the parts people usually pay for: **offline embeddings with no model file** (0 bytes, ~2 µs a document — median over 200 samples; treat it as a magnitude, not a benchmark constant), **image embeddings** in the same space as text, **speech in and out** (provider endpoints or the OS's own engines, offline), an **encrypted local brain** that persists across sessions, and five **tiny context-economy models** (~8k parameters each) that decide what enters the context, what actions are worth taking, and what stays. All of it runs offline, deterministically, with no API key.
+
 You build your frontend (React, Next.js, plain HTML — whatever you like) completely separately. Sofuu runs the server side.
 
 ---
 
 ## Install
 
+**The CLI** — pick whichever you prefer; all three install the same binary.
+
 ```bash
+# 1. curl | sh (no package manager)
 curl -fsSL https://sofuu.xyz/install | sh
+
+# 2. npm — the JS ecosystem's default
+npm install -g sofuu      # or: npx sofuu
+
+# 3. Homebrew-style manual
+#    → https://sofuu.xyz/downloads  (tarball + .sha256 per platform)
 ```
 
 Or build it yourself from source:
@@ -31,9 +42,18 @@ Or build it yourself from source:
 ```bash
 git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
+export SOFUU_QTSQ_DIR=/path/to/black-hole-disk   # the encrypted-brain codec
 make
 ./sofuu version
 ```
+
+> `make` refuses to build without the QTSQ codec unless you pass
+> `SOFUU_ALLOW_NO_QTSQ=1`. A codec-less build is *invisibly* broken — memory
+> no-ops and session persistence fails — so it is opt-out, not opt-in. Run
+> `./sofuu doctor` to confirm a build is healthy.
+
+**Embedding the runtime in your own app** is a different, packaged surface —
+Swift Package Manager, CocoaPods, and Gradle. See [Embed Sofuu](#embed-sofuu-libsofuu).
 
 ---
 
@@ -152,18 +172,84 @@ sofuu run research.js
 
 ## Why Sofuu?
 
+*Competitor cells read "add a package" when you need an extra dependency; Sofuu's
+AI features are in the binary itself.*
+
 | | Node.js | Deno | Bun | **Sofuu** |
 |---|---|---|---|---|
-| Binary size | ~100 MB | ~80 MB | ~60 MB | **~2 MB** |
+| Binary size | ~100 MB | ~80 MB | ~60 MB | **3.2 MB** (measured) |
 | Startup time | ~50 ms | ~30 ms | ~7 ms | **~3 ms** |
 | Language | C++ | Rust | Zig | **Rust-first + C (low-level)** |
-| LLM streaming | npm install | npm install | npm install | **Built in** |
-| MCP client + server | npm install | npm install | npm install | **Built in** |
-| SIMD vector math | npm install | npm install | npm install | **Built in (NEON/AVX2)** |
+| LLM streaming | add a package | add a package | add a package | **Built in** |
+| MCP client + server | add a package | add a package | add a package | **Built in** |
+| SIMD vector math | add a package | add a package | add a package | **Built in (NEON/AVX2)** |
+| Embeddings (offline, 0 bytes) | add a package | add a package | add a package | **Built in (`ai.embed`, hash-v1)** |
+| Image embeddings | add a package | add a package | add a package | **Built in (`ai.embedImage`)** |
+| Speech in / out | paid API | paid API | paid API | **Built in (`ai.transcribe`/`speak` + OS bridges)** |
+| Persistent local brain | paid service | add a package | add a package | **Built in (encrypted `.qtsq`)** |
 | TypeScript support | Separate compiler | Built in | Built in | **Built in (Rust stripper)** |
-| AI agents + sub-agents | npm install | npm install | npm install | **Built in (`sofuu.agent`)** |
-| Web search for agents | npm install | npm install | npm install | **Built in (`sofuu.web`, keyless default)** |
+| AI agents + sub-agents | add a package | add a package | add a package | **Built in (`sofuu.agent`)** |
+| Web search for agents | add a package | add a package | add a package | **Built in (`sofuu.web`, keyless default)** |
+| Context-economy ML gates | — | — | — | **Built in (`sofuu.ml`, ~8k params each)** |
 | Memory safety of shell | ❌ | ✅ | ✅ | **✅ (Rust shell)** |
+
+---
+
+## Embedding benchmarks
+
+Measured, not estimated. Reproduce with:
+
+```bash
+bash scripts/bench/fetch_datasets.sh      # BEIR SciFact + STS test split
+cargo run -p ml-train --release -- bench # SOFUU_BENCH_JSON=out.json to capture
+```
+
+**Text — BEIR SciFact** (5,183 scientific abstracts, 300 judged queries,
+official qrels) and **STS test** (1,379 human-rated sentence pairs,
+Spearman ρ). Apple M2 Pro, release build, single thread, no network:
+
+| space | dim | params | artifact | median embed | SciFact R@1 | R@5 | nDCG@10 | STS ρ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BM25 *(reference, measured here)* | — | — | 0 | — | 0.537 | 0.750 | **0.663** | — |
+| **hash-v1** *(shipped default)* | 768 | **0** | **0 B** | **~0.002 ms** | 0.307 | 0.493 | **0.410** | **0.613** |
+| sem1-64 *(opt-in)* | 64 | 13,392 | 13.7 KB | ~0.05 ms | 0.003 | 0.017 | 0.014 | 0.421 |
+| sem2-64 *(opt-in)* | 64 | 30,032 | 29.9 KB | ~0.08 ms | 0.037 | 0.090 | 0.081 | 0.517 |
+
+Read this honestly:
+
+- The **BM25 row is the calibration check** — our implementation lands at
+  0.663 nDCG@10 against the ~0.665 published for SciFact, so the harness,
+  the qrels and the metrics agree with the literature.
+- **hash-v1 is the default because it is the one that works.** It reaches
+  62% of BM25's nDCG with **zero parameters, zero bytes and no model
+  file** — the whole embedder is arithmetic over trigram hashes, at ~2 µs
+  a document. It is also the only space that beats nothing: it is what
+  `ai.embed` uses by default, and it is what makes the brain work with no
+  download and no API key.
+- **The 64-dim learned spaces are not general-domain retrievers.** On
+  out-of-domain text they reach 12% (sem2) and 2% (sem1) of BM25's nDCG.
+  They exist to be tiny and to win on their own in-domain gates; they are
+  opt-in, and the repo's own pre-registered gate (`embed-eval`) currently
+  returns **FAIL** on two of them, so they must not replace the default.
+  We are reporting this rather than quietly dropping the table.
+- We did **not** run a hosted-model baseline (it costs money per run);
+  expect a 1536-dim API embedder to be well ahead of every row here. That
+  is the trade: they need a network round-trip, a key and cents per
+  million documents.
+
+**Image — IMG1** (`ai.embedImage`, 7.4 KB projector, 144 features → 64-d):
+text→image **R@1 0.581 / R@5 1.000** on 93 held-out procedurally
+generated scenes across 39 unseen tag combinations, versus 0.247 for raw
+image features and 0.538 for a lexical caption baseline. **This is a
+synthetic, in-domain set** — it shows the projector learns its intended
+mapping, not that it matches a real-image retriever. We publish it
+labelled as synthetic because there is no honest real-image number to put
+beside it yet.
+
+The internal synthetic suites (`embed-eval`, `img-eval`) report friendlier
+numbers (fused 0.917 vs hash 0.875 on our own 8-category corpus). They
+are training gates, in-domain by construction, and are not comparable to
+the external table above.
 
 ---
 
@@ -187,14 +273,46 @@ sofuu agent list             # List agent definitions (~/.sofuu/agents/*.js)
 sofuu agent run <name> "task"       # Run one agent headless
 sofuu agent run <name> "task" --json  # …with a JSON result
 sofuu serve --brain <path>    # Serve the brain over HTTP (--port, --host, --token)
+sofuu doctor                 # Health check: QTSQ link, brain round-trip, ctx resolution
 sofuu version                # Print version information
 sofuu help                   # Print usage help
 ```
 
+`sofuu doctor` answers the three questions you cannot otherwise check —
+is the brain actually linked and persisting, where does it live, and what
+context window does the current model resolve to (with the evidence behind
+it):
+
+```text
+QTSQ / brain
+  ✓ QTSQ linked into this binary (brain persistence available)
+  ✓ brain write→read round-trip passed (temp store 5.2 KB)
+  · brain file not created yet: /path/.sofuu/brain/brain.qtsq
+
+context window
+  · model stealth/space-bunny-alpha @ https://openrouter.ai/api/v1/chat/completions
+  · resolved window 32768 (source: default) · max output 384000 (config)
+  · discovered model caps: 677 entries cached
+```
+
+A non-zero exit means a hard dependency is missing (an unlinked QTSQ
+build silently no-ops memory — this is what catches it).
+
+**Building from source** requires the QTSQ codec checkout, because a
+binary without it cannot persist a brain or a session:
+
+```bash
+SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make
+```
+
+`make` refuses to build without it (pass `SOFUU_ALLOW_NO_QTSQ=1` if you
+really want a memory-less binary). The chat banner never claims memory
+persists when the codec is missing.
+
 **Chat slash commands** (inside `sofuu` / `sofuu chat`):
 
 ```text
-/help  /models  /providers  /model <name>  /provider <name>
+/help  /model <name>  /provider <name>
 /effort <lvl>  /compact  /clear  /brain [on|off]  /rlm [on|off|auto]
 /tools  /agents  /version  /exit
 
@@ -204,7 +322,6 @@ sofuu help                   # Print usage help
 /share [path]      # Export brain as a portable card
 /import <path>     # Import a brain card from someone else
 /cost              # Token usage + spend breakdown + budget
-/verify <provider> # Second-model verification pass with diff
 /ghost [on|off]    # Toggle ghost prompt completion
 
 # Context
@@ -280,10 +397,6 @@ pricing table (seeded with popular models; add your own in config under
 Set `budget_usd` in config to cap spend — the chat preflight-blocks turns
 when the budget is exceeded.
 
-**Second-model verification** (`/verify <provider>`): after the final answer,
-the chat runs a second completion against a different provider and reports a
-word-agreement diff (>95% = ✓ verified; mismatches are surfaced inline).
-
 **File mentions** (`@file` or `@file:start-end`): type `@path` in a prompt to
 attach file contents. Paths resolve against cwd; `..` escapes are rejected.
 The attachment budget scales with the model's context window (~25% of it,
@@ -301,8 +414,34 @@ thinking support and effort ladders come from a built-in per-model table
 (`rt/model_caps.rs`, exposed as `sofuu.ai.modelCaps(model)`). RLM routing
 (`/rlm auto`) uses the real window (GPT/Claude/Llama/Qwen/Grok/…) so
 oversized turns route correctly; output requests default to the model's
-real max output instead of a flat constant. Explicit `/ctx` and `/maxout`
-overrides always win.
+real max output instead of a flat constant.
+
+**Context-window detection** (evidence ladder, strongest wins):
+a real provider 400 → caps the endpoint itself publishes for this exact
+model (harvested from its `/models` listing) → the built-in registry →
+an honest `32,768` default. `/model` and `/provider` force a fresh
+harvest for the endpoint you just selected and print what was found, so a
+1M model never sits silently at 32k:
+
+```text
+/model <name>
+  ✓ Model → some/model
+  ✓ detected 1,048,576 context for some/model (discovered, 214 models)
+```
+
+Overrides behave differently on purpose:
+
+- `/ctx <n>` is **explicit** — you typed it for this model, so it is
+  obeyed exactly as given, even above everything Sofuu knows. If it sits
+  above the known evidence you get one advisory line naming the bound; if
+  the provider disagrees, its 400 teaches the real limit and the session
+  corrects itself.
+- A `ctx_window` **inherited** from `config.json` (or another model) still
+  shrinks to the selected model's real bound, so a stale global can never
+  shadow a smaller model.
+
+`/ctx default` clears both. `sofuu doctor` prints the current resolution
+and its evidence without starting a chat.
 
 **Directory watching** (`/watch <path>`): watches a directory for changes
 (mtime + size poll on the 1s tick, 2k file cap, skips `.git`/`node_modules`/
@@ -331,58 +470,96 @@ for remote access — `GET /health`, `POST /remember`, `GET /recall?q=…&k=…`
 `POST /share`. Bearer-token auth (auto-generated or `--token`). Remote bind
 (`0.0.0.0`) requires an explicit token.
 
-### Embed Sofuu (libsofuu C ABI)
+### Embed Sofuu (libsofuu)
 
-Sofuu ships as an embeddable library (`libsofuu`) for any host — iOS, Android,
-desktop, server, edge. QuickJS is a pure interpreter (no JIT), so iOS App Store
-executable-memory policy is satisfied by design.
+Sofuu ships as an embeddable runtime for any host — iOS, Android, desktop,
+server, edge. QuickJS is a pure interpreter (no JIT), so iOS App Store
+executable-memory policy is satisfied by design. The pitch in one line:
+**a private AI agent with memory, offline, in a ~3 MB library.**
 
-```bash
-make libsofuu       # builds dist/libsofuu.{a,dylib} + dist/sofuu_embed.h
-make headless-test  # compiles + runs c_embed.c and c_rlm.c against libsofuu
-make abi-check      # verifies the exported symbol surface
+**iOS / macOS (Swift):**
+
+```swift
+// Package.swift — or: pod 'Sofuu', '~> 0.2'
+import Sofuu
+
+let sofuu = try Sofuu()
+let vec = try sofuu.embed("the sky is blue")     // 768-dim, offline, 0-byte model
+
+let brain = try Brain.openDefault(sofuu: sofuu)  // encrypted, local, yours
+try brain.remember("the sky is blue")
+let hits = try brain.recall("what colour is the sky?", k: 3)
+```
+
+**Android (Kotlin):**
+
+```groovy
+dependencies { implementation 'com.sofuu:sofuu-android:0.2.0' }
+```
+
+```kotlin
+val vec = sofuu.embedLocal("hello")   // FloatArray, 768-dim, no network
 ```
 
 **C (macOS / Linux):**
 
 ```c
 #include "sofuu_embed.h"
-int main(void) {
-    SofuuRuntime *rt = sofuu_rt_new(NULL);
-    char *out = NULL;
-    sofuu_rt_eval(rt, "1 + 1", &out);   // → {"ok":true,"result":2}
-    sofuu_free(out);
-    sofuu_rt_free(rt);
-}
+SofuuRuntime *rt = sofuu_rt_new(NULL);
+char *out = NULL;
+sofuu_rt_call(rt, "memory.open", "{\"path\":\"/tmp/b.qtsq\",\"dim\":768}", &out);
+sofuu_free(out);
+sofuu_rt_free(rt);
 ```
 
-See `examples/headless/c_embed.c` (eval + funnel), `c_rlm.c` (RLM long-context
-Q&A), and `c_agent.c` (agent define/run/stream/cancel) for complete working examples.
+**CLI on npm:**
 
-**iOS (Swift):**
-
-```swift
-let sofuu = SofuuBridge()
-sofuu.eval("1 + 1")                    // → {"ok":true,"result":2}
-sofuu.embedLocal("hello")             // → [Float] (768-dim, no network)
+```bash
+npx sofuu            # chat
+npx sofuu run app.ts
 ```
 
-See `examples/headless/SwiftSample/SofuuBridge.swift` for the full wrapper.
+Every `examples/headless/` sample **asserts** its calls, so a broken SDK
+fails `make headless-test` rather than shipping:
 
-**Android (Kotlin/JNI):**
+| Sample | Proves |
+|---|---|
+| `c_embed.c` | eval + funnel + embed + a full brain round-trip |
+| `c_embed_vec.c` | vector ABI: spaces, batch, error guards |
+| `c_llm.c` | a real LLM call (mock in CI, live with a key) |
+| `c_rlm.c` / `c_agent.c` | RLM long-context Q&A / agent run + stream + cancel |
 
-```kotlin
-val sofuu = SofuuBridge()
-sofuu.eval("1 + 1")                   // → {"ok":true,"result":2}
-sofuu.embedLocal("hello")             // → FloatArray (768-dim, no network)
-```
+From source: `make libsofuu`, `make dist-macos`, `make dist-linux`,
+`make dist-ios` (xcframework), `make dist-android` (per-ABI .so). See
+[`docs/EMBEDDING-DIST.md`](docs/EMBEDDING-DIST.md) (artifacts + install) and
+[`docs/EMBEDDING.md`](docs/EMBEDDING.md) (the contract). Design + status:
+[`PLAN-HEADLESS.md`](PLAN-HEADLESS.md).
 
-See `examples/headless/KotlinSample/` for the wrapper + JNI bridge + CMake config.
+### Full features on Windows & Linux (QTSQ port)
 
-Platform packs: `make dist-macos` (arm64+x86_64), `make dist-linux` (x86_64+arm64
-musl), `make dist-ios` (xcframework), `make dist-android` (per-ABI .so). See
-[`dist/README.md`](dist/README.md) and [`docs/EMBEDDING.md`](docs/EMBEDDING.md)
-for the full embedding contract. Design + status: [`PLAN-HEADLESS.md`](PLAN-HEADLESS.md).
+All Sofuu features — including **QTSQ session persistence** (brain/memory,
+session store, `.qtsq` container save/load, vault, secure_text, deniable
+encryption, authorship anchoring) — now build on all three desktop platforms.
+The QTSQ codec is a proprietary local checkout; each OS links it natively:
+
+| Platform | QTSQ artifact | Built by | Linked by `build.rs` |
+|---|---|---|---|
+| macOS | `libqtsq.a` + `compressor/libqtc.a` | `make` in the checkout | static=qtsq, static=qtc, `-lz` |
+| Linux | `libqtsq.a` + `compressor/libqtc.a` | same Makefile (gcc/clang — clean-build proof: docker `gcc:13`, all 21 FFI symbols link, 8 layout guards pass) | same as macOS |
+| Windows | single `qtsq.lib` (qtc + crypto + shim baked in) | `cmake -S windows -B windows/build-win64 && cmake --build windows/build-win64 --config Release` in the checkout — an MSVC port with a Win32 POSIX-compat shim (`windows/shim/`: pthreads→Win32 threads, mmap→CreateFileMapping, dirent→FindFirstFile, clock/time/rename/sysconf equivalents) so turbo keeps **parallel** worker threads | `SOFUU_QTSQ_DIR` + `SOFUU_QTSQ_LIB`; zlib from vcpkg `x64-windows-static-md` (`SOFUU_ZLIB_DIR` to override); bcrypt/advapi32 auto-linked |
+
+Point the build at a checkout with `SOFUU_QTSQ_DIR` (default:
+`~/projects/black-hole-disk`); a missing checkout degrades to the no-QTSQ
+build (session persistence disabled) instead of failing. The build script
+also re-runs an 8-assert `_Static_assert` layout guard against the checkout's
+headers on every OS (via the `cc` crate: clang/gcc on POSIX, cl.exe on
+Windows), so a format drift fails the build instead of corrupting files.
+Windows QTSQ is excluded from CI (proprietary checkout can't ship there);
+CI artifacts stay no-QTSQ/fail-closed. Windows verification status: full
+compile+link closure proven with `zig cc -target x86_64-windows-gnu`
+(100/100 sources, 21-symbol link → PE32+, layout guards pass); final
+native-MSVC proof happens on a Windows machine. See the QTSQ checkout's
+`windows/README.md` for the port's internals.
 
 ---
 
@@ -421,7 +598,42 @@ sofuu.ai.l2(a, b)            // Euclidean distance → number
 // memory path; remote embedding providers are opt-in via config):
 // text → 768-dim unit Float32Array
 const v = sofuu.ai.embedLocal("hello world");
+// Learned semantic spaces (offline, bundled): SEM1 64-dim, SEM2 64-dim
+const s = sofuu.ai.embedLocalSemanticV2("hello world");
+JSON.parse(sofuu.ai.embedInfoV2());  // → { id, dim: 64, ... } space manifest
 
+// ai.embed defaults to the bundled local model (SEM2-64, offline):
+const v2 = await sofuu.ai.embed("hello world");                 // → Float32Array(64)
+const vs = await sofuu.ai.embed(["a", "b"], { space: "hash-768" }); // → Array<Float32Array>
+const batch = await sofuu.ai.embedBatch(["a", "b", "c"]);       // → Array<Float32Array>, one call
+// Network embeddings (explicit provider — BYO key, billed by them):
+const e = await sofuu.ai.embed("hello world", { provider: "openai", model: "text-embedding-3-small" });
+
+// Vision input: user messages carry images (data URLs) on both wires
+// (OpenAI image_url parts + Anthropic base64 blocks, count/size capped)
+const r = await sofuu.ai.complete({
+  messages: [{ role: "user", content: "read this", images: ["data:image/png;base64,…"] }],
+  provider: "openai", model: "gpt-5",
+});
+
+// Image embeddings (offline, bundled IMG1 projector — PNG/JPEG bytes in,
+// 64-dim joint-space vector out; text queries retrieve images):
+const iv = sofuu.ai.embedImage(await sofuu.fs.readFileBytes("shot.png"));
+
+// Multimodal recall recipe (image store + text query):
+const store = sofuu.memory.open("/tmp/mm.qtsq", 64, "image-projector-v1");
+store.remember(iv, "login dialog", "user", 0);
+store.recall(sofuu.ai.embedLocalSemanticV2("login screen"), 3);
+
+// Provider voice (OpenAI-compatible audio endpoints, BYO key):
+const t = await sofuu.ai.transcribe(audioBytes, { provider: "openai", model: "whisper-1" });
+console.log(t.text);
+const s = await sofuu.ai.speak("hello", { provider: "openai", model: "tts-1", voice: "alloy" });
+// → { audio: Uint8Array, format: "mp3" }
+
+// Headless SDK: sofuu_embed_local/batch/image/info + sofuu_voice_transcribe/speak
+// C ABI (libsofuu) + Swift/Kotlin wrappers (incl. on-device OS speech:
+// Apple Speech/AVSpeech, Android SpeechRecognizer/TTS — offline, free).
 // Run a command and capture its output
 const r = await sofuu.exec("echo", ["hi"]);
 console.log(r.code, r.stdout, r.stderr);   // 0 "hi\n" ""
@@ -594,7 +806,6 @@ const p = JSON.parse(sofuu.ml.compaction.plan(JSON.stringify(
 // segments: [{ text, tokens, age, kind, retrievable, compacted }]
 // → {"compact":[2,4,5,3],"keep":[0,1,6,7],"freeable":1018,
 //    "tiers":["dup","dup","dup","dup"],"scores":[...]}
-
 // Relevance — within a fixed budget, which candidates deserve the space?
 // (trained, baked weights: 37→104→44→1, threshold 0.95 recall-first; §6 of
 // the plan). Pre-retrieval ADVISOR: it scores a menu of candidates against
@@ -606,6 +817,42 @@ const r = JSON.parse(sofuu.ml.relevance.plan(JSON.stringify(
 
 sofuu.ml.info();     // gate states + working-set counters (JSON)
 sofuu.ml.track(json) // feed the in-memory context working set
+
+**Compaction is the one irreversible thing the chat does**, so it runs
+under two guards that do not depend on the model being right:
+
+- **A per-pass cap** — at most a quarter of the complete turn blocks, and
+  never fewer than two survive. A gate that flags 200 of 200 blocks still
+  leaves 150 turns in place.
+- **A lexical floor** — a turn whose *user* message asks a question, gives
+  an instruction, or records a decision/approval is never removed,
+  whatever the net says. The last line of defence is deliberately not the
+  component under suspicion. Skipped turns are counted and reported, and
+  they never consume the drop budget.
+
+**Do the gates earn their bytes?** `ml-train gate-eval` grades the shipped
+weights against two references on held-out *families* (whole content
+constructions, never random rows):
+
+| gate | params | MLP F1 | logistic F1 | constant F1 |
+|---|---:|---:|---:|---:|
+| freshness | 8,721 | 1.000 | 0.571 | 0.000 |
+| compaction | 8,201 | 0.850 | 0.553 | 0.545 |
+| relevance | 8,617 | 0.989 | 0.484 | 0.000 |
+| supervisor | 8,201 | 1.000 | 0.832 | 0.769 |
+| alloc | 6,321 | 0.991 | 0.973 | 0.000 |
+
+Every gate beats both a constant predictor and a logistic regression on
+the same features. Compaction's benchmark was rebuilt to include a family
+that is provably non-separable (verified by exhaustive search, not
+assumed) — before that, linear also scored 1.000 and the comparison could
+not tell whether the network was doing anything.
+
+**The honest caveat**, printed by the command on every run: all five
+training sets are synthetic with mechanically derived labels, so a pass
+means "learnable on the distribution we generate" — not "correct on real
+user traffic". The instrument that would answer that is a shadow-mode A/B
+on live sessions; it does not exist yet.
 ```
 
 When the freshness gate fires, the turn gets ONE evidence-carrying notice
@@ -875,28 +1122,78 @@ duplicates (`memory/hnsw.c`, `memory/dream.c`, `ts/stripper.c`,
 ## Build from Source
 
 ```bash
-# Requirements: Rust (cargo), clang, make. libcurl is needed for HTTP features.
+# Requirements: Rust (cargo), clang, make. libcurl for HTTP features.
 git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
+
+export SOFUU_QTSQ_DIR=/path/to/black-hole-disk   # the encrypted-brain codec
 make                 # cargo build --release (build.rs compiles QuickJS+SIMD+http-parser)
-make size-check      # fails if binary exceeds 5MB
-make install         # copies binary to /usr/local/bin
+make test            # JS e2e suite
+make size-check      # fails if the binary exceeds 5MB
+./sofuu doctor       # confirms QTSQ linkage + a real brain round-trip
+make install         # copies the binary to /usr/local/bin
 ```
 
-- `cargo test` — runs the Rust unit tests (memory, SSE, JSON-RPC, TS,
-  bundler, npm, rt loop/promises/timer/fs/spawn, console, MCP, RLM, engine,
-  shipped drivers, chat features — 177 tests).
-- `./sofuu run examples/agent_test.js` — agents + web E2E battery over a
-  scripted mock provider and real MCP child servers (46 checks).
-- `./sofuu run examples/rlm_mock_test.js` — RLM E2E, network-free.
-- `make test` — JS parity test suite (priority1/priority2/ts_test/simd_test).
-- `make size-check` — fails if binary exceeds 5MB (current: 2.0MB).
+> **Why `SOFUU_QTSQ_DIR` is required:** the encrypted brain is the product, and
+> a build without the QTSQ codec is *silently* broken — memory calls no-op and
+> every session persist fails while the UI still claims persistence. A release
+> tarball built that way shipped once (2026-09-22). `make` now refuses it
+> unless you pass `SOFUU_ALLOW_NO_QTSQ=1` (what CI does), and
+> `sofuu doctor` catches it in one command.
+
+### The gates
+
+| Command | What it proves |
+|---|---|
+| `cargo test --release` | 395 `sofuu-core` unit tests **and** the 36 `sofuu-capi` tests (funnel, memory handles, streaming, cancel, multi-instance, the doc anti-drift test) |
+| `make test` | JS e2e/parity suite — 46 passed / 0 failed / 1 skipped (the skip is an opt-in live test, `SOFUU_LIVE_TEST=1`) |
+| `make headless-test` | compiles **and runs** all 5 C samples against `libsofuu`; every sample asserts, so a broken SDK fails the build |
+| `make abi-check` | exported C symbols still match `scripts/abi_symbols.txt` (a new symbol must be acknowledged) |
+| `make size-check` | 5 MB cap (currently 3.2 MB) |
+| `./sofuu doctor` | QTSQ is linked, a real write→flush→reopen→recall round-trips, caps resolve |
+| `ruby scripts/check_podspec.rb` | the CocoaPods manifest is valid |
+| `swift package dump-package` | the SwiftPM manifest parses |
+| `xcrun swiftc -typecheck` | the typed Swift layer still matches `sofuu_embed.h` |
+
+Other suites: `./sofuu run tests/agent_test.js` (agents + web E2E over a
+scripted mock provider and real MCP child servers), `tests/rlm_mock_test.js`
+(RLM, network-free), `tests/verify_memory_test.js` (CMA brain: recall, dedup,
+entity upsert, persistence, decay, consolidation), `tests/long_horizon_test.js`
+(endurance: 429 storms, mid-answer transport cuts, 25-round tool loops,
+sub-agent budget inheritance, provider-outage salvage).
+
 - The C engine layer is compiled by `crates/sofuu-ffi/build.rs`: QuickJS
-  (from `deps/quickjs/`), SIMD kernels (`src/simd/`), vendored http-parser
+  (`deps/quickjs/`), SIMD kernels (`src/simd/`), vendored http-parser
   (`deps/http-parser/`), and prebuilt libuv (`deps/libuv/build/libuv.a` —
   build with `cmake -S deps/libuv -B deps/libuv/build && cmake --build deps/libuv/build`).
-- Cross-compilation: `make linux-x86_64` or `make linux-arm64` (requires Zig —
-  `make zig-install` once; builds via cargo + zig as linker).
+- Cross-compilation: `make linux-x86_64` / `make linux-arm64` (requires Zig —
+  `make zig-install` once).
+
+**Embedding the runtime** (not just the CLI): see [Embed Sofuu](#embed-sofuu-libsofuu),
+[`docs/EMBEDDING.md`](docs/EMBEDDING.md) (the contract) and
+[`docs/EMBEDDING-DIST.md`](docs/EMBEDDING-DIST.md) (artifacts + install).
+Platform packs: `make dist-macos` · `dist-linux` · `dist-ios` (xcframework) ·
+`dist-android` (per-ABI `.so`).
+
+---
+
+## Documentation map
+
+| I want to… | Read |
+|---|---|
+| Install and run the CLI | this README · [sofuu.xyz/docs](https://sofuu.xyz/docs) |
+| Put the runtime inside my app | [`docs/EMBEDDING.md`](docs/EMBEDDING.md) (contract) · [`docs/EMBEDDING-DIST.md`](docs/EMBEDDING-DIST.md) (install) |
+| Understand the architecture | [`CONTEXT.md`](CONTEXT.md) · [Architecture](#architecture) above |
+| See what's done and what isn't | [`TASKS.md`](TASKS.md) (status board) · [`ROADMAP.md`](ROADMAP.md) |
+| Read a design decision | `PLAN-*.md` at the repo root (indexed in [ROADMAP.md](ROADMAP.md)) |
+| Reproduce the embedding numbers | [`docs/EMBEDDING.md`](docs/EMBEDDING.md) §13 + `scripts/bench/fetch_datasets.sh` |
+| Check a build is healthy | `./sofuu doctor` |
+
+Design plans worth knowing about: [`PLAN-HEADLESS.md`](PLAN-HEADLESS.md)
+(the embeddable SDK) · [`PLAN-MULTIMODAL-EMBEDDINGS.md`](PLAN-MULTIMODAL-EMBEDDINGS.md)
+(embeddings/image/voice) · [`PLAN-ML-GATES.md`](PLAN-ML-GATES.md) (the five
+context-economy models) · [`PLAN-POSITIONING-2026.md`](PLAN-POSITIONING-2026.md)
+(why the SDK is the product).
 
 ---
 

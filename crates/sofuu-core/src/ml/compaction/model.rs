@@ -13,6 +13,7 @@
 use std::sync::LazyLock;
 
 use super::features::{self, SegKind, SegmentInput, COMPACTION_FEATURES};
+use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 
 pub const IN_DIM: u32 = COMPACTION_FEATURES as u32; // 33
@@ -151,15 +152,26 @@ pub fn plan(
         return out;
     }
 
-    let feats = features::extract_all(&features::CompactionContext {
+    let mut feats = features::extract_all(&features::CompactionContext {
         task,
         summary,
         recent,
         segments,
     });
+    // Phase 1.2: NaN must never reach a forward pass (sigmoid(NaN) is
+    // NaN → "NaN" in the returned JSON → the caller's parse breaks).
+    for f in feats.iter_mut() {
+        crate::ml::sanitize_features(f);
+    }
     out.scores = feats.iter().map(|f| NET.forward(f)).collect();
 
-    let total_tokens: u32 = segments.iter().map(|s| s.tokens).sum();
+    // P1-19 (AUDIT-2026-09-01): plain `.sum()` wraps on hostile token
+    // counts (release builds wrap silently) — the 2026-08-30 hardening
+    // landed only in features.rs:220. 256×u32::MAX wrapped to a budget of
+    // ~5 tokens, freeing the wrong amount. Saturating, matching features.rs.
+    let total_tokens: u32 = segments
+        .iter()
+        .fold(0u32, |acc, s| acc.saturating_add(s.tokens));
     let budget = if budget_tokens > 0 {
         budget_tokens
     } else {
@@ -242,13 +254,21 @@ unsafe extern "C" fn js_compaction_plan(
         serde_json::Value::Null
     };
 
-    let task = v.get("task").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let summary = v.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let recent = v.get("recent").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // Bounded inputs (Phase 1.2). Segment count: histories are hundreds
+    // of messages at most; the extractor embeds every segment and scores
+    // an O(n²) dup channel, so a giant array must never reach it. Texts
+    // match the trainer's clip; token counts clamp into u32 (a huge JSON
+    // number would wrap on the cast and feed the net garbage).
+    const MAX_SEGMENTS: usize = 256;
+    const MAX_SEG_CHARS: usize = 20_000;
+    let task = cap_str(v.get("task").and_then(|x| x.as_str()).unwrap_or(""), 4_000);
+    let summary = cap_str(v.get("summary").and_then(|x| x.as_str()).unwrap_or(""), 20_000);
+    let recent = cap_str(v.get("recent").and_then(|x| x.as_str()).unwrap_or(""), 20_000);
     let budget = opts
         .get("budget")
         .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
 
     // Segment texts must outlive the SegmentInput borrows — collect first.
     let texts: Vec<String> = v
@@ -256,7 +276,8 @@ unsafe extern "C" fn js_compaction_plan(
         .and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|s| s.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string())
+                .take(MAX_SEGMENTS)
+                .map(|s| cap_str(s.get("text").and_then(|x| x.as_str()).unwrap_or(""), MAX_SEG_CHARS))
                 .collect()
         })
         .unwrap_or_default();
@@ -265,10 +286,11 @@ unsafe extern "C" fn js_compaction_plan(
         .and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
+                .take(MAX_SEGMENTS)
                 .map(|s| {
                     (
-                        s.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-                        s.get("age").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                        s.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
+                        s.get("age").and_then(|x| x.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
                         s.get("kind").and_then(|x| x.as_u64()).unwrap_or(1).min(3) as u8,
                         s.get("retrievable").and_then(|x| x.as_bool()).unwrap_or(false),
                         s.get("compacted").and_then(|x| x.as_bool()).unwrap_or(false),

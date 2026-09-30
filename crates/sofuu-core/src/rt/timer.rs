@@ -75,6 +75,7 @@ unsafe fn timer_find(id: c_uint) -> Option<*mut Timer> {
 /// Close callback: free the Box'd Timer + the handle storage once libuv
 /// releases the handle.
 unsafe extern "C" fn on_timer_close(handle: *mut UvHandle) {
+    crate::rt::event_loop::untrack_handle(handle);
     // SAFETY: data was set at init; the handle is fully closed here.
     let t = *(handle as *mut *mut Timer);
     if t.is_null() {
@@ -158,6 +159,8 @@ unsafe fn timer_create(ctx: *mut JSContext, cb: JSValueConst, delay_ms: u64, rep
 
     uv::uv_timer_init(sofuu_loop_get(), handle);
     uv::uv_timer_start(handle, Some(on_timer), delay_ms, if repeat != 0 { delay_ms } else { 0 });
+    /* F-2: armed per-ctx — a multi-engine teardown must close it. */
+    unsafe { crate::rt::event_loop::track_handle(ctx, handle as *mut UvHandle, Some(on_timer_close)) };
 
     if !timer_register(t) {
         /* Registry full: stop and destroy instead of half-registering (an
@@ -246,6 +249,7 @@ struct SleepReq {
 }
 
 unsafe extern "C" fn on_sleep_close(handle: *mut UvHandle) {
+    crate::rt::event_loop::untrack_handle(handle);
     /* Timer handle fully closed — safe to free the container */
     // SAFETY: data set at init.
     let req = *(handle as *mut *mut SleepReq);
@@ -294,6 +298,10 @@ unsafe extern "C" fn js_sleep(
 
     uv::uv_timer_init(sofuu_loop_get(), handle);
     uv::uv_timer_start(handle, Some(on_sleep_timer), ms as u64, 0);
+    /* F-2: armed per-ctx — a multi-engine teardown must close it. */
+    unsafe {
+        crate::rt::event_loop::track_handle(ctx, handle as *mut UvHandle, Some(on_sleep_close))
+    };
 
     promise
 }

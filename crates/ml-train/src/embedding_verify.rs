@@ -70,8 +70,8 @@ fn run_probe(
     let mut hits = 0usize;
     let mut tgt_slots = 0u32;
     let mut tot_slots = 0u32;
-    let mut per_cat_hits = vec![0u32; CURATED_CAT];
-    let mut per_cat_tot = vec![0u32; CURATED_CAT];
+    let mut per_cat_hits = [0u32; CURATED_CAT];
+    let mut per_cat_tot = [0u32; CURATED_CAT];
     // separation accumulators
     let mut same = 0f64;
     let mut same_n = 0f64;
@@ -148,8 +148,8 @@ fn run_probe_fused(
     let mut hits = 0usize;
     let mut tgt_slots = 0u32;
     let mut tot_slots = 0u32;
-    let mut per_cat_hits = vec![0u32; CURATED_CAT];
-    let mut per_cat_tot = vec![0u32; CURATED_CAT];
+    let mut per_cat_hits = [0u32; CURATED_CAT];
+    let mut per_cat_tot = [0u32; CURATED_CAT];
     for (q, tag) in probes {
         let fused = store.top5(&sem_fn(q), &hash_fn(q));
         let mut hit = false;

@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use super::features::{self, CandKind, CandidateInput, RELEVANCE_FEATURES};
 use crate::ml::net::TinyMlp;
+use crate::ml::cap_str;
 
 pub const IN_DIM: u32 = RELEVANCE_FEATURES as u32; // 37
 pub const H1: u32 = 104;
@@ -79,12 +80,17 @@ pub fn plan(
         return out;
     }
 
-    let feats = features::extract_all(&features::RelevanceContext {
+    let mut feats = features::extract_all(&features::RelevanceContext {
         task,
         recent,
         candidates,
         kept,
     });
+    // Phase 1.2: NaN must never reach a forward pass (sigmoid(NaN) is
+    // NaN → "NaN" in the returned JSON → the caller's parse breaks).
+    for f in feats.iter_mut() {
+        crate::ml::sanitize_features(f);
+    }
     out.scores = feats.iter().map(|f| NET.forward(f)).collect();
 
     for (i, f) in feats.iter().enumerate() {
@@ -152,12 +158,25 @@ unsafe extern "C" fn js_relevance_plan(
         serde_json::Value::Null
     };
 
-    let task = v.get("task").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let recent = v.get("recent").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // Bounded inputs (Phase 1.2). The JS caller caps task/recent at 4000
+    // chars, but a hostile/buggy caller could pass more — cap again here.
+    // Candidate count: recall menus are ≤15 in practice; the extractor is
+    // O(n²) over embeddings (candidate×kept cosines + BM25), so a giant
+    // array must never reach it. 64 is far above any real menu while
+    // bounding the pass. Per-candidate text: matches the trainer's clip.
+    const MAX_CANDIDATES: usize = 64;
+    const MAX_CAND_CHARS: usize = 4_000;
+    let task = cap_str(v.get("task").and_then(|x| x.as_str()).unwrap_or(""), 4_000);
+    let recent = cap_str(v.get("recent").and_then(|x| x.as_str()).unwrap_or(""), 4_000);
     let kept: Vec<usize> = opts
         .get("kept")
         .and_then(|x| x.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|i| i as usize)).collect())
+        .map(|arr| {
+            arr.iter()
+                .take(MAX_CANDIDATES)
+                .filter_map(|x| x.as_u64().filter(|&i| i < MAX_CANDIDATES as u64).map(|i| i as usize))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Candidate texts/paths must outlive the CandidateInput borrows.
@@ -166,7 +185,8 @@ unsafe extern "C" fn js_relevance_plan(
         .and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|c| c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string())
+                .take(MAX_CANDIDATES)
+                .map(|c| cap_str(c.get("text").and_then(|x| x.as_str()).unwrap_or(""), MAX_CAND_CHARS))
                 .collect()
         })
         .unwrap_or_default();
@@ -175,15 +195,20 @@ unsafe extern "C" fn js_relevance_plan(
         .and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
+                .take(MAX_CANDIDATES)
                 .map(|c| {
+                    let strength = c
+                        .get("strength")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0) as f32;
                     (
                         kind_of(c.get("kind").and_then(|x| x.as_str()).unwrap_or("other")),
-                        c.get("strength")
-                            .and_then(|x| x.as_f64())
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0) as f32,
+                        // A non-finite JSON float (1e400 → Inf) must never
+                        // become a feature (NaN score → broken JSON).
+                        if strength.is_finite() { strength } else { 0.0 },
                         c.get("role").and_then(|x| x.as_u64()).unwrap_or(0).min(255) as u8,
-                        c.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        cap_str(c.get("path").and_then(|x| x.as_str()).unwrap_or(""), 512),
                     )
                 })
                 .collect()

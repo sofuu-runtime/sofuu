@@ -97,17 +97,45 @@ mod impl_qtsq {
         metadata_json: &str,
     ) -> c_int {
         let ctmp = CString::new(format!("{path}.tmp")).unwrap_or_default();
+        /* The brain lives at <project>/.sofuu/brain/brain.qtsq now — make
+         * sure the folder exists before the codec (which does not mkdir)
+         * writes the tmp file. */
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let container = qtsq::qtsq_ctx_alloc();
         if container.is_null() {
             return qtsq::QTSQ_ERR_ALLOC;
         }
         let mut r = qtsq::qtsq_container_create(container);
         if r == QTSQ_OK {
-            /* Stream 1: memory vectors (lossless f32, flat table) */
+            /* Phase 7: every write context rides the qtc compressor — the
+             * zlib write path in the current checkout produces containers
+             * its own read path cannot parse back (2026-08-30). zlib stays
+             * read-only for legacy files. */
+            unsafe { (*container).set_codec(qtsq::QTSQ_CODEC_QTC) };
+            /* Stream 1: memory vectors (lossless f32, flat table).
+             * OMITTED when there is nothing to store: the QTSQ tensor
+             * compressor rejects a zero-length payload, so an "empty"
+             * stream cannot be written. An empty brain is therefore a
+             * valid container with metadata only — the loader recognizes
+             * that shape (see cma_open) instead of calling it corrupt. */
             if let Some(vecs) = vecs {
                 if !vecs.is_empty() && vec_dim > 0 {
                     let sub = qtsq::qtsq_ctx_alloc();
-                    qtsq::qtsq_init(sub);
+                    if sub.is_null() {
+                        qtsq::qtsq_free(container);
+                        qtsq::qtsq_ctx_free(container);
+                        return qtsq::QTSQ_ERR_ALLOC;
+                    }
+                    let init_rc = qtsq::qtsq_init(sub);
+                    if init_rc != QTSQ_OK {
+                        qtsq::qtsq_ctx_free(sub);
+                        qtsq::qtsq_free(container);
+                        qtsq::qtsq_ctx_free(container);
+                        return init_rc;
+                    }
+                    unsafe { (*sub).set_codec(qtsq::QTSQ_CODEC_QTC) };
                     let dims: [u32; 2] = [n_memories as u32, vec_dim as u32];
                     r = qtsq::qtsq_compress_tensor(sub, vecs.as_ptr(), n_memories * vec_dim, dims.as_ptr(), 2);
                     if r == QTSQ_OK {
@@ -127,7 +155,19 @@ mod impl_qtsq {
             if !metadata_json.is_empty() {
                 let cmeta = CString::new(metadata_json).unwrap_or_default();
                 let sub = qtsq::qtsq_ctx_alloc();
-                qtsq::qtsq_init(sub);
+                if sub.is_null() {
+                    qtsq::qtsq_free(container);
+                    qtsq::qtsq_ctx_free(container);
+                    return qtsq::QTSQ_ERR_ALLOC;
+                }
+                let init_rc = qtsq::qtsq_init(sub);
+                if init_rc != QTSQ_OK {
+                    qtsq::qtsq_ctx_free(sub);
+                    qtsq::qtsq_free(container);
+                    qtsq::qtsq_ctx_free(container);
+                    return init_rc;
+                }
+                unsafe { (*sub).set_codec(qtsq::QTSQ_CODEC_QTC) };
                 r = qtsq::qtsq_compress_json(sub, cmeta.as_ptr(), cmeta.as_bytes().len());
                 if r == QTSQ_OK {
                     r = qtsq::qtsq_container_add_stream(container, sub, c"metadata".as_ptr());
@@ -166,6 +206,24 @@ mod impl_qtsq {
         r
     }
 
+    /// Copy a brain we are about to replace to a backup path that is NEVER
+    /// clobbered: `<path>.bak`, then `.bak.1`, `.bak.2`, … An earlier
+    /// fixed-name `.bak` meant every reopen overwrote the only copy of a
+    /// brain we could not read — the one moment the backup matters most.
+    fn backup_brain(path: &str) -> String {
+        let first = format!("{path}.bak");
+        let mut target = first.clone();
+        let mut n = 1u32;
+        while std::path::Path::new(&target).exists() && n < 1000 {
+            target = format!("{path}.bak.{n}");
+            n += 1;
+        }
+        if std::fs::copy(path, &target).is_err() {
+            return first;
+        }
+        target
+    }
+
     struct BrainData {
         vecs: Vec<f32>,
         n: usize,
@@ -177,6 +235,10 @@ mod impl_qtsq {
     /// cma_qtsq_load — read + decrypt a container, extract the "memories"
     /// tensor (n/dim from its schema) and the "metadata" JSON stream.
     unsafe fn cma_qtsq_load(path: &str) -> Result<BrainData, c_int> {
+        // P3 (AUDIT-2026-09-07): every open is the one chance to clear the
+        // `{brain}.tmp` a crashed writer left behind (age-guarded — see
+        // sweep_stale_tmp_file).
+        sweep_stale_tmp_file(&format!("{path}.tmp"));
         let cpath = CString::new(path).unwrap_or_default();
         let container = qtsq::qtsq_ctx_alloc();
         if container.is_null() {
@@ -230,16 +292,28 @@ mod impl_qtsq {
                 let mut data: *mut f32 = ptr::null_mut();
                 let mut count: usize = 0;
                 if qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count) == QTSQ_OK {
-                    let slice = std::slice::from_raw_parts(data, count);
-                    vecs = slice.to_vec();
-                    libc::free(data as *mut c_void);
-                    if (*sub).schema_num_dims() >= 2 {
+                    /* ml-2 (AUDIT-2026-09-07): the header dims are hostile-
+                     * controlled file content — the C compressor validates
+                     * neither side. Accept the tensor only when the declared
+                     * [n, dim] shape multiplies out to the real float count;
+                     * on mismatch skip the stream entirely (vecs stays empty
+                     * + n/dim 0 → cma_open falls through to a fresh shell).
+                     * The writer always emits [n, dim], so legit files pass. */
+                    let sd = (*sub).schema_num_dims();
+                    let shape_ok = if sd >= 2 {
+                        ((*sub).schema_dim(0) as usize)
+                            .saturating_mul((*sub).schema_dim(1) as usize)
+                            == count
+                    } else {
+                        false
+                    };
+                    if shape_ok {
+                        let slice = std::slice::from_raw_parts(data, count);
+                        vecs = slice.to_vec();
                         n = (*sub).schema_dim(0) as usize;
                         dim = (*sub).schema_dim(1) as usize;
-                    } else {
-                        n = count;
-                        dim = 1;
                     }
+                    libc::free(data as *mut c_void);
                 }
             } else if name == b"metadata" && meta.is_none() {
                 let mut raw: *mut u8 = ptr::null_mut();
@@ -304,6 +378,7 @@ mod impl_qtsq {
             return qtsq::QTSQ_ERR_ALLOC;
         }
         qtsq::qtsq_init(ctx_k);
+        unsafe { (*ctx_k).set_codec(qtsq::QTSQ_CODEC_QTC) };
         let name_k = format!("kv_{:08}_K", page_id);
         let cname_k = CString::new(name_k).unwrap_or_default();
         let mut r = qtsq::qtsq_compress_tensor_quantized(ctx_k, k, count, dims.as_ptr(), 4, k_precision);
@@ -322,6 +397,7 @@ mod impl_qtsq {
             return qtsq::QTSQ_ERR_ALLOC;
         }
         qtsq::qtsq_init(ctx_v);
+        unsafe { (*ctx_v).set_codec(qtsq::QTSQ_CODEC_QTC) };
         let name_v = format!("kv_{:08}_V", page_id);
         let cname_v = CString::new(name_v).unwrap_or_default();
         r = qtsq::qtsq_compress_tensor_quantized(ctx_v, v, count, dims.as_ptr(), 4, v_precision);
@@ -389,12 +465,31 @@ mod impl_qtsq {
                         let mut data: *mut f32 = ptr::null_mut();
                         let mut count: usize = 0;
                         if qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count) == QTSQ_OK {
-                            k_data = std::slice::from_raw_parts(data, count).to_vec();
-                            libc::free(data as *mut c_void);
-                            if (*sub).schema_num_dims() >= 3 {
+                            /* ml-2 (AUDIT-2026-09-07): the K header is
+                             * attacker-controlled in a crafted file — the old
+                             * count-parity tail gate accepted hostile dims and
+                             * handed them to ActivePage. Require the full
+                             * [l, h, tok, d] schema whose saturating product
+                             * equals the real float count (the writer always
+                             * emits 4-D, so legit pages pass); on mismatch
+                             * leave k_data empty — the tail gate then rejects
+                             * the page with QTSQ_ERR_FORMAT. */
+                            let sd = (*sub).schema_num_dims();
+                            let schema_ok = if sd >= 4 {
+                                let product = ((*sub).schema_dim(0) as usize)
+                                    .saturating_mul((*sub).schema_dim(1) as usize)
+                                    .saturating_mul((*sub).schema_dim(2) as usize)
+                                    .saturating_mul((*sub).schema_dim(3) as usize);
+                                product == count
+                            } else {
+                                false
+                            };
+                            if schema_ok {
+                                k_data = std::slice::from_raw_parts(data, count).to_vec();
                                 n_layers = (*sub).schema_dim(0) as usize;
                                 n_tokens = (*sub).schema_dim(2) as usize; /* [l, h, tok, d] */
                             }
+                            libc::free(data as *mut c_void);
                         }
                     } else if name == cname_v.as_bytes() {
                         let mut data: *mut f32 = ptr::null_mut();
@@ -435,6 +530,10 @@ mod impl_qtsq {
         }
         if r == QTSQ_OK {
             if std::fs::rename(format!("{path}.tmp"), path).is_err() {
+                // P3 (AUDIT-2026-09-07): the old code left the tmp behind on
+                // a failed rename — the exact leak the atomic-write scheme
+                // exists to avoid.
+                let _ = std::fs::remove_file(format!("{path}.tmp"));
                 r = qtsq::QTSQ_ERR_FORMAT;
             }
         } else {
@@ -453,6 +552,10 @@ mod impl_qtsq {
     struct CmaShell {
         mind_path: String,
         vec_dim: usize,
+        /// Identity of the vector space stored in this brain.  A dimension
+        /// alone is not enough: two 64-dimensional models are not
+        /// interchangeable, so the manifest is checked on every open.
+        embedding_id: String,
         cma: crate::memory::cma::Cma,
     }
 
@@ -476,69 +579,425 @@ mod impl_qtsq {
         exotic: ptr::null_mut(),
     };
 
+    fn inferred_legacy_embedding_id(dim: usize) -> Option<&'static str> {
+        /* The retired local brain used the 768-dimensional hash embedder and
+         * wrote no model manifest.  That one legacy space is safe to infer;
+         * an unmanifested 64-dimensional file is deliberately ambiguous and
+         * is refused rather than mixed with the learned model. */
+        if dim == crate::embedding::HASH_DIM {
+            Some(crate::embedding::INPUT_EMBEDDER_ID)
+        } else {
+            None
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct EmbeddingManifest {
+        id: String,
+        input: String,
+        dimension: usize,
+        artifact: String,
+    }
+
+    fn embedding_manifest(meta: &str) -> Option<EmbeddingManifest> {
+        let root: serde_json::Value = serde_json::from_str(meta).ok()?;
+        let embedding = root.get("embedding")?;
+        Some(EmbeddingManifest {
+            id: embedding.get("id")?.as_str()?.to_string(),
+            input: embedding
+                .get("input")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            dimension: embedding.get("dimension")?.as_u64()? as usize,
+            artifact: embedding
+                .get("artifact")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    fn manifest_matches(meta: &str, expected_id: &str, expected_dim: usize) -> bool {        let Some(manifest) = embedding_manifest(meta) else {
+            return false;
+        };
+        if manifest.id != expected_id || manifest.dimension != expected_dim {
+            return false;
+        }
+        if expected_id == crate::embedding::MODEL_ID {
+            manifest.input == crate::embedding::INPUT_EMBEDDER_ID
+                && manifest.artifact == crate::embedding::model_artifact_id()
+        } else if expected_id == crate::embedding::semantic_v2::MODEL_ID_V2 {
+            // SEM2 is its own space: same input embedder (hash-v1 features),
+            // different table + artifact — verified identically strict.
+            manifest.input == crate::embedding::semantic_v2::INPUT_EMBEDDER_ID_V2
+                && manifest.artifact == crate::embedding::semantic_v2::model_artifact_id_v2()
+        } else {
+            true
+        }
+    }
+
+    fn metadata_with_embedding(shell: &CmaShell) -> String {
+        // P3 (AUDIT-2026-09-07): take the Value directly — the old
+        // records_json → from_str round trip serialized and re-parsed the
+        // whole record table on every metadata write.
+        let mut root: serde_json::Value = shell.cma.records_value();
+        if let Some(object) = root.as_object_mut() {
+            let (input, artifact) = if shell.embedding_id == crate::embedding::MODEL_ID {
+                (
+                    crate::embedding::INPUT_EMBEDDER_ID,
+                    crate::embedding::model_artifact_id(),
+                )
+            } else if shell.embedding_id == crate::embedding::semantic_v2::MODEL_ID_V2 {
+                (
+                    crate::embedding::semantic_v2::INPUT_EMBEDDER_ID_V2,
+                    crate::embedding::semantic_v2::model_artifact_id_v2(),
+                )
+            } else {
+                ("", String::new())
+            };
+            object.insert("schema".into(), serde_json::json!("sofuu-cma@2"));
+            object.insert(
+                "embedding".into(),
+                serde_json::json!({
+                    "id": shell.embedding_id,
+                    "input": input,
+                    "dimension": shell.vec_dim,
+                    "artifact": artifact,
+                }),
+            );
+        }
+        serde_json::to_string(&root).unwrap_or_else(|_| shell.cma.records_json())
+    }
+
+    fn unique_sidecar(path: &str, suffix: &str) -> String {
+        let base = format!("{path}.{suffix}");
+        // P3 (AUDIT-2026-09-07): pick-by-exists()-then-act was a TOCTOU race —
+        // two processes (desktop + CLI on one project) could both claim the
+        // same name and the second would clobber the first (a lost backup).
+        // create_new claims the name atomically; callers overwrite their own
+        // reservation immediately after, and a losing claimant just retries
+        // with the next candidate.
+        let mut candidate = base.clone();
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .is_ok()
+        {
+            return candidate;
+        }
+        for i in 1..10_000u32 {
+            candidate = format!("{base}.{i}");
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+        // Last resort: the pid-scoped name can only collide with ourselves.
+        candidate = format!("{base}.{}.overflow", std::process::id());
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate);
+        candidate
+    }
+
+    /// P3 (AUDIT-2026-09-07): atomic writes stage through `{file}.tmp`
+    /// siblings, and a crash between write and rename left them behind
+    /// forever. Remove one at open time — but only when clearly stale
+    /// (10 minutes old): a concurrent desktop/CLI process on the same
+    /// project legitimately holds a fresh tmp mid-write, and deleting that
+    /// would turn its rename into a failed save. An unreadable mtime can
+    /// never prove liveness, so such files are left alone.
+    const STALE_TMP_SECS: u64 = 600;
+
+    fn sweep_stale_tmp_file(file_tmp: &str) {
+        let Ok(md) = std::fs::metadata(file_tmp) else {
+            return;
+        };
+        if let Ok(modified) = md.modified() {
+            if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                if age.as_secs() >= STALE_TMP_SECS {
+                    let _ = std::fs::remove_file(file_tmp);
+                }
+            }
+        }
+    }
+
+    /// Same sweep for a directory of page containers (`*.qtsq.tmp` etc.).
+    fn sweep_stale_tmp_dir(dir: &str) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "tmp") {
+                sweep_stale_tmp_file(&p.to_string_lossy());
+            }
+        }
+    }
+
+    /// Re-embed a legacy 768-dimensional hash brain into the current
+    /// semantic space.  The old file is copied to a unique backup first; the
+    /// new QTSQ is staged, read back and manifest-verified before it replaces
+    /// the canonical path. Ok((records, backup)) on success; Err(reason)
+    /// leaves the original file untouched in every case.
+    unsafe fn migrate_legacy_hash_brain(
+        path: &str,
+        brain: &BrainData,
+        shell: &mut CmaShell,
+    ) -> Result<(usize, String), String> {
+        let refuse = |msg: &str| {
+            eprintln!("[sofuu/cma] {msg}; migration refused");
+            Err(msg.to_string())
+        };
+        let Some(meta) = brain.meta.as_deref() else {
+            return refuse("legacy brain has no metadata");
+        };
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(meta) else {
+            return refuse("legacy brain metadata is not JSON");
+        };
+        let Some(records) = root.get("records").and_then(|v| v.as_array()) else {
+            return refuse("legacy brain has no records array");
+        };
+        if records.len() != brain.n || brain.vecs.len() != brain.n * brain.dim {
+            return refuse("legacy brain record/vector count mismatch");
+        }
+
+        let mut flat = Vec::with_capacity(brain.n * crate::embedding::SEMANTIC_DIM);
+        for record in records {
+            let Some(text) = record.get("text").and_then(|v| v.as_str()) else {
+                return refuse("legacy record has no text");
+            };
+            let Some(vector) = crate::embedding::semantic_v1(text) else {
+                return refuse("semantic model unavailable");
+            };
+            if vector.len() != crate::embedding::SEMANTIC_DIM
+                || vector.iter().any(|v| !v.is_finite())
+            {
+                return refuse("semantic re-embedding returned invalid data");
+            }
+            flat.extend_from_slice(&vector);
+        }
+        if !shell.cma.hydrate(&flat, brain.n, crate::embedding::SEMANTIC_DIM, meta) {
+            return refuse("re-embedded brain failed CMA validation");
+        }
+
+        let staging = unique_sidecar(path, "semantic-migration.tmp");
+        if cma_flush_to(shell, &staging) != 0 {
+            let _ = std::fs::remove_file(&staging);
+            return refuse("staged semantic brain write failed; old brain kept");
+        }
+        let staged = match cma_qtsq_load(&staging) {
+            Ok(value)
+                if value.n == brain.n
+                    && value.dim == crate::embedding::SEMANTIC_DIM
+                    && value.vecs.len() == brain.n * crate::embedding::SEMANTIC_DIM
+                    && value
+                        .meta
+                        .as_deref()
+                        .map(|m| {
+                            manifest_matches(
+                                m,
+                                crate::embedding::MODEL_ID,
+                                crate::embedding::SEMANTIC_DIM,
+                            )
+                        })
+                        .unwrap_or(false) => value,
+            _ => {
+                let _ = std::fs::remove_file(&staging);
+                return refuse("staged semantic brain verification failed; old brain kept");
+            }
+        };
+        let _ = staged;
+
+        let backup = unique_sidecar(path, "hash-v1.bak");
+        if std::fs::copy(path, &backup).is_err() {
+            let _ = std::fs::remove_file(&staging);
+            return refuse("could not preserve legacy brain backup");
+        }
+        if std::fs::rename(&staging, path).is_err() {
+            let _ = std::fs::remove_file(&staging);
+            return refuse("could not publish semantic brain; old brain kept");
+        }
+        eprintln!(
+            "[sofuu/cma] migrated legacy hash brain to {} (backup: {})",
+            crate::embedding::MODEL_ID,
+            backup
+        );
+        Ok((brain.n, backup))
+    }
+
     /// cma_open — validate dims, build the Rust CMA, hydrate from the QTSQ
     /// brain file (vectors + metadata JSON). None when the open fails.
-    unsafe fn cma_open(path: &str, vec_dim: usize) -> Option<Box<CmaShell>> {
+    unsafe fn cma_open(path: &str, vec_dim: usize, requested_embedding_id: Option<&str>) -> Option<Box<CmaShell>> {
         if vec_dim == 0 || vec_dim > 8192 {
             eprintln!("[sofuu/cma] invalid vector dim {}", vec_dim);
+            return None;
+        }
+        let embedding_id = requested_embedding_id
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                if vec_dim == crate::embedding::SEMANTIC_DIM {
+                    Some(crate::embedding::MODEL_ID.to_string())
+                } else if vec_dim == crate::embedding::HASH_DIM {
+                    Some(crate::embedding::INPUT_EMBEDDER_ID.to_string())
+                } else {
+                    Some(format!("legacy-dim-{vec_dim}"))
+                }
+            })
+            .unwrap();
+        if embedding_id == crate::embedding::MODEL_ID && crate::embedding::baked_model().is_err() {
+            eprintln!("[sofuu/cma] semantic embedding model is unavailable");
+            return None;
+        }
+        if embedding_id == crate::embedding::semantic_v2::MODEL_ID_V2
+            && crate::embedding::semantic_v2::baked_model_v2().is_err()
+        {
+            eprintln!("[sofuu/cma] SEM2 embedding model is unavailable");
+            return None;
+        }
+        // M1: image space (img1-64, joint with sem2-64 text geometry).
+        if embedding_id == crate::embedding::image::MODEL_ID_IMG
+            && crate::embedding::image::baked_model_img().is_err()
+        {
+            eprintln!("[sofuu/cma] IMG1 embedding model is unavailable");
             return None;
         }
 
         let mut shell = Box::new(CmaShell {
             mind_path: path.to_string(),
             vec_dim,
+            embedding_id: embedding_id.clone(),
             cma: crate::memory::cma::Cma::new(vec_dim),
         });
 
         /* Hydrate from the QTSQ brain file (vectors + metadata JSON). */
-        if let Ok(brain) = cma_qtsq_load(path) {
-            if !brain.vecs.is_empty() && brain.n > 0 {
-                /* Guard against dimension mismatch between saved file and
-                 * the caller's vec_dim — same behavior as the C. */
-                if brain.dim != vec_dim {
-                    eprintln!(
-                        "[sofuu/cma] dimension mismatch: file has {}, requested {} — \
-                         ignoring saved vectors and starting fresh.",
-                        brain.dim, vec_dim
-                    );
-                } else if let Some(meta) = &brain.meta {
-                    if !shell.cma.hydrate(&brain.vecs, brain.n, brain.dim, meta) {
-                        eprintln!("[sofuu/cma] brain file metadata unreadable — starting fresh");
+        match cma_qtsq_load(path) {
+            Ok(brain) => {
+                if !brain.vecs.is_empty() && brain.n > 0 {
+                    let manifest = brain.meta.as_deref().and_then(embedding_manifest);
+                    let source_id = manifest
+                        .as_ref()
+                        .map(|m| m.id.as_str())
+                        .or_else(|| inferred_legacy_embedding_id(brain.dim));
+                    let same_space = brain.dim == vec_dim
+                        && source_id == Some(embedding_id.as_str())
+                        && brain.meta.as_deref().map(|m| {
+                            if manifest.is_some() {
+                                manifest_matches(m, &embedding_id, vec_dim)
+                            } else {
+                                embedding_id == crate::embedding::INPUT_EMBEDDER_ID
+                            }
+                        }).unwrap_or(false);
+                    if same_space {
+                        if let Some(meta) = &brain.meta {
+                            if !shell.cma.hydrate(&brain.vecs, brain.n, brain.dim, meta) {
+                                eprintln!("[sofuu/cma] brain file metadata unreadable — open refused");
+                                return None;
+                            }
+                        } else {
+                            eprintln!("[sofuu/cma] brain has no metadata — open refused");
+                            return None;
+                        }
+                    } else if embedding_id == crate::embedding::MODEL_ID
+                        && brain.dim == crate::embedding::HASH_DIM
+                        && source_id == Some(crate::embedding::INPUT_EMBEDDER_ID)
+                    {
+                        if migrate_legacy_hash_brain(path, &brain, &mut shell).is_err() {
+                            return None;
+                        }
+                    } else {
+                        eprintln!(
+                            "[sofuu/cma] incompatible brain vector space (file: {} / {:?}, requested: {} / {}) — open refused",
+                            brain.dim,
+                            source_id,
+                            vec_dim,
+                            embedding_id
+                        );
+                        return None;
+                    }
+                } else if std::path::Path::new(path).exists() && !brain.found_memories {
+                    /* No vectors AND no "memories" stream. That is EITHER a
+                     * provably EMPTY brain (metadata says zero records) or
+                     * a container we cannot read. A brain with no records
+                     * has nothing to protect: the old code called it
+                     * "empty/corrupt", copied it to a fixed .bak on EVERY
+                     * open and printed a false alarm in every fresh
+                     * project. Adopt it silently — a legacy manifest id is
+                     * refreshed on the next write, and a file that cannot
+                     * be parsed at all still takes the backup path. */
+                    let provably_empty = brain
+                        .meta
+                        .as_deref()
+                        .and_then(|meta| serde_json::from_str::<serde_json::Value>(meta).ok())
+                        .and_then(|root| root.get("records").cloned())
+                        .map(|records| records.as_array().map(|a| a.is_empty()).unwrap_or(false))
+                        .unwrap_or(false);
+                    if !provably_empty {
+                        /* Unusable (no memories stream, and we cannot prove
+                         * it is empty). Back it up BEFORE the next flush
+                         * could silently overwrite it — never wipe a brain
+                         * silently, and never clobber an existing .bak. */
+                        let bak = backup_brain(path);
+                        eprintln!(
+                            "[sofuu/cma] brain file {} is unreadable (no memories stream) — \
+                             backed up to {} and starting fresh",
+                            path, bak
+                        );
                     }
                 }
-            } else if std::path::Path::new(path).exists() && !brain.found_memories {
-                /* The file exists but is unusable (empty container, missing
-                 * "memories" stream). Back it up BEFORE the next flush would
-                 * silently overwrite it — never wipe a brain silently. */
-                let bak = format!("{path}.bak");
-                let _ = std::fs::copy(path, &bak);
-                eprintln!(
-                    "[sofuu/cma] brain file {} is empty/corrupt (no memories stream) — \
-                     backed up to {} and starting fresh",
-                    path, bak
-                );
+            }
+            Err(code) => {
+                /* A load that FAILED outright (garbage container, wrong
+                 * magic, structurally invalid) used to fall through to a
+                 * silent fresh shell — the next flush would then overwrite
+                 * the user's brain file with no trace. Same rule as the
+                 * empty-container branch above: back up, warn, start
+                 * fresh — never wipe silently, never break chat. */
+                if std::path::Path::new(path).exists() {
+                    let bak = backup_brain(path);
+                    eprintln!(
+                        "[sofuu/cma] brain file {} failed to load (qtsq error {}) — \
+                         backed up to {} and starting fresh",
+                        path, code, bak
+                    );
+                }
             }
         }
         Some(shell)
     }
 
-    /// cma_flush — dump vectors + records JSON, write via the QTSQ adapter
-    /// (same stream layout as before — brain files stay compatible).
-    unsafe fn cma_flush(shell: &mut CmaShell) -> c_int {
-        let n = shell.cma.vectors.len();
+    /// cma_flush — dump vectors + records JSON (with the embedding
+    /// manifest, so the next open can verify the vector space), write via
+    /// the QTSQ adapter (same stream layout as before — brain files stay
+    /// compatible).
+    unsafe fn cma_flush_to(shell: &mut CmaShell, path: &str) -> c_int {
+        let n = shell.cma.index.len();
         let dim = shell.cma.vec_dim;
         let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
-        for v in &shell.cma.vectors {
-            flat.extend_from_slice(v);
+        for i in 0..n {
+            flat.extend_from_slice(shell.cma.index.vector(i as u32));
         }
         let vecs = if n == 0 { None } else { Some(flat.as_slice()) };
-        let meta = shell.cma.records_json();
-        let r = cma_qtsq_save(&shell.mind_path, vecs, n, dim, &meta);
+        let meta = metadata_with_embedding(shell);
+        let r = cma_qtsq_save(path, vecs, n, dim, &meta);
         if r == QTSQ_OK {
             0
         } else {
             -1
         }
+    }
+
+    unsafe fn cma_flush(shell: &mut CmaShell) -> c_int {
+        let path = shell.mind_path.clone();
+        cma_flush_to(shell, &path)
     }
 
     unsafe fn cma_remember(
@@ -624,8 +1083,21 @@ mod impl_qtsq {
         let path = qjs::sofuu_js_to_cstring(ctx, *argv);
         let mut dim: u32 = 0;
         qjs::sofuu_js_to_uint32(ctx, &mut dim, *argv.add(1));
+        // Optional 3rd arg: embedding space id ("hash-v1" |
+        // "semantic-projector-v1" | "provider:model@rev" for remote).
+        // Absent → inferred from the dimension (legacy behavior).
+        let embed_id: Option<String> = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
+            let eptr = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+            let id = cstr_opt(eptr);
+            if !eptr.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, eptr);
+            }
+            id.filter(|s| !s.is_empty())
+        } else {
+            None
+        };
 
-        let shell = cstr_opt(path).and_then(|p| cma_open(&p, dim as usize));
+        let shell = cstr_opt(path).and_then(|p| cma_open(&p, dim as usize, embed_id.as_deref()));
         if !path.is_null() {
             qjs::sofuu_js_free_cstring(ctx, path);
         }
@@ -873,8 +1345,20 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        let mut dt: u32 = 0;
-        qjs::sofuu_js_to_uint32(ctx, &mut dt, *argv);
+        // P3 (AUDIT-2026-09-07): parse via float64, not ToUint32 — ToUint32
+        // wraps negatives (ToUint32(-1) = 4294967295 "seconds" ≈ 136 years),
+        // turning a caller bug into an instant permanent erase of every weak
+        // record. Negative / non-finite dt is a no-op; huge positive dt
+        // clamps to u32::MAX (full decay) instead of wrapping.
+        let mut dt_f: f64 = 0.0;
+        // SAFETY: argv[0] is a valid JSValueConst; JS_ToFloat64 writes dt_f
+        // on success (non-numeric input throws and leaves dt_f at 0).
+        unsafe { qjs::JS_ToFloat64(ctx, &mut dt_f, *argv) };
+        let dt = if dt_f.is_finite() && dt_f > 0.0 {
+            dt_f.min(u32::MAX as f64) as u32
+        } else {
+            0
+        };
         cma.cma.decay_tick(dt);
         qjs::sofuu_js_undefined()
     }
@@ -950,6 +1434,109 @@ mod impl_qtsq {
         qjs::sofuu_js_new_bool(ctx, if r == 0 { 1 } else { 0 })
     }
 
+    /// sofuu.memory.migrate(path) → JSON string.
+    /// Explicit hash→semantic migration (§9.3): reports source/target,
+    /// record count, backup path and outcome. Never deletes or blanks the
+    /// original on any failure path.
+    unsafe extern "C" fn js_memory_migrate(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        fn report(ok: bool, migrated: bool, records: usize, backup: &str, message: &str) -> String {
+            serde_json::json!({
+                "ok": ok, "migrated": migrated, "records": records,
+                "backup": backup, "message": message,
+                "source": crate::embedding::INPUT_EMBEDDER_ID,
+                "target": crate::embedding::MODEL_ID,
+            })
+            .to_string()
+        }
+        if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+            return qjs::JS_ThrowTypeError(ctx, c"memory.migrate(path) expected a string".as_ptr());
+        }
+        let path_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let Some(path) = cstr_opt(path_ptr) else {
+            if !path_ptr.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, path_ptr);
+            }
+            return qjs::sofuu_js_exception();
+        };
+        if !path_ptr.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, path_ptr);
+        }
+        if crate::embedding::baked_model().is_err() {
+            let s = report(false, false, 0, "", "semantic model unavailable");
+            return qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr());
+        }
+        let brain = match cma_qtsq_load(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                let s = report(false, false, 0, "", "brain file unreadable");
+                return qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr());
+            }
+        };
+        if !brain.found_memories || brain.n == 0 {
+            let s = report(false, false, 0, "", "brain has no memories to migrate");
+            return qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr());
+        }
+        let manifest = brain.meta.as_deref().and_then(embedding_manifest);
+        let source_id = manifest
+            .as_ref()
+            .map(|m| m.id.as_str())
+            .or_else(|| inferred_legacy_embedding_id(brain.dim));
+        if source_id == Some(crate::embedding::MODEL_ID)
+            && brain.dim == crate::embedding::SEMANTIC_DIM
+            && brain.meta.as_deref().map(|m| manifest_matches(m, crate::embedding::MODEL_ID, crate::embedding::SEMANTIC_DIM)).unwrap_or(false)
+        {
+            let s = report(true, false, brain.n, "", "already semantic-projector-v1");
+            return qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr());
+        }
+        if !(brain.dim == crate::embedding::HASH_DIM
+            && source_id == Some(crate::embedding::INPUT_EMBEDDER_ID))
+        {
+            let s = report(false, false, brain.n, "", "unknown or incompatible vector space; preserved untouched");
+            return qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr());
+        }
+        // Open a scratch shell (NOT the canonical path) so a failed
+        // migration can never disturb the live brain handle.
+        let mut shell = Box::new(CmaShell {
+            mind_path: path.clone(),
+            vec_dim: crate::embedding::SEMANTIC_DIM,
+            embedding_id: crate::embedding::MODEL_ID.to_string(),
+            cma: crate::memory::cma::Cma::new(crate::embedding::SEMANTIC_DIM),
+        });
+        match migrate_legacy_hash_brain(&path, &brain, &mut shell) {
+            Ok((records, backup)) => {
+                let s = report(true, true, records, &backup, "migrated; original preserved at backup path");
+                qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr())
+            }
+            Err(reason) => {
+                let s = report(false, false, brain.n, "", &reason);
+                qjs::sofuu_js_new_string(ctx, CString::new(s).unwrap_or_default().as_ptr())
+            }
+        }
+    }
+
+    /// sofuu.memory.embeddingInfo() → JSON string describing the compiled
+    /// memory backends (ids, dims, artifact). Selection reads this, never
+    /// literals.
+    unsafe extern "C" fn js_memory_embedding_info(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let json = format!(
+            "{{\"hash\":{{\"id\":\"{}\",\"dimension\":{}}},\"semantic\":{}}}",
+            crate::embedding::INPUT_EMBEDDER_ID,
+            crate::embedding::HASH_DIM,
+            crate::embedding::model_info_json(),
+        );
+        qjs::sofuu_js_new_string(ctx, CString::new(json).unwrap_or_default().as_ptr())
+    }
+
     thread_local! {
         static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 11] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
@@ -964,8 +1551,11 @@ mod impl_qtsq {
             cfunc_entry(c"count", 0, js_cma_count),
             cfunc_entry(c"markPositive", 1, js_cma_mark_positive),
         ];
-        static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 1] =
-            [cfunc_entry(c"open", 2, js_cma_open)];
+        static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
+            cfunc_entry(c"open", 2, js_cma_open),
+            cfunc_entry(c"migrate", 1, js_memory_migrate),
+            cfunc_entry(c"embeddingInfo", 0, js_memory_embedding_info),
+        ];
     }
 
     /* ══════════════════════════════════════════════════════════════
@@ -1220,6 +1810,9 @@ mod impl_qtsq {
         head_dim: usize,
     ) -> Option<Box<Kvs>> {
         ensure_dir(path);
+        // P3 (AUDIT-2026-09-07): crashed kv writers left `page_NNNN.qtsq.tmp`
+        // siblings behind forever — sweep them once per open (age-guarded).
+        sweep_stale_tmp_dir(path);
 
         let mut kv = Box::new(Kvs {
             file_path: path.to_string(),
@@ -1255,7 +1848,14 @@ mod impl_qtsq {
                         qjs::sofuu_js_to_uint32(ctx, &mut arr_len, len_val);
                         qjs::sofuu_js_free_value(ctx, len_val);
 
-                        kv.pages.reserve(arr_len as usize + 256);
+                        /* ml-1 (AUDIT-2026-09-07): arr_len is the parsed
+                         * array's real length (JS_IsArray-gated), so the
+                         * loop below is item-bounded — but clamp the upfront
+                         * reservation so a giant-but-well-formed index (or a
+                         * future parser change) cannot turn reserve() into
+                         * the amplifier. Vec growth covers the true count. */
+                        const KV_PAGES_RESERVE_CAP: u32 = 1 << 16;
+                        kv.pages.reserve(arr_len.min(KV_PAGES_RESERVE_CAP) as usize + 256);
 
                         for i in 0..arr_len {
                             let item = qjs::JS_GetPropertyUint32(ctx, pages_arr, i);
@@ -1321,6 +1921,8 @@ mod impl_qtsq {
         }
         qtsq::qtsq_init(container);
         let _ = qtsq::qtsq_container_create(container);
+        /* Phase 7: qtc write codec — see cma_qtsq_save's comment. */
+        unsafe { (*container).set_codec(qtsq::QTSQ_CODEC_QTC) };
 
         let mut r = kv_qtsq_save_page(
             container,
@@ -1341,6 +1943,12 @@ mod impl_qtsq {
         qtsq::qtsq_ctx_free(container);
 
         if r != QTSQ_OK {
+            // P3 (AUDIT-2026-09-07): a failed flush can leave a partial
+            // page_{id}.qtsq behind. The next save reuses this id (pages.len()
+            // never advanced) and would overwrite it, but until then the file
+            // on disk is a corrupt page for anything that reads by path —
+            // remove it so disk never disagrees with the in-memory index.
+            let _ = std::fs::remove_file(&page_path);
             return 0;
         }
 
@@ -1527,9 +2135,6 @@ mod impl_qtsq {
         let path = qjs::sofuu_js_to_cstring(ctx, *argv);
         let cfg = *argv.add(1);
 
-        let v_mod = qjs::sofuu_js_get_property_str(ctx, cfg, c"modelId".as_ptr());
-        let model_id = qjs::sofuu_js_to_cstring(ctx, v_mod);
-
         let mut n_l: u32 = 0;
         let mut n_h: u32 = 0;
         let mut h_d: u32 = 0;
@@ -1547,10 +2152,6 @@ mod impl_qtsq {
             kv_store_open(ctx, &p, n_l as usize, n_h as usize, h_d as usize)
         });
 
-        if !model_id.is_null() {
-            qjs::sofuu_js_free_cstring(ctx, model_id);
-        }
-        qjs::sofuu_js_free_value(ctx, v_mod);
         if !path.is_null() {
             qjs::sofuu_js_free_cstring(ctx, path);
         }
@@ -1622,6 +2223,11 @@ mod impl_qtsq {
 
         let mut n_hints: u32 = 0;
         qjs::sofuu_js_to_uint32(ctx, &mut n_hints, *argv.add(1));
+        if n_hints > 1024 {
+            /* P1-6: same clamp as the CMA hints path — kv_search reserves
+             * with_capacity(n_hints), so an unclamped count is a 17GB OOM. */
+            n_hints = 1024;
+        }
 
         let query = std::slice::from_raw_parts(q_ptr, q_len);
         let hints = kv_search(kv, query, n_hints as usize);
@@ -1975,6 +2581,793 @@ mod impl_qtsq {
             assert_eq!(kv.active.len(), 1);
             assert_eq!(kv.active[0].page_id, 1);
         }
+    }
+
+    /* ── brain migration + vector-space fault tests ───────────────── */
+
+    #[cfg(test)]
+    fn fresh_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sofuu-mig-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(test)]
+    fn dir_entries(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A legacy brain exactly as the retired C shell wrote it: 768-dim
+    /// hash vectors + plain records JSON, no embedding manifest.
+    #[cfg(test)]
+    fn build_legacy_hash_brain(path: &std::path::Path, texts: &[&str]) {
+        let mut cma = crate::memory::cma::Cma::new(crate::embedding::HASH_DIM);
+        let mut flat: Vec<f32> = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            let v = crate::embedding::hash_v1_features(text);
+            flat.extend_from_slice(&v);
+            cma.remember(&v, text, "memory", (7 + i) as u32);
+        }
+        let r = unsafe {
+            cma_qtsq_save(
+                path.to_str().unwrap(),
+                Some(&flat),
+                texts.len(),
+                crate::embedding::HASH_DIM,
+                &cma.records_json(),
+            )
+        };
+        assert_eq!(r, QTSQ_OK);
+    }
+
+    /// A semantic brain through the real open→remember→flush path, so the
+    /// manifest is the one the runtime itself writes.
+    #[cfg(test)]
+    fn build_semantic_brain(path: &std::path::Path, texts: &[&str]) {
+        let p = path.to_str().unwrap();
+        let mut shell = unsafe {
+            cma_open(p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+        }
+        .expect("fresh semantic shell on a nonexistent file");
+        for text in texts {
+            let v = crate::embedding::semantic_v1(text).expect("baked model");
+            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7) };
+            assert!(r >= 0);
+        }
+        assert_eq!(unsafe { cma_flush_to(&mut shell, p) }, 0);
+    }
+
+    #[test]
+    fn migration_success_preserves_records_and_backup() {
+        let dir = fresh_test_dir("mig-ok");
+        let path = dir.join("brain.qtsq");
+        let texts = [
+            "decided to use qtc compression for the session store",
+            "the payment webhook retries three times before dropping",
+            "deploy checklist: bump version, tag, build, upload",
+            "login timeout bug fixed by raising the pool limit",
+            "grep the migration tests under crates/ml-train",
+        ];
+        build_legacy_hash_brain(&path, &texts);
+        let before = std::fs::read(&path).unwrap();
+        let p = path.to_str().unwrap().to_string();
+
+        let mut shell = unsafe {
+            cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+        }
+        .expect("migration must succeed for a healthy legacy brain");
+        assert_eq!(shell.embedding_id, crate::embedding::MODEL_ID);
+        assert_eq!(shell.cma.len(), texts.len());
+        let js = shell.cma.records_json();
+        for text in &texts {
+            assert!(js.contains(text), "record lost in migration: {text}");
+        }
+
+        /* Canonical file is now semantic with a matching manifest. */
+        let brain = unsafe { cma_qtsq_load(&p) }.expect("reload canonical file");
+        assert_eq!(brain.n, texts.len());
+        assert_eq!(brain.dim, crate::embedding::SEMANTIC_DIM);
+        assert!(manifest_matches(
+            brain.meta.as_deref().unwrap(),
+            crate::embedding::MODEL_ID,
+            crate::embedding::SEMANTIC_DIM
+        ));
+
+        /* Backup is byte-identical to the pre-migration file and still a
+         * loadable hash-v1 brain. */
+        let backup = dir.join("brain.qtsq.hash-v1.bak");
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        let old = unsafe { cma_qtsq_load(backup.to_str().unwrap()) }.expect("backup loads");
+        assert_eq!(old.dim, crate::embedding::HASH_DIM);
+        assert_eq!(old.n, texts.len());
+
+        /* The migrated index actually retrieves. */
+        let q = crate::embedding::semantic_v1("payment webhook retries").unwrap();
+        assert!(!shell.cma.recall(&q, 5).is_empty());
+
+        /* Restart: the migrated file reopens in the same space — no second
+         * migration, no leftover sidecars. */
+        let again = unsafe {
+            cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+        }
+        .expect("migrated brain reopens");
+        assert_eq!(again.cma.len(), texts.len());
+        let entries = dir_entries(&dir);
+        assert!(entries.iter().any(|e| e.ends_with("hash-v1.bak")));
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.ends_with("hash-v1.bak.1") || e.contains("semantic-migration")),
+            "leftover sidecars after restart: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn v2_semantic_space_round_trips_and_is_isolated() {
+        use crate::embedding::semantic_v2 as v2;
+
+        let dir = fresh_test_dir("v2-isolation");
+        let path = dir.join("brain-v2.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let texts = [
+            "decided to use qtc compression for the session store",
+            "the payment webhook retries three times before dropping",
+            "deploy checklist: bump version, tag, build, upload",
+        ];
+
+        /* Fresh v2 open through the real remember→flush path. */
+        let mut shell = unsafe {
+            cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(v2::MODEL_ID_V2))
+        }
+        .expect("fresh SEM2 shell on a nonexistent file");
+        assert_eq!(shell.embedding_id, v2::MODEL_ID_V2);
+        for text in &texts {
+            let v = v2::semantic_v2(text).expect("baked SEM2 model");
+            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7) };
+            assert!(r >= 0);
+        }
+        assert_eq!(unsafe { cma_flush_to(&mut shell, &p) }, 0);
+
+        /* The manifest the runtime wrote identifies the v2 space exactly. */
+        let brain = unsafe { cma_qtsq_load(&p) }.expect("reload v2 file");
+        assert_eq!(brain.n, texts.len());
+        assert_eq!(brain.dim, crate::embedding::SEMANTIC_DIM);
+        let meta = brain.meta.as_deref().unwrap();
+        assert!(manifest_matches(
+            meta,
+            v2::MODEL_ID_V2,
+            crate::embedding::SEMANTIC_DIM
+        ));
+        let manifest = embedding_manifest(meta).unwrap();
+        assert_eq!(manifest.id, v2::MODEL_ID_V2);
+        assert_eq!(manifest.input, v2::INPUT_EMBEDDER_ID_V2);
+        assert_eq!(manifest.artifact, v2::model_artifact_id_v2());
+
+        /* Same space reopens; the index retrieves. */
+        let mut again = unsafe {
+            cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(v2::MODEL_ID_V2))
+        }
+        .expect("v2 brain reopens");
+        assert_eq!(again.cma.len(), texts.len());
+        let q = v2::semantic_v2("payment webhook retries").unwrap();
+        assert!(!again.cma.recall(&q, 5).is_empty());
+
+        /* §12: a v1 semantic open of the SAME file must be refused —
+         * both are 64-dim, so only the manifest can catch this. */
+        assert!(
+            unsafe {
+                cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+            }
+            .is_none(),
+            "v1 open of a v2 brain must refuse (dimension collision)"
+        );
+
+        /* §12: the reverse — a v2 open of a v1 brain is refused too. */
+        let v1_path = dir.join("brain.qtsq");
+        build_semantic_brain(&v1_path, &texts);
+        assert!(
+            unsafe {
+                cma_open(
+                    v1_path.to_str().unwrap(),
+                    crate::embedding::SEMANTIC_DIM,
+                    Some(v2::MODEL_ID_V2),
+                )
+            }
+            .is_none(),
+            "v2 open of a v1 brain must refuse"
+        );
+
+        /* §12: a v2 open of a legacy hash brain must NOT fire the v1
+         * migration — the file stays untouched, no backup sidecars. */
+        let legacy = dir.join("legacy.qtsq");
+        build_legacy_hash_brain(&legacy, &texts);
+        let before = std::fs::read(&legacy).unwrap();
+        assert!(
+            unsafe {
+                cma_open(
+                    legacy.to_str().unwrap(),
+                    crate::embedding::SEMANTIC_DIM,
+                    Some(v2::MODEL_ID_V2),
+                )
+            }
+            .is_none(),
+            "v2 open of a hash-v1 brain must refuse"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), before, "hash brain mutated");
+        let entries = dir_entries(&dir);
+        assert!(
+            entries.iter().all(|e| !e.contains("hash-v1.bak") && !e.contains("migration")),
+            "v2 open must not migrate or back up: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn migration_refused_when_a_record_has_no_text() {
+        let dir = fresh_test_dir("mig-notext");
+        let path = dir.join("brain.qtsq");
+        build_legacy_hash_brain(
+            &path,
+            &["first memory", "second memory", "third memory"],
+        );
+        /* Corrupt exactly like a damaged legacy file: record 1 loses text. */
+        let brain = unsafe { cma_qtsq_load(path.to_str().unwrap()) }.unwrap();
+        let mut root: serde_json::Value =
+            serde_json::from_str(brain.meta.as_deref().unwrap()).unwrap();
+        root["records"][1].as_object_mut().unwrap().remove("text");
+        assert_eq!(
+            unsafe {
+                cma_qtsq_save(
+                    path.to_str().unwrap(),
+                    Some(&brain.vecs),
+                    brain.n,
+                    brain.dim,
+                    &root.to_string(),
+                )
+            },
+            QTSQ_OK
+        );
+        let before = std::fs::read(&path).unwrap();
+        let entries_before = dir_entries(&dir);
+
+        let opened = unsafe {
+            cma_open(
+                path.to_str().unwrap(),
+                crate::embedding::SEMANTIC_DIM,
+                Some(crate::embedding::MODEL_ID),
+            )
+        };
+        assert!(
+            opened.is_none(),
+            "migration must refuse a brain with a textless record"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "original file modified on refusal"
+        );
+        assert_eq!(
+            dir_entries(&dir),
+            entries_before,
+            "sidecar left behind on refusal"
+        );
+    }
+
+    #[test]
+    fn semantic_brain_refuses_hash_open() {
+        let dir = fresh_test_dir("sem-refuse-hash");
+        let path = dir.join("brain.qtsq");
+        build_semantic_brain(&path, &["semantic memory one", "semantic memory two"]);
+        let p = path.to_str().unwrap();
+        let before = std::fs::read(p).unwrap();
+
+        /* No explicit id → a 768 request infers hash-v1 and must be
+         * refused: the file's manifest names a different space. */
+        assert!(unsafe { cma_open(p, crate::embedding::HASH_DIM, None) }.is_none());
+        assert!(
+            unsafe { cma_open(p, crate::embedding::HASH_DIM, Some(crate::embedding::INPUT_EMBEDDER_ID)) }
+                .is_none()
+        );
+        assert_eq!(std::fs::read(p).unwrap(), before);
+
+        /* The matching request still opens (nothing was damaged). */
+        let mut shell = unsafe {
+            cma_open(p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+        }
+        .expect("matching space still opens after refusals");
+        assert_eq!(shell.cma.len(), 2);
+    }
+
+    #[test]
+    fn semantic_brain_refuses_stale_artifact_and_remote_vectors() {
+        let dir = fresh_test_dir("sem-stale");
+        let path = dir.join("brain.qtsq");
+        build_semantic_brain(&path, &["stale artifact probe"]);
+        let p = path.to_str().unwrap();
+
+        /* Tamper: replace the artifact id with a stale one. */
+        let brain = unsafe { cma_qtsq_load(p) }.unwrap();
+        let mut root: serde_json::Value =
+            serde_json::from_str(brain.meta.as_deref().unwrap()).unwrap();
+        root["embedding"]["artifact"] = serde_json::json!("0000000000000000");
+        assert_eq!(
+            unsafe {
+                cma_qtsq_save(p, Some(&brain.vecs), brain.n, brain.dim, &root.to_string())
+            },
+            QTSQ_OK
+        );
+        let before = std::fs::read(p).unwrap();
+        assert!(
+            unsafe { cma_open(p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID)) }
+                .is_none(),
+            "a stale artifact must not be mixed into the live semantic space"
+        );
+        assert_eq!(std::fs::read(p).unwrap(), before);
+
+        /* A remote-provider brain (different embedding id) is likewise
+         * refused from the local semantic space. */
+        root["embedding"]["id"] = serde_json::json!("provider:test-model@rev1");
+        root["embedding"]["artifact"] = serde_json::json!("");
+        assert_eq!(
+            unsafe {
+                cma_qtsq_save(p, Some(&brain.vecs), brain.n, brain.dim, &root.to_string())
+            },
+            QTSQ_OK
+        );
+        let before = std::fs::read(p).unwrap();
+        assert!(
+            unsafe { cma_open(p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID)) }
+                .is_none(),
+            "remote vectors must not enter the local semantic space"
+        );
+        assert_eq!(std::fs::read(p).unwrap(), before);
+    }
+
+    /// A PROVABLY EMPTY brain (metadata says zero records) is a healthy
+    /// fresh store, not damage: adopting it silently is what stops every
+    /// chat start in a new project from printing "empty/corrupt" and
+    /// churning the file through a .bak. The fresh shell keeps working.
+    #[test]
+    fn empty_brain_is_adopted_without_backup_noise() {
+        let dir = fresh_test_dir("brain-empty");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap();
+        /* Metadata-only container: no "memories" stream (the QTSQ tensor
+         * codec cannot store a zero-length tensor, so an empty brain is
+         * always written this way). */
+        assert_eq!(
+            unsafe { cma_qtsq_save(p, None, 0, 64, "{\"records\":[]}") },
+            QTSQ_OK
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let mut shell = unsafe { cma_open(p, crate::embedding::HASH_DIM, None) }
+            .expect("an empty brain opens as a fresh store");
+        assert!(shell.cma.is_empty());
+        assert!(
+            !dir.join("brain.qtsq.bak").exists(),
+            "an empty brain has nothing to protect — no backup, no warning"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file is left untouched");
+
+        /* And it round-trips like any other store. */
+        let v = crate::embedding::hash_v1_features("first real memory");
+        assert!(unsafe {
+            cma_remember(&mut shell, &v, Some("first real memory"), Some("memory"), 1)
+        } >= 0);
+        assert_eq!(unsafe { cma_flush_to(&mut shell, p) }, 0);
+        let reloaded = unsafe { cma_qtsq_load(p) }.unwrap();
+        assert_eq!(reloaded.n, 1);
+        assert!(reloaded.found_memories);
+    }
+
+    /// The dangerous shape: metadata claims records but the vectors are
+    /// GONE (no "memories" stream). That is real data loss the user has
+    /// not seen yet — back it up before anything can overwrite it.
+    #[test]
+    fn brain_claiming_records_without_vectors_is_backed_up() {
+        let dir = fresh_test_dir("brain-claims-records");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap();
+        assert_eq!(
+            unsafe { cma_qtsq_save(p, None, 0, 64, "{\"records\":[{\"text\":\"lost\"}]}") },
+            QTSQ_OK
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let mut shell = unsafe { cma_open(p, crate::embedding::HASH_DIM, None) }
+            .expect("unreadable brain still starts fresh instead of failing the open");
+        assert!(shell.cma.is_empty());
+        assert_eq!(
+            std::fs::read(dir.join("brain.qtsq.bak")).unwrap(),
+            before,
+            "a brain whose vectors are missing must be backed up before any flush"
+        );
+    }
+
+    /// Backups must never clobber an earlier one: the moment a brain is
+    /// unreadable is exactly when the previous copy matters most.
+    #[test]
+    fn repeated_backups_never_clobber() {
+        let dir = fresh_test_dir("brain-backup-chain");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap();
+        assert_eq!(
+            unsafe { cma_qtsq_save(p, None, 0, 64, "{\"records\":[{\"text\":\"lost\"}]}") },
+            QTSQ_OK
+        );
+        let first = unsafe { cma_open(p, crate::embedding::HASH_DIM, None) };
+        assert!(first.is_some());
+        let original = std::fs::read(dir.join("brain.qtsq.bak")).unwrap();
+        /* Second failure on the same path must land beside the first. */
+        let second = unsafe { backup_brain(p) };
+        assert_ne!(second, format!("{p}.bak"));
+        assert!(std::path::Path::new(&second).exists());
+        assert_eq!(std::fs::read(dir.join("brain.qtsq.bak")).unwrap(), original);
+    }
+
+    #[test]
+    fn corrupt_container_is_backed_up_then_fresh_start() {
+        let dir = fresh_test_dir("brain-garbage");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, b"not a qtsq container at all").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut shell = unsafe { cma_open(p, crate::embedding::HASH_DIM, None) }
+            .expect("garbage must not fail the open — chat keeps working");
+        assert!(shell.cma.is_empty());
+        assert_eq!(std::fs::read(dir.join("brain.qtsq.bak")).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_hash_brain_still_opens_as_hash() {
+        let dir = fresh_test_dir("legacy-hash");
+        let path = dir.join("brain.qtsq");
+        build_legacy_hash_brain(&path, &["legacy memory one", "legacy memory two"]);
+        let p = path.to_str().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let entries_before = dir_entries(&dir);
+
+        let shell = unsafe { cma_open(p, crate::embedding::HASH_DIM, None) }
+            .expect("legacy brain opens as hash-v1 without migrating");
+        assert_eq!(shell.embedding_id, crate::embedding::INPUT_EMBEDDER_ID);
+        assert_eq!(shell.cma.len(), 2);
+        let js = shell.cma.records_json();
+        assert!(js.contains("legacy memory one") && js.contains("legacy memory two"));
+        /* A plain hash open must not migrate or touch anything. */
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(dir_entries(&dir), entries_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_refused_when_staging_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_test_dir("mig-readonly");
+        let path = dir.join("brain.qtsq");
+        build_legacy_hash_brain(&path, &["read only probe one", "read only probe two"]);
+        let p = path.to_str().unwrap().to_string();
+        let before = std::fs::read(&path).unwrap();
+        let entries_before = dir_entries(&dir);
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let opened = unsafe {
+            cma_open(&p, crate::embedding::SEMANTIC_DIM, Some(crate::embedding::MODEL_ID))
+        };
+
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&dir, restore).unwrap();
+
+        assert!(
+            opened.is_none(),
+            "migration must refuse when it cannot stage the new brain"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(dir_entries(&dir), entries_before, "no sidecars on refusal");
+    }
+
+    /* ── P1-6: a hostile n_hints must never reach with_capacity raw ── */
+
+    /// 1025 seeded pages make the clamp observable in the RESULT itself:
+    /// kv.search(q, 4294967295) must come back with exactly 1024 hints —
+    /// unclamped, js_kv_search hands u32::MAX to kv_search's
+    /// Vec::with_capacity, a ~16GB reservation (allocator abort where the
+    /// platform refuses it; a silent virtual reservation under macOS
+    /// overcommit). Both signatures fail this test: process death, or
+    /// resLen 1025 ≠ 1024.
+    #[test]
+    fn kv_search_hostile_n_hints_clamped() {
+        use sofuu_ffi::qjs::CtxPtr;
+
+        let dir = fresh_test_dir("kv-hints");
+        let root = dir.join("kv");
+        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+            kv_register(ctx);
+
+            /* count = 1 layer × 1 head × 1 token × headDim 8 = 8 floats/page. */
+            let script = format!(
+                "var kv = sofuu.kv.open('{}', {{nLayers:1, nHeads:1, headDim:8}});\n{}",
+                root.to_str().unwrap(),
+                r#"var k = new Float32Array(8);
+var v = new Float32Array(8);
+var saved = 0;
+for (var i = 0; i < 1025; i++) {
+  k[0] = (i % 7) + 0.25;
+  if (kv.save(k, v, 1) > 0) saved++;
+}
+var q = new Float32Array(64);
+q[0] = 1.0;
+var hostile = kv.search(q, 4294967295);
+var normal = kv.search(q, 3);
+var seen = {};
+var distinct = 0;
+for (var i = 0; i < hostile.length; i++) {
+  if (!seen[hostile[i]]) { seen[hostile[i]] = 1; distinct++; }
+}
+globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
+  first: hostile.length ? hostile[0] : -1, distinct: distinct,
+  normalLen: normal.length});"#
+            );
+
+            let script_c = CString::new(script).unwrap();
+            let r = qjs::JS_Eval(
+                ctx,
+                script_c.as_ptr(),
+                script_c.as_bytes().len(),
+                c"<p1-6>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "kv search script threw");
+
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let v = qjs::sofuu_js_get_property_str(ctx, global, c"out".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+            let p = qjs::sofuu_js_to_cstring(ctx, v);
+            qjs::sofuu_js_free_value(ctx, v);
+            assert!(!p.is_null(), "script did not set globalThis.out");
+            let out = CStr::from_ptr(p).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, p);
+
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+
+            let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(j["saved"], 1025, "every page save must succeed");
+            assert_eq!(j["resLen"], 1024, "hostile n_hints must be clamped to 1024");
+            let first = j["first"].as_u64().unwrap();
+            assert!((1..=1025).contains(&first), "hint must be a real page id, got {first}");
+            assert_eq!(j["distinct"], 1024, "hints must be distinct page ids");
+            assert_eq!(j["normalLen"], 3, "a small n_hints stays exact");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ml-2 (AUDIT-2026-09-07): a hostile brain file whose "memories"
+    /// tensor header claims dims [1000,1000] (product 1_000_000) but
+    /// carries 6 floats. The C compressor validates neither side, so only
+    /// the Rust loader can refuse. Pre-fix this loaded vecs.len()=6 with
+    /// n=1000/dim=1000; the loader must skip the stream itself (vecs
+    /// empty → cma_open falls through to a fresh shell, fail-safe).
+    #[test]
+    fn brain_load_rejects_inconsistent_memories_schema() {
+        let dir = fresh_test_dir("ml2-brain");
+        let path = dir.join("brain.qtsq");
+        let path_s = path.to_str().unwrap().to_string();
+        unsafe {
+            let container = qtsq::qtsq_ctx_alloc();
+            assert!(!container.is_null());
+            assert_eq!(qtsq::qtsq_container_create(container), QTSQ_OK);
+            (*container).set_codec(qtsq::QTSQ_CODEC_QTC);
+
+            let sub = qtsq::qtsq_ctx_alloc();
+            assert!(!sub.is_null());
+            assert_eq!(qtsq::qtsq_init(sub), QTSQ_OK);
+            (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let dims: [u32; 2] = [1000, 1000];
+            assert_eq!(
+                qtsq::qtsq_compress_tensor(sub, data.as_ptr(), 6, dims.as_ptr(), 2),
+                QTSQ_OK,
+                "the C compressor accepts the hostile header (no product check)"
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, sub, c"memories".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(sub);
+            qtsq::qtsq_ctx_free(sub);
+
+            assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
+            assert_eq!(qtsq_adapter_encrypt(container), QTSQ_OK);
+            let ctmp = CString::new(format!("{path_s}.tmp")).unwrap();
+            assert_eq!(qtsq::qtsq_write(container, ctmp.as_ptr()), QTSQ_OK);
+            qtsq::qtsq_free(container);
+            qtsq::qtsq_ctx_free(container);
+            std::fs::rename(format!("{path_s}.tmp"), &path_s).unwrap();
+
+            let brain = cma_qtsq_load(&path_s).expect("the container itself must still load");
+            assert!(brain.found_memories, "the memories stream was present");
+            assert!(
+                brain.vecs.is_empty() && brain.n == 0 && brain.dim == 0,
+                "inconsistent schema must be skipped (vecs={}, n={}, dim={})",
+                brain.vecs.len(),
+                brain.n,
+                brain.dim
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ml-2 site B: a page file whose K stream claims dims
+    /// [999999,1,999999,1] (product ≈1e12) but carries 8 floats, next to
+    /// an honest V stream. The tail k/v length-parity gate alone accepted
+    /// this (8 == 8) and handed n_layers=999999/n_tokens=999999 — read
+    /// from the hostile header — to ActivePage.
+    #[test]
+    fn kv_page_load_rejects_inconsistent_k_schema() {
+        let dir = fresh_test_dir("ml2-page");
+        let path = dir.join("pages.qtsq");
+        let path_s = path.to_str().unwrap().to_string();
+        unsafe {
+            let container = qtsq::qtsq_ctx_alloc();
+            assert!(!container.is_null());
+            assert_eq!(qtsq::qtsq_container_create(container), QTSQ_OK);
+            (*container).set_codec(qtsq::QTSQ_CODEC_QTC);
+
+            let ksub = qtsq::qtsq_ctx_alloc();
+            assert!(!ksub.is_null());
+            assert_eq!(qtsq::qtsq_init(ksub), QTSQ_OK);
+            (*ksub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            let k: [f32; 8] = [0.5; 8];
+            let kdims: [u32; 4] = [999_999, 1, 999_999, 1];
+            assert_eq!(
+                qtsq::qtsq_compress_tensor(ksub, k.as_ptr(), 8, kdims.as_ptr(), 4),
+                QTSQ_OK
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, ksub, c"kv_00000007_K".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(ksub);
+            qtsq::qtsq_ctx_free(ksub);
+
+            let vsub = qtsq::qtsq_ctx_alloc();
+            assert!(!vsub.is_null());
+            assert_eq!(qtsq::qtsq_init(vsub), QTSQ_OK);
+            (*vsub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            let v: [f32; 8] = [1.0; 8];
+            let vdims: [u32; 4] = [1, 1, 1, 8];
+            assert_eq!(
+                qtsq::qtsq_compress_tensor(vsub, v.as_ptr(), 8, vdims.as_ptr(), 4),
+                QTSQ_OK
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, vsub, c"kv_00000007_V".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(vsub);
+            qtsq::qtsq_ctx_free(vsub);
+
+            assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
+            assert_eq!(qtsq_adapter_encrypt(container), QTSQ_OK);
+            let ctmp = CString::new(format!("{path_s}.tmp")).unwrap();
+            assert_eq!(qtsq::qtsq_write(container, ctmp.as_ptr()), QTSQ_OK);
+            qtsq::qtsq_free(container);
+            qtsq::qtsq_ctx_free(container);
+            std::fs::rename(format!("{path_s}.tmp"), &path_s).unwrap();
+
+            let r = kv_qtsq_load_page(&path_s, 7);
+            assert!(
+                r.is_err(),
+                "inconsistent K dims must reject the page, got {:?}",
+                r.as_ref().map(|(_, _, l, t)| (*l, *t))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ml-2 positive control: a well-formed page (K dims [1,1,2,4],
+    /// count 8) must keep loading and report its schema dims.
+    #[test]
+    fn kv_page_load_accepts_consistent_k_schema() {
+        let dir = fresh_test_dir("ml2-page-ok");
+        let path = dir.join("pages.qtsq");
+        let path_s = path.to_str().unwrap().to_string();
+        unsafe {
+            let container = qtsq::qtsq_ctx_alloc();
+            assert!(!container.is_null());
+            assert_eq!(qtsq::qtsq_container_create(container), QTSQ_OK);
+            (*container).set_codec(qtsq::QTSQ_CODEC_QTC);
+            for (suffix, vals) in [("_K", [0.5f32; 8]), ("_V", [1.0f32; 8])] {
+                let sub = qtsq::qtsq_ctx_alloc();
+                assert!(!sub.is_null());
+                assert_eq!(qtsq::qtsq_init(sub), QTSQ_OK);
+                (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
+                let dims: [u32; 4] = [1, 1, 2, 4];
+                assert_eq!(
+                    qtsq::qtsq_compress_tensor(sub, vals.as_ptr(), 8, dims.as_ptr(), 4),
+                    QTSQ_OK
+                );
+                let name = CString::new(format!("kv_00000003{suffix}")).unwrap();
+                assert_eq!(qtsq::qtsq_container_add_stream(container, sub, name.as_ptr()), QTSQ_OK);
+                qtsq::qtsq_free(sub);
+                qtsq::qtsq_ctx_free(sub);
+            }
+            assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
+            assert_eq!(qtsq_adapter_encrypt(container), QTSQ_OK);
+            let ctmp = CString::new(format!("{path_s}.tmp")).unwrap();
+            assert_eq!(qtsq::qtsq_write(container, ctmp.as_ptr()), QTSQ_OK);
+            qtsq::qtsq_free(container);
+            qtsq::qtsq_ctx_free(container);
+            std::fs::rename(format!("{path_s}.tmp"), &path_s).unwrap();
+
+            let (k, v, n_layers, n_tokens) =
+                kv_qtsq_load_page(&path_s, 3).expect("well-formed page must load");
+            assert_eq!(k.len(), 8);
+            assert_eq!(v.len(), 8);
+            assert_eq!(n_layers, 1);
+            assert_eq!(n_tokens, 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ml-1 (AUDIT-2026-09-07) no-regression guard: a 3000-page
+    /// index.json still hydrates every page after the reserve clamp (the
+    /// clamp bounds only the initial reservation; Vec growth covers the
+    /// real item count, which JS_ParseJSON makes authoritative).
+    #[test]
+    fn kv_index_with_many_pages_loads_fully() {
+        use sofuu_ffi::qjs::CtxPtr;
+
+        let dir = fresh_test_dir("kv-ml1");
+        let root = dir.join("kv");
+        std::fs::create_dir_all(&root).unwrap();
+        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+
+            let mut entries = String::from("{\"pages\":[");
+            for i in 0..3000u32 {
+                if i > 0 {
+                    entries.push(',');
+                }
+                entries.push_str(&format!(
+                    "{{\"page_id\":{},\"strength\":1.0,\"created_at\":{}}}",
+                    i + 1,
+                    1000 + i
+                ));
+            }
+            entries.push_str("]}");
+            std::fs::write(root.join("index.json"), entries).unwrap();
+
+            let kv = kv_store_open(ctx, root.to_str().unwrap(), 1, 1, 8)
+                .expect("kv_store_open must succeed");
+            assert_eq!(kv.pages.len(), 3000, "every page entry must load");
+            assert_eq!(kv.pages[2999].page_id, 3000);
+            assert_eq!(kv.pages[0].strength, 1.0);
+            // Omitted k_summary zero-fills (older-index path), not garbage.
+            assert!(kv.pages[42].k_summary.iter().all(|v| *v == 0.0));
+
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

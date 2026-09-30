@@ -85,15 +85,50 @@ class SofuuBridge(configJson: String? = null) {
         return eval(js) ?: "{}"
     }
 
-    /// Embed text using the bundled offline embedder (no network).
-    fun embedLocal(text: String): FloatArray? {
-        val escaped = text.replace("\\", "\\\\").replace("'", "\\'")
-        val js = "JSON.stringify(Array.from(sofuu.ai.embedLocal('$escaped')))"
-        val result = eval(js) ?: return null
-        // Parse "[0.1, 0.2, ...]" into FloatArray.
-        val trimmed = result.trim().removeSurrounding("[", "]")
-        if (trimmed.isEmpty()) return null
-        return trimmed.split(",").mapNotNull { it.trim().toFloatOrNull() }.toFloatArray()
+    /// Embed text using the bundled offline embedder (no network, no JSON).
+    /// @param space "sem2-64" (default), "sem1-64", or "hash-768".
+    fun embedLocal(text: String, space: String? = null): FloatArray? {
+        return nativeEmbedLocal(rtPtr, text, space)
+    }
+
+    /// Embed many texts in one call. Returns one FloatArray per input.
+    fun embedBatch(texts: Array<String>, space: String? = null): Array<FloatArray>? {
+        if (texts.isEmpty()) return arrayOf()
+        return nativeEmbedBatch(rtPtr, texts, space)
+    }
+
+    /// Embed image bytes (PNG/JPEG) into img1-64 (joint with sem2-64 text).
+    fun embedImage(bytes: ByteArray): FloatArray? {
+        if (bytes.isEmpty()) return null
+        return nativeEmbedImage(rtPtr, bytes)
+    }
+
+    /// Provider transcription via the libsofuu funnel (BYO key in config).
+    /// For offline use SofuuVoice (OS speech) instead. Returns transcript text.
+    fun transcribeProvider(audio: ByteArray, optsJson: String? = null): String? {
+        val b64 = android.util.Base64.encodeToString(audio, android.util.Base64.NO_WRAP)
+        val env = nativeVoiceTranscribe(rtPtr, b64, optsJson) ?: return null
+        return try {
+            org.json.JSONObject(env).getJSONObject("result").getString("text")
+        } catch (e: Exception) { null }
+    }
+
+    /// Provider speech via the libsofuu funnel. Returns (bytes, format).
+    fun speakProvider(text: String, optsJson: String? = null): Pair<ByteArray, String>? {
+        val env = nativeVoiceSpeak(rtPtr, text, optsJson) ?: return null
+        return try {
+            val result = org.json.JSONObject(env).getJSONObject("result")
+            val indexed = result.getJSONObject("audio")
+            val keys = indexed.keys().asSequence().mapNotNull { it.toIntOrNull() }.sorted().toList()
+            if (keys.isEmpty()) return null
+            val bytes = ByteArray(keys.size) { i -> indexed.getInt(keys[i].toString()).toByte() }
+            Pair(bytes, result.getString("format"))
+        } catch (e: Exception) { null }
+    }
+
+    /// Space manifest JSON (default space, model ids, dims, artifact hashes).
+    fun embedInfo(): String? {
+        return nativeEmbedInfo(rtPtr)
     }
 
     /// Compute cosine similarity between two vectors.
@@ -117,5 +152,11 @@ class SofuuBridge(configJson: String? = null) {
         @JvmStatic private external fun nativeRtFree(rt: Long)
         @JvmStatic private external fun nativeRtEval(rt: Long, source: String): String?
         @JvmStatic private external fun nativeRtCall(rt: Long, method: String, args: String?): String?
+        @JvmStatic private external fun nativeEmbedLocal(rt: Long, text: String, space: String?): FloatArray?
+        @JvmStatic private external fun nativeEmbedBatch(rt: Long, texts: Array<String>, space: String?): Array<FloatArray>?
+        @JvmStatic private external fun nativeEmbedImage(rt: Long, bytes: ByteArray): FloatArray?
+        @JvmStatic private external fun nativeVoiceTranscribe(rt: Long, audioB64: String, optsJson: String?): String?
+        @JvmStatic private external fun nativeVoiceSpeak(rt: Long, text: String, optsJson: String?): String?
+        @JvmStatic private external fun nativeEmbedInfo(rt: Long): String?
     }
 }

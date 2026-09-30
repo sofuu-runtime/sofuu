@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::features::{self, FreshnessInput, SourceKind, FRESHNESS_FEATURES};
+use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 
 pub const IN_DIM: u32 = FRESHNESS_FEATURES as u32; // 28
@@ -57,7 +58,10 @@ pub fn score(
     now_year: u32,
 ) -> FreshnessVerdict {
     let inp = FreshnessInput { text, task, kind, strength, age_days, now_year };
-    let feats = features::extract(&inp);
+    let mut feats = features::extract(&inp);
+    // Phase 1.2: NaN must never reach the forward pass (sigmoid(NaN) is
+    // NaN → "NaN" in the returned JSON → the caller's parse breaks).
+    crate::ml::sanitize_features(&mut feats);
     let s = NET.forward(&feats);
     FreshnessVerdict {
         score: s,
@@ -145,8 +149,11 @@ unsafe extern "C" fn js_freshness_score(
     argv: *const JSValueConst,
 ) -> JSValue {
     let empty = String::new();
-    let text = if argc >= 1 { arg_str(ctx, *argv) } else { empty.clone() };
-    let task = if argc >= 2 { arg_str(ctx, *argv.add(1)) } else { empty.clone() };
+    // Bounded inputs (Phase 1.2): text/task feed whole-document feature
+    // extraction; a megabyte blob must not turn a per-result gate into a
+    // latency/memory hazard. The score caps stay as they were.
+    let text = if argc >= 1 { cap_str(&arg_str(ctx, *argv), 20_000) } else { empty.clone() };
+    let task = if argc >= 2 { cap_str(&arg_str(ctx, *argv.add(1)), 4_000) } else { empty.clone() };
     let opts = if argc >= 3 {
         serde_json::from_str::<serde_json::Value>(&arg_str(ctx, *argv.add(2)))
             .unwrap_or(serde_json::Value::Null)
@@ -169,8 +176,15 @@ unsafe extern "C" fn js_freshness_score(
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0)
         .max(0.0) as f32;
+    // NaN/Inf from JSON exponent overflow must never reach the net
+    // (Phase 1.2): a non-finite scalar feature renders NaN into the
+    // returned JSON and breaks the caller's parse.
+    let strength = if strength.is_finite() { strength } else { 0.0 };
+    let age_days = if age_days.is_finite() { age_days } else { 0.0 };
 
     let v = score(&text, &task, kind, strength, age_days, current_year());
+    // reason flows into a JSON string literal — escape it (a quote or
+    // newline in the evidence text must not break the parse).
     let json = format!(
         "{{\"score\":{:.4},\"stale\":{},\"years\":{:.1},\"reason\":\"{}\"}}",
         v.score,

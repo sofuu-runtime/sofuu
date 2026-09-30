@@ -16,6 +16,17 @@ export default function App() {
   const store = useAppStore();
   const { state } = store;
 
+  // Prefetch every provider's model list in the background and keep it
+  // fresh — the model picker reads this cache, so clicking a provider
+  // never waits on the network (run at start, then every 5 minutes).
+  useEffect(() => {
+    if (!backend.isTauri()) return;
+    const refresh = () => backend.refreshModelCache().catch(() => {});
+    refresh();
+    const t = window.setInterval(refresh, 5 * 60_000);
+    return () => window.clearInterval(t);
+  }, []);
+
   // NSMenu actions arrive as "menu://action" events (accelerators are
   // consumed by the native menu, so this is their only path in Tauri).
   useEffect(() => {
@@ -138,19 +149,22 @@ export default function App() {
         activePath={state.projectDir}
         onAddFolder={pickProject}
         onSelectWorkspace={store.openWorkspace}
+        onRemoveWorkspace={store.removeWorkspace}
         onOpenSettings={() => store.openSettings(true)}
         collapsed={state.sidebarCollapsed}
         onToggle={store.toggleSidebar}
       />
 
       <div className="main">
-        <CloudBackground />
+        {state.cloudBg && <CloudBackground dark={state.resolvedDark} />}
         <TopBar
           activeId={currentId}
           previewLabel={preview ? preview.label : null}
           sessions={state.sessions}
           onNewChat={store.newChat}
           onSelectSession={switchSession}
+          onDeleteSession={store.deleteSession}
+          onClearSessions={store.clearSessions}
           onExitPreview={store.closePreview}
         />
 
@@ -158,7 +172,7 @@ export default function App() {
           {state.bootError && <div className="banner error">{state.bootError}</div>}
 
           {preview ? (
-            <ChatPane messages={[]} chatFontSize={state.chatFontSize} preview={preview} />
+            <ChatPane messages={[]} chatFontSize={state.chatFontSize} phase={null} preview={preview} />
           ) : !hasMessages ? (
             <div className="home-empty">
               <div className="headline">What should we work on?</div>
@@ -171,15 +185,17 @@ export default function App() {
                 streaming={state.streaming}
                 mode={state.mode}
                 permissions={state.permissions}
+                ctx={state.ctx}
                 onSubmit={store.submit}
                 onCancel={store.cancel}
                 onModeChange={store.setMode}
                 onPermissionsChange={store.setPermissions}
                 onConfigPatch={patchConfig}
+                onOpenSettings={() => store.openSettings(true, "providers")}
               />
             </div>
           ) : (
-            <ChatPane messages={state.messages} chatFontSize={state.chatFontSize} />
+            <ChatPane messages={state.messages} chatFontSize={state.chatFontSize} phase={state.phase} />
           )}
         </div>
 
@@ -195,11 +211,13 @@ export default function App() {
               streaming={state.streaming}
               mode={state.mode}
               permissions={state.permissions}
+              ctx={state.ctx}
               onSubmit={store.submit}
               onCancel={store.cancel}
               onModeChange={store.setMode}
               onPermissionsChange={store.setPermissions}
               onConfigPatch={patchConfig}
+              onOpenSettings={() => store.openSettings(true, "providers")}
             />
           </div>
         )}
@@ -208,9 +226,16 @@ export default function App() {
       {state.settingsOpen && (
         <SettingsModal
           config={state.config}
+          initialTab={state.settingsTab}
           projectDir={state.projectDir}
           chatFontSize={state.chatFontSize}
           zoom={state.zoom}
+          cloudBg={state.cloudBg}
+          theme={state.theme}
+          onTheme={store.setTheme}
+          onCloudBg={store.setCloudBg}
+          permissions={state.permissions}
+          onPermissionsChange={store.setPermissions}
           onChatFontSize={store.setChatFontSize}
           onZoomBy={store.zoomBy}
           onZoomReset={store.zoomReset}

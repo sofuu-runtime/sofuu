@@ -1,0 +1,54 @@
+{
+  "name": "sofuu",
+  "version": "0.2.0",
+  "description": "The private, offline AI runtime \u2014 offline embeddings, an encrypted local brain, agents and MCP in a ~3MB binary. No API key to ship, no telemetry.",
+  "keywords": [
+    "ai",
+    "agent",
+    "agents",
+    "llm",
+    "mcp",
+    "embeddings",
+    "vector",
+    "offline",
+    "on-device",
+    "runtime",
+    "quickjs",
+    "typescript"
+  ],
+  "homepage": "https://sofuu.xyz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sofuu-runtime/sofuu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sofuu-runtime/sofuu/issues"
+  },
+  "license": "MIT",
+  "author": "Sofuu <hello@sofuu.xyz>",
+  "type": "commonjs",
+  "bin": {
+    "sofuu": "bin/sofuu.js"
+  },
+  "files": [
+    "bin/sofuu.js",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node install.js --verify-only"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

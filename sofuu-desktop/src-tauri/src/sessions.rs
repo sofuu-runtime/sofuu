@@ -43,8 +43,13 @@ struct Registry {
     sessions: Vec<SessionInfo>,
 }
 
-fn sessions_dir(project: &Path) -> PathBuf {
+pub(crate) fn sessions_dir(project: &Path) -> PathBuf {
     project.join(".sofuu").join("sessions")
+}
+
+/// Public wrapper for commands.rs — the mesh root of a picked project.
+pub(crate) fn mesh_root_for(project: &Path) -> PathBuf {
+    mesh_root(project)
 }
 
 /// The session-mesh root for a picked project dir — must match what

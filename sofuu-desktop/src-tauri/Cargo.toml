@@ -16,6 +16,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# macos-private-api must be a base feature, not target-gated: tauri-build's
+# manifest check validates every host's Cargo.toml against tauri.conf.json
+# (macOSPrivateApi:true → the feature is required even on Linux CI). It is
+# inert off-Apple — it only flips empty wry transparent/fullscreen flags
+# whose uses are all cfg'd to macOS.
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
@@ -29,6 +34,16 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 objc2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows Credential Manager backend for keychain.rs.
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# freedesktop Secret Service (GNOME Keyring / KWallet) backend for
+# keychain.rs. Needs libdbus-1-dev to build and a running secret-service
+# daemon at runtime — without one, keys simply fail to persist.
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [features]
 default = ["custom-protocol"]

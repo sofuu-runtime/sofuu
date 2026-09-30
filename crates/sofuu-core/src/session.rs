@@ -7,10 +7,10 @@
 //!                        heartbeat. Plaintext on purpose — it is
 //!                        bookkeeping (heartbeats rewrite it constantly),
 //!                        not session data.
-//!   - `<id>.qtsq`      — the session's data (events, task, notes) as ONE
-//!                        QTSQ file, sanitize + password-vault encrypted.
-//!                        The password is derived from the project root, so
-//!                        every session of the same project can read them.
+//!   - `<id>.store/`    — main Sofuu's bounded active + sealed QTSQ segments
+//!                        and a manifest; legacy flat `<id>.qtsq` files remain
+//!                        readable (small records are raw; records at or above
+//!                        500 KiB are compressed).
 //!
 //! Every chat session in the same project sees the others' current task,
 //! recent activity and — the critical part — `critical` notices in
@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::session_store;
 
 pub const SESSIONS_DIR: &str = ".sofuu/sessions";
 const REGISTRY_FILE: &str = "registry.json";
@@ -49,6 +51,8 @@ pub struct SessionInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionEvent {
+    #[serde(default)]
+    pub seq: u64,
     pub t: u64,
     pub kind: String, // start | prompt | task | note | critical | end
     pub text: String,
@@ -90,6 +94,12 @@ fn unix() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "windows")]
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+}
+
+#[cfg(not(target_os = "windows"))]
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is a writable 256-byte buffer; gethostname writes at most
@@ -113,7 +123,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// Strip terminal-control characters from UNTRUSTED peer text. A local peer
-/// (registry.json is plaintext, the .qtsq password is derivable) could
+/// (registry.json is plaintext and local session records are readable) could
 /// otherwise inject ANSI escape sequences into our console or forge text
 /// inside the model's prompt. Keeps \n and \t for readability.
 pub fn sanitize_peer_text(s: &str) -> String {
@@ -214,9 +224,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Deterministic per-project password for the `.qtsq` session files. All
-/// sessions of one project derive the same one. Local obfuscation, not
-/// real security — the machine owner can always read them.
+/// Deterministic per-project password retained for loading legacy encrypted
+/// `.qtsq` session files. New session records do not use it.
 pub fn session_password(project: &Path) -> String {
     format!(
         "sofuu-session-{:016x}",
@@ -263,7 +272,7 @@ fn lock_path(project: &Path) -> PathBuf {
 /// is a plaintext file any local process can rewrite, so ids are validated
 /// BEFORE they reach any filesystem path (defense against forged registry
 /// entries turning `session prune`/`show` into an arbitrary-path primitive).
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("s-") else {
         return false;
     };
@@ -288,33 +297,69 @@ fn session_file(project: &Path, id: &str) -> PathBuf {
 }
 
 /// Exclusive advisory lock around read-modify-write of the registry.
-fn with_registry_lock<T>(project: &Path, f: impl FnOnce() -> T) -> T {
-    use std::os::unix::io::AsRawFd;
+/// P3 (AUDIT-2026-09-07): both failure paths used to degrade to running
+/// the closure WITHOUT the lock — concurrent writers could then silently
+/// lose registry updates. Lock failures now surface as errors; callers
+/// decide whether to warn (best-effort updates) or fail the command.
+fn with_registry_lock<T>(project: &Path, f: impl FnOnce() -> T) -> Result<T, String> {
     let lock = lock_path(project);
     let _ = std::fs::create_dir_all(lock.parent().unwrap_or(Path::new(".")));
-    let Ok(file) = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(&lock)
-    else {
-        return f();
-    };
-    // SAFETY: flock on our own fd; blocks until we hold the exclusive lock.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        .map_err(|e| format!("cannot open session registry lock ({}): {e}", lock.display()))?;
+    // Blocks until we hold the exclusive lock (flock / LockFileEx).
+    file.lock()
+        .map_err(|e| format!("cannot lock session registry ({}): {e}", lock.display()))?;
     let out = f();
-    // SAFETY: same fd — release the lock.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    out
+    let _ = file.unlock();
+    Ok(out)
 }
 
 // ── Registry ───────────────────────────────────────────────────────
 
 impl Registry {
     pub fn read(project: &Path) -> Self {
-        match std::fs::read_to_string(registry_path(project)) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        let path = registry_path(project);
+        match std::fs::read_to_string(&path) {
+            /* A registry file that EXISTS but does not parse used to
+             * silently become an empty registry — the next write then
+             * rewrote it wholesale, orphaning every sessions/<id>.store
+             * dir on disk with no trace. Back it up first (fail-open is
+             * preserved: chat must never die on a bad registry) and warn
+             * loudly, so the corruption is recoverable and visible. */
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    let corrupt = format!("{}.corrupt-{}", path.display(),
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0));
+                    eprintln!("\x1b[33mWarning:\x1b[0m session registry {} is corrupt ({e}) — backed up to {corrupt}; starting from an empty registry",
+                        path.display());
+                    let _ = std::fs::copy(&path, &corrupt);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
+        }
+    }
+
+    /// session-1 (AUDIT-2026-09-07): strict read for destructive paths.
+    /// `read` fails open — a corrupt or unreadable registry parses as an
+    /// EMPTY registry, which makes prune treat every session as inactive
+    /// and delete its protected archives. Callers that use the active set
+    /// to PROTECT records must distinguish a missing file (fresh project,
+    /// empty is truthful) from one that exists yet cannot be read or
+    /// parsed (only "no active sessions" to a reader that fails open).
+    pub fn read_strict(project: &Path) -> Result<Self, String> {
+        let path = registry_path(project);
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("registry unreadable ({}): {e}", path.display())),
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| format!("registry corrupt ({}): {e}", path.display())),
         }
     }
 
@@ -323,8 +368,30 @@ impl Registry {
         let _ = std::fs::create_dir_all(&dir);
         let json = serde_json::to_string_pretty(self).unwrap_or_default();
         let tmp = dir.join("registry.json.tmp");
-        if std::fs::write(&tmp, json).is_err() {
-            return false;
+        /* P3-11: consistency with the other secret-adjacent files — create
+         * 0600 (not the 0644 default) even though content is non-secret. */
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::io::Write;
+            let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+            else {
+                return false;
+            };
+            if f.write_all(json.as_bytes()).is_err() {
+                return false;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if std::fs::write(&tmp, json).is_err() {
+                return false;
+            }
         }
         std::fs::rename(&tmp, registry_path(project)).is_ok()
     }
@@ -345,12 +412,15 @@ pub struct Session {
     pub info: SessionInfo,
     project: PathBuf,
     data: SessionData,
-    password: String,
+    next_seq: u64,
+    /// True while a persist() failure streak is active (P1-9) — gates the
+    /// one-line warning to fire once per streak, not once per turn.
+    persist_failed: bool,
 }
 
 impl Session {
     /// Register a new session in the project's mesh and write its first
-    /// `.qtsq` file.
+    /// segmented QTSQ store.
     pub fn join(project: &Path, model: &str, provider: &str) -> Self {
         let now = unix();
         let id = gen_session_id();
@@ -386,7 +456,8 @@ impl Session {
             info,
             project: project.to_path_buf(),
             data,
-            password: session_password(project),
+            next_seq: 1,
+            persist_failed: false,
         };
         session.log_event("start", "session started");
         session.update_registry();
@@ -403,33 +474,43 @@ impl Session {
     }
 
     fn update_registry(&self) {
-        with_registry_lock(&self.project, || {
+        // Best-effort: the transcript in the segmented store is the source
+        // of truth, so a registry loss must not kill the session — but it
+        // must be loud, never silently lockless (P3, AUDIT-2026-09-07).
+        if let Err(e) = with_registry_lock(&self.project, || {
             let mut reg = Registry::read(&self.project);
             reg.upsert(self.info.clone());
             reg.write(&self.project);
-        });
+        }) {
+            eprintln!("\x1b[33mWarning:\x1b[0m session registry update failed: {e}");
+        }
     }
 
-    /// Rewrite this session's `.qtsq` file (events capped). Returns
-    /// success; failures are non-fatal (the mesh degrades to registry-only).
+    /// Persist the current session snapshot through the bounded segmented
+    /// store. Legacy flat files remain a read-only compatibility format.
     pub fn persist(&mut self) -> bool {
-        if self.data.events.len() > EVENT_CAP {
-            let dropped = self.data.events.len() - EVENT_CAP;
-            self.data.events.drain(0..dropped);
+        // P3 (AUDIT-2026-09-07): the cap used to drain live events BEFORE
+        // the store write, so a transient persist failure permanently
+        // discarded the drained tail. Trim only after a successful write:
+        // on failure the buffers grow past the cap until the store
+        // recovers, and the next success trims them back.
+        let ok = session_store::persist_snapshot(&self.project, &self.data);
+        if ok {
+            if self.data.events.len() > EVENT_CAP {
+                let dropped = self.data.events.len() - EVENT_CAP;
+                self.data.events.drain(0..dropped);
+            }
+            self.data.notes.truncate(20);
         }
-        self.data.notes.truncate(20);
-        let Some(json) = serde_json::to_vec(&self.data).ok() else {
-            return false;
-        };
-        let path = session_file(&self.project, &self.info.id);
-        let path_s = path.to_string_lossy();
-        sofuu_ffi::qtsq_session_save(&path_s, &json, &self.password) == 0
+        ok
     }
 
     fn log_event(&mut self, kind: &str, text: &str) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
         self.data
             .events
-            .push(SessionEvent { t: unix(), kind: kind.into(), text: text.into() });
+            .push(SessionEvent { seq, t: unix(), kind: kind.into(), text: text.into() });
         self.info.last_seen = unix();
     }
 
@@ -449,21 +530,21 @@ impl Session {
         self.data.task = task.clone();
         self.log_event("task", &text);
         self.update_registry();
-        let _ = self.persist();
+        self.persist_warn();
     }
 
     /// A personal note, visible to peers as an ordinary notice.
     pub fn add_note(&mut self, msg: &str) {
         self.data.notes.push(msg.to_string());
         self.log_event("note", msg);
-        let _ = self.persist();
+        self.persist_warn();
     }
 
     /// An escalation: every live peer is told about this immediately.
     pub fn broadcast_critical(&mut self, msg: &str) {
         self.log_event("critical", msg);
         self.update_registry();
-        let _ = self.persist();
+        self.persist_warn();
     }
 
     /// Record a user prompt (truncated) so peers can see what this session
@@ -471,7 +552,7 @@ impl Session {
     pub fn log_prompt(&mut self, text: &str) {
         let t = truncate(text, 300);
         self.log_event("prompt", &t);
-        let _ = self.persist();
+        self.persist_warn();
     }
 
     /// Record the assistant's answer (persisted so a resumed chat can
@@ -479,7 +560,7 @@ impl Session {
     pub fn log_answer(&mut self, text: &str) {
         let t = truncate(text, 2000);
         self.log_event("answer", &t);
-        let _ = self.persist();
+        self.persist_warn();
     }
 
     /// Close the session (kept in the registry as ended for a week).
@@ -487,24 +568,53 @@ impl Session {
         self.log_event("end", "session ended");
         self.info.ended = true;
         self.update_registry();
-        let _ = self.persist();
+        self.persist_warn();
+    }
+
+    /// persist() with a one-line warning on failure (P1-9): disk full,
+    /// flock poison, manifest corruption — the transcript used to vanish
+    /// silently while the chat kept running. Only the FIRST failure in a
+    /// streak warns (a full disk must not spam every turn).
+    fn persist_warn(&mut self) {
+        let ok = self.persist();
+        if !ok {
+            if !self.persist_failed {
+                self.persist_failed = true;
+                sout(&format!(
+                    "  \x1b[33m⚠ session persist failed — transcript is memory-only until it recovers\x1b[0m\n"
+                ));
+            }
+        } else {
+            self.persist_failed = false;
+        }
     }
 }
 
 // ── Reading other sessions (peers) ─────────────────────────────────
 
-/// Load + decrypt another session's `.qtsq` data.
+/// Load another session's data. New main sessions use the segmented store;
+/// legacy flat files, including encrypted records, remain readable.
 pub fn load_session_data(project: &Path, id: &str) -> Option<SessionData> {
+    if session_store::has_manifest(project, id) {
+        return session_store::load_full(project, id);
+    }
     let path = session_file(project, id);
     let path_s = path.to_string_lossy();
     let bytes = sofuu_ffi::qtsq_session_load(&path_s, &session_password(project))?;
     serde_json::from_slice(&bytes).ok()
 }
 
+fn load_recent_session_data(project: &Path, id: &str, limit: usize) -> Option<SessionData> {
+    if session_store::has_manifest(project, id) {
+        return session_store::load_tail(project, id, limit);
+    }
+    load_session_data(project, id)
+}
+
 /// Tracks which peer events this session has already seen.
 #[derive(Default)]
 pub struct PeerWatch {
-    seen: HashMap<String, usize>,
+    seen: HashMap<String, u64>,
     last_scan: u64,
 }
 
@@ -535,15 +645,55 @@ impl PeerWatch {
             if now.saturating_sub(info.last_seen) >= STALE_AFTER_SECS {
                 continue;
             }
+            let watched = self.seen.get(&info.id).copied().unwrap_or(0);
+            if session_store::has_manifest(project, &info.id) {
+                let Some((latest, events)) = session_store::read_since(project, &info.id, watched)
+                else {
+                    continue;
+                };
+                /* P1-8: advance `seen` only past what was actually DELIVERED.
+                 * The old code inserted `latest` unconditionally — on a
+                 * >MAX_NOTICES_PER_POLL burst, events after the cap break
+                 * were marked seen without ever being noticed, and a
+                 * peer's broadcast could vanish. Capped polls re-scan the
+                 * remainder next tick (already-delivered events are
+                 * filtered by the `watched` seq above). */
+                let mut delivered = watched;
+                let mut capped = false;
+                for ev in events {
+                    if matches!(ev.kind.as_str(), "critical" | "note" | "task") {
+                        out.push(Notice {
+                            id: short_id(&info.id),
+                            kind: ev.kind,
+                            text: truncate(&sanitize_peer_text(&ev.text), 240),
+                        });
+                        if out.len() >= MAX_NOTICES_PER_POLL {
+                            capped = true;
+                            break;
+                        }
+                    }
+                    delivered = delivered.max(ev.seq);
+                }
+                self.seen.insert(info.id.clone(), if capped { delivered } else { latest });
+                if capped {
+                    break;
+                }
+                continue;
+            }
+
             let Some(data) = load_session_data(project, &info.id) else {
                 continue;
             };
-            let total = data.events.len();
-            let watched = self.seen.get(&info.id).copied().unwrap_or(0).min(total);
-            if total == watched {
+            let total = data.events.len() as u64;
+            let watched = watched.min(total) as usize;
+            if total as usize == watched {
                 continue;
             }
-            for ev in data.events.iter().skip(watched) {
+            /* P1-8 (flat path): same delivered-only advance as the manifest
+             * path — a cap break must not mark unread events as seen. */
+            let mut delivered_idx = watched;
+            let mut capped = false;
+            for (i, ev) in data.events.iter().enumerate().skip(watched) {
                 if matches!(ev.kind.as_str(), "critical" | "note" | "task") {
                     out.push(Notice {
                         id: short_id(&info.id),
@@ -551,12 +701,15 @@ impl PeerWatch {
                         text: truncate(&sanitize_peer_text(&ev.text), 240),
                     });
                     if out.len() >= MAX_NOTICES_PER_POLL {
+                        capped = true;
                         break;
                     }
                 }
+                delivered_idx = i + 1;
             }
-            self.seen.insert(info.id.clone(), total);
-            if out.len() >= MAX_NOTICES_PER_POLL {
+            self.seen
+                .insert(info.id.clone(), if capped { delivered_idx as u64 } else { total });
+            if capped {
                 break;
             }
         }
@@ -613,7 +766,7 @@ pub fn shared_context(project: &Path, own_id: &str) -> String {
             age_s,
             s.host
         );
-        if let Some(data) = load_session_data(project, &s.id) {
+        if let Some(data) = load_recent_session_data(project, &s.id, 64) {
             if let Some(last) = data.events.iter().rev().find(|e| e.kind == "prompt") {
                 ent.push_str(&format!(
                     " · last activity: {}",
@@ -635,7 +788,7 @@ pub fn shared_context(project: &Path, own_id: &str) -> String {
 /// The last (prompt → answer) turns of this session, oldest first — used
 /// by the chat UI to re-open a previous transcript.
 pub fn past_turns(project: &Path, id: &str) -> Vec<(String, String)> {
-    let Some(data) = load_session_data(project, id) else {
+    let Some(data) = load_recent_session_data(project, id, EVENT_CAP) else {
         return Vec::new();
     };
     let mut out: Vec<(String, String)> = Vec::new();
@@ -659,7 +812,7 @@ pub fn session_context(project: &Path, id: &str) -> String {
     let Some(info) = reg.sessions.iter().find(|s| s.id == id) else {
         return format!("No session with id '{}' (use `sofuu session list`).\n", id);
     };
-    let data = load_session_data(project, id);
+    let data = load_recent_session_data(project, id, 15);
     let mut out = String::new();
     out.push_str(&format!(
         "Session {} · {} · model {}\n  started {}, host {}, cwd {}\n",
@@ -769,7 +922,11 @@ fn truncate_30(s: &str) -> String {
     truncate(s, 30)
 }
 
-pub fn cmd_show(project: &Path, id: &str) -> i32 {
+/// Resolve a user-typed session id (full or short 4-char form) to the full
+/// id against the registry. /resume's picker text advertises the SHORT form
+/// (chat.rs handleResume + __chat_sessions), so every consumer that accepts
+/// a typed id must route through here (P1-10).
+pub fn resolve_session_id(project: &Path, id: &str) -> Result<String, String> {
     let reg = Registry::read(project);
     let matches: Vec<String> = reg
         .sessions
@@ -777,24 +934,256 @@ pub fn cmd_show(project: &Path, id: &str) -> i32 {
         .map(|s| s.id.clone())
         .filter(|full| full == id || short_id(full) == id)
         .collect();
-    match matches.first() {
-        Some(full) => {
-            let ctx = session_context(project, full);
+    match matches.as_slice() {
+        [full] => Ok(full.clone()),
+        [] if valid_session_id(id) => {
+            let legacy = session_file(project, id);
+            let segmented = session_store::store_dir(project, id)
+                .map(|path| path.exists())
+                .unwrap_or(false);
+            if legacy.is_file() || segmented {
+                Ok(id.to_string())
+            } else {
+                Err(format!("No session matching '{id}' (try sofuu session list)."))
+            }
+        }
+        [] => Err(format!("No session matching '{id}' (try sofuu session list).")),
+        _ => Err(format!(
+            "Session id '{id}' is ambiguous; use the full session id from sofuu session list."
+        )),
+    }
+}
+
+pub fn cmd_show(project: &Path, id: &str) -> i32 {
+    /* P3-10: route through resolve_session_id — the local copy matched the
+     * FIRST hit on an ambiguous short id instead of erroring, and /context
+     * on the wrong session would show the wrong transcript. */
+    match resolve_session_id(project, id) {
+        Ok(full) => {
+            let ctx = session_context(project, &full);
             sout(&ctx);
             0
         }
-        None => {
-            sout(&format!("  No session matching '{id}' (try `sofuu session list`).\n"));
+        Err(e) => {
+            sout(&format!("  {e}\n"));
             1
         }
     }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn print_segmented_stats(full: &str, stats: &session_store::StorageStats) {
+    sout(&format!(
+        "  storage: {} (.store), manifest schema {}\n",
+        if stats.segmented { "segmented" } else { "unknown" },
+        stats.manifest_schema
+    ));
+    sout(&format!(
+        "  records: {} total · {} raw · {} compressed · {} encrypted\n",
+        stats.record_count,
+        stats.raw_record_count,
+        stats.compressed_record_count,
+        stats.encrypted_record_count
+    ));
+    sout(&format!(
+        "  segments: {} total · {} sealed · {} active events · active payload {}\n",
+        stats.segment_count,
+        stats.sealed_count,
+        stats.active_events,
+        human_bytes(stats.active_bytes)
+    ));
+    sout(&format!(
+        "  retained: seq {}..{} ({} events)\n",
+        stats.retained_from_seq,
+        stats.next_seq.saturating_sub(1),
+        stats.event_count
+    ));
+    sout(&format!("  payload bytes: {}\n", human_bytes(stats.payload_bytes)));
+    if let Some(hash) = &stats.source_sha256 {
+        sout(&format!("  migrated legacy source sha256: {hash}\n"));
+    }
+    if let Some(at) = stats.migrated_at {
+        sout(&format!("  migrated at: {at} (unix seconds)\n"));
+    }
+    if stats.segments.is_empty() {
+        sout("  ranges: (empty)\n");
+    } else {
+        sout("  ranges:\n");
+        for segment in &stats.segments {
+            sout(&format!(
+                "    {} {}..{} · {} events · {}\n",
+                segment.state,
+                segment.start_seq,
+                segment.end_seq,
+                segment.event_count,
+                human_bytes(segment.payload_bytes)
+            ));
+        }
+    }
+    if stats.missing_count
+        + stats.corrupt_count
+        + stats.orphaned_count
+        + stats.quarantined_count
+        + stats.incomplete_count
+        > 0
+    {
+        sout(&format!(
+            "  diagnostics: {} missing · {} corrupt · {} orphaned · {} quarantined · {} incomplete\n",
+            stats.missing_count,
+            stats.corrupt_count,
+            stats.orphaned_count,
+            stats.quarantined_count,
+            stats.incomplete_count
+        ));
+    }
+    sout(&format!("  session: {full}\n"));
+}
+
+fn print_legacy_stats(project: &Path, full: &str) -> i32 {
+    let path = session_file(project, full);
+    if !path.is_file() {
+        sout(&format!(
+            "  Session '{full}' has no readable segmented manifest or legacy file.\n"
+        ));
+        return 1;
+    }
+    let Some(data) = load_session_data(project, full) else {
+        sout(&format!(
+            "  Legacy session '{full}' exists but its QTSQ payload is unreadable.\n"
+        ));
+        return 1;
+    };
+    let encrypted = path
+        .to_str()
+        .and_then(sofuu_ffi::qtsq_session_is_encrypted)
+        .map(|value| if value { "yes" } else { "no" })
+        .unwrap_or("unknown");
+    let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    sout("  storage: legacy flat .qtsq (read-only compatibility path)\n");
+    sout(&format!(
+        "  schema: {} · events: {} · notes: {} · file bytes: {}\n",
+        data.schema,
+        data.events.len(),
+        data.notes.len(),
+        human_bytes(bytes)
+    ));
+    sout(&format!(
+        "  encrypted: {encrypted} · new Sofuu writes use plaintext segmented records\n"
+    ));
+    sout(&format!("  migration: sofuu session migrate {}\n", short_id(full)));
+    0
+}
+
+/// Inspect storage without printing prompt/answer bodies.
+pub fn cmd_inspect(project: &Path, id: &str) -> i32 {
+    let full = match resolve_session_id(project, id) {
+        Ok(full) => full,
+        Err(message) => {
+            sout(&format!("  {message}\n"));
+            return 1;
+        }
+    };
+    if let Some(stats) = session_store::stats(project, &full) {
+        print_segmented_stats(&full, &stats);
+        return if stats.missing_count == 0 && stats.corrupt_count == 0 {
+            0
+        } else {
+            1
+        };
+    }
+    if session_store::store_dir(project, &full)
+        .map(|path| path.is_dir())
+        .unwrap_or(false)
+    {
+        sout(&format!(
+            "  Segmented store for '{full}' has an invalid or unreadable manifest; run `sofuu session repair {}`.\n",
+            short_id(&full)
+        ));
+        return 1;
+    }
+    print_legacy_stats(project, &full)
+}
+
+/// Rebuild a segmented manifest from valid published/orphaned segments.
+pub fn cmd_repair(project: &Path, id: &str) -> i32 {
+    let full = match resolve_session_id(project, id) {
+        Ok(full) => full,
+        Err(message) => {
+            sout(&format!("  {message}\n"));
+            return 1;
+        }
+    };
+    if !session_store::store_dir(project, &full)
+        .map(|path| path.is_dir())
+        .unwrap_or(false)
+    {
+        sout("  Nothing to repair: this session is still in the legacy flat format.\n");
+        return 1;
+    }
+    if !session_store::repair(project, &full) {
+        sout(&format!(
+            "  Repair failed for {full}; no valid contiguous segment chain was found.\n"
+        ));
+        return 1;
+    }
+    sout(&format!("  Repaired/validated segmented store for {full}.\n"));
+    if let Some(stats) = session_store::stats(project, &full) {
+        print_segmented_stats(&full, &stats);
+        if stats.missing_count > 0 || stats.corrupt_count > 0 {
+            return 1;
+        }
+    } else {
+        sout("  Repair completed without a readable manifest; inspect the store and retry.\n");
+        return 1;
+    }
+    0
+}
+
+/// Explicitly migrate one legacy flat session, preserving its source file.
+pub fn cmd_migrate(project: &Path, id: &str) -> i32 {
+    let full = match resolve_session_id(project, id) {
+        Ok(full) => full,
+        Err(message) => {
+            sout(&format!("  {message}\n"));
+            return 1;
+        }
+    };
+    match session_store::migrate_legacy(project, &full) {
+        Ok(()) => {
+            sout(&format!(
+                "  Migrated {full} to .store; legacy .qtsq source was preserved.\n"
+            ));
+            if let Some(stats) = session_store::stats(project, &full) {
+                print_segmented_stats(&full, &stats);
+            }
+            0
+        }
+        Err(message) => {
+            sout(&format!("  Migration failed for {full}: {message}\n"));
+            1
+        }
+    }
+}
+
+/// Print storage counters and segment ranges for one session.
+pub fn cmd_storage_stats(project: &Path, id: &str) -> i32 {
+    cmd_inspect(project, id)
 }
 
 /// Remove ended sessions older than a week (files + registry entries).
 pub fn cmd_prune(project: &Path) -> i32 {
     let now = unix();
     let mut removed = 0;
-    with_registry_lock(project, || {
+    let locked = with_registry_lock(project, || {
         let mut reg = Registry::read(project);
         let keep: Vec<SessionInfo> = reg
             .sessions
@@ -804,6 +1193,7 @@ pub fn cmd_prune(project: &Path) -> i32 {
                 if s.ended && old {
                     let file = session_file(project, &s.id);
                     let _ = std::fs::remove_file(file);
+                    let _ = session_store::remove_store(project, &s.id);
                     removed += 1;
                     false
                 } else {
@@ -814,6 +1204,12 @@ pub fn cmd_prune(project: &Path) -> i32 {
         reg.sessions = keep;
         reg.write(project);
     });
+    if let Err(e) = locked {
+        // P3 (AUDIT-2026-09-07): a lock failure used to degrade to a
+        // lockless prune racing other writers; it now fails the command.
+        eprintln!("\x1b[31mError:\x1b[0m {e}");
+        return 1;
+    }
     if removed > 0 {
         sout(&format!("  Pruned {removed} ended session(s).\n"));
     } else {
@@ -983,6 +1379,110 @@ mod tests {
     }
 
     #[test]
+    fn segmented_store_rotates_and_reads_recent_context() {
+        let proj = tmp_project("segmented");
+        let mut session = Session::join(&proj, "m1", "openai");
+        for i in 0..70 {
+            session.log_prompt(&format!("prompt-{i}"));
+        }
+
+        let store = session_store::store_dir(&proj, session.id()).expect("safe store path");
+        assert!(store.join("manifest.qtsq").is_file());
+        assert!(!session_file(&proj, session.id()).exists());
+        let stats = session_store::stats(&proj, session.id()).expect("segmented stats");
+        assert!(stats.segmented);
+        assert!(stats.sealed_count >= 1, "rotation should seal the first segment");
+        assert!(stats.segment_count <= 6, "bounded session should stay compact: {stats:?}");
+        assert_eq!(stats.encrypted_record_count, 0, "new records are never encrypted");
+        assert_eq!(stats.event_count, 71);
+
+        let loaded = load_session_data(&proj, session.id()).expect("segmented round-trip");
+        assert_eq!(loaded.events.len(), 71);
+        assert_eq!(loaded.events.first().unwrap().seq, 1);
+        assert_eq!(loaded.events.last().unwrap().seq, 71);
+        let turns = past_turns(&proj, session.id());
+        assert_eq!(turns.len(), 10);
+        assert_eq!(turns.last().unwrap().0, "prompt-69");
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn legacy_flat_session_is_readable_and_migrates_without_deleting_source() {
+        let proj = tmp_project("legacy-migrate");
+        let id = gen_session_id();
+        let data = SessionData {
+            schema: 1,
+            id: id.clone(),
+            created: unix(),
+            host: "legacy-host".into(),
+            cwd: proj.to_string_lossy().into_owned(),
+            model: "m1".into(),
+            provider: "openai".into(),
+            task: Some("legacy task".into()),
+            notes: vec!["legacy note".into()],
+            events: vec![
+                SessionEvent {
+                    seq: 0,
+                    t: unix(),
+                    kind: "start".into(),
+                    text: "legacy start".into(),
+                },
+                SessionEvent {
+                    seq: 0,
+                    t: unix(),
+                    kind: "prompt".into(),
+                    text: "legacy prompt".into(),
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&data).unwrap();
+        let legacy = session_file(&proj, &id);
+        std::fs::create_dir_all(sessions_dir(&proj)).unwrap();
+        assert_eq!(
+            sofuu_ffi::qtsq_session_save(legacy.to_str().unwrap(), &bytes),
+            0
+        );
+
+        let loaded = load_session_data(&proj, &id).expect("legacy reader");
+        assert_eq!(loaded.events.len(), 2);
+        assert_eq!(loaded.events[0].seq, 0, "legacy flat data stays source-shaped");
+        assert!(!session_store::has_manifest(&proj, &id));
+
+        session_store::migrate_legacy(&proj, &id).expect("explicit migration");
+        assert!(session_store::has_manifest(&proj, &id));
+        assert!(legacy.is_file(), "migration must preserve the source file");
+        let migrated = session_store::load_full(&proj, &id).expect("migrated reader");
+        assert_eq!(migrated.events.len(), 2);
+        assert_eq!(migrated.events[0].seq, 1);
+        assert_eq!(migrated.events[1].seq, 2);
+        let migration_stats = session_store::stats(&proj, &id).expect("migration stats");
+        assert!(migration_stats.source_sha256.is_some());
+        assert!(migration_stats.migrated_at.is_some());
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn repair_rebuilds_manifest_from_published_segments() {
+        let proj = tmp_project("repair");
+        let mut session = Session::join(&proj, "m1", "openai");
+        for i in 0..70 {
+            session.log_prompt(&format!("repair-{i}"));
+        }
+        let store = session_store::store_dir(&proj, session.id()).unwrap();
+        std::fs::remove_file(store.join("manifest.qtsq")).unwrap();
+        assert!(!session_store::has_manifest(&proj, session.id()));
+
+        assert!(session_store::repair(&proj, session.id()));
+        let repaired = session_store::load_full(&proj, session.id()).expect("repaired reader");
+        assert_eq!(repaired.events.len(), 71);
+        assert_eq!(repaired.events.first().unwrap().seq, 1);
+        assert_eq!(repaired.events.last().unwrap().seq, 71);
+        let stats = session_store::stats(&proj, session.id()).expect("repaired stats");
+        assert_eq!(stats.corrupt_count, 0);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
     fn peers_see_each_others_criticals() {
         let proj = tmp_project("peers");
         let mut s1 = Session::join(&proj, "qwen:4b", "ollama");
@@ -1017,6 +1517,64 @@ mod tests {
             notices2.iter().any(|n| n.kind == "critical" && n.text.contains("/v2")),
             "critical from an ended session must still be delivered: {notices2:?}"
         );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // P3 (AUDIT-2026-09-07): persist used to drain events beyond EVENT_CAP
+    // BEFORE the store write — a transient failure permanently discarded
+    // the tail. Regression: trim only after success; failure keeps the
+    // buffer; the next success trims it back.
+    #[test]
+    fn persist_failure_keeps_events_and_success_trims() {
+        use std::os::unix::fs::PermissionsExt;
+        let proj = tmp_project("persist-cap");
+        let mut s = Session::join(&proj, "qwen:4b", "ollama");
+        for i in 0..(EVENT_CAP + 10) {
+            s.log_event("user", &format!("filler event {i}"));
+        }
+        assert!(s.persist(), "first persist should succeed");
+        assert_eq!(s.data.events.len(), EVENT_CAP, "a successful persist trims to the cap");
+
+        // Break the store: a read-only store dir cannot take new segment
+        // files, so persist must report failure.
+        let store = session_store::store_dir(&proj, s.id()).expect("store dir exists after persist");
+        let mut perms = std::fs::metadata(&store).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&store, perms.clone()).unwrap();
+        for i in 0..5 {
+            s.log_event("user", &format!("post-failure event {i}"));
+        }
+        assert!(!s.persist(), "persist must fail while the store is unwritable");
+        assert_eq!(
+            s.data.events.len(),
+            EVENT_CAP + 5,
+            "a FAILED persist must not trim the live buffer"
+        );
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&store, perms).unwrap();
+        assert!(s.persist(), "recovered persist should succeed");
+        assert_eq!(s.data.events.len(), EVENT_CAP, "post-recovery persist trims back to the cap");
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // P3 (AUDIT-2026-09-07): with_registry_lock used to degrade to a
+    // lockless closure when the lock could not be taken — concurrent
+    // writers silently lost registry updates. Regression: the failure
+    // must surface as an Err, never run the closure unlocked.
+    #[test]
+    fn registry_lock_failure_is_reported_not_degraded() {
+        let proj = tmp_project("registry-lock");
+        // The lock lives under <project>/.sofuu/sessions/.lock; making
+        // .sofuu a regular file makes the lock un-openable.
+        std::fs::write(proj.join(".sofuu"), b"not a directory").unwrap();
+        let mut ran = false;
+        let result = with_registry_lock(&proj, || {
+            ran = true;
+            7usize
+        });
+        assert!(result.is_err(), "lock failure must surface as Err");
+        assert!(!ran, "the closure must not run without the lock");
         let _ = std::fs::remove_dir_all(&proj);
     }
 }

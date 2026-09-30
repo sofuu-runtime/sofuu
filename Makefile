@@ -21,15 +21,23 @@ endif
 
 # QTSQ codec checkout (proprietary, optional). The cargo build reads
 # SOFUU_QTSQ_DIR; point at a checkout to enable brain persistence +
-# session store, or leave unset for a degraded build (CI does the same).
-QTSQ_DIR ?= /Users/priyanshuboruah/projects/black-hole-disk
+# session store, or leave unset for a degraded build (CI does the same):
+#   SOFUU_QTSQ_DIR=~/projects/<checkout> make
+#
+# SOFUU_ALLOW_NO_QTSQ=1 opts out of the guard below. The guard exists
+# because a QTSQ-free build is INVISIBLY broken: memory calls no-op and
+# every session persist fails, while the chat banner still claims
+# "Memory: on (persists across sessions)". A release tarball built that
+# way shipped once (2026-09-22) and doctor now catches it in one command.
+QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ_DIR)/libqtsq.dylib))
 
 # ──────────────────────────────────────────────────────────────────
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test bench c-only size-check cargo-build \
-        libsofuu zig-install linux linux-x86_64 linux-arm64 release-archives dist \
+        libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
+        release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
         desktop desktop-dev desktop-clean
 
@@ -39,6 +47,22 @@ all: $(TARGET)
 
 # ── Rust-first build (default and only maintained build) ────────
 cargo-build:
+	@if [ -z "$(SOFUU_QTSQ_DIR)" ]; then \
+		if [ "$$SOFUU_ALLOW_NO_QTSQ" = "1" ]; then \
+			echo "  \033[33m⚠\033[0m  QTSQ NOT linked (SOFUU_ALLOW_NO_QTSQ=1) — brain/memory/sessions will NOT persist"; \
+		else \
+			echo "  \033[31m✗ SOFUU_QTSQ_DIR is not set.\033[0m"; \
+			echo "    This build would ship WITHOUT the brain codec: memory silently"; \
+			echo "    no-ops and every session persist fails, while the UI still claims"; \
+			echo "    memory persists. Build it properly:"; \
+			echo "      SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make"; \
+			echo "    (or SOFUU_ALLOW_NO_QTSQ=1 make for a deliberate QTSQ-free build)"; \
+			exit 1; \
+		fi; \
+	elif [ -z "$(QTSQ_LIB_GUARD)" ]; then \
+		echo "  \033[31m✗ no libqtsq.a/libqtsq.dylib in SOFUU_QTSQ_DIR=$(SOFUU_QTSQ_DIR)\033[0m"; \
+		exit 1; \
+	fi
 	cargo build --release
 
 $(TARGET): cargo-build
@@ -131,6 +155,7 @@ bench: $(TARGET)
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).
 # First run:  make zig-install
 # Then:       make linux  OR  make linux-x86_64  OR  make linux-arm64
+#             make windows-x86_64   (.exe, Schannel TLS, no Docker/MSVC)
 # NOTE: cross builds are QTSQ-free (the local checkout is macOS-only).
 
 ZIG_INSTALL = scripts/cross/install_zig.sh
@@ -147,6 +172,9 @@ linux-x86_64: zig-install
 
 linux-arm64: zig-install
 	@bash $(CROSS_SCRIPT) arm64
+
+windows-x86_64: zig-install
+	@bash scripts/cross/build_windows_x86_64.sh
 
 release-archives: linux
 	@echo "Archives are in dist/"
@@ -193,6 +221,15 @@ headless-test: libsofuu
 	@echo "\033[36m--- Run c_embed against the library ---\033[0m"
 	@examples/headless/c_embed
 	@echo ""
+	@echo "\033[36m--- Compile c_embed_vec.c against libsofuu ---\033[0m"
+	@cc examples/headless/c_embed_vec.c -Idist -Ldist -lsofuu -o examples/headless/c_embed_vec \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_embed_vec)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_embed_vec against the library ---\033[0m"
+	@examples/headless/c_embed_vec
+	@echo ""
 	@echo "\033[36m--- Compile c_rlm.c against libsofuu ---\033[0m"
 	@cc examples/headless/c_rlm.c -Idist -Ldist -lsofuu -o examples/headless/c_rlm \
 		-Wl,-rpath,dist 2>&1 || \
@@ -210,6 +247,15 @@ headless-test: libsofuu
 	@echo ""
 	@echo "\033[36m--- Run c_agent against the library ---\033[0m"
 	@examples/headless/c_agent
+	@echo ""
+	@echo "\033[36m--- Compile c_llm.c against libsofuu (real LLM, mock in CI) ---\033[0m"
+	@cc examples/headless/c_llm.c -Idist -Ldist -lsofuu -o examples/headless/c_llm \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_llm)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_llm against the library (no key → mock) ---\033[0m"
+	@examples/headless/c_llm
 	@echo ""
 	@echo "\033[32m✓ Headless tests passed\033[0m"
 	@echo ""

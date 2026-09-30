@@ -37,6 +37,10 @@ use crate::rt::promise::sofuu_flush_jobs;
 static QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// The live async handle; null until `host_poke_init` runs.
 static HANDLE: AtomicPtr<UvAsync> = AtomicPtr::new(ptr::null_mut());
+/// F-2: the engine context that owns the poke (first init wins, matching
+/// HANDLE). A non-owner engine_destroy must not close it out from under the
+/// surviving engine.
+static OWNER: AtomicPtr<JSContext> = AtomicPtr::new(ptr::null_mut());
 
 /// Per-handle context: the leading `data` field of the uv handle points at
 /// this (same pattern as rt/timer.rs).
@@ -155,6 +159,7 @@ pub unsafe extern "C" fn sofuu_host_poke_init(ctx: *mut JSContext) {
     // alive on its own (drain semantics for every other host stay intact).
     unsafe { uv::uv_unref(handle as *mut UvHandle) };
     HANDLE.store(handle, Ordering::Release);
+    OWNER.store(ctx, Ordering::Release);
 }
 
 /// Close the poke handle before the loop tears down.
@@ -171,6 +176,27 @@ pub unsafe extern "C" fn sofuu_host_poke_shutdown() {
     }
     // SAFETY: h is the live handle; we are on the loop thread.
     unsafe { uv::uv_close(h as *mut UvHandle, Some(on_poke_close)) };
+}
+
+/// F-2: engine-scoped shutdown. The poke is process-global and owned by the
+/// FIRST engine that initialized (see sofuu_host_poke_init) — a surviving
+/// engine still needs it, so a non-owner destroy must NOT close the handle.
+/// Passing the owner's own ctx closes it exactly like the unconditional
+/// variant. (Known limitation, unchanged: a second engine never re-arms a
+/// poke for itself, so after the owner is destroyed the remaining engines
+/// lose host pokes — P0-7's "one runtime per process" punt.)
+///
+/// # Safety
+/// Loop thread only; call before `sofuu_loop_close`.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_host_poke_shutdown_for(ctx: *mut JSContext) {
+    let owner = OWNER.load(Ordering::Acquire);
+    if !owner.is_null() && owner != ctx {
+        /* Another engine owns the poke and is staying alive. */
+        return;
+    }
+    OWNER.store(ptr::null_mut(), Ordering::Release);
+    unsafe { sofuu_host_poke_shutdown() };
 }
 
 #[cfg(test)]

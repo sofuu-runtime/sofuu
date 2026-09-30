@@ -50,6 +50,10 @@ typedef void (*sofuu_event_cb)(const char *event_json, void *opaque);
 #define SOFUU_ERR_JS_EXCEPTION  -4   /* JS threw; details in out_json      */
 #define SOFUU_ERR_BAD_CONFIG    -5   /* config_json failed to parse        */
 #define SOFUU_ERR_INTERNAL      -6   /* engine/alloc failure               */
+/* H-E1 vector-embedding codes (do not overlap the funnel codes above). */
+#define SOFUU_ERR_UNKNOWN_SPACE -7   /* space id not recognized            */
+#define SOFUU_ERR_MODEL_UNAVAIL -8   /* baked embedding artifact unusable  */
+#define SOFUU_ERR_NOMEM         -9   /* host-visible malloc failed         */
 
 /* ── Versioning ────────────────────────────────────────────────── */
 /* Returns the ABI version this library implements (v2 = 2). The ABI is
@@ -72,11 +76,21 @@ void sofuu_embed_set_log_cb(sofuu_log_cb cb, void *opaque);
  *   { "embedded": true,            // hosted-library mode (default true)
  *     "config_root": "/path",      // replaces $HOME/.sofuu derivations
  *     "enable_signals": false,     // install signal handlers (default off)
- *     "qtsq": true,                // QTSQ brain/KV persistence (build-gated)
  *     "brain_path": "/path.qtsq",  // explicit brain file
  *     "api_keys": { "openai": "…" },
+ *     "provider": "openai",        // request DEFAULT, used only when a
+ *     "model": "gpt-4o-mini",      //   call omits it (per-call wins)
+ *     "base_url": "http://host/v1",//  e.g. pin to a local LLM server
  *     "agents": [ { "name":"researcher", "system":"…", "provider":"…",
  *                   "model":"…", "tools":[…], "budget":{…} } ] }
+ * provider/model/base_url exist because an embedded host has no interactive
+ * `/model` picker: set the endpoint once here instead of on every call.
+ * They are read only from the creating runtime's settings, so one runtime's
+ * defaults never retarget another. The CLI sets none, so chat's
+ * "no model configured" guidance is unchanged.
+ *
+ * NOTE: there is no "qtsq" config key. Whether the encrypted-brain codec is
+ * present is a BUILD-time property of the library, not a runtime toggle.
  * In embedded mode process.exit(N) throws a catchable ExitError with an
  * `exitCode` property instead of terminating the host process, and the
  * config is visible to JS as globalThis.__sofuu_embed_config.
@@ -101,26 +115,35 @@ void sofuu_rt_free(SofuuRuntime *rt);
 int sofuu_rt_call(SofuuRuntime *rt, const char *method,
                   const char *args_json, char **out_json);
 
-/* Streaming / cancellable variant (agent.run, ai.stream, rlm, …).
+/* Streaming / cancellable variant (agent.run, ai.stream, …).
  *
- * Calls a method that accepts an `onStep` callback option (e.g.
- * `agent.run`) and forwards each event to the host's `on_event` callback
- * on the calling thread. The method is called with args_json merged with
- * { onStep: <internal callback>, signal: <cancel_id> }.
+ * Two shapes are supported, and one driver handles both:
  *
- * For `agent.run`, args_json should be: {"target":"<name>","task":"…",…opts}.
- * Events are JSON objects: {"runId":"…","name":"…","depth":0,"t":<ms>,
- *                           "kind":"start|plan|tool|delegate|answer|stop",
- *                           "payload":{…}}
+ *  1. Methods taking an `onStep` option (agent.run) forward each step
+ *     event to the host. args_json should be
+ *     {"target":"<name>","task":"…",…opts}.
+ *  2. Methods returning an async iterable (ai.stream) are drained: each
+ *     chunk is forwarded as {"kind":"delta", …}.
  *
- * *out_cancel_id receives a token usable with sofuu_rt_cancel.
+ * The stream ALWAYS ends with exactly one terminal event
+ * {"kind":"done", …}:
+ *   - on success: {"kind":"done","deltas":<n>,"aborted":<bool>,"usage":…}
+ *     (for the onStep shape the final value is in "result")
+ *   - on failure: {"kind":"done","error":{"code":…,"message":…}}
+ * A host that waits for `kind:"done"` is never left hanging, and this
+ * signature has no out_json — the final value is delivered as that event.
+ *
+ * *out_cancel_id receives a token usable with sofuu_rt_cancel; it is
+ * written BEFORE the stream starts, so a callback may cancel in-flight.
  * Returns SOFUU_OK or a SOFUU_ERR_*. */
 int sofuu_rt_call_stream(SofuuRuntime *rt, const char *method,
                          const char *args_json,
                          sofuu_event_cb on_event, void *opaque,
                          uint64_t *out_cancel_id);
 
-/* Request cancellation of a streaming call. Calls sofuu.agent.cancel(id).
+/* Request cancellation of a streaming call. Works for both shapes: a
+ * stream in flight on this thread is flagged (the ai.stream pump checks
+ * it once per chunk), and agent.cancel(id) is nudged when present.
  * Returns SOFUU_OK if the cancel ID was recognized, -1 if not found. */
 int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
 
@@ -131,6 +154,47 @@ int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
  * For async work, drive it through sofuu_rt_call or manage your own
  * globals + a follow-up read. Returns SOFUU_OK or a SOFUU_ERR_*. */
 int sofuu_rt_eval(SofuuRuntime *rt, const char *source, char **out_json);
+
+/* ── Vector embeddings (H-E1 text, M1 image) ─────────────────────── */
+/* Direct float-vector entry points so hosts never JSON-encode embeddings.
+ * The embedders are stateless pure functions; `rt` is reserved for future
+ * per-runtime config and may be NULL on all four calls.
+ *
+ * Space ids (stable strings): "hash-768" (default when NULL/"" — and the
+ * same space the brain stores in, so embed→remember needs no space
+ * argument), "sem1-64", "sem2-64". One space per index — never mix spaces
+ * in a single store. Query sofuu_embed_info() for the live manifest and
+ * its default_space.
+ * *out is malloc-owned (dim / n*dim floats); the host frees it with
+ * sofuu_free(). Error codes: SOFUU_OK, SOFUU_ERR_INVALID_ARG,
+ * SOFUU_ERR_UNKNOWN_SPACE, SOFUU_ERR_MODEL_UNAVAIL, SOFUU_ERR_NOMEM. */
+int sofuu_embed_local(SofuuRuntime *rt, const char *text, const char *space,
+                      float **out, size_t *out_dim);
+int sofuu_embed_batch(SofuuRuntime *rt, const char **texts, size_t n,
+                      const char *space,
+                      float **out, size_t *out_n, size_t *out_dim);
+/* Image bytes (PNG/JPEG) → img1-64 vector (joint with sem2-64 text
+ * geometry, so text queries retrieve images). *out is malloc-owned floats;
+ * host frees with sofuu_free(). rt may be NULL. Undecodable input reports
+ * SOFUU_ERR_MODEL_UNAVAIL (no vector exists for it). */
+int sofuu_embed_image(SofuuRuntime *rt, const uint8_t *bytes, size_t len,
+                      float **out, size_t *out_dim);
+/* Space manifest: malloc'd {"ok":true,"result":{...}} (default_space,
+ * per-space model ids, dims, artifact hashes). Host frees with sofuu_free. */
+int sofuu_embed_info(SofuuRuntime *rt, char **out_json);
+
+/* ── Provider voice (M2C) ──────────────────────────────────────── */
+/* Thin funnel routing to ai.transcribe / ai.speak (same implementation
+ * the JS surface uses — no HTTP duplication). Hosts base64 audio
+ * themselves; the alphabet is validated before embedding (no JS string
+ * escape possible). opts_json NULL/"" selects {}. Speak resolves
+ * {audio, format} — over JSON transport the Uint8Array travels as an
+ * indexed-byte object; hosts reassemble it. Returns the funnel rc with
+ * a malloc'd envelope (host frees with sofuu_free()). */
+int sofuu_voice_transcribe(SofuuRuntime *rt, const char *audio_b64,
+                           const char *opts_json, char **out_json);
+int sofuu_voice_speak(SofuuRuntime *rt, const char *text,
+                      const char *opts_json, char **out_json);
 
 /* ── Memory ────────────────────────────────────────────────────── */
 /* Free a buffer handed out by this library (out_json strings). NULL-safe. */

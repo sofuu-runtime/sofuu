@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 /// Reject names/versions that could escape the install dir (path traversal).
 /// Scoped names legitimately contain one '/'; `..`, leading '/', backslashes,
-/// and control chars are rejected.
+/// control chars, and URL metacharacters (`?`/`#` — a registry or resolver
+/// would treat everything after them as query/fragment, so what we install
+/// would no longer match the name we validated) are rejected.
 pub fn spec_is_safe(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') || s.starts_with('.') {
         return false;
@@ -24,7 +26,7 @@ pub fn spec_is_safe(s: &str) -> bool {
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         let c = bytes[i];
-        if c == b'\\' || c < 0x20 {
+        if c == b'\\' || c < 0x20 || c == b'?' || c == b'#' {
             return false;
         }
         if c == b'.' && i + 1 < bytes.len() && bytes[i + 1] == b'.' {
@@ -276,16 +278,27 @@ pub fn extract_tarball_safe(tgz: &[u8], dest: &Path, strip_components: usize) ->
 
 fn inflate_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Read;
+    // Bomb guard: cap inflated size (gz bomb would OOM via read_to_end).
+    const MAX_INFLATED: u64 = 64 * 1024 * 1024; // 64MB
     let mut out = Vec::new();
     let mut decoder = flate2::read::GzDecoder::new(data);
     decoder
+        .take(MAX_INFLATED + 1)
         .read_to_end(&mut out)
         .map_err(|e| format!("gzip: {e}"))?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err("gzip bomb: inflated size exceeds 64MB cap".into());
+    }
     Ok(out)
 }
 
 fn extract_tar(data: &[u8], dest: &Path, strip: usize) -> Result<usize, String> {
+    // Tar bomb guards: file count, total bytes, per-file size.
+    const MAX_TAR_FILES: usize = 10_000;
+    const MAX_TAR_TOTAL: usize = 256 * 1024 * 1024; // 256MB
+    const MAX_TAR_FILE: usize = 64 * 1024 * 1024; // 64MB single file
     let mut count = 0usize;
+    let mut total: usize = 0;
     let mut off = 0usize;
     let block = 512usize;
     while off + block <= data.len() {
@@ -326,6 +339,15 @@ fn extract_tar(data: &[u8], dest: &Path, strip: usize) -> Result<usize, String> 
         {
             return Err(format!("unsafe tar entry: {name}"));
         }
+        if size > MAX_TAR_FILE {
+            return Err(format!("tar entry too large ({size} bytes): {name}"));
+        }
+        if count >= MAX_TAR_FILES {
+            return Err("tar bomb: too many files (>10000)".into());
+        }
+        if total.saturating_add(size) > MAX_TAR_TOTAL {
+            return Err("tar bomb: total size exceeds 256MB cap".into());
+        }
 
         let target = dest.join(rel_path);
         if let Some(parent) = target.parent() {
@@ -341,6 +363,7 @@ fn extract_tar(data: &[u8], dest: &Path, strip: usize) -> Result<usize, String> 
                 std::fs::write(&target, &data[data_start..data_end.min(data.len())])
                     .map_err(|e| format!("write {rel}: {e}"))?;
                 count += 1;
+                total = total.saturating_add(size);
             }
             _ => { /* ignore other types (hardlinks, devices) */ }
         }
@@ -361,6 +384,12 @@ mod tests {
         assert!(!spec_is_safe("/abs"));
         assert!(!spec_is_safe("a\\b"));
         assert!(!spec_is_safe(".."));
+        // P3 (AUDIT-2026-09-07): URL metacharacters — everything after ? or
+        // # would be treated as query/fragment by a registry/resolver, so
+        // the installed package would no longer match the validated name.
+        assert!(!spec_is_safe("lodash?version=1"));
+        assert!(!spec_is_safe("lodash#frag"));
+        assert!(!spec_is_safe("@scope/pkg#main"));
     }
 
     #[test]

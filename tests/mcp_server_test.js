@@ -1,7 +1,11 @@
-// examples/mcp_server_test.js
-// Test sofuu.mcp.serve() — build a simple MCP tool server
-// Run: ./sofuu run examples/mcp_server_test.js
-// Then test with: npx @modelcontextprotocol/inspector stdio ./sofuu run examples/mcp_server_test.js
+// tests/mcp_server_test.js — MCP stdio fixture, NOT a standalone test.
+// P3-14 (AUDIT-2026-09-01): this file is a server program (it "passes"
+// by starting, asserts nothing). Its job is being the in-repo spawn
+// target for tests/mcp_client_test.js — which connects over stdio and
+// hard-asserts echo/add behavior. Run the CLIENT test, not this file:
+//   ./sofuu run tests/mcp_client_test.js
+// Manual inspection (optional):
+//   npx @modelcontextprotocol/inspector stdio ./sofuu run tests/mcp_server_test.js
 
 const { mcp } = sofuu;
 

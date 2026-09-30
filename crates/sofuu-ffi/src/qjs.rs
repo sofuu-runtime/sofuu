@@ -450,7 +450,12 @@ extern "C" {
         magic: c_int,
     ) -> JSValue;
     pub fn js_std_dump_error(ctx: *mut JSContext);
-    pub fn js_malloc(rt: *mut JSRuntime, size: usize) -> *mut c_void;
+    /* C signature is js_malloc(JSContext*, size_t) (quickjs.h:393) — the
+     * JSRuntime* variant is js_malloc_rt. An earlier binding declared the
+     * rt pointer here and the sole caller passed JS_GetRuntime(ctx): the C
+     * code then read ctx->rt from a JSRuntime struct → garbage → wild jump
+     * inside js_malloc_rt. Verified via the P1-5 arrayBuffer neg control. */
+    pub fn js_malloc(ctx: *mut JSContext, size: usize) -> *mut c_void;
     pub fn JS_NewArrayBuffer(
         ctx: *mut JSContext,
         buf: *mut c_void,
@@ -459,6 +464,8 @@ extern "C" {
         opaque: *mut c_void,
         flags: c_int,
     ) -> JSValue;
+    // quickjs.h:821 — single-copy buffer alloc for bulk chunk delivery (net-7).
+    pub fn JS_NewArrayBufferCopy(ctx: *mut JSContext, buf: *const u8, len: usize) -> JSValue;
     // ── M10: the real exports behind the reimplemented shims ──
     pub fn __JS_FreeValue(ctx: *mut JSContext, v: JSValue);
     pub fn __JS_FreeValueRT(rt: *mut JSRuntime, v: JSValue);
@@ -656,7 +663,12 @@ pub struct JSCFunctionListEntry {
 }
 
 pub const JS_DEF_CFUNC: u8 = 0;
-pub const JS_PROP_CONFIGURABLE: u8 = 0x10;
+/* quickjs.h:263 — JS_PROP_CONFIGURABLE is (1 << 0). The old 0x10 collided
+ * with the JS_PROP_TMASK type bits (JS_PROP_GETSET is 1 << 4): masked with
+ * JS_PROP_C_W_E (0x07) it silently dropped configurability on every
+ * JS_SetPropertyFunctionList registration, and on the direct JS_DefineProperty
+ * paths it would have been read as a getter/setter slot (heap corruption). */
+pub const JS_PROP_CONFIGURABLE: u8 = 0x01;
 
 // ── Eval flags (quickjs.h:296-309 — verified against the vendored
 // header after M10's loader debug: JS_EVAL_FLAG_COMPILE_ONLY is (1<<5),
@@ -743,9 +755,10 @@ impl<'a> CtxPtr<'a> {
 /// # Safety
 /// `ctx` valid; returned value must be freed or rooted.
 pub unsafe fn new_string(ctx: CtxPtr, s: &str) -> JSValue {
-    let c = CString::new(s).unwrap_or_default();
-    // SAFETY: c valid for the call; QuickJS copies.
-    sofuu_js_new_string(ctx.as_ptr(), c.as_ptr())
+    // P3 (AUDIT-2026-09-07): this used to round-trip through CString::new
+    // with unwrap_or_default — an interior NUL silently produced an EMPTY
+    // JS string. JS_NewStringLen takes the raw bytes, so NULs survive.
+    JS_NewStringLen(ctx.as_ptr(), s.as_ptr() as *const c_char, s.len())
 }
 
 /// # Safety
@@ -836,26 +849,21 @@ pub unsafe fn value_to_string(ctx: CtxPtr, val: JSValueConst) -> Option<String> 
 /// # Safety
 /// `ctx` valid; `func` must be `'static`; returned value must be freed.
 pub unsafe fn new_cfunction(ctx: CtxPtr, name: &str, func: JSCFunction, length: c_int) -> JSValue {
-    let c = CString::new(name).unwrap_or_default();
+    // P3 (AUDIT-2026-09-07): a NUL in `name` used to unwrap_or_default into
+    // an EMPTY name. The C API cannot express an interior NUL in an
+    // identifier, so escape instead of silently emptying — reaching this
+    // escape at all means a caller bug, and a visible mangled name beats a
+    // silent empty one.
+    let c = CString::new(name.replace('\0', "\\0")).unwrap_or_default();
     // SAFETY: c valid; func 'static.
     sofuu_js_new_cfunction(ctx.as_ptr(), func, c.as_ptr(), length)
 }
 
-/// Pump the job queue until empty. Returns 0 when calm, -1 on an
-/// unhandled job exception (exception left in `pctx`).
-///
-/// # Safety
-/// `rt` must be the runtime owning the current context.
-pub unsafe fn flush_jobs(rt: *mut JSRuntime) -> c_int {
-    // SAFETY: rt valid.
-    loop {
-        let mut ctx2: *mut JSContext = ptr::null_mut();
-        let err = JS_ExecutePendingJob(rt, &mut ctx2);
-        if err <= 0 {
-            return err;
-        }
-    }
-}
+/* P2-22 (AUDIT-2026-09-01): the dead `flush_jobs` mirror was removed — it
+ * had zero call sites AND silently skipped the uncaught-exception +
+ * rejection dispatch that the live promise.rs `sofuu_flush_jobs` does;
+ * anyone "simplifying" back to this shape would silence unhandled
+ * rejections. Use sofuu_ffi::bridge / promise.rs's flush path. */
 
 // ── Tag helpers (via shims — never peek the layout) ──────────────
 
@@ -892,6 +900,19 @@ pub unsafe fn is_object(v: JSValueConst) -> bool {
 pub unsafe fn is_number(v: JSValueConst) -> bool {
     // SAFETY: shim.
     sofuu_js_is_number(v) != 0
+}
+
+/// # Safety
+/// `v` must be a valid JSValue.
+pub unsafe fn is_bool(v: JSValueConst) -> bool {
+    (v.tag as i32) == JS_TAG_BOOL
+}
+
+/// # Safety
+/// `ctx` valid; `v` a live value.
+pub unsafe fn to_bool(ctx: CtxPtr, v: JSValueConst) -> bool {
+    // SAFETY: `v` is a live value; JS_ToBool only reads it.
+    unsafe { JS_ToBool(ctx.as_ptr(), v) != 0 }
 }
 
 /// # Safety

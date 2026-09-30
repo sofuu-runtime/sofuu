@@ -117,13 +117,7 @@ fn with_ws<R>(f: impl FnOnce(&mut WorkingSet) -> R) -> R {
 /// so nested runs never pollute the parent's trajectory.
 pub fn run_start(run_id: &str, task: &str) {
     with_ws(|ws| {
-        if !ws.runs.contains_key(run_id) {
-            ws.order.push(run_id.to_string());
-            while ws.order.len() > MAX_RUNS {
-                let oldest = ws.order.remove(0);
-                ws.runs.remove(&oldest);
-            }
-        }
+        ensure_run(ws, run_id, task);
         ws.runs.insert(run_id.to_string(), RunState::new(run_id, task));
     });
 }
@@ -132,8 +126,34 @@ pub fn run_end(run_id: &str) {
     with_ws(|ws| {
         if let Some(r) = ws.runs.get_mut(run_id) {
             r.finished = true;
+            /* P2-35 (AUDIT-2026-09-01): the per-run maps (sig_first/reads/
+             * writes) are insert-only for the process lifetime — 50k
+             * distinct-target calls ≈ ~3MB+. A finished run's trajectory
+             * lives in `calls` (capped) and `segments` (capped); the rule
+             * maps only ever served the live run. Clear them at the
+             * boundary. */
+            r.sig_first.clear();
+            r.reads.clear();
+            r.writes.clear();
         }
     });
+}
+
+/// Mint a run entry if absent AND register it in the eviction order.
+/// P2-35: runs minted implicitly by precheck()/track_segment() used to
+/// bypass ws.order entirely — the MAX_RUNS eviction loop never saw them,
+/// so 2,000 hostile track() calls created 2,000 live runs that persisted
+/// forever. Every mint path now goes through here.
+fn ensure_run(ws: &mut WorkingSet, run_id: &str, task: &str) {
+    if !ws.runs.contains_key(run_id) {
+        ws.order.push(run_id.to_string());
+        while ws.order.len() > MAX_RUNS {
+            let oldest = ws.order.remove(0);
+            ws.runs.remove(&oldest);
+        }
+        // seed with the task if given; precheck-minted runs have none yet
+        ws.runs.insert(run_id.to_string(), RunState::new(run_id, task));
+    }
 }
 
 /// Pre-call rule check (PLAN-ML-GATES §11 rule subset). Detects the two most
@@ -146,10 +166,11 @@ pub fn run_end(run_id: &str) {
 /// the tool result back into the message array.
 pub fn precheck(run_id: &str, step: u32, tool: &str, sig: &str, target: &str) -> Verdict {
     with_ws(|ws| {
+        ensure_run(ws, run_id, ""); /* P2-35: implicit mints evict like the rest */
         let r = ws
             .runs
-            .entry(run_id.to_string())
-            .or_insert_with(|| RunState::new(run_id, ""));
+            .get_mut(run_id)
+            .expect("ensure_run just minted this run");
 
         let mut v = Verdict {
             ok: true,
@@ -257,10 +278,11 @@ pub fn postcall(run_id: &str, step: u32, tool: &str, target: &str, chars: u32, e
 /// recorded from day one so the trajectory is complete when it lands).
 pub fn track_segment(run_id: &str, kind: u8, chars: u32, tokens: u32, tool: &str, target: &str) {
     with_ws(|ws| {
+        ensure_run(ws, run_id, ""); /* P2-35: implicit mints evict like the rest */
         let r = ws
             .runs
-            .entry(run_id.to_string())
-            .or_insert_with(|| RunState::new(run_id, ""));
+            .get_mut(run_id)
+            .expect("ensure_run just minted this run");
         if r.segments.len() >= MAX_SEGMENTS {
             r.segments.remove(0);
         }
@@ -305,8 +327,20 @@ pub fn summary() -> (usize, usize, usize, u64) {
 mod tests {
     use super::*;
 
+    // The working set is process-global and the eviction tests churn its
+    // LRU hard (MAX_RUNS*3 insertions) — under parallel test execution that
+    // evicts other tests' runs mid-loop and breaks their global-counter
+    // assertions. Serialize this module's tests; into_inner recovers from a
+    // panicked holder so one failure can't cascade into PoisonErrors.
+    static CTX_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn ctx_guard() -> std::sync::MutexGuard<'static, ()> {
+        CTX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn dup_call_detected() {
+        let _g = ctx_guard();
         run_start("t-dup", "task");
         let v1 = precheck("t-dup", 1, "grep", "grep:{\"pattern\":\"foo\"}", "");
         assert!(v1.ok, "first call is clean");
@@ -321,6 +355,7 @@ mod tests {
 
     #[test]
     fn reread_unchanged_detected() {
+        let _g = ctx_guard();
         run_start("t-reread", "task");
         let v1 = precheck("t-reread", 1, "read_file", "read_file:{\"path\":\"a.rs\"}", "a.rs");
         assert!(v1.ok);
@@ -341,6 +376,7 @@ mod tests {
 
     #[test]
     fn write_invalidates_reread() {
+        let _g = ctx_guard();
         run_start("t-write", "task");
         precheck("t-write", 1, "read_file", "read_file:{\"path\":\"b.rs\"}", "b.rs");
         postcall("t-write", 2, "edit_file", "b.rs", 100, false);
@@ -356,6 +392,7 @@ mod tests {
 
     #[test]
     fn write_invalidates_identical_reread() {
+        let _g = ctx_guard();
         run_start("t-dup-write", "task");
         let v1 = precheck("t-dup-write", 1, "read_file", "read_file:{\"path\":\"c.rs\"}", "c.rs");
         assert!(v1.ok);
@@ -375,6 +412,7 @@ mod tests {
 
     #[test]
     fn runs_evicted_beyond_cap() {
+        let _g = ctx_guard();
         for i in 0..(MAX_RUNS + 8) {
             run_start(&format!("t-evict-{i}"), "");
         }
@@ -382,8 +420,48 @@ mod tests {
         assert!(runs <= MAX_RUNS, "working set stays bounded");
     }
 
+    /// P2-35 regression: runs minted implicitly by track()/precheck() used
+    /// to bypass ws.order — the cap test above (run_start only) passed
+    /// while this path leaked forever.
+    #[test]
+    fn implicit_runs_evicted_beyond_cap() {
+        let _g = ctx_guard();
+        for i in 0..(MAX_RUNS * 3) {
+            track_segment(&format!("t-implicit-{i}"), 1, 10, 5, "read_file", "x.rs");
+        }
+        let (runs, _, _, _) = summary();
+        assert!(runs <= MAX_RUNS, "implicitly-minted runs stay bounded too");
+        // And precheck-minted runs likewise.
+        for i in 0..(MAX_RUNS * 3) {
+            precheck(&format!("t-prechk-{i}"), 1, "grep", "s", "");
+        }
+        let (runs2, _, _, _) = summary();
+        assert!(runs2 <= MAX_RUNS, "precheck-minted runs stay bounded");
+    }
+
+    /// P2-35: a finished run's rule maps are pruned at run_end.
+    #[test]
+    fn run_end_prunes_rule_maps() {
+        let _g = ctx_guard();
+        run_start("t-prune", "task");
+        precheck("t-prune", 1, "read_file", "read_file:{\"path\":\"p.rs\"}", "p.rs");
+        precheck("t-prune", 2, "grep", "grep:{\"pattern\":\"x\"}", "");
+        run_end("t-prune");
+        let (runs, calls, _, _) = summary();
+        assert!(runs >= 1);
+        assert!(calls >= 2, "trajectory (calls) survives run_end");
+        // The maps were cleared: verify via with_ws directly.
+        with_ws(|ws| {
+            let r = ws.runs.get("t-prune").expect("run still tracked");
+            assert!(r.sig_first.is_empty(), "sig_first pruned at run_end");
+            assert!(r.reads.is_empty(), "reads pruned at run_end");
+            assert!(r.writes.is_empty(), "writes pruned at run_end");
+        });
+    }
+
     #[test]
     fn segments_recorded_and_capped() {
+        let _g = ctx_guard();
         run_start("t-seg", "task");
         for i in 0..20 {
             track_segment("t-seg", 3, 100, 25, "read_file", "x.rs");

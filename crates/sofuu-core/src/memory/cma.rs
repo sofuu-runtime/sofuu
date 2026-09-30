@@ -86,8 +86,6 @@ pub struct Cma {
     pub vec_dim: usize,
     pub index: Hnsw,
     pub records: Vec<Record>,
-    /// Vector store parallel to records (index by record id).
-    pub vectors: Vec<Vec<f32>>,
 }
 
 /// One record's JSON metadata — exactly the format the C brain files use
@@ -112,10 +110,10 @@ struct RecordJson {
     entity_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     corecall_ids: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    corecall_count: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    corecall_rpos: Option<u8>,
+    // P3 (AUDIT-2026-09-07): corecall_count/corecall_rpos were dropped —
+    // both were derivable from corecall_ids (len, len % 8) and never read
+    // back on hydrate. serde ignores unknown fields, so brain files written
+    // with them still parse.
     total_recalls: u16,
     positive_recalls: u16,
 }
@@ -130,7 +128,6 @@ impl Cma {
             vec_dim,
             index: Hnsw::new(vec_dim),
             records: Vec::new(),
-            vectors: Vec::new(),
         }
     }
 
@@ -151,15 +148,20 @@ impl Cma {
             Err(_) => return false,
         };
         for i in 0..n {
-            let v: Vec<f32> = vecs[i * dim..(i + 1) * dim].to_vec();
-            self.vectors.push(v.clone());
-            self.index.add_vector(&v);
+            self.index.add_vector(&vecs[i * dim..(i + 1) * dim]);
             let mut rec = Record::new(i as u32, "", "", 0);
             if let Some(rj) = records.get(i) {
                 rec.kv_page_id = rj.kv_page_id;
                 rec.strength = rj.strength;
                 rec.age_seconds = rj.age_seconds;
-                rec.half_life = rj.half_life;
+                // ml-3 (AUDIT-2026-09-07): a hostile file can carry
+                // half_life 0 — every decay tick would become exp(-inf) = 0,
+                // an instant permanent erase. Normalize to the 1-day default.
+                rec.half_life = if rj.half_life == 0 {
+                    default_half_life()
+                } else {
+                    rj.half_life
+                };
                 rec.tier = rj.tier;
                 rec.text = rj.text.clone();
                 rec.role = rj.role.clone();
@@ -178,6 +180,13 @@ impl Cma {
 
     /// Serialize records to the brain-file metadata JSON (matches C).
     pub fn records_json(&self) -> String {
+        self.records_value().to_string()
+    }
+
+    /// P3 (AUDIT-2026-09-07): the same document as a Value — callers that
+    /// post-process the metadata take it directly instead of the old
+    /// serialize-to-String-then-reparse round trip.
+    pub fn records_value(&self) -> serde_json::Value {
         let arr: Vec<RecordJson> = self
             .records
             .iter()
@@ -194,13 +203,11 @@ impl Cma {
                 entity_name: r.entity_name.clone(),
                 entity_type: r.entity_type.clone(),
                 corecall_ids: r.corecall_ids.clone(),
-                corecall_count: if r.corecall_ids.is_empty() { None } else { Some(r.corecall_ids.len() as u8) },
-                corecall_rpos: if r.corecall_ids.is_empty() { None } else { Some((r.corecall_ids.len() % 8) as u8) },
                 total_recalls: r.total_recalls,
                 positive_recalls: r.positive_recalls,
             })
             .collect();
-        serde_json::json!({ "records": arr }).to_string()
+        serde_json::json!({ "records": arr })
     }
 
     /// KV hints: the distinct kv_page_ids of the top-n nearest memories.
@@ -258,7 +265,6 @@ impl Cma {
         let id = self.records.len() as u32;
         let rec = Record::new(id, text, role, kv_page_id);
         self.records.push(rec);
-        self.vectors.push(vec.to_vec());
         self.index.add_vector(vec);
         id as i32
     }
@@ -341,6 +347,12 @@ impl Cma {
                 continue;
             }
             rec.age_seconds = rec.age_seconds.saturating_add(dt_seconds);
+            // ml-3 (AUDIT-2026-09-07) belt: half_life 0 would make the factor
+            // exp(-inf) = 0 — an instant permanent erase. hydrate normalizes
+            // the file value; decay stays multiplicative-neutral, not fatal.
+            if rec.half_life == 0 {
+                continue;
+            }
             let f = (-(dt_seconds as f32) / rec.half_life as f32).exp();
             rec.strength *= f;
         }
@@ -400,7 +412,7 @@ impl Cma {
                 continue;
             }
             remap.insert(rec.id, kept_records.len() as u32);
-            kept_vectors.push(self.vectors[rec.id as usize].clone());
+            kept_vectors.push(self.index.vector(rec.id).to_vec());
             kept_records.push(rec);
         }
         // Renumber + remap co-recall partners onto the new id space.
@@ -413,10 +425,9 @@ impl Cma {
                 .collect();
         }
         self.records = kept_records;
-        self.vectors = kept_vectors;
         // Rebuild the HNSW store over survivors (ids are positions again).
         self.index = Hnsw::new(self.vec_dim);
-        for v in &self.vectors {
+        for v in &kept_vectors {
             self.index.add_vector(v);
         }
         before - self.records.len()
@@ -437,11 +448,13 @@ impl Cma {
                 rec.text = text.to_string();
                 rec.strength = 1.0;
                 rec.age_seconds = 0;
-                let id = rec.id as usize;
-                self.vectors[id] = vec.to_vec();
-                // Re-index: rebuild the HNSW store is heavy; for entity updates
-                // we keep the old vector (acceptable drift, matches C which
-                // also just memcpys into the store without re-adding).
+                // ml-5 (AUDIT-2026-09-07): the old upsert replaced only the
+                // side Vec and left the search store stale — the drift the
+                // audit flagged. The HNSW store IS the single vector store;
+                // set_vector lands the upsert there (search sees the new
+                // coordinates; neighbor links keep old-geometry decisions,
+                // the same trade C makes by memcpying without re-adding).
+                self.index.set_vector(rec.id, vec);
                 return rec.id as i32;
             }
         }
@@ -480,7 +493,7 @@ impl Cma {
         let mut centroids: Vec<Vec<f32>> = (0..k)
             .map(|_| {
                 rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-                self.vectors[weak[(rng as usize) % weak.len()] as usize].clone()
+                self.index.vector(weak[(rng as usize) % weak.len()]).to_vec()
             })
             .collect();
         let mut counts = vec![0usize; k];
@@ -490,7 +503,7 @@ impl Cma {
             let mut sums: Vec<Vec<f32>> = vec![vec![0.0; self.vec_dim]; k];
             counts = vec![0usize; k];
             for (i, &wid) in weak.iter().enumerate() {
-                let v = &self.vectors[wid as usize];
+                let v = self.index.vector(wid);
                 let mut best = 0usize;
                 let mut best_d = f32::MAX;
                 for (ci, c) in centroids.iter().enumerate() {
@@ -785,7 +798,7 @@ mod tests {
         assert_eq!(dropped, 2, "weak + tombstone should be dropped");
         assert_eq!(cma.records.len(), 3);
         // Survivors renumbered 0..n with their vectors intact.
-        assert_eq!(cma.vectors.len(), 3);
+        assert_eq!(cma.index.len(), 3);
         assert!(cma.records.iter().any(|r| r.text == "healthy memory"));
         assert!(cma.records.iter().any(|r| r.role == PIN_ROLE && r.strength < FORGET_FLOOR));
         assert!(cma.records.iter().any(|r| r.tier == TIER_ENTITY));
@@ -795,6 +808,68 @@ mod tests {
         // No-op retain reports zero and changes nothing.
         assert_eq!(cma.retain(), 0);
         assert_eq!(cma.records.len(), 3);
+    }
+
+    /// ml-3: hostile brain metadata carrying `half_life: 0` must
+    /// normalize to the 1-day default at hydrate — a 0 half-life turns
+    /// every decay tick into exp(-inf) = 0, an instant permanent erase.
+    #[test]
+    fn hydrate_normalizes_zero_half_life() {
+        let mut c = Cma::new(4);
+        let json = r#"{"records":[{"vector_index":0,"kv_page_id":0,"strength":1.0,"age_seconds":0,"half_life":0,"tier":0,"text":"hostile","role":"user","total_recalls":0,"positive_recalls":0}]}"#;
+        let vecs = [1.0f32, 0.0, 0.0, 0.0];
+        assert!(c.hydrate(&vecs, 1, 4, json), "hydrate must accept the payload");
+        assert_eq!(
+            c.records[0].half_life,
+            86400,
+            "half_life 0 must normalize to the default"
+        );
+        c.decay_tick(3600); // one hour
+        assert!(
+            c.records[0].strength > 0.5,
+            "an hour of decay at an 86400s half-life must not annihilate strength, got {}",
+            c.records[0].strength
+        );
+    }
+
+    /// ml-3 belt: any record that still reaches decay_tick with
+    /// half_life 0 (no path does after the hydrate normalization — this
+    /// pins the guard) must keep its strength; age still advances.
+    #[test]
+    fn decay_tick_never_zeroes_on_zero_half_life() {
+        let mut cma = Cma::new(4);
+        let mut v = vec![0.0; 4];
+        v[0] = 1.0;
+        cma.remember(&v, "belt", "user", 0);
+        cma.records[0].half_life = 0;
+        cma.decay_tick(86400);
+        assert_eq!(cma.records[0].strength, 1.0, "exp(-inf) must not multiply in");
+        assert_eq!(cma.records[0].age_seconds, 86400, "age still advances");
+    }
+
+    /// ml-5: an entity upsert must replace the vector in the one true
+    /// store (the HNSW index), so recall sees the new coordinates
+    /// immediately. Pre-fix the store kept the first geometry, so recall
+    /// from the upserted coordinates missed the record head-on.
+    #[test]
+    fn entity_upsert_vector_reaches_the_search_store() {
+        let mut cma = Cma::new(4);
+        let v1 = [1.0f32, 0.0, 0.0, 0.0];
+        let id = cma.remember_entity(&v1, "Bob likes rust", "Bob", "person") as usize;
+        let v2 = [0.0f32, 1.0, 0.0, 0.0];
+        let id2 = cma.remember_entity(&v2, "Bob now likes zig", "Bob", "person");
+        assert_eq!(id2, id as i32, "upsert must reuse the record");
+        assert_eq!(
+            cma.index.vector(id as u32),
+            &v2[..],
+            "store must carry the upserted coordinates"
+        );
+        let hits = cma.recall(&v2, 3);
+        assert!(
+            hits.iter().any(|h| h.id as usize == id && h.distance < 0.01),
+            "recall from the new geometry must hit the entity head-on, got {:?}",
+            hits.iter().map(|h| (h.id, h.distance)).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -810,8 +885,11 @@ mod ffi_format_tests {
         let json = c.records_json();
         println!("JSON: {}", json);
         let mut c2 = Cma::new(4);
-        let vecs: Vec<f32> = c.vectors.iter().flatten().copied().collect();
-        assert!(c2.hydrate(&vecs, c.vectors.len(), 4, &json), "hydrate failed");
+        let mut vecs: Vec<f32> = Vec::new();
+        for i in 0..c.len() {
+            vecs.extend_from_slice(c.index.vector(i as u32));
+        }
+        assert!(c2.hydrate(&vecs, c.len(), 4, &json), "hydrate failed");
         assert_eq!(c2.len(), 1);
         assert_eq!(c2.records[0].text, "hello world");
         assert_eq!(c2.records[0].role, "user");
@@ -830,8 +908,11 @@ mod ffi_format_tests {
         c.mark_positive(&[0]);
         let json = c.records_json();
         let mut c2 = Cma::new(4);
-        let vecs: Vec<f32> = c.vectors.iter().flatten().copied().collect();
-        assert!(c2.hydrate(&vecs, c.vectors.len(), 4, &json), "hydrate failed: {}", json);
+        let mut vecs: Vec<f32> = Vec::new();
+        for i in 0..c.len() {
+            vecs.extend_from_slice(c.index.vector(i as u32));
+        }
+        assert!(c2.hydrate(&vecs, c.len(), 4, &json), "hydrate failed: {}", json);
         assert_eq!(c2.records[0].tier, TIER_ENTITY);
         assert_eq!(c2.records[0].entity_name.as_deref(), Some("Barnaby"));
         assert_eq!(c2.records[0].positive_recalls, 1);

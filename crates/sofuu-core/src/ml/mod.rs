@@ -48,6 +48,53 @@ use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 use crate::rt::ai::json_escape;
 
 /* ------------------------------------------------------------------ */
+/* Shared test serialization (Phase 1.1 of the no-retraining plan)     */
+/* ------------------------------------------------------------------ */
+
+/// The ML layer's process-global state (context working set, learned
+/// limits, discovered caps, online observations) is mutated by tests in
+/// five different modules, and several of those tests touch MORE than one
+/// store at a time (supervisor eval seeds the working set AND records
+/// online observations; alloc policy reads learned limits AND the
+/// discovered store; the rt/ai wire tests clear the discovered store).
+/// Cargo runs tests on parallel threads, so every test that touches ANY
+/// of these stores holds THIS lock for its whole body — one coarse lock
+/// instead of per-store locks, because overlapping acquisitions in
+/// different orders would deadlock. Production locking is unchanged.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/* ------------------------------------------------------------------ */
+/* Boundary hardening helpers (Phase 1.2 of the no-retraining plan)    */
+/* ------------------------------------------------------------------ */
+
+/// A non-finite feature (NaN/±Inf that survived an upstream clamp) must
+/// never reach the forward pass: sigmoid(NaN) is NaN, `{:.4}` renders
+/// "NaN", and the JSON string the JS caller parses becomes invalid — a
+/// broken chat turn instead of a silent no-op. Replace with the neutral
+/// value; every finite path is bit-identical to before.
+pub(crate) fn sanitize_features<const N: usize>(v: &mut [f32; N]) {
+    for x in v.iter_mut() {
+        if !x.is_finite() {
+            *x = 0.0;
+        }
+    }
+}
+
+/// Head-cap a JS-supplied string before feature extraction. Phase 1
+/// bounds inputs so a hostile or accidental multi-megabyte argument
+/// cannot turn a per-call gate into a memory/latency hazard; Phase 2
+/// (§6.1) may refine this into evidence-preserving head+tail truncation,
+/// which would be a semantics change requiring the baseline comparison.
+/// `chars().take()` never splits a multibyte scalar.
+pub(crate) fn cap_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect()
+}
+
+/* ------------------------------------------------------------------ */
 /* Small JSON helpers (serde_json is already a core dependency)         */
 /* ------------------------------------------------------------------ */
 
@@ -58,8 +105,14 @@ fn s(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// Unsigned integer field, clamped into u32 — a huge JSON number would
+/// otherwise wrap on the `as u32` cast and feed the gates a garbage
+/// step/char/token count.
 fn n(v: &serde_json::Value, key: &str) -> u32 {
-    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0) as u32
+    v.get(key)
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
 
 fn b(v: &serde_json::Value, key: &str) -> bool {
@@ -67,7 +120,15 @@ fn b(v: &serde_json::Value, key: &str) -> bool {
 }
 
 fn f(v: &serde_json::Value, key: &str, default: f32) -> f32 {
-    v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(default)
+    v.get(key)
+        .and_then(|x| x.as_f64())
+        .map(|x| {
+            let x = x as f32;
+            // A non-finite JSON float (1e400 parses as Inf) is not a
+            // usable feature — fall back, never propagate.
+            if x.is_finite() { x } else { default }
+        })
+        .unwrap_or(default)
 }
 
 /// Read a JS string argument into an owned String ("" when not a string).
@@ -202,21 +263,30 @@ unsafe extern "C" fn js_ml_supervisor_check(
         return ret_json(ctx, "{\"ok\":true,\"reason\":\"\",\"nudge\":null,\"score\":0,\"source\":\"\"}".to_string());
     }
     let v = parse_obj(&arg_str(ctx, *argv));
+    // Bounded inputs (Phase 1.2): the strings feed per-call feature
+    // extraction, and skipTargets embeds at 256 chars each — a giant
+    // array or a megabyte arg blob must not turn a per-call gate into a
+    // latency/memory hazard. Caps match the extractor's own bounds.
     let skip: Vec<String> = v
         .get("skipTargets")
         .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .take(16)
+                .filter_map(|x| x.as_str().map(|s| cap_str(s, 256)))
+                .collect()
+        })
         .unwrap_or_default();
     let verdict = supervisor::model::check(
-        &s(&v, "run"),
+        &cap_str(&s(&v, "run"), 128),
         n(&v, "step"),
-        &s(&v, "tool"),
-        &s(&v, "sig"),
-        &s(&v, "target"),
-        &s(&v, "argsText"),
+        &cap_str(&s(&v, "tool"), 64),
+        &cap_str(&s(&v, "sig"), 512),
+        &cap_str(&s(&v, "target"), 256),
+        &cap_str(&s(&v, "argsText"), 4000),
         &skip,
         n(&v, "budget"),
-        &s(&v, "task"),
+        &cap_str(&s(&v, "task"), 4000),
     );
     let nudge = match &verdict.nudge {
         Some(t) => format!("\"{}\"", json_escape(Some(t))),
@@ -251,7 +321,7 @@ unsafe extern "C" fn js_ml_supervisor_loop(
         return ret_json(ctx, "{\"ok\":true,\"reason\":\"\",\"nudge\":null,\"score\":0,\"source\":\"\"}".to_string());
     }
     let v = parse_obj(&arg_str(ctx, *argv));
-    let verdict = supervisor::model::loop_check(&s(&v, "run"), n(&v, "step"), n(&v, "budget"));
+    let verdict = supervisor::model::loop_check(&cap_str(&s(&v, "run"), 128), n(&v, "step"), n(&v, "budget"));
     let nudge = match &verdict.nudge {
         Some(t) => format!("\"{}\"", json_escape(Some(t))),
         None => "null".to_string(),

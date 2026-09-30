@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 
 use super::features::{self, AllocInput, ALLOC_FEATURES, THINK_BUDGET, THINK_EFFORT, THINK_UNKNOWN};
 use super::policy::{self, Resolved};
+use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 use crate::rt::model_caps;
 
@@ -115,8 +116,14 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// model's caps fields are OVERWRITTEN here — the allocator fetches the
 /// selected model's details first (policy::resolve), whatever the caller
 /// thought it knew.
-pub fn plan(input: &AllocInput, model: Option<&str>, cfg_window: i64, cfg_max_output: i64) -> AllocPlan {
-    let resolved: Resolved = policy::resolve(model, cfg_window, cfg_max_output);
+pub fn plan(
+    input: &AllocInput,
+    model: Option<&str>,
+    cfg_window: i64,
+    cfg_max_output: i64,
+    base_url: Option<&str>,
+) -> AllocPlan {
+    let resolved: Resolved = policy::resolve(model, cfg_window, cfg_max_output, base_url);
     plan_with(input, resolved)
 }
 
@@ -125,10 +132,17 @@ pub fn plan(input: &AllocInput, model: Option<&str>, cfg_window: i64, cfg_max_ou
 pub fn plan_with(input: &AllocInput, resolved: Resolved) -> AllocPlan {
     let mut notes: Vec<String> = Vec::new();
     if resolved.clamped_config {
-        notes.push(format!(
-            "config clamped to the model's limits: window {} tk, output {} tk",
-            resolved.window, resolved.max_output
-        ));
+        match resolved.config_exceeds_evidence {
+            // Obeyed: the user asked for it, evidence merely advises.
+            Some(bound) if resolved.window > bound => notes.push(format!(
+                "requested window/output is above known evidence ({} tk) -- honored as requested; a provider limit error will correct it",
+                bound
+            )),
+            _ => notes.push(format!(
+                "config clamped to the model's limits: window {} tk, output {} tk",
+                resolved.window, resolved.max_output
+            )),
+        }
     }
     if resolved.source == policy::Source::Learned {
         notes.push("limits learned from a provider error this session".to_string());
@@ -234,15 +248,18 @@ unsafe fn arg_str(ctx: *mut JSContext, val: JSValueConst) -> String {
 }
 
 fn i64_field(v: &serde_json::Value, key: &str) -> i64 {
+    // Bounded (Phase 1.2): a JSON number above i64 range parses as None
+    // (0), and negatives are clamped to the sane floor per field below —
+    // history/overhead/attach are magnitudes.
     v.get(key)
         .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
         .unwrap_or(0)
 }
 
 fn f32_field(v: &serde_json::Value, key: &str) -> f32 {
-    v.get(key)
-        .and_then(|x| x.as_f64())
-        .unwrap_or(0.0) as f32
+    // Non-finite (1e400 parses as Inf) → 0, never NaN into the net.
+    let f = v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+    if f.is_finite() { f } else { 0.0 }
 }
 
 fn bool_field(v: &serde_json::Value, key: &str) -> bool {
@@ -250,15 +267,18 @@ fn bool_field(v: &serde_json::Value, key: &str) -> bool {
 }
 
 /// plan(stateJson) → JSON string
-/// in:  {"model","cfgWindow","cfgMaxOutput","overheadTk","calibrated",
-///       "historyTk","turns","toolFrac","summary","growthTk",
+/// in:  {"model","baseUrl?","cfgWindow","cfgMaxOutput","overheadTk",
+///       "calibrated","historyTk","turns","toolFrac","summary","growthTk",
 ///       "growthAccel","taskTk","attachTk","toolHeavy","writing",
 ///       "meanAnswerTk","maxAnswerTk","sawLengthStop"}
 /// out: {"window","maxOutput","pressure","compactAt","toolCapChars",
 ///       "recallBudgetTok","attachBudgetTok","known","source","notes":[]}
 /// The model's capabilities are resolved FIRST from the model name —
 /// callers never pass caps, so a stale caller can't allocate against a
-/// window the selected model doesn't have.
+/// window the selected model doesn't have. `baseUrl` (optional) is the
+/// endpoint the request will hit: when present, caps the endpoint itself
+/// published for this exact model (the discovered store) take precedence
+/// over the name-keyed registry.
 unsafe extern "C" fn js_alloc_plan(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -271,32 +291,34 @@ unsafe extern "C" fn js_alloc_plan(
         serde_json::Value::Null
     };
 
-    let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let model = cap_str(v.get("model").and_then(|x| x.as_str()).unwrap_or(""), 200);
+    let base_url = v.get("baseUrl").and_then(|x| x.as_str()).map(|s| cap_str(s, 2_048));
     let input = AllocInput {
         ctx_window: 0, // resolved inside plan() — never trusted from JS
         max_output: 0,
         thinking: thinking_kind(if model.is_empty() { None } else { Some(&model) }),
-        overhead_tk: i64_field(&v, "overheadTk"),
+        overhead_tk: i64_field(&v, "overheadTk").clamp(0, 100_000_000),
         calibrated: bool_field(&v, "calibrated"),
-        history_tk: i64_field(&v, "historyTk"),
-        turns: i64_field(&v, "turns").max(0) as u32,
-        tool_frac: f32_field(&v, "toolFrac"),
+        history_tk: i64_field(&v, "historyTk").clamp(0, 1 << 40),
+        turns: i64_field(&v, "turns").clamp(0, u32::MAX as i64) as u32,
+        tool_frac: f32_field(&v, "toolFrac").clamp(0.0, 1.0),
         summary_present: bool_field(&v, "summary"),
-        growth_tk: f32_field(&v, "growthTk"),
-        growth_accel: f32_field(&v, "growthAccel"),
-        task_tk: i64_field(&v, "taskTk"),
-        attach_tk: i64_field(&v, "attachTk"),
+        growth_tk: f32_field(&v, "growthTk").max(0.0),
+        growth_accel: f32_field(&v, "growthAccel").clamp(0.0, 10.0),
+        task_tk: i64_field(&v, "taskTk").clamp(0, 1 << 30),
+        attach_tk: i64_field(&v, "attachTk").clamp(0, 1 << 30),
         tool_heavy: bool_field(&v, "toolHeavy"),
         writing: bool_field(&v, "writing"),
-        mean_answer_tk: f32_field(&v, "meanAnswerTk"),
-        max_answer_tk: f32_field(&v, "maxAnswerTk"),
+        mean_answer_tk: f32_field(&v, "meanAnswerTk").max(0.0),
+        max_answer_tk: f32_field(&v, "maxAnswerTk").max(0.0),
         saw_length_stop: bool_field(&v, "sawLengthStop"),
     };
     let p = plan(
         &input,
         if model.is_empty() { None } else { Some(&model) },
-        i64_field(&v, "cfgWindow"),
-        i64_field(&v, "cfgMaxOutput"),
+        i64_field(&v, "cfgWindow").clamp(0, 1 << 30),
+        i64_field(&v, "cfgMaxOutput").clamp(0, 1 << 30),
+        base_url.as_deref(),
     );
 
     let notes: Vec<String> = p
@@ -333,8 +355,8 @@ unsafe extern "C" fn js_alloc_note_limit(
     argc: c_int,
     argv: *const JSValueConst,
 ) -> JSValue {
-    let model = if argc >= 1 { arg_str(ctx, *argv) } else { String::new() };
-    let err = if argc >= 2 { arg_str(ctx, *argv.add(1)) } else { String::new() };
+    let model = if argc >= 1 { cap_str(&arg_str(ctx, *argv), 200) } else { String::new() };
+    let err = if argc >= 2 { cap_str(&arg_str(ctx, *argv.add(1)), 4_000) } else { String::new() };
     /* Returns the learned limit KIND ("context"/"output") so callers can
      * retry once per kind, or "" when nothing was learned. */
     let s = match policy::note_limit_error_kind(&model, &err) {
@@ -346,8 +368,35 @@ unsafe extern "C" fn js_alloc_note_limit(
     qjs::sofuu_js_new_string(ctx, c.as_ptr())
 }
 
+/// ingestListing(baseUrl, listingJson) → count — feed a model listing
+/// (whatever the endpoint returned for /models, verbatim) into the
+/// discovered-caps store. Provider-agnostic: entries are keyed by the
+/// endpoint's normalized API root + model id, and the union of field
+/// spellings is accepted (context_length / context_window / ctx …,
+/// max_completion_tokens / max_tokens …, nested top_provider /
+/// per_request_limits objects). Returns how many entries carried caps.
+/// Malformed JSON → -1 (the caller surfaces its own fetch error).
+unsafe extern "C" fn js_alloc_ingest(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    // Bounded inputs (Phase 1.2): a listing is at most a few MB in
+    // practice; the ingest parser itself is bounded by serde, but a
+    // runaway argument must not be buffered here.
+    let base_url = if argc >= 1 { cap_str(&arg_str(ctx, *argv), 2_048) } else { String::new() };
+    let listing = if argc >= 2 { cap_str(&arg_str(ctx, *argv.add(1)), 8_000_000) } else { String::new() };
+    let n = match crate::rt::model_caps_discovered::ingest_listing_json(&base_url, &listing) {
+        Ok(n) => n as i64,
+        Err(_) => -1,
+    };
+    let s = std::ffi::CString::new(n.to_string()).unwrap_or_default();
+    qjs::sofuu_js_new_string(ctx, s.as_ptr())
+}
+
 thread_local! {
-    static ALLOC_FUNCS: [qjs::JSCFunctionListEntry; 2] = [
+    static ALLOC_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
         qjs::JSCFunctionListEntry {
             name: c"plan".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -361,6 +410,13 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_alloc_note_limit },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"ingestListing".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_alloc_ingest },
         },
     ];
 }

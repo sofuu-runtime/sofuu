@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::session;
+use crate::{output_archive, session};
 
 // ── Session config ──────────────────────────────────────────────
 
@@ -40,6 +40,12 @@ pub struct ProviderEntry {
     pub api_key: String,
     pub model: String,
     pub profile: String,
+    /// Models remembered for this provider: every model the user set here
+    /// (picked or typed) plus the last successful live listing. The /model
+    /// picker replays them when the endpoint is unreachable. Absent in old
+    /// configs (serde default) and omitted from JSON while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +63,11 @@ pub struct ChatConfig {
     /// An env var (e.g. OPENAI_API_KEY) still takes precedence at request
     /// time (the C layer prefers opts.api_key, then the env).
     pub api_key: String,
+    /// P3 (AUDIT-2026-09-07): the api_key came from `-k/--apikey` on argv —
+    /// honored for this session only; save() never writes it to disk (argv
+    /// is readable by any local process, so it must not silently become the
+    /// durable key in config.json).
+    pub api_key_from_cli: bool,
     /// Optional base URL override for the current provider (e.g. a
     /// self-hosted OpenAI-compatible endpoint). Empty = built-in URL.
     pub base_url: String,
@@ -70,9 +81,22 @@ pub struct ChatConfig {
     /// RLM routing for long-context turns: ""/"off" | "on" | "auto"
     /// ("auto" = the R3 heuristic decides per turn).
     pub rlm: String,
+    /// Permission profile enforced by the ONE agent loop (agent.js):
+    /// "full" | "edit" (read-only + jailed local writes, no shell/MCP) |
+    /// "plan" (read-only). Same semantics as the desktop's profiles —
+    /// the gate itself is shared in src/js/agent.js permissionBlocked().
+    pub permissions: String,
     /// Per-session context window in tokens (used for history trimming and
     /// RLM routing). 0 = provider default (see default_ctx_window).
     pub ctx_window: i64,
+    /// True when `ctx_window` was set deliberately for a specific model
+    /// (`/ctx <n>` or `--ctx-window`) rather than inherited as a loose
+    /// global. An explicit value is OBEYED even when it sits above the
+    /// strongest known evidence (the user knows their endpoint's plan);
+    /// an inherited one shrinks to the model's real bound, which is what
+    /// keeps a stale global from shadowing a smaller model. Reset by
+    /// `/ctx default`.
+    pub ctx_window_explicit: bool,
     /// Per-session max OUTPUT tokens per response. 0 = provider default.
     pub max_output: i64,
     /// Optional REMOTE embeddings provider+model for the brain (recall /
@@ -80,6 +104,19 @@ pub struct ChatConfig {
     /// `sofuu.ai.embedLocal` — no embeddings provider is required.
     pub embed_provider: String,
     pub embed_model: String,
+    /// Memory embedding backend (PLAN-TINY-SEMANTIC-EMBEDDER §7):
+    /// ""/"hash" = 768-dim trigram hash (default); "semantic" = opt-in
+    /// 64-dim learned projector. SOFUU_MEMORY_BACKEND env overrides.
+    /// Remote embed_provider+embed_model bypass local selection.
+    pub memory_backend: String,
+    /// Optional explicit brain file override (config.json "brain_path").
+    /// Empty = the runtime default chain: <cwd>/.sofuu/brain/brain.qtsq
+    /// (project-local — every workspace carries its own memories), then
+    /// ~/.sofuu/brain/brain.qtsq. The agent runtime AND the chat driver's
+    /// direct brain ops (/remember, /share, /import, ghost) honor the same
+    /// value so they can never split stores; the driver still opens NO
+    /// handle of its own — it shares the runtime's via sofuu.agent.brainFor.
+    pub brain_path: String,
     /// F6: per-model pricing table, $ per 1M input/output tokens.
     /// Key = "provider/model" (e.g. "openai/gpt-4o"). Seeded with defaults.
     pub pricing: std::collections::BTreeMap<String, [f64; 2]>,
@@ -104,7 +141,26 @@ pub struct ChatConfig {
     /// "does not support thinking" and turns run without effort for these
     /// (auto-detected once from the API error text; persisted).
     pub no_think_models: Vec<String>,
+    /// Project-local output archive controls. The archive is additive to the
+    /// session stream and defaults to local-only, redacted, and enabled.
+    pub archive_enabled: bool,
+    pub archive_retain_final: bool,
+    pub archive_retain_tool_results: bool,
+    pub archive_retain_partial: bool,
+    pub archive_redact: bool,
+    pub archive_max_bytes: u64,
+    pub archive_max_count: usize,
+    pub archive_max_age_secs: u64,
+    pub archive_auto_recover: bool,
+    pub archive_recovery_budget_chars: usize,
 }
+
+/// P3 (AUDIT-2026-09-07): f64 bits of the lifetime spend last flushed to
+/// config.json. The per-turn cost hook used to rewrite the whole config
+/// (every provider API key included) on EVERY turn just to persist the
+/// running spend; it now flushes only when ≥1 more cent has accrued since
+/// this mark. Updated by save() after a successful write.
+static SPEND_SAVED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Default for ChatConfig {
     /* One source of truth for "fresh config" — the derived Default would
@@ -162,14 +218,19 @@ impl ChatConfig {
             ml: true,
             sync: true,
             api_key: String::new(),
+            api_key_from_cli: false,
             base_url: String::new(),
             profile: String::new(),
             providers: Vec::new(),
             active: String::new(),
             rlm: String::new(),
+            permissions: "full".into(),
             embed_provider: String::new(),
             embed_model: String::new(),
+            memory_backend: String::new(),
+            brain_path: String::new(),
             ctx_window: 0,
+            ctx_window_explicit: false,
             max_output: 0,
             pricing,
             budget_usd: 0.0,
@@ -179,6 +240,31 @@ impl ChatConfig {
             recall_min: 0.0,
             recall_budget: 0,
             no_think_models: Vec::new(),
+            archive_enabled: true,
+            archive_retain_final: true,
+            archive_retain_tool_results: false,
+            archive_retain_partial: true,
+            archive_redact: true,
+            archive_max_bytes: 100 * 1024 * 1024,
+            archive_max_count: 10_000,
+            archive_max_age_secs: 0,
+            archive_auto_recover: true,
+            archive_recovery_budget_chars: 12_000,
+        }
+    }
+
+    pub(crate) fn archive_policy(&self) -> crate::output_archive::ArchivePolicy {
+        crate::output_archive::ArchivePolicy {
+            enabled: self.archive_enabled,
+            retain_final: self.archive_retain_final,
+            retain_tool_results: self.archive_retain_tool_results,
+            retain_partial: self.archive_retain_partial,
+            redact: self.archive_redact,
+            max_bytes: self.archive_max_bytes,
+            max_count: self.archive_max_count,
+            max_age_secs: self.archive_max_age_secs,
+            automatic_recovery: self.archive_auto_recover,
+            recovery_budget_chars: self.archive_recovery_budget_chars,
         }
     }
 
@@ -198,7 +284,7 @@ impl ChatConfig {
         if let Some(root) = sofuu_core::embed_config::get_config_root() {
             return PathBuf::from(root);
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = sofuu_core::embed_config::home_dir().unwrap_or_else(|| ".".into());
         PathBuf::from(home).join(".sofuu")
     }
 
@@ -215,6 +301,11 @@ impl ChatConfig {
             return Vec::new();
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            /* Corrupt mcp.json must still not break chat (empty list), but
+             * it must not be SILENT either — the user's servers silently
+             * vanished. The file is left untouched for manual repair. */
+            eprintln!("\x1b[33mWarning:\x1b[0m {} is corrupt — MCP servers disabled until it is fixed (left in place, not overwritten)",
+                path.display());
             return Vec::new();
         };
         let Some(arr) = v.as_array() else {
@@ -236,6 +327,12 @@ impl ChatConfig {
             return cfg;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            /* Corrupt config.json must still not break chat (defaults),
+             * but silently losing every provider/key/model setting is a
+             * data-loss trap: the next save would overwrite the file.
+             * Warn loudly; the file itself is left for manual repair. */
+            eprintln!("\x1b[33mWarning:\x1b[0m {} is corrupt — using defaults; providers/settings from this file are being ignored (left in place, not overwritten)",
+                Self::config_path().display());
             return cfg;
         };
         // New registry: providers + active. Legacy flat "provider" synthesizes one entry.
@@ -247,7 +344,10 @@ impl ChatConfig {
                 let api_key = item.get("api_key").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let model = item.get("model").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let profile = item.get("profile").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                cfg.providers.push(ProviderEntry { name, endpoint, api_key, model, profile });
+                let models = item.get("models").and_then(|x| x.as_array()).map(|arr| {
+                    arr.iter().filter_map(|m| m.as_str()).map(|m| m.to_string()).collect()
+                }).unwrap_or_default();
+                cfg.providers.push(ProviderEntry { name, endpoint, api_key, model, profile, models });
             }
             if let Some(s) = v.get("active").and_then(|x| x.as_str()) {
                 cfg.active = s.to_string();
@@ -266,7 +366,7 @@ impl ChatConfig {
         if let Some(s) = v.get("base_url").and_then(|x| x.as_str()) { legacy_base_url = s.to_string(); }
         if let Some(s) = v.get("profile").and_then(|x| x.as_str()) { legacy_profile = s.to_string(); }
         if cfg.providers.is_empty() && !legacy_provider.is_empty() {
-            cfg.providers.push(ProviderEntry { name: legacy_provider.clone(), endpoint: legacy_base_url.clone(), api_key: legacy_api_key.clone(), model: legacy_model.clone(), profile: legacy_profile.clone() });
+            cfg.providers.push(ProviderEntry { name: legacy_provider.clone(), endpoint: legacy_base_url.clone(), api_key: legacy_api_key.clone(), model: legacy_model.clone(), profile: legacy_profile.clone(), models: Vec::new() });
             cfg.active = legacy_provider.clone();
         }
         // Flat mirror: prefer active entry when registry exists, else legacy flat.
@@ -289,9 +389,19 @@ impl ChatConfig {
         if let Some(b) = v.get("ml").and_then(|x| x.as_bool()) { cfg.ml = b; }
         if let Some(b) = v.get("sync").and_then(|x| x.as_bool()) { cfg.sync = b; }
         if let Some(s) = v.get("rlm").and_then(|x| x.as_str()) { cfg.rlm = s.to_string(); }
+        // Permission profile: only the three known modes are honored — a
+        // typo in config.json must never mean "more access" (default full).
+        if let Some(s) = v.get("permissions").and_then(|x| x.as_str()) {
+            if s == "full" || s == "edit" || s == "plan" {
+                cfg.permissions = s.to_string();
+            }
+        }
         if let Some(s) = v.get("embed_provider").and_then(|x| x.as_str()) { cfg.embed_provider = s.to_string(); }
         if let Some(s) = v.get("embed_model").and_then(|x| x.as_str()) { cfg.embed_model = s.to_string(); }
+        if let Some(s) = v.get("memory_backend").and_then(|x| x.as_str()) { cfg.memory_backend = s.to_string(); }
+        if let Some(s) = v.get("brain_path").and_then(|x| x.as_str()) { cfg.brain_path = s.to_string(); }
         if let Some(n) = v.get("ctx_window").and_then(|x| x.as_i64()) { cfg.ctx_window = clamp_ctx_window(n); }
+        if let Some(b) = v.get("ctx_window_explicit").and_then(|x| x.as_bool()) { cfg.ctx_window_explicit = b; }
         if let Some(n) = v.get("max_output").and_then(|x| x.as_i64()) { cfg.max_output = clamp_max_output(n); }
         // F6/F7/F10 config fields.
         if let Some(p) = v.get("pricing").and_then(|x| x.as_object()) {
@@ -316,6 +426,16 @@ impl ChatConfig {
                 .map(|s| s.to_string())
                 .collect();
         }
+        if let Some(b) = v.get("archive_enabled").and_then(|x| x.as_bool()) { cfg.archive_enabled = b; }
+        if let Some(b) = v.get("archive_retain_final").and_then(|x| x.as_bool()) { cfg.archive_retain_final = b; }
+        if let Some(b) = v.get("archive_retain_tool_results").and_then(|x| x.as_bool()) { cfg.archive_retain_tool_results = b; }
+        if let Some(b) = v.get("archive_retain_partial").and_then(|x| x.as_bool()) { cfg.archive_retain_partial = b; }
+        if let Some(b) = v.get("archive_redact").and_then(|x| x.as_bool()) { cfg.archive_redact = b; }
+        if let Some(n) = v.get("archive_max_bytes").and_then(|x| x.as_u64()) { cfg.archive_max_bytes = n.min(1u64 << 40); }
+        if let Some(n) = v.get("archive_max_count").and_then(|x| x.as_u64()) { cfg.archive_max_count = n.min(100_000) as usize; }
+        if let Some(n) = v.get("archive_max_age_secs").and_then(|x| x.as_u64()) { cfg.archive_max_age_secs = n; }
+        if let Some(b) = v.get("archive_auto_recover").and_then(|x| x.as_bool()) { cfg.archive_auto_recover = b; }
+        if let Some(n) = v.get("archive_recovery_budget_chars").and_then(|x| x.as_u64()) { cfg.archive_recovery_budget_chars = n.clamp(512, 131_072) as usize; }
         // Validate active still points at an entry; if not, fall back to first provider.
         if !cfg.active.is_empty() && !cfg.providers.iter().any(|p| p.name == cfg.active) {
             cfg.active = cfg.providers.first().map(|p| p.name.clone()).unwrap_or_default();
@@ -333,7 +453,11 @@ impl ChatConfig {
             let mut flat_provider = self.provider.clone();
             let mut flat_model = self.model.clone();
             let mut flat_base = self.base_url.clone();
-            let mut flat_key = self.api_key.clone();
+            /* P3 (AUDIT-2026-09-07): a `-k/--apikey` session key never
+             * lands on disk (see api_key_from_cli) — write the empty flat
+             * key instead so save() can't turn an argv secret into the
+             * durable config.json one. */
+            let mut flat_key = if self.api_key_from_cli { String::new() } else { self.api_key.clone() };
             let mut flat_profile = self.profile.clone();
             if let Some(e) = self.providers.iter().find(|p| p.name == self.active) {
                 flat_provider = e.name.clone(); flat_model = e.model.clone(); flat_base = e.endpoint.clone(); flat_key = e.api_key.clone(); flat_profile = e.profile.clone();
@@ -353,9 +477,13 @@ impl ChatConfig {
                 "base_url": flat_base,
                 "profile": flat_profile,
                 "rlm": self.rlm,
+                "permissions": self.permissions,
                 "embed_provider": self.embed_provider,
                 "embed_model": self.embed_model,
+                "memory_backend": self.memory_backend,
+                "brain_path": self.brain_path,
                 "ctx_window": self.ctx_window,
+                "ctx_window_explicit": self.ctx_window_explicit,
                 "max_output": self.max_output,
                 "pricing": self.pricing,
                 "budget_usd": self.budget_usd,
@@ -365,16 +493,47 @@ impl ChatConfig {
                 "recall_min": self.recall_min,
                 "recall_budget": self.recall_budget,
                 "no_think_models": self.no_think_models,
+                "archive_enabled": self.archive_enabled,
+                "archive_retain_final": self.archive_retain_final,
+                "archive_retain_tool_results": self.archive_retain_tool_results,
+                "archive_retain_partial": self.archive_retain_partial,
+                "archive_redact": self.archive_redact,
+                "archive_max_bytes": self.archive_max_bytes,
+                "archive_max_count": self.archive_max_count,
+                "archive_max_age_secs": self.archive_max_age_secs,
+                "archive_auto_recover": self.archive_auto_recover,
+                "archive_recovery_budget_chars": self.archive_recovery_budget_chars,
             })
             .to_string();
             let tmp = dir.join("config.json.tmp");
-            let _ = std::fs::write(&tmp, &json);
+            /* P2-10: the config carries the API key — create the tmp with
+             * 0600 from the FIRST write instead of write-then-chmod (which
+             * left a world-readable window on every save). Non-unix has no
+             * mode API; the write is the best available there. */
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::io::Write;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .and_then(|mut f| f.write_all(json.as_bytes()));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write(&tmp, &json);
             }
             let _ = std::fs::rename(&tmp, Self::config_path());
+            /* P3: record the flushed spend mark so the per-turn cost hook
+             * (js_chat_report_usage) can throttle full-config rewrites to
+             * once per accrued cent. */
+            SPEND_SAVED_BITS.store(
+                self.spend_total_usd.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 }
@@ -384,10 +543,36 @@ impl ChatConfig {
 const VALID_PROVIDERS: [&str; 3] = ["openai", "anthropic", "local"];
 const VALID_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
 
-/// Hard ceiling on a user-configured context window: 1M tokens.
-/// Real 1M-window models (e.g. Gemini 2.5 Pro) accept it; smaller models
-/// still reject oversized requests at the API and the error surfaces.
-const MAX_CTX_WINDOW: i64 = 1_000_000;
+/// Hard ceiling on a user-configured context window: 4Mi tokens.
+/// Real 1M-window models (Gemini 2.5 Pro, GPT-4.1, GLM 5) are 1,048,576
+/// tokens — the previous 1,000,000 ceiling made the /ctx picker's own "1M"
+/// preset (1048576) REJECTED, and a literal `/ctx 1m` unusable. 2M-class
+/// models now fit too. Smaller models still reject oversized requests at
+/// the API and the error surfaces (and is learned).
+const MAX_CTX_WINDOW: i64 = 4_194_304;
+
+/// Parse a token count the way people type it: `1048576`, `128000`,
+/// `128k`, `1m`, `1.5m`, `2M`. Suffixes are binary (1k = 1024, 1m =
+/// 1048576) because every real model window is a power of two.
+pub fn parse_token_count(s: &str) -> Option<i64> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(v) = t.strip_suffix('k') {
+        (v, 1024.0)
+    } else if let Some(v) = t.strip_suffix('m') {
+        (v, 1024.0 * 1024.0)
+    } else {
+        (t.as_str(), 1.0)
+    };
+    let num = num.trim();
+    let n: f64 = num.parse().ok()?;
+    if !n.is_finite() || n <= 0.0 {
+        return None;
+    }
+    Some((n * mult).round() as i64)
+}
 
 /// Hard ceiling on a user-configured max OUTPUT tokens: 384k. Models like
 /// Gemini 2.5 Pro support up to 64k output natively; some reasoning models
@@ -415,6 +600,27 @@ pub fn effective_ctx_window(provider: &str, ctx_window: i64) -> i64 {
     }
 }
 
+/// The evidence-ladder resolve for the SELECTED model (the same one every
+/// JS driver consumer uses via sofuu.ai.resolveCaps): learned-from-400s >
+/// endpoint-discovered > registry > default, with the flat config honored
+/// only as far as the strictest real evidence allows. This is what /ctx
+/// reports back to the user — a global 1M override can no longer claim
+/// the model has 1M when its real window is 262k.
+fn resolved_ctx_window(cfg: &ChatConfig) -> i64 {
+    resolved_ctx_caps(cfg).window
+}
+
+/// Full resolve for the active model, honoring the explicitness flag.
+fn resolved_ctx_caps(cfg: &ChatConfig) -> sofuu_core::ml::alloc::policy::Resolved {
+    sofuu_core::ml::alloc::policy::resolve_explicit(
+        if cfg.model.is_empty() { None } else { Some(cfg.model.as_str()) },
+        cfg.ctx_window,
+        0,
+        if cfg.base_url.is_empty() { None } else { Some(cfg.base_url.as_str()) },
+        cfg.ctx_window_explicit,
+    )
+}
+
 /// Clamp a configured window into [1024, 1M]; 0/negative = provider default.
 fn clamp_ctx_window(n: i64) -> i64 {
     if n <= 0 {
@@ -435,7 +641,7 @@ fn clamp_max_output(n: i64) -> i64 {
 
 /// Every slash command — the single source of truth for the C readline's
 /// TAB completion (`__chat_complete`) and for "did you mean" suggestions.
-const ALL_COMMANDS: [&str; 33] = [
+const ALL_COMMANDS: [&str; 38] = [
     "/help",
     "/version",
     "/model",
@@ -446,8 +652,13 @@ const ALL_COMMANDS: [&str; 33] = [
     "/brain",
     "/ml",
     "/rlm",
+    "/mode",
+    "/plan",
+    "/edit",
+    "/full",
     "/ctx",
     "/maxout",
+    "/outputs",
     "/tools",
     "/agents",
     "/sessions",
@@ -495,8 +706,13 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/brain", "Toggle the memory/brain integration", "on | off"),
     ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
+    ("/mode", "View/set the permission mode", "full | edit | plan  (bare = show · TAB cycles)"),
+    ("/plan", "Plan mode: read-only (no writes, no shell)", ""),
+    ("/edit", "Edit mode: reads + local file edits (no shell, no MCP)", ""),
+    ("/full", "Full access: every tool allowed", ""),
     ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 1M)"),
     ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
+    ("/outputs", "Inspect timestamped model/tool output history", "[list|show <id>|search <text>|context <task>|stats|rebuild-index|prune|on|off]"),
     ("/tools", "List connected MCP servers + tools", ""),
     ("/agents", "List agent definitions (+ ~/.sofuu/agents/*.js)", ""),
     ("/sessions", "List sessions on this project", ""),
@@ -508,10 +724,10 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/sync", "Toggle the session-mesh polling", "on | off"),
     ("/exit", "Save config and exit", ""),
     // F1–F11 chat features
-    ("/remember", "Pin a fact directly to the brain", "<fact>"),
+    ("/remember", "Pin a fact to the brain + AGENTS.md", "<fact>"),
     ("/why", "Explain which memories shaped the last answer", ""),
     ("/resume", "Browse and resume a past session", "[id]  (bare = picker)"),
-    ("/share", "Export brain as an encrypted card", "[path.qtsq] [label]"),
+    ("/share", "Export brain as a plain JSON card (v1: metadata + pointers; not encrypted)", "[path.qtsq] [label]"),
     ("/import", "Import a brain card (merge)", "<path.qtsq>"),
     ("/cost", "Show token usage + spend breakdown", ""),
     ("/watch", "Watch a directory for changes in context", "<path> | off  (bare = list)"),
@@ -534,6 +750,25 @@ fn valid_provider(p: &str) -> bool {
 }
 fn valid_effort(e: &str) -> bool {
     VALID_EFFORTS.contains(&e)
+}
+
+/// One-line honest description of a permission mode (for /mode echoes —
+/// semantics enforced once, in agent.js permissionBlocked).
+fn mode_hint(mode: &str) -> &'static str {
+    match mode {
+        "plan" => "read-only: no writes, no shell",
+        "edit" => "reads + local file edits; no shell, no MCP",
+        _ => "every tool allowed",
+    }
+}
+
+/// Set + persist the permission profile. The JS driver re-applies it to
+/// the agent runtime (sofuu.agent.setPermissions) after every command.
+fn set_mode(cfg: &mut ChatConfig, mode: &str) -> &'static str {
+    cfg.permissions = mode.to_string();
+    cfg.save();
+    chat_out(&format!("  \u{2713} mode \u{2192} {} ({})\n", mode, mode_hint(mode)));
+    "ok"
 }
 
 /// Handle a slash command. Returns a token the JS driver interprets:
@@ -578,11 +813,10 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             "ok"
         }
         "/context" => {
-            let (project, own) = {
-                let p = PROJECT.lock().unwrap().clone();
-                let own = SESS.lock().unwrap().as_ref().map(|s| s.id().to_string());
-                (p, own)
-            };
+            /* Lock order is SESS → WATCH → PROJECT (documented above) —
+             * take them in that order, never nested reversed (P2-17). */
+            let own = SESS.lock().unwrap().as_ref().map(|s| s.id().to_string());
+            let project = PROJECT.lock().unwrap().clone();
             match project {
                 Some(p) => {
                     let id = if arg.is_empty() {
@@ -673,8 +907,18 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         }
         "/model" => {
             if arg.is_empty() { return "pick_model"; }
-            cfg.model = arg.to_string();
-            if let Some(entry) = cfg.providers.iter_mut().find(|p| p.name == cfg.active) { entry.model = cfg.model.clone(); }
+            let picked = arg.trim().to_string();
+            cfg.model = picked.clone();
+            if let Some(entry) = cfg.providers.iter_mut().find(|p| p.name == cfg.active) {
+                entry.model = cfg.model.clone();
+                /* Remember every model set on this provider (picked from the
+                 * live list or typed manually) — the /model picker replays
+                 * them when the endpoint is unreachable. */
+                if !picked.is_empty() && !entry.models.contains(&picked) {
+                    entry.models.push(picked.clone());
+                    while entry.models.len() > 50 { entry.models.remove(0); }
+                }
+            }
             cfg.save();
             chat_out(&format!("  ✓ Model → {}\n", cfg.model));
             "ok"
@@ -729,7 +973,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 let base = if parts.len() >= 2 { parts[1..].join(" ") } else { String::new() };
                 // Preserve existing entry's other fields when upserting via shorthand.
                 let existing = cfg.providers.iter().find(|p| p.name == name).cloned();
-                let entry = ProviderEntry { name: name.clone(), endpoint: if base.is_empty() { existing.as_ref().map(|e| e.endpoint.clone()).unwrap_or_default() } else { base }, api_key: existing.as_ref().map(|e| e.api_key.clone()).unwrap_or_default(), model: existing.as_ref().map(|e| e.model.clone()).unwrap_or_default(), profile: existing.as_ref().map(|e| e.profile.clone()).unwrap_or_default() };
+                let entry = ProviderEntry { name: name.clone(), endpoint: if base.is_empty() { existing.as_ref().map(|e| e.endpoint.clone()).unwrap_or_default() } else { base }, api_key: existing.as_ref().map(|e| e.api_key.clone()).unwrap_or_default(), model: existing.as_ref().map(|e| e.model.clone()).unwrap_or_default(), profile: existing.as_ref().map(|e| e.profile.clone()).unwrap_or_default(), models: existing.as_ref().map(|e| e.models.clone()).unwrap_or_default() };
                 cfg.upsert_provider(entry);
                 cfg.save();
                 if cfg.base_url.is_empty() { chat_out(&format!("  ✓ Provider → {}\n", cfg.provider)); } else { chat_out(&format!("  ✓ Provider → {} · URL → {}\n", cfg.provider, cfg.base_url)); }
@@ -902,31 +1146,86 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 }
             }
         }
+        /* Permission modes. /mode is the query+set command; /plan /edit
+         * /full are the direct shorthands. Enforcement lives in agent.js
+         * (permissionBlocked); this persists the choice and the JS driver
+         * re-applies it to the runtime after every command (applyMode). */
+        "/mode" => match arg {
+            "" => {
+                chat_out(&format!("  mode: {} ({})\n", cfg.permissions, mode_hint(&cfg.permissions)));
+                chat_out("  usage: /mode full|edit|plan  (shorthands: /full /edit /plan · TAB cycles)\n");
+                "ok"
+            }
+            "full" | "edit" | "plan" => set_mode(cfg, arg),
+            _ => {
+                chat_out("  Usage: /mode [full|edit|plan]\n");
+                "ok"
+            }
+        },
+        "/plan" => set_mode(cfg, "plan"),
+        "/edit" => set_mode(cfg, "edit"),
+        "/full" => set_mode(cfg, "full"),
+        "/outputs" => {
+            match arg {
+                "on" => {
+                    cfg.archive_enabled = true;
+                    cfg.save();
+                    chat_out("  ✓ Output archive enabled\n");
+                    "ok"
+                }
+                "off" => {
+                    cfg.archive_enabled = false;
+                    cfg.save();
+                    chat_out("  ✓ Output archive disabled (existing records remain)\n");
+                    "ok"
+                }
+                _ => "outputs",
+            }
+        }
         "/tools" => "tools",
         "/agents" => "agents",
         "/ctx" => {
             // /ctx          → config panel (DRIVER handles "pick_ctx")
-            // /ctx <n>      → set (tokens; clamped to [1024, 1M]; 0 = default)
+            // /ctx <n>      → set for THIS model (obeyed as typed)
             // /ctx default  → reset to the provider default
             if arg.is_empty() {
                 "pick_ctx"
             } else if arg == "default" || arg == "0" {
                 cfg.ctx_window = 0;
+                cfg.ctx_window_explicit = false;
                 cfg.save();
-                let eff = effective_ctx_window(&cfg.provider, cfg.ctx_window);
+                let eff = resolved_ctx_window(&cfg);
                 chat_out(&format!("  ✓ Context window → provider default ({eff} tokens)\n"));
                 "ok"
-            } else if let Ok(n) = arg.parse::<i64>() {
-                if n < 0 || n > MAX_CTX_WINDOW {
+            } else if let Some(n) = parse_token_count(&arg) {
+                if n > MAX_CTX_WINDOW {
                     chat_out(&format!(
                         "  Context window must be between 0 and {} tokens (0 = provider default)\n",
                         MAX_CTX_WINDOW
                     ));
                 } else {
                     cfg.ctx_window = clamp_ctx_window(n);
+                    cfg.ctx_window_explicit = true;
                     cfg.save();
-                    let eff = effective_ctx_window(&cfg.provider, cfg.ctx_window);
-                    chat_out(&format!("  ✓ Context window → {eff} tokens\n"));
+                    let r = resolved_ctx_caps(&cfg);
+                    chat_out(&format!("  ✓ Context window → {} tokens\n", r.window));
+                    /* Say so when the value is above everything we know —
+                     * obeyed as typed, but the user should see the gap
+                     * rather than discover it as a provider 400 later. */
+                    if let Some(bound) = r.config_exceeds_evidence {
+                        if r.window > bound {
+                            chat_out(&format!(
+                                "  ⚠ {r_window} is above the strongest known evidence ({bound} tokens, {} source) — honored as set; if the provider rejects it, the real limit is learned automatically\n",
+                                r.win_source.as_str(),
+                                r_window = r.window
+                            ));
+                        } else {
+                            chat_out(&format!(
+                                "  · inherited value clamped to the model's known limit: {bound} tokens ({})\n",
+                                r.win_source.as_str()
+                            ));
+                        }
+                    }
                 }
                 "ok"
             } else {
@@ -943,10 +1242,17 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             } else if arg == "default" || arg == "0" {
                 cfg.max_output = 0;
                 cfg.save();
-                chat_out(&format!("  ✓ Max output tokens → provider default\n"));
+                let eff = sofuu_core::ml::alloc::policy::resolve(
+                    if cfg.model.is_empty() { None } else { Some(cfg.model.as_str()) },
+                    0,
+                    0,
+                    if cfg.base_url.is_empty() { None } else { Some(cfg.base_url.as_str()) },
+                )
+                .max_output;
+                chat_out(&format!("  ✓ Max output tokens → provider default ({eff})\n"));
                 "ok"
-            } else if let Ok(n) = arg.parse::<i64>() {
-                if n < 0 || n > MAX_OUTPUT_TOKENS {
+            } else if let Some(n) = parse_token_count(&arg) {
+                if n > MAX_OUTPUT_TOKENS {
                     chat_out(&format!(
                         "  Max output tokens must be between 0 and {} (0 = provider default)\n",
                         MAX_OUTPUT_TOKENS
@@ -954,7 +1260,21 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 } else {
                     cfg.max_output = clamp_max_output(n);
                     cfg.save();
-                    chat_out(&format!("  ✓ Max output tokens → {}\n", cfg.max_output));
+                    /* Honest feedback: what the ladder will actually send
+                     * for THIS model, not the raw config number. */
+                    let eff = sofuu_core::ml::alloc::policy::resolve(
+                        if cfg.model.is_empty() { None } else { Some(cfg.model.as_str()) },
+                        0,
+                        cfg.max_output,
+                        if cfg.base_url.is_empty() { None } else { Some(cfg.base_url.as_str()) },
+                    )
+                    .max_output;
+                    let note = if eff < cfg.max_output {
+                        format!(" (clamped from {} — the model's real max is {})", cfg.max_output, eff)
+                    } else {
+                        String::new()
+                    };
+                    chat_out(&format!("  ✓ Max output tokens → {}{}\n", cfg.max_output, note));
                 }
                 "ok"
             } else {
@@ -966,7 +1286,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         "/remember" => {
             if arg.is_empty() {
                 chat_out("  Usage: /remember <fact>\n");
-                chat_out("  Pins a fact directly to the brain (survives decay).\n");
+                chat_out("  Pins a fact to the brain AND the project AGENTS.md (standing context).\n");
                 return "ok";
             }
             "remember"
@@ -1101,6 +1421,8 @@ fn print_help() {
     c("/brain [on|off]", "toggle memory/brain integration");
     c("/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
     c("/rlm [on|off|auto]", "route long-context turns through the RLM loop");
+    c("/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
+    c("/plan /edit /full", "shorthands for /mode plan|edit|full");
     c("/ctx [<tokens>]", "view/set the context window (max 1M)");
     c("/maxout [<tokens>]", "view/set max output tokens (max 384k)");
     c("/tools", "list connected MCP servers + their tools");
@@ -1133,11 +1455,12 @@ fn print_help() {
     chat_out(&format!("\x1b[2m  notes, critical notices). Data persists as .qtsq files in\x1b[0m"));
     chat_out(&format!("\x1b[2m  <project>/.sofuu/sessions/.\x1b[0m"));
     h("\n  Shortcuts");
-    c("TAB", "accept slash-command completion");
+    c("TAB", "complete after '/', cycle permission mode otherwise");
     c("↑ / ↓", "input history");
     c("PgUp / PgDn", "scroll the conversation");
     c("Shift+Enter", "newline inside the input (Alt+Enter too)");
     c("Esc", "stop the response (while streaming) / clear the input");
+    c("Ctrl-K", "copy the mouse-selected text (drag over rows, then Ctrl-K)");
     c("Ctrl-C", "quit sofuu");
     c("Ctrl-D", "exit");
     chat_out("");
@@ -1276,10 +1599,17 @@ fn welcome_bird_rows(_cfg: &ChatConfig, _session: &str, _dir: &str, w: usize) ->
     ]
 }
 
-/// The full welcome panel, one String per display row, for a terminal
-/// `width` cells wide. `session` = mesh short id ("" = no session).
+/// The full welcome panel, one String per display row, `width` cells wide.
+/// `width` is the caller's VIEWPORT BUDGET (terminal width − renderer
+/// gutter − one spare cell), not the raw terminal width: every returned
+/// row must pass the TUI soft-wrap budget unchanged. `session` = mesh
+/// short id ("" = no session).
 fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) -> Vec<String> {
-    let w = width.clamp(40, 400);
+    // Floor 30, not 40: tui_size floors the terminal at 40, so the caller's
+    // budget bottoms out at 37 — lifting that back up to 40 would push every
+    // row over the wrap budget again and tear the box on minimal terminals.
+    // Overflowing content is clipped by panel_row, not fixed by widening.
+    let w = width.clamp(30, 400);
     let inner = w - 4;
     let mut rows = Vec::with_capacity(12);
 
@@ -1298,7 +1628,7 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     } else {
         format!("{}/{}{}", cfg.provider, cfg.model, effort)
     };
-    let labels: [(String, String); 5] = [
+    let labels: [(String, String); 6] = [
         ("Directory:".into(), trunc_cells(dir, inner.saturating_sub(14))),
         (
             "Session:".into(),
@@ -1306,9 +1636,25 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
         ),
         ("Model:".into(), model),
         (
+            "Mode:".into(),
+            match cfg.permissions.as_str() {
+                "plan" => "plan - read-only (no writes, no shell)".into(),
+                "edit" => "edit - local writes, no shell".into(),
+                _ => "full access".into(),
+            },
+        ),
+        (
             "Memory:".into(),
             if cfg.brain {
-                "on (persists across sessions)".to_string()
+                /* Never claim persistence the binary cannot deliver: a
+                 * QTSQ-free build no-ops every write while this line used
+                 * to say "persists across sessions" — the exact lie that
+                 * shipped in the 2026-09-22 macOS tarball. */
+                if sofuu_ffi::qtsq_linked() {
+                    "on (persists across sessions)".to_string()
+                } else {
+                    "on, but NOT persisting (QTSQ codec not linked in this build — run `sofuu doctor`)".to_string()
+                }
             } else {
                 "off (/brain on to enable)".to_string()
             },
@@ -1394,7 +1740,8 @@ struct RecallHit {
 struct SessionCost {
     /// Per-turn breakdowns: (model, input_tokens, output_tokens, cost_usd,
     /// cache_read_tokens, cache_write_tokens) — cache slots are 0 for
-    /// providers that don't report them (P6.4).
+    /// providers that don't report them (P6.4). Ring-capped: only the most
+    /// recent MAX_TURNS are kept (older turns fold into session_total).
     turns: Vec<(String, u64, u64, f64, u64, u64)>,
     /// Cumulative session spend in USD.
     session_total: f64,
@@ -1403,8 +1750,17 @@ struct SessionCost {
 }
 
 impl SessionCost {
+    /// Bounded history: enough for /cost detail, never unbounded.
+    const MAX_TURNS: usize = 512;
     const fn new() -> Self {
         Self { turns: Vec::new(), session_total: 0.0, cache_read_total: 0 }
+    }
+    fn push_turn(&mut self, t: (String, u64, u64, f64, u64, u64)) {
+        // Ring: drop oldest when at cap so thousands of turns stay O(1).
+        if self.turns.len() >= Self::MAX_TURNS {
+            self.turns.remove(0);
+        }
+        self.turns.push(t);
     }
 }
 
@@ -1415,6 +1771,8 @@ struct FsWatcher {
 }
 
 impl FsWatcher {
+    /// Max watched dirs: each snapshots up to 2000 files, so cap dirs too.
+    const MAX_WATCH_DIRS: usize = 32;
     const fn new() -> Self {
         Self { paths: Vec::new() }
     }
@@ -1423,6 +1781,10 @@ impl FsWatcher {
         let p = PathBuf::from(path);
         if self.paths.iter().any(|(watched, _)| *watched == p) {
             return; // already watching
+        }
+        if self.paths.len() >= Self::MAX_WATCH_DIRS {
+            // Evict oldest so the vec stays bounded over long sessions.
+            self.paths.remove(0);
         }
         let snapshot = self.snapshot_dir(&p);
         self.paths.push((p, snapshot));
@@ -1539,7 +1901,17 @@ unsafe extern "C" fn js_chat_getcfg(
 ) -> JSValue {
     let json = {
         let guard = CFG.lock().unwrap();
-        let cfg = guard.as_ref().cloned().unwrap_or_default();
+        /* P3 (AUDIT-2026-09-07): borrow instead of cloning the whole
+         * ChatConfig (providers registry + pricing table included) on
+         * every serialization; json! serializes through references. */
+        let default_cfg;
+        let cfg: &ChatConfig = match guard.as_ref() {
+            Some(c) => c,
+            None => {
+                default_cfg = ChatConfig::defaults();
+                &default_cfg
+            }
+        };
         serde_json::json!({
             "provider": cfg.provider,
             "model": cfg.model,
@@ -1553,10 +1925,13 @@ unsafe extern "C" fn js_chat_getcfg(
             "providers": cfg.providers,
             "active": cfg.active,
             "rlm": cfg.rlm,
+            "permissions": cfg.permissions,
             "ctx_window": cfg.ctx_window,
             "max_output": cfg.max_output,
             "embed_provider": cfg.embed_provider,
             "embed_model": cfg.embed_model,
+            "memory_backend": cfg.memory_backend,
+            "brain_path": cfg.brain_path,
             "pricing": cfg.pricing,
             "budget_usd": cfg.budget_usd,
             "spend_total_usd": cfg.spend_total_usd,
@@ -1564,6 +1939,21 @@ unsafe extern "C" fn js_chat_getcfg(
             "rss_warn_mb": cfg.rss_warn_mb,
             "recall_min": cfg.recall_min,
             "recall_budget": cfg.recall_budget,
+            /* save() persists no_think_models but this serializer dropped it —
+             * a JS-side cfg reload never saw the runtime thinking rejection,
+             * so the THINK "no-effort retry" re-sent reasoning_effort and
+             * hit the same 400 (every later turn repeated it). */
+            "no_think_models": cfg.no_think_models,
+            "archive_enabled": cfg.archive_enabled,
+            "archive_retain_final": cfg.archive_retain_final,
+            "archive_retain_tool_results": cfg.archive_retain_tool_results,
+            "archive_retain_partial": cfg.archive_retain_partial,
+            "archive_redact": cfg.archive_redact,
+            "archive_max_bytes": cfg.archive_max_bytes,
+            "archive_max_count": cfg.archive_max_count,
+            "archive_max_age_secs": cfg.archive_max_age_secs,
+            "archive_auto_recover": cfg.archive_auto_recover,
+            "archive_recovery_budget_chars": cfg.archive_recovery_budget_chars,
         })
         .to_string()
     };
@@ -1605,10 +1995,55 @@ unsafe extern "C" fn js_chat_apply_provider(
             let raw_profile = args.get(4).and_then(|x| x.as_ref()).cloned().unwrap_or_default();
             let profile = if raw_profile == "anthropic" || raw_profile == "local" { raw_profile } else { String::new() };
             // Preserve existing model when wizard sent empty; otherwise use new.
-            let existing_model = cfg.providers.iter().find(|p| p.name == name).map(|p| p.model.clone()).unwrap_or_default();
-            let final_model = if model.is_empty() { existing_model } else { model };
-            cfg.upsert_provider(ProviderEntry { name, endpoint, api_key, model: final_model, profile });
+            let existing = cfg.providers.iter().find(|p| p.name == name).cloned();
+            let final_model = if model.is_empty() {
+                existing.as_ref().map(|p| p.model.clone()).unwrap_or_default()
+            } else { model };
+            cfg.upsert_provider(ProviderEntry { name, endpoint, api_key, model: final_model, profile, models: existing.map(|p| p.models).unwrap_or_default() });
             cfg.save();
+        }
+    }
+    js_new_bool(ctx, true)
+}
+
+/// `__chat_models_cache(name, json_array)` — remember a provider's models
+/// (the last successful live listing) so the /model picker still offers them
+/// when the endpoint is unreachable next time. Best-effort: unknown provider
+/// or malformed JSON is a silent no-op.
+unsafe extern "C" fn js_chat_models_cache(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc >= 2 {
+        if let (Some(name), Some(list)) = (js_to_string(ctx, *argv), js_to_string(ctx, *argv.add(1))) {
+            let name = name.trim().to_string();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&list) {
+                let mut models: Vec<String> = Vec::new();
+                if let Some(arr) = parsed.as_array() {
+                    for it in arr {
+                        if let Some(s) = it.as_str() {
+                            let s = s.trim();
+                            if !s.is_empty() && !models.iter().any(|m| m == s) {
+                                models.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !name.is_empty() && !models.is_empty() {
+                    if let Ok(mut guard) = CFG.lock() {
+                        let cfg = guard.get_or_insert_with(ChatConfig::defaults);
+                        if let Some(entry) = cfg.providers.iter_mut().find(|p| p.name == name) {
+                            for m in models {
+                                if !entry.models.contains(&m) { entry.models.push(m); }
+                            }
+                            while entry.models.len() > 50 { entry.models.remove(0); }
+                            cfg.save();
+                        }
+                    }
+                }
+            }
         }
     }
     js_new_bool(ctx, true)
@@ -1617,6 +2052,8 @@ unsafe extern "C" fn js_chat_apply_provider(
 /// Runtime thinking-support detection: mark the model as "cannot think"
 /// after the provider rejected a reasoning parameter for it. Persisted so
 /// the picker reports it and turns skip effort for this model.
+/// (The shipped chat.js driver persists the same field through
+/// rt/session_js.rs's `__chat_note_no_think` — P2-4.)
 unsafe extern "C" fn js_chat_no_think(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -1863,6 +2300,13 @@ unsafe extern "C" fn js_chat_resume_turns(
         let project = PROJECT.lock().unwrap().clone();
         match project {
             Some(p) => {
+                /* /resume advertises the SHORT id in its picker (P1-10) —
+                 * resolve short/ambiguous ids against the registry before
+                 * loading, same as the session inspect/repair commands. */
+                let id = session::resolve_session_id(&p, &id).unwrap_or_else(|e| {
+                    eprintln!("\x1b[33m  {e}\x1b[0m");
+                    id.clone()
+                });
                 let turns = session::past_turns(&p, &id);
                 serde_json::json!(
                     turns.iter()
@@ -1892,8 +2336,12 @@ unsafe extern "C" fn js_chat_report_usage(
         return js_new_string(ctx, r#"{"cost_usd":0,"session_total":0,"lifetime_total":0}"#);
     }
     let model = js_to_string(ctx, *argv).unwrap_or_default();
-    let pt = js_to_int(ctx, *argv.add(1));
-    let ct = js_to_int(ctx, *argv.add(2));
+    /* Clamp at parse: a provider reporting negative/overflowing usage must
+     * not walk lifetime spend backwards (P1-7) — the cache slots below were
+     * already clamped; pt/ct were the gap. `pt as u64` on a negative i64
+     * would also wrap into ~1.8e19 garbage in /cost. */
+    let pt = js_to_int(ctx, *argv.add(1)).max(0);
+    let ct = js_to_int(ctx, *argv.add(2)).max(0);
     let cache_read = if argc > 3 { js_to_int(ctx, *argv.add(3)).max(0) } else { 0 };
     let cache_write = if argc > 4 { js_to_int(ctx, *argv.add(4)).max(0) } else { 0 };
     let result = if let Ok(mut guard) = CFG.lock() {
@@ -1901,11 +2349,18 @@ unsafe extern "C" fn js_chat_report_usage(
         let key = format!("{}/{}", cfg.provider, model);
         let [in_p, out_p] = cfg.pricing.get(&key).cloned().unwrap_or([0.0, 0.0]);
         let cost = (pt as f64 / 1_000_000.0) * in_p + (ct as f64 / 1_000_000.0) * out_p;
-        SESSION_COST.lock().unwrap().turns.push((model, pt as u64, ct as u64, cost, cache_read as u64, cache_write as u64));
+        SESSION_COST.lock().unwrap().push_turn((model, pt as u64, ct as u64, cost, cache_read as u64, cache_write as u64));
         SESSION_COST.lock().unwrap().session_total += cost;
         SESSION_COST.lock().unwrap().cache_read_total += cache_read as u64;
         cfg.spend_total_usd += cost;
-        cfg.save();
+        /* P3 (AUDIT-2026-09-07): this hook runs EVERY turn and save()
+         * rewrites the whole config.json (all provider API keys) each
+         * time. Flush to disk only once per accrued cent — the in-memory
+         * total is always exact and /cost reads it live. */
+        let saved = f64::from_bits(SPEND_SAVED_BITS.load(std::sync::atomic::Ordering::Relaxed));
+        if cfg.spend_total_usd - saved >= 0.01 {
+            cfg.save();
+        }
         let session_total = SESSION_COST.lock().unwrap().session_total;
         serde_json::json!({
             "cost_usd": (cost * 1e6).round() / 1e6,
@@ -2047,7 +2502,15 @@ unsafe extern "C" fn js_chat_ghost(
 /// the FFI only exposes sofuu_js_to_uint32 (no int64 helper).
 unsafe fn js_to_int(ctx: *mut JSContext, val: JSValueConst) -> i64 {
     if let Some(s) = js_to_string(ctx, val) {
-        s.trim().parse::<i64>().unwrap_or(0)
+        let t = s.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return n;
+        }
+        /* P3 (AUDIT-2026-09-07): usage numbers can arrive as JS floats
+         * ("1234.5"); the i64-only parse turned them into 0 — a silent
+         * bill of zero. Fall back to an f64 parse truncated toward zero
+         * (Rust's saturating float→int cast). */
+        t.parse::<f64>().map(|f| f as i64).unwrap_or(0)
     } else {
         0
     }
@@ -2088,14 +2551,23 @@ unsafe extern "C" fn js_chat_welcome(
 
     if sofuu_ffi::tui_active() {
         let w = sofuu_ffi::tui_width();
-        let gutter = sofuu_core::rt::tui::GUTTER;
-        // The renderer indents every conversation row by GUTTER cells, so the
-        // panel is built GUTTER cells narrower and pre-indented here — the
-        // box borders land inside the viewport instead of under the "…" clip.
-        let pad = " ".repeat(gutter);
-        let rows = welcome_panel_at(&cfg, sess.as_deref().unwrap_or(""), &dir, w.saturating_sub(gutter));
+        // The renderer indents every conversation row by GUTTER cells itself
+        // (render_rows) and tui_push_split soft-wraps any stored row to
+        // w − GUTTER, so the panel must be logged at w − GUTTER − 1 cells.
+        // Pre-indenting here used to double the gutter: stored rows hit w
+        // cells, every row exceeded the wrap budget by GUTTER, and wrap_row
+        // tore each one apart — the right │ was pushed onto its own line
+        // while the dash borders survived as clean fragments. The spare
+        // cell keeps the border off the last column so the paint-time "…"
+        // clip can never touch it either.
+        let rows = welcome_panel_at(
+            &cfg,
+            sess.as_deref().unwrap_or(""),
+            &dir,
+            w.saturating_sub(sofuu_core::rt::tui::GUTTER + 1),
+        );
         for row in &rows {
-            sofuu_ffi::tui_log(&format!("{pad}{row}"));
+            sofuu_ffi::tui_log(row);
         }
     } else {
         for line in welcome_plain(&cfg, sess.as_deref(), &dir) {
@@ -2284,6 +2756,215 @@ unsafe extern "C" fn js_chat_log(
     js_new_bool(ctx, true)
 }
 
+// ── Project-local output archive bridge ───────────────────────────────
+
+fn current_archive_config() -> ChatConfig {
+    CFG.lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(ChatConfig::load)
+}
+
+fn current_archive_policy() -> output_archive::ArchivePolicy {
+    current_archive_config().archive_policy()
+}
+
+fn current_archive_session_id() -> String {
+    SESS.lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|session| session.id().to_string()))
+        .unwrap_or_default()
+}
+
+fn current_archive_provider_model() -> (String, String) {
+    let cfg = current_archive_config();
+    (cfg.provider, cfg.model)
+}
+
+fn archive_write_request_json(raw: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("invalid output write request: {e}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "output write request must be a JSON object".to_string())?;
+    let session_id = current_archive_session_id();
+    let (provider, model) = current_archive_provider_model();
+    if object.get("session_id").and_then(|value| value.as_str()).unwrap_or_default().is_empty() {
+        object.insert("session_id".into(), serde_json::Value::String(session_id));
+    }
+    if object.get("provider").and_then(|value| value.as_str()).unwrap_or_default().is_empty() {
+        object.insert("provider".into(), serde_json::Value::String(provider));
+    }
+    if object.get("model").and_then(|value| value.as_str()).unwrap_or_default().is_empty() {
+        object.insert("model".into(), serde_json::Value::String(model));
+    }
+    Ok(value.to_string())
+}
+
+fn archive_project_or_empty() -> Option<PathBuf> {
+    session::project_root()
+}
+
+unsafe extern "C" fn js_chat_archive_write(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = if argc < 1 {
+        r#"{"ok":false,"error":"missing output write request"}"#.to_string()
+    } else if let Some(raw) = js_to_string(ctx, *argv) {
+        match archive_project_or_empty() {
+            Some(project) => match archive_write_request_json(&raw) {
+                Ok(request) => output_archive::write_json(&project, &request, &current_archive_policy()),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }).to_string(),
+            },
+            None => serde_json::json!({ "ok": true, "stored": false, "reason": "no project root" }).to_string(),
+        }
+    } else {
+        r#"{"ok":false,"error":"output write request is not a string"}"#.to_string()
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_list(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => {
+            let raw = if argc >= 1 { js_to_string(ctx, *argv).unwrap_or_else(|| "{}".into()) } else { "{}".into() };
+            match serde_json::from_str::<output_archive::OutputQuery>(&raw) {
+                Ok(query) => output_archive::list_json(&project, query),
+                Err(error) => serde_json::json!({ "ok": false, "error": format!("invalid output query: {error}") }).to_string(),
+            }
+        }
+        None => serde_json::json!({ "ok": true, "items": [] }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_get(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = if argc < 1 {
+        serde_json::json!({ "ok": false, "error": "missing output id" }).to_string()
+    } else if let Some(id) = js_to_string(ctx, *argv) {
+        match archive_project_or_empty() {
+            Some(project) => output_archive::get_json(&project, id.trim()),
+            None => serde_json::json!({ "ok": false, "error": "no project root" }).to_string(),
+        }
+    } else {
+        serde_json::json!({ "ok": false, "error": "output id is not a string" }).to_string()
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_search(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => {
+            let raw = if argc >= 1 { js_to_string(ctx, *argv).unwrap_or_else(|| "{}".into()) } else { "{}".into() };
+            match serde_json::from_str::<output_archive::OutputQuery>(&raw) {
+                Ok(query) => output_archive::search_json(&project, query),
+                Err(error) => serde_json::json!({ "ok": false, "error": format!("invalid output query: {error}") }).to_string(),
+            }
+        }
+        None => serde_json::json!({ "ok": true, "items": [] }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_context(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => {
+            let raw = if argc >= 1 { js_to_string(ctx, *argv).unwrap_or_else(|| "{}".into()) } else { "{}".into() };
+            match serde_json::from_str::<output_archive::RecoveryQuery>(&raw) {
+                Ok(query) => output_archive::context_json(&project, query),
+                Err(error) => serde_json::json!({ "ok": false, "error": format!("invalid recovery query: {error}") }).to_string(),
+            }
+        }
+        None => serde_json::json!({ "ok": true, "bundle": { "context": "", "items": [], "total_chars": 0, "total_bytes": 0, "omitted_count": 0, "truncated": false } }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_stats(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => output_archive::stats_json(&project, &current_archive_policy()),
+        None => serde_json::json!({ "ok": true, "stats": { "enabled_root": false, "index_entries": 0 } }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_rebuild(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => output_archive::rebuild_index_json(&project),
+        None => serde_json::json!({ "ok": true, "report": { "rebuilt": false, "indexed": 0, "corrupt": 0, "orphaned": 0, "temporary": 0 } }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
+unsafe extern "C" fn js_chat_archive_prune(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = match archive_project_or_empty() {
+        Some(project) => {
+            let raw = if argc >= 1 { js_to_string(ctx, *argv).unwrap_or_else(|| "{}".into()) } else { "{}".into() };
+            let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(error) => return js_new_string(ctx, &serde_json::json!({ "ok": false, "error": format!("invalid prune policy: {error}") }).to_string()),
+            };
+            if let Some(object) = value.as_object_mut() {
+                object.entry("dry_run").or_insert(serde_json::Value::Bool(true));
+                let defaults = current_archive_policy();
+                if defaults.max_age_secs > 0 {
+                    object.entry("older_than_secs").or_insert(serde_json::Value::from(defaults.max_age_secs));
+                }
+                if defaults.max_bytes > 0 {
+                    object.entry("max_bytes").or_insert(serde_json::Value::from(defaults.max_bytes));
+                }
+                if defaults.max_count > 0 {
+                    object.entry("max_count").or_insert(serde_json::Value::from(defaults.max_count));
+                }
+            }
+            match serde_json::from_value::<output_archive::PrunePolicy>(value) {
+                Ok(policy) => output_archive::prune_json(&project, policy),
+                Err(error) => serde_json::json!({ "ok": false, "error": format!("invalid prune policy: {error}") }).to_string(),
+            }
+        }
+        None => serde_json::json!({ "ok": true, "report": { "dry_run": true, "candidate_count": 0, "candidate_ids": [], "candidate_content_bytes": 0, "candidate_file_bytes": 0, "removed": 0 } }).to_string(),
+    };
+    js_new_string(ctx, &result)
+}
+
 /// `__chat_mcpservers()` → JSON string of the configured MCP servers from
 /// ~/.sofuu/mcp.json: `[{"name":"fs","command":"..."}]` (empty → `[]`).
 unsafe extern "C" fn js_chat_mcpservers(
@@ -2303,7 +2984,7 @@ unsafe extern "C" fn js_chat_mcpservers(
     js_new_string(ctx, &json)
 }
 
-fn register_bridge(rt: &SofuuRuntime) {
+pub(crate) fn register_bridge(rt: &SofuuRuntime) {
     let ctx = rt.engine_ctx() as *mut JSContext;
     if ctx.is_null() {
         return;
@@ -2315,9 +2996,18 @@ fn register_bridge(rt: &SofuuRuntime) {
         register_global_fn(ctx, "__chat_exit_check", js_chat_exit_check as JSCFunction);
         register_global_fn(ctx, "__chat_poll", js_chat_poll as JSCFunction);
         register_global_fn(ctx, "__chat_log", js_chat_log as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_write", js_chat_archive_write as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_list", js_chat_archive_list as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_get", js_chat_archive_get as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_search", js_chat_archive_search as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_context", js_chat_archive_context as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_stats", js_chat_archive_stats as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_rebuild", js_chat_archive_rebuild as JSCFunction);
+        register_global_fn(ctx, "__chat_archive_prune", js_chat_archive_prune as JSCFunction);
         register_global_fn(ctx, "__chat_complete", js_chat_complete as JSCFunction);
         register_global_fn(ctx, "__chat_command_info", js_chat_command_info as JSCFunction);
         register_global_fn(ctx, "__chat_apply_provider", js_chat_apply_provider as JSCFunction);
+        register_global_fn(ctx, "__chat_models_cache", js_chat_models_cache as JSCFunction);
         register_global_fn(ctx, "__chat_select_provider", js_chat_select_provider as JSCFunction);
         register_global_fn(ctx, "__chat_no_think", js_chat_no_think as JSCFunction);
         register_global_fn(ctx, "__chat_remove_provider", js_chat_remove_provider as JSCFunction);
@@ -2349,8 +3039,158 @@ fn register_bridge(rt: &SofuuRuntime) {
 const DRIVER: &str = r#"
 (function() {
   let cfg = JSON.parse(__chat_getcfg());
+  /* Permission mode: cfg.permissions is the persisted source of truth
+   * (/mode, /plan, /edit, /full write it via Rust). The runtime gate is
+   * ONE — sofuu.agent.setPermissions drives agent.js's permissionBlocked.
+   * Idempotent + guarded so a not-yet-loaded agent.js can't break boot. */
+  function applyMode() {
+    try {
+      if (sofuu.agent && typeof sofuu.agent.setPermissions === 'function')
+        sofuu.agent.setPermissions(cfg.permissions || 'full');
+    } catch (e) {}
+  }
+  applyMode();
   let history = [];
   let lastShared = '';
+  /* Output archive state is deliberately driver-local. Storage is additive
+   * and best-effort: a QTSQ/index failure must never turn a usable model
+   * response into a failed chat turn. */
+  let archiveTurn = 0;
+  let archiveAttempt = 1;
+  let archivePendingRecovery = '';
+  let archiveLastFailure = null;
+  let archiveRecoveryUsed = false;
+  /* session-2 (AUDIT-2026-09-07): the prompt event logs ONCE per logical
+   * turn. turn() runs again on THINK/CAPACITY retries with the same
+   * archiveTurn, so gate on it — duplicate prompt events would replay as
+   * extra user turns on resume. */
+  let promptLoggedTurn = -1;
+  function archiveWrite(kind, status, source, content, metadata, links) {
+    if (cfg.archive_enabled === false || content === undefined || content === null) return null;
+    const text = String(content);
+    if (!text.trim()) return null;
+    const request = {
+      turn: archiveTurn,
+      attempt: archiveAttempt,
+      kind: kind,
+      status: status,
+      source: source,
+      provider: (applyFailover(cfg).provider || cfg.provider || ''),
+      model: (applyFailover(cfg).model || cfg.model || ''),
+      content: text,
+      metadata: metadata || {},
+      related_output_ids: (links && links.related_output_ids) || [],
+      retry_of: (links && links.retry_of) || null,
+      redact: true,
+    };
+    try {
+      const result = JSON.parse(__chat_archive_write(JSON.stringify(request)) || '{}');
+      return (result && result.stored && result.ref) ? result.ref : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  function archiveErrorCode(message) {
+    const text = String(message || '').toLowerCase();
+    if (/context|prompt.{0,12}too long|maximum context|token limit/.test(text)) return 'context_limit';
+    if (/max.{0,12}output|length.{0,12}limit|too many output|finish.?reason.{0,8}length/.test(text)) return 'output_limit';
+    if (/auth|unauthori[sz]ed|forbidden|api.?key|invalid token|credential/.test(text)) return 'auth';
+    if (/timeout|timed out|connection|transport|http\/?2|empty reply|reset by peer|rate.?limit|overloaded|temporarily/.test(text)) return 'transport';
+    if (/provider|model|endpoint|http \d+/.test(text)) return 'provider';
+    return 'runtime';
+  }
+  function archiveContext(query) {
+    const automatic = !!(query && query.automatic === true);
+    if (cfg.archive_enabled === false || (automatic && cfg.archive_auto_recover === false)) return '';
+    try {
+      const requestedBudget = Number(query && query.budget_chars || cfg.archive_recovery_budget_chars || 12000);
+      const q = Object.assign({}, query || {}, {
+        automatic: automatic,
+        budget_chars: Math.max(512, Math.min(131072, isFinite(requestedBudget) ? requestedBudget : 12000)),
+        ml_relevance: cfg.ml !== false && !!(sofuu.ml && sofuu.ml.relevance &&
+          typeof sofuu.ml.relevance.plan === 'function'),
+      });
+      const result = JSON.parse(__chat_archive_context(JSON.stringify(q)) || '{}');
+      if (automatic && result && result.bundle && Array.isArray(result.bundle.items) && result.bundle.items.length) {
+        const items = result.bundle.items;
+        const latest = items.reduce(function (best, item) {
+          return !best || String(item.created_at || '') > String(best.created_at || '') ? item : best;
+        }, null);
+        const kinds = items.slice(0, 3).map(function (item) { return String(item.kind || 'output'); }).join(' + ');
+        try { out('\x1b[90m  ⏺ recovered ' + items.length + ' historical output' + (items.length === 1 ? '' : 's') +
+          (latest && latest.created_at ? ' · latest ' + latest.created_at : '') +
+          (kinds ? ' · ' + kinds : '') + '\x1b[0m\n'); } catch (eNotice) {}
+      }
+      return result && result.bundle && result.bundle.context ? String(result.bundle.context) : '';
+    } catch (e) {
+      return '';
+    }
+  }
+  /* Public native-backed surface for scripts running inside the main chat
+   * runtime. It returns parsed JSON envelopes so callers do not need to know
+   * about the QuickJS string bridge. Historical context remains explicitly
+   * bounded and labeled by the native implementation. */
+  if (!sofuu.outputs) sofuu.outputs = {};
+  function archiveApiResult(raw) {
+    try { return JSON.parse(raw || '{}'); }
+    catch (e) { return { ok: false, error: 'invalid output archive response' }; }
+  }
+  sofuu.outputs.info = function () {
+    return archiveApiResult(__chat_archive_stats());
+  };
+  sofuu.outputs.list = function (query) {
+    return archiveApiResult(__chat_archive_list(JSON.stringify(query || {})));
+  };
+  sofuu.outputs.get = function (id) {
+    return archiveApiResult(__chat_archive_get(String(id || '')));
+  };
+  sofuu.outputs.search = function (query) {
+    const q = typeof query === 'string' ? { text: query } : (query || {});
+    return archiveApiResult(__chat_archive_search(JSON.stringify(q)));
+  };
+  sofuu.outputs.context = function (query) {
+    const q = typeof query === 'string' ? { current_task: query } : Object.assign({}, query || {});
+    q.automatic = false;
+    return archiveApiResult(__chat_archive_context(JSON.stringify(q)));
+  };
+  sofuu.outputs.rebuildIndex = function () {
+    return archiveApiResult(__chat_archive_rebuild());
+  };
+  sofuu.outputs.prune = function (policy) {
+    const p = Object.assign({ dry_run: true }, policy || {});
+    return archiveApiResult(__chat_archive_prune(JSON.stringify(p)));
+  };
+  /* Provider failover (P1): when a turn dies with a capacity/auth-class
+   * error on the active provider, the main loop picks the next
+   * configured provider entry and sets this override for the retry. All
+   * per-turn consumers (streamOpts, resolveCaps, the agent def) read cfg
+   * through applyFailover() so the whole turn runs against the target.
+   * Cleared at turn end — the SAVED config never changes; failover is a
+   * per-turn recovery, not a provider switch. */
+  let failoverTo = null;
+  function applyFailover(c) {
+    if (!failoverTo) return c;
+    return Object.assign({}, c, {
+      provider: failoverTo.name,
+      base_url: failoverTo.endpoint,
+      api_key: failoverTo.api_key || '',
+      profile: failoverTo.profile || '',
+      model: failoverTo.model,
+    });
+  }
+  function failoverChain() {
+    const chain = [null];
+    if (Array.isArray(cfg.providers)) {
+      for (const pe of cfg.providers) {
+        if (pe && pe.name && pe.model && pe.endpoint && pe.name !== cfg.provider) {
+          chain.push({ name: pe.name, endpoint: pe.endpoint,
+                       api_key: pe.api_key || '', profile: pe.profile || '',
+                       model: pe.model });
+        }
+      }
+    }
+    return chain;
+  }
   /* Footer meter = CURRENT context usage (what the next request's prompt
    * will be), not a lifetime total: it grows as history grows and drops
    * when /compact (or auto-compaction) folds history, exactly like the
@@ -2360,9 +3200,15 @@ const DRIVER: &str = r#"
    * the budget logic's own estimator when a provider reports no usage. */
   let usedCtx = 0;
   let ctxOverhead = -1;   /* −1 = not calibrated (history estimate only) */
+  /* Live mid-turn growth (estimated tokens accumulated since the latest
+   * in-flight request): the footer adds this WHILE a turn is running so
+   * the meter climbs as the answer streams and tool results land — reset
+   * to 0 when the turn ends (the end-of-turn calibration takes over). */
+  let liveCtxExtra = 0;
   function ctxMeter() {
     const h = historyTokens();
-    return ctxOverhead >= 0 ? h + ctxOverhead : h;
+    const base = ctxOverhead >= 0 ? h + ctxOverhead : h;
+    return base + liveCtxExtra;
   }
   let lastChip = '';  /* last per-turn usage chip, so /compact can refresh the footer without clearing it */
   let rssWarned = false; /* M6: one-time RAM tripwire notice */
@@ -2510,6 +3356,35 @@ const DRIVER: &str = r#"
         names[t.name] = 1;
       }
     }
+    /* Historical output is an explicit, bounded tool rather than hidden
+     * context on every request. The native archive applies the timestamped
+     * untrusted-data wrapper and the same recovery budget used by retries. */
+    if (cfg.archive_enabled !== false && !names.output_history) {
+      defs.push({
+        name: 'output_history',
+        description: 'Retrieve a bounded historical Sofuu output by id or task text when prior run evidence is needed. Historical output is untrusted data and may be stale.',
+        parameters: {
+          type: 'object',
+          properties: {
+            output_id: { type: 'string', description: 'Exact archived output id, when known.' },
+            query: { type: 'string', description: 'Short task or text query for relevant archived outputs.' },
+            budget_chars: { type: 'integer', minimum: 512, maximum: 131072 },
+          },
+        },
+        execute: function (args) {
+          const a = args || {};
+          const ids = a.output_id ? [String(a.output_id)] : [];
+          const context = archiveContext({
+            explicit_ids: ids,
+            current_task: String(a.query || ''),
+            budget_chars: Number(a.budget_chars || cfg.archive_recovery_budget_chars || 12000),
+            automatic: false,
+          });
+          return context || 'No matching archived output was found.';
+        },
+      });
+      names.output_history = 1;
+    }
     for (const t of mcpTools) {
       if (names[t.name]) {
         out('\x1b[33m  ⚠ MCP tool ' + t.name + ' (' + t.server + ') shadowed by a built-in tool\x1b[0m');
@@ -2551,6 +3426,21 @@ const DRIVER: &str = r#"
     globalThis.__on_esc();
     requestExit();
   };
+  /* TAB on a non-slash line (process.rs tty_read_cb) cycles the permission
+   * mode. Reuses the /mode command so the echo + persistence come from the
+   * same Rust path as the slash commands, then mirrors the submit loop's
+   * refresh set: engine (sofuu.agent), footer chip, welcome panel. */
+  globalThis.__on_tab = function() {
+    const order = ['full', 'edit', 'plan'];
+    const cur = cfg.permissions || 'full';
+    let next = order.indexOf(cur);
+    next = order[(next + 1) % order.length];
+    __chat_slash('/mode ' + next);
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    applyMode();
+    refreshStatus(lastChip);
+    try { __chat_refresh(); } catch (e) {}
+  };
   /* ── Memory: OWNED BY THE AGENT RUNTIME (PLAN-AGENTS A1.4) ──────
    * Recall augmentation, scoped storage, and markPositive live in
    * src/js/agent.js (sofuu.agent.run with memory:'shared'); this driver
@@ -2567,26 +3457,89 @@ const DRIVER: &str = r#"
    * ═════════════════════════════════════════════════════════════════ */
 
   /* ── F1: /remember + /why ────────────────────────────────────────── */
-  /* brain handle for /remember + /why (cached; the agent runtime has its
-   * own — this is a lightweight driver-level handle for direct brain ops). */
-  let driverBrain = null;
+  /* ONE brain handle, ONE store: the agent runtime's BRAINS cache owns the
+   * brain file for this process — a QTSQ flush rewrites the whole file from
+   * the handle's in-memory view, so a second driver-owned handle would
+   * clobber turns stored after its hydrate (last flush wins). Every direct
+   * brain op (/remember, /share, /import, ghost) goes through
+   * sofuu.agent.brainFor(), which returns that SAME cached handle the turn
+   * loop recalls and stores with. Path default is project-local
+   * (<cwd>/.sofuu/brain/brain.qtsq), shared by every session in this
+   * folder; config "brain_path" overrides for both sides. (The old
+   * ~/.sofuu_brain.qtsq default forked /remember onto a file the runtime
+   * never opened — fixed 2026-09-09.) */
+  function brainDef() {
+    return {
+      name: 'chat',
+      memory: cfg.brain ? 'shared' : 'off',
+      brainPath: cfg.brain_path || undefined,
+      embed_provider: cfg.embed_provider || undefined,
+      embed_model: cfg.embed_model || undefined,
+      embedding: cfg.memory_backend || undefined,
+    };
+  }
   function brainPath() {
-    try { return (cfg.brainPath) || ((env('HOME') || '.') + '/.sofuu_brain.qtsq'); }
-    catch (e) { return (env('HOME') || '.') + '/.sofuu_brain.qtsq'; }
+    /* Display/metadata mirror of agent.js brainFor's path chain: explicit
+     * config override, then project-local, then HOME. */
+    if (cfg.brain_path) return cfg.brain_path;
+    try { return process.cwd() + '/.sofuu/brain/brain.qtsq'; } catch (e) {}
+    return (env('HOME') || env('USERPROFILE') || '.') + '/.sofuu/brain/brain.qtsq';
   }
   function env(n) { try { return process.env[n] || ''; } catch (e) { return ''; } }
   function ensureDriverBrain() {
-    if (driverBrain) return driverBrain;
-    if (!sofuu.memory || typeof sofuu.memory.open !== 'function') return null;
     try {
-      driverBrain = sofuu.memory.open(brainPath(), 768);
-      return driverBrain;
+      if (!sofuu.agent || typeof sofuu.agent.brainFor !== 'function') return null;
+      const entry = sofuu.agent.brainFor(brainDef());
+      if (!entry || !entry.cma) return null;
+      if (entry.backend) driverBrainBackend = entry.backend;
+      return entry.cma;
+    } catch (e) { return null; }
+  }
+  /* Driver-side embedding backend (PLAN-TINY-SEMANTIC-EMBEDDER §7) —
+   * mirrors agent.js selection; now only a FALLBACK identity source for
+   * embedText(): the real backend of the shared handle arrives via
+   * sofuu.agent.brainFor (ensureDriverBrain caches entry.backend).
+   * Dims come from sofuu.ai.embedInfo(), never literals. Null = the
+   * selected backend is unavailable (memory declines, never substitutes). */
+  let driverBrainBackend = null;
+  function driverBackend() {
+    try {
+      if (cfg.embed_provider && cfg.embed_model) {
+        return { kind: 'remote', id: 'remote:' + cfg.embed_provider + ':' + cfg.embed_model, dim: 0 };
+      }
+      let name = String(cfg.memory_backend || env('SOFUU_MEMORY_BACKEND') || '').toLowerCase();
+      if (name === 'semantic' || name === 'semantic-projector-v1') {
+        if (sofuu.ai && typeof sofuu.ai.embedInfo === 'function' && typeof sofuu.ai.embedLocalSemantic === 'function') {
+          const info = JSON.parse(sofuu.ai.embedInfo());
+          if (info && info.id === 'semantic-projector-v1' && info.available && (info.dimension | 0) > 0) {
+            return { kind: 'semantic', id: info.id, dim: info.dimension | 0 };
+          }
+        }
+        return null;
+      }
+      let dim = 768;
+      if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
+        try { const v = sofuu.ai.embedLocal(''); if (v && v.length) dim = v.length; } catch (e) {}
+      }
+      return { kind: 'hash', id: 'hash-v1', dim: dim };
     } catch (e) { return null; }
   }
   async function embedText(text) {
-    /* Local-first: use the bundled offline embedder (no network needed). */
+    const be = driverBrainBackend || driverBackend();
+    if (!be) return null;
+    /* Local-first: use the selected backend (hash default, semantic opt-in). */
+    if (be.kind === 'semantic' && sofuu.ai && typeof sofuu.ai.embedLocalSemantic === 'function') {
+      try {
+        const v = await sofuu.ai.embedLocalSemantic(text);
+        if (v && v.length === be.dim) return v;
+      } catch (e) {}
+      return null;
+    }
     if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
-      try { return await sofuu.ai.embedLocal(text); } catch (e) {}
+      try {
+        const v = await sofuu.ai.embedLocal(text);
+        if (v && v.length === be.dim) return v;
+      } catch (e) {}
     }
     /* Fall back to a remote embedding provider if configured. */
     if (cfg.embed_provider && cfg.embed_model && sofuu.ai && typeof sofuu.ai.embed === 'function') {
@@ -2601,6 +3554,8 @@ const DRIVER: &str = r#"
   }
   async function handleRemember(fact) {
     if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
+    fact = String(fact || '').trim();
+    if (!fact) { out('\x1b[90m  Usage: /remember <fact>\x1b[0m\n'); return; }
     const brain = ensureDriverBrain();
     if (!brain) { out('\x1b[90m  Brain unavailable (QTSQ not linked?)\x1b[0m\n'); return; }
     const vec = await embedText(fact);
@@ -2608,7 +3563,18 @@ const DRIVER: &str = r#"
     try {
       brain.remember(new Float32Array(vec), fact, 'user_pin', 0);
       brain.flush();
-      out('\x1b[90m  ⏺ remembered · ' + brain.count() + ' memories\x1b[0m\n');
+      /* AGENTS.md (2026-09-12): the fact also lands in the project context
+       * file so it rides EVERY request as standing context, not just via
+       * semantic recall. Never fatal — the brain pin above already held. */
+      let fileNote = '';
+      if (sofuu.agent && typeof sofuu.agent.pinProjectFact === 'function') {
+        try {
+          const r = await sofuu.agent.pinProjectFact(fact);
+          if (r === 'added') fileNote = ' · pinned to AGENTS.md';
+          else if (r === 'exists') fileNote = ' · already in AGENTS.md';
+        } catch (eP) {}
+      }
+      out('\x1b[90m  ⏺ remembered · ' + brain.count() + ' memories · ' + brainPath() + fileNote + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
   function handleWhy() {
@@ -2627,6 +3593,107 @@ const DRIVER: &str = r#"
       out('  \x1b[90m' + score + '\x1b[0m  ' + role + text);
     }
     out('');
+  }
+
+  /* ── Timestamped output archive ──────────────────────────────────── */
+  function printArchiveItems(items, title) {
+    if (title) out('\n\x1b[1m  ' + title + '\x1b[0m');
+    if (!items.length) {
+      out('\x1b[90m  (no archived outputs)\x1b[0m\n');
+      return;
+    }
+    for (const item of items) {
+      out('  \x1b[36m' + clip1(item.id, 56) + '\x1b[0m · ' +
+          String(item.created_at || '?') + ' · ' + String(item.kind || '?') +
+          ' · ' + String(item.status || '?') +
+          ' · ' + clip1(item.summary || '', 120) +
+          (item.missing ? ' \x1b[33m[missing]\x1b[0m' : ''));
+    }
+    out('');
+  }
+  function archiveItems(query, title) {
+    let result;
+    try { result = JSON.parse(__chat_archive_list(JSON.stringify(query || {})) || '{}'); }
+    catch (e) { result = null; }
+    if (!result || result.ok === false) {
+      out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n');
+      return [];
+    }
+    const items = Array.isArray(result.items) ? result.items : [];
+    printArchiveItems(items, title);
+    return items;
+  }
+  function handleOutputs(arg) {
+    const raw = String(arg || '').trim();
+    const parts = raw ? raw.split(/\s+/) : [];
+    const op = parts[0] || 'list';
+    if (op === 'list' || op === 'ls') {
+      const limit = parts.indexOf('--limit') >= 0 ? parseInt(parts[parts.indexOf('--limit') + 1], 10) : 20;
+      archiveItems({ limit: isFinite(limit) ? limit : 20 }, 'Recent archived outputs');
+      return;
+    }
+    if (op === 'show' || op === 'get') {
+      const id = parts[1] || '';
+      if (!id) { out('\x1b[90m  Usage: /outputs show <output-id>\x1b[0m\n'); return; }
+      try {
+        const result = JSON.parse(__chat_archive_get(id) || '{}');
+        if (!result || result.ok === false || !result.record) {
+          out('\x1b[33m  ⚠ output not found\x1b[0m\n');
+          return;
+        }
+        const record = result.record;
+        out('\n\x1b[1m  ' + record.id + '\x1b[0m · ' + record.created_at +
+            ' · ' + record.kind + ' · ' + record.status);
+        out(String(record.content || (record.artifact ? JSON.stringify(record.artifact, null, 2) : '')) + '\n');
+      } catch (e) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); }
+      return;
+    }
+    if (op === 'search') {
+      const text = parts.slice(1).filter(function (p) { return p !== '--limit'; }).join(' ');
+      let result;
+      try { result = JSON.parse(__chat_archive_search(JSON.stringify({ text: text, limit: 50 })) || '{}'); }
+      catch (e) { result = null; }
+      if (!result || result.ok === false) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); return; }
+      printArchiveItems(Array.isArray(result.items) ? result.items : [], 'Search results for "' + clip1(text, 80) + '"');
+      return;
+    }
+    if (op === 'context') {
+      const task = parts.slice(1).join(' ');
+      if (!task) { out('\x1b[90m  Usage: /outputs context <task>\x1b[0m\n'); return; }
+      const context = archiveContext({ current_task: task, automatic: false });
+      if (context) out('\n' + context);
+      else out('\x1b[90m  No relevant archived output found.\x1b[0m\n');
+      return;
+    }
+    if (op === 'stats' || op === 'info') {
+      try {
+        const result = JSON.parse(__chat_archive_stats() || '{}');
+        const s = result && result.stats;
+        if (!s) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); return; }
+        out('\n\x1b[1m  Output archive\x1b[0m');
+        out('  ' + (s.index_entries || 0) + ' records · ' + (s.indexed_bytes || 0) + ' logical bytes · ' +
+            (s.payload_file_bytes || 0) + ' archive bytes');
+        out('  raw ' + (s.raw_records || 0) + ' · compressed ' + (s.compressed_records || 0) +
+            ' · encrypted ' + (s.encrypted_records || 0) + ' · corrupt ' + (s.corrupt_records || 0) +
+            ' · missing ' + (s.missing_records || 0));
+        out('');
+      } catch (e) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); }
+      return;
+    }
+    if (op === 'rebuild-index' || op === 'repair') {
+      try { out('\n  ' + JSON.stringify(JSON.parse(__chat_archive_rebuild() || '{}'), null, 2) + '\n'); }
+      catch (e) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); }
+      return;
+    }
+    if (op === 'prune') {
+      const apply = parts.indexOf('--apply') >= 0 || parts.indexOf('apply') >= 0;
+      try {
+        const result = JSON.parse(__chat_archive_prune(JSON.stringify({ dry_run: !apply })) || '{}');
+        out('\n  ' + JSON.stringify(result, null, 2) + '\n');
+      } catch (e) { out('\x1b[33m  ⚠ output archive unavailable\x1b[0m\n'); }
+      return;
+    }
+    out('\x1b[90m  Usage: /outputs [list|show <id>|search <text>|context <task>|stats|rebuild-index|prune [--apply]|on|off]\x1b[0m\n');
   }
 
   /* ── F2: /resume ──────────────────────────────────────────────────── */
@@ -2682,6 +3749,14 @@ const DRIVER: &str = r#"
       history.push({ role: 'user', content: t.prompt });
       history.push({ role: 'assistant', content: t.answer });
     }
+    /* Resume is an explicit recovery boundary. Attach only the bounded,
+     * same-session archive context selected by the native index; ordinary
+     * turns never perform this historical scan. */
+    const resumedArchive = archiveContext({
+      session_id: sessionId,
+      automatic: true,
+    });
+    if (resumedArchive) history.unshift({ role: 'system', content: resumedArchive });
     usedCtx = ctxMeter(); /* meter reflects the resumed history immediately */
     const short = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
     out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' +
@@ -2714,10 +3789,11 @@ const DRIVER: &str = r#"
         pathPart = rangeMatch[1];
         startLine = parseInt(rangeMatch[2], 10);
         endLine = parseInt(rangeMatch[3], 10);
+        /* P3-7: "0-5" parses to startLine=0 — slice(-1,5) would wrap and
+         * return the LAST line. Clamp to 1 (line numbers are 1-based). */
+        if (startLine < 1) startLine = 1;
+        if (endLine < startLine) endLine = startLine;
       }
-      /* Resolve against cwd. */
-      let resolved;
-      try { resolved = sofuu.fs ? null : null; } catch (e) {}
       /* Use the path as-is (sofuu.fs.readFile resolves relative to cwd). */
       let content = '';
       try {
@@ -2798,6 +3874,10 @@ const DRIVER: &str = r#"
     const parts = arg ? arg.split(/\s+/).filter(Boolean) : [];
     const path = parts[0] || (brainPath() + '.card.qtsq');
     const label = parts.slice(1).join(' ') || '';
+    /* P2-18: only append .json when the user's path doesn't already carry
+     * it — "/share card.qtsq" used to write "card.qtsq.json" (double
+     * suffix). */
+    const cardPath = /\.json$/i.test(path) ? path : path + '.json';
     try {
       const count = brain.count();
       if (count === 0) { out('\x1b[90m  Brain is empty — nothing to export\x1b[0m\n'); return; }
@@ -2813,12 +3893,12 @@ const DRIVER: &str = r#"
       const cardJson = JSON.stringify(card, null, 2);
       /* Write the card metadata JSON. */
       if (sofuu.fs && typeof sofuu.fs.writeFile === 'function') {
-        try { sofuu.fs.writeFile(path + '.json', cardJson); }
+        try { sofuu.fs.writeFile(cardPath, cardJson); }
         catch (e) { out('\x1b[33m  ⚠ Could not write card file: ' + String(e.message || e) + '\x1b[0m\n'); return; }
       }
-      out('\x1b[90m  ⏺ exported ' + count + ' memories → ' + path + '.json\x1b[0m');
+      out('\x1b[90m  ⏺ exported ' + count + ' memories → ' + cardPath + '\x1b[0m');
       out('\x1b[90m  Card metadata written. Brain file: ' + brainPath() + '\x1b[0m');
-      out('\x1b[90m  Share both files; import with /import ' + path + '.json\x1b[0m\n');
+      out('\x1b[90m  Share both files; import with /import ' + cardPath + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
   async function handleImport(arg) {
@@ -2864,7 +3944,7 @@ const DRIVER: &str = r#"
           (t.cache_write_tokens > 0 ? ' / ' + fmtTk(t.cache_write_tokens) + ' write' : '') + '\x1b[0m'
         : '';
       out('  \x1b[90m#' + t.turn + '\x1b[0m  ' + t.model +
-          '  \x1b[2m' + t.input_tokens + '→' + t.output_tokens + ' tk\x1b[0m' + cache +
+          '  \x1b[2min ' + fmtTk(t.input_tokens) + ' · out ' + fmtTk(t.output_tokens) + '\x1b[0m' + cache +
           '  \x1b[1m$' + t.cost_usd.toFixed(6) + '\x1b[0m');
     }
     out('\n  \x1b[1mSession total:\x1b[0m $' + breakdown.session_total.toFixed(6));
@@ -2940,8 +4020,21 @@ const DRIVER: &str = r#"
   async function runHookPre(text) {
     if (!hooks || typeof hooks.pre !== 'function') return text;
     try {
+      // Redacted cfg: hooks get everything EXCEPT secrets (api_key,
+      // providers[].api_key). A malicious hooks.js could otherwise exfil
+      // keys with one fetch — local file-write = key theft.
+      var safeCfg = {};
+      try {
+        safeCfg = JSON.parse(JSON.stringify(cfg || {}));
+        delete safeCfg.api_key;
+        if (Array.isArray(safeCfg.providers)) {
+          for (var hi = 0; hi < safeCfg.providers.length; hi++) {
+            if (safeCfg.providers[hi]) delete safeCfg.providers[hi].api_key;
+          }
+        }
+      } catch (eRedact) { safeCfg = {}; }
       const result = await Promise.race([
-        hooks.pre({ text: text, cfg: cfg }),
+        hooks.pre({ text: text, cfg: safeCfg }),
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
       ]);
       if (typeof result === 'string') return result;
@@ -2986,14 +4079,19 @@ const DRIVER: &str = r#"
    * or ''. It uses sofuu.ai.embedLocal (sync) + brain.recall. */
   let ghostLastPrefix = '';
   let ghostLastResult = '';
-  let ghostTimer = null;
+  let ghostBusyUntil = 0;
   globalThis.__chat_ghost_check = function(prefix) {
     if (!cfg.ghost || !cfg.brain) return '';
     if (prefix.length < 8) return '';
     /* Debounce: return cached result if prefix hasn't changed enough. */
     if (prefix === ghostLastPrefix) return ghostLastResult;
-    /* Only re-check if the last check was > 250ms ago. */
-    if (ghostTimer) return ghostLastResult;
+    /* Only re-check if the last check was > 250ms ago. (P3-3: this used to
+     * test a ghostTimer that was never assigned — the debounce was dead —
+     * so every keystroke > 8 chars re-embedded. The prefix-equality cache
+     * above still holds; this bounds the rest.) */
+    const now = Date.now();
+    if (now < ghostBusyUntil) return ghostLastResult;
+    ghostBusyUntil = now + 250;
     ghostLastPrefix = prefix;
     try {
       if (!sofuu.ai || typeof sofuu.ai.embedLocal !== 'function') return '';
@@ -3043,27 +4141,190 @@ const DRIVER: &str = r#"
   const COMPACT_KEEP_TURNS = 4;   /* verbatim turns kept by auto-compaction */
   let autoCompactArmed = true;    /* one shot per threshold crossing */
 
-  /* Capability lookup for the active model (native registry, rt/model_caps).
-   * Returns null for unknown models — callers apply their own fallback. */
+  /* Capability lookup for the active model (native registry, rt/model_caps,
+   * plus the discovered store). Second arg: the ENDPOINT this request will
+   * hit — when present, caps the endpoint itself published for this exact
+   * model override the name-keyed registry. Returns null for models nobody
+   * knows — callers apply their own fallback. */
   function modelCaps() {
     try {
       if (sofuu.ai && typeof sofuu.ai.modelCaps === 'function') {
-        const c = JSON.parse(sofuu.ai.modelCaps(cfg.model || ''));
+        const v = applyFailover(cfg);
+        const c = JSON.parse(sofuu.ai.modelCaps(v.model || '', v.base_url || undefined));
         return (c && c.known) ? c : null;
       }
     } catch (e) {}
     return null;
   }
+  /* Evidence-ladder resolve (same native the shipped chat.js uses):
+   * learned > endpoint-discovered > registry > conservative default. An
+   * INHERITED config number shrinks to the strictest real evidence (a
+   * stale global can never shadow the selected model's real window); an
+   * EXPLICIT one (`/ctx n` typed this session) is obeyed as typed, with
+   * the evidence reported as an advisory. Every budget consumer in this
+   * driver (footer meter, compaction, attachments, output cap, the agent
+   * def) routes through here. */
+  function resolveCaps() {
+    const c = applyFailover(cfg);
+    try {
+      if (sofuu.ai && typeof sofuu.ai.resolveCaps === 'function') {
+        const r = JSON.parse(sofuu.ai.resolveCaps(
+          c.model || '', c.base_url || '',
+          c.ctx_window > 0 ? c.ctx_window : 0,
+          c.max_output > 0 ? c.max_output : 0,
+          c.ctx_window_explicit === true));
+        if (r && r.window > 0) return r;
+      }
+    } catch (e) {}
+    /* Legacy ladder when the native is absent: config, capped by any
+     * caps evidence (registry/discovered), then the per-provider floor.
+     * An explicit value keeps the caller's number. */
+    const capsL = modelCaps() || {};
+    const explicit = c.ctx_window_explicit === true;
+    let win = c.ctx_window > 0 ? c.ctx_window
+      : (capsL.ctxWindow > 0 ? capsL.ctxWindow
+      : ({ openai: 128000, anthropic: 128000, local: 32768 }[c.provider] || 32768));
+    if (!explicit && capsL.ctxWindow > 0 && win > capsL.ctxWindow) win = capsL.ctxWindow;
+    let mx = c.max_output > 0 ? c.max_output
+      : (capsL.maxOutput > 0 ? capsL.maxOutput : 0);
+    if (capsL.maxOutput > 0 && mx > capsL.maxOutput) mx = capsL.maxOutput;
+    return { window: win, maxOutput: mx, known: !!(capsL.known), source: 'legacy',
+             clampedConfig: false, thinking: (capsL.thinking || 'unknown') };
+  }
+
+  /* ── Caps discovery (provider-agnostic) ─────────────────────────
+   * Same contract as shipped chat.js: the active endpoint's model listing
+   * carries its models' real limits; harvest it into the alloc gate's
+   * discovered store (keyed by API root + model in Rust — any provider,
+   * any field spelling). TTL-gated, best-effort, silent on failure. */
+  const DISCOVER_TTL_MS = 7 * 24 * 3600 * 1000;
+  /* P3 (AUDIT-2026-09-07): failed discovery harvests retry on this short
+   * clock instead of being cached for the full TTL. */
+  const DISCOVER_RETRY_MS = 10 * 60 * 1000;
+  let capsDiscoveredAt = 0;
+  function isLocalHost(u) {
+    return /^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/i.test(String(u || ''));
+  }
+  function modelsRootUrl(endpoint) {
+    let u = String(endpoint || '');
+    u = u.split('#')[0].split('?')[0];
+    while (/\/(chat\/completions|completions|messages)\/?$/.test(u)) {
+      u = u.replace(/\/(chat\/completions|completions|messages)\/?$/, '');
+    }
+    if (u.charAt(u.length - 1) === '/') u = u.slice(0, -1);
+    return u + '/models';
+  }
+  function discoverCaps() {
+    try {
+      if (!cfg.model || !cfg.base_url) return;
+      if (isLocalHost(cfg.base_url)) return;
+      if (Date.now() - capsDiscoveredAt < DISCOVER_TTL_MS) return;
+      /* P3 (AUDIT-2026-09-07): the full TTL used to be stamped BEFORE the
+       * harvest, so a fully failed run (network down, 401s) was cached for
+       * 7 days like a success. A short retry clock goes up front (still
+       * throttles re-entry while in flight — a dead endpoint is not
+       * hammered every turn); the full TTL lands only when ≥1 listing
+       * actually succeeded. */
+      capsDiscoveredAt = Date.now() - DISCOVER_TTL_MS + DISCOVER_RETRY_MS;
+      /* Harvest the ACTIVE endpoint AND every other configured provider
+       * with a distinct endpoint — cross-root fallback needs their
+       * listings to know the same model's real caps when the active
+       * endpoint publishes none. Provider-agnostic: whatever is
+       * configured, nothing hardcoded. */
+      const targets = [cfg.base_url];
+      if (Array.isArray(cfg.providers)) {
+        for (const pe of cfg.providers) {
+          if (pe && pe.endpoint && pe.endpoint !== cfg.base_url &&
+              targets.indexOf(pe.endpoint) < 0) {
+            targets.push(pe.endpoint);
+          }
+        }
+      }
+      const jobs = [];
+      for (let ti = 0; ti < targets.length; ti++) {
+        const endpoint = targets[ti];
+        let apiKey = ti === 0 ? cfg.api_key : '';
+        if (ti > 0 && Array.isArray(cfg.providers)) {
+          const pe = cfg.providers.filter(p => p && p.endpoint === endpoint)[0];
+          if (pe) apiKey = pe.api_key || '';
+        }
+        const headers = {};
+        if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+        jobs.push(
+          fetch(modelsRootUrl(endpoint), { headers: headers })
+            .then(res => (res && res.ok) ? res.json() : null)
+            .then(j => ({ endpoint: endpoint, listing: j }))
+            .catch(() => ({ endpoint: endpoint, listing: null }))
+        );
+      }
+      Promise.all(jobs).then(function (results) {
+        let anyOk = false;
+        for (const r of results) {
+          if (!r || !r.listing) continue;
+          anyOk = true;
+          if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
+            try { sofuu.ml.alloc.ingestListing(r.endpoint, JSON.stringify(r.listing)); } catch (eI) {}
+          }
+        }
+        if (anyOk) capsDiscoveredAt = Date.now();
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  /* ── F2: detect-on-select ──────────────────────────────────────────
+   * Force a harvest for the ACTIVE endpoint right after a model/provider
+   * switch and report the detected window in one line. Unlike
+   * discoverCaps() this ignores the TTL (the user just asked about this
+   * model) and never stays silent: either the endpoint published caps, or
+   * it did not, and both outcomes are worth saying. */
+  async function detectCapsNow() {
+    try {
+      const c = applyFailover(cfg);
+      if (!c.model || !c.base_url) return;
+      const local = isLocalHost(c.base_url);
+      const endpoint = c.base_url;
+      /* Show the API root, not the full chat/completions URL. */
+      let shown = String(endpoint).replace(/\/(chat\/completions|completions|messages)\/?$/, '');
+      if (shown.length > 72) shown = shown.slice(0, 69) + '…';
+      const headers = {};
+      if (c.api_key) headers['Authorization'] = 'Bearer ' + c.api_key;
+      let listing = null;
+      try {
+        const res = await fetch(modelsRootUrl(endpoint), { headers: headers });
+        if (res && res.ok) listing = await res.json();
+      } catch (eF) { listing = null; }
+      let ingested = 0;
+      if (listing && sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
+        try { ingested = sofuu.ml.alloc.ingestListing(endpoint, JSON.stringify(listing)) || 0; } catch (eI) { ingested = 0; }
+      }
+      /* Stamp the TTL so the per-turn harvest does not re-fetch what we
+       * just pulled (a failed pull keeps the short retry clock). */
+      capsDiscoveredAt = Date.now() - DISCOVER_TTL_MS + (ingested > 0 ? DISCOVER_TTL_MS : DISCOVER_RETRY_MS);
+      const r = resolveCaps();
+      const known = r && r.known;
+      if (!listing) {
+        if (local) {
+          out('\x1b[90m  local endpoint — no model list to read; context is detected from its first response (default ' + fmtTk(r.window) + ')\x1b[0m\n');
+        } else {
+          out('\x1b[33m  ⚠ could not read the model list from ' + shown + ' (auth, network, or no /models) — using ' + fmtTk(r.window) + ' context\x1b[0m\n');
+        }
+      } else if (ingested > 0 && known) {
+        out('\x1b[32m  ✓ detected ' + fmtTk(r.window) + ' context for ' + c.model + ' (' + (r.source || 'evidence') + ', ' + ingested + ' model' + (ingested === 1 ? '' : 's') + ')\x1b[0m\n');
+      } else if (ingested > 0) {
+        out('\x1b[33m  ⚠ ' + shown + ' lists ' + ingested + ' models but publishes no limits for ' + c.model + ' — using ' + fmtTk(r.window) + ' (set /ctx explicitly if you know better)\x1b[0m\n');
+      } else if (local) {
+        out('\x1b[90m  local endpoint — ' + shown + ' publishes no limits for ' + c.model + '; using ' + fmtTk(r.window) + ' until its first response teaches us\x1b[0m\n');
+      } else {
+        out('\x1b[33m  ⚠ ' + shown + ' publishes no limits for ' + c.model + ' — using ' + fmtTk(r.window) + ' (set /ctx explicitly if you know better)\x1b[0m\n');
+      }
+      refreshStatus('');
+    } catch (e) {}
+  }
 
   function ctxBudget() {
-    /* Dynamic: explicit /ctx override → model's published window →
-     * per-endpoint fallback map. Never a flat constant. */
-    const win = cfg.ctx_window > 0
-      ? cfg.ctx_window
-      : ((modelCaps() || {}).ctxWindow > 0
-        ? modelCaps().ctxWindow
-        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
-    return Math.floor(win * 0.85);
+    /* The ladder resolves the SELECTED model's real window (config can
+     * only shrink it); the budget is 85% of that. Never a flat constant. */
+    return Math.floor(resolveCaps().window * 0.85);
   }
   /* @file mention attachments scale with the same window (~25% of it). */
   function attachTokenBudget() {
@@ -3072,12 +4333,7 @@ const DRIVER: &str = r#"
      * ML is off. */
     const planA = attachPlanCache();
     if (planA && planA.attachBudgetTok > 0) return planA.attachBudgetTok;
-    const win = cfg.ctx_window > 0
-      ? cfg.ctx_window
-      : ((modelCaps() || {}).ctxWindow > 0
-        ? modelCaps().ctxWindow
-        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
-    return Math.min(65536, Math.max(2048, Math.floor(win * 0.25)));
+    return Math.min(65536, Math.max(2048, Math.floor(resolveCaps().window * 0.25)));
   }
   /* ── alloc gate (PLAN-ML-GATES §14): model-aware config allocation ──
    * Layer 2: a tiny net measures context pressure from this session's live
@@ -3111,6 +4367,10 @@ const DRIVER: &str = r#"
       }
       const p = JSON.parse(sofuu.ml.alloc.plan(JSON.stringify({
         model: cfg.model || '',
+        /* The endpoint the request will hit — caps it published for THIS
+         * exact model (discovered store) take precedence over the
+         * name-keyed registry inside Rust. */
+        baseUrl: cfg.base_url || '',
         cfgWindow: cfg.ctx_window > 0 ? cfg.ctx_window : 0,
         cfgMaxOutput: cfg.max_output > 0 ? cfg.max_output : 0,
         overheadTk: ctxOverhead >= 0 ? ctxOverhead : 0,
@@ -3147,9 +4407,48 @@ const DRIVER: &str = r#"
     }
     return Math.ceil(String(s).length / 4);
   }
+  /* ── Turn blocks (Claude-style retention, 2026-09-03 e) ────────────
+   * History is a list of TURN BLOCKS: one user message, then zero or more
+   * retained tool_calls/tool messages (the turn's transcript), then the
+   * assistant answer. Trimming/compaction moves whole blocks — an
+   * orphaned tool message (its assistant tool_calls pair dropped) is a
+   * hard 400 at OpenAI-compatible providers. */
+  function turnStartAt(i) {
+    let j = Math.max(0, Math.min(i, history.length - 1));
+    while (j > 0 && history[j].role !== 'user') j--;
+    return j;
+  }
+  function removeTurnBlock(i) {
+    const s = turnStartAt(i);
+    let e = s + 1;
+    while (e < history.length && history[e].role !== 'user') e++;
+    history.splice(s, e - s);
+  }
+  /* A turn the compaction gate may never delete on its own authority.
+   * LEXICAL and model-free on purpose: the user asked a question, gave an
+   * instruction, or recorded a decision/approval. Mirrors the shipped
+   * chat.js guard exactly — both drivers must enforce the same floor. */
+  const PROTECT_RE = /(\?|^\s*(please\s+)?(do\s+not|don't|never|always|must|make\s+sure|keep)\b)|(\b(approved|approve|accepted|rejected|decided|decision|agreed|sign\s*off)\b)/i;
+  function isProtectedBlock(hist, idx) {
+    const s = turnStartAt(idx);
+    if (s < 0 || s >= hist.length) return false;
+    let e = s + 1;
+    while (e < hist.length && hist[e].role !== 'user') e++;
+    for (let i = s; i < e; i++) {
+      const m = hist[i];
+      /* Only the USER's own words protect the turn. */
+      if (m && m.role === 'user' && PROTECT_RE.test(String(m.content || ''))) return true;
+    }
+    return false;
+  }
   function historyTokens() {
     let n = 0;
-    for (const m of history) n += estTok(String(m.content || ''));
+    for (const m of history) {
+      n += estTok(String(m.content || ''));
+      /* Retained transcripts bill their tool_calls JSON too — the provider
+       * counts the whole assistant message, not just its (null) content. */
+      if (m.tool_calls) { try { n += estTok(JSON.stringify(m.tool_calls)); } catch (eTC) {} }
+    }
     return n;
   }
   /* Summarize all but the last keepTurns turns into one system entry
@@ -3157,22 +4456,44 @@ const DRIVER: &str = r#"
    * there is nothing to fold or the summarizer failed/returned junk —
    * callers fall back to dropping, never block the turn. */
   async function summarizeHistory(keepTurns) {
-    const keepMsgs = Math.min(keepTurns * 2, history.length);
-    const oldCount = history.length - keepMsgs;
-    if (oldCount <= 0) return false;
+    /* Block-aware split point: index where the (keepTurns+1)-th-from-last
+     * turn block starts. Everything before it is folded — whole blocks,
+     * so a block's retained tool transcript never straddles the fold. */
+    let foldFrom = history.length;
+    let seen = 0;
+    for (let fi = history.length - 1; fi >= 0; fi--) {
+      if (history[fi].role === 'user') {
+        seen++;
+        if (seen > keepTurns) { foldFrom = fi; break; }
+      }
+    }
+    /* Nothing to fold only when EVERY block is kept (the scan never moved
+     * foldFrom) — foldFrom === 0 is the normal two-block case and must fold. */
+    if (foldFrom >= history.length) return false;
+    const oldCount = foldFrom;
     const summary = await complete([
       { role: 'system', content: 'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' },
       ...history.slice(0, oldCount)
     ]);
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
+    archiveWrite('summary', 'complete', 'compaction', summary, {
+      compacted_messages: oldCount,
+      kept_turns: keepTurns,
+    });
     history = [{ role: 'system', content: 'Prior conversation summary: ' + summary },
                ...history.slice(oldCount)];
     return true;
   }
   async function trimHistory() {
-    /* Hard safety net: the absolute entry cap. */
+    /* Hard safety net: the absolute entry cap — shed whole turn blocks from
+     * the front so retained tool transcripts are never orphaned. */
     if (history.length > MAX_HISTORY_ENTRIES) {
-      history.splice(0, history.length - MAX_HISTORY_ENTRIES);
+      let over = history.length - MAX_HISTORY_ENTRIES;
+      while (over > 0 && history.length > 0) {
+        const before0 = history.length;
+        removeTurnBlock(0);
+        over -= (before0 - history.length);
+      }
     }
     const budget = ctxBudget();
     /* alloc gate (§14): the compaction cliff moves with context pressure —
@@ -3226,29 +4547,57 @@ const DRIVER: &str = r#"
               const hi = segHist[compact[c]];
               if (hi !== undefined) flaggedFree.add(hi);
             }
-            /* Complete turns only (user+assistant both flagged), never
-             * the newest turn; oldest first, until usage drains below
-             * half the budget. */
-            const pairStarts = [];
-            for (let i = 0; i + 1 < history.length && i < history.length - 2; i++) {
-              if (history[i].role === 'user' && history[i + 1].role === 'assistant'
-                  && flaggedFree.has(i) && flaggedFree.has(i + 1)) {
-                pairStarts.push(i);
-                i++;
+            /* Complete turn BLOCKS only (user+assistant both flagged),
+             * never the newest block; oldest first, until usage drains
+             * below half. Removal is block-atomic — a flagged block's
+             * retained tool transcript leaves with it. */
+            const blockStarts = [];
+            for (let bi = 0; bi < history.length - 1; bi++) {
+              if (history[bi].role !== 'user') continue;
+              let bAns = -1;
+              for (let bj = bi + 1; bj < history.length; bj++) {
+                if (history[bj].role === 'user') break;
+                if (history[bj].role === 'assistant' && !history[bj].tool_calls) { bAns = bj; break; }
               }
+              if (bAns >= 0 && flaggedFree.has(bi) && flaggedFree.has(bAns)) blockStarts.push(bi);
             }
             let freed = 0, droppedTurns = 0;
-            for (let p = 0; p < pairStarts.length && historyTokens() > budget * 0.5; p++) {
-              const pi = pairStarts[p] - droppedTurns * 2;
-              freed += estTok(String(history[pi].content || ''))
-                     + estTok(String(history[pi + 1].content || ''));
-              history.splice(pi, 2);
+            /* blockObjs hold the block user-message OBJECTS — after each
+             * removal the array shifts, so re-locate by identity. */
+            const blockObjs = blockStarts.map(bx => history[bx]);
+            /* SAFETY CAP (2026-09-25): one pass may never gut the session.
+             * Without it the only stop condition is "usage below half the
+             * budget", which on a long history authorises deleting dozens
+             * of turns whenever the gate is wrong. A quarter of the
+             * complete blocks, never the two most recent. */
+            /* count complete turns (a user message + its answer) */
+            let completeBlocks = 0;
+            for (let cb = 0; cb < history.length - 1; cb++) {
+              if (history[cb].role === 'user') completeBlocks++;
+            }
+            const cap0 = Math.max(1, Math.floor(completeBlocks * 0.25));
+            const maxDrops = (completeBlocks - cap0 < 2)
+              ? Math.max(0, completeBlocks - 2) : cap0;
+            let skippedProtected = 0;
+            for (let b = 0; b < blockObjs.length && droppedTurns < maxDrops &&
+                   historyTokens() > budget * 0.5; b++) {
+              const blockIdx = history.indexOf(blockObjs[b]);
+              if (blockIdx < 0) continue; /* already removed */
+              /* Model-independent guard — the gate is the component under
+               * suspicion, so the last line of defence cannot be the gate. */
+              if (isProtectedBlock(history, blockIdx)) { skippedProtected++; continue; }
+              const beforeBlk = historyTokens();
+              removeTurnBlock(blockIdx);
+              freed += beforeBlk - historyTokens();
               droppedTurns++;
             }
             if (droppedTurns > 0) {
               out('\x1b[90m  ml-compaction freed ' + fmtTk(freed) + ' tk (' +
-                  droppedTurns + ' junk turn' + (droppedTurns === 1 ? '' : 's') +
-                  ': dup/boilerplate/re-fetchable)\x1b[0m');
+                  droppedTurns + ' of ' + completeBlocks + ' turn' +
+                  (completeBlocks === 1 ? '' : 's') +
+                  ': dup/boilerplate/re-fetchable' +
+                  (skippedProtected > 0 ? '; ' + skippedProtected + ' protected kept' : '') +
+                  ')\x1b[90m\x1b[0m');
             }
           }
         }
@@ -3274,11 +4623,15 @@ const DRIVER: &str = r#"
       } catch (e) { /* summarizer failed — the drop loop below still guards */ }
     }
     /* Drop-oldest guard: still over budget after compaction (or compaction
-     * failed)? Shed oldest pairs — always keep at least the last turn.
-     * With the new summarize-all policy this rarely fires. */
+     * failed)? Shed oldest whole turn blocks — never the newest block, and
+     * never an orphaned tool message (hard 400 at the provider). */
     let droppedTurns = 0;
-    while (history.length > 2 && historyTokens() > budget) {
-      history.splice(0, 2);
+    while (history.length > 0 && historyTokens() > budget) {
+      const lastStart = turnStartAt(history.length - 1);
+      if (lastStart === 0) break; /* only the newest block left */
+      const beforeDrop = historyTokens();
+      removeTurnBlock(0);
+      if (historyTokens() >= beforeDrop) break; /* safety: no progress */
       droppedTurns++;
     }
     if (droppedTurns > 0) {
@@ -3287,19 +4640,19 @@ const DRIVER: &str = r#"
     }
   }
   function streamOpts() {
-    const o = { messages: [], provider: cfg.provider, model: cfg.model };
-    if (cfg.effort) o.effort = cfg.effort;
-    if (cfg.api_key) o.api_key = cfg.api_key;
-    if (cfg.base_url) o.base_url = cfg.base_url;
-    if (cfg.profile) o.profile = cfg.profile;
-    if (cfg.max_output > 0) o.max_tokens = cfg.max_output;
-    else {
-      /* alloc gate (§14): explicit /maxout wins; otherwise the plan's
-       * feasibility-checked output reserve (never above the model's hard
-       * cap — resolved inside Rust). */
-      const planM = allocPlanChat(0, 0);
-      if (planM && planM.maxOutput > 0) o.max_tokens = planM.maxOutput;
-    }
+    const c = applyFailover(cfg);
+    const o = { messages: [], provider: c.provider, model: c.model };
+    if (c.effort) o.effort = c.effort;
+    if (c.api_key) o.api_key = c.api_key;
+    if (c.base_url) o.base_url = c.base_url;
+    if (c.profile) o.profile = c.profile;
+    /* Output cap from the ladder: config honored only as far as the
+     * strictest real evidence for THIS model allows. A number the ladder
+     * DEFAULTED (model unknown everywhere) is never sent — the endpoint
+     * applies its own default (Pass-31 rule). Layer 0 re-clamps on the
+     * wire — this keeps the driver consistent with it. */
+    const capR = resolveCaps();
+    if (capR.maxOutput > 0 && capR.maxSource !== 'default') o.max_tokens = capR.maxOutput;
     return o;
   }
   async function complete(messages, opts) {
@@ -3312,10 +4665,11 @@ const DRIVER: &str = r#"
   /* Known built-in providers. An unknown provider name is treated as
    * "custom" by the AI layer and needs a base URL. */
   const KNOWN = ['openai', 'anthropic', 'local'];
-  function usableConfig() {
-    if (!cfg.provider || !cfg.model) return false;
-    if (KNOWN.indexOf(cfg.provider) < 0 && !cfg.base_url) return false;
-    if (cfg.provider === 'local') return false; /* not shipped yet */
+  function usableConfig(view) {
+    const v = view || cfg;
+    if (!v.provider || !v.model) return false;
+    if (KNOWN.indexOf(v.provider) < 0 && !v.base_url) return false;
+    if (v.provider === 'local') return false; /* not shipped yet */
     return true;
   }
   /* Pretty tool-call rendering: show the interesting argument as a quoted
@@ -3391,12 +4745,26 @@ const DRIVER: &str = r#"
     if (TTY) { try { __chat_phase(''); } catch (e) {} }
   }
 
-  async function turn(text) {
-    /* Unusable config = never call the API: one clean line, nothing else. */
-    if (!usableConfig()) {
+  async function turn(text, ov, turnNo, attemptNo) {
+    failoverTo = ov || null;
+    archiveTurn = turnNo || archiveTurn;
+    archiveAttempt = attemptNo || archiveAttempt;
+    const recoveryForTurn = archivePendingRecovery;
+    archivePendingRecovery = '';
+    const c = applyFailover(cfg);
+    /* Unusable config = never call the API: one clean line, nothing else.
+     * Judged on the MERGED view so a failover target is usable even when
+     * the active config is not. */
+    if (!usableConfig(c)) {
+      failoverTo = null;
       out('\x1b[90m  No usable model configured — run /provider to set one up\x1b[0m\n');
       return;
     }
+    /* Caps discovery (TTL-gated, best-effort): the endpoint's model
+     * listing carries what its models really accept — harvest it into
+     * the alloc gate's discovered store. Silent on any failure; local
+     * endpoints skipped. */
+    discoverCaps();
     /* F9: load hooks.js lazily on first turn. */
     await ensureHooks();
     /* F9: pre-hook — may modify or skip the prompt. */
@@ -3468,7 +4836,10 @@ const DRIVER: &str = r#"
     const expanded = await expandMentions(text);
     const turnText = expanded.text;
     const manifest = expanded.manifest;
-    try { __chat_log('prompt', String(typed)); } catch (e) {}
+    if (promptLoggedTurn !== archiveTurn) {
+      promptLoggedTurn = archiveTurn;
+      try { __chat_log('prompt', String(typed)); } catch (e) {}
+    }
     /* The turn starts in Thinking, including while lazy MCP/agent setup runs. */
     CURRENT_PHASE = 'Thinking';
     startPhase();
@@ -3482,10 +4853,10 @@ const DRIVER: &str = r#"
     watchChangesPending.length = 0;
     /* Strict effort: the CLI follows EXACTLY what the user picked.
      * `off`/empty → no thinking on ANY endpoint (never auto-injects).
-     * The thinking block is only sent when cfg.effort is low/medium/high/max.
+     * The thinking block is only sent when c.effort is low/medium/high/max.
      * Models detected as thinking-incapable at runtime (no_think_models)
      * also never get an effort parameter. */
-    let noThink = (cfg.no_think_models || []).indexOf(cfg.model) >= 0;
+    let noThink = (c.no_think_models || []).indexOf(c.model) >= 0;
     const def = {
       name: 'chat',
       /* P1: the byte-stable shared core prompt. lastShared mesh notes no
@@ -3494,24 +4865,35 @@ const DRIVER: &str = r#"
       system: sofuu.agent.CORE_PROMPT,
       tools: chatToolDefs(),
       agents: subAgentNames.length ? subAgentNames : undefined,
-      provider: cfg.provider, model: cfg.model,
+      provider: c.provider, model: c.model,
       /* strict: only what the user selected, never more; off → undefined */
-      effort: noThink ? undefined : (cfg.effort && cfg.effort !== 'off' ? cfg.effort : undefined),
-      api_key: cfg.api_key || undefined,
-      base_url: cfg.base_url || undefined,
-      profile: cfg.profile || undefined,
-      max_tokens: cfg.max_output > 0 ? cfg.max_output : undefined,
-      embed_provider: cfg.embed_provider || undefined,
-      embed_model: cfg.embed_model || undefined,
-      memory: cfg.brain ? 'shared' : 'off',
+      effort: noThink ? undefined : (c.effort && c.effort !== 'off' ? c.effort : undefined),
+      api_key: c.api_key || undefined,
+      base_url: c.base_url || undefined,
+      profile: c.profile || undefined,
+      max_tokens: (function () { const r = resolveCaps(); return (r.maxOutput > 0 && r.maxSource !== 'default') ? r.maxOutput : undefined; })(),
+      embed_provider: c.embed_provider || undefined,
+      embed_model: c.embed_model || undefined,
+      /* Memory embedding backend (PLAN-TINY-SEMANTIC-EMBEDDER §7):
+       * ''/hash default; 'semantic' opts the brain into the 64-dim
+       * projector (agent.js resolves + enforces, SOFUU_MEMORY_BACKEND
+       * env also honored there). */
+      embedding: c.memory_backend || undefined,
+      memory: c.brain ? 'shared' : 'off',
+      /* Config "brain_path" override — an empty value falls through to
+       * agent.js's project-local <cwd>/.sofuu/brain/brain.qtsq default,
+       * so this only bites when a host deliberately points the brain
+       * elsewhere. The driver's /remember etc. share whatever this
+       * resolves to (sofuu.agent.brainFor). */
+      brainPath: c.brain_path || undefined,
       /* PLAN-ML-GATES: context-economy gates for this turn ('off' skips
        * every gate in agent.js; SOFUU_NO_ML=1 unregisters sofuu.ml too). */
-      ml: cfg.ml ? 'on' : 'off',
-      rlm: cfg.rlm === 'on' ? 'on' : (cfg.rlm === 'auto' ? 'auto' : 'off'),
-      ctx_window: cfg.ctx_window > 0 ? cfg.ctx_window : undefined,
+      ml: c.ml ? 'on' : 'off',
+      rlm: c.rlm === 'on' ? 'on' : (c.rlm === 'auto' ? 'auto' : 'off'),
+      ctx_window: (function () { const r = resolveCaps(); return r.window > 0 ? r.window : undefined; })(),
       /* P2: config-level recall gating knobs (0 = agent.js defaults). */
-      recallMin: cfg.recall_min > 0 ? cfg.recall_min : undefined,
-      recallBudget: cfg.recall_budget > 0 ? cfg.recall_budget : undefined,
+      recallMin: c.recall_min > 0 ? c.recall_min : undefined,
+      recallBudget: c.recall_budget > 0 ? c.recall_budget : undefined,
       /* Chat historically has no budgets beyond the step cap and the 200k
        * answer cap (both enforced inside agent.js). The step cap is
        * deliberately generous: real coding turns routinely need 10-30
@@ -3551,12 +4933,56 @@ const DRIVER: &str = r#"
      * the `finally` below, mirroring stopAnim(). One onStep renderer for
      * both paths (chat loop + direct @agent mention run). */
     let firstPromptTk = 0;  /* first LLM request's prompt = current context size */
+    /* ── Live context meter (real-time during a running turn) ─────────
+     * The footer's usedCtx used to freeze until the turn ENDED: the
+     * numbers only calibrated from the final result. Mid-turn the real
+     * signal exists though — EVERY 'llm' event carries that request's
+     * promptTokens (each tool round is bigger than the last), and the
+     * streaming deltas/tool results estimate the growth BETWEEN requests.
+     * liveReqTk = last real request size; liveGrownTk = estimated growth
+     * since that request (this turn's deltas + fresh tool results). The
+     * 2s metricsTimer paints refreshStatus, which folds them in. */
+    let liveReqTk = 0;       /* latest request's real promptTokens */
+    let liveGrownTk = 0;     /* estimated growth since that request */
+    let liveTurnTk = 0;      /* est. tokens of THIS turn's prompt text */
+    let lastLivePaint = 0;   /* throttle: painted footer at most 1/s */
+    liveCtxExtra = 0;        /* fresh turn: no mid-turn growth yet */
+    const paintLive = function () {
+      liveCtxExtra = liveGrownTk;
+      const now = Date.now();
+      if (now - lastLivePaint > 1000) { lastLivePaint = now; refreshStatus(''); }
+    };
     const onStep = function (e) {
           const p = (e.payload === undefined || e.payload === null) ? {} : e.payload;
           /* Meter capture: the first LLM request's prompt size. */
-          if (!firstPromptTk && e.kind === 'llm' && e.payload && e.payload.usage &&
-              e.payload.usage.promptTokens > 0) {
-            firstPromptTk = e.payload.usage.promptTokens;
+          if (!firstPromptTk && e.kind === 'llm' && p.usage &&
+              p.usage.promptTokens > 0) {
+            firstPromptTk = p.usage.promptTokens;
+          }
+          /* Live meter: each round's real request size replaces the
+           * estimate; growth since it starts from zero again. The first
+           * request also calibrates ctxOverhead EARLY (same formula as the
+           * turn-end calibration) so the +overhead part is real mid-turn. */
+          if (e.kind === 'llm' && p.usage && p.usage.promptTokens > 0) {
+            liveReqTk = e.payload.usage.promptTokens;
+            liveGrownTk = 0;
+            if (!liveTurnTk) liveTurnTk = estTok(text);
+            if (ctxOverhead < 0) {
+              const hNow = historyTokens();
+              ctxOverhead = Math.max(0, liveReqTk - hNow - liveTurnTk);
+            }
+            usedCtx = liveReqTk;
+            paintLive();
+          }
+          /* Between requests: the streamed answer + fresh tool results
+           * grow the context the NEXT request will carry. Estimate only —
+           * replaced by the real number on the next 'llm' event. */
+          if (e.kind === 'answer_delta') {
+            liveGrownTk += estTok(String(p));
+            paintLive();
+          } else if (e.kind === 'tool_result' && p && p.result !== undefined) {
+            liveGrownTk += estTok(String(p.result));
+            paintLive();
           }
           const ph = phaseForStep(e.kind, p);
           if (ph !== null && ph !== CURRENT_PHASE) {
@@ -3570,7 +4996,7 @@ const DRIVER: &str = r#"
              * still feeds the Thinking phase) but not painted into the
              * transcript, and sawThink stays false so no seal line is
              * emitted for a line that was never drawn. */
-            if (cfg.effort) {
+            if (c.effort) {
               sawThink = true;
               outLast('  ▸ thinking \x1b[2m' + thinks.join('') + '\x1b[0m');
             }
@@ -3627,6 +5053,19 @@ const DRIVER: &str = r#"
                           : 'fit ' + String(p.fit || '') + ' · ' + String(p.actions || '')) +
                 '\x1b[0m');
           } else if (e.kind === 'tool_result') {
+            /* Keep tool output sparse: normal results stay in the live
+             * transcript, while failures (or an explicitly marked result)
+             * become independently recoverable archive records. */
+            if (p && (p.error || p.archive === true)) {
+              const material = p.error || p.result;
+              if (material !== undefined && material !== null) {
+                archiveWrite('tool_result', p.error ? 'failed' : 'complete', 'tool', material, {
+                  tool_name: String(p.name || ''),
+                  error_code: p.error ? archiveErrorCode(p.error) : undefined,
+                  chars: p.chars || 0,
+                });
+              }
+            }
             if (TTY && p.result) {
               /* Compact one-row result: embedded newlines become " · " so
                * multi-line tool output (search results, file dumps) no
@@ -3640,20 +5079,55 @@ const DRIVER: &str = r#"
             rlmSummary = p;
           }
     };
+    let runError = null;
+    /* Re-apply every turn: covers the mode being set (or persisted from a
+     * previous session) after agent.js finished loading past boot. */
+    applyMode();
     try {
       res = agentMention
-        ? await sofuu.agent.run(agentMention.name, turnText, { signal: 'chat', onStep })
+        ? await sofuu.agent.run(agentMention.name, turnText, {
+            signal: 'chat', onStep, context: recoveryForTurn || undefined,
+          })
         : await sofuu.agent.run(def, turnText, {
             history: history, signal: 'chat', onStep,
             /* P1/P6: volatile context rides the ephemeral context message —
              * never inside the byte-stable system prompt. */
             shared: lastShared || '',
             watched: watchedNote || '',
+            context: recoveryForTurn || undefined,
           });
       answer = String((res && res.answer) || '(no response)');
+    } catch (e) {
+      runError = e;
     } finally {
       stopAnim();
       stopPhase(); /* turn end (G): hide the indicator, never leave it stale */
+      /* Turn over — the mid-turn growth estimate is superseded by the
+       * end-of-turn calibration below; zero it so ctxMeter()/refreshStatus
+       * paint the settled value, not estimate + old growth. */
+      liveCtxExtra = 0;
+    }
+    if (runError) {
+      const message = String((runError && runError.message) || runError);
+      const errorCode = archiveErrorCode(message);
+      const partialRef = acc.trim()
+        ? archiveWrite('partial', 'partial', 'assistant', acc, {
+            error_code: errorCode,
+            turn_complete: false,
+          }, { retry_of: archiveLastFailure && archiveLastFailure.errorId })
+        : null;
+      const related = partialRef ? [partialRef.id] : [];
+      const errorRef = archiveWrite('error', 'failed',
+        errorCode === 'runtime' ? 'runtime' : 'provider', message, {
+          error_code: errorCode,
+          turn_complete: false,
+        }, { related_output_ids: related, retry_of: archiveLastFailure && archiveLastFailure.errorId });
+      archiveLastFailure = {
+        errorId: errorRef && errorRef.id,
+        partialId: partialRef && partialRef.id,
+        errorCode: errorCode,
+      };
+      throw runError;
     }
     if (rlmSummary) {
       /* RLM turn: the answer arrived complete — print it plus the
@@ -3682,6 +5156,10 @@ const DRIVER: &str = r#"
         ? 'step budget' + (agentMention ? '' : ' (' + def.budget.maxSteps + ' rounds)')
         : (res.stopped === 'budget_wall' ? 'wall-clock budget' : 'token budget');
       out('\x1b[90m  ⏹ stopped: ' + why + ' reached\x1b[0m');
+    } else if (res && res.stopped) {
+      /* Unknown stop cause (future agent.js values): still say SOMETHING —
+       * a silent stop reads as a dead provider (P3-2). */
+      out('\x1b[90m  ⏹ stopped: ' + String(res.stopped) + '\x1b[0m');
     }
     if (agentMention && res) {
       /* @agent mention: compact run summary under the answer. */
@@ -3708,13 +5186,22 @@ const DRIVER: &str = r#"
       usedCtx = ctxTk;
       ctxOverhead = Math.max(0, ctxTk - histAtReq - turnTk);
     }
-    let tk = (ctxTk > 0 || outTk > 0) ? (ctxTk + '→' + outTk + ' tk') : '';
+    /* Chip names the two numbers (user request 2026-09-03 f): "in 30k ·
+     * out 800" — the bare "30k→800" made the sides ambiguous once the
+     * footer also shows ctx. Multi-round turns: the usage aggregate SUMS
+     * every round's prompt — it is the turn's total INPUT bill, not one
+     * request's context size (each tool round re-sends the whole context);
+     * the call count says so. */
+    const nCalls = ((res && res.usage && res.usage.llmCalls) || 0);
+    let tk = (ctxTk > 0 || outTk > 0)
+      ? ('in ' + fmtTk(ctxTk) + ' · out ' + fmtTk(outTk)) : '';
+    if (nCalls > 1) tk = tk + ' · ' + nCalls + ' calls';
     /* F6: report usage → compute cost + persist. Cache token slots (P6.4)
      * ride along so /cost can show prefix-cache hits when non-zero. */
     if (ctxTk > 0 || outTk > 0) {
       const cacheR = (res && res.usage && res.usage.cacheReadTokens) || 0;
       const cacheW = (res && res.usage && res.usage.cacheWriteTokens) || 0;
-      try { __chat_report_usage(cfg.model || '', ctxTk, outTk, cacheR, cacheW); } catch (e) {}
+      try { __chat_report_usage(c.model || '', ctxTk, outTk, cacheR, cacheW); } catch (e) {}
       /* Show running spend in the footer next to tk. */
       let cost;
       try { cost = JSON.parse(__chat_budget_check()); } catch (e) { cost = null; }
@@ -3726,15 +5213,37 @@ const DRIVER: &str = r#"
     refreshStatus(tk);
     /* Persist the answer to this session's .qtsq (the prompt was already
      * logged at the start of the turn) so a resumed session replays the
-     * full transcript. */
-    try { __chat_log('answer', String(answer)); } catch (e) {}
-    /* F3: history stores the manifest only (not full file text). */
-    const histText = manifest ? text + ' [' + manifest + ']' : text;
-    history.push({ role: 'user', content: histText }, { role: 'assistant', content: answer });
-    await trimHistory();
-    /* Meter: re-estimate for the NEXT request — grows with this turn's
-     * history, drops when compaction/drop-oldest just shrank it. */
+     * full transcript. A failed-salvage placeholder is NEVER persisted nor
+     * pushed into history (P2-14): a resumed session would replay
+     * "(no response)" as if it were the answer. */
+    const noResponse = answer === '(no response)' && res && res.stopped;
+    if (!noResponse) {
+      try { __chat_log('answer', String(answer)); } catch (e) {}
+      /* F3: history stores the manifest only (not full file text). */
+      const histText = manifest ? text + ' [' + manifest + ']' : text;
+      history.push({ role: 'user', content: histText });
+      /* Claude-style retention (2026-09-03 e): the turn's tool transcript
+       * (assistant tool_calls + tool results) persists into history between
+       * the prompt and the answer — the model keeps its tool context across
+       * turns; compaction sheds it, not a per-turn release. */
+      const turnTranscript = (res && Array.isArray(res.transcript)) ? res.transcript : null;
+      if (turnTranscript) {
+        for (const tm of turnTranscript) history.push(tm);
+      }
+      history.push({ role: 'assistant', content: answer });
+      await trimHistory();
+    }
+    /* Meter: re-estimate for the NEXT request. With transcripts retained
+     * (2026-09-03 e) the settled value stays close to the live one — it
+     * moves only when compaction/drop-oldest just shrank history. A big
+     * drop is compaction (its own ⚙ line explains it), so the settle note
+     * stays generic; fire only on a real unexplained shift. */
+    const liveShown = usedCtx + liveCtxExtra;
     usedCtx = ctxMeter();
+    if (TTY && liveShown > usedCtx * 1.2 && liveShown > 1000) {
+      out('\x1b[90m  · ctx meter settled ' + fmtTk(Math.round(liveShown)) + '→' +
+          fmtTk(usedCtx) + '\x1b[0m');
+    }
     /* M2: one full GC per completed turn — bounds JS garbage to a single
      * turn's worth instead of accumulating against the heap cap. */
     try { __chat_gc(); } catch (e) {}
@@ -3743,6 +5252,47 @@ const DRIVER: &str = r#"
     if (finalAnswer !== answer) {
       /* Update the last history entry if the post-hook changed the answer. */
       if (history.length >= 1) history[history.length - 1].content = finalAnswer;
+    }
+    /* Materialize the user-visible result after post-processing. A cancelled
+     * or budget-stopped run is partial evidence, never a successful final. */
+    const usage = (res && res.usage) || {};
+    const archiveMeta = {
+      prompt_tokens: usage.promptTokens || 0,
+      completion_tokens: usage.completionTokens || 0,
+      llm_calls: usage.llmCalls || 0,
+      tool_calls: usage.toolCalls || 0,
+      stopped: res && res.stopped ? String(res.stopped) : undefined,
+    };
+    const partialText = (acc && acc.trim()) ? acc :
+      ((finalAnswer && finalAnswer !== '(no response)' && finalAnswer !== '(cancelled)') ? finalAnswer : '');
+    if (res && res.stopped === 'cancelled') {
+      const partialRef = partialText
+        ? archiveWrite('partial', 'cancelled', 'assistant', partialText, archiveMeta,
+            { retry_of: archiveLastFailure && archiveLastFailure.errorId })
+        : null;
+      archiveWrite('error', 'cancelled', 'runtime', 'turn cancelled by user', {
+        error_code: 'cancelled',
+        stopped: 'cancelled',
+      }, { related_output_ids: partialRef ? [partialRef.id] : [] });
+    } else if (res && res.stopped) {
+      const errorCode = String(res.stopped) === 'budget_tokens' ? 'output_limit' : 'runtime';
+      const partialRef = partialText
+        ? archiveWrite('partial', 'partial', 'assistant', partialText,
+            Object.assign({}, archiveMeta, { error_code: errorCode }),
+            { retry_of: archiveLastFailure && archiveLastFailure.errorId })
+        : null;
+      archiveWrite('error', 'failed', 'runtime', 'turn stopped: ' + String(res.stopped), {
+        error_code: errorCode,
+        stopped: String(res.stopped),
+      }, { related_output_ids: partialRef ? [partialRef.id] : [] });
+    } else if (finalAnswer && finalAnswer !== '(no response)') {
+      archiveWrite('final', 'complete', 'assistant', finalAnswer, archiveMeta, {
+        retry_of: archiveLastFailure && archiveLastFailure.errorId,
+      });
+    } else {
+      archiveWrite('error', 'failed', 'runtime', 'model returned no response', {
+        error_code: 'empty_response',
+      }, { retry_of: archiveLastFailure && archiveLastFailure.errorId });
     }
   }
   // ── Provider setup wizard: /provider (no args) ──────────────────
@@ -3778,23 +5328,49 @@ const DRIVER: &str = r#"
       if (timer) clearTimeout(timer);
     }
   }
+  /* Stored endpoint → API root for the models listing. The base may be a
+   * bare host, a /v1 root, or the FULL completion URL — including corrupted
+   * forms like /v1/chat/completions/chat/completions (saved by old desktop
+   * builds). Collapse doubles, loop-strip every completion suffix, then
+   * drop a leftover /chat: the listing lives at the version root
+   * (…/v1/models — /chat/models is not a wire endpoint). stripV1 is for the
+   * local branch (ollama's /api/tags sits at the server ROOT). */
+  function wizardModelsRoot(base, stripV1) {
+    let u = String(base || '').trim();
+    u = u.split('#')[0].split('?')[0].replace(/\/+$/, '');
+    u = u.replace(/\/chat\/completions\/chat\/completions$/i, '/chat/completions');
+    let again = true;
+    while (again) {
+      again = false;
+      const sufs = ['/chat/completions', '/completions', '/messages', '/api/chat'];
+      for (const s of sufs) {
+        if (u.toLowerCase().endsWith(s)) { u = u.slice(0, u.length - s.length); again = true; }
+      }
+    }
+    while (u.charAt(u.length - 1) === '/') u = u.slice(0, -1);
+    if (stripV1) u = u.replace(/\/v1$/i, '');
+    else if (/\/chat$/i.test(u)) u = u.slice(0, -'/chat'.length);
+    return u;
+  }
   async function wizardFetchModels(prov, base, key) {
     try {
       if (prov === 'local') {
-        const r = await fetchWithTimeout((base || 'http://127.0.0.1:11434') + '/api/tags', {}, 4000);
-        const j = await r.json();
+        /* /api/tags lives at the server ROOT (P3-5: appending it to a
+         * completion endpoint 404'd every local fetch). */
+        const root = wizardModelsRoot(base || 'http://127.0.0.1:11434', true);
+        const r = await fetchWithTimeout(root + '/api/tags', {}, 4000);
+        const j = JSON.parse(await r.text());
         return (j.models || []).map(m => m.name);
       }
       if (prov === 'anthropic') return []; // no public model list
-      /* openai-compatible endpoint. The stored base_url is the FULL
-       * completion URL (e.g. https://host/v1/chat/completions) — the
-       * models list lives at the API ROOT + /models, so strip any
-       * trailing /chat/completions (or /completions) first. */
-      let root = (base || WIZARD_BUILTIN_BASE.openai).replace(/\/+$/, '');
-      root = root.replace(/\/chat\/completions$/, '').replace(/\/completions$/, '');
+      /* openai-compatible: listing at the API root + /models. */
+      const root = wizardModelsRoot(base || WIZARD_BUILTIN_BASE.openai, false);
       const h = key ? { Authorization: 'Bearer ' + key } : {};
       const r = await fetchWithTimeout(root + '/models', { headers: h }, 6000);
-      const j = await r.json();
+      /* text() + JSON.parse — Response.json() truncated some chunked
+       * bodies ("unexpected data at the end", e.g. lightning.ai's 53-model
+       * listing), so parse the full body ourselves. */
+      const j = JSON.parse(await r.text());
       return (j.data || []).map(m => m.id).filter(Boolean);
     } catch (e) {
       return []; // unreachable / no key → fall back to manual entry
@@ -3921,7 +5497,16 @@ const DRIVER: &str = r#"
     lastChip = tk;
     if (typeof __chat_status !== 'function') return;
     const dim = (s) => '\x1b[2m' + s + '\x1b[0m';
-    let s = 'sofuu ' + dim('·') + ' \x1b[35m' + (cfg.model || '(no model)') + '\x1b[0m';
+    let s = 'sofuu ' + dim('·') + ' \x1b[35m' + (cfg.model || '(no model)') + '\x1b[0m'
+      /* Mode chip rides the status row only when RESTRICTIVE (plan/edit):
+       * the default 'full' stays clean, but a gated turn must never be
+       * confused for an unguarded one — amber so it reads at a glance.
+       * Placed RIGHT AFTER the model: the footer truncates from the tail
+       * (≈47 cells on an 80-col pty once hints are subtracted), and the
+       * active restriction must survive where provider/effort may not. */
+      + (cfg.permissions && cfg.permissions !== 'full'
+        ? ' ' + dim('·') + ' \x1b[33m' + 'mode ' + cfg.permissions + '\x1b[0m'
+        : '');
     if (cfg.provider) {
       const prov = cfg.provider === 'custom'
         ? ((cfg.profile || 'openai') + '-compat')
@@ -3929,15 +5514,20 @@ const DRIVER: &str = r#"
       s += ' ' + dim('·') + ' ' + dim(prov);
     }
     if (cfg.effort) s += ' ' + dim('·') + ' ' + dim('effort ' + cfg.effort);
-    if (tk) s += ' ' + dim('·') + ' ' + dim(tk);
+    /* The per-turn usage chip ("in 96 · out 1 · $") goes to the METRIC row,
+     * not here: the status row shares its width with the hints column
+     * (W-gutter-1-hints ≈ 32 cells on an 80-col terminal) and the chip
+     * was silently truncated away there — "no token display" was really
+     * "no room". Row 2 has the space. */
+    const chip = tk || '';
     /* Footer row 1 right: dim hints. Row 2: left = context used,
-     * right = real-time RAM of the sofuu process. */
-    const win = cfg.ctx_window > 0
-      ? cfg.ctx_window
-      : ((modelCaps() || {}).ctxWindow > 0
-        ? modelCaps().ctxWindow
-        : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768));
-    const used = usedCtx;
+     * right = real-time RAM of the sofuu process. The window is the
+     * ladder-resolved one for the SELECTED model — the footer can't
+     * show a stale global number the model doesn't have. */
+    const win = resolveCaps().window;
+    /* Mid-turn: the meter shows the live estimate (last real request +
+     * growth since) so it climbs while the answer streams/tools run. */
+    const used = usedCtx > 0 ? usedCtx + liveCtxExtra : liveCtxExtra;
     const pct = used > 0 ? Math.round(used / win * 100) : 0;
     /* Percent only once it is meaningful (≥1%) — "ctx 0.2k/128k (0%)"
      * reads like a bug. Turns amber past 80% of the window. */
@@ -3949,8 +5539,10 @@ const DRIVER: &str = r#"
       ctxMet = 'ctx 0/' + fmtTk(win);
     }
     /* Brain state rides the ctx metric — the footer stays clean when the
-     * brain is off. */
+     * brain is off. The per-turn usage chip rides the SAME row (left of
+     * RAM): "ctx 2.4k/128k · brain · in 30k · out 800 · $0.0121". */
     if (cfg.brain) { ctxMet = ctxMet + dim(' · brain'); }
+    if (chip) { ctxMet = ctxMet + dim(' · ' + chip); }
     let ramMet = '';
     try {
       if (typeof __chat_rss === 'function') {
@@ -3972,7 +5564,7 @@ const DRIVER: &str = r#"
         }
       }
     } catch (e) {}
-    try { __chat_status(s, '/help · enter ⏎ · esc stop', ramMet, ctxMet); } catch (e) {}
+    try { __chat_status(s, '/help · ⏎ · esc · ctrl-k copy', ramMet, ctxMet); } catch (e) {}
   }
   // ── Interactive selector overlay (pickers for /model /provider /effort)
   // C routes keys + draws the overlay rows; ALL state lives here.
@@ -4107,6 +5699,11 @@ const DRIVER: &str = r#"
           wizardFetchModels(profile, p.endpoint, p.api_key || ''),
           new Promise(r => setTimeout(() => r(null), 6000)),
         ]);
+        if (Array.isArray(got) && got.length) {
+          /* Remember the live listing on the provider entry — an endpoint
+           * that is unreachable NEXT time still offers these models. */
+          try { __chat_models_cache(p.name, JSON.stringify(got)); } catch (e) {}
+        }
         return Array.isArray(got) ? got : [];
       } catch (e) { return []; }
     }));
@@ -4130,6 +5727,15 @@ const DRIVER: &str = r#"
         const id = p.name + '|' + m;
         if (seen[id]) continue; seen[id] = 1;
         items.push({ id: id, label: m, tab: p.name, note: '' });
+      }
+      /* Models remembered for this provider (every model the user set here
+       * + the last successful listing) — shown even when the live fetch
+       * came back empty, so an unreachable endpoint no longer hides them. */
+      const stored = Array.isArray(p.models) ? p.models : [];
+      for (const m of stored) {
+        const id = p.name + '|' + m;
+        if (seen[id]) continue; seen[id] = 1;
+        items.push({ id: id, label: m, tab: p.name, note: 'saved' });
       }
       /* The provider's stored default model, when not in the live list. */
       if (p.model && !seen[p.name + '|' + p.model]) {
@@ -4289,8 +5895,7 @@ const DRIVER: &str = r#"
   }
   async function pickCtx() {
     const mc = modelCaps();
-    const eff = (cfg.ctx_window > 0 ? cfg.ctx_window
-      : (mc && mc.ctxWindow > 0 ? mc.ctxWindow : ({ openai: 128000, anthropic: 128000, local: 32768 }[cfg.provider] || 32768)));
+    const eff = resolveCaps().window;
     const presets = [
       { id: '0', label: 'default', note: (mc ? 'model default (' + fmtTk(mc.ctxWindow) + ')' : 'provider default (' + fmtTk(eff) + ')') },
       { id: '32768', label: '32k', note: '32,768 tokens' },
@@ -4377,9 +5982,11 @@ const DRIVER: &str = r#"
      * turn) connects on demand. */
     refreshStatus('');
     /* Real-time metrics: refresh the footer (ctx used + RAM) every 2s so
-     * the numbers track the live process without waiting for input. */
+     * the numbers track the live process without waiting for input. The
+     * repaint carries lastChip — the per-turn usage chip ("in→out tk · $")
+     * must SURVIVE the timer, not vanish 2s after the turn ends. */
     const metricsTimer = setInterval(function() {
-      try { refreshStatus(''); } catch (e) {}
+      try { refreshStatus(lastChip); } catch (e) {}
     }, 2000);
     const stopMetrics = () => { try { clearInterval(metricsTimer); } catch (e) {} };
     globalThis.__metrics_stop = stopMetrics;
@@ -4452,9 +6059,28 @@ const DRIVER: &str = r#"
         try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
         /* Any command that can change settings re-renders the welcome panel
          * so the header (model/provider/effort) updates instantly. */
-        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync'];
+        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync', '/outputs', '/mode', '/plan', '/edit', '/full'];
         const changed = cfgCmds.some(c => t === c || t.indexOf(c + ' ') === 0);
-        if (changed) { try { __chat_refresh(); } catch (e) {} }
+        if (changed) {
+          /* A mode change must reach the engine runtime, not just the panel:
+           * applyMode() re-pushes cfg.permissions into sofuu.agent so the
+           * next turn is gated immediately, and refreshStatus re-renders
+           * the amber mode chip. */
+          applyMode();
+          refreshStatus(lastChip);
+          try { __chat_refresh(); } catch (e) {}
+        }
+        /* F2 detect-on-select: a model/provider switch is exactly when the
+         * user needs the NEW model's real window, and the 7-day discovery
+         * TTL usually has nothing cached for a root just selected. Force
+         * the harvest for the active endpoint and report what it found —
+         * a silent 32k for a 1M model (or vice versa) is the bug this
+         * removes. */
+        const reselect = t === '/model' || t.indexOf('/model ') === 0 ||
+                         t === '/provider' || t.indexOf('/provider ') === 0;
+        if (reselect && (r === 'ok' || r === 'pick_model' || r === 'pick_provider')) {
+          await detectCapsNow();
+        }
         if (r === 'pick_model') {
           if (TTY) await pickModel();
           else out('\x1b[90m  Usage: /model <name>  (the picker needs a TTY)\x1b[0m\n');
@@ -4479,7 +6105,15 @@ const DRIVER: &str = r#"
         } else if (r === 'pick_sync') {
           if (TTY) await pickSync();
           else out('\x1b[90m  Usage: /sync <on|off>  (current: ' + (cfg.sync ? 'on' : 'off') + ')\x1b[0m\n');
-        } else if (r === 'clear') { history = []; out('\x1b[90m  ✓ session cleared\x1b[0m\n'); }
+        } else if (r === 'clear') {
+          history = [];
+          /* /compact resets the meter (below) — /clear must too, or the
+           * footer shows stale tokens until the next turn re-syncs (P2-9).
+           * The calibration stays: the per-request overhead is a property
+           * of the provider, not of the (now empty) history. */
+          usedCtx = ctxMeter();
+          out('\x1b[90m  ✓ session cleared\x1b[0m\n');
+        }
         else if (r === 'compact') { await compact(); }
         else if (r === 'tools') { await connectMcpServers(); showTools(); }
         else if (r === 'agents') { await handleAgentsCmd(); }
@@ -4490,6 +6124,7 @@ const DRIVER: &str = r#"
         else if (r === 'share') { await handleShare(t.replace(/^\/share\s*/, '').trim()); }
         else if (r === 'import') { await handleImport(t.replace(/^\/import\s*/, '').trim()); }
         else if (r === 'cost') { handleCost(); }
+        else if (r === 'outputs') { handleOutputs(t.replace(/^\/outputs\s*/, '').trim()); }
         else if (r === 'watch') {
           var watchArg = t.replace(/^\/watch\s*/, '').trim();
           handleWatch(watchArg);
@@ -4498,6 +6133,14 @@ const DRIVER: &str = r#"
         // handle_slash — nothing more to show here.
         continue;
       }
+      /* One logical user turn may have several provider attempts. Keep one
+       * stable turn number, but give every retry its own archive attempt and
+       * allow at most one narrowly selected recovery lookup. */
+      archiveTurn++;
+      archiveAttempt = 1;
+      archivePendingRecovery = '';
+      archiveLastFailure = null;
+      archiveRecoveryUsed = false;
       /* A failed turn must never kill the chat: print the error and loop
        * back to the prompt. (Without this, an API/config exception rejects
        * the driver's main() promise and the CLI exits immediately.)
@@ -4506,21 +6149,89 @@ const DRIVER: &str = r#"
        * reasoning parameter for this model, remember it (persisted), tell
        * the user, and retry the turn once WITHOUT effort. */
       const THINK_ERR_RE = /thinking|reasoning_effort|extended.?thinking|reasoning/i;
+      /* Provider failover (P1): capacity/auth-class failures (429 / 5xx /
+       * rate-limit / 401/403 — a bad key is specific to that provider
+       * entry) fall through to the next configured provider; validation
+       * errors (400) stay fatal. One no-effort retry per model — the
+       * reasoning-parameter rejection is per-model, persisted via
+       * __chat_no_think. */
+      const CAPACITY_ERR_RE = /HTTP (40[13]|429|5\d\d)|rate.?limit|overloaded|temporarily|quota|invalid token|unauthorized|forbidden|api key/i;
+      const chain = failoverChain();
+      const noThinkTried = {};
+      let chainIdx = 0;
       let turnErr = null;
-      try {
-        await turn(t);
-      } catch (e) {
-        turnErr = e;
-        const msg = String((e && e.message) || e);
-        if (THINK_ERR_RE.test(msg) && cfg.effort && cfg.model &&
-            !(cfg.no_think_models || []).includes(cfg.model)) {
-          try { __chat_no_think(cfg.model); } catch (eNT) {}
-          out('\x1b[33m  ⓘ ' + cfg.model + ' rejected thinking (' + msg.slice(0, 160) +
-              ') — disabling effort for this model and retrying.\x1b[0m\n');
+      function prepareArchiveRecovery(message) {
+        if (!archiveLastFailure || archiveRecoveryUsed) return;
+        archiveRecoveryUsed = true;
+        const ids = [];
+        if (archiveLastFailure.errorId) ids.push(archiveLastFailure.errorId);
+        if (archiveLastFailure.partialId) ids.push(archiveLastFailure.partialId);
+        const recovered = archiveContext({
+          turn: archiveTurn,
+          attempt: archiveAttempt,
+          error_code: archiveLastFailure.errorCode || archiveErrorCode(message),
+          related_output_ids: ids,
+          current_task: t,
+          automatic: true,
+        });
+        if (recovered) archivePendingRecovery = recovered;
+      }
+      for (;;) {
+        const cur = chain[chainIdx];
+        const curModel = cur ? cur.model : cfg.model;
+        try {
+          await turn(t, cur, archiveTurn, archiveAttempt);
           turnErr = null;
-          try { await turn(t); } catch (e2) { turnErr = e2; }
+          break;
+        } catch (e) {
+          failoverTo = null;
+          turnErr = e;
+          const msg = String((e && e.message) || e);
+          /* Setup/MCP/hook failures can happen before the agent's run
+           * boundary. Preserve those too, while keeping the archive path
+           * non-fatal to the normal retry loop. */
+          if (!archiveLastFailure) {
+            const errorCode = archiveErrorCode(msg);
+            const errorRef = archiveWrite('error', 'failed',
+              errorCode === 'runtime' ? 'runtime' : 'provider', msg, {
+                error_code: errorCode,
+                turn_complete: false,
+              });
+            archiveLastFailure = { errorId: errorRef && errorRef.id, partialId: null, errorCode: errorCode };
+          }
+          if (THINK_ERR_RE.test(msg) && cfg.effort && curModel &&
+              !noThinkTried[curModel] &&
+              !(cfg.no_think_models || []).includes(curModel)) {
+            noThinkTried[curModel] = true;
+            try { __chat_no_think(curModel); } catch (eNT) {}
+            /* session-2 e2e catch: __chat_no_think only updates the Rust
+             * config — this JS mirror still showed an empty
+             * no_think_models, so the "no-effort retry" re-sent
+             * reasoning_effort and hit the same rejection (the retry was a
+             * no-op on the wire; every later turn repeated it too).
+             * Reload the mirror, exactly like the provider wizard does. */
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (eCFG) {}
+            out('\x1b[33m  ⓘ ' + curModel + ' rejected thinking (' + msg.slice(0, 160) +
+                ') — disabling effort for this model and retrying.\x1b[0m\n');
+            prepareArchiveRecovery(msg);
+            archiveAttempt++;
+            continue;
+          }
+          if (CAPACITY_ERR_RE.test(msg) && chainIdx + 1 < chain.length) {
+            chainIdx++;
+            const next = chain[chainIdx];
+            out('\x1b[33m  ⓘ ' + (chain[chainIdx - 1] ? chain[chainIdx - 1].name : cfg.provider) +
+                ' unavailable (' + msg.slice(0, 120) + ') — failing over to ' +
+                next.name + ' / ' + next.model + '\x1b[0m\n');
+            prepareArchiveRecovery(msg);
+            archiveAttempt++;
+            continue;
+          }
+          break;
         }
       }
+      failoverTo = null;
+      archiveLastFailure = null;
       if (turnErr) out('\x1b[31m  ✗ ' + String((turnErr && turnErr.message) || turnErr) + '\x1b[0m\n');
     }
     /* Brain flush happens per-store inside sofuu.agent.run (agent.js). */
@@ -4594,6 +6305,71 @@ pub fn run_chat(rt: &SofuuRuntime, initial: ChatConfig) -> i32 {
 mod tests {
     use super::*;
 
+    /// The embedded DRIVER is JavaScript, not Rust. Pasting a Rust
+    /// statement into it (`let mut x = …`) compiles fine here — the whole
+    /// driver is one `r#"…"#` string literal — and then fails at RUNTIME
+    /// with "SyntaxError: expecting ';'" in the middle of a chat turn,
+    /// which is a miserable way to find out. This keeps the obvious
+    /// Rust-only constructs out of the JS body.
+    #[test]
+    fn driver_js_contains_no_rust_isms() {
+        let start = DRIVER.find("r#\"").expect("driver literal") + 3;
+        let end = start + DRIVER[start..].find("\"#;").expect("driver terminator");
+        let js = &DRIVER[start..end];
+        for (i, line) in js.lines().enumerate() {
+            let t = line.trim_start();
+            assert!(
+                !t.starts_with("let mut "),
+                "driver line {}: Rust `let mut` inside the JS driver: {}",
+                i + 1,
+                t
+            );
+            assert!(
+                !t.starts_with("impl ") && !t.contains(" -> bool {") && !t.contains(" -> f32 {"),
+                "driver line {}: Rust signature inside the JS driver: {}",
+                i + 1,
+                t
+            );
+        }
+    }
+
+    /// The compaction guard must exist in BOTH drivers. They are separate
+    /// copies of the same logic, and a fix applied to only one ships as a
+    /// bug in whichever binary the user happens to run.
+    #[test]
+    fn compaction_guard_present_in_both_drivers() {
+        assert!(
+            DRIVER.contains("function isProtectedBlock"),
+            "chat.rs driver: protected-turn guard missing"
+        );
+        assert!(DRIVER.contains("maxDrops"), "chat.rs driver: per-pass cap missing");
+        let shipped = include_str!("../../../src/js/chat.js");
+        assert!(
+            shipped.contains("function isProtectedBlock"),
+            "chat.js: protected-turn guard missing"
+        );
+        assert!(shipped.contains("maxDrops"), "chat.js: per-pass cap missing");
+    }
+
+    /// The lexical floor is the last line of defence for the one
+    /// irreversible action in the chat, so the pattern itself is pinned:
+    /// loosening it would make a question or an approval deletable on the
+    /// model's word alone.
+    #[test]
+    fn protect_pattern_covers_the_documented_cases() {
+        let src = include_str!("../../../src/js/chat.js");
+        let at = src.find("PROTECT_RE = ").expect("protect pattern");
+        let line = &src[at..src[at..].find('\n').unwrap_or(0)];
+        for needed in ["do\\s+not", "never", "always", "must", "approved", "decided", "\\?"] {
+            assert!(
+                line.contains(needed),
+                "protect pattern lost {:?}: {}",
+                needed,
+                line
+            );
+        }
+    }
+
     #[test]
     fn defaults_are_unconfigured() {
         // "No default model" design rule: a fresh config names NO provider
@@ -4626,7 +6402,7 @@ mod tests {
         // Write the file directly (save() is a no-op in tests).
         std::fs::write(
             tmp.join("config.json"),
-            "{\n  \"provider\": \"openai\",\n  \"model\": \"gpt-4o\",\n  \"effort\": \"high\",\n  \"brain\": true,\n  \"ml\": false,\n  \"ctx_window\": 1000000,\n  \"max_output\": 384000\n}\n",
+            "{\n  \"provider\": \"openai\",\n  \"model\": \"gpt-4o\",\n  \"effort\": \"high\",\n  \"brain\": true,\n  \"ml\": false,\n  \"ctx_window\": 1000000,\n  \"max_output\": 384000,\n  \"permissions\": \"plan\"\n}\n",
         )
         .unwrap();
 
@@ -4638,6 +6414,20 @@ mod tests {
         assert!(!l.ml, "ml flag round-trips from config.json");
         assert_eq!(l.ctx_window, 1_000_000);
         assert_eq!(l.max_output, 384_000);
+        assert_eq!(l.permissions, "plan", "persisted permission mode loads");
+
+        // A typo in config.json must never mean "more access": unknown
+        // profiles fall back to the default, they never load.
+        std::fs::write(
+            tmp.join("config.json"),
+            "{\n  \"provider\": \"openai\",\n  \"permissions\": \"sudo\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ChatConfig::load().permissions,
+            "full",
+            "unknown persisted profile must not raise access"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -4688,6 +6478,19 @@ mod tests {
         assert_eq!(c.rlm, "auto", "bad /rlm arg must not change state");
         assert_eq!(handle_slash(&mut c, "/rlm off"), "ok");
         assert!(c.rlm.is_empty());
+        // Permission modes: /plan /edit /full shorthands; /mode <name> sets,
+        // bare /mode shows; a bad arg never changes access (fail closed).
+        assert_eq!(c.permissions, "full", "defaults to full access");
+        assert_eq!(handle_slash(&mut c, "/plan"), "ok");
+        assert_eq!(c.permissions, "plan");
+        assert_eq!(handle_slash(&mut c, "/mode edit"), "ok");
+        assert_eq!(c.permissions, "edit");
+        assert_eq!(handle_slash(&mut c, "/mode"), "ok", "bare /mode just shows");
+        assert_eq!(c.permissions, "edit", "bare /mode must not change the mode");
+        assert_eq!(handle_slash(&mut c, "/mode sudo"), "ok");
+        assert_eq!(c.permissions, "edit", "unknown mode must not change access");
+        assert_eq!(handle_slash(&mut c, "/full"), "ok");
+        assert_eq!(c.permissions, "full");
         // /ctx: bare opens panel; set, clamp, reset to default.
         assert_eq!(handle_slash(&mut c, "/ctx"), "pick_ctx");
         assert_eq!(handle_slash(&mut c, "/ctx 1000000"), "ok");
@@ -4798,10 +6601,32 @@ mod tests {
         assert_eq!(clamp_max_output(999_999_999), 384_000);
     }
 
+    /// The Memory row must never claim a persistence the binary cannot
+    /// deliver: a QTSQ-free build no-ops every brain write (and that is
+    /// exactly what shipped in the 2026-09-22 macOS tarball while the
+    /// banner still read "persists across sessions").
+    #[test]
+    fn memory_row_never_lies_about_persistence() {
+        let mut cfg = ChatConfig { brain: true, ..Default::default() };
+        let rows = welcome_panel_at(&cfg, "s-ab12", "/tmp/work", 120);
+        let line = rows
+            .iter()
+            .find(|r| r.contains("Memory:"))
+            .unwrap_or_else(|| panic!("no Memory row in {:?}", rows));
+        if sofuu_ffi::qtsq_linked() {
+            assert!(line.contains("persists across sessions"), "{line}");
+        } else {
+            assert!(!line.contains("persists across sessions"), "{line}");
+            assert!(line.contains("NOT persisting"), "{line}");
+        }
+        cfg.brain = false;
+        let rows = welcome_panel_at(&cfg, "s-ab12", "/tmp/work", 120);
+        let line = rows.iter().find(|r| r.contains("Memory:")).unwrap();
+        assert!(line.contains("off"), "{line}");
+    }
+
     #[test]
     fn welcome_panel_layout() {
-        // Explicit fixture values (layout test data — no provider is the
-        // default anywhere; these are just strings).
         let cfg = ChatConfig {
             provider: "test-prov".into(),
             model: "tm-1".into(),
@@ -4871,6 +6696,39 @@ mod tests {
             let expect = w.clamp(40, 400);
             for r in rows.iter().filter(|r| r.contains('│') || r.contains('╭')) {
                 assert_eq!(cell_w(r), expect, "width {} row: {:?}", w, r);
+            }
+        }
+    }
+
+    #[test]
+    fn welcome_panel_rows_survive_tui_wrap() {
+        // js_chat_welcome logs each panel row at term − GUTTER − 1 and
+        // tui_push_split soft-wraps stored rows to term − GUTTER — a stored
+        // row wider than that budget is torn apart (the right │ lands on
+        // its own line; the broken welcome rectangle of 2026-09-09). Every
+        // box row must therefore pass through wrap_row byte-identical at
+        // every reachable terminal width (tui_size floors at 40); free
+        // tail text may soft-wrap and is exempt.
+        use sofuu_core::rt::tui::{wrap_row, GUTTER};
+        let cfg = ChatConfig {
+            provider: "test-prov".into(),
+            model: "tm-1".into(),
+            ..Default::default()
+        };
+        for term in [40usize, 44, 57, 80, 120, 157, 241] {
+            let budget = term - GUTTER;
+            let rows = welcome_panel_at(&cfg, "s-ab12", "/tmp/work", budget - 1);
+            let is_box = |r: &String| r.contains('│') || r.contains('╭') || r.contains('╰');
+            let widths: Vec<usize> = rows.iter().filter(|r| is_box(r)).map(|r| cell_w(r)).collect();
+            assert!(!widths.is_empty(), "term {term}: no box rows");
+            assert!(
+                widths.iter().all(|&x| x == widths[0]),
+                "term {term}: box rows disagree on width: {widths:?}"
+            );
+            for r in rows.iter().filter(|r| is_box(r)) {
+                let wrapped = wrap_row(r, budget);
+                assert_eq!(wrapped.len(), 1, "term {term}: box row torn: {r:?}");
+                assert_eq!(wrapped[0], *r, "term {term}: box row mutated");
             }
         }
     }

@@ -5,7 +5,11 @@
 # Produces: dist/libcurl-<target>/lib/libcurl.a
 #
 # This avoids needing a system libcurl on the cross-target.
-# Only includes: HTTP/HTTPS + TLS (system ssl is mbedTLS — no OpenSSL dep).
+# P1-16 (AUDIT-2026-09-07): ALL TLS backends are DISABLED here (no OpenSSL/
+# mbedTLS cross-deps) — this curl does HTTP only: `http://` works,
+# `https://` does NOT through this layer (proxy that terminates TLS, or wire
+# an mbedTLS/OpenSSL backend below, to get https). Documented in
+# cli/README.md "Networking"; the earlier "HTTP/HTTPS + TLS" claim was false.
 #
 # Usage:
 #   bash scripts/cross/build_libcurl_static.sh x86_64-linux-musl
@@ -21,6 +25,11 @@ DIST="$REPO_ROOT/dist"
 CURL_VER="8.6.0"
 CURL_TARBALL="curl-${CURL_VER}.tar.gz"
 CURL_URL="https://curl.se/download/${CURL_TARBALL}"
+# P2-24 (AUDIT-2026-09-01): pin the tarball — an unverified download is a
+# supply-chain hole (zlib was already hash-checked in build_qtsq_cross.sh;
+# curl wasn't). Hash verified against the curl.se PGP signature
+# (27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2, Daniel Stenberg).
+CURL_SHA256="9c6db808160015f30f3c656c0dec125feb9dc00753596bf858a272b5dd8dc398"
 CURL_SRC="/tmp/curl-${CURL_VER}"
 CURL_INSTALL="$DIST/libcurl-${TARGET}"
 
@@ -43,9 +52,26 @@ if [ ! -x "$ZIG" ]; then
 fi
 
 echo "→ Downloading curl ${CURL_VER}..."
-if [ ! -d "$CURL_SRC" ]; then
+if [ ! -f "/tmp/${CURL_TARBALL}" ]; then
     curl -fsSL "$CURL_URL" -o "/tmp/${CURL_TARBALL}"
+fi
+# Verify before extracting — cached or fresh, the hash must match the pin.
+GOT_SHA="$(shasum -a 256 "/tmp/${CURL_TARBALL}" | cut -d' ' -f1)"
+if [ "$GOT_SHA" != "$CURL_SHA256" ]; then
+    echo "✗ curl tarball checksum mismatch:"
+    echo "    expected $CURL_SHA256"
+    echo "    got      $GOT_SHA"
+    echo "  Refusing to build from an unverified download."
+    exit 1
+fi
+# P1-17 companion: reuse the extracted tree only when it provably came from
+# the verified tarball (marker names the hash); a stale or tampered /tmp
+# tree is wiped and re-extracted.
+CURL_MARK="${CURL_SRC}/.verified-sha"
+if [ ! -d "$CURL_SRC" ] || [ ! -f "$CURL_MARK" ] || [ "$(cat "$CURL_MARK")" != "$CURL_SHA256" ]; then
+    rm -rf "$CURL_SRC"
     tar -xf "/tmp/${CURL_TARBALL}" -C /tmp
+    printf '%s\n' "$CURL_SHA256" > "$CURL_MARK"
 fi
 
 echo "→ Configuring curl for ${TARGET}..."

@@ -1,7 +1,9 @@
-// examples/agent_test.js — self-contained E2E battery for sofuu.agent
+// tests/agent_test.js — self-contained E2E battery for sofuu.agent
 // (PLAN-AGENTS A1–A5, A8, A9) + the web tools, over a scripted
 // OpenAI-compatible mock provider (sofuu.createServer) and REAL MCP
 // child servers (examples/mcp_echo_server.js).
+// (P2-28, AUDIT-2026-09-01: examples/agent_test.js was an older 46-check
+// fork of this file — the fork is deleted; tests/ holds the real battery.)
 //
 // No network, no API keys. Covers:
 //   A1  single agent + inline tool, result tree/usage/trace fields
@@ -10,6 +12,9 @@
 //   A2  depth cap: child at maxDepth gets NO delegate tool (structurally)
 //   A2  cycle guard: A→B→A surfaces a tool error, not a hang
 //   A2  runMany concurrency cap (max in-flight ≤ configured)
+//   DEL delegation awareness: when-hints in the delegate spec, one-shot
+//       [delegation] nudge, map_context as a model tool (caps + cycle),
+//       parallel fan-out for delegate-only rounds
 //   A3  memory scopes shared/agent/off on one brain file (needs QTSQ;
 //       auto-skips when sofuu.memory is unavailable)
 //   A4  RLM fallback trace when sofuu.rlm fails; mapContext needle hunt;
@@ -24,8 +29,8 @@
 //       input_json_delta fragments, usage input/output token mapping)
 //   web built-in web_search tool end-to-end (via SOFUU_WEB_ENDPOINT mock)
 //
-// Run:  ./sofuu run examples/agent_test.js
-// Verbose:  AGENT_TEST_VERBOSE=1 ./sofuu run examples/agent_test.js
+// Run:  ./sofuu run tests/agent_test.js
+// Verbose:  AGENT_TEST_VERBOSE=1 ./sofuu run tests/agent_test.js
 
 let failures = 0;
 let skips = 0;
@@ -50,6 +55,14 @@ let RLM_SYS = "";         // last RLM-driver system prompt (tool docs probe)
 let LAST_OPENAI_RAW = ""; // P6: openai bodies must stay cache_control-free
 let PARTIAL429_HITS = 0;  // retry-policy probes (A5): request counts
 let EARLY429_HITS = 0;
+/* PLAN-DELEGATE-AWARENESS probes (Moves 1–4) */
+let HINT_TOOLS = null;    // toolset captured from the hintorch request
+let DELGATE_SEES = 0;     // requests that saw the [delegation] notice
+let DELEARLY_SEES = 0;    // same, negative-control run (must stay 0)
+let MCW_HITS = 0;         // mcworker requests (chunk fan-out + reduce)
+let FAN_MSGS = null;      // final fanorch messages (transcript-order probe)
+let MD_PROBE = null;      // AGENTS.md block captured from the mdprobe request
+const MC_CTX = ("MC-PIECE filler text for chunking. ").repeat(260);
 
 function sysOf(msgs) {
   for (let i = 0; i < msgs.length; i++) {
@@ -140,20 +153,71 @@ function decide(body) {
     if (!body.tools || !body.tools.length) return { text: "loopy-salvage-summary" };
     return { tool: { name: "get_weather", args: { city: "X" } } };
   }
+  /* Task-gate scenarios (owner 2026-09-08): long work must produce a
+   * checklist. The mock never calls todo_write in "todogate" — the loop
+   * must inject the [task-gate] notice once past TODO_GATE_STEPS; in
+   * "todoplan" the model plans first and the gate must stay silent. */
+  if (sys.indexOf("AGENT=todogate") >= 0) {
+    if (txt.indexOf("[task-gate]") >= 0) return { text: "todogate-final[nudged]" };
+    return { tool: { name: "list_dir", args: { path: "." } } };
+  }
+  if (sys.indexOf("AGENT=todoplan") >= 0) {
+    if (txt.indexOf("[task-gate]") >= 0) return { text: "todoplan-final[NUDGED-BUG]" };
+    if (tc === 0) return { tool: { name: "todo_write", args: { todos: [
+      { content: "step one", status: "doing" }, { content: "step two", status: "todo" } ] } } };
+    if (tc < 9) return { tool: { name: "list_dir", args: { path: "." } } };
+    return { text: "todoplan-final[clean]" };
+  }
+  /* Permission-profile scenarios (owner 2026-09-08): call write_file →
+   * bash → read_file in sequence. All three are INLINE so the profile gate
+   * is the only decider (duplicate built-in names never resolve). The final
+   * answer encodes each slot: E = executed, B = blocked by policy. */
+  if (sys.indexOf("AGENT=perm") >= 0) {
+    const tm = msgs.filter(m => m.role === "tool").map(m => String(m.content || ""));
+    if (tc === 0) return { tool: { name: "write_file", args: {} } };
+    if (tc === 1) return { tool: { name: "bash", args: {} } };
+    if (tc === 2) return { tool: { name: "read_file", args: {} } };
+    return { text: "perm-final[" + tm.map(t =>
+      t.indexOf("Blocked by permissions policy") >= 0 ? "B" :
+      t.indexOf("GATE-EXEC") >= 0 ? "E" : "?").join("") + "]" };
+  }
   /* Retry-policy probes (A5): raw SSE frame sequences that don't fit the
    * {text}/{tool} verdict shape — the handler writes d.frames verbatim. */
   if (sys.indexOf("AGENT=partial429") >= 0) {
     PARTIAL429_HITS++;
-    return { frames: [
-      { choices: [{ delta: { content: "partial-text" } }] },
-      { error: { message: "upstream died mid-stream", code: 429 } },
-    ] };
+    if (PARTIAL429_HITS % 2 === 1) {
+      /* Odd hit = the fresh attempt: partial text then the transport
+       * dies mid-stream (in-stream 429 error frame). */
+      return { frames: [
+        { choices: [{ delta: { content: "partial-text" } }] },
+        { error: { message: "upstream died mid-stream", code: 429 } },
+      ] };
+    }
+    /* Even hit = the mid-stream CONTINUATION request (the partial is in
+     * the messages as an assistant turn): finish the answer. */
+    return { text: "-continued-clean" };
   }
   if (sys.indexOf("AGENT=early429") >= 0) {
     EARLY429_HITS++;
     return { frames: [
       { error: { message: "upstream died before tokens", code: 429 } },
     ] };
+  }
+  /* P1-14 (AUDIT-2026-09-07): hostile provider index — a provider-supplied
+   * "index":"__proto__" must not drop the call or pollute Object.prototype.
+   * Needs the raw-frames path: the {tool} verdict shape always uses numeric
+   * index 0. The two calls ride ONE stream; the final answer encodes whether
+   * each tool actually ran. */
+  if (sys.indexOf("AGENT=proto") >= 0) {
+    if (tc === 0) return { frames: [
+      { choices: [{ delta: { tool_calls: [
+        { index: "__proto__", id: "call_evil", function: { name: "evil_probe", arguments: "{\"city\":\"Evil\"}" } },
+        { index: 0, id: "call_good", function: { name: "get_weather", arguments: "{\"city\":\"Good\"}" } },
+      ] } }] },
+    ] };
+    return { text: "proto-final[" +
+      (txt.indexOf("EVILRES-1") >= 0 ? "evil-ran" : "evil-dropped") +
+      (txt.indexOf("TOOLRES-9f3") >= 0 ? "+good-ran" : "-good-miss") + "]" };
   }
   if (sys.indexOf("AGENT=tooly") >= 0) {
     if (tc === 0) return { tool: { name: "slow_tool", args: {} } };
@@ -263,6 +327,89 @@ function decide(body) {
     /* delayed response — drives the concurrency probe */
     return { text: "slow-done", delay: 350 };
   }
+  /* ── AGENTS.md project context (2026-09-12) ───────────────────────── */
+  if (sys.indexOf("AGENT=mdprobe") >= 0) {
+    /* Report whether the AGENTS.md block rode the ephemeral context message. */
+    MD_PROBE = allText(msgs);
+    return { text: "mdprobe-final" };
+  }
+  if (sys.indexOf("AGENT=mdtool") >= 0) {
+    if (tc === 0) return { tool: { name: "remember", args: { fact: "tests use pytest" } } };
+    return { text: "mdtool-final[pinned]" };
+  }
+
+  /* ── Delegation awareness (PLAN-DELEGATE-AWARENESS Moves 1–4) ────── */
+  if (sys.indexOf("AGENT=hintorch") >= 0) {
+    /* Move 1+3 probe: capture the toolset so the battery can assert the
+     * delegate description carries the when-hint and map_context exists. */
+    HINT_TOOLS = body.tools || [];
+    return { text: "hintorch-final" };
+  }
+  if (sys.indexOf("AGENT=delgate") >= 0) {
+    /* Move 2: silent tool rounds — the [delegation] notice must arrive
+     * exactly once and carry the specialist's when-hint. */
+    if (txt.indexOf("[delegation]") >= 0) {
+      DELGATE_SEES++;
+      return { text: "delgate-final[nudged" + (txt.indexOf("hintspec — ") >= 0 ? "+hint" : "-nohint") + "]" };
+    }
+    if (tc < 9) return { tool: { name: "list_dir", args: { path: "." } } };
+    return { text: "delgate-final[NO-NUDGE-BUG]" };
+  }
+  if (sys.indexOf("AGENT=delearly") >= 0) {
+    /* Move 2 negative control: delegate on step 1, then run long — the
+     * latch must keep the notice away forever. */
+    if (txt.indexOf("[delegation]") >= 0) DELEARLY_SEES++;
+    if (tc === 0) return { tool: { name: "delegate", args: { agent: "researcher", task: "early hop", why: "latch the nudge" } } };
+    if (tc < 10) return { tool: { name: "list_dir", args: { path: "." } } };
+    return { text: "delearly-final[clean]" };
+  }
+  if (sys.indexOf("AGENT=mcworker") >= 0) {
+    /* Move 3 workers echo a marker; the reduce call (its input carries the
+     * chunk answers) merges them. */
+    MCW_HITS++;
+    if (txt.indexOf("MC-CHUNK-ANSWER") >= 0) return { text: "mcw-merged" };
+    return { text: "MC-CHUNK-ANSWER" };
+  }
+  if (sys.indexOf("AGENT=mcorch") >= 0) {
+    if (tc === 0) return { tool: { name: "map_context", args: {
+      context: MC_CTX, task: "collect the markers", agent: "mcworker", chunk_chars: 4000 } } };
+    return { text: "mcorch-final[" + (txt.indexOf("mcw-merged") >= 0 ? "merged" : "nomerge") +
+      (txt.indexOf("[map_context · ") >= 0 ? "+meta" : "-nometa") + "]" };
+  }
+  if (sys.indexOf("AGENT=mcerr") >= 0) {
+    /* Move 3 cap: ~29k chars at 2000/chunk ≫ 12 chunks → tool error. */
+    if (tc === 0) return { tool: { name: "map_context", args: {
+      context: ("chunk filler sentence with varied words. ").repeat(790), task: "too fine",
+      agent: "mcworker", chunk_chars: 2000 } } };
+    return { text: "mcerr-final[" + (txt.indexOf("Raise chunk_chars") >= 0 ? "capped" : "uncapped") + "]" };
+  }
+  if (sys.indexOf("AGENT=mcyA") >= 0) {
+    if (tc === 0) return { tool: { name: "map_context", args: { context: "hop one", task: "go deeper", agent: "mcyB" } } };
+    return { text: "mcyA-final[" + (txt.indexOf("saw-cycle") >= 0 ? "saw-cycle" : "no-cycle") + "]" };
+  }
+  if (sys.indexOf("AGENT=mcyB") >= 0) {
+    /* Deliberately non-conforming: the enum only offers mcsolo (the spec
+     * strips in-chain names), yet the call names mcyA — the chain guard,
+     * not the enum, is what must stop it. Keyed on the broad "cycle"
+     * because the reduce run (a fresh mcyB run, tc reset) converges here
+     * too after its own guarded call. */
+    if (tc === 0) return { tool: { name: "map_context", args: { context: "hop two", task: "back", agent: "mcyA" } } };
+    return { text: "mcyB-final[" + (txt.indexOf("cycle") >= 0 ? "saw-cycle" : "no-cycle") + "]" };
+  }
+  if (sys.indexOf("AGENT=fanorch") >= 0) {
+    /* Move 4: TWO delegate calls in ONE round (raw frames — the {tool}
+     * verdict shape carries a single call). */
+    if (tc === 0) return { frames: [
+      { choices: [{ delta: { tool_calls: [
+        { index: 0, id: "call_fanl", function: { name: "delegate", arguments: JSON.stringify({ agent: "fanl", task: "left wing", why: "fan" }) } },
+        { index: 1, id: "call_fanr", function: { name: "delegate", arguments: JSON.stringify({ agent: "fanr", task: "right wing", why: "fan" }) } },
+      ] } }] },
+    ] };
+    FAN_MSGS = msgs;
+    return { text: "fanorch-final[" + (txt.indexOf("FANL-OK") >= 0 && txt.indexOf("FANR-OK") >= 0 ? "both" : "miss") + "]" };
+  }
+  if (sys.indexOf("AGENT=fanl") >= 0) return { text: "FANL-OK", delay: 200 };
+  if (sys.indexOf("AGENT=fanr") >= 0) return { text: "FANR-OK", delay: 200 };
 
   /* No marker: the RLM driver's own calls (system-first) + single-user
    * plain sub-prompts. */
@@ -438,6 +585,11 @@ function anthropicHandler(req, res) {
 }
 
 async function main() {
+  /* LONG-HORIZON ladder pin: the shipped default retry ladder is patient
+   * (6 steps to 60s) so real long tasks ride out provider outages — far
+   * too slow for a test battery. Pin a 2-step ladder here; the A5 retry
+   * counts below expect exactly this shape. */
+  process.env.SOFUU_STREAM_RETRY_DELAYS = "300,300";
   /* sanity: the shipped drivers registered */
   check("sofuu.agent.define/run exist", !!(sofuu.agent && typeof sofuu.agent.define === "function" && typeof sofuu.agent.run === "function"));
   check("sofuu.agent.create (memory.rs) survived the merge", typeof sofuu.agent.create === "function");
@@ -533,6 +685,29 @@ async function main() {
     check("A1 fragment carried city arg", r.trace.some(e => e.kind === "tool" && String(e.payload && e.payload.args || "").indexOf("Paris") >= 0));
   }
 
+  /* A1: P1-14 — hostile provider index "__proto__" must neither drop the
+   * call nor pollute Object.prototype (null-prototype merge map). */
+  sofuu.agent.define({
+    name: "proto",
+    system: "AGENT=proto You probe hostile provider frames.",
+    tools: [
+      { name: "evil_probe", description: "x",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+        execute: async (args) => "EVILRES-1 " + JSON.stringify(args) },
+      { name: "get_weather", description: "Get weather",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+        execute: async (args) => "TOOLRES-9f3 weather " + JSON.stringify(args) },
+    ],
+    memory: "off", rlm: "off", provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const r = await sofuu.agent.run("proto", "probe hostile frames", {});
+    check("A1 proto: hostile __proto__-indexed call executed", r.answer.indexOf("proto-final[evil-ran+good-ran]") >= 0);
+    check("A1 proto: Object.prototype unpolluted", Object.keys(Object.prototype).length === 0);
+    check("A1 proto: plain objects carry no injected id/name", ({}).id === undefined && ({}).name === undefined);
+    check("A1 proto: both calls reached the tools", r.trace.filter(e => e.kind === "tool").length === 2);
+  }
+
   /* ── A2: delegation ─────────────────────────────────────────────── */
   sofuu.agent.define({ name: "researcher", system: "AGENT=researcher", memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
   sofuu.agent.define({
@@ -621,6 +796,57 @@ async function main() {
           r.usage.llmCalls === 2 && r.answer === "loopy-salvage-summary");
   }
 
+  /* ── Task-gate: long runs must maintain a todo_write checklist ───── */
+  sofuu.agent.define({
+    name: "todogate", system: "AGENT=todogate", tools: ["code"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 12, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const r = await sofuu.agent.run("todogate", "do a long unprompted job", {});
+    check("task-gate: nudges a checklist-less long run", r.answer === "todogate-final[nudged]");
+    check("task-gate: reminder fired past the threshold, inside the cap (steps " + r.steps + ")",
+          r.steps >= 6 && r.steps < 12);
+  }
+  sofuu.agent.define({
+    name: "todoplan", system: "AGENT=todoplan", tools: ["code"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 12, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const r = await sofuu.agent.run("todoplan", "plan then work", {});
+    check("task-gate: silent when todo_write was called first (negative control)",
+          r.answer === "todoplan-final[clean]");
+  }
+
+  /* ── Permission profiles: plan / edit / full gate every tool call ─── */
+  sofuu.agent.define({
+    name: "perm", system: "AGENT=perm",
+    tools: ["write_file", "bash", "read_file"].map(n => ({
+      name: n, description: "gate probe " + n,
+      parameters: { type: "object", properties: {} },
+      execute: async () => "GATE-EXEC-" + n,
+    })),
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 8, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const permRun = async (p) => {
+      const s = sofuu.agent.setPermissions(p);
+      if (!s.ok) return "set-failed";
+      return (await sofuu.agent.run("perm", "probe the gate", {})).answer;
+    };
+    check("perm: engine default profile is full", sofuu.agent.getPermissions() === "full");
+    check("perm: full passes every tool", (await permRun("full")) === "perm-final[EEE]");
+    check("perm: edit allows writes + reads, blocks shell", (await permRun("edit")) === "perm-final[EBE]");
+    check("perm: plan blocks writes + shell, allows reads", (await permRun("plan")) === "perm-final[BBE]");
+    const bad = sofuu.agent.setPermissions("sudo");
+    check("perm: unknown profile refused", bad.ok === false && !!bad.error);
+    check("perm: refused switch keeps the previous mode", sofuu.agent.getPermissions() === "plan");
+    const back = sofuu.agent.setPermissions("full");
+    check("perm: restore to full round-trips", back.ok === true && sofuu.agent.getPermissions() === "full");
+  }
+
   /* Retry-policy classifier — every libcurl transport-error wording must be
    * transient (HTTP/2 stream resets, connection cuts), HTTP 429/5xx and
    * rate-limit phrases too; permanent failures (auth, empty stream, stall)
@@ -656,9 +882,11 @@ async function main() {
     for (const m of PERMANENT) check("A5 permanent NOT classified: " + m, !sofuu.agent.isTransientProviderError(m));
   }
 
-  /* Retry gate: transient errors are retried ONLY while nothing has been
-   * forwarded to the UI yet — a mid-stream failure after content was shown
-   * must fail loudly instead of duplicating text by re-streaming. */
+  /* Mid-stream transport cut with text already forwarded: ONE continuation
+   * request (partial acknowledged, resume-exactly instruction), the answer
+   * = partial + continuation with overlap trimmed. Re-streaming from
+   * scratch would duplicate text; dying would lose a 95%-delivered
+   * answer. */
   sofuu.agent.define({
     name: "partial429", system: "AGENT=partial429", memory: "off", rlm: "off",
     budget: { maxSteps: 4 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK
@@ -666,9 +894,21 @@ async function main() {
   {
     const before = PARTIAL429_HITS;
     let err = null;
-    try { await sofuu.agent.run("partial429", "hi", {}); } catch (e) { err = e; }
-    check("A5 mid-stream 429 after content: NO retry, cause surfaced",
-          !!err && String(err.message).indexOf("HTTP 429") >= 0 && PARTIAL429_HITS === before + 1);
+    let r = null;
+    try { r = await sofuu.agent.run("partial429", "hi", {}); } catch (e) { err = e; }
+    check("A5 mid-stream cut after content: turn CONTINUES (no throw)",
+          !err && !!r);
+    check("A5 continuation: answer = partial + continuation, no duplicate",
+          !!r && r.answer.indexOf("partial-text") === 0 &&
+          r.answer.indexOf("-continued-clean") > 0 &&
+          r.answer.indexOf("partial-text", 1) < 0);
+    /* 1 cut request + 1 continuation request. */
+    check("A5 continuation: exactly one follow-up request (" +
+          (PARTIAL429_HITS - before) + ")",
+          PARTIAL429_HITS === before + 2);
+    const contEvt = (r.trace || []).find(e => e.kind === "tool_result" &&
+      e.payload && /continuing from/i.test(String(e.payload.result || "")));
+    check("A5 continuation: visible system note in the trace", !!contEvt);
   }
   sofuu.agent.define({
     name: "early429", system: "AGENT=early429", memory: "off", rlm: "off",
@@ -741,6 +981,210 @@ async function main() {
     });
     check("A4 mapContext merged answer finds needle", r.answer.indexOf("MAP-NEEDLE-8891 present") >= 0);
     check("A4 mapContext subRuns = chunk count (" + r.subRuns.length + ")", r.subRuns.length >= 8 && r.subRuns.length <= 25);
+  }
+
+  /* ── Delegation awareness (PLAN-DELEGATE-AWARENESS Moves 1–4) ────── */
+  sofuu.agent.define({
+    name: "hintspec", system: "AGENT=hintspec", when: "probe hints for specialists",
+    memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({
+    name: "hintlong", system: "AGENT=hintlong",
+    when: ("long hint to prove the 200-char define-time clip. ").repeat(8),
+    memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({
+    name: "hintorch", system: "AGENT=hintorch", agents: ["hintspec"],
+    memory: "off", rlm: "off", provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    const r = await sofuu.agent.run("hintorch", "show me your tools", {});
+    /* The Rust ai client wraps specs into {type:'function',function:{…}}
+     * on the wire (ai.rs) — unwrap before asserting on the surface. */
+    const tnm = t => ((t.function && t.function.name) || t.name);
+    const dtRaw = HINT_TOOLS.find(t => tnm(t) === "delegate");
+    const dt = dtRaw && dtRaw.function ? dtRaw.function : dtRaw;
+    const mtRaw = HINT_TOOLS.find(t => tnm(t) === "map_context");
+    const mt = mtRaw && mtRaw.function ? mtRaw.function : mtRaw;
+    check("delegate: when-hint composed into the description",
+          !!dt && dt.description.indexOf("hintspec") >= 0 &&
+          dt.description.indexOf("probe hints for specialists") >= 0);
+    check("delegate: agent enum carries the specialist",
+          !!dt && dt.parameters.properties.agent.enum.indexOf("hintspec") >= 0);
+    check("map_context: spec rides the same gate as delegate", !!mt);
+    const lst = sofuu.agent.list();
+    const hs = lst.find(a => a.name === "hintspec");
+    const hl = lst.find(a => a.name === "hintlong");
+    check("list(): when projected", !!hs && hs.when === "probe hints for specialists");
+    check("list(): when clipped to 80", !!hl && hl.when.length <= 81 &&
+          hl.when.indexOf("…") === hl.when.length - 1);
+    check("hintorch run still answers", r.answer === "hintorch-final");
+  }
+
+  sofuu.agent.define({
+    name: "delgate", system: "AGENT=delgate", tools: ["code"], agents: ["hintspec"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 12, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    DELGATE_SEES = 0;
+    const r = await sofuu.agent.run("delgate", "grind a long job", {});
+    check("delegation nudge: fires once, carrying the when-hint (" + DELGATE_SEES + ")",
+          r.answer.indexOf("delgate-final[nudged+hint]") >= 0 && DELGATE_SEES === 1);
+    check("delegation nudge: fired past the threshold, inside the cap (steps " + r.steps + ")",
+          r.steps >= 6 && r.steps < 12);
+  }
+  sofuu.agent.define({
+    name: "delearly", system: "AGENT=delearly", tools: ["code"], agents: ["researcher"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 14, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    DELEARLY_SEES = 0;
+    const r = await sofuu.agent.run("delearly", "delegate then grind", {});
+    check("delegation nudge: latched after a real delegation (negative control)",
+          r.answer === "delearly-final[clean]" && DELEARLY_SEES === 0);
+  }
+
+  /* map_context as a model-callable tool (Move 3) */
+  sofuu.agent.define({ name: "mcworker", system: "AGENT=mcworker", memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({
+    name: "mcorch", system: "AGENT=mcorch", agents: ["mcworker"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 8, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    MCW_HITS = 0;
+    const r = await sofuu.agent.run("mcorch", "harvest the markers", {});
+    check("map_context tool: chunk runs + reduce recorded, merged answer + meta (" +
+          r.subRuns.length + " runs, " + MCW_HITS + " worker requests)",
+          r.answer.indexOf("mcorch-final[merged+meta]") >= 0 &&
+          MCW_HITS >= 3 && r.subRuns.length === MCW_HITS &&
+          r.subRuns.every(s => s.name === "mcworker"));
+    check("map_context tool: usage merged into the parent", r.usage.llmCalls >= MCW_HITS);
+  }
+  sofuu.agent.define({
+    name: "mcerr", system: "AGENT=mcerr", agents: ["mcworker"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 8, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    const r = await sofuu.agent.run("mcerr", "request absurd granularity", {});
+    check("map_context tool: >12 chunks refused with guidance",
+          r.answer.indexOf("mcerr-final[capped]") >= 0);
+  }
+  /* mcsolo exists only so mcyB's map_context spec injects: the spec's
+   * allowed-filter strips in-chain names, so with mcyA as mcyB's ONLY
+   * specialist the tool would never reach the model and the chain guard
+   * (which catches non-conforming calls) would go unexercised. */
+  sofuu.agent.define({ name: "mcsolo", system: "AGENT=mcsolo", memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({
+    name: "mcyA", system: "AGENT=mcyA", agents: ["mcyB"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 8, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  sofuu.agent.define({
+    name: "mcyB", system: "AGENT=mcyB", agents: ["mcyA", "mcsolo"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 8, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    const r = await sofuu.agent.run("mcyA", "start the ping-pong", {});
+    check("map_context tool: chain cycle surfaces as tool error, no hang",
+          r.answer.indexOf("saw-cycle") >= 0);
+  }
+
+  /* Parallel fan-out for delegate-only rounds (Move 4) */
+  sofuu.agent.define({ name: "fanl", system: "AGENT=fanl", memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({ name: "fanr", system: "AGENT=fanr", memory: "off", rlm: "off", provider: DEF_PROV.provider, model: DEF_PROV.model, api_key: DEF_PROV.api_key, base_url: DEF_PROV.base_url });
+  sofuu.agent.define({
+    name: "fanorch", system: "AGENT=fanorch", agents: ["fanl", "fanr"],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 6, maxTokens: 1000000, maxWallMs: 60000 }, provider: "openai", model: "mock", api_key: "x", base_url: MOCK });
+  {
+    REQ_LOG.length = 0;
+    const r = await sofuu.agent.run("fanorch", "fan out both wings", {});
+    check("fan-out: both delegates ran and reached the parent",
+          r.answer === "fanorch-final[both]" &&
+          r.subRuns.some(s => s.name === "fanl") && r.subRuns.some(s => s.name === "fanr"));
+    const fanTools = FAN_MSGS ? FAN_MSGS.filter(m => m.role === "tool").map(m => String(m.content || "")) : [];
+    check("fan-out: transcript pairs land in issue order",
+          fanTools.length === 2 && fanTools[0].indexOf("FANL-OK") >= 0 && fanTools[1].indexOf("FANR-OK") >= 0);
+    let maxIn = 0;
+    for (const a of REQ_LOG) {
+      if (!a.end) continue;
+      let in_ = 0;
+      for (const b of REQ_LOG) {
+        if (!b.end) continue;
+        if (b.start <= a.start && a.start < b.end) in_++;
+      }
+      if (in_ > maxIn) maxIn = in_;
+    }
+    check("fan-out: delegates actually ran in parallel (max in-flight " + maxIn + ")",
+          maxIn >= 2);
+  }
+
+  /* ── A7c: AGENTS.md project context (owner directive 2026-09-12) ──── */
+  {
+    const prevCwd = process.cwd();
+    const proj = "/tmp/sofuu_agentsmd_" + Date.now();
+    await sofuu.fs.mkdir(proj, { recursive: true });
+    process.chdir(proj);
+    try {
+      /* Read side: the file rides the ephemeral context message. */
+      await sofuu.fs.writeFile(proj + "/AGENTS.md",
+        "# Project memory\n\n- Postgres port is 5433.\n- Codename LANTERN.\n");
+      let sawCtx = null;
+      sofuu.agent.define({
+        name: "mdprobe", system: "AGENT=mdprobe", memory: "off", rlm: "off",
+        tools: [], provider: "openai", model: "mock", api_key: "x", base_url: MOCK,
+        budget: { maxSteps: 3, maxTokens: 100000, maxWallMs: 30000 },
+      });
+      /* decide() branch: report whether the AGENTS.md block arrived. */
+      MD_PROBE = null;
+      await sofuu.agent.run("mdprobe", "what is standing context", {});
+      sawCtx = MD_PROBE;
+      check("AGENTS.md: content rides the ephemeral context message",
+        !!sawCtx && sawCtx.indexOf("AGENTS.md") >= 0 &&
+        sawCtx.indexOf("LANTERN") >= 0 && sawCtx.indexOf("5433") >= 0);
+
+      /* Read side freshness: an edit between runs flows on the next turn. */
+      await sofuu.fs.writeFile(proj + "/AGENTS.md",
+        "# Project memory\n\n- Postgres port is 5433.\n- Codename LANTERN.\n- NEWPIN ZEPHYR-9.\n");
+      MD_PROBE = null;
+      await sofuu.agent.run("mdprobe", "what is standing context now", {});
+      sawCtx = MD_PROBE;
+      check("AGENTS.md: mid-session edit flows on the next run",
+        !!sawCtx && sawCtx.indexOf("ZEPHYR-9") >= 0);
+
+      /* Write side: upsert into the pinned section, user content kept. */
+      const r1 = await sofuu.agent.pinProjectFact("The staging URL is https://stg.example/api");
+      const txt1 = String(await sofuu.fs.readFile(proj + "/AGENTS.md"));
+      check("pin: fact lands in the marked section, user content untouched",
+        r1 === "added" &&
+        txt1.indexOf("## Pinned by sofuu") >= 0 &&
+        txt1.indexOf("<!-- sofuu:pinned begin -->") >= 0 &&
+        txt1.indexOf("- The staging URL is https://stg.example/api") >= 0 &&
+        txt1.indexOf("- Codename LANTERN.") >= 0);
+      /* Dedup: same fact again → exists, single line. */
+      const r2 = await sofuu.agent.pinProjectFact("the staging url is https://stg.example/api");
+      const txt2 = String(await sofuu.fs.readFile(proj + "/AGENTS.md"));
+      check("pin: duplicate fact is deduped (case/space-insensitive)",
+        r2 === "exists" &&
+        txt2.split("The staging URL").length === 2 && /* 1 occurrence */
+        txt2.split("- The").length === 2);
+      /* Second distinct fact appends before END. */
+      const r3 = await sofuu.agent.pinProjectFact("Never run cargo clean");
+      const txt3 = String(await sofuu.fs.readFile(proj + "/AGENTS.md"));
+      const pinned = txt3.slice(txt3.indexOf("<!-- sofuu:pinned begin -->"),
+                                txt3.indexOf("<!-- sofuu:pinned end -->"));
+      check("pin: second fact appends inside the section",
+        r3 === "added" &&
+        pinned.indexOf("The staging URL") < pinned.indexOf("Never run cargo clean"));
+
+      /* remember tool: spec present + executes through the toolset. */
+      MD_PROBE = null;
+      sofuu.agent.define({
+        name: "mdtool", system: "AGENT=mdtool", memory: "off", rlm: "off",
+        tools: [], provider: "openai", model: "mock", api_key: "x", base_url: MOCK,
+        budget: { maxSteps: 4, maxTokens: 100000, maxWallMs: 30000 },
+      });
+      await sofuu.agent.run("mdtool", "pin this: tests use pytest", {});
+      const txt4 = String(await sofuu.fs.readFile(proj + "/AGENTS.md"));
+      check("remember tool: model call pins into AGENTS.md",
+        txt4.indexOf("- tests use pytest") >= 0);
+    } finally { process.chdir(prevCwd); }
   }
 
   /* ── A4: RLM fallback + recurseVia ──────────────────────────────── */
@@ -1002,6 +1446,17 @@ async function main() {
     /* re-load is safe: duplicate define lands in broken, not a crash */
     const ld2 = await sofuu.agent.loadDir(dir);
     check("A8 duplicate define is reported, not fatal", ld2.broken.length >= 1);
+  }
+
+  /* ── A8b: loadDir auto-creates a missing agents dir ─────────────── */
+  {
+    /* The folder is sofuu's to provide: loading from a nonexistent path
+     * must create it, not silently yield an empty registry. */
+    const missing = "/tmp/sofuu_agent_defs_missing_" + Date.now();
+    const ld = await sofuu.agent.loadDir(missing);
+    check("A8 loadDir auto-creates a missing agents dir",
+      ld.loaded.length === 0 && ld.broken.length === 0 &&
+      !!(await sofuu.fs.exists(missing)));
   }
 
   /* ── Per-model context windows (RLM routing) ────────────────────── */
@@ -1438,6 +1893,49 @@ async function main() {
       allocPlanObj("learnprobe-out").maxOutput <= 2048);
     check("alloc learn: unrelated errors parse to nothing",
       sofuu.ml.alloc.noteLimit("learnprobe-none", "invalid api key") === "");
+
+    /* ── Discovered caps (provider-agnostic): the endpoint's own model
+     * listing is better evidence than the name-keyed registry. Ingest a
+     * listing for a fake root, then verify the ladder resolves against
+     * it — including the exact liquid-400 class (oversized global
+     * config vs a small endpoint cap). ──────────────────────────── */
+    check("alloc surface: sofuu.ml.alloc.ingestListing present",
+      !!sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === "function");
+    const DISC_ROOT = "https://caps-gw.example.com/v1";
+    const nIngested = Number(sofuu.ml.alloc.ingestListing(DISC_ROOT, JSON.stringify({
+      data: [
+        { id: "caps/unknown-model:free", context_length: 65536,
+          top_provider: { max_completion_tokens: 8192 } },
+        { id: "gpt-4o", context_length: 32000, max_tokens: 4096 },
+        { id: "caps/empty-entry" },
+      ],
+    })));
+    check("alloc discovered: listing ingest counts only entries with caps (got " +
+          nIngested + ")", nIngested === 2);
+    const pDisc = allocPlanObj("caps/unknown-model:free", { baseUrl: DISC_ROOT });
+    check("alloc discovered: unknown model resolves from the endpoint's numbers " +
+          "(window " + pDisc.window + ", output " + pDisc.maxOutput + ", source " + pDisc.source + ")",
+      pDisc.window === 65536 && pDisc.maxOutput === 8192 &&
+      pDisc.known === true && pDisc.source === "discovered");
+    const pDiscGw = allocPlanObj("gpt-4o", { baseUrl: DISC_ROOT });
+    check("alloc discovered: gateway's real caps override the registry guess " +
+          "(window " + pDiscGw.window + " vs registry 128000)",
+      pDiscGw.window === 32000 && pDiscGw.maxOutput === 4096);
+    const pOffRoot = allocPlanObj("gpt-4o", { baseUrl: "https://elsewhere.example.com/v1" });
+    check("alloc discovered: a different root keeps the registry numbers",
+      pOffRoot.window === 128000 && pOffRoot.source === "registry");
+    const pNoRoot = allocPlanObj("gpt-4o");
+    check("alloc discovered: no baseUrl → registry (historical behavior)",
+      pNoRoot.window === 128000);
+    /* The liquid-400 class end to end: oversized global config (1M ctx,
+     * 384k maxout) vs the endpoint's published 65536/8192 — the plan must
+     * clamp to what the endpoint really accepts. */
+    const pOversize = allocPlanObj("caps/unknown-model:free",
+      { baseUrl: DISC_ROOT, cfgWindow: 1000000, cfgMaxOutput: 384000 });
+    check("alloc discovered: oversized config clamped to the endpoint's caps " +
+          "(window " + pOversize.window + ", output " + pOversize.maxOutput + ")",
+      pOversize.window === 65536 && pOversize.maxOutput <= 8192 &&
+      pOversize.notes.length > 0);
 
     /* ── Enforcing-mock E2E: the provider 400s like a real one when the
      * prompt exceeds its window or max_tokens its cap. WITH the alloc gate

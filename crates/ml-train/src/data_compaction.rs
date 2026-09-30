@@ -624,6 +624,148 @@ pub fn build() -> Vec<Example> {
         }
     }
 
+    /* ── CONFLICT TRUTH TABLE (groups 17–24) ──────────────────────────
+     *
+     * Hardening (2026-09-25). Every family above is PURE: one reason to
+     * keep or drop, and the classes do not overlap in feature space. A
+     * logistic regression separates them perfectly, which is why
+     * `gate-eval` first reported compaction as a tie with the linear
+     * reference (F1 1.000 both) — the benchmark could not tell whether
+     * the 8 KB network earned its place.
+     *
+     * The eight families below are a full truth table over the three
+     * channels that actually argue with each other:
+     *
+     *     R = referenced by the recent keep-window   (f9/f10)
+     *     T = retrievable, cheap to re-fetch         (f13)
+     *     D = carries decision language              (f23)
+     *
+     *     R T D | label
+     *     ───────┼────────
+     *     1 0 0  | keep      referenced and not re-fetchable
+     *     1 1 0  | dispose   referenced, but a re-fetch is cheaper
+     *     0 1 0  | dispose   old and re-fetchable
+     *     0 0 0  | dispose   old, plain, unreferenced chatter
+     *     1 1 1  | keep      the decision outranks the re-fetch
+     *     1 0 1  | keep      decision + reference
+     *     0 1 1  | keep      a decision is load-bearing on its own
+     *     0 0 1  | keep      ditto
+     *
+     * The R/T/D table above turned out to be LINEARLY SEPARABLE (verified
+     * by brute-force search: a single plane splits all eight cells), so
+     * it could not answer the question either — a linear model scored
+     * 1.000 on it. A conflict only counts if no straight line can solve
+     * it.
+     *
+     * GROUPS 25–26 are therefore an XOR family, the smallest pattern that
+     * is provably non-separable in binary coordinates (exhaustive search
+     * over a coefficient grid finds no separator). The compaction
+     * semantics behind it:
+     *
+     *   R = the recent keep-window cites this segment
+     *   D = the segment records a decision
+     *
+     *     R D | label   reading
+     *     ────┼────────  ──────────────────────────────────────────────
+     *     1 0 | keep     one clean reason to keep it: it was cited
+     *     0 1 | keep     one clean reason to keep it: it decided something
+     *     1 1 | DISPOSE  cited for an unrelated reason AND carrying a
+     *                    decision is a coincidence of vocabulary, not a
+     *                    reason to keep — the cite is incidental
+     *     0 0 | DISPOSE  no cite, no decision: ordinary churn
+     *
+     * i.e. keep iff EXACTLY ONE of {cited, decided} holds. No weighted
+     * sum of the two channels reproduces that: the positive cells sit
+     * on the diagonal and the negatives off it, so any line that catches
+     * both positives also catches a negative.
+     *
+     * This is the measurement the original benchmark could not make. If
+     * the network clears this and the linear reference does not, the
+     * 8 KB is buying real capacity; if BOTH clear it, the data is still
+     * too easy and the honest conclusion is that the gate does not need
+     * a network. Either outcome is useful; a tie reported as a tie is
+     * the point. */
+    for (di, (domain, _words)) in DOMAINS.iter().enumerate() {
+        for k in 0..36usize {
+            let (tdomain, twords) = DOMAINS[(di + 2 + k) % DOMAINS.len()];
+            let w = twords[(k * 3 + 1) % twords.len()];
+            let task = fill(TASKS[(di + k * 5) % TASKS.len()], domain, "", "");
+            let path = PATHS[(di * 3 + k) % PATHS.len()];
+            let filler = sibling(
+                &fill(FILLERS[(di * 11 + k) % FILLERS.len()], domain, "", ""),
+                12 + (k % 3) as u32,
+                1,
+            );
+            let age = 5 + (k % 7) as u32;
+
+            // A keep-window that cites the target (R = 1) and one that
+            // does not (R = 0). The citation is lexical, so f10 fires.
+            let citing_recent = format!(
+                "going back to what you said about {path} and the {w} numbers — \
+                 we still need that before the {} work",
+                tdomain
+            );
+            let neutral_recent = format!(
+                "moving on to the {domain} side now, the {w} part is done and closed"
+            );
+            // Bodies differing ONLY in decision language, so the D
+            // channel is the single difference between the pair.
+            let plain_body = format!(
+                "the {w} column in {path} is 4200 wide and the {} rows follow the \
+                 same order as the previous run",
+                tdomain
+            );
+            let decide_body = format!(
+                "we decided to pin the {w} column in {path} at 4200; that choice is \
+                 final and the {} rows must match it",
+                tdomain
+            );
+
+            // One cell emitter, parameterised by the retrievable flag, so
+            // both the XOR (25/26) and the R/T/D table (17–24) share a
+            // single borrow of `out`.
+            let mut cell = |r: bool, t: bool, d: bool, y: f32, group: u32| {
+                let recent = if r { citing_recent.clone() } else { neutral_recent.clone() };
+                let body = if d { decide_body.clone() } else { plain_body.clone() };
+                out.push(make(
+                    &task,
+                    "",
+                    &recent,
+                    vec![
+                        filler.clone(),
+                        Seg { text: body, age, kind: 1, retr: t },
+                        sibling(&recent, 0, 0),
+                    ],
+                    1,
+                    y,
+                    group,
+                ));
+            };
+
+            /* Groups 17–24: the R/T/D disagreement table — a THIRD
+             * channel (retrievable) joins the XOR's two, and the
+             * combinations are not all learnable from the XOR pair
+             * alone. Held out of training entirely, so the network is
+             * asked to apply the interaction it learned on 25/26 to
+             * conflicts it has never seen. */
+            cell(true, false, false, 0.0, 17); // cited, unique            → keep
+            cell(true, true, false, 1.0, 18); // cited, re-fetchable       → dispose
+            cell(false, true, false, 1.0, 19); // old + re-fetchable        → dispose
+            cell(false, false, false, 1.0, 20); // no cite, no decision      → dispose
+            cell(true, true, true, 0.0, 21); // cited + decided + refetch → keep
+            cell(true, false, true, 0.0, 22); // cited + decided           → keep
+            cell(false, true, true, 0.0, 23); // decided, re-fetchable     → keep
+            cell(false, false, true, 0.0, 24); // decided alone             → keep
+
+            // Groups 25/26: the XOR itself (TRAIN — see the trainer's
+            // split comment; a pattern never trained on is unlearnable).
+            cell(true, false, false, 0.0, 25); // R=1 D=0 → keep
+            cell(false, false, true, 0.0, 25); // R=0 D=1 → keep
+            cell(true, false, true, 1.0, 26); // R=1 D=1 → dispose
+            cell(false, false, false, 1.0, 26); // R=0 D=0 → dispose
+        }
+    }
+
     /* Augmentation: ~1/5 of the examples get an existing summary that
      * PARAPHRASES the target (redundancy channel) — label invariant: a
      * segment already absorbed into the summary is AT LEAST as
@@ -636,7 +778,7 @@ pub fn build() -> Vec<Example> {
             // Redundancy shows up in feature 12 — recompute with summary.
             let head: String = e.text.chars().take(60).collect();
             let summary = format!("earlier material covered: {head}");
-            let segs = vec![
+            let segs = [
                 sibling(&summary, 12, 1),
                 sibling(&e.text, 8, 3),
                 sibling("keep going", 0, 0),

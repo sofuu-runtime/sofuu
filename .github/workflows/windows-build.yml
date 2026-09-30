@@ -1,0 +1,76 @@
+name: Windows Desktop
+
+# Builds the Sofuu Desktop app for Windows x64 and uploads the NSIS
+# installer as an artifact. First-boot MSVC port gate: cargo test --release
+# runs after the artifact upload so a test failure never hides the installer.
+#
+# QTSQ is a proprietary local checkout that cannot be built here — these
+# builds degrade gracefully (no brain/memory persistence, sessions are
+# fail-closed), exactly like the macOS/Linux CI builds.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "sofuu-desktop/**"
+      - "crates/**"
+      - "deps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-build.yml"
+
+jobs:
+  desktop-windows:
+    name: Sofuu Desktop (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # build.rs probes this dir for uv_a.lib (MSVC static libuv build)
+      SOFUU_UV_DIR: ${{ github.workspace }}\deps\libuv\build-win64\Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # curl[schannel] static-MD: libcurl.lib that links against the same
+      # dynamic CRT (/MD) the Rust MSVC toolchain uses. build.rs finds it via
+      # VCPKG_INSTALLATION_ROOT automatically.
+      - name: Install curl (vcpkg schannel, static-MD)
+        run: |
+          vcpkg install "curl[schannel]:x64-windows-static-md"
+          ls "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" | grep -i curl
+
+      - name: Build libuv (MSVC static)
+        run: |
+          cd deps/libuv
+          cmake -S . -B build-win64 -A x64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-win64 --config Release
+          ls build-win64/Release/uv_a.lib
+
+      - name: Build Sofuu Desktop (NSIS installer)
+        run: |
+          cd sofuu-desktop
+          npm ci
+          npx tauri build --bundles nsis
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sofuu-desktop-windows-x64
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/sofuu-desktop.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Rust unit tests
+        run: cargo test --release

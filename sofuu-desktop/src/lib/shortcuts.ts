@@ -12,7 +12,6 @@ export interface ShortcutDef {
 export const SHORTCUTS: ShortcutDef[] = [
   { group: "General", keys: ["⌘", "N"], label: "New chat" },
   { group: "General", keys: ["⌘", ","], label: "Open settings" },
-  { group: "General", keys: ["⌘", "L"], label: "Focus the composer" },
   { group: "General", keys: ["Esc"], label: "Close a dialog or popover" },
   { group: "Turn", keys: ["↩"], label: "Send message" },
   { group: "Turn", keys: ["⇧", "↩"], label: "New line in the composer" },

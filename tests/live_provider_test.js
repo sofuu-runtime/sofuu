@@ -20,7 +20,10 @@ function assert(label, cond) {
 function skipSuite(why) {
   console.log("SKIP live_provider_test — " + why);
   console.log("\nLIVE PROVIDER TEST: SKIPPED");
-  process.exit(0);
+  /* Exit 77 (the POSIX skip convention) so run_js_tests.sh can report
+   * SKIP separately instead of counting an opted-out suite as PASSED
+   * (P2-26, AUDIT-2026-09-01). */
+  process.exit(77);
 }
 
 const PROVIDER = process.env.SOFUU_LIVE_PROVIDER || "";

@@ -322,7 +322,10 @@ pub fn run_stress() -> i32 {
         }
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p95 = samples[190];
-        let ok = p95 <= BUDGET_FORWARD_P95_MS && cfg!(debug_assertions) == false || p95 <= BUDGET_FORWARD_P95_MS;
+        // Clippy deny (AUDIT-2026-09-07): the old expression
+        // `p95 <= B && cfg!(debug_assertions) == false || p95 <= B` reduced to
+        // just `p95 <= B` — the `&&` arm was subsumed by the `||` arm.
+        let ok = p95 <= BUDGET_FORWARD_P95_MS;
         println!("8-KiB forward p95: {p95:.3} ms (bar {BUDGET_FORWARD_P95_MS:.0} ms) {}", if ok { "OK" } else { "FAIL" });
         if !ok {
             failed.push(format!("8-KiB forward p95 {p95:.3} ms"));
@@ -377,7 +380,7 @@ pub fn run_stress() -> i32 {
     }
 
     // ── informational: scale (≈2k records) ──
-    let scale_corpus = data_embedding_gen::corpus(0x5CA1E_0000_0001, &HashMap::new());
+    let scale_corpus = data_embedding_gen::corpus(0x0005_CA1E_0000_0001, &HashMap::new());
     {
         const VAL_OFF: usize = 1_000; // val-family tag offset (train tags are 0..)
         let mut records: Vec<(String, Tag)> = Vec::new();
@@ -468,7 +471,8 @@ pub fn run_stress() -> i32 {
         let mut hash_be = Backend::new(HASH_DIM, &hash_v1_features, &corpus.records);
         let qs: Vec<(String, Tag)> = corpus.queries.clone();
 
-        let cases: [(&str, &dyn Fn(&str) -> String); 4] = [
+        type RobustCase = (&'static str, &'static dyn Fn(&str) -> String);
+        let cases: [RobustCase; 4] = [
             ("uppercase", &|q: &str| q.to_uppercase()),
             ("prefix", &|q: &str| format!("quick q: {q}")),
             ("spacing", &|q: &str| format!("{q}   ??")),

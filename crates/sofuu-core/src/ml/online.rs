@@ -457,9 +457,9 @@ pub fn status() -> (bool, usize, usize, bool, u32, bool) {
 /* ── Persistence (§13 guardrail 8) ──────────────────────────────────── */
 
 fn persist_path() -> std::path::PathBuf {
-    let mut p = std::env::var("HOME")
+    let mut p = crate::embed_config::home_dir()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     p.push(".sofuu");
     p.push("ml");
     p.push("supervisor_online.f32");
@@ -494,7 +494,17 @@ fn persist(w3: &[f32]) -> bool {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.extend_from_slice(&weight_bytes);
-    std::fs::write(&path, &out).is_ok()
+    /* P2-36 (AUDIT-2026-09-01): tmp+rename like the rest of the tree — a
+     * crash mid-`fs::write` truncated the adaptation file. (load_persisted
+     * validates magic/hash/CRC and falls back to the pretrained layer, so
+     * the worst case was a silently LOST adaptation; this removes even
+     * that.) */
+    let tmp = path.with_extension("tmp");
+    let ok = std::fs::write(&tmp, &out).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
 }
 
 /// Load the persisted adaptation IFF it was keyed to the CURRENT pretrained
@@ -524,12 +534,19 @@ fn load_persisted() -> Option<Vec<f32>> {
     if crate::ml::net::crc32_ieee(weight_bytes) != crc {
         return None;
     }
-    Some(
-        weight_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect(),
-    )
+    // P3 (AUDIT-2026-09-07): Net::from_bytes (net.rs) rejects non-finite
+    // weights, but this loader skipped the same check — a file that passed
+    // its CRC with NaN/Inf entries (e.g. written by a buggy build) would
+    // poison the live output layer, and every downstream score with it.
+    // Stale-file fallback (None → pretrained layer) is the right recovery.
+    let weights: Vec<f32> = weight_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if !weights.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(weights)
 }
 
 /// The ONLINE state is process-global and cargo runs tests on parallel

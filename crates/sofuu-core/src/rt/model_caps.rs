@@ -126,11 +126,41 @@ pub fn lookup(model: Option<&str>) -> ModelCaps {
         return NO_CAPS;
     }
     for (prefix, ctx, out, thinking) in TABLE {
-        if m.starts_with(prefix) || m.contains(&format!("/{prefix}")) {
+        // P3 (AUDIT-2026-09-07): allocation-free `contains("/{prefix}")` —
+        // the old format! built a fresh String per table row per lookup,
+        // and lookup runs on every request.
+        let hit = m.starts_with(prefix)
+            || m.match_indices('/').any(|(i, _)| m[i + 1..].starts_with(prefix));
+        if hit {
             return ModelCaps { ctx_window: *ctx, max_output: *out, thinking: *thinking };
         }
     }
     NO_CAPS
+}
+
+/// Resolve capabilities for a request that carries an endpoint: the
+/// numbers the ENDPOINT itself published for this exact model (the
+/// discovered store, harvested from its model listing) override the
+/// static family table when present — the gateway serving the request is
+/// better evidence than a name-keyed guess (a proxy may host gpt-4o at
+/// 32k, or an unknown model the table has never heard of). The THINKING
+/// kind still comes from the registry: listings carry no reasoning
+/// syntax, and the wire builders need it to decide parameter shape.
+/// `base_url` may be None or a full endpoint URL — normalization is
+/// provider-agnostic and strips completion suffixes.
+pub fn lookup_for(model: Option<&str>, base_url: Option<&str>) -> ModelCaps {
+    let reg = lookup(model);
+    let Some(url) = base_url else { return reg };
+    super::model_caps_discovered::ensure_loaded();
+    let Some(d) = super::model_caps_discovered::lookup(url, model.unwrap_or("")) else {
+        return reg;
+    };
+    // Each side independently: a discovered 0 leaves the registry number.
+    ModelCaps {
+        ctx_window: if d.ctx_window > 0 { d.ctx_window } else { reg.ctx_window },
+        max_output: if d.max_output > 0 { d.max_output } else { reg.max_output },
+        thinking: reg.thinking,
+    }
 }
 
 impl ModelCaps {

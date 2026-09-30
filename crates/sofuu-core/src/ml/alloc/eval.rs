@@ -18,6 +18,9 @@ fn resolved(window: i64, max_output: i64, known: bool) -> Resolved {
         known,
         source: if known { Source::Registry } else { Source::Default },
         clamped_config: false,
+        config_exceeds_evidence: None,
+        win_source: if known { Source::Registry } else { Source::Default },
+        max_source: if known { Source::Registry } else { Source::Default },
     }
 }
 
@@ -184,10 +187,10 @@ fn blob_integrity_and_architecture() {
 /// ladder here too (registry above defaults, config clamped to caps).
 #[test]
 fn resolve_ladder_is_stable() {
-    let r = policy::resolve(Some("gpt-4o-mini"), 0, 0);
+    let r = policy::resolve(Some("gpt-4o-mini"), 0, 0, None);
     assert!(r.known && r.window > UNKNOWN_WINDOW, "registry model resolves above defaults");
-    let r = policy::resolve(Some("gpt-4o-mini"), 4_096, 0);
+    let r = policy::resolve(Some("gpt-4o-mini"), 4_096, 0, None);
     assert_eq!(r.window, 4_096, "smaller config honoured");
-    let r = policy::resolve(Some("no-such-model-zzz"), 0, 0);
+    let r = policy::resolve(Some("no-such-model-zzz"), 0, 0, None);
     assert_eq!(r.window, UNKNOWN_WINDOW);
 }

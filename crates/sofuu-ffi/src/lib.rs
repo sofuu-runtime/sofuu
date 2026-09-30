@@ -7,6 +7,12 @@
 // Phase 0: we bind just enough to make the Rust binary a drop-in for the C
 // main() — init/eval/run-jobs/destroy + the REPL eval path. More bindings
 // (chat bridge, HTTP, MCP, memory) land as those subsystems migrate.
+//
+// P2-20 (AUDIT-2026-09-01): the release profile is panic=abort, so a panic
+// inside an extern "C" callback (curl/uv) kills the process mid-callback
+// with locks held. Enforce "shipped code here never unwraps" at lint level:
+// clippy fails the build on unwrap() in non-test code (tests are exempt).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -224,31 +230,39 @@ impl Drop for SofuuRuntime {
 }
 
 // ── QTSQ session store (free functions — no runtime state) ────────
-// Session data persists as one `.qtsq` file per session (sanitize +
-// password-vault encrypted; fail-closed codec). The password is derived
-// per project by the caller (crates/sofuu-core/src/session.rs).
+// Session/conversation data persists as one `.qtsq` record per file. Small
+// records are stored raw; records at or above 500 KiB use QTSQ compression,
+// always without the media-vault encryption layer. The load path remains
+// password-aware so older encrypted Sofuu files stay readable.
 
-/// Persist a session-data payload as a `.qtsq` file. 0 on success (QTSQ_OK).
+/// True when THIS binary was linked against the QTSQ codec. Without it
+/// every memory/brain call is a silent no-op and every session persist
+/// fails, so the UI must not claim memory persists (see the chat banner
+/// and `sofuu doctor`).
+pub const fn qtsq_linked() -> bool {
+    cfg!(has_qtsq)
+}
+
+/// Persist a session-data payload as an unencrypted `.qtsq` file. 0 on success.
 /// Returns -1 without QTSQ (fail-closed, same as the retired C shims).
-pub fn qtsq_session_save(path: &str, data: &[u8], password: &str) -> i32 {
+pub fn qtsq_session_save(path: &str, data: &[u8]) -> i32 {
     let c_path = CString::new(path).unwrap_or_default();
-    let c_pw = CString::new(password).unwrap_or_default();
     #[cfg(has_qtsq)]
     {
         // SAFETY: buffers are valid for the duration of the call; the codec
         // (qtsq.rs, M10 — formerly src/ffi_shim.c) copies the payload in.
-        unsafe { qtsq::qtsq_session_save(c_path.as_ptr(), data.as_ptr(), data.len(), c_pw.as_ptr()) }
+        unsafe { qtsq::qtsq_session_save(c_path.as_ptr(), data.as_ptr(), data.len()) }
     }
     #[cfg(not(has_qtsq))]
     {
-        let _ = (&c_path, data, &c_pw);
+        let _ = (&c_path, data);
         -1 // no QTSQ — sessions can't persist
     }
 }
 
-/// Load a session-data `.qtsq` file, decrypting with the same per-project
-/// password. Returns the decompressed JSON payload or None (also None
-/// without QTSQ — fail-closed).
+/// Load a session-data `.qtsq` file. Plaintext records load directly;
+/// legacy encrypted records are decrypted with the supplied password.
+/// Returns the decompressed JSON payload or None (also None without QTSQ).
 pub fn qtsq_session_load(path: &str, password: &str) -> Option<Vec<u8>> {
     let c_path = CString::new(path).unwrap_or_default();
     let c_pw = CString::new(password).unwrap_or_default();
@@ -269,6 +283,39 @@ pub fn qtsq_session_load(path: &str, password: &str) -> Option<Vec<u8>> {
     #[cfg(not(has_qtsq))]
     {
         let _ = (&c_path, &c_pw);
+        None
+    }
+}
+
+/// Report whether a QTSQ session record carries the legacy encryption
+/// envelope. This is read-only diagnostics; it never decrypts or writes.
+pub fn qtsq_session_is_encrypted(path: &str) -> Option<bool> {
+    let c_path = CString::new(path).ok()?;
+    #[cfg(has_qtsq)]
+    {
+        // SAFETY: the C string remains alive for the duration of the call.
+        unsafe { qtsq::qtsq_session_is_encrypted(c_path.as_ptr()) }
+    }
+    #[cfg(not(has_qtsq))]
+    {
+        let _ = c_path;
+        None
+    }
+}
+
+/// Return a lowercase SHA-256 digest for a non-empty byte slice, or None when
+/// QTSQ is unavailable or the input is empty.
+pub fn qtsq_sha256_hex(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    #[cfg(has_qtsq)]
+    {
+        qtsq::sha256_hex(data)
+    }
+    #[cfg(not(has_qtsq))]
+    {
+        let _ = data;
         None
     }
 }

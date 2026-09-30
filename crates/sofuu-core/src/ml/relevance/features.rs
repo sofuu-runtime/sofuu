@@ -428,7 +428,8 @@ fn extract(ctx: &RelevanceContext, idx: usize, st: &SetStats) -> [f32; RELEVANCE
     f[13] = kh[3];
 
     // 14-15: brain strength + role (memories only).
-    f[14] = cand.strength.clamp(0.0, 1.0);
+    // clamp() passes NaN through — sanitize to neutral instead (Phase 1.3).
+    f[14] = if cand.strength.is_finite() { cand.strength.clamp(0.0, 1.0) } else { 0.0 };
     f[15] = (cand.role as f32 / 8.0).min(1.0);
 
     // 16-18: duplication — max cosine to an already-kept candidate,
@@ -625,6 +626,47 @@ mod tests {
             assert_eq!(va.len(), RELEVANCE_FEATURES);
             for (x, y) in va.iter().zip(vb.iter()) {
                 assert_eq!(x.to_bits(), y.to_bits(), "extraction must be deterministic");
+            }
+        }
+    }
+
+    /// Phase 1.3 (§5.3): empty/whitespace, NUL, Unicode, and path-like
+    /// candidate texts over empty and hostile tasks — every feature must
+    /// stay finite and in band, never panic.
+    #[test]
+    fn hostile_candidates_stay_finite_and_bounded() {
+        let texts: Vec<String> = vec![
+            String::new(),
+            "  \t ".into(),
+            "\u{0}\u{0}".into(),
+            "配列😀\u{2028}".into(),
+            "crate::path::to::mod".into(),
+            "x".repeat(60_000),
+            "deprecated deprecated deprecated".into(),
+        ];
+        let cands: Vec<CandidateInput> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| CandidateInput {
+                text: t,
+                kind: [CandKind::File, CandKind::Memory, CandKind::Web, CandKind::Other][i % 4],
+                strength: if i % 2 == 0 { f32::NAN } else { 2.5 },
+                role: (i * 90) as u8,
+                path: if i % 3 == 0 { "" } else { "src/deep/path/mod.rs" },
+            })
+            .collect();
+        let ctx = RelevanceContext {
+            task: "\u{0}latest 配列 version 😀",
+            recent: "",
+            candidates: &cands,
+            kept: &[0, 3],
+        };
+        let v = extract_all(&ctx);
+        assert_eq!(v.len(), cands.len());
+        for (i, vec) in v.iter().enumerate() {
+            for (j, x) in vec.iter().enumerate() {
+                assert!(x.is_finite(), "cand {i} feature {j} NaN/Inf: {x}");
+                assert!((-1.0..=2.0).contains(x), "cand {i} feature {j} out of band: {x}");
             }
         }
     }

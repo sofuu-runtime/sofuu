@@ -140,12 +140,22 @@ pub unsafe extern "C" fn tui_disp_width(s: *const c_char, len: usize) -> c_int {
 }
 
 fn tui_size(w: &mut c_int, h: &mut c_int) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if r == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        *w = ws.ws_col as c_int;
-        *h = ws.ws_row as c_int;
-    } else {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        if r == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            *w = ws.ws_col as c_int;
+            *h = ws.ws_row as c_int;
+        } else {
+            *w = 80;
+            *h = 24;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // TIOCGWINSZ has no libc binding on Windows; the TUI runs at the
+        // classic default there.
         *w = 80;
         *h = 24;
     }
@@ -173,6 +183,53 @@ pub unsafe extern "C" fn tui_height() -> c_int {
 
 // ── Lifecycle ─────────────────────────────────────────────────────
 
+/// Windows: classic conhost (cmd.exe) does not interpret ANSI escapes
+/// until the process opts in with ENABLE_VIRTUAL_TERMINAL_PROCESSING —
+/// Windows Terminal defaults it on, cmd.exe does not, so every
+/// alt-screen/color sequence the TUI writes prints as literal
+/// `[2J[?25l` soup. Enable it once on stdout + stderr before the first
+/// escape leaves the process. GetConsoleMode fails on redirected handles
+/// (file/pipe), which is the signal to skip. Left on for the life of the
+/// process — cmd builtins are unaffected by the flag.
+#[cfg(target_os = "windows")]
+pub fn windows_enable_vt() {
+    use std::os::raw::c_void;
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+    }
+
+    unsafe fn enable(which: u32) {
+        let h = GetStdHandle(which);
+        // NULL (no handle) or INVALID_HANDLE_VALUE (-1): nothing to set.
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        let mut mode: u32 = 0;
+        // 0 return = not a console (redirected to file/pipe) — skip.
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return;
+        }
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+
+    unsafe {
+        enable(STD_OUTPUT_HANDLE);
+        enable(STD_ERROR_HANDLE);
+    }
+}
+
+/// Non-Windows terminals interpret ANSI natively — nothing to opt into.
+#[cfg(not(target_os = "windows"))]
+pub fn windows_enable_vt() {}
+
 #[no_mangle]
 pub unsafe extern "C" fn tui_init() {
     let mut done = 0;
@@ -180,6 +237,10 @@ pub unsafe extern "C" fn tui_init() {
     if done != 0 {
         return;
     }
+    // Idempotent belt-and-suspenders: main() already calls this on
+    // Windows before any output; keep it here so every tui_entry path
+    // is covered even if init ordering changes.
+    windows_enable_vt();
     G_INIT_DONE.with(|d| d.set(1));
 }
 
@@ -334,14 +395,19 @@ pub unsafe extern "C" fn tui_footer2_row() -> c_int {
     h - 1
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn tui_truncate_cells(s: *const c_char, max_cells: c_int) -> usize {
-    let bytes = c_str(s);
+/// Bounded truncation over a Rust byte slice — the strlen-free twin of
+/// `tui_truncate_cells`, same semantics: whole CSI escapes consumed,
+/// multibyte chars never split, trailing zero-cell escapes absorbed,
+/// degenerate input returns the full length. The input length comes from
+/// the slice, never from a NUL scan, so callers holding non-NUL-terminated
+/// buffers (the footer statics are `Vec<u8>` from `CStr::to_bytes()`) can
+/// never have the walk run past the allocation. Returns a byte index
+/// `<= bytes.len()`, usable directly as a slice bound.
+pub fn truncate_cells(bytes: &[u8], max_cells: usize) -> usize {
     let n = bytes.len();
-    if max_cells <= 0 {
+    if max_cells == 0 {
         return 0;
     }
-    let max_cells = max_cells as usize;
     let mut cells = 0;
     let mut i = 0;
     while i < n {
@@ -408,7 +474,22 @@ pub unsafe extern "C" fn tui_truncate_cells(s: *const c_char, max_cells: c_int) 
             break;
         }
     }
-    i
+    /* A trailing lone ESC (absorption: `i += 1` twice from n-1) or a lead
+     * byte near the end claiming more bytes than remain can overshoot n;
+     * the returned index must stay a valid slice bound. */
+    i.min(n)
+}
+
+/// C-ABI entry for genuinely NUL-terminated callers (CString-backed pickers,
+/// C tests). Rust callers holding `Vec<u8>`/`String` slices must use the
+/// bounded `truncate_cells` above — this walks the pointer with strlen and
+/// reads past a non-terminated allocation.
+#[no_mangle]
+pub unsafe extern "C" fn tui_truncate_cells(s: *const c_char, max_cells: c_int) -> usize {
+    if max_cells <= 0 {
+        return 0;
+    }
+    truncate_cells(c_str(s), max_cells as usize)
 }
 
 // ── Core renderer ─────────────────────────────────────────────────
@@ -456,6 +537,12 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
      * the input box's left margin ("│ ··text") instead of touching the
      * screen edge; the truncation budget shrinks to match. */
     let budget = (w as usize).saturating_sub(GUTTER);
+    /* App-managed selection (mouse drag + Ctrl-K copy): selected rows
+     * paint inverse-video. The range is held by the readline (process.rs)
+     * in SCREEN rows — the same coordinate this loop paints. */
+    let (sel_a, sel_b) = crate::modules::process::sel_range();
+    let sel_lo = if sel_a >= 0 && sel_b >= 0 { sel_a.min(sel_b) } else { -1 };
+    let sel_hi = if sel_a >= 0 && sel_b >= 0 { sel_a.max(sel_b) } else { -1 };
     for row in t..=b {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row));
         let idx = start + (row - top);
@@ -470,21 +557,33 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
                 continue;
             }
             out.push_str(&" ".repeat(GUTTER));
-            let mut bl = unsafe { tui_truncate_cells(l.as_ptr() as *const c_char, budget as c_int) };
+            let mut bl = truncate_cells(l.as_bytes(), budget);
             /* the full row is usable — deferred wrap is absorbed by the
              * next row's ESC[…H */
             if bl < full && unsafe { tui_disp_width(l.as_ptr() as *const c_char, bl) } > budget as c_int - 1 {
-                bl = unsafe { tui_truncate_cells(l.as_ptr() as *const c_char, (budget - 1) as c_int) }; /* room for "…" */
+                bl = truncate_cells(l.as_bytes(), budget - 1); /* room for "…" */
             }
-            /* tui_truncate_cells returns a byte index based on strlen/C-cell
-             * math; it can exceed the Rust String's byte length (ANSI
-             * escapes, interior NULs). Clamp so the slice is always valid. */
+            /* truncate_cells is bounded: it returns at most l.len(), so the
+             * slice below is always valid (no strlen involved). */
             if bl > full {
                 bl = full;
             }
-            out.push_str(&l[..bl]);
-            if bl < full {
-                out.push('…'); /* only when truly truncated */
+            let selected = row >= sel_lo && row <= sel_hi;
+            if selected {
+                /* Inverse video across the whole visible row (text +
+                 * trailing pad) so the selection reads as a solid block
+                 * like a native terminal selection. */
+                out.push_str("\x1b[7m");
+                out.push_str(&l[..bl]);
+                if bl < full {
+                    out.push('…');
+                }
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str(&l[..bl]);
+                if bl < full {
+                    out.push('…'); /* only when truly truncated */
+                }
             }
         }
     }
@@ -551,6 +650,68 @@ fn tui_push(line: &str) {
 /// the terminal was wider keep their stored shape (a resize re-wraps only
 /// future output) — an acceptable trade for a chat scrollback.
 fn tui_push_split(text: &[u8]) -> c_int {
+    // Terminal-output sanitizer: model/host text may carry hostile escapes.
+    // Strip OSC (ESC ] … BEL/ESC\), DCS/SOS/PM/APC (ESC P/X/^/_ … ST) and
+    // non-SGR CSI, but KEEP SGR colors (ESC [ … m) so output stays pretty.
+    // Without this a model answer containing ESC]52;… writes the user's
+    // clipboard (paste-hijack) via the terminal's own OSC52 handling.
+    let text: Vec<u8> = {
+        let mut out: Vec<u8> = Vec::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            if text[i] == 0x1b && i + 1 < text.len() {
+                let c1 = text[i + 1];
+                if c1 == b']' {
+                    // OSC: consume until BEL or ESC\.
+                    i += 2;
+                    while i < text.len() {
+                        if text[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if text[i] == 0x1b && i + 1 < text.len() && text[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                } else if c1 == b'P' || c1 == b'X' || c1 == b'^' || c1 == b'_' {
+                    // DCS/SOS/PM/APC: consume until ST (ESC\).
+                    i += 2;
+                    while i + 1 < text.len() {
+                        if text[i] == 0x1b && text[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                } else if c1 == b'[' {
+                    // CSI: keep SGR (…m), drop everything else.
+                    let mut j = i + 2;
+                    while j < text.len() && !(0x40..=0x7e).contains(&text[j]) {
+                        j += 1;
+                    }
+                    if j < text.len() {
+                        let fin = text[j];
+                        if fin == b'm' {
+                            out.extend_from_slice(&text[i..=j]);
+                        }
+                        // else: drop hostile CSI (cursor, scroll, etc.)
+                        i = j + 1;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            out.push(text[i]);
+            i += 1;
+        }
+        out
+    };
+    let text = &text[..];
     let (mut w, mut _h) = (0, 0);
     tui_size(&mut w, &mut _h);
     // Rows render GUTTER cells indented (see render_rows), so wrap to the
@@ -651,7 +812,9 @@ fn tokenize<'a>(s: &'a str) -> Vec<WrapTok<'a>> {
 /// space that fits; hard-breaks tokens longer than a full line. Trailing
 /// plain spaces on the wrapped line are dropped (the break space is
 /// consumed); zero-cell escapes pass through untouched.
-fn wrap_row(s: &str, w: usize) -> Vec<String> {
+/// `pub` (not pub(crate)): the chat.rs panel tests live in the bin crate
+/// and assert rows survive this wrap byte-identical.
+pub fn wrap_row(s: &str, w: usize) -> Vec<String> {
     if w < 8 || s.is_empty() {
         return vec![s.to_string()];
     }
@@ -825,6 +988,36 @@ pub unsafe extern "C" fn tui_scroll_pos() -> c_int {
     G_SCROLL.with(|s| s.get())
 }
 
+/// Text of conversation screen rows r0..=r1 (inclusive), newline-joined.
+/// Mirrors the buffer→screen mapping in render_rows exactly (viewport
+/// height, G_SCROLL clamp, top anchor) so a highlighted row copies the
+/// very text the user sees on it. ANSI styling is stripped by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn tui_selected_rows(r0: c_int, r1: c_int) -> *mut c_char {
+    let top = unsafe { tui_conv_top() };
+    let vh = unsafe { tui_conv_bottom() } - top + 1;
+    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let over = count - vh;
+    let scroll = G_SCROLL.with(|s| s.get());
+    let scroll = scroll.min(over).max(0);
+    let end = count - scroll; /* exclusive */
+    let start = (end - vh).max(0);
+    let mut parts: Vec<String> = Vec::new();
+    for row in r0..=r1 {
+        let idx = start + (row - top);
+        if idx >= 0 && (idx as usize) < G_LINES.with(|l| l.borrow().len()) {
+            parts.push(G_LINES.with(|l| l.borrow()[idx as usize].clone()));
+        }
+    }
+    let joined = parts.join("\n");
+    let c = std::ffi::CString::new(joined).unwrap_or_default();
+    let p = libc::malloc(c.as_bytes_with_nul().len()) as *mut c_char;
+    if !p.is_null() {
+        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.as_bytes_with_nul().len());
+    }
+    p
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn tui_scroll(delta_rows: c_int) {
     let mut active = 0;
@@ -915,7 +1108,7 @@ pub unsafe extern "C" fn sofuu_tui_phase_row() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{tui_truncate_cells, wrap_row};
+    use super::{tui_truncate_cells, truncate_cells, wrap_row};
     use std::ffi::CString;
 
     /// For every cell budget, the returned byte length must land on a UTF-8
@@ -977,6 +1170,49 @@ mod tests {
         assert_eq!(unsafe { tui_truncate_cells(c.as_ptr(), 4) }, "素風".len());
         // 8 cells = all.
         assert_eq!(unsafe { tui_truncate_cells(c.as_ptr(), 8) }, text.len());
+    }
+
+    /// The footer status/metric statics (process.rs) are plain `Vec<u8>`
+    /// WITHOUT a NUL terminator; the strlen-walking C-ABI entry used to read
+    /// past the allocation and return an out-of-range index — the
+    /// 2026-09-09 abort ("range end index 141 out of range for slice of
+    /// length 80" at process.rs:1366) killed the CLI mid-session. The
+    /// bounded entry must return an in-range bound for every budget and
+    /// agree with the C-ABI entry on genuinely terminated input.
+    #[test]
+    fn truncate_cells_bounded_on_unterminated_buffers() {
+        // The crash shape: an 80-byte metric line, budget far past it
+        // (wide terminal), no NUL anywhere.
+        let buf: Vec<u8> = b"ctx 12.3k/32.7k (38%) in 5.1k out 890 tk"
+            .iter()
+            .copied()
+            .cycle()
+            .take(80)
+            .collect();
+        for cells in 0..=200usize {
+            let n = truncate_cells(&buf, cells);
+            assert!(n <= buf.len(), "overrun: cells={cells} n={n}");
+        }
+        // Huge budget returns the full length.
+        assert_eq!(truncate_cells(&buf, 9999), buf.len());
+        // Empty slice.
+        assert_eq!(truncate_cells(b"", 10), 0);
+        // Overshoot regressions — the old body returned past n for these:
+        // a trailing lone ESC ran the absorption loop to n+1 …
+        assert_eq!(truncate_cells(b"ab\x1b", 10), 3);
+        // … and a 4-byte lead byte claiming 4 when only 2 remain.
+        assert_eq!(truncate_cells(b"a\xF0\x9F", 10), 3);
+        // Equivalence with the C-ABI entry on NUL-terminated input: the
+        // wrapper is a thin delegate, semantics must be identical.
+        let s = "╭──╮ \x1b[2mdim\x1b[0m 素風";
+        let c = CString::new(s).unwrap();
+        for cells in 0..=(s.len() + 4) as usize {
+            assert_eq!(
+                unsafe { tui_truncate_cells(c.as_ptr(), cells as i32) },
+                truncate_cells(s.as_bytes(), cells),
+                "wrapper mismatch at cells={cells}"
+            );
+        }
     }
 
     /// Soft wrap: long prose breaks at spaces, never mid-word, every line

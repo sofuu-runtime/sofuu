@@ -873,7 +873,7 @@ pub(crate) struct EvalCorpus {
 /// Shared by `embed-eval` (acceptance gates) and `embed-stress`
 /// (variant/typo probes reuse the same queries).
 pub(crate) fn build_corpus() -> EvalCorpus {
-    let cats = vec![
+    let cats = [
         paraphrase(),
         facts(),
         documentation(),

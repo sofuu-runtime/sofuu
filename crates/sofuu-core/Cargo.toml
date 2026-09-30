@@ -19,3 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 libc = "0.2"
+# M1: runtime image decode (PNG + JPEG → RGB8). Pure Rust, no OS codecs.
+# default-features off to keep the 5MB cap: no rayon, no extra format glue.
+png = { version = "0.17", default-features = false }
+jpeg-decoder = { version = "0.3", default-features = false }

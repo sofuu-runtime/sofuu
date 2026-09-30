@@ -46,9 +46,11 @@
 
   /* alloc gate (PLAN-ML-GATES §14): RLM asks must fit the selected model
    * too. Resolves the plan from the ask's own shape (caps come from the
-   * registry/learned limits inside Rust), takes the feasibility-checked
-   * output reserve, and truncates the largest message when the prompt
-   * still does not fit. ML off → returns the options untouched. */
+   * registry → caps the endpoint itself published for this model →
+   * learned limits, all inside Rust; baseUrl tells it which endpoint),
+   * takes the feasibility-checked output reserve, and truncates the
+   * largest message when the prompt still does not fit. ML off → returns
+   * the options untouched. */
   function allocFit(o) {
     if (!sofuu.ml || !sofuu.ml.alloc || typeof sofuu.ml.alloc.plan !== 'function') return o;
     try {
@@ -56,7 +58,8 @@
       var tk = 0;
       for (var i = 0; i < ms.length; i++) tk += Math.ceil(String(ms[i].content || '').length / 4);
       var p = JSON.parse(sofuu.ml.alloc.plan(JSON.stringify({
-        model: o.model || '', cfgMaxOutput: o.max_tokens || 0,
+        model: o.model || '', baseUrl: o.base_url || '',
+        cfgMaxOutput: o.max_tokens || 0,
         historyTk: tk, turns: Math.floor(ms.length / 2), taskTk: tk,
       })));
       if (!p || !(p.window > 0)) return o;
@@ -110,18 +113,29 @@
    * separate curl path with no cancellation hook, while streams expose
    * .abort() — that is what makes mid-request Esc work (the watcher in
    * query() kills in-flight asks the moment __rlm_aborted is set). */
-  var ACTIVE_ASKS = [];   // { abort } per in-flight ask stream
+  var ACTIVE_ASKS = [];   // { abort, episode } per in-flight ask stream
+  /* P2-8 (AUDIT-2026-09-01): the abort flag used to be ONE module global —
+   * a second concurrent sofuu.rlm.query reset it (g.__rlm_aborted = false)
+   * and cleared the first episode's pending cancel; one cancel killed both
+   * episodes. Now each query() owns an episode record; the host-set
+   * __rlm_aborted remains the cancel SIGNAL (watchers copy it into their
+   * own episode flags), but only the episode's own flag steers its loop. */
+  var EPISODES = [];
+  function episodeAborted(ep) {
+    if (g.__rlm_aborted) ep.aborted = true;
+    return !!ep.aborted;
+  }
 
-  async function ask(opts, messages) {
+  async function ask(opts, messages, ep) {
     /* alloc gate Layer 1 — error learning: if the provider rejects the
      * ask over a limit, cache the real limit for this model and retry
      * ONCE PER KIND (allocFit re-resolves it). */
     var retriedKinds = {};
     for (;;) {
       try {
-        return await askOnce(opts, messages);
+        return await askOnce(opts, messages, ep);
       } catch (e) {
-        if (g.__rlm_aborted) return '';
+        if (episodeAborted(ep)) return '';
         var kind = allocNoteLimit(opts && opts.model, (e && e.message) || e);
         if (kind && !retriedKinds[kind]) { retriedKinds[kind] = true; continue; }
         throw e;
@@ -129,7 +143,7 @@
     }
   }
 
-  async function askOnce(opts, messages) {
+  async function askOnce(opts, messages, ep) {
     if (opts.recurseVia && messages.length === 1 && messages[0].role === 'user' &&
         g.sofuu && g.sofuu.agent && typeof g.sofuu.agent.run === 'function') {
       var r2 = await g.sofuu.agent.run(String(opts.recurseVia.agent), messages[0].content, { plain: true });
@@ -138,7 +152,7 @@
     var o = allocFit(completeOpts(opts, messages));
     if (sofuu.ai && typeof sofuu.ai.stream === 'function') {
       var st = sofuu.ai.stream(o);
-      var entry = { abort: function () { try { st.abort(); } catch (eA) {} } };
+      var entry = { abort: function () { try { st.abort(); } catch (eA) {} }, episode: ep };
       ACTIVE_ASKS.push(entry);
       var text = '';
       try {
@@ -149,7 +163,7 @@
         /* Aborted mid-flight: swallow so the episode loop's top-of-loop
          * check reports stopped:'aborted' instead of rejecting the whole
          * query (agent.js would otherwise fall back to the plain loop). */
-        if (g.__rlm_aborted) return '';
+        if (episodeAborted(ep)) return '';
         throw eS;
       } finally {
         var ix = ACTIVE_ASKS.indexOf(entry);
@@ -210,27 +224,34 @@
     })), 'new');
     var id = created.id;
     var started = Date.now();
+    /* Per-episode abort record (P2-8): the host flag stays the SIGNAL, but
+     * each episode latches it into its own token — episodes no longer
+     * reset or clear each other's cancels. */
+    var ep = { aborted: false };
+    EPISODES.push(ep);
     /* Mid-request abort: poll the host-set flag and kill any in-flight ask
      * streams (Esc during a long LLM call — previously only noticed at the
      * next round boundary). 100ms poll ≈ the chat's Esc disambiguation
      * timer; the flag itself is set synchronously by agent.cancel. */
     var watcher = setInterval(function () {
       if (!g.__rlm_aborted) return;
+      ep.aborted = true;
       var list = ACTIVE_ASKS.slice();
-      for (var i = 0; i < list.length; i++) list[i].abort();
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].episode === ep) list[i].abort();
+      }
     }, 100);
     try {
-      g.__rlm_aborted = false; /* a fresh episode owns the abort flag */
       var action = parseHostJson(__rlm_start(id), 'action');
       for (;;) {
-        if (g.__rlm_aborted) {
+        if (episodeAborted(ep)) {
           return {
             answer: '(aborted)', calls: 0, toolCalls: 0, rounds: 0,
             ms: Date.now() - started, stopped: 'aborted', depthReached: 0
           };
         }
         if (action.kind === 'messages') {
-          var reply = await ask(opts, action.messages);
+          var reply = await ask(opts, action.messages, ep);
           action = parseHostJson(__rlm_step(id, reply), 'action');
         } else if (action.kind === 'resolve_llm') {
           /* v1: every sub-prompt is a PLAIN completion. Recursive nested
@@ -238,7 +259,7 @@
            * depth + 1) are a documented later step — Episode already
            * threads the depth parameter through for it. */
           var answers = await Promise.all(action.prompts.map(function (p) {
-            return ask(opts, [{ role: 'user', content: p }]);
+            return ask(opts, [{ role: 'user', content: p }], ep);
           }));
           action = parseHostJson(__rlm_feed_llm(id, JSON.stringify(answers)), 'action');
         } else if (action.kind === 'resolve_tools') {
@@ -277,6 +298,18 @@
     } finally {
       clearInterval(watcher);
       /* Episodes never leak — free also on error/abort/throw paths. */
+      var epIx = EPISODES.indexOf(ep);
+      if (epIx >= 0) EPISODES.splice(epIx, 1);
+      /* Re-arm the host cancel signal for the next episode — but only
+       * when the LAST episode leaves (js-10, AUDIT-2026-09-07). The flag
+       * is a SIGNAL, not per-episode state (each episode copies it into
+       * ep.aborted via episodeAborted) — so leaving it set harms nobody
+       * still running, but clearing it here used to steal the signal
+       * from sibling episodes: whichever episode tore down first wiped
+       * the Esc before a slower sibling's watcher/boundary check saw
+       * it. Clearing on last-exit keeps the P3-13 guard too (the next
+       * query is never stillborn-aborted by a stale flag). */
+      if (g.__rlm_aborted && EPISODES.length === 0) g.__rlm_aborted = false;
       try { __rlm_free(id); } catch (e) {}
     }
   }

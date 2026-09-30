@@ -40,6 +40,25 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     }
 }
 
+/// CURLOPT_WRITEFUNCTION for the installer: writes the received chunk into
+/// the std::fs::File supplied as CURLOPT_WRITEDATA (a short count aborts
+/// the transfer). Replaces the FILE*-based default callback — mkstemp/
+/// fdopen have no portable std replacement.
+unsafe extern "C" fn tgz_write_cb(
+    ptr: *mut c_char,
+    size: usize,
+    nmemb: usize,
+    userdata: *mut c_void,
+) -> usize {
+    let file = &mut *(userdata as *mut std::fs::File);
+    let len = size.saturating_mul(nmemb);
+    let chunk = std::slice::from_raw_parts(ptr as *const u8, len);
+    match std::io::Write::write_all(file, chunk) {
+        Ok(()) => len,
+        Err(_) => 0,
+    }
+}
+
 /// The resolver C symbol (declared in the retired resolver.h) — Rust twin
 /// of the C walk-up. malloc'd absolute path or NULL.
 ///
@@ -98,15 +117,25 @@ unsafe extern "C" fn curl_write_cb(
 }
 
 struct InstallCtx {
-    installed: Vec<String>,
+    /* proc-6: name → resolved version. Dedup must compare versions, not
+     * just names — treating `pkg@1.2.0` and `pkg@2.0.0` in one session as
+     * "already installed" silently returned the wrong major. */
+    installed: Vec<(String, String)>,
 }
 
-fn is_installed(ctx: &InstallCtx, name: &str) -> bool {
-    ctx.installed.iter().any(|i| i == name)
+fn is_installed<'a>(ctx: &'a InstallCtx, name: &str) -> Option<&'a str> {
+    ctx.installed.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
 }
 
-fn mark_installed(ctx: &mut InstallCtx, name: &str) {
-    ctx.installed.push(name.to_string());
+fn mark_installed(ctx: &mut InstallCtx, name: &str, version: &str) {
+    ctx.installed.push((name.to_string(), version.to_string()));
+}
+
+/// proc-7: the registry endpoint is pinned to https; the tarball URL comes
+/// from registry JSON, so re-verify it here too (defence in depth against
+/// both a builder mistake and the option-level lock).
+fn url_is_https(url: &str) -> bool {
+    url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://")
 }
 
 /// Minimal JSON string extraction equivalent (the C scanned substrings; the
@@ -147,10 +176,15 @@ unsafe fn npm_install_recursive(
         return 1;
     }
 
-    if is_installed(inst_ctx, &name) {
+    /* proc-6: dedup on resolved versions, not names. Cheap pre-filter:
+     * an exact-pin spec equal to a previously RESOLVED version means the
+     * same package (no fetch needed). Everything else — including a
+     * different-version request that used to be a silent no-op — falls
+     * through to the metadata fetch, which resolves the real version and
+     * either skips (same) or fails loudly (conflict). */
+    if is_installed(inst_ctx, &name) == Some(clean_version.as_str()) {
         return 0; /* already installed or being installed in this session */
     }
-    mark_installed(inst_ctx, &name);
 
     println!("  \x1b[36m→\x1b[0m Resolving {}@{} from registry.npmjs.org...", name, clean_version);
 
@@ -165,6 +199,10 @@ unsafe fn npm_install_recursive(
     }
     let mut meta_buf = CurlBuf { buf: Vec::with_capacity(4096) };
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_URL, meta_c.as_ptr());
+    /* proc-7: registry endpoint is https-only — lock BOTH the initial
+     * protocol and redirects (REDIR alone never constrains the first hop). */
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_PROTOCOLS as c_int, sofuu_ffi::curl::CURLPROTO_HTTPS);
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_REDIR_PROTOCOLS as c_int, sofuu_ffi::curl::CURLPROTO_HTTPS);
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEFUNCTION, curl_write_cb as *const c_void);
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEDATA, &mut meta_buf as *mut CurlBuf as *mut c_void);
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_FOLLOWLOCATION as c_int, 1i64);
@@ -191,6 +229,31 @@ unsafe fn npm_install_recursive(
         return 1;
     };
 
+    /* proc-7: the tarball URL is registry-supplied — refuse non-https
+     * before it can reach curl (belt to the CURLOPT_PROTOCOLS braces). */
+    if !url_is_https(&tarball_url) {
+        eprintln!("  \x1b[31m✗\x1b[0m Refusing non-https tarball URL for {}", name);
+        return 1;
+    }
+
+    /* proc-6 (second half): the registry resolved the version. A same-name
+     * install at a DIFFERENT resolved version is a real conflict — fail
+     * loudly instead of the old silent same-name no-op; an exact match is
+     * a dedup hit. */
+    if let Some(prev) = is_installed(inst_ctx, &name) {
+        match resolved_version.as_deref() {
+            Some(rv) if rv == prev => return 0, /* identical resolved version */
+            Some(rv) => {
+                eprintln!(
+                    "  \x1b[31m✗\x1b[0m Version conflict: {} already installed at {} this session; refusing to also install {}",
+                    name, prev, rv
+                );
+                return 1;
+            }
+            None => {} /* registry gave no version — fall through to the old behavior */
+        }
+    }
+
     if want_shasum.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
         /* Fail closed: modern registries ship dist.integrity (sha512) and
          * may omit the legacy shasum. We don't verify sha512 yet, so refuse
@@ -205,44 +268,72 @@ unsafe fn npm_install_recursive(
     }
 
     if let Some(rv) = &resolved_version {
+        /* proc-6: mark with the RESOLVED version — the dep-recursion cycle
+         * guard and the dedup key. (Old code marked name-only before the
+         * fetch; a failed install then poisoned the name for the session.) */
+        mark_installed(inst_ctx, &name, rv);
         println!("  \x1b[36m→\x1b[0m Installing {}@{}", name, rv);
     }
 
-    /* ── Step 3: download .tgz to a securely-created temp file ── */
-    let mut tmp_c = [0i8; 32];
-    let tmp_tpl = c"/tmp/sofuu_pkg_XXXXXX";
-    std::ptr::copy_nonoverlapping(tmp_tpl.as_ptr(), tmp_c.as_mut_ptr(), 21);
-    let tfd = libc::mkstemp(tmp_c.as_mut_ptr()); /* O_EXCL + 0600 */
-    if tfd < 0 {
+    /* ── Step 3: download .tgz to a securely-created temp file ──
+     * std create_new = O_EXCL (mkstemp's guarantee, portable); 0600 on
+     * unix. TMPDIR/TEMP-aware instead of the old hardcoded /tmp. */
+    let mut tgz_opts = std::fs::OpenOptions::new();
+    tgz_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        tgz_opts.mode(0o600);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut opened: Option<(std::fs::File, String)> = None;
+    for attempt in 0..8 {
+        let cand = std::env::temp_dir()
+            .join(format!("sofuu_pkg_{}-{nanos:x}-{attempt}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        match tgz_opts.open(Path::new(&cand)) {
+            Ok(f) => {
+                opened = Some((f, cand));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+    let Some((mut tgz_file, tmp_tgz)) = opened else {
         eprintln!("  \x1b[31m✗\x1b[0m Cannot create temp file");
         return 1;
-    }
-    let tmp_tgz = CStr::from_ptr(tmp_c.as_ptr()).to_string_lossy().into_owned();
+    };
 
     let curl = sofuu_ffi::curl::curl_easy_init();
     if curl.is_null() {
-        libc::close(tfd);
+        drop(tgz_file);
         let _ = std::fs::remove_file(&tmp_tgz);
         return 1;
     }
-    let tgz_f = libc::fdopen(tfd, c"wb".as_ptr());
     let tgz_c = CString::new(tarball_url).unwrap_or_default();
-    if tgz_f.is_null() {
-        libc::close(tfd);
-        let _ = std::fs::remove_file(&tmp_tgz);
-        sofuu_ffi::curl::curl_easy_cleanup(curl);
-        return 1;
-    }
+    /* Write through the std::fs::File — the default curl callback wants a
+     * FILE*, and there is no portable fdopen for a std File handle. */
+    let cb: unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize = tgz_write_cb;
+    let tgh = &mut tgz_file as *mut std::fs::File as *mut c_void;
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_URL, tgz_c.as_ptr());
-    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEFUNCTION, std::ptr::null::<c_void>() as *const c_void);
-    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEDATA, tgz_f);
+    /* proc-7: tarball URL is registry-supplied (pre-checked https) — lock
+     * the protocol set for the transfer and its redirects. */
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_PROTOCOLS as c_int, sofuu_ffi::curl::CURLPROTO_HTTPS);
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_REDIR_PROTOCOLS as c_int, sofuu_ffi::curl::CURLPROTO_HTTPS);
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEFUNCTION, cb as usize as *const c_void);
+    sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_WRITEDATA, tgh);
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_FOLLOWLOCATION as c_int, 1i64);
     let ua = CString::new(format!("sofuu/{}", env!("CARGO_PKG_VERSION"))).unwrap_or_default();
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_USERAGENT, ua.as_ptr());
     /* A 404/5xx registry response must fail the download. */
     sofuu_ffi::curl::curl_easy_setopt(curl, sofuu_ffi::curl::CURLOPT_FAILONERROR as c_int, 1i64);
     let rc = sofuu_ffi::curl::curl_easy_perform(curl);
-    libc::fclose(tgz_f);
+    drop(tgz_file); /* flush + close (was fclose) */
     sofuu_ffi::curl::curl_easy_cleanup(curl);
 
     if rc != sofuu_ffi::curl::CURLE_OK {
@@ -255,7 +346,9 @@ unsafe fn npm_install_recursive(
     /* ── Step 3b: verify integrity against the registry shasum (SHA-1) ── */
     let tmp_c2 = CString::new(tmp_tgz.clone()).unwrap_or_default();
     if let Some(want) = &want_shasum {
-        let mut got = [0i8; 41];
+        /* c_char is i8 on darwin/x86_64-linux but u8 on aarch64-linux —
+           never hardcode i8. */
+        let mut got = [0 as c_char; 41];
         if sofuu_npm_sha1_file_rs(tmp_c2.as_ptr(), got.as_mut_ptr()) != 0 {
             eprintln!("  \x1b[31m✗\x1b[0m Integrity check failed for {} (expected {})", name, want);
             let _ = std::fs::remove_file(&tmp_tgz);
@@ -293,7 +386,7 @@ unsafe fn npm_install_recursive(
 
     /* npm tarballs have an extra "package/" prefix inside the .tgz. */
     let pkg_c = CString::new(pkg_dir.to_string_lossy().as_bytes()).unwrap_or_default();
-    let mut errbuf = [0i8; 256];
+    let mut errbuf = [0 as c_char; 256];
     let xrc = sofuu_npm_extract_safe_rs(tmp_c2.as_ptr(), pkg_c.as_ptr(), 1, errbuf.as_mut_ptr(), errbuf.len());
     let _ = std::fs::remove_file(&tmp_tgz);
     if xrc != 0 {
@@ -411,4 +504,37 @@ pub unsafe extern "C" fn npm_install_local_package_json(dest_dir: *const c_char)
     }
 
     rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /* proc-7: tarball URLs come from registry JSON — the guard must accept
+     * https (any case) and reject http, protocol-relative, and garbage. */
+    #[test]
+    fn url_is_https_accepts_only_https() {
+        assert!(url_is_https("https://registry.npmjs.org/x.tgz"));
+        assert!(url_is_https("HTTPS://example.com/pkg.tgz"));
+        assert!(!url_is_https("http://registry.npmjs.org/x.tgz"));
+        assert!(!url_is_https("//registry.npmjs.org/x.tgz"));
+        assert!(!url_is_https("ftp://x/y.tgz"));
+        assert!(!url_is_https("https:/missing-slash.tgz"));
+        assert!(!url_is_https(""));
+    }
+
+    /* proc-6: the session dedup tracks RESOLVED versions — exact match is
+     * a hit, a different version is NOT (it must reach the conflict
+     * check after the metadata fetch). */
+    #[test]
+    fn install_dedup_matches_resolved_versions_only() {
+        let mut ctx = InstallCtx { installed: Vec::new() };
+        assert_eq!(is_installed(&ctx, "left-pad"), None);
+        mark_installed(&mut ctx, "left-pad", "1.3.0");
+        assert_eq!(is_installed(&ctx, "left-pad"), Some("1.3.0"));
+        /* Same name, different resolved version → NOT a dedup hit. */
+        assert_eq!(is_installed(&ctx, "left-pad") == Some("2.0.0"), false);
+        /* Name lookups are exact. */
+        assert_eq!(is_installed(&ctx, "left"), None);
+    }
 }

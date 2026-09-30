@@ -28,7 +28,7 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOFUU="$ROOT/sofuu"
-PORT="${1:-18701}"
+PORT="${1:-$((18701 + RANDOM % 89))}"
 BASE="http://127.0.0.1:$PORT/v1/chat/completions"
 
 FAILURES=0

@@ -1,0 +1,42 @@
+// bindings/android/build.gradle — the Sofuu Android library (AAR).
+//
+// This is the Android half of the headless SDK. An app developer adds one
+// dependency and gets offline embeddings, an encrypted local brain, agents,
+// MCP and speech — on-device, with no cloud account, no API key in the APK,
+// and no telemetry. The engine is a pure interpreter (no JIT), so there is
+// no executable-memory problem on Android either.
+//
+// Publishing coordinates (E1-3):
+//   groupId    com.sofuu
+//   artifactId sofuu-android
+//   version    <the release version>
+// The AAR bundles the per-ABI libsofuu .so files plus this JNI bridge; the
+// consumer never copies files by hand (that was the old, error-prone recipe
+// documented in the sample — see examples/headless/KotlinSample for the
+// still-working manual path).
+//
+// A release build needs the prebuilt .so files in
+// src/main/jniLibs/<abi>/. Run `make dist-android` to produce them, or let
+// CI (scripts/dist/android.sh) stage them before gradle assemble.
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

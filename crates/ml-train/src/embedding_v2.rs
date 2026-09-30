@@ -20,8 +20,14 @@
 //!   - QAT: table quantizes with ONE global int8 scale (per-row scales
 //!     would blow the 32 KiB payload budget — see the plan's corrected
 //!     budget math); tower keeps per-row scales like SEM1.
-//!   - Artifact: new magic `SEM2`, ml-train-only until §10 passes.
-//!     sofuu-core runtime untouched.
+//!   - Artifact: new magic `SEM2`.
+//!     Shipped note (2026-09-08, owner-ordered): the runtime mirrors this
+//!     forward in `sofuu-core::embedding::semantic_v2` as the SEMANTIC
+//!     CHANNEL of the fused brain (hash-v1 stays canonical; fusion is
+//!     rank-based).  This is a deployment decision on the owner's call,
+//!     NOT a §10 pass — G1/G3/G6 remain FAILED on the record.  The
+//!     `runtime_semantic_v2_is_bit_identical_to_the_trainer_pipeline`
+//!     test below locks the two implementations together.
 
 use crate::train::Rng;
 use sofuu_core::embedding::{HASH_DIM, SEMANTIC_DIM};
@@ -691,6 +697,49 @@ mod tests {
             let c = q.forward(&x, &b);
             for k in 0..SEMANTIC_DIM {
                 assert_eq!(a[k].to_bits(), c[k].to_bits(), "fake-quant mismatch at {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_semantic_v2_is_bit_identical_to_the_trainer_pipeline() {
+        // The deployed fused channel must score EXACTLY like the graded
+        // round-9 eval: trainer int8 forward + "rp" anchor lens (K=32,
+        // w=0.6) over the same baked artifact.  Any drift here means the
+        // shipped numbers (0.917 fused) do not describe the runtime.
+        use crate::embedding_anchor::{anchor_forward, anchor_matrix, blend};
+
+        let bytes = sofuu_core::embedding::semantic_v2::weights_v2_bytes();
+        let q = QuantizedV2::from_blob(bytes).expect("graded artifact must parse in the trainer too");
+        assert_eq!(&q.to_blob(), bytes, "trainer re-export must be byte-identical");
+        assert_eq!(
+            sofuu_core::embedding::semantic_v2::model_artifact_id_v2(),
+            "dffb00185d090662",
+            "runtime must bake the graded soup, not a retrain"
+        );
+
+        let r = anchor_matrix(32);
+        for text in [
+            "paraphrase stability probe",
+            "",
+            "which tokio version does sofuu-cli use?",
+            "/Users/dev/project/src/main.rs:142",
+            "fix the login timeout bug in the scheduler pool",
+            "deploy the cluster before the weekend",
+        ] {
+            let x = sofuu_core::embedding::hash_v1_features(text);
+            let f_hat = q.forward(&x, &tokenize(text));
+            let a_hat = anchor_forward(&x, &r, 32);
+            let want = blend(&f_hat, &a_hat, 32, 0.6);
+            let got = sofuu_core::embedding::semantic_v2::semantic_v2(text)
+                .expect("baked runtime model must be available");
+            assert_eq!(want.len(), got.len(), "lens width must match");
+            for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "trainer/runtime bit mismatch at dim {i} for {text:?}"
+                );
             }
         }
     }

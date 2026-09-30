@@ -157,8 +157,10 @@ pub unsafe extern "C" fn sofuu_sse_free(p: *mut std::os::raw::c_void) {
 
 /// `sofuu_sse_feed(p, chunk, len)` → malloc'd NUL-terminated JSON array of
 /// complete events: `[{"event":"message","data":"..."}]`, even when empty.
-/// NULL only on OOM-equivalent failure. Chunks are lossy-decoded (SSE text
-/// may arrive split mid-codepoint across network reads).
+/// NULL only on OOM-equivalent failure. Chunks are handed to the parser as
+/// RAW BYTES — the parser buffers bytes and decodes only complete blocks,
+/// so a multi-byte UTF-8 char split across network reads survives intact
+/// (AUDIT-2026-09-01 P1-11; the old per-chunk lossy decode corrupted it).
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_sse_feed(
     p: *mut std::os::raw::c_void,
@@ -170,14 +172,23 @@ pub unsafe extern "C" fn sofuu_sse_feed(
     }
     let parser = &mut *(p as *mut crate::http::sse::SseParser);
     let bytes = std::slice::from_raw_parts(chunk as *const u8, len);
-    let text = String::from_utf8_lossy(bytes);
-    let events = parser.feed(&text);
+    let events = parser.feed(bytes);
 
     // Serialize compactly with serde_json (correct escaping for any bytes).
-    let arr: Vec<serde_json::Value> = events
+    let mut arr: Vec<serde_json::Value> = events
         .iter()
         .map(|e| serde_json::json!({ "event": e.event, "data": e.data }))
         .collect();
+    // P3 (AUDIT-2026-09-07): the buffer cap dropped the pending block (it
+    // lost its head and could never parse correctly) — surface the
+    // corruption as a synthetic error event (once per overflow) instead of
+    // silently emitting garbage data downstream.
+    if std::mem::take(&mut parser.overflowed) {
+        arr.push(serde_json::json!({
+            "event": "error",
+            "data": "sse buffer overflow: buffer cap hit, pending block dropped"
+        }));
+    }
     let out = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
     let b = out.as_bytes();
     let buf = libc::malloc(b.len() + 1) as *mut c_char;
@@ -606,7 +617,7 @@ pub unsafe extern "C" fn sofuu_cma_vectors(
         return std::ptr::null_mut();
     }
     let cma = &mut *(p as *mut crate::memory::cma::Cma);
-    let n = cma.vectors.len();
+    let n = cma.index.len();
     let dim = cma.vec_dim;
     if n == 0 {
         *out_n = 0;
@@ -618,7 +629,8 @@ pub unsafe extern "C" fn sofuu_cma_vectors(
     if buf.is_null() {
         return std::ptr::null_mut();
     }
-    for (i, v) in cma.vectors.iter().enumerate() {
+    for i in 0..n {
+        let v = cma.index.vector(i as u32);
         std::ptr::copy_nonoverlapping(v.as_ptr(), buf.add(i * dim), dim);
     }
     *out_n = n;

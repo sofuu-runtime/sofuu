@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sofuu — Runtime Architecture Map</title>
+<style>
+  /* ============ PAGE GEOMETRY ============ */
+  @page { size: 210mm 297mm; margin: 0; }
+  html, body {
+    margin: 0; padding: 0;
+    width: 210mm;
+    background: #241b31; /* darkest page color — fills sub-pixel gaps on the dark cover */
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  * { box-sizing: border-box; }
+
+  :root {
+    --ink: #222023;
+    --muted: #6f6a76;
+    --bg: #f5f5f6;
+    --card: #ffffff;
+    --stripe: #eceaed;
+    --violet-deep: #583d66;
+    --violet-head: #644f6f;
+    --violet-icon: #633f75;
+    --violet-line: #b6a9bd;
+    --violet-tint: #efebf2;
+    --cover-bg: #241b31;
+    --cover-cream: #f4eee6;
+    --accent: #238e35;
+    --border: #ddd8e0;
+  }
+
+  body { font-family: "Helvetica Neue", "SF Pro Text", Helvetica, Arial, sans-serif; color: var(--ink); }
+  .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+  .page {
+    width: 210mm; height: 297mm;
+    position: relative;
+    overflow: hidden;
+    background: var(--bg);
+    page-break-after: always;
+    padding: 15mm 16mm 12mm;
+    display: flex; flex-direction: column;
+  }
+  .page:last-child { page-break-after: auto; }
+  .page.dark { background: var(--cover-bg); color: var(--cover-cream); }
+
+  /* Browser preview auto-scale (print output unaffected) */
+  @media screen {
+    html { background: #241b31; }
+    body { margin: 0 auto; box-shadow: 0 0 60px rgba(0,0,0,0.35); }
+  }
+
+  /* ============ SHARED TEXT ============ */
+  .kicker {
+    font-size: 10px; letter-spacing: 3.5px; text-transform: uppercase;
+    color: var(--violet-icon); font-weight: 600; margin: 0 0 10px;
+  }
+  .dark .kicker { color: #c9b8d6; }
+  h1.sec {
+    font-size: 27px; font-weight: 800; letter-spacing: -0.4px;
+    margin: 0 0 6px; color: var(--ink);
+  }
+  .lead { font-size: 11.5px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; max-width: 158mm; }
+  .rule { height: 1px; background: var(--border); margin: 0 0 14px; }
+  .rule.accent { width: 34mm; height: 2px; background: var(--violet-deep); margin: 10px 0 16px; }
+
+  .pfoot {
+    margin-top: auto;
+    padding-top: 6mm;
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 8px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted);
+  }
+  .pfoot .pg { font-weight: 700; color: var(--violet-icon); }
+
+  .chip-tag {
+    display: inline-block; font-size: 8.5px; letter-spacing: 1.5px; text-transform: uppercase;
+    font-weight: 700; color: var(--violet-icon); background: var(--violet-tint);
+    border-radius: 2px; padding: 2px 7px; margin-right: 5px;
+  }
+
+  /* ============ TABLES ============ */
+  table { width: 100%; border-collapse: collapse; margin: 0 auto; }
+  th {
+    background: var(--violet-head); color: #ffffff;
+    font-size: 8.5px; letter-spacing: 1.6px; text-transform: uppercase;
+    text-align: left; padding: 7px 9px; font-weight: 700;
+  }
+  td {
+    font-size: 10px; line-height: 1.42; padding: 6.5px 9px;
+    border-bottom: 1px solid var(--border); vertical-align: top;
+    color: var(--ink);
+  }
+  tr:nth-child(even) td { background: var(--stripe); }
+  td.part { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.8px; font-weight: 600; color: var(--violet-deep); white-space: nowrap; }
+  td.sub  { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.6px; font-weight: 500; color: var(--ink); white-space: nowrap; }
+  td.role { color: #3a363e; }
+  td .lang { font-size: 8px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  tr.group td {
+    background: var(--violet-tint); color: var(--violet-deep);
+    font-size: 8.5px; letter-spacing: 2px; text-transform: uppercase; font-weight: 800;
+    border-bottom: 1px solid var(--violet-line); padding: 5.5px 9px;
+  }
+
+  /* ============ COVER ============ */
+  .cover-ghost {
+    position: absolute; right: 5mm; top: 150mm; /* top-anchored: never pins to page bottom */
+    font-size: 200px; font-weight: 800; line-height: 1;
+    color: rgba(244, 238, 230, 0.05); letter-spacing: -6px;
+    font-family: "Hiragino Maru Gothic ProN", "Helvetica Neue", sans-serif;
+  }
+  .cover-ghost::before { content: "\7d20\98a8"; } /* text lives in the pseudo-element: textless host is left alone by the converter */
+  .cover-spine {
+    position: absolute; left: 16mm; top: 0; bottom: 0; width: 1px;
+    background: linear-gradient(180deg, rgba(182,169,189,0) 0%, rgba(182,169,189,0.5) 18%, rgba(182,169,189,0.5) 82%, rgba(182,169,189,0) 100%);
+  }
+  .cover-kicker { margin: 19mm 0 0 8mm; font-size: 10.5px; letter-spacing: 4.5px; text-transform: uppercase; color: #c9b8d6; font-weight: 600; }
+  .cover-hero { margin: 20mm 0 0 8mm; }
+  .cover-hero .big {
+    font-size: 62px; font-weight: 900; line-height: 1.04; letter-spacing: -1.5px;
+    color: var(--cover-cream); margin: 0;
+  }
+  .cover-hero .big em { font-style: normal; color: #b79bc9; }
+  .cover-sum {
+    margin: 10mm 0 0 8mm; width: 118mm;
+    font-size: 12.5px; line-height: 1.62; color: #b9aec4;
+  }
+  .cover-sum strong { color: var(--cover-cream); font-weight: 700; }
+  .cover-bar { margin: 14mm 0 0 8mm; width: 30mm; height: 2px; background: #b79bc9; }
+  .cover-meta-row { margin-top: auto; padding: 0 0 14mm 8mm; display: flex; justify-content: space-between; align-items: flex-end; }
+  .cover-meta-left { font-size: 10px; letter-spacing: 3px; text-transform: uppercase; color: #8f8399; line-height: 2.1; }
+  .cover-meta-right { text-align: right; font-size: 10px; letter-spacing: 3px; text-transform: uppercase; color: #8f8399; line-height: 2.1; padding-right: 8mm; }
+  .cover-meta-right b { color: #c9b8d6; font-weight: 700; }
+
+  /* ============ STATS ============ */
+  .stats { display: flex; gap: 5mm; margin: 4px 0 16px; }
+  .stat {
+    flex: 1; background: var(--card); border: 1px solid var(--border);
+    border-top: 3px solid var(--violet-deep);
+    padding: 12px 12px 10px; border-radius: 2px;
+  }
+  .stat .n { font-size: 30px; font-weight: 900; letter-spacing: -1px; color: var(--violet-deep); line-height: 1; }
+  .stat .n span { font-size: 14px; font-weight: 700; color: var(--violet-icon); margin-left: 2px; }
+  .stat .l { font-size: 9px; letter-spacing: 1.8px; text-transform: uppercase; color: var(--muted); font-weight: 700; margin-top: 7px; }
+
+  /* ============ LAYER STACK DIAGRAM ============ */
+  .stack { margin: 2px 0 0; }
+  .band {
+    display: flex; align-items: stretch;
+    background: var(--card); border: 1px solid var(--border); border-radius: 2px;
+    overflow: hidden;
+  }
+  .band .blabel {
+    width: 44mm; flex: 0 0 44mm; padding: 11px 12px;
+    background: var(--violet-tint); border-right: 1px solid var(--violet-line);
+  }
+  .band .blabel .no { font-size: 8px; letter-spacing: 2px; color: var(--violet-icon); font-weight: 800; }
+  .band .blabel .nm { font-size: 13.5px; font-weight: 800; color: var(--violet-deep); margin-top: 3px; }
+  .band .blabel .d  { font-size: 9.3px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+  .band .bitems { flex: 1; display: flex; align-items: center; gap: 6px; padding: 10px 12px; flex-wrap: wrap; }
+  .pill {
+    background: var(--bg); border: 1px solid var(--violet-line);
+    border-radius: 2px; padding: 5px 9px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 9.8px; font-weight: 600; color: var(--ink); white-space: nowrap;
+  }
+  .pill b { color: var(--violet-deep); font-weight: 700; }
+  .join { height: 14px; position: relative; }
+  .join::before { content: ""; position: absolute; left: 50%; top: 1px; bottom: 1px; width: 1.5px; background: var(--violet-line); transform: translateX(-50%); }
+  .join::after {
+    content: ""; position: absolute; left: 50%; bottom: 0; transform: translateX(-50%);
+    border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid var(--violet-line);
+  }
+
+  /* ============ HIERARCHY MAP PAGE ============ */
+  .hband { display: flex; border: 1px solid var(--violet-line); border-radius: 2px; background: var(--card); overflow: hidden; }
+  .hband .hlabel {
+    width: 30mm; flex: 0 0 30mm; padding: 9px 10px;
+    background: var(--violet-head); color: #fff;
+  }
+  .hband .hlabel .no { font-size: 7.5px; letter-spacing: 2px; opacity: 0.75; font-weight: 800; }
+  .hband .hlabel .nm { font-size: 11.5px; font-weight: 800; margin-top: 2px; line-height: 1.15; }
+  .hband .hgrid { flex: 1; display: grid; gap: 5px; padding: 8px; }
+  .hcard {
+    background: var(--violet-tint); border: 1px solid var(--violet-line); border-radius: 2px;
+    padding: 6px 8px;
+  }
+  .hcard .t { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.8px; font-weight: 700; color: var(--violet-deep); }
+  .hcard .s { font-size: 9.5px; line-height: 1.35; color: var(--muted); margin-top: 2px; }
+  .hcard.dark-card { background: var(--stripe); }
+  .side-note {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 8px; padding: 7px 10px;
+    border: 1px dashed var(--violet-line); border-radius: 2px;
+    font-size: 9.5px; color: var(--muted); line-height: 1.4;
+  }
+  .side-note .t { font-family: "SF Mono", Menlo, Consolas, monospace; font-weight: 700; color: var(--violet-icon); font-size: 9.2px; white-space: nowrap; }
+
+  /* ============ ML MODEL CARDS ============ */
+  .mlgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 0 0 10px; }
+  .mlcard {
+    background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--violet-deep);
+    border-radius: 2px; padding: 9px 11px;
+  }
+  .mlcard .no { font-size: 8.5px; letter-spacing: 2px; color: var(--accent); font-weight: 800; text-transform: uppercase; }
+  .mlcard .t { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11.5px; font-weight: 700; color: var(--violet-deep); margin-top: 2px; }
+  .mlcard .s { font-size: 9.8px; line-height: 1.4; color: var(--muted); margin-top: 3px; }
+
+  .legend { display: flex; gap: 14px; align-items: center; margin: 10px 0 0; font-size: 9px; color: var(--muted); }
+  .legend .k { display: flex; align-items: center; gap: 5px; }
+  .legend .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+
+<!-- ================= PAGE 1 · COVER ================= -->
+<div class="page dark">
+  <div class="cover-ghost"></div>
+  <div class="cover-spine"></div>
+  <div class="cover-kicker">Sofuu 素風 &middot; v0.2.0-beta &middot; Internal Architecture Reference</div>
+  <div class="cover-hero">
+    <p class="big">RUNTIME<br>ARCHITECTURE<br><em>MAP</em></p>
+  </div>
+  <div class="cover-bar"></div>
+  <div class="cover-sum">
+    Every part and sub-part of the Sofuu runtime — from the <strong>C core</strong> (QuickJS, libuv, the QTSQ codec)
+    through the <strong>Rust shell</strong> and its <strong>five on-device ML models</strong>, up to the
+    <strong>shipped JavaScript drivers</strong> and the <strong>macOS desktop app</strong>, mapped as a visual
+    hierarchy and a set of reference tables.
+  </div>
+  <div class="cover-meta-row">
+    <div class="cover-meta-left">
+      August 2026<br>Built from source &middot; ai-native-js-runtime
+    </div>
+    <div class="cover-meta-right">
+      <b>5 layers</b> &middot; 5 crates<br><b>5</b> ML models &middot; 1 binary
+    </div>
+  </div>
+</div>
+
+<!-- ================= PAGE 2 · THE BIG PICTURE ================= -->
+<div class="page">
+  <p class="kicker">Overview</p>
+  <h1 class="sec">The Big Picture</h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    Sofuu is a server-side JavaScript runtime built in Rust around a C core. Everything an AI-era app normally
+    installs from npm — LLM streaming, agents, MCP, web search, HTTP — is built in below the language surface.
+  </p>
+
+  <div class="stats">
+    <div class="stat"><div class="n">2.5<span>MB</span></div><div class="l">Release binary</div></div>
+    <div class="stat"><div class="n">~3<span>ms</span></div><div class="l">Cold startup</div></div>
+    <div class="stat"><div class="n">53.2<span>k</span></div><div class="l">Lines of Rust</div></div>
+    <div class="stat"><div class="n">5.0<span>k</span></div><div class="l">Lines of shipped JS</div></div>
+  </div>
+
+  <p class="kicker" style="margin-bottom:8px;">The layer stack — top-level hierarchy</p>
+  <div class="stack">
+    <div class="band">
+      <div class="blabel"><div class="no">LAYER 4</div><div class="nm">Surfaces</div><div class="d">How humans &amp; hosts talk to the engine</div></div>
+      <div class="bitems">
+        <div class="pill">CLI / TUI chat</div>
+        <div class="pill">sofuu run <b>file.js|.ts</b></div>
+        <div class="pill">REPL</div>
+        <div class="pill">C ABI (embed)</div>
+        <div class="pill">macOS desktop app</div>
+      </div>
+    </div>
+    <div class="join"></div>
+    <div class="band">
+      <div class="blabel"><div class="no">LAYER 3</div><div class="nm">Shipped JS</div><div class="d">5 drivers embedded into the binary</div></div>
+      <div class="bitems">
+        <div class="pill"><b>agent.js</b> 2,160 ln</div>
+        <div class="pill"><b>chat.js</b> 1,787 ln</div>
+        <div class="pill"><b>tools.js</b> 428 ln</div>
+        <div class="pill"><b>web.js</b> 327 ln</div>
+        <div class="pill"><b>rlm.js</b> 305 ln</div>
+      </div>
+    </div>
+    <div class="join"></div>
+    <div class="band">
+      <div class="blabel"><div class="no">LAYER 2</div><div class="nm">Rust core</div><div class="d">crates/sofuu-core &middot; 70 files &middot; 43.6k LOC</div></div>
+      <div class="bitems">
+        <div class="pill"><b>rt/</b> event-loop substrate</div>
+        <div class="pill"><b>ml/</b> 5 tiny models</div>
+        <div class="pill"><b>memory/</b> CMA + HNSW</div>
+        <div class="pill"><b>rlm/</b> recursive loop</div>
+        <div class="pill"><b>mcp/</b> + <b>http/</b> + <b>modules/</b></div>
+        <div class="pill"><b>chat.rs</b> + session mesh</div>
+      </div>
+    </div>
+    <div class="join"></div>
+    <div class="band">
+      <div class="blabel"><div class="no">LAYER 1</div><div class="nm">FFI bridge</div><div class="d">crates/sofuu-ffi + sofuu-capi</div></div>
+      <div class="bitems">
+        <div class="pill"><b>qjs.rs</b> QuickJS</div>
+        <div class="pill"><b>uv.rs</b> libuv</div>
+        <div class="pill"><b>curl.rs</b> libcurl</div>
+        <div class="pill"><b>qtsq.rs</b> codec</div>
+        <div class="pill"><b>capi</b> embeddable ABI</div>
+      </div>
+    </div>
+    <div class="join"></div>
+    <div class="band">
+      <div class="blabel"><div class="no">LAYER 0</div><div class="nm">C core</div><div class="d">deps/ + the QTSQ store codec</div></div>
+      <div class="bitems">
+        <div class="pill"><b>quickjs</b> JS engine</div>
+        <div class="pill"><b>libuv</b> event loop</div>
+        <div class="pill"><b>llhttp</b> HTTP parse</div>
+        <div class="pill"><b>http-parser</b> vendored</div>
+        <div class="pill"><b>QTSQ</b> binary store</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="side-note" style="margin-top:12px;">
+    <span class="t">support crates</span>
+    <span><span class="mono">ml-train</span> — the offline trainer that bakes model weights into the binary &middot;
+    <span class="mono">fuzz</span> — 7 cargo-fuzz targets over the trust boundaries (JSON-RPC, SSE, TS stripper, C ABI&hellip;)</span>
+  </div>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">02 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 3 · VISUAL HIERARCHY MAP ================= -->
+<div class="page">
+  <p class="kicker">Visual Hierarchy</p>
+  <h1 class="sec">Every Part, One Map</h1>
+  <div class="rule accent"></div>
+
+  <div class="hband">
+    <div class="hlabel"><div class="no">LAYER 4</div><div class="nm">Surfaces</div></div>
+    <div class="hgrid" style="grid-template-columns: repeat(4, 1fr);">
+      <div class="hcard dark-card"><div class="t">CLI + TUI</div><div class="s">sofuu / sofuu chat — alt-screen TUI in rt/tui.rs</div></div>
+      <div class="hcard dark-card"><div class="t">sofuu run / REPL</div><div class="s">file evaluation + JS evaluation shell</div></div>
+      <div class="hcard dark-card"><div class="t">sofuu-capi</div><div class="s">embeddable C ABI for host apps (headless)</div></div>
+      <div class="hcard dark-card"><div class="t">Desktop (Tauri)</div><div class="s">13 components + 8 backend modules, own thread</div></div>
+    </div>
+  </div>
+  <div class="join"></div>
+
+  <div class="hband">
+    <div class="hlabel"><div class="no">LAYER 3</div><div class="nm">Shipped JS<br>src/js/</div></div>
+    <div class="hgrid" style="grid-template-columns: repeat(5, 1fr);">
+      <div class="hcard"><div class="t">agent.js</div><div class="s">agent runtime: defs, tool loop, traces</div></div>
+      <div class="hcard"><div class="t">chat.js</div><div class="s">chat turn engine: streaming, gates, resume</div></div>
+      <div class="hcard"><div class="t">tools.js</div><div class="s">read / write / edit / grep / glob / bash</div></div>
+      <div class="hcard"><div class="t">web.js</div><div class="s">web_search + web_open, keyless default</div></div>
+      <div class="hcard"><div class="t">rlm.js</div><div class="s">RLM protocol inside the sandbox</div></div>
+    </div>
+  </div>
+  <div class="join"></div>
+
+  <div class="hband">
+    <div class="hlabel"><div class="no">LAYER 2</div><div class="nm">Rust core<br>sofuu-core</div></div>
+    <div class="hgrid" style="grid-template-columns: repeat(6, 1fr);">
+      <div class="hcard"><div class="t">rt/ (20)</div><div class="s">engine, loop, fs, http, ai, caps, tui&hellip;</div></div>
+      <div class="hcard"><div class="t">ml/ (5 models)</div><div class="s">relevance &middot; freshness &middot; supervisor &middot; compaction &middot; alloc</div></div>
+      <div class="hcard"><div class="t">memory/</div><div class="s">CMA 4-tier + HNSW vector index</div></div>
+      <div class="hcard"><div class="t">rlm/</div><div class="s">episode, router, sandbox, js_api</div></div>
+      <div class="hcard"><div class="t">mcp/ + http/</div><div class="s">JSON-RPC 2.0 + SSE parser</div></div>
+      <div class="hcard"><div class="t">modules/</div><div class="s">console, process, JS module shells</div></div>
+      <div class="hcard dark-card" style="grid-column: span 3;"><div class="t">chat.rs + session.rs</div><div class="s">Rust chat driver (TUI) + per-project session mesh</div></div>
+      <div class="hcard dark-card" style="grid-column: span 3;"><div class="t">bundler &middot; ts &middot; npm &middot; shipped</div><div class="s">ESM bundler, TS stripper, npm safe core, driver registrar</div></div>
+    </div>
+  </div>
+  <div class="join"></div>
+
+  <div class="hband">
+    <div class="hlabel"><div class="no">LAYER 1</div><div class="nm">FFI bridge<br>sofuu-ffi</div></div>
+    <div class="hgrid" style="grid-template-columns: repeat(4, 1fr);">
+      <div class="hcard"><div class="t">qjs.rs + qjs_rt.rs</div><div class="s">QuickJS bindings + hermetic sandbox runtime</div></div>
+      <div class="hcard"><div class="t">uv.rs</div><div class="s">libuv event-loop bindings</div></div>
+      <div class="hcard"><div class="t">curl.rs + http_parser.rs</div><div class="s">HTTP client + vendored parser bindings</div></div>
+      <div class="hcard"><div class="t">qtsq.rs + bridge.rs</div><div class="s">store codec + engine bridge; build.rs compiles the C core</div></div>
+    </div>
+  </div>
+  <div class="join"></div>
+
+  <div class="hband">
+    <div class="hlabel"><div class="no">LAYER 0</div><div class="nm">C core<br>deps/</div></div>
+    <div class="hgrid" style="grid-template-columns: repeat(5, 1fr);">
+      <div class="hcard dark-card"><div class="t">quickjs</div><div class="s">the JS engine — executes all user code</div></div>
+      <div class="hcard dark-card"><div class="t">libuv</div><div class="s">async I/O event loop</div></div>
+      <div class="hcard dark-card"><div class="t">llhttp</div><div class="s">HTTP request/response parsing</div></div>
+      <div class="hcard dark-card"><div class="t">http-parser</div><div class="s">vendored legacy parser (server)</div></div>
+      <div class="hcard dark-card"><div class="t">QTSQ codec</div><div class="s">binary store format: brain, sessions, audits</div></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span class="k"><span class="sw" style="background:var(--violet-tint); border:1px solid var(--violet-line);"></span> Rust-owned part</span>
+    <span class="k"><span class="sw" style="background:var(--stripe); border:1px solid var(--violet-line);"></span> C or C-boundary part</span>
+    <span class="k" style="margin-left:auto;"><span class="mono">rt/ (20)</span> = 20 source files in the folder</span>
+  </div>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">03 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 4 · TABLE: C CORE & FFI ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; 1 of 5</p>
+  <h1 class="sec">C Core &amp; the FFI Bridge</h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    Layer 0 and Layer 1. The C core is vendored under <span class="mono">deps/</span> plus the QTSQ store codec;
+    <span class="mono">sofuu-ffi</span> wraps every C symbol in safe Rust; <span class="mono">sofuu-capi</span> turns
+    the whole runtime into an embeddable C library.
+  </p>
+
+  <table>
+    <tr><th style="width:34mm;">Part</th><th style="width:36mm;">Sub-part</th><th>Role in the runtime</th></tr>
+    <tr class="group"><td colspan="3">deps/ — vendored C dependencies (Layer 0)</td></tr>
+    <tr><td class="part">deps/quickjs</td><td class="sub">JS engine</td><td class="role">The JavaScript engine itself — parses and executes all user code, both at the CLI and inside RLM sandboxes.</td></tr>
+    <tr><td class="part">deps/libuv</td><td class="sub">event loop</td><td class="role">Async I/O: timers, file I/O, sockets, subprocesses. The Rust <span class="mono">rt/loop.rs</span> interleaves its loop with QuickJS microtasks.</td></tr>
+    <tr><td class="part">deps/llhttp</td><td class="sub">HTTP parsing</td><td class="role">Request/response parsing for the HTTP server and client wire paths.</td></tr>
+    <tr><td class="part">deps/http-parser</td><td class="sub">HTTP parsing (vendored)</td><td class="role">Legacy parser kept for the server path; bound in <span class="mono">sofuu-ffi/src/http_parser.rs</span>.</td></tr>
+    <tr><td class="part">QTSQ codec</td><td class="sub">binary store format</td><td class="role">Lives in its own repo (black-hole-disk); compressed, checksummed containers for the .qtsq stores — brain, sessions, audits.</td></tr>
+
+    <tr class="group"><td colspan="3">crates/sofuu-ffi — safe Rust bindings to the C core (Layer 1)</td></tr>
+    <tr><td class="part" rowspan="1">src/lib.rs</td><td class="sub">facade</td><td class="role">The safe-Rust facade over the whole C core — every other crate calls through here.</td></tr>
+    <tr><td class="part">src/build.rs</td><td class="sub">build script</td><td class="role">Compiles the C core (QuickJS + src/*.c + libuv + curl) into static libraries; guards against QTSQ layout drift.</td></tr>
+    <tr><td class="part">src/qjs.rs</td><td class="sub">QuickJS bindings</td><td class="role">Engine bindings — the M0 keystone of the Rust migration.</td></tr>
+    <tr><td class="part">src/qjs_rt.rs</td><td class="sub">sandbox runtime</td><td class="role">Hermetic QuickJS sandbox runtime used by the RLM loop (nested, isolated contexts).</td></tr>
+    <tr><td class="part">src/uv.rs</td><td class="sub">libuv bindings</td><td class="role">Event-loop and handle bindings backing all async Rust-side I/O.</td></tr>
+    <tr><td class="part">src/curl.rs</td><td class="sub">libcurl bindings</td><td class="role">HTTP client transport — including the UAF-hardened streaming callbacks behind <span class="mono">fetch</span> and AI streams.</td></tr>
+    <tr><td class="part">src/http_parser.rs</td><td class="sub">parser bindings</td><td class="role">Bindings to the vendored http-parser used by the HTTP server.</td></tr>
+    <tr><td class="part">src/qtsq.rs</td><td class="sub">codec bindings</td><td class="role">Read/write of .qtsq containers — the project store format for brain and sessions.</td></tr>
+    <tr><td class="part">src/bridge.rs</td><td class="sub">engine bridge</td><td class="role">QuickJS bridge bindings connecting engine callbacks into Rust.</td></tr>
+
+    <tr class="group"><td colspan="3">crates/sofuu-capi — the embeddable C ABI (Layer 1)</td></tr>
+    <tr><td class="part">src/lib.rs</td><td class="sub">C ABI surface</td><td class="role">Embeddable C ABI (PLAN-HEADLESS H1) — host applications can run the Sofuu engine as a library.</td></tr>
+  </table>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">04 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 5 · TABLE: rt/ ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; 2 of 5</p>
+  <h1 class="sec">The Runtime Substrate — <span class="mono" style="font-size:22px;">sofuu-core/src/rt/</span></h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    Twenty files that make the engine tick: the event loop, every I/O primitive exposed to JS, the AI and MCP
+    modules, and the capability registries that keep requests inside each model&rsquo;s real limits.
+  </p>
+
+  <table>
+    <tr><th style="width:44mm;">Sub-part (file)</th><th>Role in the runtime</th></tr>
+    <tr><td class="sub">mod.rs</td><td class="role">Module root — the Rust event-loop substrate (libuv loop + microtask interleaving).</td></tr>
+    <tr><td class="sub">engine.rs</td><td class="role">QuickJS engine lifecycle + file evaluation; registers all Rust modules into JS.</td></tr>
+    <tr><td class="sub">loop.rs</td><td class="role">Global libuv event loop with QuickJS microtask interleaving after every poll.</td></tr>
+    <tr><td class="sub">promise.rs</td><td class="role">Promise &harr; libuv async bridge + deferred unhandled-rejection tracker.</td></tr>
+    <tr><td class="sub">timer.rs</td><td class="role">setTimeout / setInterval / clearTimeout / <span class="mono">sofuu.sleep</span>.</td></tr>
+    <tr><td class="sub">fs.rs</td><td class="role">Async file I/O on libuv — <span class="mono">sofuu.fs</span> read/write/stat family.</td></tr>
+    <tr><td class="sub">process_spawn.rs</td><td class="role"><span class="mono">sofuu.spawn</span> / <span class="mono">sofuu.exec</span> subprocesses.</td></tr>
+    <tr><td class="sub">http_client.rs</td><td class="role">The <span class="mono">fetch</span> API over libcurl — UAF-hardened streaming response buffers.</td></tr>
+    <tr><td class="sub">http_server.rs</td><td class="role">The <span class="mono">sofuu.http</span> HTTP/1.1 server (createServer, routing, streaming responses).</td></tr>
+    <tr><td class="sub">http_sse.rs</td><td class="role">JS-facing <span class="mono">sofuu.SSEParser</span> shell over the Rust SSE parser.</td></tr>
+    <tr><td class="sub">ai.rs</td><td class="role">The <span class="mono">sofuu.ai</span> module — streaming LLM calls across OpenAI / Anthropic / ollama wires.</td></tr>
+    <tr><td class="sub">mcp.rs</td><td class="role">MCP module — client + server, tools/resources/prompts over JSON-RPC.</td></tr>
+    <tr><td class="sub">memory.rs</td><td class="role">Memory subsystem JS module — CMA cognitive memory, key-value store, agent memory.</td></tr>
+    <tr><td class="sub">model_caps.rs</td><td class="role">Per-model capability registry — context window, max output, thinking kind; single source of truth.</td></tr>
+    <tr><td class="sub">model_caps_discovered.rs</td><td class="role">Caps the endpoint itself publishes — a discovery ladder between learned-400 limits and the registry.</td></tr>
+    <tr><td class="sub">cjs.rs</td><td class="role">CommonJS compatibility shim (require/module.exports) for legacy packages.</td></tr>
+    <tr><td class="sub">npm.rs</td><td class="role">npm package resolution + installer (port of the C resolver, semantics verbatim).</td></tr>
+    <tr><td class="sub">session_js.rs</td><td class="role">Synchronous session-mesh primitives exposed to shipped JS (cross-session context sharing).</td></tr>
+    <tr><td class="sub">host_poke.rs</td><td class="role">Thread-safe host&rarr;engine wakeup — how the desktop app injects turns into the blocking engine thread.</td></tr>
+    <tr><td class="sub">tui.rs</td><td class="role">Minimal alt-screen TUI for interactive chat (port of the retired C TUI, same render model).</td></tr>
+  </table>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">05 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 6 · TABLE: SUBSYSTEMS ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; 3 of 5</p>
+  <h1 class="sec">Core Subsystems &amp; Top-Level Files</h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    The rest of <span class="mono">sofuu-core/src/</span>: protocol subsystems, the cognitive memory stack,
+    the RLM scaffolding, JS-visible module shells, and the single-file heavyweights that tie it together.
+  </p>
+
+  <table>
+    <tr><th style="width:30mm;">Part</th><th style="width:33mm;">Sub-part</th><th>Role in the runtime</th></tr>
+    <tr class="group"><td colspan="3">http/ — HTTP subsystem</td></tr>
+    <tr><td class="part">http/mod.rs</td><td class="sub">subsystem root</td><td class="role">Shared HTTP types and setup for client + server paths.</td></tr>
+    <tr><td class="part">http/sse.rs</td><td class="sub">SSE parser</td><td class="role">Streaming Server-Sent Events parser (Rust port of the C parser) — feeds AI streams and MCP.</td></tr>
+    <tr class="group"><td colspan="3">mcp/ — Model Context Protocol</td></tr>
+    <tr><td class="part">mcp/mod.rs</td><td class="sub">subsystem root</td><td class="role">MCP client + server lifecycle over JSON-RPC 2.0.</td></tr>
+    <tr><td class="part">mcp/jsonrpc.rs</td><td class="sub">JSON-RPC layer</td><td class="role">Security-sensitive request/notification/response parsing (fuzz target).</td></tr>
+    <tr class="group"><td colspan="3">memory/ — cognitive memory stack</td></tr>
+    <tr><td class="part">memory/cma.rs</td><td class="sub">CMA</td><td class="role">Cognitive Memory Architecture — the 4-tier memory model (working / episodic / semantic / archive).</td></tr>
+    <tr><td class="part">memory/hnsw.rs</td><td class="sub">HNSW index</td><td class="role">Hierarchical Navigable Small World vector index powering CMA recall.</td></tr>
+    <tr class="group"><td colspan="3">rlm/ — Recursive Language Model loop</td></tr>
+    <tr><td class="part">rlm/sandbox.rs</td><td class="sub">sandbox</td><td class="role">Hermetic nested QuickJS sandbox — the context lives as data inside it.</td></tr>
+    <tr><td class="part">rlm/episode.rs</td><td class="sub">episode loop</td><td class="role">The RLM state machine; the model stays external (network), never inside the loop.</td></tr>
+    <tr><td class="part">rlm/router.rs</td><td class="sub">router</td><td class="role">Routes a turn between a plain model call and the RLM loop; heuristics first, logged for future learning.</td></tr>
+    <tr><td class="part">rlm/js_api.rs</td><td class="sub">JS API</td><td class="role">The engine seam that registers RLM + shipped JS drivers into QuickJS.</td></tr>
+    <tr class="group"><td colspan="3">modules/ — JS-visible module shells</td></tr>
+    <tr><td class="part">modules/console.rs</td><td class="sub">console</td><td class="role">console.log/info/warn/error/assert/time/table.</td></tr>
+    <tr><td class="part">modules/process.rs</td><td class="sub">process</td><td class="role">process object, TTY readline, and the chat bridges into the TUI driver.</td></tr>
+    <tr class="group"><td colspan="3">Top-level single files</td></tr>
+    <tr><td class="part">chat.rs</td><td class="sub">chat driver</td><td class="role">The Rust interactive chat driver — turn engine, TUI phases, provider failover, resume.</td></tr>
+    <tr><td class="part">session.rs</td><td class="sub">session mesh</td><td class="role">Multi-session real-time context sharing, scoped to one project (git root).</td></tr>
+    <tr><td class="part">bundler.rs</td><td class="sub">ESM bundler</td><td class="role">Resolves an ESM import graph into a single executable bundle.</td></tr>
+    <tr><td class="part">ts.rs</td><td class="sub">TS stripper</td><td class="role">TypeScript type stripper — replaces type-only syntax with spaces (fuzz target).</td></tr>
+    <tr><td class="part">npm.rs</td><td class="sub">npm safe core</td><td class="role">Security-sensitive pure logic of npm resolution (spec parsing — fuzz target).</td></tr>
+    <tr><td class="part">shipped.rs</td><td class="sub">driver registrar</td><td class="role">Registers the shipped runtime JS (agent, chat, tools, web) into the engine via include_str!.</td></tr>
+    <tr><td class="part">embed_config.rs</td><td class="sub">embed config</td><td class="role">Process-global config for embedded mode when Sofuu runs as a library.</td></tr>
+    <tr><td class="part">ffi_exports.rs</td><td class="sub">C-ABI exports</td><td class="role">C-ABI exports letting the remaining C core call into safe Rust mid-migration.</td></tr>
+  </table>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">06 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 7 · ML SUITE ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; 4 of 5</p>
+  <h1 class="sec">The ML Suite — Five Tiny On-Device Models</h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    Each gate is a separate ~8.5k-parameter MLP trained offline by <span class="mono">ml-train</span>, baked into
+    the binary, and strictly advise-only: <span class="mono">/ml off</span> (or <span class="mono">SOFUU_NO_ML=1</span>)
+    restores the mechanical ratios exactly.
+  </p>
+
+  <div class="mlgrid">
+    <div class="mlcard"><div class="no">Model 1</div><div class="t">ml/freshness</div><div class="s">Is this material current? Scores staleness of recalled context before it enters the prompt.</div></div>
+    <div class="mlcard"><div class="no">Gate</div><div class="t">ml/relevance</div><div class="s">Pre-retrieval relevance gate — decides what is worth fetching into context at all.</div></div>
+    <div class="mlcard"><div class="no">Gate</div><div class="t">ml/supervisor</div><div class="s">Real-time supervisor over tool calls — flags likely-wasted calls as they happen, with guarded online learning.</div></div>
+    <div class="mlcard"><div class="no">Model 4</div><div class="t">ml/compaction</div><div class="s">When and what to compact — replaces the old fixed 70% cliff with a learned trigger.</div></div>
+    <div class="mlcard" style="grid-column: span 2;"><div class="no">Model 5 &middot; newest</div><div class="t">ml/alloc</div><div class="s">Context-window allocator — fetches the selected model&rsquo;s real caps first (registry &rarr; learned limits &rarr; defaults), then allocates per turn: compact point, tool-result cap, recall budget, attach budget, output reserve. Paired with a mechanical Layer-0 clamp and a Layer-1 pre-flight fit ladder so an oversized request never reaches the provider.</div></div>
+  </div>
+
+  <table>
+    <tr><th style="width:44mm;">Sub-part (file)</th><th>Role in the suite</th></tr>
+    <tr><td class="sub">ml/net.rs</td><td class="role">The generic tiny MLP shared by every gate (24&rarr;96&rarr;40&rarr;1 shape family).</td></tr>
+    <tr><td class="sub">ml/online.rs</td><td class="role">Online adaptation of the supervisor&rsquo;s output layer — confidence-weighted labels, gold = 2.0, two-step adopt/discard, 31-fixture gate.</td></tr>
+    <tr><td class="sub">ml/context.rs</td><td class="role">Shared in-memory context working set — structured view of what the agent loop currently holds.</td></tr>
+    <tr><td class="sub">ml/*/features.rs</td><td class="role">One feature extractor per family — 24+ numeric features from caps, history state, and task shape.</td></tr>
+    <tr><td class="sub">ml/*/model.rs</td><td class="role">Per-family model wrapper — loads baked weights (include_bytes!), runs inference.</td></tr>
+    <tr><td class="sub">ml/*/eval.rs</td><td class="role">Per-family evaluation harness — fixture gates + property tests (no plan exceeds hard limits).</td></tr>
+  </table>
+
+  <div class="side-note" style="margin-top:10px;">
+    <span class="t">crates/ml-train</span>
+    <span>The offline trainer: <span class="mono">train.rs</span> plus one synthetic-data generator per family
+    (<span class="mono">data_alloc / data_compaction / data_freshness / data_relevance / data_supervisor</span>) —
+    4,810+ labeled trajectories, channel-coverage splits so val/test families never leak into train.</span>
+  </div>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">07 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 8 · SHIPPED JS + DESKTOP ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; 5 of 5</p>
+  <h1 class="sec">Shipped JavaScript &amp; the Desktop App</h1>
+  <div class="rule accent"></div>
+  <p class="lead">
+    Layer 3 embeds five JS drivers straight into the binary; Layer 4&rsquo;s macOS app wraps the same engine in
+    Tauri with a permission gate and a dedicated engine thread.
+  </p>
+
+  <p class="kicker" style="margin-bottom:6px;">src/js/ — shipped drivers (embedded via include_str!)</p>
+  <table style="margin-bottom:14px;">
+    <tr><th style="width:34mm;">Sub-part</th><th style="width:20mm;">Lines</th><th>Role in the runtime</th></tr>
+    <tr><td class="sub">agent.js</td><td>2,160</td><td class="role">Agent runtime — agent definitions, the tool loop, sub-agents, traces (<span class="mono">sofuu.agent</span>).</td></tr>
+    <tr><td class="sub">chat.js</td><td>1,787</td><td class="role">Chat turn engine — streaming, alloc pre-flight ladder, provider failover, session resume.</td></tr>
+    <tr><td class="sub">tools.js</td><td>428</td><td class="role">Built-in coding tools — read / write / edit / grep / glob / list_dir / bash.</td></tr>
+    <tr><td class="sub">web.js</td><td>327</td><td class="role"><span class="mono">sofuu.web</span> — web_search + web_open; keyless DuckDuckGo default.</td></tr>
+    <tr><td class="sub">rlm.js</td><td>305</td><td class="role">RLM protocol running inside the hermetic sandbox (tool() dispatch, replies).</td></tr>
+  </table>
+
+  <p class="kicker" style="margin-bottom:6px;">sofuu-desktop/src-tauri/ — Tauri backend (Rust)</p>
+  <table style="margin-bottom:14px;">
+    <tr><th style="width:34mm;">Sub-part</th><th>Role</th></tr>
+    <tr><td class="sub">engine.rs</td><td class="role">Dedicated engine worker thread — the UI never blocks on the runtime.</td></tr>
+    <tr><td class="sub">commands.rs</td><td class="role">The Tauri command surface — every IPC entry point the WebView can call.</td></tr>
+    <tr><td class="sub">host.rs</td><td class="role">The JS&rarr;desktop event sink — engine events stream out to the UI.</td></tr>
+    <tr><td class="sub">keychain.rs</td><td class="role">Provider API keys in the macOS Keychain — keys never reach the WebView.</td></tr>
+    <tr><td class="sub">config.rs / sessions.rs</td><td class="role">Desktop config access; read-only mirror of the session registry.</td></tr>
+  </table>
+
+  <p class="kicker" style="margin-bottom:6px;">sofuu-desktop/src/ — React UI (13 components + lib)</p>
+  <table>
+    <tr><th style="width:34mm;">Sub-part</th><th>Role</th></tr>
+    <tr><td class="sub">ChatPane &middot; Composer &middot; TopBar &middot; Sidebar</td><td class="role">Core shell — message rows, input composer, session pills, workspace sidebar (liquid-glass).</td></tr>
+    <tr><td class="sub">ToolTimeline &middot; ApprovalDialog &middot; DiffView</td><td class="role">Agent activity tree, the allow/deny permission gate, and code diffs for edits.</td></tr>
+    <tr><td class="sub">ContextRing &middot; SettingsModal &middot; Popover</td><td class="role">Context-pressure ring, provider/model settings, drill-in pickers.</td></tr>
+    <tr><td class="sub">CloudBackground &middot; Icon &middot; ErrorBoundary</td><td class="role">WebGL procedural clouds (never loops), icon set, crash containment.</td></tr>
+    <tr><td class="sub">lib/ (backend &middot; events &middot; store &middot; errlog &middot; shortcuts)</td><td class="role">IPC bridge to Tauri, event typing, UI state store, error log, keybindings.</td></tr>
+  </table>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map</span><span class="pg">08 / 09</span></div>
+</div>
+
+<!-- ================= PAGE 9 · SUPPORT, STORAGE, PERIPHERY ================= -->
+<div class="page">
+  <p class="kicker">Reference Tables &middot; Appendix</p>
+  <h1 class="sec">Support Crates, Storage &amp; Periphery</h1>
+  <div class="rule accent"></div>
+
+  <p class="kicker" style="margin-bottom:6px;">Support crates + the project store</p>
+  <table style="margin-bottom:16px;">
+    <tr><th style="width:40mm;">Part</th><th style="width:36mm;">Sub-parts</th><th>Role</th></tr>
+    <tr><td class="part">crates/ml-train</td><td class="sub">train.rs + 5 data_*.rs</td><td class="role">Offline trainer — synthetic trajectory generators, split discipline, weight baking for all five models.</td></tr>
+    <tr><td class="part">crates/fuzz</td><td class="sub">7 fuzz targets</td><td class="role">cargo-fuzz over the trust boundaries: capi_call, jsonrpc, npm_spec, rlm_reply, rlm_snippet, sse, ts_strip.</td></tr>
+    <tr><td class="part">&lt;project&gt;/.sofuu/</td><td class="sub">brain &middot; sessions &middot; audits &middot; debug &middot; issues</td><td class="role">QTSQ-only project store — per-session conversation files written in real time, plus debug/issue/audit records.</td></tr>
+  </table>
+
+  <p class="kicker" style="margin-bottom:6px;">How the pieces connect — the three seams</p>
+  <table style="margin-bottom:16px;">
+    <tr><th style="width:40mm;">Seam</th><th>What crosses it</th></tr>
+    <tr><td class="part">C &harr; Rust</td><td class="role">sofuu-ffi: QuickJS eval + handles, libuv loop polling, libcurl transfers, QTSQ container read/write.</td></tr>
+    <tr><td class="part">Rust &harr; JS</td><td class="role">rt/engine.rs registers every <span class="mono">sofuu.*</span> module; shipped.rs embeds the five JS drivers; host_poke wakes the engine thread.</td></tr>
+    <tr><td class="part">Engine &harr; UI</td><td class="role">Desktop only: commands.rs in, host.rs events out — the WebView never sees API keys or raw engine state.</td></tr>
+  </table>
+
+  <p class="kicker" style="margin-bottom:6px;">Periphery — in the repo, outside the runtime</p>
+  <table>
+    <tr><th style="width:40mm;">Folder</th><th>Contents</th></tr>
+    <tr><td class="part">examples/</td><td class="role">~26 runnable demos — HTTP servers, AI streaming, agents, MCP, SIMD.</td></tr>
+    <tr><td class="part">tests/</td><td class="role">Agent test suite (171+ checks), chat dual-path E2E, resume/failover drivers, live-provider probes.</td></tr>
+    <tr><td class="part">bench/ + benchmarks/</td><td class="role">Startup, throughput, and SIMD micro-benchmarks.</td></tr>
+    <tr><td class="part">scripts/ + tools/</td><td class="role">Build/dev helper scripts and dev tooling.</td></tr>
+    <tr><td class="part">sofuu-landing/</td><td class="role">The marketing site (separate deployable).</td></tr>
+  </table>
+
+  <div class="side-note" style="margin-top:12px;">
+    <span class="t">reading order</span>
+    <span>New to the codebase: start at Layer 0 on the map (page 3), then follow the tables upward —
+    C core &amp; FFI (p.4), runtime substrate (p.5), subsystems (p.6), ML suite (p.7), JS &amp; desktop (p.8).</span>
+  </div>
+
+  <div class="pfoot"><span>Sofuu &middot; Runtime Architecture Map &middot; August 2026</span><span class="pg">09 / 09</span></div>
+</div>
+
+</body>
+</html>

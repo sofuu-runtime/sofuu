@@ -103,6 +103,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Boot diagnostics: page-load lifecycle → stderr.
+        .on_page_load(|webview, payload| {
+            let url = webview.url().map(|u| u.to_string()).unwrap_or_default();
+            eprintln!("[webview] load event={:?} url={}", payload.event(), url);
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             host::set_app_handle(handle.clone());
@@ -157,6 +162,21 @@ pub fn run() {
                     );
                 }
             }
+
+            // Windows: the same glass effect via Mica (Win11) with an
+            // acrylic fallback (Win10 1809+). Older systems keep a plain
+            // opaque window — tauri.conf's transparent flag degrades fine.
+            #[cfg(target_os = "windows")]
+            {
+                use window_vibrancy::{apply_acrylic, apply_mica};
+                if let Some(win) = app.get_webview_window("main") {
+                    // dark: None = follow the system preference (the theme
+                    // effect re-applies live via Window::setTheme anyway).
+                    if apply_mica(&win, None).is_err() {
+                        let _ = apply_acrylic(&win, None);
+                    }
+                }
+            }
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -195,7 +215,10 @@ pub fn run() {
             commands::resume_session,
             commands::set_permissions,
             commands::chat_state,
+            commands::usage_report,
             commands::compact,
+            commands::list_models,
+            commands::refresh_model_cache,
             commands::get_config,
             commands::update_config,
             commands::get_desktop_state,
@@ -205,6 +228,16 @@ pub fn run() {
             commands::keychain_has,
             commands::keychain_set,
             commands::keychain_delete,
+            commands::remove_provider,
+            commands::frontend_log,
+            commands::delete_session,
+            commands::clear_all_sessions,
+            commands::list_tools,
+            commands::list_agents,
+            commands::brain_remember,
+            commands::brain_why,
+            commands::ml_info,
+            commands::context_dump,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build sofuu-desktop")

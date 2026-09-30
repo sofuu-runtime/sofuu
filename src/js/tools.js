@@ -12,7 +12,9 @@
 //   - bash runs /bin/sh -c with a hard timeout (default 60s, max 180s) and
 //     kills the child on expiry; stdout capped. A shell can still touch
 //     anything the user can — set SOFUU_NO_SHELL=1 to strip bash entirely.
-//   - read/grep/glob are read-only and unrestricted (like cat/rg).
+//   - read/grep/glob are read-only (like cat/rg) but refuse credential
+//     stores — .sofuu/config.json, .ssh/*, *.pem|.key|.p12|.pfx (js-5:
+//     grep/glob skip them so keys never reach the provider transcript).
 //   - Every result is additionally capped by the agent loop's P3
 //     tool-result truncation.
 
@@ -28,7 +30,32 @@
   var BASH_OUT_CAP = 16000;
   var BASH_ERR_CAP = 4096;
   var BASH_DEFAULT_TIMEOUT_MS = 60000;
-  var BASH_MAX_TIMEOUT_MS = 180000;
+  /* LONG-HORIZON: real builds and test batteries legitimately run for
+   * many minutes — the old 180s cap killed them at the agent's long
+   * horizon. 10 minutes covers full cargo/maven/npm pipelines; the
+   * caller (or the model via timeout_ms) can still go lower. */
+  var BASH_MAX_TIMEOUT_MS = 600000;
+  /* Catastrophic-command deny-list (P3). Deliberately SHORT and unambiguous:
+   * root/wildcard destruction, disk imagery, fork bombs, host power. Not a
+   * sandbox — the approval gate still runs first — this is the second look
+   * for the commands that should never run no matter who approves them. */
+  var BASH_DENY = [
+    /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)*(-[a-zA-Z]*[rf][a-zA-Z]*\s+)*\/(\s|$)/,       // rm -rf /
+    /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+\/\*/,                                             // rm -r /* (broad wildcard)
+    /\brm\s+-[a-zA-Z]*r[a-zA-Z]*[^ ]*\s+\/[a-z]+(\s|$)/,                                // rm -rf /usr, /etc, /tmp …
+    /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(~|\$HOME)(\/|\s|$)/,                           // rm -rf ~ (P3-8: home destruction)
+    /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+\.\.?(\/|\s|$)/,                                // rm -rf .. (parent of cwd)
+    /\bgit\s+clean\s+-[a-zA-Z]*x[a-zA-Z]*[fd]/,                                          // git clean -xfd (P3-8: nukes ignored files incl. .env)
+    /\bcurl\b[^|;]*\|\s*(ba)?sh\b/,                                                      // curl | sh (P3-8: remote code exec)
+    /\bwget\b[^|;]*\|\s*(ba)?sh\b/,                                                      // wget | sh (P3-8)
+    /mkfs(\.|\s)/,                                                                       // mkfs.*
+    /\bdd\s+[^|;]*of=\/dev\/(disk|rdisk|[sh]d|nvme)/,                                    // dd of=<disk device>
+    /:\(\)\s*\{\s*:\|\s*:\s*&\s*\}\s*;\s*:/,                                             // fork bomb
+    /\b(shutdown|reboot|halt|poweroff)\b/,                                               // host power
+    /\bchown\s+-R\s+\w+\s+\/(\s|$)/,                                                     // chown -R x /
+    /\bchmod\s+-R\s+777\s+\/(\s|$)/,                                                      // chmod -R 777 /
+    />\s*\/dev\/(disk|rdisk|[sh]d|nvme)/,                                                // truncate a disk
+  ];
   var SKIP_DIRS = { '.git': 1, 'node_modules': 1, 'target': 1, 'dist': 1, '.sofuu': 1 };
 
   function cwd() { try { return process.cwd() || '.'; } catch (e) { return '.'; } }
@@ -50,20 +77,66 @@
     return '/' + out.join('/');
   }
 
-  /* Jail for mutating tools: the resolved path must stay under cwd. */
-  function mustBeInRoot(p) {
+  /* Jail for mutating tools: the resolved path must stay under cwd.
+   * P1-4 (AUDIT-2026-09-01): used to be purely LEXICAL — a symlink inside
+   * the project pointing outside it (cloned repo, node_modules, or one
+   * minted by a prior `ln -s` bash call) passed the prefix check and the
+   * write escaped the project. Now symlink-aware: canonicalize the target
+   * (sofuu.fs.realpath, native std::fs::canonicalize) and the root, and
+   * require the canonical containment. A target that does not exist yet
+   * (new file) canonicalizes its NEAREST existing ancestor — a symlink
+   * in the leading directories still resolves; a fresh path with no
+   * symlinked ancestors falls back to the lexical check, which is exact
+   * in that case. */
+  async function mustBeInRoot(p) {
     var abs = lexNorm(p);
     var root = lexNorm('.');
     if (abs !== root && abs.indexOf(root + '/') !== 0) {
       throw new Error('path escapes the project directory (writes are jailed to cwd): ' + p);
+    }
+    if (sofuu.fs && typeof sofuu.fs.realpath === 'function') {
+      var rootReal = null;
+      try { rootReal = await sofuu.fs.realpath('.'); } catch (eR) {}
+      if (rootReal) {
+        /* Canonicalize the deepest EXISTING ancestor of the target: walk
+         * up until realpath succeeds, then re-attach the missing tail. */
+        var probe = abs, tail = '';
+        var targetReal = null;
+        for (var i = 0; i < 32 && probe && probe !== '/'; i++) {
+          try {
+            targetReal = await sofuu.fs.realpath(probe);
+            break;
+          } catch (eP) {
+            var slash = probe.lastIndexOf('/');
+            if (slash <= 0) break;
+            tail = probe.slice(slash + 1) + (tail ? '/' + tail : '');
+            probe = probe.slice(0, slash);
+          }
+        }
+        if (targetReal) {
+          var canonical = tail ? (targetReal.replace(/\/+$/, '') + '/' + tail) : targetReal;
+          if (canonical !== rootReal && canonical.indexOf(rootReal + '/') !== 0) {
+            throw new Error('path resolves (via symlink) outside the project directory: ' + p +
+              ' → ' + canonical);
+          }
+          /* P1-12 (AUDIT-2026-09-07): hand the write the CANONICAL path we
+           * just vetted, not the lexical one — the native open adds
+           * O_NOFOLLOW, so a symlink swapped into the final component after
+           * this check now fails with ELOOP instead of being followed, and
+           * a symlink that legitimately stays inside the project keeps
+           * working because we open its already-vetted real target. */
+          return canonical;
+        }
+        /* targetReal === null: no existing ancestor within reach — the
+         * lexical check above already ran, nothing more to verify. */
+      }
     }
     return abs;
   }
 
   function rel(p) {
     var abs = lexNorm(p);
-    var root = lexNorm('.');
-    if (abs === root) return '.';
+    var root = lexNorm('.');    if (abs === root) return '.';
     if (abs.indexOf(root + '/') === 0) return abs.slice(root.length + 1);
     return abs;
   }
@@ -121,6 +194,32 @@
 
   function basename(p) { var i = p.lastIndexOf('/'); return i < 0 ? p : p.slice(i + 1); }
 
+  /* Sensitive-file policy, one source of truth (js-5 AUDIT-2026-09-07):
+   * returns a reason string when the path is a credential store the agent
+   * must not read, null otherwise. read_file throws on it; grep/glob skip
+   * the file (they used to walk and print it — both auto-approved — so a
+   * routine scan exfiltrated keys into the provider transcript). The user
+   * can still paste credentials manually if a task truly needs them. */
+  function sensitiveReason(p) {
+    var abs = lexNorm(p);
+    var base = basename(abs);
+    if (/(^|\/)\.sofuu\/config\.json$/.test(abs)) {
+      return 'holds API keys — ask the user to provide what you need';
+    }
+    if (/(^|\/)\.ssh\//.test(abs + '/')) {
+      return 'SSH keys are off-limits';
+    }
+    if (/\.(pem|key|p12|pfx)$/i.test(base)) {
+      return 'private key material — ask the user';
+    }
+    return null;
+  }
+
+  function assertNotSensitive(p) {
+    var why = sensitiveReason(p);
+    if (why) throw new Error('refusing to read ' + p + ' (' + why + ')');
+  }
+
   var TOOLS = {};
 
   TOOLS.read_file = {
@@ -137,6 +236,7 @@
     },
     execute: async function (a) {
       var p = lexNorm(a && a.path);
+      assertNotSensitive(p);
       var text = await sofuu.fs.readFile(p, 'utf8');
       var lines = text.split('\n');
       if (lines.length && lines[lines.length - 1] === '') lines.pop();
@@ -170,7 +270,7 @@
     },
     execute: async function (a) {
       if (!a || typeof a.content !== 'string') throw new Error('write_file: content must be a string');
-      var p = mustBeInRoot(a.path);
+      var p = await mustBeInRoot(a.path);
       await mkdirp(parentDir(p));
       var existed = await sofuu.fs.exists(p);
       await sofuu.fs.writeFile(p, a.content);
@@ -192,13 +292,13 @@
       required: ['path', 'old_string', 'new_string'],
     },
     execute: async function (a) {
-      var p = mustBeInRoot(a && a.path);
+      var p = await mustBeInRoot(a && a.path);
       var oldS = String((a && a.old_string) == null ? '' : a.old_string);
       if (!oldS) throw new Error('edit_file: old_string is required (quote it exactly from read_file)');
       var newS = String((a && a.new_string) == null ? '' : a.new_string);
       var text = await sofuu.fs.readFile(p, 'utf8');
-      var count = 0, idx = 0;
-      while ((idx = text.indexOf(oldS, idx)) >= 0) { count++; idx += oldS.length; }
+      var count = 0, idx = 0, first = -1;
+      while ((idx = text.indexOf(oldS, idx)) >= 0) { count++; if (first < 0) first = idx; idx += oldS.length; }
       if (count === 0) {
         throw new Error('edit_file: old_string not found in ' + rel(p) + ' — read_file it and copy the exact text');
       }
@@ -206,7 +306,13 @@
         throw new Error('edit_file: old_string matches ' + count + ' places in ' + rel(p) +
           ' — include more surrounding context to make it unique, or pass replace_all:true');
       }
-      var updated = (a && a.replace_all) ? text.split(oldS).join(newS) : text.replace(oldS, newS);
+      /* js-6 (AUDIT-2026-09-07): splice literally — String.replace (the old
+       * single-match branch) interprets $&, $$, $` and $' in new_string as
+       * replacement patterns, silently corrupting the file when the new
+       * text contains those two-char sequences. split/join (replace_all)
+       * was already literal; the single-match branch now is too. */
+      var updated = (a && a.replace_all) ? text.split(oldS).join(newS)
+                                         : text.slice(0, first) + newS + text.slice(first + oldS.length);
       await sofuu.fs.writeFile(p, updated);
       return 'edited ' + rel(p) + ': ' + ((a && a.replace_all) ? count + ' replacements' : '1 replacement') +
         ' (' + (updated.length - text.length >= 0 ? '+' : '') + (updated.length - text.length) + ' chars)';
@@ -229,11 +335,18 @@
       var re;
       try { re = new RegExp(a && a.pattern); } catch (e) { throw new Error('grep: invalid pattern: ' + String(e.message || e)); }
       var root = lexNorm((a && a.path) || '.');
+      // Jail: searching outside the project (e.g. path '/') would walk the
+      // whole filesystem — reject it like writes.
+      var cwdRoot = lexNorm('.');
+      if (root !== cwdRoot && root.indexOf(cwdRoot + '/') !== 0) {
+        throw new Error('grep: path escapes the project directory (searches are jailed to cwd): ' + (a && a.path));
+      }
       var gfilter = a && a.glob ? globToRe(a.glob) : null;
       var state = { files: 0, done: false };
       var hits = [];
       await walk(root, async function (file) {
         if (state.done) return;
+        if (sensitiveReason(file)) return; /* js-5: credential stores never enter the transcript */
         if (gfilter && !gfilter.test(basename(file))) return;
         var text;
         try { text = await sofuu.fs.readFile(file, 'utf8'); } catch (e) { return; }
@@ -266,10 +379,15 @@
       var re;
       try { re = globToRe((a && a.pattern) || ''); } catch (e) { throw new Error('glob: invalid pattern'); }
       var root = lexNorm((a && a.path) || '.');
+      var cwdRoot = lexNorm('.');
+      if (root !== cwdRoot && root.indexOf(cwdRoot + '/') !== 0) {
+        throw new Error('glob: path escapes the project directory (jailed to cwd): ' + (a && a.path));
+      }
       var state = { files: 0, done: false };
       var found = [];
       await walk(root, async function (file) {
         if (found.length >= GLOB_MAX) { state.done = true; return; }
+        if (sensitiveReason(file)) return; /* js-5: credential paths never enter the transcript */
         if (re.test(rel(file)) || re.test(basename(file))) found.push(rel(file));
       }, state);
       if (!found.length) return 'no files match ' + (a && a.pattern);
@@ -287,6 +405,10 @@
     },
     execute: async function (a) {
       var p = lexNorm((a && a.path) || '.');
+      var cwdRoot = lexNorm('.');
+      if (p !== cwdRoot && p.indexOf(cwdRoot + '/') !== 0) {
+        throw new Error('list_dir: path escapes the project directory (jailed to cwd): ' + (a && a.path));
+      }
       var entries = await sofuu.fs.readdir(p);
       var out = [];
       for (var i = 0; i < entries.length && out.length < 500; i++) {
@@ -300,12 +422,17 @@
 
   TOOLS.bash = {
     name: 'bash',
-    description: 'Run a shell command (/bin/sh -c) in the project directory and return stdout+stderr+exit code. Killed at the timeout (default 60s, max 180s). Prefer specific tools for reading/editing files.',
+    /* selfTimed: the agent's outer withTimeout must NOT wrap bash —
+     * bash polices its OWN timeout below (per-call timeout_ms, up to
+     * 10 minutes); an outer 30s default would strangle every long
+     * build the agent runs. */
+    selfTimed: true,
+    description: 'Run a shell command (/bin/sh -c) in the project directory and return stdout+stderr+exit code. Killed at the timeout (default 60s, max 600s). Prefer specific tools for reading/editing files.',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: 'The shell command to run' },
-        timeout_ms: { type: 'number', description: 'Kill after this many ms (1000-180000, default 60000)' },
+        timeout_ms: { type: 'number', description: 'Kill after this many ms (1000-600000, default 60000)' },
       },
       required: ['command'],
     },
@@ -313,6 +440,17 @@
       if (process.env.SOFUU_NO_SHELL) throw new Error('bash: disabled (SOFUU_NO_SHELL is set)');
       var cmd = String((a && a.command) || '');
       if (!cmd.trim()) throw new Error('bash: command required');
+      /* P3 deny-list: a small set of unambiguously catastrophic patterns is
+       * refused EVEN when the user approves — a mistyped approval on `rm -rf /`
+       * should not need a post-mortem. Matched against the raw command; the
+       * tool is not a security boundary (the permission gate is), this only
+       * catches the classics before they run. */
+      for (var d = 0; d < BASH_DENY.length; d++) {
+        if (BASH_DENY[d].test(cmd)) {
+          throw new Error('bash: refused — the command matches a catastrophic ' +
+            'pattern (deny-list ' + d + '). If you truly need this, run it yourself in a terminal.');
+        }
+      }
       var timeout = Math.min(BASH_MAX_TIMEOUT_MS, Math.max(1000, ((a && a.timeout_ms) | 0) || BASH_DEFAULT_TIMEOUT_MS));
       return await new Promise(function (resolve) {
         var out = '', errOut = '', done = false, code = -1, tid = null;
@@ -355,5 +493,47 @@
   sofuu.tools.TOOLS = TOOLS;
   /* The "code" group — everything above. Opt out of the shell by listing
    * individual names instead, or by exporting SOFUU_NO_SHELL. */
-  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'list_dir', 'bash'];
+  /* todo_write — a living checklist the model maintains across a multi-step
+   * task (P2, claude-code parity). The steps ride the chat's event stream
+   * so hosts render progress; state is one JSON string on a global. */
+  TOOLS.todo_write = {
+    name: 'todo_write',
+    description: 'Maintain the task checklist. Pass the FULL list every time (created/updated in order, status: todo | doing | done). Rewrite it whenever the plan or progress changes — the user watches it live.',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: 'The complete checklist, in order',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: 'The step, imperative' },
+              status: { type: 'string', enum: ['todo', 'doing', 'done'], description: 'todo = not started, doing = in progress (exactly one), done = finished' },
+            },
+            required: ['content', 'status'],
+          },
+        },
+      },
+      required: ['todos'],
+    },
+    execute: async function (a) {
+      var list = (a && Array.isArray(a.todos)) ? a.todos : null;
+      if (!list) throw new Error('todo_write: todos array required');
+      if (list.length > 50) throw new Error('todo_write: max 50 items');
+      var clean = [];
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i] || {};
+        var st = String(it.status || 'todo');
+        if (st !== 'todo' && st !== 'doing' && st !== 'done') st = 'todo';
+        var c = String(it.content || '').trim();
+        if (c) clean.push({ content: c.slice(0, 200), status: st });
+      }
+      if (!clean.length) throw new Error('todo_write: at least one non-empty item');
+      try { globalThis.__sofuu_todos = JSON.stringify(clean); } catch (eG) {}
+      return 'checklist updated (' + clean.length + ' step' + (clean.length === 1 ? '' : 's') + ')';
+    },
+  };
+
+  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'list_dir', 'bash', 'todo_write'];
 })();

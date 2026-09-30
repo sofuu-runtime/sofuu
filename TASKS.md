@@ -1,12 +1,742 @@
 # Sofuu — Task & Status Board
 
-> *Status as of 2026-08-25. Everything marked ✅ was verified by running it (builds + scripted/pty/end-to-end tests), not by reading code claims.*
+> *Status as of 2026-09-25. Everything marked ✅ was verified by running it (builds + scripted/pty/end-to-end tests), not by reading code claims.*
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
-> Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root).
+> **2026-09-27 — headless SDK made true, then installable (E0 + E1).**
+> An audit of the embeddable SDK found the credibility gap
+> `PLAN-POSITIONING-2026.md` §12.5 warns about: H0–H6 had *built* the library
+> but **7 of its 17 documented funnel methods did not exist** — including the
+> entire brain, the product's main differentiator — the flagship sample
+> called a method that does not exist and printed the error as success, and
+> `ai.stream` was advertised while delivering zero events. Fixed, each pinned
+> by a test: memory handle facade, real streaming + live mid-flight cancel +
+> an always-present terminal `done` event, asserting samples, default embed
+> space corrected to `hash-768` (it disagreed with the brain — a silent
+> dimension mismatch), `unknown_method` as a real error code, `mcp.call`/
+> `http.serve` reachable, and an **anti-drift test** that parses the method
+> table out of `docs/EMBEDDING.md` and fails if a listed method does not
+> resolve. Then made installable: `Package.swift` + `Sofuu.podspec`, a
+> Gradle AAR (`com.sofuu:sofuu-android`), an npm package for the CLI
+> (sha256-verified, tamper-refusing, zero dependencies), release CI that
+> builds and attaches all four SDK packs and commits the SwiftPM checksum
+> back, a typed Swift layer, and a podspec validator. Current state: **lib
+> 395/0 · JS 46/0/1 · capi 36/0 · 5/5 headless samples · `make abi-check`
+> green · size 3.2 MB/5 MB · Swift + JNI + Package.swift + podspec all
+> validated.** An embedder can also set `provider`/`model`/`base_url` once in
+> the `sofuu_rt_new` config instead of on every call — an embedded host has no
+> interactive `/model` picker, so repeating them per call was pure friction;
+> a per-call value still wins, and the CLI is unchanged. Release prepared in
+> `RELEASE-0.2.0-PREP.md`; the
+> tag-and-publish step is the owner's call, and refreshing
+> `sofuu.xyz/downloads` with the new tarballs is required before the
+> installer/npm paths serve a correct binary.
+>
+> **2026-09-25 sweep:** ML model audit + compaction hardening + ABI gate green
+> · Q-phase public scoreboard (BM25-calibrated) · QTSQ-free release root-caused
+> and fixed · `sofuu doctor` · ctx-window truth. Current state: **lib 395/0 ·
+> JS suite 46/0/1 · capi 24/0 · `make abi-check` green · size 3,369,152 ·
+> `sofuu doctor` healthy.** The one debt this session could not engineer
+> around: all five ML gates are trained on synthetic data with mechanical
+> labels, and the shadow-mode A/B on live traffic — the instrument that
+> would actually answer "is this right in production?" — still does not
+> exist.
+>
+> Active plan docs (2026-08-24): `PLAN-DESKTOP.md` · `PLAN-MEMORY-TOKENS.md` · `PLAN-RUST-MIGRATION.md` · `PLAN-CHAT-FEATURES.md` · `PLAN-RLM.md` · `PLAN-HEADLESS.md` · `PLAN-AGENTS.md` · `PLAN-ML-GATES.md` (repo root). New 2026-09-22: `PLAN-MULTIMODAL-EMBEDDINGS.md` (headless embedding ABI + image + voice, approved for execution; **H-E1/M1/M2/Q shipped**, P remains).
 
 ---
+
+## ⬜ Open items, consolidated (2026-09-25)
+
+The scattered ⬜ marks across this file and the plan docs, ranked by what
+they cost us if ignored. Nothing here is a known-broken thing; these are
+gaps in *proof* and *coverage*.
+
+### 1. Quality-of-evidence debt (the one that matters most)
+
+| item | why it matters | size |
+|---|---|---|
+| **Shadow-mode A/B on live sessions** | The only instrument that answers "are the five ML gates right on *real* traffic?" Every gate number we have is synthetic. The gates are default-ON and steer compaction/budgets. | S (log-only, no behavior change) |
+| **Tokens-per-completed-task end metric** | `PLAN-ML-GATES.md` §10 names this as the metric that decides whether the gates earn their place — never measured, on synthetic data or otherwise. | M (needs the A/B above) |
+| **Feature-group ablations** (§10 item 4) | No evidence each feature group earns its keep; a gate could be riding one feature. | S |
+| **Grouped k-fold with per-class P/R as a report** (§10 item 2) | `grouped_kfold` exists and trainers use it, but the per-class artifact is not emitted. | S |
+| **Seed sweep** (§10 item 5) | Reliability of the output probabilities is claimed, not shown. | S |
+
+### 1b. SDK packaging — shipped 2026-09-27, two items remain
+
+Closed: `Package.swift` + `Sofuu.podspec` (iOS/macOS), the Gradle AAR
+(`com.sofuu:sofuu-android`), the npm CLI package, release CI that builds and
+attaches all four SDK packs (xcframework + AAR included) and commits the
+SwiftPM checksum, a typed Swift layer, and a podspec validator.
+
+- ⬜ **Publish the npm package** (`cd npm && npm publish`) — a publishing
+  action, deliberately the owner's.
+- ⬜ **Configure a Maven repository** so `com.sofuu:sofuu-android` is a real
+  coordinate. Line 1 revenue prerequisite (`PLAN-POSITIONING` §6); today the
+  AAR ships as a release tarball.
+- ⬜ **Refresh `sofuu.xyz/downloads`** with the v0.2.0 tarballs. Not
+  optional: until it happens, `npm i` and `curl | sh` keep serving the
+  pre-2026-09-25 binary (the QTSQ-free one).
+
+### 2. Embedding / multimodal
+
+- **Real-image set for IMG1** — R@5 1.000 is synthetic and in-domain. No
+  honest real-image number exists, so IMG1 is published labelled as a
+  projector-mapping proof only. Needs a real photo corpus (owner input).
+- **Hosted-model baseline column** — deliberately not run (costs money
+  per run). The scoreboard says so and states the expectation instead.
+- **Agent-loop multimodal fusion** — `recall` can already return image
+  vectors, but the loop does not fuse text+image hits. Fast-follow.
+- **Full-duplex `voice_turn`** — OS mic capture is not portable C, so it
+  stays a sample recipe. Fast-follow.
+- **CLI embedding surfaces** — `sofuu embed`, semantic file search. Fast-follow.
+- **G1/G3-paths/G6 teacher-pair closure** — deprioritized on purpose: the
+  external benchmark says the 64-dim spaces are not where the value is.
+
+### 3. Robustness / correctness
+
+- **`AUDIT-2026-08-22.md` findings** — P0-7 multi-engine teardown on the
+  shared loop (architectural), plus the P1/P2 list (agent budget contract,
+  redirect header leak, npm inflate caps, dual brain handles, MCP server
+  leaks, dead `ffi_exports` shims). Full list + fix order in that file.
+- **Real `cargo-fuzz` runs** — targets compile; the tool isn't installed
+  here, so no actual fuzz campaign has been executed.
+- **ASAN/UBSAN CI job**, parser fuzzing, soak tests, JSValue leak audit.
+- **Live-provider agent run** — everything so far is deterministic mocks
+  (same standard RLM v1 shipped under).
+- **RLM live-model needle proof** vs Ollama; pty `/rlm` session E2E.
+- **Kotlin/Android compile verification** — needs Android Studio; the
+  files are written and type-checked by eye only.
+
+### 4. Build / release
+
+- **musl static builds via cargo + Zig linker** (`scripts/cross/`) — honor
+  `CC_<target>` / `CARGO_TARGET_*_LINKER` in `build.rs`, reuse the
+  existing per-target libuv/curl statics. (Track D4.)
+- **Rebuild + redeploy every platform pack.** Measured 2026-09-25:
+  `dist/sofuu-linux-{x86_64,arm64}.tar.gz` are dated **2026-04-11** and
+  `dist/sofuu-darwin-arm64.tar.gz` is **2026-09-22** — i.e. *all* of them
+  predate this session's ctx/doctor/brain/compaction/ABI work. The public
+  `sofuu.xyz/downloads` copy of the macOS tarball was rebuilt with QTSQ
+  and redeployed (that was the live bug), but `dist/` and the other
+  platforms are unreleased artifacts carrying the old binary. Rebuild with
+  `make dist-macos` / `dist-linux` (each requires `SOFUU_QTSQ_DIR`; the
+  Makefile now refuses without it) and republish.
+- **R4 KV fusion hook + E0–E5 RLM embeddings** — both ride on Track B
+  (local inference), documented not built.
+
+### 5. Deliberately not started (large arcs)
+
+- **Track B — local inference** (llama.cpp behind `SOFUU_LLM=1`, the
+  `sofuu_infer_backend` vtable, the QTSQ KV bridge, CMA↔KV fusion).
+- **Track C — custom engine** (scalar f32 forward → quantized kernels →
+  greedy parity).
+- **PLAN-MULTIMODAL-EMBEDDINGS phase P** — proof surfaces + market
+  (airplane-mode demo, offline iOS voice agent, RAG-in-a-box, landing SDK
+  section). The Q-phase scoreboard is the raw material; the defensible
+  claim there is the *footprint* row, not a quality row.
+
+### Closed since the last board update
+
+- ~~`rlm::js_api::tests::js_roundtrip_through_quickjs` fails~~ — **stale
+  note; it passes** (7/7 as of 2026-09-25). Only the test path ever hit
+  the unterminated-`&str` issue; production uses `CString`.
+
+---
+
+**Done 2026-09-25 (compaction hardening — the gate that deletes user
+data)** — follow-up to the audit above, which found compaction tying a
+logistic reference and therefore had no evidence that its 8 KB network
+earned its place. Two independent problems, both fixed.
+
+**(a) The benchmark could not detect the difference.** Every compaction
+family was PURE — one signal per class, no overlap — so a linear model
+solved it perfectly and the tie was uninformative. Added conflict
+families 17–24 (R=referenced × T=retrievable × D=decision, all eight
+combinations) and, critically, an **XOR family 25/26** (keep iff exactly
+one of {cited, decided}), which is provably non-separable in binary
+coordinates — verified by exhaustive search over a coefficient grid, not
+assumed. The XOR is in TRAIN (a pattern never trained on is unlearnable by
+any model) and 17–24 are the held-out generalization test.
+
+Result on the held-out conflict fold: **MLP F1 0.850 / precision 0.994
+vs logistic 0.553 and the constant 0.545.** The network's precision — the
+number that matters, since a false positive deletes a load-bearing turn
+— clears the 0.95 keep-safety floor. The 8 KB is now demonstrably buying
+capacity the linear model does not have. Two of my own dead ends are
+recorded because they nearly produced a false conclusion: the R/T/D table
+turned out linearly separable (brute-force search found a single plane
+splitting all eight cells), and putting the XOR in the test fold made it
+unlearnable so the trainer refused to write weights.
+
+**(b) The blast radius was unbounded, and guarded by the suspect.** The
+ML path's only stop condition was "usage below half the budget" — on a
+long history that authorises deleting dozens of turns whenever the gate is
+wrong. Two guards, in BOTH drivers (`src/js/chat.js` and the embedded
+`chat.rs` copy, which must not drift):
+  - **Per-pass cap** — at most a quarter of the complete blocks, and never
+    fewer than two survive. A gate that flags 200 of 200 blocks now leaves
+    150 turns.
+  - **Model-independent lexical floor** — a turn whose USER message asks a
+    question, gives an instruction, or records a decision/approval is
+    never removed whatever the model says. The last line of defence
+    cannot be the component under suspicion; protected turns are skipped
+    rather than counted against the cap, so they never starve a
+    disposable turn. The summary line now reports the cap and the skipped
+    count.
+Pinned by `tests/compaction_guard_test.js` (25 asserts, incl. the
+pathological "gate flags everything" case).
+
+**Also fixed: three bugs in the ABI gate itself**, which had been red and
+therefore protecting nothing (`tests/abi_script_test.js`, 14 asserts):
+  1. `sofuu_voice_*` was exported and baselined but MISSING from the
+     `PUBLIC_RE` allowlist — a symbol the filter hides can be detected
+     neither as added nor as removed, so the gate was blind to a whole
+     prefix and then reported those functions as "removed" on a build
+     that exports them.
+  2. `comm` is byte-order and needs both inputs in one collation; the
+     extracted list used locale `sort` and the baseline was ASCII, so
+     under the C locale it invented a phantom removal of
+     `sofuu_run_jobs`. Now `LC_ALL=C` on both sides.
+  3. `$SOFUU_ABI_ALLOW_NEW` was read unguarded under `set -u`, so the
+     acknowledgement path crashed with "unbound variable" instead of
+     reporting the failure it exists to report.
+Plus `sofuu_loop_shutdown_engine` (a real export at `rt/loop.rs:130`) was
+never baselined and failed every run. `make abi-check` is **green for the
+first time**.
+
+**A bug I introduced and caught:** the first compaction guard patch pasted
+Rust (`let mut x = …`) into the embedded JS driver. It compiles — the
+driver is one `r#"…"#` literal — and then died at runtime with
+"SyntaxError: expecting ';'" mid-turn, breaking 8 e2e suites.
+`driver_js_contains_no_rust_isms` now fails the build on that class.
+
+Evidence: lib 395/0 · JS suite 46/0/1 (two new suites) · `make abi-check`
+green · `gate-eval` all five gates PASS on held-out families
+(freshness 1.000/0.571/0.000 · compaction 0.850/0.553/0.545 · relevance
+0.989/0.484/0.000 · supervisor 1.000/0.832/0.769 · alloc
+0.991/0.973/0.000, MLP/logistic/constant F1).
+
+---
+
+**Done 2026-09-25 (ML model base audit — "is it better than the trivial
+thing?")** — new `ml-train gate-eval`
+(`crates/ml-train/src/gate_eval.rs`) grades each gate's COMMITTED weights
+on its held-out families against two references the existing graders
+never compared against: a **majority-class constant** and **logistic
+regression** on the same features/split (PLAN-ML-GATES §10's "beat linear"
+bar). Thresholds come from the validation fold only. Freshness 1.000 F1
+on its test fold is worthless as evidence until the references are on
+the table, and they were not.
+
+| gate | params | MLP F1 | logreg F1 | constant F1 | verdict |
+|---|---:|---:|---:|---:|---|
+| freshness | 8,721 | 1.000 | 0.571 | 0.000 | PASS (recall 1.000 vs 0.400) |
+| compaction | 8,201 | 1.000 | **1.000** | 0.667 | **HOLD — ties linear exactly** |
+| relevance | 8,617 | 0.989 | 0.484 | 0.000 | PASS (decisive) |
+| supervisor | 8,201 | 1.000 | 0.832 | 0.769 | PASS* (wins F1, ties constant on its recall metric) |
+| alloc | 6,321 | 0.991 | 0.973 | 0.000 | PASS (marginal: recall 0.994 vs 0.947) |
+
+Two audit bugs found and fixed while building it — both would have
+produced a flattering lie:
+1. **The linear baseline was a strawman.** `train_logreg` at lr=0.05 on
+   UNSTANDARDIZED features saturates the sigmoid to exactly 0.0, so
+   freshness's linear reference scored recall 0.000 and the MLP appeared
+   to crush it. The reference now z-scores features on train statistics
+   only (0.400 recall, F1 0.571 — a real baseline).
+2. **Comparing only the selection metric hid the truth.** Supervisor is
+   selected for recall, where "always intervene" also reaches 1.000; on
+   F1 the net is 1.000 vs the constant's 0.769. Verdicts now consider both
+   and label the qualified case PASS* rather than calling it a failure.
+   Single-class folds and silent baselines are printed as explicit
+   "UNVALIDATED / UNMEASURED" warnings instead of reading as wins.
+
+**The one real finding: compaction does not beat a logistic regression**
+(F1 1.000 both, precision 1.000 both) — and compaction is the gate that
+DELETES conversation blocks (`chat.js` / `chat.rs` drop flagged complete
+turns until usage drains). Its safety comes from the precision ≥0.95
+keep-safety floor, which both satisfy, so this is a footprint-and-honesty
+problem rather than a demonstrated-harm one. It is also the one gate whose
+decision is irreversible from the user's point of view.
+
+**Standing caveat, printed by the command on every run:** all five
+datasets are synthetic with mechanical labels, and freshness's label is
+`time_sensitive_task AND possibly_stale` where the task-wording pool is
+shared across splits — so a pass means "learnable on the distribution we
+generate", not "correct on real user data". The missing instrument is a
+shadow-mode A/B on live sessions; it does not exist. No runtime code
+changed (dev-only crate).
+
+---
+
+**Done 2026-09-25 (Q phase — public embedding scoreboard)** — new
+`ml-train bench` (`crates/ml-train/src/embedding_bench.rs`) + 
+`scripts/bench/fetch_datasets.sh`. Everything measured before was on our
+OWN synthetic corpora, which can only ever say "we beat our own
+baselines". This runs the standard public sets: **BEIR SciFact**
+(5,183 abstracts, 300 judged queries, 339 qrels) for retrieval
+(R@1/R@5/R@10, nDCG@10, MRR@10) and the **STS test split** (1,379 rated
+pairs) for Spearman ρ, plus artifact bytes, parameter count and median
+embed latency measured in-process. A BM25 implementation runs in the same
+harness as the reference row.
+
+Results (Apple M2 Pro, release, single thread, no network):
+
+| space | dim | params | KB | ms | R@1 | R@5 | nDCG@10 | ρ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bm25 (reference) | — | — | 0 | — | 0.537 | 0.750 | **0.663** | — |
+| hash-v1 (default) | 768 | **0** | **0** | **0.002** | 0.307 | 0.493 | **0.410** | **0.613** |
+| sem1-64 (opt-in) | 64 | 13,392 | 13.7 | 0.043 | 0.003 | 0.017 | 0.014 | 0.421 |
+| sem2-64 (opt-in) | 64 | 30,032 | 29.9 | 0.071 | 0.037 | 0.090 | 0.081 | 0.517 |
+
+**The BM25 row is the calibration check**: 0.663 nDCG@10 against the
+~0.665 published for SciFact, so the harness, qrels and metrics agree
+with the literature. **The headline finding inverts the internal suite**:
+on out-of-domain text the 64-dim learned spaces reach 12% (sem2) and 2%
+(sem1) of BM25's nDCG and lose to the 768-dim hash space they were meant
+to replace. Our own pre-registered `embed-eval` gate independently
+returns FAIL on 2 gates and says "do NOT replace the current embedder" —
+so the shipped default (hash-v1) was already the right call, and the
+opt-in spaces are published with their gap rather than quietly dropped.
+The in-house suite (fused 0.917 vs hash 0.875) is in-domain by
+construction and is now labelled as such next to the external table.
+
+IMG1 reproduces: text→image R@1 0.581 / R@5 1.000 on 93 held-out
+procedural scenes (39 unseen tags) vs 0.247 raw / 0.538 lexical — labelled
+**synthetic, in-domain** in README and the landing page; no real-image
+claim is made. A hosted-model baseline was NOT run (costs money per run)
+and the docs say so.
+
+Published: README "Embedding benchmarks" + landing `/docs#benchmarks`
+(deployed). No runtime code changed — the scoreboard is dev-only
+(`ml-train` is not in the workspace default members and is never linked
+into the binary).
+
+---
+
+**Done 2026-09-25 (the QTSQ-free release — root-caused from a user
+screenshot)** — symptom: `⚠ session persist failed — transcript is
+memory-only until it recovers`, with the banner still claiming
+`Memory: on (persists across sessions)`. Reproduced exactly. The
+installed `/usr/local/bin/sofuu` (2,864,880 B, 2026-09-22) and **the
+publicly shipped `sofuu-darwin-arm64.tar.gz` were both built WITHOUT
+QTSQ** — `qtsq_session_save` returns -1 in such a build, so every session
+persist failed and every brain write no-opped while the UI claimed
+otherwise. Every install since 2026-09-22 had broken memory. Four fixes:
+
+1. **The shipped tarball is rebuilt WITH QTSQ** and redeployed
+   (3,352,640 B); live-verified end to end — `curl -fsSL
+   https://sofuu.xyz/install | sh` → `sofuu doctor` reports QTSQ linked
+   and the brain round-trip passing.
+2. **`make` refuses to build without it.** `cargo-build` now fails when
+   `SOFUU_QTSQ_DIR` is unset (or has no `libqtsq.a`/`.dylib`), naming the
+   consequence; `SOFUU_ALLOW_NO_QTSQ=1` is the explicit opt-out. The
+   silent degradation is what shipped the broken binary in the first place.
+3. **The banner can no longer lie** — `Memory:` reads
+   `on, but NOT persisting (QTSQ codec not linked in this build — run
+   sofuu doctor)` when the codec is absent, via
+   `sofuu_ffi::qtsq_linked()` (compile-time `cfg!(has_qtsq)`), the same
+   signal `doctor` reports. Pinned by `memory_row_never_lies_about_persistence`.
+4. **`doctor`'s link check is now compile-time**, not string-sniffing the
+   probe output (which would have agreed with a no-op module).
+
+**Also fixed (found while reproducing): the false "empty/corrupt" brain
+alarm.** The QTSQ tensor codec cannot store a zero-length payload, so a
+brain with no memories is written as a metadata-only container with no
+`memories` stream — which `cma_open` then classified as CORRUPT. Every
+chat start in a fresh project printed the warning and copied the file to
+a fixed `.bak`; repeated opens kept re-copying over the same `.bak`, so
+the one moment a backup matters was the moment it got clobbered. Now: a
+brain whose metadata proves `"records": []` is adopted silently (nothing
+to protect), a brain whose metadata claims records but has no vectors is
+still backed up (real, unseen data loss), and `backup_brain()` never
+overwrites an existing backup (`.bak`, `.bak.1`, `.bak.2`, …). The old
+`corrupt_brain_backed_up_then_fresh_start` test pinned the wrong policy
+and is replaced by four: empty-adopted, claims-records-backed-up,
+backup-chain-never-clobbers, garbage-container-backed-up.
+
+Evidence: lib 395/0 · capi 24/0 · JS suite 44/0/1 · c_embed_vec gate ·
+size 3,352,640 · live: societyos project now runs clean (no persist
+warning, no corruption alarm) and `/usr/local/bin/sofuu doctor` says
+`healthy`.
+
+**Done 2026-09-23 (ctx-window truth + `sofuu doctor` — F1–F5)** — user
+report: "a 1M model shows 32k and `/ctx 1m` does nothing". Four distinct
+defects, all now fixed and verified:
+
+1. **`/ctx 1000000` was silently shrunk** to the strongest evidence — a
+   1M model capped at 32k produced "✓ Context window → 32768" and no
+   explanation. The ladder now distinguishes EXPLICIT from INHERITED:
+   a value typed this session (`/ctx n`, `--ctx-window`, persisted as
+   `ctx_window_explicit`) is **obeyed as given** with one advisory line
+   naming the bound it exceeds; an inherited `config.json` global still
+   shrinks to the model's real bound (the P0 ring-bug guard is intact).
+   `Resolved.config_exceeds_evidence` + `resolveCaps().configExceedsEvidence`
+   carry the bound to the UI. Pinned by 4 new ladder tests.
+2. **The /ctx picker's own "1M" preset was unusable** — it sends
+   `1048576` but `MAX_CTX_WINDOW` was `1_000_000`, so selecting 1M was
+   rejected outright. Ceiling raised to 4Mi (2M-class models now fit) and
+   `parse_token_count` accepts `128k` / `1m` / `1.5m` (binary suffixes)
+   for `/ctx`, `/maxout`, `--ctx-window`, `--max-output`.
+3. **Silent 32k after a model switch** — `discoverCaps()` is 7-day TTL
+   gated and silent, so a newly selected model had no evidence and no
+   explanation. `/model` and `/provider` now force a harvest for the
+   active root (`detectCapsNow()` in the chat driver) and ALWAYS report:
+   detected window + source + model count, or why not (unreadable list /
+   no caps published for this model / local endpoint). Local endpoints
+   are no longer skipped — Ollama/LM Studio listings are harvested too.
+   `sofuu.chat.detectCaps()` exposes the same pass to embedded hosts.
+4. **A 400 on one gateway shrank the same model on another** — the
+   learned-limits store was keyed by model name only. Now keyed by
+   (normalized api root, model) with the name-only key kept as fallback
+   for callers without a URL; trailing-slash spellings address one entry.
+
+**`sofuu doctor`** (new command, non-zero exit on a hard failure):
+QTSQ link detection + a real brain write→flush→**reopen**→recall
+round-trip in a temp store (the reopen re-hydrates from the file, so it
+cannot pass on cache), the resolved brain path and whether it exists,
+the current model's resolved window/output with the evidence source and
+any advisory, discovered-caps entry count, config presence + masked key.
+Catches both silent-failure classes: an unlinked QTSQ build and a brain
+that never reaches disk.
+
+Evidence: lib 392/0 (33 alloc-ladder), capi 24/0, JS suite 44/0/1
+(new `tests/caps_test.js` 28 asserts through the real native seam, run
+under a scratch HOME so synthetic listings never touch the user's
+`~/.sofuu/ml/model_caps.json`), c_embed_vec gate, size 3,352,640.
+**Live check on the reported case**: `/model stealth/space-bunny-alpha`
+at openrouter now prints `✓ detected 1000k context … (discovered, 460
+models)` where it previously reported 32,768; `doctor` agrees
+(`resolved window 1000000 (source: discovered)`).
+
+Bugs found while building the doctor probe: the memory API is
+`remember(vec, text, role, page_id)` (a doctor probe written against the
+old 3-arg shape wrote a file literally named `undefined`, because
+`process.env` is a snapshot taken at engine init — the path is now
+inlined into the probe source).
+
+**Done 2026-09-23 (M2 voice, both tracks)** — provider audio: `ai.transcribe`
+(multipart MIMEPOST via new curl mime bindings, `{text}` out) + `ai.speak`
+(JSON in, raw-bytes `{audio: Uint8Array, format}` out) on a dedicated 4th
+curl-multi request tag (own struct/lifecycle/completion arms); `{audio_b64}`
+bridge form + strict b64 codec; OS speech: `SofuuVoice.swift` (file + live-mic
+STT, AVSpeech TTS) + `SofuuVoice.kt` (SpeechRecognizer + TTS); C ABI
+`sofuu_voice_transcribe`/`speak` (funnel routing, alphabet-guarded) + header +
+symbols + Swift/Kotlin provider fallbacks (+JNI). Evidence: Rust audio
+validation (9 asserts) + b64 vectors + capi voice guards ok,
+`tests/voice_test.js` 12/12 against a mock (multipart framing, opts, b64,
+500s both ways). Real bug found: AiAudioReq lacked `#[repr(C)]` while the
+shared write callback assumes the header layout — heap corruption (hangs +
+SIGSEGV); fixed + hardened AiCompleteReq the same way. No bundled STT;
+full-duplex voice_turn stays a sample recipe.
+Swift typechecked, JNI syntax-clean (Kotlin needs Android Studio).
+Docs: README, landing `/docs` voice rows, EMBEDDING §12 flipped.
+
+**Done 2026-09-23 (M1 image embeddings, SHIP gates pass)** — IMG1 tiny distilled
+projector (144 frozen IMGF1 features → 32 tanh → 64, 3408 params, 7452-byte int8
+artifact id `9b0b7077897360c5`, goldens pinned): PNG/JPEG decode (`png` +
+`jpeg-decoder`, ~150KB size cost), procedural UI-scene corpus (8 families,
+tag-split holdout), InfoNCE + MSE-assist trainer (`ml-train img-train`,
+bit-reproducible), eval harness (`img-eval`: R@5 1.000 ≥ 0.80 bar, +0.75 over
+raw, +0.46 over lexical, zero text degradation). Wired: `sofuu_embed_image` ABI
+(+header/symbols), Swift/Kotlin/JNI, `ai.embedImage` JS, image space arm in
+`cma_open`, `tests/multimodal_test.js` 9/9 (text queries retrieve images),
+`tests/fixtures/mm_{red,blue}.png`. Evidence: lib 370/0, capi 23/0,
+headless-test green, JS 42/0/1, size 3,031,168 ≤ 5MB. Honest notes: procedural
+toy scenes (not real photos — owner to supply); R@1 0.58 soft; eval pool 93
+pairs; agent-loop multimodal fusion deferred to fast-follow; `img-diag` command
+kept for task-posedness checks. Training lessons: exact-draw recall metric
+punishes duplicate-rich corpora (fixed → same-caption hits, R@5 0.08→0.55);
+HashSet drain order broke reproducibility (fixed: sort before shuffle);
+IMG_BLOB_LEN hardcoded 16 (fixed: derive from consts).
+
+**Done 2026-09-23 (H-E1 SDK-grade text embedding ABI)** — native `sofuu_embed_local` /
+`sofuu_embed_batch` / `sofuu_embed_info` in `sofuu-capi` + `sofuu_embed.h` (new codes
+-7/-8/-9; funnel -2/-3/-5 untouched), `ai.embed` local-default (SEM2-64; explicit
+provider/model/URL/key still network) + `ai.embedBatch` (local-only) in `rt/ai.rs`,
+Swift (`embedLocal` rewired + `embedBatch`/`embedInfo`) and Kotlin/JNI wrappers,
+`c_embed_vec.c` in `make headless-test`, `abi_symbols.txt` +3, `docs/EMBEDDING-DIST` updated.
+Evidence: capi test `embed_local_batch_info_round_trip` ok, core test
+`embed_local_default_and_batch` ok (8 asserts: default/explicit/determinism/spaces/
+batch/throws), lib 364/0, capi 23/0, headless-test green incl. `c_embed_vec: all
+checks passed`, JS suite 41/0/1 (exact baseline), size 3,185,776 ≤ 5MB, batch
+1000×SEM2-64 in 169ms (< 5s bar). Notes: `make test` without `SOFUU_QTSQ_DIR`
+silently rebuilds QTSQ-free and 4 suites fail (agent.create undefined) — always
+build/test with the env set; `make abi-check` already red pre-change on
+unbaselined `sofuu_loop_shutdown_engine` + a `set -u` script bug (not ours).
+TS Swift typechecked (`swiftc -typecheck`), JNI `cc -fsyntax-only` clean; Kotlin
+uncompiled here (no kotlinc/NDK — verify in Android Studio).
+
+**Planned 2026-09-22 (multimodal embeddings: headless vector ABI + image + voice)** —
+new implementation plan `PLAN-MULTIMODAL-EMBEDDINGS.md`, approved for execution. Order:
+H-E1 SDK-grade text embedding ABI (`sofuu_embed_local`/`batch`, Swift/Kotlin, `ai.embed`
+local-default + `ai.embedBatch`) → M1 tiny distilled image projector (new image-only space,
+multimodal RRF) → M2 voice both tracks (provider `ai.transcribe`/`ai.speak` + OS speech
+bridges, `sofuu_voice_turn`) → Q quality gate (G1/G3/G6 + public mini-benchmark) → P proof
++ market. Hard outs: no whisper.cpp, no cloud embedding API, 5MB cap stands. Docs updated
+to match: `docs/EMBEDDING.md` §12 (PLANNED vector ABI), README `sofuu.ai` (image message
+input, local embed family, roadmap note), landing `/docs` (embed rows + roadmap note).
+
+**Verified 2026-09-19 (ctx-window over-report fix: cross-root plan-stem inheritance removed)** —
+`z-ai/glm-5.3-free` @ tokenrouter metered ~1.1M ctxBudget off a 1,310,720 fiction inherited from the
+PAID stem id on other roots (`plan_stem` + `max_by_key` in `lookup_any_root` Pass 2); serving endpoint
+publishes no caps, registry unknown, config 0 — full diagnosis in `PLAN-CTX-WINDOW-OVERREPORT.md`.
+Fix (option a): `lookup_any_root` is now exact-id only (same id, same weights — sound); plan-suffixed
+variants fall to `UNKNOWN_WINDOW = 32,768` until the first real 400 teaches the truth (learned-400s
+still override everything). Regression tests `cross_root_is_exact_id_only_no_plan_stem_inheritance`
+(store) + `free_tier_variant_does_not_inherit_paid_stem_window` (policy ladder end-to-end) pass.
+Evidence: cargo lib 379/0, `make test` 41/0/1, re-probe `-free` → window 32768 default (was 1310720),
+exact stem still 1310720 cross-root; doubled orca endpoint repaired in `~/.sofuu/config.json`;
+`./sofuu` re-copied to `/usr/local/bin/sofuu`.
+
+**Verified 2026-09-09 (/remember brain-path fix: ONE shared brain handle + config brain_path)** —
+owner-diagnosed mismatch: `/remember` (and `/share`/`/import`/ghost completion) opened the chat
+driver's OWN brain handle at `~/.sofuu_brain.qtsq` while every turn's recall/auto-store ran on the
+agent runtime's project-local `<cwd>/.sofuu/brain/brain.qtsq` — pins went to a file recall never
+read, and even with matching paths two long-lived handles on one file clobber on flush (a QTSQ
+flush rewrites the whole file from the handle's view; last flush wins). Fix (src/js/agent.js +
+rt/chat.rs driver JS + embed_config.rs doc, uncommitted):
+1. New `sofuu.agent.brainFor(def)` export — returns the SAME BRAINS-cached `{cma, sem, backend}`
+   entry `run()` uses (key path+backend.id, LRU-8, fusion gates identical); null when
+   memory:'off' or the backend is unavailable. Direct brain ops MUST share this handle.
+2. Chat driver rewired: no self-opened handle. `brainDef()` mirrors the turn def (memory
+   shared/off, brainPath, embed provider/model, memory_backend) → `brainFor`; /remember, /share,
+   /import and ghost completion recall/store/flush through the runtime's handle; driverBackend is
+   now only a fallback identity source for embedText (the real backend arrives with the entry).
+3. Default path is project-local `<cwd>/.sofuu/brain/brain.qtsq` (every workspace carries its own
+   memories) with the HOME fallback unchanged for `sofuu run` scripts that chdir elsewhere; the
+   old `~/.sofuu_brain.qtsq` default is gone.
+4. New config.json `"brain_path"` field end-to-end (ChatConfig struct + defaults/load/save +
+   js_chat_getcfg + both sides honor it) — a host can point BOTH the runtime and the driver at
+   one deliberate file. /remember ack now prints the store path + count.
+5. /remember with an empty argument prints usage instead of silently pinning ''.
+Evidence: new tests/chat_remember_e2e.sh (pty + mock LLM, wired into run_js_tests.sh) — 8/8 PASS
+twice: pin lands `<proj>/.sofuu/brain/brain.qtsq` + ack; `~/.sofuu_brain.qtsq` never created;
+cross-session recall proven at the REQUEST level (mock replies RECALL-HIT-QZ77 only when the
+canary is in the payload — session 2 is a fresh process asking a canary-free question, so a TUI
+echo or history carry-over can't fake it); brain_path override pins into the custom file and the
+project-local file is not created. Note: the fused SEM2 sibling (brain-v2.qtsq) materializes on
+turn-store flushes, not on a bare /remember — deliberately not asserted here (brain battery in
+make test covers fusion). Mock got the REMEMBER-CANARY→RECALL-HIT-QZ77 reply rule (tests/mock_llm_server.js).
+
+**Verified 2026-09-09 (TUI footer panic fix: bounded truncation over non-NUL-terminated buffers)** —
+owner report, live crash mid-session: `panicked at crates/sofuu-core/src/modules/process.rs:1366:126:
+range end index 141 out of range for slice of length 80` + abort (panic=abort kills the whole CLI).
+Root cause (code-proven): `tui_truncate_cells` (rt/tui.rs) is a C-ABI fn that walks its input with
+`CStr::from_ptr` (strlen). Three call sites passed non-NUL-terminated Rust buffers — the footer
+statics `STATUS`/`METRIC_LEFT` in process.rs (RefCell<Vec<u8>> from `CStr::to_bytes()`, no NUL kept)
+and render_rows' stored rows. On a wide terminal the cell budget is never reached, the strlen walk
+runs past the Vec allocation into adjacent heap, and the returned garbage byte index (141 past an
+80-byte buffer) feeds `&metric_l[..bl_l]` → slice panic. Heap-layout dependent (the walk only
+overruns when the bytes after the buffer are non-NUL), which is why it never fired locally.
+Fix (rt/tui.rs + process.rs, uncommitted):
+1. New bounded pure-Rust `pub fn truncate_cells(bytes: &[u8], max_cells: usize) -> usize` — identical
+   semantics (whole CSI escapes, multibyte never split, trailing zero-cell escapes absorbed,
+   degenerate returns full len) but the length comes from the slice, never a NUL scan; return
+   clamped `min(n)` (a trailing lone ESC or a 4-byte lead near the end used to overshoot even on
+   bounded input — masked before by render_rows' clamp).
+2. `tui_truncate_cells` (C-ABI) reduced to a thin `c_str` delegate for genuinely terminated callers
+   (CString-backed picker at process.rs:1677, lib tests) — semantics byte-identical (test-proven).
+3. All three unsafe call sites repointed: render_rows (tui.rs:540/544) now `truncate_cells(l.as_bytes(), …)`;
+   process.rs footer status + metric-left rows call `crate::rt::tui::truncate_cells(&status/&metric_l, …)`.
+4. New regression `truncate_cells_bounded_on_unterminated_buffers`: the 80-byte crash shape under
+   budgets 0..=200 stays in-range; huge budget returns full len; empty slice → 0; trailing lone-ESC
+   and short-4-byte-lead overshoot regressions; C-ABI/bounded equivalence sweep over escapes+multibyte.
+Evidence: cargo lib 329/329 (incl. new test); rebuild clean (only pre-existing warnings);
+post-fix footer probe at the crash geometry 157×38 = 3 turns, no panic (heap-layout dependent —
+the deterministic gate is the bounded fn + tests); panel_probe 157/120/80 PASS; chat_modes_e2e 20/20.
+New probe tests/footer_panic_probe.sh (mock-LLM pty driver, no live keys, crash-geometry default).
+
+**Verified 2026-09-09 (TUI welcome-panel rectangle: closed box at any width)** —
+owner directive "the rectangle is not fully complete many lines are not in
+right place, fix this ... a complete rectangle with no lines misalgiments".
+Root cause (arithmetically proven from code, then pty-proven): js_chat_welcome
+built the panel at `w − GUTTER` cells but PRE-PENDED a GUTTER-space pad to
+each row, while tui_push_split soft-wraps stored rows to `w − GUTTER` — every
+panel row exceeded the wrap budget by exactly 2 cells, so wrap_row tore each
+row apart (content rows broke inside their trailing pad: the right `│` landed
+on its own stray line, left border zigzagged cols 3/5; dash borders survived
+as clean fragments, hence the "half-open box" look). The renderer already
+indents every painted row by GUTTER (render_rows), so the pad was a
+double-indent. Fix (chat.rs + rt/tui.rs, uncommitted):
+1. js_chat_welcome: dropped the `{pad}` prefix; panel is built at
+   `w − GUTTER − 1` (one spare cell keeps the right border off the last
+   column so the paint-time "…" re-truncation can never touch it either).
+2. welcome_panel_at clamp floor lowered 40 → 30: tui_size floors the
+   terminal at 40 so the caller's budget bottoms out at 37 — the old 40
+   floor re-inflated rows past the budget on minimal terminals.
+3. `wrap_row` is now `pub` (chat.rs's tests live in the bin crate, not the
+   lib) and a new regression test `welcome_panel_rows_survive_tui_wrap`
+   asserts EVERY box row passes wrap_row byte-identical at terminal widths
+   40/44/57/80/120/157/241 (budget − 1 construction) — the exact tear that
+   shipped before.
+4. tests/panel_probe.py rewritten into a screen-reconstruction gate:
+   spawns `sofuu chat` on a pty at 157×38 / 120×30 / 80×24, replays the
+   stream through a mini terminal model (CUP/EL/2J/SGR/charset), and
+   asserts all box rows share one left border column, one right border
+   column, and the right border sits at col width−1 (cols 3 and 156 at
+   the user's 157) — no torn rows, full 11-row box. Drains until the
+   stream goes quiet (killing mid-repaint slices a half-written row).
+Evidence: probe PASS at all 3 sizes (11 box rows each, borders at cols
+3/width−1); chat_modes_e2e 20/20 (welcome-panel asserts included); cargo
+test 367/0 (incl. the 3 panel tests); formal `make test` RC=0 (JS 29/0/1).
+
+---
+**Verified 2026-09-08 (TUI permission modes: plan / edit / full)** — owner
+directive "add modes, like plan, edit only, full access in the cli tui".
+Same single-loop strategy as the task-gate: enforcement lives in agent.js so
+TUI, headless and delegate sub-runs all inherit it (desktop chat.js keeps
+its mirrored gate; the TUI never touches chat.js):
+1. `agent.js` gate: `AUTO_PASS_TOOLS` (read_file/grep/glob/list_dir/
+   todo_write/web_search/web_open), `EDIT_TOOLS` (write_file/edit_file);
+   profiles `full` (default) / `edit` (no bash, no MCP) / `plan` (no writes
+   at all). Blocked call returns the plain string `Blocked by permissions
+   policy (why): name` — checked in `execOneTool` right after `emit('tool')`
+   and BEFORE the supervisor checkpoint, so the model can react and no
+   side effect ever runs. Exports `sofuu.agent.setPermissions(profile)`
+   (validates full|edit|plan, unknown refused fail-closed, returns
+   {ok,error}) + `getPermissions()`.
+2. TUI commands (chat.rs): `/mode` bare shows current + usage;
+   `/mode full|edit|plan` and shorthands `/plan` `/edit` `/full` set +
+   PERSIST `cfg.permissions` via `set_mode` (echo `✓ mode → X (hint)`),
+   unknown arg refused without state change. Added to ALL_COMMANDS (38) +
+   COMMAND_INFO completion; cfgCmds triggers applyMode + status repaint +
+   welcome refresh; DRIVER `applyMode()` re-pushes cfg.permissions into the
+   runtime at boot and after every turn/command. `load()` only accepts the
+   three profiles — a corrupt/tampered persisted value falls back to
+   `full`, never raises access.
+3. Display: welcome panel gains a Mode row (full access / edit - local
+   writes, no shell / plan - read-only); status footer carries an amber
+   `mode plan|edit` chip ONLY when restrictive — placed RIGHT AFTER the
+   model name because the footer truncates from the tail (~47 cells on an
+   80-col pty): the safety-relevant chip survives where provider/effort
+   may not.
+4. Tests: agent_test.js `perm` block — 7 checks over inline no-side-effect
+   probes (write_file/bash/read_file): full⇒EEE, edit⇒EBE, plan⇒BBE,
+   setPermissions('sudo') refused, refused switch keeps prior mode, restore
+   round-trips. cargo: slash_dispatch mode cases + config_roundtrip extended
+   (persisted "plan" loads; persisted "sudo" → full). NOTE cargo-test gotcha:
+   SOFUU_TEST_CONFIG_DIR is process-global — a second env-setting test races
+   config_roundtrip; asserts were merged INTO it, standalone test deleted.
+   New `tests/chat_modes_e2e.sh` (12 asserts, PORT 19803): welcome row,
+   bare /mode, switch echoes, welcome re-render, footer chip paint, bad arg
+   refused keeping prior mode, config.json persistence, restart boots
+   straight into plan (row + chip). Also fixed a pre-existing doctest:
+   semantic_v2.rs module-doc pseudocode needed a ```text fence.
+5. Suite-hardening found along the way — `make test` was flaking (brain_auth
+   once, chat_chip twice) BEFORE the modes wiring was even the suspect:
+   chat_paste_e2e.sh spawned its mock inside `( cd … && sofuu run … ) &` so
+   `MOCK_PID` was the SUBSHELL — the EXIT trap killed the shell and LEAKED
+   the LISTENing sofuu, one orphan per paste run, poisoning the shared
+   random-port pool (12 accumulated mocks held 18802-18889). Fixed: paste
+   now `exec`s the server so $! IS the mock (0 leaks after; verified in-suite);
+   modes moved to 19803 (outside every 18699-18999 random range); chat_chip
+   S2's fixed 4s sleep replaced by poll-until-chip-grows (cap 20s) and both
+   mock-READY windows widened to 20s — waits only, no assertion loosened.
+Verified: agent_test perm 7/7, cargo suites green (incl. doctests),
+chat_modes_e2e 12/12, `make test` 29/0/1 (30 incl. 1 skip) RC=0 with zero
+leaked mocks. Uncommitted per standing rule.
+6. Follow-up (owner: "this mode can be changed by clicking TAB just like
+   other CLIs"): TAB now cycles full → edit → plan → full on non-slash
+   lines — slash completion keeps the key when the line starts with '/'
+   (no collision; selector mode intercepts TAB before this handler).
+   process.rs TAB handler: inline path erases the input box (UI_LINES)
+   BEFORE the /mode echo lands and redraws after; TUI needs no erase (its
+   tui_log renders into the conversation region, above the input box). JS
+   `globalThis.__on_tab` (chat.rs driver scope, next to __on_ctrl_c)
+   computes the next profile, goes through `__chat_slash('/mode <m>')` so
+   echo+persistence stay the ONE /mode path, then mirrors the submit
+   refresh set: cfg re-read → applyMode → refreshStatus(lastChip) →
+   __chat_refresh. Help updated: print_help TAB line, /mode usage
+   ("· TAB cycles"), COMMAND_INFO options. e2e extended: chat_modes_e2e
+   now 20 asserts — S6 tab1/tab2/tab3 cycles (echo, chip edit, chip gone
+   at full, welcome refresh), immediate config.json persistence without
+   restart, and completion-non-preemption probe on '/pl' (can't use
+   '/mo': /model shares every /mode prefix so no unique completion)
+   ending state consistent. NOTE: chat_chip flaked once more in-suite on
+   the first rerun (passes standalone; no Tab in its keystrokes — load
+   timing, unchanged pre-existing sensitivity); formal rerun green.
+   ml::context segments_recorded_and_capped flaked once under parallel
+   load (passes alone; shares the process-global WORKSET static with other
+   tests) — pre-existing test race, not this change.
+Verified: chat_modes_e2e 20/20, cargo 317 lib + all suites green,
+`make test` 29/0/1 RC=0 with zero leaked mocks / port holders.
+Uncommitted per standing rule.
+
+---
+**Verified 2026-09-08 (task-gate: plan before executing)** — owner report:
+"Sofuu does not create tasks before doing complex and long work, working
+directly." Root cause: `todo_write` existed and CORE_PROMPT mentioned it,
+but only reactively ("keep a checklist current") and nothing enforced
+planning at runtime. Fix, one edit covering every surface (TUI chat.rs,
+desktop chat.js, headless — all route through the ONE loop in agent.js,
+CORE_PROMPT is its single system prompt):
+1. CORE_PROMPT rewritten into a hard gate — "Plan before executing: for
+   any long or multi-step task … call todo_write FIRST with the full
+   checklist and only then start work" + one-doing/rewrite rule + explicit
+   single-step exemption (no checklist for a short answer).
+2. Runtime backstop in `agent.js` run(): `TODO_GATE_STEPS = 6` — a turn
+   past 6 tool steps that never called `todo_write` gets ONE ephemeral
+   `[task-gate]` user notice to create the checklist now (one-shot per run,
+   mirroring the supervisor's no-nagging credibility bar; `sawTodo` latches
+   in `execOneTool` so planned runs stay silent; sits below default
+   maxSteps 12 so a genuinely long run always sees it). Emits
+   `mlgate {rule:'taskgate'}` like the other boundary notices.
+3. Tests in `tests/agent_test.js` against the scripted mock: `todogate`
+   (checklist-less long run ⇒ answer `todogate-final[nudged]`, fires at
+   steps 6 < 12) + `todoplan` negative control (plans first ⇒ gate never
+   speaks). Verified: agent_test ALL PASSED (3 new checks), `make test`
+   28/0/1 baseline holds. Uncommitted; the desktop app needs a
+   `tauri build` to pick the prompt change up.
+
+---
+**Verified 2026-09-08 (brain fused-SEM2 deployment, owner-ordered)** — per
+the owner's directive "add the current train embedder to brain and add the
+old one as fallback", the round-9 SEM2 table (artifact `dffb00185d090662`,
+30,636 B baked → `embedding/weights_v2.sem`) now runs as the brain's
+SEMANTIC channel beside the canonical hash-v1 store: sibling `*-v2.qtsq`
+(dim 64, id `semantic-table-v2`) carries SEM2 vectors (tower + frozen
+anchor lens, bit-identical to the trainer — ml-train cross-check);
+`agent.js` mirrors byte-identical clipped text to both stores, fuses
+recall with the graded RRF rule (top-20/channel, α=10, sem-only cap 2 in
+first 5), splits markPositive by channel, and mirrors decay/retain (no
+consolidation on the v2 space). Fallback is real: any v2 probe/embed/open
+failure ⇒ hash-only, NEVER memory-off; `SOFUU_MEMORY_BACKEND=hash` forces
+it. ON THE RECORD: this is a deployment decision, not a §10 pass —
+G1 0.750 / G3-paths 0.667 / G6 3/8 stay FAILED (offline fused OVERALL
+0.917, sem-alone 0.807 vs hash-alone 0.870); embedder line stays CLOSED.
+A3 regression caught + fixed: v2 sibling must be derived per-brain
+(`semPathFor`: base−ext+`-v2.qtsq`) — the first pass dropped a fixed
+`brain-v2.qtsq` in the directory, making every brain there share one v2
+store and re-creating the cross-agent scope leak on the 2nd run. Verified:
+fused `agent_test.js` ×2 consecutive with preserved state; escape hatch
+creates no `-v2` sibling; `make test` 28/0/1; cargo lib 307/307
+(299→307 with the v2 work). Rust side: `semantic_v2.rs` (+7 tests, golden
+`3a00025c59cb864a`), `ai.rs` bindings `embedLocalSemanticV2`/`embedInfoV2`,
+`rt/memory.rs` v2 manifest identity + isolation test. UNCOMMITTED (owner
+commits on request).
+
+---
+**Verified 2026-09-08 (core audit P0 pair CLOSED)** — AUDIT-2026-09-07.md
+P0-2 (MCP disconnect wild deref) fixed: `js_mcp_connect` now stamps
+`->data` on all four handles (process + stdin/stdout/stderr pipes); the
+`free_pipe_cb` alternative was rejected — it stalls the `closing = 4`
+fence at 2 (client leak) and double-frees storages through
+`mcp_client_free`. Regression test
+`rt::mcp::tests::mcp_disconnect_runs_the_close_fence` connects a real
+child (`/usr/bin/true` — macOS has no `/bin/true`), drains the loop, and
+asserts via a `#[cfg(test)]` free-counter that the fence frees the client
+exactly once; DIFF-VERIFIED — with stdin/stderr un-stamped (pre-fix
+state) it fails deterministically with `frees == 0`. Module suite
+297/297; `mcp_client_test.js` green in `make test` (the 2 make-test
+failures are the parallel session's WIP: agent_test.js memory.rs-merge +
+P4-embedding checks, untracked verify_memory_test.js `sofuu.memory`
+undefined — not mcp). P0-1 (Subprocess.write clobber) was fixed earlier
+the same day; both fixes UNCOMMITTED — the dirty tree carries the
+parallel session's work. Next in the audit fix order: secrets/jail
+(parent-env leak, TOCTOU write jail, grep/glob secrets, -k argv).
+
 **Verified 2026-09-08 (embedder line CLOSED)** — G1 TABLE PROBE
 (`ml-train embed-probe`, new dev tool) on the round-9 artifact
 SUPERSEDES the round-9 "BUDGET finding" reading: G1 is **DATA-bound**.
@@ -1586,7 +2316,7 @@ replay) at 100/80/62 cols before/after; 9 new `rt/tui` unit tests; full
 - ✅ **RLM scaffold landed** (PLAN-RLM.md R0–R3, 2026-08-13): nested QuickJS sandbox with zero new C, episode state machine, heuristic router + `routing_log.jsonl`, `sofuu.rlm.query/route` headless JS API, `/rlm` chat command (on/off/auto) — 33 rlm unit tests + mock-server E2E (15 assertions) green, binary 1.8MB.
 - ✅ **RLM security guardrails** (2026-08-13): frozen whitelist + deterministic Date/random (suspension-safe re-runs), per-eval time slice + episode wall cap, 64KB answer cap, 512-event trace cap with drop counter, 256KB llm-cache cap, anti-loop (3× identical batch → `loop_detected`), sentinel-spoof + credential-redaction proofs, `rlm_snippet`/`rlm_reply` fuzz targets. +11 tests (121 → 132 total green). Open in that plan: embeddings E0–E5 + R4 KV hook + nested-episode recursion (v2).
 - ✅ **No-default-model, provider-neutral onboarding** (2026-08-13): `ChatConfig::defaults()` no longer presets ollama/qwen — provider+model start empty; first run auto-opens the provider wizard (`/provider` always available); unconfigured prompts print one guidance line and never call an API; `rt/ai.rs` throws an actionable "No model configured" from `complete`/`stream`/`embed` (silent llama3/nomic substitutions removed); brain `embedText` is local-first (`embedLocal`) with opt-in `embed_provider`/`embed_model`; README/examples no longer imply ollama is built in. Fixtures proven: unconfigured→wizard+guidance, configured-mock→works, rlm E2E unaffected. Bonus fix while verifying: `rt/tui.rs` `tui_truncate_cells` could split a multibyte char (panicked ALL TTY chat on the border frame — pre-existing from the M-track port) → boundary-safe now + regression test.
-- ✅ **Headless/embeddable runtime — FULLY DONE** (2026-08-20): PLAN-HEADLESS.md H0–H6 all landed. ✅ H0 `docs/EMBEDDING.md` embedding contract. ✅ H1 `crates/sofuu-capi` (libsofuu) — `sofuu_rt_new/free/call/eval`, `include/sofuu_embed.h`, `make libsofuu` (1.7MB dylib). ✅ H2 hostile-host audit — `process.exit`→catchable `ExitError`, signal installs gated, console routed through log callback, `config_root` replaces `$HOME`. ✅ H4 platform packs — `scripts/dist/{macos,linux,ios,android,all}.sh` + `dist/README.md` + Makefile targets. ✅ H5 samples & docs — `examples/headless/c_embed.c` + `c_rlm.c` (compile+run in CI), `SwiftSample/SofuuBridge.swift` (iOS), `KotlinSample/` (Android JNI: `SofuuBridge.kt` + `jni_bridge.c` + `CMakeLists.txt`), `docs/EMBEDDING.md` per-platform getting-started pages, README "Embed Sofuu" section. ✅ H6 CI gates — `make headless-test` (compile+run both C samples), `make abi-check` (symbol diff vs `scripts/abi_symbols.txt`), `crates/fuzz/fuzz_targets/capi_call.rs` (funnel fuzz). CI + release workflows ship libsofuu tarballs. Agents/sub-agents **landed 2026-08-16** (PLAN-AGENTS.md A1–A6, A8, A9).
+- ✅ **Headless/embeddable runtime — FULLY DONE** (2026-08-20): PLAN-HEADLESS.md H0–H6 all landed. ✅ H0 `docs/EMBEDDING.md` embedding contract. ✅ H1 `crates/sofuu-capi` (libsofuu) — `sofuu_rt_new/free/call/eval`, `include/sofuu_embed.h`, `make libsofuu` (1.7MB dylib). ✅ H2 hostile-host audit — `process.exit`→catchable `ExitError`, signal installs gated, console routed through log callback, `config_root` replaces `$HOME`. ✅ H4 platform packs — `scripts/dist/{macos,linux,ios,android,all}.sh` + `docs/EMBEDDING-DIST.md` + Makefile targets. ✅ H5 samples & docs — `examples/headless/c_embed.c` + `c_rlm.c` (compile+run in CI), `SwiftSample/SofuuBridge.swift` (iOS), `KotlinSample/` (Android JNI: `SofuuBridge.kt` + `jni_bridge.c` + `CMakeLists.txt`), `docs/EMBEDDING.md` per-platform getting-started pages, README "Embed Sofuu" section. ✅ H6 CI gates — `make headless-test` (compile+run both C samples), `make abi-check` (symbol diff vs `scripts/abi_symbols.txt`), `crates/fuzz/fuzz_targets/capi_call.rs` (funnel fuzz). CI + release workflows ship libsofuu tarballs. Agents/sub-agents **landed 2026-08-16** (PLAN-AGENTS.md A1–A6, A8, A9).
 - ⬜ **RLM remaining polish** (PLAN-RLM.md): live-model needle proof (`examples/rlm_demo.js` vs Ollama), pty `/rlm` session E2E, real `cargo-fuzz` run (targets compile-only today). ~~mid-request Esc abort~~ ✅ 2026-08-21 · ~~per-model context windows~~ ✅ 2026-08-21 (see the 2026-08-21 section below).
 - ⬜ Optional: `fs.rm` recursive delete of non-empty dirs (Node-parity choice; not in any plan).
 - ✅ **PLAN-CHAT-FEATURES F1–F11 landed** (2026-08-19): all 9 remaining chat/brain features implemented and verified. F1 `/remember` + `/why` (brain pin + recall explainability), F2 `/resume` (session picker), F3 `@file` mentions (budget-trimmed, manifest-only history), F5 `/share` + `/import` (brain cards), F6 `/cost` + budget caps (pricing table, session/lifetime spend, preflight blocks), F7 `/verify` (second-model pass with word-agreement diff), F8 `/watch` (filesystem mtime/size poller on the 1s tick), F9 `~/.sofuu/hooks.js` (pre/post middleware with 3s timeout + 3-strike disable), F10 ghost completion (sync embedLocal + brain.recall, `__chat_ghost_check` global), F11 `sofuu serve --brain` (HTTP server: /health, /remember, /recall, /share with Bearer auth). `cargo test` 177 green (3 new tests), `make test` green, `make size-check` 2.0MB ≤ 5MB. Config fields: pricing, budget_usd, spend_total_usd, verify, verify_model, ghost. F4a/F4b were already landed.

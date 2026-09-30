@@ -36,6 +36,9 @@ use std::sync::OnceLock;
 
 use crate::ml::net::crc32_ieee;
 
+pub mod semantic_v2; // round-9 SEM2 table embedder — fused-channel runtime
+pub mod image; // M1: frozen hand-built image features (decode + IMGF1 layout)
+
 pub const HASH_DIM: usize = 768;
 /// Hidden width.  Experiments rebuild with `SOFUU_EMB_H=64|128 …` (build.rs
 /// whitelists the values and emits `emb_h_*` cfgs); the shipped default is
@@ -799,8 +802,14 @@ pub const fn payload_len_v2(k: usize) -> usize {
 /// Reuse the existing deterministic hash embedder as the frozen input layer.
 pub fn hash_v1_features(text: &str) -> Vec<f32> {
     let mut out = vec![0.0f32; HASH_DIM];
-    crate::rt::ai::sofuu_tfidf_embed(text.as_bytes(), &mut out, HASH_DIM);
+    hash_v1_features_into(text, &mut out);
     out
+}
+
+/// Writes the same frozen v1 features into a caller-provided buffer so hot
+/// paths can build them on the stack.
+pub fn hash_v1_features_into(text: &str, out: &mut [f32]) {
+    crate::rt::ai::sofuu_tfidf_embed(text.as_bytes(), out, HASH_DIM);
 }
 
 /// The same deterministic tf-idf embedder at an arbitrary bucket count.
@@ -824,7 +833,11 @@ pub fn baked_model() -> Result<&'static QuantizedProjector, &'static str> {
 
 pub fn semantic_v1(text: &str) -> Option<Vec<f32>> {
     let model = baked_model().ok()?;
-    Some(model.forward(&hash_v1_features(text)).to_vec())
+    // P3 (AUDIT-2026-09-07): build the frozen input features on the stack —
+    // hash_v1_features' per-call Vec was allocation churn on every embed.
+    let mut feats = [0.0f32; HASH_DIM];
+    hash_v1_features_into(text, &mut feats);
+    Some(model.forward(&feats).to_vec())
 }
 
 pub fn model_artifact_id() -> String {

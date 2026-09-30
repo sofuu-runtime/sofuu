@@ -15,7 +15,10 @@ use std::process::ExitCode;
 use sofuu_ffi::SofuuRuntime;
 
 mod chat;
+mod doctor;
+mod output_archive;
 mod session;
+mod session_store;
 
 const VERSION: &str = "0.2.0-beta";
 
@@ -50,19 +53,33 @@ fn print_help() {
     println!("  sofuu agent run <name> \"task\"  Run one agent headless");
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
+    println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
     println!("  sofuu version            Print version and exit");
     println!("  sofuu licenses           Print open-source licenses");
     println!("  sofuu help               Print this help");
     println!("  sofuu session list       List active sessions on this project");
     println!("  sofuu session show <id>  Show one session's full context");
+    println!("  sofuu session inspect <id>  Inspect storage without payload text");
+    println!("  sofuu session repair <id>   Rebuild a damaged segmented manifest");
+    println!("  sofuu session migrate <id>  Migrate one legacy flat session");
+    println!("  sofuu session storage-stats <id>  Show segment/storage counters");
     println!("  sofuu session prune      Remove ended sessions older than 7 days");
+    println!("  sofuu outputs list       List timestamped model/tool outputs");
+    println!("  sofuu outputs show <id>  Decode one archived output");
+    println!("  sofuu outputs search <text>  Search archived output summaries/content");
+    println!("  sofuu outputs context <task>  Build bounded historical context");
+    println!("  sofuu outputs stats      Show archive counters and diagnostics");
+    println!("  sofuu outputs rebuild-index  Rebuild output metadata index");
+    println!("  sofuu outputs prune      Dry-run retention candidates (use --apply to delete)");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
-    println!("  /help  /models  /providers  /model <n>  /provider <n>");
+    /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
+     * command — the model list lives in /provider) — stop advertising it. */
+    println!("  /help  /providers  /model <n>  /provider <n>");
     println!("  /effort <lvl>  /compact  /clear  /brain  /exit");
     println!("  /sessions | /context [id] | /work <desc> | /done | /note <msg> | /notify <msg>");
     println!("\nSession mesh: `sofuu chat` syncs with other sessions on the SAME project");
     println!("in real time (tasks, notes, critical notices, shared context).");
-    println!("Disable with `--sync off`. Session data persists as .qtsq files.");
+    println!("Disable with `--sync off`. Main session data uses bounded .store QTSQ segments; legacy flat .qtsq files remain readable.");
     println!("\n\x1b[90mBuilt with Rust + QuickJS + C + QTSQ | MIT License (QTSQ proprietary)\x1b[0m\n");
 }
 
@@ -127,6 +144,9 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
             rt.eval_string(code, "<agent-list>")
         }
         "run" => {
+            // The headless agent uses the same native archive bridge as chat,
+            // so one-shot runs remain inspectable without starting the chat UI.
+            chat::register_bridge(rt);
             if args.len() < 5 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu agent run' requires <name> and a task");
                 eprintln!("Usage: sofuu agent run <name> <task…> [--json]");
@@ -157,11 +177,16 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
                     }
                   },"#
             } else {
+                /* P3 (AUDIT-2026-09-07): raw tool args / delegate task text
+                 * can carry secrets into stderr scrollback — print the name
+                 * and arg KEYS only (matching --json's name-only lines). */
                 r#"onStep: function (e) {
                     if (e.kind === 'tool') {
-                      console.error('  ⏺ tool ' + (e.payload && e.payload.name) + '(' + String((e.payload && e.payload.args) || '').slice(0, 120) + ')');
+                      var keys = '';
+                      try { keys = Object.keys(JSON.parse((e.payload && e.payload.args) || '{}')).join(', '); } catch (e2) {}
+                      console.error('  ⏺ tool ' + (e.payload && e.payload.name) + '(' + keys + ')');
                     } else if (e.kind === 'delegate') {
-                      console.error('  ⏺ agent ' + (e.payload && e.payload.agent) + '(' + String((e.payload && e.payload.task) || '').slice(0, 120) + ')');
+                      console.error('  ⏺ agent ' + (e.payload && e.payload.agent) + '()');
                     }
                   },"#
             };
@@ -181,10 +206,33 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
                 r#"(async function () {{
   const ld = await sofuu.agent.loadDir();
   for (const b of (ld && ld.broken) || []) console.error('⚠ ' + b.file + ': ' + b.error);
-  const r = await sofuu.agent.run({name_js}, {task_js}, {{
-    {on_step}
-  }});
-  {print}
+  function archiveAgent(kind, status, source, content, metadata) {{
+    if (content === undefined || content === null || !String(content).trim()) return;
+    try {{
+      __chat_archive_write(JSON.stringify({{
+        turn: 1, attempt: 1, kind: kind, status: status, source: source,
+        content: String(content), metadata: metadata || {{}}, redact: true
+      }}));
+    }} catch (_) {{}}
+  }}
+  try {{
+    const r = await sofuu.agent.run({name_js}, {task_js}, {{
+      {on_step}
+    }});
+    if (r && r.answer && String(r.answer).trim()) {{
+      archiveAgent(r.stopped ? 'partial' : 'final',
+                   r.stopped === 'cancelled' ? 'cancelled' : (r.stopped ? 'partial' : 'complete'),
+                   'assistant', r.answer, {{ headless: true, steps: r.steps, stopped: r.stopped || null }});
+    }} else {{
+      archiveAgent('error', 'failed', 'runtime', 'agent returned no response',
+                   {{ headless: true, error_code: 'empty_response' }});
+    }}
+    {print}
+  }} catch (e) {{
+    archiveAgent('error', 'failed', 'runtime', String((e && e.message) || e),
+                 {{ headless: true, error_code: 'runtime' }});
+    throw e;
+  }}
 }})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});"#
             );
             rt.eval_string(&code, "<agent-run>")
@@ -347,85 +395,200 @@ fn needs_more(s: &str) -> bool {
     br > 0 || par > 0 || sqb > 0 || tmpl
 }
 
+/// The value of a value-taking CLI flag — unless the next token is itself
+/// flag-shaped. P3 (AUDIT-2026-09-07): `sofuu chat -m --brain` used to set
+/// model="--brain" and silently swallow the --brain flag.
+fn value_arg(args: &[String], i: usize) -> Option<String> {
+    let v = args.get(i + 1)?;
+    if v.starts_with('-') && v.len() > 1 {
+        None
+    } else {
+        Some(v.clone())
+    }
+}
+
 /// `sofuu chat` — interactive chat UI (Rust, Phase 1).
 fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
     let mut cfg = chat::ChatConfig::load();
     // CLI overrides: -m/--model, -p/--provider, --effort/--think, --brain,
-    // --sync on|off
+    // --sync on|off, -k/--apikey, --base-url, --ctx-window, --max-output.
+    // P3 (AUDIT-2026-09-07): value flags parse through value_arg so a
+    // following flag is never eaten as the value; missing values error out.
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-m" | "--model" if i + 1 < args.len() => {
-                cfg.model = args[i + 1].clone();
-                i += 2;
-            }
-            "-p" | "--provider" if i + 1 < args.len() => {
-                cfg.provider = args[i + 1].clone();
-                i += 2;
-            }
-            "--effort" | "--think" if i + 1 < args.len() => {
-                cfg.effort = args[i + 1].clone();
-                i += 2;
-            }
-            "--think" => {
-                // bare --think → effort high
-                cfg.effort = "high".into();
-                i += 1;
-            }
+            "-m" | "--model" => match value_arg(args, i) {
+                Some(v) => {
+                    cfg.model = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
+            "-p" | "--provider" => match value_arg(args, i) {
+                /* P2-15 (AUDIT-2026-09-01): a typo'd provider used to be
+                 * accepted silently and surface as a confusing turn-time
+                 * request error. Validate against the wire profiles and
+                 * the configured provider names; custom base_url implies
+                 * openai-compat, which the profile "openai" covers. */
+                Some(p) => match p.as_str() {
+                    "openai" | "anthropic" | "local" => {
+                        cfg.provider = p;
+                        i += 2;
+                    }
+                    _ => {
+                        let known = chat::ChatConfig::load()
+                            .providers
+                            .iter()
+                            .any(|e| e.name == p);
+                        if known {
+                            cfg.provider = p;
+                            i += 2;
+                        } else {
+                            eprintln!(
+                                "\x1b[31mError:\x1b[0m unknown provider '{p}' (known: openai, anthropic, local)."
+                            );
+                            eprintln!("  Add it in the TUI (/provider) or use --base-url for a custom endpoint.");
+                            return 1;
+                        }
+                    }
+                },
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
+            "--effort" | "--think" => match value_arg(args, i) {
+                Some(v) => {
+                    cfg.effort = v;
+                    i += 2;
+                }
+                None => {
+                    if a == "--think" {
+                        // bare --think → effort high (a following flag is
+                        // NOT its value — P3)
+                        cfg.effort = "high".into();
+                        i += 1;
+                    } else {
+                        eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                        return 1;
+                    }
+                }
+            },
             "--brain" => {
                 cfg.brain = true;
                 i += 1;
             }
-            "--sync" if i + 1 < args.len() => {
-                cfg.sync = args[i + 1] == "on";
-                i += 2;
+            "--sync" => {
+                /* P3 (AUDIT-2026-09-07): only "on"/"off" are values — the
+                 * old guard consumed ANY following token (`--sync --brain`
+                 * set sync=false and ate the flag). Bare `--sync` = on
+                 * (matches "Disable with --sync off"). */
+                match args.get(i + 1).map(|s| s.as_str()) {
+                    Some("on") => {
+                        cfg.sync = true;
+                        i += 2;
+                    }
+                    Some("off") => {
+                        cfg.sync = false;
+                        i += 2;
+                    }
+                    Some(v) if !v.starts_with('-') => {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --sync wants on|off (got '{v}'); treating as on");
+                        cfg.sync = true;
+                        i += 2;
+                    }
+                    _ => {
+                        cfg.sync = true;
+                        i += 1;
+                    }
+                }
             }
             "--no-sync" => {
                 cfg.sync = false;
                 i += 1;
             }
-            "-k" | "--apikey" if i + 1 < args.len() => {
-                cfg.api_key = args[i + 1].clone();
-                i += 2;
-            }
-            "--base-url" if i + 1 < args.len() => {
-                cfg.base_url = args[i + 1].clone();
-                i += 2;
-            }
-            "--ctx-window" | "--ctx" if i + 1 < args.len() => {
-                if let Ok(n) = args[i + 1].parse::<i64>() {
-                    if n < 0 || n > 1_000_000 {
-                        eprintln!(
-                            "\x1b[33mWarning:\x1b[0m --ctx-window must be 0–1000000 (0 = provider default); ignoring '{}'",
-                            args[i + 1]
-                        );
-                    } else {
-                        cfg.ctx_window = n;
-                    }
+            "-k" | "--apikey" => match value_arg(args, i) {
+                Some(v) => {
+                    /* P3 (AUDIT-2026-09-07): the key sits in argv (readable
+                     * by any local process via `ps`) and the old path let it
+                     * persist into config.json. Warn, honor it for this
+                     * session, and mark it CLI-only — save() never writes
+                     * it (see ChatConfig::api_key_from_cli). */
+                    eprintln!(
+                        "\x1b[33mWarning:\x1b[0m -k/--apikey exposes the key in the process list; prefer the keychain, config.json, or SOFUU_API_KEY."
+                    );
+                    cfg.api_key = v;
+                    cfg.api_key_from_cli = true;
+                    i += 2;
                 }
-                i += 2;
-            }
-            "--max-output" | "--maxout" | "--max-tokens" if i + 1 < args.len() => {
-                if let Ok(n) = args[i + 1].parse::<i64>() {
-                    if n < 0 || n > 384_000 {
-                        eprintln!(
-                            "\x1b[33mWarning:\x1b[0m --max-output must be 0–384000 (0 = provider default); ignoring '{}'",
-                            args[i + 1]
-                        );
-                    } else {
-                        cfg.max_output = n;
-                    }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
                 }
-                i += 2;
-            }
+            },
+            "--base-url" => match value_arg(args, i) {
+                Some(v) => {
+                    cfg.base_url = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
+            "--ctx-window" | "--ctx" => match value_arg(args, i) {
+                Some(v) => {
+                    if let Some(n) = chat::parse_token_count(&v) {
+                        if n > 4_194_304 {
+                            eprintln!(
+                                "\x1b[33mWarning:\x1b[0m --ctx-window must be 0–4194304 (accepts 1m, 128k); ignoring '{v}'"
+                            );
+                        } else {
+                            cfg.ctx_window = n;
+                            cfg.ctx_window_explicit = n > 0;
+                        }
+                    } else {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --ctx-window wants a number (1048576, 1m, 128k); ignoring '{v}'");
+                    }
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
+            "--max-output" | "--maxout" | "--max-tokens" => match value_arg(args, i) {
+                Some(v) => {
+                    if let Some(n) = chat::parse_token_count(&v) {
+                        if n > 384_000 {
+                            eprintln!(
+                                "\x1b[33mWarning:\x1b[0m --max-output must be 0–384000 (0 = provider default); ignoring '{v}'"
+                            );
+                        } else {
+                            cfg.max_output = n;
+                        }
+                    } else {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --max-output wants a number (65536, 64k); ignoring '{v}'");
+                    }
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
             _ => i += 1,
         }
     }
     chat::run_chat(rt, cfg)
 }
 
-/// `sofuu session list|show <id>|prune` — inspect the project's session mesh
+/// `sofuu session list|show|inspect|repair|migrate|storage-stats|prune` —
+/// inspect and maintain the project's session mesh
 /// without starting a chat (no runtime needed).
 fn cmd_session(args: &[String]) -> i32 {
     let Some(project) = session::project_root() else {
@@ -444,12 +607,52 @@ fn cmd_session(args: &[String]) -> i32 {
             };
             session::cmd_show(&project, id)
         }
+        "inspect" => {
+            let Some(id) = args.get(3) else {
+                println!("  Usage: sofuu session inspect <id>\n");
+                return 1;
+            };
+            session::cmd_inspect(&project, id)
+        }
+        "repair" => {
+            let Some(id) = args.get(3) else {
+                println!("  Usage: sofuu session repair <id>\n");
+                return 1;
+            };
+            session::cmd_repair(&project, id)
+        }
+        "migrate" => {
+            let Some(id) = args.get(3) else {
+                println!("  Usage: sofuu session migrate <id>\n");
+                return 1;
+            };
+            session::cmd_migrate(&project, id)
+        }
+        "storage-stats" | "stats" => {
+            let Some(id) = args.get(3) else {
+                println!("  Usage: sofuu session storage-stats <id>\n");
+                return 1;
+            };
+            session::cmd_storage_stats(&project, id)
+        }
         "prune" | "clean" => session::cmd_prune(&project),
         other => {
-            eprintln!("\x1b[31mError:\x1b[0m unknown session command '{other}' (list|show <id>|prune)");
+            eprintln!("\x1b[31mError:\x1b[0m unknown session command '{other}' (list|show|inspect|repair|migrate|storage-stats|prune)");
             1
         }
     }
+}
+
+/// `sofuu outputs ...` — inspect and maintain the main runtime's project-local
+/// timestamped output archive without starting a chat or desktop host.
+fn cmd_outputs(args: &[String]) -> i32 {
+    let Some(project) = session::project_root() else {
+        eprintln!("\x1b[31mError:\x1b[0m cannot determine project root (cwd?)");
+        return 1;
+    };
+    println!("\x1b[2mproject: {}\x1b[0m\n", project.display());
+    let policy = chat::ChatConfig::load().archive_policy();
+    output_archive::cli(&project, args, &policy)
 }
 
 /// `sofuu serve --brain <path> --port <n> --host <h> --token <t>` —
@@ -460,39 +663,79 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     let mut brain_path = String::new();
     let mut port: u16 = 7707;
     let mut host = "127.0.0.1".to_string();
-    let mut token = String::new();
+    // Prefer env over argv: --token is visible via `ps`. SOFUU_SERVE_TOKEN
+    // wins when set; --token stays for scripts but prints a warning.
+    let mut token = std::env::var("SOFUU_SERVE_TOKEN").unwrap_or_default();
+    let mut token_from_argv = false;
 
     let mut i = 2;
     while i < args.len() {
+        /* P3 (AUDIT-2026-09-07): value flags refuse a flag-shaped token as
+         * their value (the old loop swallowed whatever followed —
+         * `--brain --port 9` silently made the brain path "--port"), a bad
+         * --port warns instead of silently keeping the default, and --token
+         * no longer overwrites SOFUU_SERVE_TOKEN (the comment above — and
+         * the safer precedence — say env wins). */
         match args[i].as_str() {
-            "--brain" | "-b" => {
-                i += 1;
-                if i < args.len() { brain_path = args[i].clone(); }
-            }
-            "--port" | "-p" => {
-                i += 1;
-                if i < args.len() {
-                    if let Ok(p) = args[i].parse::<u16>() { port = p; }
+            "--brain" | "-b" => match value_arg(args, i) {
+                Some(v) => {
+                    brain_path = v;
+                    i += 2;
                 }
-            }
-            "--host" => {
-                i += 1;
-                if i < args.len() { host = args[i].clone(); }
-            }
-            "--token" | "-t" => {
-                i += 1;
-                if i < args.len() { token = args[i].clone(); }
-            }
-            _ => {}
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            "--port" | "-p" => match value_arg(args, i) {
+                Some(v) => {
+                    if let Ok(p) = v.parse::<u16>() {
+                        port = p;
+                    } else {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --port wants 0-65535; keeping default {port}");
+                    }
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            "--host" => match value_arg(args, i) {
+                Some(v) => {
+                    host = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            "--token" | "-t" => match value_arg(args, i) {
+                Some(v) => {
+                    if token.is_empty() {
+                        token = v;
+                        token_from_argv = true;
+                    } else {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --token ignored: SOFUU_SERVE_TOKEN is set (env wins).");
+                    }
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            _ => i += 1,
         }
-        i += 1;
     }
 
     /// HOME-derived paths must stay inside the home directory — reject any
     /// `..` component so a hostile HOME cannot redirect writes elsewhere.
+    /// Both separators: Windows USERPROFILE paths are backslash-joined.
     fn home_checked() -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
-        if home.is_empty() || home.split('/').any(|seg| seg == "..") {
+        let home = sofuu_core::embed_config::home_dir()?;
+        if home.is_empty() || home.split(['/', '\\']).any(|seg| seg == "..") {
             return None;
         }
         Some(home)
@@ -519,19 +762,28 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
             return 1;
         }
         token = format!("sofuu-{}", entropy.iter().map(|b| format!("{b:02x}")).collect::<String>());
-        // Persist the token to ~/.sofuu/serve_token (0600).
+        // Persist the token to ~/.sofuu/serve_token. P2-10: create with
+        // 0600 from the first write (write-then-chmod left a world-
+        // readable window).
         if let Some(home) = home_checked() {
             let dir = format!("{home}/.sofuu");
             let _ = std::fs::create_dir_all(&dir);
             let token_path = format!("{dir}/serve_token");
-            let _ = std::fs::write(&token_path, &token);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &token_path,
-                    std::fs::Permissions::from_mode(0o600),
-                );
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::io::Write;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&token_path)
+                    .and_then(|mut f| f.write_all(token.as_bytes()));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write(&token_path, &token);
             }
         }
     }
@@ -541,7 +793,11 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     if (host != "127.0.0.1" && host != "localhost") && auto_token {
         eprintln!("\x1b[31mError:\x1b[0m remote binding requires an explicit --token");
         eprintln!("  Use: sofuu serve --host {} --token <your-secret>\n", host);
+        eprintln!("  Prefer: SOFUU_SERVE_TOKEN=<secret> sofuu serve --host {}", host);
         return 1;
+    }
+    if token_from_argv {
+        eprintln!("\x1b[33m  ⚠ --token is visible via `ps`; prefer SOFUU_SERVE_TOKEN env.\x1b[0m");
     }
 
     eprintln!("\x1b[1;36m  ┌─────────────────────────────────┐");
@@ -550,7 +806,13 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     eprintln!("  └─────────────────────────────────┘\x1b[0m");
     eprintln!("\x1b[2m  brain: {}\x1b[0m", brain_path);
     eprintln!("\x1b[2m  listen: http://{}:{}\x1b[0m", host, port);
-    eprintln!("\x1b[2m  token: {}\x1b[0m", token);
+    // Token is a bearer secret: never print it to stderr (scrollback/CI
+    // logs). Point at the persisted file or env instead.
+    if auto_token {
+        eprintln!("\x1b[2m  token: (auto-generated, stored in ~/.sofuu/serve_token with 0600)\x1b[0m");
+    } else {
+        eprintln!("\x1b[2m  token: (from --token / SOFUU_SERVE_TOKEN)\x1b[0m");
+    }
     eprintln!("\x1b[2m  endpoints:\x1b[0m");
     eprintln!("\x1b[2m    GET  /health\x1b[0m");
     eprintln!("\x1b[2m    POST /remember  {{text, role?, tier?}}\x1b[0m");
@@ -683,6 +945,13 @@ fn cmd_bundle(_rt: &SofuuRuntime, args: &[String]) -> i32 {
     let entry = std::path::PathBuf::from(&args[2]);
     let mut output = "bundle.js".to_string();
     let mut i = 3;
+    /* P3-6 (AUDIT-2026-09-01): a TRAILING `-o` with no value used to be
+     * skipped by `i + 1 < len` and silently wrote bundle.js. Error loudly. */
+    if args.len() > 3 && (args[args.len() - 1] == "-o" || args[args.len() - 1] == "--out") {
+        eprintln!("\x1b[31mError:\x1b[0m -o requires an output path");
+        eprintln!("Usage: sofuu bundle <entry.js> [-o <out.js>]");
+        return 1;
+    }
     while i + 1 < args.len() {
         if args[i] == "-o" || args[i] == "--out" {
             output = args[i + 1].clone();
@@ -770,6 +1039,10 @@ fn print_licenses() {
 }
 
 fn main() -> ExitCode {
+    // conhost (cmd.exe) prints ANSI escapes as literal text until the
+    // process opts in — enable VT processing before anything prints
+    // (no-op off-Windows).
+    sofuu_core::rt::tui::windows_enable_vt();
     let args: Vec<String> = env::args().collect();
 
     // M3: give the JS side process.argv (the ported mod_process_set_args;
@@ -842,6 +1115,20 @@ fn main() -> ExitCode {
             };
             let rc = cmd_eval(&rt, &args[2]);
             if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "doctor" => {
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if doctor::run(&rt, &args) == 0 {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -928,6 +1215,14 @@ fn main() -> ExitCode {
         }
         "session" | "sessions" => {
             let rc = cmd_session(&args);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "outputs" | "output" => {
+            let rc = cmd_outputs(&args);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

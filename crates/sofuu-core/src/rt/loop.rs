@@ -17,10 +17,11 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use sofuu_ffi::qjs::JSContext;
-use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_DEFAULT, UV_RUN_ONCE};
+use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_DEFAULT, UV_RUN_NOWAIT, UV_RUN_ONCE};
 
 use crate::rt::promise::sofuu_flush_jobs;
 
@@ -43,6 +44,123 @@ extern "C" {
     /// check (process.on handlers or the exit(130/143) fallback). Stays C
     /// until M3; the retired loop.c called it after every UV_RUN_ONCE.
     fn process_dispatch_pending_signals();
+}
+
+// ── F-2 (AUDIT-2026-09-01-CLI): per-ctx armed-handle registry ──────────
+//
+// The loop is process-global; `sofuu_loop_close` deliberately tears it down
+// only when the LAST engine releases it. That leaves a gap: destroying one
+// of several live engines does NOT close that engine's handles, and its
+// still-armed timers/pipes/polls carry `data` pointers into the Rust boxes
+// and JSContext that engine_destroy is about to free. The next engine's
+// uv_run would fire them into freed memory (use-after-free).
+//
+// Every module that arms a uv handle for a specific engine registers it
+// here (track_handle); the handle's close callback unregisters it
+// (untrack_handle). At engine teardown, sofuu_loop_shutdown_engine closes
+// exactly the handles that belong to the dying ctx and drains the close
+// callbacks out of the shared loop — while every other engine's handles
+// stay live. Attribution is by JSContext, so two engines on ONE thread are
+// attributed correctly too (capi multi-instance runs them that way).
+
+/// `uv_close_cb` shape — the same signature the uv modules already use.
+pub type UvCloseCb = unsafe extern "C" fn(*mut UvHandle);
+
+struct ArmedHandle {
+    /// The engine context the handle belongs to (attribution key).
+    ctx: *mut JSContext,
+    /// The armed uv handle (uv_timer_t / uv_pipe_t / uv_poll_t / …).
+    handle: *mut UvHandle,
+    /// The close callback the owning module wants (frees its storage/box).
+    close: Option<UvCloseCb>,
+}
+
+// SAFETY: the raw pointers are only ever dereferenced on the loop thread
+// (track at arm time, untrack in close callbacks, shutdown in the teardown
+// path — all loop-thread), and every mutation of the registry is behind the
+// ARMED mutex. The registry never "sends" a handle anywhere; it is a
+// bookkeeping list for loop-thread consumers.
+unsafe impl Send for ArmedHandle {}
+
+static ARMED: Mutex<Vec<ArmedHandle>> = Mutex::new(Vec::new());
+
+/// Register an armed uv handle against `ctx` so a later per-engine teardown
+/// can close it without touching other engines' handles. Re-registering the
+/// same handle pointer is a no-op (dedupe by pointer). Call right after the
+/// handle is armed (init/start); the handle's close callback must call
+/// untrack_handle.
+///
+/// # Safety
+/// `handle` must be a live uv handle armed on the global loop; `ctx` must be
+/// the engine context that owns it. Loop thread.
+pub unsafe fn track_handle(ctx: *mut JSContext, handle: *mut UvHandle, close: Option<UvCloseCb>) {
+    if handle.is_null() {
+        return;
+    }
+    if let Ok(mut armed) = ARMED.lock() {
+        if armed.iter().any(|e| e.handle == handle) {
+            return;
+        }
+        armed.push(ArmedHandle { ctx, handle, close });
+    }
+}
+
+/// Drop the registration for `handle` (called from its close callback — the
+/// handle is fully closed by then). Unknown pointers are ignored.
+pub fn untrack_handle(handle: *mut UvHandle) {
+    if let Ok(mut armed) = ARMED.lock() {
+        armed.retain(|e| e.handle != handle);
+    }
+}
+
+/// Close and drain every armed handle that belongs to `ctx`, leaving all
+/// other engines' handles live. Single-engine teardown is unaffected: the
+/// last-engine `sofuu_loop_close` walk closes whatever is left (and
+/// untracks it).
+///
+/// Ordering matters: close callbacks fire during the drain while `ctx` is
+/// still live, so cbs that free JSValues with ctx stay valid. The ARMED lock
+/// is released before uv_run (close cbs may call track/untrack).
+///
+/// # Safety
+/// `ctx` must be the dying engine's context; must run on the loop thread
+/// before JS_FreeContext/JS_FreeRuntime. No new handles for `ctx` may be
+/// armed afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_loop_shutdown_engine(ctx: *mut JSContext) {
+    if loop_ptr().is_null() {
+        return;
+    }
+    /* Extract this engine's entries; drop the lock before uv_run — close
+     * callbacks may re-enter track/untrack. */
+    let mine: Vec<ArmedHandle> = match ARMED.lock() {
+        Ok(mut armed) => {
+            let (mine, rest): (Vec<_>, Vec<_>) = armed.drain(..).partition(|e| e.ctx == ctx);
+            *armed = rest;
+            mine
+        }
+        Err(_) => return, /* poisoned registry — last-engine walk still cleans up */
+    };
+    if mine.is_empty() {
+        return;
+    }
+    for e in &mine {
+        if uv::uv_is_closing(e.handle) == 0 {
+            uv::uv_close(e.handle, e.close);
+        }
+    }
+    /* Drain the shared loop so the close callbacks fire NOW (while ctx is
+     * still live) instead of during another engine's later uv_run. NOWAIT
+     * never blocks on the surviving engines' long timers; a handful of
+     * iterations is plenty — libuv delivers pending close callbacks on the
+     * very next closing phase, and none of our close cbs re-arm handles. */
+    let lp = loop_ptr();
+    for _ in 0..8 {
+        if uv::uv_loop_alive(lp) == 0 {
+            break;
+        }
+        uv::uv_run(lp, UV_RUN_NOWAIT);
+    }
 }
 
 fn loop_ptr() -> *mut UvLoop {
@@ -125,6 +243,9 @@ unsafe extern "C" fn walk_close_cb(handle: *mut UvHandle, _arg: *mut c_void) {
     if uv::uv_is_closing(handle) == 0 {
         uv::uv_close(handle, None);
     }
+    /* Last-engine walk: whatever it closes is gone — drop its registration
+     * so the registry never holds stale pointers across a full close. */
+    untrack_handle(handle);
 }
 
 /// Drain all remaining handles before closing the loop — prevents the GC
@@ -157,4 +278,113 @@ pub unsafe extern "C" fn sofuu_loop_close() {
     uv::uv_run(lp, UV_RUN_DEFAULT);
 
     uv::uv_loop_close(lp); /* rc ignored — same as the retired C code */
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rt::timer::mod_timer_register;
+    use sofuu_ffi::qjs::{self, CtxPtr};
+
+    /// F-2 (AUDIT-2026-09-01-CLI): destroying ONE of several engines must
+    /// close only ITS armed handles. Engine A arms a 50ms timer, then is
+    /// torn down exactly like engine_destroy's handle phase
+    /// (shutdown_engine → JS_FreeContext/JS_FreeRuntime); engine B's 200ms
+    /// timer then runs on the shared loop. Before the per-ctx registry,
+    /// A's timer stayed armed and fired into the freed context during B's
+    /// run (UAF — deterministic under sanitizers, and locked here by the
+    /// white-box registry asserts regardless).
+    #[test]
+    fn shutdown_engine_closes_only_that_ctx_armed_handles() {
+        // The process-global uv loop is shared — serialize loop-driving
+        // tests (see rt/mod.rs TEST_LOOP_LOCK).
+        let _loop_guard = crate::rt::TEST_LOOP_LOCK.lock().unwrap();
+        unsafe {
+            sofuu_loop_init();
+
+            /* Engine A: fresh runtime/context + timer module + 50ms timer. */
+            let rt_a = qjs::JS_NewRuntime();
+            let ctx_a = qjs::JS_NewContext(rt_a);
+            mod_timer_register(ctx_a);
+            let src_a = c"globalThis.__a_fired = 0; \
+setTimeout(function () { globalThis.__a_fired = 1; }, 50);";
+            let r = qjs::JS_Eval(
+                ctx_a,
+                src_a.as_ptr(),
+                src_a.to_bytes().len(),
+                c"<f2-engine-a>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "engine A script must not throw");
+            qjs::sofuu_js_free_value(ctx_a, r);
+
+            /* Engine B: same setup, 200ms timer. */
+            let rt_b = qjs::JS_NewRuntime();
+            let ctx_b = qjs::JS_NewContext(rt_b);
+            let ctp = CtxPtr::new(ctx_b);
+            mod_timer_register(ctx_b);
+            let src_b = c"globalThis.__b_fired = 0; \
+setTimeout(function () { globalThis.__b_fired = 1; }, 200);";
+            let r = qjs::JS_Eval(
+                ctx_b,
+                src_b.as_ptr(),
+                src_b.to_bytes().len(),
+                c"<f2-engine-b>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "engine B script must not throw");
+            qjs::sofuu_js_free_value(ctx_b, r);
+
+            /* Both timers are tracked against their own context. */
+            assert_eq!(
+                ARMED.lock().unwrap().len(),
+                2,
+                "A's + B's timers must be tracked"
+            );
+
+            /* Teardown A exactly like engine_destroy's handle phase. */
+            sofuu_loop_shutdown_engine(ctx_a);
+            {
+                let armed = ARMED.lock().unwrap();
+                assert_eq!(armed.len(), 1, "shutdown must drain only A's entry");
+                assert_eq!(armed[0].ctx, ctx_b, "the surviving entry must be B's");
+            }
+            /* The shared loop must still be alive: B's timer survived. */
+            assert!(
+                uv::uv_loop_alive(loop_ptr()) != 0,
+                "engine B's timer must survive engine A's teardown"
+            );
+
+            /* A's JS heap is gone. Before the fix, A's still-armed 50ms
+             * timer fired into this freed context during B's run below. */
+            qjs::JS_FreeContext(ctx_a);
+            qjs::JS_FreeRuntime(rt_a);
+
+            /* Drive the loop like engine B would: B's 200ms timer fires,
+             * then the loop drains and run() returns. */
+            sofuu_loop_run(ctx_b);
+
+            let rd = qjs::JS_Eval(
+                ctx_b,
+                c"__b_fired".as_ptr(),
+                c"__b_fired".to_bytes().len(),
+                c"<f2-read>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(rd), "reading __b_fired must not throw");
+            let mut b_i: i32 = 0;
+            assert!(qjs::to_int32(ctp, rd, &mut b_i), "__b_fired must be an int");
+            qjs::sofuu_js_free_value(ctx_b, rd);
+            assert_eq!(b_i, 1, "engine B's timer must fire on the shared loop");
+            assert!(
+                ARMED.lock().unwrap().is_empty(),
+                "B's timer must be untracked once closed"
+            );
+
+            /* M0/M1 discipline: loop teardown BEFORE context teardown. */
+            sofuu_loop_close();
+            qjs::JS_FreeContext(ctx_b);
+            qjs::JS_FreeRuntime(rt_b);
+        }
+    }
 }

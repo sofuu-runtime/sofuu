@@ -94,6 +94,21 @@ impl Hnsw {
         self.vec_store.is_empty()
     }
 
+    /// Stored coordinates for a record id (as returned by add_vector).
+    /// The HNSW store IS the single vector store — Cma.vectors was folded
+    /// into it (AUDIT-2026-09-07 ml-5).
+    pub fn vector(&self, id: u32) -> &[f32] {
+        &self.vec_store[id as usize]
+    }
+
+    /// Overwrite a stored vector in place (entity upsert). Neighbor links
+    /// keep their old-geometry decisions — the same trade the C store
+    /// makes — but searches see the new coordinates immediately.
+    pub fn set_vector(&mut self, id: u32, v: &[f32]) {
+        debug_assert_eq!(v.len(), self.vec_dim);
+        self.vec_store[id as usize].copy_from_slice(v);
+    }
+
     fn dist(&self, a: u32, b: u32) -> f32 {
         let va = &self.vec_store[a as usize];
         let vb = &self.vec_store[b as usize];
@@ -116,12 +131,14 @@ impl Hnsw {
     }
 
     fn random_level(&self) -> u8 {
-        // Geometric-ish level assignment: level 0 most likely, capped.
+        // P3 (AUDIT-2026-09-07): canonical HNSW level assignment —
+        // P(level >= l) = (1/e)^l, i.e. climb with probability 1/e per level
+        // (~63.2% of nodes stay at 0). The old 50% coin over-produced upper
+        // levels, growing the skip-list's memory and search fan-out.
         let mut l = 0u8;
         while l < (HNSW_MAX_LEVELS as u8 - 1) {
-            // ~50% chance to go up a level (matches C's simple rand gate).
             let r: u32 = rand_u32();
-            if r % 2 == 0 {
+            if (r as f64) / (u32::MAX as f64 + 1.0) >= std::f64::consts::E.recip() {
                 break;
             }
             l += 1;

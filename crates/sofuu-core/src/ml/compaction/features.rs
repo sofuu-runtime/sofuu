@@ -195,10 +195,19 @@ fn lexical_overlap(text: &str, other: &str) -> f32 {
 
 /* ── Extraction ──────────────────────────────────────────────────── */
 
-/// Extract the 33-feature vector for segment `idx`. Embeddings are
-/// computed once per call site that needs them (the caller batches via
-/// `extract_all` in practice).
-pub fn extract(ctx: &CompactionContext, idx: usize, emb: &[Vec<f32>]) -> [f32; COMPACTION_FEATURES] {
+/// Extract the 33-feature vector for segment `idx`. `emb` holds the
+/// per-segment embeds; the anchor embeds (recent/task/summary) are passed
+/// in pre-computed as `Option<&[f32]>` (`None` = empty anchor) so the
+/// context-wide embeds are never recomputed per segment — `extract_all`
+/// hoists them (AUDIT-2026-09-07 ml-6).
+pub fn extract(
+    ctx: &CompactionContext,
+    idx: usize,
+    emb: &[Vec<f32>],
+    recent_emb: Option<&[f32]>,
+    task_emb: Option<&[f32]>,
+    summary_emb: Option<&[f32]>,
+) -> [f32; COMPACTION_FEATURES] {
     let seg = &ctx.segments[idx];
     let mut f = [0.0f32; COMPACTION_FEATURES];
 
@@ -210,7 +219,15 @@ pub fn extract(ctx: &CompactionContext, idx: usize, emb: &[Vec<f32>]) -> [f32; C
         .unwrap_or(0)
         .max(1);
     let max_tokens = ctx.segments.iter().map(|s| s.tokens).max().unwrap_or(1).max(1);
-    let total_tokens: u32 = ctx.segments.iter().map(|s| s.tokens).sum::<u32>().max(1);
+    // Saturating sum: hostile token counts must not overflow (a u32 sum
+    // panics in debug and wraps in release — Phase 1.3, §5.3 "overflows
+    // in … token … math"). The ratio features saturate to 1.0, correct
+    // for "this segment is (nearly) all of the history".
+    let total_tokens: u32 = ctx
+        .segments
+        .iter()
+        .fold(0u32, |acc, s| acc.saturating_add(s.tokens))
+        .max(1);
 
     // 0-1: age
     f[0] = seg.age_steps as f32 / max_age as f32;
@@ -226,17 +243,17 @@ pub fn extract(ctx: &CompactionContext, idx: usize, emb: &[Vec<f32>]) -> [f32; C
     f[7] = (seg.tokens as f32 / 4000.0).min(1.0);
     f[8] = seg.tokens as f32 / total_tokens as f32;
     // 9-10: referenced by the recent keep-window (load-bearing signal)
-    if !ctx.recent.is_empty() {
-        f[9] = cosine(&emb[idx], &embed_text(ctx.recent));
+    if let Some(re) = recent_emb {
+        f[9] = cosine(&emb[idx], re);
         f[10] = lexical_overlap(seg.text, ctx.recent);
     }
     // 11: on-task similarity
-    if !ctx.task.is_empty() {
-        f[11] = cosine(&emb[idx], &embed_text(ctx.task));
+    if let Some(te) = task_emb {
+        f[11] = cosine(&emb[idx], te);
     }
     // 12: redundancy with the existing compacted summary
-    if !ctx.summary.is_empty() {
-        f[12] = cosine(&emb[idx], &embed_text(ctx.summary));
+    if let Some(se) = summary_emb {
+        f[12] = cosine(&emb[idx], se);
     }
     // 13: retrievable
     f[13] = if seg.retrievable { 1.0 } else { 0.0 };
@@ -294,10 +311,26 @@ pub fn extract(ctx: &CompactionContext, idx: usize, emb: &[Vec<f32>]) -> [f32; C
 }
 
 /// Embed every segment once, then extract all vectors (the JS shim's
-/// batch path — embedding is the expensive part).
+/// batch path — embedding is the expensive part). The anchor embeds are
+/// context-wide, so each is computed exactly once here (AUDIT-2026-09-07
+/// ml-6 — the pre-hoist code re-embedded recent/task/summary per segment).
 pub fn extract_all(ctx: &CompactionContext) -> Vec<[f32; COMPACTION_FEATURES]> {
     let emb: Vec<Vec<f32>> = ctx.segments.iter().map(|s| embed_text(s.text)).collect();
-    (0..ctx.segments.len()).map(|i| extract(ctx, i, &emb)).collect()
+    let recent_emb = (!ctx.recent.is_empty()).then(|| embed_text(ctx.recent));
+    let task_emb = (!ctx.task.is_empty()).then(|| embed_text(ctx.task));
+    let summary_emb = (!ctx.summary.is_empty()).then(|| embed_text(ctx.summary));
+    (0..ctx.segments.len())
+        .map(|i| {
+            extract(
+                ctx,
+                i,
+                &emb,
+                recent_emb.as_deref(),
+                task_emb.as_deref(),
+                summary_emb.as_deref(),
+            )
+        })
+        .collect()
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
@@ -330,6 +363,35 @@ mod tests {
             assert_eq!(va.len(), COMPACTION_FEATURES);
             for (x, y) in va.iter().zip(vb.iter()) {
                 assert_eq!(x.to_bits(), y.to_bits(), "extraction must be deterministic");
+            }
+        }
+    }
+
+    /// Phase 1.3 (§5.3): empty segments, NUL/Unicode text, u32::MAX tokens,
+    /// zero-token histories — the self-mixing ratios (tokens/total,
+    /// age/max_age) must never divide by zero or overflow.
+    #[test]
+    fn hostile_segments_stay_finite_and_bounded() {
+        let empty: &'static str = "";
+        let nul: &'static str = "\u{0}\u{0}yes\u{0}";
+        let uni: &'static str = "配列の😀テスト";
+        let segs = [
+            seg(empty, 0, 0, SegKind::ToolResult, true),
+            seg(nul, u32::MAX, 5, SegKind::User, false),
+            seg(uni, 42, u32::MAX, SegKind::Assistant, false),
+            seg("x".repeat(30_000).leak(), 7, 2, SegKind::ToolCall, true),
+        ];
+        let ctx = CompactionContext {
+            task: "\u{0}task😀",
+            summary: "",
+            recent: uni,
+            segments: &segs,
+        };
+        let v = extract_all(&ctx);
+        for (i, vec) in v.iter().enumerate() {
+            for (j, x) in vec.iter().enumerate() {
+                assert!(x.is_finite(), "seg {i} feature {j} NaN/Inf: {x}");
+                assert!((-1.0..=2.0).contains(x), "seg {i} feature {j} out of band: {x}");
             }
         }
     }
@@ -367,5 +429,36 @@ mod tests {
         let v = extract_all(&ctx);
         assert!(v[2][16] > 0.9, "identical earlier segment must read as duplicate");
         assert!(v[1][16] < 0.6, "unrelated segment must not");
+    }
+
+    /// ml-6 guard: hoisting the recent/task/summary anchor embeds into
+    /// extract_all must leave every feature bit-identical to the
+    /// pre-hoist implementation. The context below exercises all three
+    /// anchor channels (summary ""; covered by the other tests); the
+    /// golden row is captured bit-exact from pre-hoist code.
+    #[test]
+    fn anchor_hoist_keeps_features_bit_identical() {
+        let segs = [
+            seg("old verbose tool output with lots of detail about the database migration run", 400, 9, SegKind::ToolResult, true),
+            seg("we decided to use the ripgrep binary for all searches going forward", 40, 5, SegKind::Assistant, false),
+            seg("what is the current status of the database migration?", 20, 0, SegKind::User, false),
+        ];
+        let ctx = CompactionContext {
+            task: "finish the database migration",
+            summary: "earlier turns settled on ripgrep for all searches",
+            recent: "what is the current status of the database migration? finish the database migration",
+            segments: &segs,
+        };
+        let feats = extract_all(&ctx);
+        let flat: Vec<String> = feats
+            .iter()
+            .flatten()
+            .map(|x| x.to_bits().to_string())
+            .collect();
+        assert_eq!(
+            flat.join(","),
+            "1065353216,1047251171,0,0,0,1065353216,1065353216,1036831949,1063164883,1056883398,1051372203,1056589096,1037661764,1065353216,1050397206,0,0,0,0,0,0,0,0,0,0,0,0,0,1008444899,1056883398,1065353216,0,0,1057896676,1043823078,0,1065353216,0,0,1036831949,1008981770,1035081283,1045237785,0,1044713895,1056063035,0,1045754074,0,1045797221,0,0,0,0,0,0,1061143203,0,0,0,0,1007236940,1038342400,0,1051372203,0,0,0,1065353216,0,0,0,1028443341,1000593162,1026692675,1064260038,1065353216,1059388974,1028741962,0,1049923933,1038323256,1054894810,1065353216,1065353216,0,0,0,0,0,0,1065353216,0,0,1004082823,0,0,1059760811,0",
+            "features must stay bit-identical to the pre-hoist implementation"
+        );
     }
 }

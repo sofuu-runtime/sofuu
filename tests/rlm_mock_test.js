@@ -195,8 +195,12 @@ async function main() {
     check("abort: stopped === 'aborted'", ab.stopped === "aborted");
     check("abort: killed mid-flight (" + ms + "ms « 2100ms drip, " +
           DRIPS_DONE + "/14 chunks)", ms < 1500 && DRIPS_DONE < 14);
-    check("abort: flag cleared for the next episode",
-      typeof sofuu.rlm.query === "function");
+    /* P3-13 (AUDIT-2026-09-01): the intended invariant is that the
+     * episode teardown RESETS the host abort flag — otherwise the next
+     * episode would be stillborn-aborted. The old check asserted a
+     * constant (typeof function) and verified nothing. */
+    check("abort: host flag reset for the next episode",
+          globalThis.__rlm_aborted === false);
   }
 
   console.log(failures === 0

@@ -22,27 +22,51 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "transparent": true,
-        "backgroundColor": { "red": 255, "green": 251, "blue": 240, "alpha": 0 },
+        "backgroundColor": {
+          "red": 255,
+          "green": 251,
+          "blue": 240,
+          "alpha": 0
+        },
         "resizable": true,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' https: data:; media-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; object-src 'none'; frame-src 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "deb",
+      "appimage"
+    ],
     "category": "DeveloperTool",
-    "shortDescription": "Sofuu — the AI-native JS runtime, desktop edition",
-    "longDescription": "Sofuu Desktop links the full sofuu runtime in-process: streaming agent chat, coding tools with approval prompts, session resume, and macOS-native integration.",
+    "shortDescription": "Sofuu \u2014 the AI-native JS runtime, desktop edition",
+    "longDescription": "Sofuu Desktop links the full sofuu runtime in-process: streaming agent chat, coding tools with approval prompts, session resume, and native desktop integration (macOS vibrancy / Windows Mica). Bundler skips targets that don't apply to the host OS.",
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
+    "windows": {
+      "nsis": {
+        "languages": [
+          "English"
+        ],
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
       "icons/icon.png",
-      "icons/icon.icns"
+      "icons/icon.icns",
+      "icons/icon.ico"
     ]
   }
 }

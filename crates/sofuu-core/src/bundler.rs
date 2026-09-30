@@ -4,7 +4,9 @@
 // entry file and emits a single self-contained JS bundle using a
 // `__d(id, factory)` / `__r(id)` registry. Handles:
 //   - import default/named/namespace/side-effect/dynamic
-//   - export default / named / star / re-export
+//   - export default / named / star / star-as-namespace / re-export
+//     (`export * [as ns] from '…'` and `export { … } from '…'` — the
+//     re-export target also joins the import graph)
 //   - export const/let/var/function/class
 //   - TypeScript source (via crate::ts::strip)
 //
@@ -91,6 +93,36 @@ fn skip_wsn(src: &[u8], mut pos: usize, len: usize) -> usize {
     pos
 }
 
+/* proc-12: raw byte scans for `;`/newline walked straight through string
+ * literals, so `export const s = "a;b"` truncated the module at the `;`
+ * inside the string (dropping every later export). stmt_end finds the
+ * first statement terminator OUTSIDE any literal (skip_string/skip_template
+ * above) or line comment. */
+fn stmt_end(src: &[u8], mut pos: usize, len: usize) -> usize {
+    while pos < len {
+        let c = src[pos];
+        if c == b'"' || c == b'\'' {
+            pos = skip_string(src, pos, len);
+            continue;
+        }
+        if c == b'`' {
+            pos = skip_template(src, pos, len);
+            continue;
+        }
+        if c == b'/' && pos + 1 < len && src[pos + 1] == b'/' {
+            while pos < len && src[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if c == b';' || c == b'\n' {
+            return pos;
+        }
+        pos += 1;
+    }
+    len
+}
+
 /// Read a quoted string at `pos` (on the quote). Returns the inner string.
 fn read_quoted(src: &[u8], pos: &mut usize, len: usize) -> Option<String> {
     *pos = skip_wsn(src, *pos, len);
@@ -137,9 +169,9 @@ fn parse_import_specifier(
         if pos < len && src[pos] == b')' {
             pos += 1;
         }
-        while pos < len && src[pos] != b';' && src[pos] != b'\n' {
-            pos += 1;
-        }
+        /* proc-12: string-aware statement end (dynamic import specifier
+         * could contain a quoted `;`). */
+        pos = stmt_end(src, pos, len);
         if pos < len && src[pos] == b';' {
             pos += 1;
         }
@@ -150,9 +182,8 @@ fn parse_import_specifier(
     // Bare import: import 'specifier'
     if pos < len && (src[pos] == b'"' || src[pos] == b'\'') {
         let spec = read_quoted(src, &mut pos, len);
-        while pos < len && src[pos] != b';' && src[pos] != b'\n' {
-            pos += 1;
-        }
+        /* proc-12: string-aware statement end. */
+        pos = stmt_end(src, pos, len);
         if pos < len && src[pos] == b';' {
             pos += 1;
         }
@@ -200,6 +231,8 @@ fn parse_import_specifier(
             pos = skip_wsn(src, pos, len);
             let spec = read_quoted(src, &mut pos, len);
             pos = skip_ws(src, pos, len);
+            /* proc-12: the specifier itself was read; a trailing `;` here
+             * is directly adjacent — safe either way, kept explicit. */
             if pos < len && src[pos] == b';' {
                 pos += 1;
             }
@@ -209,6 +242,63 @@ fn parse_import_specifier(
         pos += 1;
     }
     *end_pos = pos;
+    None
+}
+
+/// After `export`, extract a re-export specifier if the statement is one of
+/// `export * from`, `export * as ns from`, or `export { … } from 'spec'`.
+/// Returns None for plain exports (they can't pull in a new module).
+fn parse_reexport_specifier(src: &[u8], pos: usize, len: usize) -> Option<String> {
+    let mut p = skip_wsn(src, pos, len);
+
+    // `export * [as ns] from 'spec'`
+    if p < len && src[p] == b'*' {
+        p = skip_wsn(src, p + 1, len);
+        // Optional `as ns`.
+        if p + 2 < len && &src[p..p + 2] == b"as" && !is_id_cont(src[p + 2]) {
+            p = skip_wsn(src, p + 2, len);
+            while p < len && is_id_cont(src[p]) {
+                p += 1;
+            }
+            p = skip_wsn(src, p, len);
+        }
+        if p + 4 <= len && &src[p..p + 4] == b"from" && (p + 4 >= len || !is_id_cont(src[p + 4])) {
+            p = skip_wsn(src, p + 4, len);
+            return read_quoted(src, &mut p, len);
+        }
+        return None;
+    }
+
+    // `export { a, b as c } from 'spec'` — find the closing brace, then `from`.
+    if p < len && src[p] == b'{' {
+        let mut depth = 0i32;
+        while p < len {
+            let c = src[p];
+            if c == b'"' || c == b'\'' {
+                p = skip_string(src, p, len);
+                continue;
+            }
+            if c == b'`' {
+                p = skip_template(src, p, len);
+                continue;
+            }
+            if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    p += 1;
+                    break;
+                }
+            }
+            p += 1;
+        }
+        p = skip_wsn(src, p, len);
+        if p + 4 <= len && &src[p..p + 4] == b"from" && (p + 4 >= len || !is_id_cont(src[p + 4])) {
+            p = skip_wsn(src, p + 4, len);
+            return read_quoted(src, &mut p, len);
+        }
+    }
     None
 }
 
@@ -250,6 +340,33 @@ pub fn collect_specifiers(src: &str) -> Vec<Spec> {
                     is_dynamic: is_dyn,
                 });
                 p = end;
+                continue;
+            }
+        }
+        /* P1-13 (AUDIT-2026-09-07): re-export targets must join the graph —
+         * `export * as ns from './dep'` (and the plain-star / brace forms)
+         * transform into a require() of the target, so a module reachable
+         * ONLY through a re-export used to miss from the bundle ("missing
+         * module" stub at runtime). Collected as a static (non-dynamic) spec. */
+        if c == b'e'
+            && p + 6 <= len
+            && &bytes[p..p + 6] == b"export"
+            && (p == 0 || !is_id_cont(bytes[p - 1]))
+            && (p + 6 >= len || !is_id_cont(bytes[p + 6]))
+        {
+            if let Some(spec) = parse_reexport_specifier(bytes, p + 6, len) {
+                out.push(Spec {
+                    spec,
+                    is_dynamic: false,
+                });
+                // Advance past the statement so the `from` clause's module-id
+                // text can't be rescanned (it holds no further statements).
+                /* proc-12: string-aware — `export { x } from './a;b'` must
+                 * not have its scan stopped inside the specifier. */
+                p = stmt_end(bytes, p, len);
+                if p < len && bytes[p] == b';' {
+                    p += 1;
+                }
                 continue;
             }
         }
@@ -303,7 +420,20 @@ fn resolve_specifier(
     } else {
         // npm module — resolved via the resolver callback.
         let resolved = npm_resolve(mod_dir, spec)?;
-        let id = format!("node_modules/{spec}");
+        /* P2-13 (AUDIT-2026-09-01): the id used to be the RAW specifier —
+         * `pkg` vs `pkg/index.js` (and any subpath forms that resolve to
+         * the same file) minted TWO nodes → duplicate module instances and
+         * broken `instanceof`. Key the id on the RESOLVED path so every
+         * specifier that resolves here shares one module. */
+        let base = resolved
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec.to_string());
+        let parent = resolved
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let id = format!("node_modules/{}/{}", parent.replace('\\', "/"), base);
         Some((resolved, id))
     }
 }
@@ -500,10 +630,10 @@ pub fn transform_module(
             if tp + 4 <= len && &bytes[tp..tp + 4] == b"type" && !is_id_cont(bytes[tp + 4]) {
                 let peek = skip_ws(bytes, tp + 4, len);
                 if peek < len && bytes[peek] != b'(' {
-                    let mut end = peek;
-                    while end < len && bytes[end] != b';' && bytes[end] != b'\n' {
-                        end += 1;
-                    }
+                    /* proc-12: string-aware — `import type {A} from './a;b'`
+                     * must erase the WHOLE statement, not stop at the `;`
+                     * inside the specifier (which leaked `b';` into output). */
+                    let mut end = stmt_end(bytes, peek, len);
                     if end < len && bytes[end] == b';' {
                         end += 1;
                     }
@@ -573,11 +703,46 @@ pub fn transform_module(
                         expr.push(bytes[ep] as char);
                         ep += 1;
                     }
-                } else {
-                    while ep < len && bytes[ep] != b';' && bytes[ep] != b'\n' {
-                        expr.push(bytes[ep] as char);
+                } else if ep < len && bytes[ep] == b'{' {
+                    /* P2-11 (AUDIT-2026-09-01): `export default {\n a: 1\n};`
+                     * used to stop at the FIRST newline — emitting
+                     * `exports.default=…={;` (a syntax error). A brace
+                     * expression counts braces so multi-line object
+                     * literals survive; strings/chars containing braces
+                     * are NOT parsed here (matching the fn/class path's
+                     * documented limitation). */
+                    let mut d = 0i32;
+                    while ep < len {
+                        let b = bytes[ep];
+                        if b == b'{' {
+                            d += 1;
+                            expr.push('{');
+                            ep += 1;
+                            continue;
+                        }
+                        if b == b'}' {
+                            d -= 1;
+                            expr.push('}');
+                            ep += 1;
+                            if d == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        expr.push(b as char);
                         ep += 1;
                     }
+                    /* consume an optional trailing ';' */
+                    if ep < len && bytes[ep] == b';' {
+                        ep += 1;
+                    }
+                } else {
+                    /* proc-12: string-aware — `export default "a;b"` must
+                     * capture the WHOLE expression, not stop at the `;`
+                     * inside the literal. */
+                    let e = stmt_end(bytes, ep, len);
+                    expr.push_str(&String::from_utf8_lossy(&bytes[ep..e]));
+                    ep = e;
                     if ep < len && bytes[ep] == b';' {
                         ep += 1;
                     }
@@ -591,14 +756,34 @@ pub fn transform_module(
                 continue;
             }
 
-            // export * from './x'
+            // export * from './x'  |  export * as ns from './x'
             if ep0 < len && bytes[ep0] == b'*' {
                 let mut ep = skip_wsn(bytes, ep0 + 1, len);
+                /* P1-13 (AUDIT-2026-09-07): the optional `as ns` clause used
+                 * to be left in the output verbatim — `export` is illegal in
+                 * the __d factory, so any dependency using star-as-namespace
+                 * failed to load with a SyntaxError. Parse it and emit the
+                 * namespace object onto exports. */
+                let mut ns: Option<String> = None;
+                if ep + 2 < len && &bytes[ep..ep + 2] == b"as" && !is_id_cont(bytes[ep + 2]) {
+                    ep = skip_wsn(bytes, ep + 2, len);
+                    let name_start = ep;
+                    while ep < len && is_id_cont(bytes[ep]) {
+                        ep += 1;
+                    }
+                    ns = Some(src[name_start..ep].to_string());
+                    ep = skip_wsn(bytes, ep, len);
+                }
                 if ep + 4 <= len && &bytes[ep..ep + 4] == b"from" {
                     ep = skip_wsn(bytes, ep + 4, len);
                     if let Some(spec) = read_quoted(bytes, &mut ep, len) {
                         let id = resolve_id_in_graph(graph, &m.abs_path, &spec, npm_resolve);
-                        out.push_str(&format!("Object.assign(exports,require('{id}'));"));
+                        match ns {
+                            Some(name) => out.push_str(&format!(
+                                "var __sx=require('{id}');exports.{name}=__sx;"
+                            )),
+                            None => out.push_str(&format!("Object.assign(exports,require('{id}'));")),
+                        }
                         while ep < len && bytes[ep] != b'\n' {
                             ep += 1;
                         }
@@ -625,13 +810,14 @@ pub fn transform_module(
                 }
                 ep = skip_ws(bytes, ep, len);
                 let mut from_spec: Option<String> = None;
-                if ep + 4 <= len && &bytes[ep..ep + 4] == b"from" && !is_id_cont(bytes[ep + 4]) {
+                if ep + 4 < len && &bytes[ep..ep + 4] == b"from" && !is_id_cont(bytes[ep + 4]) {
                     ep = skip_wsn(bytes, ep + 4, len);
                     from_spec = read_quoted(bytes, &mut ep, len);
                 }
-                while ep < len && bytes[ep] != b';' && bytes[ep] != b'\n' {
-                    ep += 1;
-                }
+                /* proc-12: string-aware — `export { a } from './a;b'` must
+                 * consume the whole statement. */
+                let e = stmt_end(bytes, ep, len);
+                ep = e;
                 if ep < len && bytes[ep] == b';' {
                     ep += 1;
                 }
@@ -669,6 +855,22 @@ pub fn transform_module(
                 let mut rest = String::new();
                 let mut d = 0i32;
                 while ep < len {
+                    /* proc-12: skip string literals FIRST — a `;` inside
+                     * `"a;b"` (or a `{`/`}` in a string) must not touch the
+                     * depth counter or end the initializer. */
+                    let b0 = bytes[ep];
+                    if b0 == b'"' || b0 == b'\'' {
+                        let e = skip_string(bytes, ep, len);
+                        rest.push_str(&String::from_utf8_lossy(&bytes[ep..e]));
+                        ep = e;
+                        continue;
+                    }
+                    if b0 == b'`' {
+                        let e = skip_template(bytes, ep, len);
+                        rest.push_str(&String::from_utf8_lossy(&bytes[ep..e]));
+                        ep = e;
+                        continue;
+                    }
                     if bytes[ep] == b'{' || bytes[ep] == b'(' || bytes[ep] == b'[' {
                         d += 1;
                     }
@@ -812,6 +1014,16 @@ fn emit_import(bind: &str, id: &str, pos: usize) -> String {
                     out.push_str(&format!("var {tok}=__r_{def_name}.{tok};"));
                 }
             }
+        } else if named.starts_with('*') {
+            /* P2-12 (AUDIT-2026-09-01): `import Default, * as ns from '…'`
+             * used to emit `var * as ns=…` — invalid JS. The `*` check was
+             * only applied to b[0], so the mixed form fell through here. */
+            let nsa = named.split("as").nth(1).map(|s| trim(s).to_string()).unwrap_or_default();
+            let ns_name: String = nsa
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            out.push_str(&format!("var {ns_name}=require('{id}');"));
         } else {
             out.push_str(&format!("var {named}=__r_{def_name}"));
         }
@@ -835,10 +1047,14 @@ fn emit_named_exports(names: &str, id: &str) -> String {
             let orig = trim(orig);
             let alias = trim(alias);
             if alias == "default" {
-                out.push_str(&format!(
-                    "exports.default=exports.__default={}__rx.{orig};",
-                    if has_from { "" } else { "" }
-                ));
+                // P3: the old `if has_from { "" } else { "" }` was dead AND
+                // masked a latent bug — without a from-clause there is no
+                // `__rx`, so re-export the local name directly.
+                if has_from {
+                    out.push_str(&format!("exports.default=exports.__default=__rx.{orig};"));
+                } else {
+                    out.push_str(&format!("exports.default=exports.__default={orig};"));
+                }
             } else if has_from {
                 out.push_str(&format!("exports.{alias}=__rx.{orig};"));
             } else {
@@ -910,11 +1126,6 @@ pub fn bundle(
     Ok(emit_bundle(&graph))
 }
 
-/// Default npm resolver stub — no node_modules support without the C core.
-pub fn no_npm_resolve(_dir: &Path, _spec: &str) -> Option<PathBuf> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,6 +1194,19 @@ mod tests {
     }
 
     #[test]
+    fn transforms_export_named_default_no_from() {
+        // P3 (AUDIT-2026-09-07): `export { x as default }` with NO
+        // from-clause used to emit `__rx.x` — a variable the bundle never
+        // defines — because the `if has_from { "" } else { "" }` conditional
+        // was dead on both arms.
+        let g = Graph { mods: vec![], root_dir: PathBuf::from("."), entry_id: "./e.js".into() };
+        let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
+        let out = transform_module(&g, &m, "function x(){return 1}\nexport { x as default };\n", &resolver);
+        assert!(out.contains("exports.default=exports.__default=x;"), "no-from default re-exports the local, got: {out}");
+        assert!(!out.contains("__rx"), "no __rx may be referenced without a from-clause, got: {out}");
+    }
+
+    #[test]
     fn transforms_export_named() {
         let g = Graph { mods: vec![], root_dir: PathBuf::from("."), entry_id: "./e.js".into() };
         let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
@@ -1005,6 +1229,93 @@ mod tests {
         let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
         let out = transform_module(&g, &m, "export * from './lib';\n", &resolver);
         assert!(out.contains("Object.assign(exports,require('./lib'))"));
+    }
+
+    /* P1-13 (AUDIT-2026-09-07): star-as-namespace used to be copied verbatim
+     * into the __d factory — `export` is illegal in a function body, so any
+     * dependency using it failed to load with a SyntaxError. */
+    #[test]
+    fn transforms_export_star_as_namespace() {
+        let g = Graph { mods: vec![], root_dir: PathBuf::from("."), entry_id: "./e.js".into() };
+        let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
+        let out = transform_module(&g, &m, "export * as ns from './dep';\n", &resolver);
+        assert!(out.contains("var __sx=require('./dep');exports.ns=__sx;"), "got: {out}");
+        assert!(!out.contains("export *"), "verbatim export leaked: {out}");
+    }
+
+    /* proc-12 (AUDIT-2026-09-07): the statement scanners stopped at the
+     * FIRST `;` or newline even when it sat inside a string literal —
+     * `export const s = "a;b";` emitted `const s = "a;` and the rest of
+     * the module after it was parsed from inside an unterminated string. */
+    #[test]
+    fn semicolon_inside_string_does_not_truncate_export() {
+        let g = Graph { mods: vec![], root_dir: PathBuf::from("."), entry_id: "./e.js".into() };
+        let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
+        let src = "export const s = \"a;b\";\nexport function f() { return 2; }\n";
+        let out = transform_module(&g, &m, src, &resolver);
+        assert!(out.contains("\"a;b\""), "string literal must survive intact: {out}");
+        assert!(out.contains("exports.s=s;"), "export const must still emit its export: {out}");
+        assert!(
+            out.contains("function f"),
+            "the statement after the string-bearing one must survive: {out}"
+        );
+    }
+
+    /* proc-12: same family — `import type ... from './a;b'` must erase
+     * through the REAL terminator; the raw scan stopped inside the quoted
+     * specifier and swallowed the next statement into a string. */
+    #[test]
+    fn semicolon_in_import_type_specifier_does_not_leak() {
+        let g = Graph { mods: vec![], root_dir: PathBuf::from("."), entry_id: "./e.js".into() };
+        let m = BundleMod { abs_path: PathBuf::from("/e.js"), id: "./e.js".into(), source: String::new(), transformed: None };
+        let src = "import type {A} from './a;b';\nexport default 1;\n";
+        let out = transform_module(&g, &m, src, &resolver);
+        assert!(
+            out.contains("exports.default=exports.__default=1"),
+            "the statement after the type import must transform: {out}"
+        );
+    }
+
+    /* proc-12: stmt_end must skip literals AND line comments when hunting
+     * for the terminator. */
+    #[test]
+    fn stmt_end_skips_strings_and_comments() {
+        let src = b"let x = \"a;b\" // no; end\nlet y = 2;";
+        let e = stmt_end(src, 4, src.len());
+        assert_eq!(&src[4..e], b"x = \"a;b\" // no; end");
+    }
+
+    /* P1-13: re-export targets must join the module graph — a module reachable
+     * only through `export * [as ns] from` used to miss from the bundle and hit
+     * the "missing module" stub at runtime. Plain exports must NOT be collected. */
+    #[test]
+    fn collects_reexport_specifiers() {
+        let src = "export * as ns from './a';\nexport * from './b';\nexport { c } from './c';\nexport { local };\nexport const q = 1;\nexport default 7;\n";
+        let specs = collect_specifiers(src);
+        let got: Vec<&str> = specs.iter().map(|s| s.spec.as_str()).collect();
+        assert_eq!(got, vec!["./a", "./b", "./c"], "got: {got:?}");
+        assert!(specs.iter().all(|s| !s.is_dynamic));
+    }
+
+    #[test]
+    fn bundles_star_as_ns_reexport_chain() {
+        let tmp = std::env::temp_dir().join(format!("sofuu-bundle-ns-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("dep.js"), "export const alpha = 1;\nexport const beta = 2;\nexport default 42;\n").unwrap();
+        std::fs::write(tmp.join("extra.js"), "export const gamma = 3;\n").unwrap();
+        std::fs::write(tmp.join("mid.js"), "export * as ns from './dep.js';\nexport * from './extra.js';\n").unwrap();
+        std::fs::write(tmp.join("entry.js"), "import { ns } from './mid.js';\nconst t = ns;\n").unwrap();
+        let out = bundle(&tmp.join("entry.js"), &resolver).unwrap();
+        // Every module in the chain made it into the graph…
+        assert!(out.contains("__d('./dep.js'"), "dep missing: {out}");
+        assert!(out.contains("__d('./extra.js'"), "extra missing: {out}");
+        assert!(out.contains("__d('./mid.js'"), "mid missing: {out}");
+        // …the star-as transform emitted the namespace binding…
+        assert!(out.contains("var __sx=require('./dep.js');exports.ns=__sx;"), "got: {out}");
+        assert!(out.contains("Object.assign(exports,require('./extra.js'))"));
+        // …and no illegal verbatim `export` statement survived.
+        assert!(!out.contains("export *"), "verbatim export leaked: {out}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -14,9 +14,7 @@ jobs:
     name: macOS arm64
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install dependencies
         run: brew install curl cmake ninja
@@ -60,24 +58,71 @@ jobs:
           sha256sum dist/libsofuu-darwin-arm64.tar.gz > dist/libsofuu-darwin-arm64.tar.gz.sha256
           ls -lh dist/
 
+      # ── E1: the iOS beachhead (the positioning plan's Phase 1) ──
+      # libsofuu.xcframework is what SwiftPM and CocoaPods resolve, so a
+      # release that omits it means `pod 'Sofuu'` and `.package(...)` both
+      # fail to install — the SDK is not actually shippable without it.
+      - name: Build iOS xcframework (SwiftPM + CocoaPods payload)
+        run: |
+          set -euo pipefail
+          SOFUU_ALLOW_NO_QTSQ=1 ./scripts/dist/ios.sh xcframework
+          # SwiftPM needs a *zip* of the xcframework, and CocoaPods needs the
+          # directory; ship the zip and keep the framework on disk too.
+          ditto -c -k --keepParent dist/libsofuu.xcframework \
+            dist/libsofuu.xcframework.zip
+          sha256sum dist/libsofuu.xcframework.zip > dist/libsofuu.xcframework.zip.sha256
+          du -sh dist/libsofuu.xcframework dist/libsofuu.xcframework.zip
+
+      # The checksum is a SwiftPM requirement: without it the manifest cannot
+      # resolve, so pin it to the artifact we just built.
+      - name: Stamp SwiftPM checksum
+        env:
+          SOFUU_VERSION: ${{ github.ref_name }}
+        run: SOFUU_VERSION="${SOFUU_VERSION#v}" ./scripts/stamp-swiftpm.sh dist/libsofuu.xcframework.zip
+
+      - name: Validate the SDK manifests against the built artifact
+        run: |
+          set -euo pipefail
+          # The package must still parse after stamping, and the checksum it
+          # pins must be the one we shipped.
+          swift package dump-package > /dev/null
+          ruby scripts/check_podspec.rb
+          grep -q "$(shasum -a 256 dist/libsofuu.xcframework.zip | awk '{print $1}')" Package.swift
+
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/sofuu-darwin-arm64.tar.gz
             dist/sofuu-darwin-arm64.tar.gz.sha256
             dist/libsofuu-darwin-arm64.tar.gz
             dist/libsofuu-darwin-arm64.tar.gz.sha256
+            dist/libsofuu.xcframework.zip
+            dist/libsofuu.xcframework.zip.sha256
           generate_release_notes: true
+
+      # The stamped Package.swift is the thing consumers actually resolve, so
+      # commit it back: otherwise the next release ships a manifest pinned to
+      # the *previous* artifact's checksum.
+      - name: Commit the stamped Package.swift
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Package.swift; then
+            echo "Package.swift unchanged."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Package.swift
+            git commit -m "chore(pkg): pin SwiftPM xcframework checksum for ${GITHUB_REF_NAME}"
+            git push
+          fi
 
   # ── Linux x86_64 (static musl) ────────────────────────────────
   release-linux-x86_64:
     name: Linux x86_64 (static)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install dependencies
         run: |
@@ -121,7 +166,7 @@ jobs:
           ls -lh dist/
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/sofuu-linux-x86_64.tar.gz
@@ -134,9 +179,7 @@ jobs:
     name: Linux arm64 (static)
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install dependencies
         run: |
@@ -180,7 +223,7 @@ jobs:
           ls -lh dist/
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/sofuu-linux-arm64.tar.gz
@@ -188,16 +231,86 @@ jobs:
             dist/libsofuu-linux-arm64.tar.gz
             dist/libsofuu-linux-arm64.tar.gz.sha256
 
+  # ── Android (the Gradle SDK payload) ────────────────────────
+  # An AAR is what an app actually consumes
+  # (`implementation 'com.sofuu:sofuu-android'`), and it can only be built
+  # here: the native .so's are cross-compiled with the NDK. A release
+  # without this job ships a broken Android install path.
+  release-android:
+    name: Android (AAR)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl cmake ninja-build
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+            -o /tmp/cmdline-tools.zip
+          sudo mkdir -p /usr/local/android-sdk/cmdline-tools
+          sudo unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline
+          sudo mv /tmp/cmdline/cmdline-tools /usr/local/android-sdk/cmdline-tools/latest
+          yes | sudo /usr/local/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null
+          sudo /usr/local/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          echo "ANDROID_NDK_HOME=/usr/local/android-sdk/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "ANDROID_HOME=/usr/local/android-sdk" >> $GITHUB_ENV
+
+      - name: Build libuv
+        run: |
+          cd deps/libuv
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build
+
+      - name: Build the Android .so's
+        run: SOFUU_ALLOW_NO_QTSQ=1 ./scripts/dist/android.sh all
+
+      - name: Build the AAR
+        run: |
+          set -euo pipefail
+          # Stage the prebuilt .so's where the library's CMake expects them.
+          mkdir -p bindings/android/sofuu/src/main/jniLibs/arm64-v8a
+          mkdir -p bindings/android/sofuu/src/main/jniLibs/x86_64
+          cp dist/libsofuu-android-aarch64.so bindings/android/sofuu/src/main/jniLibs/arm64-v8a/libsofuu.so
+          cp dist/libsofuu-android-x86_64.so  bindings/android/sofuu/src/main/jniLibs/x86_64/libsofuu.so
+          # Verify the native payload is really there — an AAR with no .so is a
+          # silent UnsatisfiedLinkError in every consumer app.
+          for abi in arm64-v8a x86_64; do
+            test -s "bindings/android/sofuu/src/main/jniLibs/$abi/libsofuu.so" \
+              || { echo "missing .so for $abi"; exit 1; }
+          done
+          cd bindings/android
+          # A committed gradle wrapper is not in this repo; use the runner's
+          # gradle. This job is the one place the AAR is built.
+          gradle --no-daemon :sofuu:assembleRelease
+          cd ../..
+          mkdir -p dist/sofuu-android
+          cp bindings/android/sofuu/build/outputs/aar/sofuu-release.aar dist/sofuu-android/sofuu-android.aar
+          cp examples/headless/KotlinSample/CMakeLists.txt dist/sofuu-android/ 2>/dev/null || true
+          tar -czf dist/libsofuu-android.tar.gz -C dist sofuu-android
+          sha256sum dist/libsofuu-android.tar.gz > dist/libsofuu-android.tar.gz.sha256
+          # Prove the AAR really contains the native libs.
+          unzip -l dist/sofuu-android/sofuu-android.aar | grep -E 'jni/.+\.so' \
+            || { echo "AAR contains no jni .so files"; exit 1; }
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/libsofuu-android.tar.gz
+            dist/libsofuu-android.tar.gz.sha256
+
   # ── Generate install manifest ─────────────────────────────────
   release-manifest:
     name: Release Manifest
     runs-on: ubuntu-22.04
-    needs: [release-macos, release-linux-x86_64, release-linux-arm64]
+    needs: [release-macos, release-linux-x86_64, release-linux-arm64, release-android]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Download all release assets
-        uses: robinraju/release-downloader@v1.9
+        uses: robinraju/release-downloader@368754b9c6f47c345fcfbf42bcb577c2f0f5f395 # v1.9
         with:
           tag: ${{ github.ref_name }}
           fileName: '*.sha256'
@@ -209,6 +322,6 @@ jobs:
           cat dist/CHECKSUMS.txt
 
       - name: Upload manifest
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/CHECKSUMS.txt

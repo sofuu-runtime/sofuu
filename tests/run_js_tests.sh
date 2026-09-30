@@ -149,11 +149,19 @@ for entry in "${E2E_TESTS[@]}"; do
 
     echo -e "\n${CYAN}--- $file: $desc ---${RESET}"
 
-    if bash "$path" 2>&1; then
+    rc=0
+    bash "$path" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
         echo -e "${GREEN}✓ PASSED: $file${RESET}"
         PASS=$((PASS + 1))
+    elif [ "$rc" -eq 77 ]; then
+        # 77 = the test itself chose to skip (opt-in gate not met, e.g. no
+        # QTSQ codec so sofuu.memory does not exist). Counted honestly as
+        # SKIP, never as PASSED — same convention as the .js suites.
+        echo -e "${CYAN}⊘ SKIPPED: $file${RESET}"
+        SKIP=$((SKIP + 1))
     else
-        echo -e "${RED}✗ FAILED: $file${RESET}"
+        echo -e "${RED}✗ FAILED: $file (exit $rc)${RESET}"
         FAIL=$((FAIL + 1))
         FAILED_TESTS+=("$file")
     fi

@@ -34,6 +34,17 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOFUU="$ROOT/sofuu"
+
+# A QTSQ-free build has NO sofuu.memory: crates/sofuu-core/src/rt/memory.rs gates
+# the register bodies on #[cfg(has_qtsq)], so the surface is compiled out. These
+# e2e suites drive the brain, so they cannot run without it, and CI builds
+# QTSQ-free on purpose (the codec is a proprietary local checkout). Exit 77 is
+# the POSIX skip convention run_js_tests.sh already honours for the .js suites.
+if ! "$SOFUU" eval 'console.log("__HAS_MEMORY__" + (typeof sofuu.memory === "object" && typeof sofuu.memory.open === "function"))' \
+      2>/dev/null | grep -q '__HAS_MEMORY__true'; then
+  echo "SKIP chat_remember_e2e — this build has no QTSQ codec, so sofuu.memory does not exist"
+  exit 77
+fi
 PORT="${1:-$((18901 + RANDOM % 89))}"
 BASE="http://127.0.0.1:$PORT/v1/chat/completions"
 

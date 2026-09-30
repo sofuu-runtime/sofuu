@@ -6,6 +6,19 @@
  * Run:  ./sofuu run tests/verify_memory_test.js
  * ======================================================================== */
 
+/* A QTSQ-free build has NO sofuu.memory at all: crates/sofuu-core/src/rt/memory.rs
+ * gates the register bodies on #[cfg(has_qtsq)], so the whole surface is compiled
+ * out and the funnel answers unknown_method. These suites exercise the brain, so
+ * they cannot run without it -- and CI builds QTSQ-free on purpose (the checkout
+ * is proprietary). Exit 77 (the POSIX skip convention, already used by
+ * live_provider_test.js and multimodal_test.js) so run_js_tests.sh reports an
+ * honest SKIP instead of a failure that looks like a product bug. */
+if (typeof sofuu.memory === "undefined" || typeof sofuu.memory.open !== "function") {
+  console.log("SKIP " + "verify_memory_test" + " — this build has no QTSQ codec, so sofuu.memory does not exist");
+  console.log("\nverify_memory_test: SKIPPED");
+  process.exit(77);
+}
+
 const VEC_DIM = 768;
 // Each run uses timestamp-unique brain files: the suite asserts state that
 // only holds on an empty store (dedup + decay phases), and a reused file

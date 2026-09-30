@@ -13,6 +13,19 @@ jobs:
     # A deadlock should fail in minutes, not burn a 6-hour runner: a hung
     # test binary previously sat here until the job was cancelled by hand.
     timeout-minutes: 35
+    env:
+      # Job-wide, not per-step. QTSQ is a proprietary local checkout that
+      # cannot be built here, so every step makes a DELIBERATE QTSQ-free
+      # build. This must be visible to EVERY step, not just the first: the
+      # Makefile's cargo-build guard hard-fails without it, and several
+      # later steps (size-check, make test, make libsofuu, headless-test,
+      # abi-check) re-enter make -> cargo-build. Setting it only on the
+      # build step made 'Size cap' fail with "SOFUU_QTSQ_DIR is not set".
+      SOFUU_ALLOW_NO_QTSQ: "1"
+      # See the 'Rust unit tests' step: Homebrew curl (linked dynamically by
+      # sofuu-ffi) needs libuv.1.dylib at load time even though libuv is
+      # also linked statically into the same binary.
+      DYLD_LIBRARY_PATH: /opt/homebrew/opt/libuv/lib:/opt/homebrew/opt/curl/lib:/opt/homebrew/lib
     strategy:
       fail-fast: false
       matrix:
@@ -64,39 +77,24 @@ jobs:
           ls -l build/libuv.a
 
       - name: Build Sofuu (Rust-first)
-        # QTSQ is a proprietary local checkout that cannot be built here, so
-        # CI makes a DELIBERATE QTSQ-free build. The flag is the documented
-        # escape hatch: the Makefile guard hard-fails on a build that would
-        # silently no-op memory (that is what shipped the brain-less
-        # 2026-09-22 tarball), and an empty dir is NOT an opt-out — only
-        # this flag is. build.rs then degrades gracefully: the memory module
-        # registers as a no-op and sessions do not persist.
-        env:
-          SOFUU_ALLOW_NO_QTSQ: "1"
+        # SOFUU_ALLOW_NO_QTSQ comes from the job-level env. The flag is the
+        # documented escape hatch: the Makefile guard hard-fails on a build
+        # that would silently no-op memory (that is what shipped the
+        # brain-less 2026-09-22 tarball), and an empty dir is NOT an opt-out
+        # -- only this flag is. build.rs then degrades gracefully: the memory
+        # module registers as a no-op and sessions do not persist.
         run: make
 
       - name: Rust unit tests
-        env:
-          SOFUU_ALLOW_NO_QTSQ: "1"
-          # sofuu-ffi links the system/Homebrew libcurl dynamically (it is
-          # genuinely used — rt/http_client.rs drives it for fetch()). On a
-          # macOS runner that curl is Homebrew's, whose transitive deps
-          # (libssh2) pull in libuv.1.dylib, and the test binary then aborts
-          # at dyld: "Library not loaded: @rpath/libuv.1.dylib" — while
-          # libuv itself is linked STATICALLY into the same binary, so the
-          # dylib is a redundant transitive need with no rpath to find it.
-          # Point DYLD at Homebrew's libs so the transitive dylibs resolve.
-          # Only needed on macOS; harmless elsewhere.
-          DYLD_LIBRARY_PATH: /opt/homebrew/opt/libuv/lib:/opt/homebrew/opt/curl/lib:/opt/homebrew/lib
-          # --test-threads=1 is deliberate. The runtime has ONE process-global
-          # libuv loop, so the tests that pump it serialize on TEST_LOOP_LOCK.
-          # On Linux runners that serialization deadlocked: a sofuu-core test
-          # binary sat in "Rust unit tests" for 20+ minutes with 17 loop-locked
-          # tests (mcp / process_spawn / promise / timer / http_client) never
-          # started, while the capi binary right before it passed 36/36. Running
-          # the suite on one thread removes the cross-thread interleaving that
-          # the lock exists to manage, so the deadlock cannot form at all. It
-          # costs ~1s (376 tests in 2.8s locally).
+        # --test-threads=1 is deliberate. The runtime has ONE process-global
+        # libuv loop, so the tests that pump it serialize on TEST_LOOP_LOCK.
+        # On Linux runners that serialization deadlocked: a sofuu-core test
+        # binary sat in "Rust unit tests" for 20+ minutes with 17 loop-locked
+        # tests (mcp / process_spawn / promise / timer / http_client) never
+        # started, while the capi binary right before it passed 36/36. Running
+        # the suite on one thread removes the cross-thread interleaving that
+        # the lock exists to manage, so the deadlock cannot form at all. It
+        # costs ~1s (376 tests in 2.8s locally).
         run: cargo test --release -- --test-threads=1
 
       - name: Size cap

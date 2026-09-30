@@ -32,6 +32,19 @@
 // Run:  ./sofuu run tests/agent_test.js
 // Verbose:  AGENT_TEST_VERBOSE=1 ./sofuu run tests/agent_test.js
 
+/* A QTSQ-free build has NO sofuu.memory at all: crates/sofuu-core/src/rt/memory.rs
+ * gates the register bodies on #[cfg(has_qtsq)], so the whole surface is compiled
+ * out and the funnel answers unknown_method. These suites exercise the brain, so
+ * they cannot run without it -- and CI builds QTSQ-free on purpose (the checkout
+ * is proprietary). Exit 77 (the POSIX skip convention, already used by
+ * live_provider_test.js and multimodal_test.js) so run_js_tests.sh reports an
+ * honest SKIP instead of a failure that looks like a product bug. */
+if (typeof sofuu.memory === "undefined" || typeof sofuu.memory.open !== "function") {
+  console.log("SKIP " + "agent_test" + " — this build has no QTSQ codec, so sofuu.memory does not exist");
+  console.log("\nagent_test: SKIPPED");
+  process.exit(77);
+}
+
 let failures = 0;
 let skips = 0;
 function check(name, cond) {

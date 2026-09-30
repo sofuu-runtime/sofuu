@@ -5,6 +5,16 @@
 # presses Ctrl-K, then checks the system clipboard holds the dragged rows'
 # text (ANSI stripped, no escape bytes, includes a known marker).
 set -u
+# Clipboard verification is macOS-only: it reads the system clipboard with
+# /usr/bin/pbpaste (the file notes other hosts would need xclip). On Linux
+# runners that binary does not exist and the test died with
+# FileNotFoundError: '/usr/bin/pbpaste', which reads as a product failure
+# and is not one. Exit 77 — the POSIX skip convention run_js_tests.sh
+# already honours for shell e2e suites.
+if [ "$(uname -s)" != "Darwin" ] || [ ! -x /usr/bin/pbpaste ]; then
+  echo "SKIP chat_copy_e2e — clipboard verification needs macOS pbpaste (host: $(uname -s))"
+  exit 77
+fi
 BIN="$(cd "$(dirname "$0")/.." && pwd)/sofuu"
 TMPD="$(mktemp -d)"
 export SOFUU_HOME="$TMPD"

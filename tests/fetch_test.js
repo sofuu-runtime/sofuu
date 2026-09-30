@@ -61,6 +61,13 @@ async function main() {
         } catch (e) { server = null; }
     }
     if (!server) { console.log("FAIL could not bind mock port"); process.exit(1); }
+    /* Let the listener actually start accepting before the first fetch.
+     * listen() returns before the socket is servicing connections, and this
+     * server runs in-process on the same event loop as the client. Firing
+     * fetch() in the same tick was a race: macOS lost it and passed, the
+     * Linux runners won it and every later fetch in the file failed with an
+     * opaque "Test failed: {}". One loop turn is enough to settle it. */
+    await new Promise((r) => setTimeout(r, 50));
     const URL = "http://127.0.0.1:" + port;
 
     // ── GET + Response surface ─────────────────────────────────────

@@ -170,6 +170,11 @@ async function main() {
     if (!bound) ok = false;
   }
   if (!ok) { console.log("FAIL could not bind mock ports"); process.exit(1); }
+  /* Let all four listeners start accepting before anything fetches. These
+   * servers run in-process on the same event loop as the client, and
+   * listen() returns before the socket is servicing; querying in the same
+   * tick was a race that the Linux runners lost. Same fix as fetch_test.js. */
+  await new Promise((r) => setTimeout(r, 50));
   const DDG = "http://127.0.0.1:" + servers.ddg.port + "/html/";
   const BRAVE = "http://127.0.0.1:" + servers.brave.port + "/res/v1/web/search";
   const TAVILY = "http://127.0.0.1:" + servers.tavily.port + "/search";

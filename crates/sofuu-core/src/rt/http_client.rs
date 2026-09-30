@@ -3104,9 +3104,26 @@ function go(f) {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
+                /* Drain the request before replying — see the note in
+                 * stream_bulk_delivers_fast_ab. Closing with curl's request
+                 * still unread makes Linux send RST rather than FIN. */
+                let mut req = [0u8; 2048];
+                let mut seen = 0usize;
+                while seen < req.len() {
+                    match stream.read(&mut req[seen..]) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            seen += k;
+                            if req[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let _ = stream.write_all(&raw);
                 let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                let _ = stream.shutdown(std::net::Shutdown::Write);
                 break; /* exactly one connection */
             }
         });

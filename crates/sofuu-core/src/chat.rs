@@ -1656,13 +1656,44 @@ fn cell_w(s: &str) -> usize {
     w
 }
 
-/// Truncate plain (escape-free) text to `max` cells, marking the cut.
+/// Truncate plain (escape-free) text to `max` DISPLAY CELLS, marking the
+/// cut.
+///
+/// Cell-based, not char-based. This used to compare and slice on
+/// `chars().count()`, so a CJK/emoji value was allowed 2x the cells it
+/// occupies: a 60-cell panel row holding wide glyphs came out 102 cells
+/// wide and the right │ landed far off-screen, tearing the box.
 fn trunc_cells(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cell_w(s) <= max {
         return s.to_string();
     }
-    let t: String = s.chars().take(max.saturating_sub(1)).collect();
+    // Take whole chars while they FIT, reserving one cell for the ellipsis.
+    let mut t = String::new();
+    let mut w = 0;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        let cw = char_cells(c);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        t.push(c);
+        w += cw;
+    }
     format!("{t}…")
+}
+
+/// UTF-8 sequence length implied by a lead byte (mirrors truncate_cells
+/// in rt/tui.rs — a truncated tail is clamped with .min(len) at the call).
+fn ln_of(c: u8) -> usize {
+    if c >= 0xF0 {
+        4
+    } else if c >= 0xE0 {
+        3
+    } else if c >= 0xC0 {
+        2
+    } else {
+        1
+    }
 }
 
 /// Clip possibly-colored content to `max` visible cells. ANSI CSI
@@ -1692,11 +1723,22 @@ fn clip_cells(s: &str, max: usize) -> String {
             continue;
         }
         if b[i] & 0xC0 != 0x80 {
-            if cells >= max {
+            /* Count DISPLAY CELLS, not one per char. A wide glyph (CJK,
+             * emoji) is 2 cells; counting it as 1 let clip_cells return
+             * content twice as wide as the caller asked for, which
+             * panel_row then padded against — the panel row overflowed its
+             * own box. Use the same char_cells the measuring side
+             * (cell_w) uses, so measure and clip can never disagree. */
+            let cw = std::str::from_utf8(&b[i..(i + ln_of(b[i])).min(b.len())])
+                .ok()
+                .and_then(|ch| ch.chars().next())
+                .map(char_cells)
+                .unwrap_or(1);
+            if cells + cw > max {
                 clipped = true;
                 break;
             }
-            cells += 1;
+            cells += cw;
         }
         out.push(b[i]);
         i += 1;
@@ -7149,3 +7191,61 @@ mod tests {
         }
     }
 }
+
+    /// Wide glyphs are 2 cells, so the panel's measure (cell_w) and its
+    /// clip (clip_cells/trunc_cells) MUST both count cells. They did not:
+    /// the clip side counted chars, letting a 60-cell row come out 102
+    /// cells wide — the right border landed far off-screen and the welcome
+    /// box tore open. Any overflowing CJK/emoji value hit this.
+    #[test]
+    fn panel_row_wide_glyphs_clip_to_the_box_width() {
+        let cases = [
+            "Directory: ".to_string() + &"素".repeat(60),
+            "Model: ".to_string() + &"🎉".repeat(60),
+            "Model: ".to_string() + &"a".repeat(60),
+            // mixed: wide and narrow interleaved, so the bug needs both
+            "Model: ".to_string() + &"素🎉ab".repeat(20),
+            // exactly at the boundary (no clip) and one cell over
+            "Model: ".to_string() + &"素".repeat(26),
+            "Model: ".to_string() + &"素".repeat(27),
+        ];
+        for width in [40usize, 60, 80] {
+            for content in &cases {
+                let row = panel_row(content, width);
+                assert_eq!(
+                    cell_w(&row),
+                    width,
+                    "width {width}, content cells {} chars {}: {:?}",
+                    cell_w(content),
+                    content.chars().count(),
+                    &content.chars().take(16).collect::<String>()
+                );
+            }
+        }
+    }
+
+    /// trunc_cells is the standalone (escape-free) truncation used for the
+    /// Directory value. Same cell/char confusion as panel_row: it compared
+    /// `chars().count()` to a cell budget, so a wide-glyph path was kept
+    /// whole at ~2x the width it occupies.
+    #[test]
+    fn trunc_cells_counts_display_cells_not_chars() {
+        for max in [4usize, 10, 20] {
+            // 2x over budget in cells: must be cut.
+            let wide = "素".repeat(max);
+            let out = trunc_cells(&wide, max);
+            assert!(
+                cell_w(&out) <= max,
+                "wide {max}: got {} cells from {:?}",
+                cell_w(&out),
+                out
+            );
+            assert!(out.ends_with('…'), "wide {max}: expected a cut marker");
+            // Narrow text at the same budget must be untouched.
+            let narrow = "a".repeat(max);
+            assert_eq!(trunc_cells(&narrow, max), narrow, "narrow {max}");
+            // Under budget: returned verbatim, no ellipsis.
+            let short = "素".repeat(max / 2);
+            assert_eq!(trunc_cells(&short, max), short, "short {max}");
+        }
+    }

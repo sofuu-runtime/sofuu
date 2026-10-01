@@ -100,6 +100,17 @@ fn char_cells(c: char) -> usize {
     }
 }
 
+/// Display cells for one char, exposed for the readline's own truncation
+/// loops in modules/process.rs.
+///
+/// Those loops already MEASURE with tui_disp_width (cell-accurate) but
+/// used to CUT one cell per char, so a wide CJK/emoji row was allowed ~2x
+/// the width it occupied and ran past the input box border. Measuring and
+/// cutting must use the same table — this is that table.
+pub fn char_cells_pub(c: char) -> usize {
+    char_cells(c)
+}
+
 /// tui_disp_width — UTF-8 display cells, ANSI escape sequences skipped,
 /// wide (CJK/emoji) characters counted as 2 cells like a real terminal.
 /// Uses the caller-provided `len` (NOT strlen) so a dangling pointer from

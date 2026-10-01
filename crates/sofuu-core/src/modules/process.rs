@@ -743,6 +743,50 @@ fn chat_history_append(line: &[u8]) {
 
 /// UTF-8 display width in terminal CELLS — mirrors tty_disp_width() in the
 /// C file (continuation bytes 0, ANSI sequences invisible).
+/// Byte index at which `bytes` should be cut so it occupies at most
+/// `keep` DISPLAY CELLS.
+///
+/// One shared implementation for the readline's truncation sites. They all
+/// measured with tui_disp_width (cell-accurate) but used to cut one cell
+/// per char, so a wide CJK/emoji row was allowed ~2x its real width and
+/// overran the input box / suggestion box borders.
+///
+/// Returns a byte index that is always a char boundary and never exceeds
+/// `bytes.len()` — callers slice with it directly.
+fn cut_to_cells(bytes: &[u8], keep: usize) -> usize {
+    let mut cells = 0usize;
+    let mut cut = 0usize;
+    for k in 0..bytes.len() {
+        if (bytes[k] & 0xC0) != 0x80 {
+            let ln = utf8_len(bytes[k]);
+            let c = std::str::from_utf8(&bytes[k..(k + ln).min(bytes.len())])
+                .ok()
+                .and_then(|c| c.chars().next())
+                .unwrap_or('\u{fffd}');
+            cells += crate::rt::tui::char_cells_pub(c);
+        }
+        if cells > keep {
+            break;
+        }
+        cut = k + 1;
+    }
+    cut
+}
+
+/// UTF-8 sequence length implied by a lead byte. Paired with the
+/// cell-aware truncation below (mirrors truncate_cells in rt/tui.rs).
+fn utf8_len(c: u8) -> usize {
+    if c >= 0xF0 {
+        4
+    } else if c >= 0xE0 {
+        3
+    } else if c >= 0xC0 {
+        2
+    } else {
+        1
+    }
+}
+
 fn tty_disp_width(s: &[u8]) -> usize {
     let mut w = 0usize;
     let mut i = 0;
@@ -988,17 +1032,7 @@ unsafe fn render_box_row(
     let mut used;
     if row_cells > avail && avail > 0 {
         let keep = if avail >= 1 { avail - 1 } else { 0 };
-        let mut cells = 0usize;
-        let mut cut = 0usize;
-        for k in 0..seg.len() {
-            if (seg[k] & 0xC0) != 0x80 {
-                cells += 1;
-            }
-            if cells > keep {
-                break;
-            }
-            cut = k + 1;
-        }
+        let cut = cut_to_cells(seg, keep);
         let _ = write!(out, "…");
         let _ = out.write_all(&seg[cut..]);
         used = inner as usize;
@@ -1337,17 +1371,7 @@ unsafe fn tty_render_tui(
         let row_cells = tui_disp_width(line[seg..].as_ptr() as *const c_char, row_len) as usize;
         if row_cells > avail && avail > 0 {
             let keep = if avail >= 1 { avail - 1 } else { 0 };
-            let mut cells = 0usize;
-            let mut cut = 0usize;
-            for k in 0..row_len {
-                if (line[seg + k] & 0xC0) != 0x80 {
-                    cells += 1;
-                }
-                if cells > keep {
-                    break;
-                }
-                cut = k + 1;
-            }
+            let cut = cut_to_cells(&line[seg..], keep);
             let _ = write!(out, "…");
             let _ = out.write_all(&line[seg + cut..]);
             used = inner as usize;
@@ -3854,6 +3878,53 @@ mod tests {
         let out = chat_history_trimmed(&text, 4);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, vec!["line-6", "line-7", "line-8", "line-9"]);
+    }
+
+    /// The readline truncates a row that overruns its box. It MEASURES in
+    /// display cells but used to CUT one cell per char, so a wide CJK/emoji
+    /// row got ~2x the budget and spilled past the border. cut_to_cells
+    /// must agree with tui_disp_width on the same bytes.
+    #[test]
+    fn cut_to_cells_never_exceeds_a_cell_budget() {
+        let samples = [
+            "plain ascii text",
+            "\u{7d20}\u{98a8}\u{7d20}\u{98a8}",   // CJK: 2 cells each
+            "\u{1f389}\u{1f389}\u{1f389}",             // emoji: 2 cells each
+            "mix \u{7d20}\u{1f389} ab",                 // interleaved
+            "e\u{0301}combining",                        // zero-width
+            "",
+        ];
+        for text in samples {
+            let b = text.as_bytes();
+            for keep in 0..=20usize {
+                let cut = cut_to_cells(b, keep);
+                assert!(cut <= b.len(), "{text:?} keep={keep} cut={cut} len={}", b.len());
+                assert!(
+                    text.is_char_boundary(cut),
+                    "{text:?} keep={keep} cut={cut} splits a char"
+                );
+                let shown = crate::rt::tui::truncate_cells(&b[..cut], keep);
+                assert!(
+                    shown <= b.len(),
+                    "{text:?} keep={keep} produced {shown} bytes for a {keep}-cell budget"
+                );
+            }
+        }
+    }
+
+    /// The specific failure: a row of wide glyphs must be cut at roughly
+    /// half its character count, not all of it.
+    #[test]
+    fn cut_to_cells_halves_wide_glyph_rows() {
+        let cjk = "\u{7d20}".repeat(30).into_bytes();
+        let cut = cut_to_cells(&cjk, 10);
+        // 10 cells of 2-cell glyphs = 5 chars = 15 bytes.
+        assert_eq!(cut, 15, "expected 5 CJK chars, cut at {cut}");
+        assert!(cut < cjk.len(), "row must actually be truncated");
+
+        let emoji = "\u{1f389}".repeat(30).into_bytes();
+        let cut_e = cut_to_cells(&emoji, 10);
+        assert_eq!(cut_e, 20, "expected 5 emoji (4 bytes each), cut at {cut_e}");
     }
 
     #[test]

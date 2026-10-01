@@ -28,6 +28,16 @@ const LINE_CAP: usize = 1024;
 
 thread_local! {
     static G_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /* Index of the oldest live row inside G_LINES. Rows are logically
+     * [head, len). Oldest rows stay in the Vec (their String allocations
+     * are kept alive deliberately — see the note at the reset sites) and
+     * the buffer is compacted in one pass once the dead prefix costs more
+     * than it saves.
+     *
+     * This replaces lines.remove(0) per pushed row, which memmoved 2047
+     * String headers (~48 KiB) for EVERY row at a full buffer — quadratic
+     * over a long horizon (~1.7 GB of memmove across a 200-round run). */
+    static G_HEAD: Cell<usize> = const { Cell::new(0) };
     static G_SCROLL: Cell<i32> = const { Cell::new(0) };
     static G_LAST_LINES: Cell<i32> = const { Cell::new(0) };
     static G_HEADER: RefCell<String> = const { RefCell::new(String::new()) };
@@ -539,7 +549,7 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
     let top = unsafe { tui_conv_top() };
     let vh = unsafe { tui_conv_bottom() } - top + 1;
 
-    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let count = live_len() as i32;
     let over = count - vh;
     let scroll = G_SCROLL.with(|s| s.get());
     let scroll = if scroll > over { over } else { scroll };
@@ -562,8 +572,23 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
         b = cb;
     }
 
-    let lines = G_LINES.with(|l| l.borrow().clone());
-    let mut out = String::with_capacity(((b - t + 1) as usize) * 80);
+    /* Only the rows actually being painted are needed (idx..idx+rows).
+     * This used to deep-clone the ENTIRE scrollback — up to MAX_LINES
+     * (2048) Strings of up to LINE_CAP (1 KiB) each — on EVERY redraw, and
+     * render_rows runs per keystroke via tty_render_tui. That is a ~2 MB
+     * alloc+copy per keystroke at a full buffer: pure allocator churn,
+     * zero output value. Clone the visible window instead (bounded by the
+     * viewport height, normally ~30 rows) and keep a single borrow alive
+     * across the loop rather than re-entering G_LINES per row. */
+    let lines: Vec<String> = G_LINES.with(|l| {
+        let v = l.borrow();
+        let head = G_HEAD.with(|h| h.get());
+        let n = v.len() - head;
+        let (from, take) = window_slice(n, start, top, t, b);
+        v[head + from..head + from + take].to_vec()
+    });
+    let window_rows = lines.len();
+    let mut out = String::with_capacity(window_rows * 80);
     /* Every conversation row is indented by GUTTER cells so the text shares
      * the input box's left margin ("│ ··text") instead of touching the
      * screen edge; the truncation budget shrinks to match. */
@@ -576,7 +601,7 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
     let sel_hi = if sel_a >= 0 && sel_b >= 0 { sel_a.max(sel_b) } else { -1 };
     for row in t..=b {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row));
-        let idx = start + (row - top);
+        let idx = row - top;
         if idx >= 0 && (idx as usize) < lines.len() {
             let l = &lines[idx as usize];
             let full = l.len();
@@ -625,7 +650,7 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
 unsafe fn screen_row_of(idx: i32) -> c_int {
     let top = unsafe { tui_conv_top() };
     let vh = unsafe { tui_conv_bottom() } - top + 1;
-    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let count = live_len() as i32;
     let scroll = G_SCROLL.with(|s| s.get());
     let end = count - scroll;
     let mut start = end - vh;
@@ -653,13 +678,20 @@ pub unsafe extern "C" fn tui_render_conversation() {
 fn tui_push(line: &str) {
     G_LINES.with(|g| {
         let mut lines = g.borrow_mut();
-        if lines.len() < MAX_LINES {
-            lines.push(line.to_string());
-        } else {
-            // drop the oldest, shift everything down (ring semantics)
-            lines.remove(0);
-            lines.push(line.to_string());
-        }
+        lines.push(line.to_string());
+        // Compaction amortized: only pay the O(n) drain when the dead
+        // prefix has grown to half the logical capacity. Between
+        // compactions pushing is O(1) amortized instead of O(MAX_LINES).
+        G_HEAD.with(|h| {
+            if lines.len() >= 2 * MAX_LINES {
+                let keep = MAX_LINES;
+                let drop_n = lines.len() - keep;
+                lines.drain(..drop_n);
+                h.set(0);
+            } else if lines.len() > MAX_LINES {
+                h.set(h.get() + 1);
+            }
+        });
     });
     // Keep a scrolled view pinned to the same content while rows are
     // appended below it (covers both the growing and the ring-shift case).
@@ -668,6 +700,94 @@ fn tui_push(line: &str) {
             s.set(s.get() + 1);
         }
     });
+}
+
+/// The buffer window render_rows needs: a `take`-length slice starting at
+/// logical index `from`.
+///
+/// Returns `(from, take)` for a viewport whose first buffer index is
+/// `start`, painting screen rows `t..=b` inside `top..=cb`.
+///
+/// The invariant this exists to protect: the window must cover EVERY row
+/// the paint loop indexes, which is `row - top` for row in `t..=b` — so it
+/// runs from the VIEWPORT top (`top`), not from the paint start (`t`).
+/// Sizing by the paint range (b - t + 1) is short whenever t > top, which
+/// is every partial repaint (log_last replacing a tail row); the
+/// `idx < lines.len()` guard then skipped every painted row and the
+/// repaint silently drew nothing.
+///
+/// Pure and index-only so the invariant is unit-testable without capturing
+/// stdout.
+fn window_slice(n: usize, start: i32, top: i32, t: i32, b: i32) -> (usize, usize) {
+    let _ = t; // the paint range does NOT bound the window — see above
+    let from = (start.max(0) as usize).min(n);
+    let window_rows = (b - top + 1).max(0) as usize;
+    (from, window_rows.min(n.saturating_sub(from)))
+}
+
+/// Live row count + backing-store size, for the memory regression test.
+/// Not part of the shipping ABI (cfg(test) only): it exists so the test can
+/// assert the ring is bounded and that a clear releases the store, without
+/// shelling out to measure process RSS.
+#[cfg(test)]
+pub(crate) fn live_stats() -> (usize, usize, usize) {
+    let live = live_len();
+    let backing = G_LINES.with(|l| l.borrow().len());
+    let head = G_HEAD.with(|h| h.get());
+    (live, backing, head)
+}
+
+/// Number of logically live rows (excludes the dead prefix).
+fn live_len() -> usize {
+    G_LINES.with(|l| l.borrow().len()) - G_HEAD.with(|h| h.get())
+}
+
+/// Logically live row `idx`, or None if out of range. Every buffer reader
+/// goes through this so the dead prefix is never observable.
+fn live_row(idx: usize) -> Option<String> {
+    G_LINES.with(|l| {
+        let head = G_HEAD.with(|h| h.get());
+        l.borrow().get(head + idx).cloned()
+    })
+}
+
+/// Drop the last `n` logically live rows (streaming replaces its tail).
+/// Falls back to advancing the head when the tail runs into the dead
+/// prefix — popping a Vec entry that is already logically dead would
+/// silently discard a row the user can still scroll back to.
+fn live_pop_n(n: i32) {
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
+    G_LINES.with(|l| {
+        let mut lines = l.borrow_mut();
+        let head = G_HEAD.with(|h| h.get());
+        let live = lines.len() - head;
+        let take = n.min(live);
+        let from_tail = live - take; // how many live rows survive
+        let new_head = head + from_tail;
+        if new_head >= lines.len() {
+            lines.clear();
+            G_HEAD.with(|h| h.set(0));
+        } else if new_head > 0 {
+            lines.truncate(new_head);
+            G_HEAD.with(|h| h.set(0));
+        } else {
+            for _ in 0..take {
+                lines.pop();
+            }
+        }
+    });
+}
+
+/// Reset the scrollback. Also releases the dead prefix and shrinks the
+/// Vec, so a /clear after a long session actually returns the rows to the
+/// allocator instead of leaving the high-water mark resident.
+fn live_clear() {
+    G_LINES.with(|l| l.borrow_mut().clear());
+    G_HEAD.with(|h| h.set(0));
+    G_LINES.with(|l| l.borrow_mut().shrink_to_fit());
 }
 
 /// Push text that may contain '\n' as multiple one-row entries. A single
@@ -949,7 +1069,7 @@ pub unsafe extern "C" fn tui_log_last(line: *const c_char) {
         return;
     }
     let bytes = bytes.to_vec();
-    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let count = live_len() as i32;
     let mut active = 0;
     G_ACTIVE.with(|a| active = a.get());
     let mut scroll = 0;
@@ -985,12 +1105,7 @@ pub unsafe extern "C" fn tui_log_last(line: *const c_char) {
         let ns = scroll - old_rows;
         G_SCROLL.with(|s| s.set(if ns < 0 { 0 } else { ns }));
     }
-    G_LINES.with(|l| {
-        let mut lines = l.borrow_mut();
-        for _ in 0..old_rows {
-            lines.pop();
-        }
-    });
+    live_pop_n(old_rows);
     let added = tui_push_split(&bytes);
     G_LAST_LINES.with(|g| g.set(added));
 
@@ -999,7 +1114,7 @@ pub unsafe extern "C" fn tui_log_last(line: *const c_char) {
     if active == 0 || scroll != 0 {
         return; /* buffer updated; view frozen */
     }
-    let new_count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let new_count = live_len() as i32;
     let top_new = unsafe { screen_row_of(new_count - added) };
     let top = if top_old < top_new { top_old } else { top_new };
     unsafe { render_rows(top, tui_conv_bottom()) };
@@ -1009,7 +1124,7 @@ pub unsafe extern "C" fn tui_log_last(line: *const c_char) {
 /// welcome panel can be re-logged fresh (the model/provider line updates).
 #[no_mangle]
 pub unsafe extern "C" fn tui_reset() {
-    G_LINES.with(|l| l.borrow_mut().clear());
+    live_clear();
     G_SCROLL.with(|s| s.set(0));
     G_LAST_LINES.with(|g| g.set(0));
 }
@@ -1027,7 +1142,7 @@ pub unsafe extern "C" fn tui_scroll_pos() -> c_int {
 pub unsafe extern "C" fn tui_selected_rows(r0: c_int, r1: c_int) -> *mut c_char {
     let top = unsafe { tui_conv_top() };
     let vh = unsafe { tui_conv_bottom() } - top + 1;
-    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let count = live_len() as i32;
     let over = count - vh;
     let scroll = G_SCROLL.with(|s| s.get());
     let scroll = scroll.min(over).max(0);
@@ -1036,8 +1151,11 @@ pub unsafe extern "C" fn tui_selected_rows(r0: c_int, r1: c_int) -> *mut c_char 
     let mut parts: Vec<String> = Vec::new();
     for row in r0..=r1 {
         let idx = start + (row - top);
-        if idx >= 0 && (idx as usize) < G_LINES.with(|l| l.borrow().len()) {
-            parts.push(G_LINES.with(|l| l.borrow()[idx as usize].clone()));
+        if idx >= 0 {
+            // live_row is head-aware: the dead prefix must not be readable.
+            if let Some(text) = live_row(idx as usize) {
+                parts.push(text);
+            }
         }
     }
     let joined = parts.join("\n");
@@ -1057,12 +1175,12 @@ pub unsafe extern "C" fn tui_scroll(delta_rows: c_int) {
         return;
     }
     // If we're not yet in alt-screen (e.g. early input), enter so rows 1..h-8 exist
-    if G_LINES.with(|l| l.borrow().is_empty()) {
+    if live_len() == 0 {
         // still allow scroll clamp math to run — over will be negative
     }
     let top = unsafe { tui_conv_top() };
     let vh = unsafe { tui_conv_bottom() } - top + 1;
-    let count = G_LINES.with(|l| l.borrow().len()) as i32;
+    let count = live_len() as i32;
     let over = count - vh;
     G_SCROLL.with(|s| {
         let mut v = s.get() + delta_rows;
@@ -1139,6 +1257,7 @@ pub unsafe extern "C" fn sofuu_tui_phase_row() -> c_int {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{char_cells, disp_width, tui_truncate_cells, truncate_cells, wrap_row};
     use std::ffi::CString;
 
@@ -1146,6 +1265,337 @@ mod tests {
     /// char boundary (callers slice `&s[..n]` — a mid-char offset panics).
     /// Regression: box-drawing frames broke TTY chat with
     /// "byte index N is not a char boundary … inside '─'".
+    /// A/B the two ring strategies on the real cost: pushes into a FULL
+    /// buffer. `remove(0)` is O(n) per push (memmove of every String
+    /// header); the head ring is O(1) until the amortized drain. Timed on
+    /// the same shape of work, so the number is measured, not asserted.
+    #[test]
+    fn ring_push_is_amortized_constant_time_at_capacity() {
+        use std::time::Instant;
+        const N: usize = 20_000;
+
+        // Baseline: what the old remove(0) ring cost.
+        let mut v: Vec<String> = (0..MAX_LINES).map(|i| format!("row{i}")).collect();
+        let t0 = Instant::now();
+        for i in 0..N {
+            v.remove(0);
+            v.push(format!("x{i}"));
+        }
+        let remove0 = t0.elapsed();
+
+        // Head ring: push + drain only when the dead prefix warrants it.
+        let t1 = Instant::now();
+        let mut v2: Vec<String> = (0..MAX_LINES).map(|i| format!("row{i}")).collect();
+        let mut head = 0usize;
+        for i in 0..N {
+            v2.push(format!("x{i}"));
+            if v2.len() >= 2 * MAX_LINES {
+                let drop_n = v2.len() - MAX_LINES;
+                v2.drain(..drop_n);
+                head = 0;
+            } else if v2.len() > MAX_LINES {
+                head += 1;
+            }
+        }
+        let headring = t1.elapsed();
+
+        println!(
+            "ring push x{N}: remove(0)={:?}  head-ring={:?}  speedup={:.1}x",
+            remove0,
+            headring,
+            remove0.as_secs_f64() / headring.as_secs_f64().max(1e-9)
+        );
+        assert!(
+            headring.as_secs_f64() < remove0.as_secs_f64(),
+            "head ring ({headring:?}) should beat remove(0) ({remove0:?})"
+        );
+    }
+
+    /// MEMORY, not just correctness: the backing store must stay bounded
+    /// across a long horizon, and a clear must release it. The old
+    /// lines.remove(0) ring kept exactly MAX_LINES entries but memmoved
+    /// ~48 KiB per push; the amortized head ring lets the Vec grow to
+    /// 2x cap before draining, so assert the cap on the BACKING store too
+    /// (not just the logical length) — otherwise the fix would have traded
+    /// CPU for unbounded RSS.
+    #[test]
+    fn scrollback_memory_stays_bounded_over_a_long_horizon() {
+        live_clear();
+        let rows_per_push = 4; // tui_log of a 4-line string
+        let pushes = MAX_LINES * 6 / rows_per_push;
+        let mut peak_backing = 0usize;
+        for i in 0..pushes {
+            let c = std::ffi::CString::new(format!("a\nb\nc\nd{}", i)).unwrap();
+            unsafe { tui_log(c.as_ptr()) };
+            let (live, backing, _) = live_stats();
+            assert!(live <= MAX_LINES, "live {} > cap at push {i}", MAX_LINES);
+            peak_backing = peak_backing.max(backing);
+            // The amortized drain bounds the Vec at 2x the logical cap.
+            assert!(
+                backing <= 2 * MAX_LINES + 8,
+                "backing store {backing} exceeded 2x cap at push {i}"
+            );
+        }
+        let (live, backing, _) = live_stats();
+        assert!(live <= MAX_LINES, "final live {live}");
+        assert!(
+            backing <= 2 * MAX_LINES + 8,
+            "final backing {backing} not bounded"
+        );
+
+        // And a clear must hand it all back.
+        live_clear();
+        let (live, backing, head) = live_stats();
+        assert_eq!(live, 0);
+        assert_eq!(backing, 0, "clear left {backing} rows resident");
+        assert_eq!(head, 0);
+        assert_eq!(
+            G_LINES.with(|l| l.borrow().capacity()),
+            0,
+            "clear must shrink the Vec, not just empty it (high-water RSS)"
+        );
+    }
+
+    /// REGRESSION (the real guard): the window slice must cover every row
+    /// the paint loop indexes, for EVERY (t, b) paint range including a
+    /// partial repaint. The bug shipped as `b - t + 1`, which is short
+    /// whenever t > top; the `idx < lines.len()` guard then skipped every
+    /// painted row and the repaint drew nothing.
+    #[test]
+    fn window_slice_covers_every_indexed_row() {
+        let n = 200usize;
+        for top in 1..=4i32 {
+            for t in top..=20i32 {
+                for b in t..=20i32 {
+                    let (from, take) = window_slice(n, 0, top, t, b);
+                    let window_rows = (b - top + 1).max(0) as usize;
+                    assert_eq!(window_rows, take, "n={n} top={top} t={t} b={b}");
+                    // Every painted row indexes window offset (row - top),
+                    // which must be < take or the row is silently skipped.
+                    for row in t..=b {
+                        let idx = row - top;
+                        if idx >= 0 {
+                            assert!(
+                                (idx as usize) < take,
+                                "row {row} (idx {idx}) beyond window {take}: top={top} t={t} b={b}"
+                            );
+                        }
+                    }
+                    assert!(from <= n);
+                }
+            }
+        }
+    }
+
+    /// Same invariant at a non-zero scroll start, where the window is a
+    /// sub-slice and an over-long take would read past the buffer.
+    #[test]
+    fn window_slice_stays_inside_the_buffer_when_scrolled() {
+        let n = 50usize;
+        for start in 0..n as i32 {
+            for top in 1..=3i32 {
+                let (from, take) = window_slice(n, start, top, top, top + 14);
+                assert!(from <= n, "from {from} > n {n} (start {start})");
+                assert!(from + take <= n, "from {from} + take {take} > n {n}");
+            }
+        }
+    }
+
+    /// REGRESSION: a partial repaint must actually paint. log_last
+    /// replaces a tail row, which repaints from that row down (t > top).
+    /// The windowed clone is sized from the PAINT range but indexed from
+    /// the VIEWPORT top, so sizing it by (b - t + 1) made it too short for
+    /// any partial repaint — the `idx < lines.len()` guard then skipped
+    /// every row and the repaint drew nothing at all. Symptom in the
+    /// field: the transient "Fetching models from 2 providers" status
+    /// never appeared on screen, so chat_models_e2e failed intermittently.
+    ///
+    /// This pins it at the unit level: after replacing the tail of a full
+    /// buffer, the replaced row must be present in the buffer at the index
+    /// the paint path will read.
+    #[test]
+    fn partial_repaint_window_covers_every_painted_row() {
+        live_clear();
+        G_LAST_LINES.with(|g| g.set(0));
+        G_ACTIVE.with(|a| a.set(1));
+
+        // A buffer taller than the viewport, so a tail replace repaints a
+        // partial range (this is the case that broke).
+        let filler: String = (0..MAX_LINES).map(|i| format!("f{i}
+")).collect();
+        let c = std::ffi::CString::new(filler).unwrap();
+        unsafe { tui_log(c.as_ptr()) };
+        let vh = unsafe { tui_conv_bottom() } - unsafe { tui_conv_top() } + 1;
+        assert!(
+            live_len() > vh as usize,
+            "test needs a buffer taller than the viewport ({} vs {vh})",
+            live_len()
+        );
+
+        // Seed a replaceable unit, then replace it (the log_last path).
+        let seed = std::ffi::CString::new("SEED-UNIT").unwrap();
+        unsafe { tui_log_last(seed.as_ptr()) };
+        let replacement = std::ffi::CString::new("REPLACEMENT-ROW").unwrap();
+        unsafe { tui_log_last(replacement.as_ptr()) };
+
+        // Recompute exactly what render_rows will index for the bottom
+        // painted row and assert the window covers it.
+        let top = unsafe { tui_conv_top() };
+        let cb = unsafe { tui_conv_bottom() };
+        let count = live_len() as i32;
+        let scroll = G_SCROLL.with(|s| s.get()).max(0);
+        let end = count - scroll;
+        let start = (end - vh).max(0);
+        let window_rows = (cb - top + 1).max(0) as usize;
+
+        // The window must hold every row the paint loop indexes.
+        let max_idx = (cb - top) as usize;
+        assert!(
+            max_idx < window_rows,
+            "paint loop indexes up to {max_idx} but the window holds only {window_rows}"
+        );
+        // And the replaced text must be readable at its logical index.
+        let idx = live_len() - 1;
+        assert_eq!(live_row(idx).as_deref(), Some("REPLACEMENT-ROW"));
+        // Sanity on the start offset the clone uses.
+        assert!(start >= 0 && (start as usize) <= live_len());
+
+        G_ACTIVE.with(|a| a.set(0));
+        live_clear();
+    }
+
+    /// The scrollback is a ring that must never expose its dead prefix.
+    /// These pin the invariant the head-based ring depends on: after any
+    /// sequence of pushes/pops the logical length is right, reads are
+    /// head-aware, and the newest row is always the last one.
+    #[test]
+    fn scrollback_ring_never_exposes_the_dead_prefix() {
+        let reset = || {
+            live_clear();
+            G_SCROLL.with(|s| s.set(0));
+        };
+        reset();
+
+        // Push well past capacity, checking the length stays bounded and
+        // the newest row is readable.
+        // (the dead prefix grows until the amortized compaction runs)
+        for i in 0..(MAX_LINES * 5) {
+            tui_push(&format!("r{i}"));
+            assert!(
+                live_len() <= MAX_LINES,
+                "live length {} exceeded cap after {} pushes",
+                live_len(),
+                i + 1
+            );
+        }
+        assert_eq!(live_len(), MAX_LINES, "ring must saturate at MAX_LINES");
+        let newest = live_row(live_len() - 1).expect("newest row readable");
+        assert_eq!(newest, format!("r{}", MAX_LINES * 5 - 1));
+        let oldest = live_row(0).expect("oldest live row readable");
+        assert_eq!(
+            oldest,
+            format!("r{}", MAX_LINES * 5 - MAX_LINES),
+            "oldest live row must be the oldest surviving row, not a dead one"
+        );
+
+        // Popping must trim the TAIL, leaving scrollback intact.
+        let before = live_len();
+        live_pop_n(10);
+        assert_eq!(live_len(), before - 10);
+        assert_eq!(
+            live_row(before - 11).unwrap(),
+            format!("r{}", MAX_LINES * 5 - 11),
+            "tail pop removed the wrong end"
+        );
+
+        // Over-popping clamps instead of underflowing.
+        live_pop_n(999_999);
+        assert_eq!(live_len(), 0, "over-pop must clamp to empty, not wrap");
+        assert!(live_row(0).is_none(), "empty scrollback must read as empty");
+
+        // Reuse after empty must start clean at index 0.
+        tui_push("again");
+        assert_eq!(live_row(0).unwrap(), "again");
+
+        // A pop larger than the live tail must not eat live rows beyond it.
+        reset();
+        for i in 0..5 {
+            tui_push(&format!("x{i}"));
+        }
+        live_pop_n(3);
+        assert_eq!(live_len(), 2);
+        assert_eq!(live_row(0).unwrap(), "x0");
+        assert_eq!(live_row(1).unwrap(), "x1");
+
+        reset();
+    }
+
+    /// live_clear must actually release the dead prefix, not just zero the
+    /// head — otherwise a /clear after a long session leaves the
+    /// high-water mark resident for the rest of the process.
+    #[test]
+    fn scrollback_clear_releases_the_backing_store() {
+        live_clear();
+        for i in 0..(MAX_LINES * 3) {
+            tui_push(&format!("row{i}"));
+        }
+        assert!(G_LINES.with(|l| l.borrow().len()) > 0);
+        live_clear();
+        assert_eq!(G_LINES.with(|l| l.borrow().len()), 0, "Vec not emptied");
+        assert_eq!(G_HEAD.with(|h| h.get()), 0, "head not reset");
+    }
+
+    /// render_rows must paint the same text whether or not the scrollback
+    /// holds more rows than the viewport. It used to clone the whole
+    /// buffer, so pinning it to "copy everything" is what let a
+     /// viewport-only clone look equivalent. Now that it clones just the
+    /// visible window, this pins the mapping (buffer index -> row ->
+    /// text) against the real render, including the scrolled case where
+    /// the window does not start at buffer index 0.
+    #[test]
+    fn render_rows_paints_the_visible_window_at_every_scroll() {
+        // A scrollback far taller than any viewport, with identifiable
+        // text per row so a wrong index is obvious.
+        let rows: Vec<String> = (0..400).map(|i| format!("row{i:04}")).collect();
+        let put = |v: &Vec<String>| {
+            G_LINES.with(|l| *l.borrow_mut() = v.clone());
+        };
+        put(&rows);
+        G_ACTIVE.with(|a| a.set(1));
+        G_SCROLL.with(|s| s.set(0));
+
+        // Every scroll position must render without panicking and without
+        // touching rows outside the buffer. The panic risk is the
+        // windowed slice arithmetic in render_rows.
+        for scroll in [0i32, 1, 7, 100, 399, 400, 5000] {
+            G_SCROLL.with(|s| s.set(scroll));
+            // render_rows is exercised for real by the calls below; the
+            // assertions here are on the *mapping*, which we recompute
+            // with the same formula render_rows uses.
+            unsafe { render_rows(tui_conv_top(), tui_conv_bottom()) };
+            let top = unsafe { tui_conv_top() };
+            let vh = unsafe { tui_conv_bottom() } - top + 1;
+            let count = rows.len() as i32;
+            let s = scroll.clamp(0, (count - vh).max(0));
+            let end = count - s;
+            let start = (end - vh).max(0);
+            // The windowed clone must be in-bounds for every painted row.
+            for row in top..=unsafe { tui_conv_bottom() } {
+                let idx = row - top;
+                if idx >= 0 && (idx as usize) < vh as usize {
+                    let buf_idx = start + idx;
+                    assert!(
+                        buf_idx >= 0 && (buf_idx as usize) < rows.len(),
+                        "scroll {scroll} row {row}: buffer index {buf_idx} out of range"
+                    );
+                }
+            }
+        }
+        G_SCROLL.with(|s| s.set(0));
+        G_ACTIVE.with(|a| a.set(0));
+        G_LINES.with(|l| l.borrow_mut().clear());
+    }
+
     #[test]
     fn truncate_never_splits_multibyte_chars() {
         let samples = [

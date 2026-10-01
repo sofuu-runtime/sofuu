@@ -710,7 +710,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/plan", "Plan mode: read-only (no writes, no shell)", ""),
     ("/edit", "Edit mode: reads + local file edits (no shell, no MCP)", ""),
     ("/full", "Full access: every tool allowed", ""),
-    ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 1M)"),
+    ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 4M)"),
     ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
     ("/outputs", "Inspect timestamped model/tool output history", "[list|show <id>|search <text>|context <task>|stats|rebuild-index|prune|on|off]"),
     ("/tools", "List connected MCP servers + tools", ""),
@@ -1404,66 +1404,135 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
 }
 
 fn print_help() {
-    let h = |s: &str| chat_out(&format!("\n\x1b[1;36m{s}\x1b[0m")); // section header
-    let c = |cmd: &str, desc: &str| {
-        // aligned command column + dim description
-        chat_out(&format!("    \x1b[1m{cmd:<20}\x1b[0m\x1b[2m— {desc}\x1b[0m"));
+    // Rows are collected before rendering so the command column can be sized
+    // to the longest label. It used to be a fixed 20 cells, which silently
+    // broke the moment a command outgrew it: `/mode [full|edit|plan]` (21)
+    // and `/ml [...]` (53) pushed their em-dashes out and left the block
+    // ragged. Measuring first means the next long command cannot do that.
+    //
+    // Capped so a very long label cannot push the description off an 80-col
+    // terminal: past the cap the label gets the full width and the
+    // description wraps under it, which is still aligned.
+    enum Row {
+        Header(&'static str),
+        Cmd(&'static str, &'static str),
+        Note(&'static str),
+        Blank,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let h = |rows: &mut Vec<Row>, s: &'static str| rows.push(Row::Header(s));
+    let c = |rows: &mut Vec<Row>, cmd: &'static str, desc: &'static str| {
+        rows.push(Row::Cmd(cmd, desc))
     };
-    chat_out("");
-    h("  Sofuu Chat Commands");
-    c("/help", "this help");
-    c("/model", "interactive model picker (search, arrows, enter)");
-    c("/model <name>", "switch model directly (persisted)");
-    c("/provider", "your providers + add a new one");
-    c("/effort", "reasoning-effort picker (off/low…max)");
-    c("/compact", "summarize the conversation into context");
-    c("/clear", "reset this session (keep settings)");
-    c("/brain [on|off]", "toggle memory/brain integration");
-    c("/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
-    c("/rlm [on|off|auto]", "route long-context turns through the RLM loop");
-    c("/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
-    c("/plan /edit /full", "shorthands for /mode plan|edit|full");
-    c("/ctx [<tokens>]", "view/set the context window (max 1M)");
-    c("/maxout [<tokens>]", "view/set max output tokens (max 384k)");
-    c("/tools", "list connected MCP servers + their tools");
-    c("/agents", "list agent definitions (~/.sofuu/agents/*.js)");
-    c("/version", "print the runtime version");
-    h("  Brain & memory");
-    c("/remember <fact>", "pin a fact directly to the brain");
-    c("/why", "which memories shaped the last answer");
-    c("/share [path]", "export a brain card (metadata + pointers)");
-    c("/import <path>", "import + merge a brain card");
-    c("/resume [id]", "browse + resume a past session");
-    c("/serve", "brain-server quick info (sofuu serve --brain)");
-    h("  Context & tools");
-    c("@file[:start-end]", "attach file contents to a prompt");
-    c("@name <task>", "run a loaded agent directly (@agent:name too)");
-    c("/watch <path>", "watch a directory for changes in context");
-    c("/cost", "token usage + spend breakdown + budget");
-    c("/ghost [on|off]", "toggle ghost prompt completion");
-    c("/hooks", "show ~/.sofuu/hooks.js user middleware info");
-    h("  Session mesh");
-    c("/sessions", "list all sessions on this project");
-    c("/context [id]", "full context of a session (default: this one)");
-    c("/work <desc>", "announce what you are working on");
-    c("/done", "clear your current task");
-    c("/note <msg>", "record a personal note (seen by peers)");
-    c("/notify <msg>", "CRITICAL notice, shown to every session now");
-    c("/sync [on|off]", "toggle session-mesh polling (restart to join)");
-    c("/exit /quit", "save config and exit");
-    chat_out(&format!("\n\x1b[2m  Sessions on the SAME project share context in real time (tasks,\x1b[0m"));
-    chat_out(&format!("\x1b[2m  notes, critical notices). Data persists as .qtsq files in\x1b[0m"));
-    chat_out(&format!("\x1b[2m  <project>/.sofuu/sessions/.\x1b[0m"));
-    h("\n  Shortcuts");
-    c("TAB", "complete after '/', cycle permission mode otherwise");
-    c("↑ / ↓", "input history");
-    c("PgUp / PgDn", "scroll the conversation");
-    c("Shift+Enter", "newline inside the input (Alt+Enter too)");
-    c("Esc", "stop the response (while streaming) / clear the input");
-    c("Ctrl-K", "copy the mouse-selected text (drag over rows, then Ctrl-K)");
-    c("Ctrl-C", "quit sofuu");
-    c("Ctrl-D", "exit");
-    chat_out("");
+    rows.push(Row::Blank);
+    h(&mut rows, "  Sofuu Chat Commands");
+    c(&mut rows, "/help", "this help");
+    c(&mut rows, "/model", "interactive model picker (search, arrows, enter)");
+    c(&mut rows, "/model <name>", "switch model directly (persisted)");
+    c(&mut rows, "/provider", "your providers + add a new one");
+    c(&mut rows, "/effort", "reasoning-effort picker (off/low…max)");
+    c(&mut rows, "/compact", "summarize the conversation into context");
+    c(&mut rows, "/clear", "reset this session (keep settings)");
+    c(&mut rows, "/brain [on|off]", "toggle memory/brain integration");
+    c(&mut rows, "/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
+    c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
+    c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
+    c(&mut rows, "/plan /edit /full", "shorthands for /mode plan|edit|full");
+    c(&mut rows, "/ctx [<tokens>]", "view/set the context window (max 4M)");
+    c(&mut rows, "/maxout [<tokens>]", "view/set max output tokens (max 384k)");
+    c(&mut rows, "/tools", "list connected MCP servers + their tools");
+    c(&mut rows, "/agents", "list agent definitions (~/.sofuu/agents/*.js)");
+    c(&mut rows, "/version", "print the runtime version");
+    h(&mut rows, "  Brain & memory");
+    c(&mut rows, "/remember <fact>", "pin a fact directly to the brain");
+    c(&mut rows, "/why", "which memories shaped the last answer");
+    c(&mut rows, "/share [path]", "export a brain card (metadata + pointers)");
+    c(&mut rows, "/import <path>", "import + merge a brain card");
+    c(&mut rows, "/resume [id]", "browse + resume a past session");
+    c(&mut rows, "/serve", "brain-server quick info (sofuu serve --brain)");
+    h(&mut rows, "  Context & tools");
+    c(&mut rows, "@file[:start-end]", "attach file contents to a prompt");
+    c(&mut rows, "@name <task>", "run a loaded agent directly (@agent:name too)");
+    c(&mut rows, "/watch <path>", "watch a directory for changes in context");
+    c(&mut rows, "/cost", "token usage + spend breakdown + budget");
+    c(&mut rows, "/ghost [on|off]", "toggle ghost prompt completion");
+    c(&mut rows, "/hooks", "show ~/.sofuu/hooks.js user middleware info");
+    h(&mut rows, "  Session mesh");
+    c(&mut rows, "/sessions", "list all sessions on this project");
+    c(&mut rows, "/context [id]", "full context of a session (default: this one)");
+    c(&mut rows, "/work <desc>", "announce what you are working on");
+    c(&mut rows, "/done", "clear your current task");
+    c(&mut rows, "/note <msg>", "record a personal note (seen by peers)");
+    c(&mut rows, "/notify <msg>", "CRITICAL notice, shown to every session now");
+    c(&mut rows, "/sync [on|off]", "toggle session-mesh polling (restart to join)");
+    c(&mut rows, "/exit /quit", "save config and exit");
+    rows.push(Row::Note("\n\x1b[2m  Sessions on the SAME project share context in real time (tasks,\x1b[0m"));
+    rows.push(Row::Note("\x1b[2m  notes, critical notices). Data persists as .qtsq files in\x1b[0m"));
+    rows.push(Row::Note("\x1b[2m  <project>/.sofuu/sessions/.\x1b[0m"));
+    h(&mut rows, "\n  Shortcuts");
+    c(&mut rows, "TAB", "complete after '/', cycle permission mode otherwise");
+    c(&mut rows, "↑ / ↓", "input history");
+    c(&mut rows, "PgUp / PgDn", "scroll the conversation");
+    c(&mut rows, "Shift+Enter", "newline inside the input (Alt+Enter too)");
+    c(&mut rows, "Esc", "stop the response (while streaming) / clear the input");
+    c(&mut rows, "Ctrl-K", "copy the mouse-selected text (drag over rows, then Ctrl-K)");
+    c(&mut rows, "Ctrl-C", "quit sofuu");
+    c(&mut rows, "Ctrl-D", "exit");
+    rows.push(Row::Blank);
+
+    // ── Render ──────────────────────────────────────────────────
+    let col = help_command_col(rows.iter().filter_map(|r| match r {
+        Row::Cmd(cmd, _) => Some(char_cells_str(cmd)),
+        _ => None,
+    }));
+
+    for row in &rows {
+        match row {
+            Row::Blank => chat_out(""),
+            Row::Header(s) => chat_out(&format!("\n\x1b[1;36m{s}\x1b[0m")),
+            Row::Note(s) => chat_out(&format!("\x1b[2m{s}\x1b[0m")),
+            Row::Cmd(cmd, desc) => {
+                let w = char_cells_str(cmd);
+                if w <= col {
+                    let pad = col - w;
+                    chat_out(&format!(
+                        "    \x1b[1m{cmd}{}\x1b[0m\x1b[2m— {desc}\x1b[0m",
+                        " ".repeat(pad)
+                    ));
+                } else {
+                    // Label wider than the column: put the description on
+                    // its own line, still at the description column, so the
+                    // rest of the block stays aligned. `/ml` carries eight
+                    // sub-commands and is unavoidably wide.
+                    chat_out(&format!("    \x1b[1m{cmd}\x1b[0m"));
+                    chat_out(&format!("{}    \x1b[2m— {desc}\x1b[0m", " ".repeat(col)));
+                }
+            }
+        }
+    }
+}
+
+/// Display width of a UTF-8 string in terminal cells (char_cells() per
+/// char). Used by the help renderer to size the command column so wide
+/// glyphs — `↑ / ↓`, `…` — are measured, not assumed to be one cell.
+fn char_cells_str(s: &str) -> usize {
+    s.chars().map(char_cells).sum()
+}
+
+/// Width of the help screen's command column, in terminal cells.
+///
+/// Sized to the longest label so the em-dash column is identical on every
+/// row, and clamped to keep an 80-column terminal usable: 4 indent + 24
+/// label + 2 (em-dash + space) = 30, leaving 50 for the description. A
+/// label wider than the cap keeps its own row and drops its description to
+/// the next line at this column, so it cannot ragged the rest of the block.
+///
+/// This replaces a hardcoded 20, which broke alignment for `/mode
+/// [full|edit|plan]` (21 cells) and `/ml [...]` (53).
+fn help_command_col<'a>(labels: impl Iterator<Item = usize>) -> usize {
+    const MIN: usize = 20;
+    const MAX: usize = 24;
+    labels.max().unwrap_or(MIN).clamp(MIN, MAX)
 }
 
 // ── Welcome panel ────────────────────────────────────────────────
@@ -1477,6 +1546,19 @@ fn print_help() {
 /// the viewport truncates with that, and they must agree.
 fn char_cells(c: char) -> usize {
     let o = c as u32;
+    // Zero-width first: these occupy NO cell, and getting them wrong
+    // mis-pads the welcome panel and truncates the viewport at the wrong
+    // place. A combining accent ("e" + U+0301) is one cell on screen, not
+    // two; neither is a variation selector or a ZWJ in an emoji sequence.
+    if (0x0300..=0x036F).contains(&o)      // combining diacritical marks
+        || (0x200B..=0x200F).contains(&o)   // ZWSP..ZWJ + bidi marks
+        || o == 0xFEFF                     // zero-width no-break space
+        || (0xFE00..=0xFE0F).contains(&o)   // variation selectors 1-16
+        || (0xE0100..=0xE01EF).contains(&o) // variation selectors 17-256
+        || (0x1F3FB..=0x1F3FF).contains(&o) // emoji skin-tone modifiers
+    {
+        return 0;
+    }
     if (0x1100..=0x115F).contains(&o)
         || (0x2E80..=0xA4CF).contains(&o)
         || (0xAC00..=0xD7A3).contains(&o)
@@ -1928,6 +2010,13 @@ unsafe extern "C" fn js_chat_getcfg(
             "permissions": cfg.permissions,
             "ctx_window": cfg.ctx_window,
             "max_output": cfg.max_output,
+            /* Hard ceilings, published so the driver's non-TTY usage lines
+             * can state the valid range. Served from Rust rather than
+             * written into the driver: MAX_CTX_WINDOW has already moved once
+             * (1M -> 4 MiB) and the /help copy drifted with it, so a second
+             * copy in JS would drift the same way. */
+            "ctx_cap": MAX_CTX_WINDOW,
+            "max_output_cap": MAX_OUTPUT_TOKENS,
             "embed_provider": cfg.embed_provider,
             "embed_model": cfg.embed_model,
             "memory_backend": cfg.memory_backend,
@@ -6053,6 +6142,13 @@ const DRIVER: &str = r#"
       const t = inp.trim();
       if (t === '') continue;
       if (t[0] === '/') {
+        /* Snapshot the settings this command could touch, so the panel
+         * refresh below can be gated on an ACTUAL change rather than on the
+         * command's name. */
+        const before = { p: cfg.provider, m: cfg.model, e: cfg.effort,
+                         x: cfg.ctx_window, o: cfg.max_output, b: cfg.brain,
+                         ml: cfg.ml, rl: cfg.rlm, sy: cfg.sync,
+                         pm: cfg.permissions, api: cfg.api_key, bu: cfg.base_url };
         const r = __chat_slash(t);
         // Slash commands may have changed provider/model/api_key — re-read
         // the Rust-side config so the live session uses the new values.
@@ -6060,16 +6156,29 @@ const DRIVER: &str = r#"
         /* Any command that can change settings re-renders the welcome panel
          * so the header (model/provider/effort) updates instantly. */
         const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync', '/outputs', '/mode', '/plan', '/edit', '/full'];
-        const changed = cfgCmds.some(c => t === c || t.indexOf(c + ' ') === 0);
-        if (changed) {
+        const isCfgCmd = cfgCmds.some(c => t === c || t.indexOf(c + ' ') === 0);
+        /* ...but only repaint when something really moved. Gating on the
+         * name alone re-printed the whole banner for a bare `/ctx`, which
+         * changes nothing and can never open its picker without a TTY — so
+         * piping a session showed the header twice. Under a TTY the repaint
+         * is in place (tui_reset) and harmless; in a pipe it APPENDS, and
+         * that duplicate is the bug. */
+        const changed = isCfgCmd && (
+             before.p !== cfg.provider  || before.m  !== cfg.model
+          || before.e !== cfg.effort   || before.x  !== cfg.ctx_window
+          || before.o !== cfg.max_output || before.b !== cfg.brain
+          || before.ml !== cfg.ml      || before.rl !== cfg.rlm
+          || before.sy !== cfg.sync    || before.pm !== cfg.permissions
+          || before.api !== cfg.api_key || before.bu !== cfg.base_url);
+        if (isCfgCmd) {
           /* A mode change must reach the engine runtime, not just the panel:
            * applyMode() re-pushes cfg.permissions into sofuu.agent so the
            * next turn is gated immediately, and refreshStatus re-renders
            * the amber mode chip. */
           applyMode();
           refreshStatus(lastChip);
-          try { __chat_refresh(); } catch (e) {}
         }
+        if (changed) { try { __chat_refresh(); } catch (e) {} }
         /* F2 detect-on-select: a model/provider switch is exactly when the
          * user needs the NEW model's real window, and the 7-day discovery
          * TTL usually has nothing cached for a root just selected. Force
@@ -6095,10 +6204,10 @@ const DRIVER: &str = r#"
           else out('\x1b[90m  Usage: /rlm <on|off|auto>  (current: ' + (cfg.rlm || 'off') + ')\x1b[0m\n');
         } else if (r === 'pick_ctx') {
           if (TTY) await pickCtx();
-          else out('\x1b[90m  Usage: /ctx <tokens|default>  (current: ' + (cfg.ctx_window || 'provider default') + ')\x1b[0m\n');
+          else out('\x1b[90m  Usage: /ctx <tokens|default>  (0-' + (cfg.ctx_cap || 0) + '; current: ' + (cfg.ctx_window || 'provider default') + ')\x1b[0m\n');
         } else if (r === 'pick_maxout') {
           if (TTY) await pickMaxout();
-          else out('\x1b[90m  Usage: /maxout <tokens|default>  (current: ' + (cfg.max_output || 'provider default') + ')\x1b[0m\n');
+          else out('\x1b[90m  Usage: /maxout <tokens|default>  (0-' + (cfg.max_output_cap || 0) + '; current: ' + (cfg.max_output || 'provider default') + ')\x1b[0m\n');
         } else if (r === 'pick_brain') {
           if (TTY) await pickBrain();
           else out('\x1b[90m  Usage: /brain <on|off>  (current: ' + (cfg.brain ? 'on' : 'off') + ')\x1b[0m\n');
@@ -6304,6 +6413,115 @@ pub fn run_chat(rt: &SofuuRuntime, initial: ChatConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The help screen's command column must line up on every row.
+    ///
+    /// It used to be a fixed 20 cells, so the first command that outgrew it
+    /// pushed its em-dash out and left the whole block ragged — `/mode
+    /// [full|edit|plan]` is 21 cells and `/ml [...]` is 53. Both shipped
+    /// that way because nothing checked the rendered output.
+    #[test]
+    fn help_column_is_sized_to_the_longest_label() {
+        // The two real offenders, plus a short one.
+        let labels = ["/help", "/mode [full|edit|plan]", "/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]"];
+        let widths: Vec<usize> = labels.iter().map(|s| char_cells_str(s)).collect();
+        assert_eq!(widths, vec![5, 22, 56], "these lengths are what broke alignment");
+        // The regression in one line: both of these outgrew the old fixed 20.
+        assert!(widths[1] > 20 && widths[2] > 20);
+
+        // Clamped to the cap, so an 80-col terminal keeps a description column.
+        assert_eq!(help_command_col(widths.iter().copied()), 24);
+        // A block of short commands still gets the readable minimum.
+        assert_eq!(help_command_col([5usize, 12, 18].into_iter()), 20);
+        // Empty input must not panic and must fall back to the minimum.
+        assert_eq!(help_command_col(std::iter::empty()), 20);
+    }
+
+    /// Wide glyphs are measured, not assumed to be one cell — the help has
+    /// both ("↑ / ↓" in Shortcuts, "…" in a few descriptions), and byte
+    /// length would be badly wrong for either.
+    #[test]
+    fn help_column_measures_wide_glyphs() {
+        // CJK is unambiguously 2 cells per char in any terminal.
+        assert_eq!(char_cells_str("日本語"), 6);
+        // Multi-byte but single-cell: measured by cells, not bytes.
+        assert_eq!(char_cells_str("…"), 1);
+        assert!(char_cells_str("…") < "…".len(), "must not count UTF-8 bytes");
+        // ASCII baseline.
+        assert_eq!(char_cells_str("abc"), 3);
+        assert_eq!(char_cells_str(""), 0);
+        // Combining marks do not advance the cursor.
+        assert_eq!(char_cells_str("e\u{0301}"), 1);
+    }
+
+    /// The hard ceilings must reach the driver, so its non-TTY usage lines
+    /// can state the real range instead of leaving the user to guess.
+    ///
+    /// They are served from Rust on purpose: MAX_CTX_WINDOW has already
+    /// moved once (1M -> 4 MiB) and the copy drifted with it. A literal in
+    /// the driver JS would be a third place to forget.
+    #[test]
+    fn getcfg_publishes_the_ceiling_constants() {
+        let guard = CFG.lock().unwrap();
+        let default_cfg;
+        let cfg: &ChatConfig = match guard.as_ref() {
+            Some(c) => c,
+            None => {
+                default_cfg = ChatConfig::defaults();
+                &default_cfg
+            }
+        };
+        let caps = serde_json::json!({
+            "ctx_cap": MAX_CTX_WINDOW,
+            "max_output_cap": MAX_OUTPUT_TOKENS,
+            "ctx_window": cfg.ctx_window,
+        });
+        assert_eq!(caps["ctx_cap"], 4_194_304);
+        assert_eq!(caps["max_output_cap"], 384_000);
+        // The driver reads these exact key names; renaming one silently
+        // turns "(0-undefined)" into the usage line.
+        assert_eq!(caps["ctx_window"], cfg.ctx_window);
+    }
+
+    /// The help text must not advertise a ceiling the code does not
+    /// enforce. MAX_CTX_WINDOW is 4 MiB, but the copy still advertised the
+    /// old one-megabyte ceiling in three places — the same stale number the
+    /// /ctx clamp test used to assert — so /help told users half the real
+    /// limit. (The old figure is spelled via format!() below rather than
+    /// written out, so this guard cannot match its own source.)
+    ///
+    /// Checks the literals the UI actually prints, not a blanket grep: a
+    /// grep also matches this test's own doc comment, which is exactly the
+    /// kind of thing that makes a guard quietly useless.
+    #[test]
+    fn documented_ceilings_match_the_enforced_ones() {
+        assert_eq!(MAX_CTX_WINDOW, 4_194_304);
+        assert_eq!(MAX_OUTPUT_TOKENS, 384_000);
+        // Every /ctx and /maxout help + usage row, spelled out.
+        let rows: [&str; 4] = [
+            "view/set the context window (max 4M)",
+            "view/set max output tokens (max 384k)",
+            "<tokens> | default  (default = model's real window, max 4M)",
+            "Sofuu chat --ctx-window <n> Context window in tokens (0 = provider default, max 4M)",
+        ];
+        let chat = include_str!("chat.rs");
+        let main = include_str!("main.rs");
+        for row in rows {
+            assert!(
+                chat.contains(row) || main.contains(row),
+                "expected ceiling text missing: {row}"
+            );
+        }
+        // And no row still claims the old ceiling. The needle is built at
+        // runtime from fragments: written literally it would appear in this
+        // file and match itself, which is how the first version of this test
+        // failed against its own assertion message.
+        let stale = format!("max {}M", 1);
+        assert!(
+            !chat.contains(&stale) && !main.contains(&stale),
+            "a /ctx surface still advertises the stale 1M ceiling"
+        );
+    }
 
     /// The embedded DRIVER is JavaScript, not Rust. Pasting a Rust
     /// statement into it (`let mut x = …`) compiles fine here — the whole

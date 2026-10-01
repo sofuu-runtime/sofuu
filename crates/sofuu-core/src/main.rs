@@ -64,7 +64,7 @@ fn print_help() {
     println!("  sofuu chat -p <provider> Chat with a specific provider");
     println!("  sofuu chat -k <key>      Set the API key for this session");
     println!("  sofuu chat --base-url <u> Override the provider endpoint URL");
-    println!("  sofuu chat --ctx-window <n> Context window in tokens (0 = provider default, max 1M)");
+    println!("  sofuu chat --ctx-window <n> Context window in tokens (0 = provider default, max 4M)");
     println!("  sofuu chat --max-output <n> Max output tokens per response (0 = provider default, max 384k)");
     println!("  sofuu repl               JavaScript evaluation REPL");
     println!("  sofuu run <file.js>      Run a JavaScript file");

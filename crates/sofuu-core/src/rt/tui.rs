@@ -70,6 +70,19 @@ fn c_str<'a>(s: *const c_char) -> &'a [u8] {
 /// chat.rs's `cell_w` so panel padding and viewport math agree.
 fn char_cells(c: char) -> usize {
     let o = c as u32;
+    // Zero-width first: these occupy NO cell, and getting them wrong
+    // mis-pads the welcome panel and truncates the viewport at the wrong
+    // place. A combining accent ("e" + U+0301) is one cell on screen, not
+    // two; neither is a variation selector or a ZWJ in an emoji sequence.
+    if (0x0300..=0x036F).contains(&o)      // combining diacritical marks
+        || (0x200B..=0x200F).contains(&o)   // ZWSP..ZWJ + bidi marks
+        || o == 0xFEFF                     // zero-width no-break space
+        || (0xFE00..=0xFE0F).contains(&o)   // variation selectors 1-16
+        || (0xE0100..=0xE01EF).contains(&o) // variation selectors 17-256
+        || (0x1F3FB..=0x1F3FF).contains(&o) // emoji skin-tone modifiers
+    {
+        return 0;
+    }
     if (0x1100..=0x115F).contains(&o)
         || (0x2E80..=0xA4CF).contains(&o)
         || (0xAC00..=0xD7A3).contains(&o)
@@ -403,6 +416,13 @@ pub unsafe extern "C" fn tui_footer2_row() -> c_int {
 /// buffers (the footer statics are `Vec<u8>` from `CStr::to_bytes()`) can
 /// never have the walk run past the allocation. Returns a byte index
 /// `<= bytes.len()`, usable directly as a slice bound.
+/// Display cells of a plain string (no ANSI). Convenience for tests and for
+/// callers that already know the text is escape-free.
+#[cfg(test)]
+fn disp_width(s: &str) -> usize {
+    s.chars().map(char_cells).sum()
+}
+
 pub fn truncate_cells(bytes: &[u8], max_cells: usize) -> usize {
     let n = bytes.len();
     if max_cells == 0 {
@@ -1108,7 +1128,7 @@ pub unsafe extern "C" fn sofuu_tui_phase_row() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{tui_truncate_cells, truncate_cells, wrap_row};
+    use super::{char_cells, disp_width, tui_truncate_cells, truncate_cells, wrap_row};
     use std::ffi::CString;
 
     /// For every cell budget, the returned byte length must land on a UTF-8
@@ -1299,5 +1319,32 @@ mod tests {
         let text = "\x1b[2;35m│  short row\x1b[0m";
         assert_eq!(wrap_row(text, 100), vec![text.to_string()]);
         assert_eq!(wrap_row("", 100), vec![String::new()]);
+    }
+
+    /// Zero-width characters must not consume a cell.
+    ///
+    /// A combining accent, a variation selector or a ZWJ occupies no column
+    /// on a real terminal. Counting them as 1 cell over-reports the width,
+    /// which made the viewport truncate a line early and left the welcome
+    /// panel padded short. Both copies of char_cells (this one and the one
+    /// in chat.rs) had this bug.
+    #[test]
+    fn zero_width_chars_measure_as_zero_cells() {
+        // Combining acute: "e" + U+0301 renders as ONE cell.
+        assert_eq!(char_cells('\u{0301}'), 0);
+        assert_eq!(disp_width("e\u{0301}"), 1);
+        // ZWJ and the bidi/zero-width punctuation block.
+        assert_eq!(char_cells('\u{200B}'), 0);
+        assert_eq!(char_cells('\u{200D}'), 0);
+        assert_eq!(char_cells('\u{FEFF}'), 0);
+        // Variation selectors.
+        assert_eq!(char_cells('\u{FE0F}'), 0);
+        assert_eq!(disp_width("\u{1F469}\u{FE0F}\u{1F4BB}"), 4);
+        // Emoji skin-tone modifiers attach to the base glyph.
+        assert_eq!(char_cells('\u{1F3FB}'), 0);
+        // The wide/narrow classification itself is unchanged.
+        assert_eq!(char_cells('日'), 2);
+        assert_eq!(disp_width("日本語"), 6);
+        assert_eq!(char_cells('a'), 1);
     }
 }

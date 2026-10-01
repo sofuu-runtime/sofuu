@@ -5304,6 +5304,30 @@ const DRIVER: &str = r#"
         ? 'step budget' + (agentMention ? '' : ' (' + def.budget.maxSteps + ' rounds)')
         : (res.stopped === 'budget_wall' ? 'wall-clock budget' : 'token budget');
       out('\x1b[90m  ⏹ stopped: ' + why + ' reached\x1b[0m');
+      /* Say WHY, not just that it stopped. A bare "step budget reached"
+       * cannot be acted on: 200 rounds on a genuinely large task needs a
+       * bigger budget or a /compact, while 200 rounds re-reading one file
+       * is a different bug entirely. agent.js collects this at the moment
+       * of the breach, which is the only time the numbers exist. */
+      try {
+        const b = res.breach;
+        if (b && b.kind === 'budget_steps') {
+          const tk = (b.promptTokens || 0) + (b.completionTokens || 0);
+          const win = b.ctxWindow || 0;
+          const pct = win > 0 ? Math.round((tk / win) * 100) : null;
+          out('\x1b[90m    ↳ ' + (b.steps || 0) + '/' + (b.maxSteps || 0) + ' rounds · ' +
+              (b.llmCalls || 0) + ' llm calls · ' + (b.toolCalls || 0) + ' tool calls' +
+              (b.loopMsgs ? ' · ' + b.loopMsgs + ' msgs in turn' : '') +
+              (tk ? ' · ctx ' + fmtTk(tk) + (pct !== null ? ' (' + pct + '% of ' + fmtTk(win) + ')' : '') : '') +
+              (b.mostCalledTool ? ' · most: ' + b.mostCalledTool : '') +
+              '\x1b[0m');
+          /* If the window was the real constraint, say so — /compact is
+           * the immediate action and the user cannot infer it. */
+          if (pct !== null && pct >= 85) {
+            out('\x1b[90m    ↳ context was at ' + pct + '% — /compact now, or lower /ctx\x1b[0m');
+          }
+        }
+      } catch (eB) {}
     } else if (res && res.stopped) {
       /* Unknown stop cause (future agent.js values): still say SOMETHING —
        * a silent stop reads as a dead provider (P3-2). */

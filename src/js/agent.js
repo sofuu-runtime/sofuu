@@ -1656,6 +1656,7 @@
       if (steps >= d.budget.maxSteps) return 'budget_steps';
       return null;
     }
+
     function finish(answer) {
       if (answer && answer.length > ANSWER_CAP_CHARS) answer = answer.slice(0, ANSWER_CAP_CHARS);
       var wall = Date.now() - started;
@@ -1664,6 +1665,43 @@
         runId: runId, name: d.name, answer: answer || '',
         steps: steps, subRuns: subRuns,
         usage: own, trace: trace, stopped: stopped,
+        /* Why a budget stopped us. A bare "step budget reached" is
+         * unactionable: the reader cannot tell a model that genuinely
+         * needed 200 rounds from one stuck re-reading the same file, and
+         * those need opposite fixes. Cheap to collect at the one moment
+         * it matters, and it is the only place the numbers still exist. */
+        breach: stopped && String(stopped).indexOf('budget_') === 0
+          ? (function () {
+              /* trace entries are {t, kind, payload}; tool calls are
+               * emitted as kind:'tool' with payload.name. Reading .name off
+               * the entry reported '?' for every tool, which made the
+               * histogram useless exactly when it was needed. */
+              var hist = {}, top = '';
+              for (var ti = 0; ti < trace.length; ti++) {
+                var e = trace[ti] || {};
+                if (e.kind !== 'tool') continue;
+                var nm = (e.payload && (e.payload.name || e.payload.tool)) || '?';
+                hist[nm] = (hist[nm] || 0) + 1;
+              }
+              for (var k in hist) { if (!top || hist[k] > hist[top]) top = k; }
+              return {
+                kind: stopped,
+                maxSteps: d.budget.maxSteps,
+                steps: steps,
+                llmCalls: own.llmCalls,
+                toolCalls: own.toolCalls,
+                promptTokens: tree.promptTokens,
+                completionTokens: tree.completionTokens,
+                /* Live context pressure at the moment of the stop — the
+                 * number that separates "ran out of steps because the task
+                 * was big" from "ran out because the window was full". */
+                ctxWindow: contextWindow(d && d.model, d && d.baseUrl, !mlEnabled(d)),
+                loopMsgs: (typeof loopMsgs !== 'undefined' && loopMsgs) ? loopMsgs.length : 0,
+                mostCalledTool: top,
+                toolHistogram: hist,
+              };
+            })()
+          : null,
         /* Claude-style retention: the turn's tool transcript for the driver
          * to persist into history. Empty array on plain turns (falsy length
          * checks keep old callers working). */
@@ -1708,6 +1746,7 @@
      * class per run at the boundary (credibility bar: no nagging). */
     var mlSkipTargets = [];
     var mlLoopNoticed = {};
+
 
     /* ── alloc gate state for this run (§14) ─────────────────────────
      * lastPlan is re-resolved before every LLM call: caps come from the

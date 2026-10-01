@@ -8,12 +8,17 @@
 > This file is the *artifact + install* reference. The API contract lives in
 > [`EMBEDDING.md`](./EMBEDDING.md).
 
+> **Shipped host platform: macOS only, for now.** CI builds and tests
+> macOS only, and the release publishes no Linux or Windows artifact. Every
+> non-macOS row below still builds from source with the target named — those
+> paths are intact, just not exercised by CI for now.
+
 ## Artifacts
 
 | Platform | Artifact | Architecture(s) | Status |
 |---|---|---|---|
-| macOS | `libsofuu-darwin-{arm64,x86_64}.{a,dylib}` | arm64, x86_64 | built by `make dist-macos` |
-| Linux (musl) | `libsofuu-linux-{x86_64,arm64}.{a,so}` | x86_64, arm64 | built by `make dist-linux` (needs Zig) |
+| macOS | `libsofuu-darwin-{arm64,x86_64}.{a,dylib}` | arm64, x86_64 | ✅ built by `make dist-macos`, published |
+| Linux (musl) | `libsofuu-linux-{x86_64,arm64}.{a,so}` | x86_64, arm64 | builds via `make dist-linux` (needs Zig); ⏸ not built or published for now |
 | iOS | `libsofuu.xcframework` | arm64 (device), arm64+x86_64 (sim) | built by `make dist-ios` (needs Xcode) |
 | Android | `libsofuu-android-{aarch64,x86_64}.so` | aarch64, x86_64 | built by `make dist-android` (needs NDK) |
 | Windows | `libsofuu-windows-x86_64.dll` | x86_64 | ⬜ v2 (not yet) |

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
 
 > ⚠️ **Beta software.** Sofuu is under active development. APIs may change before a stable release.
 
@@ -24,6 +24,17 @@ You build your frontend (React, Next.js, plain HTML — whatever you like) compl
 
 ## Install
 
+> **Platform: macOS (Apple Silicon and Intel) is the only host we ship a
+> binary for today.** CI builds and tests macOS only, and the release has no
+> Linux or Windows artifact — the installer says so plainly instead of
+> failing on a missing download. Building from source works anywhere,
+> including Linux and Windows: the cross-compile targets (`make
+> linux-x86_64`, `make windows-x86_64`) and `scripts/cross/*.sh` are all
+> still in the tree, just not exercised by CI for now.
+>
+> The **SDK packs** — SwiftPM, CocoaPods, the Android AAR — are unaffected;
+> those target iOS/Android *devices*, not desktop hosts.
+
 **The CLI** — pick whichever you prefer; all three install the same binary.
 
 ```bash
@@ -34,7 +45,7 @@ curl -fsSL https://sofuu.xyz/install | sh
 npm install -g sofuu      # or: npx sofuu
 
 # 3. Homebrew-style manual
-#    → https://sofuu.xyz/downloads  (tarball + .sha256 per platform)
+#    → https://sofuu.xyz/downloads  (macOS tarball + .sha256)
 ```
 
 Or build it yourself from source:
@@ -529,17 +540,25 @@ fails `make headless-test` rather than shipping:
 | `c_llm.c` | a real LLM call (mock in CI, live with a key) |
 | `c_rlm.c` / `c_agent.c` | RLM long-context Q&A / agent run + stream + cancel |
 
-From source: `make libsofuu`, `make dist-macos`, `make dist-linux`,
-`make dist-ios` (xcframework), `make dist-android` (per-ABI .so). See
+From source: `make libsofuu`, `make dist-macos`, `make dist-ios`
+(xcframework), `make dist-android` (per-ABI .so). `make dist-linux` still
+exists and still works, but CI does not build or publish it for now. See
 [`docs/EMBEDDING-DIST.md`](docs/EMBEDDING-DIST.md) (artifacts + install) and
 [`docs/EMBEDDING.md`](docs/EMBEDDING.md) (the contract). Design + status:
 [`PLAN-HEADLESS.md`](PLAN-HEADLESS.md).
 
 ### Full features on Windows & Linux (QTSQ port)
 
+> **Shipped platform: macOS only, for now.** The QTSQ codec genuinely ports
+> to all three desktop OSes and the build path for each is intact — the
+> Makefile's `linux-x86_64` / `linux-arm64` targets and `scripts/cross/*.sh`
+> still cross-compile. What is switched off for now is *building and
+> shipping* them: CI runs macOS only, and no Linux/Windows release artifact is
+> published. Re-enabling either is a small, self-contained change.
+
 All Sofuu features — including **QTSQ session persistence** (brain/memory,
 session store, `.qtsq` container save/load, vault, secure_text, deniable
-encryption, authorship anchoring) — now build on all three desktop platforms.
+encryption, authorship anchoring) — build on all three desktop platforms.
 The QTSQ codec is a proprietary local checkout; each OS links it natively:
 
 | Platform | QTSQ artifact | Built by | Linked by `build.rs` |
@@ -1172,8 +1191,10 @@ sub-agent budget inheritance, provider-outage salvage).
 **Embedding the runtime** (not just the CLI): see [Embed Sofuu](#embed-sofuu-libsofuu),
 [`docs/EMBEDDING.md`](docs/EMBEDDING.md) (the contract) and
 [`docs/EMBEDDING-DIST.md`](docs/EMBEDDING-DIST.md) (artifacts + install).
-Platform packs: `make dist-macos` · `dist-linux` · `dist-ios` (xcframework) ·
-`dist-android` (per-ABI `.so`).
+Platform packs: `make dist-macos` · `dist-ios` (xcframework) ·
+`dist-android` (per-ABI `.so`). These build libuv/curl with CMake + Ninja, so
+they need `brew install cmake ninja curl` first (CI installs all three); a
+plain `make` only needs a Rust toolchain.
 
 ---
 

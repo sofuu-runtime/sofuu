@@ -49,11 +49,11 @@ npm run tauri build -- --bundles nsis
 
 ### CI
 
-GitHub Actions: `.github/workflows/windows-build.yml` (windows-latest)
-installs curl via the runner's preinstalled vcpkg, builds vendored libuv,
-bundles the NSIS installer, and uploads it as an artifact. Trigger: push to
-`main` touching the engine/desktop/deps trees, or manually via
-`workflow_dispatch`.
+> **Not built in CI for now.** The Windows workflow existed here and was
+> removed alongside the other non-macOS jobs; the commands it ran are listed
+> above so it can be restored verbatim. To rebuild by hand: install curl via
+> the runner's preinstalled vcpkg, build vendored libuv with
+> `-DBUILD_SHARED_LIBS=OFF`, then `npm run tauri build -- --bundles nsis`.
 
 ### Windows notes & limitations
 
@@ -126,10 +126,11 @@ needed.
 
 ### CI
 
-GitHub Actions: `.github/workflows/linux-build.yml` (ubuntu-22.04) installs
-the apt prerequisites, builds vendored libuv, bundles the `.deb` and
-`.AppImage`, and uploads them as artifacts. Trigger: push to `main` touching
-the engine/desktop/deps trees, or manually via `workflow_dispatch`.
+> **Not built in CI for now.** The Linux workflow existed here and was
+> removed alongside the other non-macOS jobs; the commands it ran are listed
+> above so it can be restored verbatim. To rebuild by hand: install the apt
+> prerequisites, build vendored libuv with `-DBUILD_SHARED_LIBS=OFF`, then
+> `npm run tauri build -- --bundles deb,appimage`.
 
 ### Linux notes & limitations
 

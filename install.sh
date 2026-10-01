@@ -25,7 +25,23 @@ esac
 
 case "$OS" in
     darwin) PLATFORM="darwin" ;;
-    linux)  PLATFORM="linux"  ;;
+    linux)
+        # The project ships the macOS CLI only, for now, so no Linux archive
+        # is published. Say that plainly instead of 404-ing on a download the
+        # user cannot act on. The build path is untouched — `make
+        # linux-x86_64` still cross-compiles — so this branch goes away with
+        # the release job, not with any capability.
+        cat >&2 <<EOF
+  Sofuu currently ships a macOS build only.
+
+  Host: ${OS}/${ARCH}. No Linux archive is published right now, so there is
+  nothing to download. Re-run this script on macOS, or build from source:
+
+      git clone https://github.com/sofuu-runtime/sofuu
+      cd sofuu && SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make
+EOF
+        exit 1
+        ;;
     *)
         echo "Unsupported OS: $OS"
         exit 1

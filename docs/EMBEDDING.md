@@ -518,6 +518,12 @@ networking via host imports later).
 | `make dist-android` | `dist/libsofuu-android-{aarch64,x86_64}.so` |
 | `make dist-all` | Every platform available on the current host |
 
+> **Published host platform: macOS only, for now.** CI builds and tests
+> macOS only and the release attaches no Linux or Windows artifact. Every
+> target in that table still works from source on a capable host — they are
+> simply not built or published for now. The SDK packs (iOS xcframework,
+> Android AAR) are unaffected: those target devices, not desktop hosts.
+
 ### CI gates (H6)
 
 Every CI push/PR and release build runs:

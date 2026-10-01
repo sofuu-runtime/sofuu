@@ -52,7 +52,12 @@
    * KV reuse) can anchor on it. def.system composes AFTER it; nothing
    * dynamic ever enters the system message. */
   var CORE_PROMPT = 'Sofuu coding agent. Be direct and concise. Verify with tools before asserting. If unsure, say so. Prefer the latest data: check that facts and information are current, and fetch fresh data with tools rather than trusting what may be stale. Plan before executing: for any long or multi-step task (one you expect to need several tool calls or distinct phases), call todo_write FIRST with the full checklist and only then start work. Keep exactly one item doing, rewrite the list whenever the plan or progress changes. A short single-step answer needs no checklist.';
-  var BUDGET_DEFAULTS = { maxSteps: 12, maxDepth: 2, maxTokens: 200000, maxWallMs: 300000 };
+  var BUDGET_DEFAULTS = { maxSteps: 12, maxDepth: 2, maxTokens: 200000, maxWallMs: 300000,
+                          /* Auto-continue (2026-10-01): how many times a run
+                           * may renew its step allowance after hitting
+                           * budget_steps. See continueAfterSteps() for why
+                           * a budget is a guardrail rather than a wall. */
+                          maxContinuations: 2 };
   /* Task-gate backstop: tool steps in ONE turn with no todo_write before
    * the ephemeral "plan now" reminder fires (one-shot per run — the
    * supervisor's no-nagging credibility bar applies here too). Sits well
@@ -503,6 +508,10 @@
     d.budget.maxWallMs = (b.maxWallMs | 0) || BUDGET_DEFAULTS.maxWallMs;
     /* Per-def tool-result context cap — 0 = scale with the model window. */
     d.budget.maxToolResultChars = (b.maxToolResultChars | 0) || 0;
+    /* 0 is meaningful here (renewals disabled → pre-2026-10-01 behaviour),
+     * so test with 'in' rather than falling back to the default. */
+    d.budget.maxContinuations = ('maxContinuations' in b)
+      ? Math.max(0, (b.maxContinuations | 0)) : BUDGET_DEFAULTS.maxContinuations;
 
     var tools = def.tools || [];
     if (!Array.isArray(tools)) throw new Error('agent.define: tools must be an array');
@@ -1589,6 +1598,9 @@
     var trace = [];
     var subRuns = [];
     var steps = 0;
+    /* Cumulative across auto-continue windows — `steps` resets on a
+     * renewal, so this is what "how long did this actually run" means. */
+    var stepsTotal = 0;
     var stopped = null;
     /* Task-gate state (see TODO_GATE_STEPS): did this run ever call
      * todo_write, and has the one-shot reminder already been injected? */
@@ -1612,6 +1624,83 @@
         return false; /* ephemeral ML notices (freshness/supervisor) — gate
                        * telemetry never persists into context */
       }).map(function (m) { return Object.assign({}, m); });
+    }
+
+    /* ── Auto-continue across a step budget (2026-10-01) ───────────────
+     * A step budget is a guardrail, not a wall. Tripping it used to end
+     * the turn: the agent salvaged one summary and the user was left with
+     * a large task silently unfinished, told only that the limit was hit.
+     * That is the worst outcome for the case the budget exists to serve —
+     * a genuinely long task.
+     *
+     * So on budget_steps the run keeps its progress instead of dropping
+     * it: the live turn transcript is compacted down to a summary (this is
+     * what frees the context the next window needs — a bare step reset
+     * would re-send the same growing transcript and blow the window),
+     * the step counter renews, and the loop goes on. Bounded by
+     * maxContinuations so a model that cannot converge still terminates
+     * and still salvages honestly on the final window.
+     *
+     * Only budget_steps renews. budget_wall is wall-clock and cannot be
+     * undone; budget_tokens is measured on cumulative tree usage, which
+     * compaction does not reduce, so pretending otherwise would report a
+     * budget that was not actually respected. */
+    var continuations = 0;
+    function msgChars(m) {
+      if (!m) return 0;
+      var n = String(m.content == null ? '' : m.content).length;
+      if (m.tool_calls) {
+        for (var i = 0; i < m.tool_calls.length; i++) {
+          var f = m.tool_calls[i].function || {};
+          n += String(f.name || '').length + String(f.arguments || '').length;
+        }
+      }
+      return n;
+    }
+    /* Compact the live transcript, cutting only at a provider-safe
+     * boundary. A cut is legal only where the message before it is not a
+     * tool RESULT and the message after it is not one either: slicing
+     * between an assistant tool_call and its result orphans the pairing and
+     * the provider rejects the whole request (this is the same invariant
+     * chat.js enforces in isProtectedBlock). */
+    function compactLoop() {
+      var total = 0, i, j;
+      for (i = 0; i < loopMsgs.length; i++) total += msgChars(loopMsgs[i]);
+      /* Too small to be worth the churn — do not drop a short transcript
+       * just because a budget tripped; the model still needs it. */
+      if (total < 12000) return null;
+      var cut = -1;
+      for (var k = loopMsgs.length - 1; k >= 1; k--) {
+        if (loopMsgs[k].role === 'tool') continue;
+        if (loopMsgs[k - 1].role === 'tool') continue;
+        cut = k;
+        break;
+      }
+      if (cut <= 0) return null;
+      var head = loopMsgs.slice(0, cut), tail = loopMsgs.slice(cut);
+      var dropped = 0, calls = 0, hist = {};
+      for (i = 0; i < head.length; i++) {
+        dropped += msgChars(head[i]);
+        var tcs = head[i].tool_calls;
+        if (!tcs) continue;
+        for (j = 0; j < tcs.length; j++) {
+          var nm = String((tcs[j].function && tcs[j].function.name) || '?');
+          hist[nm] = (hist[nm] || 0) + 1;
+          calls++;
+        }
+      }
+      /* Must actually buy something. */
+      if (dropped < 4000) return null;
+      var names = [];
+      for (var n2 in hist) names.push(n2 + '×' + hist[n2]);
+      names.sort();
+      var summary = '[compacted] The first ' + head.length + ' messages of this turn (' +
+        calls + ' tool calls' + (names.length ? ': ' + names.slice(0, 10).join(', ') : '') +
+        ') were compacted to free context. Their full output is no longer available — ' +
+        'if you need something from it, re-read that source rather than assuming.';
+      var kept = [{ role: 'user', content: summary }].concat(tail);
+      return { msgs: kept, droppedMsgs: head.length, calls: calls,
+               savedChars: dropped, totalChars: total };
     }
 
     function emit(kind, payload) {
@@ -1663,7 +1752,7 @@
       own.wallMs = wall;
       var res = {
         runId: runId, name: d.name, answer: answer || '',
-        steps: steps, subRuns: subRuns,
+        steps: stepsTotal, subRuns: subRuns,
         usage: own, trace: trace, stopped: stopped,
         /* Why a budget stopped us. A bare "step budget reached" is
          * unactionable: the reader cannot tell a model that genuinely
@@ -1687,7 +1776,7 @@
               return {
                 kind: stopped,
                 maxSteps: d.budget.maxSteps,
-                steps: steps,
+                steps: stepsTotal,
                 llmCalls: own.llmCalls,
                 toolCalls: own.toolCalls,
                 promptTokens: tree.promptTokens,
@@ -1699,6 +1788,11 @@
                 loopMsgs: (typeof loopMsgs !== 'undefined' && loopMsgs) ? loopMsgs.length : 0,
                 mostCalledTool: top,
                 toolHistogram: hist,
+                /* Renewals already spent when the budget finally won —
+                 * distinguishes "never got a second window" from "renewed
+                 * twice and still not done". */
+                continuations: continuations,
+                maxContinuations: d.budget.maxContinuations,
               };
             })()
           : null,
@@ -2677,6 +2771,35 @@
       for (;;) {
         state.emptyRetriesRound = 0; /* LONG-HORIZON: fresh empty-stream allowance per round */
         var breach0 = budgetBreach();
+        /* Renew instead of stopping, while renewal is still allowed and
+         * the run is not cancelled. `steps` is per-window; stepsTotal
+         * keeps the honest cumulative count for reporting, so nothing
+         * about the run is hidden from the caller or the breach report. */
+        if (breach0 === 'budget_steps' && !state.cancelled &&
+            continuations < d.budget.maxContinuations) {
+          /* Compaction is an OPTIMISATION here, not a precondition. A run
+           * can trip the step budget with a small transcript and plenty of
+           * window left (the common case in a long chat); refusing to
+           * renew unless compaction succeeded re-introduced exactly the
+           * hard stop this is meant to remove. Renew either way, compact
+           * when there is something worth compacting. */
+          var compacted = compactLoop();
+          if (compacted) loopMsgs = compacted.msgs;
+          /* Only the per-window counter resets. stepsTotal already counted
+           * every round as it happened; adding `steps` again here counted
+           * each round twice and reported a run 1.7x longer than it was. */
+          steps = 0;
+          continuations++;
+          emit('plan', { continuation: continuations, of: d.budget.maxContinuations,
+                         compacted: !!compacted,
+                         droppedMsgs: compacted ? compacted.droppedMsgs : 0,
+                         savedChars: compacted ? compacted.savedChars : 0 });
+          emit('warn', { message: 'step budget reached — ' +
+            (compacted ? 'compacted ' + compacted.droppedMsgs + ' messages (' +
+              compacted.calls + ' tool calls) and c' : 'c') +
+            'ontinuing (' + continuations + '/' + d.budget.maxContinuations + ')' });
+          continue;
+        }
         if (breach0) {
           stopped = breach0;
           /* Salvage (AUDIT-NO-RESPONSE-2026-08-24 b): a budget breach used
@@ -2860,7 +2983,7 @@
           }
           break;
         }
-        steps++;
+        steps++; stepsTotal++;
         /* Parallel fan-out (PLAN-DELEGATE-AWARENESS Move 4): a round whose
          * calls are ALL delegates runs them concurrently — that is the
          * point of a swarm. Any other mix keeps the strict sequential

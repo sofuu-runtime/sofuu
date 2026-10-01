@@ -5051,7 +5051,14 @@ const DRIVER: &str = r#"
        * agent spends one salvage round summarizing progress (agent.js) and
        * the driver prints why it stopped. SOFUU_CHAT_MAX_STEPS is a test
        * seam, not a user knob. */
-      budget: { maxSteps: (parseInt(env('SOFUU_CHAT_MAX_STEPS'), 10) || 200), maxDepth: 1, maxTokens: 1e9, maxWallMs: 1e9 },
+      /* maxContinuations: how many times the step allowance renews before
+       * the run finally stops (2026-10-01). 0 = hard stop at maxSteps,
+       * which is what a test that only wants to exercise the breach
+       * path sets — otherwise every breach test silently runs 3x the
+       * windows it thinks it is running. */
+      budget: { maxSteps: (parseInt(env('SOFUU_CHAT_MAX_STEPS'), 10) || 200), maxDepth: 1, maxTokens: 1e9, maxWallMs: 1e9,
+                maxContinuations: env('SOFUU_CHAT_MAX_CONTINUATIONS') === ''
+                  ? 2 : Math.max(0, parseInt(env('SOFUU_CHAT_MAX_CONTINUATIONS'), 10) || 0) },
     };
     /* alloc gate (§14): surface allocation notes BEFORE the request goes
      * out — config clamped to the model's caps, a learned limit applied,
@@ -5300,8 +5307,17 @@ const DRIVER: &str = r#"
       /* Budget breach (steps/wall/tokens): the agent attempted a salvage
        * summary before stopping; say WHY it stopped so a breach is never
        * mistaken for a dead provider (AUDIT-NO-RESPONSE-2026-08-24 b). */
+      /* With renewals, naming only maxSteps reads as a lie: the run
+       * genuinely executed several windows' worth of rounds. Report the
+       * renewals in the headline and let the detail line carry the
+       * totals. */
+      const renewed = !!(res.breach && res.breach.continuations);
       const why = res.stopped === 'budget_steps'
-        ? 'step budget' + (agentMention ? '' : ' (' + def.budget.maxSteps + ' rounds)')
+        ? 'step budget' + (renewed
+            ? ' after ' + res.breach.continuations + ' renewal' +
+              (res.breach.continuations === 1 ? '' : 's') +
+              ' (' + (res.breach.maxSteps || '?') + ' rounds/window)'
+            : (agentMention ? '' : ' (' + def.budget.maxSteps + ' rounds)'))
         : (res.stopped === 'budget_wall' ? 'wall-clock budget' : 'token budget');
       out('\x1b[90m  ⏹ stopped: ' + why + ' reached\x1b[0m');
       /* Say WHY, not just that it stopped. A bare "step budget reached"
@@ -5321,6 +5337,12 @@ const DRIVER: &str = r#"
               (tk ? ' · ctx ' + fmtTk(tk) + (pct !== null ? ' (' + pct + '% of ' + fmtTk(win) + ')' : '') : '') +
               (b.mostCalledTool ? ' · most: ' + b.mostCalledTool : '') +
               '\x1b[0m');
+          /* Renewals already spent — the difference between "never got a
+           * second window" and "renewed and still not done". */
+          if (b.continuations) {
+            out('\x1b[90m    ↳ ' + b.continuations + '/' + (b.maxContinuations || '?') +
+                ' renewals spent before it stopped\x1b[0m');
+          }
           /* If the window was the real constraint, say so — /compact is
            * the immediate action and the user cannot infer it. */
           if (pct !== null && pct >= 85) {

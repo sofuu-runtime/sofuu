@@ -785,6 +785,11 @@ async function main() {
   }
 
   /* ── A5: budgets, cancel, tool timeout ──────────────────────────── */
+  /* This agent loops forever, so it WILL exhaust the budget. Since
+   * 2026-10-01 exhausting it renews the allowance instead of ending the
+   * run (budget.maxContinuations, default 2), so it takes 3 windows of 3
+   * to stop: 9 steps, still budget_steps, still one honest salvage. The
+   * hard stop is asserted separately below with maxContinuations:0. */
   sofuu.agent.define({
     name: "loopy", system: "AGENT=loopy",
     tools: [{ name: "get_weather", description: "w", parameters: { type: "object", properties: {} }, execute: async () => "w" }],
@@ -793,8 +798,21 @@ async function main() {
   });
   {
     const r = await sofuu.agent.run("loopy", "loop forever", {});
-    check("A5 budget_steps stop + salvage answer", r.stopped === "budget_steps" && r.steps === 3 &&
-          r.answer === "loopy-salvage-summary");
+    check("A5 budget_steps stop + salvage answer (after renewals)", r.stopped === "budget_steps" &&
+          r.steps === 9 && r.answer === "loopy-salvage-summary");
+    check("A5 breach reports the renewals spent", !!(r.breach && r.breach.continuations === 2));
+  }
+  sofuu.agent.define({
+    name: "loopyHard", system: "AGENT=loopy",
+    tools: [{ name: "get_weather", description: "w", parameters: { type: "object", properties: {} }, execute: async () => "w" }],
+    memory: "off", rlm: "off",
+    budget: { maxSteps: 3, maxContinuations: 0, maxTokens: 1000000, maxWallMs: 60000 },
+    provider: "openai", model: "mock", api_key: "x", base_url: MOCK
+  });
+  {
+    const r = await sofuu.agent.run("loopyHard", "loop forever", {});
+    check("A5 maxContinuations:0 = hard stop at exactly maxSteps", r.stopped === "budget_steps" &&
+          r.steps === 3 && r.answer === "loopy-salvage-summary");
   }
   sofuu.agent.define({
     name: "loopyTk", system: "AGENT=loopy",

@@ -45,6 +45,7 @@ for i in $(seq 1 50); do grep -q "MOCK-FAIL-READY" "$TMP/mock.log" 2>/dev/null &
 
 printf 'MODE429 hello\nMODEERRFRAME hello\nMODEEMPTY hello\nMODESILENT hello\nMODELOOP hello\nMODECLOSE hello\n/exit\n' |
   HOME="$HOME_DIR" SOFUU_PROJECT="$TMP/proj" SOFUU_STALL_TIMEOUT_SECS=3 SOFUU_CHAT_MAX_STEPS=2 \
+  SOFUU_CHAT_MAX_CONTINUATIONS=0 \
   SOFUU_STREAM_RETRY_DELAYS="300,300" \
   "$SOFUU" chat >"$TMP/out" 2>&1
 sed -i '' $'s/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP/out" 2>/dev/null || sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP/out"
@@ -64,6 +65,9 @@ grep -q "provider sent no data for 3s" "$TMP/out"
 check "MODESILENT: stall watchdog fires (unresponsive model)" $?
 grep -q "SALVAGED-SUMMARY" "$TMP/out"
 check "MODELOOP: salvage summary present at step-budget breach" $?
+# Renewals are disabled here on purpose: this test is about the BREACH
+# path (salvage + an explained stop, never a bare "(no response)"), and
+# leaving renewals on would triple the windows it walks through.
 grep -q "stopped: step budget (2 rounds) reached" "$TMP/out"
 check "MODELOOP: honest stop line (budget reached)" $?
 # The transport-error wording comes from libcurl itself, and it is NOT stable

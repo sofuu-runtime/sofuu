@@ -50,6 +50,7 @@ TESTS=(
     "voice_test.js|ai.transcribe + ai.speak (multipart/bytes over local mock provider)"
     "caps_test.js|Context-window ladder (explicit /ctx obeys, inherited global shrinks, endpoint caps detected)"
     "compaction_guard_test.js|Compaction safety (per-pass cap, model-independent protected-turn floor)"
+    "auto_continue_test.js|Step budget renews instead of stopping (long task finishes, bounded renewals, 0 disables)"
     "abi_script_test.js|ABI gate soundness (allowlist coverage, comm collation, set -u, baseline vs library)"
     "web_test.js|Web search (mock DDG, tool end-to-end)"
     "web_guard_test.js|SSRF guard host extraction (userinfo/IPv6/port, P1-15)"

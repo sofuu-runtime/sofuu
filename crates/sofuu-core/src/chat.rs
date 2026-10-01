@@ -1485,6 +1485,13 @@ fn print_help() {
         Row::Cmd(cmd, _) => Some(char_cells_str(cmd)),
         _ => None,
     }));
+    // Wrap to the real terminal when there is one. tui_width() floors at 40;
+    // piped, there is no width, so assume the classic 80.
+    let term_w = if sofuu_ffi::tui_active() {
+        sofuu_ffi::tui_width().max(40) as usize
+    } else {
+        80
+    };
 
     for row in &rows {
         match row {
@@ -1492,20 +1499,29 @@ fn print_help() {
             Row::Header(s) => chat_out(&format!("\n\x1b[1;36m{s}\x1b[0m")),
             Row::Note(s) => chat_out(&format!("\x1b[2m{s}\x1b[0m")),
             Row::Cmd(cmd, desc) => {
+                // 4 indent + column + "— " puts the description at DESC_COL.
+                let desc_col = 4 + col + 2;
                 let w = char_cells_str(cmd);
-                if w <= col {
+                let label = if w <= col {
                     let pad = col - w;
-                    chat_out(&format!(
-                        "    \x1b[1m{cmd}{}\x1b[0m\x1b[2m— {desc}\x1b[0m",
-                        " ".repeat(pad)
-                    ));
+                    format!("    \x1b[1m{cmd}{}\x1b[0m", " ".repeat(pad))
                 } else {
-                    // Label wider than the column: put the description on
-                    // its own line, still at the description column, so the
-                    // rest of the block stays aligned. `/ml` carries eight
-                    // sub-commands and is unavoidably wide.
+                    // Label wider than the column: it keeps its own row and
+                    // the description starts on the next one, still at the
+                    // description column. `/ml` carries eight sub-commands
+                    // and is unavoidably wide.
                     chat_out(&format!("    \x1b[1m{cmd}\x1b[0m"));
-                    chat_out(&format!("{}    \x1b[2m— {desc}\x1b[0m", " ".repeat(col)));
+                    " ".repeat(desc_col)
+                };
+                // Wrap the description with a hanging indent so an 80-column
+                // terminal gets a clean block instead of the terminal
+                // soft-wrapping it mid-sentence.
+                for (i, chunk) in wrap_help_desc(desc, term_w.saturating_sub(desc_col)).iter().enumerate() {
+                    if i == 0 {
+                        chat_out(&format!("{label}\x1b[2m— {chunk}\x1b[0m"));
+                    } else {
+                        chat_out(&format!("{}\x1b[2m{chunk}\x1b[0m", " ".repeat(desc_col)));
+                    }
                 }
             }
         }
@@ -1529,6 +1545,49 @@ fn char_cells_str(s: &str) -> usize {
 ///
 /// This replaces a hardcoded 20, which broke alignment for `/mode
 /// [full|edit|plan]` (21 cells) and `/ml [...]` (53).
+/// Greedy word wrap of a help description to `width` terminal cells.
+///
+/// Returns the pieces to print one per line. A word longer than the budget
+/// is hard-split rather than allowed to overflow — a URL or a long option
+/// list must not push the row past the terminal edge.
+fn wrap_help_desc(desc: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in desc.split_whitespace() {
+        let mut w = word;
+        // Hard-split any single word that cannot fit on a line of its own.
+        while char_cells_str(w) > width {
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            let mut head = String::new();
+            for ch in w.chars() {
+                if char_cells_str(&head) + char_cells(ch) > width {
+                    break;
+                }
+                head.push(ch);
+            }
+            if head.is_empty() {
+                break; // cannot make progress; avoid an infinite loop
+            }
+            out.push(head.clone());
+            w = &w[head.len()..];
+        }
+        if !line.is_empty() && char_cells_str(&line) + 1 + char_cells_str(w) > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(w);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 fn help_command_col<'a>(labels: impl Iterator<Item = usize>) -> usize {
     const MIN: usize = 20;
     const MAX: usize = 24;
@@ -6454,6 +6513,43 @@ mod tests {
         assert_eq!(char_cells_str("e\u{0301}"), 1);
     }
 
+    /// Help descriptions must wrap to the terminal with a hanging indent.
+    ///
+    /// Unwrapped, the longer rows ran to 94 cells and the terminal
+    /// soft-wrapped them mid-sentence, which is what made the block look
+    /// broken on a standard 80-column window.
+    #[test]
+    fn help_descriptions_wrap_within_budget() {
+        let desc = "copy the mouse-selected text (drag over rows, then Ctrl-K)";
+        let lines = wrap_help_desc(desc, 50);
+        assert!(lines.len() > 1, "should have wrapped: {lines:?}");
+        for l in &lines {
+            assert!(cell_w(l) <= 50, "line over budget ({}): {l:?}", cell_w(l));
+        }
+        // No text is lost or duplicated across the wrap.
+        assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+                   desc.split_whitespace().collect::<Vec<_>>());
+
+        // A single word longer than the budget is hard-split, never allowed
+        // to overflow (a long path or URL must not break the column).
+        let long = "a".repeat(120);
+        for l in wrap_help_desc(&long, 30) {
+            assert!(cell_w(&l) <= 30, "hard-split failed: {} cells", cell_w(&l));
+        }
+        assert_eq!(wrap_help_desc(&long, 30).concat(), long, "hard-split lost bytes");
+
+        // Short text is a single line; empty input must not panic or emit
+        // an empty trailing row.
+        assert_eq!(wrap_help_desc("short", 50), vec!["short".to_string()]);
+        assert_eq!(wrap_help_desc("", 50).len(), 1);
+
+        // Widths are measured in cells, not bytes.
+        let cjk = "日本語のテキストが折り返されるべきです";
+        for l in wrap_help_desc(cjk, 20) {
+            assert!(cell_w(&l) <= 20, "CJK line over budget ({}): {l:?}", cell_w(&l));
+        }
+    }
+
     /// The hard ceilings must reach the driver, so its non-TTY usage lines
     /// can state the real range instead of leaving the user to guess.
     ///
@@ -6912,6 +7008,44 @@ mod tests {
         assert!(unconf_model.contains("not configured"), "{unconf_model:?}");
         // No provider-shaped placeholder: nothing resembles a provider/model pair.
         assert!(!unconf_model.contains("//"), "{unconf_model:?}");
+        // The panel must survive a narrow terminal. Its width is clamped to a
+        // floor of 30, so anything below that must still produce closed,
+        // equal-width box rows rather than a torn border -- the failure the
+        // panel_probe.py pty probe exists to catch, but that probe has not
+        // been run since the box layout changed and is not in any runner.
+        for w in [30usize, 34, 40, 56, 80, 120] {
+            let narrow = welcome_panel_at(&ChatConfig::defaults(), "s-ab12", "/tmp/work", w);
+            assert!(!narrow.is_empty(), "w={w}: panel rendered nothing");
+            assert!(narrow[0].contains('╭'), "w={w}: no top border {:?}", narrow[0]);
+            assert!(
+                narrow.iter().any(|r| r.contains('╯')),
+                "w={w}: no bottom border in {narrow:?}"
+            );
+            // Every row is exactly the requested width: a row that overruns
+            // is what soft-wraps and tears the right-hand │ onto its own
+            // line.
+            let want = w.max(30);
+            for r in &narrow {
+                if r.is_empty() {
+                    continue; // trailing spacer, legitimately zero-width
+                }
+                assert_eq!(
+                    cell_w(r),
+                    want,
+                    "w={w}: row width {} != {want}: {r:?}",
+                    cell_w(r)
+                );
+            }
+        }
+        // A width below the floor is lifted to it, not honoured literally.
+        let tiny = welcome_panel_at(&ChatConfig::defaults(), "s", "/w", 10);
+        for r in &tiny {
+            if r.is_empty() {
+                continue;
+            }
+            assert_eq!(cell_w(r), 30, "under-floor width not lifted: {r:?}");
+        }
+
         let plain = welcome_plain(&ChatConfig::defaults(), None, "/tmp/work");
         assert!(plain[1].contains("not configured"), "{plain:?}");
 

@@ -3968,6 +3968,16 @@ const DRIVER: &str = r#"
     const short = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
     out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' +
         (capped ? ' (partial — kept most recent 30)' : '') + '\x1b[0m\n');
+    /* Replay the transcript into the conversation area. Resuming used to
+     * load history silently — the user stared at an empty screen with only
+     * a "resumed" notice and no way to see what was resumed. What is
+     * shown here is exactly what entered context above (same `turns`
+     * array), so display and context can never disagree. */
+    for (const t of turns) {
+      out('\x1b[90m  › ' + t.prompt + '\x1b[0m');
+      if (t.answer) out(t.answer);
+    }
+    out('\x1b[90m  ── end of resumed transcript ──\x1b[0m\n');
   }
 
   /* ── /sessions: interactive session browser ───────────────────────

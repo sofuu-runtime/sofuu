@@ -20,6 +20,18 @@ check() { # check <name> <cond-exit-code>
   if [ "$2" -eq 0 ]; then echo "PASS $1"; else echo "FAIL $1"; FAILURES=$((FAILURES+1)); fi
 }
 
+# Resuming needs the session store, which needs the QTSQ codec: without it
+# persist fails ("transcript is memory-only") and no session ever owns
+# turns, so phase 2 can never pass. CI builds QTSQ-free on purpose (the
+# codec is a proprietary local checkout). Exit 77 is the POSIX skip
+# convention run_js_tests.sh honours. Same probe as chat_prompt_dedupe —
+# one codec gates both.
+if ! "$SOFUU" eval 'console.log("__HAS_MEMORY__" + (typeof sofuu.memory === "object" && typeof sofuu.memory.open === "function"))' \
+      2>/dev/null | grep -q '__HAS_MEMORY__true'; then
+  echo "SKIP chat_resume_replay_e2e — this build has no QTSQ codec, so sessions never persist turns"
+  exit 77
+fi
+
 TMP="$(mktemp -d /tmp/sofuu_resume_replay_XXXXXX)"
 HOME_DIR="$TMP/home"
 PROJ="$TMP/proj"

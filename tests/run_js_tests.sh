@@ -81,6 +81,7 @@ E2E_TESTS=(
     "chat_state_copy_e2e.sh|js-4 state({history:true}) live tool_calls reference (deep copy — a host vandalizing the returned history cannot corrupt the next turn's request)"
     "chat_secrets_guard_e2e.sh|js-5 grep/glob sensitive-file guard (canary config/.ssh/.pem fixtures never reach the mock transcript via auto-approved scans; read_file control still works)"
     "tools_edit_literal_e2e.sh|js-6 edit_file literal splice (replacement-pattern sequences in new_string land literally: single-match, replace_all, zero-match throw; scratch-project fixtures cleaned up)"
+    "tools_diff_e2e.sh|TUI edit/write diff (bounded unified diff stashed per call, return strings unchanged, agent event carries diff, errors carry no diff)"
 )
 
 # ── Helpers ───────────────────────────────────────────────────────

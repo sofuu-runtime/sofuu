@@ -257,6 +257,86 @@
     },
   };
 
+  /* ── TUI edit/write diff (2026-10-03) ──────────────────────────
+   * edit_file/write_file stash a bounded unified diff here for agent.js
+   * to forward on the tool_result EVENT. The execute() return strings
+   * below are UNCHANGED (the model reads them; existing tests parse
+   * them) — this is display-only data for the TUI driver, whose event
+   * results are clipped to 200 chars and could otherwise never show WHAT
+   * changed. Single-slot: agent.js consumes + clears it per call, so a
+   * stale diff can never attach to the wrong event. */
+  function setLastDiff(name, diff) {
+    try { globalThis.__sofuu_last_diff = { name: name, diff: String(diff || '') }; }
+    catch (e) {}
+  }
+  /* Bounded unified diff of one replacement. first = byte offset of the
+   * (first) match in text. Context lines come from the ORIGINAL text;
+   * removed/added lines from oldS/newS. Capped so a huge replacement
+   * cannot flood the TUI (or the event payload): callers pass the limits. */
+  var DIFF_MAX_BODY_LINES = 40;
+  function buildEditDiff(rel, text, first, oldS, newS, totalCount) {
+    function lineOf(off) {
+      var n = 0;
+      for (var i = 0; i < off; i++) if (text[i] === '\n') n++;
+      return n; /* 0-based */
+    }
+    var startLine0 = lineOf(first);
+    /* Lines spanned by the match, expanded to whole lines: a mid-line
+     * replacement of "alpha" shows "-one alpha two" / "+one beta two",
+     * not the bare "-alpha" / "+beta" the raw strings would give. */
+    var endLine0 = lineOf(first + String(oldS).length - 1);
+    if (endLine0 < startLine0) endLine0 = startLine0;
+    var allOld = text.split('\n');
+    var lineStartOff = first;
+    while (lineStartOff > 0 && text[lineStartOff - 1] !== '\n') lineStartOff--;
+    var oldBlockText = allOld.slice(startLine0, endLine0 + 1).join('\n');
+    var newBlockText = oldBlockText.slice(0, first - lineStartOff) + String(newS) +
+      oldBlockText.slice(first - lineStartOff + String(oldS).length);
+    var oldBlock = oldBlockText.split('\n');
+    var newBlock = newBlockText.split('\n');
+    var startLine = startLine0 + 1; /* 1-based for the header */
+    var CTX = 3;
+    var from = Math.max(0, startLine0 - CTX);
+    var to = Math.min(allOld.length, startLine0 + oldBlock.length + CTX);
+    var merged = [];
+    for (var l = from; l < to; l++) {
+      if (l === startLine0) {
+        /* The replaced block: old lines out, new lines in. */
+        for (var o = 0; o < oldBlock.length; o++) merged.push('-' + oldBlock[o]);
+        for (var nI = 0; nI < newBlock.length; nI++) merged.push('+' + newBlock[nI]);
+        l += oldBlock.length - 1; /* skip the replaced originals */
+        continue;
+      }
+      merged.push(' ' + allOld[l]);
+    }
+    var truncated = false;
+    if (merged.length > DIFF_MAX_BODY_LINES) {
+      merged = merged.slice(0, DIFF_MAX_BODY_LINES);
+      truncated = true;
+    }
+    var out = ['--- a/' + rel + ' (line ' + startLine + ')',
+               '+++ b/' + rel,
+               '@@ -' + (from + 1) + ',' + (to - from) +
+               ' +' + (from + 1) + ',' + (to - from + (newBlock.length - oldBlock.length)) + ' @@']
+      .concat(merged);
+    if (truncated) out.push('... (diff truncated — file has the rest)');
+    if (totalCount > 1) out.push('... (' + totalCount + ' total replacements; showing the first)');
+    return out.join('\n');
+  }
+  /* Bounded preview of written content: every line is new, so there is no
+   * old side. Capped — the model already holds the full content (it sent
+   * it); duplicating a whole file into the result would bill context for
+   * zero information. */
+  var WRITE_PREVIEW_LINES = 25;
+  function buildWritePreview(rel, content) {
+    var lines = String(content).split('\n');
+    var out = ['+++ b/' + rel + ' (' + lines.length + ' lines)'];
+    var shown = Math.min(lines.length, WRITE_PREVIEW_LINES);
+    for (var i = 0; i < shown; i++) out.push('+' + lines[i]);
+    if (lines.length > shown) out.push('... (' + (lines.length - shown) + ' more lines)');
+    return out.join('\n');
+  }
+
   TOOLS.write_file = {
     name: 'write_file',
     description: 'Create or overwrite a file with the full given content (jailed to the project directory; parent dirs are created). For targeted changes prefer edit_file.',
@@ -274,6 +354,7 @@
       await mkdirp(parentDir(p));
       var existed = await sofuu.fs.exists(p);
       await sofuu.fs.writeFile(p, a.content);
+      setLastDiff('write_file', buildWritePreview(rel(p), a.content));
       return (existed ? 'overwrote ' : 'created ') + rel(p) + ' (' + a.content.length + ' chars)';
     },
   };
@@ -314,6 +395,7 @@
       var updated = (a && a.replace_all) ? text.split(oldS).join(newS)
                                          : text.slice(0, first) + newS + text.slice(first + oldS.length);
       await sofuu.fs.writeFile(p, updated);
+      setLastDiff('edit_file', buildEditDiff(rel(p), text, first, oldS, newS, count));
       return 'edited ' + rel(p) + ': ' + ((a && a.replace_all) ? count + ' replacements' : '1 replacement') +
         ' (' + (updated.length - text.length >= 0 ? '+' : '') + (updated.length - text.length) + ' chars)';
     },

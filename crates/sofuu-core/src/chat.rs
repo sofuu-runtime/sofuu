@@ -4957,6 +4957,31 @@ const DRIVER: &str = r#"
     return s.length > n ? s.slice(0, n) + '…' : s;
   }
 
+  /* Paint a unified diff from an edit_file/write_file tool_result event,
+   * one row per diff line so the TUI shows WHAT changed, not just that
+   * something did. Per-line colors complete the transcript's per-kind
+   * scheme (answer white · thinking dim · tool call cyan · delegate
+   * magenta · error red · diff red/green): removed red, added green,
+   * hunk headers cyan, everything else (context, file markers, notes)
+   * dim. '---'/'+++' are checked before bare '-'/'?' so file markers are
+   * never miscolored as content. */
+  function paintDiff(diff) {
+    const rows = String(diff == null ? '' : diff).split('\n');
+    for (const row of rows) {
+      if (row.indexOf('+++') === 0 || row.indexOf('---') === 0 || row.indexOf('...') === 0) {
+        out('\x1b[2m    ' + row + '\x1b[0m');
+      } else if (row.indexOf('@@') === 0) {
+        out('\x1b[36m    ' + row + '\x1b[0m');
+      } else if (row.indexOf('+') === 0) {
+        out('\x1b[32m    ' + row + '\x1b[0m');
+      } else if (row.indexOf('-') === 0) {
+        out('\x1b[31m    ' + row + '\x1b[0m');
+      } else {
+        out('\x1b[2m    ' + row + '\x1b[0m');
+      }
+    }
+  }
+
   /* ── Agent-phase label mapping ────────────────────────────────────
    * Pure function: onStep's {kind, payload} → the phase label, or null to
    * leave CURRENT_PHASE unchanged (tool_result: the tool/delegate phase
@@ -5338,6 +5363,26 @@ const DRIVER: &str = r#"
                * longer splats unindented rows into the transcript. */
               const r = String(p.result).replace(/\s*\n+\s*/g, ' · ').replace(/\s+/g, ' ').trim();
               out('\x1b[2m  ↳ ' + clip1(r, 140) + '\x1b[0m');
+              /* edit_file/write_file carry their unified diff on p.diff
+               * (the 200-char event result could never hold it): paint it
+               * multi-line below the summary row so the change itself is
+               * visible, not just its byte count. */
+              if ((p.name === 'edit_file' || p.name === 'write_file') && p.diff) {
+                paintDiff(p.diff);
+              }
+            }
+            /* Tool ERRORS used to print nothing at all: the error emit
+             * carries {name, error} with no `result`, so the branch above
+             * skipped it and a failed edit_file died silently on screen
+             * while only the model saw the message in-band. Red ✗, always
+             * visible, so a failed write is unmistakable. */
+            else if (TTY && p.error) {
+              /* The error text itself usually starts with "<tool>:" (the
+               * tools name their own failures) — don't print the name
+               * twice ("✗ edit_file: edit_file: …"). */
+              const em = clip1(String(p.error), 200);
+              const nm = String(p.name || 'tool');
+              out('\x1b[31m  ✗ ' + (em.indexOf(nm + ':') === 0 ? em : nm + ': ' + em) + '\x1b[0m');
             }
           } else if (e.kind === 'rlm:route') {
             out('\x1b[90m  ⏺ rlm · working…\x1b[0m');
@@ -6826,6 +6871,30 @@ mod tests {
             "chat.js: protected-turn guard missing"
         );
         assert!(shipped.contains("maxDrops"), "chat.js: per-pass cap missing");
+    }
+
+    /// The tool-result painter must keep three branches that each fix a
+    /// real invisibility: the unified-diff painter for edit_file /
+    /// write_file (WHAT changed, not just its byte count), the red error
+    /// line (tool errors used to print nothing at all — the error emit
+    /// carries no `result`, so the old branch skipped it and a failed
+    /// edit died silently on screen), and the compact one-row summary for
+    /// everything else. Presence-pinned like the compaction guard above:
+    /// the per-kind color scheme degrades silently if any branch rots.
+    #[test]
+    fn tool_result_painter_keeps_all_three_branches() {
+        assert!(
+            DRIVER.contains("function paintDiff"),
+            "chat.rs driver: diff painter missing — edits render byte counts only"
+        );
+        assert!(
+            DRIVER.contains("p.diff"),
+            "chat.rs driver: tool_result ignores the event diff payload"
+        );
+        assert!(
+            DRIVER.contains("31m  ✗ ' + "),
+            "chat.rs driver: red tool-error line missing — failures go silent"
+        );
     }
 
     /// The lexical floor is the last line of defence for the one

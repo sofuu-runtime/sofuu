@@ -70,6 +70,7 @@ E2E_TESTS=(
     "chat_copy_e2e.sh|Mouse-drag selection + Ctrl-K copy (inverse-video paint, clipboard holds clean text)"
     "chat_chip_e2e.sh|Usage-chip persistence (in→out tk survives the 2s timer, reflects the request's real ptk)"
     "chat_models_e2e.sh|Model picker e2e (/model lists ALL live models per provider, stored models survive an unreachable provider, typed manual model persists, live listing cached)"
+    "chat_sessions_e2e.sh|Sessions browser e2e (/sessions opens the keyboard picker titled with its project, arrows move, Enter resumes)"
     "chat_retention_e2e.sh|Claude-style transcript retention (tool transcript persists into history, no orphaned tool messages)"
     "chat_modes_e2e.sh|Permission modes (welcome Mode row, /mode /plan /edit /full, footer chip, bad arg refused, persists + boot-applied across restart)"
     "chat_prompt_dedupe_e2e.sh|Prompt-event dedupe (one prompt per turn across THINK/CAPACITY retries, both drivers, no over-suppression)"

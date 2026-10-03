@@ -715,7 +715,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/outputs", "Inspect timestamped model/tool output history", "[list|show <id>|search <text>|context <task>|stats|rebuild-index|prune|on|off]"),
     ("/tools", "List connected MCP servers + tools", ""),
     ("/agents", "List agent definitions (+ ~/.sofuu/agents/*.js)", ""),
-    ("/sessions", "List sessions on this project", ""),
+    ("/sessions", "Browse sessions on this project", "[id]  (bare = picker · ↑↓ + Enter resumes)"),
     ("/context", "Show a session's full context", "[id]  (default: this session)"),
     ("/work", "Announce what you are working on", "<description>"),
     ("/done", "Clear your current task", ""),
@@ -803,14 +803,12 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         }
         // ── Session mesh commands ──────────────────────────────
         "/sessions" => {
-            let project = PROJECT.lock().unwrap().clone();
-            match project {
-                Some(p) => {
-                    session::cmd_list(&p);
-                }
-                None => chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n")),
-            }
-            "ok"
+            /* Bare /sessions opens the interactive browser in the driver
+             * (TTY picker with ↑↓ + Enter, plain table when piped);
+             * /sessions <id> resumes directly like /resume <id>. The
+             * outside-chat `sofuu sessions` CLI still prints the static
+             * table via session::cmd_list. */
+            "sessions"
         }
         "/context" => {
             /* Lock order is SESS → WATCH → PROJECT (documented above) —
@@ -1458,7 +1456,7 @@ fn print_help() {
     c(&mut rows, "/ghost [on|off]", "toggle ghost prompt completion");
     c(&mut rows, "/hooks", "show ~/.sofuu/hooks.js user middleware info");
     h(&mut rows, "  Session mesh");
-    c(&mut rows, "/sessions", "list all sessions on this project");
+    c(&mut rows, "/sessions [id]", "browse sessions on this project (↑↓ + Enter resumes)");
     c(&mut rows, "/context [id]", "full context of a session (default: this one)");
     c(&mut rows, "/work <desc>", "announce what you are working on");
     c(&mut rows, "/done", "clear your current task");
@@ -2437,6 +2435,24 @@ unsafe extern "C" fn js_chat_get_recall(
 
 // ── F2: /resume — sessions list for the picker ───────────────────────
 
+/// `__chat_project()` → the project root the session mesh is scoped to
+/// ($SOFUU_PROJECT, else git top-level, else cwd), or "" when the mesh is
+/// off. The /sessions browser titles itself with this so the list is
+/// visibly scoped to the directory it belongs to.
+unsafe extern "C" fn js_chat_project(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let path = PROJECT
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|p| p.display().to_string());
+    js_new_string(ctx, path.as_deref().unwrap_or(""))
+}
+
 /// `__chat_sessions()` → JSON array of sessions from the registry, excluding
 /// the current session. Each: {id, short, started_at, model, task, ended, turns}.
 unsafe extern "C" fn js_chat_sessions(
@@ -3212,6 +3228,7 @@ pub(crate) fn register_bridge(rt: &SofuuRuntime) {
         register_global_fn(ctx, "__chat_set_recall", js_chat_set_recall as JSCFunction);
         register_global_fn(ctx, "__chat_get_recall", js_chat_get_recall as JSCFunction);
         register_global_fn(ctx, "__chat_sessions", js_chat_sessions as JSCFunction);
+        register_global_fn(ctx, "__chat_project", js_chat_project as JSCFunction);
         register_global_fn(ctx, "__chat_resume_turns", js_chat_resume_turns as JSCFunction);
         register_global_fn(ctx, "__chat_report_usage", js_chat_report_usage as JSCFunction);
         register_global_fn(ctx, "__chat_cost_breakdown", js_chat_cost_breakdown as JSCFunction);
@@ -3951,6 +3968,48 @@ const DRIVER: &str = r#"
     const short = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
     out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' +
         (capped ? ' (partial — kept most recent 30)' : '') + '\x1b[0m\n');
+  }
+
+  /* ── /sessions: interactive session browser ───────────────────────
+   * /sessions used to print a static table (session::cmd_list) that looked
+   * selectable but took no keys — arrows and Enter did nothing there. Bare
+   * /sessions now opens the same keyboard-driven picker as /resume, scoped
+   * to this project (the title names it); Enter resumes the highlighted
+   * session. /sessions <id> resumes directly. Piped output keeps the plain
+   * table. */
+  async function handleSessions(arg) {
+    if (arg && arg.length > 0) { await handleResume(arg); return; }
+    let project = '';
+    try { project = __chat_project() || ''; } catch (e) {}
+    if (!project) { try { project = process.cwd(); } catch (e) {} }
+    let sessions = [];
+    try { sessions = JSON.parse(__chat_sessions()); } catch (e) {}
+    if (!sessions.length) {
+      out('\x1b[90m  No other sessions found on this project' +
+          (project ? ' (' + project + ')' : '') + '.\x1b[0m\n');
+      return;
+    }
+    if (!TTY) {
+      out('\x1b[90m  Sessions for ' + project + ':\x1b[0m');
+      for (const s of sessions) {
+        out('  \x1b[36m' + s.short + '\x1b[0m · ' + s.turns + ' turns · ' +
+            (s.task || '(no task)') + (s.ended ? '' : ' \x1b[33m(active)\x1b[0m'));
+      }
+      out('\n\x1b[90m  Use /sessions <id> (or /resume <id>) to resume one.\x1b[0m\n');
+      return;
+    }
+    const items = sessions.map(s => ({
+      id: s.id,
+      label: s.short + ' · ' + s.turns + ' turns',
+      note: (s.task || '(no task)') + (s.ended ? '' : ' (active)'),
+    }));
+    const picked = await selectMenu({
+      title: 'Sessions for ' + project,
+      hint: '↑↓ to navigate, enter to resume, esc to cancel',
+      items: items,
+    });
+    if (!picked) { out('\x1b[90m  Cancelled\x1b[0m\n'); return; }
+    await handleResume(picked.id);
   }
 
   /* ── F3: @file mentions ──────────────────────────────────────────── */
@@ -6377,6 +6436,7 @@ const DRIVER: &str = r#"
         else if (r === 'remember') { await handleRemember(t.replace(/^\/remember\s*/, '').trim()); }
         else if (r === 'why') { handleWhy(); }
         else if (r === 'resume') { await handleResume(t.replace(/^\/resume\s*/, '').trim()); }
+        else if (r === 'sessions') { await handleSessions(t.replace(/^\/sessions\s*/, '').trim()); }
         else if (r === 'share') { await handleShare(t.replace(/^\/share\s*/, '').trim()); }
         else if (r === 'import') { await handleImport(t.replace(/^\/import\s*/, '').trim()); }
         else if (r === 'cost') { handleCost(); }
@@ -6934,6 +6994,8 @@ mod tests {
         // F2: /resume
         assert_eq!(handle_slash(&mut c, "/resume"), "resume");
         assert_eq!(handle_slash(&mut c, "/resume s-abc"), "resume");
+        assert_eq!(handle_slash(&mut c, "/sessions"), "sessions");
+        assert_eq!(handle_slash(&mut c, "/sessions s-abc"), "sessions");
         // F3: /at (help)
         assert_eq!(handle_slash(&mut c, "/at"), "ok");
         // F5: /share + /import

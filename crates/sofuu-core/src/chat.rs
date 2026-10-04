@@ -3956,9 +3956,26 @@ const DRIVER: &str = r#"
       history.push({ role: 'user', content: t.prompt });
       history.push({ role: 'assistant', content: t.answer });
     }
+    /* Resume distills instead of dumping: the old turns go through the
+     * ACTIVE model for a brief continuity summary, which becomes the
+     * context — the full transcript is neither printed nor (past the kept
+     * last turn) loaded. A single turn has nothing worth distilling, and
+     * without a usable provider there is nothing to distill WITH: both
+     * fall through to the direct load below. */
+    const canDistill = turns.length > 1 && usableConfig();
+    let resumedSummary = null;
+    if (canDistill) {
+      try {
+        resumedSummary = await summarizeHistory(0, {
+          source: 'resume',
+          prompt: 'You are resuming a previous coding session. Summarize the conversation below BRIEFLY for continuity: what the user was working on, key decisions, files touched (exact paths), current task state, and the next step. Output only the summary, no preamble.',
+        });
+      } catch (e) { resumedSummary = null; }
+    }
     /* Resume is an explicit recovery boundary. Attach only the bounded,
      * same-session archive context selected by the native index; ordinary
-     * turns never perform this historical scan. */
+     * turns never perform this historical scan. Attached AFTER the distill
+     * so archive context is never summarized as if it were conversation. */
     const resumedArchive = archiveContext({
       session_id: sessionId,
       automatic: true,
@@ -3966,13 +3983,24 @@ const DRIVER: &str = r#"
     if (resumedArchive) history.unshift({ role: 'system', content: resumedArchive });
     usedCtx = ctxMeter(); /* meter reflects the resumed history immediately */
     const short = sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
-    out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' +
-        (capped ? ' (partial — kept most recent 30)' : '') + '\x1b[0m\n');
-    /* Replay the transcript into the conversation area. Resuming used to
-     * load history silently — the user stared at an empty screen with only
-     * a "resumed" notice and no way to see what was resumed. What is
-     * shown here is exactly what entered context above (same `turns`
-     * array), so display and context can never disagree. */
+    const capNote = capped ? ' (partial — kept most recent 30)' : '';
+    if (resumedSummary) {
+      out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns → summary' + capNote + '\x1b[0m\n');
+      out(resumedSummary);
+      /* The most recent exchange stays verbatim (summarizeHistory keeps
+       * the last block) so immediate context is exact, not paraphrased. */
+      const last = turns[turns.length - 1];
+      out('\x1b[2m  ›\x1b[0m ' + last.prompt + '\x1b[0m');
+      if (last.answer) out(last.answer);
+      out('\x1b[90m  full transcript: /context ' + short + '\x1b[0m\n');
+      return;
+    }
+    out('\x1b[90m  ⏺ resumed ' + short + ' · ' + turns.length + ' turns' + capNote + '\x1b[0m\n');
+    if (canDistill) {
+      out('\x1b[90m  (summary unavailable — showing full transcript)\x1b[0m');
+    }
+    /* Direct load: the transcript enters context AND the conversation area
+     * (same array both places, so display and context agree). */
     for (const t of turns) {
       out('\x1b[2m  ›\x1b[0m ' + t.prompt + '\x1b[0m');
       if (t.answer) out(t.answer);
@@ -4714,7 +4742,7 @@ const DRIVER: &str = r#"
    * (same shape manual /compact has always produced). Returns false when
    * there is nothing to fold or the summarizer failed/returned junk —
    * callers fall back to dropping, never block the turn. */
-  async function summarizeHistory(keepTurns) {
+  async function summarizeHistory(keepTurns, opts) {
     /* Block-aware split point: index where the (keepTurns+1)-th-from-last
      * turn block starts. Everything before it is folded — whole blocks,
      * so a block's retained tool transcript never straddles the fold. */
@@ -4730,18 +4758,25 @@ const DRIVER: &str = r#"
      * foldFrom) — foldFrom === 0 is the normal two-block case and must fold. */
     if (foldFrom >= history.length) return false;
     const oldCount = foldFrom;
+    /* opts.prompt overrides the stock compaction instruction (resume uses
+     * its own framing); opts.source labels the archive record honestly
+     * instead of stamping everything 'compaction'. Returns the summary
+     * text on success (truthy — existing `if (await …)` callers keep
+     * working), false when there is nothing usable. */
+    const sysPrompt = (opts && opts.prompt) ||
+      'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.';
     const summary = await complete([
-      { role: 'system', content: 'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' },
+      { role: 'system', content: sysPrompt },
       ...history.slice(0, oldCount)
     ]);
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
-    archiveWrite('summary', 'complete', 'compaction', summary, {
+    archiveWrite('summary', 'complete', (opts && opts.source) || 'compaction', summary, {
       compacted_messages: oldCount,
       kept_turns: keepTurns,
     });
     history = [{ role: 'system', content: 'Prior conversation summary: ' + summary },
                ...history.slice(oldCount)];
-    return true;
+    return summary.trim();
   }
   async function trimHistory() {
     /* Hard safety net: the absolute entry cap — shed whole turn blocks from
@@ -6897,6 +6932,32 @@ mod tests {
         assert!(
             DRIVER.contains("31m  ✗ ' + "),
             "chat.rs driver: red tool-error line missing — failures go silent"
+        );
+    }
+
+    /// Resume distills instead of dumping: handleResume must route old
+    /// turns through summarizeHistory with the resume framing (not the
+    /// stock compaction prompt), label the archive record 'resume' (not
+    /// 'compaction'), and point at /context for the full transcript.
+    /// Presence-pinned: without this branch a resume silently loads the
+    /// whole past into context and prints all of it.
+    #[test]
+    fn resume_distills_through_the_active_model() {
+        assert!(
+            DRIVER.contains("summarizeHistory(0, {"),
+            "handleResume must distill via summarizeHistory instead of dumping turns"
+        );
+        assert!(
+            DRIVER.contains("source: 'resume'"),
+            "resume archive record must be sourced 'resume', not 'compaction'"
+        );
+        assert!(
+            DRIVER.contains("full transcript: /context"),
+            "resume must point at /context for the full transcript"
+        );
+        assert!(
+            DRIVER.contains("summary unavailable"),
+            "resume must say why it falls back to the full transcript"
         );
     }
 

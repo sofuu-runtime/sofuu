@@ -72,6 +72,7 @@ E2E_TESTS=(
     "chat_models_e2e.sh|Model picker e2e (/model lists ALL live models per provider, stored models survive an unreachable provider, typed manual model persists, live listing cached)"
     "chat_sessions_e2e.sh|Sessions browser e2e (/sessions opens the keyboard picker titled with its project, arrows move, Enter resumes)"
     "chat_resume_replay_e2e.sh|Resume replay e2e (/resume prints the previous turns, not just a notice)"
+    "chat_transcript_e2e.sh|Transcript hierarchy e2e (markdown levels render, blank row opens tool groups, live todo checklist replaces the one-row summary)"
     "chat_retention_e2e.sh|Claude-style transcript retention (tool transcript persists into history, no orphaned tool messages)"
     "chat_modes_e2e.sh|Permission modes (welcome Mode row, /mode /plan /edit /full, footer chip, bad arg refused, persists + boot-applied across restart)"
     "chat_prompt_dedupe_e2e.sh|Prompt-event dedupe (one prompt per turn across THINK/CAPACITY retries, both drivers, no over-suppression)"

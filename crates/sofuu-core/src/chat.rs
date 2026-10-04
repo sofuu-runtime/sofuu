@@ -4992,6 +4992,79 @@ const DRIVER: &str = r#"
     return s.length > n ? s.slice(0, n) + '…' : s;
   }
 
+  /* Inline spans: code yellow, bold otherwise. Single pass split on
+   * backticks — even segments are prose (bold applies), odd closed ones
+   * are code (literal, so ** inside code never bolds). An unterminated
+   * backtick keeps its mark and stays prose; unpaired ** stays literal.
+   * Bold never spans segments, so markers can't merge across a span. */
+  function fmtInline(t) {
+    const segs = String(t).split('`');
+    let r = '';
+    for (let i = 0; i < segs.length; i++) {
+      if (i % 2 === 1 && i !== segs.length - 1) {
+        r += '\x1b[33m' + segs[i] + '\x1b[0m';
+      } else {
+        if (i % 2 === 1) r += '`';
+        r += segs[i].replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[0m');
+      }
+    }
+    return r;
+  }
+
+  /* Markdown hierarchy for the final answer paint (TTY only). Model
+   * answers arrive as undifferentiated white text — headings, emphasis
+   * and code all read at the same level, so long answers are a wall.
+   * Applied ONCE to the complete answer at turn end (never to the
+   * streaming deltas, where markers can straddle chunk boundaries, and
+   * never piped output, which stays raw). Newlines are never added or
+   * removed, so soft-wrap row counts stay close to what streamed. */
+  function formatMarkdown(s) {
+    const lines = String(s == null ? '' : s).split('\n');
+    const out = [];
+    let inFence = false;
+    for (const line of lines) {
+      /* Fence lines dim whole; content inside fences is left alone
+       * (code blocks are already visually distinct by indentation). */
+      if (/^\s*```/.test(line)) { inFence = !inFence; out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
+      if (inFence) { out.push(line); continue; }
+      /* Setext/HR rules and quotes recede. */
+      if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) { out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
+      if (/^\s>/.test(line)) { out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
+      let t = line;
+      /* ATX headings: bold cyan, markers stripped. The body stays literal
+       * (no inline spans inside) so the whole title reads as one level —
+       * a reset mid-title would split it into two visual weights. */
+      const hm = t.match(/^(#{1,6})\s+(.*)$/);
+      if (hm) { out.push('\x1b[1;36m' + hm[2] + '\x1b[0m'); continue; }
+      out.push(fmtInline(t));
+    }
+    return out.join('\n');
+  }
+
+  /* Live todo checklist (2026-10-03): the agent maintains its plan via
+   * todo_write on long tasks, and the checklist rides the tool_result
+   * event — but the TUI never rendered it, so users never SAW a todo
+   * list. Painted here, every update: done dim ✓ (finished work
+   * recedes), doing cyan ▸ at full weight (the current step pops),
+   * queued dim ○. Bounded at 15 rows with a "+N more" tail so a 50-item
+   * list cannot flood the transcript. Replaces the one-row "checklist
+   * updated (N steps)" summary — the list IS the result. */
+  function paintChecklist(todos) {
+    const list = Array.isArray(todos) ? todos : [];
+    let done = 0;
+    for (const t of list) if (t && t.status === 'done') done++;
+    out('\x1b[1m  ☑ ' + done + '/' + list.length + '\x1b[0m');
+    const shown = Math.min(list.length, 15);
+    for (let i = 0; i < shown; i++) {
+      const t = list[i] || {};
+      const c = String(t.content || '').replace(/\s+/g, ' ').trim();
+      if (t.status === 'done') out('\x1b[2m    ✓ ' + c + '\x1b[0m');
+      else if (t.status === 'doing') out('\x1b[36m    ▸ ' + c + '\x1b[0m');
+      else out('\x1b[2m    ○ ' + c + '\x1b[0m');
+    }
+    if (list.length > shown) out('\x1b[2m    +' + (list.length - shown) + ' more\x1b[0m');
+  }
+
   /* Paint a unified diff from an edit_file/write_file tool_result event,
    * one row per diff line so the TUI shows WHAT changed, not just that
    * something did. Per-line colors complete the transcript's per-kind
@@ -5248,6 +5321,11 @@ const DRIVER: &str = r#"
     /* Streaming render state — same UX as the pre-migration driver:
      * spinner + growing line in the TUI, plain writes when piped. */
     let acc = '', anim = null, si2 = 0, sawThink = false, capped = false;
+    /* Whitespace rhythm: a blank row opens each tool-call group so tools
+     * don't run directly into the prose above. Set on tool/delegate,
+     * cleared by answer text — consecutive calls in one burst share one
+     * blank row instead of each taking one. TTY only (pipes stay clean). */
+    let lastRowWasTool = false;
     const thinks = [];
     const stopAnim = () => { if (anim) { clearTimeout(anim); anim = null; } };
     const tick2 = () => { outLast('\x1b[2m' + SPINNER[si2++ % SPINNER.length] + '\x1b[0m ' + acc); };
@@ -5335,15 +5413,20 @@ const DRIVER: &str = r#"
             }
             if (TTY) { startAnim(); tick2(); }
             else { process.stdout.write(String(p)); }
+            lastRowWasTool = false;
           } else if (e.kind === 'plan') {
             /* A new planning round discards any preliminary streamed text. */
             acc = '';
           } else if (e.kind === 'tool') {
             stopAnim();
+            if (TTY && !lastRowWasTool) out(' '); /* air before a tool group */
+            lastRowWasTool = true;
             const a = prettyToolArgs(p.args);
             out('\x1b[90m  ⏺\x1b[0m \x1b[36m' + p.name + '\x1b[0m\x1b[2m(' + a + ')\x1b[0m');
           } else if (e.kind === 'delegate') {
             stopAnim();
+            if (TTY && !lastRowWasTool) out(' '); /* air before a tool group */
+            lastRowWasTool = true;
             out('\x1b[90m  ⏺\x1b[0m \x1b[35m' + p.agent + '\x1b[0m\x1b[2m ← ' + clip1(p.task, 60) + '\x1b[0m');
           } else if (e.kind === 'recall') {
             /* F1/P2: /why reports exactly what gating let through this turn
@@ -5393,20 +5476,26 @@ const DRIVER: &str = r#"
               }
             }
             if (TTY && p.result) {
-              /* Compact one-row result: embedded newlines become " · " so
-               * multi-line tool output (search results, file dumps) no
-               * longer splats unindented rows into the transcript. The ↳
-               * marker stays dim but the CONTENT renders at full weight —
-               * the whole row used to be dim and read as a whisper next
-               * to the white answer text. */
-              const r = String(p.result).replace(/\s*\n+\s*/g, ' · ').replace(/\s+/g, ' ').trim();
-              out('\x1b[2m  ↳\x1b[0m ' + clip1(r, 140) + '\x1b[0m');
-              /* edit_file/write_file carry their unified diff on p.diff
-               * (the 200-char event result could never hold it): paint it
-               * multi-line below the summary row so the change itself is
-               * visible, not just its byte count. */
-              if ((p.name === 'edit_file' || p.name === 'write_file') && p.diff) {
-                paintDiff(p.diff);
+              /* todo_write carries its checklist on the event: paint the
+               * list itself instead of the "checklist updated" summary. */
+              if (p.name === 'todo_write' && Array.isArray(p.todos) && p.todos.length) {
+                paintChecklist(p.todos);
+              } else {
+                /* Compact one-row result: embedded newlines become " · "
+                 * so multi-line tool output (search results, file dumps)
+                 * no longer splats unindented rows into the transcript.
+                 * The ↳ marker stays dim but the CONTENT renders at full
+                 * weight — the whole row used to be dim and read as a
+                 * whisper next to the white answer text. */
+                const r = String(p.result).replace(/\s*\n+\s*/g, ' · ').replace(/\s+/g, ' ').trim();
+                out('\x1b[2m  ↳\x1b[0m ' + clip1(r, 140) + '\x1b[0m');
+                /* edit_file/write_file carry their unified diff on p.diff
+                 * (the 200-char event result could never hold it): paint it
+                 * multi-line below the summary row so the change itself is
+                 * visible, not just its byte count. */
+                if ((p.name === 'edit_file' || p.name === 'write_file') && p.diff) {
+                  paintDiff(p.diff);
+                }
               }
             }
             /* Tool ERRORS used to print nothing at all: the error emit
@@ -5481,13 +5570,16 @@ const DRIVER: &str = r#"
     if (rlmSummary) {
       /* RLM turn: the answer arrived complete — print it plus the
        * one-line trace summary (same format as the pre-migration path). */
-      out(answer);
+      out(TTY ? formatMarkdown(answer) : answer);
       out('\n\x1b[90m  ⏺ rlm · ' + (rlmSummary.calls || 0) + ' calls · ' + (rlmSummary.rounds || 0) + ' rounds · '
           + ((rlmSummary.ms || 0) / 1000).toFixed(1) + 's' + (rlmSummary.stopped ? ' · ' + rlmSummary.stopped : '') + '\x1b[0m\n');
     } else {
       if (TTY) {
         if (sawThink) out('');          /* seal a think-only answer */
-        outLast(answer);                /* final line, no spinner */
+        /* Full-text repaint with markdown hierarchy (headings/bold/code
+         * get their levels — the streamed rows above showed raw markers).
+         * Same newlines in and out, so the replaceable unit just swaps. */
+        outLast(formatMarkdown(answer)); /* final line, no spinner */
       } else {
         /* Piped mode renders only answer_delta chunks — a turn with zero
          * deltas would print nothing at all, so emit the final answer
@@ -6932,6 +7024,40 @@ mod tests {
         assert!(
             DRIVER.contains("31m  ✗ ' + "),
             "chat.rs driver: red tool-error line missing — failures go silent"
+        );
+    }
+
+    /// Transcript hierarchy, rhythm, checklist: the driver must keep the
+    /// markdown formatter (headings/bold/code on the final paint), the
+    /// inline-span tokenizer, the checklist painter, the blank-row
+    /// separator before tool groups, and the markdown call on both final
+    /// answer paints. Presence-pinned: each degrades silently (raw
+    /// markers on screen / tools glued to prose / checklist invisible).
+    #[test]
+    fn transcript_hierarchy_rhythm_checklist_present() {
+        assert!(
+            DRIVER.contains("function formatMarkdown"),
+            "driver: markdown hierarchy formatter missing — answers render as a wall"
+        );
+        assert!(
+            DRIVER.contains("function fmtInline"),
+            "driver: inline-span tokenizer missing — bold/code markers leak or mis-nest"
+        );
+        assert!(
+            DRIVER.contains("function paintChecklist"),
+            "driver: todo checklist painter missing — the list stays invisible"
+        );
+        assert!(
+            DRIVER.contains("lastRowWasTool"),
+            "driver: tool-group spacing flag missing — tools run into prose"
+        );
+        assert!(
+            DRIVER.contains("outLast(formatMarkdown(answer))"),
+            "driver: final answer paint must format markdown, not print raw"
+        );
+        assert!(
+            DRIVER.contains("paintChecklist(p.todos)"),
+            "driver: todo_write results must paint the list, not the one-row summary"
         );
     }
 

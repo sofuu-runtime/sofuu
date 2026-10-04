@@ -3974,7 +3974,7 @@ const DRIVER: &str = r#"
      * shown here is exactly what entered context above (same `turns`
      * array), so display and context can never disagree. */
     for (const t of turns) {
-      out('\x1b[90m  › ' + t.prompt + '\x1b[0m');
+      out('\x1b[2m  ›\x1b[0m ' + t.prompt + '\x1b[0m');
       if (t.answer) out(t.answer);
     }
     out('\x1b[90m  ── end of resumed transcript ──\x1b[0m\n');
@@ -4960,11 +4960,11 @@ const DRIVER: &str = r#"
   /* Paint a unified diff from an edit_file/write_file tool_result event,
    * one row per diff line so the TUI shows WHAT changed, not just that
    * something did. Per-line colors complete the transcript's per-kind
-   * scheme (answer white · thinking dim · tool call cyan · delegate
-   * magenta · error red · diff red/green): removed red, added green,
-   * hunk headers cyan, everything else (context, file markers, notes)
-   * dim. '---'/'+++' are checked before bare '-'/'?' so file markers are
-   * never miscolored as content. */
+   * scheme (answer white · thinking italic · tool call cyan · delegate
+   * magenta · error bold red · diff bold red/green): removed bold red,
+   * added bold green, hunk headers cyan, everything else (context, file
+   * markers, notes) dim. '---'/'+++' are checked before bare '-'/'+',
+   * so file markers are never miscolored as content. */
   function paintDiff(diff) {
     const rows = String(diff == null ? '' : diff).split('\n');
     for (const row of rows) {
@@ -4973,9 +4973,9 @@ const DRIVER: &str = r#"
       } else if (row.indexOf('@@') === 0) {
         out('\x1b[36m    ' + row + '\x1b[0m');
       } else if (row.indexOf('+') === 0) {
-        out('\x1b[32m    ' + row + '\x1b[0m');
+        out('\x1b[1;32m    ' + row + '\x1b[0m');
       } else if (row.indexOf('-') === 0) {
-        out('\x1b[31m    ' + row + '\x1b[0m');
+        out('\x1b[1;31m    ' + row + '\x1b[0m');
       } else {
         out('\x1b[2m    ' + row + '\x1b[0m');
       }
@@ -5289,7 +5289,7 @@ const DRIVER: &str = r#"
              * emitted for a line that was never drawn. */
             if (c.effort) {
               sawThink = true;
-              outLast('  ▸ thinking \x1b[2m' + thinks.join('') + '\x1b[0m');
+              outLast('  ▸ thinking \x1b[3m' + thinks.join('') + '\x1b[0m');
             }
           } else if (e.kind === 'answer_delta') {
             if (sawThink && TTY) { out(''); sawThink = false; thinks.length = 0; }
@@ -5360,9 +5360,12 @@ const DRIVER: &str = r#"
             if (TTY && p.result) {
               /* Compact one-row result: embedded newlines become " · " so
                * multi-line tool output (search results, file dumps) no
-               * longer splats unindented rows into the transcript. */
+               * longer splats unindented rows into the transcript. The ↳
+               * marker stays dim but the CONTENT renders at full weight —
+               * the whole row used to be dim and read as a whisper next
+               * to the white answer text. */
               const r = String(p.result).replace(/\s*\n+\s*/g, ' · ').replace(/\s+/g, ' ').trim();
-              out('\x1b[2m  ↳ ' + clip1(r, 140) + '\x1b[0m');
+              out('\x1b[2m  ↳\x1b[0m ' + clip1(r, 140) + '\x1b[0m');
               /* edit_file/write_file carry their unified diff on p.diff
                * (the 200-char event result could never hold it): paint it
                * multi-line below the summary row so the change itself is
@@ -5382,7 +5385,7 @@ const DRIVER: &str = r#"
                * twice ("✗ edit_file: edit_file: …"). */
               const em = clip1(String(p.error), 200);
               const nm = String(p.name || 'tool');
-              out('\x1b[31m  ✗ ' + (em.indexOf(nm + ':') === 0 ? em : nm + ': ' + em) + '\x1b[0m');
+              out('\x1b[1;31m  ✗ ' + (em.indexOf(nm + ':') === 0 ? em : nm + ': ' + em) + '\x1b[0m');
             }
           } else if (e.kind === 'rlm:route') {
             out('\x1b[90m  ⏺ rlm · working…\x1b[0m');
@@ -6894,6 +6897,32 @@ mod tests {
         assert!(
             DRIVER.contains("31m  ✗ ' + "),
             "chat.rs driver: red tool-error line missing — failures go silent"
+        );
+    }
+
+    /// Transcript typography: body text renders at full weight, thinking
+    /// in italic, signal lines bold. The transcript used to be almost
+    /// entirely dim, which read as a whisper next to the white answer
+    /// text; terminals have no percentages, so the scheme is: markers dim,
+    /// content normal, signal (diff +/-, errors) bold. Italic falls back
+    /// to normal on terminals without italic support — still readable.
+    #[test]
+    fn transcript_typography_weights() {
+        assert!(
+            DRIVER.contains("▸ thinking \\x1b[3m"),
+            "thinking must render italic, not dim"
+        );
+        assert!(
+            DRIVER.contains("↳\\x1b[0m "),
+            "tool-result ↳ marker must close before the content so the content renders at full weight"
+        );
+        assert!(
+            DRIVER.contains("\\x1b[1;32m"),
+            "added diff lines must be bold green"
+        );
+        assert!(
+            DRIVER.contains("\\x1b[1;31m"),
+            "removed diff lines and errors must be bold red"
         );
     }
 

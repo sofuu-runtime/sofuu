@@ -78,8 +78,8 @@ async function agentDiffChecks(files) {
   assert("agent: one edit_file result event", evs.length === 1, "got " + evs.length);
   const p = evs.length ? evs[0].payload : {};
   assert("agent: event carries the unified diff",
-         typeof p.diff === "string" && p.diff.indexOf("-one alpha two") >= 0 &&
-         p.diff.indexOf("+one beta two") >= 0 && p.diff.indexOf("@@") >= 0,
+         typeof p.diff === "string" && p.diff.indexOf("- one alpha two") >= 0 &&
+         p.diff.indexOf("+ one beta two") >= 0 && p.diff.indexOf("@@") >= 0,
          JSON.stringify((p.diff || "").slice(0, 80)));
   assert("agent: event result still reports the replacement",
          String(p.result || "").indexOf("1 replacement") >= 0);
@@ -120,21 +120,25 @@ async function main() {
     const d1 = lastDiff();
     assert("edit: diff stashed under the tool name", !!(d1 && d1.name === "edit_file"),
            JSON.stringify(d1 && d1.name));
-    assert("edit: removed line present", d1 && d1.diff.indexOf("-OLD") >= 0);
-    assert("edit: added line present", d1 && d1.diff.indexOf("+NEW") >= 0);
+    assert("edit: removed line numbered in the gutter", d1 && d1.diff.indexOf("   5 - OLD") >= 0,
+           (d1 && d1.diff) || "no diff");
+    assert("edit: added line numbered in the gutter", d1 && d1.diff.indexOf("   5 + NEW") >= 0);
     assert("edit: hunk header names the line", d1 && d1.diff.indexOf("(line 5)") >= 0,
            (d1 && d1.diff.split("\n").slice(0, 3).join(" | ")) || "no diff");
     assert("edit: context lines carried", d1 && d1.diff.indexOf(" l4") >= 0 && d1.diff.indexOf(" l6") >= 0);
     assert("edit: file actually changed", (await sofuu.fs.readFile(files[0], "utf8")).indexOf("\nNEW\n") >= 0);
+    /* The payload also travels to the model: raw ANSI escapes there would
+     * burn context and risk confusing it. Styling lives in the driver. */
+    assert("edit: payload carries no ANSI escapes", d1 && d1.diff.indexOf("\x1b") < 0);
 
     /* (2) edit_file multi-line old/new. */
     await sofuu.fs.writeFile(files[1], "a\nb1\nb2\nc\n");
     const r2 = await ef({ path: files[1], old_string: "b1\nb2", new_string: "B1\nB2\nB3" });
     assert("edit multi-line: reports 1 replacement", String(r2).indexOf("1 replacement") >= 0);
     const d2 = lastDiff();
-    assert("edit multi-line: both removed lines", d2 && d2.diff.indexOf("-b1") >= 0 && d2.diff.indexOf("-b2") >= 0);
+    assert("edit multi-line: both removed lines", d2 && d2.diff.indexOf("   2 - b1") >= 0 && d2.diff.indexOf("   3 - b2") >= 0);
     assert("edit multi-line: all added lines",
-           d2 && d2.diff.indexOf("+B1") >= 0 && d2.diff.indexOf("+B2") >= 0 && d2.diff.indexOf("+B3") >= 0);
+           d2 && d2.diff.indexOf("   2 + B1") >= 0 && d2.diff.indexOf("+ B2") >= 0 && d2.diff.indexOf("+ B3") >= 0);
 
     /* (3) replace_all: first hunk shown, total noted, return keeps count. */
     await sofuu.fs.writeFile(files[2], "x\nx\nx\n");
@@ -167,7 +171,7 @@ async function main() {
            JSON.stringify(r5));
     const d5 = lastDiff();
     assert("write create: preview stashed", !!(d5 && d5.name === "write_file"));
-    assert("write create: preview lines prefixed +", d5 && d5.diff.indexOf("+wline-0") >= 0);
+    assert("write create: preview lines prefixed +", d5 && d5.diff.indexOf("   1 + wline-0") >= 0);
     assert("write create: preview bounded with overflow note",
            d5 && d5.diff.indexOf("more lines") >= 0, (d5 && d5.diff.split("\n").slice(-1)[0]) || "");
     assert("write create: preview does not dump the whole file",
@@ -179,7 +183,7 @@ async function main() {
     assert("write overwrite: return says overwrote", String(r6).indexOf("overwrote " + files[5]) === 0,
            JSON.stringify(r6));
     const d6 = lastDiff();
-    assert("write overwrite: preview of new content", d6 && d6.diff.indexOf("+fresh-a") >= 0);
+    assert("write overwrite: preview of new content", d6 && d6.diff.indexOf("+ fresh-a") >= 0);
 
     /* (7) failed edit: throws AND leaves no fresh diff behind. */
     await sofuu.fs.writeFile(files[7], "nothing matches here\n");

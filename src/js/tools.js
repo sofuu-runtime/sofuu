@@ -272,8 +272,20 @@
   /* Bounded unified diff of one replacement. first = byte offset of the
    * (first) match in text. Context lines come from the ORIGINAL text;
    * removed/added lines from oldS/newS. Capped so a huge replacement
-   * cannot flood the TUI (or the event payload): callers pass the limits. */
+   * cannot flood the TUI (or the event payload): callers pass the limits.
+   *
+   * Row shape is `NNNN mark content` (4-wide right-aligned gutter, mark
+   * in {'-','+',' '}, one space, the line): the TUI driver paints the
+   * gutter dim and tints +/- rows full-width like a difftool. The payload
+   * itself stays ANSI-free — it also travels to the model. Gutter numbers
+   * are old-file lines for context/removed rows and new-file lines for
+   * added rows (the @@ header carries both starts). */
   var DIFF_MAX_BODY_LINES = 40;
+  function diffNum(n) {
+    var s = String(n);
+    while (s.length < 4) s = ' ' + s;
+    return s;
+  }
   function buildEditDiff(rel, text, first, oldS, newS, totalCount) {
     function lineOf(off) {
       var n = 0;
@@ -299,26 +311,32 @@
     var from = Math.max(0, startLine0 - CTX);
     var to = Math.min(allOld.length, startLine0 + oldBlock.length + CTX);
     var merged = [];
+    var oldLn = from + 1, newLn = from + 1;
     for (var l = from; l < to; l++) {
       if (l === startLine0) {
         /* The replaced block: old lines out, new lines in. */
-        for (var o = 0; o < oldBlock.length; o++) merged.push('-' + oldBlock[o]);
-        for (var nI = 0; nI < newBlock.length; nI++) merged.push('+' + newBlock[nI]);
+        for (var o = 0; o < oldBlock.length; o++) {
+          merged.push({ ln: oldLn++, mark: '-', text: oldBlock[o] });
+        }
+        for (var nI = 0; nI < newBlock.length; nI++) {
+          merged.push({ ln: newLn++, mark: '+', text: newBlock[nI] });
+        }
         l += oldBlock.length - 1; /* skip the replaced originals */
         continue;
       }
-      merged.push(' ' + allOld[l]);
+      merged.push({ ln: oldLn, mark: ' ', text: allOld[l] });
+      oldLn++; newLn++;
     }
-    var truncated = false;
-    if (merged.length > DIFF_MAX_BODY_LINES) {
-      merged = merged.slice(0, DIFF_MAX_BODY_LINES);
-      truncated = true;
+    var rows = [];
+    for (var r = 0; r < merged.length && rows.length < DIFF_MAX_BODY_LINES; r++) {
+      rows.push(diffNum(merged[r].ln) + ' ' + merged[r].mark + ' ' + merged[r].text);
     }
+    var truncated = merged.length > rows.length;
     var out = ['--- a/' + rel + ' (line ' + startLine + ')',
                '+++ b/' + rel,
                '@@ -' + (from + 1) + ',' + (to - from) +
                ' +' + (from + 1) + ',' + (to - from + (newBlock.length - oldBlock.length)) + ' @@']
-      .concat(merged);
+      .concat(rows);
     if (truncated) out.push('... (diff truncated — file has the rest)');
     if (totalCount > 1) out.push('... (' + totalCount + ' total replacements; showing the first)');
     return out.join('\n');
@@ -332,7 +350,7 @@
     var lines = String(content).split('\n');
     var out = ['+++ b/' + rel + ' (' + lines.length + ' lines)'];
     var shown = Math.min(lines.length, WRITE_PREVIEW_LINES);
-    for (var i = 0; i < shown; i++) out.push('+' + lines[i]);
+    for (var i = 0; i < shown; i++) out.push(diffNum(i + 1) + ' + ' + lines[i]);
     if (lines.length > shown) out.push('... (' + (lines.length - shown) + ' more lines)');
     return out.join('\n');
   }

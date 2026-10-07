@@ -5067,25 +5067,29 @@ const DRIVER: &str = r#"
 
   /* Paint a unified diff from an edit_file/write_file tool_result event,
    * one row per diff line so the TUI shows WHAT changed, not just that
-   * something did. Per-line colors complete the transcript's per-kind
-   * scheme (answer white · thinking italic · tool call cyan · delegate
-   * magenta · error bold red · diff bold red/green): removed bold red,
-   * added bold green, hunk headers cyan, everything else (context, file
-   * markers, notes) dim. '---'/'+++' are checked before bare '-'/'+',
-   * so file markers are never miscolored as content. */
+   * something did. Rows arrive as `NNNN mark content` (4-wide gutter,
+   * mark in {'-','+',' '}, ANSI-free — the payload also travels to the
+   * model). The gutter paints dim; +/- rows get a full-row background
+   * tint (dark green / dark red) under bold bright text, difftool-style;
+   * hunk headers cyan; context, file markers and notes dim. Text-span
+   * tints only (no padding to terminal width — a padded row that wraps
+   * would tear the gutter on the continuation line). */
   function paintDiff(diff) {
     const rows = String(diff == null ? '' : diff).split('\n');
     for (const row of rows) {
-      if (row.indexOf('+++') === 0 || row.indexOf('---') === 0 || row.indexOf('...') === 0) {
-        out('\x1b[2m    ' + row + '\x1b[0m');
-      } else if (row.indexOf('@@') === 0) {
-        out('\x1b[36m    ' + row + '\x1b[0m');
-      } else if (row.indexOf('+') === 0) {
-        out('\x1b[1;32m    ' + row + '\x1b[0m');
-      } else if (row.indexOf('-') === 0) {
-        out('\x1b[1;31m    ' + row + '\x1b[0m');
+      const t = row.replace(/^\s+/, '');
+      if (t.indexOf('+++') === 0 || t.indexOf('---') === 0 || t.indexOf('...') === 0) {
+        out('\x1b[2m    ' + t + '\x1b[0m');
+      } else if (t.indexOf('@@') === 0) {
+        out('\x1b[36m    ' + t + '\x1b[0m');
       } else {
-        out('\x1b[2m    ' + row + '\x1b[0m');
+        const m = row.match(/^\s*(\d+)\s+([-+ ])\s?([\s\S]*)$/);
+        if (!m) { out('\x1b[2m    ' + row + '\x1b[0m'); continue; }
+        let g = m[1];
+        while (g.length < 4) g = ' ' + g;
+        if (m[2] === '+') out('    \x1b[2m' + g + '\x1b[0m \x1b[1;32m\x1b[48;5;22m+ ' + m[3] + '\x1b[0m');
+        else if (m[2] === '-') out('    \x1b[2m' + g + '\x1b[0m \x1b[1;31m\x1b[48;5;52m- ' + m[3] + '\x1b[0m');
+        else out('\x1b[2m    ' + g + '   ' + m[3] + '\x1b[0m');
       }
     }
   }
@@ -7025,6 +7029,10 @@ mod tests {
             DRIVER.contains("31m  ✗ ' + "),
             "chat.rs driver: red tool-error line missing — failures go silent"
         );
+        assert!(
+            DRIVER.contains("48;5;22") && DRIVER.contains("48;5;52"),
+            "chat.rs driver: diff +/- rows must carry full-row background tints"
+        );
     }
 
     /// Transcript hierarchy, rhythm, checklist: the driver must keep the
@@ -7059,6 +7067,53 @@ mod tests {
             DRIVER.contains("paintChecklist(p.todos)"),
             "driver: todo_write results must paint the list, not the one-row summary"
         );
+    }
+
+    /// Compile gate for the embedded JS: cargo builds the DRIVER string
+    /// blind — a JS syntax slip ships a binary whose chat dies on boot
+    /// with `SyntaxError` (this exact failure shipped: two stray braces
+    /// after paintDiff, caught only by a manual pty probe). Parse DRIVER
+    /// and the shipped agent/tools JS with COMPILE_ONLY so a typo fails
+    /// `cargo test` in seconds instead of a session at runtime.
+    #[test]
+    fn embedded_js_drivers_parse() {
+        use sofuu_ffi::qjs;
+        use std::ffi::CString;
+        fn check_parse(name: &str, src: &str, expect_ok: bool) {
+            unsafe {
+                let rt = qjs::JS_NewRuntime();
+                assert!(!rt.is_null(), "{name}: no QuickJS runtime");
+                let ctx = qjs::JS_NewContext(rt);
+                assert!(!ctx.is_null(), "{name}: no QuickJS context");
+                let c_src = CString::new(src).expect("driver has interior NUL");
+                let c_name = CString::new(name).unwrap();
+                let v = qjs::JS_Eval(
+                    ctx,
+                    c_src.as_ptr(),
+                    c_src.as_bytes().len(),
+                    c_name.as_ptr(),
+                    qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+                );
+                let failed = qjs::is_exception(v);
+                qjs::sofuu_js_free_value(ctx, v);
+                qjs::JS_FreeContext(ctx);
+                qjs::JS_FreeRuntime(rt);
+                if expect_ok {
+                    assert!(!failed, "{name}: JS syntax error — chat would die on boot");
+                } else {
+                    /* Self-proof: the gate must actually reject broken JS,
+                     * or a future refactor could neuter it (wrong flags,
+                     * swallowed exception) and every check above would pass
+                     * vacuously. */
+                    assert!(failed, "{name}: gate accepted broken JS — it proves nothing");
+                }
+            }
+        }
+        check_parse("<negative-control>", "function broken( {", false);
+        check_parse("<chat-driver>", DRIVER, true);
+        check_parse("agent.js", include_str!("../../../src/js/agent.js"), true);
+        check_parse("tools.js", include_str!("../../../src/js/tools.js"), true);
+        check_parse("chat.js", include_str!("../../../src/js/chat.js"), true);
     }
 
     /// Resume distills instead of dumping: handleResume must route old

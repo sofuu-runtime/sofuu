@@ -2,6 +2,11 @@
 
 **Copyright (c) 2026 Haruhito. All Rights Reserved.**
 
+> Amendment (2026-10-07): Section 2 is replaced in full by the Sofuu usage
+> grant below. Use of the Format through Sofuu — personal or commercial — is
+> free of charge and needs no separate approval. Sections 3–6 are adjusted
+> only to carve out that grant; everything else stands.
+
 This license governs the use of the QTSQ file format specification and its
 associated data structures as embedded within the Sofuu JavaScript Runtime.
 
@@ -21,25 +26,35 @@ associated data structures as embedded within the Sofuu JavaScript Runtime.
 
 ---
 
-## 2. Grant of Rights
+## 2. Sofuu usage grant (free, including commercial)
 
-You are granted a limited, non-exclusive, non-transferable, revocable license
-to **use** the Format as embedded in the Sofuu Runtime strictly for
-**free non-commercial personal, educational, and academic research purposes**,
-subject to the conditions set forth in this license.
+The Author grants you a perpetual, irrevocable, worldwide, royalty-free,
+non-exclusive license to **use** the Format **through the Sofuu Runtime**
+(including its CLI, SDKs, bindings, and developer tools) for **any purpose,
+personal or commercial, with no fees and no separate approval**, including:
 
-All other rights are strictly reserved by the Author.
+- creating, reading, writing, and storing `.qtsq` / `.qtsw` files via Sofuu;
+- shipping applications, products, and services that contain or produce such
+  files through Sofuu;
+- building commercial products on the Sofuu Runtime, SDKs, and APIs.
+
+This grant terminates automatically only if you materially breach this
+license and fail to cure within 30 days of notice.
+
+All rights not expressly granted here are strictly reserved by the Author.
 
 ---
 
 ## 3. Restrictions
 
-Except for the permitted uses in Section 2, you may NOT, without prior written
-authorization from the Author:
+Except for the Sofuu-channel uses granted in Section 2, you may NOT, without
+prior written authorization from the Author:
 
-### 3.1 Commercial Use
-- Use the Format, in whole or in part, for any commercial or for-profit purpose.
-- Incorporate the Format into any commercial software, product, or service.
+### 3.1 Commercial Use outside Sofuu
+- Use the Format, in whole or in part, for any commercial purpose **outside**
+  the Sofuu Runtime (use through Sofuu is covered by Section 2 and is free).
+- Incorporate the Format into any commercial software, product, or service
+  except via the Sofuu Runtime, SDKs, and APIs.
 
 ### 3.2 Modify the Format
 - Modify, adapt, reverse engineer, or create derivative works based on the
@@ -64,7 +79,7 @@ authorization from the Author:
 
 ## 4. Attribution
 
-For all permitted free uses, you must:
+For all uses under this license, you must:
 - Retain all copyright notices referencing the Author and this Format.
 - Academic or research publications using this Format must cite the Author
   (Priyanshu Boruah) and the Quantum Tensor Sequence project.

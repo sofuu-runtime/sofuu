@@ -3,10 +3,11 @@
 > *A fast, private JavaScript runtime built in **Rust** (shell, parsers, memory logic) with a **C** core (QuickJS engine, libuv event loop, SIMD kernels, QTSQ codec) — designed from day one for AI-era workloads.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Status: Active Development](https://img.shields.io/badge/status-active_development-brightgreen.svg)]()
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
 
-> ⚠️ **Beta software.** Sofuu is under active development. APIs may change before a stable release.
+> 🚧 **Active development — iterating fast.** Sofuu is under active development. APIs may change before a stable release.
 
 ---
 
@@ -26,7 +27,7 @@ You build your frontend (React, Next.js, plain HTML — whatever you like) compl
 
 The Sofuu runtime is **fully open source (MIT)** — engine, CLI, JS/TS APIs, agents, MCP, HTTP, vector ops, local memory, embeddings, and the SDK bindings. Use, modify, and distribute it freely, commercially or not.
 
-Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-FORMAT.txt)) and **future hosted/cloud/enterprise services**, which will be separate offerings around the core. Nothing is removed from the core to create them. Full boundary: [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md).
+Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-FORMAT.txt) — using it *through Sofuu*, commercially or not, is free and needs no approval) and **future hosted/cloud/enterprise services**, which will be separate offerings around the core. Nothing is removed from the core to create them. Full boundary: [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md).
 
 ---
 

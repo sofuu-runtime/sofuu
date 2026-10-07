@@ -19,6 +19,11 @@ by the Quantum Tensor Sequence Proprietary License (QTSPL) v1.0, which is
 separate and distinct from the MIT License covering the
 Sofuu runtime source code.
 
+Use of the Format through Sofuu (runtime, SDKs, tools — including
+commercial products built on them) is free of charge and needs no separate
+approval; see Section 2 of that license. Restricted without one: forking
+the spec and independent competing read/write implementations.
+
 See: LICENSES/QTSQ-FORMAT.txt for the full QTSQ format license terms.
 
 Key restrictions specific to the QTSQ Format (not covered by the MIT License):

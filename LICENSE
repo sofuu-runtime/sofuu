@@ -30,5 +30,7 @@ embeddings, and core developer tooling.
 It DOES NOT cover the design, mathematics, or specification of the QTSQ
 tensor format, nor any future hosted, cloud, enterprise, or managed
 offerings. Those remain proprietary — see `LICENSES/QTSQ-FORMAT.txt` for
-the QTSQ format terms. The full boundary is documented in
-`docs/OPEN-CORE.md`.
+the QTSQ format terms. Note: that license grants free use of the Format
+through Sofuu itself (personal and commercial, no fees); what stays
+restricted is forking the spec and independent competing implementations.
+The full boundary is documented in `docs/OPEN-CORE.md`.

@@ -23,9 +23,10 @@ with `git clone https://github.com/sofuu-runtime/sofuu && make`.
 
 1. **The QTSQ format specification** — the design, mathematics, and spec of
    the `.qtsq` / `.qtsw` tensor format, per
-   [`LICENSES/QTSQ-FORMAT.txt`](../LICENSES/QTSQ-FORMAT.txt). The runtime code
-   that reads and writes it is MIT; the format itself, and independent
-   competing read/write implementations outside the Sofuu ecosystem, are not.
+   [`LICENSES/QTSQ-FORMAT.txt`](../LICENSES/QTSQ-FORMAT.txt). Using the format
+   *through Sofuu* (runtime, SDKs, tools — including in commercial products)
+   is free of charge and needs no approval. What stays restricted: forking the
+   spec and independent competing read/write implementations outside Sofuu.
 2. **Future commercial offerings** — hosted/cloud runtime, enterprise features,
    managed infrastructure, and premium services. These will be separate
    services around the core, announced when they exist. Nothing in the list

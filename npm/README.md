@@ -41,7 +41,7 @@ See https://sofuu.xyz/docs for the full picture.
 ## Project
 
 Sofuu is an early-stage, bootstrapped, open-core project founded and built by
-Priyanshu Boruah, who publishes and develops it under the public identity
+Prianshu Boruah, who publishes and develops it under the public identity
 **Haruhito**. The source of truth for the runtime is the
 [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu) repository.
 

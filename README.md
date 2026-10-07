@@ -33,7 +33,7 @@ Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-F
 
 ## Project and founder
 
-The founder of Sofuu is **Priyanshu Boruah**, who publishes and develops it
+The founder of Sofuu is **Prianshu Boruah**, who publishes and develops it
 under the public identity **Haruhito**. Sofuu is an early-stage, bootstrapped,
 open-core project in active development.
 
@@ -1253,4 +1253,4 @@ This means you can use, modify, and distribute it freely for both commercial and
 
 See [LICENSE](LICENSE) for the full terms, and [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md) for the open-core boundary (what's MIT vs. commercial).
 
-© 2026 Priyanshu Boruah (Haruhito)
+© 2026 Prianshu Boruah (Haruhito)

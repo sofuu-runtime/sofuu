@@ -1,5 +1,5 @@
 Sofuu (素風) JavaScript Runtime
-Copyright (c) 2026 Priyanshu Boruah (Haruhito)
+Copyright (c) 2026 Prianshu Boruah (Haruhito)
 
 ================================================================================
 OPEN-CORE MODEL — WHAT IS MIT AND WHAT IS NOT
@@ -11,7 +11,7 @@ developer tooling) is open source under the MIT License (see LICENSE).
 Not covered by the MIT License:
 
 QTSQ File Format (.qtsq / .qtsw)
-Copyright (c) 2026 Priyanshu Boruah (Haruhito). All Rights Reserved.
+Copyright (c) 2026 Prianshu Boruah (Haruhito). All Rights Reserved.
 
 The Quantum Tensor Sequence (QTSQ) binary file format embedded in this runtime
 is a proprietary format designed and owned solely by the Author. It is governed

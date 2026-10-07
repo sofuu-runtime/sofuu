@@ -25,7 +25,7 @@
     "url": "https://github.com/sofuu-runtime/sofuu/issues"
   },
   "license": "MIT",
-  "author": "Priyanshu Boruah (Haruhito) <hello@sofuu.xyz>",
+  "author": "Prianshu Boruah (Haruhito) <hello@sofuu.xyz>",
   "type": "commonjs",
   "bin": {
     "sofuu": "bin/sofuu.js"

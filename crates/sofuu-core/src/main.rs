@@ -1046,7 +1046,7 @@ fn cmd_add(rt: &SofuuRuntime, args: &[String]) -> i32 {
 fn print_licenses() {
     println!("\n\x1b[1m⚡ Sofuu (素風) Open Source Notices\x1b[0m\n");
     println!("Sofuu is MIT Licensed.");
-    println!("Copyright (c) 2024 Priyanshu Boruah (Haruhito)\n");
+    println!("Copyright (c) 2024 Prianshu Boruah (Haruhito)\n");
     println!("\x1b[1mThird-party components bundled in this binary:\x1b[0m\n");
     println!("  QuickJS (JS Engine)");
     println!("    Copyright (c) 2017-2021 Fabrice Bellard, Charlie Gordon");

@@ -131,14 +131,14 @@ async function runAll() {
   const gb = sofuu.memory.open(GMF_PATH, VEC_DIM);
   const vA = makeVec(1.1), vB = makeVec(1.2), vC = makeVec(9.9);
   gb.remember(vA, 'Barnaby is a golden retriever', 'user', 0);
-  gb.remember(vB, 'Priyanshu owns Barnaby', 'user', 0);
+  gb.remember(vB, 'Prianshu owns Barnaby', 'user', 0);
   gb.remember(vC, 'Completely unrelated memory about stock markets', 'user', 0);
 
   // Recall vA 10 times — GMF will record that A and B co-appear together
   for (let i = 0; i < 10; i++) gb.recall(vA, 3);
 
   const gmfHits = gb.recall(vA, 5);
-  const bIdx = gmfHits.findIndex(h => h.text && h.text.includes('Priyanshu'));
+  const bIdx = gmfHits.findIndex(h => h.text && h.text.includes('Prianshu'));
   const cIdx = gmfHits.findIndex(h => h.text && h.text.includes('stock'));
   ok('GMF: related memory (B) appears in recall', bIdx >= 0);
   ok('GMF: co-recalled B ranks above unrelated C (or C absent)',
@@ -149,7 +149,7 @@ async function runAll() {
   const gb2 = sofuu.memory.open(GMF_PATH, VEC_DIM);
   const gmfReloadHits = gb2.recall(vA, 5);
   ok('GMF: corecall ring survives brain reload (B still in results)',
-     gmfReloadHits.some(h => h.text && h.text.includes('Priyanshu')));
+     gmfReloadHits.some(h => h.text && h.text.includes('Prianshu')));
   console.log('');
 
   /* ── Upgrade 2: Dream Consolidation ── */

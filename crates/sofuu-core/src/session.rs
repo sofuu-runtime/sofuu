@@ -563,12 +563,44 @@ impl Session {
         self.persist_warn();
     }
 
-    /// Close the session (kept in the registry as ended for a week).
+    /// True once the session holds anything worth keeping: a user turn
+    /// or peer-visible work (task, note, critical). Start/end bookkeeping
+    /// alone does not count — and neither do transient serving/usage
+    /// markers, which only ever accompany real turns.
+    pub fn has_content(&self) -> bool {
+        self.data.events.iter().any(|e| {
+            matches!(e.kind.as_str(), "prompt" | "answer" | "task" | "note" | "critical")
+        })
+    }
+
+    /// Close the session. A session the user never spoke in (opened and
+    /// closed with no prompt) is REMOVED instead of ended — it was never
+    /// a conversation, so keeping it would list phantom sessions on every
+    /// /sessions and /resume picker. All exit paths (direct /exit plus
+    /// Ctrl-C/EOF via requestExit → /exit) funnel through here.
     pub fn finish(&mut self) {
+        if !self.has_content() {
+            self.remove();
+            return;
+        }
         self.log_event("end", "session ended");
         self.info.ended = true;
         self.update_registry();
         self.persist_warn();
+    }
+
+    /// Delete an empty session's registry entry and on-disk records.
+    /// Best-effort per record (mirrors cmd_prune): a half-removed session
+    /// is re-attempted next exit, never fatal to quitting.
+    fn remove(&self) {
+        let id = self.info.id.clone();
+        let _ = with_registry_lock(&self.project, || {
+            let mut reg = Registry::read(&self.project);
+            reg.sessions.retain(|s| s.id != id);
+            reg.write(&self.project);
+        });
+        let _ = std::fs::remove_file(session_file(&self.project, &id));
+        let _ = session_store::remove_store(&self.project, &id);
     }
 
     /// persist() with a one-line warning on failure (P1-9): disk full,
@@ -1233,6 +1265,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    /// Opening sofuu and closing it without sending anything must not
+    /// leave a saved session behind: finish() on a turn-less session
+    /// removes the registry entry (and any store) instead of ending it.
+    #[test]
+    fn finish_removes_empty_sessions_instead_of_saving_them() {
+        let proj = tmp_project("empty-finish");
+        let mut s = Session::join(&proj, "m", "p");
+        let id = s.id().to_string();
+        assert!(
+            Registry::read(&proj).sessions.iter().any(|e| e.id == id),
+            "join registers the session while it is live"
+        );
+        s.finish();
+        assert!(
+            !Registry::read(&proj).sessions.iter().any(|e| e.id == id),
+            "an unspoken session must not survive exit"
+        );
+        assert!(
+            !session_store::store_dir(&proj, &id).map(|d| d.exists()).unwrap_or(false),
+            "an unspoken session must leave no store dir behind"
+        );
+    }
+
+    /// ...while a session the user actually spoke in is kept and marked
+    /// ended exactly as before.
+    #[test]
+    fn finish_keeps_sessions_with_turns_and_marks_them_ended() {
+        let proj = tmp_project("kept-finish");
+        let mut s = Session::join(&proj, "m", "p");
+        let id = s.id().to_string();
+        s.log_prompt("hello");
+        s.log_answer("hi");
+        assert!(s.has_content(), "a logged prompt counts as content");
+        s.finish();
+        let kept = Registry::read(&proj)
+            .sessions
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+            .expect("a spoken session is kept");
+        assert!(kept.ended, "a kept session is marked ended");
     }
 
     #[test]

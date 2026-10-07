@@ -3737,6 +3737,16 @@ const DRIVER: &str = r#"
    * mode. Reuses the /mode command so the echo + persistence come from the
    * same Rust path as the slash commands, then mirrors the submit loop's
    * refresh set: engine (sofuu.agent), footer chip, welcome panel. */
+  /* Refresh the welcome panel ONLY when it cannot destroy anything: the
+   * full refresh wipes the scrollback, so running it mid-conversation
+   * erases the visible transcript (a mode/theme switch looked like a
+   * fresh session). Before the first turn the panel is all there is, so
+   * refresh freely; after that the command's own confirmation line plus
+   * the live footer already report the new settings. TTY-only: piped, a
+   * refresh appends a duplicate panel instead of replacing in place. */
+  function maybeRefreshPanel() {
+    if (TTY && history.length === 0) { try { __chat_refresh(); } catch (e) {} }
+  }
   globalThis.__on_tab = function() {
     const order = ['full', 'edit', 'plan'];
     const cur = cfg.permissions || 'full';
@@ -3746,7 +3756,7 @@ const DRIVER: &str = r#"
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     applyMode();
     refreshStatus(lastChip);
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   };
   /* ── Memory: OWNED BY THE AGENT RUNTIME (PLAN-AGENTS A1.4) ──────
    * Recall augmentation, scoped storage, and markPositive live in
@@ -6067,7 +6077,7 @@ const DRIVER: &str = r#"
       ' · ' + endpoint +
       (key ? ' · key set' : '') + '\n');
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
     return true;
   }
 
@@ -6377,7 +6387,7 @@ const DRIVER: &str = r#"
     }
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickProvider() {
     const provs = (cfg.providers && cfg.providers.length) ? cfg.providers : [];
@@ -6413,11 +6423,11 @@ const DRIVER: &str = r#"
       if (ans && String(ans).trim().toLowerCase() === 'y') {
         try { __chat_remove_provider(name); } catch (e) {}
         out('\x1b[90m  Removed ' + name + '\x1b[0m');
-      } else { out('\x1b[90m  (unchanged)\x1b[0m'); try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {} refreshStatus(''); try { __chat_refresh(); } catch (e) {} return; }
+      } else { out('\x1b[90m  (unchanged)\x1b[0m'); try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {} refreshStatus(''); maybeRefreshPanel(); return; }
     }
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickEffort() {
     /* Capability-aware picker (rt/model_caps via sofuu.ai.modelCaps):
@@ -6483,7 +6493,7 @@ const DRIVER: &str = r#"
     __chat_slash('/effort ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickTheme() {
     /* 25 themes, dark + light, independent of the terminal's own theme.
@@ -6504,7 +6514,7 @@ const DRIVER: &str = r#"
     __chat_slash('/theme ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     PAL = null;
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickRlm() {
     const notes = { off: 'provider default routing', on: 'every long turn goes through the RLM loop', auto: 'heuristic routing for long-context turns' };
@@ -6520,7 +6530,7 @@ const DRIVER: &str = r#"
     __chat_slash('/rlm ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickCtx() {
     const mc = modelCaps();
@@ -6542,7 +6552,7 @@ const DRIVER: &str = r#"
     __chat_slash('/ctx ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickMaxout() {
     const mc = modelCaps();
@@ -6566,7 +6576,7 @@ const DRIVER: &str = r#"
     __chat_slash('/maxout ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickBrain() {
     const notes = { on: 'memory recall + agent loop enabled', off: 'memory integration disabled' };
@@ -6581,7 +6591,7 @@ const DRIVER: &str = r#"
     __chat_slash('/brain ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function pickSync() {
     const notes = { on: 'session-mesh polling enabled', off: 'this session stops polling peers' };
@@ -6596,7 +6606,7 @@ const DRIVER: &str = r#"
     __chat_slash('/sync ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
     refreshStatus('');
-    try { __chat_refresh(); } catch (e) {}
+    maybeRefreshPanel();
   }
   async function main() {
     let me = '';
@@ -6651,7 +6661,7 @@ const DRIVER: &str = r#"
       } else {
         out('\x1b[90m  Setup skipped — run /provider any time to configure a model.\x1b[0m\n');
       }
-      try { __chat_refresh(); } catch (e) {}
+      maybeRefreshPanel();
     }
     while (!__chat_exit_check()) {
       let notices = [];
@@ -6723,7 +6733,7 @@ const DRIVER: &str = r#"
           applyMode();
           refreshStatus(lastChip);
         }
-        if (changed) { try { __chat_refresh(); } catch (e) {} }
+        if (changed) maybeRefreshPanel();
         /* F2 detect-on-select: a model/provider switch is exactly when the
          * user needs the NEW model's real window, and the 7-day discovery
          * TTL usually has nothing cached for a root just selected. Force
@@ -7276,6 +7286,30 @@ mod tests {
         check_parse("agent.js", include_str!("../../../src/js/agent.js"), true);
         check_parse("tools.js", include_str!("../../../src/js/tools.js"), true);
         check_parse("chat.js", include_str!("../../../src/js/chat.js"), true);
+    }
+
+    /// Settings changes must never wipe a lived-in transcript: every
+    /// panel refresh goes through maybeRefreshPanel, which only fires
+    /// pre-first-turn (TTY-only — piped, a refresh appends a duplicate).
+    /// A mode/theme/model switch mid-conversation used to tui_reset() the
+    /// scrollback and look like a fresh session. Presence-pinned plus a
+    /// call-count: exactly one direct __chat_refresh() may exist (inside
+    /// the helper), so no settings path can wipe around it.
+    #[test]
+    fn settings_changes_keep_a_lived_in_transcript() {
+        assert!(
+            DRIVER.contains("function maybeRefreshPanel"),
+            "driver: gated panel refresh missing"
+        );
+        assert!(
+            DRIVER.contains("history.length === 0"),
+            "driver: refresh gate must key on lived-in history"
+        );
+        assert_eq!(
+            DRIVER.matches("__chat_refresh();").count(),
+            1,
+            "exactly one direct refresh call may exist (inside the gate)"
+        );
     }
 
     /// Theme plumbing: the driver must resolve colors through T(role)

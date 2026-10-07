@@ -21,6 +21,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------------
-Note on QTSQ Format:
-The MIT License applies only to the execution runtime codebase of Sofuu. 
-It DOES NOT apply to the design, mathematics, or specification of the QTSQ tensor format. Please refer to `LICENSES/QTSQ-FORMAT.txt`for specific licensing terms regarding the QTSQ infrastructure.
+Open-core note:
+Sofuu follows an open-core model. The MIT License above covers the entire
+Sofuu execution runtime codebase: the engine, CLI, JavaScript/TypeScript
+APIs, agents, MCP client/server, HTTP, vector operations, local memory,
+embeddings, and core developer tooling.
+
+It DOES NOT cover the design, mathematics, or specification of the QTSQ
+tensor format, nor any future hosted, cloud, enterprise, or managed
+offerings. Those remain proprietary — see `LICENSES/QTSQ-FORMAT.txt` for
+the QTSQ format terms. The full boundary is documented in
+`docs/OPEN-CORE.md`.

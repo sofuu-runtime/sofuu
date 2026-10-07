@@ -22,6 +22,14 @@ You build your frontend (React, Next.js, plain HTML — whatever you like) compl
 
 ---
 
+## Open core
+
+The Sofuu runtime is **fully open source (MIT)** — engine, CLI, JS/TS APIs, agents, MCP, HTTP, vector ops, local memory, embeddings, and the SDK bindings. Use, modify, and distribute it freely, commercially or not.
+
+Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-FORMAT.txt)) and **future hosted/cloud/enterprise services**, which will be separate offerings around the core. Nothing is removed from the core to create them. Full boundary: [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md).
+
+---
+
 ## Install
 
 > **Platform: macOS (Apple Silicon and Intel) is the only host we ship a
@@ -1229,6 +1237,6 @@ This means you can use, modify, and distribute it freely for both commercial and
 > 
 > Please refer to [LICENSES/QTSQ-FORMAT.txt](LICENSES/QTSQ-FORMAT.txt) for specific licensing terms regarding the QTSQ infrastructure.
 
-See [LICENSE](LICENSE) for the full terms.
+See [LICENSE](LICENSE) for the full terms, and [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md) for the open-core boundary (what's MIT vs. commercial).
 
 © 2026 Priyanshu Boruah

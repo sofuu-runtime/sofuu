@@ -2,8 +2,14 @@ Sofuu (素風) JavaScript Runtime
 Copyright (c) 2026 Priyanshu Boruah
 
 ================================================================================
-PROPRIETARY COMPONENT NOTICE
+OPEN-CORE MODEL — WHAT IS MIT AND WHAT IS NOT
 ================================================================================
+The Sofuu execution runtime (engine, CLI, JavaScript/TypeScript APIs,
+agents, MCP, HTTP, vector operations, local memory, embeddings, and core
+developer tooling) is open source under the MIT License (see LICENSE).
+
+Not covered by the MIT License:
+
 QTSQ File Format (.qtsq / .qtsw)
 Copyright (c) 2026 Haruhito. All Rights Reserved.
 

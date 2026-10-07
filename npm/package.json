@@ -1,7 +1,7 @@
 {
   "name": "sofuu",
   "version": "0.2.0",
-  "description": "The private, offline AI runtime \u2014 offline embeddings, an encrypted local brain, agents and MCP in a ~3MB binary. No API key to ship, no telemetry.",
+  "description": "Sofuu \u2014 an early-stage, bootstrapped, open-core AI-native JavaScript/TypeScript runtime with offline embeddings, agents, MCP, and local memory.",
   "keywords": [
     "ai",
     "agent",
@@ -25,7 +25,7 @@
     "url": "https://github.com/sofuu-runtime/sofuu/issues"
   },
   "license": "MIT",
-  "author": "Sofuu <hello@sofuu.xyz>",
+  "author": "Priyanshu Boruah (Haruhito) <hello@sofuu.xyz>",
   "type": "commonjs",
   "bin": {
     "sofuu": "bin/sofuu.js"

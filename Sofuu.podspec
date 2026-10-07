@@ -36,7 +36,7 @@ Pod::Spec.new do |s|
 
   s.homepage         = 'https://sofuu.xyz'
   s.license          = { :type => 'MIT', :file => 'LICENSE' }
-  s.author           = { 'Sofuu' => 'hello@sofuu.xyz' }
+  s.author           = { 'Priyanshu Boruah (Haruhito)' => 'hello@sofuu.xyz' }
   s.source           = {
     :http => 'https://github.com/sofuu-runtime/sofuu/releases/download/v0.2.0/libsofuu.xcframework.zip'
   }

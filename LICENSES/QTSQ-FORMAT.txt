@@ -1,6 +1,6 @@
 # Quantum Tensor Sequence Proprietary License (QTSPL) v1.0
 
-**Copyright (c) 2026 Haruhito. All Rights Reserved.**
+**Copyright (c) 2026 Priyanshu Boruah (Haruhito). All Rights Reserved.**
 
 > Amendment (2026-10-07): Section 2 is replaced in full by the Sofuu usage
 > grant below. Use of the Format through Sofuu — personal or commercial — is
@@ -17,8 +17,8 @@ associated data structures as embedded within the Sofuu JavaScript Runtime.
 - **"Format"** refers to the .qtsq (Quantum Tensor Sequence) and .qtsw (Event Wave)
   binary file format specifications, including their five-layer architecture,
   structural layout, encoding rules, and all associated algorithms.
-- **"Author"** refers to Haruhito, the sole creator and copyright holder
-  of the Format.
+- **"Author"** refers to Priyanshu Boruah, who publishes the Format under the
+  public identity Haruhito, and is its sole creator and copyright holder.
 - **"Marks"** refers to the names "Quantum Tensor Sequence", ".qtsq", ".qtsw",
   "QTSQ", and all associated branding and terminology.
 - **"Runtime"** refers to the Sofuu JavaScript Runtime which embeds and uses
@@ -102,4 +102,4 @@ THE AUTHOR BE LIABLE FOR ANY CLAIM OR DAMAGES ARISING FROM ITS USE.
 ---
 
 **QTSPL v1.0 — Effective Date: 2026**
-**Copyright (c) 2026 Haruhito. All Rights Reserved.**
+**Copyright (c) 2026 Priyanshu Boruah (Haruhito). All Rights Reserved.**

@@ -338,7 +338,7 @@ funnel grows to absorb the common calls.
 
 The Sofuu runtime is **MIT** (`LICENSE`). Builds with the QTSQ codec
 linked additionally fall under `LICENSES/QTSQ-FORMAT.txt` (Quantum Tensor
-Sequence Proprietary License v1.0, © Haruhito) for the QTSQ file-format
+Sequence Proprietary License v1.0, © Priyanshu Boruah — public identity Haruhito) for the QTSQ file-format
 components; **QTSQ-free builds are pure MIT**. Per-platform packs (H4)
 ship both flavors and state which artifact is which in `docs/EMBEDDING-DIST.md`;
 the iOS/Android samples use the QTSQ-off flavor.

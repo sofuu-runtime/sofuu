@@ -31,6 +31,19 @@ Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-F
 
 ---
 
+## Project and founder
+
+The founder of Sofuu is **Priyanshu Boruah**, who publishes and develops it
+under the public identity **Haruhito**. Sofuu is an early-stage, bootstrapped,
+open-core project in active development.
+
+Public verification links:
+
+- Website: [sofuu.xyz](https://sofuu.xyz)
+- GitHub organization: [sofuu-runtime](https://github.com/sofuu-runtime)
+- Source repository: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu)
+- Project contact: [hello@sofuu.xyz](mailto:hello@sofuu.xyz)
+
 ## Install
 
 > **Platform: macOS (Apple Silicon and Intel) is the only host we ship a
@@ -1240,4 +1253,4 @@ This means you can use, modify, and distribute it freely for both commercial and
 
 See [LICENSE](LICENSE) for the full terms, and [`docs/OPEN-CORE.md`](docs/OPEN-CORE.md) for the open-core boundary (what's MIT vs. commercial).
 
-© 2026 Priyanshu Boruah
+© 2026 Priyanshu Boruah (Haruhito)

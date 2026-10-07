@@ -44,6 +44,7 @@ mod doctor;
 mod output_archive;
 mod session;
 mod session_store;
+mod theme;
 
 const VERSION: &str = "0.2.0-beta";
 

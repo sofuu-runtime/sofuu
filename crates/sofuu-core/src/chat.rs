@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::{output_archive, session};
+use crate::{output_archive, session, theme};
 
 // ── Session config ──────────────────────────────────────────────
 
@@ -86,6 +86,9 @@ pub struct ChatConfig {
     /// "plan" (read-only). Same semantics as the desktop's profiles —
     /// the gate itself is shared in src/js/agent.js permissionBlocked().
     pub permissions: String,
+    /// TUI theme name (see theme.rs — 25 muted schemes, dark + light).
+    /// Unknown/empty resolves to the default at render time, never errors.
+    pub theme: String,
     /// Per-session context window in tokens (used for history trimming and
     /// RLM routing). 0 = provider default (see default_ctx_window).
     pub ctx_window: i64,
@@ -225,6 +228,7 @@ impl ChatConfig {
             active: String::new(),
             rlm: String::new(),
             permissions: "full".into(),
+            theme: theme::DEFAULT_THEME.into(),
             embed_provider: String::new(),
             embed_model: String::new(),
             memory_backend: String::new(),
@@ -389,6 +393,13 @@ impl ChatConfig {
         if let Some(b) = v.get("ml").and_then(|x| x.as_bool()) { cfg.ml = b; }
         if let Some(b) = v.get("sync").and_then(|x| x.as_bool()) { cfg.sync = b; }
         if let Some(s) = v.get("rlm").and_then(|x| x.as_str()) { cfg.rlm = s.to_string(); }
+        // TUI theme: only known names persist — a typo falls back to the
+        // default at render time, but we don't enshrine it in the file.
+        if let Some(s) = v.get("theme").and_then(|x| x.as_str()) {
+            if theme::resolve(s).is_some() {
+                cfg.theme = s.to_string();
+            }
+        }
         // Permission profile: only the three known modes are honored — a
         // typo in config.json must never mean "more access" (default full).
         if let Some(s) = v.get("permissions").and_then(|x| x.as_str()) {
@@ -478,6 +489,7 @@ impl ChatConfig {
                 "profile": flat_profile,
                 "rlm": self.rlm,
                 "permissions": self.permissions,
+                "theme": self.theme,
                 "embed_provider": self.embed_provider,
                 "embed_model": self.embed_model,
                 "memory_backend": self.memory_backend,
@@ -641,7 +653,7 @@ fn clamp_max_output(n: i64) -> i64 {
 
 /// Every slash command — the single source of truth for the C readline's
 /// TAB completion (`__chat_complete`) and for "did you mean" suggestions.
-const ALL_COMMANDS: [&str; 38] = [
+const ALL_COMMANDS: [&str; 39] = [
     "/help",
     "/version",
     "/model",
@@ -653,6 +665,7 @@ const ALL_COMMANDS: [&str; 38] = [
     "/ml",
     "/rlm",
     "/mode",
+    "/theme",
     "/plan",
     "/edit",
     "/full",
@@ -707,6 +720,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
     ("/mode", "View/set the permission mode", "full | edit | plan  (bare = show · TAB cycles)"),
+    ("/theme", "Switch the TUI color theme", "[name]  (bare = picker over 25 dark + light themes)"),
     ("/plan", "Plan mode: read-only (no writes, no shell)", ""),
     ("/edit", "Edit mode: reads + local file edits (no shell, no MCP)", ""),
     ("/full", "Full access: every tool allowed", ""),
@@ -800,6 +814,32 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             cfg.save();
             chat_out("\n  Bye! 👋\n");
             "exit"
+        }
+        // ── TUI theme ──────────────────────────────────────────
+        // Bare /theme opens the picker in the driver ("pick_theme");
+        // /theme <name> applies directly. Unknown names never unstyle
+        // anything: the file keeps its old value and the user gets the
+        // count + picker hint instead of a 25-line dump.
+        "/theme" => {
+            if arg.is_empty() {
+                "pick_theme"
+            } else if theme::resolve(arg).is_some() {
+                cfg.theme = arg.to_string();
+                cfg.save();
+                let t = theme::lookup(arg);
+                chat_out(&format!(
+                    "  ✓ Theme → {} ({}, {} of 25)\n",
+                    t.name,
+                    if t.dark { "dark" } else { "light" },
+                    theme::THEMES.iter().position(|x| x.name == t.name).map(|i| i + 1).unwrap_or(1)
+                ));
+                "ok"
+            } else {
+                chat_out(&format!(
+                    "  Unknown theme '{arg}' — bare /theme lists all 25 (dark + light).\n"
+                ));
+                "ok"
+            }
         }
         // ── Session mesh commands ──────────────────────────────
         "/sessions" => {
@@ -1436,6 +1476,7 @@ fn print_help() {
     c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
     c(&mut rows, "/plan /edit /full", "shorthands for /mode plan|edit|full");
+    c(&mut rows, "/theme [name]", "switch the TUI color theme (25 dark + light)");
     c(&mut rows, "/ctx [<tokens>]", "view/set the context window (max 4M)");
     c(&mut rows, "/maxout [<tokens>]", "view/set max output tokens (max 384k)");
     c(&mut rows, "/tools", "list connected MCP servers + their tools");
@@ -1747,8 +1788,20 @@ fn clip_cells(s: &str, max: usize) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// SGR open sequence for the active theme's panel border (dim + accent
+/// hue), e.g. "\x1b[2;38;5;139m". The border follows the theme; unknown
+/// names fall back to the default via theme::lookup.
+fn theme_panel(cfg: &ChatConfig) -> String {
+    format!("\x1b[{}m", theme::lookup(&cfg.theme).panel)
+}
+
+/// SGR open sequence for the active theme's accent (model names, titles).
+fn theme_accent(cfg: &ChatConfig) -> String {
+    format!("\x1b[{}m", theme::lookup(&cfg.theme).accent)
+}
+
 /// One box row: `│  <content><pad>│` at exactly `width` cells.
-fn panel_row(content: &str, width: usize) -> String {
+fn panel_row(content: &str, width: usize, border: &str) -> String {
     let inner = width.saturating_sub(4);
     let clipped;
     // ASCII "..." (not the ambiguous-width ellipsis) so a clipped row's
@@ -1760,22 +1813,21 @@ fn panel_row(content: &str, width: usize) -> String {
         content
     };
     let pad = inner.saturating_sub(cell_w(content));
-    format!(
-        "\x1b[2;35m│\x1b[0m  {}{}\x1b[2;35m│\x1b[0m",
-        content,
-        " ".repeat(pad)
-    )
+    format!("{border}│\x1b[0m  {content}{pad}{border}│\x1b[0m", pad = " ".repeat(pad))
 }
 
 /// The 2 welcome-panel heading rows (title, then the subtitle aligned
 /// under it). No mascot — the animated Shima-enaga mark was removed; the
 /// title now stands alone at a fixed 2-cell indent.
-fn welcome_bird_rows(_cfg: &ChatConfig, _session: &str, _dir: &str, w: usize) -> Vec<String> {
+fn welcome_bird_rows(cfg: &ChatConfig, _session: &str, _dir: &str, w: usize) -> Vec<String> {
+    let border = theme_panel(cfg);
+    let accent = theme_accent(cfg);
     vec![
-        panel_row("  \x1b[1;35mWelcome to Sofuu!\x1b[0m", w),
+        panel_row(&format!("  {accent}Welcome to Sofuu!\x1b[0m"), w, &border),
         panel_row(
             "  \x1b[2mAsk anything (/help for the command list)\x1b[0m",
             w,
+            &border,
         ),
     ]
 }
@@ -1795,9 +1847,10 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     let mut rows = Vec::with_capacity(12);
 
     let dash = "─".repeat(w - 2);
-    rows.push(format!("\x1b[2;35m╭{dash}╮\x1b[0m"));
+    let border = theme_panel(cfg);
+    rows.push(format!("{border}╭{dash}╮\x1b[0m"));
     rows.extend(welcome_bird_rows(cfg, session, dir, w));
-    rows.push(panel_row("", w));
+    rows.push(panel_row("", w, &border));
 
     let effort = if cfg.effort.is_empty() {
         String::new()
@@ -1848,9 +1901,10 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
         rows.push(panel_row(
             &format!("\x1b[2m{label:<10}\x1b[0m  {value}"),
             w,
+            &border,
         ));
     }
-    rows.push(format!("\x1b[2;35m╰{dash}╯\x1b[0m"));
+    rows.push(format!("{border}╰{dash}╯\x1b[0m"));
 
     rows.push(String::new());
     if session.is_empty() {
@@ -2107,6 +2161,7 @@ unsafe extern "C" fn js_chat_getcfg(
             "active": cfg.active,
             "rlm": cfg.rlm,
             "permissions": cfg.permissions,
+            "theme": cfg.theme,
             "ctx_window": cfg.ctx_window,
             "max_output": cfg.max_output,
             /* Hard ceilings, published so the driver's non-TTY usage lines
@@ -2451,6 +2506,49 @@ unsafe extern "C" fn js_chat_project(
         .clone()
         .map(|p| p.display().to_string());
     js_new_string(ctx, path.as_deref().unwrap_or(""))
+}
+
+/// `__chat_theme()` → JSON palette for the active TUI theme:
+/// {name, dark, accent, tool, delegate, heading, code, warn, error, add,
+/// del, hunk, panel}. Unknown names fall back to the default (see
+/// theme::lookup), so a bad config value can never unstyle the TUI.
+unsafe extern "C" fn js_chat_theme(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let name = CFG
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.theme.clone())
+        .unwrap_or_default();
+    let t = theme::lookup(&name);
+    let json = serde_json::json!({
+        "name": t.name, "dark": t.dark,
+        "accent": t.accent, "tool": t.tool, "delegate": t.delegate,
+        "heading": t.heading, "code": t.code, "warn": t.warn,
+        "error": t.error, "add": t.add, "del": t.del,
+        "hunk": t.hunk, "panel": t.panel,
+    })
+    .to_string();
+    js_new_string(ctx, &json)
+}
+
+/// `__chat_themes()` → JSON array of all themes: [{name, dark}].
+/// Drives the /theme picker and the non-TTY usage list.
+unsafe extern "C" fn js_chat_themes(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let arr: Vec<serde_json::Value> = theme::THEMES
+        .iter()
+        .map(|t| serde_json::json!({ "name": t.name, "dark": t.dark }))
+        .collect();
+    js_new_string(ctx, &serde_json::json!(arr).to_string())
 }
 
 /// `__chat_sessions()` → JSON array of sessions from the registry, excluding
@@ -3229,6 +3327,8 @@ pub(crate) fn register_bridge(rt: &SofuuRuntime) {
         register_global_fn(ctx, "__chat_get_recall", js_chat_get_recall as JSCFunction);
         register_global_fn(ctx, "__chat_sessions", js_chat_sessions as JSCFunction);
         register_global_fn(ctx, "__chat_project", js_chat_project as JSCFunction);
+        register_global_fn(ctx, "__chat_theme", js_chat_theme as JSCFunction);
+        register_global_fn(ctx, "__chat_themes", js_chat_themes as JSCFunction);
         register_global_fn(ctx, "__chat_resume_turns", js_chat_resume_turns as JSCFunction);
         register_global_fn(ctx, "__chat_report_usage", js_chat_report_usage as JSCFunction);
         register_global_fn(ctx, "__chat_cost_breakdown", js_chat_cost_breakdown as JSCFunction);
@@ -4992,6 +5092,30 @@ const DRIVER: &str = r#"
     return s.length > n ? s.slice(0, n) + '…' : s;
   }
 
+  /* ── TUI theme palette ────────────────────────────────────────────
+   * All transcript colors resolve through T(role) into the active
+   * theme's 256-palette params (see theme.rs — fixed colors, never the
+   * terminal-themed 30-37 range, so a theme looks the same under any
+   * terminal theme). THEME_FALLBACK reproduces the pre-theme look so a
+   * missing bridge degrades to exactly today's colors, never unstyled.
+   * PAL resets after every slash command (theme switches apply to the
+   * very next paint) and is otherwise cached for the session. */
+  const THEME_FALLBACK = { accent: '1;35', tool: '36', delegate: '35',
+    heading: '1;36', code: '33', warn: '33', error: '1;31',
+    add: '1;32', del: '1;31', hunk: '36' };
+  let PAL = null;
+  function pal() {
+    if (!PAL) {
+      try { PAL = JSON.parse(__chat_theme()); } catch (e) { PAL = null; }
+      if (!PAL || typeof PAL !== 'object') PAL = {};
+    }
+    return PAL;
+  }
+  function T(role) {
+    const p = pal();
+    return (p && typeof p[role] === 'string' && p[role]) ? p[role] : THEME_FALLBACK[role];
+  }
+
   /* Inline spans: code yellow, bold otherwise. Single pass split on
    * backticks — even segments are prose (bold applies), odd closed ones
    * are code (literal, so ** inside code never bolds). An unterminated
@@ -5002,7 +5126,7 @@ const DRIVER: &str = r#"
     let r = '';
     for (let i = 0; i < segs.length; i++) {
       if (i % 2 === 1 && i !== segs.length - 1) {
-        r += '\x1b[33m' + segs[i] + '\x1b[0m';
+        r += '\x1b[' + T('code') + 'm' + segs[i] + '\x1b[0m';
       } else {
         if (i % 2 === 1) r += '`';
         r += segs[i].replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[0m');
@@ -5035,7 +5159,7 @@ const DRIVER: &str = r#"
        * (no inline spans inside) so the whole title reads as one level —
        * a reset mid-title would split it into two visual weights. */
       const hm = t.match(/^(#{1,6})\s+(.*)$/);
-      if (hm) { out.push('\x1b[1;36m' + hm[2] + '\x1b[0m'); continue; }
+      if (hm) { out.push('\x1b[' + T('heading') + 'm' + hm[2] + '\x1b[0m'); continue; }
       out.push(fmtInline(t));
     }
     return out.join('\n');
@@ -5059,7 +5183,7 @@ const DRIVER: &str = r#"
       const t = list[i] || {};
       const c = String(t.content || '').replace(/\s+/g, ' ').trim();
       if (t.status === 'done') out('\x1b[2m    ✓ ' + c + '\x1b[0m');
-      else if (t.status === 'doing') out('\x1b[36m    ▸ ' + c + '\x1b[0m');
+      else if (t.status === 'doing') out('\x1b[' + T('tool') + 'm    ▸ ' + c + '\x1b[0m');
       else out('\x1b[2m    ○ ' + c + '\x1b[0m');
     }
     if (list.length > shown) out('\x1b[2m    +' + (list.length - shown) + ' more\x1b[0m');
@@ -5081,14 +5205,14 @@ const DRIVER: &str = r#"
       if (t.indexOf('+++') === 0 || t.indexOf('---') === 0 || t.indexOf('...') === 0) {
         out('\x1b[2m    ' + t + '\x1b[0m');
       } else if (t.indexOf('@@') === 0) {
-        out('\x1b[36m    ' + t + '\x1b[0m');
+        out('\x1b[' + T('hunk') + 'm    ' + t + '\x1b[0m');
       } else {
         const m = row.match(/^\s*(\d+)\s+([-+ ])\s?([\s\S]*)$/);
         if (!m) { out('\x1b[2m    ' + row + '\x1b[0m'); continue; }
         let g = m[1];
         while (g.length < 4) g = ' ' + g;
-        if (m[2] === '+') out('    \x1b[2m' + g + '\x1b[0m \x1b[1;32m\x1b[48;5;22m+ ' + m[3] + '\x1b[0m');
-        else if (m[2] === '-') out('    \x1b[2m' + g + '\x1b[0m \x1b[1;31m\x1b[48;5;52m- ' + m[3] + '\x1b[0m');
+        if (m[2] === '+') out('    \x1b[2m' + g + '\x1b[0m \x1b[' + T('add') + 'm+ ' + m[3] + '\x1b[0m');
+        else if (m[2] === '-') out('    \x1b[2m' + g + '\x1b[0m \x1b[' + T('del') + 'm- ' + m[3] + '\x1b[0m');
         else out('\x1b[2m    ' + g + '   ' + m[3] + '\x1b[0m');
       }
     }
@@ -5239,7 +5363,7 @@ const DRIVER: &str = r#"
     /* The turn starts in Thinking, including while lazy MCP/agent setup runs. */
     CURRENT_PHASE = 'Thinking';
     startPhase();
-    if (TTY) out('\x1b[1;35m  ⏺ you\x1b[0m \x1b[2m·\x1b[0m ' + typed);
+    if (TTY) out('\x1b[' + T('accent') + 'm  ⏺ you\x1b[0m \x1b[2m·\x1b[0m ' + typed);
     /* M1: /watch changes surface in chat context ONCE — drained into this
      * turn's ephemeral context note and cleared (hard-capped at the poll
      * site too, so an idle session can't accumulate). */
@@ -5413,7 +5537,7 @@ const DRIVER: &str = r#"
             acc += String(p);
             if (acc.length > MAX_ANSWER_CHARS && !capped) {
               capped = true;
-              out('  \x1b[33m⚠ answer capped at ' + MAX_ANSWER_CHARS + ' chars\x1b[0m');
+              out('  \x1b[' + T('warn') + 'm⚠ answer capped at ' + MAX_ANSWER_CHARS + ' chars\x1b[0m');
             }
             if (TTY) { startAnim(); tick2(); }
             else { process.stdout.write(String(p)); }
@@ -5426,12 +5550,12 @@ const DRIVER: &str = r#"
             if (TTY && !lastRowWasTool) out(' '); /* air before a tool group */
             lastRowWasTool = true;
             const a = prettyToolArgs(p.args);
-            out('\x1b[90m  ⏺\x1b[0m \x1b[36m' + p.name + '\x1b[0m\x1b[2m(' + a + ')\x1b[0m');
+            out('\x1b[90m  ⏺\x1b[0m \x1b[' + T('tool') + 'm' + p.name + '\x1b[0m\x1b[2m(' + a + ')\x1b[0m');
           } else if (e.kind === 'delegate') {
             stopAnim();
             if (TTY && !lastRowWasTool) out(' '); /* air before a tool group */
             lastRowWasTool = true;
-            out('\x1b[90m  ⏺\x1b[0m \x1b[35m' + p.agent + '\x1b[0m\x1b[2m ← ' + clip1(p.task, 60) + '\x1b[0m');
+            out('\x1b[90m  ⏺\x1b[0m \x1b[' + T('delegate') + 'm' + p.agent + '\x1b[0m\x1b[2m ← ' + clip1(p.task, 60) + '\x1b[0m');
           } else if (e.kind === 'recall') {
             /* F1/P2: /why reports exactly what gating let through this turn
              * (hits already thresholded, deduped, budget-cut by agent.js). */
@@ -5513,7 +5637,7 @@ const DRIVER: &str = r#"
                * twice ("✗ edit_file: edit_file: …"). */
               const em = clip1(String(p.error), 200);
               const nm = String(p.name || 'tool');
-              out('\x1b[1;31m  ✗ ' + (em.indexOf(nm + ':') === 0 ? em : nm + ': ' + em) + '\x1b[0m');
+              out('\x1b[' + T('error') + 'm  ✗ ' + (em.indexOf(nm + ':') === 0 ? em : nm + ': ' + em) + '\x1b[0m');
             }
           } else if (e.kind === 'rlm:route') {
             out('\x1b[90m  ⏺ rlm · working…\x1b[0m');
@@ -5981,7 +6105,7 @@ const DRIVER: &str = r#"
     lastChip = tk;
     if (typeof __chat_status !== 'function') return;
     const dim = (s) => '\x1b[2m' + s + '\x1b[0m';
-    let s = 'sofuu ' + dim('·') + ' \x1b[35m' + (cfg.model || '(no model)') + '\x1b[0m'
+    let s = 'sofuu ' + dim('·') + ' \x1b[' + T('accent') + 'm' + (cfg.model || '(no model)') + '\x1b[0m'
       /* Mode chip rides the status row only when RESTRICTIVE (plan/edit):
        * the default 'full' stays clean, but a gated turn must never be
        * confused for an unguarded one — amber so it reads at a glance.
@@ -6361,6 +6485,27 @@ const DRIVER: &str = r#"
     refreshStatus('');
     try { __chat_refresh(); } catch (e) {}
   }
+  async function pickTheme() {
+    /* 25 themes, dark + light, independent of the terminal's own theme.
+     * Applies through /theme <name> (the Rust side validates + persists)
+     * so the picker and the typed command share one code path. */
+    let themes = [];
+    try { themes = JSON.parse(__chat_themes()); } catch (e) {}
+    if (!themes.length) { out('\x1b[90m  No themes available.\x1b[0m\n'); return; }
+    const it = await selectMenu({
+      title: 'Theme',
+      hint: '↑↓ move · enter apply · esc cancel',
+      tabs: [],
+      items: themes.map(t => ({ id: t.name, label: t.name,
+        note: (t.dark ? 'dark' : 'light') + ' theme' })),
+      currentId: cfg.theme || '',
+    });
+    if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
+    __chat_slash('/theme ' + it.id);
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    PAL = null;
+    try { __chat_refresh(); } catch (e) {}
+  }
   async function pickRlm() {
     const notes = { off: 'provider default routing', on: 'every long turn goes through the RLM loop', auto: 'heuristic routing for long-context turns' };
     const order = ['off', 'on', 'auto'];
@@ -6483,7 +6628,7 @@ const DRIVER: &str = r#"
       try {
         const past = JSON.parse(__chat_past_turns());
         for (const t of past) {
-          out('\x1b[1;35m  ⏺ you\x1b[0m · ' + t.prompt);
+          out('\x1b[' + T('accent') + 'm  ⏺ you\x1b[0m · ' + t.prompt);
           if (t.answer) out(t.answer);
         }
         if (past.length) out('');
@@ -6532,7 +6677,7 @@ const DRIVER: &str = r#"
           }
         }
       } catch (e) {}
-      const inp = await __readline('\x1b[1;35m❯\x1b[0m ');
+      const inp = await __readline('\x1b[' + T('accent') + 'm❯\x1b[0m ');
       if (inp === null || inp === undefined) { requestExit(); break; }
       const t = inp.trim();
       if (t === '') continue;
@@ -6542,15 +6687,19 @@ const DRIVER: &str = r#"
          * command's name. */
         const before = { p: cfg.provider, m: cfg.model, e: cfg.effort,
                          x: cfg.ctx_window, o: cfg.max_output, b: cfg.brain,
-                         ml: cfg.ml, rl: cfg.rlm, sy: cfg.sync,
+                         ml: cfg.ml, rl: cfg.rlm, sy: cfg.sync, th: cfg.theme,
                          pm: cfg.permissions, api: cfg.api_key, bu: cfg.base_url };
         const r = __chat_slash(t);
         // Slash commands may have changed provider/model/api_key — re-read
         // the Rust-side config so the live session uses the new values.
         try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+        /* A theme switch must recolor the very next paint, not next
+         * session: drop the cached palette on every command (re-read is
+         * one JSON parse per command — noise). */
+        PAL = null;
         /* Any command that can change settings re-renders the welcome panel
          * so the header (model/provider/effort) updates instantly. */
-        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync', '/outputs', '/mode', '/plan', '/edit', '/full'];
+        const cfgCmds = ['/model', '/provider', '/effort', '/ctx', '/maxout', '/brain', '/ml', '/rlm', '/sync', '/outputs', '/mode', '/plan', '/edit', '/full', '/theme'];
         const isCfgCmd = cfgCmds.some(c => t === c || t.indexOf(c + ' ') === 0);
         /* ...but only repaint when something really moved. Gating on the
          * name alone re-printed the whole banner for a bare `/ctx`, which
@@ -6564,6 +6713,7 @@ const DRIVER: &str = r#"
           || before.o !== cfg.max_output || before.b !== cfg.brain
           || before.ml !== cfg.ml      || before.rl !== cfg.rlm
           || before.sy !== cfg.sync    || before.pm !== cfg.permissions
+          || before.th !== cfg.theme
           || before.api !== cfg.api_key || before.bu !== cfg.base_url);
         if (isCfgCmd) {
           /* A mode change must reach the engine runtime, not just the panel:
@@ -6609,6 +6759,18 @@ const DRIVER: &str = r#"
         } else if (r === 'pick_sync') {
           if (TTY) await pickSync();
           else out('\x1b[90m  Usage: /sync <on|off>  (current: ' + (cfg.sync ? 'on' : 'off') + ')\x1b[0m\n');
+        } else if (r === 'pick_theme') {
+          if (TTY) { await pickTheme(); }
+          else {
+            let themes = [];
+            try { themes = JSON.parse(__chat_themes()); } catch (e) {}
+            out('\x1b[90m  Usage: /theme <name>  (current: ' + (cfg.theme || 'sofuu') + ')\x1b[0m');
+            for (const th of themes) {
+              const cur = th.name === cfg.theme ? ' \x1b[32m← current\x1b[0m' : '';
+              out('  \x1b[36m' + th.name + '\x1b[0m  \x1b[90m' + (th.dark ? 'dark' : 'light') + '\x1b[0m' + cur);
+            }
+            out('');
+          }
         } else if (r === 'clear') {
           history = [];
           /* /compact resets the meter (below) — /clear must too, or the
@@ -7026,12 +7188,12 @@ mod tests {
             "chat.rs driver: tool_result ignores the event diff payload"
         );
         assert!(
-            DRIVER.contains("31m  ✗ ' + "),
-            "chat.rs driver: red tool-error line missing — failures go silent"
+            DRIVER.contains("T('error')"),
+            "chat.rs driver: tool-error line must use the theme error role — failures go silent"
         );
         assert!(
-            DRIVER.contains("48;5;22") && DRIVER.contains("48;5;52"),
-            "chat.rs driver: diff +/- rows must carry full-row background tints"
+            DRIVER.contains("T('add')") && DRIVER.contains("T('del')"),
+            "chat.rs driver: diff +/- rows must use theme roles (tints live in theme.rs, not the driver)"
         );
     }
 
@@ -7116,6 +7278,37 @@ mod tests {
         check_parse("chat.js", include_str!("../../../src/js/chat.js"), true);
     }
 
+    /// Theme plumbing: the driver must resolve colors through T(role)
+    /// (backed by __chat_theme, cached, reset on every command so a
+    /// switch recolors the next paint), offer pickTheme over
+    /// __chat_themes, and fall back to the classic look when the bridge
+    /// is missing — never unstyled.
+    #[test]
+    fn theme_plumbing_present() {
+        assert!(
+            DRIVER.contains("function T(role)"),
+            "driver: T(role) palette resolver missing"
+        );
+        assert!(
+            DRIVER.contains("__chat_theme()") && DRIVER.contains("__chat_themes()"),
+            "driver: theme bridges unwired"
+        );
+        assert!(
+            DRIVER.contains("async function pickTheme()"),
+            "driver: theme picker missing"
+        );
+        assert!(
+            DRIVER.contains("THEME_FALLBACK"),
+            "driver: classic-color fallback missing"
+        );
+        for role in ["T('accent')", "T('tool')", "T('heading')", "T('error')"] {
+            assert!(
+                DRIVER.contains(role),
+                "driver: transcript must actually use {role}"
+            );
+        }
+    }
+
     /// Resume distills instead of dumping: handleResume must route old
     /// turns through summarizeHistory with the resume framing (not the
     /// stock compaction prompt), label the archive record 'resume' (not
@@ -7159,12 +7352,8 @@ mod tests {
             "tool-result ↳ marker must close before the content so the content renders at full weight"
         );
         assert!(
-            DRIVER.contains("\\x1b[1;32m"),
-            "added diff lines must be bold green"
-        );
-        assert!(
-            DRIVER.contains("\\x1b[1;31m"),
-            "removed diff lines and errors must be bold red"
+            DRIVER.contains("T('add')") && DRIVER.contains("T('del')") && DRIVER.contains("T('error')"),
+            "signal lines must use theme roles, not hardcoded escapes"
         );
     }
 
@@ -7346,6 +7535,13 @@ mod tests {
         assert_eq!(handle_slash(&mut c, "/resume s-abc"), "resume");
         assert_eq!(handle_slash(&mut c, "/sessions"), "sessions");
         assert_eq!(handle_slash(&mut c, "/sessions s-abc"), "sessions");
+        assert_eq!(handle_slash(&mut c, "/theme"), "pick_theme");
+        assert_eq!(handle_slash(&mut c, "/theme slate"), "ok");
+        assert_eq!(c.theme, "slate", "applying a known theme persists it on the config");
+        assert_eq!(handle_slash(&mut c, "/theme SLATE"), "ok", "theme names match case-insensitively");
+        assert_eq!(theme::lookup(&c.theme).name, "slate");
+        assert_eq!(handle_slash(&mut c, "/theme no-such-theme"), "ok");
+        assert_eq!(theme::lookup(&c.theme).name, "slate", "an unknown name must not clobber the active theme");
         // F3: /at (help)
         assert_eq!(handle_slash(&mut c, "/at"), "ok");
         // F5: /share + /import
@@ -7623,7 +7819,7 @@ mod tests {
         ];
         for width in [40usize, 60, 80] {
             for content in &cases {
-                let row = panel_row(content, width);
+                let row = panel_row(content, width, "\x1b[2;35m");
                 assert_eq!(
                     cell_w(&row),
                     width,

@@ -132,12 +132,12 @@ PTY_TXT="$TMP/pty.txt"
 
 # ── assertions (raw stream: escapes intact) ──────────────────────
 # 1. markdown hierarchy: levels render, markers consumed by the format.
-grep -qF "$(printf '\x1b[1;36mWork Plan')" "$PTY_TXT"
-check "heading renders bold-cyan" $?
+grep -qF "$(printf '\x1b[1;38;5;80mWork Plan')" "$PTY_TXT"
+check "heading renders in the theme heading color" $?
 grep -qF "$(printf '\x1b[1mfast\x1b[0m')" "$PTY_TXT"
 check "bold renders bold" $?
-grep -qF "$(printf '\x1b[33mcode\x1b[0m')" "$PTY_TXT"
-check "inline code renders yellow" $?
+grep -qF "$(printf '\x1b[38;5;180mcode\x1b[0m')" "$PTY_TXT"
+check "inline code renders in the theme code color" $?
 # 2. whitespace rhythm: a painted blank row (gutter + single space — bare
 # clears carry no bytes after K, and every content row starts with the
 # 2-space gutter, so `K + 3 spaces + ESC` matches ONLY a real blank row)

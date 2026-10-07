@@ -847,7 +847,7 @@ fn fallback_complete(prefix: &[u8], out_count: &mut usize) -> Option<CString> {
 const FALLBACK_COMMANDS: &[&str] = &[
     "/help", "/version", "/model", "/provider",
     "/effort", "/compact", "/clear", "/brain", "/rlm", "/ctx", "/maxout",
-    "/tools", "/sessions", "/context", "/work", "/done", "/note", "/notify",
+    "/tools", "/sessions", "/theme", "/context", "/work", "/done", "/note", "/notify",
     "/sync", "/exit",
 ];
 

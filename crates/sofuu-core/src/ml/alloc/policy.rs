@@ -622,6 +622,25 @@ pub fn note_limit_error_kind(model: &str, err: &str) -> Option<LimitKind> {
     note_limit_error_at(None, model, err)
 }
 
+/// Record an output cap learned WITHOUT a parseable 400 — the length-empty
+/// retry converged at `value` (a cap that produced text: ground truth from
+/// THIS endpoint), or exhausted its allowance just above it. Same store and
+/// strength as a parsed 400-learned limit: the resolve ladder's strongest
+/// rung, so every later request this session clamps to it instead of
+/// re-burning full turns against the gateway's ceiling. Values below
+/// MIN_MAX_OUTPUT are ignored (a smaller cap means an unusable endpoint,
+/// not a lesson). Returns the recorded value, or 0 when ignored.
+pub fn note_max_output_at(base_url: Option<&str>, model: &str, value: i64) -> i64 {
+    if model.is_empty() || value < MIN_MAX_OUTPUT {
+        return 0;
+    }
+    if let Ok(mut g) = LEARNED.lock() {
+        let e = g.entry(learned_key(base_url, model)).or_insert((None, None));
+        e.1 = Some(value);
+    }
+    value
+}
+
 /// Test/diagnostic seam — drop everything learned this session.
 pub fn clear_learned() {
     if let Ok(mut g) = LEARNED.lock() {
@@ -817,6 +836,28 @@ mod tests {
         assert_eq!(r.window, 24576);
         assert!(r.known, "a learned limit makes the model known");
         assert_eq!(r.source, Source::Learned);
+        clear_learned();
+    }
+
+    /// 2026-10-09: the length-empty retry converged at a working cap with
+    /// no parseable 400 in hand — note_max_output_at records it into the
+    /// same session-scoped store, and resolve() must honor it as the
+    /// strongest rung (later turns clamp instead of re-burning).
+    #[test]
+    fn noted_max_output_feeds_resolve() {
+        let _store = lock();
+        clear_learned();
+        let model = "deepseek-v4.1-flash-test-only";
+        // Below the usable floor: ignored, not a lesson.
+        assert_eq!(note_max_output_at(None, model, 100), 0);
+        assert_eq!(learned_for(model), (None, None));
+        // A converged working cap sticks and beats the registry guess.
+        assert_eq!(note_max_output_at(Some("https://gw.example/v1"), model, 2048), 2048);
+        let r = resolve(Some(model), 0, 0, Some("https://gw.example/v1/chat/completions"));
+        assert_eq!(r.max_output, 2048);
+        assert_eq!(r.max_source, Source::Learned);
+        // Empty model: ignored.
+        assert_eq!(note_max_output_at(None, "", 2048), 0);
         clear_learned();
     }
 

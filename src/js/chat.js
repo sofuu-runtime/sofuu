@@ -410,9 +410,14 @@
      * foldFrom) — foldFrom === 0 is the normal two-block case and must fold. */
     if (foldFrom >= S.history.length) return false;
     var oldCount = foldFrom;
+    /* Strict gateways reject a request whose last message is not role=user
+     * (2026-10-09: compactions died with "The last message must have
+     * role=user" — the folded prefix ends with an assistant message). The
+     * instruction rides LAST as a user message; system-first stays for
+     * lenient providers. */
     var summary = await complete([
       { role: 'system', content: 'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }
-    ].concat(S.history.slice(0, oldCount)));
+    ].concat(S.history.slice(0, oldCount), [{ role: 'user', content: 'Summarize the conversation above into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }]));
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
     S.history = [{ role: 'system', content: 'Prior conversation summary: ' + summary }].concat(S.history.slice(oldCount));
     return true;

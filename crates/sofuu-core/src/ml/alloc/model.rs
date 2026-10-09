@@ -368,6 +368,33 @@ unsafe extern "C" fn js_alloc_note_limit(
     qjs::sofuu_js_new_string(ctx, c.as_ptr())
 }
 
+/// noteMaxOutput(baseUrl, model, value) → recorded value | 0 — record an
+/// output cap the length-empty retry converged at (or exhausted just above).
+/// Feeds the same session-scoped learned store as noteLimit, so the resolve
+/// ladder's strongest rung clamps every later request to it. 0 = ignored
+/// (empty model or below the usable floor).
+unsafe extern "C" fn js_alloc_note_max_output(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let base_url = if argc >= 1 { cap_str(&arg_str(ctx, *argv), 2_048) } else { String::new() };
+    let model = if argc >= 2 { cap_str(&arg_str(ctx, *argv.add(1)), 200) } else { String::new() };
+    let mut value: i64 = 0;
+    if argc >= 3 {
+        // SAFETY: argv[2] is a valid JS value; JS_ToInt64 writes value on success.
+        unsafe { qjs::JS_ToInt64(ctx, &mut value, *argv.add(2)) };
+    }
+    let recorded = policy::note_max_output_at(
+        if base_url.is_empty() { None } else { Some(base_url.as_str()) },
+        &model,
+        value,
+    );
+    let s = std::ffi::CString::new(recorded.to_string()).unwrap_or_default();
+    qjs::sofuu_js_new_string(ctx, s.as_ptr())
+}
+
 /// ingestListing(baseUrl, listingJson) → count — feed a model listing
 /// (whatever the endpoint returned for /models, verbatim) into the
 /// discovered-caps store. Provider-agnostic: entries are keyed by the
@@ -396,7 +423,7 @@ unsafe extern "C" fn js_alloc_ingest(
 }
 
 thread_local! {
-    static ALLOC_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
+    static ALLOC_FUNCS: [qjs::JSCFunctionListEntry; 4] = [
         qjs::JSCFunctionListEntry {
             name: c"plan".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -417,6 +444,13 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_alloc_ingest },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"noteMaxOutput".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_alloc_note_max_output },
         },
     ];
 }

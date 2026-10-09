@@ -90,7 +90,19 @@ static TABLE: &[(&str, i32, i32, Thinking)] = &[
     /* ── Other openai-compatible families ──────────────────────────── */
     // DeepSeek thinks via <think> tags in the text (stripped client-side),
     // not via an API parameter — modeled as Thinking::None here.
+    // V4 generation (V4-Flash / V4.1-Flash): 1M context, 128k output tier
+    // (providers tier higher — up to ~384k; the per-endpoint ladder
+    // (discovered/learned) refines this guess). MUST precede the V3-era
+    // row: first match wins, and the bare prefix would swallow V4 names
+    // into 64k (2026-10-09: footer read 65.5k on a 1M model).
+    ("deepseek-v4", 1_048_576, 131_072, Thinking::None),
     ("deepseek", 65_536, 8_192, Thinking::None),
+    // Kimi K2.5/K2.6: 256K per Moonshot (HF card + vendor docs) — NOT 1M
+    // (that figure is Kimi K3). Max outputs are provider-tiered; these
+    // conservative tier values defer to discovered/learned evidence.
+    ("kimi-k2.6", 262_144, 32_768, Thinking::None),
+    ("kimi-k2.5", 262_144, 32_768, Thinking::None),
+    ("kimi-k3", 1_048_576, 131_072, Thinking::None),
     ("qwen3", 131_072, 32_768, Thinking::None),
     ("qwen", 32_768, 8_192, Thinking::None),
     ("llama4", 1_000_000, 8_192, Thinking::None),
@@ -337,6 +349,29 @@ mod tests {
         assert_eq!(lookup(Some("gpt-4.1-mini")).ctx_window, 1_000_000);
         assert_eq!(lookup(Some("llama3.1-70b")).ctx_window, 131_072);
         assert_eq!(lookup(Some("llama3-8b")).ctx_window, 8_192);
+    }
+
+    #[test]
+    fn versioned_families_resolve_to_model_truth() {
+        // 2026-10-09: deepseek-v4.1-flash:free resolved to the V3-era 64k
+        // row — the chat footer read 65.5k on a 1M-context model, so the
+        // 85%-of-window budget bled turns at ~55k and auto-compact could
+        // never reach a sane threshold.
+        let c = lookup(Some("deepseek-v4.1-flash:free"));
+        assert_eq!(c.ctx_window, 1_048_576);
+        assert_eq!(c.max_output, 131_072);
+        // The V3 generation keeps its real 64k — the versioned row must
+        // not swallow it.
+        let c = lookup(Some("deepseek-chat"));
+        assert_eq!(c.ctx_window, 65_536);
+        assert_eq!(c.max_output, 8_192);
+        // Kimi K2.5 is 256K per Moonshot (HF card + vendor docs), not 1M —
+        // the 1M figure belongs to Kimi K3.
+        assert_eq!(lookup(Some("kimi-k2.5")).ctx_window, 262_144);
+        assert_eq!(lookup(Some("kimi-k2.6")).ctx_window, 262_144);
+        assert_eq!(lookup(Some("kimi-k3")).ctx_window, 1_048_576);
+        // org-prefixed forms match too.
+        assert_eq!(lookup(Some("moonshotai/kimi-k2.5")).ctx_window, 262_144);
     }
 
     #[test]

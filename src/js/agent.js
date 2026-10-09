@@ -303,8 +303,13 @@
     ['gpt-5', 400000], ['gpt-4.1', 1000000], ['gpt-4o', 128000], ['gpt-4-turbo', 128000], ['gpt-4', 128000],
     ['o3', 200000], ['o4', 200000], ['o1', 200000],
     ['claude-opus-4', 200000], ['claude-sonnet-4', 200000], ['claude-haiku-4', 200000],
-    ['claude-3-7', 200000], ['claude-3-5', 200000], ['claude-3', 200000], ['claude', 200000],
+    ['claude-3-7', 200000], ['claude-3-5', 200000], ['claude-3', 200000],     ['claude', 200000],
+    /* V4 generation is 1M — must precede the V3-era bare prefix (first
+     * match wins) or V4 names collapse into 64k. Kimi K2.5/K2.6 are 256K
+     * per Moonshot (not 1M — that figure is Kimi K3). */
+    ['deepseek-v4', 1048576],
     ['deepseek', 65536],
+    ['kimi-k3', 1048576], ['kimi-k2.6', 262144], ['kimi-k2.5', 262144],
     ['qwen3', 131072], ['qwen2.5', 32768], ['qwen', 32768],
     ['llama4', 1000000], ['llama3.1', 131072], ['llama3', 8192], ['llama', 8192],
     ['mistral', 32768], ['mixtral', 32768],
@@ -441,6 +446,18 @@
       var k = sofuu.ml.alloc.noteLimit(String((d && d.model) || ''), String(errText == null ? '' : errText));
       return (k === 'context' || k === 'output') ? k : '';
     } catch (e) { return ''; }
+  }
+  /* Length-empty learning: record a WORKING output cap (or the next
+   * untried halving) per (endpoint, model) for the session — the resolve
+   * ladder's strongest rung, so every later request clamps to it instead
+   * of re-burning full turns against the gateway's ceiling. True = the
+   * lesson stuck. */
+  function allocNoteMaxOutput(d, value) {
+    if (!mlEnabled(d) || !sofuu.ml.alloc || typeof sofuu.ml.alloc.noteMaxOutput !== 'function') return false;
+    try {
+      var r = sofuu.ml.alloc.noteMaxOutput(String((d && d.baseUrl) || ''), String((d && d.model) || ''), Math.floor(value));
+      return String(r) === String(Math.floor(value));
+    } catch (e) { return false; }
   }
 
   /* ── Definitions ───────────────────────────────────────────────── */
@@ -2968,18 +2985,49 @@
              * recovery for every later round (round 3's empty stayed an
              * error). Each generation gets a fresh allowance. */
             var emptyTries = state.emptyRetriesRound || 0;
-            if (emptyTries < 2) {
+            /* Length-empty stepped backoff (2026-10-09): some gateways
+             * empty the stream whenever max_tokens exceeds the endpoint's
+             * real per-request output cap — and the old retry re-sent
+             * 12.5%-of-window, which can EQUAL the cap just sent
+             * (registry 8192 vs 65536*0.125), so "retry 1/2" changed
+             * nothing and the run died. Every length retry now sends a
+             * STRICTLY smaller cap than the attempt that just emptied
+             * (halved, window-ratio as ceiling, 1024 floor). The working
+             * cap — or, on total failure, the next untried halving — is
+             * learned per (endpoint, model) for the session, so later
+             * turns clamp instead of re-burning full requests. Non-length
+             * empties keep the old single effortless retry: the cap was
+             * not the cause there. */
+            var lenEmpty = (fr === 'length');
+            var lastCap = (so && so.max_tokens > 0) ? so.max_tokens : 0;
+            var ratioCap = 0;
+            if (lenEmpty) {
+              var winE = contextWindow(d.model, d.baseUrl);
+              if (winE > 0) ratioCap = Math.floor(winE * 0.125);
+              /* No cap was sent (the endpoint defaulted and emptied):
+               * pretend the ceiling was 2x the ratio cap so the first
+               * retry still steps strictly below it. */
+              if (!(lastCap > 0) && ratioCap > 0) lastCap = ratioCap * 2;
+            }
+            var recovered = false;
+            while (emptyTries < (lenEmpty ? 2 : 1) && !state.cancelled) {
+              var nextCap = 0;
+              if (lenEmpty) {
+                nextCap = Math.floor(lastCap / 2);
+                if (ratioCap > 0 && nextCap > ratioCap) nextCap = ratioCap;
+                if (nextCap < 1024) nextCap = 1024;
+                /* Converged: no untried lower cap exists — stop burning. */
+                if (!(nextCap < lastCap)) break;
+              }
               state.emptyRetriesRound = emptyTries + 1;
               absorbUsage(st); /* P1-2: the empty stream still billed its prompt tokens */
               emit('tool_result', { name: 'system',
                                     result: 'empty stream' + (fr ? ' (finish_reason: ' + fr + ')' : '') +
-                                            ' → retry ' + (emptyTries + 1) + '/2' });
+                                            ' → retry ' + (emptyTries + 1) + '/' + (lenEmpty ? 2 : 1) +
+                                            (nextCap > 0 ? ' @ maxout ' + nextCap : ' (no effort)') });
               await new Promise(function (rD) { setTimeout(rD, 1200); }); /* let the pool breathe */
               var retryOpts = Object.assign({}, opts, { effort: undefined });
-              if (fr === 'length') {
-                var winE = contextWindow(d.model, d.baseUrl);
-                if (winE > 0) retryOpts.max_tokens = Math.floor(winE * 0.125);
-              }
+              if (nextCap > 0) retryOpts.max_tokens = nextCap;
               /* P3: renamed retryRo — was `var ro`, which function-scoped
                * onto the RLM route's `ro` (1966) and silently reused it. */
               var retryRo = aiOpts(Object.assign({}, d, { effort: '', max_tokens: 0, maxTokensOut: 0 }), retryOpts,
@@ -2988,11 +3036,34 @@
                 var rr = await streamWithRetry(retryRo,
                   function (t) { emit('think', { text: clip(t, 200) }); }, null);
                 var rtxt = rr.parts.join('').trim();
-                if (rtxt) { answer = rtxt; break; }
-                var fr2 = String((rr.st && rr.st.usage && rr.st.usage.finishReason) || fr || '');
+                if (rtxt) {
+                  /* Ground truth: this cap produced text on this endpoint —
+                   * learn it so later turns start here, not at the ceiling. */
+                  var workedCap = (retryRo.max_tokens > 0) ? retryRo.max_tokens : nextCap;
+                  if (workedCap > 0 && allocNoteMaxOutput(d, workedCap)) {
+                    emit('allocgate', { action: 'learned_maxout', model: String(d.model || ''),
+                                        maxOutput: workedCap });
+                  }
+                  answer = rtxt; recovered = true; break;
+                }
+                fr = String((rr.st && rr.st.usage && rr.st.usage.finishReason) || fr || '');
+                lastCap = (retryRo.max_tokens > 0) ? retryRo.max_tokens : nextCap;
               } catch (eR) {
                 if (state.cancelled) { stopped = 'cancelled'; break; }
                 throw eR;
+              }
+              emptyTries++;
+            }
+            if (recovered) break;
+            if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
+            if (lenEmpty && lastCap > 1024) {
+              /* Allowance burned with no text: teach the next untried
+               * halving so the NEXT turn starts below the ceiling instead
+               * of re-burning full requests against it. */
+              var taught = Math.max(1024, Math.floor(lastCap / 2));
+              if (allocNoteMaxOutput(d, taught)) {
+                emit('allocgate', { action: 'learned_maxout', model: String(d.model || ''),
+                                    maxOutput: taught, after: 'empty-exhausted' });
               }
             }
             throw new Error('provider returned an empty stream' +
@@ -3219,13 +3290,24 @@
             await new Promise(function (rD2) { setTimeout(rD2, 1200); });
             var ro2opts = Object.assign({}, opts, { effort: undefined });
             if (frF === 'length') {
+              /* Strictly below the cap that just emptied (same rule as the
+               * tool loop): the old 12.5%-of-window re-send was a no-op
+               * whenever it equaled the sent cap (2026-10-09). */
               var winF = contextWindow(d.model, d.baseUrl);
-              if (winF > 0) ro2opts.max_tokens = Math.floor(winF * 0.125);
+              var ratioF = (winF > 0) ? Math.floor(winF * 0.125) : 0;
+              var lastF = (o && o.max_tokens > 0) ? o.max_tokens : 0;
+              if (!(lastF > 0) && ratioF > 0) lastF = ratioF * 2;
+              var nextF = Math.floor(lastF / 2);
+              if (ratioF > 0 && nextF > ratioF) nextF = ratioF;
+              if (nextF >= 1024 && nextF < lastF) ro2opts.max_tokens = nextF;
             }
             var ro2 = aiOpts(Object.assign({}, d, { effort: '', max_tokens: 0, maxTokensOut: 0 }), ro2opts, msgs);
             var r2 = await streamWithRetry(ro2, onThink, onDelta);
             var t2 = r2.parts.join('').trim();
-            if (t2) return t2;
+            if (t2) {
+              if (ro2.max_tokens > 0) allocNoteMaxOutput(d, ro2.max_tokens);
+              return t2;
+            }
             frF = String((r2.st && r2.st.usage && r2.st.usage.finishReason) || frF || '');
           }
           throw new Error('provider returned an empty stream' +

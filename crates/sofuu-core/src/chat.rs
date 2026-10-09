@@ -4875,9 +4875,18 @@ const DRIVER: &str = r#"
      * working), false when there is nothing usable. */
     const sysPrompt = (opts && opts.prompt) ||
       'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.';
+    /* Strict gateways reject a request whose last message is not
+     * role=user (2026-10-09: every auto + manual compaction on tokenrouter
+     * died with "The last message must have role=user" — the folded prefix
+     * ends with an assistant message). The instruction rides LAST as a user
+     * message: system-first stays for lenient providers, and
+     * instruction-last is the better summary shape anyway. */
+    const tailAsk = { role: 'user', content: (opts && opts.tailPrompt) ||
+      'Summarize the conversation above into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' };
     const summary = await complete([
       { role: 'system', content: sysPrompt },
-      ...history.slice(0, oldCount)
+      ...history.slice(0, oldCount),
+      tailAsk,
     ]);
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
     archiveWrite('summary', 'complete', (opts && opts.source) || 'compaction', summary, {
@@ -5024,7 +5033,12 @@ const DRIVER: &str = r#"
               fmtTk(Math.max(0, savedTk - historyTokens())) + ' tk saved, meter ' +
               fmtTk(m0) + '→' + fmtTk(usedCtx) + ')\x1b[0m');
         }
-      } catch (e) { /* summarizer failed — the drop loop below still guards */ }
+      } catch (e) {
+        /* A failed auto-compact must not be silent: the drop-oldest guard
+         * below will eat turns with no summary kept, which reads as
+         * context loss. One dim line names the cause. */
+        out('\x1b[90m  [auto-compact failed: ' + String(e.message || e) + ' — history will trim instead]\x1b[0m\n');
+      }
     }
     /* Drop-oldest guard: still over budget after compaction (or compaction
      * failed)? Shed oldest whole turn blocks — never the newest block, and

@@ -232,6 +232,18 @@ function decide(body) {
       (txt.indexOf("EVILRES-1") >= 0 ? "evil-ran" : "evil-dropped") +
       (txt.indexOf("TOOLRES-9f3") >= 0 ? "+good-ran" : "-good-miss") + "]" };
   }
+  if (sys.indexOf("AGENT=lenempty-never") >= 0) {
+    LENEMPTY_CAPS.push(body.max_tokens | 0);
+    return { frames: [{ choices: [{ delta: {}, finish_reason: "length" }] }] };
+  }
+  if (sys.indexOf("AGENT=lenempty") >= 0) {
+    const lcap = body.max_tokens | 0;
+    LENEMPTY_CAPS.push(lcap);
+    if (!(lcap > 0) || lcap > LENEMPTY_OUT) {
+      return { frames: [{ choices: [{ delta: {}, finish_reason: "length" }] }] };
+    }
+    return { text: "lenempty-recovered@" + lcap };
+  }
   if (sys.indexOf("AGENT=tooly") >= 0) {
     if (tc === 0) return { tool: { name: "slow_tool", args: {} } };
     return { text: txt.indexOf("timed out") >= 0 ? "tooly-done-saw-timeout" : "tooly-done" };
@@ -547,6 +559,13 @@ function webHandler(req, res) {
 
 let ANT_SYS = ""; // last-seen system prompt (tool docs probe)
 let ANT_BODY = null;  // P6: last anthropic body (cache_control shape probe)
+/* Length-empty stepped-backoff probe (2026-10-09): LENEMPTY_OUT is the
+ * gateway's real per-request output cap. Anything above it (or an unset
+ * cap — the endpoint defaulted past its own ceiling) empties with
+ * finish_reason length; at/below answers. LENEMPTY_CAPS records every
+ * lenempty request's max_tokens in order. */
+const LENEMPTY_OUT = 2048;
+let LENEMPTY_CAPS = [];
 function antEvent(res, obj) { res.write("data: " + JSON.stringify(obj) + "\n\n"); }
 function antToolStream(res, name, args) {
   const argsStr = JSON.stringify(args);
@@ -911,6 +930,80 @@ async function main() {
       "no such tool: xyz",
     ];
     for (const m of PERMANENT) check("A5 permanent NOT classified: " + m, !sofuu.agent.isTransientProviderError(m));
+  }
+
+  /* Length-empty stepped backoff (2026-10-09, live tokenrouter session):
+   * the gateway empties the stream whenever max_tokens exceeds its real
+   * per-request output cap. Every retry must send a STRICTLY smaller cap
+   * than the attempt that just emptied (the old 12.5%-of-window re-send
+   * equaled the registry cap just sent, so "retry 1/2" changed nothing
+   * and the run died); the working cap is learned per (endpoint, model)
+   * so the next turn starts below the ceiling instead of re-burning
+   * full requests. Model deepseek-chat resolves 8192 first (registry),
+   * the mock's real cap is LENEMPTY_OUT (2048). */
+  sofuu.agent.define({
+    name: "lenempty", system: "AGENT=lenempty You answer briefly.",
+    tools: [{ name: "get_weather", description: "Get weather",
+      parameters: { type: "object", properties: { city: { type: "string" } } },
+      execute: async (args) => "TOOLRES-lenempty " + JSON.stringify(args) }],
+    memory: "off", rlm: "off", budget: { maxSteps: 4 },
+    provider: "openai", model: "deepseek-chat", api_key: "x", base_url: MOCK
+  });
+  {
+    LENEMPTY_CAPS.length = 0;
+    let r = null, runErr = null;
+    try { r = await sofuu.agent.run("lenempty", "hi", {}); } catch (e) { runErr = e; }
+    check("length-empty: run recovers with text (no throw)",
+      !runErr && !!r && r.answer.indexOf("lenempty-recovered@") === 0);
+    check("length-empty: first attempt exceeded the gateway cap (setup)",
+      LENEMPTY_CAPS.length > 0 && LENEMPTY_CAPS[0] > LENEMPTY_OUT);
+    check("length-empty: every retry stepped strictly below the cap that emptied (" +
+      LENEMPTY_CAPS.join(",") + ")",
+      LENEMPTY_CAPS.length >= 2 && LENEMPTY_CAPS.every((c, i) =>
+        i === 0 || c < LENEMPTY_CAPS[i - 1]));
+    check("length-empty: converged at/below the gateway cap",
+      LENEMPTY_CAPS[LENEMPTY_CAPS.length - 1] <= LENEMPTY_OUT);
+    const learnt = ((r && r.trace) || []).filter(e => e.kind === "allocgate" &&
+      e.payload && e.payload.action === "learned_maxout");
+    check("length-empty: working cap learned into the session (allocgate)",
+      learnt.length >= 1 && learnt[learnt.length - 1].payload.maxOutput <= LENEMPTY_OUT);
+  }
+  {
+    /* Same session: the lesson sticks — the next turn opens below the
+     * ceiling instead of re-burning full requests against it. */
+    LENEMPTY_CAPS.length = 0;
+    let r2 = null;
+    try { r2 = await sofuu.agent.run("lenempty", "hi again", {}); } catch (e) {}
+    check("length-empty: second turn recovers",
+      !!r2 && r2.answer.indexOf("lenempty-recovered@") === 0);
+    check("length-empty: second turn opens at/below the learned cap (" +
+      LENEMPTY_CAPS.join(",") + ")",
+      LENEMPTY_CAPS.length >= 1 && LENEMPTY_CAPS[0] <= LENEMPTY_OUT);
+  }
+  /* Unusable endpoint (always empties): the allowance is honored exactly
+   * (attempt + 2 stepped retries, then the loud /maxout error) — no
+   * infinite retry, no silent (no response). Fresh model so no earlier
+   * lesson interferes. */
+  sofuu.agent.define({
+    name: "lenemptynever", system: "AGENT=lenempty-never You answer briefly.",
+    tools: [{ name: "get_weather", description: "Get weather",
+      parameters: { type: "object", properties: { city: { type: "string" } } },
+      execute: async (args) => "TOOLRES-lenempty-never " + JSON.stringify(args) }],
+    memory: "off", rlm: "off", budget: { maxSteps: 4 },
+    provider: "openai", model: "deepseek-coder", api_key: "x", base_url: MOCK
+  });
+  {
+    LENEMPTY_CAPS.length = 0;
+    let err = null;
+    try { await sofuu.agent.run("lenemptynever", "hi", {}); } catch (e) { err = e; }
+    check("length-empty: unusable endpoint still throws (loud, not silent)", !!err);
+    check("length-empty: throw names the cause + /maxout remedy",
+      !!err && String(err.message || err).indexOf("empty stream") >= 0 &&
+      String(err.message || err).indexOf("/maxout") >= 0);
+    check("length-empty: exactly attempt + 2 stepped retries (" +
+      LENEMPTY_CAPS.join(",") + ")",
+      LENEMPTY_CAPS.length === 3 && LENEMPTY_CAPS.every((c, i) =>
+        i === 0 || c < LENEMPTY_CAPS[i - 1]));
   }
 
   /* Mid-stream transport cut with text already forwarded: ONE continuation

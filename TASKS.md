@@ -4,6 +4,45 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-09 — live-session ctx/compaction/stall trio (deepseek-v4.1-flash:free @ tokenrouter).**
+> A live long-horizon session exposed three compounding failures, all
+> reproduced with scripted mocks and pinned by tests:
+> - **Window under-reported 16×:** `deepseek-v4.1-flash:free` resolved to the
+>   V3-era `("deepseek", 65_536)` registry row — footer read `ctx 41.8k/65.5k`
+>   on a 1M-context model (verified 1,048,576 in / 131,072 out across four
+>   public spec sources), so the 85%-of-window budget bled turns at ~55k.
+>   Registry is now version-aware (`deepseek-v4` → 1M; `kimi-k2.5`/`k2.6` →
+>   256K per Moonshot, `kimi-k3` → 1M — note K2.5 is NOT 1M, that figure is
+>   K3), with JS offline-table parity. Pinned by
+>   `rt::model_caps::tests::versioned_families_resolve_to_model_truth`
+>   (failed pre-fix with 65536).
+> - **Every compaction 400d:** `summarizeHistory` sent `[{system},
+>   ...foldedPrefix]` and the prefix ends with an assistant message —
+>   strict gateways reject with "The last message must have role=user"
+>   (manual AND the auto-cliff, which then swallowed the error and trimmed
+>   turns with no summary kept). The instruction now rides LAST as a user
+>   message (both TUI DRIVER and shipped `chat.js`); the auto path prints
+>   one dim failure line instead of swallowing. Pinned by
+>   `tests/chat_compact_role_e2e.sh` (pty + 400-on-assistant-last mock:
+>   2 failures pre-fix, green after; pre-existing `chat_compact_e2e.sh`
+>   still passes).
+> - **Run died on `finish_reason: length`:** the gateway empties the stream
+>   when `max_tokens` exceeds its real per-request output cap, and the
+>   retry re-sent 12.5%-of-window — which EQUALS the registry cap just
+>   sent (8192 vs 65536×0.125), so "retry 1/2" was a no-op and the run
+>   stopped. Retries now step STRICTLY below the cap that emptied (halved,
+>   window-ratio ceiling, 1024 floor, both allowances as backoff steps);
+>   the working cap — or the next untried halving on total failure — is
+>   learned per (endpoint, model) via the new `sofuu.ml.alloc.noteMaxOutput`
+>   seam (same session-scoped store as 400-learned limits, strongest ladder
+>   rung), so later turns clamp instead of re-burning. Live-probed:
+>   `[8192,4096,2048]` → recovered; next turn opens with a single `[2048]`.
+>   Pinned by 10 `length-empty` checks in `tests/agent_test.js` (old code:
+>   `(8192,8192)` then throw, 7 failures) plus
+>   `policy::noted_max_output_feeds_resolve`.
+> Current state: **lib 409/0 · bin 60/0 · capi 36/0 · JS 55/0/1 · ABI green ·
+> size 3.4 MB/5 MB.**
+>
 > **2026-09-27 — headless SDK made true, then installable (E0 + E1).**
 > An audit of the embeddable SDK found the credibility gap
 > `PLAN-POSITIONING-2026.md` §12.5 warns about: H0–H6 had *built* the library

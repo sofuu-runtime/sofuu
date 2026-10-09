@@ -455,6 +455,7 @@ sofuu.ml.info()                              // per-model params, arch, weights 
 sofuu.ml.feedback(model, verdict)            // explicit label from /ml wrong
 sofuu.ml.alloc.plan(stateJson)               // model-aware allocation: cfgWindow/maxOutput/compactAt/toolCap/budgets
 sofuu.ml.alloc.noteLimit(model, errText)     // "context"|"output"|""  — learn a real limit from a provider error
+sofuu.ml.alloc.noteMaxOutput(baseUrl, model, value) // recorded|0 — learn a working output cap from length-empty convergence (no parseable 400)
 ```
 
 Registered as a nested object per model under `sofuu.ml`, following `mod_ai_register`

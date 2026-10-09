@@ -824,9 +824,27 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             if arg.is_empty() {
                 "pick_theme"
             } else if theme::resolve(arg).is_some() {
+                let prev_name = cfg.theme.clone();
                 cfg.theme = arg.to_string();
                 cfg.save();
                 let t = theme::lookup(arg);
+                /* Whole-window flip: the theme owns the window background
+                 * now. Set it, remap already-painted rows to the new
+                 * foregrounds, and repaint everything (conversation +
+                 * input chrome) so the switch lands at once instead of
+                 * coloring only future rows. TTY-gated inside: piped
+                 * /theme stays byte-clean. */
+                if sofuu_ffi::tui_active() {
+                    unsafe {
+                        sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
+                    }
+                    let from = theme::lookup(&prev_name);
+                    sofuu_core::rt::tui::tui_remap_rows(&theme::fg_remap_pairs(from, t));
+                    unsafe {
+                        sofuu_core::rt::tui::tui_render_conversation();
+                        sofuu_core::modules::process::tui_repaint_chrome();
+                    }
+                }
                 chat_out(&format!(
                     "  ✓ Theme → {} ({}, {} of 25)\n",
                     t.name,
@@ -2509,9 +2527,13 @@ unsafe extern "C" fn js_chat_project(
 }
 
 /// `__chat_theme()` → JSON palette for the active TUI theme:
-/// {name, dark, accent, tool, delegate, heading, code, warn, error, add,
-/// del, hunk, panel}. Unknown names fall back to the default (see
+/// {name, dark, bg, accent, tool, delegate, heading, code, warn, error,
+/// add, del, hunk, panel}. Unknown names fall back to the default (see
 /// theme::lookup), so a bad config value can never unstyle the TUI.
+/// Resolving ALSO activates the theme's window background (idempotent):
+/// the driver loads this palette before __tui_on at boot and re-reads it
+/// on every command, so boot and any out-of-band config change follow
+/// without a separate sync call. Emits nothing when the TUI is inactive.
 unsafe extern "C" fn js_chat_theme(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -2525,8 +2547,11 @@ unsafe extern "C" fn js_chat_theme(
         .map(|c| c.theme.clone())
         .unwrap_or_default();
     let t = theme::lookup(&name);
+    unsafe {
+        sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
+    }
     let json = serde_json::json!({
-        "name": t.name, "dark": t.dark,
+        "name": t.name, "dark": t.dark, "bg": t.bg,
         "accent": t.accent, "tool": t.tool, "delegate": t.delegate,
         "heading": t.heading, "code": t.code, "warn": t.warn,
         "error": t.error, "add": t.add, "del": t.del,

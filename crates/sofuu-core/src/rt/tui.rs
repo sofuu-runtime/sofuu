@@ -43,6 +43,60 @@ thread_local! {
     static G_HEADER: RefCell<String> = const { RefCell::new(String::new()) };
     static G_ACTIVE: Cell<i32> = const { Cell::new(0) };
     static G_INIT_DONE: Cell<i32> = const { Cell::new(0) };
+    /* Active window background (256-palette index) from the selected TUI
+     * theme, or -1 for the classic transparent look. Erases (\x1b[K,
+     * \x1b[J, \x1b[2J) fill with the CURRENT background color, so every
+     * erase site prefixes this — the whole alt-screen window follows the
+     * theme (light theme = light window), not just the text. A mid-row
+     * \x1b[0m cannot break it: the erase already painted the full row,
+     * and nothing repaints the tail after the content ends. */
+    static G_BG: Cell<i32> = const { Cell::new(-1) };
+}
+
+/// Background SGR for the active theme, or "" when unthemed (byte-exact
+/// classic output — themed painting must never perturb the default look).
+pub fn tui_bg_prefix() -> String {
+    let bg = G_BG.with(|g| g.get());
+    if (0..=255).contains(&bg) {
+        format!("\x1b[48;5;{bg}m")
+    } else {
+        String::new()
+    }
+}
+
+/// Select the window background (0-255); anything else clears it.
+/// Emits nothing itself — the next erase paints it.
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_bg(idx: c_int) {
+    G_BG.with(|g| g.set(idx));
+}
+
+/// Remap already-painted buffer rows from one theme's foregrounds to
+/// another's (see theme::fg_remap_pairs): full `\x1b[<params>m` sequences
+/// only, longest-old-first. Display-only — the session transcript is
+/// untouched.
+pub fn tui_remap_rows(map: &[(&str, &str)]) {
+    if map.is_empty() {
+        return;
+    }
+    G_LINES.with(|l| {
+        let mut v = l.borrow_mut();
+        let head = G_HEAD.with(|h| h.get());
+        for row in v.iter_mut().skip(head) {
+            *row = remap_row(row, map);
+        }
+    });
+}
+
+fn remap_row(row: &str, map: &[(&str, &str)]) -> String {
+    let mut out = row.to_string();
+    for (old, new) in map {
+        let from = format!("\x1b[{old}m");
+        if out.contains(&from) {
+            out = out.replace(&from, &format!("\x1b[{new}m"));
+        }
+    }
+    out
 }
 
 /// Write a raw byte string to stdout and flush (C: fputs + fflush).
@@ -59,7 +113,7 @@ fn write_out(s: &str) {
 #[no_mangle]
 pub unsafe extern "C" fn tui_overlay_row(row: c_int, content: *const c_char) {
     let bytes = c_str(content);
-    write_out(&format!("\x1b[{};1H\x1b[K", row));
+    write_out(&format!("\x1b[{};1H{}\x1b[K", row, tui_bg_prefix()));
     let mut out = std::io::stdout();
     let _ = out.write_all(bytes);
     let _ = out.flush();
@@ -289,7 +343,10 @@ pub unsafe extern "C" fn tui_enter() {
     G_ACTIVE.with(|a| a.set(1));
     G_SCROLL.with(|s| s.set(0));
     // alt screen on + cursor hidden (the armed readline shows it) + clear.
-    write_out(concat!("\x1b[?1049h", "\x1b[?25l", "\x1b[2J\x1b[H"));
+    // The clear carries the theme background so the whole fresh window
+    // opens themed (an erase fills with the current bg color).
+    write_out("\x1b[?1049h\x1b[?25l");
+    write_out(&format!("{}\x1b[2J\x1b[H", tui_bg_prefix()));
     tui_render_conversation();
 }
 
@@ -301,6 +358,11 @@ pub unsafe extern "C" fn tui_exit() {
         return;
     }
     G_ACTIVE.with(|a| a.set(0));
+    /* A themed background outlives the alt screen in most emulators (SGR
+     * state persists across 1049l) — reset FIRST so the shell keeps the
+     * user's own colors, then leave. */
+    write_out("\x1b[0m");
+    G_BG.with(|g| g.set(-1));
     write_out("\x1b[?25h\x1b[?1049l"); /* cursor back, alt screen off */
 }
 
@@ -314,8 +376,9 @@ unsafe fn tui_clear_rows(a: c_int, b: c_int) {
         return;
     }
     let mut out = String::with_capacity(((b - a + 1) as usize) * 16);
+    let bg = tui_bg_prefix();
     for r in a..=b {
-        out.push_str(&format!("\x1b[{};1H\x1b[K", r));
+        out.push_str(&format!("\x1b[{};1H{}\x1b[K", r, bg));
     }
     write_out(&out);
 }
@@ -349,7 +412,7 @@ pub unsafe extern "C" fn tui_relayout() {
     if active == 0 {
         return;
     }
-    write_out("\x1b[2J\x1b[H");
+    write_out(&format!("{}\x1b[2J\x1b[H", tui_bg_prefix()));
     tui_render_conversation();
     // Gap rows are outside conversation (h-7,h-6) — ensure they are blank
     // after a full-screen clear, so a prior picker/info row cannot survive.
@@ -588,6 +651,7 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
         v[head + from..head + from + take].to_vec()
     });
     let window_rows = lines.len();
+    let bg = tui_bg_prefix();
     let mut out = String::with_capacity(window_rows * 80);
     /* Every conversation row is indented by GUTTER cells so the text shares
      * the input box's left margin ("│ ··text") instead of touching the
@@ -600,7 +664,7 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
     let sel_lo = if sel_a >= 0 && sel_b >= 0 { sel_a.min(sel_b) } else { -1 };
     let sel_hi = if sel_a >= 0 && sel_b >= 0 { sel_a.max(sel_b) } else { -1 };
     for row in t..=b {
-        out.push_str(&format!("\x1b[{};1H\x1b[K", row));
+        out.push_str(&format!("\x1b[{};1H{}\x1b[K", row, bg));
         let idx = row - top;
         if idx >= 0 && (idx as usize) < lines.len() {
             let l = &lines[idx as usize];
@@ -1593,6 +1657,66 @@ mod tests {
         }
         G_SCROLL.with(|s| s.set(0));
         G_ACTIVE.with(|a| a.set(0));
+        G_LINES.with(|l| l.borrow_mut().clear());
+    }
+
+    /// Window-background contract: unthemed output is byte-exact classic
+    /// (empty prefix), a set theme prefixes every erase with its bg SGR.
+    #[test]
+    fn bg_prefix_is_empty_unthemed_and_sgr_when_set() {
+        G_BG.with(|g| g.set(-1));
+        assert_eq!(tui_bg_prefix(), "");
+        unsafe { tui_set_bg(235) };
+        assert_eq!(tui_bg_prefix(), "\x1b[48;5;235m");
+        unsafe { tui_set_bg(255) };
+        assert_eq!(tui_bg_prefix(), "\x1b[48;5;255m");
+        unsafe { tui_set_bg(-1) };
+        assert_eq!(tui_bg_prefix(), "");
+    }
+
+    /// Buffer remap on a switch: full old sequences flip to the new
+    /// theme's, anything else (plain text, foreign ANSI) is untouched,
+    /// and the new params never re-match (disjoint sets, one pass).
+    #[test]
+    fn remap_row_flips_roles_and_leaves_the_rest() {
+        let map: &[(&str, &str)] = &[
+            ("1;38;5;110", "1;38;5;25"), // slate accent -> paper accent
+            ("38;5;109", "38;5;29"),     // slate tool   -> paper tool
+        ];
+        let row = "\x1b[1;38;5;110m  ⏺ you\x1b[0m · hi \x1b[38;5;109mtodo_write\x1b[0m \x1b[31mdiy-red\x1b[0m";
+        let out = remap_row(row, map);
+        assert!(
+            out.contains("\x1b[1;38;5;25m  ⏺ you"),
+            "accent flips: {out:?}"
+        );
+        assert!(out.contains("\x1b[38;5;29mtodo_write"), "tool flips: {out:?}");
+        assert!(out.contains("\x1b[31mdiy-red\x1b[0m"), "foreign ANSI untouched: {out:?}");
+        assert!(!out.contains("38;5;110"), "no old params survive: {out:?}");
+        assert!(!out.contains("38;5;109m"), "no old params survive: {out:?}");
+        // Empty map is the identity (same-theme switch does nothing).
+        assert_eq!(remap_row(row, &[]), row);
+    }
+
+    /// End-to-end through the live buffer: painted rows remap, head-dead
+    /// rows (outside the live window) are left alone.
+    #[test]
+    fn remap_rows_covers_only_live_buffer() {
+        let map: &[(&str, &str)] = &[("38;5;109", "38;5;29")];
+        G_LINES.with(|l| {
+            *l.borrow_mut() = vec![
+                "\x1b[38;5;109mdead-row".to_string(),
+                "\x1b[38;5;109mlive-row".to_string(),
+            ]
+        });
+        G_HEAD.with(|h| h.set(1));
+        tui_remap_rows(map);
+        G_LINES.with(|l| {
+            let v = l.borrow();
+            assert!(v[0].contains("38;5;109m"), "dead prefix untouched");
+            assert!(v[1].contains("\x1b[38;5;29mlive-row"), "live row flips");
+            assert!(!v[1].contains("38;5;109m"), "no old params in live row");
+        });
+        G_HEAD.with(|h| h.set(0));
         G_LINES.with(|l| l.borrow_mut().clear());
     }
 

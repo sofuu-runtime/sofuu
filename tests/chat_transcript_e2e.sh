@@ -143,7 +143,9 @@ check "inline code renders in the theme code color" $?
 # 2-space gutter, so `K + 3 spaces + ESC` matches ONLY a real blank row)
 # opens the dim-⏺ tool line. (The input prompt is bold-magenta ⏺, and
 # panel blanks are bare clears — neither can match.)
-grep -q "$(printf '\x1b\\[K   \x1b\\[[0-9]*;1H\x1b\\[K  \x1b\\[90m  \xe2\x8f\xba')" "$PTY_TXT"
+# The middle clear may carry the theme window background
+# (`H \x1b[48;5;Nm K`) — tolerate it so the rhythm assert survives themes.
+grep -q "$(printf '\x1b\\[K   \x1b\\[[0-9]*;1H\\(\x1b\\[48;5;[0-9][0-9]*m\\)\\?\x1b\\[K  \x1b\\[90m  \xe2\x8f\xba')" "$PTY_TXT"
 check "blank row opens the tool group" $?
 # 3. live checklist instead of the one-row summary.
 grep -q "☑ 1/3" "$PTY_TXT"

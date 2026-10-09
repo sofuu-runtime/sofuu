@@ -4,6 +4,29 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-09 — themes repaint the whole window (light/dark follows the theme).**
+> Switching themes used to recolor only future text: the window kept the
+> terminal's own background, so light themes were light text on a dark
+> window. Every theme now carries an explicit 256-palette window
+> background (`bg`: dark themes 235, light themes 255, pinned by
+> `theme_background_follows_polarity`), and every erase site paints it —
+> erases fill with the current bg color, so prefixing all `\x1b[K` /
+> `\x1b[J` / `\x1b[2J` sites (conversation renderer, input chrome,
+> selector, gap clears, enter/relayout clears) flips the whole alt-screen
+> window with zero behavior change unthemed (empty prefix). A switch
+> additionally remaps already-painted rows to the new foregrounds
+> (`theme::fg_remap_pairs`, full-sequence match, disjoint param sets so
+> one pass cannot double-remap) and repaints everything, so a
+> dark→light flip never strands light text on a light window; exit
+> resets SGR before leaving the alt screen (no shell leak), and piped
+> output stays byte-clean of backgrounds. Pinned by 6 new
+> `chat_theme_e2e.sh` checks (dark bg 235, light flip to 255, old-row
+> remap, exit reset, no pipe leak — 4 fail pre-fix) plus Rust unit tests
+> for the prefix/remap appliers; the one byte-pinned rhythm assert in
+> `chat_transcript_e2e.sh` was taught to tolerate the bg insert.
+> Current state: **lib 412/0 · bin 62/0 · capi 36/0 · JS 56 suites 55/0/1 ·
+> ABI green · size 3.5 MB/5 MB.**
+>
 > **2026-10-09 — live-session ctx/compaction/stall trio (deepseek-v4.1-flash:free @ tokenrouter).**
 > A live long-horizon session exposed three compounding failures, all
 > reproduced with scripted mocks and pinned by tests:

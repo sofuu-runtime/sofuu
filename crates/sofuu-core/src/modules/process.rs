@@ -1108,10 +1108,10 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
     let ui_lines = UI_LINES.with(|l| l.get());
     if ui_lines > 0 {
         let _ = write!(out, "\x1b[{}A", ui_lines);
-        let _ = write!(out, "\x1b[J");
+                        let _ = write!(out, "{}\x1b[J", crate::rt::tui::tui_bg_prefix());
         UI_LINES.with(|l| l.set(0));
     } else {
-        let _ = write!(out, "\r\x1b[K");
+        let _ = write!(out, "\r{}\x1b[K", crate::rt::tui::tui_bg_prefix());
     }
 
     /* 2. Draw suggestions above the box (dim), capped + scrolling window. */
@@ -1231,10 +1231,10 @@ unsafe fn tty_render_tui(
         let mut info_shown = 0usize;
         let clear_lo = (conv_bottom - MAX_SUGG as c_int).min(box_top - 1);
         for r in clear_lo..=conv_bottom {
-            let _ = write!(out, "\x1b[{};1H\x1b[K", r);
+            let _ = write!(out, "\x1b[{};1H{}\x1b[K", r, crate::rt::tui::tui_bg_prefix());
         }
         for r in (conv_bottom + 1)..box_top {
-            let _ = write!(out, "\x1b[{};1H\x1b[K", r);
+            let _ = write!(out, "\x1b[{};1H{}\x1b[K", r, crate::rt::tui::tui_bg_prefix());
         }
         /* The typed line may be an EXACT command even when it's also a
          * prefix of others (e.g. "/model" vs "/models"). When no list is
@@ -1267,10 +1267,10 @@ unsafe fn tty_render_tui(
                     if mi >= start {
                         if mi == sel as usize {
                             /* highlighted suggestion — reverse video */
-                            let _ = write!(out, "\x1b[{};1H\x1b[K  \x1b[7m{}\x1b[0m", row, String::from_utf8_lossy(&m[..l]));
+                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[7m{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), String::from_utf8_lossy(&m[..l]));
                             sel_line = Some(m[..l].to_vec());
                         } else {
-                            let _ = write!(out, "\x1b[{};1H\x1b[K  \x1b[2m{}\x1b[0m", row, String::from_utf8_lossy(&m[..l]));
+                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[2m{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), String::from_utf8_lossy(&m[..l]));
                         }
                         shown += 1;
                         row -= 1;
@@ -1293,13 +1293,13 @@ unsafe fn tty_render_tui(
                         info.push_str(" — ");
                         info.push_str(&opts);
                     }
-                    let _ = write!(out, "\x1b[{};1H\x1b[K  \x1b[36m{}\x1b[0m", info_row, info);
+                    let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[36m{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), info);
                     info_shown = 1;
                 }
             }
             /* "+N more" hint above the window when there are hidden items. */
             if n as usize > start + shown {
-                let _ = write!(out, "\x1b[{};1H\x1b[K  \x1b[2m… {} more\x1b[0m", info_row - 1, n - (start + shown));
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[2m… {} more\x1b[0m", info_row - 1, crate::rt::tui::tui_bg_prefix(), n - (start + shown));
             }
         }
         /* Exact-command info (drawn after the list so it wins any overlap):
@@ -1317,7 +1317,7 @@ unsafe fn tty_render_tui(
                 } else {
                     tui_box_top() - 1
                 };
-                let _ = write!(out, "\x1b[{};1H\x1b[K  \x1b[36m{}\x1b[0m", info_row, info);
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[36m{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), info);
                 info_shown = 1;
             }
         }
@@ -1331,13 +1331,13 @@ unsafe fn tty_render_tui(
         let T = tui_box_top();
         let I = tui_input_row();
 
-        let _ = write!(out, "\x1b[{};1H\x1b[K\x1b[2;35m╭", T);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m╭", T, crate::rt::tui::tui_bg_prefix());
         for _ in 0..(W - 2) {
             let _ = write!(out, "─");
         }
         let _ = write!(out, "╮\x1b[0m");
 
-        let _ = write!(out, "\x1b[{};1H\x1b[K\x1b[2;35m│\x1b[0m  ", I);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m│\x1b[0m  ", I, crate::rt::tui::tui_bg_prefix());
         let mut prow = 0usize;
         let prompt = RL_PROMPT.with(|p| p.borrow().clone());
         if !prompt.is_empty() {
@@ -1387,7 +1387,7 @@ unsafe fn tty_render_tui(
             pad += 1;
         }
         let _ = write!(out, "\x1b[2;35m│\x1b[0m");
-        let _ = write!(out, "\x1b[{};1H\x1b[K\x1b[2;35m╰", I + 1);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m╰", I + 1, crate::rt::tui::tui_bg_prefix());
         for _ in 0..(W - 2) {
             let _ = write!(out, "─");
         }
@@ -1396,7 +1396,7 @@ unsafe fn tty_render_tui(
 
     /* 4. Footer row F (H-2): left status, right dim hints. */
     let F = tui_footer_row();
-    let _ = write!(out, "\x1b[{};1H\x1b[K", F);
+    let _ = write!(out, "\x1b[{};1H{}\x1b[K", F, crate::rt::tui::tui_bg_prefix());
     let hints = HINTS.with(|h| h.borrow().clone());
     let status = STATUS.with(|s| s.borrow().clone());
     let hints_w = if !hints.is_empty() {
@@ -1434,7 +1434,7 @@ unsafe fn tty_render_tui(
 
     /* 5. Footer row 2 (H-1): left context metric + right RAM metric — GUTTER-aligned with H-2. */
     let metric = METRIC.with(|m| m.borrow().clone());
-    let _ = write!(out, "\x1b[{};1H\x1b[K", tui_footer2_row());
+    let _ = write!(out, "\x1b[{};1H{}\x1b[K", tui_footer2_row(), crate::rt::tui::tui_bg_prefix());
     let metric_l = METRIC_LEFT.with(|m| m.borrow().clone());
     if !metric_l.is_empty() {
         let avail_l = W - gutter - 1 - if !metric.is_empty() { tui_disp_width(metric.as_ptr() as *const c_char, metric.len()) as c_int + 1 } else { 0 };
@@ -1539,6 +1539,24 @@ unsafe extern "C" fn on_winch(_handle: *mut UvSignal, _signum: c_int) {
         tty_render_line_ui(tty_ctx, 0);
     }
     /* A resize wipes the overlay zone — ask the driver to re-draw it. */
+    if SELECTOR_ACTIVE.with(|a| a.get()) != 0 && !tty_ctx.is_null() {
+        selector_key(tty_ctx, "redraw", None);
+    }
+}
+
+/// Repaint the input chrome (box/footer) + selector overlay with the
+/// current theme — the conversation half is tui_render_conversation's
+/// job. Called after a theme switch so the whole window flips at once
+/// (same shape as the resize path, minus the relayout).
+#[no_mangle]
+pub unsafe extern "C" fn tui_repaint_chrome() {
+    if tui_active() == 0 {
+        return;
+    }
+    let tty_ctx = TTY_CTX.with(|c| c.get());
+    if TTY_OPEN.with(|o| o.get()) != 0 && !tty_ctx.is_null() {
+        tty_render_line_ui(tty_ctx, 0);
+    }
     if SELECTOR_ACTIVE.with(|a| a.get()) != 0 && !tty_ctx.is_null() {
         selector_key(tty_ctx, "redraw", None);
     }
@@ -1741,7 +1759,7 @@ unsafe extern "C" fn js_selector_draw(
         // new one fully overwrites. This handles filter narrowing,
         // expanding, and H/W changes without stranded rows.
         for r in sel_top..=last_old {
-            let _ = write!(out, "\x1b[{};1H\x1b[K", r);
+            let _ = write!(out, "\x1b[{};1H{}\x1b[K", r, crate::rt::tui::tui_bg_prefix());
         }
         // Bottom-tail when H shrank: old zone_bottom may be below new one,
         // but that tail was part of the old rect already (cleared above).
@@ -1755,7 +1773,7 @@ unsafe extern "C" fn js_selector_draw(
         let tmp = &p[..len];
         let tcs = CString::new(tmp).unwrap_or_default();
         let bl = tui_truncate_cells(tcs.as_ptr(), W);
-        let _ = write!(out, "\x1b[{};1H\x1b[K", top + i as c_int);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K", top + i as c_int, crate::rt::tui::tui_bg_prefix());
         let _ = out.write_all(&tmp[..bl.min(tmp.len())]);
         p = match nl {
             None => &p[p.len()..],
@@ -1795,7 +1813,7 @@ unsafe extern "C" fn js_selector_close(
             use std::io::Write;
             let mut out2 = std::io::stdout().lock();
             for r in prev_top..prev_top + prev_rows {
-                let _ = write!(out2, "\x1b[{};1H\x1b[K", r);
+                let _ = write!(out2, "\x1b[{};1H{}\x1b[K", r, crate::rt::tui::tui_bg_prefix());
             }
             let _ = out2.flush();
             tui_clear_gap();
@@ -2070,7 +2088,7 @@ unsafe fn sel_show_notice(ctx: *mut JSContext, n_lines: usize) {
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "\x1b[{};1H\x1b[K\x1b[2m  {}\x1b[0m", row, msg);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2m  {}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), msg);
         let _ = out.flush();
     }
     /* remember + arm the clearing timer */
@@ -2206,7 +2224,7 @@ unsafe extern "C" fn sel_notice_timer_cb(_t: *mut UvTimer) {
     }
     use std::io::Write;
     let mut out = std::io::stdout().lock();
-    let _ = write!(out, "\x1b[{};1H\x1b[K", tui_phase_row());
+    let _ = write!(out, "\x1b[{};1H{}\x1b[K", tui_phase_row(), crate::rt::tui::tui_bg_prefix());
     let _ = out.flush();
 }
 
@@ -2774,7 +2792,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let _ = write!(out, "\x1b[{}A", ui_lines - 2);
-            let _ = write!(out, "\x1b[J");
+                    let _ = write!(out, "{}\x1b[J", crate::rt::tui::tui_bg_prefix());
             let _ = out.flush();
             UI_LINES.with(|l| l.set(0));
         }
@@ -2854,7 +2872,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                     use std::io::Write;
                     let mut out = std::io::stdout().lock();
                     let _ = write!(out, "\x1b[{}A", ui_lines - 2);
-                    let _ = write!(out, "\x1b[J");
+            let _ = write!(out, "{}\x1b[J", crate::rt::tui::tui_bg_prefix());
                     let _ = out.flush();
                     UI_LINES.with(|l| l.set(0));
                 }
@@ -2885,7 +2903,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                     let ui_lines = UI_LINES.with(|l| l.get());
                     if ui_lines > 0 {
                         let mut out = std::io::stdout().lock();
-                        let _ = write!(out, "\x1b[{}A\x1b[J", ui_lines);
+                        let _ = write!(out, "\x1b[{}A{}\x1b[J", ui_lines, crate::rt::tui::tui_bg_prefix());
                         let _ = out.flush();
                         UI_LINES.with(|l| l.set(0));
                     }
@@ -2930,7 +2948,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                         }
                         let mut out = std::io::stdout().lock();
                         let _ = write!(out, "\x1b[{}A", up);
-                        let _ = write!(out, "\x1b[J");
+        let _ = write!(out, "{}\x1b[J", crate::rt::tui::tui_bg_prefix());
                         let _ = out.flush();
                         UI_LINES.with(|l| l.set(0));
                     }

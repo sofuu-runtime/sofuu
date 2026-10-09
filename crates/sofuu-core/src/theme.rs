@@ -4,7 +4,12 @@
 //! Every color is a fixed 256-palette SGR parameter string — never the
 //! terminal-themed 30–37 range — so a theme renders identically under any
 //! terminal theme, light or dark. All hues are muted (no neons); each
-//! theme is tagged dark/light for the background it was designed against.
+//! theme is tagged dark/light for the background it was designed against,
+//! AND carries that background as an explicit 256-palette index (`bg`):
+//! switching themes repaints the whole window (the TUI owns an alt
+//! screen), not just the text. Dark themes share bg 235, light themes bg
+//! 255 — uniform per polarity so a same-polarity switch keeps the window
+//! steady while a cross-polarity switch flips it.
 //!
 //! Roles (precomposed with their conventional attributes, e.g. bold for
 //! headings/errors and the diff background tints baked into add/del):
@@ -28,6 +33,8 @@
 pub struct Theme {
     pub name: &'static str,
     pub dark: bool,
+    /// Window background, 256-palette index (dark themes 235, light 255).
+    pub bg: u8,
     pub accent: &'static str,
     pub tool: &'static str,
     pub delegate: &'static str,
@@ -46,67 +53,67 @@ pub const DEFAULT_THEME: &str = "sofuu";
 /// All 25 themes: 13 designed for dark terminals, 12 for light ones.
 pub const THEMES: &[Theme] = &[
     // ── dark ──────────────────────────────────────────────────────
-    Theme { name: "sofuu", dark: true, // faithful port of the classic look
+    Theme { name: "sofuu", dark: true, bg: 235, // faithful port of the classic look
         accent: "1;38;5;139", tool: "38;5;80", delegate: "38;5;140",
         heading: "1;38;5;80", code: "38;5;180", warn: "38;5;173",
         error: "1;38;5;174", add: "1;38;5;157;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;80", panel: "2;38;5;139" },
-    Theme { name: "slate", dark: true, // blue-gray monochrome calm
+    Theme { name: "slate", dark: true, bg: 235, // blue-gray monochrome calm
         accent: "1;38;5;110", tool: "38;5;109", delegate: "38;5;103",
         heading: "1;38;5;110", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;109", panel: "2;38;5;110" },
-    Theme { name: "moss", dark: true, // green-dominant, warm gray accents
+    Theme { name: "moss", dark: true, bg: 235, // green-dominant, warm gray accents
         accent: "1;38;5;150", tool: "38;5;108", delegate: "38;5;144",
         heading: "1;38;5;150", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;22", del: "1;38;5;181;48;5;52",
         hunk: "38;5;108", panel: "2;38;5;150" },
-    Theme { name: "clay", dark: true, // terracotta warmth
+    Theme { name: "clay", dark: true, bg: 235, // terracotta warmth
         accent: "1;38;5;173", tool: "38;5;180", delegate: "38;5;174",
         heading: "1;38;5;173", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;180", panel: "2;38;5;173" },
-    Theme { name: "plum", dark: true, // muted purple, low saturation
+    Theme { name: "plum", dark: true, bg: 235, // muted purple, low saturation
         accent: "1;38;5;140", tool: "38;5;139", delegate: "38;5;183",
         heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
         hunk: "38;5;139", panel: "2;38;5;140" },
-    Theme { name: "tide", dark: true, // deep teal water
+    Theme { name: "tide", dark: true, bg: 235, // deep teal water
         accent: "1;38;5;115", tool: "38;5;80", delegate: "38;5;109",
         heading: "1;38;5;115", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;23", del: "1;38;5;174;48;5;52",
         hunk: "38;5;80", panel: "2;38;5;115" },
-    Theme { name: "ember", dark: true, // ember orange on charcoal
+    Theme { name: "ember", dark: true, bg: 235, // ember orange on charcoal
         accent: "1;38;5;180", tool: "38;5;173", delegate: "38;5;174",
         heading: "1;38;5;180", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
         hunk: "38;5;173", panel: "2;38;5;180" },
-    Theme { name: "dusk", dark: true, // dusky blue-violet evening
+    Theme { name: "dusk", dark: true, bg: 235, // dusky blue-violet evening
         accent: "1;38;5;140", tool: "38;5;110", delegate: "38;5;139",
         heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;110", panel: "2;38;5;140" },
-    Theme { name: "forest", dark: true, // deep pine, bark browns
+    Theme { name: "forest", dark: true, bg: 235, // deep pine, bark browns
         accent: "1;38;5;108", tool: "38;5;150", delegate: "38;5;144",
         heading: "1;38;5;108", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;22", del: "1;38;5;181;48;5;88",
         hunk: "38;5;150", panel: "2;38;5;108" },
-    Theme { name: "wine", dark: true, // muted oxblood red family
+    Theme { name: "wine", dark: true, bg: 235, // muted oxblood red family
         accent: "1;38;5;174", tool: "38;5;181", delegate: "38;5;139",
         heading: "1;38;5;174", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;88",
         hunk: "38;5;181", panel: "2;38;5;174" },
-    Theme { name: "storm", dark: true, // cold steel gray-blue
+    Theme { name: "storm", dark: true, bg: 235, // cold steel gray-blue
         accent: "1;38;5;109", tool: "38;5;110", delegate: "38;5;103",
         heading: "1;38;5;109", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;110", panel: "2;38;5;109" },
-    Theme { name: "honey", dark: true, // warm amber, softened gold
+    Theme { name: "honey", dark: true, bg: 235, // warm amber, softened gold
         accent: "1;38;5;180", tool: "38;5;186", delegate: "38;5;173",
         heading: "1;38;5;180", code: "38;5;223", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;186", panel: "2;38;5;180" },
-    Theme { name: "lagoon", dark: true, // pale aqua on deep slate
+    Theme { name: "lagoon", dark: true, bg: 235, // pale aqua on deep slate
         accent: "1;38;5;116", tool: "38;5;115", delegate: "38;5;110",
         heading: "1;38;5;116", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;23", del: "1;38;5;181;48;5;52",
@@ -114,62 +121,62 @@ pub const THEMES: &[Theme] = &[
     // ── light ─────────────────────────────────────────────────────
     // Light themes use dark foregrounds (readable on pale backgrounds)
     // and light tints behind diff rows (dark text stays legible).
-    Theme { name: "paper", dark: false, // ink on paper, restrained blue
+    Theme { name: "paper", dark: false, bg: 255, // ink on paper, restrained blue
         accent: "1;38;5;25", tool: "38;5;29", delegate: "38;5;95",
         heading: "1;38;5;25", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;29", panel: "2;38;5;25" },
-    Theme { name: "linen", dark: false, // warm neutral, umber ink
+    Theme { name: "linen", dark: false, bg: 255, // warm neutral, umber ink
         accent: "1;38;5;95", tool: "38;5;100", delegate: "38;5;130",
         heading: "1;38;5;95", code: "38;5;136", warn: "38;5;130",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;100", panel: "2;38;5;95" },
-    Theme { name: "porcelain", dark: false, // cool celadon on white
+    Theme { name: "porcelain", dark: false, bg: 255, // cool celadon on white
         accent: "1;38;5;29", tool: "38;5;24", delegate: "38;5;66",
         heading: "1;38;5;29", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;24", panel: "2;38;5;29" },
-    Theme { name: "wheat", dark: false, // harvest golds, toasted brown
+    Theme { name: "wheat", dark: false, bg: 255, // harvest golds, toasted brown
         accent: "1;38;5;130", tool: "38;5;136", delegate: "38;5;95",
         heading: "1;38;5;130", code: "38;5;100", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;136", panel: "2;38;5;130" },
-    Theme { name: "mist", dark: false, // fog gray-blue, quiet
+    Theme { name: "mist", dark: false, bg: 255, // fog gray-blue, quiet
         accent: "1;38;5;60", tool: "38;5;66", delegate: "38;5;95",
         heading: "1;38;5;60", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;66", panel: "2;38;5;60" },
-    Theme { name: "bone", dark: false, // pale neutral, graphite ink
+    Theme { name: "bone", dark: false, bg: 255, // pale neutral, graphite ink
         accent: "1;38;5;58", tool: "38;5;59", delegate: "38;5;95",
         heading: "1;38;5;58", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;59", panel: "2;38;5;58" },
-    Theme { name: "sage-light", dark: false, // pale garden green-gray
+    Theme { name: "sage-light", dark: false, bg: 255, // pale garden green-gray
         accent: "1;38;5;64", tool: "38;5;29", delegate: "38;5;100",
         heading: "1;38;5;64", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;29", panel: "2;38;5;64" },
-    Theme { name: "clay-light", dark: false, // sunbaked terracotta tint
+    Theme { name: "clay-light", dark: false, bg: 255, // sunbaked terracotta tint
         accent: "1;38;5;131", tool: "38;5;130", delegate: "38;5;95",
         heading: "1;38;5;131", code: "38;5;100", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;130", panel: "2;38;5;131" },
-    Theme { name: "ink", dark: false, // maximal contrast, navy ink
+    Theme { name: "ink", dark: false, bg: 255, // maximal contrast, navy ink
         accent: "1;38;5;18", tool: "38;5;24", delegate: "38;5;90",
         heading: "1;38;5;18", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;24", panel: "2;38;5;18" },
-    Theme { name: "rose-light", dark: false, // blush, muted cranberry
+    Theme { name: "rose-light", dark: false, bg: 255, // blush, muted cranberry
         accent: "1;38;5;131", tool: "38;5;95", delegate: "38;5;60",
         heading: "1;38;5;131", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;95", panel: "2;38;5;131" },
-    Theme { name: "moss-light", dark: false, // pale lichen, deep pine ink
+    Theme { name: "moss-light", dark: false, bg: 255, // pale lichen, deep pine ink
         accent: "1;38;5;29", tool: "38;5;64", delegate: "38;5;66",
         heading: "1;38;5;29", code: "38;5;130", warn: "38;5;136",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
         hunk: "38;5;64", panel: "2;38;5;29" },
-    Theme { name: "dune", dark: false, // desert sand, dark bronze
+    Theme { name: "dune", dark: false, bg: 255, // desert sand, dark bronze
         accent: "1;38;5;136", tool: "38;5;100", delegate: "38;5;95",
         heading: "1;38;5;136", code: "38;5;64", warn: "38;5;130",
         error: "1;38;5;124", add: "38;5;28;48;5;194", del: "38;5;124;48;5;224",
@@ -194,6 +201,38 @@ pub fn lookup(name: &str) -> &'static Theme {
 pub fn resolve(name: &str) -> Option<&'static Theme> {
     let want = name.trim().to_lowercase();
     THEMES.iter().find(|t| t.name == want)
+}
+
+/// Foreground remap from one theme to another: (old_params, new_params)
+/// per role, longest old-params first.
+///
+/// Applied to already-painted buffer rows on a theme switch so the old
+/// transcript flips foregrounds along with the window background instead
+/// of going unreadable across a dark/light switch. Roles pair by position
+/// (accent→accent … panel→panel); pairs with identical params are dropped.
+/// Matching is on the full escape (`\x1b[<params>m`), never a bare
+/// substring, and the two themes' param sets are disjoint by construction
+/// (dark roles never use light values), so one pass cannot double-remap.
+/// Caveat, documented not hidden: rows from tools/models may carry raw
+/// ANSI that happens to equal an old role sequence — that span remaps too
+/// (display-only; the session transcript underneath is untouched).
+pub fn fg_remap_pairs(from: &Theme, to: &Theme) -> Vec<(&'static str, &'static str)> {
+    let mut v: Vec<(&'static str, &'static str)> = vec![
+        (from.accent, to.accent),
+        (from.tool, to.tool),
+        (from.delegate, to.delegate),
+        (from.heading, to.heading),
+        (from.code, to.code),
+        (from.warn, to.warn),
+        (from.error, to.error),
+        (from.add, to.add),
+        (from.del, to.del),
+        (from.hunk, to.hunk),
+        (from.panel, to.panel),
+    ];
+    v.retain(|(a, b)| a != b);
+    v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    v
 }
 
 #[cfg(test)]
@@ -299,5 +338,46 @@ mod tests {
         assert_eq!(lookup("no-such-theme").name, DEFAULT_THEME);
         assert!(resolve("moss-light").is_some());
         assert!(resolve("nope").is_none());
+    }
+
+    /// Window-background contract: every dark theme flips the window to
+    /// bg 235, every light theme to 255 — switching themes repaints the
+    /// whole window, never just the text.
+    #[test]
+    fn theme_background_follows_polarity() {
+        for t in THEMES {
+            let want = if t.dark { 235u8 } else { 255u8 };
+            assert_eq!(
+                t.bg, want,
+                "theme {} (dark={}) must carry bg {want}",
+                t.name, t.dark
+            );
+        }
+    }
+
+    /// The remap used on a switch: role pairs, longest-first, disjoint
+    /// param sets (one pass cannot double-remap).
+    #[test]
+    fn remap_pairs_are_longest_first_and_disjoint() {
+        let from = lookup("slate");
+        let to = lookup("paper");
+        let pairs = fg_remap_pairs(from, to);
+        assert!(!pairs.is_empty(), "a polarity switch must remap roles");
+        for w in pairs.windows(2) {
+            assert!(
+                w[0].0.len() >= w[1].0.len(),
+                "pairs must be longest-old-first"
+            );
+        }
+        let olds: Vec<&str> = pairs.iter().map(|(a, _)| *a).collect();
+        let news: Vec<&str> = pairs.iter().map(|(_, b)| *b).collect();
+        for o in &olds {
+            assert!(
+                !news.iter().any(|n| n == o),
+                "new params must never equal an old param ({o})"
+            );
+        }
+        // Same-theme remap is empty (nothing to do).
+        assert!(fg_remap_pairs(from, from).is_empty());
     }
 }

@@ -91,8 +91,8 @@ if pid == 0:
 
 out = b""
 start = time.time()
-s1 = s2 = s3 = s4 = s5 = False
-while time.time() - start < 30:
+s1 = s2 = s3 = s4 = s5 = s6 = s7 = False
+while time.time() - start < 36:
     r, _, _ = select.select([fd], [], [], 0.2)
     if r:
         try: d = os.read(fd, 65536)
@@ -118,11 +118,19 @@ while time.time() - start < 30:
     if s4 and not s5 and time.time() - start > 14.5:
         s5 = True
         os.write(fd, b"do the thing\r")
-    if time.time() - start > 26:
+    # 4) switch to a LIGHT theme mid-session — the whole window must
+    # flip background (not just future text) and old rows remap.
+    if s5 and not s6 and time.time() - start > 19:
+        s6 = True
+        os.write(fd, b"/theme paper\r")
+    # 5) clean exit INSIDE the read loop so the exit bytes (SGR reset +
+    # alt-screen leave) land in the transcript for the no-leak assert.
+    if s6 and not s7 and time.time() - start > 24:
+        s7 = True
+        os.write(fd, b"/exit\r")
+    if time.time() - start > 32:
         break
 try:
-    os.write(fd, b"/exit\r")
-    time.sleep(0.5)
     os.write(fd, b"\x03")
     time.sleep(0.3)
     os.kill(pid, 9)
@@ -159,7 +167,24 @@ check "post-switch tool line wears the slate tool color" $?
 # slate panel border 2;38;5;110 repainted by the refresh.
 grep -qF "$(printf '\x1b[2;38;5;110m')" "$PTY_TXT"
 check "panel border repaints in the slate color" $?
-grep -q '"theme": *"slate"' "$HOME_P/.sofuu/config.json"
+# slate is dark: every erase fills with its window bg 235.
+grep -qF "$(printf '\x1b[48;5;235m')" "$PTY_TXT"
+check "dark theme paints the window background (48;5;235)" $?
+grep -q "✓ Theme → paper" "$PTY_TXT"
+check "mid-session switch to a light theme confirms" $?
+# paper is light: the whole window flips to bg 255…
+grep -qF "$(printf '\x1b[48;5;255m')" "$PTY_TXT"
+check "light theme flips the window background (48;5;255)" $?
+# …and the slate tool line from the earlier turn repaints remapped to
+# the paper tool color (old rows flip foregrounds with the window —
+# a polarity switch must not strand light text on a light window).
+grep -qF "$(printf '\x1b[38;5;29mtodo_write')" "$PTY_TXT"
+check "old rows remap foregrounds on the switch" $?
+# leaving the TUI resets SGR before dropping the alt screen, so the
+# themed background never leaks into the user's shell.
+grep -qF "$(printf '\x1b[0m\x1b[?25h\x1b[?1049l')" "$PTY_TXT"
+check "exit resets colors before leaving the alt screen" $?
+grep -q '"theme": *"paper"' "$HOME_P/.sofuu/config.json"
 check "choice persists in config.json" $?
 
 # ── piped: list + unknown-name rejection ─────────────────────────
@@ -173,8 +198,16 @@ printf '/theme nope-nope\n/exit\n' |
   HOME="$HOME_P" SOFUU_PROJECT="$PROJ" "$SOFUU" chat >"$TMP/piped_bad" 2>&1
 grep -q "Unknown theme 'nope-nope'" "$TMP/piped_bad"
 check "unknown name rejected with a hint, not applied" $?
-grep -q '"theme": *"slate"' "$HOME_P/.sofuu/config.json"
+grep -q '"theme": *"paper"' "$HOME_P/.sofuu/config.json"
 check "rejected name did not clobber the active theme" $?
+# window backgrounds are a TTY paint concern — piped output must stay
+# byte-clean of them (both polarities).
+if grep -q '48;5;25[55]' "$TMP/piped_list" "$TMP/piped_bad"; then
+  echo "FAIL themed background leaked into piped output"
+  FAILURES=$((FAILURES+1))
+else
+  echo "PASS no themed background in piped output"
+fi
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

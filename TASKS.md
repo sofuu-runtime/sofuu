@@ -4,6 +4,24 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-10 — single dark theme family (light themes removed).**
+> The white-window polarity flip blended with nothing (dark text stranded
+> on white, unreadable surfaces). Per owner direction the light/dark split
+> is gone: 12 light themes deleted, 13 dark remain, each with its own dark
+> window background (near-black 233 … bright steel 238 plus muted
+> hue-tinted darks — moss/forest pine-green, tide/teal, plum/dusk
+> purple-black, clay/honey bronze, wine oxblood), opencode-style: the
+> surface blends brighter or darker per theme, never flipping polarity.
+> Four diff tints that collided with the new backgrounds were shifted one
+> step (moss/forest add 22→28, tide/lagoon add 23→29), pinned by a new
+> tint-vs-bg collision test; `paper` and friends now fall back to the
+> default instead of erroring. Pinned by the rewritten `chat_theme_e2e.sh`
+> (slate 236 → ember 233 mid-session flip + remap, 13-count piped list —
+> 3 fail pre-fix) and the registry-shape test (13/all-dark).
+> Current state: **lib 416/0 · bin 62/0 · capi 36/0 · JS suites 54/0/1
+> (mcp_server_test delisted by the parallel session — file still present)
+> · ABI green · size 3.5 MB/5 MB.**
+>
 > **2026-10-09 — themes repaint the whole window (light/dark follows the theme).**
 > Switching themes used to recolor only future text: the window kept the
 > terminal's own background, so light themes were light text on a dark

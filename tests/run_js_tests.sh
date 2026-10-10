@@ -73,7 +73,7 @@ E2E_TESTS=(
     "chat_sessions_e2e.sh|Sessions browser e2e (/sessions opens the keyboard picker titled with its project, arrows move, Enter resumes)"
     "chat_resume_replay_e2e.sh|Resume replay e2e (/resume prints the previous turns, not just a notice)"
     "chat_transcript_e2e.sh|Transcript hierarchy e2e (markdown levels render, blank row opens tool groups, live todo checklist replaces the one-row summary)"
-    "chat_theme_e2e.sh|Theme e2e (25 dark+light themes listed, slate applies live to transcript+panel, persists, unknown rejected)"
+    "chat_theme_e2e.sh|Theme e2e (13 dark-blend themes listed, slate applies live with window bg, ember switch re-blends + remaps, persists, unknown rejected)"
     "chat_mode_no_wipe_e2e.sh|Settings-change e2e (/mode mid-conversation keeps the transcript — panel logged once, not re-logged)"
     "chat_empty_session_e2e.sh|Empty-session e2e (open+quit with no turns saves nothing; one turn is kept once, ended)"
     "chat_compact_role_e2e.sh|Strict-gateway compact e2e (summarize payload ends with role=user — a 400-on-assistant-last mock compacts instead of [Compact failed])"

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# tests/chat_theme_e2e.sh — 25 user-selectable TUI themes.
+# tests/chat_theme_e2e.sh — 13 user-selectable dark-blend TUI themes.
 #
-# Themes are fixed 256-palette colors (never the terminal-themed 30-37
-# range), so they render identically under any terminal theme. This drives
-# the REAL chat on a pty plus two piped runs and asserts:
-#   1. /theme opens a picker listing dark + light themes,
-#   2. /theme slate applies it (confirmation names it, panel border and
-#      later tool lines repaint in slate colors — the switch is live,
-#      not next-session),
-#   3. the choice persists in config.json,
-#   4. piped /theme lists all 25 and rejects unknown names without
-#      touching the active theme.
+# One dark family, opencode-style: every theme carries its own dark window
+# background (near-black 233 … bright steel 238, plus muted hue tints) and
+# switching repaints the whole window — the surface always blends, bright
+# to dark, with no light/dark polarity flip. This drives the REAL chat on
+# a pty plus two piped runs and asserts:
+#   1. /theme opens a picker listing the dark-blend themes,
+#   2. /theme slate applies it (confirmation, slate tool color on the next
+#      turn, slate panel border, slate window bg 236),
+#   3. a mid-session switch to ember flips the whole window to bg 233 and
+#      remaps old rows (slate tool fg becomes ember tool fg),
+#   4. leaving the TUI resets SGR before dropping the alt screen,
+#   5. the choice persists in config.json,
+#   6. piped /theme lists all 13 and rejects unknown names without
+#      touching the active theme — and no window background leaks piped.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOFUU="$ROOT/sofuu"
@@ -72,7 +76,7 @@ for i in $(seq 1 200); do
 done
 grep -q "MOCK-THEME-READY" "$TMP/mock.log" || { echo "mock failed to start"; cat "$TMP/mock.log"; exit 1; }
 
-# ── pty: open picker, apply slate by name, run a turn ───────────
+# ── pty: picker + filter, apply slate, turn, switch to ember ────
 export HOME_P SOFUU PROJ
 python3 - <<'PYEOF'
 import os, pty, time, select
@@ -99,14 +103,14 @@ while time.time() - start < 36:
         except OSError: break
         if not d: break
         out += d
-    # 1) open the theme picker, filter to light themes (they sit below
-    # the 10-row fold unfiltered), then cancel — listing is the assert
+    # 1) open the theme picker, filter to "emb", then cancel — the
+    # listing + the match count are the asserts
     if not s1 and time.time() - start > 6:
         s1 = True
         os.write(fd, b"/theme\r")
     if s1 and not s2 and time.time() - start > 8.5:
         s2 = True
-        os.write(fd, b"light")
+        os.write(fd, b"emb")
     if s2 and not s3 and time.time() - start > 10.5:
         s3 = True
         os.write(fd, b"\x1b")
@@ -118,11 +122,11 @@ while time.time() - start < 36:
     if s4 and not s5 and time.time() - start > 14.5:
         s5 = True
         os.write(fd, b"do the thing\r")
-    # 4) switch to a LIGHT theme mid-session — the whole window must
-    # flip background (not just future text) and old rows remap.
+    # 4) switch to ember mid-session — the whole window must blend to
+    # its near-black bg and old rows remap foregrounds with it
     if s5 and not s6 and time.time() - start > 19:
         s6 = True
-        os.write(fd, b"/theme paper\r")
+        os.write(fd, b"/theme ember\r")
     # 5) clean exit INSIDE the read loop so the exit bytes (SGR reset +
     # alt-screen leave) land in the transcript for the no-leak assert.
     if s6 and not s7 and time.time() - start > 24:
@@ -146,63 +150,59 @@ PYEOF
 
 PTY_TXT="$TMP/pty.txt"
 
-# ── assertions: picker + live switch + persistence ───────────────
+# ── assertions: picker + live switches + persistence ─────────────
 grep -q "Theme" "$PTY_TXT"
 check "theme picker opens" $?
-# slate with its "dark theme" note: listing context, not a stray substring.
-grep -q "slate.*dark theme" "$PTY_TXT"
+grep -q "slate" "$PTY_TXT"
 check "picker lists slate" $?
-# "light" filters to exactly the 12 light themes; paper is first and
-# always above the fold (moss-light sits 11th — asserting it would pin
-# scroll position, not listing).
-grep -q "paper" "$PTY_TXT"
-check "filtering to light themes lists paper" $?
-grep -q "12 matches" "$PTY_TXT"
-check "the light set is exactly the 12 light themes" $?
+grep -q "ember" "$PTY_TXT"
+check "filtering to emb lists ember" $?
+grep -q "1 match" "$PTY_TXT"
+check "the filter narrows to exactly one theme" $?
 grep -q "✓ Theme → slate" "$PTY_TXT"
-check "applying by name confirms (dark, position)" $?
+check "applying by name confirms" $?
 # slate tool color 38;5;109 on the post-switch turn (default is 38;5;80).
 grep -qF "$(printf '\x1b[38;5;109mtodo_write')" "$PTY_TXT"
 check "post-switch tool line wears the slate tool color" $?
 # slate panel border 2;38;5;110 repainted by the refresh.
 grep -qF "$(printf '\x1b[2;38;5;110m')" "$PTY_TXT"
 check "panel border repaints in the slate color" $?
-# slate is dark: every erase fills with its window bg 235.
-grep -qF "$(printf '\x1b[48;5;235m')" "$PTY_TXT"
-check "dark theme paints the window background (48;5;235)" $?
-grep -q "✓ Theme → paper" "$PTY_TXT"
-check "mid-session switch to a light theme confirms" $?
-# paper is light: the whole window flips to bg 255…
-grep -qF "$(printf '\x1b[48;5;255m')" "$PTY_TXT"
-check "light theme flips the window background (48;5;255)" $?
+# slate blends the window to its bg 236 (near-black, not terminal default).
+grep -qF "$(printf '\x1b[48;5;236m')" "$PTY_TXT"
+check "slate theme blends the window background (48;5;236)" $?
+grep -q "✓ Theme → ember" "$PTY_TXT"
+check "mid-session switch to ember confirms" $?
+# ember blends darker, to bg 233…
+grep -qF "$(printf '\x1b[48;5;233m')" "$PTY_TXT"
+check "ember blends the window darker (48;5;233)" $?
 # …and the slate tool line from the earlier turn repaints remapped to
-# the paper tool color (old rows flip foregrounds with the window —
-# a polarity switch must not strand light text on a light window).
-grep -qF "$(printf '\x1b[38;5;29mtodo_write')" "$PTY_TXT"
+# the ember tool color (old rows blend with the window — a switch must
+# not strand stale foregrounds).
+grep -qF "$(printf '\x1b[38;5;173mtodo_write')" "$PTY_TXT"
 check "old rows remap foregrounds on the switch" $?
 # leaving the TUI resets SGR before dropping the alt screen, so the
 # themed background never leaks into the user's shell.
 grep -qF "$(printf '\x1b[0m\x1b[?25h\x1b[?1049l')" "$PTY_TXT"
 check "exit resets colors before leaving the alt screen" $?
-grep -q '"theme": *"paper"' "$HOME_P/.sofuu/config.json"
+grep -q '"theme": *"ember"' "$HOME_P/.sofuu/config.json"
 check "choice persists in config.json" $?
 
 # ── piped: list + unknown-name rejection ─────────────────────────
 printf '/theme\n/exit\n' |
   HOME="$HOME_P" SOFUU_PROJECT="$PROJ" "$SOFUU" chat >"$TMP/piped_list" 2>&1
 sed -i '' $'s/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP/piped_list" 2>/dev/null || sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP/piped_list"
-NTHEMES="$(grep -cE '^  [a-z0-9-]+  +(dark|light)' "$TMP/piped_list" || true)"
-[ "$NTHEMES" -eq 25 ]
-check "piped /theme lists all 25 themes (got $NTHEMES)" $?
+NTHEMES="$(grep -cE '^  [a-z0-9-]+( ← current)?$' "$TMP/piped_list" || true)"
+[ "$NTHEMES" -eq 13 ]
+check "piped /theme lists all 13 themes (got $NTHEMES)" $?
 printf '/theme nope-nope\n/exit\n' |
   HOME="$HOME_P" SOFUU_PROJECT="$PROJ" "$SOFUU" chat >"$TMP/piped_bad" 2>&1
 grep -q "Unknown theme 'nope-nope'" "$TMP/piped_bad"
 check "unknown name rejected with a hint, not applied" $?
-grep -q '"theme": *"paper"' "$HOME_P/.sofuu/config.json"
+grep -q '"theme": *"ember"' "$HOME_P/.sofuu/config.json"
 check "rejected name did not clobber the active theme" $?
-# window backgrounds are a TTY paint concern — piped output must stay
-# byte-clean of them (both polarities).
-if grep -q '48;5;25[55]' "$TMP/piped_list" "$TMP/piped_bad"; then
+# window backgrounds are a TTY paint concern — the theme bgs in play
+# here (235/236/233) must never reach piped output.
+if grep -qE '48;5;23[356]' "$TMP/piped_list" "$TMP/piped_bad"; then
   echo "FAIL themed background leaked into piped output"
   FAILURES=$((FAILURES+1))
 else

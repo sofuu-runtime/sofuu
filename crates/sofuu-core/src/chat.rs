@@ -86,7 +86,7 @@ pub struct ChatConfig {
     /// "plan" (read-only). Same semantics as the desktop's profiles —
     /// the gate itself is shared in src/js/agent.js permissionBlocked().
     pub permissions: String,
-    /// TUI theme name (see theme.rs — 25 muted schemes, dark + light).
+    /// TUI theme name (see theme.rs — 13 muted dark-blend schemes).
     /// Unknown/empty resolves to the default at render time, never errors.
     pub theme: String,
     /// Per-session context window in tokens (used for history trimming and
@@ -720,7 +720,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
     ("/mode", "View/set the permission mode", "full | edit | plan  (bare = show · TAB cycles)"),
-    ("/theme", "Switch the TUI color theme", "[name]  (bare = picker over 25 dark + light themes)"),
+    ("/theme", "Switch the TUI color theme", "[name]  (bare = picker over 13 dark-blend themes)"),
     ("/plan", "Plan mode: read-only (no writes, no shell)", ""),
     ("/edit", "Edit mode: reads + local file edits (no shell, no MCP)", ""),
     ("/full", "Full access: every tool allowed", ""),
@@ -819,7 +819,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         // Bare /theme opens the picker in the driver ("pick_theme");
         // /theme <name> applies directly. Unknown names never unstyle
         // anything: the file keeps its old value and the user gets the
-        // count + picker hint instead of a 25-line dump.
+        // count + picker hint instead of a 13-line dump.
         "/theme" => {
             if arg.is_empty() {
                 "pick_theme"
@@ -846,15 +846,14 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                     }
                 }
                 chat_out(&format!(
-                    "  ✓ Theme → {} ({}, {} of 25)\n",
+                    "  ✓ Theme → {} ({} of 13)\n",
                     t.name,
-                    if t.dark { "dark" } else { "light" },
                     theme::THEMES.iter().position(|x| x.name == t.name).map(|i| i + 1).unwrap_or(1)
                 ));
                 "ok"
             } else {
                 chat_out(&format!(
-                    "  Unknown theme '{arg}' — bare /theme lists all 25 (dark + light).\n"
+                    "  Unknown theme '{arg}' — bare /theme lists all 13.\n"
                 ));
                 "ok"
             }
@@ -1494,7 +1493,7 @@ fn print_help() {
     c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
     c(&mut rows, "/plan /edit /full", "shorthands for /mode plan|edit|full");
-    c(&mut rows, "/theme [name]", "switch the TUI color theme (25 dark + light)");
+    c(&mut rows, "/theme [name]", "switch the TUI color theme (13 dark-blend)");
     c(&mut rows, "/ctx [<tokens>]", "view/set the context window (max 4M)");
     c(&mut rows, "/maxout [<tokens>]", "view/set max output tokens (max 384k)");
     c(&mut rows, "/tools", "list connected MCP servers + their tools");
@@ -6535,7 +6534,7 @@ const DRIVER: &str = r#"
     maybeRefreshPanel();
   }
   async function pickTheme() {
-    /* 25 themes, dark + light, independent of the terminal's own theme.
+    /* 13 dark-blend themes, independent of the terminal's own theme.
      * Applies through /theme <name> (the Rust side validates + persists)
      * so the picker and the typed command share one code path. */
     let themes = [];
@@ -6545,8 +6544,7 @@ const DRIVER: &str = r#"
       title: 'Theme',
       hint: '↑↓ move · enter apply · esc cancel',
       tabs: [],
-      items: themes.map(t => ({ id: t.name, label: t.name,
-        note: (t.dark ? 'dark' : 'light') + ' theme' })),
+      items: themes.map(t => ({ id: t.name, label: t.name })),
       currentId: cfg.theme || '',
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
@@ -6816,7 +6814,7 @@ const DRIVER: &str = r#"
             out('\x1b[90m  Usage: /theme <name>  (current: ' + (cfg.theme || 'sofuu') + ')\x1b[0m');
             for (const th of themes) {
               const cur = th.name === cfg.theme ? ' \x1b[32m← current\x1b[0m' : '';
-              out('  \x1b[36m' + th.name + '\x1b[0m  \x1b[90m' + (th.dark ? 'dark' : 'light') + '\x1b[0m' + cur);
+              out('  \x1b[36m' + th.name + '\x1b[0m' + cur);
             }
             out('');
           }

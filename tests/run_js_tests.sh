@@ -77,6 +77,7 @@ E2E_TESTS=(
     "chat_mode_no_wipe_e2e.sh|Settings-change e2e (/mode mid-conversation keeps the transcript — panel logged once, not re-logged)"
     "chat_empty_session_e2e.sh|Empty-session e2e (open+quit with no turns saves nothing; one turn is kept once, ended)"
     "chat_compact_role_e2e.sh|Strict-gateway compact e2e (summarize payload ends with role=user — a 400-on-assistant-last mock compacts instead of [Compact failed])"
+    "chat_select_e2e.sh|Selection-blend e2e (mouse drag wears the theme accent bar, follows switches — no raw inverse)"
     "chat_retention_e2e.sh|Claude-style transcript retention (tool transcript persists into history, no orphaned tool messages)"
     "chat_modes_e2e.sh|Permission modes (welcome Mode row, /mode /plan /edit /full, footer chip, bad arg refused, persists + boot-applied across restart)"
     "chat_prompt_dedupe_e2e.sh|Prompt-event dedupe (one prompt per turn across THINK/CAPACITY retries, both drivers, no over-suppression)"

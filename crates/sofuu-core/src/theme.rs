@@ -124,6 +124,28 @@ pub const THEMES: &[Theme] = &[
         hunk: "38;5;115", panel: "2;38;5;116" },
 ];
 
+/// Palette index of a role's `38;5;N` foreground — feeds the selection
+/// bar, which wears the theme accent (opencode-style), so a mouse drag
+/// blends on every present and future theme without a table entry.
+/// None when the params carry no 256-palette foreground.
+pub fn accent_index(params: &str) -> Option<u8> {
+    let mut it = params.split(';').peekable();
+    while let Some(p) = it.next() {
+        if p.trim() == "38" && it.peek() == Some(&"5") {
+            it.next();
+            if let Some(n) = it.next() {
+                if let Ok(v) = n.trim().parse::<i32>() {
+                    if (16..=255).contains(&v) {
+                        return Some(v as u8);
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// Look up a theme by name (case-insensitive); unknown names fall back
 /// to the default so a typo in config can never unstyle the TUI.
 pub fn lookup(name: &str) -> &'static Theme {
@@ -277,6 +299,27 @@ mod tests {
         assert_eq!(lookup("no-such-theme").name, DEFAULT_THEME);
         assert!(resolve("lagoon").is_some());
         assert!(resolve("nope").is_none());
+    }
+
+    /// Selection-bar derivation: the bar wears the accent's palette
+    /// index (bg) with near-black text — one rule for every theme.
+    #[test]
+    fn accent_index_finds_the_256_foreground() {
+        assert_eq!(accent_index("1;38;5;139"), Some(139));
+        assert_eq!(accent_index("38;5;29"), Some(29));
+        assert_eq!(accent_index("2;38;5;110"), Some(110));
+        assert_eq!(accent_index("1;35"), None);
+        assert_eq!(accent_index(""), None);
+        assert_eq!(accent_index("38;5;7"), None);
+        assert_eq!(accent_index("38;5;300"), None);
+        // Every shipped accent must derive (else that theme gets no bar).
+        for t in THEMES {
+            assert!(
+                accent_index(t.accent).is_some(),
+                "theme {} accent {:?} must carry 38;5;N",
+                t.name, t.accent
+            );
+        }
     }
 
     /// Window-background contract: every theme blends the whole window in

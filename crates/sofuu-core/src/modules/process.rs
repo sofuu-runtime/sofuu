@@ -1134,7 +1134,9 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
             if l > 0 {
                 if mi >= start && shown < MAX_SUGG {
                     if mi == sel as usize {
-                        let _ = write!(out, "  \x1b[7m{}\x1b[0m\n", String::from_utf8_lossy(&m[..l]));
+                        /* highlighted suggestion — the theme accent bar,
+                         * same as a mouse selection, never raw inverse. */
+                        let _ = write!(out, "  {}{}\x1b[0m\n", crate::rt::tui::tui_sel_sgr(), String::from_utf8_lossy(&m[..l]));
                     } else {
                         let _ = write!(out, "  \x1b[2m{}\x1b[0m\n", String::from_utf8_lossy(&m[..l]));
                     }
@@ -1267,7 +1269,7 @@ unsafe fn tty_render_tui(
                     if mi >= start {
                         if mi == sel as usize {
                             /* highlighted suggestion — reverse video */
-                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[7m{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), String::from_utf8_lossy(&m[..l]));
+                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_sel_sgr(), String::from_utf8_lossy(&m[..l]));
                             sel_line = Some(m[..l].to_vec());
                         } else {
                             let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[2m{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), String::from_utf8_lossy(&m[..l]));

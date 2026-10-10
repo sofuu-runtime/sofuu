@@ -837,6 +837,9 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 if sofuu_ffi::tui_active() {
                     unsafe {
                         sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
+                        sofuu_core::rt::tui::tui_set_sel(
+                            theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
+                        );
                     }
                     let from = theme::lookup(&prev_name);
                     sofuu_core::rt::tui::tui_remap_rows(&theme::fg_remap_pairs(from, t));
@@ -2548,6 +2551,9 @@ unsafe extern "C" fn js_chat_theme(
     let t = theme::lookup(&name);
     unsafe {
         sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
+        sofuu_core::rt::tui::tui_set_sel(
+            theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
+        );
     }
     let json = serde_json::json!({
         "name": t.name, "dark": t.dark, "bg": t.bg,

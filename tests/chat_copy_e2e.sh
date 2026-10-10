@@ -97,7 +97,7 @@ except ChildProcessError:
 os.close(fd)
 
 painted = buf.decode("utf-8", "replace")
-ok_sel = "\x1b[7m" in painted                       # inverse-video paint seen
+ok_sel = ("\x1b[7m" in painted) or ("38;5;16;48;5;" in painted)  # selection paint seen (raw inverse or theme accent bar)
 clean = "\x1b" not in clip                            # ANSI stripped
 utf8 = "\ufffd" not in clip                          # multibyte survived
 marker = any(("Sofuu Chat Commands" in l) or ("this help" in l)

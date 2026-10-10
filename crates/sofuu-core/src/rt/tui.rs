@@ -51,6 +51,9 @@ thread_local! {
      * \x1b[0m cannot break it: the erase already painted the full row,
      * and nothing repaints the tail after the content ends. */
     static G_BG: Cell<i32> = const { Cell::new(-1) };
+    /* Accent palette index for the selection bar (set alongside G_BG on
+     * every theme sync), or -1 for the classic raw-inverse look. */
+    static G_SEL: Cell<i32> = const { Cell::new(-1) };
 }
 
 /// Background SGR for the active theme, or "" when unthemed (byte-exact
@@ -69,6 +72,28 @@ pub fn tui_bg_prefix() -> String {
 #[no_mangle]
 pub unsafe extern "C" fn tui_set_bg(idx: c_int) {
     G_BG.with(|g| g.set(idx));
+}
+
+/// Select the selection-bar accent (256-palette index from the theme's
+/// accent role); anything outside 16-255 falls back to raw inverse.
+/// Emits nothing itself — the next selection repaint wears it.
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_sel(accent_idx: c_int) {
+    G_SEL.with(|g| g.set(accent_idx));
+}
+
+/// Selection-bar SGR: theme-accent background + near-black text, so a
+/// mouse drag blends like the rest of the window (opencode-style accent
+/// bar) instead of flashing raw inverse — black boxes on light themes,
+/// white boxes on dark ones. Falls back to plain inverse when no theme
+/// has been synced.
+pub fn tui_sel_sgr() -> String {
+    let n = G_SEL.with(|g| g.get());
+    if (16..=255).contains(&n) {
+        format!("\x1b[38;5;16;48;5;{n}m")
+    } else {
+        "\x1b[7m".to_string()
+    }
 }
 
 /// Remap already-painted buffer rows from one theme's foregrounds to
@@ -363,6 +388,7 @@ pub unsafe extern "C" fn tui_exit() {
      * user's own colors, then leave. */
     write_out("\x1b[0m");
     G_BG.with(|g| g.set(-1));
+    G_SEL.with(|g| g.set(-1));
     write_out("\x1b[?25h\x1b[?1049l"); /* cursor back, alt screen off */
 }
 
@@ -692,8 +718,9 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
             if selected {
                 /* Inverse video across the whole visible row (text +
                  * trailing pad) so the selection reads as a solid block
-                 * like a native terminal selection. */
-                out.push_str("\x1b[7m");
+                 * like a native terminal selection. Theme-aware: the
+                 * accent bar, never raw inverse. */
+                out.push_str(&tui_sel_sgr());
                 out.push_str(&l[..bl]);
                 if bl < full {
                     out.push('…');
@@ -1672,6 +1699,20 @@ mod tests {
         assert_eq!(tui_bg_prefix(), "\x1b[48;5;255m");
         unsafe { tui_set_bg(-1) };
         assert_eq!(tui_bg_prefix(), "");
+    }
+
+    /// Selection bar: theme accent behind near-black text; raw inverse
+    /// only before any theme sync (byte-exact classic then).
+    #[test]
+    fn sel_sgr_is_accent_bar_once_synced() {
+        G_SEL.with(|g| g.set(-1));
+        assert_eq!(tui_sel_sgr(), "\x1b[7m");
+        unsafe { tui_set_sel(139) };
+        assert_eq!(tui_sel_sgr(), "\x1b[38;5;16;48;5;139m");
+        unsafe { tui_set_sel(7) };
+        assert_eq!(tui_sel_sgr(), "\x1b[7m", "below-palette falls back");
+        unsafe { tui_set_sel(-1) };
+        assert_eq!(tui_sel_sgr(), "\x1b[7m");
     }
 
     /// Buffer remap on a switch: full old sequences flip to the new

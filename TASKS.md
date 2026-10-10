@@ -4,6 +4,52 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-10 — selection wears the theme accent (no more inverse boxes).**
+> A mouse drag painted raw inverse video (`\x1b[7m`) — black boxes on
+> light themes, white boxes on dark ones, blending with nothing (seen live
+> dragging panel/input/footer rows on a white window). Selection now wears
+> the theme accent background + near-black text (opencode-style accent
+> bar), derived from the accent role's `38;5;N` (`theme::accent_index`) so
+> it follows every theme with no table entry; same treatment for the
+> suggestion-row highlight; exit clears it with the bg. Raw inverse
+> remains only as the pre-sync fallback (byte-exact classic). Pinned by
+> the new `tests/chat_select_e2e.sh` (pty drag → accent bar, slate switch
+> → bar follows, zero `\x1b[7m` — 3 fail pre-fix) plus unit tests for the
+> derivation and the SGR shape; `chat_copy_e2e.sh` now accepts the accent
+> bar as selection paint (clipboard path itself untouched and green).
+> Current state: **lib 426/0 · bin 63/0 · capi 36/0 · JS suites 55/0/1 ·
+> ABI green · size 3.6 MB/5 MB.**
+>
+> **2026-10-10 — emb-m v1: sparsity + stability + speed, 15/15 green.**
+> Architecture upgrade in `emb-m/sofuu_arch/`: sparse MoE FFNs on alternate
+> layers (8 experts, top-1 Switch-style routing, experts sized f/8 so MoE
+> layers cost what dense layers cost + 2,048 router params; load-balance aux
+> + router z-loss; capacity counts REAL tokens only), QK-RMSNorm (128
+> params/layer), stochastic depth (0→0.1 ramp, train-only), fused-SDPA
+> attention kernel with proven 1e-5 parity to the eager path. Measured:
+> s-code 18,731,008 total / 15,634,432 active (20M budget),
+> s-docs 14,569,472 / 11,472,896 (15M), s-mem 9,549,312 / 8,173,056 (10M).
+> Two real bugs caught by the new tests: the counter overcounted QK-norm
+> (shared-across-heads, 128 not 512/ layer) and padding-dependent MoE
+> capacity leaked padding into real outputs (a train/serve skew in
+> production). Docs updated (README active-params table, ARCHITECTURE v1
+> sections + MoE/stability prior art + 9-ablation plan). Standing caveat:
+> MoE-at-20M is the least-proven component (all precedent is 300M+);
+> ablation (g) is a genuine go/no-go with all-dense as the free fallback.
+>
+> **2026-10-10 — emb-m: custom embedding architecture v0 + docs.**
+> New root folder `emb-m/` holds the clean-room embedding-model project:
+> `sofuu_arch/` (PyTorch: `config` + 3 presets, exact pure-Python param
+> counter, RMSNorm, Sofuu-DPB log-bucketed relative tables, SofuuBlock with
+> disentangled C2C/C2P/P2C attention + local/global rhythm + gated-SiLU FFN,
+> encoder with masked mean pool + L2 + Matryoshka contract), `tests/`
+> (8/8 green: counter-vs-torch agreement, pinned totals, padding
+> non-leakage, determinism, window mask), `README.md` + `docs/ARCHITECTURE.md`
+> (full spec, equations, exact param tables, prior-art citations, 6-ablation
+> plan, honesty appendix). Measured totals: s-code-20m 18,717,184 / s-docs-15m
+> 14,555,648 / s-mem-10m 9,540,096 — all within budget. No training run yet;
+> every quality expectation is a hypothesis until pilot numbers exist.
+>
 > **2026-10-10 — single dark theme family (light themes removed).**
 > The white-window polarity flip blended with nothing (dark text stranded
 > on white, unreadable surfaces). Per owner direction the light/dark split

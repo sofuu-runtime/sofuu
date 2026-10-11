@@ -1167,13 +1167,11 @@ enum EmbedSpace {
 
 /// Resolve a space id. E0-5: the default is now **hash-768**, not sem2-64.
 ///
-/// The default used to disagree with three other things at once: the
-/// brain's canonical space (HASH_DIM = 768), the documented "shipped
-/// default" in docs/EMBEDDING.md, and the measured quality table where
-/// hash-v1 wins on recall (R@5 0.493 vs 0.090). An embedder calling
+/// The default used to disagree with the brain's canonical space
+/// (HASH_DIM = 768). An embedder calling
 /// `sofuu_embed_local(rt, text, NULL, …)` therefore got 64-dim vectors it
 /// could not store in — or match against — the 768-dim brain. Now the C
-/// default, the brain, the docs, and the benchmark all agree.
+/// default and the brain agree.
 fn resolve_embed_space(space: Option<&str>) -> Result<EmbedSpace, c_int> {
     match space {
         None | Some("") | Some("hash-768") | Some("hash") | Some("hash-v1") => Ok(EmbedSpace::Hash),
@@ -2609,62 +2607,59 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
-    /// E0-4: the anti-drift test.
+    /// E0-4: the funnel-method resolution test.
     ///
-    /// The audit found that 7 of the 17 funnel methods listed in
-    /// docs/EMBEDDING.md did not exist — the docs were aspirational and
-    /// nothing checked. This parses the method table straight out of the
-    /// doc and asserts every listed method resolves as a real function on a
-    /// fresh runtime, so the list can never drift from the code again.
+    /// Every method on the headless funnel must resolve as a real function
+    /// on a fresh runtime. The list lives here in code (it used to be parsed
+    /// out of a doc table; the docs folder was removed, so the contract moved
+    /// next to the code it guards). Add new funnel methods to this list —
+    /// the test fails until you do, which is the point.
     #[test]
     fn documented_funnel_methods_all_resolve() {
         let _g = lock();
 
-        // 1. Parse the "enforced by a test" table out of the doc.
-        let doc = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../docs/EMBEDDING.md"
-        ))
-        .expect("docs/EMBEDDING.md must be readable from the capi test");
-
-        // Only the method table between these two markers counts; the rest of
-        // the doc is full of backticked filenames that are not methods.
-        let table = doc
-            .split_once("enforced by a test")
-            .and_then(|(_, rest)| rest.split_once("**Handle-addressed namespaces.**"))
-            .map(|(a, _)| a)
-            .expect("the method table markers must exist in docs/EMBEDDING.md");
-
-        let mut methods: Vec<String> = Vec::new();
-        for line in table.lines() {
-            if !line.trim_start().starts_with('|') {
-                continue;
-            }
-            for cell in line.split('|') {
-                // Pull every `backticked` token out of the cell.
-                let mut rest = cell;
-                while let Some(start) = rest.find('`') {
-                    let after = &rest[start + 1..];
-                    let Some(end) = after.find('`') else { break };
-                    let tok = &after[..end];
-                    // A method is `namespace.method` — no spaces, no globs,
-                    // and a known top-level namespace.
-                    const NS: [&str; 6] = ["ai", "memory", "mcp", "agent", "rlm", "http"];
-                    if NS.iter().any(|n| tok.starts_with(&format!("{n}.")))
-                        && !tok.contains(' ')
-                        && !tok.contains('*')
-                    {
-                        methods.push(tok.to_string());
-                    }
-                    rest = &after[end + 1..];
-                }
-            }
-        }
+        // 1. The funnel contract: every entry must resolve below.
+        let mut methods: Vec<String> = [
+            "ai.complete",
+            "ai.stream",
+            "ai.embed",
+            "ai.embedLocal",
+            "ai.embedBatch",
+            "ai.embedImage",
+            "ai.embedInfo",
+            "ai.similarity",
+            "ai.transcribe",
+            "ai.speak",
+            "memory.open",
+            "memory.remember",
+            "memory.recall",
+            "memory.count",
+            "memory.flush",
+            "memory.forget",
+            "memory.close",
+            "mcp.connect",
+            "mcp.call",
+            "mcp.listTools",
+            "mcp.listResources",
+            "mcp.disconnect",
+            "agent.define",
+            "agent.run",
+            "agent.list",
+            "agent.cancel",
+            "agent.renderTrace",
+            "rlm.query",
+            "rlm.route",
+            "http.serve",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         methods.sort();
         methods.dedup();
-        assert!(
-            methods.len() >= 20,
-            "expected the doc's method table to yield 20+ methods, got {methods:?}"
+        assert_eq!(
+            methods.len(),
+            30,
+            "the funnel contract list changed length — update it deliberately"
         );
 
         // 2. Every one of them must resolve as a function on a real runtime.
@@ -2716,8 +2711,8 @@ mod tests {
         //                 half-registered facade, which a blanket "skip the
         //                 memory rows" would hide).
         //
-        // Doc drift in the memory rows is still caught on any QTSQ build, and
-        // the `>= 20` parse assertion above keeps the table itself honest in
+        // Drift in the memory rows is still caught on any QTSQ build, and
+        // the `== 30` length assertion above keeps the list itself honest in
         // every build.
         let mut broken: Vec<&String> = Vec::new();
         let mut memory_resolved: Vec<&String> = Vec::new();
@@ -2733,7 +2728,7 @@ mod tests {
         }
         assert!(
             broken.is_empty(),
-            "docs/EMBEDDING.md documents funnel methods that do not resolve: {broken:?}"
+            "funnel methods that do not resolve: {broken:?}"
         );
         if sofuu_core::HAS_QTSQ {
             assert!(

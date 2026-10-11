@@ -35,7 +35,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test bench c-only size-check cargo-build \
+.PHONY: all clean install test c-only size-check cargo-build \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -147,9 +147,6 @@ test: $(TARGET)
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
 	@bash tests/run_js_tests.sh
-
-bench: $(TARGET)
-	@bash bench/run_bench.sh
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).

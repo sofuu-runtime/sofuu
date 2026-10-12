@@ -435,10 +435,8 @@ impl Lfm2Model {
             LinearTensor::Bf16(tv) => {
                 #[cfg(target_os = "macos")]
                 if let (Some(engine), Some(m_buf)) = (metal_engine, metal_mmap_buf) {
-                    if tv.data_offset % 256 == 0 {
-                        engine.gemv_bf16(m_buf, tv.data_offset, x, y, tv.shape[0], tv.shape[1]);
-                        return;
-                    }
+                    engine.gemv_bf16(m_buf, tv.data_offset, x, y, tv.shape[0], tv.shape[1]);
+                    return;
                 }
 
                 // Multi-threaded CPU vectorized BF16 GEMV across all CPU P-cores
@@ -450,24 +448,22 @@ impl Lfm2Model {
             LinearTensor::Mlx4 { weight, scales, biases, group_size } => {
                 #[cfg(target_os = "macos")]
                 if let (Some(engine), Some(m_buf)) = (metal_engine, metal_mmap_buf) {
-                    if weight.data_offset % 256 == 0 && scales.data_offset % 256 == 0 && biases.data_offset % 256 == 0 {
-                        let rows = weight.shape[0];
-                        let cols = x.len();
-                        engine.gemv_mlx4(
-                            m_buf,
-                            weight.data_offset,
-                            m_buf,
-                            scales.data_offset,
-                            m_buf,
-                            biases.data_offset,
-                            x,
-                            y,
-                            rows,
-                            cols,
-                            *group_size,
-                        );
-                        return;
-                    }
+                    let rows = weight.shape[0];
+                    let cols = x.len();
+                    engine.gemv_mlx4(
+                        m_buf,
+                        weight.data_offset,
+                        m_buf,
+                        scales.data_offset,
+                        m_buf,
+                        biases.data_offset,
+                        x,
+                        y,
+                        rows,
+                        cols,
+                        *group_size,
+                    );
+                    return;
                 }
 
                 // Multi-threaded CPU vectorized MLX 4-bit affine GEMV across all CPU P-cores

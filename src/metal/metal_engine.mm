@@ -27,6 +27,35 @@ static const char* METAL_KERNEL_SOURCE = R"(
 #include <metal_stdlib>
 using namespace metal;
 
+static inline uint read_u32(device const uchar* base, uint byte_offset) {
+    device const uchar* p = base + byte_offset;
+    if ((uintptr_t(p) & 3) == 0) {
+        return *(device const uint*)p;
+    } else {
+        return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+    }
+}
+
+static inline bfloat read_bf16(device const uchar* base, uint byte_offset) {
+    device const uchar* p = base + byte_offset;
+    if ((uintptr_t(p) & 1) == 0) {
+        return *(device const bfloat*)p;
+    } else {
+        ushort u = ushort(p[0]) | (ushort(p[1]) << 8);
+        return as_type<bfloat>(u);
+    }
+}
+
+static inline half read_f16(device const uchar* base, uint byte_offset) {
+    device const uchar* p = base + byte_offset;
+    if ((uintptr_t(p) & 1) == 0) {
+        return *(device const half*)p;
+    } else {
+        ushort u = ushort(p[0]) | (ushort(p[1]) << 8);
+        return as_type<half>(u);
+    }
+}
+
 kernel void gemv_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const float  *x              [[buffer(1)]],
@@ -36,19 +65,25 @@ kernel void gemv_bf16(
     uint row                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    device const bfloat *w = (device const bfloat*)(w_base + w_rem);
     float sum = 0.0f;
-    device const bfloat *row_w = w + row * cols;
+    uint row_byte = w_rem + row * cols * 2;
 
-    uint i = lane * 4;
-    for (; i + 4 <= cols; i += 32 * 4) {
-        sum += float(row_w[i + 0]) * x[i + 0];
-        sum += float(row_w[i + 1]) * x[i + 1];
-        sum += float(row_w[i + 2]) * x[i + 2];
-        sum += float(row_w[i + 3]) * x[i + 3];
-    }
-    for (; i < cols; ++i) {
-        sum += float(row_w[i]) * x[i];
+    if (((uintptr_t(w_base) + w_rem) & 1) == 0) {
+        device const bfloat *row_w = (device const bfloat*)(w_base + row_byte);
+        uint i = lane * 4;
+        for (; i + 4 <= cols; i += 32 * 4) {
+            sum += float(row_w[i + 0]) * x[i + 0];
+            sum += float(row_w[i + 1]) * x[i + 1];
+            sum += float(row_w[i + 2]) * x[i + 2];
+            sum += float(row_w[i + 3]) * x[i + 3];
+        }
+        for (; i < cols; ++i) {
+            sum += float(row_w[i]) * x[i];
+        }
+    } else {
+        for (uint i = lane; i < cols; i += 32) {
+            sum += float(read_bf16(w_base, row_byte + i * 2)) * x[i];
+        }
     }
 
     sum = simd_sum(sum);
@@ -66,19 +101,25 @@ kernel void gemv_f16(
     uint row                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    device const half *w = (device const half*)(w_base + w_rem);
     float sum = 0.0f;
-    device const half *row_w = w + row * cols;
+    uint row_byte = w_rem + row * cols * 2;
 
-    uint i = lane * 4;
-    for (; i + 4 <= cols; i += 32 * 4) {
-        sum += float(row_w[i + 0]) * x[i + 0];
-        sum += float(row_w[i + 1]) * x[i + 1];
-        sum += float(row_w[i + 2]) * x[i + 2];
-        sum += float(row_w[i + 3]) * x[i + 3];
-    }
-    for (; i < cols; ++i) {
-        sum += float(row_w[i]) * x[i];
+    if (((uintptr_t(w_base) + w_rem) & 1) == 0) {
+        device const half *row_w = (device const half*)(w_base + row_byte);
+        uint i = lane * 4;
+        for (; i + 4 <= cols; i += 32 * 4) {
+            sum += float(row_w[i + 0]) * x[i + 0];
+            sum += float(row_w[i + 1]) * x[i + 1];
+            sum += float(row_w[i + 2]) * x[i + 2];
+            sum += float(row_w[i + 3]) * x[i + 3];
+        }
+        for (; i < cols; ++i) {
+            sum += float(row_w[i]) * x[i];
+        }
+    } else {
+        for (uint i = lane; i < cols; i += 32) {
+            sum += float(read_f16(w_base, row_byte + i * 2)) * x[i];
+        }
     }
 
     sum = simd_sum(sum);
@@ -96,19 +137,26 @@ kernel void gemv_f32(
     uint row                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    device const float *w = (device const float*)(w_base + w_rem);
     float sum = 0.0f;
-    device const float *row_w = w + row * cols;
+    uint row_byte = w_rem + row * cols * 4;
 
-    uint i = lane * 4;
-    for (; i + 4 <= cols; i += 32 * 4) {
-        sum += row_w[i + 0] * x[i + 0];
-        sum += row_w[i + 1] * x[i + 1];
-        sum += row_w[i + 2] * x[i + 2];
-        sum += row_w[i + 3] * x[i + 3];
-    }
-    for (; i < cols; ++i) {
-        sum += row_w[i] * x[i];
+    if (((uintptr_t(w_base) + w_rem) & 3) == 0) {
+        device const float *row_w = (device const float*)(w_base + row_byte);
+        uint i = lane * 4;
+        for (; i + 4 <= cols; i += 32 * 4) {
+            sum += row_w[i + 0] * x[i + 0];
+            sum += row_w[i + 1] * x[i + 1];
+            sum += row_w[i + 2] * x[i + 2];
+            sum += row_w[i + 3] * x[i + 3];
+        }
+        for (; i < cols; ++i) {
+            sum += row_w[i] * x[i];
+        }
+    } else {
+        for (uint i = lane; i < cols; i += 32) {
+            float val = as_type<float>(read_u32(w_base, row_byte + i * 4));
+            sum += val * x[i];
+        }
     }
 
     sum = simd_sum(sum);
@@ -126,7 +174,6 @@ kernel void rmsnorm(
     constant uint       &w_rem          [[buffer(5)]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    device const bfloat *w = (device const bfloat*)(w_base + w_rem);
     float sum_sq = 0.0f;
     for (uint i = lane; i < dim; i += 32) {
         float val = x[i];
@@ -136,7 +183,7 @@ kernel void rmsnorm(
     float rms = rsqrt(sum_sq / float(dim) + eps);
 
     for (uint i = lane; i < dim; i += 32) {
-        y[i] = x[i] * rms * float(w[i]);
+        y[i] = x[i] * rms * float(read_bf16(w_base, w_rem + i * 2));
     }
 }
 
@@ -157,10 +204,13 @@ kernel void conv1d_3(
     constant uint      &w_rem           [[buffer(3)]],
     uint c                              [[thread_position_in_grid]]
 ) {
-    device const bfloat *conv_w = (device const bfloat*)(conv_w_base + w_rem);
-    device const bfloat *cw = conv_w + c * 3;
-    device const float  *st = state + c * 3;
-    float sum = float(cw[0]) * st[0] + float(cw[1]) * st[1] + float(cw[2]) * st[2];
+    uint base = w_rem + c * 3 * 2;
+    float w0 = float(read_bf16(conv_w_base, base + 0));
+    float w1 = float(read_bf16(conv_w_base, base + 2));
+    float w2 = float(read_bf16(conv_w_base, base + 4));
+
+    device const float *st = state + c * 3;
+    float sum = w0 * st[0] + w1 * st[1] + w2 * st[2];
     out[c] = sum;
 }
 
@@ -176,24 +226,20 @@ kernel void gemv_mlx4_affine(
     uint row                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    device const uint   *q_w    = (device const uint*)(w_base + rems.x);
-    device const bfloat *scales = (device const bfloat*)(scales_base + rems.y);
-    device const bfloat *biases = (device const bfloat*)(biases_base + rems.z);
-
     float sum = 0.0f;
     uint u32_cols = cols / 8;
     uint n_groups = cols / group_size;
 
-    device const uint   *row_qw = q_w + row * u32_cols;
-    device const bfloat *row_s  = scales + row * n_groups;
-    device const bfloat *row_b  = biases + row * n_groups;
+    uint qw_row_byte = rems.x + row * (u32_cols * 4);
+    uint s_row_byte  = rems.y + row * (n_groups * 2);
+    uint b_row_byte  = rems.z + row * (n_groups * 2);
 
     for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
-        uint val = row_qw[col_u32];
+        uint val = read_u32(w_base, qw_row_byte + col_u32 * 4);
         uint c_base = col_u32 * 8;
         uint g_idx = c_base / group_size;
-        float s = float(row_s[g_idx]);
-        float b = float(row_b[g_idx]);
+        float s = float(read_bf16(scales_base, s_row_byte + g_idx * 2));
+        float b = float(read_bf16(biases_base, b_row_byte + g_idx * 2));
 
         #pragma unroll
         for (uint i = 0; i < 8; ++i) {

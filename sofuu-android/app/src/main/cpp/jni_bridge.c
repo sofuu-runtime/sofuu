@@ -583,3 +583,31 @@ Java_com_sofuu_engine_SofuuBridge_nativeHostToolResolve(JNIEnv *env, jclass cls,
     if (err_c) (*env)->ReleaseStringUTFChars(env, error, err_c);
     return rc == SOFUU_OK ? JNI_TRUE : JNI_FALSE;
 }
+
+/* ── Process environment ──────────────────────────────────────────
+ *
+ * The engine reads its knobs with plain std::env::var (SOFUU_NO_TOOLS,
+ * SOFUU_MEMORY_BACKEND, SOFUU_WEB_ENGINE, …). Kotlin cannot reach libc's
+ * setenv, and there is deliberately no ABI call for them — they are
+ * process configuration, not runtime state — so the host sets them here
+ * before sofuu_rt_new.
+ */
+
+/* SofuuBridge.nativeSetEnv(name, value) — a null value unsets the key. */
+JNIEXPORT void JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeSetEnv(JNIEnv *env, jclass cls, jstring name, jstring value) {
+    (void)cls;
+    if (name == NULL) return;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    if (n == NULL) return;
+    if (value == NULL) {
+        unsetenv(n);
+    } else {
+        const char *v = (*env)->GetStringUTFChars(env, value, NULL);
+        if (v != NULL) {
+            setenv(n, v, 1);
+            (*env)->ReleaseStringUTFChars(env, value, v);
+        }
+    }
+    (*env)->ReleaseStringUTFChars(env, name, n);
+}

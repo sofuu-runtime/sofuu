@@ -165,6 +165,22 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
         @JvmStatic private external fun nativeSetHome(path: String)
         @JvmStatic private external fun nativeChdir(path: String)
 
+        /**
+         * Set (or, with a null value, unset) a process environment
+         * variable.
+         *
+         * This is how the engine's own knobs get applied. The library reads
+         * them with `std::env::var` — `SOFUU_NO_TOOLS`, `SOFUU_NO_SHELL`,
+         * `SOFUU_MEMORY_BACKEND`, `SOFUU_WEB_ENGINE` and friends — so the
+         * host has to put them in the environment before `sofuu_rt_new`.
+         * Kotlin has no libc binding, hence the JNI hop.
+         */
+        @JvmStatic fun setEnv(name: String, value: String?) {
+            nativeSetEnv(name, value)
+        }
+
+        @JvmStatic private external fun nativeSetEnv(name: String, value: String?)
+
         @JvmStatic private external fun nativeAbiVersion(): Int
         @JvmStatic private external fun nativeRtNew(config: String?): Long
         @JvmStatic private external fun nativeRtFree(rt: Long)

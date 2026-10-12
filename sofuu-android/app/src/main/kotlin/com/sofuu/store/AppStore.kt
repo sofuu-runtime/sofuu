@@ -101,6 +101,36 @@ class AppStore(app: Application) : AndroidViewModel(app) {
     val configs = ConfigStore(app)
     private val uiPrefs = UiPrefs(app)
 
+/** The library's env-var knobs, applied before the runtime boots. */
+val runtimeEnv = RuntimeEnv(app)
+
+    /**
+     * Re-write the process environment from the current settings.
+     *
+     * Safe without a restart for everything the engine re-reads per turn
+     * or per request — the tool set, the shell gate, the memory backend,
+     * the web engine, the SSRF guard, the stall deadline. Those call
+     * sites run inside the agent loop, not once at load.
+     */
+    fun applyRuntimeEnv(): Map<String, String> = runtimeEnv.apply()
+
+    /**
+     * Tear the engine down and boot it again so a registration-gated knob
+     * takes effect. Only SOFUU_NO_ML needs this — sofuu-core registers
+     * the whole `sofuu.ml` namespace at init, so without a restart the
+     * namespace is simply absent and every gate is a silent no-op.
+     */
+    fun restartEngineForEnv() {
+        if (state.streaming) {
+            // Freeing the runtime mid-turn would strand the open tool
+            // round-trip. Cancel first so the agent's abort path runs.
+            engine.cancelTurn()
+        }
+        engine.shutdown()
+        runtimeEnv.apply()
+        engine.start()
+    }
+
     val engine: SofuuEngine = SofuuEngine(
         homeDir = app.filesDir.absolutePath,
         projectDir = (configs.projectDir() ?: File(app.filesDir, "workspace").absolutePath),
@@ -134,7 +164,12 @@ class AppStore(app: Application) : AndroidViewModel(app) {
         }
         // Load config + state immediately (cheap, no engine).
         state = state.copy(config = configs.redacted())
+        // Engine environment knobs MUST be in place before the runtime is
+        // created: SOFUU_NO_ML gates module registration inside the
+        // library, so setting it afterwards silently does nothing.
+        val appliedEnv = runtimeEnv.apply()
         engine.start()
+        android.util.Log.i("sofuu-engine", "env applied: $appliedEnv")
     }
 
     // ── Engine event reducer ──────────────────────────────────────

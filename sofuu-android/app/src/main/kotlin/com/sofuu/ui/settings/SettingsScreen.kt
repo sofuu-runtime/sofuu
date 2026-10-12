@@ -24,6 +24,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Switch
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -43,6 +44,7 @@ import com.sofuu.store.AppStore
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.theme.LocalSofuuColors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -399,7 +401,145 @@ private fun GeneralPane(store: AppStore) {
             })
         })
         VectorEngineCard(store)
+        PhoneToolsCard(store)
+        EngineEnvCard(store)
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+// ── Phone tools + engine knobs ──────────────────────────────────
+
+/**
+ * What the phone adds over a terminal.
+ *
+ * Host tools are registered on the engine thread at boot and appear in
+ * /tools alongside the built-ins; listing them here is the only place a
+ * user can see what the device can do that a CLI cannot.
+ */
+@Composable
+private fun PhoneToolsCard(store: AppStore) {
+    val c = LocalSofuuColors.current
+    var tools by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        // The engine fills the list during boot, which may not be done the
+        // first time this pane is drawn.
+        while (true) {
+            tools = store.engine.hostTools.toList()
+            delay(500)
+        }
+    }
+
+    Section("Phone tools")
+    Text(
+        "Native capabilities the agent can call. Registered on the engine at " +
+            "boot, so they obey the permission profile and show up in /tools.",
+        fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
+    )
+    if (tools.isEmpty()) {
+        Text("None registered yet.", fontSize = 12.sp, color = c.textFaint)
+    } else {
+        for (t in tools) {
+            Text(
+                "  ·  $t",
+                fontSize = 12.sp, color = c.text,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.padding(vertical = 2.dp),
+            )
+        }
+    }
+}
+
+/**
+ * The library's env-var switches.
+ *
+ * These are plain process configuration the engine reads through
+ * std::env::var — there is no ABI call for them. Most are consulted per
+ * turn, so a change applies to the next message; SOFUU_NO_ML gates module
+ * registration and so needs a restart, which the UI says outright rather
+ * than letting a user wonder why nothing moved.
+ */
+@Composable
+private fun EngineEnvCard(store: AppStore) {
+    val c = LocalSofuuColors.current
+    val env = store.runtimeEnv
+
+    Section("Engine controls")
+    Text(
+        "These are the runtime's own environment knobs, set before the engine " +
+            "boots. Most take effect on the next message.",
+        fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
+    )
+
+    var noTools by remember { mutableStateOf(env.noTools) }
+    var noShell by remember { mutableStateOf(env.noShell) }
+    var noMl by remember { mutableStateOf(env.noMl) }
+    var allowInternal by remember { mutableStateOf(env.webAllowInternal) }
+    var backend by remember { mutableStateOf(env.memoryBackend) }
+    var engine by remember { mutableStateOf(env.webEngine) }
+
+    ToggleRow("Coding tools", "All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.", noTools)
+    { noTools = it; env.noTools = it; store.applyRuntimeEnv() }
+    ToggleRow("Shell", "Keep bash listed but refuse every invocation. Does not stop an MCP server that shells out itself.", noShell)
+    { noShell = it; env.noShell = it; store.applyRuntimeEnv() }
+    ToggleRow("Context gates (ML)", "Drop the whole sofuu.ml gate layer. This one needs a restart — it is decided when the engine loads.", noMl)
+    { noMl = it; env.noMl = it; store.restartEngineForEnv() }
+    ToggleRow("Allow private addresses", "Let web.open reach loopback and LAN addresses. The SSRF guard blocks them otherwise.", allowInternal)
+    { allowInternal = it; env.webAllowInternal = it }
+
+    Row_("Memory backend", "Auto uses the semantic projector when its artifact is present, else hash-768.") {
+        Segmented(listOf("auto", "hash", "semantic"), backend.ifEmpty { "auto" }) {
+            backend = it; env.memoryBackend = if (it == "auto") "" else it
+        }
+    }
+    Row_("Web search engine", "Default engine for web_search. Blank picks the keyless one.") {
+        Segmented(listOf("auto", "brave", "tavily"), engine.ifEmpty { "auto" }) {
+            engine = it; env.webEngine = if (it == "auto") "" else it
+        }
+    }
+    Row_("Turn step budget", "Tool rounds allowed per turn. 0 uses the engine default (200).") {
+        TextFieldRow(
+            "maxsteps",
+            if (env.chatMaxSteps > 0) env.chatMaxSteps.toString() else "",
+            "200 (engine default)",
+            onSubmit = {
+                val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
+                env.chatMaxSteps = n
+                store.applyRuntimeEnv()
+            },
+        )
+    }
+    Row_("Stalled-request timeout", "Seconds before an unresponsive endpoint gives up. 0 uses the engine default (300).") {
+        TextFieldRow(
+            "stall",
+            if (env.stallTimeoutSecs > 0) env.stallTimeoutSecs.toString() else "",
+            "300 (engine default)",
+            onSubmit = {
+                val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
+                env.stallTimeoutSecs = n
+                store.applyRuntimeEnv()
+            },
+        )
+    }
+    Text(
+        "Only Context gates needs a restart; everything else is read while a turn " +
+            "runs, so it applies to the next message.",
+        fontSize = 10.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp),
+    )
+}
+
+@Composable
+private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    val c = LocalSofuuColors.current
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 44.dp).clickable { onChange(!checked) }
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, fontSize = 14.sp, color = c.text)
+            Text(desc, fontSize = 11.sp, color = c.textFaint)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }
 

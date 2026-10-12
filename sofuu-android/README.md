@@ -102,7 +102,75 @@ Notes:
   else is HTTPS-only.
 - Min SDK 24, ABIs `arm64-v8a` + `x86_64`.
 
-## Local models
+## What the phone adds
+
+The runtime is the same engine the CLI embeds; a phone cannot do less of
+it, and in two places it can do more.
+
+### Host tools
+
+`sofuu_rt_register_host_tool` lets the host hand the agent a native
+capability with no JS in the loop — the QuickJS sandbox cannot reach the
+Android SDK, so anything platform-specific has to be answered by the host.
+It was declared in `include/sofuu_embed.h` and wired through
+`crates/sofuu-capi`, and exposed by **no** binding at all until now.
+
+Four ship, all permission-light so none of them silently fails:
+
+| Tool | Does |
+|---|---|
+| `device_info` | model, Android version, battery, free storage and memory |
+| `open_url` | opens a link in the phone's browser |
+| `share_text` | opens the Android share sheet |
+| `vibrate` | a short buzz, to get the user's attention |
+
+They register as ordinary agent tools, so `/tools` lists them, the
+permission profile applies (`plan` refuses them), and they land in the
+normal tool timeline. `Settings → General → Phone tools` shows what
+actually registered at boot.
+
+To add one, implement `SofuuBridge.HostTool` and call
+`bridge.registerHostTool(name, description, schemaJson, tool)`. Return a
+JSON string for a synchronous answer, or null and settle later with
+`resolveHostTool` — safe from any thread.
+
+### Surfaces the CLI reaches through a terminal
+
+Settings carries panes for the runtime's own capabilities, each routed
+through the engine's existing eval path:
+
+- **Agents** — register an agent from the phone (`sofuu.agent.define`)
+  and run one headlessly (`sofuu.agent.run`). An agent added here is a
+  first-class registry entry the chat turn, `/agents` and `delegate` all
+  see, and its tools may include the host tools above.
+- **Brain** — count, recall search with per-hit scores, forget,
+  consolidate, decay, the embedding-space manifest with unavailable
+  artifacts called out, text similarity, and the multimodal tower
+  (pick an image, embed it, compare against a text query in img1's space).
+  Every call goes through `sofuu.agent.brainFor`, the ONE cached handle —
+  a QTSQ flush rewrites the whole file, so a second handle would clobber
+  the first on every write.
+- **Context gates** — `sofuu.ml.info` and `ml.workset`, gold-label the most
+  recent call wrong or wasted (`ml.feedback`), and ask
+  `ml.supervisor.check` what a gate would say before the agent acts.
+
+### Engine controls
+
+The library configures itself through `std::env::var`. A CLI can
+`export SOFUU_NO_SHELL=1`; a phone had no equivalent at all. General →
+Engine controls now exposes:
+
+`SOFUU_NO_TOOLS` · `SOFUU_NO_SHELL` · `SOFUU_NO_ML` ·
+`SOFUU_MEMORY_BACKEND` · `SOFUU_WEB_ENGINE` ·
+`SOFUU_WEB_ALLOW_INTERNAL` · `SOFUU_STALL_TIMEOUT_SECS` ·
+`SOFUU_CHAT_MAX_STEPS`
+
+Most are read inside the agent loop, so they apply to the next message.
+`SOFUU_NO_ML` is the exception — it gates *module registration* in
+sofuu-core, so it needs a restart and the UI says so rather than leaving a
+switch that appears to do nothing.
+
+### Local models
 
 Settings → Models → **On this device** imports a `.gguf` file. The pick is
 copied into `filesDir/models/` (the engine opens models by absolute path
@@ -138,6 +206,16 @@ bad file reports its error instead of failing the next turn.
 - The whole engine console stream was unreachable until the
   `sofuu_embed_set_log_cb` shim landed; it now appears in logcat under
   the `sofuu-js` tag alongside the app's own `sofuu-engine` tag.
+- **MCP is not reachable.** `sofuu.mcp.connect` spawns a child process
+  over stdio, and Android 10+ forbids executing files from app-writable
+  storage (W^X). There is no shell on a phone and no way to launch an MCP
+  server, so no MCP UI is built — a connect button could only ever fail.
+  Everything else in `sofuu.mcp` depends on a spawned server and is out
+  for the same reason. An in-process or bundled-native MCP server would
+  need engine work, not an app change.
+- `__sofuu_gc` is exposed under Brain → Memory rather than automatically:
+  one runtime lives for the whole process on a phone, so nothing else
+  would run the collector at the moment a big fan-out wants it.
 - No automated tests. There is no `src/test/` and no `src/androidTest/`
   despite the junit dependencies in `app/build.gradle.kts`, and CI only
   runs `cc -fsyntax-only` over the *SDK's* bridge — it never compiles this

@@ -939,6 +939,7 @@ private fun BrainPane(store: AppStore) {
     var probeTool by remember { mutableStateOf("read_file") }
     var probeArgs by remember { mutableStateOf("{\"path\":\"README.md\"}") }
     var verdict by remember { mutableStateOf<JSONObject?>(null) }
+    var gcNote by remember { mutableStateOf<String?>(null) }
     var imgNote by remember { mutableStateOf<String?>(null) }
     var imgPath by remember { mutableStateOf<String?>(null) }
     var imgQuery by remember { mutableStateOf("a red background") }
@@ -1190,6 +1191,21 @@ private fun BrainPane(store: AppStore) {
                 fontSize = 11.sp, color = if (v.optBoolean("ok")) c.textMuted else c.warn,
             )
         }
+
+        Section("Memory")
+        Text(
+            "One runtime lives for the whole process on a phone, so nothing else " +
+                "would run the collector at the right moment. Do this after a big " +
+                "headless run or a batch embed.",
+            fontSize = 11.sp, color = c.textFaint,
+        )
+        SmallButton(c.accent, c.accentContrast, "Collect garbage") {
+            scope.launch {
+                val okRun = withContext(Dispatchers.IO) { surface.collectGarbage() }
+                gcNote = if (okRun) "Collected." else "The runtime did not expose __sofuu_gc in this build."
+            }
+        }
+        gcNote?.let { Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 4.dp)) }
 
         Section("Image vectors")
         Text(

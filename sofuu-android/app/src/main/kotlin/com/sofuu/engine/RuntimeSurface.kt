@@ -346,4 +346,20 @@ fun imageTextSimilarity(imagePath: String, text: String): JSONObject? {
     return JSONObject().put("ok", true).put("similarity", dot / (Math.sqrt(na) * Math.sqrt(nb)))
         .put("dim", tv.size)
 }
+
+    /**
+     * Force a QuickJS collection.
+     *
+     * `__sofuu_gc` is installed by the runtime specifically for hosts that
+     * fan out — a headless agent run, a batch of embeddings — and then
+     * want the garbage back before a long-lived process keeps growing.
+     * A phone is the worst case for that: one runtime for the whole
+     * process lifetime, so nothing else would ever run the collector at
+     * the right moment.
+     */
+    fun collectGarbage(): Boolean = engine.evalJson(
+        "(function(){ try { globalThis.__sofuu_gc(); return { ok:true }; } " +
+            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+    )?.optBoolean("ok") ?: false
 }
+

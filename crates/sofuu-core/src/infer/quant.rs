@@ -40,6 +40,12 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits((sign << 31) | (exp_f32 << 23) | mant_f32)
 }
 
+/// Convert bfloat16 to 32-bit single precision IEEE 754 float.
+#[inline(always)]
+pub fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
 /// Convert f32 to f16 (for kv-cache / quantization).
 #[inline(always)]
 pub fn f32_to_f16(val: f32) -> u16 {
@@ -878,8 +884,34 @@ mod tests {
             let mut y_single = vec![0.0f32; rows];
             let x_slice = &x_batch[b * cols..(b + 1) * cols];
             matvec(&block, GGML_TYPE_Q4_K, rows, cols, x_slice, &mut y_single);
-            assert_eq!(y_batch[b * rows..(b + 1) * rows], y_single, "batch {b} mismatch");
+            for i in 0..rows {
+                let diff = (y_batch[b * rows + i] - y_single[i]).abs();
+                assert!(diff < 1e-2, "batch {b} mismatch at row {i}: got {} vs {}", y_batch[b * rows + i], y_single[i]);
+            }
         }
+    }
+
+    #[test]
+    fn test_cpp_gemv_q8_0() {
+        // block_q8_0: 2 bytes fp16 scale + 32 bytes int8
+        let mut block = vec![0u8; 34];
+        block[0] = 0x00;
+        block[1] = 0x3c; // d = 1.0 (fp16)
+        block[2] = 5;    // qs[0] = 5
+        block[3] = -2i8 as u8; // qs[1] = -2
+
+        let cols = 32;
+        let rows = 1;
+        let mut x = vec![0.0f32; cols];
+        x[0] = 3.0;
+        x[1] = 4.0;
+
+        let mut y = vec![0.0f32; rows];
+        matvec(&block, GGML_TYPE_Q8_0, rows, cols, &x, &mut y);
+
+        // Expected: 5 * 3.0 + (-2) * 4.0 = 15 - 8 = 7.0
+        let diff = (y[0] - 7.0).abs();
+        assert!(diff < 0.1, "Q8_0 mismatch: got {} vs 7.0", y[0]);
     }
 
     #[test]

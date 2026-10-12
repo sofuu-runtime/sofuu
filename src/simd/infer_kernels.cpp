@@ -1242,11 +1242,26 @@ void sofuu_gemv_q8_0(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q8_0);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+    if (tls_x_q8.size() < n_blocks) {
+        tls_x_q8.resize(n_blocks);
+    }
+    sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), n_blocks);
+
+    const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+    g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+        for (size_t r = start; r < end; ++r) {
+            out[r] = sofuu_vec_dot_q8_0_dotprod_a76((const block_q8_0 *)(w + r * row_size), x_q8_ptr, n_blocks);
+        }
+    });
+#else
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
             out[r] = sofuu_vec_dot_q8_0(w + r * row_size, x, n_blocks);
         }
     });
+#endif
 }
 
 void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {
@@ -1254,11 +1269,27 @@ void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q4_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    size_t q8_blocks = cols / 32;
+    thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+    if (tls_x_q8.size() < q8_blocks) {
+        tls_x_q8.resize(q8_blocks);
+    }
+    sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
+
+    const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+    g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+        for (size_t r = start; r < end; ++r) {
+            out[r] = sofuu_vec_dot_q4_k_dotprod_a76((const block_q4_K *)(w + r * row_size), x_q8_ptr, n_blocks);
+        }
+    });
+#else
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
             out[r] = sofuu_vec_dot_q4_k(w + r * row_size, x, n_blocks);
         }
     });
+#endif
 }
 
 void sofuu_gemv_q6_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {

@@ -12,8 +12,10 @@
 
 use std::sync::Arc;
 
+use super::model::ModelConfig;
 use super::npy::TensorDType;
-use super::quant::{f16_to_f32, rmsnorm};
+use super::quant::{bf16_to_f32, f16_to_f32, rmsnorm, rope, swiglu_in_place};
+use super::tensor_table::UnifiedTensorTable;
 
 /// Normalization kind across transformer architectures
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,11 +207,63 @@ impl WeightMatrix {
                     y[r] = sum;
                 }
             }
+            TensorDType::BF16 => {
+                let w_u16 = unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr() as *const u16, self.rows * self.cols)
+                };
+                for r in 0..self.rows {
+                    let row = &w_u16[r * self.cols..(r + 1) * self.cols];
+                    let mut sum = 0.0f32;
+                    for c in 0..self.cols {
+                        sum += x[c] * bf16_to_f32(row[c]);
+                    }
+                    y[r] = sum;
+                }
+            }
             _ => {
                 // Generic fallback for unquantized weights
                 for r in 0..self.rows {
                     y[r] = 0.0f32;
                 }
+            }
+        }
+    }
+
+    /// Read a single embedding row into destination f32 buffer.
+    pub fn get_row(&self, row: usize, dst: &mut [f32]) {
+        if row >= self.rows {
+            dst.fill(0.0);
+            return;
+        }
+        let slice = &self.data[self.byte_offset..];
+        match self.dtype {
+            TensorDType::F32 => {
+                let w_f32 = unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr() as *const f32, self.rows * self.cols)
+                };
+                let r = &w_f32[row * self.cols..(row + 1) * self.cols];
+                dst[..self.cols].copy_from_slice(r);
+            }
+            TensorDType::F16 => {
+                let w_u16 = unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr() as *const u16, self.rows * self.cols)
+                };
+                let r = &w_u16[row * self.cols..(row + 1) * self.cols];
+                for i in 0..self.cols {
+                    dst[i] = f16_to_f32(r[i]);
+                }
+            }
+            TensorDType::BF16 => {
+                let w_u16 = unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr() as *const u16, self.rows * self.cols)
+                };
+                let r = &w_u16[row * self.cols..(row + 1) * self.cols];
+                for i in 0..self.cols {
+                    dst[i] = bf16_to_f32(r[i]);
+                }
+            }
+            _ => {
+                dst.fill(0.0);
             }
         }
     }
@@ -279,6 +333,635 @@ impl BlockKvCache {
     pub fn get_v(&self, kv_head: usize, pos: usize) -> &[f32] {
         let offset = (kv_head * self.max_seq_len + pos) * self.head_dim;
         &self.v[offset..offset + self.head_dim]
+    }
+}
+
+/// Complete Composable Transformer Layer weights and spec
+pub struct BlockGraphLayer {
+    pub pre_norm: NormKind,
+    pub pre_norm_weight: Vec<f32>,
+    pub mixer_weights: BlockMixerWeights,
+    pub post_attention_norm: Option<NormKind>,
+    pub post_attention_norm_weight: Option<Vec<f32>>,
+    pub ffn_norm: NormKind,
+    pub ffn_norm_weight: Vec<f32>,
+    pub channel_mixer_weights: BlockChannelMixerWeights,
+    pub post_ffn_norm: Option<NormKind>,
+    pub post_ffn_norm_weight: Option<Vec<f32>>,
+}
+
+pub enum BlockMixerWeights {
+    Attention {
+        spec: AttentionSpec,
+        q_proj: WeightMatrix,
+        k_proj: WeightMatrix,
+        v_proj: WeightMatrix,
+        o_proj: WeightMatrix,
+        q_norm_weight: Option<Vec<f32>>,
+        k_norm_weight: Option<Vec<f32>>,
+    },
+    Conv1d {
+        spec: Conv1dSpec,
+        conv_weight: Vec<f32>,
+    },
+}
+
+pub enum BlockChannelMixerWeights {
+    SwiGLU {
+        gate_proj: WeightMatrix,
+        up_proj: WeightMatrix,
+        down_proj: WeightMatrix,
+    },
+    GeGLU {
+        gate_proj: WeightMatrix,
+        up_proj: WeightMatrix,
+        down_proj: WeightMatrix,
+    },
+    SparseMoE {
+        num_experts: usize,
+        top_k: usize,
+        router: WeightMatrix,
+        experts_gate: Vec<WeightMatrix>,
+        experts_up: Vec<WeightMatrix>,
+        experts_down: Vec<WeightMatrix>,
+    },
+}
+
+fn find_and_load_weight<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &[S]) -> Result<WeightMatrix, String> {
+    for cand in candidates {
+        if let Some((meta, slice)) = table.get_tensor(cand.as_ref()) {
+            let (rows, cols) = if meta.shape.len() == 2 {
+                (meta.shape[0], meta.shape[1])
+            } else if meta.shape.len() == 1 {
+                (1, meta.shape[0])
+            } else {
+                (meta.shape[0], meta.shape[1..].iter().product())
+            };
+            return Ok(WeightMatrix::new(
+                rows,
+                cols,
+                meta.dtype,
+                Arc::new(slice.to_vec()),
+                0,
+            ));
+        }
+    }
+    Err(format!("failed to find tensor matching candidates"))
+}
+
+fn find_and_load_vec<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &[S]) -> Result<Vec<f32>, String> {
+    for cand in candidates {
+        if let Some((meta, slice)) = table.get_tensor(cand.as_ref()) {
+            let len: usize = meta.shape.iter().product();
+            let v = match meta.dtype {
+                TensorDType::F32 => {
+                    let s = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const f32, len) };
+                    s.to_vec()
+                }
+                TensorDType::F16 => {
+                    let s = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, len) };
+                    s.iter().map(|&h| f16_to_f32(h)).collect()
+                }
+                TensorDType::BF16 => {
+                    let s = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, len) };
+                    s.iter().map(|&h| bf16_to_f32(h)).collect()
+                }
+                _ => return Err(format!("unsupported dtype {:?} for norm vector", meta.dtype)),
+            };
+            return Ok(v);
+        }
+    }
+    Err(format!("failed to find norm vector matching candidates"))
+}
+
+pub struct BlockGraphModel {
+    pub config: ModelConfig,
+    pub graph_config: BlockGraphConfig,
+    pub embed_tokens: WeightMatrix,
+    pub layers: Vec<BlockGraphLayer>,
+    pub final_norm_weight: Vec<f32>,
+    pub lm_head: Option<WeightMatrix>,
+    pub kv_caches: Vec<BlockKvCache>,
+    pub logits: Vec<f32>,
+    pub buf_x: Vec<f32>,
+    pub buf_norm: Vec<f32>,
+    pub buf_res: Vec<f32>,
+    pub buf_attn_out: Vec<f32>,
+    pub buf_q: Vec<f32>,
+    pub buf_k: Vec<f32>,
+    pub buf_v: Vec<f32>,
+    pub buf_gate: Vec<f32>,
+    pub buf_up: Vec<f32>,
+    pub buf_ffn_out: Vec<f32>,
+}
+
+impl BlockGraphModel {
+    pub fn from_tensor_table(table: &UnifiedTensorTable, max_seq_len: usize) -> Result<Self, String> {
+        let names = table.tensor_names();
+
+        // 1. Discover number of layers
+        let mut max_layer_idx = 0;
+        let mut found_layer = false;
+        for name in &names {
+            for part in name.split('.') {
+                if let Ok(idx) = part.parse::<usize>() {
+                    if name.contains("layer") || name.contains("blk") || name.contains("block") {
+                        max_layer_idx = max_layer_idx.max(idx + 1);
+                        found_layer = true;
+                    }
+                }
+            }
+        }
+        let n_layers = if found_layer { max_layer_idx } else { 0 };
+        if n_layers == 0 {
+            return Err("no transformer layers detected in tensor table".to_string());
+        }
+
+        // 2. Discover embed tokens
+        let embed_cands = [
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+            "tok_embeddings.weight",
+            "transformer.wte.weight",
+        ];
+        let embed_tokens = find_and_load_weight(table, &embed_cands)?;
+        let vocab_size = embed_tokens.rows;
+        let dim = embed_tokens.cols;
+
+        // 3. Detect architecture variants (Gemma vs standard LLaMA/Qwen/Mistral)
+        let is_gemma = names.iter().any(|n| n.contains("post_feedforward_layernorm"));
+        let norm_kind = if is_gemma {
+            NormKind::GemmaRmsNorm { eps: 1e-6 }
+        } else {
+            NormKind::RmsNorm { eps: 1e-5 }
+        };
+        let embed_scale = if is_gemma { Some((dim as f32).sqrt()) } else { None };
+        let final_soft_cap = if is_gemma { Some(30.0) } else { None };
+        let attn_soft_cap = if is_gemma { Some(50.0) } else { None };
+
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut inferred_n_heads = 0;
+        let mut inferred_n_kv_heads = 0;
+        let mut inferred_head_dim = 0;
+        let mut max_intermediate_dim = 0;
+
+        for i in 0..n_layers {
+            // Pre-norm
+            let pre_norm_cands = [
+                format!("model.layers.{i}.input_layernorm.weight"),
+                format!("layers.{i}.input_layernorm.weight"),
+                format!("layers.{i}.attention_norm.weight"),
+            ];
+            let pre_norm_weight = find_and_load_vec(table, &pre_norm_cands)?;
+
+            // Attention projections
+            let q_cands = [
+                format!("model.layers.{i}.self_attn.q_proj.weight"),
+                format!("layers.{i}.self_attn.q_proj.weight"),
+                format!("layers.{i}.attention.wq.weight"),
+            ];
+            let q_proj = find_and_load_weight(table, &q_cands)?;
+
+            let k_cands = [
+                format!("model.layers.{i}.self_attn.k_proj.weight"),
+                format!("layers.{i}.self_attn.k_proj.weight"),
+                format!("layers.{i}.attention.wk.weight"),
+            ];
+            let k_proj = find_and_load_weight(table, &k_cands)?;
+
+            let v_cands = [
+                format!("model.layers.{i}.self_attn.v_proj.weight"),
+                format!("layers.{i}.self_attn.v_proj.weight"),
+                format!("layers.{i}.attention.wv.weight"),
+            ];
+            let v_proj = find_and_load_weight(table, &v_cands)?;
+
+            let o_cands = [
+                format!("model.layers.{i}.self_attn.o_proj.weight"),
+                format!("layers.{i}.self_attn.o_proj.weight"),
+                format!("layers.{i}.attention.wo.weight"),
+            ];
+            let o_proj = find_and_load_weight(table, &o_cands)?;
+
+            if i == 0 {
+                let q_rows = q_proj.rows;
+                let k_rows = k_proj.rows;
+                inferred_head_dim = if q_rows >= 128 && q_rows % 128 == 0 && q_rows / 128 <= 64 {
+                    128
+                } else if q_rows >= 64 && q_rows % 64 == 0 {
+                    64
+                } else {
+                    q_rows.min(dim).max(1)
+                };
+                inferred_n_heads = (q_rows / inferred_head_dim).max(1);
+                inferred_n_kv_heads = (k_rows / inferred_head_dim).max(1);
+            }
+
+            // Q/K norms (Qwen 2.5 / 3)
+            let q_norm_cands = [
+                format!("model.layers.{i}.self_attn.q_norm.weight"),
+                format!("layers.{i}.self_attn.q_norm.weight"),
+            ];
+            let q_norm_weight = find_and_load_vec(table, &q_norm_cands).ok();
+
+            let k_norm_cands = [
+                format!("model.layers.{i}.self_attn.k_norm.weight"),
+                format!("layers.{i}.self_attn.k_norm.weight"),
+            ];
+            let k_norm_weight = find_and_load_vec(table, &k_norm_cands).ok();
+
+            let spec = AttentionSpec {
+                n_heads: inferred_n_heads,
+                n_kv_heads: inferred_n_kv_heads,
+                head_dim: inferred_head_dim,
+                rope_theta: 10000.0,
+                sliding_window: None,
+                q_norm: if q_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
+                k_norm: if k_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
+                attn_logit_soft_cap: attn_soft_cap,
+            };
+
+            let mixer_weights = BlockMixerWeights::Attention {
+                spec,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm_weight,
+                k_norm_weight,
+            };
+
+            // Post-attention norm
+            let post_attn_cands = [
+                format!("model.layers.{i}.post_attention_layernorm.weight"),
+                format!("layers.{i}.post_attention_layernorm.weight"),
+            ];
+            let post_attention_norm_weight = if is_gemma {
+                find_and_load_vec(table, &post_attn_cands).ok()
+            } else {
+                None
+            };
+            let post_attention_norm = if post_attention_norm_weight.is_some() { Some(norm_kind) } else { None };
+
+            // FFN norm
+            let ffn_norm_cands = [
+                format!("model.layers.{i}.post_attention_layernorm.weight"),
+                format!("layers.{i}.post_attention_layernorm.weight"),
+                format!("layers.{i}.ffn_norm.weight"),
+            ];
+            let ffn_norm_weight = find_and_load_vec(table, &ffn_norm_cands)?;
+
+            // FFN Channel Mixer
+            let gate_cands = [
+                format!("model.layers.{i}.mlp.gate_proj.weight"),
+                format!("layers.{i}.mlp.gate_proj.weight"),
+                format!("layers.{i}.feed_forward.w1.weight"),
+            ];
+            let gate_proj = find_and_load_weight(table, &gate_cands)?;
+            max_intermediate_dim = max_intermediate_dim.max(gate_proj.rows);
+
+            let up_cands = [
+                format!("model.layers.{i}.mlp.up_proj.weight"),
+                format!("layers.{i}.mlp.up_proj.weight"),
+                format!("layers.{i}.feed_forward.w3.weight"),
+            ];
+            let up_proj = find_and_load_weight(table, &up_cands)?;
+
+            let down_cands = [
+                format!("model.layers.{i}.mlp.down_proj.weight"),
+                format!("layers.{i}.mlp.down_proj.weight"),
+                format!("layers.{i}.feed_forward.w2.weight"),
+            ];
+            let down_proj = find_and_load_weight(table, &down_cands)?;
+
+            let channel_mixer_weights = BlockChannelMixerWeights::SwiGLU {
+                gate_proj,
+                up_proj,
+                down_proj,
+            };
+
+            // Post-FFN norm (Gemma)
+            let post_ffn_cands = [
+                format!("model.layers.{i}.post_feedforward_layernorm.weight"),
+                format!("layers.{i}.post_feedforward_layernorm.weight"),
+            ];
+            let post_ffn_norm_weight = if is_gemma {
+                find_and_load_vec(table, &post_ffn_cands).ok()
+            } else {
+                None
+            };
+            let post_ffn_norm = if post_ffn_norm_weight.is_some() { Some(norm_kind) } else { None };
+
+            layers.push(BlockGraphLayer {
+                pre_norm: norm_kind,
+                pre_norm_weight,
+                mixer_weights,
+                post_attention_norm,
+                post_attention_norm_weight,
+                ffn_norm: norm_kind,
+                ffn_norm_weight,
+                channel_mixer_weights,
+                post_ffn_norm,
+                post_ffn_norm_weight,
+            });
+        }
+
+        // Final norm
+        let final_cands = [
+            "model.norm.weight",
+            "norm.weight",
+        ];
+        let final_norm_weight = find_and_load_vec(table, &final_cands)?;
+
+        // LM head (optional; tied if absent)
+        let lm_cands = ["lm_head.weight"];
+        let lm_head = find_and_load_weight(table, &lm_cands).ok();
+
+        let seq_len = if max_seq_len > 0 { max_seq_len } else { 2048 };
+
+        let kv_caches = (0..n_layers)
+            .map(|_| BlockKvCache::new(inferred_n_kv_heads, seq_len, inferred_head_dim))
+            .collect();
+
+        let config = ModelConfig {
+            dim,
+            n_layers,
+            n_heads: inferred_n_heads,
+            n_kv_heads: inferred_n_kv_heads,
+            head_dim: inferred_head_dim,
+            hidden_dim: max_intermediate_dim,
+            vocab_size,
+            norm_eps: 1e-5,
+            rope_freq_base: 10000.0,
+            max_seq_len: seq_len,
+            sliding_window: 0,
+        };
+
+        let graph_config = BlockGraphConfig {
+            dim,
+            vocab_size,
+            max_seq_len: seq_len,
+            blocks: Vec::new(),
+            embed_scale,
+            final_norm: norm_kind,
+            final_logit_soft_cap: final_soft_cap,
+            tied_embeddings: lm_head.is_none(),
+        };
+
+        Ok(Self {
+            config,
+            graph_config,
+            embed_tokens,
+            layers,
+            final_norm_weight,
+            lm_head,
+            kv_caches,
+            logits: vec![0.0f32; vocab_size],
+            buf_x: vec![0.0f32; dim],
+            buf_norm: vec![0.0f32; dim],
+            buf_res: vec![0.0f32; dim],
+            buf_attn_out: vec![0.0f32; (inferred_n_heads * inferred_head_dim).max(dim)],
+            buf_q: vec![0.0f32; inferred_n_heads * inferred_head_dim],
+            buf_k: vec![0.0f32; inferred_n_kv_heads * inferred_head_dim],
+            buf_v: vec![0.0f32; inferred_n_kv_heads * inferred_head_dim],
+            buf_gate: vec![0.0f32; max_intermediate_dim],
+            buf_up: vec![0.0f32; max_intermediate_dim],
+            buf_ffn_out: vec![0.0f32; dim],
+        })
+    }
+
+    pub fn reset_cache(&mut self) {
+        for cache in &mut self.kv_caches {
+            cache.k.fill(0.0);
+            cache.v.fill(0.0);
+        }
+    }
+
+    pub fn compact_kv_cache(&mut self, cur_pos: usize, sink: usize, drop: usize) -> usize {
+        if cur_pos <= sink + drop {
+            return cur_pos;
+        }
+        let keep = cur_pos - drop;
+        let new_len = keep;
+        let head_dim = self.config.head_dim;
+        let max_seq_len = self.config.max_seq_len;
+        for cache in &mut self.kv_caches {
+            for kv_h in 0..cache.n_kv_heads {
+                let base = kv_h * max_seq_len * head_dim;
+                for p in sink..new_len {
+                    let old_p = p + drop;
+                    let dst_off = base + p * head_dim;
+                    let src_off = base + old_p * head_dim;
+                    cache.k.copy_within(src_off..src_off + head_dim, dst_off);
+                    cache.v.copy_within(src_off..src_off + head_dim, dst_off);
+                }
+            }
+        }
+        new_len
+    }
+
+    pub fn forward(&mut self, token: u32, pos: usize) -> &[f32] {
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let freq_base = self.config.rope_freq_base;
+
+        // 1. Embedding lookup
+        self.embed_tokens.get_row(token as usize, &mut self.buf_x[..dim]);
+        if let Some(scale) = self.graph_config.embed_scale {
+            for v in &mut self.buf_x[..dim] {
+                *v *= scale;
+            }
+        }
+
+        // 2. Transformer layers
+        for (l, layer) in self.layers.iter().enumerate() {
+            // Residual copy
+            self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
+
+            // Pre-norm
+            layer.pre_norm.apply(&self.buf_x[..dim], &layer.pre_norm_weight, &mut self.buf_norm[..dim]);
+
+            // Sequence mixer
+            match &layer.mixer_weights {
+                BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
+                    q_proj.gemv(&self.buf_norm[..dim], &mut self.buf_q[..q_proj.rows]);
+                    k_proj.gemv(&self.buf_norm[..dim], &mut self.buf_k[..k_proj.rows]);
+                    v_proj.gemv(&self.buf_norm[..dim], &mut self.buf_v[..v_proj.rows]);
+
+                    if let (Some(q_nw), Some(qn)) = (q_norm_weight, spec.q_norm) {
+                        for h in 0..n_heads {
+                            let off = h * head_dim;
+                            let mut tmp = [0.0f32; 256];
+                            qn.apply(&self.buf_q[off..off + head_dim], q_nw, &mut tmp[..head_dim]);
+                            self.buf_q[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                        }
+                    }
+                    if let (Some(k_nw), Some(kn)) = (k_norm_weight, spec.k_norm) {
+                        for h in 0..n_kv_heads {
+                            let off = h * head_dim;
+                            let mut tmp = [0.0f32; 256];
+                            kn.apply(&self.buf_k[off..off + head_dim], k_nw, &mut tmp[..head_dim]);
+                            self.buf_k[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                        }
+                    }
+
+                    // RoPE
+                    rope(&mut self.buf_q[..n_heads * head_dim], n_heads, head_dim, pos, freq_base);
+                    rope(&mut self.buf_k[..n_kv_heads * head_dim], n_kv_heads, head_dim, pos, freq_base);
+
+                    // Store K and V in cache
+                    let kv_cache = &mut self.kv_caches[l];
+                    for kv_h in 0..n_kv_heads {
+                        let off = kv_h * head_dim;
+                        kv_cache.store(kv_h, pos, &self.buf_k[off..off + head_dim], &self.buf_v[off..off + head_dim]);
+                    }
+
+                    // Attention calculation
+                    let inv_sqrt_head_dim = 1.0f32 / (head_dim as f32).sqrt();
+                    let group_size = (n_heads / n_kv_heads).max(1);
+
+                    for h in 0..n_heads {
+                        let kv_h = h / group_size;
+                        let q_h = &self.buf_q[h * head_dim..(h + 1) * head_dim];
+
+                        let mut max_score = -f32::INFINITY;
+                        let mut scores = Vec::with_capacity(pos + 1);
+                        for t in 0..=pos {
+                            let k_t = kv_cache.get_k(kv_h, t);
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q_h[d] * k_t[d];
+                            }
+                            let mut score = dot * inv_sqrt_head_dim;
+                            if let Some(cap) = spec.attn_logit_soft_cap {
+                                score = cap * (score / cap).tanh();
+                            }
+                            if score > max_score {
+                                max_score = score;
+                            }
+                            scores.push(score);
+                        }
+
+                        let mut exp_sum = 0.0f32;
+                        for s in &mut scores {
+                            *s = (*s - max_score).exp();
+                            exp_sum += *s;
+                        }
+                        let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
+
+                        let h_out = &mut self.buf_attn_out[h * head_dim..(h + 1) * head_dim];
+                        h_out.fill(0.0);
+                        for (t, &weight) in scores.iter().enumerate() {
+                            let w = weight * inv_sum;
+                            let v_t = kv_cache.get_v(kv_h, t);
+                            for d in 0..head_dim {
+                                h_out[d] += w * v_t[d];
+                            }
+                        }
+                    }
+
+                    // Output projection
+                    o_proj.gemv(&self.buf_attn_out[..o_proj.cols], &mut self.buf_x[..dim]);
+                }
+                BlockMixerWeights::Conv1d { .. } => {
+                    self.buf_x[..dim].copy_from_slice(&self.buf_norm[..dim]);
+                }
+            }
+
+            // Post-attention norm (Gemma)
+            if let (Some(pan), Some(pan_w)) = (layer.post_attention_norm, &layer.post_attention_norm_weight) {
+                let mut tmp = vec![0.0f32; dim];
+                pan.apply(&self.buf_x[..dim], pan_w, &mut tmp);
+                self.buf_x[..dim].copy_from_slice(&tmp);
+            }
+
+            // Residual add
+            for i in 0..dim {
+                self.buf_x[i] += self.buf_res[i];
+            }
+
+            // Save residual for FFN
+            self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
+
+            // FFN Pre-norm
+            layer.ffn_norm.apply(&self.buf_x[..dim], &layer.ffn_norm_weight, &mut self.buf_norm[..dim]);
+
+            // Channel mixer
+            match &layer.channel_mixer_weights {
+                BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                    gate_proj.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..gate_proj.rows]);
+                    up_proj.gemv(&self.buf_norm[..dim], &mut self.buf_up[..up_proj.rows]);
+                    swiglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
+                    down_proj.gemv(&self.buf_gate[..gate_proj.rows], &mut self.buf_ffn_out[..dim]);
+                }
+                BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
+                    gate_proj.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..gate_proj.rows]);
+                    up_proj.gemv(&self.buf_norm[..dim], &mut self.buf_up[..up_proj.rows]);
+                    geglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
+                    down_proj.gemv(&self.buf_gate[..gate_proj.rows], &mut self.buf_ffn_out[..dim]);
+                }
+                BlockChannelMixerWeights::SparseMoE { router, experts_gate, experts_up, experts_down, .. } => {
+                    let mut router_logits = vec![0.0f32; router.rows];
+                    router.gemv(&self.buf_norm[..dim], &mut router_logits);
+                    self.buf_ffn_out[..dim].fill(0.0);
+                    let best_expert = router_logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(idx, _)| idx).unwrap_or(0);
+                    if best_expert < experts_gate.len() {
+                        experts_gate[best_expert].gemv(&self.buf_norm[..dim], &mut self.buf_gate[..experts_gate[best_expert].rows]);
+                        experts_up[best_expert].gemv(&self.buf_norm[..dim], &mut self.buf_up[..experts_up[best_expert].rows]);
+                        swiglu_in_place(&mut self.buf_gate[..experts_gate[best_expert].rows], &self.buf_up[..experts_up[best_expert].rows]);
+                        experts_down[best_expert].gemv(&self.buf_gate[..experts_gate[best_expert].rows], &mut self.buf_ffn_out[..dim]);
+                    }
+                }
+            }
+
+            // Post-FFN norm (Gemma)
+            if let (Some(pfn), Some(pfn_w)) = (layer.post_ffn_norm, &layer.post_ffn_norm_weight) {
+                let mut tmp = vec![0.0f32; dim];
+                pfn.apply(&self.buf_ffn_out[..dim], pfn_w, &mut tmp);
+                self.buf_ffn_out[..dim].copy_from_slice(&tmp);
+            }
+
+            // Residual add
+            for i in 0..dim {
+                self.buf_x[i] = self.buf_res[i] + self.buf_ffn_out[i];
+            }
+        }
+
+        // 3. Final norm
+        self.graph_config.final_norm.apply(&self.buf_x[..dim], &self.final_norm_weight, &mut self.buf_norm[..dim]);
+
+        // 4. LM Head projection
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.gemv(&self.buf_norm[..dim], &mut self.logits);
+        } else {
+            self.embed_tokens.gemv(&self.buf_norm[..dim], &mut self.logits);
+        }
+
+        // 5. Final logit soft-capping
+        if let Some(cap) = self.graph_config.final_logit_soft_cap {
+            soft_cap_in_place(&mut self.logits, cap);
+        }
+
+        &self.logits
+    }
+
+    pub fn forward_prefill(&mut self, token: u32, pos: usize) {
+        self.forward(token, pos);
+    }
+
+    pub fn forward_prefill_batch(&mut self, tokens: &[u32], start_pos: usize) {
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.forward_prefill(tok, start_pos + i);
+        }
+    }
+
+    pub fn forward_prefill_all_with_logits(&mut self, tokens: &[u32], start_pos: usize) -> &[f32] {
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.forward(tok, start_pos + i);
+        }
+        &self.logits
     }
 }
 

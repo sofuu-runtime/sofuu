@@ -169,3 +169,68 @@ with zipfile.ZipFile('{}', 'w', compression=zipfile.ZIP_STORED) as zf:
 
     let _ = std::fs::remove_file(npz_path);
 }
+
+#[test]
+fn test_block_graph_model_loading_and_forward() {
+    use sofuu_core::infer::block_graph::BlockGraphModel;
+
+    let temp_dir = std::env::temp_dir();
+    let pt_path = temp_dir.join("test_block_graph_mini.pt");
+
+    let script = format!(
+        r#"
+import torch
+dim = 8
+vocab = 16
+hidden = 16
+sd = {{
+    'model.embed_tokens.weight': torch.randn(vocab, dim, dtype=torch.float32),
+    'model.norm.weight': torch.ones(dim, dtype=torch.float32),
+    'lm_head.weight': torch.randn(vocab, dim, dtype=torch.float32),
+}}
+for i in range(2):
+    sd[f'model.layers.{{i}}.input_layernorm.weight'] = torch.ones(dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.self_attn.q_proj.weight'] = torch.randn(dim, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.self_attn.k_proj.weight'] = torch.randn(dim, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.self_attn.v_proj.weight'] = torch.randn(dim, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.self_attn.o_proj.weight'] = torch.randn(dim, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.post_attention_layernorm.weight'] = torch.ones(dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.mlp.gate_proj.weight'] = torch.randn(hidden, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.mlp.up_proj.weight'] = torch.randn(hidden, dim, dtype=torch.float32)
+    sd[f'model.layers.{{i}}.mlp.down_proj.weight'] = torch.randn(dim, hidden, dtype=torch.float32)
+torch.save(sd, '{}')
+"#,
+        pt_path.display()
+    );
+
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        eprintln!("python3 or torch not available, skipping block graph test");
+        return;
+    }
+
+    let table = UnifiedTensorTable::open(&pt_path).expect("failed to open checkpoint via UnifiedTensorTable");
+    let mut model = BlockGraphModel::from_tensor_table(&table, 32).expect("failed to build BlockGraphModel");
+
+    assert_eq!(model.config.dim, 8);
+    assert_eq!(model.config.vocab_size, 16);
+    assert_eq!(model.layers.len(), 2);
+
+    let logits0 = model.forward(3, 0);
+    assert_eq!(logits0.len(), 16);
+    for val in logits0 {
+        assert!(val.is_finite(), "expected finite logits at pos 0, got {}", val);
+    }
+
+    let logits1 = model.forward(5, 1);
+    assert_eq!(logits1.len(), 16);
+    for val in logits1 {
+        assert!(val.is_finite(), "expected finite logits at pos 1, got {}", val);
+    }
+
+    let _ = std::fs::remove_file(pt_path);
+}

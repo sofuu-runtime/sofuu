@@ -141,6 +141,7 @@ fn main() {
 
     if target_arch == "aarch64" {
         cpp.flag_if_supported("-march=armv8-a");
+        cpp.flag_if_supported("-march=armv8.2-a+dotprod");
     } else if target_arch == "x86_64" {
         cpp.flag_if_supported("-mavx2");
         cpp.flag_if_supported("-mfma");

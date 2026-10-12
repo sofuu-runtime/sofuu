@@ -20,10 +20,12 @@ pub mod zip_reader;
 
 use std::path::Path;
 
+use self::block_graph::BlockGraphModel;
 use self::gguf::GgufFile;
 use self::lfm2::Lfm2Model;
 use self::model::{ModelConfig, TransformerModel};
 use self::sampler::{Sampler, SamplerConfig};
+use self::tensor_table::UnifiedTensorTable;
 use self::tokenizer::BpeTokenizer;
 
 #[derive(Debug, Clone)]
@@ -62,6 +64,7 @@ impl Default for GenerateOptions {
 pub enum ModelBackend {
     Gguf(TransformerModel),
     Lfm2(Lfm2Model),
+    BlockGraph(BlockGraphModel),
 }
 
 pub struct InferModel {
@@ -94,10 +97,22 @@ impl InferModel {
         })
     }
 
+    pub fn from_tensor_table(table: &UnifiedTensorTable, max_seq_len: usize) -> Result<Self, String> {
+        let m = BlockGraphModel::from_tensor_table(table, max_seq_len)?;
+        let config = m.config.clone();
+        Ok(Self {
+            config,
+            backend: ModelBackend::BlockGraph(m),
+            sliding_window: 0,
+            sink_tokens: 4,
+        })
+    }
+
     pub fn reset_cache(&mut self) {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.reset_cache(),
             ModelBackend::Lfm2(m) => m.reset_cache(),
+            ModelBackend::BlockGraph(m) => m.reset_cache(),
         }
     }
 
@@ -105,6 +120,7 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::Lfm2(m) => m.compact_kv_cache(cur_pos, sink, drop),
+            ModelBackend::BlockGraph(m) => m.compact_kv_cache(cur_pos, sink, drop),
         }
     }
 
@@ -112,6 +128,7 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward(token, pos),
             ModelBackend::Lfm2(m) => m.forward(token, pos),
+            ModelBackend::BlockGraph(m) => m.forward(token, pos),
         }
     }
 
@@ -119,6 +136,7 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_prefill(token, pos),
             ModelBackend::Lfm2(m) => m.forward_prefill(token, pos),
+            ModelBackend::BlockGraph(m) => m.forward_prefill(token, pos),
         }
     }
 
@@ -126,6 +144,7 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_prefill_batch(tokens, start_pos),
             ModelBackend::Lfm2(m) => m.forward_prefill_batch(tokens, start_pos),
+            ModelBackend::BlockGraph(m) => m.forward_prefill_batch(tokens, start_pos),
         }
     }
 
@@ -133,6 +152,7 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
             ModelBackend::Lfm2(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+            ModelBackend::BlockGraph(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
         }
     }
 }
@@ -188,35 +208,25 @@ impl InferEngine {
         let raw_str = model_path.as_ref().to_str().unwrap_or("");
         let clean_path = clean_model_path(raw_str);
 
-        // 1. Directory mode (HuggingFace / SafeTensors model directory)
+        // 1. Directory mode (HuggingFace / SafeTensors / PyTorch / NumPy model directory)
         if clean_path.is_dir() {
             let config_path = clean_path.join("config.json");
-            let safetensors_path = clean_path.join("model.safetensors");
             let tokenizer_path = clean_path.join("tokenizer.json");
 
-            if config_path.exists() && safetensors_path.exists() {
+            if tokenizer_path.exists() {
                 let tokenizer = BpeTokenizer::from_hf_file(&tokenizer_path)
                     .map_err(|e| format!("failed to load tokenizer.json from {}: {}", clean_path.display(), e))?;
-                let model = InferModel::from_lfm2_dir(&clean_path, max_seq_len)?;
-                return Ok(Self {
-                    model,
-                    tokenizer,
-                    last_prefill_tokens: 0,
-                    last_prefill_duration: std::time::Duration::ZERO,
-                    cached_tokens: Vec::new(),
-                });
-            }
-        }
 
-        // 2. Direct .safetensors file mode
-        if clean_path.extension().map_or(false, |ext| ext == "safetensors") {
-            if let Some(parent) = clean_path.parent() {
-                let config_path = parent.join("config.json");
-                let tokenizer_path = parent.join("tokenizer.json");
-                if config_path.exists() {
-                    let tokenizer = BpeTokenizer::from_hf_file(&tokenizer_path)
-                        .map_err(|e| format!("failed to load tokenizer.json: {}", e))?;
-                    let model = InferModel::from_lfm2_dir(parent, max_seq_len)?;
+                // Check for LFM2 SafeTensors directory
+                let is_lfm2 = if config_path.exists() {
+                    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                    content.contains("Lfm2ForCausalLM") || content.contains("\"lfm2\"")
+                } else {
+                    false
+                };
+
+                if is_lfm2 && clean_path.join("model.safetensors").exists() {
+                    let model = InferModel::from_lfm2_dir(&clean_path, max_seq_len)?;
                     return Ok(Self {
                         model,
                         tokenizer,
@@ -224,6 +234,66 @@ impl InferEngine {
                         last_prefill_duration: std::time::Duration::ZERO,
                         cached_tokens: Vec::new(),
                     });
+                }
+
+                // Check other weight files
+                for weight_name in &["model.safetensors", "pytorch_model.bin", "model.pt", "model.npz"] {
+                    let weight_path = clean_path.join(weight_name);
+                    if weight_path.exists() {
+                        if let Ok(table) = UnifiedTensorTable::open(&weight_path) {
+                            if let Ok(model) = InferModel::from_tensor_table(&table, max_seq_len) {
+                                return Ok(Self {
+                                    model,
+                                    tokenizer,
+                                    last_prefill_tokens: 0,
+                                    last_prefill_duration: std::time::Duration::ZERO,
+                                    cached_tokens: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Direct file mode (.safetensors, .pt, .pth, .npz, .npy)
+        let ext = clean_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if ext == "safetensors" || ext == "pt" || ext == "pth" || ext == "npz" || ext == "npy" {
+            if let Some(parent) = clean_path.parent() {
+                let config_path = parent.join("config.json");
+                let tokenizer_path = parent.join("tokenizer.json");
+                if tokenizer_path.exists() {
+                    let tokenizer = BpeTokenizer::from_hf_file(&tokenizer_path)
+                        .map_err(|e| format!("failed to load tokenizer.json: {}", e))?;
+
+                    let is_lfm2 = if config_path.exists() {
+                        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                        content.contains("Lfm2ForCausalLM") || content.contains("\"lfm2\"")
+                    } else {
+                        false
+                    };
+
+                    if is_lfm2 && ext == "safetensors" {
+                        let model = InferModel::from_lfm2_dir(parent, max_seq_len)?;
+                        return Ok(Self {
+                            model,
+                            tokenizer,
+                            last_prefill_tokens: 0,
+                            last_prefill_duration: std::time::Duration::ZERO,
+                            cached_tokens: Vec::new(),
+                        });
+                    }
+
+                    if let Ok(table) = UnifiedTensorTable::open(&clean_path) {
+                        let model = InferModel::from_tensor_table(&table, max_seq_len)?;
+                        return Ok(Self {
+                            model,
+                            tokenizer,
+                            last_prefill_tokens: 0,
+                            last_prefill_duration: std::time::Duration::ZERO,
+                            cached_tokens: Vec::new(),
+                        });
+                    }
                 }
             }
         }

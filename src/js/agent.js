@@ -517,6 +517,11 @@
       mcpSets: [],
       webTools: [],
       codeTools: [],
+      /* E2 (PLAN-EMBED-SDK): host-registered native tools (Swift/Kotlin/C
+       * callbacks). Tracked separately from codeTools because they resolve
+       * by *run time*, not define time — an agent defined from the C `agents`
+       * config predates sofuu_rt_register_host_tool. */
+      hostTools: [],
       toolTimeoutMs: (def.toolTimeoutMs | 0) || TOOL_TIMEOUT_MS,
     };
     var b = def.budget && typeof def.budget === 'object' ? def.budget : {};
@@ -551,6 +556,8 @@
           if (d.webTools.indexOf(bn) < 0) d.webTools.push(bn);
         } else if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[bn]) {
           if (d.codeTools.indexOf(bn) < 0) d.codeTools.push(bn);
+        } else if (globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[bn]) {
+          if (d.hostTools.indexOf(bn) < 0) d.hostTools.push(bn);
         } else {
           throw new Error("agent.define: unknown builtin tool '" + bn + "'");
         }
@@ -1217,6 +1224,18 @@
         var cdSpec = { name: cd.name, description: cd.description, parameters: cd.parameters };
         if (cd.selfTimed) cdSpec.selfTimed = true;
         add(cdSpec, cd.execute);
+      }
+    }
+    for (var ht = 0; ht < d.hostTools.length; ht++) {
+      var hn = d.hostTools[ht];
+      var hd = globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[hn];
+      if (hd) {
+        add({ name: hd.name, description: hd.description, parameters: hd.parameters }, hd.execute);
+      } else {
+        /* Registered into the def before the host registered the tool (or
+         * after a re-registration that dropped it). Say so rather than
+         * calling a missing function mid-turn. */
+        warn({ tool: hn, note: 'host tool not registered in this runtime' });
       }
     }
     for (var m = 0; m < d.mcpSets.length; m++) {

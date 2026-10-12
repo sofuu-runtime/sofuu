@@ -20,6 +20,12 @@
 #define SOFUU_NEON 1
 #endif
 
+#if defined(__aarch64__)
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #define SOFUU_AVX2 1
@@ -1225,6 +1231,34 @@ void sofuu_vec_dot_f32_x8(const float *w,
 }
 
 // ── Multi-Threaded Parallel Matrix-Vector (GEMV) Kernels ─────────────
+
+// Does THIS cpu actually implement the ARMv8.2 dot-product (SDOT) extension?
+//
+// __ARM_FEATURE_DOTPROD only says the *translation unit* was compiled with
+// -march=armv8.2-a+dotprod, which build.rs passes for every aarch64 target.
+// On a device whose cpu predates ARMv8.2 that flag is still honoured at
+// compile time and the sdot instructions are emitted unconditionally —
+// so the kernel would SIGILL at the first weight block instead of taking
+// the generic path.
+//
+// This asks the kernel instead. Android and every other aarch64 Linux
+// userland are __linux__, so getauxval(AT_HWCAP) is available; the answer
+// is a per-CPU constant, cached in a function-local static.
+static bool sofuu_cpu_has_dotprod() {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && defined(__aarch64__)
+#if defined(__linux__)
+    static const bool has = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+    return has;
+#else
+    // Not Linux: __ARM_FEATURE_DOTPROD was the only signal available, and
+    // every non-Linux aarch64 target we build (Apple silicon) has sdot.
+    return true;
+#endif
+#else
+    return false;
+#endif
+}
+
 void sofuu_gemv_q4_0(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {
     size_t n_blocks = cols / 32;
     size_t row_size = n_blocks * sizeof(block_q4_0);
@@ -1243,25 +1277,30 @@ void sofuu_gemv_q8_0(const void *weight_bytes, const float *x, float *out, size_
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
-    if (tls_x_q8.size() < n_blocks) {
-        tls_x_q8.resize(n_blocks);
-    }
-    sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), n_blocks);
-
-    const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
-    g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
-        for (size_t r = start; r < end; ++r) {
-            out[r] = sofuu_vec_dot_q8_0_dotprod_a76((const block_q8_0 *)(w + r * row_size), x_q8_ptr, n_blocks);
+    // Compiled in, but only taken on a cpu that implements SDOT — see
+    // sofuu_cpu_has_dotprod(). Anything older falls through to the generic
+    // kernel below rather than faulting on the first weight block.
+    if (sofuu_cpu_has_dotprod()) {
+        thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+        if (tls_x_q8.size() < n_blocks) {
+            tls_x_q8.resize(n_blocks);
         }
-    });
-#else
+        sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), n_blocks);
+
+        const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                out[r] = sofuu_vec_dot_q8_0_dotprod_a76((const block_q8_0 *)(w + r * row_size), x_q8_ptr, n_blocks);
+            }
+        });
+        return;
+    }
+#endif
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
             out[r] = sofuu_vec_dot_q8_0(w + r * row_size, x, n_blocks);
         }
     });
-#endif
 }
 
 void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {
@@ -1270,26 +1309,28 @@ void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    size_t q8_blocks = cols / 32;
-    thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
-    if (tls_x_q8.size() < q8_blocks) {
-        tls_x_q8.resize(q8_blocks);
-    }
-    sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
-
-    const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
-    g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
-        for (size_t r = start; r < end; ++r) {
-            out[r] = sofuu_vec_dot_q4_k_dotprod_a76((const block_q4_K *)(w + r * row_size), x_q8_ptr, n_blocks);
+    if (sofuu_cpu_has_dotprod()) {
+        size_t q8_blocks = cols / 32;
+        thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+        if (tls_x_q8.size() < q8_blocks) {
+            tls_x_q8.resize(q8_blocks);
         }
-    });
-#else
+        sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
+
+        const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                out[r] = sofuu_vec_dot_q4_k_dotprod_a76((const block_q4_K *)(w + r * row_size), x_q8_ptr, n_blocks);
+            }
+        });
+        return;
+    }
+#endif
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
             out[r] = sofuu_vec_dot_q4_k(w + r * row_size, x, n_blocks);
         }
     });
-#endif
 }
 
 void sofuu_gemv_q6_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {

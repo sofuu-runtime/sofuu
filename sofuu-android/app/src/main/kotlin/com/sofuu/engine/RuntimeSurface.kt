@@ -217,11 +217,133 @@ class RuntimeSurface(private val engine: SofuuEngine) {
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
     )
 
-    // ── Agents ───────────────────────────────────────────────────
+    // ── Agents ─────────────────────────────────────────────────────
 
     /** Registered agents with their tools, budgets and sub-agent fan-out. */
     fun agents(): JSONArray? = engine.evalJson(
         "(function(){ try { return { ok:true, agents: sofuu.agent.list() }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
     )?.optJSONArray("agents")
+
+    /**
+     * Register an agent from the phone.
+     *
+     * The shape is the runtime's, not the UI's: `tools` takes `'web'`,
+     * `'code'`, or `{builtin:"name"}` for anything already in
+     * `sofuu.tools.TOOLS` — which, after host-tool registration, includes
+     * the phone's own tools. `budget` is a guardrail rather than a wall:
+     * breaching `maxSteps` salvages an answer and reports `budget_steps`
+     * rather than throwing, so a generous default is the safe default.
+     *
+     * Refuses a duplicate name the same way the runtime does, so the error
+     * a user sees is the one the engine actually raised.
+     */
+    fun defineAgent(
+        name: String,
+        system: String,
+        tools: List<String>,
+        budget: JSONObject = JSONObject(),
+        provider: String = "",
+        model: String = "",
+    ): JSONObject? {
+        val toolsJson = JSONArray().apply {
+            tools.forEach { t ->
+                when {
+                    t == "web" || t == "code" -> put(t)
+                    else -> put(JSONObject().put("builtin", t))
+                }
+            }
+        }
+        val def = JSONObject()
+            .put("name", name)
+            .put("system", system)
+            .put("tools", toolsJson)
+        if (budget.length() > 0) def.put("budget", budget)
+        if (provider.isNotEmpty()) def.put("provider", provider)
+        if (model.isNotEmpty()) def.put("model", model)
+        return engine.evalJson(
+            """
+            (function(){ try {
+              var h = sofuu.agent.define(JSON.parse(${SofuuEngine.quote(def.toString())}));
+              return { ok:true, name: h.name };
+            } catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()
+            """.trimIndent()
+        )
+    }
+
+    /**
+     * Run an agent headlessly and wait for its answer.
+     *
+     * Goes through the same `agent.run` the chat turn uses, so the tools,
+     * the permission profile, the budget and the brain recall all behave
+     * identically — the only difference is that the result is collected
+     * instead of streamed. Long: a phone caller should expect tens of
+     * seconds, which is why this is off the engine thread.
+     */
+    fun runAgent(name: String, task: String, timeoutMs: Long): java.util.concurrent.CompletableFuture<JSONObject?> =
+        engine.queryFuture(
+            "(function(){ var r = sofuu.agent.run(" +
+                SofuuEngine.quote(name) + ", " + SofuuEngine.quote(task) + "); " +
+                "return r.then(function(v){ return { ok:true, answer:v.answer, steps:v.steps, " +
+                "stopped:v.stopped, usage:v.usage, runId:v.runId }; }, " +
+                "function(e){ return { ok:false, error:String(e&&e.message||e) }; }); })()",
+            timeoutMs,
+        )
+
+    /** Cancel a run, and its sub-tree, by run id. */
+    fun cancelAgent(runId: String): Boolean = engine.evalJson(
+        "(function(){ try { return { ok:true, n: sofuu.agent.cancel(${SofuuEngine.quote(runId)}) }; } " +
+            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+    )?.optBoolean("ok") ?: false
+
+    /** Caps for a model id, without switching to it. */
+    fun modelCaps(model: String): JSONObject? = engine.evalJson(
+        "(function(){ try { return { ok:true, caps: sofuu.ai.modelCaps(${SofuuEngine.quote(model)}) }; } " +
+            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+    )
+
+    /** Load agent definitions from a directory of `.js` files. */
+    fun loadAgentDir(dir: String): JSONObject? = engine.evalJson(
+        "(function(){ try { return sofuu.agent.loadDir(${SofuuEngine.quote(dir)}); } " +
+            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+    )
+
+/**
+ * Embed a picked image with the multimodal tower.
+ *
+ * `embedImage` needs its projector artifact, which most builds do not
+ * carry — so this reports unavailability rather than returning a zero
+ * vector that would silently never match anything.
+ *
+ * The path is read on the engine thread, so callers must keep the file
+ * where it is until the future resolves.
+ */
+fun embedImage(path: String): java.util.concurrent.CompletableFuture<JSONObject?> =
+    engine.queryFuture(
+        "(function(){ try { var v = sofuu.ai.embedImage(${SofuuEngine.quote(path)}); " +
+            "return { ok:true, dim: v ? v.length : 0, vec: Array.prototype.slice.call(v || []) }; " +
+            "} catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()",
+        30_000,
+    )
+
+/** Cosine between an image vector and a text vector, both in img1's space. */
+fun imageTextSimilarity(imagePath: String, text: String): JSONObject? {
+    val f = embedImage(imagePath).get()
+    if (f?.optBoolean("ok") != true) return f
+    val img = f.optJSONArray("vec") ?: return null
+    val tv = engine.embedLocal(text, "img1").get(5, java.util.concurrent.TimeUnit.SECONDS) ?: return null
+    if (img.length() != tv.size) {
+        return JSONObject().put("ok", false)
+            .put("error", "image is ${img.length()}-dim, text is ${tv.size}-dim — different spaces")
+    }
+    var dot = 0.0; var na = 0.0; var nb = 0.0
+    for (i in 0 until tv.size) {
+        val a = img.optDouble(i)
+        val b = tv[i].toDouble()
+        dot += a * b; na += a * a; nb += b * b
+    }
+    if (na == 0.0 || nb == 0.0) return null
+    return JSONObject().put("ok", true).put("similarity", dot / (Math.sqrt(na) * Math.sqrt(nb)))
+        .put("dim", tv.size)
+}
 }

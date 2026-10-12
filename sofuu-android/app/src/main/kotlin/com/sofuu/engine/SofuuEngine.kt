@@ -487,6 +487,21 @@ class SofuuEngine(
      *  through `__reply_put`. Resolves with the parsed JSON value. */
     private fun query(expr: String): CompletableFuture<Any?> {
         val f = CompletableFuture<Any?>()
+        return submit(expr, f)
+    }
+
+    /**
+     * Queue [expr] and resolve when the engine answers.
+     *
+     * Like [query] but bounded, so a caller that waits on the result off
+     * the engine thread — a headless agent run takes tens of seconds —
+     * cannot hang forever on an endpoint that never replies.
+     */
+    fun queryFuture(expr: String, timeoutMs: Long): CompletableFuture<JSONObject?> =
+        query(expr).thenApply { it as? JSONObject }.orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+
+    private fun submit(expr: String, f: CompletableFuture<Any?>): CompletableFuture<Any?> {
+        val f = CompletableFuture<Any?>()
         val script = "(function(){ try { Promise.resolve(eval(${jsonString(expr)})).then(function (v) { " +
             "__reply_put(JSON.stringify(v)); }, function (e) { " +
             "__reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e)})); }); } " +

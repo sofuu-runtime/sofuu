@@ -915,6 +915,28 @@ val runtimeEnv = RuntimeEnv(app)
     fun embedText(text: String, space: String? = null): FloatArray? =
         engine.embedLocal(text, space).get(5, TimeUnit.SECONDS)
 
+    /**
+     * Copy a picked image into app storage and return its path.
+     *
+     * The multimodal tower opens images by path, so a content:// URI is
+     * no use to it — the same reason GGUF imports are copied rather than
+     * referenced. Blocking; callers must be off the main thread.
+     */
+    fun importPickedImage(uri: android.net.Uri): String? {
+        val dir = File(getApplication<Application>().filesDir, "images").apply { mkdirs() }
+        val stamp = System.currentTimeMillis()
+        val dest = File(dir, "img-$stamp.jpg")
+        return try {
+            getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { out -> input.copyTo(out, 64 * 1024) }
+            } ?: return null
+            dest.absolutePath
+        } catch (e: Exception) {
+            dest.delete()
+            null
+        }
+    }
+
     // ── Workspaces ────────────────────────────────────────────────
 
     fun openWorkspace(path: String) {

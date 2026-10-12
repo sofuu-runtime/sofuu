@@ -51,7 +51,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-private val TABS = listOf("general", "appearance", "models", "providers", "brain", "usage")
+private val TABS = listOf("general", "appearance", "models", "providers", "agents", "brain", "usage")
 
 /** Full-screen settings — the same panes as the desktop modal, minus
  *  Shortcuts (deliberately dropped on mobile). */
@@ -91,6 +91,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                     "appearance" -> AppearancePane(store)
                     "models" -> ModelsPane(store)
                     "providers" -> ProvidersPane(store)
+                    "agents" -> AgentsPane(store)
                     "brain" -> BrainPane(store)
                     "usage" -> UsagePane(store)
                 }
@@ -938,6 +939,31 @@ private fun BrainPane(store: AppStore) {
     var probeTool by remember { mutableStateOf("read_file") }
     var probeArgs by remember { mutableStateOf("{\"path\":\"README.md\"}") }
     var verdict by remember { mutableStateOf<JSONObject?>(null) }
+    var imgNote by remember { mutableStateOf<String?>(null) }
+    var imgPath by remember { mutableStateOf<String?>(null) }
+    var imgQuery by remember { mutableStateOf("a red background") }
+    var imgSim by remember { mutableStateOf<JSONObject?>(null) }
+    val pickImage = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val img = withContext(Dispatchers.IO) { store.importPickedImage(uri) }
+            if (img == null) {
+                imgNote = "Could not import that image."
+            } else {
+                val r = withContext(Dispatchers.IO) { surface.embedImage(img).get() }
+                if (r?.optBoolean("ok") == true) {
+                    imgNote = "${img.substringAfterLast('/')} · ${r.optInt("dim")}-dim img1 vector"
+                    imgPath = img
+                } else {
+                    imgNote = "The image projector is not in this build: ${r?.optString("error") ?: "unavailable"}"
+                    imgPath = null
+                }
+            }
+        }
+    }
+
     var simA by remember { mutableStateOf("the cat sat down") }
     var simB by remember { mutableStateOf("a feline rested") }
     var sim by remember { mutableStateOf<JSONObject?>(null) }
@@ -1165,6 +1191,36 @@ private fun BrainPane(store: AppStore) {
             )
         }
 
+        Section("Image vectors")
+        Text(
+            "The multimodal tower embeds a picture into the same space a text " +
+                "query lands in, so you can ask what an image looks like.",
+            fontSize = 11.sp, color = c.textFaint,
+        )
+        SmallButton(c.accent, c.accentContrast, "Pick an image") { pickImage.launch("image/*") }
+        imgNote?.let {
+            Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
+        }
+        if (imgPath != null) {
+            TextFieldRow("describe", imgQuery, "what to look for", onSubmit = { imgQuery = it })
+            SmallButton(c.accent, c.accentContrast, "Compare to text") {
+                scope.launch {
+                    imgSim = withContext(Dispatchers.IO) { surface.imageTextSimilarity(imgPath!!, imgQuery) }
+                }
+            }
+            imgSim?.let { r ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (r.optBoolean("ok")) "cosine ${"%.4f".format(r.optDouble("similarity"))}" +
+                        " · ${r.optInt("dim")}-dim"
+                    else r.optString("error").ifEmpty { "spaces do not line up" },
+                    fontSize = 12.sp,
+                    color = if (r.optBoolean("ok")) c.text else c.warn,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+
         Section("Similarity")
         TextFieldRow("a", simA, "first string", onSubmit = { simA = it })
         TextFieldRow("b", simB, "second string", onSubmit = { simB = it })
@@ -1203,4 +1259,144 @@ private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit
             .clickable { onClick() }
             .padding(horizontal = 14.dp, vertical = 8.dp),
     )
+}
+
+// ── Agents ──────────────────────────────────────────────────────
+
+/**
+ * Registered agents, and the form to add one from a phone.
+ *
+ * `define` is the runtime's own registry — an agent added here is a
+ * first-class entry that the chat turn, `/agents` and `delegate` all see,
+ * not a local preset. Its tools are named the way `sofuu.tools.TOOLS`
+ * names them, which after host-tool registration includes the phone's own
+ * capabilities (device_info, share_text, …).
+ */
+@Composable
+private fun AgentsPane(store: AppStore) {
+    val c = LocalSofuuColors.current
+    val surface = remember { com.sofuu.engine.RuntimeSurface(store.engine) }
+    val scope = rememberCoroutineScope()
+
+    var list by remember { mutableStateOf<org.json.JSONArray?>(null) }
+    var reload by remember { mutableStateOf(0) }
+    var note by remember { mutableStateOf<String?>(null) }
+
+    var name by remember { mutableStateOf("reviewer") }
+    var system by remember { mutableStateOf("You are a careful code reviewer. Report only what you can point at.") }
+    var maxSteps by remember { mutableStateOf("24") }
+    var withWeb by remember { mutableStateOf(true) }
+    var withCode by remember { mutableStateOf(true) }
+
+    var task by remember { mutableStateOf("") }
+    var answer by remember { mutableStateOf<JSONObject?>(null) }
+    var running by remember { mutableStateOf(false) }
+
+    LaunchedEffect(reload) {
+        list = withContext(Dispatchers.IO) { surface.agents() }
+    }
+
+    Column(Modifier.verticalScroll(rememberScrollState())) {
+
+        Section("Registered")
+        val l = list
+        if (l == null) {
+            Text("Reading the registry…", fontSize = 12.sp, color = c.textFaint)
+        } else if (l.length() == 0) {
+            Text("No agents defined yet. Add one below.", fontSize = 12.sp, color = c.textFaint)
+        } else {
+            for (i in 0 until l.length()) {
+                val a = l.optJSONObject(i) ?: continue
+                Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Text(
+                        a.optString("name"),
+                        fontSize = 14.sp, color = c.text, fontFamily = FontFamily.Monospace,
+                    )
+                    val tools = a.optJSONArray("tools")
+                    val subs = a.optInt("agents")
+                    Text(
+                        buildString {
+                            tools?.let { t ->
+                                append(
+                                    (0 until t.length()).joinToString(", ") { t.optString(it) }
+                                        .ifEmpty { "no tools" }
+                                )
+                            }
+                            if (subs > 0) append(" · $subs sub-agent slots")
+                            a.optString("provider").takeIf { it.isNotEmpty() }?.let { append(" · $it") }
+                        },
+                        fontSize = 11.sp, color = c.textFaint,
+                    )
+                }
+            }
+        }
+
+        Section("Define an agent")
+        TextFieldRow("name", name, "reviewer", onSubmit = { name = it })
+        TextFieldRow("system", system, "what this agent is for", onSubmit = { system = it })
+        TextFieldRow("max steps", maxSteps, "24", onSubmit = { maxSteps = it })
+        ToggleRow("Web tools", "web_search and web_open", withWeb) { withWeb = it }
+        ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 10.dp)) {
+            SmallButton(c.accent, c.accentContrast, "Register") {
+                scope.launch {
+                    val tools = buildList {
+                        if (withWeb) add("web")
+                        if (withCode) add("code")
+                    }
+                    val budget = JSONObject().put("maxSteps", maxSteps.filter { it.isDigit() }.toIntOrNull() ?: 24)
+                    val r = withContext(Dispatchers.IO) {
+                        surface.defineAgent(name.trim(), system.trim(), tools, budget)
+                    }
+                    note = if (r?.optBoolean("ok") == true) {
+                        "${r.optString("name")} registered — the agent can use it by name, and /agents lists it."
+                    } else {
+                        "Could not register: ${r?.optString("error") ?: "unknown error"}"
+                    }
+                    reload++
+                }
+            }
+        }
+        note?.let {
+            Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
+        }
+
+        Section("Run headlessly")
+        TextFieldRow("task", task, "a task to hand the agent", onSubmit = { task = it })
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+            SmallButton(if (running) c.bgCardHover else c.accent, if (running) c.textFaint else c.accentContrast,
+                if (running) "Running…" else "Run") {
+                if (running || task.isBlank()) return@SmallButton
+                running = true; answer = null
+                scope.launch {
+                    val r = withContext(Dispatchers.IO) { surface.runAgent(name.trim(), task.trim(), 300_000).get() }
+                    answer = r
+                    running = false
+                }
+            }
+        }
+        Text(
+            "A run goes through the same agent loop, tools, budget and brain as a " +
+                "chat turn — the only difference is that the answer is collected " +
+                "instead of streamed.",
+            fontSize = 10.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp),
+        )
+        answer?.let { a ->
+            Spacer(Modifier.height(10.dp))
+            if (a.optBoolean("ok") != true) {
+                Text(a.optString("error").ifEmpty { "run failed" }, fontSize = 12.sp, color = c.err)
+            } else {
+                Text(
+                    "${a.optInt("steps")} steps" + (a.optString("stopped").takeIf { it.isNotEmpty() && it != "null" }
+                        ?.let { " · stopped: $it" } ?: ""),
+                    fontSize = 11.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                )
+                Text(
+                    a.optString("answer"),
+                    fontSize = 13.sp, color = c.text, modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
 }

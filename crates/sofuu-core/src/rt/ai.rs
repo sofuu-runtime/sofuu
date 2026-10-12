@@ -24,6 +24,7 @@ use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 use sofuu_ffi::uv::{self, UvCheck, UvHandle, UvPoll, UvTimer};
 
 use crate::rt::event_loop::sofuu_loop_get;
+use crate::rt::local_tools::{ParsedCall, ToolCallParser, ToolEvent};
 use crate::rt::promise::{
     sofuu_flush_jobs, sofuu_promise_new, sofuu_promise_reject, sofuu_promise_resolve,
     PromiseHandle,
@@ -3649,16 +3650,52 @@ fn with_local_engine<R, F: FnOnce(&mut crate::infer::InferEngine) -> Result<R, S
     f(eng)
 }
 
-fn format_chatml(messages: &[AiMessage], system_prompt: Option<&str>) -> String {
+fn format_chatml(messages: &[AiMessage], system_prompt: Option<&str>, tools: &[AiToolDef]) -> String {
+    /* C1: local models get their tool specs in the system turn (Hermes /
+     * Qwen-3 protocol — render_tools_block) and their prior calls rendered
+     * back into <tool_call> blocks, so the same agent loop that drives
+     * remote providers can drive a local model. */
+    let tools_block = if tools.is_empty() {
+        String::new()
+    } else {
+        let specs: Vec<crate::rt::local_tools::ToolSpec> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.name.as_deref().unwrap_or("").trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(crate::rt::local_tools::ToolSpec {
+                    name,
+                    description: t.description.as_deref().unwrap_or(""),
+                    parameters_json: t.parameters_json.as_deref(),
+                })
+            })
+            .collect();
+        crate::rt::local_tools::render_tools_block(&specs)
+    };
     let mut out = String::new();
     let mut has_system = false;
     if let Some(sys) = system_prompt {
         if !sys.is_empty() {
             out.push_str("<|im_start|>system\n");
             out.push_str(sys);
+            if !tools_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&tools_block);
+            }
             out.push_str("<|im_end|>\n");
             has_system = true;
         }
+    } else if !tools_block.is_empty()
+        && !messages.iter().any(|m| m.role.as_deref() == Some("system"))
+    {
+        /* No system prompt and no system message: the tools block still
+         * needs a system turn, or the model never sees the specs. */
+        out.push_str("<|im_start|>system\n");
+        out.push_str(&tools_block);
+        out.push_str("<|im_end|>\n");
+        has_system = true;
     }
     for m in messages {
         let role = m.role.as_deref().unwrap_or("user");
@@ -3668,11 +3705,41 @@ fn format_chatml(messages: &[AiMessage], system_prompt: Option<&str>) -> String 
                 continue;
             }
             has_system = true;
+            out.push_str("<|im_start|>system\n");
+            out.push_str(content);
+            if !tools_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&tools_block);
+            }
+            out.push_str("<|im_end|>\n");
+            continue;
+        }
+        /* C1: tool results ride the Qwen convention — a user turn wrapping
+         * the result in <tool_response> — the exact shape the Qwen-3
+         * family was trained on for tool feedback. */
+        if role == "tool" {
+            out.push_str("<|im_start|>user\n<tool_response>\n");
+            out.push_str(content);
+            out.push_str("\n</tool_response><|im_end|>\n");
+            continue;
         }
         out.push_str("<|im_start|>");
         out.push_str(role);
         out.push('\n');
         out.push_str(content);
+        /* C1: assistant tool-call turns render their calls back into the
+         * Hermes <tool_call> form so the model sees its own prior calls. */
+        if role == "assistant" {
+            if let Some(tc) = m.tool_calls.as_deref() {
+                let rendered = crate::rt::local_tools::render_assistant_tool_calls(tc);
+                if !rendered.is_empty() {
+                    if !content.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&rendered);
+                }
+            }
+        }
         out.push_str("<|im_end|>\n");
     }
     out.push_str("<|im_start|>assistant\n");
@@ -3692,7 +3759,7 @@ unsafe fn js_run_local_complete(ctx: *mut JSContext, cfg: &AiRequestConfig) -> J
         }
     };
 
-    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref());
+    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref(), &cfg.tools);
 
     let max_tokens = if cfg.max_tokens > 0 { cfg.max_tokens as usize } else { 512 };
     let temperature = if cfg.temperature > 0.0 { cfg.temperature as f32 } else { 0.7 };
@@ -3717,9 +3784,26 @@ unsafe fn js_run_local_complete(ctx: *mut JSContext, cfg: &AiRequestConfig) -> J
     match res {
         Ok(text) => {
             let res_obj = qjs::JS_NewObject(ctx);
-            let text_c = CString::new(text).unwrap_or_default();
+            /* C1: split <tool_call> blocks out of the answer — the visible
+             * text keeps everything else, the calls ride `tool_calls`. */
+            let mut parser = ToolCallParser::new();
+            let mut events = parser.feed(&text);
+            events.extend(parser.finish());
+            let mut visible = String::new();
+            let mut calls: Vec<ParsedCall> = Vec::new();
+            for ev in events {
+                match ev {
+                    ToolEvent::Text(t) => visible.push_str(&t),
+                    ToolEvent::Call(c) => calls.push(c),
+                }
+            }
+            let text_c = CString::new(visible).unwrap_or_default();
             let text_val = qjs::sofuu_js_new_string(ctx, text_c.as_ptr());
             qjs::sofuu_js_set_property_str(ctx, res_obj, c"text".as_ptr(), text_val);
+            if !calls.is_empty() {
+                let arr = build_tool_calls_array(ctx, &calls);
+                qjs::sofuu_js_set_property_str(ctx, res_obj, c"tool_calls".as_ptr(), arr);
+            }
             sofuu_promise_resolve(promise_ptr, res_obj);
         }
         Err(e) => {
@@ -3735,6 +3819,8 @@ unsafe fn js_run_local_complete(ctx: *mut JSContext, cfg: &AiRequestConfig) -> J
 enum LocalStreamMsg {
     Text(String),
     Think(String),
+    /* C1: accumulated <tool_call> blocks, surfaced via setToolCalls. */
+    ToolCalls(Vec<ParsedCall>),
     Done(usize, usize),
     Error(String),
 }
@@ -3745,6 +3831,7 @@ struct LocalStreamState {
     done_fn: JSValue,
     error_fn: JSValue,
     think_fn: JSValue,
+    tool_calls_fn: JSValue,
     rx: std::sync::mpsc::Receiver<LocalStreamMsg>,
     async_handle: *mut uv::UvAsync,
     aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3785,6 +3872,17 @@ unsafe extern "C" fn on_local_stream_async(handle: *mut uv::UvAsync) {
                     qjs::sofuu_js_free_value(ctx, val);
                 }
             }
+            LocalStreamMsg::ToolCalls(calls) => {
+                if qjs::JS_IsFunction(ctx, state.tool_calls_fn) != 0 {
+                    let arr = build_tool_calls_array(ctx, &calls);
+                    let ret = qjs::JS_Call(ctx, state.tool_calls_fn, qjs::sofuu_js_undefined(), 1, &arr);
+                    if qjs::is_exception(ret) {
+                        qjs::js_std_dump_error(ctx);
+                    }
+                    qjs::sofuu_js_free_value(ctx, ret);
+                    qjs::sofuu_js_free_value(ctx, arr);
+                }
+            }
             LocalStreamMsg::Done(prompt_tokens, token_count) => {
                 let stats_obj = qjs::JS_NewObject(ctx);
                 let p_tok = qjs::sofuu_js_new_int64(ctx, prompt_tokens as i64);
@@ -3819,6 +3917,7 @@ unsafe extern "C" fn on_local_stream_async(handle: *mut uv::UvAsync) {
         qjs::sofuu_js_free_value(ctx, state.done_fn);
         qjs::sofuu_js_free_value(ctx, state.error_fn);
         qjs::sofuu_js_free_value(ctx, state.think_fn);
+        qjs::sofuu_js_free_value(ctx, state.tool_calls_fn);
         let h = state.async_handle;
         uv::uv_close(h as *mut uv::UvHandle, Some(on_local_stream_close));
     }
@@ -3832,6 +3931,53 @@ unsafe extern "C" fn on_local_stream_close(handle: *mut uv::UvHandle) {
     libc::free(handle as *mut libc::c_void);
 }
 
+/// Route one visible-text fragment through the tool-call parser (C1).
+/// `parse == false` keeps the pre-C1 passthrough byte-for-byte.
+fn route_local_text(
+    parse: bool,
+    tx: &std::sync::mpsc::Sender<LocalStreamMsg>,
+    parser: &mut ToolCallParser,
+    pending: &mut Vec<ParsedCall>,
+    s: &str,
+) {
+    if !parse {
+        let _ = tx.send(LocalStreamMsg::Text(s.to_string()));
+        return;
+    }
+    for ev in parser.feed(s) {
+        match ev {
+            ToolEvent::Text(t) => {
+                let _ = tx.send(LocalStreamMsg::Text(t));
+            }
+            ToolEvent::Call(c) => pending.push(c),
+        }
+    }
+}
+
+/// Build the OpenAI-shaped JS array `[{id, type:"function", function:{name,
+/// arguments}}]` that the JS-side merger (mergeStreamToolCalls) consumes (C1).
+unsafe fn build_tool_calls_array(ctx: *mut JSContext, calls: &[ParsedCall]) -> JSValue {
+    let arr = qjs::JS_NewArray(ctx);
+    for (i, c) in calls.iter().enumerate() {
+        let obj = qjs::JS_NewObject(ctx);
+        let id_c = CString::new(c.id.as_str()).unwrap_or_default();
+        let id_v = qjs::sofuu_js_new_string(ctx, id_c.as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, obj, c"id".as_ptr(), id_v);
+        let type_v = qjs::sofuu_js_new_string(ctx, c"function".as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, obj, c"type".as_ptr(), type_v);
+        let fobj = qjs::JS_NewObject(ctx);
+        let name_c = CString::new(c.name.as_str()).unwrap_or_default();
+        let name_v = qjs::sofuu_js_new_string(ctx, name_c.as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, fobj, c"name".as_ptr(), name_v);
+        let args_c = CString::new(c.arguments.as_str()).unwrap_or_default();
+        let args_v = qjs::sofuu_js_new_string(ctx, args_c.as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, fobj, c"arguments".as_ptr(), args_v);
+        qjs::sofuu_js_set_property_str(ctx, obj, c"function".as_ptr(), fobj);
+        qjs::JS_SetPropertyUint32(ctx, arr, i as u32, obj);
+    }
+    arr
+}
+
 unsafe fn launch_local_stream(
     ctx: *mut JSContext,
     model_path: &str,
@@ -3843,6 +3989,8 @@ unsafe fn launch_local_stream(
     done_fn: JSValue,
     error_fn: JSValue,
     think_fn: JSValue,
+    tool_calls_fn: JSValue,
+    parse_tools: bool,
     iterator: JSValue,
     sid: i64,
 ) -> JSValue {
@@ -3881,6 +4029,7 @@ unsafe fn launch_local_stream(
         done_fn: qjs::sofuu_js_dup_value(ctx, done_fn),
         error_fn: qjs::sofuu_js_dup_value(ctx, error_fn),
         think_fn: qjs::sofuu_js_dup_value(ctx, think_fn),
+        tool_calls_fn: qjs::sofuu_js_dup_value(ctx, tool_calls_fn),
         rx,
         async_handle,
         aborted: aborted.clone(),
@@ -3896,6 +4045,11 @@ unsafe fn launch_local_stream(
         let handle_send = handle_addr as *mut uv::UvAsync;
         let mut token_count = 0usize;
         let mut in_think = false;
+        /* C1: visible text is scanned for <tool_call> blocks; completed
+         * calls are batched and surfaced through the factory's setToolCalls
+         * just before Done, so the JS driver reads them off the iterator. */
+        let mut parser = ToolCallParser::new();
+        let mut pending_calls: Vec<ParsedCall> = Vec::new();
         let push_closure = |tok: &str| -> bool {
             if aborted.load(std::sync::atomic::Ordering::Relaxed) {
                 return false;
@@ -3905,7 +4059,7 @@ unsafe fn launch_local_stream(
                 in_think = true;
                 let parts: Vec<&str> = tok.split("<think>").collect();
                 if !parts[0].is_empty() {
-                    let _ = tx.send(LocalStreamMsg::Text(parts[0].to_string()));
+                    route_local_text(parse_tools, &tx, &mut parser, &mut pending_calls, parts[0]);
                 }
                 if parts.len() > 1 && !parts[1].is_empty() {
                     let _ = tx.send(LocalStreamMsg::Think(parts[1].to_string()));
@@ -3917,12 +4071,12 @@ unsafe fn launch_local_stream(
                     let _ = tx.send(LocalStreamMsg::Think(parts[0].to_string()));
                 }
                 if parts.len() > 1 && !parts[1].is_empty() {
-                    let _ = tx.send(LocalStreamMsg::Text(parts[1].to_string()));
+                    route_local_text(parse_tools, &tx, &mut parser, &mut pending_calls, parts[1]);
                 }
             } else if in_think {
                 let _ = tx.send(LocalStreamMsg::Think(tok.to_string()));
             } else {
-                let _ = tx.send(LocalStreamMsg::Text(tok.to_string()));
+                route_local_text(parse_tools, &tx, &mut parser, &mut pending_calls, tok);
             }
             unsafe { uv::uv_async_send(handle_send) };
             true
@@ -3942,6 +4096,23 @@ unsafe fn launch_local_stream(
                 push_closure,
             )
         });
+
+        /* C1: end-of-stream flush — held-back text plus any final
+         * unterminated tool-call block (models often drop the closing
+         * tag), then the accumulated calls in one setToolCalls batch. */
+        if parse_tools {
+            for ev in parser.finish() {
+                match ev {
+                    ToolEvent::Text(t) => {
+                        let _ = tx.send(LocalStreamMsg::Text(t));
+                    }
+                    ToolEvent::Call(c) => pending_calls.push(c),
+                }
+            }
+            if !pending_calls.is_empty() {
+                let _ = tx.send(LocalStreamMsg::ToolCalls(std::mem::take(&mut pending_calls)));
+            }
+        }
 
         match res {
             Ok(_) => {
@@ -3965,6 +4136,7 @@ unsafe fn js_run_local_stream(
     done_fn: JSValue,
     error_fn: JSValue,
     think_fn: JSValue,
+    tool_calls_fn: JSValue,
     iterator: JSValue,
     sid: i64,
 ) -> JSValue {
@@ -3979,7 +4151,7 @@ unsafe fn js_run_local_stream(
         }
     };
 
-    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref());
+    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref(), &cfg.tools);
 
     let max_tokens = if cfg.max_tokens > 0 { cfg.max_tokens as usize } else { 512 };
     let temperature = if cfg.temperature > 0.0 { cfg.temperature as f32 } else { 0.7 };
@@ -4000,6 +4172,11 @@ unsafe fn js_run_local_stream(
         done_fn,
         error_fn,
         think_fn,
+        tool_calls_fn,
+        /* C1: the agent path declares its tools — parse only then, so a
+         * plain local chat that happens to print tool-call-looking text
+         * is never reinterpreted. */
+        !cfg.tools.is_empty(),
         iterator,
         sid,
     )
@@ -4282,6 +4459,7 @@ unsafe extern "C" fn js_ai_stream(
         let done_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"done".as_ptr());
         let error_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"error".as_ptr());
         let think_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setThink".as_ptr());
+        let tool_calls_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setToolCalls".as_ptr());
         let iterator = qjs::sofuu_js_get_property_str(ctx, factory, c"iterator".as_ptr());
         qjs::sofuu_js_free_value(ctx, factory);
 
@@ -4291,11 +4469,12 @@ unsafe extern "C" fn js_ai_stream(
             v
         });
 
-        let ret = js_run_local_stream(ctx, &cfg, push_fn, done_fn, error_fn, think_fn, iterator, sid);
+        let ret = js_run_local_stream(ctx, &cfg, push_fn, done_fn, error_fn, think_fn, tool_calls_fn, iterator, sid);
         qjs::sofuu_js_free_value(ctx, push_fn);
         qjs::sofuu_js_free_value(ctx, done_fn);
         qjs::sofuu_js_free_value(ctx, error_fn);
         qjs::sofuu_js_free_value(ctx, think_fn);
+        qjs::sofuu_js_free_value(ctx, tool_calls_fn);
         return ret;
     }
 
@@ -5948,6 +6127,7 @@ unsafe extern "C" fn js_ai_stream_local(
     let done_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"done".as_ptr());
     let error_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"error".as_ptr());
     let think_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setThink".as_ptr());
+    let tool_calls_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setToolCalls".as_ptr());
     let iterator = qjs::sofuu_js_get_property_str(ctx, factory, c"iterator".as_ptr());
     qjs::sofuu_js_free_value(ctx, factory);
     let sid = G_STREAM_SID.with(|s| {
@@ -5967,6 +6147,10 @@ unsafe extern "C" fn js_ai_stream_local(
         done_fn,
         error_fn,
         think_fn,
+        tool_calls_fn,
+        /* streamLocal is the raw-prompt API: the caller owns the protocol,
+         * so a well-formed tool-call block is always surfaced. */
+        true,
         iterator,
         sid,
     );
@@ -5975,6 +6159,7 @@ unsafe extern "C" fn js_ai_stream_local(
     qjs::sofuu_js_free_value(ctx, done_fn);
     qjs::sofuu_js_free_value(ctx, error_fn);
     qjs::sofuu_js_free_value(ctx, think_fn);
+    qjs::sofuu_js_free_value(ctx, tool_calls_fn);
 
     res_iter
 }
@@ -6050,7 +6235,7 @@ unsafe extern "C" fn js_ai_apply_chat_template(
         qjs::sofuu_js_free_value(ctx, msgs_val);
     }
 
-    let formatted = format_chatml(&messages, sys_opt.as_deref());
+    let formatted = format_chatml(&messages, sys_opt.as_deref(), &[]);
     let c_str = CString::new(formatted).unwrap_or_default();
     qjs::sofuu_js_new_string(ctx, c_str.as_ptr())
 }
@@ -7688,4 +7873,75 @@ mod tests {
             net11_close(rt, ctx);
         }
     }
+
+    /* ── C1: local tool-calling protocol ─────────────────────────── */
+
+    fn c1_msg(role: &str, content: Option<&str>) -> AiMessage {
+        AiMessage {
+            role: Some(role.to_string()),
+            content: content.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chatml_renders_tools_block_into_system() {
+        let tools = vec![AiToolDef {
+            name: Some("read_file".to_string()),
+            description: Some("Read a file".to_string()),
+            parameters_json: Some("{\"type\":\"object\"}".to_string()),
+        }];
+        let msgs = vec![c1_msg("user", Some("hi"))];
+        let out = format_chatml(&msgs, Some("sys"), &tools);
+        assert!(out.starts_with("<|im_start|>system\nsys\n\n# Tools"), "{out}");
+        assert!(out.contains("\"name\":\"read_file\""), "{out}");
+        assert!(out.contains("\"description\":\"Read a file\""), "{out}");
+        assert!(out.ends_with("<|im_start|>assistant\n"), "{out}");
+    }
+
+    #[test]
+    fn chatml_tools_block_merges_into_existing_system_message() {
+        let tools = vec![AiToolDef {
+            name: Some("t".to_string()),
+            description: None,
+            parameters_json: None,
+        }];
+        let msgs = vec![c1_msg("system", Some("SYS")), c1_msg("user", Some("u"))];
+        let out = format_chatml(&msgs, None, &tools);
+        assert_eq!(out.matches("<|im_start|>system").count(), 1, "{out}");
+        assert!(out.contains("<|im_start|>system\nSYS\n\n# Tools"), "{out}");
+    }
+
+    #[test]
+    fn chatml_without_tools_is_byte_identical_to_legacy_shape() {
+        let msgs = vec![c1_msg("user", Some("hi"))];
+        let out = format_chatml(&msgs, Some("sys"), &[]);
+        assert_eq!(
+            out,
+            "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn chatml_renders_assistant_tool_calls_and_tool_results() {
+        let mut assistant = c1_msg("assistant", None);
+        assistant.tool_calls = Some(
+            r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]"#
+                .to_string(),
+        );
+        let mut tool = c1_msg("tool", Some("file body"));
+        tool.tool_call_id = Some("c1".to_string());
+        let out = format_chatml(&[assistant, tool], None, &[]);
+        assert!(out.contains("<|im_start|>assistant\n<tool_call>"), "{out}");
+        assert!(out.contains("\"name\":\"read_file\""), "{out}");
+        assert!(out.contains("\"arguments\":{\"path\":\"a\"}"), "{out}");
+        assert!(out.contains("</tool_call><|im_end|>"), "{out}");
+        assert!(
+            out.contains("<|im_start|>user\n<tool_response>\nfile body\n</tool_response><|im_end|>"),
+            "{out}"
+        );
+    }
+
 }

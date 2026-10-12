@@ -39,9 +39,23 @@ void sofuu_gemv_q8_0(const void *weight_bytes, const float *x, float *out, size_
 void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
 void sofuu_gemv_q6_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
 void sofuu_gemv_f32(const float *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
-void sofuu_gemv_f16(const uint16_t *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
+void sofuu_gemv_f16(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
 void sofuu_gemv_bf16(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols);
 void sofuu_gemv_mlx4(const void *w_bytes, const void *scales_bytes, const void *biases_bytes, const float *x, float *out, size_t rows, size_t cols, size_t group_size, int is_bf16);
+
+// Batched MLX4 GEMV: runs num_mats matrices against one activation vector.
+void sofuu_gemv_mlx4_multi(
+    const void *const *w_bytes,
+    const void *const *scales_bytes,
+    const void *const *biases_bytes,
+    const float *x,
+    float *const *outs,
+    const size_t *rows,
+    size_t num_mats,
+    size_t cols,
+    size_t group_size,
+    int is_bf16
+);
 
 /* Matrix-matrix multiplication (batched prefill): out = X * W^T
  * Where W has shape [rows, cols] (in row-major layout),

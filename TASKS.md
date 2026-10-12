@@ -4,6 +4,45 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-12 — C2 shipped: QTSQ power-loss resilience (durable publish + write-ahead journal).**
+> New `crates/sofuu-core/src/rt/wal.rs`: durable atomic publish (fsync staged file → rename → fsync
+> directory — the rename was atomic but its DATA was not, so a power loss could leave a brain file that
+> exists and is garbage), a write-ahead journal (intent + sha256 recorded and fsynced before any rename;
+> `recover` rolls forward when the staged bytes match and back when they do not), and a pure-Rust SHA-256
+> (verified against NIST vectors; keeps the module testable in QTSQ-free CI). Wired into the brain save,
+> KV page flush, KV index write, and the semantic-migration publish; recovery runs on `cma_open` and
+> `kv_store_open`. `index.json` was a bare `fs::write` — a crash mid-write left a truncated index that the
+> loader silently read as "no pages", orphaning the whole store; it is now staged + journalled + published,
+> a corrupt index reports itself, and pages on disk that the index does not know about are adopted on open
+> rather than clobbered by the next save's id reuse. Per-stream content integrity was already provided by
+> the codec (sha256 in the container header, verified after decode). Adjacent fix: `ensure_dir` used
+> single-level `create_dir`, so a nested KV path never persisted and `kv_flush` lied about success.
+> Tests: 13 in `rt::wal` (NIST SHA-256 vectors, roll-forward/roll-back/already-committed recovery,
+> live-writer guard, awkward-path round-trip) + 3 QTSQ integration tests (clean commit leaves no journal,
+> crashed commit rolls forward on open, orphan page adopted without clobbering). Full suite **478/0** in
+> both QTSQ-enabled and QTSQ-free builds; live smoke through the JS surface (`sofuu.memory` + `sofuu.kv`)
+> leaves no journal or staging file behind.
+>
+> **2026-10-12 — C1 shipped: local tool calling (no API key).**
+> Local models now drive the agent loop end-to-end. New `crates/sofuu-core/src/rt/local_tools.rs` renders the
+> Hermes/Qwen-3 tool protocol into the local system turn, renders prior assistant calls back into `<tool_call>`
+> blocks in ChatML history (tool results ride the Qwen `<tool_response>` user-turn convention), and scans the
+> token stream incrementally — `<tool_call>` plus the `<tools>` near-miss small models emit — surfacing completed
+> calls as OpenAI-shaped `tool_calls` on `ai.stream` / `ai.complete` / `ai.streamLocal` (the shape
+> `mergeStreamToolCalls` already consumes). Conservative by construction: a block becomes a call only when its
+> payload parses as `{name, arguments}`; malformed JSON, unknown shapes, and no-declared-tools runs pass through
+> as visible text. 21 parser/rendering unit tests + 4 ChatML tests green; full lib suite **462/0** in a clean HEAD
+> worktree. Live E2E on `Qwen3-0.6B-Q4_K_M` (GGUF): agent → `<tool_call>` → `read_file` executed → final answer
+> carrying the file's real contents (2 LLM calls, 1 tool call, zero keys). Remaining C1 item: grammar-guided
+> decoding on local logits — deferred until the inference-engine refactor lands.
+>
+> **2026-10-12 — Architecture decision: `emb-m` is API-served, never bundled; only the tiny ML models ship in the binary.**
+> The clean-room `emb-m` embedding models (`s-mem-10m`, `s-docs-15m`, `s-code-20m`) are **not** compiled into the Sofuu binary.
+> They run as a separate embedding service and are consumed through the standard API surface (`ai.embed` / `ai.embedBatch`
+> with a provider or custom base URL). The binary bundles only the tiny models: `hash-768` (0 B), the `sem1/2` + `img1`
+> projectors, and the 5 context-economy gates — and those gates are being upgraded on real trajectory data per
+> `docs/PLAN-TINY-ML-UPGRADE.md`. Canonical doc updated: `docs/PLAN-SOFUU-CORE.md` (§3.7, §4, milestones C3–C4).
+>
 > **2026-10-11 — Deep Inference Engine Optimization & Universal SafeTensors Support.**
 > - **Universal Multi-Format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`)**: Format auto-detection supporting directory with `config.json` + `tokenizer.json` + `model.safetensors`, `.pt` ZIP checkpoints, `.npy`/`.npz` arrays, and `.gguf`. Integrated Hugging Face BpeTokenizer with uniform `InferModel` abstraction. Canonical plan: `docs/PLAN-INFERENCE-ENGINE.md`.
 > - **Liquid Foundation Model (LFM-2) Engine**: Full hybrid causal 1D short convolutions ($K=3$) + GQA multi-head attention + SwiGLU FFN + tied linear LM head projections with dynamic intermediate tensor dimension resolution.

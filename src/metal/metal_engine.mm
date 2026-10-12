@@ -910,6 +910,153 @@ void sofuu_metal_gemv_mlx4(
     }
 }
 
+static inline void dispatch_mlx4_gemv(
+    id<MTLComputeCommandEncoder> enc,
+    id<MTLComputePipelineState> pso,
+    id<MTLBuffer> w_buf, size_t w_offset,
+    id<MTLBuffer> scales_buf, size_t scales_offset,
+    id<MTLBuffer> biases_buf, size_t biases_offset,
+    id<MTLBuffer> x_buf,
+    id<MTLBuffer> y_buf, size_t y_offset,
+    size_t rows, size_t cols, size_t group_size
+) {
+    size_t w_aligned = w_offset & ~255ULL;
+    size_t scales_aligned = scales_offset & ~255ULL;
+    size_t biases_aligned = biases_offset & ~255ULL;
+    uint32_t rems[4] = {
+        (uint32_t)(w_offset & 255ULL),
+        (uint32_t)(scales_offset & 255ULL),
+        (uint32_t)(biases_offset & 255ULL),
+        0
+    };
+    uint c = (uint)cols;
+    uint g = (uint)group_size;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:w_buf offset:w_aligned atIndex:0];
+    [enc setBuffer:scales_buf offset:scales_aligned atIndex:1];
+    [enc setBuffer:biases_buf offset:biases_aligned atIndex:2];
+    [enc setBuffer:x_buf offset:0 atIndex:3];
+    [enc setBuffer:y_buf offset:y_offset atIndex:4];
+    [enc setBytes:&c length:sizeof(uint) atIndex:5];
+    [enc setBytes:&g length:sizeof(uint) atIndex:6];
+    [enc setBytes:rems length:sizeof(rems) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+void sofuu_metal_gemv_qkv_mlx4(
+    void* ctx_ptr,
+    void* q_buf_ptr, size_t q_offset, size_t q_rows,
+    void* q_scales_ptr, size_t q_scales_offset,
+    void* q_biases_ptr, size_t q_biases_offset,
+    void* k_buf_ptr, size_t k_offset, size_t k_rows,
+    void* k_scales_ptr, size_t k_scales_offset,
+    void* k_biases_ptr, size_t k_biases_offset,
+    void* v_buf_ptr, size_t v_offset, size_t v_rows,
+    void* v_scales_ptr, size_t v_scales_offset,
+    void* v_biases_ptr, size_t v_biases_offset,
+    const float* x,
+    float* q_out, float* k_out, float* v_out,
+    size_t cols, size_t group_size, int is_bf16
+) {
+    if (!ctx_ptr || !q_buf_ptr || !k_buf_ptr || !v_buf_ptr || !q_scales_ptr || !k_scales_ptr || !v_scales_ptr ||
+        !q_biases_ptr || !k_biases_ptr || !v_biases_ptr || !x || !q_out || !k_out || !v_out ||
+        !q_rows || !k_rows || !v_rows || !cols) return;
+    sofuu_metal_sync(ctx_ptr);
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLComputePipelineState> pso = (is_bf16 != 0) ? ctx->pso_gemv_mlx4_bf16 : ctx->pso_gemv_mlx4_f16;
+    pso = (is_bf16 != 0) ? ctx->pso_gemv_mlx4_bf16 : ctx->pso_gemv_mlx4_f16;
+
+    @autoreleasepool {
+        size_t x_bytes = cols * sizeof(float);
+        size_t q_bytes = q_rows * sizeof(float);
+        size_t k_bytes = k_rows * sizeof(float);
+        size_t v_bytes = v_rows * sizeof(float);
+        size_t q_slot = (q_bytes + 255) & ~255ULL;
+        size_t k_slot = (k_bytes + 255) & ~255ULL;
+        size_t total_y_bytes = q_slot + k_slot + v_bytes;
+        ensure_buffers(ctx, x_bytes, total_y_bytes);
+        std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        dispatch_mlx4_gemv(enc, pso,
+            (__bridge id<MTLBuffer>)q_buf_ptr, q_offset,
+            (__bridge id<MTLBuffer>)q_scales_ptr, q_scales_offset,
+            (__bridge id<MTLBuffer>)q_biases_ptr, q_biases_offset,
+            ctx->x_buf, ctx->y_buf, 0, q_rows, cols, group_size);
+        dispatch_mlx4_gemv(enc, pso,
+            (__bridge id<MTLBuffer>)k_buf_ptr, k_offset,
+            (__bridge id<MTLBuffer>)k_scales_ptr, k_scales_offset,
+            (__bridge id<MTLBuffer>)k_biases_ptr, k_biases_offset,
+            ctx->x_buf, ctx->y_buf, q_slot, k_rows, cols, group_size);
+        dispatch_mlx4_gemv(enc, pso,
+            (__bridge id<MTLBuffer>)v_buf_ptr, v_offset,
+            (__bridge id<MTLBuffer>)v_scales_ptr, v_scales_offset,
+            (__bridge id<MTLBuffer>)v_biases_ptr, v_biases_offset,
+            ctx->x_buf, ctx->y_buf, q_slot + k_slot, v_rows, cols, group_size);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        const char* y_ptr = (const char*)ctx->y_buf.contents;
+        std::memcpy(q_out, y_ptr, q_bytes);
+        std::memcpy(k_out, y_ptr + q_slot, k_bytes);
+        std::memcpy(v_out, y_ptr + q_slot + k_slot, v_bytes);
+    }
+}
+
+void sofuu_metal_gemv_gate_up_mlx4(
+    void* ctx_ptr,
+    void* gate_buf_ptr, size_t gate_offset, size_t gate_rows,
+    void* gate_scales_ptr, size_t gate_scales_offset,
+    void* gate_biases_ptr, size_t gate_biases_offset,
+    void* up_buf_ptr, size_t up_offset, size_t up_rows,
+    void* up_scales_ptr, size_t up_scales_offset,
+    void* up_biases_ptr, size_t up_biases_offset,
+    const float* x,
+    float* gate_out, float* up_out,
+    size_t cols, size_t group_size, int is_bf16
+) {
+    if (!ctx_ptr || !gate_buf_ptr || !up_buf_ptr || !gate_scales_ptr || !up_scales_ptr ||
+        !gate_biases_ptr || !up_biases_ptr || !x || !gate_out || !up_out ||
+        !gate_rows || !up_rows || !cols) return;
+    sofuu_metal_sync(ctx_ptr);
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLComputePipelineState> pso = (is_bf16 != 0) ? ctx->pso_gemv_mlx4_bf16 : ctx->pso_gemv_mlx4_f16;
+
+    @autoreleasepool {
+        size_t x_bytes = cols * sizeof(float);
+        size_t gate_bytes = gate_rows * sizeof(float);
+        size_t up_bytes = up_rows * sizeof(float);
+        size_t gate_slot = (gate_bytes + 255) & ~255ULL;
+        size_t total_y_bytes = gate_slot + up_bytes;
+        ensure_buffers(ctx, x_bytes, total_y_bytes);
+        std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        dispatch_mlx4_gemv(enc, pso,
+            (__bridge id<MTLBuffer>)gate_buf_ptr, gate_offset,
+            (__bridge id<MTLBuffer>)gate_scales_ptr, gate_scales_offset,
+            (__bridge id<MTLBuffer>)gate_biases_ptr, gate_biases_offset,
+            ctx->x_buf, ctx->y_buf, 0, gate_rows, cols, group_size);
+        dispatch_mlx4_gemv(enc, pso,
+            (__bridge id<MTLBuffer>)up_buf_ptr, up_offset,
+            (__bridge id<MTLBuffer>)up_scales_ptr, up_scales_offset,
+            (__bridge id<MTLBuffer>)up_biases_ptr, up_biases_offset,
+            ctx->x_buf, ctx->y_buf, gate_slot, up_rows, cols, group_size);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        const char* y_ptr = (const char*)ctx->y_buf.contents;
+        std::memcpy(gate_out, y_ptr, gate_bytes);
+        std::memcpy(up_out, y_ptr + gate_slot, up_bytes);
+    }
+}
+
 void sofuu_metal_gemv_qkv_multi(
     void* ctx_ptr,
     void* q_buf_ptr, size_t q_offset, size_t q_rows,
@@ -1158,6 +1305,8 @@ void sofuu_metal_gemv_qkv_multi(void* ctx, void* q_buf, size_t q_offset, size_t 
 void sofuu_metal_gemv_gate_up_multi(void* ctx, void* gate_buf, size_t gate_offset, void* up_buf, size_t up_offset, const float* x, float* gate_out, float* up_out, size_t inter_rows, size_t cols, int dtype) {}
 void sofuu_metal_gemv_async(void* ctx, void* w_buf, size_t w_offset, const float* x, float* y, size_t rows, size_t cols, int dtype) {}
 void sofuu_metal_sync(void* ctx) {}
+void sofuu_metal_gemv_qkv_mlx4(void* ctx, void* q_buf, size_t q_offset, size_t q_rows, void* q_scales_buf, size_t q_scales_offset, void* q_biases_buf, size_t q_biases_offset, void* k_buf, size_t k_offset, size_t k_rows, void* k_scales_buf, size_t k_scales_offset, void* k_biases_buf, size_t k_biases_offset, void* v_buf, size_t v_offset, size_t v_rows, void* v_scales_buf, size_t v_scales_offset, void* v_biases_buf, size_t v_biases_offset, const float* x, float* q_out, float* k_out, float* v_out, size_t cols, size_t group_size, int is_bf16) {}
+void sofuu_metal_gemv_gate_up_mlx4(void* ctx, void* gate_buf, size_t gate_offset, size_t gate_rows, void* gate_scales_buf, size_t gate_scales_offset, void* gate_biases_buf, size_t gate_biases_offset, void* up_buf, size_t up_offset, size_t up_rows, void* up_scales_buf, size_t up_scales_offset, void* up_biases_buf, size_t up_biases_offset, const float* x, float* gate_out, float* up_out, size_t cols, size_t group_size, int is_bf16) {}
 
 #endif
 

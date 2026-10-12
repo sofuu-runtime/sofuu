@@ -15,8 +15,8 @@ Every capability an AI application needs is integrated directly into the core bi
 * **QTSQ Persistent Encrypted Brain**: Proprietary tensor container (`.qtsq`) storing memories and KV pages locally across restarts.
 * **Autonomous Agent Loop**: Budget-controlled multi-step reasoning, sub-agent delegation, and sandboxed coding tools.
 * **Native Model Context Protocol (MCP)**: In-tree JSON-RPC client and server connecting tools and data sources.
-* **Offline Vector Subsystem**: Instant zero-byte character-trigram embeddings (`hash-768`), learned semantic projectors, and joint text/image embedding.
-* **Context-Economy ML Gates**: 5 on-device learned models (~8k params each) preventing token waste.
+* **Offline Vector Subsystem**: Instant zero-byte character-trigram embeddings (`hash-768`), learned semantic projectors, and joint text/image embedding. The larger clean-room `emb-m` models are **not bundled** — they run as a separate service consumed through the embedding API (see §3.7).
+* **Context-Economy ML Gates**: 5 on-device learned models (~8k params each) preventing token waste — the only ML models bundled in the binary, with an upgrade on real trajectory data in progress (`PLAN-TINY-ML-UPGRADE.md`).
 
 ---
 
@@ -106,7 +106,8 @@ Every capability an AI application needs is integrated directly into the core bi
   - `hash-768`: 768-dimensional character-trigram projection using MurmurHash3 and L2-normalization. Runs in $< 2\ \mu\text{s}$ per doc with **0 bytes** model footprint.
   - `sem1-64` / `sem2-64`: Compact learned linear/table projectors for 64-dim memory indexing.
   - `img1-64`: Joint text/image embedding (`image.rs`) projecting image bytes into the same metric space as text.
-* **Context-Economy ML Gates (`sofuu.ml`)**:
+* **Bundled vs. served (decided 2026-10-12)**: The binary bundles only the tiny models — `hash-768` (0 B), the `sem1/2` + `img1` projectors, and the 5 context-economy gates. The clean-room `emb-m` models (`s-mem-10m`, `s-docs-15m`, `s-code-20m`) are **never compiled into the binary**: they run as a separate embedding service and are consumed through the standard API surface (`ai.embed` / `ai.embedBatch` with a provider or custom base URL), exactly like any remote embedding provider. The in-binary `hash-768` default stays the zero-key, zero-network path.
+* **Context-Economy ML Gates (`sofuu.ml`)** — bundled, and being upgraded on real trajectory data (`PLAN-TINY-ML-UPGRADE.md`):
   - 5 tiny on-device ML models (~8k params each) that advise the agent loop:
     1. **Freshness Gate**: Predicts if retrieved context is stale.
     2. **Supervisor Gate**: Evaluates if the agent's current step is making progress or looping.
@@ -126,27 +127,32 @@ Every capability an AI application needs is integrated directly into the core bi
 | **QTSQ Brain** | ✅ Shipped | Round-trip verified, encrypted at rest, SSD paging | Implement write-ahead logging (WAL) for power-loss crash safety. |
 | **Agent Loop** | ✅ Shipped | Delegation, budget trees, cancel, traces, web tool | Wire in-process local inference model tool-calling. |
 | **MCP Client/Server** | ✅ Shipped | JSON-RPC 2.0, stdio + SSE, multi-server routing | Add OAuth/Bearer token authentication support for remote MCP. |
-| **Offline Embeddings** | ✅ Shipped | `hash-768` (0 B, 2 µs), `sem1/2`, `img1-64` | Complete clean-room `emb-m` pilot model training/quantization. |
-| **ML Gates** | ✅ Shipped | Beat constant & logistic baselines on synthetic data | Implement live shadow-mode A/B logging on real user traffic. |
+| **Offline Embeddings** | ✅ Shipped | `hash-768` (0 B, 2 µs), `sem1/2`, `img1-64` | `emb-m` is served via API, **not bundled** (see C3); in-binary path keeps `hash-768` as the zero-byte default. |
+| **ML Gates** | ✅ Shipped | Beat constant & logistic baselines on synthetic data | Upgrade the 5 bundled gates on real trajectory data (`PLAN-TINY-ML-UPGRADE.md`) + live shadow-mode A/B logging on real user traffic. |
 
 ---
 
 ## 5. Phased Roadmap (Milestone-Driven)
 
 ### Milestone C1: Local Inference & Tool Calling Fusion
-- [ ] Connect `sofuu.agent` tool-calling directly to `sofuu.ai.streamLocal()` using JSON schema grammar-guided decoding.
-- [ ] Enable local models (Qwen-3, LFM-2) to drive autonomous agents without any remote API key.
-- [ ] Implement structured output enforcement on local logits.
+- [x] **Local tool-call protocol + stream parser (2026-10-12).** Tool specs ride the system turn (Hermes/Qwen-3 `<tools>` block), prior assistant calls render back into `<tool_call>` blocks in ChatML history, and tool results use the Qwen `<tool_response>` user-turn convention. The local stream scanner (`rt/local_tools.rs`) parses `<tool_call>` — plus the `<tools>` near-miss small models emit — out of the token stream and surfaces completed calls as OpenAI-shaped `tool_calls` on `ai.stream` / `ai.complete` / `ai.streamLocal`, the exact shape the agent loop already consumes for every remote provider. Conservative by construction: a block becomes a call only when its payload parses as `{name, arguments}`; with no declared tools the local output passes through byte-for-byte.
+- [x] **Local models drive autonomous agents with no remote API key — verified live 2026-10-12** on `Qwen3-0.6B-Q4_K_M` (GGUF): agent → `<tool_call>` → `read_file` executed → tool result → final answer carrying the file's real contents (2 LLM calls, 1 tool call, zero keys). LFM-2 remains untested for tool calling.
+- [ ] Structured output enforcement on local logits (JSON-schema grammar-guided decoding in the sampler) — deferred until the inference-engine refactor lands; the text-protocol parser above is the compatibility layer until then.
 
 ### Milestone C2: QTSQ Power-Loss Resilience & WAL
-- [ ] Implement write-ahead journaling for the QTSQ persistence engine to prevent brain file corruption during unexpected power loss or device reboots.
-- [ ] Add atomic page commits and checksum verification on load.
+- [x] **Durable atomic publish (2026-10-12).** Every persistence rename now fsyncs the staged file before the rename and fsyncs the directory after it (`rt/wal.rs::publish`) — without the first fsync the data can be lost while the rename survives, the classic power-loss corruption that left a brain file that exists and is garbage. Wired into the brain save, the KV page flush, the KV index write, and the semantic-migration publish.
+- [x] **Write-ahead journal.** `rt/wal.rs::Journal` records the intent (target, staged path, sha256) and fsyncs it BEFORE any rename; `recover` replays it on open — rolling the commit forward when the staged bytes are intact and match, back when they are not. A journal younger than 30 s is treated as a live writer's and never stolen (desktop + CLI on one project).
+- [x] **Atomic page commits + orphan adoption.** `index.json` was a bare `fs::write` (a crash mid-write left a truncated index that `kv_store_open` silently read as "no pages", orphaning the entire store) — it is now staged and published like a page, and a corrupt index says so out loud. Pages on disk that the index does not know about (a crash between page write and index flush) are adopted on open instead of being clobbered by the next save's id reuse.
+- [x] **Checksum verification on load.** Per-stream content integrity is provided by the codec itself — compress writes sha256(original bytes) into the container header and `qtsq_decompress` verifies it after decode (`qtsq_singularity.c` / `qtsq_radiation.c`). The adapter adds the crash-window digest via the journal and verifies it during recovery.
+- [x] **Adjacent fix found while testing:** `ensure_dir` used single-level `create_dir`, so a nested KV store path whose parent did not exist yet never persisted anything — and the old `kv_flush` reported success anyway. Now `create_dir_all`, and `kv_flush` reports a real failure.
 
-### Milestone C3: Clean-Room `emb-m` Distilled Embedder
+### Milestone C3: `emb-m` Embedding Service (API-Served, Never Bundled)
 - [ ] Complete pilot training of `s-mem-10m` (agent memory retrieval model) from permissively licensed datasets.
-- [ ] Quantize model to 4-bit/8-bit weights and embed runtime forward pass directly in `sofuu-core` ($\le 1.5\text{ MB}$ footprint).
-- [ ] Provide drop-in semantic upgrade over `hash-768`.
+- [ ] Serve `emb-m` through an embedding API (hosted or self-hosted) as a separate service — the models are deliberately **not** compiled into the binary (no `include_bytes!`, no in-binary forward pass, zero binary-footprint cost).
+- [ ] Integrate the runtime through the existing provider surface (`ai.embed` / `ai.embedBatch` with a provider or custom base URL) — no new in-binary model loader.
+- [ ] Keep `hash-768` as the zero-byte in-binary default; the semantic upgrade is a configuration choice, not a binary change.
 
-### Milestone C4: Shadow A/B Telemetry for Context Gates
+### Milestone C4: Bundled Tiny-Model Upgrade & Shadow A/B Telemetry
+- [ ] Upgrade the 5 bundled context-economy gates with real-world trajectory data per `PLAN-TINY-ML-UPGRADE.md` (≤15k params each, <50 µs CPU forward pass, weights still compiled in via `include_bytes!`).
 - [ ] Implement non-invasive session logging to measure real-world token savings produced by the 5 ML gates.
 - [ ] Measure tokens-per-completed-task end metric on production workflows.

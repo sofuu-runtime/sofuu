@@ -1446,7 +1446,12 @@ fn main() -> ExitCode {
             let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
             eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
             let t0 = std::time::Instant::now();
-            let mut engine = match sofuu_core::infer::InferEngine::load_with_seq_len(model_path, custom_ctx) {
+            let load_result = if gpu_layers == 0 {
+                sofuu_core::infer::InferEngine::load_with_seq_len_cpu(model_path, custom_ctx)
+            } else {
+                sofuu_core::infer::InferEngine::load_with_seq_len(model_path, custom_ctx)
+            };
+            let mut engine = match load_result {
                 Ok(eng) => eng,
                 Err(e) => {
                     eprintln!("\x1b[31mError loading model:\x1b[0m {e}");

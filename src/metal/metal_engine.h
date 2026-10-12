@@ -135,6 +135,37 @@ void sofuu_metal_gemv_mlx4(
     int is_bf16
 );
 
+// Execute Batched Q, K, V MLX 4-bit affine GEMV in one command buffer.
+void sofuu_metal_gemv_qkv_mlx4(
+    void* ctx,
+    void* q_buf, size_t q_offset, size_t q_rows,
+    void* q_scales_buf, size_t q_scales_offset,
+    void* q_biases_buf, size_t q_biases_offset,
+    void* k_buf, size_t k_offset, size_t k_rows,
+    void* k_scales_buf, size_t k_scales_offset,
+    void* k_biases_buf, size_t k_biases_offset,
+    void* v_buf, size_t v_offset, size_t v_rows,
+    void* v_scales_buf, size_t v_scales_offset,
+    void* v_biases_buf, size_t v_biases_offset,
+    const float* x,
+    float* q_out, float* k_out, float* v_out,
+    size_t cols, size_t group_size, int is_bf16
+);
+
+// Execute Batched Gate and Up MLX 4-bit affine GEMV in one command buffer.
+void sofuu_metal_gemv_gate_up_mlx4(
+    void* ctx,
+    void* gate_buf, size_t gate_offset, size_t gate_rows,
+    void* gate_scales_buf, size_t gate_scales_offset,
+    void* gate_biases_buf, size_t gate_biases_offset,
+    void* up_buf, size_t up_offset, size_t up_rows,
+    void* up_scales_buf, size_t up_scales_offset,
+    void* up_biases_buf, size_t up_biases_offset,
+    const float* x,
+    float* gate_out, float* up_out,
+    size_t cols, size_t group_size, int is_bf16
+);
+
 // Create a Metal buffer from pointer (zero-copy if page-aligned, copy fallback if not).
 void* sofuu_metal_buffer_create(void* ctx, const void* ptr, size_t size_bytes);
 

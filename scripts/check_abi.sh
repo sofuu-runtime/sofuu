@@ -73,6 +73,31 @@ if [ ! -f "$BASELINE" ]; then
     exit 0
 fi
 
+# Every baseline symbol must be inside PUBLIC_RE's scope. The 2026-09-25 bug
+# was the mirror image of this: a symbol in the baseline that the filter
+# hides is invisible to the gate forever — it can be added, changed or
+# removed with no line of output. (This is the assertion the comment above
+# PUBLIC_RE has claimed exists since then; it did not.)
+assert_abi_prefix_coverage() {
+    local uncovered
+    uncovered=$(LC_ALL=C grep -vE "$PUBLIC_RE" "$BASELINE" || true)
+    if [ -n "$uncovered" ]; then
+        echo "  \033[31m✗ ABI baseline is outside the filter scope:\033[0m"
+        echo "$uncovered" | sed 's/^/    /'
+        echo ""
+        echo "  These baseline symbols do not match PUBLIC_RE, so the gate can"
+        echo "  never report them as added or removed. Extend PUBLIC_RE with"
+        echo "  their prefix, then re-run."
+        return 1
+    fi
+    return 0
+}
+
+if ! assert_abi_prefix_coverage; then
+    rm -f "$SYMBOLS_FILE" "$BASELINE_SORTED"
+    exit 1
+fi
+
 # Diff against the baseline.
 #
 # 2026-09-25: `comm` is byte-order and REQUIRES both inputs sorted in the
@@ -108,7 +133,14 @@ if [ -n "$NEW_SYMBOLS" ]; then
     # via SOFUU_ABI_ALLOW_NEW=1 (set it when deliberately adding API).
     if [ "${SOFUU_ABI_ALLOW_NEW:-0}" = "1" ]; then
         echo "  SOFUU_ABI_ALLOW_NEW=1 set — treating as an acknowledged addition."
-        echo "  Update the baseline: cp $SYMBOLS_FILE $BASELINE && commit scripts/abi_symbols.txt."
+        # Write the proposed baseline NEXT TO the real one instead of to the
+        # temp file we are about to delete: the old message told the reader to
+        # `cp $SYMBOLS_FILE …`, which was already gone by the time they could
+        # read it. A stable path makes the diff reviewable.
+        cp "$SYMBOLS_FILE" "$BASELINE.new"
+        echo "  Proposed baseline written to:"
+        echo "    $BASELINE.new"
+        echo "  Review it, then:  mv $BASELINE.new $BASELINE  (and commit scripts/abi_symbols.txt)"
         rm -f "$SYMBOLS_FILE" "$BASELINE_SORTED"
         exit 0
     fi

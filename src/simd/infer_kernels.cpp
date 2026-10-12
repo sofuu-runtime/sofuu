@@ -14,6 +14,9 @@
 #include <atomic>
 #include <functional>
 #include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -1338,6 +1341,24 @@ void sofuu_gemv_q6_k(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q6_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (sofuu_cpu_has_dotprod()) {
+        size_t q8_blocks = cols / 32;
+        thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+        if (tls_x_q8.size() < q8_blocks) {
+            tls_x_q8.resize(q8_blocks);
+        }
+        sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
+
+        const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                out[r] = sofuu_vec_dot_q6_k_dotprod_a76((const block_q6_K *)(w + r * row_size), x_q8_ptr, n_blocks);
+            }
+        });
+        return;
+    }
+#endif
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
             out[r] = sofuu_vec_dot_q6_k(w + r * row_size, x, n_blocks);
@@ -1353,16 +1374,50 @@ void sofuu_gemv_f32(const float *weight_bytes, const float *x, float *out, size_
     });
 }
 
-void sofuu_gemv_f16(const uint16_t *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {
+void sofuu_gemv_f16(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols) {
+    const uint8_t *w_base = (const uint8_t *)weight_bytes;
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+#if defined(SOFUU_NEON)
         for (size_t r = start; r < end; ++r) {
-            const uint16_t *row = weight_bytes + r * cols;
-            float sum = 0.0f;
-            for (size_t c = 0; c < cols; ++c) {
-                sum += f16_to_f32_val(row[c]) * x[c];
+            const uint8_t *row = w_base + r * cols * 2;
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            size_t c = 0;
+            for (; c + 16 <= cols; c += 16) {
+                uint16x8_t raw0 = vreinterpretq_u16_u8(vld1q_u8(row + c * 2));
+                uint16x8_t raw1 = vreinterpretq_u16_u8(vld1q_u8(row + c * 2 + 16));
+                float32x4_t f0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(raw0)));
+                float32x4_t f1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(raw0)));
+                float32x4_t f2 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(raw1)));
+                float32x4_t f3 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(raw1)));
+                acc0 = vfmaq_f32(acc0, f0, vld1q_f32(x + c));
+                acc1 = vfmaq_f32(acc1, f1, vld1q_f32(x + c + 4));
+                acc2 = vfmaq_f32(acc2, f2, vld1q_f32(x + c + 8));
+                acc3 = vfmaq_f32(acc3, f3, vld1q_f32(x + c + 12));
+            }
+            float32x4_t total = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            float sum = vaddvq_f32(total);
+            for (; c < cols; ++c) {
+                uint16_t val;
+                std::memcpy(&val, row + c * 2, 2);
+                sum += f16_to_f32_val(val) * x[c];
             }
             out[r] = sum;
         }
+#else
+        for (size_t r = start; r < end; ++r) {
+            const uint8_t *row = w_base + r * cols * 2;
+            float sum = 0.0f;
+            for (size_t c = 0; c < cols; ++c) {
+                uint16_t val;
+                std::memcpy(&val, row + c * 2, 2);
+                sum += f16_to_f32_val(val) * x[c];
+            }
+            out[r] = sum;
+        }
+#endif
     });
 }
 
@@ -1571,12 +1626,109 @@ void sofuu_gemv_mlx4(
     size_t grp_row_bytes = (cols / group_size) * 2;
     bool bf16_flag = is_bf16 != 0;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (!bf16_flag && sofuu_cpu_has_dotprod()) {
+        size_t q8_blocks = cols / 32;
+        thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+        if (tls_x_q8.size() < q8_blocks) {
+            tls_x_q8.resize(q8_blocks);
+        }
+        sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
+        const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                out[r] = sofuu_vec_dot_mlx4_dotprod_a76(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, x_q8_ptr);
+            }
+        });
+        return;
+    }
+#endif
+
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
 #if defined(SOFUU_NEON)
             out[r] = vec_dot_mlx4_neon(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, bf16_flag);
 #else
             out[r] = vec_dot_mlx4_scalar(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, bf16_flag);
+#endif
+        }
+    });
+}
+
+void sofuu_gemv_mlx4_multi(
+    const void *const *w_bytes,
+    const void *const *scales_bytes,
+    const void *const *biases_bytes,
+    const float *x,
+    float *const *outs,
+    const size_t *rows,
+    size_t num_mats,
+    size_t cols,
+    size_t group_size,
+    int is_bf16
+) {
+    if (!w_bytes || !scales_bytes || !biases_bytes || !x || !outs || !rows || num_mats == 0 || !cols) return;
+    size_t total_rows = 0;
+    for (size_t m = 0; m < num_mats; ++m) total_rows += rows[m];
+    if (!total_rows) return;
+
+    size_t w_row_bytes = (cols / 8) * 4;
+    size_t grp_row_bytes = (cols / group_size) * 2;
+    bool bf16_flag = is_bf16 != 0;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (!bf16_flag && sofuu_cpu_has_dotprod()) {
+        size_t q8_blocks = cols / 32;
+        thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
+        if (tls_x_q8.size() < q8_blocks) tls_x_q8.resize(q8_blocks);
+        sofuu_quantize_row_q8_a76(x, tls_x_q8.data(), q8_blocks);
+        const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
+
+        g_pool.parallel_for(0, total_rows, [=](size_t start, size_t end) {
+            size_t mat = 0;
+            size_t mat_start = 0;
+            size_t mat_end = rows[0];
+            for (size_t r = start; r < end; ++r) {
+                while (r >= mat_end) {
+                    ++mat;
+                    mat_start = mat_end;
+                    mat_end = mat_start + rows[mat];
+                }
+                size_t local = r - mat_start;
+                outs[mat][local] = sofuu_vec_dot_mlx4_dotprod_a76(
+                    (const uint8_t *)w_bytes[mat] + local * w_row_bytes,
+                    (const uint8_t *)scales_bytes[mat] + local * grp_row_bytes,
+                    (const uint8_t *)biases_bytes[mat] + local * grp_row_bytes,
+                    x, cols, group_size, x_q8_ptr);
+            }
+        });
+        return;
+    }
+#endif
+
+    g_pool.parallel_for(0, total_rows, [=](size_t start, size_t end) {
+        size_t mat = 0;
+        size_t mat_start = 0;
+        size_t mat_end = rows[0];
+        for (size_t r = start; r < end; ++r) {
+            while (r >= mat_end) {
+                ++mat;
+                mat_start = mat_end;
+                mat_end = mat_start + rows[mat];
+            }
+            size_t local = r - mat_start;
+#if defined(SOFUU_NEON)
+            outs[mat][local] = vec_dot_mlx4_neon(
+                (const uint8_t *)w_bytes[mat] + local * w_row_bytes,
+                (const uint8_t *)scales_bytes[mat] + local * grp_row_bytes,
+                (const uint8_t *)biases_bytes[mat] + local * grp_row_bytes,
+                x, cols, group_size, bf16_flag);
+#else
+            outs[mat][local] = vec_dot_mlx4_scalar(
+                (const uint8_t *)w_bytes[mat] + local * w_row_bytes,
+                (const uint8_t *)scales_bytes[mat] + local * grp_row_bytes,
+                (const uint8_t *)biases_bytes[mat] + local * grp_row_bytes,
+                x, cols, group_size, bf16_flag);
 #endif
         }
     });

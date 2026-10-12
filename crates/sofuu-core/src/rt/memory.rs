@@ -195,9 +195,32 @@ mod impl_qtsq {
         qtsq::qtsq_free(container);
         qtsq::qtsq_ctx_free(container);
         if r == QTSQ_OK {
-            /* Atomic publish: rename tmp → real. On failure the tmp file
-             * remains (never wipe a good brain with a partial write). */
-            if std::fs::rename(format!("{path}.tmp"), path).is_err() {
+            /* C2: durable atomic publish behind a write-ahead journal.
+             * fsync the staged file, record the intent (+digest) and fsync
+             * the record, rename, fsync the directory, then clear the
+             * journal. A crash at any point is recovered on the next open:
+             * roll forward when the staged bytes are intact and match,
+             * roll back when they are not — the old brain is never left
+             * half-replaced. A journal we cannot claim (a live writer on
+             * the same project) degrades to the plain durable publish. */
+            let tmp = format!("{path}.tmp");
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            let mut journal = crate::rt::wal::Journal::begin(&dir);
+            let recorded = journal
+                .as_mut()
+                .map(|j| j.record(&tmp, path))
+                .unwrap_or(false);
+            if crate::rt::wal::publish(&tmp, path) {
+                if recorded {
+                    if let Some(j) = journal {
+                        j.commit();
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(&tmp);
                 r = qtsq::QTSQ_ERR_FORMAT;
             }
         } else {
@@ -529,11 +552,30 @@ mod impl_qtsq {
             r = qtsq::qtsq_write(container, ctmp.as_ptr());
         }
         if r == QTSQ_OK {
-            if std::fs::rename(format!("{path}.tmp"), path).is_err() {
+            /* C2: same durable publish as the brain — a page that survives
+             * a power loss is either the complete new page or the old one,
+             * never a torn file. */
+            let tmp = format!("{path}.tmp");
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            let mut journal = crate::rt::wal::Journal::begin(&dir);
+            let recorded = journal
+                .as_mut()
+                .map(|j| j.record(&tmp, path))
+                .unwrap_or(false);
+            if crate::rt::wal::publish(&tmp, path) {
+                if recorded {
+                    if let Some(j) = journal {
+                        j.commit();
+                    }
+                }
+            } else {
                 // P3 (AUDIT-2026-09-07): the old code left the tmp behind on
                 // a failed rename — the exact leak the atomic-write scheme
                 // exists to avoid.
-                let _ = std::fs::remove_file(format!("{path}.tmp"));
+                let _ = std::fs::remove_file(&tmp);
                 r = qtsq::QTSQ_ERR_FORMAT;
             }
         } else {
@@ -821,7 +863,9 @@ mod impl_qtsq {
             let _ = std::fs::remove_file(&staging);
             return refuse("could not preserve legacy brain backup");
         }
-        if std::fs::rename(&staging, path).is_err() {
+        /* C2: the migration's final rename is the commit — make it durable
+         * (fsync staged file, rename, fsync directory). */
+        if !crate::rt::wal::publish(&staging, path) {
             let _ = std::fs::remove_file(&staging);
             return refuse("could not publish semantic brain; old brain kept");
         }
@@ -877,6 +921,20 @@ mod impl_qtsq {
             embedding_id: embedding_id.clone(),
             cma: crate::memory::cma::Cma::new(vec_dim),
         });
+
+        /* C2: replay any write-ahead journal a crashed commit left behind
+         * BEFORE the load — a staged brain that was fully written but never
+         * renamed is rolled forward here, so the open sees the newest
+         * committed state instead of the stale one. */
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            let report = crate::rt::wal::recover(&dir.to_string_lossy());
+            if report.journal_found {
+                eprintln!(
+                    "[sofuu/cma] recovered interrupted brain commit ({} rolled forward, {} rolled back)",
+                    report.rolled_forward, report.rolled_back
+                );
+            }
+        }
 
         /* Hydrate from the QTSQ brain file (vectors + metadata JSON). */
         match cma_qtsq_load(path) {
@@ -1639,7 +1697,12 @@ mod impl_qtsq {
 
     fn ensure_dir(path: &str) {
         if std::fs::metadata(path).is_err() {
-            let _ = std::fs::create_dir(path);
+            /* C2: create_dir (single level) silently failed for a nested
+             * store path whose parent did not exist yet — every page save
+             * then failed with no directory to write into, and the old
+             * kv_flush reported success anyway. create_dir_all matches what
+             * the brain path already does. */
+            let _ = std::fs::create_dir_all(path);
         }
     }
 
@@ -1813,6 +1876,15 @@ mod impl_qtsq {
         // P3 (AUDIT-2026-09-07): crashed kv writers left `page_NNNN.qtsq.tmp`
         // siblings behind forever — sweep them once per open (age-guarded).
         sweep_stale_tmp_dir(path);
+        /* C2: replay a crashed commit (page or index) before reading the
+         * index, so the store opens on the newest committed state. */
+        let recovery = crate::rt::wal::recover(path);
+        if recovery.journal_found {
+            eprintln!(
+                "[sofuu/kv] recovered interrupted commit ({} rolled forward, {} rolled back)",
+                recovery.rolled_forward, recovery.rolled_back
+            );
+        }
 
         let mut kv = Box::new(Kvs {
             file_path: path.to_string(),
@@ -1830,6 +1902,7 @@ mod impl_qtsq {
         });
 
         let idx_path = format!("{}/index.json", path);
+        let mut index_parsed = false;
         if let Ok(data) = std::fs::read(&idx_path) {
             if !data.is_empty() {
                 let mut json_buf = data.to_vec();
@@ -1888,9 +1961,50 @@ mod impl_qtsq {
                         }
                     }
                     qjs::sofuu_js_free_value(ctx, pages_arr);
+                    index_parsed = true;
+                } else {
+                    /* C2: a corrupt index used to read as "no pages" — the
+                     * whole store silently disappeared. Say so; the orphan
+                     * adoption below then re-links the pages that are still
+                     * on disk. */
+                    eprintln!(
+                        "[sofuu/kv] index.json is unreadable ({} bytes) — adopting pages from disk",
+                        data.len()
+                    );
                 }
                 qjs::sofuu_js_free_value(ctx, meta_obj);
             }
+        }
+        /* C2: a crash between a page write and the index flush leaves the
+         * page on disk but absent from the index — invisible forever. Adopt
+         * every page file the index does not know about; they rank neutral
+         * (zeroed k_summary) until the next flush records them. */
+        let mut adopted = 0usize;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(rest) = name.strip_prefix("page_") else { continue };
+                let Some(id_str) = rest.strip_suffix(".qtsq") else { continue };
+                let Ok(page_id) = id_str.parse::<u32>() else { continue };
+                if page_id == 0 || kv.pages.iter().any(|p| p.page_id == page_id) {
+                    continue;
+                }
+                kv.pages.push(PageSummary {
+                    page_id,
+                    strength: 0.0,
+                    created_at: 0,
+                    k_summary: [0.0; KV_SUMMARY_DIM],
+                });
+                adopted += 1;
+            }
+        }
+        if adopted > 0 {
+            kv.pages.sort_by_key(|p| p.page_id);
+            eprintln!(
+                "[sofuu/kv] adopted {adopted} page(s) missing from the index{}",
+                if index_parsed { "" } else { " (index was unreadable)" }
+            );
         }
         Some(kv)
     }
@@ -2105,13 +2219,33 @@ mod impl_qtsq {
         }
 
         let bytes = CStr::from_ptr(json_c).to_bytes();
-        let _ = std::fs::write(&idx_path, bytes);
+        /* C2: the index is the commit record for every page on disk — a bare
+         * fs::write here meant a crash mid-write left a truncated index.json
+         * that kv_store_open silently read as "no pages", orphaning the whole
+         * store. Stage + journal + durable publish, exactly like a page. */
+        let tmp_path = format!("{idx_path}.tmp");
+        let wrote = std::fs::write(&tmp_path, bytes).is_ok();
+        let mut journal = crate::rt::wal::Journal::begin(&kv.file_path);
+        let recorded = journal
+            .as_mut()
+            .map(|j| j.record(&tmp_path, &idx_path))
+            .unwrap_or(false);
+        let published = wrote && crate::rt::wal::publish(&tmp_path, &idx_path);
+        if published {
+            if recorded {
+                if let Some(j) = journal {
+                    j.commit();
+                }
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
 
         qjs::sofuu_js_free_cstring(kv.ctx, json_c);
         qjs::sofuu_js_free_value(kv.ctx, str_val);
         qjs::sofuu_js_free_value(kv.ctx, root);
 
-        0
+        if published { 0 } else { -1 }
     }
 
     unsafe fn kv_from_this<'a>(ctx: *mut JSContext, this_val: JSValueConst) -> Option<&'a mut Kvs> {
@@ -3074,6 +3208,132 @@ mod impl_qtsq {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(dir_entries(&dir), entries_before, "no sidecars on refusal");
+    }
+
+    /* ── C2: write-ahead journal + durable publish ─────────────────── */
+
+    /// A completed brain save must leave no journal and no staging file.
+    #[test]
+    fn brain_commit_leaves_no_journal_or_tmp() {
+        let dir = fresh_test_dir("c2-clean");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let mut shell = unsafe {
+            cma_open(&p, crate::embedding::HASH_DIM, None)
+        }
+        .expect("fresh brain");
+        let v = crate::embedding::hash_v1_features("the deploy checklist lives here");
+        assert!(unsafe { cma_remember(&mut shell, &v, Some("deploy"), Some("memory"), 5) } >= 0);
+        assert_eq!(unsafe { cma_flush_to(&mut shell, &p) }, 0);
+
+        let entries = dir_entries(&dir);
+        assert!(
+            !entries.iter().any(|e| e.contains(".sofuu-wal")),
+            "journal left behind after a clean commit: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.ends_with(".tmp")),
+            "staging file left behind after a clean commit: {entries:?}"
+        );
+        assert!(entries.contains("brain.qtsq"), "{entries:?}");
+    }
+
+    /// A crash between "staged file written" and "rename" must be rolled
+    /// FORWARD on the next open: the newer brain wins, the journal clears.
+    #[test]
+    fn crashed_brain_commit_rolls_forward_on_open() {
+        let dir = fresh_test_dir("c2-forward");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+
+        /* Old committed state: one record. */
+        let mut old = unsafe { cma_open(&p, crate::embedding::HASH_DIM, None) }.expect("old brain");
+        let v1 = crate::embedding::hash_v1_features("first record");
+        assert!(unsafe { cma_remember(&mut old, &v1, Some("one"), Some("memory"), 5) } >= 0);
+        assert_eq!(unsafe { cma_flush_to(&mut old, &p) }, 0);
+
+        /* Newer state staged to a sibling and never renamed (the crash). */
+        let staged_path = dir.join("brain.qtsq.staged");
+        let staged = staged_path.to_str().unwrap().to_string();
+        let mut newer = unsafe { cma_open(&staged, crate::embedding::HASH_DIM, None) }.expect("staged brain");
+        for text in ["first record", "second record"] {
+            let v = crate::embedding::hash_v1_features(text);
+            assert!(unsafe { cma_remember(&mut newer, &v, Some(text), Some("memory"), 5) } >= 0);
+        }
+        assert_eq!(unsafe { cma_flush_to(&mut newer, &staged) }, 0);
+
+        let d = dir.to_string_lossy().to_string();
+        {
+            let mut j = crate::rt::wal::Journal::begin(&d).expect("journal");
+            assert!(j.record(&staged, &p));
+            /* Drop = crash: the rename never happens. */
+        }
+
+        /* The open must replay the journal before reading. */
+        let reopened = unsafe { cma_open(&p, crate::embedding::HASH_DIM, None) }.expect("recovered brain");
+        assert_eq!(reopened.cma.len(), 2, "roll-forward must expose the staged state");
+        let entries = dir_entries(&dir);
+        assert!(
+            !entries.iter().any(|e| e.contains(".sofuu-wal")),
+            "journal must be cleared after recovery: {entries:?}"
+        );
+        assert!(!staged_path.exists(), "staging file must be consumed");
+    }
+
+    /// A page file on disk that the index does not know about (a crash
+    /// between the page write and the index flush) must be adopted — and
+    /// crucially, the next save must NOT reuse its id and clobber it.
+    #[test]
+    fn kv_open_adopts_orphan_pages() {
+        use sofuu_ffi::qjs::CtxPtr;
+
+        let dir = fresh_test_dir("c2-orphan");
+        let root = dir.join("kv");
+        std::fs::create_dir_all(&root).unwrap();
+        /* An orphan page: written, never indexed. Content is irrelevant —
+         * adoption keys off the filename. */
+        std::fs::write(root.join("page_00000001.qtsq"), b"orphan").unwrap();
+
+        let _loop_guard = crate::rt::test_loop_lock();
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+            kv_register(ctx);
+
+            let script = format!(
+                "var kv = sofuu.kv.open('{}', {{nLayers:1, nHeads:1, headDim:8}});\n\
+                 var k = new Float32Array(8); var v = new Float32Array(8);\n\
+                 k[0] = 1.0;\n\
+                 globalThis.out = kv.save(k, v, 1);",
+                root.to_str().unwrap()
+            );
+            let script_c = CString::new(script).unwrap();
+            let r = qjs::JS_Eval(
+                ctx,
+                script_c.as_ptr(),
+                script_c.as_bytes().len(),
+                c"<c2-orphan>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "script threw");
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let out = qjs::sofuu_js_get_property_str(ctx, global, c"out".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+            let mut id: i32 = 0;
+            qjs::JS_ToInt32(ctx, &mut id, out);
+            qjs::sofuu_js_free_value(ctx, out);
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+            /* Adopted page owns id 1, so the new save must be id 2. Without
+             * adoption this returns 1 and overwrites the orphan. */
+            assert_eq!(id, 2, "orphan page was not adopted (id reused)");
+            assert_eq!(
+                std::fs::read(root.join("page_00000001.qtsq")).unwrap(),
+                b"orphan",
+                "adoption must not rewrite the orphan file"
+            );
+        }
     }
 
     /* ── P1-6: a hostile n_hints must never reach with_capacity raw ── */

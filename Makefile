@@ -290,13 +290,21 @@ dist-all:
 	@bash scripts/dist/all.sh
 
 # ── H6: Headless CI gates ──────────────────────────────────────────
-# `make headless-test`: build libsofuu + compile c_embed.c + c_rlm.c + c_agent.c + run all.
+# `make headless-test`: build libsofuu + compile and RUN every sample in
+#   examples/headless/ against dist/ (each one asserts its own calls).
 # `make abi-check`: diff exported symbols against the checked-in baseline.
+#
+# examples/ is local-only (gitignored), so a fresh clone has nothing to run.
+# That decision has to be made at MAKE level, not inside the recipe: each
+# recipe line gets its own shell, so an `exit 0` in one line only ends that
+# line's shell and every following line still runs — which is how this gate
+# went red in CI ("nothing to run", then clang on a missing file).
+HEADLESS_SAMPLES := $(wildcard examples/headless/*.c)
+
 headless-test: libsofuu
-	@if [ ! -d examples/headless ]; then \
-		echo "\033[33m— examples/ is local-only (gitignored); nothing to run\033[0m"; \
-		exit 0; \
-	fi
+ifeq ($(strip $(HEADLESS_SAMPLES)),)
+	@echo "\033[33m— examples/ is local-only (gitignored); nothing to run\033[0m"
+else
 	@echo ""
 	@echo "\033[1m=== Headless embedding test (H6) ===\033[0m"
 	@echo ""
@@ -356,6 +364,7 @@ headless-test: libsofuu
 	@echo ""
 	@echo "\033[32m✓ Headless tests passed\033[0m"
 	@echo ""
+endif
 
 abi-check: libsofuu
 	@# Use the dylib/.so (public symbols are resolved at link time, not in the .a archive).

@@ -136,3 +136,9 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 # Makefile targets skip cleanly when they are absent.
 /tests/
 /examples/
+
+# ── Local-only clean-room embedding models (kept on this Mac) ──
+# emb-m/ is a standalone PyTorch research project (sofuu_arch/ + its own
+# tests + docs). Nothing in the runtime, Makefile, or CI references it —
+# the shipped embedders are hash-768/sem1/sem2/img1, built elsewhere.
+/emb-m/

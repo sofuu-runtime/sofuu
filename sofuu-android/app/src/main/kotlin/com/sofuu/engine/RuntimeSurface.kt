@@ -117,26 +117,61 @@ class RuntimeSurface(private val engine: SofuuEngine) {
     /**
      * Teach a gate from an outcome.
      *
-     * `gold` labels (`wrong` / `wasted`) consume the most recent observed
-     * call and count double, so they are what you want for a turn you
-     * know was bad. A plain outcome needs the observation's confidence to
-     * clear the online-learning bar — the engine refuses low-confidence
-     * labels rather than poisoning its own weights.
+     * The runtime's contract is narrow and exact (`ml/mod.rs:344`): the
+     * payload must carry `model:"supervisor"`, and `kind` must be one of
+     * `outcome`, `wrong` or `wasted`. Anything else is refused silently,
+     * so the fields are set here rather than left to a caller to guess.
+     *
+     * `wrong` and `wasted` are gold labels — they name the most recent
+     * call and count double against a proxy's weight, which makes them
+     * the right choice for a turn you know was bad. `outcome` needs a
+     * confidence the engine will accept; it abstains on ambiguous results
+     * rather than send a coin-flip label into its own weights.
+     *
+     * Returns the engine's own `{ok:false}` when it declines, which is the
+     * honest answer and not an error to swallow.
      */
-    fun mlFeedback(label: JSONObject): JSONObject? = engine.evalJson(
-        """
-        (function(){ try {
-          return { ok:true, n: sofuu.ml.feedback(${SofuuEngine.quote(label.toString())}) };
-        } catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()
-        """.trimIndent()
-    )
+    fun mlFeedback(kind: String, run: String = "", step: Int = 0, wasted: Boolean = false, conf: Double = 1.0): JSONObject? {
+        val payload = JSONObject()
+            .put("model", "supervisor")
+            .put("kind", kind)
+        if (run.isNotEmpty()) payload.put("run", run)
+        if (step > 0) payload.put("step", step)
+        if (wasted) payload.put("wasted", true)
+        payload.put("conf", conf)
+        return engine.evalJson(
+            "(function(){ try { return sofuu.ml.feedback(${SofuuEngine.quote(payload.toString())}); } " +
+                "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+        )
+    }
 
-    /** Adopt / discard / reset the pending online-learning candidates. */
-    fun mlAdopt(decision: String): JSONObject? = engine.evalJson(
-        "(function(){ try { return { ok:true, n: sofuu.ml.supervisor.loop(" +
-            SofuuEngine.quote(JSONObject().put("action", decision).put("src", "manual").toString()) + ") }; } " +
-            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    /**
+     * Ask a gate for its verdict on a proposed action, without running it.
+     *
+     * `supervisor.check` is the pre-tool-call checkpoint and `loop` the
+     * loop-boundary one; both return `{ok, reason, nudge, score, source}`
+     * where `source` is `rule` or `model`. Exposed because it is the only
+     * way to see WHY a call was nudged or blocked — the agent only ever
+     * sees the nudge, not the verdict behind it.
+     */
+    fun mlCheck(tool: String, args: JSONObject, run: String = "", step: Int = 0): JSONObject? {
+        val payload = JSONObject().put("tool", tool).put("args", args)
+        if (run.isNotEmpty()) payload.put("run", run)
+        if (step > 0) payload.put("step", step)
+        return engine.evalJson(
+            "(function(){ try { return sofuu.ml.supervisor.check(${SofuuEngine.quote(payload.toString())}); } " +
+                "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+        )
+    }
+
+    /** The loop-boundary verdict: spinning, over-budget, wasted effort. */
+    fun mlLoop(run: String, step: Int, budget: Int): JSONObject? {
+        val payload = JSONObject().put("run", run).put("step", step).put("budget", budget)
+        return engine.evalJson(
+            "(function(){ try { return sofuu.ml.supervisor.loop(${SofuuEngine.quote(payload.toString())}); } " +
+                "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
+        )
+    }
 
     // ── Vectors ──────────────────────────────────────────────────
 

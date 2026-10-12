@@ -933,6 +933,11 @@ private fun BrainPane(store: AppStore) {
     var recalled by remember { mutableStateOf("") }
     var decayArmed by remember { mutableStateOf(false) }
 
+    var ml by remember { mutableStateOf<JSONObject?>(null) }
+    var m2 by remember { mutableStateOf<Boolean?>(null) }
+    var probeTool by remember { mutableStateOf("read_file") }
+    var probeArgs by remember { mutableStateOf("{\"path\":\"README.md\"}") }
+    var verdict by remember { mutableStateOf<JSONObject?>(null) }
     var simA by remember { mutableStateOf("the cat sat down") }
     var simB by remember { mutableStateOf("a feline rested") }
     var sim by remember { mutableStateOf<JSONObject?>(null) }
@@ -944,6 +949,7 @@ private fun BrainPane(store: AppStore) {
         info = r?.takeIf { it.optBoolean("ok") }
         err = r?.optString("error")?.takeIf { it.isNotEmpty() }
         spaces = withContext(Dispatchers.IO) { surface.spaces() }
+        ml = withContext(Dispatchers.IO) { surface.mlState() }
     }
     LaunchedEffect(recalled) {
         if (recalled.isBlank()) { hits = null; return@LaunchedEffect }
@@ -1060,6 +1066,103 @@ private fun BrainPane(store: AppStore) {
             if (v2 != null) {
                 SpaceLine(c.text, c.err, c.textFaint, "semantic v2", v2.optInt("dimension"), v2.optBoolean("available", false))
             }
+        }
+
+        Section("Context gates")
+        val m = ml
+        if (m == null) {
+            Text("The sofuu.ml layer is not loaded in this build.", fontSize = 12.sp, color = c.textFaint)
+        } else if (m.optBoolean("ok") != true) {
+            Text(m.optString("error").ifEmpty { "unavailable" }, fontSize = 12.sp, color = c.err)
+        } else {
+            val info = m.optJSONObject("info")
+            val ws = m.optJSONObject("workset")
+            Text(
+                "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · " +
+                    "${ws?.optLong("segments") ?: 0} segments",
+                fontSize = 12.sp, color = c.text, fontFamily = FontFamily.Monospace,
+            )
+            val on = info?.optJSONObject("on")
+            if (on != null) {
+                val keys = on.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val state = if (on.optBoolean(k)) "on" else "off"
+                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                        Text(
+                            k, fontSize = 11.sp, color = c.textFaint,
+                            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            state, fontSize = 11.sp,
+                            color = if (state == "on") c.accent else c.textMuted,
+                        )
+                    }
+                }
+            }
+            val learner = info?.optJSONObject("online")
+            if (learner != null && learner.optBoolean("enabled")) {
+                Text(
+                    "Online learning is on" + if (learner.optBoolean("pending")) " · a candidate is pending" else "",
+                    fontSize = 11.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+                SmallButton(c.accent, c.accentContrast, "Label wrong") {
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { surface.mlFeedback("wrong") }
+                        m2 = r?.optBoolean("ok") == true
+                        reload++
+                    }
+                }
+                SmallButton(c.accent, c.accentContrast, "Label wasted") {
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { surface.mlFeedback("wasted") }
+                        m2 = r?.optBoolean("ok") == true
+                        reload++
+                    }
+                }
+            }
+            if (m2 != null) {
+                Text(
+                    if (m2 == true) "Label recorded." else "The engine declined that label — it needs an observed call to attach to.",
+                    fontSize = 10.sp, color = if (m2 == true) c.textFaint else c.warn,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+        }
+
+        Section("Gate check")
+        Text(
+            "Ask what the gates would say about a call before the agent makes it.",
+            fontSize = 11.sp, color = c.textFaint,
+        )
+        TextFieldRow("tool", probeTool, "read_file", onSubmit = { probeTool = it })
+        TextFieldRow("args", probeArgs, "{\"path\":\"README.md\"}", onSubmit = { probeArgs = it })
+        Text(
+            "Check",
+            fontSize = 12.sp,
+            color = c.accentContrast,
+            modifier = Modifier
+                .padding(top = 6.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(c.accent)
+                .clickable {
+                    scope.launch {
+                        val parsed = try { JSONObject(probeArgs) } catch (e: Exception) { JSONObject() }
+                        verdict = withContext(Dispatchers.IO) { surface.mlCheck(probeTool, parsed) }
+                    }
+                }
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+        verdict?.let { v ->
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (v.optBoolean("ok")) "pass · ${v.optString("source")} · ${"%.3f".format(v.optDouble("score"))}" +
+                    (v.optString("nudge").takeIf { it.isNotEmpty() && it != "null" }?.let { " · nudge: $it" } ?: "")
+                else "blocked · ${v.optString("reason")}",
+                fontSize = 11.sp, color = if (v.optBoolean("ok")) c.textMuted else c.warn,
+            )
         }
 
         Section("Similarity")

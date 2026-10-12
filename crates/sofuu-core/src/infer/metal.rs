@@ -246,6 +246,7 @@ impl MetalEngine {
         rows: usize,
         cols: usize,
         group_size: usize,
+        is_bf16: bool,
     ) {
         unsafe {
             sofuu_metal_gemv_mlx4(
@@ -261,6 +262,7 @@ impl MetalEngine {
                 rows,
                 cols,
                 group_size,
+                is_bf16 as i32,
             );
         }
     }

@@ -462,6 +462,7 @@ impl Lfm2Model {
                         rows,
                         cols,
                         *group_size,
+                        true,
                     );
                     return;
                 }
@@ -472,7 +473,7 @@ impl Lfm2Model {
                 let b_slice = mmap.slice(biases.data_offset, biases.size_bytes).unwrap();
                 let rows = weight.shape[0];
                 let cols = x.len();
-                super::quant::gemv_mlx4(w_slice, s_slice, b_slice, x, &mut y[..rows], rows, cols, *group_size);
+                super::quant::gemv_mlx4(w_slice, s_slice, b_slice, x, &mut y[..rows], rows, cols, *group_size, true);
             }
         }
     }

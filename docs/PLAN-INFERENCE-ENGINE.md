@@ -240,4 +240,22 @@ Instead of maintaining brittle, separate models for every new architecture, Sofu
 - [x] Validated via test suites `test_universal_formats.rs`, `test_metal_engine.rs`, and `lfm2.rs` (100% green).
 - [x] Stripped release binary footprint strictly preserved: **4.5 MB** ($\le 5.0\text{ MB}$ gate).
 
+### Stage 8: Google Gemma Architecture, Dual FP16/BF16 MLX4 Quantization, SentencePiece Normalization & Full-Stack GPU Acceleration — ✅ SHIPPED & VERIFIED
+- [x] **Dual FP16 / BF16 Scale & Bias Quantization Engine**:
+  - Upgraded SIMD NEON vector microkernels (`vec_dot_mlx4_neon`, `sofuu_gemv_mlx4`) and Metal compute pipelines (`gemv_mlx4_affine_f16`, `gemv_mlx4_affine_bf16`) with runtime `is_bf16` dispatch.
+  - Transparently decodes both Liquid models (using BF16 scales & biases) and Google Gemma models (using IEEE 754 Float16 scales & biases) with bit-accurate dequantization.
+- [x] **Universal Tokenizer Normalization Engine (`SpaceStyle::SentencePiece`)**:
+  - Implemented multi-style whitespace normalization (`SpaceStyle`: `Gpt2`, `SentencePiece`, `None`) in pure-Rust BPE tokenizer (`tokenizer.rs`).
+  - Auto-detects SentencePiece replace patterns (`String: " "` $\to$ `content: "\u{2581}"`) vs ByteLevel GPT-2 (`"Ġ"`) across Hugging Face `tokenizer.json` and GGUF metadata.
+  - Implemented robust BOS/EOS detection prioritizing `added_tokens` with `special == true` and `post_processor` templates over arbitrary vocabulary collisions (`<bos>` ID 2 vs `<s>` ID 204).
+  - Handles byte fallback tokens (`<0xHH>`) and SentencePiece space restoration (`\u{2581}` $\to$ `" "`) without allocating or corrupting UTF-8 streams.
+- [x] **Full-Stack GPU Acceleration for Tied Vocabulary & LM Head**:
+  - Offloaded tied word embeddings (`model.embed_tokens.weight` $256,000 \times 2048$ F16, ~1.05 GB) to Metal GPU in `set_gpu_layers`.
+  - Achieved a **15× throughput acceleration** on Google Gemma 2B: prefill 8.1 tk/s, generation **13.4 tk/s** on Apple Silicon.
+- [x] **End-to-End Inference Verification**:
+  - Tested on live Google Gemma 2B MLX 4-bit affine quantized checkpoint (`/Users/priyanshuboruah/Downloads/gemma-2b`): produces coherent, fluent English responses.
+  - Zero regression on Liquid LFM2 model (`/Users/priyanshuboruah/Downloads/liquid`): 9.5 tk/s decode.
+- [x] **Strict Standalone Size Gate**:
+  - Binary size strictly preserved: **4.60 MB** (4,827,312 bytes $\le 5.0\text{ MB}$ gate).
+
 

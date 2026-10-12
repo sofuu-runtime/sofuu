@@ -776,8 +776,11 @@ unsafe extern "C" fn js_stream_callback(
 /// (e.g. `agent.run`) and forwards each event to the host's `on_event`
 /// callback on the calling thread.
 ///
-/// The method is called with `args_json` merged with `{ onStep: <internal cb> }`.
-/// *out_cancel_id receives a token usable with `sofuu_rt_cancel`.
+/// `args_json` is an object (merged with `{ onStep: <internal cb> }` and the
+/// cancel token, then passed as the single options arg) or an array (spread
+/// as positional args, with the same two keys injected into its trailing
+/// options object) — the same contract `sofuu_rt_call` documents.
+/// *out_cancel_id receives a token usable with sofuu_rt_cancel.
 /// Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_call_stream(
@@ -819,11 +822,17 @@ pub unsafe extern "C" fn sofuu_rt_call_stream(
         None => return -1,
     };
 
-    let args_part = match cstr_or_null(args_json) {
-        None | Some("") => "{}".to_string(),
+    // E1 (PLAN-EMBED-SDK): args_json is an object OR an array, exactly like
+    // sofuu_rt_call — the array form is spread as positional arguments. This
+    // is what makes positional methods drivable at all: `ai.streamLocal`
+    // takes (modelPath, prompt, options), and before this the driver always
+    // called the method with a single object, so the model path never
+    // arrived.
+    let (args_text, args_is_array) = match cstr_or_null(args_json) {
+        None | Some("") => ("{}".to_string(), false),
         Some(s) => {
             match serde_json::from_str::<JsonValue>(s) {
-                Ok(_) => s.to_string(),
+                Ok(v) => (s.to_string(), v.is_array()),
                 Err(_) => return -1, // bad_args
             }
         }
@@ -863,8 +872,22 @@ pub unsafe extern "C" fn sofuu_rt_call_stream(
     // Both shapes end with a `{"kind":"done","result":…}` event, because the
     // C signature has no out_json and the final value was previously dropped
     // with nothing but a code comment saying so.
-    let args_json_lit = serde_json::to_string(&args_part).unwrap_or_default();
-    let call_expr = if method_str == "agent.run" {
+    let args_json_lit = serde_json::to_string(&args_text).unwrap_or_default();
+    // E1: the array form spreads as positional arguments. `onStep`/`signal`
+    // land on the trailing options object — the one the method already
+    // expects (`ai.streamLocal(path, prompt, opts)`) — or on an appended one
+    // when the caller passed none, so a cancel token exists either way.
+    let call_expr = if args_is_array {
+        format!(
+            r#"var a=JSON.parse({args_json_lit});
+            if(!Array.isArray(a))a=[];
+            var t=(a.length>0)?a[a.length-1]:null;
+            if(t===null||typeof t!=="object"||Array.isArray(t)){{t={{}};a.push(t);}}
+            t.onStep=function(evt){{try{{globalThis.__sofuu_stream_cb(JSON.stringify(evt));}}catch(e){{}}}};
+            t.signal={cancel_id};
+            var r=await o.apply(null,a);"#
+        )
+    } else if method_str == "agent.run" {
         format!(
             r#"var a=JSON.parse({args_json_lit});
             if(typeof a!=="object"||a===null)a={{}};
@@ -1796,6 +1819,314 @@ mod tests {
             events.iter().any(|e| e.contains(r#""kind":"done""#)),
             "expected a trailing done event, got {events:?}"
         );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    // ── E1 (PLAN-EMBED-SDK): positional (array) args in the stream driver ──
+    //
+    // Nothing model-sized is checked in — the GGUF / SafeTensors fixtures are
+    // hundreds of MB — so the live tests below degrade to a skip when the
+    // fixture is absent (override the path with the env var). Same shape
+    // sofuu-core's test_safetensors_models.rs uses, for the same reason: a
+    // gate that only passes on the author's machine is not a gate.
+    const DEFAULT_LIVE_GGUF: &str =
+        "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf";
+    const DEFAULT_LIVE_LFM2_DIR: &str = "/Users/priyanshuboruah/Downloads/liqiud-350";
+
+    /// Returns the fixture path when it exists, else None (after saying why).
+    fn live_path(env: &str, default: &str) -> Option<String> {
+        let p = std::env::var(env).unwrap_or_else(|_| default.to_string());
+        if std::path::Path::new(&p).exists() {
+            Some(p)
+        } else {
+            eprintln!("skipping: no model at {p} (set {env} to point at one)");
+            None
+        }
+    }
+
+    /// E1: `ai.streamLocal` is positional — `(modelPath, prompt, options?)` —
+    /// while the stream driver used to call every method with a single object,
+    /// so the model path never arrived. The mock here *fails the stream* if it
+    /// is not invoked positionally, so a regression cannot pass silently.
+    #[test]
+    fn stream_spreads_positional_array_args() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let setup = CString::new(
+            r#"(function(){
+              sofuu.ai.streamLocal = function(modelPath, prompt, opts) {
+                return (async function*(){
+                  if (modelPath !== "/tmp/m.gguf") throw new Error("modelPath was " + modelPath);
+                  if (prompt !== "hello") throw new Error("prompt was " + prompt);
+                  if (!opts || typeof opts.onStep !== "function") throw new Error("opts.onStep missing");
+                  if (typeof opts.signal !== "number") throw new Error("opts.signal missing");
+                  yield { text: "A" };
+                  yield { text: "B" };
+                })();
+              };
+            })()"#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        EVENTS.lock().unwrap().clear();
+        unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            EVENTS.lock().unwrap().push(s);
+        }
+
+        let method = CString::new("ai.streamLocal").unwrap();
+        // No trailing options object: the driver must append one so a cancel
+        // hook exists even when the caller passes none.
+        let args = CString::new(r#"["/tmp/m.gguf","hello"]"#).unwrap();
+        let mut cancel_id: u64 = 0;
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect),
+                ptr::null_mut(),
+                &mut cancel_id,
+            )
+        };
+        assert_eq!(rc, 0, "streamLocal via array args should return OK");
+        assert!(cancel_id != 0, "a cancel id is issued for the array shape too");
+
+        let events = EVENTS.lock().unwrap().clone();
+        let deltas = events
+            .iter()
+            .filter(|e| e.contains(r#""kind":"delta""#))
+            .count();
+        assert_eq!(deltas, 2, "expected 2 deltas, got {events:?}");
+        let done = events
+            .iter()
+            .find(|e| e.contains(r#""kind":"done""#))
+            .expect("a done event must always arrive");
+        assert!(!done.contains(r#""error""#), "stream must not fail: {done}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E1: when the caller *does* pass a trailing options object, the driver
+    /// must inject into it rather than replace it — dropping caller options
+    /// would be a silent behaviour change — and cancel must work in the array
+    /// shape exactly as it does for the object shape.
+    #[test]
+    fn stream_array_args_keep_caller_options_and_cancel() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let setup = CString::new(
+            r#"(function(){
+              sofuu.ai.streamLocal = function(modelPath, prompt, opts) {
+                return (async function*(){
+                  if (opts.maxTokens !== 7) throw new Error("caller options were dropped");
+                  for (var i = 0; i < 20; i++) yield { text: "t" + i };
+                })();
+              };
+            })()"#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        static DELTAS: Mutex<u32> = Mutex::new(0);
+        static DONE: Mutex<String> = Mutex::new(String::new());
+        *DELTAS.lock().unwrap() = 0;
+        DONE.lock().unwrap().clear();
+
+        // opaque carries the runtime + the live cancel-id slot.
+        #[repr(C)]
+        struct CancelCtx {
+            rt: *mut CapiRuntime,
+            cid: u64,
+        }
+
+        unsafe extern "C" fn collect_and_cancel(event_json: *const c_char, opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            let ctx = unsafe { &*(opaque as *const CancelCtx) };
+            if s.contains(r#""kind":"delta""#) {
+                let mut d = DELTAS.lock().unwrap();
+                *d += 1;
+                let n = *d;
+                drop(d);
+                if n == 1 {
+                    unsafe { sofuu_rt_cancel(ctx.rt, ctx.cid) };
+                }
+            } else if s.contains(r#""kind":"done""#) {
+                *DONE.lock().unwrap() = s;
+            }
+        }
+
+        let mut ctx = CancelCtx { rt, cid: 0 };
+        let method = CString::new("ai.streamLocal").unwrap();
+        let args = CString::new(r#"["/tmp/m.gguf","hello",{"maxTokens":7}]"#).unwrap();
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect_and_cancel),
+                (&mut ctx as *mut CancelCtx) as *mut c_void,
+                &mut ctx.cid,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let deltas = *DELTAS.lock().unwrap();
+        assert!(
+            deltas < 20,
+            "the first-delta cancel must stop the 20-chunk stream, saw {deltas}"
+        );
+        let done = DONE.lock().unwrap().clone();
+        assert!(done.contains(r#""aborted":true"#), "done should report aborted: {done}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E1: the real thing end to end — a GGUF on disk, streamed positionally
+    /// through the C ABI, with a live mid-flight cancel. This is the milestone
+    /// ("receive token deltas") stated as an executable assertion.
+    #[test]
+    fn live_stream_local_gguf_through_the_c_abi() {
+        let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        static DELTAS: Mutex<u32> = Mutex::new(0);
+        static TEXT: Mutex<String> = Mutex::new(String::new());
+        static DONE: Mutex<String> = Mutex::new(String::new());
+        *DELTAS.lock().unwrap() = 0;
+        TEXT.lock().unwrap().clear();
+        DONE.lock().unwrap().clear();
+
+        #[repr(C)]
+        struct Ctx {
+            rt: *mut CapiRuntime,
+            cid: u64,
+        }
+
+        unsafe extern "C" fn collect(event_json: *const c_char, opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            let ctx = unsafe { &*(opaque as *const Ctx) };
+            if s.contains(r#""kind":"delta""#) {
+                if let Ok(v) = serde_json::from_str::<JsonValue>(&s) {
+                    if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                        TEXT.lock().unwrap().push_str(t);
+                    }
+                }
+                let mut d = DELTAS.lock().unwrap();
+                *d += 1;
+                let n = *d;
+                drop(d);
+                // 6 deltas is enough to prove generation is real; cancelling
+                // there keeps the test fast and exercises abort on the path
+                // a host would actually cancel (the local decode loop).
+                if n == 6 {
+                    unsafe { sofuu_rt_cancel(ctx.rt, ctx.cid) };
+                }
+            } else if s.contains(r#""kind":"done""#) {
+                *DONE.lock().unwrap() = s;
+            }
+        }
+
+        let mut ctx = Ctx { rt, cid: 0 };
+        let method = CString::new("ai.streamLocal").unwrap();
+        let args = CString::new(
+            serde_json::json!([model, "The capital of France is", { "maxTokens": 64 }]).to_string(),
+        )
+        .unwrap();
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect),
+                (&mut ctx as *mut Ctx) as *mut c_void,
+                &mut ctx.cid,
+            )
+        };
+        assert_eq!(rc, 0, "streamLocal should return OK");
+
+        let deltas = *DELTAS.lock().unwrap();
+        let text = TEXT.lock().unwrap().clone();
+        let done = DONE.lock().unwrap().clone();
+        assert!(deltas >= 2, "expected real token deltas, got {deltas}");
+        assert!(!text.trim().is_empty(), "model produced no text");
+        assert!(
+            !done.contains(r#""error""#),
+            "stream must not fail: {done}"
+        );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E1b: a SafeTensors model *directory* must route to in-process
+    /// inference from the path alone. Before this it only did so with an
+    /// explicit `provider: "local"`, so handing an embedded host a directory
+    /// sent the request to the network as if it were a model name.
+    #[test]
+    fn live_safetensors_dir_routes_local_from_the_path_alone() {
+        let _g = lock();
+        let Some(dir) = live_path("SOFUU_TEST_LFM2_DIR", DEFAULT_LIVE_LFM2_DIR) else {
+            return;
+        };
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        static DELTAS: Mutex<u32> = Mutex::new(0);
+        static DONE: Mutex<String> = Mutex::new(String::new());
+        *DELTAS.lock().unwrap() = 0;
+        DONE.lock().unwrap().clear();
+
+        unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            if s.contains(r#""kind":"delta""#) {
+                *DELTAS.lock().unwrap() += 1;
+            } else if s.contains(r#""kind":"done""#) {
+                *DONE.lock().unwrap() = s;
+            }
+        }
+
+        // The generic funnel, not streamLocal: this is the routing predicate
+        // doing the work, with no provider hint anywhere in the call.
+        let method = CString::new("ai.stream").unwrap();
+        let args = CString::new(
+            serde_json::json!({ "model": dir, "prompt": "Hello", "maxTokens": 8 }).to_string(),
+        )
+        .unwrap();
+        let mut cancel_id: u64 = 0;
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect),
+                ptr::null_mut(),
+                &mut cancel_id,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let deltas = *DELTAS.lock().unwrap();
+        let done = DONE.lock().unwrap().clone();
+        assert!(
+            deltas >= 1,
+            "a SafeTensors directory should generate tokens locally, got {deltas} deltas, done: {done}"
+        );
+        assert!(!done.contains(r#""error""#), "stream must not fail: {done}");
 
         unsafe { sofuu_rt_free(rt) };
     }

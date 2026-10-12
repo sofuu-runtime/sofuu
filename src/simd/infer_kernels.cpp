@@ -1374,7 +1374,8 @@ static inline float vec_dot_mlx4_neon(
     const uint8_t *b_row,
     const float *x,
     size_t cols,
-    size_t group_size
+    size_t group_size,
+    bool is_bf16
 ) {
     size_t num_groups = cols / group_size;
     size_t u32_per_group = group_size / 8;
@@ -1385,11 +1386,16 @@ static inline float vec_dot_mlx4_neon(
         std::memcpy(&s_u16, s_row + g * 2, 2);
         std::memcpy(&b_u16, b_row + g * 2, 2);
 
-        uint32_t s_bits = (uint32_t)s_u16 << 16;
-        uint32_t b_bits = (uint32_t)b_u16 << 16;
         float scale, bias;
-        std::memcpy(&scale, &s_bits, 4);
-        std::memcpy(&bias, &b_bits, 4);
+        if (is_bf16) {
+            uint32_t s_bits = (uint32_t)s_u16 << 16;
+            uint32_t b_bits = (uint32_t)b_u16 << 16;
+            std::memcpy(&scale, &s_bits, 4);
+            std::memcpy(&bias, &b_bits, 4);
+        } else {
+            scale = f16_to_f32_val(s_u16);
+            bias  = f16_to_f32_val(b_u16);
+        }
 
         float32x4_t v_scale = vdupq_n_f32(scale);
         float32x4_t v_bias  = vdupq_n_f32(bias);
@@ -1451,7 +1457,8 @@ static inline float vec_dot_mlx4_scalar(
     const uint8_t *b_row,
     const float *x,
     size_t cols,
-    size_t group_size
+    size_t group_size,
+    bool is_bf16
 ) {
     size_t num_groups = cols / group_size;
     size_t u32_per_group = group_size / 8;
@@ -1462,11 +1469,16 @@ static inline float vec_dot_mlx4_scalar(
         std::memcpy(&s_u16, s_row + g * 2, 2);
         std::memcpy(&b_u16, b_row + g * 2, 2);
 
-        uint32_t s_bits = (uint32_t)s_u16 << 16;
-        uint32_t b_bits = (uint32_t)b_u16 << 16;
         float scale, bias;
-        std::memcpy(&scale, &s_bits, 4);
-        std::memcpy(&bias, &b_bits, 4);
+        if (is_bf16) {
+            uint32_t s_bits = (uint32_t)s_u16 << 16;
+            uint32_t b_bits = (uint32_t)b_u16 << 16;
+            std::memcpy(&scale, &s_bits, 4);
+            std::memcpy(&bias, &b_bits, 4);
+        } else {
+            scale = f16_to_f32_val(s_u16);
+            bias  = f16_to_f32_val(b_u16);
+        }
 
         size_t base_col = g * group_size;
         const uint8_t *w_grp = w_row + (g * u32_per_group) * 4;
@@ -1508,20 +1520,22 @@ void sofuu_gemv_mlx4(
     float *out,
     size_t rows,
     size_t cols,
-    size_t group_size
+    size_t group_size,
+    int is_bf16
 ) {
     const uint8_t *w = (const uint8_t *)w_bytes;
     const uint8_t *s = (const uint8_t *)scales_bytes;
     const uint8_t *b = (const uint8_t *)biases_bytes;
     size_t w_row_bytes = (cols / 8) * 4;
     size_t grp_row_bytes = (cols / group_size) * 2;
+    bool bf16_flag = is_bf16 != 0;
 
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         for (size_t r = start; r < end; ++r) {
 #if defined(SOFUU_NEON)
-            out[r] = vec_dot_mlx4_neon(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size);
+            out[r] = vec_dot_mlx4_neon(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, bf16_flag);
 #else
-            out[r] = vec_dot_mlx4_scalar(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size);
+            out[r] = vec_dot_mlx4_scalar(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, bf16_flag);
 #endif
         }
     });

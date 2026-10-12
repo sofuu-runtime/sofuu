@@ -225,6 +225,7 @@ extern "C" {
         rows: usize,
         cols: usize,
         group_size: usize,
+        is_bf16: i32,
     );
     fn sofuu_gemm_q4_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q8_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
@@ -379,6 +380,7 @@ extern "C" {
         rows: usize,
         cols: usize,
         group_size: usize,
+        is_bf16: i32,
     );
     pub fn sofuu_metal_buffer_create(
         ctx: *mut std::ffi::c_void,
@@ -571,6 +573,7 @@ pub fn gemv_mlx4(
     rows: usize,
     cols: usize,
     group_size: usize,
+    is_bf16: bool,
 ) {
     assert_eq!(x.len(), cols, "input x dimension mismatch");
     assert_eq!(out.len(), rows, "output dimension mismatch");
@@ -589,6 +592,7 @@ pub fn gemv_mlx4(
             rows,
             cols,
             group_size,
+            is_bf16 as i32,
         );
     }
 }

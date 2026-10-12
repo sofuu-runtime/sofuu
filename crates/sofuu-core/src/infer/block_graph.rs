@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::model::ModelConfig;
 use super::npy::TensorDType;
 use super::quant::{bf16_to_f32, f16_to_f32, rmsnorm, rope, swiglu_in_place};
-use super::tensor_table::UnifiedTensorTable;
+use super::tensor_table::{UnifiedTensorData, UnifiedTensorTable};
 
 /// Normalization kind across transformer architectures
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,40 +146,131 @@ pub struct BlockGraphConfig {
     pub tied_embeddings: bool,
 }
 
-/// Memory-backed linear weight representation (supporting F32 and F16 slices)
+/// MLX 4-bit affine quantized weight components
+#[derive(Clone)]
+pub struct Mlx4Weights {
+    pub scales: UnifiedTensorData,
+    #[cfg(target_os = "macos")]
+    pub scales_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    pub biases: UnifiedTensorData,
+    #[cfg(target_os = "macos")]
+    pub biases_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    pub group_size: usize,
+    pub is_bf16: bool,
+}
+
+/// Memory-backed linear weight representation (supporting F32, F16, BF16, and MLX4)
 #[derive(Clone)]
 pub struct WeightMatrix {
     pub rows: usize,
     pub cols: usize,
     pub dtype: TensorDType,
-    pub data: Arc<Vec<u8>>,
-    pub byte_offset: usize,
+    pub data: UnifiedTensorData,
     #[cfg(target_os = "macos")]
     pub metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    pub mlx4: Option<Mlx4Weights>,
 }
 
 impl WeightMatrix {
     pub fn new(rows: usize, cols: usize, dtype: TensorDType, data: Arc<Vec<u8>>, byte_offset: usize) -> Self {
+        let slice = if byte_offset > 0 { &data[byte_offset..] } else { &data[..] };
+        Self {
+            rows,
+            cols,
+            dtype,
+            data: UnifiedTensorData::Heap(Arc::new(slice.to_vec())),
+            #[cfg(target_os = "macos")]
+            metal_buf: None,
+            mlx4: None,
+        }
+    }
+
+    pub fn new_from_data(rows: usize, cols: usize, dtype: TensorDType, data: UnifiedTensorData) -> Self {
         Self {
             rows,
             cols,
             dtype,
             data,
-            byte_offset,
             #[cfg(target_os = "macos")]
             metal_buf: None,
+            mlx4: None,
+        }
+    }
+
+    pub fn new_mlx4(
+        rows: usize,
+        cols: usize,
+        data: UnifiedTensorData,
+        scales: UnifiedTensorData,
+        biases: UnifiedTensorData,
+        group_size: usize,
+        is_bf16: bool,
+    ) -> Self {
+        Self {
+            rows,
+            cols,
+            dtype: TensorDType::U32,
+            data,
+            #[cfg(target_os = "macos")]
+            metal_buf: None,
+            mlx4: Some(Mlx4Weights {
+                scales,
+                #[cfg(target_os = "macos")]
+                scales_metal_buf: None,
+                biases,
+                #[cfg(target_os = "macos")]
+                biases_metal_buf: None,
+                group_size,
+                is_bf16,
+            }),
         }
     }
 
     #[cfg(target_os = "macos")]
     pub fn with_metal(mut self, engine: &crate::infer::metal::MetalEngine) -> Self {
-        let slice = &self.data[self.byte_offset..];
+        let slice = self.data.as_slice();
         self.metal_buf = engine.create_buffer(slice).map(Arc::new);
+        if let Some(ref mut mlx4) = self.mlx4 {
+            let s_slice = mlx4.scales.as_slice();
+            mlx4.scales_metal_buf = engine.create_buffer(s_slice).map(Arc::new);
+            let b_slice = mlx4.biases.as_slice();
+            mlx4.biases_metal_buf = engine.create_buffer(b_slice).map(Arc::new);
+        }
         self
     }
 
     /// Matrix-vector multiplication: y = W * x
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        if let Some(ref mlx4) = self.mlx4 {
+            #[cfg(target_os = "macos")]
+            if let (Some(ref m_buf), Some(ref s_buf), Some(ref b_buf)) = (
+                &self.metal_buf,
+                &mlx4.scales_metal_buf,
+                &mlx4.biases_metal_buf,
+            ) {
+                if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
+                    engine.gemv_mlx4(
+                        m_buf, 0,
+                        s_buf, 0,
+                        b_buf, 0,
+                        x, y,
+                        self.rows, self.cols, mlx4.group_size, mlx4.is_bf16,
+                    );
+                    return;
+                }
+            }
+
+            let w_slice = self.data.as_slice();
+            let s_slice = mlx4.scales.as_slice();
+            let b_slice = mlx4.biases.as_slice();
+            crate::infer::quant::gemv_mlx4(
+                w_slice, s_slice, b_slice,
+                x, y,
+                self.rows, self.cols, mlx4.group_size, mlx4.is_bf16,
+            );
+            return;
+        }
+
         #[cfg(target_os = "macos")]
         if let Some(ref m_buf) = self.metal_buf {
             if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
@@ -201,7 +292,7 @@ impl WeightMatrix {
             }
         }
 
-        let slice = &self.data[self.byte_offset..];
+        let slice = self.data.as_slice();
         match self.dtype {
             TensorDType::F32 => {
                 if slice.len() >= self.rows * self.cols * 4 && (slice.as_ptr() as usize) % 4 == 0 {
@@ -270,7 +361,28 @@ impl WeightMatrix {
             dst.fill(0.0);
             return;
         }
-        let slice = &self.data[self.byte_offset..];
+        if let Some(ref mlx4) = self.mlx4 {
+            let u32_per_row = self.cols / 8;
+            let grp_per_row = self.cols / mlx4.group_size;
+            let w_slice = &self.data.as_slice()[row * u32_per_row * 4..];
+            let s_slice = &mlx4.scales.as_slice()[row * grp_per_row * 2..];
+            let b_slice = &mlx4.biases.as_slice()[row * grp_per_row * 2..];
+            let w_u32 = unsafe { std::slice::from_raw_parts(w_slice.as_ptr() as *const u32, u32_per_row) };
+            let s_f16 = unsafe { std::slice::from_raw_parts(s_slice.as_ptr() as *const u16, grp_per_row) };
+            let b_f16 = unsafe { std::slice::from_raw_parts(b_slice.as_ptr() as *const u16, grp_per_row) };
+            for c in 0..self.cols {
+                let u_idx = c / 8;
+                let shift = (c % 8) * 4;
+                let q = ((w_u32[u_idx] >> shift) & 0x0F) as f32;
+                let grp = c / mlx4.group_size;
+                let scale = if mlx4.is_bf16 { bf16_to_f32(s_f16[grp]) } else { f16_to_f32(s_f16[grp]) };
+                let bias = if mlx4.is_bf16 { bf16_to_f32(b_f16[grp]) } else { f16_to_f32(b_f16[grp]) };
+                dst[c] = q * scale + bias;
+            }
+            return;
+        }
+
+        let slice = self.data.as_slice();
         match self.dtype {
             TensorDType::F32 => {
                 let w_f32 = unsafe {
@@ -424,7 +536,36 @@ pub enum BlockChannelMixerWeights {
 
 fn find_and_load_weight<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &[S]) -> Result<WeightMatrix, String> {
     for cand in candidates {
-        if let Some((meta, slice)) = table.get_tensor(cand.as_ref()) {
+        if let Some((meta, data)) = table.get_tensor_data(cand.as_ref()) {
+            if meta.dtype == TensorDType::U32 {
+                // Check if this is an MLX 4-bit matrix with scales and biases
+                let cand_str = cand.as_ref();
+                let base = cand_str.trim_end_matches(".weight");
+                let s_name = format!("{}.scales", base);
+                let b_name = format!("{}.biases", base);
+                if let (Some((s_meta, s_data)), Some((_b_meta, b_data))) =
+                    (table.get_tensor_data(&s_name), table.get_tensor_data(&b_name))
+                {
+                    let rows = meta.shape[0];
+                    let cols = if meta.shape.len() > 1 { meta.shape[1] * 8 } else { meta.shape[0] * 8 };
+                    let group_size = if s_meta.shape.len() > 1 && s_meta.shape[1] > 0 {
+                        cols / s_meta.shape[1]
+                    } else {
+                        64
+                    };
+                    let is_bf16 = s_meta.dtype == TensorDType::BF16;
+                    return Ok(WeightMatrix::new_mlx4(
+                        rows,
+                        cols,
+                        data,
+                        s_data,
+                        b_data,
+                        group_size,
+                        is_bf16,
+                    ));
+                }
+            }
+
             let (rows, cols) = if meta.shape.len() == 2 {
                 (meta.shape[0], meta.shape[1])
             } else if meta.shape.len() == 1 {
@@ -432,12 +573,11 @@ fn find_and_load_weight<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &
             } else {
                 (meta.shape[0], meta.shape[1..].iter().product())
             };
-            return Ok(WeightMatrix::new(
+            return Ok(WeightMatrix::new_from_data(
                 rows,
                 cols,
                 meta.dtype,
-                Arc::new(slice.to_vec()),
-                0,
+                data,
             ));
         }
     }
@@ -467,6 +607,36 @@ fn find_and_load_vec<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &[S]
         }
     }
     Err(format!("failed to find norm vector matching candidates"))
+}
+
+#[derive(serde::Deserialize, Default, Debug)]
+struct HfConfig {
+    #[serde(default)]
+    model_type: String,
+    #[serde(default)]
+    architectures: Vec<String>,
+    #[serde(default)]
+    hidden_size: Option<usize>,
+    #[serde(default)]
+    intermediate_size: Option<usize>,
+    #[serde(default)]
+    num_hidden_layers: Option<usize>,
+    #[serde(default)]
+    num_attention_heads: Option<usize>,
+    #[serde(default)]
+    num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    head_dim: Option<usize>,
+    #[serde(default)]
+    rms_norm_eps: Option<f32>,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    hidden_act: Option<String>,
+    #[serde(default)]
+    final_logit_soft_cap: Option<f32>,
+    #[serde(default)]
+    attn_logit_soft_cap: Option<f32>,
 }
 
 pub struct BlockGraphModel {
@@ -528,16 +698,46 @@ impl BlockGraphModel {
         let vocab_size = embed_tokens.rows;
         let dim = embed_tokens.cols;
 
-        // 3. Detect architecture variants (Gemma vs standard LLaMA/Qwen/Mistral)
-        let is_gemma = names.iter().any(|n| n.contains("post_feedforward_layernorm"));
-        let norm_kind = if is_gemma {
-            NormKind::GemmaRmsNorm { eps: 1e-6 }
+        // Discover model metadata from config.json if available
+        let hf_cfg: Option<HfConfig> = if let Some(ref path) = table.path {
+            let dir = if path.is_dir() { path.clone() } else { path.parent().unwrap_or(path).to_path_buf() };
+            let cfg_path = dir.join("config.json");
+            if cfg_path.exists() {
+                std::fs::read_to_string(&cfg_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+            } else {
+                None
+            }
         } else {
-            NormKind::RmsNorm { eps: 1e-5 }
+            None
+        };
+
+        // 3. Detect architecture variants (Gemma 1/2 vs standard LLaMA/Qwen/Mistral)
+        let is_gemma_2 = names.iter().any(|n| n.contains("post_feedforward_layernorm"))
+            || hf_cfg.as_ref().map(|c| c.model_type.contains("gemma2")).unwrap_or(false);
+        let is_gemma_1 = hf_cfg.as_ref().map(|c| {
+            c.model_type.to_lowercase() == "gemma" || c.architectures.iter().any(|a| a.to_lowercase().contains("gemma"))
+        }).unwrap_or(false) || (vocab_size == 256000 && names.iter().any(|n| n.contains("post_attention_layernorm")));
+        let is_gemma = is_gemma_1 || is_gemma_2;
+
+        let norm_eps = hf_cfg.as_ref().and_then(|c| c.rms_norm_eps).unwrap_or(if is_gemma { 1e-6 } else { 1e-5 });
+        let norm_kind = if is_gemma {
+            NormKind::GemmaRmsNorm { eps: norm_eps }
+        } else {
+            NormKind::RmsNorm { eps: norm_eps }
         };
         let embed_scale = if is_gemma { Some((dim as f32).sqrt()) } else { None };
-        let final_soft_cap = if is_gemma { Some(30.0) } else { None };
-        let attn_soft_cap = if is_gemma { Some(50.0) } else { None };
+        let final_soft_cap = if is_gemma_2 {
+            hf_cfg.as_ref().and_then(|c| c.final_logit_soft_cap).or(Some(30.0))
+        } else {
+            None
+        };
+        let attn_soft_cap = if is_gemma_2 {
+            hf_cfg.as_ref().and_then(|c| c.attn_logit_soft_cap).or(Some(50.0))
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(n_layers);
         let mut inferred_n_heads = 0;
@@ -586,15 +786,27 @@ impl BlockGraphModel {
             if i == 0 {
                 let q_rows = q_proj.rows;
                 let k_rows = k_proj.rows;
-                inferred_head_dim = if q_rows >= 128 && q_rows % 128 == 0 && q_rows / 128 <= 64 {
+                inferred_head_dim = if let Some(hd) = hf_cfg.as_ref().and_then(|c| c.head_dim) {
+                    hd
+                } else if is_gemma {
+                    256
+                } else if q_rows >= 128 && q_rows % 128 == 0 && q_rows / 128 <= 64 {
                     128
                 } else if q_rows >= 64 && q_rows % 64 == 0 {
                     64
                 } else {
                     q_rows.min(dim).max(1)
                 };
-                inferred_n_heads = (q_rows / inferred_head_dim).max(1);
-                inferred_n_kv_heads = (k_rows / inferred_head_dim).max(1);
+                inferred_n_heads = if let Some(nh) = hf_cfg.as_ref().and_then(|c| c.num_attention_heads) {
+                    nh
+                } else {
+                    (q_rows / inferred_head_dim).max(1)
+                };
+                inferred_n_kv_heads = if let Some(nkv) = hf_cfg.as_ref().and_then(|c| c.num_key_value_heads) {
+                    nkv
+                } else {
+                    (k_rows / inferred_head_dim).max(1)
+                };
             }
 
             // Q/K norms (Qwen 2.5 / 3)
@@ -614,7 +826,7 @@ impl BlockGraphModel {
                 n_heads: inferred_n_heads,
                 n_kv_heads: inferred_n_kv_heads,
                 head_dim: inferred_head_dim,
-                rope_theta: 10000.0,
+                rope_theta: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
                 sliding_window: None,
                 q_norm: if q_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
                 k_norm: if k_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
@@ -631,12 +843,14 @@ impl BlockGraphModel {
                 k_norm_weight,
             };
 
-            // Post-attention norm
+            // Post-attention norm:
+            // Gemma 2 applies post_attention_layernorm after attention residual.
+            // Gemma 1 / LLaMA / Mistral use post_attention_layernorm as the pre-FFN norm!
             let post_attn_cands = [
                 format!("model.layers.{i}.post_attention_layernorm.weight"),
                 format!("layers.{i}.post_attention_layernorm.weight"),
             ];
-            let post_attention_norm_weight = if is_gemma {
+            let post_attention_norm_weight = if is_gemma_2 {
                 find_and_load_vec(table, &post_attn_cands).ok()
             } else {
                 None
@@ -674,18 +888,26 @@ impl BlockGraphModel {
             ];
             let down_proj = find_and_load_weight(table, &down_cands)?;
 
-            let channel_mixer_weights = BlockChannelMixerWeights::SwiGLU {
-                gate_proj,
-                up_proj,
-                down_proj,
+            let channel_mixer_weights = if is_gemma {
+                BlockChannelMixerWeights::GeGLU {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                }
+            } else {
+                BlockChannelMixerWeights::SwiGLU {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                }
             };
 
-            // Post-FFN norm (Gemma)
+            // Post-FFN norm (Gemma 2)
             let post_ffn_cands = [
                 format!("model.layers.{i}.post_feedforward_layernorm.weight"),
                 format!("layers.{i}.post_feedforward_layernorm.weight"),
             ];
-            let post_ffn_norm_weight = if is_gemma {
+            let post_ffn_norm_weight = if is_gemma_2 {
                 find_and_load_vec(table, &post_ffn_cands).ok()
             } else {
                 None
@@ -731,8 +953,8 @@ impl BlockGraphModel {
             head_dim: inferred_head_dim,
             hidden_dim: max_intermediate_dim,
             vocab_size,
-            norm_eps: 1e-5,
-            rope_freq_base: 10000.0,
+            norm_eps,
+            rope_freq_base: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
             max_seq_len: seq_len,
             sliding_window: 0,
         };
@@ -804,7 +1026,8 @@ impl BlockGraphModel {
                         _ => {}
                     }
                     match &mut layer.channel_mixer_weights {
-                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj }
+                        | BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
                             if gate_proj.metal_buf.is_none() {
                                 *gate_proj = gate_proj.clone().with_metal(engine);
                                 *up_proj = up_proj.clone().with_metal(engine);
@@ -824,7 +1047,8 @@ impl BlockGraphModel {
                         _ => {}
                     }
                     match &mut layer.channel_mixer_weights {
-                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj }
+                        | BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
                             gate_proj.metal_buf = None;
                             up_proj.metal_buf = None;
                             down_proj.metal_buf = None;
@@ -832,6 +1056,23 @@ impl BlockGraphModel {
                         _ => {}
                     }
                 }
+            }
+
+            if self.gpu_layers > 0 {
+                if let Some(ref mut lm) = self.lm_head {
+                    if lm.metal_buf.is_none() {
+                        *lm = lm.clone().with_metal(engine);
+                    }
+                } else {
+                    if self.embed_tokens.metal_buf.is_none() {
+                        self.embed_tokens = self.embed_tokens.clone().with_metal(engine);
+                    }
+                }
+            } else {
+                if let Some(ref mut lm) = self.lm_head {
+                    lm.metal_buf = None;
+                }
+                self.embed_tokens.metal_buf = None;
             }
         }
     }
@@ -920,26 +1161,30 @@ impl BlockGraphModel {
                 BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
                     // Batched Q, K, V Projections
                     #[cfg(target_os = "macos")]
-                    let batched_qkv_done = if let (Some(engine), Some(ref q_b), Some(ref k_b), Some(ref v_b)) =
-                        (m_eng, &q_proj.metal_buf, &k_proj.metal_buf, &v_proj.metal_buf)
-                    {
-                        let dtype_code = match q_proj.dtype {
-                            TensorDType::F16 => 1,
-                            TensorDType::F32 => 2,
-                            _ => 0,
-                        };
-                        engine.gemv_qkv_multi(
-                            q_b, 0, q_proj.rows,
-                            k_b, 0, k_proj.rows,
-                            v_b, 0, v_proj.rows,
-                            &self.buf_norm[..dim],
-                            &mut self.buf_q[..n_heads * head_dim],
-                            &mut self.buf_k[..n_kv_heads * head_dim],
-                            &mut self.buf_v[..n_kv_heads * head_dim],
-                            dim,
-                            dtype_code,
-                        );
-                        true
+                    let batched_qkv_done = if q_proj.mlx4.is_none() && k_proj.mlx4.is_none() && v_proj.mlx4.is_none() {
+                        if let (Some(engine), Some(ref q_b), Some(ref k_b), Some(ref v_b)) =
+                            (m_eng, &q_proj.metal_buf, &k_proj.metal_buf, &v_proj.metal_buf)
+                        {
+                            let dtype_code = match q_proj.dtype {
+                                TensorDType::F16 => 1,
+                                TensorDType::F32 => 2,
+                                _ => 0,
+                            };
+                            engine.gemv_qkv_multi(
+                                q_b, 0, q_proj.rows,
+                                k_b, 0, k_proj.rows,
+                                v_b, 0, v_proj.rows,
+                                &self.buf_norm[..dim],
+                                &mut self.buf_q[..n_heads * head_dim],
+                                &mut self.buf_k[..n_kv_heads * head_dim],
+                                &mut self.buf_v[..n_kv_heads * head_dim],
+                                dim,
+                                dtype_code,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
@@ -1025,20 +1270,24 @@ impl BlockGraphModel {
 
                     // Asynchronous GPU Attention Output Projection
                     #[cfg(target_os = "macos")]
-                    let async_o_done = if let (Some(engine), Some(ref o_b)) = (m_eng, &o_proj.metal_buf) {
-                        let dtype_code = match o_proj.dtype {
-                            TensorDType::F16 => 1,
-                            TensorDType::F32 => 2,
-                            _ => 0,
-                        };
-                        engine.gemv_async(
-                            o_b, 0,
-                            &self.buf_attn_out[..o_proj.cols],
-                            &mut self.buf_x[..dim],
-                            o_proj.rows, o_proj.cols,
-                            dtype_code,
-                        );
-                        true
+                    let async_o_done = if o_proj.mlx4.is_none() {
+                        if let (Some(engine), Some(ref o_b)) = (m_eng, &o_proj.metal_buf) {
+                            let dtype_code = match o_proj.dtype {
+                                TensorDType::F16 => 1,
+                                TensorDType::F32 => 2,
+                                _ => 0,
+                            };
+                            engine.gemv_async(
+                                o_b, 0,
+                                &self.buf_attn_out[..o_proj.cols],
+                                &mut self.buf_x[..dim],
+                                o_proj.rows, o_proj.cols,
+                                dtype_code,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
@@ -1080,25 +1329,29 @@ impl BlockGraphModel {
             match &layer.channel_mixer_weights {
                 BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
                     #[cfg(target_os = "macos")]
-                    let batched_gate_up = if let (Some(engine), Some(ref g_b), Some(ref u_b)) =
-                        (m_eng, &gate_proj.metal_buf, &up_proj.metal_buf)
-                    {
-                        let dtype_code = match gate_proj.dtype {
-                            TensorDType::F16 => 1,
-                            TensorDType::F32 => 2,
-                            _ => 0,
-                        };
-                        engine.gemv_gate_up_multi(
-                            g_b, 0,
-                            u_b, 0,
-                            &self.buf_norm[..dim],
-                            &mut self.buf_gate[..gate_proj.rows],
-                            &mut self.buf_up[..up_proj.rows],
-                            gate_proj.rows,
-                            dim,
-                            dtype_code,
-                        );
-                        true
+                    let batched_gate_up = if gate_proj.mlx4.is_none() && up_proj.mlx4.is_none() {
+                        if let (Some(engine), Some(ref g_b), Some(ref u_b)) =
+                            (m_eng, &gate_proj.metal_buf, &up_proj.metal_buf)
+                        {
+                            let dtype_code = match gate_proj.dtype {
+                                TensorDType::F16 => 1,
+                                TensorDType::F32 => 2,
+                                _ => 0,
+                            };
+                            engine.gemv_gate_up_multi(
+                                g_b, 0,
+                                u_b, 0,
+                                &self.buf_norm[..dim],
+                                &mut self.buf_gate[..gate_proj.rows],
+                                &mut self.buf_up[..up_proj.rows],
+                                gate_proj.rows,
+                                dim,
+                                dtype_code,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
@@ -1113,20 +1366,24 @@ impl BlockGraphModel {
                     swiglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
 
                     #[cfg(target_os = "macos")]
-                    let async_down = if let (Some(engine), Some(ref d_b)) = (m_eng, &down_proj.metal_buf) {
-                        let dtype_code = match down_proj.dtype {
-                            TensorDType::F16 => 1,
-                            TensorDType::F32 => 2,
-                            _ => 0,
-                        };
-                        engine.gemv_async(
-                            d_b, 0,
-                            &self.buf_gate[..down_proj.cols],
-                            &mut self.buf_ffn_out[..dim],
-                            down_proj.rows, down_proj.cols,
-                            dtype_code,
-                        );
-                        true
+                    let async_down = if down_proj.mlx4.is_none() {
+                        if let (Some(engine), Some(ref d_b)) = (m_eng, &down_proj.metal_buf) {
+                            let dtype_code = match down_proj.dtype {
+                                TensorDType::F16 => 1,
+                                TensorDType::F32 => 2,
+                                _ => 0,
+                            };
+                            engine.gemv_async(
+                                d_b, 0,
+                                &self.buf_gate[..down_proj.cols],
+                                &mut self.buf_ffn_out[..dim],
+                                down_proj.rows, down_proj.cols,
+                                dtype_code,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };

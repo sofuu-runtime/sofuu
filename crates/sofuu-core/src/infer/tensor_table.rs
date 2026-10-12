@@ -5,7 +5,8 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::gguf::{GgufFile, GGUF_MAGIC};
 use super::npy::{NpzFile, TensorDType};
@@ -22,6 +23,26 @@ pub struct UnifiedTensorMeta {
     pub size_bytes: usize,
 }
 
+#[derive(Clone)]
+pub enum UnifiedTensorData {
+    Heap(Arc<Vec<u8>>),
+    Mmap {
+        mmap: Arc<crate::infer::mmap::MmapFile>,
+        offset: usize,
+        size: usize,
+    },
+}
+
+impl UnifiedTensorData {
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Heap(v) => v.as_slice(),
+            Self::Mmap { mmap, offset, size } => &mmap.as_slice()[*offset..*offset + *size],
+        }
+    }
+}
+
 pub enum TensorSource {
     SafeTensors(SafeTensorsFile),
     Gguf(GgufFile),
@@ -31,26 +52,28 @@ pub enum TensorSource {
 
 pub struct UnifiedTensorTable {
     pub source: TensorSource,
+    pub path: Option<PathBuf>,
 }
 
 impl UnifiedTensorTable {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path_ref = path.as_ref();
+        let path_buf = path_ref.to_path_buf();
         let ext = path_ref.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
         // 1. Extension-guided dispatch
         if ext == "safetensors" {
             let st = SafeTensorsFile::open(path_ref)?;
-            return Ok(Self { source: TensorSource::SafeTensors(st) });
+            return Ok(Self { source: TensorSource::SafeTensors(st), path: Some(path_buf) });
         } else if ext == "gguf" {
             let gg = GgufFile::open(path_ref).map_err(|e| e.to_string())?;
-            return Ok(Self { source: TensorSource::Gguf(gg) });
+            return Ok(Self { source: TensorSource::Gguf(gg), path: Some(path_buf) });
         } else if ext == "pt" || ext == "pth" {
             let pt = PyTorchCheckpoint::open(path_ref)?;
-            return Ok(Self { source: TensorSource::PyTorch(pt) });
+            return Ok(Self { source: TensorSource::PyTorch(pt), path: Some(path_buf) });
         } else if ext == "npz" {
             let npz = NpzFile::open(path_ref)?;
-            return Ok(Self { source: TensorSource::Npz(npz) });
+            return Ok(Self { source: TensorSource::Npz(npz), path: Some(path_buf) });
         }
 
         // 2. Magic byte sniffing fallback
@@ -60,25 +83,81 @@ impl UnifiedTensorTable {
 
         if bytes_read >= 4 && u32::from_le_bytes(header[0..4].try_into().unwrap()) == GGUF_MAGIC {
             let gg = GgufFile::open(path_ref).map_err(|e| e.to_string())?;
-            return Ok(Self { source: TensorSource::Gguf(gg) });
+            return Ok(Self { source: TensorSource::Gguf(gg), path: Some(path_buf) });
         }
 
         if bytes_read >= 4 && &header[0..4] == b"PK\x03\x04" {
             // ZIP archive: try PyTorch first, then NPZ
             if let Ok(pt) = PyTorchCheckpoint::open(path_ref) {
-                return Ok(Self { source: TensorSource::PyTorch(pt) });
+                return Ok(Self { source: TensorSource::PyTorch(pt), path: Some(path_buf) });
             }
             if let Ok(npz) = NpzFile::open(path_ref) {
-                return Ok(Self { source: TensorSource::Npz(npz) });
+                return Ok(Self { source: TensorSource::Npz(npz), path: Some(path_buf) });
             }
         }
 
         // Default try SafeTensors
         if let Ok(st) = SafeTensorsFile::open(path_ref) {
-            return Ok(Self { source: TensorSource::SafeTensors(st) });
+            return Ok(Self { source: TensorSource::SafeTensors(st), path: Some(path_buf) });
         }
 
         Err(format!("unrecognized or unsupported tensor file format: {}", path_ref.display()))
+    }
+
+    #[inline]
+    pub fn get_tensor_data(&self, name: &str) -> Option<(UnifiedTensorMeta, UnifiedTensorData)> {
+        match &self.source {
+            TensorSource::SafeTensors(st) => {
+                let (tv, _) = st.get_tensor(name)?;
+                let meta = UnifiedTensorMeta {
+                    name: name.to_string(),
+                    dtype: safe_dtype_to_tensor_dtype(tv.dtype),
+                    shape: tv.shape.clone(),
+                    data_offset: tv.data_offset,
+                    size_bytes: tv.size_bytes,
+                };
+                let data = UnifiedTensorData::Mmap {
+                    mmap: st.mmap.clone(),
+                    offset: tv.data_offset,
+                    size: tv.size_bytes,
+                };
+                Some((meta, data))
+            }
+            TensorSource::Gguf(gg) => {
+                let info = gg.tensors.get(name)?;
+                let slice = gg.mmap.slice(info.offset, info.size_bytes)?;
+                let meta = UnifiedTensorMeta {
+                    name: name.to_string(),
+                    dtype: ggml_type_to_tensor_dtype(info.tensor_type),
+                    shape: info.shape.clone(),
+                    data_offset: info.offset,
+                    size_bytes: info.size_bytes,
+                };
+                Some((meta, UnifiedTensorData::Heap(Arc::new(slice.to_vec()))))
+            }
+            TensorSource::PyTorch(pt) => {
+                let (tv, slice) = pt.get_tensor(name)?;
+                let meta = UnifiedTensorMeta {
+                    name: name.to_string(),
+                    dtype: tv.dtype,
+                    shape: tv.shape.clone(),
+                    data_offset: tv.data_offset,
+                    size_bytes: tv.size_bytes,
+                };
+                Some((meta, UnifiedTensorData::Heap(Arc::new(slice.to_vec()))))
+            }
+            TensorSource::Npz(npz) => {
+                let (tv, slice) = npz.get_tensor(name)?;
+                let meta = UnifiedTensorMeta {
+                    name: name.to_string(),
+                    dtype: tv.dtype,
+                    shape: tv.shape.clone(),
+                    data_offset: tv.data_offset,
+                    size_bytes: tv.size_bytes,
+                };
+                Some((meta, UnifiedTensorData::Heap(Arc::new(slice.to_vec()))))
+            }
+        }
     }
 
     #[inline]

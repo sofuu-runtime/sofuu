@@ -59,6 +59,13 @@ impl IndexedStringTable {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpaceStyle {
+    Gpt2,
+    SentencePiece,
+    None,
+}
+
 pub struct BpeTokenizer {
     pub vocab: Vec<String>,
     pub token_to_id: IndexedStringTable,
@@ -66,7 +73,7 @@ pub struct BpeTokenizer {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub special_tokens: Vec<(String, u32)>,
-    pub use_gpt2_space: bool,
+    pub space_style: SpaceStyle,
 }
 
 impl BpeTokenizer {
@@ -85,7 +92,13 @@ impl BpeTokenizer {
         let bos_token_id = gguf.get_u32("tokenizer.ggml.bos_token_id");
         let eos_token_id = gguf.get_u32("tokenizer.ggml.eos_token_id");
 
-        let use_gpt2_space = token_to_id.get("Ġ", &vocab).is_some();
+        let space_style = if token_to_id.get("\u{2581}", &vocab).is_some() {
+            SpaceStyle::SentencePiece
+        } else if token_to_id.get("Ġ", &vocab).is_some() {
+            SpaceStyle::Gpt2
+        } else {
+            SpaceStyle::None
+        };
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (id, tok) in vocab.iter().enumerate() {
             if tok.starts_with("<|") && tok.ends_with("|>") {
@@ -101,7 +114,7 @@ impl BpeTokenizer {
             bos_token_id,
             eos_token_id,
             special_tokens,
-            use_gpt2_space,
+            space_style,
         })
     }
 
@@ -109,7 +122,42 @@ impl BpeTokenizer {
         let path_ref = path.as_ref();
         let content = std::fs::read_to_string(path_ref)
             .map_err(|e| format!("failed to read tokenizer.json at {}: {}", path_ref.display(), e))?;
-        Self::from_hf_json(&content)
+        let mut tok = Self::from_hf_json(&content)?;
+
+        // If tokenizer_config.json exists alongside tokenizer.json, refine bos_token_id / eos_token_id
+        if let Some(parent) = path_ref.parent() {
+            let config_path = parent.join("tokenizer_config.json");
+            if let Ok(cfg_str) = std::fs::read_to_string(&config_path) {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                    if let Some(bos_val) = cfg.get("bos_token") {
+                        let bos_name = if let Some(s) = bos_val.as_str() {
+                            Some(s)
+                        } else {
+                            bos_val.get("content").and_then(|c| c.as_str())
+                        };
+                        if let Some(name) = bos_name {
+                            if let Some(id) = tok.get_token_id(name) {
+                                tok.bos_token_id = Some(id);
+                            }
+                        }
+                    }
+                    if let Some(eos_val) = cfg.get("eos_token") {
+                        let eos_name = if let Some(s) = eos_val.as_str() {
+                            Some(s)
+                        } else {
+                            eos_val.get("content").and_then(|c| c.as_str())
+                        };
+                        if let Some(name) = eos_name {
+                            if let Some(id) = tok.get_token_id(name) {
+                                tok.eos_token_id = Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(tok)
     }
 
     pub fn from_hf_json(json_str: &str) -> Result<Self, String> {
@@ -174,14 +222,83 @@ impl BpeTokenizer {
         }
 
         let token_to_id = IndexedStringTable::build(&vocab);
-        let bos_token_id = token_to_id.get("<|startoftext|>", &vocab)
-            .or_else(|| token_to_id.get("<s>", &vocab))
-            .or_else(|| token_to_id.get("<|im_start|>", &vocab));
-        let eos_token_id = token_to_id.get("<|endoftext|>", &vocab)
-            .or_else(|| token_to_id.get("</s>", &vocab))
-            .or_else(|| token_to_id.get("<|im_end|>", &vocab));
 
-        let use_gpt2_space = token_to_id.get("Ġ", &vocab).is_some();
+        // 1. Detect BOS and EOS tokens from special added_tokens first
+        let mut bos_token_id = None;
+        let mut eos_token_id = None;
+
+        if let Some(added) = root.get("added_tokens").and_then(|a| a.as_array()) {
+            for tok in added {
+                let id = tok.get("id").and_then(|i| i.as_u64()).map(|i| i as u32);
+                let content = tok.get("content").and_then(|c| c.as_str());
+                let is_special = tok.get("special").and_then(|s| s.as_bool()).unwrap_or(false);
+                if is_special {
+                    if let (Some(id), Some(content)) = (id, content) {
+                        if content == "<bos>" || content == "<|startoftext|>" || content == "<|im_start|>" {
+                            bos_token_id = Some(id);
+                        } else if content == "<s>" && bos_token_id.is_none() {
+                            bos_token_id = Some(id);
+                        }
+
+                        if content == "<eos>" || content == "<|endoftext|>" || content == "<|im_end|>" {
+                            eos_token_id = Some(id);
+                        } else if content == "</s>" && eos_token_id.is_none() {
+                            eos_token_id = Some(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check post_processor if not found
+        if bos_token_id.is_none() {
+            if let Some(post) = root.get("post_processor") {
+                if let Some(spec) = post.get("special_tokens").and_then(|s| s.as_object()) {
+                    for key in ["<bos>", "<|startoftext|>", "<|im_start|>", "<s>"] {
+                        if let Some(entry) = spec.get(key) {
+                            if let Some(ids) = entry.get("ids").and_then(|i| i.as_array()) {
+                                if let Some(id) = ids.first().and_then(|i| i.as_u64()) {
+                                    bos_token_id = Some(id as u32);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback to token_to_id lookup with strict priority (<bos> before <s>)
+        if bos_token_id.is_none() {
+            bos_token_id = token_to_id.get("<bos>", &vocab)
+                .or_else(|| token_to_id.get("<|startoftext|>", &vocab))
+                .or_else(|| token_to_id.get("<|im_start|>", &vocab))
+                .or_else(|| token_to_id.get("<s>", &vocab));
+        }
+
+        if eos_token_id.is_none() {
+            eos_token_id = token_to_id.get("<eos>", &vocab)
+                .or_else(|| token_to_id.get("<|endoftext|>", &vocab))
+                .or_else(|| token_to_id.get("<|im_end|>", &vocab))
+                .or_else(|| token_to_id.get("</s>", &vocab));
+        }
+
+        // Determine space style:
+        let norm_str = root.get("normalizer").map(|n| n.to_string()).unwrap_or_default();
+        let dec_str = root.get("decoder").map(|d| d.to_string()).unwrap_or_default();
+        let pre_str = root.get("pre_tokenizer").map(|p| p.to_string()).unwrap_or_default();
+
+        let space_style = if norm_str.contains("\u{2581}") || dec_str.contains("\u{2581}") {
+            SpaceStyle::SentencePiece
+        } else if pre_str.contains("ByteLevel") || dec_str.contains("ByteLevel") {
+            SpaceStyle::Gpt2
+        } else if token_to_id.get("\u{2581}", &vocab).is_some() {
+            SpaceStyle::SentencePiece
+        } else if token_to_id.get("Ġ", &vocab).is_some() {
+            SpaceStyle::Gpt2
+        } else {
+            SpaceStyle::None
+        };
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         Ok(Self {
@@ -191,7 +308,7 @@ impl BpeTokenizer {
             bos_token_id,
             eos_token_id,
             special_tokens,
-            use_gpt2_space,
+            space_style,
         })
     }
 
@@ -258,10 +375,10 @@ impl BpeTokenizer {
             return Vec::new();
         }
 
-        let normalized = if self.use_gpt2_space {
-            text.replace(' ', "Ġ")
-        } else {
-            text.replace(' ', " ")
+        let normalized = match self.space_style {
+            SpaceStyle::Gpt2 => text.replace(' ', "Ġ"),
+            SpaceStyle::SentencePiece => text.replace(' ', "\u{2581}"),
+            SpaceStyle::None => text.to_string(),
         };
 
         // Initial character tokens
@@ -325,8 +442,24 @@ impl BpeTokenizer {
             if s.starts_with("<|") && s.ends_with("|>") {
                 return String::new();
             }
-            let dec = decode_byte_level(s);
-            dec.replace(' ', " ")
+            if s.starts_with('<') && s.ends_with('>') && !s.starts_with("<0x") {
+                return String::new();
+            }
+            if s.starts_with("<0x") && s.ends_with('>') && s.len() == 6 {
+                if let Ok(b) = u8::from_str_radix(&s[3..5], 16) {
+                    return (b as char).to_string();
+                }
+            }
+            match self.space_style {
+                SpaceStyle::Gpt2 => {
+                    let dec = decode_byte_level(s);
+                    dec.replace('\u{2581}', " ")
+                }
+                SpaceStyle::SentencePiece => {
+                    s.replace('\u{2581}', " ")
+                }
+                SpaceStyle::None => s.to_string(),
+            }
         } else {
             String::new()
         }
@@ -334,18 +467,11 @@ impl BpeTokenizer {
 
     /// Decode a sequence of token IDs to clean text.
     pub fn decode(&self, tokens: &[u32]) -> String {
-        let mut raw = String::new();
+        let mut out = String::new();
         for &t in tokens {
-            if let Some(s) = self.decode_token(t) {
-                // Skip special tokens in standard text rendering
-                if s.starts_with("<|") && s.ends_with("|>") {
-                    continue;
-                }
-                raw.push_str(s);
-            }
+            out.push_str(&self.decode_piece(t));
         }
-        let dec = decode_byte_level(&raw);
-        dec.replace(' ', " ")
+        out
     }
 }
 

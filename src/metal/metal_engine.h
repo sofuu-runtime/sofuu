@@ -131,7 +131,8 @@ void sofuu_metal_gemv_mlx4(
     float* y,
     size_t rows,
     size_t cols,
-    size_t group_size
+    size_t group_size,
+    int is_bf16
 );
 
 // Create a Metal buffer from pointer (zero-copy if page-aligned, copy fallback if not).

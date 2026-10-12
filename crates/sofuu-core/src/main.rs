@@ -1398,6 +1398,7 @@ fn main() -> ExitCode {
             let mut threads = 0usize;
             let mut sliding_window = 0usize;
             let mut custom_ctx = 0usize;
+            let mut gpu_layers = 999usize;
 
             let mut i = 4;
             while i < args.len() {
@@ -1426,12 +1427,24 @@ fn main() -> ExitCode {
                         custom_ctx = v;
                     }
                     i += 2;
+                } else if (args[i] == "--gpu-layers" || args[i] == "--ngl") && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        gpu_layers = v;
+                    }
+                    i += 2;
+                } else if args[i] == "--gpu" {
+                    gpu_layers = 999;
+                    i += 1;
+                } else if args[i] == "--cpu" {
+                    gpu_layers = 0;
+                    i += 1;
                 } else {
                     i += 1;
                 }
             }
 
-            eprintln!("\x1b[36m⚡ Sofuu CPU Inference Engine\x1b[0m — loading {}...", model_path);
+            let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
+            eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
             let t0 = std::time::Instant::now();
             let mut engine = match sofuu_core::infer::InferEngine::load_with_seq_len(model_path, custom_ctx) {
                 Ok(eng) => eng,
@@ -1440,6 +1453,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            #[cfg(target_os = "macos")]
+            engine.model.set_gpu_layers(gpu_layers);
+
             let load_dur = t0.elapsed();
             let active_threads = if threads > 0 {
                 threads

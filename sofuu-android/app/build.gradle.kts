@@ -4,6 +4,19 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// Release signing. Optional on purpose: keystore.properties is not checked
+// in, so a fresh clone still configures and still runs `assembleDebug`.
+// When the file is absent, assembleRelease still works but is UNSIGNED —
+// which is exactly what you want for a local install or an emulator
+// smoke test, and loud enough that nobody ships it by accident.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = java.util.Properties().apply {
+    if (keystorePropsFile.exists()) {
+        keystorePropsFile.inputStream().use { load(it) }
+    }
+}
+val hasSigning = keystoreProps.getProperty("storeFile") != null
+
 android {
     namespace = "com.sofuu"
     compileSdk = 35
@@ -29,6 +42,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasSigning) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
@@ -39,6 +63,12 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = if (hasSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                logger.warn("keystore.properties not found — assembling an UNSIGNED release APK")
+                null
+            }
         }
     }
 

@@ -51,13 +51,20 @@ for abi in "${ABIS[@]}"; do
     # libsofuu_jni.so's DT_NEEDED and the APK would fail to load on device.
     # With -Wl,-soname the app links against a plain "libsofuu.so" that
     # resolves from the APK's lib dir at runtime.
+    #
+    # max-page-size=16384 is equally load-bearing: the NDK toolchain
+    # defaults every PT_LOAD to 4 KiB, and targetSdk 35 means the APK must
+    # load on Android 15+ devices with a 16 KiB page size (most current
+    # Pixels). Without this the linker only aligns the FIRST segment and
+    # the .so is rejected at load time. The app's own libsofuu_jni.so needs
+    # the same flag on its target (see app/src/main/cpp/CMakeLists.txt).
     (
         cd "$REPO_ROOT"
         SOFUU_UV_DIR="$REPO_ROOT/dist/libuv-android-$MOBILE_ABI_NAME" \
         SOFUU_CURL_STATIC_DIR="$REPO_ROOT/dist/libcurl-android-$MOBILE_ABI_NAME/lib" \
         SOFUU_QTSQ_DIR="$REPO_ROOT/dist/qtsq-android-$MOBILE_ABI_NAME" \
         SOFUU_ZLIB_DIR="$REPO_ROOT/dist/qtsq-android-$MOBILE_ABI_NAME" \
-        RUSTFLAGS="-C link-arg=-Wl,-soname,libsofuu.so" \
+        RUSTFLAGS="-C link-arg=-Wl,-soname,libsofuu.so -C link-arg=-Wl,-z,max-page-size=16384" \
         cargo build $PROFILE_FLAG -p sofuu-capi --target "$MOBILE_RUST_TARGET"
     )
 

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use serde::Deserialize;
 
 use super::mmap::MmapFile;
@@ -73,7 +74,7 @@ struct RawTensorEntry {
 }
 
 pub struct SafeTensorsFile {
-    pub mmap: MmapFile,
+    pub mmap: Arc<MmapFile>,
     pub tensors: HashMap<String, SafeTensorView>,
     pub metadata: HashMap<String, String>,
     pub data_offset: usize,
@@ -82,8 +83,8 @@ pub struct SafeTensorsFile {
 impl SafeTensorsFile {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path_ref = path.as_ref();
-        let mmap = MmapFile::open(path_ref)
-            .map_err(|e| format!("failed to mmap safetensors file {}: {}", path_ref.display(), e))?;
+        let mmap = Arc::new(MmapFile::open(path_ref)
+            .map_err(|e| format!("failed to mmap safetensors file {}: {}", path_ref.display(), e))?);
 
         if mmap.len() < 8 {
             return Err("safetensors file too small (less than 8 bytes)".to_string());

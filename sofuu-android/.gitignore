@@ -10,3 +10,8 @@ captures/
 
 # Staged engine payload — built by scripts/mobile/build_engine_android.sh
 app/src/main/jniLibs/
+
+# Release signing — never checked in (contains the keystore password).
+keystore.properties
+*.jks
+*.keystore

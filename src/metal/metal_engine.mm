@@ -12,7 +12,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemv_bf16;
     id<MTLComputePipelineState> pso_gemv_f16;
     id<MTLComputePipelineState> pso_gemv_f32;
-    id<MTLComputePipelineState> pso_gemv_mlx4;
+    id<MTLComputePipelineState> pso_gemv_mlx4_f16;
+    id<MTLComputePipelineState> pso_gemv_mlx4_bf16;
     id<MTLComputePipelineState> pso_rmsnorm;
     id<MTLComputePipelineState> pso_swiglu;
     id<MTLComputePipelineState> pso_conv1d_3;
@@ -218,7 +219,48 @@ kernel void conv1d_3(
     out[c] = sum;
 }
 
-kernel void gemv_mlx4_affine(
+kernel void gemv_mlx4_affine_f16(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const uchar  *scales_base    [[buffer(1)]],
+    device const uchar  *biases_base    [[buffer(2)]],
+    device const float  *x              [[buffer(3)]],
+    device float        *y              [[buffer(4)]],
+    constant uint       &cols           [[buffer(5)]],
+    constant uint       &group_size     [[buffer(6)]],
+    constant uint4      &rems           [[buffer(7)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float sum = 0.0f;
+    uint u32_cols = cols / 8;
+    uint n_groups = cols / group_size;
+
+    uint qw_row_byte = rems.x + row * (u32_cols * 4);
+    uint s_row_byte  = rems.y + row * (n_groups * 2);
+    uint b_row_byte  = rems.z + row * (n_groups * 2);
+
+    for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
+        uint val = read_u32(w_base, qw_row_byte + col_u32 * 4);
+        uint c_base = col_u32 * 8;
+        uint g_idx = c_base / group_size;
+        float s = float(read_f16(scales_base, s_row_byte + g_idx * 2));
+        float b = float(read_f16(biases_base, b_row_byte + g_idx * 2));
+
+        #pragma unroll
+        for (uint i = 0; i < 8; ++i) {
+            uint nibble = (val >> (i * 4)) & 0x0F;
+            float w_val = float(nibble) * s + b;
+            sum += w_val * x[c_base + i];
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
+
+kernel void gemv_mlx4_affine_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const uchar  *scales_base    [[buffer(1)]],
     device const uchar  *biases_base    [[buffer(2)]],
@@ -299,7 +341,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_bf16 = load_pso(@"gemv_bf16");
         ctx->pso_gemv_f16  = load_pso(@"gemv_f16");
         ctx->pso_gemv_f32  = load_pso(@"gemv_f32");
-        ctx->pso_gemv_mlx4 = load_pso(@"gemv_mlx4_affine");
+        ctx->pso_gemv_mlx4_f16  = load_pso(@"gemv_mlx4_affine_f16");
+        ctx->pso_gemv_mlx4_bf16 = load_pso(@"gemv_mlx4_affine_bf16");
         ctx->pso_rmsnorm   = load_pso(@"rmsnorm");
         ctx->pso_swiglu    = load_pso(@"swiglu");
         ctx->pso_conv1d_3  = load_pso(@"conv1d_3");
@@ -813,7 +856,8 @@ void sofuu_metal_gemv_mlx4(
     float* y,
     size_t rows,
     size_t cols,
-    size_t group_size
+    size_t group_size,
+    int is_bf16
 ) {
     if (!ctx_ptr || !w_buf_ptr || !scales_buf_ptr || !biases_buf_ptr || !x || !y || rows == 0 || cols == 0) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -841,7 +885,8 @@ void sofuu_metal_gemv_mlx4(
             0
         };
 
-        [enc setComputePipelineState:ctx->pso_gemv_mlx4];
+        id<MTLComputePipelineState> pso = (is_bf16 != 0) ? ctx->pso_gemv_mlx4_bf16 : ctx->pso_gemv_mlx4_f16;
+        [enc setComputePipelineState:pso];
         [enc setBuffer:w_buf offset:w_aligned atIndex:0];
         [enc setBuffer:scales_buf offset:scales_aligned atIndex:1];
         [enc setBuffer:biases_buf offset:biases_aligned atIndex:2];
@@ -1108,7 +1153,7 @@ void sofuu_metal_gemv_f32(void* ctx, void* w_buf, size_t w_offset, const float* 
 void sofuu_metal_rmsnorm(void* ctx, const float* x, void* w_buf, size_t w_offset, float* y, size_t dim, float eps) {}
 void sofuu_metal_swiglu(void* ctx, float* g, const float* u, size_t size) {}
 void sofuu_metal_conv1d_3(void* ctx, void* conv_w_buf, size_t conv_w_offset, const float* state, float* out, size_t channels) {}
-void sofuu_metal_gemv_mlx4(void* ctx, void* w_buf, size_t w_offset, void* scales_buf, size_t scales_offset, void* biases_buf, size_t biases_offset, const float* x, float* y, size_t rows, size_t cols, size_t group_size) {}
+void sofuu_metal_gemv_mlx4(void* ctx, void* w_buf, size_t w_offset, void* scales_buf, size_t scales_offset, void* biases_buf, size_t biases_offset, const float* x, float* y, size_t rows, size_t cols, size_t group_size, int is_bf16) {}
 void sofuu_metal_gemv_qkv_multi(void* ctx, void* q_buf, size_t q_offset, size_t q_rows, void* k_buf, size_t k_offset, size_t k_rows, void* v_buf, size_t v_offset, size_t v_rows, const float* x, float* q_out, float* k_out, float* v_out, size_t cols, int dtype) {}
 void sofuu_metal_gemv_gate_up_multi(void* ctx, void* gate_buf, size_t gate_offset, void* up_buf, size_t up_offset, const float* x, float* gate_out, float* up_out, size_t inter_rows, size_t cols, int dtype) {}
 void sofuu_metal_gemv_async(void* ctx, void* w_buf, size_t w_offset, const float* x, float* y, size_t rows, size_t cols, int dtype) {}

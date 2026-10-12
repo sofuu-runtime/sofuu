@@ -70,7 +70,7 @@ cargo-build:
 $(TARGET): cargo-build
 	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"
 	@cp target/release/$(TARGET) $(TARGET)
-	@if [ "$$(uname -s)" = "Darwin" ]; then codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
+	@if [ "$$(uname -s)" = "Darwin" ]; then strip -x $(TARGET) 2>/dev/null || true; codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
 	@echo "  \033[32mBuilt:\033[0m ./$(TARGET) ($(shell du -sh $(TARGET) | cut -f1))"
 
 # ── Legacy pure-C build ─────────────────────────────────────────

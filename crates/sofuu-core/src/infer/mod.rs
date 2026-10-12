@@ -108,6 +108,13 @@ impl InferModel {
         })
     }
 
+    pub fn set_gpu_layers(&mut self, n: usize) {
+        match &mut self.backend {
+            ModelBackend::BlockGraph(m) => m.set_gpu_layers(n),
+            _ => {}
+        }
+    }
+
     pub fn reset_cache(&mut self) {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.reset_cache(),
@@ -451,7 +458,7 @@ impl InferEngine {
         let mut full_generated = String::new();
         let eos_id = self.tokenizer.eos_token_id;
 
-        for _ in 0..options.max_tokens {
+        for _step in 0..options.max_tokens {
             let next_token = sampler.sample(&mut logits_buf, &history);
 
             // 1. Check EOS token ID

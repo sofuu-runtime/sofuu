@@ -45,7 +45,7 @@ extern "C" {
 enum Provider {
     OpenAi = 0,
     Anthropic = 1,
-    Local = 2,  /* roadmap Track B — real local inference is not built yet */
+    Local = 2,  /* in-process inference (GGUF / SafeTensors / .pt / .npz) */
     Custom = 3, /* user-defined endpoint; wire format comes from `profile` */
 }
 
@@ -4209,6 +4209,43 @@ unsafe extern "C" fn js_ai_abort(
     qjs::sofuu_js_undefined()
 }
 
+/// E1 (PLAN-EMBED-SDK): does this `model` string name something the
+/// in-process engine can load off local disk?
+///
+/// `.gguf` files were the only shape that auto-routed. A SafeTensors /
+/// PyTorch / NumPy model — a HuggingFace-style directory, or a bare weights
+/// file — is just as local, but callers had to *also* pass
+/// `provider: "local"` or the request went to the network as a model name.
+/// Embedded hosts pass a path and expect tokens, so the path itself decides.
+fn looks_like_local_model(m: &str) -> bool {
+    let clean = crate::infer::clean_model_path(m);
+    match clean.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("gguf") => return true,
+        Some(e)
+            if matches!(
+                e.to_ascii_lowercase().as_str(),
+                "safetensors" | "pt" | "pth" | "npz" | "npy"
+            ) =>
+        {
+            // Require it to be on disk, so a *model name* that merely ends in
+            // one of these extensions still routes to the provider.
+            return clean.is_file();
+        }
+        _ => {}
+    }
+    // HuggingFace-style model directory: tokenizer.json + weights.
+    clean.is_dir()
+        && clean.join("tokenizer.json").exists()
+        && [
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.pt",
+            "model.npz",
+        ]
+        .iter()
+        .any(|w| clean.join(w).exists())
+}
+
 unsafe extern "C" fn js_ai_stream(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -4225,12 +4262,9 @@ unsafe extern "C" fn js_ai_stream(
         return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
     }
 
-    let is_local = cfg.provider == Provider::Local || eff == Provider::Local
-        || cfg.model.as_deref().map_or(false, |m| {
-            let clean = crate::infer::clean_model_path(m);
-            clean.extension().map_or(false, |e| e == "gguf")
-                || m.trim_matches(|c| c == '\'' || c == '"').ends_with(".gguf")
-        });
+    let is_local = cfg.provider == Provider::Local
+        || eff == Provider::Local
+        || cfg.model.as_deref().map_or(false, looks_like_local_model);
     if is_local {
         let factory_c = CString::new(STREAM_FACTORY).unwrap();
         let factory = qjs::JS_Eval(

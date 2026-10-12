@@ -111,6 +111,8 @@ impl InferModel {
     pub fn set_gpu_layers(&mut self, n: usize) {
         match &mut self.backend {
             ModelBackend::BlockGraph(m) => m.set_gpu_layers(n),
+            #[cfg(target_os = "macos")]
+            ModelBackend::Lfm2(m) => m.set_gpu_layers(n),
             _ => {}
         }
     }
@@ -212,6 +214,16 @@ impl InferEngine {
     /// Load a model with custom context length (0 = auto-detect from metadata).
     /// Auto-detects model format: GGUF, SafeTensors directory, or direct .safetensors file.
     pub fn load_with_seq_len<P: AsRef<Path>>(model_path: P, max_seq_len: usize) -> Result<Self, String> {
+        Self::load_inner(model_path, max_seq_len, true)
+    }
+
+    /// Load a model without creating or using GPU resources. Useful for explicit
+    /// CPU-only requests, especially for large SafeTensors models.
+    pub fn load_with_seq_len_cpu<P: AsRef<Path>>(model_path: P, max_seq_len: usize) -> Result<Self, String> {
+        Self::load_inner(model_path, max_seq_len, false)
+    }
+
+    fn load_inner<P: AsRef<Path>>(model_path: P, max_seq_len: usize, enable_gpu: bool) -> Result<Self, String> {
         let raw_str = model_path.as_ref().to_str().unwrap_or("");
         let clean_path = clean_model_path(raw_str);
 
@@ -234,13 +246,13 @@ impl InferEngine {
 
                 if is_lfm2 && clean_path.join("model.safetensors").exists() {
                     let model = InferModel::from_lfm2_dir(&clean_path, max_seq_len)?;
-                    return Ok(Self {
+                    return Self::finalize_device(Self {
                         model,
                         tokenizer,
                         last_prefill_tokens: 0,
                         last_prefill_duration: std::time::Duration::ZERO,
                         cached_tokens: Vec::new(),
-                    });
+                    }, enable_gpu);
                 }
 
                 // Check other weight files
@@ -249,13 +261,13 @@ impl InferEngine {
                     if weight_path.exists() {
                         if let Ok(table) = UnifiedTensorTable::open(&weight_path) {
                             if let Ok(model) = InferModel::from_tensor_table(&table, max_seq_len) {
-                                return Ok(Self {
+                                return Self::finalize_device(Self {
                                     model,
                                     tokenizer,
                                     last_prefill_tokens: 0,
                                     last_prefill_duration: std::time::Duration::ZERO,
                                     cached_tokens: Vec::new(),
-                                });
+                                }, enable_gpu);
                             }
                         }
                     }
@@ -282,24 +294,24 @@ impl InferEngine {
 
                     if is_lfm2 && ext == "safetensors" {
                         let model = InferModel::from_lfm2_dir(parent, max_seq_len)?;
-                        return Ok(Self {
+                        return Self::finalize_device(Self {
                             model,
                             tokenizer,
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
                             cached_tokens: Vec::new(),
-                        });
+                        }, enable_gpu);
                     }
 
                     if let Ok(table) = UnifiedTensorTable::open(&clean_path) {
                         let model = InferModel::from_tensor_table(&table, max_seq_len)?;
-                        return Ok(Self {
+                        return Self::finalize_device(Self {
                             model,
                             tokenizer,
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
                             cached_tokens: Vec::new(),
-                        });
+                        }, enable_gpu);
                     }
                 }
             }
@@ -332,6 +344,15 @@ impl InferEngine {
             last_prefill_duration: std::time::Duration::ZERO,
             cached_tokens: Vec::new(),
         })
+    }
+
+    #[allow(unused_variables)]
+    fn finalize_device(mut engine: Self, enable_gpu: bool) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            engine.model.set_gpu_layers(if enable_gpu { usize::MAX } else { 0 });
+        }
+        Ok(engine)
     }
 
     /// Explicitly clear the KV cache and cached token history.

@@ -153,6 +153,7 @@ pub struct Lfm2Model {
     pub max_seq_len: usize,
     pub sliding_window: usize,
     pub sink_tokens: usize,
+    pub gpu_layers: usize,
 }
 
 #[inline(always)]
@@ -404,6 +405,7 @@ impl Lfm2Model {
             max_seq_len: effective_max_seq_len,
             sliding_window: 0,
             sink_tokens: 4,
+            gpu_layers: n_layers,
         })
     }
 
@@ -413,6 +415,12 @@ impl Lfm2Model {
         }
         self.k_cache.fill(0.0f32);
         self.v_cache.fill(0.0f32);
+    }
+
+    /// Configure how many layers execute dense projections on GPU.
+    /// CPU still owns attention, convolutions, normalization, and sampling.
+    pub fn set_gpu_layers(&mut self, n: usize) {
+        self.gpu_layers = n.min(self.layers.len());
     }
 
     pub fn compact_kv_cache(&mut self, _cur_pos: usize, _sink: usize, _drop: usize) -> usize {
@@ -556,12 +564,17 @@ impl Lfm2Model {
         let n_kv_heads = self.config.n_kv_heads;
         let mmap = &self.sf.mmap;
         let norm_eps = self.config.norm_eps;
-        #[cfg(target_os = "macos")]
-        let (m_eng, m_buf) = (self.metal_engine.as_ref(), self.metal_mmap_buf.as_ref());
-
         // 2. Decoder layers
         for layer_idx in 0..n_layers {
             let layer = self.layers[layer_idx].clone();
+            #[cfg(target_os = "macos")]
+            let (m_eng, m_buf) = if layer_idx < self.gpu_layers {
+                (self.metal_engine.as_ref(), self.metal_mmap_buf.as_ref())
+            } else {
+                (None, None)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let layer_idx = layer_idx;
             match layer {
                 Lfm2LayerWeights::Conv {
                     operator_norm,
@@ -635,7 +648,24 @@ impl Lfm2Model {
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
                     #[cfg(target_os = "macos")]
-                    let used_batched_gate_up = if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
+                    let mlx4_gate_up_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
+                        if let (
+                            LinearTensor::Mlx4 { weight: g_w, scales: g_s, biases: g_b, group_size: g_g },
+                            LinearTensor::Mlx4 { weight: u_w, scales: u_s, biases: u_b, group_size: _u_g },
+                        ) = (&w1, &w3) {
+                            engine.gemv_gate_up_mlx4(
+                                buf, g_w.data_offset, g_w.shape[0], buf, g_s.data_offset, buf, g_b.data_offset,
+                                buf, u_w.data_offset, u_w.shape[0], buf, u_s.data_offset, buf, u_b.data_offset,
+                                &self.x_norm, &mut self.ffn_gate, &mut self.ffn_up,
+                                dim, *g_g, true,
+                            );
+                            true
+                        } else { false }
+                    } else { false };
+                    #[cfg(not(target_os = "macos"))]
+                    let mlx4_gate_up_done = false;
+                    #[cfg(target_os = "macos")]
+                    let used_batched_gate_up = if mlx4_gate_up_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
                         engine.gemv_gate_up_bf16(
                             buf,
                             g_tv.data_offset,
@@ -713,7 +743,26 @@ impl Lfm2Model {
 
                     // Q, K, V projections
                     #[cfg(target_os = "macos")]
-                    let used_batched_qkv = if let (Some(engine), Some(buf), LinearTensor::Bf16(q_tv), LinearTensor::Bf16(k_tv), LinearTensor::Bf16(v_tv)) = (m_eng, m_buf, &q_proj, &k_proj, &v_proj) {
+                    let mlx4_qkv_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
+                        if let (
+                            LinearTensor::Mlx4 { weight: q_w, scales: q_s, biases: q_b, group_size: q_g },
+                            LinearTensor::Mlx4 { weight: k_w, scales: k_s, biases: k_b, group_size: _k_g },
+                            LinearTensor::Mlx4 { weight: v_w, scales: v_s, biases: v_b, group_size: _v_g },
+                        ) = (&q_proj, &k_proj, &v_proj) {
+                            engine.gemv_qkv_mlx4(
+                                buf, q_w.data_offset, q_w.shape[0], buf, q_s.data_offset, buf, q_b.data_offset,
+                                buf, k_w.data_offset, k_w.shape[0], buf, k_s.data_offset, buf, k_b.data_offset,
+                                buf, v_w.data_offset, v_w.shape[0], buf, v_s.data_offset, buf, v_b.data_offset,
+                                &self.x_norm, &mut self.q, &mut self.k, &mut self.v,
+                                dim, *q_g, true,
+                            );
+                            true
+                        } else { false }
+                    } else { false };
+                    #[cfg(not(target_os = "macos"))]
+                    let mlx4_qkv_done = false;
+                    #[cfg(target_os = "macos")]
+                    let used_batched_qkv = if mlx4_qkv_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(q_tv), LinearTensor::Bf16(k_tv), LinearTensor::Bf16(v_tv)) = (m_eng, m_buf, &q_proj, &k_proj, &v_proj) {
                         engine.gemv_qkv_bf16(
                             buf,
                             q_tv.data_offset,
@@ -886,7 +935,24 @@ impl Lfm2Model {
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
                     #[cfg(target_os = "macos")]
-                    let used_batched_gate_up = if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
+                    let mlx4_gate_up_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
+                        if let (
+                            LinearTensor::Mlx4 { weight: g_w, scales: g_s, biases: g_b, group_size: g_g },
+                            LinearTensor::Mlx4 { weight: u_w, scales: u_s, biases: u_b, group_size: _ },
+                        ) = (&w1, &w3) {
+                            engine.gemv_gate_up_mlx4(
+                                buf, g_w.data_offset, g_w.shape[0], buf, g_s.data_offset, buf, g_b.data_offset,
+                                buf, u_w.data_offset, u_w.shape[0], buf, u_s.data_offset, buf, u_b.data_offset,
+                                &self.x_norm, &mut self.ffn_gate, &mut self.ffn_up,
+                                dim, *g_g, true,
+                            );
+                            true
+                        } else { false }
+                    } else { false };
+                    #[cfg(not(target_os = "macos"))]
+                    let mlx4_gate_up_done = false;
+                    #[cfg(target_os = "macos")]
+                    let used_batched_gate_up = if mlx4_gate_up_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
                         engine.gemv_gate_up_bf16(
                             buf,
                             g_tv.data_offset,
@@ -952,6 +1018,13 @@ impl Lfm2Model {
         // 3. Final embedding norm
         let norm_tensor = self.embedding_norm.clone();
         Self::compute_rmsnorm(mmap, norm_eps, &self.x, &norm_tensor, &mut self.x_norm);
+
+        #[cfg(target_os = "macos")]
+        let (m_eng, m_buf) = if self.gpu_layers > 0 {
+            (self.metal_engine.as_ref(), self.metal_mmap_buf.as_ref())
+        } else {
+            (None, None)
+        };
 
         // 4. Logits: tied embedding lm_head = embed_tokens @ x_norm
         Self::compute_matvec(

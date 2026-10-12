@@ -267,6 +267,68 @@ impl MetalEngine {
         }
     }
 
+    pub fn gemv_qkv_mlx4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize, q_rows: usize,
+        q_scales_buf: &MetalBuffer, q_scales_offset: usize,
+        q_biases_buf: &MetalBuffer, q_biases_offset: usize,
+        k_buf: &MetalBuffer, k_offset: usize, k_rows: usize,
+        k_scales_buf: &MetalBuffer, k_scales_offset: usize,
+        k_biases_buf: &MetalBuffer, k_biases_offset: usize,
+        v_buf: &MetalBuffer, v_offset: usize, v_rows: usize,
+        v_scales_buf: &MetalBuffer, v_scales_offset: usize,
+        v_biases_buf: &MetalBuffer, v_biases_offset: usize,
+        x: &[f32],
+        q_out: &mut [f32], k_out: &mut [f32], v_out: &mut [f32],
+        cols: usize, group_size: usize, is_bf16: bool,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_qkv_mlx4(
+                self.ctx,
+                q_buf.handle, q_offset, q_rows,
+                q_scales_buf.handle, q_scales_offset,
+                q_biases_buf.handle, q_biases_offset,
+                k_buf.handle, k_offset, k_rows,
+                k_scales_buf.handle, k_scales_offset,
+                k_biases_buf.handle, k_biases_offset,
+                v_buf.handle, v_offset, v_rows,
+                v_scales_buf.handle, v_scales_offset,
+                v_biases_buf.handle, v_biases_offset,
+                x.as_ptr(),
+                q_out.as_mut_ptr(), k_out.as_mut_ptr(), v_out.as_mut_ptr(),
+                cols, group_size, is_bf16 as i32,
+            );
+        }
+    }
+
+    pub fn gemv_gate_up_mlx4(
+        &self,
+        gate_buf: &MetalBuffer, gate_offset: usize, gate_rows: usize,
+        gate_scales_buf: &MetalBuffer, gate_scales_offset: usize,
+        gate_biases_buf: &MetalBuffer, gate_biases_offset: usize,
+        up_buf: &MetalBuffer, up_offset: usize, up_rows: usize,
+        up_scales_buf: &MetalBuffer, up_scales_offset: usize,
+        up_biases_buf: &MetalBuffer, up_biases_offset: usize,
+        x: &[f32],
+        gate_out: &mut [f32], up_out: &mut [f32],
+        cols: usize, group_size: usize, is_bf16: bool,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_gate_up_mlx4(
+                self.ctx,
+                gate_buf.handle, gate_offset, gate_rows,
+                gate_scales_buf.handle, gate_scales_offset,
+                gate_biases_buf.handle, gate_biases_offset,
+                up_buf.handle, up_offset, up_rows,
+                up_scales_buf.handle, up_scales_offset,
+                up_biases_buf.handle, up_biases_offset,
+                x.as_ptr(),
+                gate_out.as_mut_ptr(), up_out.as_mut_ptr(),
+                cols, group_size, is_bf16 as i32,
+            );
+        }
+    }
+
     pub fn gemv_qkv_multi(
         &self,
         q_buf: &MetalBuffer, q_offset: usize, q_rows: usize,

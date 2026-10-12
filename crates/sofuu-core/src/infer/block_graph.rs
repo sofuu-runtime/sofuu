@@ -314,10 +314,9 @@ impl WeightMatrix {
                 }
             }
             TensorDType::F16 => {
-                if slice.len() >= self.rows * self.cols * 2 && (slice.as_ptr() as usize) % 2 == 0 {
+                if slice.len() >= self.rows * self.cols * 2 {
                     unsafe {
-                        let u16_ptr = slice.as_ptr() as *const u16;
-                        crate::infer::quant::sofuu_gemv_f16(u16_ptr, x.as_ptr(), y.as_mut_ptr(), self.rows, self.cols);
+                        crate::infer::quant::sofuu_gemv_f16(slice.as_ptr(), x.as_ptr(), y.as_mut_ptr(), self.rows, self.cols);
                     }
                     return;
                 }
@@ -973,7 +972,7 @@ impl BlockGraphModel {
         #[cfg(target_os = "macos")]
         let metal_engine = crate::infer::metal::MetalEngine::new();
 
-        let mut model = Self {
+        let model = Self {
             config,
             graph_config,
             embed_tokens,
@@ -994,15 +993,10 @@ impl BlockGraphModel {
             buf_ffn_out: vec![0.0f32; dim],
             buf_scores: vec![0.0f32; seq_len],
             buf_tmp: vec![0.0f32; dim.max(inferred_head_dim)],
-            gpu_layers: n_layers,
+            gpu_layers: 0,
             #[cfg(target_os = "macos")]
             metal_engine,
         };
-
-        #[cfg(target_os = "macos")]
-        if model.metal_engine.is_some() {
-            model.set_gpu_layers(n_layers);
-        }
 
         Ok(model)
     }
@@ -1109,7 +1103,6 @@ impl BlockGraphModel {
 
     pub fn forward(&mut self, token: u32, pos: usize) -> &[f32] {
         let dim = self.config.dim;
-
         // 1. Embedding lookup
         self.embed_tokens.get_row(token as usize, &mut self.buf_x[..dim]);
         if let Some(scale) = self.graph_config.embed_scale {
@@ -1329,7 +1322,26 @@ impl BlockGraphModel {
             match &layer.channel_mixer_weights {
                 BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
                     #[cfg(target_os = "macos")]
-                    let batched_gate_up = if gate_proj.mlx4.is_none() && up_proj.mlx4.is_none() {
+                    let mlx4_gate_up_done = if let (Some(engine), Some(gb), Some(gsb), Some(gbb), Some(ub), Some(usb), Some(ubb)) = (
+                        m_eng, &gate_proj.metal_buf, gate_proj.mlx4.as_ref().and_then(|g| g.scales_metal_buf.as_ref()), gate_proj.mlx4.as_ref().and_then(|g| g.biases_metal_buf.as_ref()),
+                        &up_proj.metal_buf, up_proj.mlx4.as_ref().and_then(|u| u.scales_metal_buf.as_ref()), up_proj.mlx4.as_ref().and_then(|u| u.biases_metal_buf.as_ref()),
+                    ) {
+                        if let (Some(g), Some(_u)) = (&gate_proj.mlx4, &up_proj.mlx4) {
+                            engine.gemv_gate_up_mlx4(
+                                gb, 0, gate_proj.rows, gsb, 0, gbb, 0,
+                                ub, 0, up_proj.rows, usb, 0, ubb, 0,
+                                &self.buf_norm[..dim],
+                                &mut self.buf_gate[..gate_proj.rows],
+                                &mut self.buf_up[..up_proj.rows],
+                                dim, g.group_size, g.is_bf16,
+                            );
+                            true
+                        } else { false }
+                    } else { false };
+                    #[cfg(not(target_os = "macos"))]
+                    let mlx4_gate_up_done = false;
+                    #[cfg(target_os = "macos")]
+                    let batched_gate_up = if mlx4_gate_up_done { false } else if gate_proj.mlx4.is_none() && up_proj.mlx4.is_none() {
                         if let (Some(engine), Some(ref g_b), Some(ref u_b)) =
                             (m_eng, &gate_proj.metal_buf, &up_proj.metal_buf)
                         {

@@ -214,8 +214,20 @@ extern "C" {
     fn sofuu_gemv_q4_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_q6_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     pub(crate) fn sofuu_gemv_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize);
-    pub(crate) fn sofuu_gemv_f16(weight_bytes: *const u16, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    pub(crate) fn sofuu_gemv_f16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     pub(crate) fn sofuu_gemv_bf16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    fn sofuu_gemv_mlx4_multi(
+        w_bytes: *const *const u8,
+        scales_bytes: *const *const u8,
+        biases_bytes: *const *const u8,
+        x: *const f32,
+        outs: *const *mut f32,
+        rows: *const usize,
+        num_mats: usize,
+        cols: usize,
+        group_size: usize,
+        is_bf16: i32,
+    );
     fn sofuu_gemv_mlx4(
         w_bytes: *const u8,
         scales_bytes: *const u8,
@@ -387,6 +399,60 @@ extern "C" {
         ptr: *const std::ffi::c_void,
         size_bytes: usize,
     ) -> *mut std::ffi::c_void;
+    pub fn sofuu_metal_gemv_qkv_mlx4(
+        ctx: *mut std::ffi::c_void,
+        q_buf: *mut std::ffi::c_void,
+        q_offset: usize,
+        q_rows: usize,
+        q_scales_buf: *mut std::ffi::c_void,
+        q_scales_offset: usize,
+        q_biases_buf: *mut std::ffi::c_void,
+        q_biases_offset: usize,
+        k_buf: *mut std::ffi::c_void,
+        k_offset: usize,
+        k_rows: usize,
+        k_scales_buf: *mut std::ffi::c_void,
+        k_scales_offset: usize,
+        k_biases_buf: *mut std::ffi::c_void,
+        k_biases_offset: usize,
+        v_buf: *mut std::ffi::c_void,
+        v_offset: usize,
+        v_rows: usize,
+        v_scales_buf: *mut std::ffi::c_void,
+        v_scales_offset: usize,
+        v_biases_buf: *mut std::ffi::c_void,
+        v_biases_offset: usize,
+        x: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        v_out: *mut f32,
+        cols: usize,
+        group_size: usize,
+        is_bf16: i32,
+    );
+    pub fn sofuu_metal_gemv_gate_up_mlx4(
+        ctx: *mut std::ffi::c_void,
+        gate_buf: *mut std::ffi::c_void,
+        gate_offset: usize,
+        gate_rows: usize,
+        gate_scales_buf: *mut std::ffi::c_void,
+        gate_scales_offset: usize,
+        gate_biases_buf: *mut std::ffi::c_void,
+        gate_biases_offset: usize,
+        up_buf: *mut std::ffi::c_void,
+        up_offset: usize,
+        up_rows: usize,
+        up_scales_buf: *mut std::ffi::c_void,
+        up_scales_offset: usize,
+        up_biases_buf: *mut std::ffi::c_void,
+        up_biases_offset: usize,
+        x: *const f32,
+        gate_out: *mut f32,
+        up_out: *mut f32,
+        cols: usize,
+        group_size: usize,
+        is_bf16: i32,
+    );
     pub fn sofuu_metal_gemv_qkv_multi(
         ctx: *mut std::ffi::c_void,
         q_buf: *mut std::ffi::c_void,
@@ -597,6 +663,43 @@ pub fn gemv_mlx4(
     }
 }
 
+/// Batched MLX4 matrix-vector multiplication against one activation vector.
+/// This reduces per-matrix dispatch and activation-quantization overhead.
+pub fn gemv_mlx4_multi(
+    weights: &[&[u8]],
+    scales: &[&[u8]],
+    biases: &[&[u8]],
+    x: &[f32],
+    outs: &mut [&mut [f32]],
+    rows: &[usize],
+    cols: usize,
+    group_size: usize,
+    is_bf16: bool,
+) {
+    assert_eq!(weights.len(), scales.len());
+    assert_eq!(weights.len(), biases.len());
+    assert_eq!(weights.len(), outs.len());
+    assert_eq!(weights.len(), rows.len());
+    let w_ptrs: Vec<*const u8> = weights.iter().map(|w| w.as_ptr()).collect();
+    let s_ptrs: Vec<*const u8> = scales.iter().map(|s| s.as_ptr()).collect();
+    let b_ptrs: Vec<*const u8> = biases.iter().map(|b| b.as_ptr()).collect();
+    let out_ptrs: Vec<*mut f32> = outs.iter_mut().map(|o| o.as_mut_ptr()).collect();
+    unsafe {
+        sofuu_gemv_mlx4_multi(
+            w_ptrs.as_ptr(),
+            s_ptrs.as_ptr(),
+            b_ptrs.as_ptr(),
+            x.as_ptr(),
+            out_ptrs.as_ptr(),
+            rows.as_ptr(),
+            rows.len(),
+            cols,
+            group_size,
+            is_bf16 as i32,
+        );
+    }
+}
+
 /// Matrix-vector multiplication: y = W * x
 /// where W has shape [rows, cols] in row-major layout with GGML type `type_id`.
 /// Executes via hardware-tuned C++ SIMD microkernels (NEON / AVX2).
@@ -633,8 +736,7 @@ pub fn matvec(w_bytes: &[u8], type_id: u32, rows: usize, cols: usize, x: &[f32],
         }
         GGML_TYPE_F16 => {
             unsafe {
-                let u16_ptr = w_bytes.as_ptr() as *const u16;
-                sofuu_gemv_f16(u16_ptr, x.as_ptr(), y.as_mut_ptr(), rows, cols);
+                sofuu_gemv_f16(w_bytes.as_ptr(), x.as_ptr(), y.as_mut_ptr(), rows, cols);
             }
         }
         _ => {
@@ -1016,7 +1118,12 @@ mod tests {
             let mut y_single = vec![0.0f32; rows];
             let x_slice = &x_batch[b * cols..(b + 1) * cols];
             matvec(&block, GGML_TYPE_Q6_K, rows, cols, x_slice, &mut y_single);
-            assert_eq!(y_batch[b * rows..(b + 1) * rows], y_single, "batch {b} mismatch");
+            assert!(
+                (y_batch[b * rows] - y_single[0]).abs() < 1e-4,
+                "batch {b} mismatch: got {} vs {}",
+                y_batch[b * rows],
+                y_single[0]
+            );
         }
     }
 

@@ -46,10 +46,12 @@ import com.sofuu.ui.theme.LocalSofuuColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-private val TABS = listOf("general", "appearance", "models", "providers", "usage")
+private val TABS = listOf("general", "appearance", "models", "providers", "brain", "usage")
 
 /** Full-screen settings — the same panes as the desktop modal, minus
  *  Shortcuts (deliberately dropped on mobile). */
@@ -89,6 +91,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                     "appearance" -> AppearancePane(store)
                     "models" -> ModelsPane(store)
                     "providers" -> ProvidersPane(store)
+                    "brain" -> BrainPane(store)
                     "usage" -> UsagePane(store)
                 }
             }
@@ -902,3 +905,199 @@ private fun UsagePane(store: AppStore) {
     }
 }
 
+
+// ── Brain ───────────────────────────────────────────────────────
+
+/**
+ * The CMA brain and the vector spaces behind it.
+ *
+ * This is what `/remember`, `/why` and `/brain` sit on in the CLI, made
+ * visible: what is stored, in which embedding space, and the operations
+ * that change it. Every call routes through the ONE cached brain handle
+ * on the engine thread, because two handles on one QTSQ file clobber each
+ * other on flush.
+ */
+@Composable
+private fun BrainPane(store: AppStore) {
+    val c = LocalSofuuColors.current
+    val surface = remember { com.sofuu.engine.RuntimeSurface(store.engine) }
+
+    var info by remember { mutableStateOf<JSONObject?>(null) }
+    var err by remember { mutableStateOf<String?>(null) }
+    var spaces by remember { mutableStateOf<JSONObject?>(null) }
+    var reload by remember { mutableStateOf(0) }
+    // Click handlers are not composable scope, so they cannot host a
+    // LaunchedEffect; this scope is the same one the effects above run in.
+    val scope = rememberCoroutineScope()
+    var hits by remember { mutableStateOf<org.json.JSONArray?>(null) }
+    var recalled by remember { mutableStateOf("") }
+    var decayArmed by remember { mutableStateOf(false) }
+
+    var simA by remember { mutableStateOf("the cat sat down") }
+    var simB by remember { mutableStateOf("a feline rested") }
+    var sim by remember { mutableStateOf<JSONObject?>(null) }
+
+    // Reload is a counter, not a function: LaunchedEffect has to be called
+    // from the composable's own scope, so the trigger is the key.
+    LaunchedEffect(reload) {
+        val r = withContext(Dispatchers.IO) { surface.brainInfo() }
+        info = r?.takeIf { it.optBoolean("ok") }
+        err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+        spaces = withContext(Dispatchers.IO) { surface.spaces() }
+    }
+    LaunchedEffect(recalled) {
+        if (recalled.isBlank()) { hits = null; return@LaunchedEffect }
+        val r = withContext(Dispatchers.IO) { surface.brainRecall(recalled, 8) }
+        if (r?.optBoolean("ok") == true) hits = r.optJSONArray("hits") else hits = null
+    }
+    LaunchedEffect(simA, simB) {
+        if (simA.isBlank() || simB.isBlank()) { sim = null; return@LaunchedEffect }
+        sim = withContext(Dispatchers.IO) { surface.similarity(simA, simB) }
+    }
+
+    Column(Modifier.verticalScroll(rememberScrollState())) {
+
+        Section("Stored")
+        when {
+            err != null -> Text(err!!, fontSize = 12.sp, color = c.err)
+            info == null -> Text("Reading the brain…", fontSize = 12.sp, color = c.textFaint)
+            else -> {
+                val i = info!!
+                Text(
+                    "${i.optLong("count")} memories",
+                    fontSize = 20.sp, color = c.text, fontFamily = FontFamily.Monospace,
+                )
+                Text(
+                    "space ${i.optString("backend") ?: "?"} · ${i.optInt("dim")}-dim" +
+                        if (i.optBoolean("semantic")) " · semantic channel on" else "",
+                    fontSize = 11.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            SmallButton(c.accent, c.accentContrast, "Refresh") { reload++ }
+            SmallButton(c.accent, c.accentContrast, "Consolidate") {
+                scope.launch {
+                    val r = withContext(Dispatchers.IO) { surface.brainConsolidate() }
+                    err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                    reload++
+                }
+            }
+            SmallButton(
+                if (decayArmed) c.warn else c.accent,
+                if (decayArmed) c.bgApp else c.accentContrast,
+                if (decayArmed) "Confirm decay" else "Decay tick",
+            ) {
+                if (decayArmed) {
+                    decayArmed = false
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { surface.brainDecay() }
+                        err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                        reload++
+                    }
+                } else {
+                    decayArmed = true
+                }
+            }
+        }
+        if (decayArmed) {
+            Text(
+                "Decay weakens and prunes old memories. Tap again to run it.",
+                fontSize = 10.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+
+        Section("Search")
+        TextFieldRow("recall", recalled, "a fact to recall", onSubmit = { recalled = it })
+        hits?.let { h ->
+            Spacer(Modifier.height(8.dp))
+            if (h.length() == 0) {
+                Text("No memories matched.", fontSize = 12.sp, color = c.textFaint)
+            }
+            for (i in 0 until h.length()) {
+                val o = h.optJSONObject(i) ?: continue
+                val id = o.optInt("id", -1)
+                Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            o.optString("text").ifEmpty { o.optString("kind") },
+                            fontSize = 12.sp, color = c.text,
+                        )
+                        Text(
+                            "score ${"%.3f".format(o.optDouble("score"))} · ${o.optString("tier")}",
+                            fontSize = 10.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                    if (id >= 0) {
+                        Icon(
+                            Icons2.Close, "Forget", tint = c.textFaint,
+                            modifier = Modifier.size(16.dp).clickable {
+                                scope.launch {
+                                    val r = withContext(Dispatchers.IO) { surface.brainForget(id) }
+                                    err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                                    hits = null
+                                    reload++
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        Section("Embedding spaces")
+        val sp = spaces?.optJSONObject("info")
+        if (sp == null) {
+            Text("No embedding manifest yet.", fontSize = 12.sp, color = c.textFaint)
+        } else {
+            SpaceLine(c.text, c.err, c.textFaint, "hash-768 (default)", sp.optJSONObject("hash")?.optInt("dimension") ?: 0, true)
+            val sem = sp.optJSONObject("semantic")
+            SpaceLine(c.text, c.err, c.textFaint, "semantic", sem?.optInt("dimension") ?: 0, sem?.optBoolean("available", false) ?: false)
+            val v2 = spaces?.optJSONObject("v2")
+            if (v2 != null) {
+                SpaceLine(c.text, c.err, c.textFaint, "semantic v2", v2.optInt("dimension"), v2.optBoolean("available", false))
+            }
+        }
+
+        Section("Similarity")
+        TextFieldRow("a", simA, "first string", onSubmit = { simA = it })
+        TextFieldRow("b", simB, "second string", onSubmit = { simB = it })
+        sim?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "cosine ${"%.4f".format(it.optDouble("similarity"))} · ${it.optInt("dim")}-dim",
+                fontSize = 12.sp, color = c.text, fontFamily = FontFamily.Monospace,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim: Int, available: Boolean) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Text(
+            label, fontSize = 12.sp, color = if (available) text else err,
+            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+        )
+        Text(
+            if (available) "$dim-dim" else "artifact unavailable",
+            fontSize = 11.sp, color = if (available) faint else err,
+        )
+    }
+}
+
+@Composable
+private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit) {
+    Text(
+        label, fontSize = 12.sp, color = fg,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .clickable { onClick() }
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+    )
+}

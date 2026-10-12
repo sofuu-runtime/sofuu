@@ -529,6 +529,22 @@ class SofuuEngine(
         }
     }
 
+    /**
+     * Evaluate a JS expression that already evaluates to a JSON object,
+     * without the `{ok,result}` envelope the query channel wraps.
+     *
+     * [RuntimeSurface] uses this because those snippets build their own
+     * `{ok:..., error:...}` object so a failure inside the brain or the
+     * ML gates is reported rather than collapsing to null — which is the
+     * whole difference between "the brain is off" and "the call threw".
+     */
+    fun evalJson(script: String): JSONObject? =
+        try {
+            JSONObject(bridge?.eval(script))
+        } catch (e: Throwable) {
+            null
+        }
+
     companion object {
         private val BOOTSTRAP_JS = """
             (function(){
@@ -550,6 +566,10 @@ class SofuuEngine(
 
         /** JSON-encode a string as a JS string literal (JSON is a subset). */
         fun jsonString(s: String): String = JSONObject.quote(s)
+
+        /** Public alias — JS snippets built by [RuntimeSurface] embed
+         *  user-supplied strings and need the same escaping. */
+        @JvmStatic fun quote(s: String): String = JSONObject.quote(s)
 
         // ── models_url / profile detection (ported from commands.rs) ──
 

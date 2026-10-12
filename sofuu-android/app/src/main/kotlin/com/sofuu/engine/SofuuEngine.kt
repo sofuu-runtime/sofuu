@@ -37,10 +37,20 @@ import java.util.concurrent.atomic.AtomicBoolean
 class SofuuEngine(
     val homeDir: String,
     val projectDir: String,
+    /** Needed to build the native host tools ([DeviceTools]); they need a
+     *  Context for the vibrator, battery and share sheet. */
+    private val appContext: android.content.Context,
 ) {
     /** Streaming/agent events + lifecycle events for the UI. */
     private val _events = MutableSharedFlow<EngineEvent>(replay = 0, extraBufferCapacity = 512)
     val events: SharedFlow<EngineEvent> = _events
+
+    /**
+     * Native tools registered on the engine thread at boot — the names the
+     * agent can now call that JS alone could not. Surfaced so Settings can
+     * show what the phone adds over a terminal.
+     */
+    val hostTools: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf<String>())
 
     private val running = AtomicBoolean(false)
     private val ready = AtomicBoolean(false)
@@ -102,6 +112,21 @@ class SofuuEngine(
                 log("boot: bootstrap…")
                 val boot = rt.eval(BOOTSTRAP_JS)
                 log("boot: bootstrap=$boot")
+                // Host tools BEFORE chat.init: the runtime publishes each
+                // one into both __sofuu_host_tools (resolved when a turn
+                // runs) and sofuu.tools.TOOLS (resolved when an agent is
+                // defined), and registering after init would leave the
+                // first turn's agent without them.
+                val registered = try {
+                    DeviceTools(appContext).registerAll(rt)
+                } catch (e: Throwable) {
+                    log("host tools failed: ${e.message ?: e.toString()}")
+                    emptyList<String>()
+                }
+                hostTools.clear()
+                hostTools.addAll(registered)
+                log("boot: host tools = $registered")
+
                 val init = JSONObject()
                     .put("host", "android")
                     .put("project", projectDir)

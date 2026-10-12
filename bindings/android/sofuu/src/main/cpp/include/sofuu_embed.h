@@ -76,11 +76,21 @@ void sofuu_embed_set_log_cb(sofuu_log_cb cb, void *opaque);
  *   { "embedded": true,            // hosted-library mode (default true)
  *     "config_root": "/path",      // replaces $HOME/.sofuu derivations
  *     "enable_signals": false,     // install signal handlers (default off)
- *     "qtsq": true,                // QTSQ brain/KV persistence (build-gated)
  *     "brain_path": "/path.qtsq",  // explicit brain file
  *     "api_keys": { "openai": "…" },
+ *     "provider": "openai",        // request DEFAULT, used only when a
+ *     "model": "gpt-4o-mini",      //   call omits it (per-call wins)
+ *     "base_url": "http://host/v1",//  e.g. pin to a local LLM server
  *     "agents": [ { "name":"researcher", "system":"…", "provider":"…",
  *                   "model":"…", "tools":[…], "budget":{…} } ] }
+ * provider/model/base_url exist because an embedded host has no interactive
+ * `/model` picker: set the endpoint once here instead of on every call.
+ * They are read only from the creating runtime's settings, so one runtime's
+ * defaults never retarget another. The CLI sets none, so chat's
+ * "no model configured" guidance is unchanged.
+ *
+ * NOTE: there is no "qtsq" config key. Whether the encrypted-brain codec is
+ * present is a BUILD-time property of the library, not a runtime toggle.
  * In embedded mode process.exit(N) throws a catchable ExitError with an
  * `exitCode` property instead of terminating the host process, and the
  * config is visible to JS as globalThis.__sofuu_embed_config.
@@ -105,15 +115,28 @@ void sofuu_rt_free(SofuuRuntime *rt);
 int sofuu_rt_call(SofuuRuntime *rt, const char *method,
                   const char *args_json, char **out_json);
 
-/* Streaming / cancellable variant (agent.run, ai.stream, …).
+/* Streaming / cancellable variant (agent.run, ai.stream, ai.streamLocal).
+ *
+ * `args_json` follows the SAME contract as sofuu_rt_call: a JSON object is
+ * passed as one options argument, a JSON array is spread as positional
+ * arguments, and NULL/"" means none. The array form is what reaches
+ * positional methods — `ai.streamLocal` takes
+ * (modelPath, prompt, options?) — so a host streams a local model with
+ *   ["/path/to/model.gguf", "hello", {"maxTokens": 128}]
+ * and a local SafeTensors/PyTorch/NumPy model directory the same way (the
+ * path alone routes in-process; no provider hint is needed).
  *
  * Two shapes are supported, and one driver handles both:
  *
  *  1. Methods taking an `onStep` option (agent.run) forward each step
  *     event to the host. args_json should be
  *     {"target":"<name>","task":"…",…opts}.
- *  2. Methods returning an async iterable (ai.stream) are drained: each
- *     chunk is forwarded as {"kind":"delta", …}.
+ *  2. Methods returning an async iterable (ai.stream, ai.streamLocal) are
+ *     drained: each chunk is forwarded as {"kind":"delta", …}.
+ *
+ * In BOTH forms the driver injects `onStep` and the cancel token into the
+ * options object — for the array form that is the trailing object, and one is
+ * appended when the caller passed none — so sofuu_rt_cancel works either way.
  *
  * The stream ALWAYS ends with exactly one terminal event
  * {"kind":"done", …}:
@@ -136,6 +159,54 @@ int sofuu_rt_call_stream(SofuuRuntime *rt, const char *method,
  * it once per chunk), and agent.cancel(id) is nudged when present.
  * Returns SOFUU_OK if the cancel ID was recognized, -1 if not found. */
 int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
+
+/* ── Host-native tools (PLAN-EMBED-SDK E2) ─────────────────────── */
+/* Register a native host function so an in-app agent can call it as a tool.
+ *
+ * `name` is what the model sees; `description` and `parameters_json` (a JSON
+ * Schema object, NULL/"" for {"type":"object","properties":{}}) are how the
+ * model decides to call it. `cb` runs ON THE RUNTIME'S THREAD (the same
+ * thread that drives sofuu_rt_call_stream), with the arguments the model
+ * produced as a JSON object string.
+ *
+ * The callback answers in one of two ways:
+ *   - return a NUL-terminated JSON string → synchronous result. The string is
+ *     host-owned and only needs to live for the duration of the call; the
+ *     library copies it. A JSON string result reaches the model as its text,
+ *     any other JSON value as JSON text.
+ *   - return NULL → the host has taken the call and will complete it later
+ *     with sofuu_rt_host_tool_resolve(rt, call_id, …). Use this when the work
+ *     cannot finish inline (camera, location, permissions, I/O).
+ *
+ * The async path is bounded by the agent's tool timeout (30 s per tool by
+ * default, `toolTimeoutMs` per agent), which is also what keeps the event
+ * loop alive while a call is outstanding: a host that never answers gets a
+ * tool-timeout error rather than a hung turn.
+ *
+ * The tool is visible to every agent of this runtime, including agents
+ * supplied through the `agents` config key — those are defined during
+ * sofuu_rt_new, before a host can register anything, so registration must be
+ * resolvable after the fact (it is). Registering a name twice replaces the
+ * earlier registration. Tools are scoped to the runtime's thread, per the
+ * one-runtime-per-thread rule above. Returns SOFUU_OK or a SOFUU_ERR_*. */
+typedef const char *(*sofuu_host_tool_fn)(const char *args_json,
+                                          uint64_t call_id, void *opaque);
+
+int sofuu_rt_register_host_tool(SofuuRuntime *rt, const char *name,
+                                const char *description,
+                                const char *parameters_json,
+                                sofuu_host_tool_fn cb, void *opaque);
+
+/* Complete a host tool call whose callback returned NULL.
+ *
+ * `result_json` is a JSON value the agent sees as the tool result; to fail
+ * the call instead, pass a message in `error` (result_json may be NULL then).
+ * Safe to call from ANY thread — the completion is delivered to the runtime's
+ * thread through its event loop — but the runtime must outlive the call.
+ * Returns SOFUU_OK, or -1 when the id is unknown (never pending, already
+ * settled, or a zero id). */
+int sofuu_rt_host_tool_resolve(SofuuRuntime *rt, uint64_t call_id,
+                               const char *result_json, const char *error);
 
 /* ── Eval escape hatch ─────────────────────────────────────────── */
 /* Evaluate arbitrary JS (full power when the funnel isn't enough). The

@@ -44,11 +44,42 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
     fun voiceTranscribe(audioBase64: String, optsJson: String? = null): String? =
         nativeVoiceTranscribe(rtPtr, audioBase64, optsJson)
 
-    /** Synthesize speech. Resolves {audio, format}; over JSON transport the
-     *  audio bytes travel as an indexed-byte object the host reassembles.
-     *  Engine thread only. */
+/** Synthesize speech. Resolves {audio, format}; over JSON transport the
+         *  audio bytes travel as an indexed-byte object the host reassembles.
+         *  Engine thread only. */
     fun voiceSpeak(text: String, optsJson: String? = null): String? =
-        nativeVoiceSpeak(rtPtr, text, optsJson)
+            nativeVoiceSpeak(rtPtr, text, optsJson)
+
+    // ── Host tools ───────────────────────────────────────────────
+
+    /**
+     * Expose a native capability to the agent as a tool.
+     *
+     * [parametersJson] is the JSON Schema the model sees, so an accurate
+     * one is the difference between the model using the tool correctly and
+     * guessing. It must be a JSON **object** — the runtime rejects
+     * anything else as an argument error rather than surfacing it later as
+     * a confusing model failure.
+     *
+     * Engine thread only, and only while this bridge is alive. Re-using a
+     * name replaces the earlier registration.
+     */
+    fun registerHostTool(
+        name: String,
+        description: String,
+        parametersJson: String,
+        tool: HostTool,
+    ): Boolean = nativeRegisterHostTool(rtPtr, name, description, parametersJson, tool)
+
+    /**
+     * Settle a call whose [HostTool.invoke] returned null.
+     *
+     * Safe from ANY thread — the completion is marshalled onto the runtime
+     * thread through its event loop. Pass a message in [error] to fail the
+     * call instead; [resultJson] must itself be valid JSON.
+     */
+    fun resolveHostTool(callId: Long, resultJson: String? = null, error: String? = null): Boolean =
+            nativeHostToolResolve(rtPtr, callId, resultJson, error)
 
     /** Called once from [close]; never call native methods after. */
     fun close() = nativeRtFree(rtPtr)
@@ -56,6 +87,23 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
     /** Host for streaming events (runs on the engine thread). */
     interface StreamListener {
         fun onStreamEvent(eventJson: String)
+    }
+
+    /**
+     * A native capability handed to the agent as a tool.
+     *
+     * This is the whole reason `sofuu_rt_register_host_tool` exists: the
+     * QuickJS sandbox inside the runtime cannot reach the Android SDK, so
+     * anything platform-specific — the share sheet, a vibration, the
+     * device's own specs — has to be answered by the host.
+     *
+     * Runs on the ENGINE thread, inside the agent's tool round-trip, so
+     * keep it fast and never block on it. Anything that needs a result
+     * later returns null and calls [resolveHostTool] instead.
+     */
+    interface HostTool {
+        /** @return a JSON value as a string, or null to settle asynchronously. */
+        fun invoke(argsJson: String, callId: Long): String?
     }
 
     companion object {
@@ -132,5 +180,13 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
         @JvmStatic private external fun nativeEmbedImage(bytes: ByteArray): FloatArray?
         @JvmStatic private external fun nativeVoiceTranscribe(rt: Long, audioBase64: String, opts: String?): String?
         @JvmStatic private external fun nativeVoiceSpeak(rt: Long, text: String, opts: String?): String?
+
+        @JvmStatic private external fun nativeRegisterHostTool(
+            rt: Long, name: String, description: String, paramsJson: String, listener: HostTool,
+        ): Boolean
+
+        @JvmStatic private external fun nativeHostToolResolve(
+            rt: Long, callId: Long, resultJson: String?, error: String?,
+        ): Boolean
     }
 }

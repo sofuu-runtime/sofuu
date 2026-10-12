@@ -18,6 +18,22 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
+# Expand "all" to the real ABI list ONCE, up front. The dependency scripts
+# below source ndk_env.sh with each argument and that rejects anything it
+# does not recognise — so passing the literal "all" straight through (which
+# is what `make mobile-engine` does) aborts with "unknown ABI: all" before
+# a single library is configured.
+ABIS=()
+for abi in "$@"; do
+    if [ "$abi" = "all" ]; then
+        ABIS+=(arm64 x86_64)
+    else
+        ABIS+=("$abi")
+    fi
+done
+[ ${#ABIS[@]} -eq 0 ] && ABIS=(arm64 x86_64)
+set -- "${ABIS[@]}"
+
 bash "$REPO_ROOT/scripts/mobile/build_libuv_android.sh" "$@"
 bash "$REPO_ROOT/scripts/mobile/build_openssl_android.sh" "$@"
 bash "$REPO_ROOT/scripts/mobile/build_libcurl_android.sh" "$@"
@@ -31,10 +47,6 @@ case "$CARGO_PROFILE" in
     release) PROFILE_FLAG="--release"; CARGO_PROFILE_DIR="release" ;;
     *) echo "✗ unknown profile: $CARGO_PROFILE"; exit 1 ;;
 esac
-
-ABIS=()
-for abi in "$@"; do [ "$abi" = "all" ] || ABIS+=("$abi"); done
-[ ${#ABIS[@]} -eq 0 ] && ABIS=(arm64 x86_64)
 
 for abi in "${ABIS[@]}"; do
     # shellcheck disable=SC1091

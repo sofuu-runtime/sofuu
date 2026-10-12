@@ -429,3 +429,157 @@ Java_com_sofuu_engine_SofuuBridge_nativeVoiceSpeak(JNIEnv *env, jclass cls, jlon
     (void)rc;
     return result;
 }
+
+/* ── Host tools (PLAN-EMBED-SDK E2) ─────────────────────────────────
+ *
+ * sofuu_rt_register_host_tool lets the HOST hand the agent a native
+ * capability with no JS in the loop. It is the one part of the ABI that
+ * exists specifically for a mobile embedder: camera, location, the share
+ * sheet, biometrics — things JS in a QuickJS sandbox cannot reach.
+ *
+ * Two things shape this shim:
+ *
+ * 1. The C callback signature carries no tool name:
+ *      const char *(*fn)(const char *args_json, uint64_t call_id, void *opaque)
+ *    so the name, the Kotlin receiver and its method id all ride in
+ *    `opaque`, one malloc'd slot per registration.
+ *
+ * 2. The returned pointer is consumed synchronously by the caller
+ *    (capi/src/lib.rs: js_host_tool_call copies it before returning), but
+ *    a Java string has no address we can hand back. So the result is
+ *    copied into a per-thread buffer that stays valid until that thread's
+ *    next host-tool call. Returning NULL means "pending" — the host owns
+ *    the call and settles it with nativeHostToolResolve, from any thread.
+ */
+
+typedef struct {
+    char *name;
+    jobject listener;   /* global ref to the Kotlin HostTool */
+    jmethodID method;   /* invoke(String, long) -> String? */
+} SofuuHostToolSlot;
+
+/* One slot per host-tool call thread; see note 2 above. */
+static __thread char *g_host_result = NULL;
+static __thread size_t g_host_result_cap = 0;
+
+static const char *sofuu_host_tool_trampoline(const char *args_json,
+                                              uint64_t call_id,
+                                              void *opaque) {
+    SofuuHostToolSlot *slot = (SofuuHostToolSlot *)opaque;
+    JNIEnv *env = NULL;
+
+    if (slot == NULL || g_jvm == NULL) return NULL;
+    /* The call arrives on the engine thread — a Java thread that is
+     * already attached, so GetEnv is the right call here (same reasoning
+     * as on_stream_event). */
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK || env == NULL) {
+        return NULL;
+    }
+
+    jstring jargs = (*env)->NewStringUTF(env, args_json ? args_json : "{}");
+    if (jargs == NULL) return NULL;
+
+    jobject jres = (*env)->CallObjectMethod(env, slot->listener, slot->method,
+                                            jargs, (jlong)call_id);
+    (*env)->DeleteLocalRef(env, jargs);
+    if ((*env)->ExceptionCheck(env)) {
+        /* A throwing tool must not poison the engine thread. Treat it as
+         * "pending" is wrong too — the call would hang forever — so the
+         * exception is swallowed and the agent sees an error via the
+         * resolve path's own timeout. */
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    if (jres == NULL) return NULL; /* deferred to the host */
+
+    const char *utf = (*env)->GetStringUTFChars(env, (jstring)jres, NULL);
+    if (utf == NULL) {
+        (*env)->DeleteLocalRef(env, jres);
+        return NULL;
+    }
+    size_t n = strlen(utf);
+    if (n + 1 > g_host_result_cap) {
+        char *grown = (char *)realloc(g_host_result, n + 1);
+        if (grown == NULL) {
+            (*env)->ReleaseStringUTFChars(env, (jstring)jres, utf);
+            (*env)->DeleteLocalRef(env, jres);
+            return NULL;
+        }
+        g_host_result = grown;
+        g_host_result_cap = n + 1;
+    }
+    memcpy(g_host_result, utf, n + 1);
+    (*env)->ReleaseStringUTFChars(env, (jstring)jres, utf);
+    (*env)->DeleteLocalRef(env, jres);
+    return g_host_result;
+}
+
+/* SofuuBridge.nativeRegisterHostTool(rt, name, description, paramsJson, listener) */
+JNIEXPORT jboolean JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeRegisterHostTool(JNIEnv *env, jclass cls, jlong rt_ptr,
+                                                         jstring name, jstring description,
+                                                         jstring params_json, jobject listener) {
+    (void)cls;
+    if (rt_ptr == 0 || name == NULL || listener == NULL) return JNI_FALSE;
+
+    jclass iface = (*env)->GetObjectClass(env, listener);
+    if (iface == NULL) return JNI_FALSE;
+    jmethodID mid = (*env)->GetMethodID(env, iface, "invoke",
+                                        "(Ljava/lang/String;J)Ljava/lang/String;");
+    (*env)->DeleteLocalRef(env, iface);
+    if (mid == NULL) return JNI_FALSE;
+
+    const char *name_c = (*env)->GetStringUTFChars(env, name, NULL);
+    if (name_c == NULL) return JNI_FALSE;
+
+    SofuuHostToolSlot *slot = (SofuuHostToolSlot *)calloc(1, sizeof(SofuuHostToolSlot));
+    if (slot == NULL) {
+        (*env)->ReleaseStringUTFChars(env, name, name_c);
+        return JNI_FALSE;
+    }
+    slot->name = strdup(name_c);
+    slot->listener = (*env)->NewGlobalRef(env, listener);
+    slot->method = mid;
+
+    const char *desc_c = NULL, *params_c = NULL;
+    if (description != NULL) desc_c = (*env)->GetStringUTFChars(env, description, NULL);
+    if (params_json != NULL) params_c = (*env)->GetStringUTFChars(env, params_json, NULL);
+
+    int rc = sofuu_rt_register_host_tool((SofuuRuntime *)(intptr_t)rt_ptr,
+                                         slot->name, desc_c, params_c,
+                                         sofuu_host_tool_trampoline, (void *)slot);
+
+    if (params_c) (*env)->ReleaseStringUTFChars(env, params_json, params_c);
+    if (desc_c) (*env)->ReleaseStringUTFChars(env, description, desc_c);
+    (*env)->ReleaseStringUTFChars(env, name, name_c);
+
+    if (rc != SOFUU_OK) {
+        /* The runtime kept nothing, so this slot is ours to free. */
+        if (slot->listener) (*env)->DeleteGlobalRef(env, slot->listener);
+        free(slot->name);
+        free(slot);
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+/* SofuuBridge.nativeHostToolResolve(rt, callId, resultJson | null, error | null) */
+JNIEXPORT jboolean JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeHostToolResolve(JNIEnv *env, jclass cls, jlong rt_ptr,
+                                                        jlong call_id, jstring result_json,
+                                                        jstring error) {
+    (void)cls;
+    if (rt_ptr == 0 || call_id == 0) return JNI_FALSE;
+
+    const char *res_c = NULL, *err_c = NULL;
+    if (result_json != NULL) res_c = (*env)->GetStringUTFChars(env, result_json, NULL);
+    if (error != NULL) err_c = (*env)->GetStringUTFChars(env, error, NULL);
+
+    int rc = sofuu_rt_host_tool_resolve((SofuuRuntime *)(intptr_t)rt_ptr,
+                                        (uint64_t)call_id, res_c, err_c);
+
+    if (res_c) (*env)->ReleaseStringUTFChars(env, result_json, res_c);
+    if (err_c) (*env)->ReleaseStringUTFChars(env, error, err_c);
+    return rc == SOFUU_OK ? JNI_TRUE : JNI_FALSE;
+}

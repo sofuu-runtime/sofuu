@@ -104,6 +104,7 @@ class AppStore(app: Application) : AndroidViewModel(app) {
     val engine: SofuuEngine = SofuuEngine(
         homeDir = app.filesDir.absolutePath,
         projectDir = (configs.projectDir() ?: File(app.filesDir, "workspace").absolutePath),
+        appContext = app,
     )
 
     var state by mutableStateOf(

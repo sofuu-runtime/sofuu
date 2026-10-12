@@ -124,10 +124,7 @@ sofuu-desktop/src-tauri/icons/android/
 sofuu-desktop/src-tauri/icons/Square*.png
 sofuu-desktop/src-tauri/icons/StoreLogo.png
 
-# ── Local-only working docs (kept on this Mac, out of the repo) ──
-# docs/, bench/ and benchmarks/ were removed from git but live on disk
-# for day-to-day reference. Root-anchored so subdirs like
-# sofuu-ios/docs/ are unaffected.
-/docs/
+# ── Local-only working benchmarks (kept on this Mac, out of the repo) ──
+# bench/ and benchmarks/ live on disk for day-to-day reference.
 /bench/
 /benchmarks/

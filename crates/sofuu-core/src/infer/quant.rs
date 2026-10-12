@@ -772,8 +772,8 @@ mod tests {
         x[0] = 2.0;
         let mut y = vec![0.0f32; 1];
         matvec(&block, GGML_TYPE_Q4_K, 1, 256, &x, &mut y);
-        // y[0] should be dst[0] * x[0] = 5.0 * 2.0 = 10.0
-        assert_eq!(y[0], 10.0);
+        // y[0] should be dst[0] * x[0] = 5.0 * 2.0 = 10.0 (within quantization error)
+        assert!((y[0] - 10.0).abs() < 1e-3, "expected 10.0, got {}", y[0]);
     }
 
     #[test]

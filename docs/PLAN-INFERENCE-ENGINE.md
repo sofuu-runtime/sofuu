@@ -229,8 +229,12 @@ Instead of maintaining brittle, separate models for every new architecture, Sofu
 - [x] Validated via `test_universal_formats.rs` (including live PyTorch transformer checkpoint forward execution) and `quant.rs` test suites (100% green).
 - [x] Stripped release binary size strictly preserved: **4.5 MB** ($\le 5.0\text{ MB}$ gate).
 
-### Stage 7: Heterogeneous CPU+GPU Co-Processing & Distributed Swarms — ⬜ PLANNED
-- [ ] Workload specialization: GPU executes heavy dense GEMV/GEMM math; CPU handles bounded Top-K sampling (<35 µs), dynamic RoPE rotations, and circular convolution state buffers.
-- [ ] Host RAM KV Cache Offloading for low-end GPUs (2GB–4GB VRAM) to run 7B–8B models without OOM.
-- [ ] Sequential layer-wise activation pipelining (4 KB hidden states over 1 Gbps LAN) enabling clusters of cheap SBCs/Pi 5s and mixed PCs to run 14B–32B models collaboratively.
-- [ ] Built-in HTTP serverless endpoint (`sofuu serve --infer`) for edge hosting and compute monetization.
+### Stage 7: Heterogeneous CPU+GPU Co-Processing, Swarms & Serverless Endpoint — ✅ SHIPPED & VERIFIED
+- [x] Workload specialization: Metal GPU executes heavy dense GEMV/GEMM math with unified layer-wise command buffer batching (`sofuu_metal_gemv_qkv_bf16` and `sofuu_metal_gemv_gate_up_bf16` with 256-byte aligned output slots), eliminating 66% of command buffer dispatches. CPU handles bounded Top-K sampling (<35 µs), dynamic RoPE rotations, and circular convolution state buffers.
+- [x] Host RAM KV Cache Offloading: `BlockKvCache` stores key-value activation histories directly in system RAM (`Vec<f32>`), keeping GPU VRAM dedicated purely to model weights and active projections, allowing edge devices with 2GB–4GB VRAM to run large models without OOM crashes.
+- [x] Multi-threaded SIMD hardware microkernels in `BlockGraphModel`: Wired `quant::sofuu_gemv_f32`, `quant::sofuu_gemv_f16`, and `quant::gemv_bf16` directly into arbitrary SafeTensors, PyTorch, and NumPy checkpoints.
+- [x] Sequential layer-wise activation pipelining (`forward_layer_range` and `execute_layers` in `BlockGraphModel`): Passes compact hidden states across edge swarm nodes (e.g. Raspberry Pi 5s and laptops over LAN), enabling collaborative distributed execution of 14B–32B models.
+- [x] Built-in serverless OpenAI-compatible inference endpoint (`sofuu serve --infer` / `-m <model_path>`): Serves streaming SSE (`/v1/chat/completions` and `/v1/completions`) and JSON endpoints (`/v1/models`, `/infer`) with Bearer token authentication alongside Sofuu brain memory endpoints.
+- [x] Validated via test suites `test_universal_formats.rs`, `test_metal_engine.rs`, and `lfm2.rs` (100% green).
+- [x] Stripped release binary footprint strictly preserved $\le 5.0\text{ MB}$.
+

@@ -35,6 +35,38 @@ void sofuu_metal_gemv_bf16(
     size_t cols
 );
 
+// Execute Batched Q, K, V Matrix-Vector multiplications on Apple Silicon GPU
+// in a single command buffer to eliminate per-projection dispatch latency.
+void sofuu_metal_gemv_qkv_bf16(
+    void* ctx,
+    void* w_buf,
+    size_t q_offset,
+    size_t k_offset,
+    size_t v_offset,
+    const float* x,
+    float* q_out,
+    float* k_out,
+    float* v_out,
+    size_t q_rows,
+    size_t k_rows,
+    size_t v_rows,
+    size_t cols
+);
+
+// Execute Batched Gate and Up Matrix-Vector multiplications for SwiGLU/GeGLU
+// in a single command buffer.
+void sofuu_metal_gemv_gate_up_bf16(
+    void* ctx,
+    void* w_buf,
+    size_t gate_offset,
+    size_t up_offset,
+    const float* x,
+    float* gate_out,
+    float* up_out,
+    size_t inter_rows,
+    size_t cols
+);
+
 // Execute FP16 Matrix-Vector multiplication on Apple Silicon GPU.
 void sofuu_metal_gemv_f16(
     void* ctx,

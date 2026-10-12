@@ -724,6 +724,7 @@ fn cmd_outputs(args: &[String]) -> i32 {
 /// GET /recall, POST /share. Auth: Bearer token (generated or supplied).
 fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     let mut brain_path = String::new();
+    let mut model_path = String::new();
     let mut port: u16 = 7707;
     let mut host = "127.0.0.1".to_string();
     // Prefer env over argv: --token is visible via `ps`. SOFUU_SERVE_TOKEN
@@ -749,6 +750,19 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
                     eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
                     return 1;
                 }
+            },
+            "--model" | "-m" => match value_arg(args, i) {
+                Some(v) => {
+                    model_path = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            "--infer" => {
+                i += 1;
             },
             "--port" | "-p" => match value_arg(args, i) {
                 Some(v) => {
@@ -864,9 +878,12 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
 
     eprintln!("\x1b[1;36m  ┌─────────────────────────────────┐");
-    eprintln!("  │   ⚡ Sofuu Brain Server          │");
+    eprintln!("  │   ⚡ Sofuu Edge Server          │");
     eprintln!("  │   v{:<31}│", VERSION);
     eprintln!("  └─────────────────────────────────┘\x1b[0m");
+    if !model_path.is_empty() {
+        eprintln!("\x1b[2m  model: {}\x1b[0m", model_path);
+    }
     eprintln!("\x1b[2m  brain: {}\x1b[0m", brain_path);
     eprintln!("\x1b[2m  listen: http://{}:{}\x1b[0m", host, port);
     // Token is a bearer secret: never print it to stderr (scrollback/CI
@@ -878,12 +895,17 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
     eprintln!("\x1b[2m  endpoints:\x1b[0m");
     eprintln!("\x1b[2m    GET  /health\x1b[0m");
-    eprintln!("\x1b[2m    POST /remember  {{text, role?, tier?}}\x1b[0m");
+    eprintln!("\x1b[2m    GET  /v1/models\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/chat/completions  (OpenAI SSE stream & json)\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/completions       (text completions)\x1b[0m");
+    eprintln!("\x1b[2m    POST /infer                (direct local infer)\x1b[0m");
+    eprintln!("\x1b[2m    POST /remember             {{text, role?, tier?}}\x1b[0m");
     eprintln!("\x1b[2m    GET  /recall?q=…&k=…\x1b[0m");
-    eprintln!("\x1b[2m    POST /share     (export card)\x1b[0m");
+    eprintln!("\x1b[2m    POST /share                (export card)\x1b[0m");
     eprintln!();
 
     let brain_path_js = serde_json::to_string(&brain_path).unwrap_or_else(|_| "\"\"".into());
+    let model_path_js = serde_json::to_string(&model_path).unwrap_or_else(|_| "\"\"".into());
     let token_js = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".into());
     let host_js = serde_json::to_string(&host).unwrap_or_else(|_| "\"\"".into());
 
@@ -892,6 +914,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
   var g = globalThis;
   if (!g.sofuu) g.sofuu = {{}};
   var brainPath = {brain_path_js};
+  var modelPath = {model_path_js};
   var token = {token_js};
   var host = {host_js};
   var port = {port};
@@ -924,7 +947,171 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     if (req.method === 'GET' && path === '/health') {{
       var count = brain ? brain.count() : 0;
       res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{ ok: true, memories: count }}));
+      res.end(JSON.stringify({{ ok: true, memories: count, model: modelPath || null }}));
+      return;
+    }}
+    if (req.method === 'GET' && path === '/v1/models') {{
+      var mId = modelPath ? modelPath.split('/').pop() : 'sofuu-default';
+      res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+      res.end(JSON.stringify({{
+        object: 'list',
+        data: [{{
+          id: mId,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'sofuu'
+        }}]
+      }}));
+      return;
+    }}
+    if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {{
+      var body = typeof req.body === 'string' ? req.body : '';
+      try {{
+        var data = JSON.parse(body || '{{}}');
+        var targetModel = data.model || modelPath;
+        if (!targetModel) {{
+          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{ ok: false, error: 'no model loaded; specify --model <path> or pass model in body' }}));
+          return;
+        }}
+        var prompt = '';
+        if (Array.isArray(data.messages)) {{
+          for (var mi = 0; mi < data.messages.length; mi++) {{
+            var m = data.messages[mi];
+            prompt += (m.role || 'user') + ': ' + (m.content || '') + '\n';
+          }}
+          prompt += 'assistant:';
+        }} else {{
+          prompt = String(data.prompt || '');
+        }}
+        var maxTokens = data.max_tokens || 512;
+        var temp = typeof data.temperature === 'number' ? data.temperature : 0.7;
+        var reqId = 'chatcmpl-' + Math.random().toString(36).substring(2, 12);
+        var created = Math.floor(Date.now() / 1000);
+
+        if (data.stream) {{
+          res.writeHead(200, {{
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+          }});
+          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
+          while (true) {{
+            var n = await it.next();
+            if (n.done) break;
+            var chunk = n.value;
+            if (chunk && chunk.text) {{
+              var payload = {{
+                id: reqId,
+                object: 'chat.completion.chunk',
+                created: created,
+                model: targetModel,
+                choices: [{{ index: 0, delta: {{ content: chunk.text }}, finish_reason: null }}]
+              }};
+              res.write('data: ' + JSON.stringify(payload) + '\n\n');
+            }}
+          }}
+          var stopPayload = {{
+            id: reqId,
+            object: 'chat.completion.chunk',
+            created: created,
+            model: targetModel,
+            choices: [{{ index: 0, delta: {{}}, finish_reason: 'stop' }}]
+          }};
+          res.write('data: ' + JSON.stringify(stopPayload) + '\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }} else {{
+          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
+          var fullText = '';
+          while (true) {{
+            var n = await it.next();
+            if (n.done) break;
+            if (n.value && n.value.text) fullText += n.value.text;
+          }}
+          res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{
+            id: reqId,
+            object: 'chat.completion',
+            created: created,
+            model: targetModel,
+            choices: [{{
+              index: 0,
+              message: {{ role: 'assistant', content: fullText }},
+              finish_reason: 'stop'
+            }}]
+          }}));
+        }}
+      }} catch (e) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
+      }}
+      return;
+    }}
+    if (req.method === 'POST' && (path === '/v1/completions' || path === '/infer')) {{
+      var body = typeof req.body === 'string' ? req.body : '';
+      try {{
+        var data = JSON.parse(body || '{{}}');
+        var targetModel = data.model || modelPath;
+        if (!targetModel) {{
+          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{ ok: false, error: 'no model loaded; specify --model <path> or pass model in body' }}));
+          return;
+        }}
+        var prompt = String(data.prompt || '');
+        var maxTokens = data.max_tokens || 512;
+        var temp = typeof data.temperature === 'number' ? data.temperature : 0.7;
+        var reqId = 'cmpl-' + Math.random().toString(36).substring(2, 12);
+        var created = Math.floor(Date.now() / 1000);
+
+        if (data.stream) {{
+          res.writeHead(200, {{
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+          }});
+          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
+          while (true) {{
+            var n = await it.next();
+            if (n.done) break;
+            if (n.value && n.value.text) {{
+              res.write('data: ' + JSON.stringify({{
+                id: reqId,
+                object: 'text_completion',
+                created: created,
+                choices: [{{ text: n.value.text, index: 0, finish_reason: null }}]
+              }}) + '\n\n');
+            }}
+          }}
+          res.write('data: ' + JSON.stringify({{
+            id: reqId,
+            object: 'text_completion',
+            created: created,
+            choices: [{{ text: '', index: 0, finish_reason: 'stop' }}]
+          }}) + '\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }} else {{
+          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
+          var fullText = '';
+          while (true) {{
+            var n = await it.next();
+            if (n.done) break;
+            if (n.value && n.value.text) fullText += n.value.text;
+          }}
+          res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{
+            id: reqId,
+            object: 'text_completion',
+            created: created,
+            model: targetModel,
+            choices: [{{ text: fullText, index: 0, finish_reason: 'stop' }}]
+          }}));
+        }}
+      }} catch (e) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
+      }}
       return;
     }}
     if (req.method === 'POST' && path === '/remember') {{

@@ -232,5 +232,22 @@ torch.save(sd, '{}')
         assert!(val.is_finite(), "expected finite logits at pos 1, got {}", val);
     }
 
+    // Verify sequential layer-wise activation pipelining (Swarm Edge)
+    let in_hidden = vec![1.0f32; 8];
+    let mut mid_hidden = vec![0.0f32; 8];
+    let mut out_hidden = vec![0.0f32; 8];
+
+    // Stage 1: executes layer 0
+    model.forward_layer_range(2, 0, 1, &in_hidden, &mut mid_hidden);
+    for val in &mid_hidden {
+        assert!(val.is_finite(), "expected finite hidden state from layer 0");
+    }
+
+    // Stage 2: executes layer 1
+    model.forward_layer_range(2, 1, 2, &mid_hidden, &mut out_hidden);
+    for val in &out_hidden {
+        assert!(val.is_finite(), "expected finite hidden state from layer 1");
+    }
+
     let _ = std::fs::remove_file(pt_path);
 }

@@ -172,50 +172,53 @@ impl WeightMatrix {
         let slice = &self.data[self.byte_offset..];
         match self.dtype {
             TensorDType::F32 => {
-                let w_f32 = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const f32, self.rows * self.cols)
-                };
+                if slice.len() >= self.rows * self.cols * 4 && (slice.as_ptr() as usize) % 4 == 0 {
+                    unsafe {
+                        let f32_ptr = slice.as_ptr() as *const f32;
+                        crate::infer::quant::sofuu_gemv_f32(f32_ptr, x.as_ptr(), y.as_mut_ptr(), self.rows, self.cols);
+                    }
+                    return;
+                }
+                // Unaligned or boundary fallback
                 for r in 0..self.rows {
-                    let row = &w_f32[r * self.cols..(r + 1) * self.cols];
-                    let mut sum0 = 0.0f32;
-                    let mut sum1 = 0.0f32;
-                    let chunks_x = x.chunks_exact(8);
-                    let chunks_w = row.chunks_exact(8);
-                    let rem_x = chunks_x.remainder();
-                    let rem_w = chunks_w.remainder();
-                    for (cx, cw) in chunks_x.zip(chunks_w) {
-                        sum0 += cx[0] * cw[0] + cx[1] * cw[1] + cx[2] * cw[2] + cx[3] * cw[3];
-                        sum1 += cx[4] * cw[4] + cx[5] * cw[5] + cx[6] * cw[6] + cx[7] * cw[7];
+                    let base = r * self.cols * 4;
+                    let mut sum = 0.0f32;
+                    for c in 0..self.cols {
+                        let raw = f32::from_ne_bytes(slice[base + c * 4..base + (c + 1) * 4].try_into().unwrap());
+                        sum += x[c] * raw;
                     }
-                    let mut total = sum0 + sum1;
-                    for (&xv, &wv) in rem_x.iter().zip(rem_w.iter()) {
-                        total += xv * wv;
-                    }
-                    y[r] = total;
+                    y[r] = sum;
                 }
             }
             TensorDType::F16 => {
-                let w_u16 = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u16, self.rows * self.cols)
-                };
+                if slice.len() >= self.rows * self.cols * 2 && (slice.as_ptr() as usize) % 2 == 0 {
+                    unsafe {
+                        let u16_ptr = slice.as_ptr() as *const u16;
+                        crate::infer::quant::sofuu_gemv_f16(u16_ptr, x.as_ptr(), y.as_mut_ptr(), self.rows, self.cols);
+                    }
+                    return;
+                }
                 for r in 0..self.rows {
-                    let row = &w_u16[r * self.cols..(r + 1) * self.cols];
                     let mut sum = 0.0f32;
+                    let base = r * self.cols * 2;
                     for c in 0..self.cols {
-                        sum += x[c] * f16_to_f32(row[c]);
+                        let raw = u16::from_ne_bytes(slice[base + c * 2..base + (c + 1) * 2].try_into().unwrap());
+                        sum += x[c] * f16_to_f32(raw);
                     }
                     y[r] = sum;
                 }
             }
             TensorDType::BF16 => {
-                let w_u16 = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u16, self.rows * self.cols)
-                };
+                if slice.len() >= self.rows * self.cols * 2 {
+                    crate::infer::quant::gemv_bf16(slice, x, &mut y[..self.rows], self.rows, self.cols);
+                    return;
+                }
                 for r in 0..self.rows {
-                    let row = &w_u16[r * self.cols..(r + 1) * self.cols];
                     let mut sum = 0.0f32;
+                    let base = r * self.cols * 2;
                     for c in 0..self.cols {
-                        sum += x[c] * bf16_to_f32(row[c]);
+                        let raw = u16::from_ne_bytes(slice[base + c * 2..base + (c + 1) * 2].try_into().unwrap());
+                        sum += x[c] * bf16_to_f32(raw);
                     }
                     y[r] = sum;
                 }
@@ -762,10 +765,6 @@ impl BlockGraphModel {
 
     pub fn forward(&mut self, token: u32, pos: usize) -> &[f32] {
         let dim = self.config.dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
-        let head_dim = self.config.head_dim;
-        let freq_base = self.config.rope_freq_base;
 
         // 1. Embedding lookup
         self.embed_tokens.get_row(token as usize, &mut self.buf_x[..dim]);
@@ -776,14 +775,40 @@ impl BlockGraphModel {
         }
 
         // 2. Transformer layers
-        for (l, layer) in self.layers.iter().enumerate() {
-            // Residual copy
-            self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
+        self.execute_layers(pos, 0, self.layers.len());
 
-            // Pre-norm
+        // 3. Final norm
+        self.graph_config.final_norm.apply(&self.buf_x[..dim], &self.final_norm_weight, &mut self.buf_norm[..dim]);
+
+        // 4. LM Head projection
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.gemv(&self.buf_norm[..dim], &mut self.logits);
+        } else {
+            self.embed_tokens.gemv(&self.buf_norm[..dim], &mut self.logits);
+        }
+
+        // 5. Final logit soft-capping
+        if let Some(cap) = self.graph_config.final_logit_soft_cap {
+            soft_cap_in_place(&mut self.logits, cap);
+        }
+
+        &self.logits
+    }
+
+    /// Internal helper executing transformer blocks in range [start_layer, end_layer).
+    pub fn execute_layers(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let freq_base = self.config.rope_freq_base;
+
+        let end = end_layer.min(self.layers.len());
+        for l in start_layer..end {
+            let layer = &self.layers[l];
+            self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
             layer.pre_norm.apply(&self.buf_x[..dim], &layer.pre_norm_weight, &mut self.buf_norm[..dim]);
 
-            // Sequence mixer
             match &layer.mixer_weights {
                 BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
                     q_proj.gemv(&self.buf_norm[..dim], &mut self.buf_q[..q_proj.rows]);
@@ -928,23 +953,22 @@ impl BlockGraphModel {
                 self.buf_x[i] = self.buf_res[i] + self.buf_ffn_out[i];
             }
         }
+    }
 
-        // 3. Final norm
-        self.graph_config.final_norm.apply(&self.buf_x[..dim], &self.final_norm_weight, &mut self.buf_norm[..dim]);
-
-        // 4. LM Head projection
-        if let Some(lm_head) = &self.lm_head {
-            lm_head.gemv(&self.buf_norm[..dim], &mut self.logits);
-        } else {
-            self.embed_tokens.gemv(&self.buf_norm[..dim], &mut self.logits);
-        }
-
-        // 5. Final logit soft-capping
-        if let Some(cap) = self.graph_config.final_logit_soft_cap {
-            soft_cap_in_place(&mut self.logits, cap);
-        }
-
-        &self.logits
+    /// Forward pass through a subset of layers [start_layer, end_layer).
+    /// Used for Sequential Layer-Wise Activation Pipelining across distributed edge swarm nodes.
+    pub fn forward_layer_range(
+        &mut self,
+        pos: usize,
+        start_layer: usize,
+        end_layer: usize,
+        in_hidden: &[f32],
+        out_hidden: &mut [f32],
+    ) {
+        let dim = self.config.dim;
+        self.buf_x[..dim].copy_from_slice(&in_hidden[..dim]);
+        self.execute_layers(pos, start_layer, end_layer);
+        out_hidden[..dim].copy_from_slice(&self.buf_x[..dim]);
     }
 
     pub fn forward_prefill(&mut self, token: u32, pos: usize) {

@@ -61,6 +61,66 @@ impl MetalEngine {
         }
     }
 
+    pub fn gemv_qkv_bf16(
+        &self,
+        w_buf: &MetalBuffer,
+        q_offset: usize,
+        k_offset: usize,
+        v_offset: usize,
+        x: &[f32],
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+        q_rows: usize,
+        k_rows: usize,
+        v_rows: usize,
+        cols: usize,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_qkv_bf16(
+                self.ctx,
+                w_buf.handle,
+                q_offset,
+                k_offset,
+                v_offset,
+                x.as_ptr(),
+                q_out.as_mut_ptr(),
+                k_out.as_mut_ptr(),
+                v_out.as_mut_ptr(),
+                q_rows,
+                k_rows,
+                v_rows,
+                cols,
+            );
+        }
+    }
+
+    pub fn gemv_gate_up_bf16(
+        &self,
+        w_buf: &MetalBuffer,
+        gate_offset: usize,
+        up_offset: usize,
+        x: &[f32],
+        gate_out: &mut [f32],
+        up_out: &mut [f32],
+        inter_rows: usize,
+        cols: usize,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_gate_up_bf16(
+                self.ctx,
+                w_buf.handle,
+                gate_offset,
+                up_offset,
+                x.as_ptr(),
+                gate_out.as_mut_ptr(),
+                up_out.as_mut_ptr(),
+                inter_rows,
+                cols,
+            );
+        }
+    }
+
     pub fn gemv_f16(
         &self,
         w_buf: &MetalBuffer,

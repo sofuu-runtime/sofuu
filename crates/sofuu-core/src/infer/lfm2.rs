@@ -633,22 +633,43 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &ffn_norm, &mut self.x_norm);
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &w1,
-                        &self.x_norm,
-                        &mut self.ffn_gate,
-                    );
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &w3,
-                        &self.x_norm,
-                        &mut self.ffn_up,
-                    );
+                    #[cfg(target_os = "macos")]
+                    let used_batched_gate_up = if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
+                        engine.gemv_gate_up_bf16(
+                            buf,
+                            g_tv.data_offset,
+                            u_tv.data_offset,
+                            &self.x_norm,
+                            &mut self.ffn_gate,
+                            &mut self.ffn_up,
+                            w1.rows(),
+                            dim,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let used_batched_gate_up = false;
+
+                    if !used_batched_gate_up {
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &w1,
+                            &self.x_norm,
+                            &mut self.ffn_gate,
+                        );
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &w3,
+                            &self.x_norm,
+                            &mut self.ffn_up,
+                        );
+                    }
 
                     #[cfg(target_os = "macos")]
                     if let Some(engine) = m_eng {
@@ -690,30 +711,55 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &operator_norm, &mut self.x_norm);
 
                     // Q, K, V projections
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &q_proj,
-                        &self.x_norm,
-                        &mut self.q,
-                    );
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &k_proj,
-                        &self.x_norm,
-                        &mut self.k,
-                    );
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &v_proj,
-                        &self.x_norm,
-                        &mut self.v,
-                    );
+                    #[cfg(target_os = "macos")]
+                    let used_batched_qkv = if let (Some(engine), Some(buf), LinearTensor::Bf16(q_tv), LinearTensor::Bf16(k_tv), LinearTensor::Bf16(v_tv)) = (m_eng, m_buf, &q_proj, &k_proj, &v_proj) {
+                        engine.gemv_qkv_bf16(
+                            buf,
+                            q_tv.data_offset,
+                            k_tv.data_offset,
+                            v_tv.data_offset,
+                            &self.x_norm,
+                            &mut self.q,
+                            &mut self.k,
+                            &mut self.v,
+                            q_proj.rows(),
+                            k_proj.rows(),
+                            v_proj.rows(),
+                            dim,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let used_batched_qkv = false;
+
+                    if !used_batched_qkv {
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &q_proj,
+                            &self.x_norm,
+                            &mut self.q,
+                        );
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &k_proj,
+                            &self.x_norm,
+                            &mut self.k,
+                        );
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &v_proj,
+                            &self.x_norm,
+                            &mut self.v,
+                        );
+                    }
 
                     // Q & K Layernorm
                     let q_ln_slice = mmap.slice(q_layernorm.data_offset, q_layernorm.size_bytes).unwrap();
@@ -838,22 +884,43 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &ffn_norm, &mut self.x_norm);
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &w1,
-                        &self.x_norm,
-                        &mut self.ffn_gate,
-                    );
-                    Self::compute_matvec(
-                        mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
-                        &w3,
-                        &self.x_norm,
-                        &mut self.ffn_up,
-                    );
+                    #[cfg(target_os = "macos")]
+                    let used_batched_gate_up = if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
+                        engine.gemv_gate_up_bf16(
+                            buf,
+                            g_tv.data_offset,
+                            u_tv.data_offset,
+                            &self.x_norm,
+                            &mut self.ffn_gate,
+                            &mut self.ffn_up,
+                            w1.rows(),
+                            dim,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let used_batched_gate_up = false;
+
+                    if !used_batched_gate_up {
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &w1,
+                            &self.x_norm,
+                            &mut self.ffn_gate,
+                        );
+                        Self::compute_matvec(
+                            mmap,
+                            #[cfg(target_os = "macos")] m_eng,
+                            #[cfg(target_os = "macos")] m_buf,
+                            &w3,
+                            &self.x_norm,
+                            &mut self.ffn_up,
+                        );
+                    }
 
                     #[cfg(target_os = "macos")]
                     if let Some(engine) = m_eng {

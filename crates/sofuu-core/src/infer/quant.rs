@@ -213,9 +213,9 @@ extern "C" {
     fn sofuu_gemv_q8_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_q4_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_q6_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
-    fn sofuu_gemv_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize);
-    fn sofuu_gemv_f16(weight_bytes: *const u16, x: *const f32, out: *mut f32, rows: usize, cols: usize);
-    fn sofuu_gemv_bf16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    pub(crate) fn sofuu_gemv_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    pub(crate) fn sofuu_gemv_f16(weight_bytes: *const u16, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    pub(crate) fn sofuu_gemv_bf16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_mlx4(
         w_bytes: *const u8,
         scales_bytes: *const u8,
@@ -297,6 +297,32 @@ extern "C" {
         x: *const f32,
         y: *mut f32,
         rows: usize,
+        cols: usize,
+    );
+    pub fn sofuu_metal_gemv_qkv_bf16(
+        ctx: *mut std::ffi::c_void,
+        w_buf: *mut std::ffi::c_void,
+        q_offset: usize,
+        k_offset: usize,
+        v_offset: usize,
+        x: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        v_out: *mut f32,
+        q_rows: usize,
+        k_rows: usize,
+        v_rows: usize,
+        cols: usize,
+    );
+    pub fn sofuu_metal_gemv_gate_up_bf16(
+        ctx: *mut std::ffi::c_void,
+        w_buf: *mut std::ffi::c_void,
+        gate_offset: usize,
+        up_offset: usize,
+        x: *const f32,
+        gate_out: *mut f32,
+        up_out: *mut f32,
+        inter_rows: usize,
         cols: usize,
     );
     pub fn sofuu_metal_gemv_f16(

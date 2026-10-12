@@ -219,8 +219,148 @@ private struct GeneralPane: View {
                     if let n = Double($0) { store.patchConfig(["budget_usd": n]) }
                 }
             }
+
+            PhoneToolsSection(store: store)
+            EngineEnvSection(store: store)
             Spacer(minLength: 24)
         }
+    }
+}
+
+/// What the phone adds over a terminal.
+///
+/// Host tools are registered on the engine thread at boot and appear in
+/// /tools alongside the built-ins; listing them is the only place a user
+/// can see what the device can do that a terminal cannot.
+private struct PhoneToolsSection: View {
+    @ObservedObject var store: AppStore
+    @Environment(\.sofuuColors) private var c
+    @State private var tools: [String] = []
+
+    // Explicit VStack, not an implicit body: a modifier such as .task
+    // cannot hang off the implicit single-expression form.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Section(label: "Phone tools")
+            Text("Native capabilities the agent can call. Registered on the engine at boot, so they obey the permission profile and show up in /tools.")
+                .font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
+            if tools.isEmpty {
+                Text("None registered yet.").font(.system(size: 12)).foregroundStyle(c.textFaint)
+            } else {
+                ForEach(tools, id: \.self) { t in
+                    Text("  ·  \(t)").font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(c.text).padding(.vertical, 2)
+                }
+            }
+        }
+        // The engine fills the list during boot, which may not have
+        // finished the first time this pane is drawn.
+        .task {
+            while !Task.isCancelled {
+                tools = store.engine.hostTools
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+}
+
+/// The library's env-var switches.
+///
+/// These are plain process configuration the engine reads through
+/// std\.env::var — there is no ABI call for them. Most are consulted per
+/// turn, so a change applies to the next message; SOFUU_NO_ML gates module
+/// registration and so needs a restart, which the UI says outright rather
+/// than letting a user wonder why nothing moved.
+private struct EngineEnvSection: View {
+    @ObservedObject var store: AppStore
+    @Environment(\.sofuuColors) private var c
+    @State private var noTools = false
+    @State private var noShell = false
+    @State private var noMl = false
+    @State private var allowInternal = false
+    @State private var backend = ""
+    @State private var webEngine = ""
+    @State private var maxSteps = ""
+    @State private var stall = ""
+
+    var body: some View {
+     VStack(alignment: .leading, spacing: 0) {
+        Section(label: "Engine controls")
+        Text("These are the runtime's own environment knobs, set before the engine boots. Most take effect on the next message.")
+            .font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
+
+        Toggle(isOn: Binding(
+            get: { noTools }, set: { noTools = $0; store.runtimeEnv.noTools = $0; store.applyRuntimeEnv() })) {
+            Text("Coding tools").font(.system(size: 14)).foregroundStyle(c.text)
+        }
+        Text("All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.")
+            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+
+        Toggle(isOn: Binding(
+            get: { noShell }, set: { noShell = $0; store.runtimeEnv.noShell = $0; store.applyRuntimeEnv() })) {
+            Text("Shell").font(.system(size: 14)).foregroundStyle(c.text)
+        }
+        Text("Keep bash listed but refuse every invocation. Does not stop an MCP server that shells out itself.")
+            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+
+        Toggle(isOn: Binding(
+            get: { noMl }, set: { noMl = $0; store.runtimeEnv.noMl = $0; store.restartEngineForEnv() })) {
+            Text("Context gates (ML)").font(.system(size: 14)).foregroundStyle(c.text)
+        }
+        Text("Drop the whole sofuu.ml gate layer. This one needs a restart — it is decided when the engine loads.")
+            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+
+        Toggle(isOn: Binding(
+            get: { allowInternal },
+            set: { allowInternal = $0; store.runtimeEnv.webAllowInternal = $0; store.applyRuntimeEnv() })) {
+            Text("Allow private addresses").font(.system(size: 14)).foregroundStyle(c.text)
+        }
+        Text("Let web.open reach loopback and LAN addresses. The SSRF guard blocks them otherwise.")
+            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+
+        RowBox(label: "Memory backend",
+               desc: "Auto uses the semantic projector when its artifact is present, else hash-768.") {
+            Segmented(options: ["auto", "hash", "semantic"], selected: backend.isEmpty ? "auto" : backend) {
+                backend = ($0 == "auto") ? "" : $0
+                store.runtimeEnv.memoryBackend = backend
+                store.applyRuntimeEnv()
+            }
+        }
+        RowBox(label: "Web search engine", desc: "Default engine for web_search. Blank picks the keyless one.") {
+            Segmented(options: ["auto", "brave", "tavily"], selected: webEngine.isEmpty ? "auto" : webEngine) {
+                webEngine = ($0 == "auto") ? "" : $0
+                store.runtimeEnv.webEngine = webEngine
+                store.applyRuntimeEnv()
+            }
+        }
+        RowBox(label: "Turn step budget", desc: "Tool rounds allowed per turn. 0 uses the engine default (200).") {
+            TextFieldRow(placeholder: "200 (engine default)", value: maxSteps) {
+                maxSteps = $0
+                store.runtimeEnv.chatMaxSteps = Int($0.filter(\.isNumber)) ?? 0
+                store.applyRuntimeEnv()
+            }
+        }
+        RowBox(label: "Stalled-request timeout", desc: "Seconds before an unresponsive endpoint gives up. 0 uses the engine default (300).") {
+            TextFieldRow(placeholder: "300 (engine default)", value: stall) {
+                stall = $0
+                store.runtimeEnv.stallTimeoutSecs = Int($0.filter(\.isNumber)) ?? 0
+                store.applyRuntimeEnv()
+            }
+        }
+    }
+        .onAppear { load() }
+    }
+
+    func load() {
+        let env = store.runtimeEnv
+        noTools = env.noTools
+        noShell = env.noShell
+        noMl = env.noMl
+        allowInternal = env.webAllowInternal
+        backend = env.memoryBackend
+        webEngine = env.webEngine
+        maxSteps = env.chatMaxSteps > 0 ? String(env.chatMaxSteps) : ""
+        stall = env.stallTimeoutSecs > 0 ? String(env.stallTimeoutSecs) : ""
     }
 }
 

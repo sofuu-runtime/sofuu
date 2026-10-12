@@ -67,6 +67,11 @@ make mobile-engine-release         # opt-z + fat LTO + stripped (shipping)
 # 2. the app
 make mobile-apk                    # or: cd sofuu-android && ./gradlew :app:assembleDebug
 adb install -r sofuu-android/app/build/outputs/apk/debug/app-debug.apk
+
+# shipping build
+make mobile-engine-release
+cd sofuu-android && ./gradlew :app:assembleRelease
+# → app/build/outputs/apk/release/app-release-unsigned.apk
 ```
 
 Everything is cached under `dist/`: `libuv-android-*`, `openssl-android-*`,
@@ -80,10 +85,37 @@ Notes:
 - `libsofuu.so` carries `-Wl,-soname,libsofuu.so`: a Rust cdylib has no
   DT_SONAME by default and the JNI link would otherwise bake a
   build-time absolute path into the APK (dlopen fails on device).
+- **Both** native libs link `-Wl,-z,max-page-size=16384`. `targetSdk 35`
+  means the APK must load on Android 15+ devices with a 16 KiB page size,
+  and the NDK toolchain only aligns the first PT_LOAD by default. Without
+  the flag the engine `.so` is rejected at load time on current Pixels.
+  Verify with `llvm-readelf -l lib/*/libsofuu*.so` — every LOAD must say
+  `0x4000`.
+- The dot-product kernel is chosen at **runtime**
+  (`sofuu_cpu_has_dotprod` in `src/simd/infer_kernels.cpp` reads
+  `AT_HWCAP`), not at compile time. `build.rs` passes
+  `-march=armv8.2-a+dotprod` for every aarch64 target, so on a CPU older
+  than ARMv8.2 the sdot instructions would be emitted and fault with
+  SIGILL; the guard falls back to the generic kernel instead.
 - `res/xml/network_security_config.xml` allows cleartext to `10.0.2.2`
   only (the emulator's host alias, for local-model testing); everything
   else is HTTPS-only.
 - Min SDK 24, ABIs `arm64-v8a` + `x86_64`.
+
+## Local models
+
+Settings → Models → **On this device** imports a `.gguf` file. The pick is
+copied into `filesDir/models/` (the engine opens models by absolute path
+through `mmap`, so a `content://` URI is useless to it) and selecting one
+mirrors the CLI's `/model x.gguf` branch: `provider` becomes `local`,
+`base_url` and `api_key` are cleared, and the caps read out of the GGUF
+header are applied instead of guessed.
+
+No extra plumbing is needed to make the turn work — `agent.js` already
+calls `sofuu.ai.stream`, and `rt/ai.rs` routes that to the in-process
+engine whenever the provider is Local or the model path ends in `.gguf`.
+The app checks the model actually generates before switching to it, so a
+bad file reports its error instead of failing the next turn.
 
 ## Known gaps
 
@@ -94,21 +126,22 @@ Notes:
   keyboard shortcuts have no phone equivalent, so it was removed rather
   than shipped as a list of bindings that cannot fire. Settings is
   General / Appearance / Models / Providers / Usage.
-- No release signing config yet (add a `keystore.properties` +
-  `signingConfigs` to `app/build.gradle.kts`). A release build also
-  needs the engine cross-built with `SOFUU_ANDROID_PROFILE=release`,
-  which currently does not compile.
+- Release signing is wired but unconfigured: drop a `keystore.properties`
+  next to `settings.gradle.kts` and `assembleRelease` picks it up. With no
+  file present the release APK is **unsigned** and Gradle says so.
 - `armeabi-v7a` is not built, so devices older than ~2017 (32-bit only)
   cannot install.
 - Switching to a session shows an empty page until the engine resumes it.
   This is deliberate and matches the desktop (`store.ts`: "empty if the
   session never had a transcript in this window"); read a past chat with
   the history sheet (read-only) or `/resume`.
-- The embedding + voice ABI (`sofuu_embed_local/batch/image/info`,
-  `sofuu_voice_transcribe/speak`) is not yet shimmed in the JNI bridge.
 - The whole engine console stream was unreachable until the
   `sofuu_embed_set_log_cb` shim landed; it now appears in logcat under
   the `sofuu-js` tag alongside the app's own `sofuu-engine` tag.
+- No automated tests. There is no `src/test/` and no `src/androidTest/`
+  despite the junit dependencies in `app/build.gradle.kts`, and CI only
+  runs `cc -fsyntax-only` over the *SDK's* bridge — it never compiles this
+  app.
 
 ## License
 

@@ -53,6 +53,9 @@ data class AppState(
     val historyOpen: Boolean = false,
     val sheet: String? = null, // "model" | "effort" | "layers" | "mode" | "permissions"
     val modelsCache: Map<String, ModelCacheEntry> = emptyMap(),
+
+    /** Absolute paths of the GGUF models imported into filesDir/models. */
+    val localModels: List<String> = emptyList(),
 )
 
 /** One provider's cached model listing (the desktop's model cache). */
@@ -648,6 +651,9 @@ class AppStore(app: Application) : AndroidViewModel(app) {
         engine.setPermissions(state.permissions)
         // Prefetch every provider's model list in the background.
         refreshModelCache()
+        // The on-device model list is just a directory read — no engine
+        // round-trip, so it is correct to do before the first frame.
+        state = state.copy(localModels = localModels.list().map { it.absolutePath })
     }
 
     fun refreshSessions(resumeNewest: Boolean = false) {
@@ -953,6 +959,90 @@ class AppStore(app: Application) : AndroidViewModel(app) {
             .put("model", model)
         patchConfig(patch)
         refreshModelCache()
+    }
+
+    // ── Local GGUF models ───────────────────────────────────────
+
+    val localModels: LocalModels by lazy { LocalModels(getApplication()) }
+
+    /**
+     * Point the runtime at an on-device GGUF.
+     *
+     * This is the whole of the local-inference switch, and it mirrors the
+     * CLI's `/model x.gguf` branch (`crates/sofuu-core/src/chat.rs:987`).
+     * A `.gguf` path forces `provider="local"` and clears `base_url` and
+     * `api_key`, because the engine routes on provider: `agent.js` calls
+     * `sofuu.ai.stream`, and `rt/ai.rs:4228` sends it to the in-process
+     * engine when the provider is Local or the model path ends `.gguf`.
+     * Leaving the old endpoint in place would send a filesystem path to an
+     * HTTP API.
+     *
+     * The harvested caps are applied only when the engine reports real
+     * numbers — guessing a window for a model we have not opened is how a
+     * turn ends in "maximum context length exceeded".
+     */
+    fun pickLocalModel(path: String) {
+        viewModelScope.launch {
+            val caps = try {
+                engine.localModelCaps(path).get(20, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                null
+            }
+            val patch = JSONObject()
+                .put("provider", "local")
+                .put("active", "local")
+                .put("base_url", "")
+                .put("model", path)
+            if (caps?.optBoolean("ok") == true) {
+                val c = caps.optJSONObject("caps") ?: JSONObject()
+                val win = c.optLong("ctx_window", 0)
+                val maxOut = c.optLong("max_output", 0)
+                if (win > 0) patch.put("ctx_window", win)
+                if (maxOut > 0) patch.put("max_output", maxOut)
+                // A model with a thinking channel wants effort on; one
+                // without it must not be sent "high", which some kernels
+                // reject outright.
+                patch.put("effort", if (c.optBoolean("thinking", false)) "high" else "")
+            }
+            val merged = configs.updateConfig(patch)
+            // No provider entry to write: "local" is not a configured
+            // endpoint, so refreshModelCache would only 404 on it.
+            state = state.copy(config = configs.redacted(merged))
+            state = state.copy(localModels = localModels.list().map { it.absolutePath })
+            refreshSessions(resumeNewest = true)
+        }
+    }
+
+    /** Import a picked model and select it. Reports the outcome as a
+     *  system row so a bad pick is visible in the transcript, not silent. */
+    fun importLocalModel(uri: android.net.Uri) {
+        viewModelScope.launch {
+            val file = localModels.import(uri)
+            if (file == null) {
+                systemRow("Could not import that file — it needs to be a readable .gguf model.")
+                return@launch
+            }
+            val sizeMb = file.length() / (1024.0 * 1024.0)
+            systemRow("Imported ${localModels.label(file)} (${"%.0f".format(sizeMb)} MB) — checking it…")
+            val probe = try {
+                engine.probeLocalModel(file.absolutePath).get(180, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                null
+            }
+            if (probe?.optBoolean("ok") != true) {
+                systemRow("${localModels.label(file)} did not load: ${probe?.optString("error") ?: "engine timed out"}. The file is still in Settings → Models.")
+                return@launch
+            }
+            pickLocalModel(file.absolutePath)
+            systemRow("Model → ${localModels.label(file)} · running on this device, no network.")
+        }
+    }
+
+    fun deleteLocalModel(path: String) {
+        val f = File(path)
+        if (localModels.delete(f)) {
+            state = state.copy(localModels = localModels.list().map { it.absolutePath })
+        }
     }
 
     /** The drawer "+": add the default app-internal workspace (a real

@@ -1,5 +1,7 @@
 package com.sofuu.ui.settings
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -428,6 +430,72 @@ private fun ModelsPane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
     Column(Modifier.verticalScroll(rememberScrollState())) {
+
+        // ── On-device models ─────────────────────────────────────
+        // Above the providers: a phone running its own model needs no
+        // endpoint at all, and it is the only option that works offline.
+        val pickModelFile = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri -> if (uri != null) store.importLocalModel(uri) }
+
+        Section("On this device")
+        if (state.localModels.isEmpty()) {
+            Text(
+                "No models installed. Import a .gguf file — it runs entirely on the phone, no network and no API key.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+            )
+        } else {
+            for (path in state.localModels) {
+                val label = path.substringAfterLast('/').removeSuffix(".gguf")
+                val active = state.config?.model == path
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).clickable { store.pickLocalModel(path) }) {
+                        Text(
+                            label,
+                            fontSize = 13.sp,
+                            color = if (active) c.accent else c.text,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                        if (active) {
+                            Text("in use — runs locally", fontSize = 11.sp, color = c.textFaint)
+                        }
+                    }
+                    if (!active) {
+                        Icon(
+                            Icons2.Close, "Remove", tint = c.textFaint,
+                            modifier = Modifier.size(16.dp).clickable { store.deleteLocalModel(path) },
+                        )
+                    }
+                }
+            }
+            if (state.config?.model?.endsWith(".gguf") == true) {
+                Text(
+                    "Switching back to a hosted provider: pick one below.",
+                    fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+        }
+        Text(
+            "Import a model…",
+            fontSize = 13.sp,
+            color = c.accentContrast,
+            modifier = Modifier
+                .padding(top = 8.dp, bottom = 4.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(c.accent)
+                .clickable {
+                    // .gguf has no registered MIME type on most devices,
+                    // so an explicit allow-list beats a wildcard.
+                    pickModelFile.launch(arrayOf("*/*"))
+                }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        )
+
+        Spacer(Modifier.height(18.dp))
+        Section("Hosted providers")
         val providers = state.config?.providers ?: emptyList()
         providers.forEach { p ->
             Row_("Provider: ${p.name}", p.endpoint, {

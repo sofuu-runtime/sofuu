@@ -396,6 +396,40 @@ class SofuuEngine(
     fun listAgents(): CompletableFuture<JSONObject?> =
         query("JSON.stringify((function(){ try { var list = (sofuu.agent && sofuu.agent.list) ? sofuu.agent.list() : []; return {ok:true, agents:list}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())").thenObject()
 
+    // ── Local GGUF models ─────────────────────────────────────────
+
+    /**
+     * Read the real caps out of a GGUF header: `ai.modelCaps` opens the
+     * file and returns its context window, max output, and whether it
+     * carries a thinking channel. Mirrors what the CLI's `/model x.gguf`
+     * does so a phone model is configured the same way a desktop one is.
+     *
+     * Returns null when the file is missing, truncated, or not a GGUF —
+     * the caller keeps the previous limits rather than guessing.
+     */
+    fun localModelCaps(path: String): CompletableFuture<JSONObject?> =
+        query(
+            "JSON.stringify((function(){ try { var c = sofuu.ai.modelCaps(${jsonString(path)}); " +
+                "return {ok:true, caps:c||{}}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())"
+        ).thenObject()
+
+    /**
+     * Confirm the engine can actually open a model before the app points
+     * its config at it. `modelCaps` only parses the header, so this also
+     * runs one short generation — that is what surfaces a model whose
+     * tensors are the wrong shape or unsupported.
+     *
+     * Synchronous on the engine thread by design; a local model has no
+     * network round-trip to wait for.
+     */
+    fun probeLocalModel(path: String, prompt: String = "hi", maxTokens: Int = 8): CompletableFuture<JSONObject?> =
+        query(
+            "JSON.stringify((function(){ try { var t = sofuu.ai.inferLocal(${jsonString(path)}, " +
+                jsonString(prompt) + ", {maxTokens:" + maxTokens + ", temperature:0}); " +
+                "return {ok:true, text: String(t == null ? '' : t)}; } catch(e){ " +
+                "return {ok:false, error:String(e&&e.message||e)}; } })())"
+        ).thenObject()
+
     // ── Provider model lists (ported from commands.rs) ──────────────
 
     /** Fetch a provider's model list through the engine's own fetch

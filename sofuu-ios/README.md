@@ -374,5 +374,29 @@ and was not modified.
 | Type-checks | ✅ | ✅ 23/23 clean |
 | Shader | AGSL (API 33+) | Metal — compiles + renders verified |
 | Engine packaging | ✅ | ✅ `Sofuu.framework` in an xcframework, both slices |
-| App builds | ✅ | ✅ `xcodebuild` BUILD SUCCEEDED |
+| App builds | ✅ | ✅ `xcodebuild` BUILD SUCCEEDED against the current engine |
 | Runs on device | ✅ | ✅ in the Simulator (device build unprovisioned) |
+| Engine links for iOS | ✅ | ✅ 160 symbols, incl. host tools |
+
+## The engine must compile for iOS
+
+The app links `dist/libsofuu.xcframework` statically, so it can only be
+built against an engine that compiled for `aarch64-apple-ios`. That was
+not true for a while: the inference engine's GPU paths were written
+macOS-first and a handful of macOS-only constructs leaked into shared
+code, so `sofuu-core` failed to compile for iOS and the xcframework went
+stale. Typecheck alone will not catch this — `.devstub/sofuu_embed.h`
+declares every symbol the app uses, so Swift resolves cleanly against a
+library that cannot actually be produced.
+
+When `sofuu-core` fails to build for iOS, the failure is in the engine, not
+the app. Reproduce without the framework:
+
+```bash
+cargo check --release -p sofuu-core --target aarch64-apple-ios
+```
+
+Anything macOS-only referenced outside its `#[cfg]` will fail here. A new
+Metal or MLX fast path has to keep its CPU fallback unconditional and gate
+only the GPU branch — `block_graph.rs` and `lfm2.rs` both now compile for
+macOS, iOS and the Android targets from the same source.

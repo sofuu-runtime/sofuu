@@ -249,5 +249,23 @@ torch.save(sd, '{}')
         assert!(val.is_finite(), "expected finite hidden state from layer 1");
     }
 
+    // Verify Heterogeneous CPU+GPU Co-Processing layer partitioning
+    model.set_gpu_layers(1); // 1 layer on GPU, 1 layer on CPU
+    assert_eq!(model.gpu_layers, 1);
+    let logits_split = model.forward(3, 2);
+    assert_eq!(logits_split.len(), 16);
+    for val in logits_split {
+        assert!(val.is_finite(), "expected finite logits with split layer execution");
+    }
+
+    model.set_gpu_layers(0); // 100% CPU
+    assert_eq!(model.gpu_layers, 0);
+    let logits_cpu = model.forward(3, 3);
+    assert_eq!(logits_cpu.len(), 16);
+    for val in logits_cpu {
+        assert!(val.is_finite(), "expected finite logits with 100% CPU execution");
+    }
+
     let _ = std::fs::remove_file(pt_path);
 }
+

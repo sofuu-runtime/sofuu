@@ -39,6 +39,21 @@ impl MetalEngine {
         }
     }
 
+    pub fn create_buffer(&self, slice: &[u8]) -> Option<MetalBuffer> {
+        unsafe {
+            let buf = sofuu_metal_buffer_create(
+                self.ctx,
+                slice.as_ptr() as *const c_void,
+                slice.len(),
+            );
+            if buf.is_null() {
+                None
+            } else {
+                Some(MetalBuffer { handle: buf })
+            }
+        }
+    }
+
     pub fn gemv_bf16(
         &self,
         w_buf: &MetalBuffer,
@@ -249,6 +264,90 @@ impl MetalEngine {
             );
         }
     }
+
+    pub fn gemv_qkv_multi(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize, q_rows: usize,
+        k_buf: &MetalBuffer, k_offset: usize, k_rows: usize,
+        v_buf: &MetalBuffer, v_offset: usize, v_rows: usize,
+        x: &[f32],
+        q_out: &mut [f32], k_out: &mut [f32], v_out: &mut [f32],
+        cols: usize,
+        dtype: i32,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_qkv_multi(
+                self.ctx,
+                q_buf.handle, q_offset, q_rows,
+                k_buf.handle, k_offset, k_rows,
+                v_buf.handle, v_offset, v_rows,
+                x.as_ptr(),
+                q_out.as_mut_ptr(), k_out.as_mut_ptr(), v_out.as_mut_ptr(),
+                cols,
+                dtype,
+            );
+        }
+    }
+
+    pub fn gemv_gate_up_multi(
+        &self,
+        gate_buf: &MetalBuffer, gate_offset: usize,
+        up_buf: &MetalBuffer, up_offset: usize,
+        x: &[f32],
+        gate_out: &mut [f32], up_out: &mut [f32],
+        inter_rows: usize,
+        cols: usize,
+        dtype: i32,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_gate_up_multi(
+                self.ctx,
+                gate_buf.handle, gate_offset,
+                up_buf.handle, up_offset,
+                x.as_ptr(),
+                gate_out.as_mut_ptr(), up_out.as_mut_ptr(),
+                inter_rows,
+                cols,
+                dtype,
+            );
+        }
+    }
+
+    pub fn gemv_async(
+        &self,
+        w_buf: &MetalBuffer,
+        w_offset: usize,
+        x: &[f32],
+        y: &mut [f32],
+        rows: usize,
+        cols: usize,
+        dtype: i32,
+    ) {
+        unsafe {
+            sofuu_metal_gemv_async(
+                self.ctx,
+                w_buf.handle,
+                w_offset,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows,
+                cols,
+                dtype,
+            );
+        }
+    }
+
+    pub fn sync(&self) {
+        unsafe {
+            sofuu_metal_sync(self.ctx);
+        }
+    }
+}
+
+static GLOBAL_METAL: std::sync::OnceLock<Option<MetalEngine>> = std::sync::OnceLock::new();
+
+pub fn get_or_init_global_metal() -> Option<&'static MetalEngine> {
+    GLOBAL_METAL.get_or_init(MetalEngine::new).as_ref()
 }
 
 impl Drop for MetalEngine {

@@ -21,6 +21,10 @@ struct MetalContext {
     id<MTLBuffer> y_buf;
     size_t x_buf_cap;
     size_t y_buf_cap;
+
+    id<MTLCommandBuffer> pending_cmd;
+    size_t pending_y_bytes;
+    float* pending_y_dst;
 };
 
 static const char* METAL_KERNEL_SOURCE = R"(
@@ -305,13 +309,19 @@ void* sofuu_metal_init(void) {
         ctx->y_buf_cap = 65536 * sizeof(float);
         ctx->x_buf = [dev newBufferWithLength:ctx->x_buf_cap options:MTLResourceStorageModeShared];
         ctx->y_buf = [dev newBufferWithLength:ctx->y_buf_cap options:MTLResourceStorageModeShared];
+        ctx->pending_cmd = nil;
+        ctx->pending_y_bytes = 0;
+        ctx->pending_y_dst = nullptr;
 
         return (void*)ctx;
     }
 }
 
+void sofuu_metal_sync(void* ctx_ptr);
+
 void sofuu_metal_free(void* ctx_ptr) {
     if (!ctx_ptr) return;
+    sofuu_metal_sync(ctx_ptr);
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     delete ctx;
 }
@@ -324,6 +334,26 @@ void* sofuu_metal_buffer_create_zerocopy(void* ctx_ptr, const void* ptr, size_t 
                                                            length:size_bytes
                                                           options:MTLResourceStorageModeShared
                                                       deallocator:nil];
+        return (__bridge_retained void*)buf;
+    }
+}
+
+void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_bytes) {
+    if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    @autoreleasepool {
+        if (((uintptr_t)ptr % 4096) == 0) {
+            id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:(void*)ptr
+                                                               length:size_bytes
+                                                              options:MTLResourceStorageModeShared
+                                                          deallocator:nil];
+            if (buf != nil) {
+                return (__bridge_retained void*)buf;
+            }
+        }
+        id<MTLBuffer> buf = [ctx->device newBufferWithBytes:ptr
+                                                     length:size_bytes
+                                                    options:MTLResourceStorageModeShared];
         return (__bridge_retained void*)buf;
     }
 }
@@ -835,6 +865,234 @@ void sofuu_metal_gemv_mlx4(
     }
 }
 
+void sofuu_metal_gemv_qkv_multi(
+    void* ctx_ptr,
+    void* q_buf_ptr, size_t q_offset, size_t q_rows,
+    void* k_buf_ptr, size_t k_offset, size_t k_rows,
+    void* v_buf_ptr, size_t v_offset, size_t v_rows,
+    const float* x,
+    float* q_out, float* k_out, float* v_out,
+    size_t cols,
+    int dtype
+) {
+    if (!ctx_ptr || cols == 0 || !x) return;
+    sofuu_metal_sync(ctx_ptr);
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLBuffer> q_buf = q_buf_ptr ? (__bridge id<MTLBuffer>)q_buf_ptr : nil;
+    id<MTLBuffer> k_buf = k_buf_ptr ? (__bridge id<MTLBuffer>)k_buf_ptr : q_buf;
+    id<MTLBuffer> v_buf = v_buf_ptr ? (__bridge id<MTLBuffer>)v_buf_ptr : q_buf;
+    if (!q_buf && !k_buf && !v_buf) return;
+
+    id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
+    if (dtype == 1) pso = ctx->pso_gemv_f16;
+    else if (dtype == 2) pso = ctx->pso_gemv_f32;
+
+    @autoreleasepool {
+        size_t x_bytes = cols * sizeof(float);
+        size_t q_bytes = q_rows * sizeof(float);
+        size_t k_bytes = k_rows * sizeof(float);
+        size_t v_bytes = v_rows * sizeof(float);
+
+        size_t q_slot = (q_bytes + 255) & ~255ULL;
+        size_t k_slot = (k_bytes + 255) & ~255ULL;
+        size_t total_y_bytes = q_slot + k_slot + v_bytes;
+        ensure_buffers(ctx, x_bytes, total_y_bytes);
+
+        std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        uint c = (uint)cols;
+        MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
+
+        if (q_out && q_rows > 0 && q_buf != nil) {
+            size_t aligned_q = q_offset & ~255ULL;
+            uint rem_q = (uint)(q_offset & 255ULL);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:q_buf offset:aligned_q atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
+            [enc setBytes:&c length:sizeof(uint) atIndex:3];
+            [enc setBytes:&rem_q length:sizeof(uint) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(q_rows, 1, 1) threadsPerThreadgroup:threadsPerGroup];
+        }
+
+        if (k_out && k_rows > 0 && k_buf != nil) {
+            size_t aligned_k = k_offset & ~255ULL;
+            uint rem_k = (uint)(k_offset & 255ULL);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:k_buf offset:aligned_k atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->y_buf offset:q_slot atIndex:2];
+            [enc setBytes:&c length:sizeof(uint) atIndex:3];
+            [enc setBytes:&rem_k length:sizeof(uint) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(k_rows, 1, 1) threadsPerThreadgroup:threadsPerGroup];
+        }
+
+        if (v_out && v_rows > 0 && v_buf != nil) {
+            size_t aligned_v = v_offset & ~255ULL;
+            uint rem_v = (uint)(v_offset & 255ULL);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:v_buf offset:aligned_v atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->y_buf offset:q_slot + k_slot atIndex:2];
+            [enc setBytes:&c length:sizeof(uint) atIndex:3];
+            [enc setBytes:&rem_v length:sizeof(uint) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(v_rows, 1, 1) threadsPerThreadgroup:threadsPerGroup];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        const char* y_ptr = (const char*)ctx->y_buf.contents;
+        if (q_out && q_rows > 0) std::memcpy(q_out, y_ptr, q_bytes);
+        if (k_out && k_rows > 0) std::memcpy(k_out, y_ptr + q_slot, k_bytes);
+        if (v_out && v_rows > 0) std::memcpy(v_out, y_ptr + q_slot + k_slot, v_bytes);
+    }
+}
+
+void sofuu_metal_gemv_gate_up_multi(
+    void* ctx_ptr,
+    void* gate_buf_ptr, size_t gate_offset,
+    void* up_buf_ptr, size_t up_offset,
+    const float* x,
+    float* gate_out, float* up_out,
+    size_t inter_rows,
+    size_t cols,
+    int dtype
+) {
+    if (!ctx_ptr || cols == 0 || !x || inter_rows == 0) return;
+    sofuu_metal_sync(ctx_ptr);
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLBuffer> g_buf = gate_buf_ptr ? (__bridge id<MTLBuffer>)gate_buf_ptr : nil;
+    id<MTLBuffer> u_buf = up_buf_ptr ? (__bridge id<MTLBuffer>)up_buf_ptr : g_buf;
+    if (!g_buf && !u_buf) return;
+
+    id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
+    if (dtype == 1) pso = ctx->pso_gemv_f16;
+    else if (dtype == 2) pso = ctx->pso_gemv_f32;
+
+    @autoreleasepool {
+        size_t x_bytes = cols * sizeof(float);
+        size_t row_bytes = inter_rows * sizeof(float);
+        size_t slot = (row_bytes + 255) & ~255ULL;
+        size_t total_y_bytes = slot + row_bytes;
+        ensure_buffers(ctx, x_bytes, total_y_bytes);
+
+        std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        uint c = (uint)cols;
+        MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
+
+        if (gate_out && g_buf != nil) {
+            size_t aligned_g = gate_offset & ~255ULL;
+            uint rem_g = (uint)(gate_offset & 255ULL);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:g_buf offset:aligned_g atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
+            [enc setBytes:&c length:sizeof(uint) atIndex:3];
+            [enc setBytes:&rem_g length:sizeof(uint) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(inter_rows, 1, 1) threadsPerThreadgroup:threadsPerGroup];
+        }
+
+        if (up_out && u_buf != nil) {
+            size_t aligned_u = up_offset & ~255ULL;
+            uint rem_u = (uint)(up_offset & 255ULL);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:u_buf offset:aligned_u atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->y_buf offset:slot atIndex:2];
+            [enc setBytes:&c length:sizeof(uint) atIndex:3];
+            [enc setBytes:&rem_u length:sizeof(uint) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(inter_rows, 1, 1) threadsPerThreadgroup:threadsPerGroup];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        const char* y_ptr = (const char*)ctx->y_buf.contents;
+        if (gate_out) std::memcpy(gate_out, y_ptr, row_bytes);
+        if (up_out) std::memcpy(up_out, y_ptr + slot, row_bytes);
+    }
+}
+
+void sofuu_metal_sync(void* ctx_ptr) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->pending_cmd != nil) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = ctx->pending_cmd;
+            [cmd waitUntilCompleted];
+            if (ctx->pending_y_dst && ctx->pending_y_bytes > 0) {
+                std::memcpy(ctx->pending_y_dst, ctx->y_buf.contents, ctx->pending_y_bytes);
+            }
+            ctx->pending_cmd = nil;
+            ctx->pending_y_dst = nullptr;
+            ctx->pending_y_bytes = 0;
+            CFRelease((__bridge CFTypeRef)cmd);
+        }
+    }
+}
+
+void sofuu_metal_gemv_async(
+    void* ctx_ptr,
+    void* w_buf_ptr,
+    size_t w_offset,
+    const float* x,
+    float* y,
+    size_t rows,
+    size_t cols,
+    int dtype
+) {
+    if (!ctx_ptr || !w_buf_ptr || !x || !y || rows == 0 || cols == 0) return;
+    sofuu_metal_sync(ctx_ptr);
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+
+    id<MTLBuffer> w_buf = (__bridge id<MTLBuffer>)w_buf_ptr;
+    id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
+    if (dtype == 1) pso = ctx->pso_gemv_f16;
+    else if (dtype == 2) pso = ctx->pso_gemv_f32;
+
+    @autoreleasepool {
+        size_t x_bytes = cols * sizeof(float);
+        size_t y_bytes = rows * sizeof(float);
+        ensure_buffers(ctx, x_bytes, y_bytes);
+
+        std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        size_t aligned_offset = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:w_buf offset:aligned_offset atIndex:0];
+        [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+        [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
+        uint c = (uint)cols;
+        [enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+
+        MTLSize threadgroups = MTLSizeMake(rows, 1, 1);
+        MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+        [enc endEncoding];
+
+        [cmd commit];
+        ctx->pending_cmd = (__bridge id<MTLCommandBuffer>)(void*)CFBridgingRetain(cmd);
+        ctx->pending_y_dst = y;
+        ctx->pending_y_bytes = y_bytes;
+    }
+}
+
 #else
 
 // Stubs for non-macOS platforms (Linux, Android, Windows)
@@ -842,6 +1100,7 @@ bool sofuu_metal_available(void) { return false; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }
+void* sofuu_metal_buffer_create(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }
 void sofuu_metal_buffer_free(void* buf) {}
 void sofuu_metal_gemv_bf16(void* ctx, void* w_buf, size_t w_offset, const float* x, float* y, size_t rows, size_t cols) {}
 void sofuu_metal_gemv_f16(void* ctx, void* w_buf, size_t w_offset, const float* x, float* y, size_t rows, size_t cols) {}
@@ -850,5 +1109,10 @@ void sofuu_metal_rmsnorm(void* ctx, const float* x, void* w_buf, size_t w_offset
 void sofuu_metal_swiglu(void* ctx, float* g, const float* u, size_t size) {}
 void sofuu_metal_conv1d_3(void* ctx, void* conv_w_buf, size_t conv_w_offset, const float* state, float* out, size_t channels) {}
 void sofuu_metal_gemv_mlx4(void* ctx, void* w_buf, size_t w_offset, void* scales_buf, size_t scales_offset, void* biases_buf, size_t biases_offset, const float* x, float* y, size_t rows, size_t cols, size_t group_size) {}
+void sofuu_metal_gemv_qkv_multi(void* ctx, void* q_buf, size_t q_offset, size_t q_rows, void* k_buf, size_t k_offset, size_t k_rows, void* v_buf, size_t v_offset, size_t v_rows, const float* x, float* q_out, float* k_out, float* v_out, size_t cols, int dtype) {}
+void sofuu_metal_gemv_gate_up_multi(void* ctx, void* gate_buf, size_t gate_offset, void* up_buf, size_t up_offset, const float* x, float* gate_out, float* up_out, size_t inter_rows, size_t cols, int dtype) {}
+void sofuu_metal_gemv_async(void* ctx, void* w_buf, size_t w_offset, const float* x, float* y, size_t rows, size_t cols, int dtype) {}
+void sofuu_metal_sync(void* ctx) {}
 
 #endif
+

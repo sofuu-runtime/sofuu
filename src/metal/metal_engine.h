@@ -134,6 +134,51 @@ void sofuu_metal_gemv_mlx4(
     size_t group_size
 );
 
+// Create a Metal buffer from pointer (zero-copy if page-aligned, copy fallback if not).
+void* sofuu_metal_buffer_create(void* ctx, const void* ptr, size_t size_bytes);
+
+// Execute Batched Q, K, V Matrix-Vector multiplications on Apple Silicon GPU
+// supporting separate buffers and multiple data types (0 = BF16, 1 = F16, 2 = F32).
+void sofuu_metal_gemv_qkv_multi(
+    void* ctx,
+    void* q_buf, size_t q_offset, size_t q_rows,
+    void* k_buf, size_t k_offset, size_t k_rows,
+    void* v_buf, size_t v_offset, size_t v_rows,
+    const float* x,
+    float* q_out, float* k_out, float* v_out,
+    size_t cols,
+    int dtype
+);
+
+// Execute Batched Gate and Up Matrix-Vector multiplications for SwiGLU/GeGLU
+// supporting separate buffers and multiple data types (0 = BF16, 1 = F16, 2 = F32).
+void sofuu_metal_gemv_gate_up_multi(
+    void* ctx,
+    void* gate_buf, size_t gate_offset,
+    void* up_buf, size_t up_offset,
+    const float* x,
+    float* gate_out, float* up_out,
+    size_t inter_rows,
+    size_t cols,
+    int dtype
+);
+
+// Asynchronously dispatch GEMV on GPU without blocking calling CPU thread.
+void sofuu_metal_gemv_async(
+    void* ctx,
+    void* w_buf,
+    size_t w_offset,
+    const float* x,
+    float* y,
+    size_t rows,
+    size_t cols,
+    int dtype
+);
+
+// Wait for any pending asynchronous Metal GPU dispatch to complete.
+void sofuu_metal_sync(void* ctx);
+
 #ifdef __cplusplus
 }
 #endif
+

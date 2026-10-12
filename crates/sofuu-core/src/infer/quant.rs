@@ -380,6 +380,53 @@ extern "C" {
         cols: usize,
         group_size: usize,
     );
+    pub fn sofuu_metal_buffer_create(
+        ctx: *mut std::ffi::c_void,
+        ptr: *const std::ffi::c_void,
+        size_bytes: usize,
+    ) -> *mut std::ffi::c_void;
+    pub fn sofuu_metal_gemv_qkv_multi(
+        ctx: *mut std::ffi::c_void,
+        q_buf: *mut std::ffi::c_void,
+        q_offset: usize,
+        q_rows: usize,
+        k_buf: *mut std::ffi::c_void,
+        k_offset: usize,
+        k_rows: usize,
+        v_buf: *mut std::ffi::c_void,
+        v_offset: usize,
+        v_rows: usize,
+        x: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        v_out: *mut f32,
+        cols: usize,
+        dtype: std::os::raw::c_int,
+    );
+    pub fn sofuu_metal_gemv_gate_up_multi(
+        ctx: *mut std::ffi::c_void,
+        gate_buf: *mut std::ffi::c_void,
+        gate_offset: usize,
+        up_buf: *mut std::ffi::c_void,
+        up_offset: usize,
+        x: *const f32,
+        gate_out: *mut f32,
+        up_out: *mut f32,
+        inter_rows: usize,
+        cols: usize,
+        dtype: std::os::raw::c_int,
+    );
+    pub fn sofuu_metal_gemv_async(
+        ctx: *mut std::ffi::c_void,
+        w_buf: *mut std::ffi::c_void,
+        w_offset: usize,
+        x: *const f32,
+        y: *mut f32,
+        rows: usize,
+        cols: usize,
+        dtype: std::os::raw::c_int,
+    );
+    pub fn sofuu_metal_sync(ctx: *mut std::ffi::c_void);
 }
 
 /// Shift RoPE position of key vectors by `delta_pos` (negative shifts left).

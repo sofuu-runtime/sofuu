@@ -154,6 +154,8 @@ pub struct WeightMatrix {
     pub dtype: TensorDType,
     pub data: Arc<Vec<u8>>,
     pub byte_offset: usize,
+    #[cfg(target_os = "macos")]
+    pub metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
 }
 
 impl WeightMatrix {
@@ -164,11 +166,41 @@ impl WeightMatrix {
             dtype,
             data,
             byte_offset,
+            #[cfg(target_os = "macos")]
+            metal_buf: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn with_metal(mut self, engine: &crate::infer::metal::MetalEngine) -> Self {
+        let slice = &self.data[self.byte_offset..];
+        self.metal_buf = engine.create_buffer(slice).map(Arc::new);
+        self
     }
 
     /// Matrix-vector multiplication: y = W * x
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        #[cfg(target_os = "macos")]
+        if let Some(ref m_buf) = self.metal_buf {
+            if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
+                match self.dtype {
+                    TensorDType::BF16 => {
+                        engine.gemv_bf16(m_buf, 0, x, y, self.rows, self.cols);
+                        return;
+                    }
+                    TensorDType::F16 => {
+                        engine.gemv_f16(m_buf, 0, x, y, self.rows, self.cols);
+                        return;
+                    }
+                    TensorDType::F32 => {
+                        engine.gemv_f32(m_buf, 0, x, y, self.rows, self.cols);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let slice = &self.data[self.byte_offset..];
         match self.dtype {
             TensorDType::F32 => {
@@ -456,6 +488,11 @@ pub struct BlockGraphModel {
     pub buf_gate: Vec<f32>,
     pub buf_up: Vec<f32>,
     pub buf_ffn_out: Vec<f32>,
+    pub buf_scores: Vec<f32>,
+    pub buf_tmp: Vec<f32>,
+    pub gpu_layers: usize,
+    #[cfg(target_os = "macos")]
+    pub metal_engine: Option<crate::infer::metal::MetalEngine>,
 }
 
 impl BlockGraphModel {
@@ -711,7 +748,10 @@ impl BlockGraphModel {
             tied_embeddings: lm_head.is_none(),
         };
 
-        Ok(Self {
+        #[cfg(target_os = "macos")]
+        let metal_engine = crate::infer::metal::MetalEngine::new();
+
+        let mut model = Self {
             config,
             graph_config,
             embed_tokens,
@@ -730,7 +770,70 @@ impl BlockGraphModel {
             buf_gate: vec![0.0f32; max_intermediate_dim],
             buf_up: vec![0.0f32; max_intermediate_dim],
             buf_ffn_out: vec![0.0f32; dim],
-        })
+            buf_scores: vec![0.0f32; seq_len],
+            buf_tmp: vec![0.0f32; dim.max(inferred_head_dim)],
+            gpu_layers: n_layers,
+            #[cfg(target_os = "macos")]
+            metal_engine,
+        };
+
+        #[cfg(target_os = "macos")]
+        if model.metal_engine.is_some() {
+            model.set_gpu_layers(n_layers);
+        }
+
+        Ok(model)
+    }
+
+    /// Configure how many layers are offloaded to GPU (0 = all CPU, n_layers = all GPU).
+    pub fn set_gpu_layers(&mut self, n: usize) {
+        self.gpu_layers = n.min(self.layers.len());
+        #[cfg(target_os = "macos")]
+        if let Some(ref engine) = self.metal_engine {
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
+                if idx < self.gpu_layers {
+                    match &mut layer.mixer_weights {
+                        BlockMixerWeights::Attention { q_proj, k_proj, v_proj, o_proj, .. } => {
+                            if q_proj.metal_buf.is_none() {
+                                *q_proj = q_proj.clone().with_metal(engine);
+                                *k_proj = k_proj.clone().with_metal(engine);
+                                *v_proj = v_proj.clone().with_metal(engine);
+                                *o_proj = o_proj.clone().with_metal(engine);
+                            }
+                        }
+                        _ => {}
+                    }
+                    match &mut layer.channel_mixer_weights {
+                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                            if gate_proj.metal_buf.is_none() {
+                                *gate_proj = gate_proj.clone().with_metal(engine);
+                                *up_proj = up_proj.clone().with_metal(engine);
+                                *down_proj = down_proj.clone().with_metal(engine);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match &mut layer.mixer_weights {
+                        BlockMixerWeights::Attention { q_proj, k_proj, v_proj, o_proj, .. } => {
+                            q_proj.metal_buf = None;
+                            k_proj.metal_buf = None;
+                            v_proj.metal_buf = None;
+                            o_proj.metal_buf = None;
+                        }
+                        _ => {}
+                    }
+                    match &mut layer.channel_mixer_weights {
+                        BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                            gate_proj.metal_buf = None;
+                            up_proj.metal_buf = None;
+                            down_proj.metal_buf = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     pub fn reset_cache(&mut self) {
@@ -806,44 +909,77 @@ impl BlockGraphModel {
         let end = end_layer.min(self.layers.len());
         for l in start_layer..end {
             let layer = &self.layers[l];
+            let is_gpu = l < self.gpu_layers;
+            #[cfg(target_os = "macos")]
+            let m_eng = if is_gpu { self.metal_engine.as_ref() } else { None };
+
             self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
             layer.pre_norm.apply(&self.buf_x[..dim], &layer.pre_norm_weight, &mut self.buf_norm[..dim]);
 
             match &layer.mixer_weights {
                 BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
-                    q_proj.gemv(&self.buf_norm[..dim], &mut self.buf_q[..q_proj.rows]);
-                    k_proj.gemv(&self.buf_norm[..dim], &mut self.buf_k[..k_proj.rows]);
-                    v_proj.gemv(&self.buf_norm[..dim], &mut self.buf_v[..v_proj.rows]);
+                    // Batched Q, K, V Projections
+                    #[cfg(target_os = "macos")]
+                    let batched_qkv_done = if let (Some(engine), Some(ref q_b), Some(ref k_b), Some(ref v_b)) =
+                        (m_eng, &q_proj.metal_buf, &k_proj.metal_buf, &v_proj.metal_buf)
+                    {
+                        let dtype_code = match q_proj.dtype {
+                            TensorDType::F16 => 1,
+                            TensorDType::F32 => 2,
+                            _ => 0,
+                        };
+                        engine.gemv_qkv_multi(
+                            q_b, 0, q_proj.rows,
+                            k_b, 0, k_proj.rows,
+                            v_b, 0, v_proj.rows,
+                            &self.buf_norm[..dim],
+                            &mut self.buf_q[..n_heads * head_dim],
+                            &mut self.buf_k[..n_kv_heads * head_dim],
+                            &mut self.buf_v[..n_kv_heads * head_dim],
+                            dim,
+                            dtype_code,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let batched_qkv_done = false;
 
+                    if !batched_qkv_done {
+                        q_proj.gemv(&self.buf_norm[..dim], &mut self.buf_q[..q_proj.rows]);
+                        k_proj.gemv(&self.buf_norm[..dim], &mut self.buf_k[..k_proj.rows]);
+                        v_proj.gemv(&self.buf_norm[..dim], &mut self.buf_v[..v_proj.rows]);
+                    }
+
+                    // Zero-allocation Q/K LayerNorms
                     if let (Some(q_nw), Some(qn)) = (q_norm_weight, spec.q_norm) {
                         for h in 0..n_heads {
                             let off = h * head_dim;
-                            let mut tmp = [0.0f32; 256];
-                            qn.apply(&self.buf_q[off..off + head_dim], q_nw, &mut tmp[..head_dim]);
-                            self.buf_q[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                            qn.apply(&self.buf_q[off..off + head_dim], q_nw, &mut self.buf_tmp[..head_dim]);
+                            self.buf_q[off..off + head_dim].copy_from_slice(&self.buf_tmp[..head_dim]);
                         }
                     }
                     if let (Some(k_nw), Some(kn)) = (k_norm_weight, spec.k_norm) {
                         for h in 0..n_kv_heads {
                             let off = h * head_dim;
-                            let mut tmp = [0.0f32; 256];
-                            kn.apply(&self.buf_k[off..off + head_dim], k_nw, &mut tmp[..head_dim]);
-                            self.buf_k[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                            kn.apply(&self.buf_k[off..off + head_dim], k_nw, &mut self.buf_tmp[..head_dim]);
+                            self.buf_k[off..off + head_dim].copy_from_slice(&self.buf_tmp[..head_dim]);
                         }
                     }
 
-                    // RoPE
+                    // Rotary Position Embedding on CPU
                     rope(&mut self.buf_q[..n_heads * head_dim], n_heads, head_dim, pos, freq_base);
                     rope(&mut self.buf_k[..n_kv_heads * head_dim], n_kv_heads, head_dim, pos, freq_base);
 
-                    // Store K and V in cache
+                    // Store K and V in Host RAM KV cache
                     let kv_cache = &mut self.kv_caches[l];
                     for kv_h in 0..n_kv_heads {
                         let off = kv_h * head_dim;
                         kv_cache.store(kv_h, pos, &self.buf_k[off..off + head_dim], &self.buf_v[off..off + head_dim]);
                     }
 
-                    // Attention calculation
+                    // Attention calculation using preallocated buf_scores (zero heap allocations)
                     let inv_sqrt_head_dim = 1.0f32 / (head_dim as f32).sqrt();
                     let group_size = (n_heads / n_kv_heads).max(1);
 
@@ -852,7 +988,6 @@ impl BlockGraphModel {
                         let q_h = &self.buf_q[h * head_dim..(h + 1) * head_dim];
 
                         let mut max_score = -f32::INFINITY;
-                        let mut scores = Vec::with_capacity(pos + 1);
                         for t in 0..=pos {
                             let k_t = kv_cache.get_k(kv_h, t);
                             let mut dot = 0.0f32;
@@ -866,20 +1001,21 @@ impl BlockGraphModel {
                             if score > max_score {
                                 max_score = score;
                             }
-                            scores.push(score);
+                            self.buf_scores[t] = score;
                         }
 
                         let mut exp_sum = 0.0f32;
-                        for s in &mut scores {
-                            *s = (*s - max_score).exp();
-                            exp_sum += *s;
+                        for t in 0..=pos {
+                            let s = (self.buf_scores[t] - max_score).exp();
+                            self.buf_scores[t] = s;
+                            exp_sum += s;
                         }
                         let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
 
                         let h_out = &mut self.buf_attn_out[h * head_dim..(h + 1) * head_dim];
                         h_out.fill(0.0);
-                        for (t, &weight) in scores.iter().enumerate() {
-                            let w = weight * inv_sum;
+                        for t in 0..=pos {
+                            let w = self.buf_scores[t] * inv_sum;
                             let v_t = kv_cache.get_v(kv_h, t);
                             for d in 0..head_dim {
                                 h_out[d] += w * v_t[d];
@@ -887,19 +1023,46 @@ impl BlockGraphModel {
                         }
                     }
 
-                    // Output projection
-                    o_proj.gemv(&self.buf_attn_out[..o_proj.cols], &mut self.buf_x[..dim]);
+                    // Asynchronous GPU Attention Output Projection
+                    #[cfg(target_os = "macos")]
+                    let async_o_done = if let (Some(engine), Some(ref o_b)) = (m_eng, &o_proj.metal_buf) {
+                        let dtype_code = match o_proj.dtype {
+                            TensorDType::F16 => 1,
+                            TensorDType::F32 => 2,
+                            _ => 0,
+                        };
+                        engine.gemv_async(
+                            o_b, 0,
+                            &self.buf_attn_out[..o_proj.cols],
+                            &mut self.buf_x[..dim],
+                            o_proj.rows, o_proj.cols,
+                            dtype_code,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let async_o_done = false;
+
+                    if !async_o_done {
+                        o_proj.gemv(&self.buf_attn_out[..o_proj.cols], &mut self.buf_x[..dim]);
+                    } else {
+                        #[cfg(target_os = "macos")]
+                        if let Some(engine) = m_eng {
+                            engine.sync();
+                        }
+                    }
                 }
                 BlockMixerWeights::Conv1d { .. } => {
                     self.buf_x[..dim].copy_from_slice(&self.buf_norm[..dim]);
                 }
             }
 
-            // Post-attention norm (Gemma)
+            // Post-attention norm (Gemma) with preallocated buf_tmp
             if let (Some(pan), Some(pan_w)) = (layer.post_attention_norm, &layer.post_attention_norm_weight) {
-                let mut tmp = vec![0.0f32; dim];
-                pan.apply(&self.buf_x[..dim], pan_w, &mut tmp);
-                self.buf_x[..dim].copy_from_slice(&tmp);
+                pan.apply(&self.buf_x[..dim], pan_w, &mut self.buf_tmp[..dim]);
+                self.buf_x[..dim].copy_from_slice(&self.buf_tmp[..dim]);
             }
 
             // Residual add
@@ -913,13 +1076,71 @@ impl BlockGraphModel {
             // FFN Pre-norm
             layer.ffn_norm.apply(&self.buf_x[..dim], &layer.ffn_norm_weight, &mut self.buf_norm[..dim]);
 
-            // Channel mixer
+            // Channel mixer with Batched Gate/Up & Async Down projection
             match &layer.channel_mixer_weights {
                 BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
-                    gate_proj.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..gate_proj.rows]);
-                    up_proj.gemv(&self.buf_norm[..dim], &mut self.buf_up[..up_proj.rows]);
+                    #[cfg(target_os = "macos")]
+                    let batched_gate_up = if let (Some(engine), Some(ref g_b), Some(ref u_b)) =
+                        (m_eng, &gate_proj.metal_buf, &up_proj.metal_buf)
+                    {
+                        let dtype_code = match gate_proj.dtype {
+                            TensorDType::F16 => 1,
+                            TensorDType::F32 => 2,
+                            _ => 0,
+                        };
+                        engine.gemv_gate_up_multi(
+                            g_b, 0,
+                            u_b, 0,
+                            &self.buf_norm[..dim],
+                            &mut self.buf_gate[..gate_proj.rows],
+                            &mut self.buf_up[..up_proj.rows],
+                            gate_proj.rows,
+                            dim,
+                            dtype_code,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let batched_gate_up = false;
+
+                    if !batched_gate_up {
+                        gate_proj.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..gate_proj.rows]);
+                        up_proj.gemv(&self.buf_norm[..dim], &mut self.buf_up[..up_proj.rows]);
+                    }
+
                     swiglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
-                    down_proj.gemv(&self.buf_gate[..gate_proj.rows], &mut self.buf_ffn_out[..dim]);
+
+                    #[cfg(target_os = "macos")]
+                    let async_down = if let (Some(engine), Some(ref d_b)) = (m_eng, &down_proj.metal_buf) {
+                        let dtype_code = match down_proj.dtype {
+                            TensorDType::F16 => 1,
+                            TensorDType::F32 => 2,
+                            _ => 0,
+                        };
+                        engine.gemv_async(
+                            d_b, 0,
+                            &self.buf_gate[..down_proj.cols],
+                            &mut self.buf_ffn_out[..dim],
+                            down_proj.rows, down_proj.cols,
+                            dtype_code,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let async_down = false;
+
+                    if !async_down {
+                        down_proj.gemv(&self.buf_gate[..down_proj.cols], &mut self.buf_ffn_out[..dim]);
+                    } else {
+                        #[cfg(target_os = "macos")]
+                        if let Some(engine) = m_eng {
+                            engine.sync();
+                        }
+                    }
                 }
                 BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
                     gate_proj.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..gate_proj.rows]);
@@ -941,11 +1162,10 @@ impl BlockGraphModel {
                 }
             }
 
-            // Post-FFN norm (Gemma)
+            // Post-FFN norm (Gemma) with preallocated buf_tmp
             if let (Some(pfn), Some(pfn_w)) = (layer.post_ffn_norm, &layer.post_ffn_norm_weight) {
-                let mut tmp = vec![0.0f32; dim];
-                pfn.apply(&self.buf_ffn_out[..dim], pfn_w, &mut tmp);
-                self.buf_ffn_out[..dim].copy_from_slice(&tmp);
+                pfn.apply(&self.buf_ffn_out[..dim], pfn_w, &mut self.buf_tmp[..dim]);
+                self.buf_ffn_out[..dim].copy_from_slice(&self.buf_tmp[..dim]);
             }
 
             // Residual add

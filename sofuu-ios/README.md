@@ -260,6 +260,86 @@ single-member probe reported `platform: IOS ✓` for the archive that contained
   local change from another workstream and contradicts its own comment; worth
   reverting.
 
+## What the phone adds
+
+The runtime is the same engine the CLI embeds; a phone cannot do less of
+it, and in two places it can do more.
+
+### Host tools
+
+`sofuu_rt_register_host_tool` lets the host hand the agent a native
+capability with no JS in the loop — the QuickJS sandbox cannot reach UIKit,
+so anything platform-specific has to be answered from here. It was declared
+in `include/sofuu_embed.h` and wired through `crates/sofuu-capi`, and
+exposed by no binding at all until now.
+
+Four ship, the same set Android ships, mapped to the platform:
+
+| Tool | Does |
+|---|---|
+| `device_info` | model, iOS version, battery level, free storage, foreground state |
+| `open_url` | opens a link in Safari |
+| `share_text` | opens the iOS share sheet (`UIActivityViewController`) |
+| `vibrate` | a haptic, through the UIKit feedback generators |
+
+They register as ordinary agent tools, so `/tools` lists them, the
+permission profile applies, and they land in the normal tool timeline.
+`Settings → General → Phone tools` shows what actually registered at boot.
+
+Two things the Swift side has to get right that Android's JNI shim also
+had to: the C callback carries no tool name, so name + closure + context
+pointer ride in `opaque` as one retained box; and the answer has to come
+back through a buffer, because a Swift `String` has no address C can hold.
+That buffer reallocates only when a *longer* result needs it, so a
+long-running process cannot grow one per call.
+
+To add one, call `bridge.registerHostTool(name:description:parametersJson:tool:)`
+and return a JSON string, or nil and settle later with `resolveHostTool` —
+safe from any thread.
+
+### Surfaces the CLI reaches through a terminal
+
+Settings carries panes for the runtime's own capabilities, each routed
+through the existing eval path:
+
+- **Agents** — register an agent from the phone (`sofuu.agent.define`) and
+  run one headlessly (`sofuu.agent.run`). An agent added here is a
+  first-class registry entry the chat turn, `/agents` and `delegate` all
+  see, and its tools may include the host tools above.
+- **Brain** — count, recall search with per-hit scores, forget,
+  consolidate, decay, the embedding-space manifest with unavailable
+  artifacts called out, text similarity, and the multimodal tower.
+  Everything goes through `sofuu.agent.brainFor`, the ONE cached handle —
+  a QTSQ flush rewrites the whole file, so a second handle would clobber
+  the first on every write.
+- **Context gates** — `sofuu.ml.info` and `ml.workset`, gold-label the most
+  recent call wrong or wasted (`ml.feedback`), and ask
+  `ml.supervisor.check` what a gate would say before the agent acts.
+
+### Engine controls
+
+The library configures itself through `std::env::var`. A CLI can
+`export SOFUU_NO_SHELL=1`; a phone had no equivalent. General → Engine
+controls now exposes:
+
+`SOFUU_NO_TOOLS` · `SOFUU_NO_SHELL` · `SOFUU_NO_ML` ·
+`SOFUU_MEMORY_BACKEND` · `SOFUU_WEB_ENGINE` ·
+`SOFUU_WEB_ALLOW_INTERNAL` · `SOFUU_STALL_TIMEOUT_SECS` ·
+`SOFUU_CHAT_MAX_STEPS`
+
+Most are read inside the agent loop, so they apply to the next message.
+`SOFUU_NO_ML` is the exception — it gates *module registration* in
+sofuu-core, so it needs a restart and the UI says so.
+
+### Local models
+
+Brain → On this device imports a `.gguf`. The file is copied into the
+container, because the engine `mmap`s a path and a Files URL is not one.
+Selecting one mirrors the CLI's `/model x.gguf` branch: `provider` becomes
+`local`, `base_url` is cleared, and the caps read out of the GGUF header
+are applied rather than guessed. The model is probed with one short
+generation before the config points at it.
+
 ## One deliberate improvement over Android
 
 The cloud's **fallback tile is genuinely seamless here; Android's is not.**
@@ -286,9 +366,12 @@ and was not modified.
 
 | | Android | iOS |
 |---|---|---|
-| UI | Compose (Kotlin) | SwiftUI (Swift) — full port |
+| UI | Compose (Kotlin) | SwiftUI (Swift) — full port, 7 settings tabs |
+| Host tools | ✅ 4 | ✅ 4 |
+| Local models | ✅ | ✅ |
+| Engine env knobs | ✅ 8 | ✅ 8 |
 | Engine binding | JNI → `libsofuu.so` | direct C ABI → `libsofuu.xcframework` |
-| Type-checks | ✅ | ✅ 19/19 clean |
+| Type-checks | ✅ | ✅ 23/23 clean |
 | Shader | AGSL (API 33+) | Metal — compiles + renders verified |
 | Engine packaging | ✅ | ✅ `Sofuu.framework` in an xcframework, both slices |
 | App builds | ✅ | ✅ `xcodebuild` BUILD SUCCEEDED |

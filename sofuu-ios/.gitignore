@@ -1,0 +1,18 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# XcodeGen output (regenerate with `xcodegen generate`)
+Sofuu.xcodeproj/
+
+# NOTE: .devstub/ is deliberately NOT ignored. It is the stub `Sofuu` module
+# (header + modulemap) that lets `make ios-typecheck` check every Swift file
+# in ~3s without waiting on a multi-minute Rust cross-build. It is checked
+# in, small, and never linked into the app.
+
+# macOS
+.DS_Store

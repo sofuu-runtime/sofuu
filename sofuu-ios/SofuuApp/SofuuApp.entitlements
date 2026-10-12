@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- No iCloud, no push, no background modes: the runtime is fully
+	     on-device. The app talks to whatever model endpoint the user
+	     configures, so it needs the plain client network capability
+	     (no entitlement required) and nothing else. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

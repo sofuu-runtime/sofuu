@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dev-only: cleartext to the host machine from the emulator (10.0.2.2)
+     so the turn smoke test can reach a local mock. Everything else stays
+     HTTPS-only (usesCleartextTraffic=false in the manifest). -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

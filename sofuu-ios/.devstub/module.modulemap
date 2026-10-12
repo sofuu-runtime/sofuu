@@ -1,0 +1,4 @@
+module Sofuu {
+    header "sofuu_embed.h"
+    export *
+}

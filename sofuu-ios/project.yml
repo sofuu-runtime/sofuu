@@ -1,0 +1,110 @@
+# project.yml — XcodeGen spec for the Sofuu iOS app.
+#
+# The iOS sibling of sofuu-android: same product, same engine, same UI
+# language, but SwiftUI + Swift concurrency instead of Compose + Kotlin,
+# and a direct C-ABI link (no JNI) into libsofuu.
+#
+#   brew install xcodegen
+#   make ios-engine        # builds dist/libsofuu.xcframework (QTSQ-free)
+#   xcodegen generate      # writes Sofuu.xcodeproj from this file
+#   make ios-app           # xcodebuild -scheme SofuuApp -sdk iphonesimulator
+#
+# The engine is a prerequisite: the app links ../dist/libsofuu.xcframework,
+# which scripts/dist/ios.sh produces. Generate the project AFTER the
+# framework exists, or XcodeGen will warn about the missing dependency.
+
+name: Sofuu
+options:
+  bundleIdPrefix: com.sofuu
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "16.0"
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  SofuuApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: SofuuApp
+        excludes:
+          - "Info.plist"
+          - "SofuuApp.entitlements"
+    settings:
+      base:
+        PRODUCT_NAME: Sofuu
+        # NOT the default. PRODUCT_NAME is "Sofuu", which would make the
+        # target's Swift module "Sofuu" — the exact name of the Clang module
+        # that dist/libsofuu.xcframework exports via its module.modulemap.
+        # Swift silently refuses to import a module with the current module's
+        # name, so `import Sofuu` in Engine/SofuuBridge.swift was ignored
+        # with only a warning ("file 'SofuuBridge.swift' is part of module
+        # 'Sofuu'; ignoring import") and every sofuu_* symbol then failed
+        # with "cannot find 'sofuu_rt_call' in scope" — a confusing way to
+        # report a name collision. Naming the module after the *target*
+        # keeps the product, the bundle and the .app named Sofuu while
+        # leaving the engine's module name alone.
+        PRODUCT_MODULE_NAME: SofuuApp
+        PRODUCT_BUNDLE_IDENTIFIER: com.sofuu.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: SofuuApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SofuuApp/SofuuApp.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # The engine xcframework carries arm64 only — one device slice and one
+        # simulator slice (scripts/dist/ios.sh). Without this, `-sdk
+        # iphonesimulator` builds arm64 *and* x86_64, and the x86_64 pass has
+        # no library to import, so it dies with the same "cannot find
+        # 'sofuu_*' in scope" wall. Apple Silicon simulators are arm64, so
+        # excluding x86_64 costs nothing here. Remove it only alongside
+        # adding a real x86_64 simulator slice to the xcframework.
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        # The engine is a static xcframework; nothing to embed.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        # libc++ is REQUIRED, and Xcode will not add it for you.
+        #
+        # The engine archive contains a C++ translation unit
+        # (crates/sofuu-ffi/src/simd/infer_kernels.cpp — the GEMV/GEMM
+        # microkernels and their WorkerThreadPool). Those objects reference
+        # ~15 libc++ symbols (std::__1::condition_variable, std::__1::thread,
+        # std::length_error, …), and a Swift app does not link libc++ on its
+        # own. Without this the app compiles cleanly and then dies at link:
+        #     Undefined symbols for architecture arm64:
+        #       "std::__1::condition_variable::notify_all()", referenced from:
+        #           _sofuu_gemv_q4_0 in Sofuu(...518d1d5228e81997-infer_kernels.o)
+        #
+        # NOTE: crates/sofuu-ffi/build.rs emits `-lc++` only inside its
+        # `target_os == "macos"` block, and adding it there would not help
+        # anyway — `cargo rustc --crate-type staticlib` does not link, so
+        # rustc's link directives never reach the app. The app link is
+        # Xcode's, which is why the flag lives here.
+        OTHER_LDFLAGS: "$(inherited) -lc++"
+    dependencies:
+      # Built by `make ios-engine` → scripts/dist/ios.sh
+      - framework: ../dist/libsofuu.xcframework
+        embed: false
+        codeSign: false
+
+schemes:
+  SofuuApp:
+    build:
+      targets:
+        SofuuApp: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    archive:
+      config: Release

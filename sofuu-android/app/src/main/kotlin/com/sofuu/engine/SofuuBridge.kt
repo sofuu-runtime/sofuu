@@ -1,0 +1,136 @@
+package com.sofuu.engine
+
+/**
+ * Kotlin/JNI wrapper around the libsofuu C ABI (v2).
+ *
+ * One SofuuRuntime per thread; create and use it ONLY on the thread that
+ * will drive it (the engine worker). The app funnels every call through
+ * [SofuuEngine], which owns that thread — this class is intentionally
+ * thin: raw calls, no state.
+ *
+ * Ported from bindings/android/sofuu/…/SofuuBridge.kt (the public AAR
+ * wrapper), extended for the chat app's needs: HOME pinning, streaming
+ * with a host listener, and cancel.
+ */
+class SofuuBridge private constructor(private val rtPtr: Long) {
+
+    /** The ABI version this library implements. */
+    val abiVersion: Int
+        get() = nativeAbiVersion()
+
+    /** Evaluate arbitrary JS — the eval escape hatch. Returns the
+     *  JSON-stringified completion value, or null on failure. */
+    fun eval(source: String): String? = nativeRtEval(rtPtr, source)
+
+    /** Call a funnel method (e.g. "ai.complete", "agent.run").
+     *  Returns the JSON envelope, or null on failure. */
+    fun call(method: String, argsJson: String? = null): String? =
+        nativeRtCall(rtPtr, method, argsJson)
+
+    /** Run a streamable funnel call (agent.run / ai.stream). Events are
+     *  delivered to [listener].onStreamEvent on the engine thread.
+     *  Returns the cancel id (0 = dispatch failed). */
+    fun callStream(method: String, argsJson: String?, listener: StreamListener): Long =
+        nativeRtCallStream(rtPtr, method, argsJson)
+
+    /** Cancel a streaming call by its id. */
+    fun cancel(cancelId: Long): Boolean = nativeRtCancel(rtPtr, cancelId)
+
+    /** Space manifest JSON (default space, model ids, dims, hashes). */
+    fun embedInfo(): String? = nativeEmbedInfo()
+
+    /** Transcribe base64 audio via the configured provider. Returns the
+     *  JSON envelope (read `ok` / `result` / `error`). Engine thread only. */
+    fun voiceTranscribe(audioBase64: String, optsJson: String? = null): String? =
+        nativeVoiceTranscribe(rtPtr, audioBase64, optsJson)
+
+    /** Synthesize speech. Resolves {audio, format}; over JSON transport the
+     *  audio bytes travel as an indexed-byte object the host reassembles.
+     *  Engine thread only. */
+    fun voiceSpeak(text: String, optsJson: String? = null): String? =
+        nativeVoiceSpeak(rtPtr, text, optsJson)
+
+    /** Called once from [close]; never call native methods after. */
+    fun close() = nativeRtFree(rtPtr)
+
+    /** Host for streaming events (runs on the engine thread). */
+    interface StreamListener {
+        fun onStreamEvent(eventJson: String)
+    }
+
+    companion object {
+        init {
+            System.loadLibrary("sofuu_jni")
+        }
+
+        /** The ABI version this library implements (no runtime needed). */
+        fun abiVersion(): Int = nativeAbiVersion()
+
+        /** Pin $HOME for the process. MUST run before [create] — the
+         *  runtime derives config/brain/session paths from it. */
+        fun setHome(path: String) = nativeSetHome(path)
+
+        /** Set the process working directory (tool-jail default + the
+         *  cwd spawned MCP children inherit). Call before [create]. */
+        fun chdir(path: String) = nativeChdir(path)
+
+        /** Create the runtime on the calling thread. `configJson` is the
+         *  sofuu_rt_new config (NULL-safe); the app passes the app files
+         *  dir as config_root so ~/.sofuu lands in private storage. */
+        fun create(configJson: String? = null): SofuuBridge {
+            val ptr = nativeRtNew(configJson)
+            require(ptr != 0L) { "sofuu_rt_new failed" }
+            return SofuuBridge(ptr)
+        }
+
+        /** Route the engine's console output to logcat (tag `sofuu-js`).
+         * Process-global per the ABI — call once, before any runtime is
+         * created, so boot warnings are captured too. Pass false to send
+         * output back to stdio. */
+        fun setLogEnabled(enabled: Boolean) = nativeSetLogEnabled(enabled)
+
+        fun setStreamListener(listener: StreamListener?) =
+            nativeSetStreamListener(listener)
+
+        // ── Vector embeddings ──────────────────────────────────────
+        // Stateless pure functions in the ABI (sofuu_embed.h): these pass
+        // a NULL rt, so they need no runtime and no thread affinity. The
+        // default space is hash-768 — the same space the brain stores in,
+        // so an embedded string can be remembered with no space argument.
+        // Returns null when the space is unknown or the artifact is
+        // unavailable, rather than a fake zero vector.
+
+        /** Text → vector. `space` null/empty selects the default. */
+        fun embedLocal(text: String, space: String? = null): FloatArray? =
+            nativeEmbedLocal(text, space)
+
+        /** Several texts at once → array of vectors. */
+        fun embedBatch(texts: Array<String>, space: String? = null): Array<FloatArray>? =
+            nativeEmbedBatch(texts, space)
+
+        /** PNG/JPEG bytes → img1-64 vector (joint with sem2-64 geometry). */
+        fun embedImage(bytes: ByteArray): FloatArray? = nativeEmbedImage(bytes)
+
+        /** Space manifest: default space, per-space model ids/dims/hashes. */
+        fun embedInfo(): String? = nativeEmbedInfo()
+
+        @JvmStatic private external fun nativeSetHome(path: String)
+        @JvmStatic private external fun nativeChdir(path: String)
+
+        @JvmStatic private external fun nativeAbiVersion(): Int
+        @JvmStatic private external fun nativeRtNew(config: String?): Long
+        @JvmStatic private external fun nativeRtFree(rt: Long)
+        @JvmStatic private external fun nativeRtEval(rt: Long, source: String): String?
+        @JvmStatic private external fun nativeRtCall(rt: Long, method: String, args: String?): String?
+        @JvmStatic private external fun nativeRtCallStream(rt: Long, method: String, args: String?): Long
+        @JvmStatic private external fun nativeRtCancel(rt: Long, cancelId: Long): Boolean
+        @JvmStatic private external fun nativeSetStreamListener(listener: StreamListener?)
+        @JvmStatic private external fun nativeSetLogEnabled(enabled: Boolean)
+        @JvmStatic private external fun nativeEmbedInfo(): String?
+        @JvmStatic private external fun nativeEmbedLocal(text: String, space: String?): FloatArray?
+        @JvmStatic private external fun nativeEmbedBatch(texts: Array<String>, space: String?): Array<FloatArray>?
+        @JvmStatic private external fun nativeEmbedImage(bytes: ByteArray): FloatArray?
+        @JvmStatic private external fun nativeVoiceTranscribe(rt: Long, audioBase64: String, opts: String?): String?
+        @JvmStatic private external fun nativeVoiceSpeak(rt: Long, text: String, opts: String?): String?
+    }
+}

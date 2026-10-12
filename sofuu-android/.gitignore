@@ -1,0 +1,12 @@
+# Android build outputs
+build/
+.gradle/
+local.properties
+.idea/
+*.iml
+.cxx/
+app/build/
+captures/
+
+# Staged engine payload — built by scripts/mobile/build_engine_android.sh
+app/src/main/jniLibs/

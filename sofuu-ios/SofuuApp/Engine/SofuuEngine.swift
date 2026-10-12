@@ -119,6 +119,9 @@ final class SofuuEngine {
             // and pass config_root explicitly (the documented override).
             SofuuBridge.setHome(homeDir)
             SofuuBridge.chdir(projectDir)
+            // Engine console output → the device log (filter `sofuu-js`).
+            // Installed BEFORE rt_new so boot warnings are not lost.
+            SofuuBridge.setLogEnabled(true)
 
             var cfg: JSONObject = [:]
             cfg["embedded"] = true
@@ -139,6 +142,13 @@ final class SofuuEngine {
                 self.log("boot: bootstrap…")
                 let boot = rt.eval(Self.bootstrapJS)
                 self.log("boot: bootstrap=\(boot ?? "nil")")
+                // Host tools BEFORE chat.init: the runtime publishes each
+                // one into both __sofuu_host_tools (resolved when a turn
+                // runs) and sofuu.tools.TOOLS (resolved when an agent is
+                // defined), and registering after init would leave the
+                // first turn's agent without them.
+                let registered = DeviceTools.registerAll(into: rt)
+                self.log("boot: host tools = \(registered)")
                 var initCfg: JSONObject = [:]
                 initCfg["host"] = "ios"
                 initCfg["project"] = self.projectDir
@@ -398,6 +408,57 @@ final class SofuuEngine {
         await queryObject("JSON.stringify((function(){ try { var list = (sofuu.agent && sofuu.agent.list) ? sofuu.agent.list() : []; return {ok:true, agents:list}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())")
     }
 
+    // ── Local GGUF models ──────────────────────────────────────────────
+
+    /// Read the real caps out of a GGUF header: `ai.modelCaps` opens the
+    /// file and returns its context window, max output, and whether it
+    /// carries a thinking channel. Mirrors what the CLI's `/model x.gguf`
+    /// does so a phone model is configured the same way a desktop one is.
+    func localModelCaps(_ path: String) async -> JSONObject? {
+        await evalJson("(function(){ try { var c = sofuu.ai.modelCaps(\(jsonQuote(path))); return { ok:true, caps:c||{} }; } catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()")
+    }
+
+    /// Confirm the engine can actually open a model before the app points
+    /// its config at it. `modelCaps` only parses the header, so this also
+    /// runs one short generation — that is what surfaces a model whose
+    /// tensors are the wrong shape or unsupported.
+    ///
+    /// Synchronous on the engine thread by design; a local model has no
+    /// network round-trip to wait for.
+    func probeLocalModel(_ path: String, prompt: String = "hi", maxTokens: Int = 8) async -> JSONObject? {
+        await evalJson("(function(){ try { var t = sofuu.ai.inferLocal(\(jsonQuote(path)), \(jsonQuote(prompt)), {maxTokens:\(max(1, min(maxTokens, 64))), temperature:0}); return { ok:true, text: String(t == null ? '' : t) }; } catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()", timeout: 180)
+    }
+
+    // ── Host tools ─────────────────────────────────────────────────────
+
+    /// Native tools registered on the engine thread at boot.
+    ///
+    /// Surfaced so Settings can show what the phone adds over a terminal,
+    /// and so a host tool registration can be verified instead of assumed.
+    private let hostToolsLock = NSLock()
+    private var _hostTools: [String] = []
+    var hostTools: [String] {
+        hostToolsLock.lock(); defer { hostToolsLock.unlock() }
+        return _hostTools
+    }
+
+    /// Expose a native capability to the agent as a tool. Engine thread
+    /// only, and only while the runtime is alive.
+    func registerHostTool(name: String, description: String, parametersJson: String, tool: @escaping SofuuBridge.HostTool) -> Bool {
+        guard let rt = bridge else { return false }
+        let ok = rt.registerHostTool(name: name, description: description, parametersJson: parametersJson, tool: tool)
+        if ok {
+            hostToolsLock.lock(); _hostTools.append(name); hostToolsLock.unlock()
+        }
+        return ok
+    }
+
+    /// Settle a call whose host tool returned nil. Safe from any thread.
+    @discardableResult
+    func resolveHostTool(_ callId: UInt64, resultJson: String? = nil, error: String? = nil) -> Bool {
+        bridge?.resolveHostTool(callId, resultJson: resultJson, error: error) ?? false
+    }
+
     // ── Provider model lists (ported from commands.rs) ───────────────
 
     /// Fetch a provider's model list through the engine's own fetch (keys
@@ -445,6 +506,78 @@ final class SofuuEngine {
     }
     private func queryObject(_ expr: String) async -> JSONObject? { await query(expr) as? JSONObject }
     private func queryArray(_ expr: String) async -> [Any]? { await query(expr) as? [Any] }
+
+    /// Evaluate a JS expression that already evaluates to a JSON object,
+    /// without the `{ok,result}` envelope the query channel wraps.
+    ///
+    /// `RuntimeSurface` uses this because those snippets build their own
+    /// `{ok:..., error:...}` object so a failure inside the brain or the
+    /// ML gates is reported rather than collapsing to nil — the whole
+    /// difference between "the brain is off" and "the call threw".
+    func evalJson(_ script: String) async -> JSONObject? {
+        guard let raw = await queryValue(script) else { return nil }
+        return asJSONObject(raw)
+    }
+
+    /// `evalJson` with a bound, because a headless agent run takes tens of
+    /// seconds on a phone and must not hang a caller forever.
+    func evalJson(_ script: String, timeout: TimeInterval) async -> JSONObject? {
+        guard let raw = await queryValue(script, timeout: timeout) else { return nil }
+        return asJSONObject(raw)
+    }
+
+    /// A reply arrives either already parsed or still as JSON text,
+    /// depending on whether the snippet serialized it.
+    private func asJSONObject(_ raw: Any?) -> JSONObject? {
+        if let obj = raw as? JSONObject { return obj }
+        if let s = raw as? String { return parseJSONObject(s) }
+        return nil
+    }
+
+    func queryFuture(_ expr: String, timeout: TimeInterval) async -> JSONObject? {
+        await query(expr, timeout: timeout) as? JSONObject
+    }
+
+    /// Queue an expression and return its JSON text, without the envelope.
+    ///
+    /// Goes through the reply queue like `query` (so it lands on the engine
+    /// thread) but hands back the raw string, because these snippets
+    /// serialize their own object.
+    private func queryValue(_ expr: String, timeout: TimeInterval = 30) async -> Any? {
+        let script = "(function(){ try { Promise.resolve(eval(\(jsonQuote(expr)))).then(function (v) { " +
+            "__reply_put(typeof v === 'string' ? v : JSON.stringify(v)); }, function (e) { " +
+            "__reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e)})); }); } " +
+            "catch(e) { __reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e)})); } })()"
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<Any?, Never>) in
+            replyLock.lock()
+            pendingReplies.append(cont)
+            replyLock.unlock()
+            enqueue { [weak self] in
+                guard let self else { return }
+                guard let rt = self.bridge else {
+                    self.completeNext(nil)
+                    return
+                }
+                _ = rt.eval(script)
+            }
+        }
+    }
+
+    /// `query` with a deadline. The engine thread keeps running either way;
+    /// this only stops the caller waiting on a turn that will never answer.
+    private func query(_ expr: String, timeout: TimeInterval) async -> Any? {
+        await withTaskGroup(of: Any?.self) { group in
+            group.addTask { await self.query(expr) }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
 
     private func queryScript(_ expr: String) -> String {
         "(function(){ try { Promise.resolve(eval(\(jsonQuote(expr)))).then(function (v) { " +

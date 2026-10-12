@@ -148,7 +148,9 @@ test: $(TARGET)
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
-	@bash tests/run_js_tests.sh
+	@if [ ! -f tests/run_js_tests.sh ]; then \
+		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
+	else bash tests/run_js_tests.sh; fi
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).
@@ -270,6 +272,10 @@ dist-all:
 # `make headless-test`: build libsofuu + compile c_embed.c + c_rlm.c + c_agent.c + run all.
 # `make abi-check`: diff exported symbols against the checked-in baseline.
 headless-test: libsofuu
+	@if [ ! -d examples/headless ]; then \
+		echo "\033[33m— examples/ is local-only (gitignored); nothing to run\033[0m"; \
+		exit 0; \
+	fi
 	@echo ""
 	@echo "\033[1m=== Headless embedding test (H6) ===\033[0m"
 	@echo ""

@@ -128,3 +128,11 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 # bench/ and benchmarks/ live on disk for day-to-day reference.
 /bench/
 /benchmarks/
+
+# ── Local-only test suites and samples (kept on this Mac, out of the repo) ──
+# tests/ holds the JS + shell test corpus and run_js_tests.sh (the runner
+# behind `make test`); examples/ holds the demo scripts and the five
+# headless/ C samples behind `make headless-test`. Both stay on disk; the
+# Makefile targets skip cleanly when they are absent.
+/tests/
+/examples/

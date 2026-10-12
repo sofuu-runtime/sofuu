@@ -28,13 +28,15 @@ static const char* METAL_KERNEL_SOURCE = R"(
 using namespace metal;
 
 kernel void gemv_bf16(
-    device const bfloat *w          [[buffer(0)]],
-    device const float  *x          [[buffer(1)]],
-    device float        *y          [[buffer(2)]],
-    constant uint       &cols       [[buffer(3)]],
-    uint row                        [[threadgroup_position_in_grid]],
-    uint lane                       [[thread_index_in_simdgroup]]
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    device const bfloat *w = (device const bfloat*)(w_base + w_rem);
     float sum = 0.0f;
     device const bfloat *row_w = w + row * cols;
 
@@ -56,13 +58,15 @@ kernel void gemv_bf16(
 }
 
 kernel void gemv_f16(
-    device const half  *w           [[buffer(0)]],
-    device const float *x           [[buffer(1)]],
-    device float       *y           [[buffer(2)]],
-    constant uint      &cols        [[buffer(3)]],
-    uint row                        [[threadgroup_position_in_grid]],
-    uint lane                       [[thread_index_in_simdgroup]]
+    device const uchar *w_base          [[buffer(0)]],
+    device const float *x               [[buffer(1)]],
+    device float       *y               [[buffer(2)]],
+    constant uint      &cols            [[buffer(3)]],
+    constant uint      &w_rem           [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    device const half *w = (device const half*)(w_base + w_rem);
     float sum = 0.0f;
     device const half *row_w = w + row * cols;
 
@@ -84,13 +88,15 @@ kernel void gemv_f16(
 }
 
 kernel void gemv_f32(
-    device const float *w           [[buffer(0)]],
-    device const float *x           [[buffer(1)]],
-    device float       *y           [[buffer(2)]],
-    constant uint      &cols        [[buffer(3)]],
-    uint row                        [[threadgroup_position_in_grid]],
-    uint lane                       [[thread_index_in_simdgroup]]
+    device const uchar *w_base          [[buffer(0)]],
+    device const float *x               [[buffer(1)]],
+    device float       *y               [[buffer(2)]],
+    constant uint      &cols            [[buffer(3)]],
+    constant uint      &w_rem           [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    device const float *w = (device const float*)(w_base + w_rem);
     float sum = 0.0f;
     device const float *row_w = w + row * cols;
 
@@ -112,13 +118,15 @@ kernel void gemv_f32(
 }
 
 kernel void rmsnorm(
-    device const float  *x          [[buffer(0)]],
-    device const bfloat *w          [[buffer(1)]],
-    device float        *y          [[buffer(2)]],
-    constant uint       &dim        [[buffer(3)]],
-    constant float      &eps        [[buffer(4)]],
-    uint lane                       [[thread_index_in_simdgroup]]
+    device const float  *x              [[buffer(0)]],
+    device const uchar  *w_base         [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &dim            [[buffer(3)]],
+    constant float      &eps            [[buffer(4)]],
+    constant uint       &w_rem          [[buffer(5)]],
+    uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    device const bfloat *w = (device const bfloat*)(w_base + w_rem);
     float sum_sq = 0.0f;
     for (uint i = lane; i < dim; i += 32) {
         float val = x[i];
@@ -133,9 +141,9 @@ kernel void rmsnorm(
 }
 
 kernel void swiglu(
-    device float       *g           [[buffer(0)]],
-    device const float *u           [[buffer(1)]],
-    uint id                         [[thread_position_in_grid]]
+    device float       *g               [[buffer(0)]],
+    device const float *u               [[buffer(1)]],
+    uint id                             [[thread_position_in_grid]]
 ) {
     float val = g[id];
     float silu = val / (1.0f + exp(-val));
@@ -143,11 +151,13 @@ kernel void swiglu(
 }
 
 kernel void conv1d_3(
-    device const bfloat *conv_w     [[buffer(0)]],
-    device const float  *state      [[buffer(1)]],
-    device float        *out        [[buffer(2)]],
-    uint c                          [[thread_position_in_grid]]
+    device const uchar *conv_w_base     [[buffer(0)]],
+    device const float *state           [[buffer(1)]],
+    device float       *out             [[buffer(2)]],
+    constant uint      &w_rem           [[buffer(3)]],
+    uint c                              [[thread_position_in_grid]]
 ) {
+    device const bfloat *conv_w = (device const bfloat*)(conv_w_base + w_rem);
     device const bfloat *cw = conv_w + c * 3;
     device const float  *st = state + c * 3;
     float sum = float(cw[0]) * st[0] + float(cw[1]) * st[1] + float(cw[2]) * st[2];
@@ -155,35 +165,41 @@ kernel void conv1d_3(
 }
 
 kernel void gemv_mlx4_affine(
-    device const uint32_t *w        [[buffer(0)]],
-    device const bfloat   *scales   [[buffer(1)]],
-    device const bfloat   *biases   [[buffer(2)]],
-    device const float    *x        [[buffer(3)]],
-    device float          *y        [[buffer(4)]],
-    constant uint         &cols     [[buffer(5)]],
-    constant uint         &group_sz [[buffer(6)]],
-    uint row                        [[threadgroup_position_in_grid]],
-    uint lane                       [[thread_index_in_simdgroup]]
+    device const uchar  *w_base         [[buffer(0)]],
+    device const uchar  *scales_base    [[buffer(1)]],
+    device const uchar  *biases_base    [[buffer(2)]],
+    device const float  *x              [[buffer(3)]],
+    device float        *y              [[buffer(4)]],
+    constant uint       &cols           [[buffer(5)]],
+    constant uint       &group_size     [[buffer(6)]],
+    constant uint4      &rems           [[buffer(7)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    float sum = 0.0f;
-    uint u32_per_row = cols / 8;
-    device const uint32_t *row_w = w + row * u32_per_row;
-    uint groups_per_row = cols / group_sz;
-    device const bfloat *row_scales = scales + row * groups_per_row;
-    device const bfloat *row_biases = biases + row * groups_per_row;
+    device const uint   *q_w    = (device const uint*)(w_base + rems.x);
+    device const bfloat *scales = (device const bfloat*)(scales_base + rems.y);
+    device const bfloat *biases = (device const bfloat*)(biases_base + rems.z);
 
-    for (uint u = lane; u < u32_per_row; u += 32) {
-        uint32_t packed = row_w[u];
-        uint col_base = u * 8;
-        uint grp = col_base / group_sz;
-        float scale = float(row_scales[grp]);
-        float bias  = float(row_biases[grp]);
+    float sum = 0.0f;
+    uint u32_cols = cols / 8;
+    uint n_groups = cols / group_size;
+
+    device const uint   *row_qw = q_w + row * u32_cols;
+    device const bfloat *row_s  = scales + row * n_groups;
+    device const bfloat *row_b  = biases + row * n_groups;
+
+    for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
+        uint val = row_qw[col_u32];
+        uint c_base = col_u32 * 8;
+        uint g_idx = c_base / group_size;
+        float s = float(row_s[g_idx]);
+        float b = float(row_b[g_idx]);
 
         #pragma unroll
         for (uint i = 0; i < 8; ++i) {
-            uint val_4b = (packed >> (i * 4)) & 0x0F;
-            float weight = float(val_4b) * scale + bias;
-            sum += weight * x[col_base + i];
+            uint nibble = (val >> (i * 4)) & 0x0F;
+            float w_val = float(nibble) * s + b;
+            sum += w_val * x[c_base + i];
         }
     }
 
@@ -308,12 +324,16 @@ void sofuu_metal_gemv_bf16(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t aligned_offset = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+
         [enc setComputePipelineState:ctx->pso_gemv_bf16];
-        [enc setBuffer:w_buf offset:w_offset atIndex:0];
+        [enc setBuffer:w_buf offset:aligned_offset atIndex:0];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
         uint c = (uint)cols;
         [enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
 
         MTLSize threadgroups = MTLSizeMake(rows, 1, 1);
         MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
@@ -350,12 +370,16 @@ void sofuu_metal_gemv_f16(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t aligned_offset = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+
         [enc setComputePipelineState:ctx->pso_gemv_f16];
-        [enc setBuffer:w_buf offset:w_offset atIndex:0];
+        [enc setBuffer:w_buf offset:aligned_offset atIndex:0];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
         uint c = (uint)cols;
         [enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
 
         MTLSize threadgroups = MTLSizeMake(rows, 1, 1);
         MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
@@ -392,12 +416,16 @@ void sofuu_metal_gemv_f32(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t aligned_offset = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+
         [enc setComputePipelineState:ctx->pso_gemv_f32];
-        [enc setBuffer:w_buf offset:w_offset atIndex:0];
+        [enc setBuffer:w_buf offset:aligned_offset atIndex:0];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
         uint c = (uint)cols;
         [enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
 
         MTLSize threadgroups = MTLSizeMake(rows, 1, 1);
         MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
@@ -432,13 +460,17 @@ void sofuu_metal_rmsnorm(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t aligned_offset = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+
         [enc setComputePipelineState:ctx->pso_rmsnorm];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:0];
-        [enc setBuffer:w_buf offset:w_offset atIndex:1];
+        [enc setBuffer:w_buf offset:aligned_offset atIndex:1];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
         uint d = (uint)dim;
         [enc setBytes:&d length:sizeof(uint) atIndex:3];
         [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:5];
 
         MTLSize threadgroups = MTLSizeMake(1, 1, 1);
         MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);
@@ -508,10 +540,14 @@ void sofuu_metal_conv1d_3(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t aligned_offset = conv_w_offset & ~255ULL;
+        uint w_rem = (uint)(conv_w_offset & 255ULL);
+
         [enc setComputePipelineState:ctx->pso_conv1d_3];
-        [enc setBuffer:conv_w_buf offset:conv_w_offset atIndex:0];
+        [enc setBuffer:conv_w_buf offset:aligned_offset atIndex:0];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:2];
+        [enc setBytes:&w_rem length:sizeof(uint) atIndex:3];
 
         MTLSize threadsPerGroup = MTLSizeMake(256, 1, 1);
         MTLSize threadgroups = MTLSizeMake((channels + 255) / 256, 1, 1);
@@ -555,16 +591,27 @@ void sofuu_metal_gemv_mlx4(
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        size_t w_aligned = w_offset & ~255ULL;
+        size_t scales_aligned = scales_offset & ~255ULL;
+        size_t biases_aligned = biases_offset & ~255ULL;
+        uint32_t rems[4] = {
+            (uint32_t)(w_offset & 255ULL),
+            (uint32_t)(scales_offset & 255ULL),
+            (uint32_t)(biases_offset & 255ULL),
+            0
+        };
+
         [enc setComputePipelineState:ctx->pso_gemv_mlx4];
-        [enc setBuffer:w_buf offset:w_offset atIndex:0];
-        [enc setBuffer:scales_buf offset:scales_offset atIndex:1];
-        [enc setBuffer:biases_buf offset:biases_offset atIndex:2];
+        [enc setBuffer:w_buf offset:w_aligned atIndex:0];
+        [enc setBuffer:scales_buf offset:scales_aligned atIndex:1];
+        [enc setBuffer:biases_buf offset:biases_aligned atIndex:2];
         [enc setBuffer:ctx->x_buf offset:0 atIndex:3];
         [enc setBuffer:ctx->y_buf offset:0 atIndex:4];
         uint c = (uint)cols;
         uint g = (uint)group_size;
         [enc setBytes:&c length:sizeof(uint) atIndex:5];
         [enc setBytes:&g length:sizeof(uint) atIndex:6];
+        [enc setBytes:rems length:sizeof(rems) atIndex:7];
 
         MTLSize threadgroups = MTLSizeMake(rows, 1, 1);
         MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);

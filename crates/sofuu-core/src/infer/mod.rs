@@ -3,15 +3,20 @@
 // Combines zero-copy mmap, safe GGUF parsing, BPE tokenizer, and C++ SIMD microkernels
 // into a lightweight, zero-dependency LLM engine for edge, laptop, and serverless environments.
 
+pub mod block_graph;
 pub mod gguf;
 pub mod lfm2;
 pub mod metal;
 pub mod mmap;
 pub mod model;
+pub mod npy;
+pub mod pytorch;
 pub mod quant;
 pub mod safetensors;
 pub mod sampler;
+pub mod tensor_table;
 pub mod tokenizer;
+pub mod zip_reader;
 
 use std::path::Path;
 

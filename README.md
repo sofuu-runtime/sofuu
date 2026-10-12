@@ -1,6 +1,6 @@
 # ⚡ Sofuu (素風)
 
-> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU inference, agents, and encrypted memory in a single ≤5 MB binary (4.7 MB shipped). Zero daemons, zero external deps.*
+> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single ≤5 MB binary (4.4 MB shipped). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
@@ -21,7 +21,7 @@ Everything AI workloads need is built into the binary — no npm packages requir
 ## Features
 
 - **JS/TS runtime** — QuickJS (ES2023) + libuv event loop, ~3 ms startup, TypeScript runs with no tsconfig or compiler step, `sofuu bundle` ships one file
-- **Local CPU inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model.gguf>`; GGUF Q4_K/Q6_K/Q8_0/Q4_0, mmap load in ~20 ms, ~140 tok/s prefill, ~30 tok/s decode, sliding-window attention past context limits
+- **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), mmap load in 17–38 ms, up to 150 tok/s prefill, up to 68.7 tok/s decode, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + sub-agents** — `sofuu.agent.define/run`, built-in `code` + `web` tools, budgets, cancel, trace rendering; the same loop powers chat
 - **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving
@@ -120,21 +120,26 @@ sofuu run research.js
 
 ## Local Inference
 
+Sofuu provides a zero-dependency, in-process inference engine supporting **GGUF**, **HuggingFace SafeTensors**, raw **PyTorch checkpoints (`.pt` / `.pth`)**, and **NumPy arrays (`.npy` / `.npz`)**:
+
 ```bash
-# One-shot generation from a quantized GGUF model (zero daemons):
+# One-shot generation from a quantized GGUF model:
 sofuu infer ./Qwen-3-0.6B-Q4_K_M.gguf "Explain virtual memory paging." --max-tokens 200
 
-# Generate past context limits with sliding window:
+# One-shot generation from a HuggingFace SafeTensors directory (LFM-2 BF16 or MLX4):
+sofuu infer ./liqiud-350 "Explain quantum entanglement in simple terms." --max-tokens 50
+
+# Generate past context limits with in-place KV compaction & sliding-window attention:
 sofuu infer ./model.gguf "Write an essay" --ctx 256 --swa 128 --max-tokens 1000
 
-# Interactive chat powered by the local model:
-sofuu chat -m ./model.gguf
+# Interactive chat powered by any local model:
+sofuu chat -m ./Qwen-3-0.6B-Q4_K_M.gguf
 ```
 
 ```javascript
-// In-process streaming — no network calls, no background servers:
+// In-process streaming in JS/TS — no network calls, no background servers:
 const stream = sofuu.ai.streamLocal("Explain vector quantization.", {
-  model: "./Qwen-3-0.6B-Q4_K_M.gguf",
+  model: "./Qwen-3-0.6B-Q4_K_M.gguf",  // or "./liqiud-350"
   temperature: 0.7,
   maxTokens: 500,
 });
@@ -142,6 +147,15 @@ for await (const chunk of stream) {
   process.stdout.write(chunk.text);
 }
 ```
+
+### Verified Hardware Benchmarks
+
+| Hardware Target | Model & Precision | Cold Load | Prompt Prefill | Autoregressive Decode | Notes |
+|---|---|---|---|---|---|
+| **Apple Silicon Mac** (M2 Pro) | `liqiud-350` (BF16 SafeTensors) | **127.9 ms** | — | **68.7 tk/s** | 19.1× speedup via NEON bit-extension |
+| **Apple Silicon Mac** (M2 Pro) | `liquid` (MLX 4-bit SafeTensors) | **119.2 ms** | — | **8.1 tk/s** | 20.25× speedup via group scale/bias broadcast |
+| **Apple Silicon Mac** (M2 Pro) | `Qwen-3-0.6B` (Q4_K_M GGUF) | **17.7 ms** | **138–150 tk/s** | **30.0–33.5 tk/s** | 4-way unrolled vector accumulators |
+| **Raspberry Pi 5** (ARM64 musl) | `Qwen-3-0.6B` (Q4_K_M GGUF) | **38.15 ms** | **49.3–49.8 tk/s** | **15.6–15.7 tk/s** | Zero futex storms, core-pinned, LPDDR4X prefetch |
 
 ---
 

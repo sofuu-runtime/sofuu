@@ -181,6 +181,7 @@
   var RECALL_BUDGET_TOK = 1024; /* floor for tiny windows */
   function recallBudgetTok(d) {
     if (d && d.recallBudget > 0) return d.recallBudget;
+    if (d && d.provider === 'local') return 256;
     var win = contextWindow(d && d.model, d && d.baseUrl, !mlEnabled(d));
     return Math.min(16384, Math.max(RECALL_BUDGET_TOK, Math.floor(win * 0.02)));
   }
@@ -475,8 +476,8 @@
        * the discipline lines survive user overrides; passing the core
        * itself (the chat def does) is a no-op, not a duplication. */
       system: (def.system && String(def.system) !== CORE_PROMPT)
-        ? CORE_PROMPT + '\n' + String(def.system)
-        : CORE_PROMPT,
+        ? (def.provider === 'local' ? String(def.system) : CORE_PROMPT + '\n' + String(def.system))
+        : (def.provider === 'local' ? 'You are a helpful AI assistant.' : CORE_PROMPT),
       provider: def.provider || '',
       model: def.model || '',
       effort: def.effort || '',
@@ -1318,6 +1319,7 @@
     if (opts && opts.api_key) o.api_key = opts.api_key; else if (d.apiKey) o.api_key = d.apiKey;
     if (opts && opts.base_url) o.base_url = opts.base_url; else if (d.baseUrl) o.base_url = d.baseUrl;
     if (opts && opts.profile) o.profile = opts.profile; else if (d.profile) o.profile = d.profile;
+    if (opts && opts.threads) o.threads = opts.threads; else if (d.threads) o.threads = d.threads;
     /* Dynamic output cap: explicit def/opts value wins, else the model's
      * published max output (model_caps). 0 = unknown → omit the field so
      * the endpoint applies its own default. Never a flat constant. */
@@ -2085,14 +2087,18 @@
         var st = sofuu.ai.stream(ro);
         state.aborts.push(function () { try { st.abort(); } catch (e) {} });
         var parts = [];
+        var thinkParts = [];
         var forwarded = false;
         try {
           for await (var chunk of st) {
             if (!chunk) continue;
-            if (chunk.think) { forwarded = true; if (onThink) onThink(chunk.think); continue; }
+            if (chunk.think) { forwarded = true; thinkParts.push(chunk.think); if (onThink) onThink(chunk.think); continue; }
             if (chunk.text) { forwarded = true; parts.push(chunk.text); if (onText && !isCont) onText(chunk.text); }
           }
           var add = parts.join('');
+          if (!add.trim() && thinkParts.length) {
+            add = thinkParts.join('').trim();
+          }
           if (isCont) {
             add = trimOverlap(acc, add);
             if (onText && add) onText(add);
@@ -2178,9 +2184,10 @@
           var qemb = await embedTextFor(d, backend, String(task));
           var qvec = qemb ? qemb.vec : null;
           var semQvec = semCma ? embedSemV2(String(task)) : null;
+          var maxRecallHits = (d && d.provider === 'local') ? 3 : 15;
           var hits = (semCma && semQvec)
-            ? fuseRecall(d, brainEntry, qvec, semQvec, 15)
-            : scopeRecall(d, cma, qvec, 15);
+            ? fuseRecall(d, brainEntry, qvec, semQvec, maxRecallHits)
+            : scopeRecall(d, cma, qvec, maxRecallHits);
           /* alloc gate (§14): the recall block budget comes from the plan
            * when ML is on (tight sessions recall less); an explicit
            * def.recallBudget still wins. */
@@ -2220,13 +2227,11 @@
        * (never the byte-stable system prompt, P1/P6) so the model can judge
        * staleness at all. ~8 tokens/turn; the freshness gate (§5) builds on
        * this, it does not substitute for it. */
-      ctxParts.push('Current date: ' + isoDate() + '.');
-      /* AGENTS.md (owner directive 2026-09-12): the project's standing
-       * context file rides the ephemeral context message every turn —
-       * read fresh from disk at run start, so an edit between turns flows
-       * on the very next request. Same untrusted framing as recalls. */
-      var agentsMd = await readAgentsMd(d);
-      if (agentsMd) ctxParts.push(agentsMd);
+      if (d.provider !== 'local') {
+        ctxParts.push('Current date: ' + isoDate() + '.');
+        var agentsMd = await readAgentsMd(d);
+        if (agentsMd) ctxParts.push(agentsMd);
+      }
       if (recallBlock) {
         ctxParts.push(recallBlock);
         /* Freshness gate on recalled memory (§5): the block is scored as

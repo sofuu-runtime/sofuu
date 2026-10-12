@@ -130,13 +130,95 @@ static TABLE: &[(&str, i32, i32, Thinking)] = &[
     ("claude", 200_000, 8_192, Thinking::None),
 ];
 
+fn inspect_gguf_caps(path: &str) -> Option<ModelCaps> {
+    let clean = crate::infer::clean_model_path(path);
+    let clean_str = clean.to_string_lossy().into_owned();
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(String, ModelCaps)>> = Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_path, caps)) = &*guard {
+            if cached_path == &clean_str {
+                return Some(*caps);
+            }
+        }
+    }
+
+    let gguf = crate::infer::gguf::GgufFile::open(&clean).ok()?;
+    let arch = gguf.get_str("general.architecture").unwrap_or("llama");
+    let mut ctx_u32 = gguf
+        .get_u32(&format!("{arch}.context_length"))
+        .or_else(|| gguf.get_u32("context_length"))
+        .or_else(|| gguf.get_u32("context_window"));
+    if ctx_u32.is_none() {
+        for (k, _) in &gguf.metadata {
+            if k.ends_with(".context_length") || k.ends_with(".context_window") {
+                if let Some(val) = gguf.get_u32(k) {
+                    ctx_u32 = Some(val);
+                    break;
+                }
+            }
+        }
+    }
+    let ctx = ctx_u32.unwrap_or(4096) as i32;
+    let max_output = (ctx / 4).clamp(512, 4096);
+
+    let chat_tmpl = gguf.get_str("tokenizer.chat_template").unwrap_or("");
+    let name = gguf.get_str("general.name").unwrap_or("");
+    let finetune = gguf.get_str("general.finetune").unwrap_or("");
+    let path_lower = path.to_lowercase();
+    let is_reasoning = chat_tmpl.contains("<think>")
+        || chat_tmpl.contains("reasoning_content")
+        || chat_tmpl.contains("enable_thinking")
+        || name.to_lowercase().contains("reasoning")
+        || name.to_lowercase().contains("opus-distilled")
+        || name.to_lowercase().contains("qwq")
+        || name.to_lowercase().contains("r1")
+        || finetune.to_lowercase().contains("reasoning")
+        || finetune.to_lowercase().contains("distill")
+        || path_lower.contains("deepseek-r1")
+        || path_lower.contains("qwq")
+        || path_lower.contains("distilled")
+        || path_lower.contains("reasoning");
+
+    let thinking = if is_reasoning {
+        Thinking::Effort(O_EFFORTS)
+    } else {
+        Thinking::None
+    };
+
+    let caps = ModelCaps {
+        ctx_window: ctx,
+        max_output,
+        thinking,
+    };
+
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((clean_str, caps));
+    }
+    Some(caps)
+}
+
 /// Resolve capabilities by model name (case-insensitive prefix match;
 /// `org/model` forms match too).
 pub fn lookup(model: Option<&str>) -> ModelCaps {
-    let m = model.unwrap_or("").trim().to_lowercase();
-    if m.is_empty() {
+    let raw = model.unwrap_or("").trim();
+    if raw.is_empty() {
         return NO_CAPS;
     }
+    let cleaned = crate::infer::clean_model_path(raw);
+    let is_gguf = cleaned.extension().map_or(false, |e| e == "gguf")
+        || raw.ends_with(".gguf");
+    if is_gguf {
+        if let Some(caps) = inspect_gguf_caps(raw) {
+            return caps;
+        }
+        return ModelCaps {
+            ctx_window: 4096,
+            max_output: 2048,
+            thinking: Thinking::None,
+        };
+    }
+    let m = raw.to_lowercase();
     for (prefix, ctx, out, thinking) in TABLE {
         // P3 (AUDIT-2026-09-07): allocation-free `contains("/{prefix}")` —
         // the old format! built a fresh String per table row per lookup,
@@ -162,6 +244,9 @@ pub fn lookup(model: Option<&str>) -> ModelCaps {
 /// provider-agnostic and strips completion suffixes.
 pub fn lookup_for(model: Option<&str>, base_url: Option<&str>) -> ModelCaps {
     let reg = lookup(model);
+    if model.map_or(false, |m| m.contains(".gguf")) {
+        return reg;
+    }
     let Some(url) = base_url else { return reg };
     super::model_caps_discovered::ensure_loaded();
     let Some(d) = super::model_caps_discovered::lookup(url, model.unwrap_or("")) else {
@@ -435,5 +520,15 @@ mod tests {
         let unk = lookup(Some("weird-model"));
         assert_eq!(resolve_openai_effort(&unk, Some("max")), None);
         assert_eq!(resolve_openai_effort(&unk, Some("medium")), None);
+    }
+
+    #[test]
+    fn test_qwen_gguf_caps() {
+        let p = "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf";
+        if std::path::Path::new(p).exists() {
+            let caps = lookup(Some(p));
+            println!("QWEN GGUF CAPS: ctx_window={}, max_output={}", caps.ctx_window, caps.max_output);
+            assert!(caps.ctx_window > 0);
+        }
     }
 }

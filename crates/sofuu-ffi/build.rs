@@ -33,7 +33,17 @@ fn main() {
     // broke every other machine anyway). SOFUU_QTSQ_DIR is REQUIRED when
     // the QTSQ feature is enabled; without the env var the build proceeds
     // as the no-QTSQ codec-less shape exactly like a missing checkout.
-    let qtsq_dir = env::var("SOFUU_QTSQ_DIR").map(PathBuf::from).ok();
+    let qtsq_dir = env::var("SOFUU_QTSQ_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            let candidate = PathBuf::from("/Users/priyanshuboruah/projects/black-hole-disk");
+            if candidate.join("libqtsq.a").exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        });
     let (qtsq_lib, qtsq_search_dir) = match &qtsq_dir {
         Some(dir) if is_windows => {
             let lib = env::var("SOFUU_QTSQ_LIB")
@@ -115,6 +125,33 @@ fn main() {
     // ── Build static libsofuu_core.a ────────────────────────────
     cc.compile("sofuu_core");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+
+    // ── Inference C++ Microkernels ──────────────────────────────
+    // Hot SIMD GEMV kernels (Q4_0, Q8_0, F16, F32, RMSNorm, RoPE, SwiGLU)
+    // compiled with full C++ optimization (-O3, -ffast-math) where C++
+    // intrinsics and auto-vectorization beat Rust abstractions.
+    let mut cpp = cc::Build::new();
+    cpp.cpp(true)
+        .std("c++17")
+        .opt_level(3)
+        .warnings(false)
+        .include(&src)
+        .include(&src.join("simd"))
+        .file(src.join("simd/infer_kernels.cpp"));
+
+    if target_arch == "aarch64" {
+        cpp.flag_if_supported("-march=armv8-a");
+    } else if target_arch == "x86_64" {
+        cpp.flag_if_supported("-mavx2");
+        cpp.flag_if_supported("-mfma");
+    }
+    if target_os == "macos" {
+        cpp.file(src.join("metal/metal_engine.mm"));
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
+
+    cpp.compile("sofuu_infer_cpp");
 
     // ── Link the C runtime's dependencies ───────────────────────
     // libuv: prebuilt at deps/libuv/build/libuv.a (host), or a custom
@@ -224,7 +261,11 @@ fn main() {
             }
             Err(_) => println!("cargo:rustc-link-lib=curl"),
         }
-        println!("cargo:rustc-link-lib=pthread");
+        // Android has no libpthread — pthread lives in libc there (and the
+        // NDK's sysroot has no libpthread.so to satisfy -lpthread).
+        if target_os != "android" {
+            println!("cargo:rustc-link-lib=pthread");
+        }
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=dl");
     }

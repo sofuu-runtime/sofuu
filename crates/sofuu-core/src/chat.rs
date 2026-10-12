@@ -156,6 +156,7 @@ pub struct ChatConfig {
     pub archive_max_age_secs: u64,
     pub archive_auto_recover: bool,
     pub archive_recovery_budget_chars: usize,
+    pub threads: usize,
 }
 
 /// P3 (AUDIT-2026-09-07): f64 bits of the lifetime spend last flushed to
@@ -254,6 +255,7 @@ impl ChatConfig {
             archive_max_age_secs: 0,
             archive_auto_recover: true,
             archive_recovery_budget_chars: 12_000,
+            threads: 0,
         }
     }
 
@@ -452,6 +454,22 @@ impl ChatConfig {
             cfg.active = cfg.providers.first().map(|p| p.name.clone()).unwrap_or_default();
             if let Some(entry) = cfg.providers.iter().find(|p| p.name == cfg.active).cloned() {
                 cfg.provider = entry.name; cfg.model = entry.model; cfg.base_url = entry.endpoint; cfg.api_key = entry.api_key; cfg.profile = entry.profile;
+            }
+        }
+        if !cfg.ctx_window_explicit && !cfg.model.is_empty() {
+            let is_gguf = cfg.model.ends_with(".gguf")
+                || sofuu_core::infer::clean_model_path(&cfg.model).extension().map_or(false, |e| e == "gguf");
+            if is_gguf {
+                let caps = sofuu_core::rt::model_caps::lookup(Some(&cfg.model));
+                if caps.ctx_window > 0 {
+                    cfg.ctx_window = caps.ctx_window as i64;
+                }
+                if caps.max_output > 0 {
+                    cfg.max_output = caps.max_output as i64;
+                }
+                if caps.thinking != sofuu_core::rt::model_caps::Thinking::None && (cfg.effort == "off" || cfg.effort.is_empty()) {
+                    cfg.effort = "high".into();
+                }
             }
         }
         cfg
@@ -966,6 +984,26 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         "/model" => {
             if arg.is_empty() { return "pick_model"; }
             let picked = arg.trim().to_string();
+            let is_gguf = picked.ends_with(".gguf")
+                || sofuu_core::infer::clean_model_path(&picked).extension().map_or(false, |e| e == "gguf");
+            if is_gguf {
+                cfg.provider = "local".to_string();
+                cfg.base_url.clear();
+                cfg.api_key.clear();
+                let caps = sofuu_core::rt::model_caps::lookup(Some(&picked));
+                if caps.ctx_window > 0 {
+                    cfg.ctx_window = caps.ctx_window as i64;
+                    cfg.ctx_window_explicit = false;
+                }
+                if caps.max_output > 0 {
+                    cfg.max_output = caps.max_output as i64;
+                }
+                if caps.thinking != sofuu_core::rt::model_caps::Thinking::None {
+                    cfg.effort = "high".to_string();
+                } else {
+                    cfg.effort = "off".to_string();
+                }
+            }
             cfg.model = picked.clone();
             if let Some(entry) = cfg.providers.iter_mut().find(|p| p.name == cfg.active) {
                 entry.model = cfg.model.clone();
@@ -1879,6 +1917,8 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     };
     let model = if cfg.provider.is_empty() || cfg.model.is_empty() {
         "not configured · run /provider to pick one".to_string()
+    } else if cfg.provider == "local" {
+        format!("local: {}{}", cfg.model, effort)
     } else {
         format!("{}/{}{}", cfg.provider, cfg.model, effort)
     };
@@ -1888,7 +1928,7 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
             "Session:".into(),
             if session.is_empty() { "none".into() } else { session.into() },
         ),
-        ("Model:".into(), model),
+        ("Model:".into(), trunc_cells(&model, inner.saturating_sub(14))),
         (
             "Mode:".into(),
             match cfg.permissions.as_str() {
@@ -1942,6 +1982,8 @@ fn welcome_plain(cfg: &ChatConfig, session: Option<&str>, dir: &str) -> Vec<Stri
     };
     let model_str = if cfg.provider.is_empty() || cfg.model.is_empty() {
         "not configured · run /provider to pick one".to_string()
+    } else if cfg.provider == "local" {
+        format!("local: {}{}", cfg.model, effort)
     } else {
         format!("{}/{}{}", cfg.provider, cfg.model, effort)
     };
@@ -2183,6 +2225,7 @@ unsafe extern "C" fn js_chat_getcfg(
             "permissions": cfg.permissions,
             "theme": cfg.theme,
             "ctx_window": cfg.ctx_window,
+            "ctx_window_explicit": cfg.ctx_window_explicit,
             "max_output": cfg.max_output,
             /* Hard ceilings, published so the driver's non-TTY usage lines
              * can state the valid range. Served from Rust rather than
@@ -2202,6 +2245,7 @@ unsafe extern "C" fn js_chat_getcfg(
             "rss_warn_mb": cfg.rss_warn_mb,
             "recall_min": cfg.recall_min,
             "recall_budget": cfg.recall_budget,
+            "threads": cfg.threads,
             /* save() persists no_think_models but this serializer dropped it —
              * a JS-side cfg reload never saw the runtime thinking rejection,
              * so the THINK "no-effort retry" re-sent reasoning_effort and
@@ -5094,6 +5138,7 @@ const DRIVER: &str = r#"
     if (c.api_key) o.api_key = c.api_key;
     if (c.base_url) o.base_url = c.base_url;
     if (c.profile) o.profile = c.profile;
+    if (c.threads) o.threads = c.threads;
     /* Output cap from the ladder: config honored only as far as the
      * strictest real evidence for THIS model allows. A number the ladder
      * DEFAULTED (model unknown everywhere) is never sent — the endpoint
@@ -5116,8 +5161,7 @@ const DRIVER: &str = r#"
   function usableConfig(view) {
     const v = view || cfg;
     if (!v.provider || !v.model) return false;
-    if (KNOWN.indexOf(v.provider) < 0 && !v.base_url) return false;
-    if (v.provider === 'local') return false; /* not shipped yet */
+    if (v.provider === 'local') return true;
     return true;
   }
   /* Pretty tool-call rendering: show the interesting argument as a quoted
@@ -5430,21 +5474,22 @@ const DRIVER: &str = r#"
      * The thinking block is only sent when c.effort is low/medium/high/max.
      * Models detected as thinking-incapable at runtime (no_think_models)
      * also never get an effort parameter. */
-    let noThink = (c.no_think_models || []).indexOf(c.model) >= 0;
+    let noThink = (c.no_think_models || []).indexOf(c.model) >= 0 || (c.effort === 'off') || (resolveCaps().thinking === 'none');
+    const isLocal = c.provider === 'local';
     const def = {
       name: 'chat',
-      /* P1: the byte-stable shared core prompt. lastShared mesh notes no
-       * longer concatenate into the system string — they ride the ephemeral
-       * context message via opts.shared so prefix caching works (P6). */
-      system: sofuu.agent.CORE_PROMPT,
-      tools: chatToolDefs(),
-      agents: subAgentNames.length ? subAgentNames : undefined,
+      /* P1: the byte-stable shared core prompt. For local models, keep
+       * it lean so CPU prefill latency matches direct `sofuu infer`. */
+      system: isLocal ? 'You are a helpful AI assistant.' : sofuu.agent.CORE_PROMPT,
+      tools: isLocal ? [] : chatToolDefs(),
+      agents: (isLocal || !subAgentNames.length) ? undefined : subAgentNames,
       provider: c.provider, model: c.model,
       /* strict: only what the user selected, never more; off → undefined */
       effort: noThink ? undefined : (c.effort && c.effort !== 'off' ? c.effort : undefined),
       api_key: c.api_key || undefined,
       base_url: c.base_url || undefined,
       profile: c.profile || undefined,
+      threads: c.threads || undefined,
       max_tokens: (function () { const r = resolveCaps(); return (r.maxOutput > 0 && r.maxSource !== 'default') ? r.maxOutput : undefined; })(),
       embed_provider: c.embed_provider || undefined,
       embed_model: c.embed_model || undefined,
@@ -5582,7 +5627,7 @@ const DRIVER: &str = r#"
              * still feeds the Thinking phase) but not painted into the
              * transcript, and sawThink stays false so no seal line is
              * emitted for a line that was never drawn. */
-            if (c.effort) {
+            if (c.effort || c.provider === 'local') {
               sawThink = true;
               outLast('  ▸ thinking \x1b[3m' + thinks.join('') + '\x1b[0m');
             }
@@ -7872,6 +7917,23 @@ mod tests {
                 let wrapped = wrap_row(r, budget);
                 assert_eq!(wrapped.len(), 1, "term {term}: box row torn: {r:?}");
                 assert_eq!(wrapped[0], *r, "term {term}: box row mutated");
+            }
+        }
+
+        let long_cfg = ChatConfig {
+            provider: "local".into(),
+            model: "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf".into(),
+            effort: "high".into(),
+            ..Default::default()
+        };
+        for term in [40usize, 60, 80, 100, 120] {
+            let budget = term - GUTTER;
+            let rows = welcome_panel_at(&long_cfg, "s-5654", "/Users/priyanshuboruah/ai-native-js-runtime", budget - 1);
+            let is_box = |r: &String| r.contains('│') || r.contains('╭') || r.contains('╰');
+            for r in rows.iter().filter(|r| is_box(r)) {
+                let wrapped = wrap_row(r, budget);
+                assert_eq!(wrapped.len(), 1, "term {term}: box row torn by long model path: {r:?}");
+                assert_eq!(cell_w(r), budget - 1, "term {term}: row width mismatch");
             }
         }
     }

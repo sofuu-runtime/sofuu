@@ -28,7 +28,8 @@ endif
 # because a QTSQ-free build is INVISIBLY broken: memory calls no-op and
 # every session persist fails, while the chat banner still claims
 # "Memory: on (persists across sessions)". A release tarball built that
-# way shipped once (2026-09-22) and doctor now catches it in one command.
+# Default to local checkout if present
+SOFUU_QTSQ_DIR ?= $(firstword $(wildcard /Users/priyanshuboruah/projects/black-hole-disk $(HOME)/projects/black-hole-disk))
 QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ_DIR)/libqtsq.dylib))
 
 # ──────────────────────────────────────────────────────────────────
@@ -39,7 +40,8 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
-        desktop desktop-dev desktop-clean
+        desktop desktop-dev desktop-clean \
+        ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
 SIZE_LIMIT ?= 5242880   # 5 MB hard cap (bytes)
 
@@ -198,6 +200,68 @@ dist-ios:
 
 dist-android:
 	@bash scripts/dist/android.sh all
+
+# ── Sofuu Mobile (Android app) ─────────────────────────────────────
+# `make mobile-engine`: build the QTSQ-linked libsofuu per Android ABI
+# (libuv + OpenSSL + curl + QTSQ + sofuu-capi) and stage the .so's into
+# sofuu-android/app/src/main/jniLibs. Then build the app with gradle:
+#   cd sofuu-android && ./gradlew :app:assembleDebug
+mobile-engine:
+	@bash scripts/mobile/build_engine_android.sh all
+
+# Release engine (.so stripped, opt-z + fat LTO) — what a shipping APK
+# links. Needs the runtime workspace to compile (cargo build --release).
+mobile-engine-release:
+	@SOFUU_ANDROID_PROFILE=release bash scripts/mobile/build_engine_android.sh all
+
+# The app itself (Kotlin/Compose).
+mobile-apk:
+	@cd sofuu-android && ./gradlew :app:assembleDebug
+
+# ── Sofuu Mobile (iOS app) ─────────────────────────────────────────
+# The iOS app lives in sofuu-ios/ (SwiftUI + Swift concurrency, linking
+# libsofuu through its C ABI — no JNI). Its Xcode project is generated from
+# sofuu-ios/project.yml, so the .xcodeproj is a build artifact, not source.
+#
+#   make ios-typecheck   Swift + Metal check, ~3s, no engine needed
+#   make ios-engine-deps cross-build OpenSSL + libcurl for both slices
+#   make ios-engine      build dist/libsofuu.xcframework (device + sim)
+#   make ios-project     regenerate Sofuu.xcodeproj from project.yml
+#   make ios-app         build the app for the simulator
+#
+# `ios-typecheck` first: it needs nothing but Xcode, and it is where every
+# Swift error will actually show up.
+ios-typecheck:
+	@bash scripts/mobile/typecheck_ios.sh sim
+
+# Needs `brew install xcodegen`.
+ios-project:
+	@cd sofuu-ios && xcodegen generate
+
+# The third-party TLS stack (OpenSSL → libcurl) for both iOS slices. iOS has
+# no system libcurl and no system OpenSSL, so unlike Android these must be
+# cross-built before the engine can link. `ios-engine` invokes this
+# automatically; it is a separate target only so the slow, one-time step can
+# be run and cached on its own.
+ios-engine-deps:
+	@bash scripts/dist/ios.sh deps
+
+# Device + simulator slices → dist/libsofuu.xcframework, which project.yml
+# links. Builds the iOS OpenSSL/libcurl stack first if it is not cached.
+ios-engine:
+	@bash scripts/dist/ios.sh all
+
+ios-app: ios-project
+	@cd sofuu-ios && xcodebuild -project Sofuu.xcodeproj -scheme SofuuApp \
+		-sdk iphonesimulator -configuration Debug build
+
+# Boot the app on an already-running simulator (open Simulator.app first).
+ios-sim: ios-app
+	@cd sofuu-ios && xcrun simctl install booted \
+		"$$(xcodebuild -project Sofuu.xcodeproj -scheme SofuuApp -sdk iphonesimulator \
+			-configuration Debug -showBuildSettings 2>/dev/null \
+			| awk '/ BUILT_PRODUCTS_DIR /{print $$3}')/Sofuu.app" && \
+		xcrun simctl launch booted com.sofuu.app
 
 dist-all:
 	@bash scripts/dist/all.sh

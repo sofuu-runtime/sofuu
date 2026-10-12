@@ -15,6 +15,8 @@ tools/
 *.dylib
 *.so
 *.out
+*.air
+*.metallib
 
 # ── Rust build artifacts ──────────────────────────
 target/
@@ -36,6 +38,9 @@ Makefile.bak
 context.md
 build.log
 compile_commands.json
+findings.md
+progress.md
+task_plan.md
 
 # ── Research archive (not part of this repo) ─────
 black-hole-disk/
@@ -73,6 +78,7 @@ ascii-art.png
 .commandcode/
 .zcode/
 .mimosa/
+.workbuddy-ai/
 
 # ── Excluded research dir (not part of this repo) ─
 new-model-arch./
@@ -117,3 +123,11 @@ sofuu-desktop/src-tauri/icons/ios/
 sofuu-desktop/src-tauri/icons/android/
 sofuu-desktop/src-tauri/icons/Square*.png
 sofuu-desktop/src-tauri/icons/StoreLogo.png
+
+# ── Local-only working docs (kept on this Mac, out of the repo) ──
+# docs/, bench/ and benchmarks/ were removed from git but live on disk
+# for day-to-day reference. Root-anchored so subdirs like
+# sofuu-ios/docs/ are unaffected.
+/docs/
+/bench/
+/benchmarks/

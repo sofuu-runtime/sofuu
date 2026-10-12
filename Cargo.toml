@@ -35,6 +35,9 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+[profile.release.package.sofuu-core]
+opt-level = 3
+
 # Debug builds stay fast to compile.
 [profile.dev]
 opt-level = 1

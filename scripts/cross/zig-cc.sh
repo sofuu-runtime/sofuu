@@ -21,22 +21,23 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ZIG="$DIR/../../tools/zig/zig"
 SUB="cc"
 
-if [ "${1:-}" = "--cxx" ]; then
+while [ "${1:-}" = "--cxx" ]; do
     SUB="c++"
     shift
-fi
+done
 
 declare -a ARGS=()
 for a in "$@"; do
     case "$a" in
         --target=x86_64-unknown-linux-musl)   ARGS+=("-target" "x86_64-linux-musl") ;;
-        --target=aarch64-unknown-linux-musl)  ARGS+=("-target" "aarch64-linux-musl") ;;
+        --target=aarch64-unknown-linux-musl)  ARGS+=("-target" "aarch64-linux-musl" "-mcpu=cortex_a76") ;;
         --target=x86_64-unknown-linux-gnu)    ARGS+=("-target" "x86_64-linux-gnu") ;;
         --target=aarch64-unknown-linux-gnu)   ARGS+=("-target" "aarch64-linux-gnu") ;;
         --target=x86_64-pc-windows-gnu)       ARGS+=("-target" "x86_64-windows-gnu") ;;
         --target=aarch64-pc-windows-gnullvm)  ARGS+=("-target" "aarch64-windows-gnu") ;;
         --target=x86_64-apple-darwin)         ARGS+=("-target" "x86_64-macos") ;;
         --target=aarch64-apple-darwin)        ARGS+=("-target" "aarch64-macos") ;;
+        -march=armv8-a)                       ;;
         *)                                    ARGS+=("$a") ;;
     esac
 done

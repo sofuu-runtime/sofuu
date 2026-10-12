@@ -680,7 +680,7 @@ unsafe extern "C" fn rfb_open_cb(req_fs: *mut UvFs) {
     // uv wrote, and an error path drops the Vec without ever observing the
     // capacity. SAFETY: uv writes only into the spare capacity reserved here.
     let cap = if sz > 0 { sz as usize } else { 1 };
-    let mut b: Vec<u8> = Vec::with_capacity(cap);
+    let b: Vec<u8> = Vec::with_capacity(cap);
     (*r).buf = b;
 
     let rr = fs_req_alloc();

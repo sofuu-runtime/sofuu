@@ -281,7 +281,7 @@ fn inflate_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
     // Bomb guard: cap inflated size (gz bomb would OOM via read_to_end).
     const MAX_INFLATED: u64 = 64 * 1024 * 1024; // 64MB
     let mut out = Vec::new();
-    let mut decoder = flate2::read::GzDecoder::new(data);
+    let decoder = flate2::read::GzDecoder::new(data);
     decoder
         .take(MAX_INFLATED + 1)
         .read_to_end(&mut out)

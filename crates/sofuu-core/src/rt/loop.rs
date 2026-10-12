@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use sofuu_ffi::qjs::JSContext;
-use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_DEFAULT, UV_RUN_NOWAIT, UV_RUN_ONCE};
+use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_NOWAIT, UV_RUN_ONCE};
 
 use crate::rt::promise::sofuu_flush_jobs;
 

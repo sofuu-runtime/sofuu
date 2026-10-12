@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 // sofuu-core — Rust entrypoint for the Sofuu runtime.
 //
 // Phase 1: this binary is a drop-in for the C main(). It dispatches the same
@@ -79,6 +81,7 @@ fn print_help() {
     println!("  sofuu agent run <name> \"task\"  Run one agent headless");
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
+    println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
     println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
     println!("  sofuu version            Print version and exit");
     println!("  sofuu licenses           Print open-source licenses");
@@ -446,7 +449,41 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
         match a {
             "-m" | "--model" => match value_arg(args, i) {
                 Some(v) => {
+                    let cleaned = sofuu_core::infer::clean_model_path(&v);
+                    let is_gguf = v.ends_with(".gguf")
+                        || cleaned.extension().map_or(false, |e| e == "gguf");
+                    if is_gguf {
+                        cfg.provider = "local".into();
+                        cfg.base_url.clear();
+                        cfg.api_key.clear();
+                        let caps = sofuu_core::rt::model_caps::lookup(Some(&v));
+                        if caps.ctx_window > 0 {
+                            cfg.ctx_window = caps.ctx_window as i64;
+                            cfg.ctx_window_explicit = false;
+                        }
+                        if caps.max_output > 0 {
+                            cfg.max_output = caps.max_output as i64;
+                        }
+                        if caps.thinking != sofuu_core::rt::model_caps::Thinking::None {
+                            cfg.effort = "high".into();
+                        } else {
+                            cfg.effort = "off".into();
+                        }
+                    }
                     cfg.model = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} needs a value");
+                    return 1;
+                }
+            },
+            "-t" | "--threads" => match value_arg(args, i) {
+                Some(v) => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        cfg.threads = n;
+                        sofuu_core::infer::quant::set_thread_count(n);
+                    }
                     i += 2;
                 }
                 None => {
@@ -1159,6 +1196,123 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+        "infer" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu infer' requires a model file and a prompt");
+                eprintln!("Usage: sofuu infer <model.gguf> \"<prompt>\" [--max-tokens <n>] [--temp <f>]");
+                return ExitCode::FAILURE;
+            }
+            let model_path = &args[2];
+            let prompt = &args[3];
+
+            let mut max_tokens = 256;
+            let mut temperature = 0.7f32;
+            let mut threads = 0usize;
+            let mut sliding_window = 0usize;
+            let mut custom_ctx = 0usize;
+
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--max-tokens" && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        max_tokens = v;
+                    }
+                    i += 2;
+                } else if args[i] == "--temp" && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<f32>() {
+                        temperature = v;
+                    }
+                    i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        threads = v;
+                    }
+                    i += 2;
+                } else if (args[i] == "--sliding-window" || args[i] == "--swa") && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        sliding_window = v;
+                    }
+                    i += 2;
+                } else if (args[i] == "--ctx" || args[i] == "-c") && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        custom_ctx = v;
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+
+            eprintln!("\x1b[36m⚡ Sofuu CPU Inference Engine\x1b[0m — loading {}...", model_path);
+            let t0 = std::time::Instant::now();
+            let mut engine = match sofuu_core::infer::InferEngine::load_with_seq_len(model_path, custom_ctx) {
+                Ok(eng) => eng,
+                Err(e) => {
+                    eprintln!("\x1b[31mError loading model:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let load_dur = t0.elapsed();
+            let active_threads = if threads > 0 {
+                threads
+            } else {
+                sofuu_core::infer::quant::get_thread_count()
+            };
+            eprintln!(
+                "\x1b[32m✓ Model loaded in {:.2?}\x1b[0m (dim={}, layers={}, heads={}, vocab={}, threads={})\n",
+                load_dur,
+                engine.model.config.dim,
+                engine.model.config.n_layers,
+                engine.model.config.n_heads,
+                engine.model.config.vocab_size,
+                active_threads
+            );
+
+            let t_gen = std::time::Instant::now();
+            let mut token_count = 0usize;
+            use std::io::Write;
+            let res = engine.stream(
+                prompt,
+                sofuu_core::infer::GenerateOptions {
+                    max_tokens,
+                    temperature,
+                    threads,
+                    sliding_window,
+                    ..Default::default()
+                },
+                |tok| {
+                    token_count += 1;
+                    print!("{tok}");
+                    let _ = std::io::stdout().flush();
+                    true
+                },
+            );
+
+            println!();
+            let gen_dur = t_gen.elapsed();
+            if let Err(e) = res {
+                eprintln!("\n\x1b[31mInference error:\x1b[0m {e}");
+                return ExitCode::FAILURE;
+            }
+            let prefill_toks = engine.last_prefill_tokens;
+            let prefill_dur = engine.last_prefill_duration;
+            let prefill_rate = if prefill_dur.as_secs_f32() > 0.0 {
+                prefill_toks as f32 / prefill_dur.as_secs_f32()
+            } else {
+                0.0
+            };
+            let decode_dur = gen_dur.saturating_sub(prefill_dur);
+            let decode_rate = if decode_dur.as_secs_f32() > 0.0 {
+                token_count as f32 / decode_dur.as_secs_f32()
+            } else {
+                0.0
+            };
+            eprintln!(
+                "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
+                prefill_toks, prefill_dur, prefill_rate, token_count, decode_dur, decode_rate, gen_dur
+            );
+            ExitCode::SUCCESS
         }
         "run" => {
             if args.len() < 3 {

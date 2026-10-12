@@ -20,7 +20,17 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(emb_h_32,emb_h_36,emb_h_48,emb_h_64,emb_h_96,emb_h_128)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let is_windows = target_os == "windows";
-    let qtsq_dir = env::var("SOFUU_QTSQ_DIR").map(PathBuf::from).ok();
+    let qtsq_dir = env::var("SOFUU_QTSQ_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            let candidate = PathBuf::from("/Users/priyanshuboruah/projects/black-hole-disk");
+            if candidate.join("libqtsq.a").exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        });
     // P3 (AUDIT-2026-09-07): the probe used to look for libqtsq.a on every
     // host while sofuu-ffi/build.rs links qtsq.lib (or SOFUU_QTSQ_LIB) on
     // Windows — the two crates' has_qtsq cfgs could disagree on a Windows

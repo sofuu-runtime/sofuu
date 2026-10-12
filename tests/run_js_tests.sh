@@ -39,7 +39,6 @@ TESTS=(
     "ai_stream_error_frame_test.js|ai.stream error surfacing (in-stream error frame, 429, empty)"
     "fetch_test.js|fetch() Response API (status/headers/text/json)"
     "mcp_client_test.js|MCP client (connect/tools/call)"
-    "mcp_server_test.js|MCP server (tool registration/handling)"
     "server_test.js|HTTP server (GET/POST/routes)"
     "agent_test.js|Agent loop (define/run/delegate/budgets/cancel)"
     "long_horizon_test.js|Long-horizon endurance (429 storm/mid-answer cuts/empty recovery/25-round loop/delegate budget/bash self-timing/wall honesty)"

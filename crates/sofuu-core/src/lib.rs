@@ -69,6 +69,7 @@ mod ffi_runtime_test {
     }
 }
 pub mod http;
+pub mod infer; // CPU-first GGUF inference engine (C++ SIMD GEMV kernels + Rust)
 pub mod mcp;
 pub mod memory;
 pub mod ml; // PLAN-ML-GATES: context-economy models + the in-memory working set

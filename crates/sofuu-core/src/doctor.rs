@@ -70,7 +70,37 @@ fn brain_path(cfg: &ChatConfig) -> PathBuf {
 /// Run the health check. Returns the process exit code.
 pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     let json = args.iter().any(|a| a == "--json");
-    let cfg = ChatConfig::load();
+    let mut cfg = ChatConfig::load();
+    let mut model_override = None;
+    for i in 0..args.len() {
+        if (args[i] == "-m" || args[i] == "--model") && i + 1 < args.len() {
+            model_override = Some(args[i + 1].clone());
+            break;
+        }
+    }
+    if let Some(m) = model_override {
+        let is_gguf = m.ends_with(".gguf")
+            || sofuu_core::infer::clean_model_path(&m).extension().map_or(false, |e| e == "gguf");
+        if is_gguf {
+            cfg.provider = "local".into();
+            cfg.base_url.clear();
+            cfg.api_key.clear();
+            let caps = sofuu_core::rt::model_caps::lookup(Some(&m));
+            if caps.ctx_window > 0 {
+                cfg.ctx_window = caps.ctx_window as i64;
+                cfg.ctx_window_explicit = false;
+            }
+            if caps.max_output > 0 {
+                cfg.max_output = caps.max_output as i64;
+            }
+            if caps.thinking != sofuu_core::rt::model_caps::Thinking::None {
+                cfg.effort = "high".into();
+            } else {
+                cfg.effort = "off".into();
+            }
+        }
+        cfg.model = m;
+    }
     let mut failures = 0usize;
 
     println!("\x1b[1msofuu doctor\x1b[0m — v{} · {}", crate::VERSION, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()));

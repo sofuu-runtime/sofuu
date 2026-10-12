@@ -172,6 +172,7 @@ struct AiRequestConfig {
     temperature: f64,                // default: -1.0 (omit)
     top_p: f64,                      // default: -1.0 (omit)
     stream: bool,
+    threads: usize,
     timeout_ms: c_long,              /* 0 = unlimited (default); >0 = ms timeout */
     messages: Vec<AiMessage>,
     tools: Vec<AiToolDef>,
@@ -191,6 +192,7 @@ impl Default for AiRequestConfig {
             max_tokens: 0,
             temperature: -1.0,
             top_p: -1.0,
+            threads: 0,
             stream: false,
             timeout_ms: 0,
             messages: Vec::new(),
@@ -3307,13 +3309,26 @@ unsafe fn parse_ai_args(
             }
             cfg.messages = messages;
         } else {
-            // Handle { prompt: "..." } fallback?
-            qjs::JS_ThrowTypeError(
-                ctx,
-                c"ai.complete/stream: config object must contain a 'messages' array".as_ptr(),
-            );
-            qjs::sofuu_js_free_value(ctx, msgs);
-            return Err(());
+            let pr = qjs::sofuu_js_get_property_str(ctx, opts, c"prompt".as_ptr());
+            if qjs::sofuu_js_is_string(pr) != 0 {
+                let p_str = cstr_opt(ctx, pr);
+                qjs::sofuu_js_free_value(ctx, pr);
+                cfg.messages = vec![AiMessage {
+                    role: Some("user".to_string()),
+                    content: p_str,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                }];
+            } else {
+                qjs::sofuu_js_free_value(ctx, pr);
+                qjs::JS_ThrowTypeError(
+                    ctx,
+                    c"ai.complete/stream: config object must contain a 'messages' array or 'prompt'".as_ptr(),
+                );
+                qjs::sofuu_js_free_value(ctx, msgs);
+                return Err(());
+            }
         }
         qjs::sofuu_js_free_value(ctx, msgs);
     } else {
@@ -3382,6 +3397,16 @@ unsafe fn parse_ai_args(
         }
         if qjs::is_number(v) {
             qjs::JS_ToInt32(ctx, &mut cfg.max_tokens, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"threads".as_ptr());
+        if qjs::is_number(v) {
+            let mut th: i32 = 0;
+            qjs::JS_ToInt32(ctx, &mut th, v);
+            if th > 0 {
+                cfg.threads = th as usize;
+            }
         }
         qjs::sofuu_js_free_value(ctx, v);
 
@@ -3603,6 +3628,383 @@ fn require_model(m: Option<&str>) -> bool {
     matches!(m, Some(m) if !m.trim().is_empty())
 }
 
+static LOCAL_ENGINE: std::sync::Mutex<Option<(String, crate::infer::InferEngine)>> = std::sync::Mutex::new(None);
+
+fn with_local_engine<R, F: FnOnce(&mut crate::infer::InferEngine) -> Result<R, String>>(
+    model_path: &str,
+    f: F,
+) -> Result<R, String> {
+    let clean = crate::infer::clean_model_path(model_path);
+    let clean_str = clean.to_string_lossy().into_owned();
+    let mut guard = LOCAL_ENGINE.lock().unwrap_or_else(|p| p.into_inner());
+    let needs_reload = match &*guard {
+        Some((path, _)) => path != &clean_str,
+        None => true,
+    };
+    if needs_reload {
+        let eng = crate::infer::InferEngine::load(&clean_str)?;
+        *guard = Some((clean_str, eng));
+    }
+    let (_, eng) = guard.as_mut().unwrap();
+    f(eng)
+}
+
+fn format_chatml(messages: &[AiMessage], system_prompt: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut has_system = false;
+    if let Some(sys) = system_prompt {
+        if !sys.is_empty() {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
+            has_system = true;
+        }
+    }
+    for m in messages {
+        let role = m.role.as_deref().unwrap_or("user");
+        let content = m.content.as_deref().unwrap_or("");
+        if role == "system" {
+            if has_system {
+                continue;
+            }
+            has_system = true;
+        }
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(content);
+        out.push_str("<|im_end|>\n");
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
+}
+
+unsafe fn js_run_local_complete(ctx: *mut JSContext, cfg: &AiRequestConfig) -> JSValue {
+    let mut promise_ptr: *mut PromiseHandle = ptr::null_mut();
+    let promise = sofuu_promise_new(ctx, &mut promise_ptr);
+
+    let model_path = match cfg.model.as_deref() {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            let err = qjs::sofuu_js_new_string(ctx, c"Local model path required (e.g. -m /path/to/model.gguf)".as_ptr());
+            sofuu_promise_reject(promise_ptr, err);
+            return promise;
+        }
+    };
+
+    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref());
+
+    let max_tokens = if cfg.max_tokens > 0 { cfg.max_tokens as usize } else { 512 };
+    let temperature = if cfg.temperature > 0.0 { cfg.temperature as f32 } else { 0.7 };
+    let threads = if cfg.threads > 0 {
+        cfg.threads
+    } else {
+        crate::infer::quant::get_thread_count()
+    };
+
+    let res = with_local_engine(model_path, |eng| {
+        eng.generate(
+            &prompt,
+            crate::infer::GenerateOptions {
+                max_tokens,
+                temperature,
+                threads,
+                ..Default::default()
+            },
+        )
+    });
+
+    match res {
+        Ok(text) => {
+            let res_obj = qjs::JS_NewObject(ctx);
+            let text_c = CString::new(text).unwrap_or_default();
+            let text_val = qjs::sofuu_js_new_string(ctx, text_c.as_ptr());
+            qjs::sofuu_js_set_property_str(ctx, res_obj, c"text".as_ptr(), text_val);
+            sofuu_promise_resolve(promise_ptr, res_obj);
+        }
+        Err(e) => {
+            let err_c = CString::new(format!("local inference error: {e}")).unwrap_or_default();
+            let err_val = qjs::sofuu_js_new_string(ctx, err_c.as_ptr());
+            sofuu_promise_reject(promise_ptr, err_val);
+        }
+    }
+
+    promise
+}
+
+enum LocalStreamMsg {
+    Text(String),
+    Think(String),
+    Done(usize, usize),
+    Error(String),
+}
+
+struct LocalStreamState {
+    ctx: *mut JSContext,
+    push_fn: JSValue,
+    done_fn: JSValue,
+    error_fn: JSValue,
+    think_fn: JSValue,
+    rx: std::sync::mpsc::Receiver<LocalStreamMsg>,
+    async_handle: *mut uv::UvAsync,
+    aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sid: i64,
+}
+
+static LOCAL_ABORTS: std::sync::Mutex<Vec<(i64, std::sync::Arc<std::sync::atomic::AtomicBool>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn on_local_stream_async(handle: *mut uv::UvAsync) {
+    let state_ptr = *(handle as *mut *mut LocalStreamState);
+    if state_ptr.is_null() {
+        return;
+    }
+    let state = &mut *state_ptr;
+    let ctx = state.ctx;
+
+    let mut is_finished = false;
+    while let Ok(msg) = state.rx.try_recv() {
+        match msg {
+            LocalStreamMsg::Think(th) => {
+                if let Ok(c_th) = CString::new(th) {
+                    let val = qjs::sofuu_js_new_string(ctx, c_th.as_ptr());
+                    let ret = qjs::JS_Call(ctx, state.think_fn, qjs::sofuu_js_undefined(), 1, &val);
+                    qjs::sofuu_js_free_value(ctx, ret);
+                    qjs::sofuu_js_free_value(ctx, val);
+                    let empty_val = qjs::sofuu_js_new_string(ctx, c"".as_ptr());
+                    let ret2 = qjs::JS_Call(ctx, state.push_fn, qjs::sofuu_js_undefined(), 1, &empty_val);
+                    qjs::sofuu_js_free_value(ctx, ret2);
+                    qjs::sofuu_js_free_value(ctx, empty_val);
+                }
+            }
+            LocalStreamMsg::Text(tok) => {
+                if let Ok(c_tok) = CString::new(tok) {
+                    let val = qjs::sofuu_js_new_string(ctx, c_tok.as_ptr());
+                    let ret = qjs::JS_Call(ctx, state.push_fn, qjs::sofuu_js_undefined(), 1, &val);
+                    qjs::sofuu_js_free_value(ctx, ret);
+                    qjs::sofuu_js_free_value(ctx, val);
+                }
+            }
+            LocalStreamMsg::Done(prompt_tokens, token_count) => {
+                let stats_obj = qjs::JS_NewObject(ctx);
+                let p_tok = qjs::sofuu_js_new_int64(ctx, prompt_tokens as i64);
+                let comp_tok = qjs::sofuu_js_new_int64(ctx, token_count as i64);
+                qjs::sofuu_js_set_property_str(ctx, stats_obj, c"promptTokens".as_ptr(), p_tok);
+                qjs::sofuu_js_set_property_str(ctx, stats_obj, c"completionTokens".as_ptr(), comp_tok);
+                let ret = qjs::JS_Call(ctx, state.done_fn, qjs::sofuu_js_undefined(), 1, &stats_obj);
+                qjs::sofuu_js_free_value(ctx, ret);
+                qjs::sofuu_js_free_value(ctx, stats_obj);
+                is_finished = true;
+                break;
+            }
+            LocalStreamMsg::Error(err) => {
+                let err_c = CString::new(format!("local inference error: {err}")).unwrap_or_default();
+                let err_val = qjs::sofuu_js_new_string(ctx, err_c.as_ptr());
+                let ret = qjs::JS_Call(ctx, state.error_fn, qjs::sofuu_js_undefined(), 1, &err_val);
+                qjs::sofuu_js_free_value(ctx, ret);
+                qjs::sofuu_js_free_value(ctx, err_val);
+                is_finished = true;
+                break;
+            }
+        }
+    }
+
+    crate::rt::promise::sofuu_flush_jobs(ctx);
+
+    if is_finished {
+        if let Ok(mut list) = LOCAL_ABORTS.lock() {
+            list.retain(|(s, _)| *s != state.sid);
+        }
+        qjs::sofuu_js_free_value(ctx, state.push_fn);
+        qjs::sofuu_js_free_value(ctx, state.done_fn);
+        qjs::sofuu_js_free_value(ctx, state.error_fn);
+        qjs::sofuu_js_free_value(ctx, state.think_fn);
+        let h = state.async_handle;
+        uv::uv_close(h as *mut uv::UvHandle, Some(on_local_stream_close));
+    }
+}
+
+unsafe extern "C" fn on_local_stream_close(handle: *mut uv::UvHandle) {
+    let state_ptr = *(handle as *mut *mut LocalStreamState);
+    if !state_ptr.is_null() {
+        drop(Box::from_raw(state_ptr));
+    }
+    libc::free(handle as *mut libc::c_void);
+}
+
+unsafe fn launch_local_stream(
+    ctx: *mut JSContext,
+    model_path: &str,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    threads: usize,
+    push_fn: JSValue,
+    done_fn: JSValue,
+    error_fn: JSValue,
+    think_fn: JSValue,
+    iterator: JSValue,
+    sid: i64,
+) -> JSValue {
+    let sid_val = qjs::sofuu_js_new_int64(ctx, sid);
+    qjs::sofuu_js_set_property_str(ctx, iterator, c"_sid".as_ptr(), sid_val);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    if let Ok(mut list) = LOCAL_ABORTS.lock() {
+        list.push((sid, aborted.clone()));
+    }
+
+    let async_handle = libc::malloc(uv::sofuu_uv_async_size()) as *mut uv::UvAsync;
+    if async_handle.is_null() {
+        let err = qjs::sofuu_js_new_string(ctx, c"OOM initializing local stream async handle".as_ptr());
+        let ret = qjs::JS_Call(ctx, error_fn, qjs::sofuu_js_undefined(), 1, &err);
+        qjs::sofuu_js_free_value(ctx, ret);
+        qjs::sofuu_js_free_value(ctx, err);
+        return iterator;
+    }
+
+    let rc = uv::uv_async_init(sofuu_loop_get(), async_handle, Some(on_local_stream_async));
+    if rc != 0 {
+        libc::free(async_handle as *mut libc::c_void);
+        let err = qjs::sofuu_js_new_string(ctx, c"Failed to init local stream async handle".as_ptr());
+        let ret = qjs::JS_Call(ctx, error_fn, qjs::sofuu_js_undefined(), 1, &err);
+        qjs::sofuu_js_free_value(ctx, ret);
+        qjs::sofuu_js_free_value(ctx, err);
+        return iterator;
+    }
+
+    let state = Box::into_raw(Box::new(LocalStreamState {
+        ctx,
+        push_fn: qjs::sofuu_js_dup_value(ctx, push_fn),
+        done_fn: qjs::sofuu_js_dup_value(ctx, done_fn),
+        error_fn: qjs::sofuu_js_dup_value(ctx, error_fn),
+        think_fn: qjs::sofuu_js_dup_value(ctx, think_fn),
+        rx,
+        async_handle,
+        aborted: aborted.clone(),
+        sid,
+    }));
+    *(async_handle as *mut *mut LocalStreamState) = state;
+
+    let model_path_str = model_path.to_string();
+    let prompt_str = prompt.to_string();
+    let handle_addr = async_handle as usize;
+
+    std::thread::spawn(move || {
+        let handle_send = handle_addr as *mut uv::UvAsync;
+        let mut token_count = 0usize;
+        let mut in_think = false;
+        let push_closure = |tok: &str| -> bool {
+            if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            token_count += 1;
+            if tok.contains("<think>") {
+                in_think = true;
+                let parts: Vec<&str> = tok.split("<think>").collect();
+                if !parts[0].is_empty() {
+                    let _ = tx.send(LocalStreamMsg::Text(parts[0].to_string()));
+                }
+                if parts.len() > 1 && !parts[1].is_empty() {
+                    let _ = tx.send(LocalStreamMsg::Think(parts[1].to_string()));
+                }
+            } else if tok.contains("</think>") {
+                in_think = false;
+                let parts: Vec<&str> = tok.split("</think>").collect();
+                if !parts[0].is_empty() {
+                    let _ = tx.send(LocalStreamMsg::Think(parts[0].to_string()));
+                }
+                if parts.len() > 1 && !parts[1].is_empty() {
+                    let _ = tx.send(LocalStreamMsg::Text(parts[1].to_string()));
+                }
+            } else if in_think {
+                let _ = tx.send(LocalStreamMsg::Think(tok.to_string()));
+            } else {
+                let _ = tx.send(LocalStreamMsg::Text(tok.to_string()));
+            }
+            unsafe { uv::uv_async_send(handle_send) };
+            true
+        };
+
+        let mut prompt_tokens = 0usize;
+        let res = with_local_engine(&model_path_str, |eng| {
+            prompt_tokens = eng.tokenizer.encode(&prompt_str).len();
+            eng.stream(
+                &prompt_str,
+                crate::infer::GenerateOptions {
+                    max_tokens,
+                    temperature,
+                    threads,
+                    ..Default::default()
+                },
+                push_closure,
+            )
+        });
+
+        match res {
+            Ok(_) => {
+                let _ = tx.send(LocalStreamMsg::Done(prompt_tokens, token_count));
+                unsafe { uv::uv_async_send(handle_send) };
+            }
+            Err(e) => {
+                let _ = tx.send(LocalStreamMsg::Error(e));
+                unsafe { uv::uv_async_send(handle_send) };
+            }
+        }
+    });
+
+    iterator
+}
+
+unsafe fn js_run_local_stream(
+    ctx: *mut JSContext,
+    cfg: &AiRequestConfig,
+    push_fn: JSValue,
+    done_fn: JSValue,
+    error_fn: JSValue,
+    think_fn: JSValue,
+    iterator: JSValue,
+    sid: i64,
+) -> JSValue {
+    let model_path = match cfg.model.as_deref() {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            let err = qjs::sofuu_js_new_string(ctx, c"Local model path required (e.g. -m /path/to/model.gguf)".as_ptr());
+            let ret = qjs::JS_Call(ctx, error_fn, qjs::sofuu_js_undefined(), 1, &err);
+            qjs::sofuu_js_free_value(ctx, ret);
+            qjs::sofuu_js_free_value(ctx, err);
+            return iterator;
+        }
+    };
+
+    let prompt = format_chatml(&cfg.messages, cfg.system_prompt.as_deref());
+
+    let max_tokens = if cfg.max_tokens > 0 { cfg.max_tokens as usize } else { 512 };
+    let temperature = if cfg.temperature > 0.0 { cfg.temperature as f32 } else { 0.7 };
+    let threads = if cfg.threads > 0 {
+        cfg.threads
+    } else {
+        crate::infer::quant::get_thread_count()
+    };
+
+    launch_local_stream(
+        ctx,
+        model_path,
+        &prompt,
+        max_tokens,
+        temperature,
+        threads,
+        push_fn,
+        done_fn,
+        error_fn,
+        think_fn,
+        iterator,
+        sid,
+    )
+}
+
 /* ------------------------------------------------------------------ */
 /* JS: sofuu.ai.complete(prompt, opts?)  → Promise<{text}>             */
 /* ------------------------------------------------------------------ */
@@ -3618,6 +4020,21 @@ unsafe extern "C" fn js_ai_complete(
         Err(()) => return qjs::sofuu_js_exception(),
     };
 
+    let eff = effective_provider(&cfg);
+    if !require_model(cfg.model.as_deref()) {
+        return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
+    }
+
+    let is_local = cfg.provider == Provider::Local || eff == Provider::Local
+        || cfg.model.as_deref().map_or(false, |m| {
+            let clean = crate::infer::clean_model_path(m);
+            clean.extension().map_or(false, |e| e == "gguf")
+                || m.trim_matches(|c| c == '\'' || c == '"').ends_with(".gguf")
+        });
+    if is_local {
+        return js_run_local_complete(ctx, &cfg);
+    }
+
     /* P3 (AUDIT-2026-09-07): curl_easy_init() can return NULL (global init
      * failure / OOM) — an unchecked handle made every setopt a silent no-op
      * and the request die with an opaque curl error. Init here, before
@@ -3626,20 +4043,6 @@ unsafe extern "C" fn js_ai_complete(
     if easy.is_null() {
         qjs::JS_ThrowInternalError(ctx, c"ai.complete: curl init failed".as_ptr());
         return qjs::sofuu_js_exception();
-    }
-
-    let eff = effective_provider(&cfg);
-    if !require_model(cfg.model.as_deref()) {
-        return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
-    }
-    if cfg.provider == Provider::Local || eff == Provider::Local {
-        return qjs::JS_ThrowTypeError(
-            ctx,
-            c"provider \"local\" is not available yet: local inference is roadmap \
-              Track B (llama.cpp backend / custom engine). Use a remote provider \
-              (openai, anthropic, local) or a custom endpoint."
-                .as_ptr(),
-        );
     }
     if cfg.provider == Provider::Custom
         && !matches!(cfg.base_url.as_deref(), Some(u) if !u.is_empty())
@@ -3796,6 +4199,13 @@ unsafe extern "C" fn js_ai_abort(
         }
         r = next;
     }
+    if let Ok(list) = LOCAL_ABORTS.lock() {
+        for (stream_sid, flag) in list.iter() {
+            if sid < 0 || *stream_sid == sid {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     qjs::sofuu_js_undefined()
 }
 
@@ -3810,6 +4220,51 @@ unsafe extern "C" fn js_ai_stream(
         Err(()) => return qjs::sofuu_js_exception(),
     };
 
+    let eff = effective_provider(&cfg);
+    if !require_model(cfg.model.as_deref()) {
+        return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
+    }
+
+    let is_local = cfg.provider == Provider::Local || eff == Provider::Local
+        || cfg.model.as_deref().map_or(false, |m| {
+            let clean = crate::infer::clean_model_path(m);
+            clean.extension().map_or(false, |e| e == "gguf")
+                || m.trim_matches(|c| c == '\'' || c == '"').ends_with(".gguf")
+        });
+    if is_local {
+        let factory_c = CString::new(STREAM_FACTORY).unwrap();
+        let factory = qjs::JS_Eval(
+            ctx,
+            factory_c.as_ptr(),
+            factory_c.as_bytes().len(),
+            c"<ai.stream>".as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL,
+        );
+        if qjs::is_exception(factory) {
+            return qjs::sofuu_js_exception();
+        }
+
+        let push_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"push".as_ptr());
+        let done_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"done".as_ptr());
+        let error_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"error".as_ptr());
+        let think_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setThink".as_ptr());
+        let iterator = qjs::sofuu_js_get_property_str(ctx, factory, c"iterator".as_ptr());
+        qjs::sofuu_js_free_value(ctx, factory);
+
+        let sid = G_STREAM_SID.with(|s| {
+            let v = s.get() + 1;
+            s.set(v);
+            v
+        });
+
+        let ret = js_run_local_stream(ctx, &cfg, push_fn, done_fn, error_fn, think_fn, iterator, sid);
+        qjs::sofuu_js_free_value(ctx, push_fn);
+        qjs::sofuu_js_free_value(ctx, done_fn);
+        qjs::sofuu_js_free_value(ctx, error_fn);
+        qjs::sofuu_js_free_value(ctx, think_fn);
+        return ret;
+    }
+
     /* P3 (AUDIT-2026-09-07): curl_easy_init() can return NULL (global init
      * failure / OOM) — an unchecked handle made every setopt a silent no-op
      * and the request die with an opaque curl error. Init here, before
@@ -3818,20 +4273,6 @@ unsafe extern "C" fn js_ai_stream(
     if easy.is_null() {
         qjs::JS_ThrowInternalError(ctx, c"ai.stream: curl init failed".as_ptr());
         return qjs::sofuu_js_exception();
-    }
-
-    let eff = effective_provider(&cfg);
-    if !require_model(cfg.model.as_deref()) {
-        return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
-    }
-    if cfg.provider == Provider::Local || eff == Provider::Local {
-        return qjs::JS_ThrowTypeError(
-            ctx,
-            c"provider \"local\" is not available yet: local inference is roadmap \
-              Track B (llama.cpp backend / custom engine). Use a remote provider \
-              (openai, anthropic, local) or a custom endpoint."
-                .as_ptr(),
-        );
     }
     if cfg.provider == Provider::Custom
         && !matches!(cfg.base_url.as_deref(), Some(u) if !u.is_empty())
@@ -4764,9 +5205,32 @@ unsafe extern "C" fn js_ai_speak(
 /* SIMD Vector JS Bindings                                              */
 /* ------------------------------------------------------------------ */
 
+enum F32View {
+    Borrowed(*const f32, usize),
+    Owned(Vec<f32>),
+}
+
+impl F32View {
+    #[inline]
+    fn as_ptr(&self) -> *const f32 {
+        match self {
+            F32View::Borrowed(p, _) => *p,
+            F32View::Owned(v) => v.as_ptr(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            F32View::Borrowed(_, len) => *len,
+            F32View::Owned(v) => v.len(),
+        }
+    }
+}
+
 /// # Safety
-/// `val` a live JS value of `ctx`; returns a copied float vector or None.
-unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<Vec<f32>> {
+/// `val` a live JS value of `ctx`; returns a zero-copy borrowed or copied float vector view or None.
+unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<F32View> {
     let mut byte_offset: usize = 0;
     let mut byte_length: usize = 0;
     let buf = qjs::JS_GetTypedArrayBuffer(ctx, val, &mut byte_offset, &mut byte_length, ptr::null_mut());
@@ -4778,9 +5242,9 @@ unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<Vec<f32>
             return None;
         }
         let n = byte_length / std::mem::size_of::<f32>();
-        let mut out = vec![0.0f32; n];
-        std::ptr::copy_nonoverlapping(ptr.add(byte_offset) as *const f32, out.as_mut_ptr(), n);
-        return Some(out);
+        let slice_ptr = ptr.add(byte_offset) as *const f32;
+        // Zero-copy: borrow directly from the TypedArray buffer with zero heap allocations and zero memcpy!
+        return Some(F32View::Borrowed(slice_ptr, n));
     }
     qjs::sofuu_js_free_value(ctx, buf);
     let len_v = qjs::sofuu_js_get_property_str(ctx, val, c"length".as_ptr());
@@ -4795,7 +5259,7 @@ unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<Vec<f32>
         qjs::sofuu_js_free_value(ctx, el);
         out[i as usize] = d as f32;
     }
-    Some(out)
+    Some(F32View::Owned(out))
 }
 
 unsafe extern "C" fn js_ai_similarity(
@@ -5296,13 +5760,274 @@ unsafe extern "C" fn js_ai_embed_info_v2(
     }
 }
 
+/// `sofuu.ai.inferLocal(modelPath, prompt, options?)`
+/// Synchronous / fast on-device CPU inference on GGUF models.
+unsafe extern "C" fn js_ai_infer_local(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.inferLocal requires (modelPath, prompt, options?)".as_ptr());
+    }
+    let p_model = qjs::sofuu_js_to_cstring(ctx, *argv.add(0));
+    if p_model.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let model_path = CStr::from_ptr(p_model).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p_model);
+
+    let p_prompt = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+    if p_prompt.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let prompt = CStr::from_ptr(p_prompt).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p_prompt);
+
+    let mut max_tokens = 256usize;
+    let mut temperature = 0.7f32;
+    let mut threads = 0usize;
+
+    if argc >= 3 && !qjs::is_undefined(*argv.add(2)) && !qjs::is_null(*argv.add(2)) {
+        let opts = *argv.add(2);
+        let prop_mt = qjs::sofuu_js_get_property_str(ctx, opts, c"maxTokens".as_ptr());
+        if !qjs::is_undefined(prop_mt) {
+            let mut val: u32 = 0;
+            if qjs::sofuu_js_to_uint32(ctx, &mut val, prop_mt) == 0 && val > 0 {
+                max_tokens = val as usize;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_mt);
+        }
+        let prop_temp = qjs::sofuu_js_get_property_str(ctx, opts, c"temperature".as_ptr());
+        if !qjs::is_undefined(prop_temp) {
+            let mut val: f64 = 0.0;
+            if qjs::JS_ToFloat64(ctx, &mut val, prop_temp) == 0 {
+                temperature = val as f32;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_temp);
+        }
+        let prop_th = qjs::sofuu_js_get_property_str(ctx, opts, c"threads".as_ptr());
+        if !qjs::is_undefined(prop_th) {
+            let mut val: u32 = 0;
+            if qjs::sofuu_js_to_uint32(ctx, &mut val, prop_th) == 0 && val > 0 {
+                threads = val as usize;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_th);
+        }
+    }
+
+    let res = with_local_engine(&model_path, |eng| {
+        eng.generate(
+            &prompt,
+            crate::infer::GenerateOptions {
+                max_tokens,
+                temperature,
+                threads,
+                ..Default::default()
+            },
+        )
+    });
+
+    match res {
+        Ok(result) => match CString::new(result) {
+            Ok(c) => qjs::sofuu_js_new_string(ctx, c.as_ptr()),
+            Err(_) => qjs::sofuu_js_new_string(ctx, c"".as_ptr()),
+        },
+        Err(err) => {
+            let err_c = CString::new(format!("inference error: {err}")).unwrap_or_default();
+            qjs::JS_ThrowInternalError(ctx, err_c.as_ptr())
+        }
+    }
+}
+
+/// `sofuu.ai.streamLocal(modelPath, prompt, options?)`
+/// Stream local GGUF inference yielding an AsyncIterator<{text, done}>.
+unsafe extern "C" fn js_ai_stream_local(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.streamLocal requires (modelPath, prompt, options?)".as_ptr());
+    }
+    let p_model = qjs::sofuu_js_to_cstring(ctx, *argv.add(0));
+    if p_model.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let model_path = CStr::from_ptr(p_model).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p_model);
+
+    let p_prompt = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+    if p_prompt.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let prompt = CStr::from_ptr(p_prompt).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p_prompt);
+
+    let mut max_tokens = 512usize;
+    let mut temperature = 0.7f32;
+    let mut threads = 0usize;
+
+    if argc >= 3 && !qjs::is_undefined(*argv.add(2)) && !qjs::is_null(*argv.add(2)) {
+        let opts = *argv.add(2);
+        let prop_mt = qjs::sofuu_js_get_property_str(ctx, opts, c"maxTokens".as_ptr());
+        if !qjs::is_undefined(prop_mt) {
+            let mut val: u32 = 0;
+            if qjs::sofuu_js_to_uint32(ctx, &mut val, prop_mt) == 0 && val > 0 {
+                max_tokens = val as usize;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_mt);
+        }
+        let prop_temp = qjs::sofuu_js_get_property_str(ctx, opts, c"temperature".as_ptr());
+        if !qjs::is_undefined(prop_temp) {
+            let mut val: f64 = 0.0;
+            if qjs::JS_ToFloat64(ctx, &mut val, prop_temp) == 0 {
+                temperature = val as f32;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_temp);
+        }
+        let prop_th = qjs::sofuu_js_get_property_str(ctx, opts, c"threads".as_ptr());
+        if !qjs::is_undefined(prop_th) {
+            let mut val: u32 = 0;
+            if qjs::sofuu_js_to_uint32(ctx, &mut val, prop_th) == 0 && val > 0 {
+                threads = val as usize;
+            }
+            qjs::sofuu_js_free_value(ctx, prop_th);
+        }
+    }
+
+    let factory_c = CString::new(STREAM_FACTORY).unwrap();
+    let factory = qjs::JS_Eval(
+        ctx,
+        factory_c.as_ptr(),
+        factory_c.as_bytes().len(),
+        c"<ai.streamLocal>".as_ptr(),
+        qjs::JS_EVAL_TYPE_GLOBAL,
+    );
+    if qjs::is_exception(factory) {
+        return qjs::sofuu_js_exception();
+    }
+
+    let push_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"push".as_ptr());
+    let done_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"done".as_ptr());
+    let error_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"error".as_ptr());
+    let think_fn = qjs::sofuu_js_get_property_str(ctx, factory, c"setThink".as_ptr());
+    let iterator = qjs::sofuu_js_get_property_str(ctx, factory, c"iterator".as_ptr());
+    qjs::sofuu_js_free_value(ctx, factory);
+    let sid = G_STREAM_SID.with(|s| {
+        let v = s.get() + 1;
+        s.set(v);
+        v
+    });
+
+    let res_iter = launch_local_stream(
+        ctx,
+        &model_path,
+        &prompt,
+        max_tokens,
+        temperature,
+        threads,
+        push_fn,
+        done_fn,
+        error_fn,
+        think_fn,
+        iterator,
+        sid,
+    );
+
+    qjs::sofuu_js_free_value(ctx, push_fn);
+    qjs::sofuu_js_free_value(ctx, done_fn);
+    qjs::sofuu_js_free_value(ctx, error_fn);
+    qjs::sofuu_js_free_value(ctx, think_fn);
+
+    res_iter
+}
+
+/// `sofuu.ai.applyChatTemplate(messages, systemPrompt?)`
+/// or `sofuu.ai.applyChatTemplate({ messages, system })`
+/// Formats messages using the ChatML chat template (Qwen format).
+unsafe extern "C" fn js_ai_apply_chat_template(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"ai.applyChatTemplate requires (messages, systemPrompt?) or ({ messages, system })".as_ptr());
+    }
+
+    let mut msgs_val = *argv.add(0);
+    let mut sys_opt: Option<String> = None;
+    let mut need_free_msgs = false;
+
+    if qjs::is_object(msgs_val) && qjs::JS_IsArray(ctx, msgs_val) == 0 {
+        let sys_val = qjs::sofuu_js_get_property_str(ctx, msgs_val, c"system".as_ptr());
+        if qjs::sofuu_js_is_string(sys_val) != 0 {
+            sys_opt = cstr_opt(ctx, sys_val);
+        }
+        qjs::sofuu_js_free_value(ctx, sys_val);
+
+        let m = qjs::sofuu_js_get_property_str(ctx, msgs_val, c"messages".as_ptr());
+        msgs_val = m;
+        need_free_msgs = true;
+    } else if argc >= 2 {
+        let sys_val = *argv.add(1);
+        if qjs::sofuu_js_is_string(sys_val) != 0 {
+            sys_opt = cstr_opt(ctx, sys_val);
+        }
+    }
+
+    if qjs::JS_IsArray(ctx, msgs_val) == 0 {
+        if need_free_msgs {
+            qjs::sofuu_js_free_value(ctx, msgs_val);
+        }
+        return qjs::JS_ThrowTypeError(ctx, c"ai.applyChatTemplate: messages must be an array".as_ptr());
+    }
+
+    let mut len: u32 = 0;
+    let len_val = qjs::sofuu_js_get_property_str(ctx, msgs_val, c"length".as_ptr());
+    qjs::sofuu_js_to_uint32(ctx, &mut len, len_val);
+    qjs::sofuu_js_free_value(ctx, len_val);
+
+    let mut messages = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let item = qjs::JS_GetPropertyUint32(ctx, msgs_val, i);
+        if qjs::is_object(item) {
+            let r_val = qjs::sofuu_js_get_property_str(ctx, item, c"role".as_ptr());
+            let c_val = qjs::sofuu_js_get_property_str(ctx, item, c"content".as_ptr());
+            let role = if qjs::sofuu_js_is_string(r_val) != 0 { cstr_opt(ctx, r_val) } else { None };
+            let content = if qjs::sofuu_js_is_string(c_val) != 0 { cstr_opt(ctx, c_val) } else { None };
+            qjs::sofuu_js_free_value(ctx, r_val);
+            qjs::sofuu_js_free_value(ctx, c_val);
+            messages.push(AiMessage {
+                role,
+                content,
+                tool_calls: None,
+                tool_call_id: None,
+                images: Vec::new(),
+            });
+        }
+        qjs::sofuu_js_free_value(ctx, item);
+    }
+
+    if need_free_msgs {
+        qjs::sofuu_js_free_value(ctx, msgs_val);
+    }
+
+    let formatted = format_chatml(&messages, sys_opt.as_deref());
+    let c_str = CString::new(formatted).unwrap_or_default();
+    qjs::sofuu_js_new_string(ctx, c_str.as_ptr())
+}
+
 /* ------------------------------------------------------------------ */
 /* Module registration                                                   */
 /* ------------------------------------------------------------------ */
 
 thread_local! {
     // JS_CFUNC_DEF(name, length, func): magic=0, u.func = { length, generic, func }.
-        static AI_FUNCS: [qjs::JSCFunctionListEntry; 18] = [
+    static AI_FUNCS: [qjs::JSCFunctionListEntry; 21] = [
         qjs::JSCFunctionListEntry {
             name: c"complete".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -5316,6 +6041,27 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_stream },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"inferLocal".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_ai_infer_local },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"streamLocal".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_ai_stream_local },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"applyChatTemplate".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_ai_apply_chat_template },
         },
         qjs::JSCFunctionListEntry {
             name: c"embed".as_ptr(),
@@ -5843,6 +6589,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: msgs.clone(),
             tools: vec![],
         };
@@ -5880,6 +6627,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             tools: vec![],
             messages: vec![AiMessage {
                 role: Some("user".into()),
@@ -5939,6 +6687,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             tools: vec![],
             messages: vec![AiMessage {
                 role: Some("user".into()),
@@ -6001,6 +6750,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![
                 AiMessage {
                     role: Some("system".into()),
@@ -6079,6 +6829,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: msgs,
             tools: vec![],
         };
@@ -6159,6 +6910,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![
                 AiMessage {
                     role: Some("system".into()),
@@ -6241,6 +6993,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![],
             tools: vec![],
         };
@@ -6301,6 +7054,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![],
             tools: vec![],
         };
@@ -6364,6 +7118,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![],
             tools: vec![],
         };
@@ -6422,6 +7177,7 @@ mod tests {
             top_p: -1.0,
             stream: false,
             timeout_ms: 0,
+            threads: 0,
             messages: vec![],
             tools: vec![],
         };

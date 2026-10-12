@@ -21,10 +21,12 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde_json::Value as JsonValue;
 use sofuu_ffi::qjs;
@@ -469,11 +471,16 @@ pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRu
     // A7: per-process agent definitions. If the config includes "agents",
     // inject each definition via sofuu.agent.define(). This lets hosts
     // supply agents without filesystem access.
+    //
+    // E2: allowHostTools — such an agent may name a host tool that the host
+    // registers later (sofuu_rt_register_host_tool cannot run until this
+    // call returns), so the unknown-builtin throw is deferred to run time
+    // for this path only.
     if let Some(agents) = config_val.get("agents").and_then(|v| v.as_array()) {
         for agent_def in agents {
             let def_json = serde_json::to_string(agent_def).unwrap_or_default();
             let src = format!(
-                "try {{ sofuu.agent.define({}); }} catch(e) {{ /* duplicate/bad def — non-fatal */ }}",
+                "try {{ sofuu.agent.define({}, {{allowHostTools: true}}); }} catch(e) {{ /* duplicate/bad def — non-fatal */ }}",
                 def_json
             );
             if let Ok(csrc) = CString::new(src) {
@@ -493,6 +500,11 @@ pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRu
         ffi_rt,
     });
 
+    // E2: the host-tool registry is thread-scoped, so a runtime created on
+    // this thread starts empty (the previous runtime's callbacks and opaque
+    // pointers are gone with it).
+    HOST_TOOLS.with(|m| m.borrow_mut().clear());
+
     Box::into_raw(handle)
 }
 
@@ -500,6 +512,9 @@ pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRu
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_free(rt: *mut CapiRuntime) {
     if !rt.is_null() {
+        // E2: drop host tools with the runtime — the host's opaque pointers
+        // must never be called after it freed the runtime that owned them.
+        HOST_TOOLS.with(|m| m.borrow_mut().clear());
         drop(Box::from_raw(rt));
     }
 }
@@ -813,6 +828,14 @@ pub unsafe extern "C" fn sofuu_rt_call_stream(
         *out_cancel_id = cancel_id;
     }
 
+    // E2: when this runtime has host tools, make sure the bridge is the one
+    // currently installed. sofuu.chat.init() installs its own __host_poke
+    // handler, and a host may call it after registering tools; re-asserting
+    // here (cheap, idempotent) keeps completions flowing either way.
+    if HOST_TOOLS.with(|m| !m.borrow().is_empty()) {
+        install_host_tool_bridge(ctx);
+    }
+
     // P2-19 (AUDIT-2026-09-01): parse method + args BEFORE installing the
     // thread-local slot and the global callback — the old order left the
     // slot + a dangling `opaque` installed on every early `return -1`
@@ -1036,6 +1059,325 @@ pub unsafe extern "C" fn sofuu_rt_cancel(
     } else {
         -1
     }
+}
+
+// ── Host-native tools (PLAN-EMBED-SDK E2) ─────────────────────────
+//
+// A host registers a native function (Swift/Kotlin/C) that an in-app agent
+// can call as a tool — the plan's headline case is `take_photo`: the model
+// asks for it, the host opens the camera, and a result that arrives seconds
+// later goes back into the agent loop.
+//
+// The callback answers in two ways, which is what makes that possible
+// without the host blocking its own thread:
+//   - a JSON string → synchronous result, used immediately;
+//   - NULL          → "I took the call", settled later from ANY thread with
+//                     sofuu_rt_host_tool_resolve.
+//
+// Wiring: a C function is installed as the JS global `__sofuu_host_tool`
+// (the same trick the per-stream callback uses), and `HOST_TOOL_BRIDGE_JS`
+// owns the pending-promise map in JS. A completion crosses threads through
+// rt/host_poke.rs — uv_async_send is the one libuv call documented as safe
+// from another thread — and lands on the loop thread, which is the only
+// thread allowed to touch QuickJS.
+//
+// The event loop stays alive while a call is outstanding because the agent's
+// own tool timeout is a real timer handle (agent.js withTimeout), so no
+// extra uv handle is needed — and that same timer is the honest ceiling on
+// "the host may answer later" (30 s per tool by default, toolTimeoutMs).
+
+/// Host tool callback signature; matches `sofuu_host_tool_fn` in the header.
+pub type SofuuHostToolFn =
+    unsafe extern "C" fn(*const c_char, u64, *mut c_void) -> *const c_char;
+
+struct HostTool {
+    cb: SofuuHostToolFn,
+    opaque: *mut c_void,
+}
+
+thread_local! {
+    /// Host tools registered for this thread's runtime, by name. Thread-scoped
+    /// like STREAM_CB, so the documented one-runtime-per-thread rule applies:
+    /// a runtime created on a thread starts with an empty registry.
+    static HOST_TOOLS: std::cell::RefCell<HashMap<String, HostTool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Host tool calls awaiting a completion. Process-global rather than
+/// thread-local because sofuu_rt_host_tool_resolve arrives from any thread.
+static PENDING_HOST_CALLS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The JS half of the host-tool bridge, installed once per runtime.
+///
+/// `__sofuu_host_tool_exec` mints the call id, stores the promise resolvers,
+/// and calls the C entry point. A string answer is shaped and returned;
+/// `undefined` means the host took the call, so the pending promise goes back
+/// to the agent loop and `__sofuu_host_tool_settle` settles it later.
+///
+/// Shaping rule: a JSON string result reaches the model as its text, anything
+/// else as JSON text. agent.js stringifies tool results with String(), so an
+/// object handed back raw would reach the model as "[object Object]".
+///
+/// The `__host_poke` chaining matters: chat.js installs its own handler for
+/// cancel/approval decisions, so this composes with it (and re-installs if a
+/// later writer replaced it) instead of hijacking the channel.
+const HOST_TOOL_BRIDGE_JS: &str = r#"(function(){
+  globalThis.__sofuu_host_tools = globalThis.__sofuu_host_tools || {};
+  globalThis.__sofuu_host_pending = globalThis.__sofuu_host_pending || {};
+  globalThis.__sofuu_host_seq = globalThis.__sofuu_host_seq || 0;
+  if (!globalThis.__sofuu_host_shape) {
+    globalThis.__sofuu_host_shape = function(raw){
+      var v;
+      try { v = JSON.parse(raw); } catch (e) { throw new Error("host tool returned invalid JSON: " + raw); }
+      return (typeof v === "string") ? v : raw;
+    };
+  }
+  if (!globalThis.__sofuu_host_tool_exec) {
+    globalThis.__sofuu_host_tool_exec = function(name, args){
+      var id = ++globalThis.__sofuu_host_seq;
+      var res = null, rej = null;
+      var p = new Promise(function(a, b){ res = a; rej = b; });
+      var pending = globalThis.__sofuu_host_pending;
+      var now = Date.now();
+      for (var k in pending) { if (now - pending[k].ts > 600000) delete pending[k]; }
+      pending[id] = { resolve: res, reject: rej, ts: now };
+      var raw = globalThis.__sofuu_host_tool(name, JSON.stringify(args === undefined ? {} : args), id);
+      if (typeof raw === "string") { delete pending[id]; return globalThis.__sofuu_host_shape(raw); }
+      return p;
+    };
+  }
+  if (!globalThis.__sofuu_host_tool_settle) {
+    globalThis.__sofuu_host_tool_settle = function(m){
+      var pending = globalThis.__sofuu_host_pending || {};
+      var e = pending[m.call_id];
+      if (!e) return;
+      delete pending[m.call_id];
+      if (m.error) { e.reject(new Error(String(m.error))); return; }
+      try { e.resolve(globalThis.__sofuu_host_shape(String(m.result))); }
+      catch (err) { e.reject(err); }
+    };
+  }
+  var prev = globalThis.__host_poke;
+  if (!(prev && prev.__sofuuEmbedBridge)) {
+    var w = function(json){
+      var m = null;
+      try { m = JSON.parse(String(json)); } catch (e) {}
+      if (m && m.__sofuu_host_tool_result) { globalThis.__sofuu_host_tool_settle(m); return; }
+      if (typeof prev === "function") return prev(json);
+    };
+    w.__sofuuEmbedBridge = true;
+    globalThis.__host_poke = w;
+  }
+})()"#;
+
+/// Read a JS value as a Rust string (numbers included — JS_ToCString
+/// stringifies them, which is how the call id crosses over).
+unsafe fn js_value_string(ctx: *mut qjs::JSContext, val: qjs::JSValueConst) -> Option<String> {
+    let s = qjs::sofuu_js_to_cstring(ctx, val);
+    if s.is_null() {
+        return None;
+    }
+    let r = CStr::from_ptr(s).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, s);
+    Some(r)
+}
+
+/// Install the C entry point + the JS bridge. Idempotent: safe to call on
+/// every registration and again before each stream.
+unsafe fn install_host_tool_bridge(ctx: *mut qjs::JSContext) {
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let fname = c"__sofuu_host_tool";
+    let existing = qjs::sofuu_js_get_property_str(ctx, global, fname.as_ptr());
+    let present = qjs::JS_IsFunction(ctx, existing) != 0;
+    qjs::sofuu_js_free_value(ctx, existing);
+    if !present {
+        let fn_val = qjs::sofuu_js_new_cfunction(ctx, js_host_tool_call, fname.as_ptr(), 3);
+        qjs::sofuu_js_set_property_str(ctx, global, fname.as_ptr(), fn_val);
+    }
+    qjs::sofuu_js_free_value(ctx, global);
+
+    if let Ok(c) = CString::new(HOST_TOOL_BRIDGE_JS) {
+        // ffi-1: drain any exception so a broken snippet cannot leave a
+        // sticky error on the context for the next call.
+        eval_init_snippet(ctx, &c, c"<host-tool-bridge>");
+    }
+}
+
+/// The C entry point JS calls for a registered host tool. Returns the
+/// callback's JSON result as a JS string, or undefined when the host took the
+/// call (the JS side then waits on the pending promise).
+unsafe extern "C" fn js_host_tool_call(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValueConst,
+    argc: c_int,
+    argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    if argc < 3 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"__sofuu_host_tool(name, argsJson, callId)".as_ptr(),
+        );
+    }
+    let Some(name) = js_value_string(ctx, *argv) else {
+        return qjs::sofuu_js_undefined();
+    };
+    let args_json = js_value_string(ctx, *argv.add(1)).unwrap_or_else(|| "{}".to_string());
+    let call_id: u64 = js_value_string(ctx, *argv.add(2))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    let entry = HOST_TOOLS.with(|m| m.borrow().get(&name).map(|t| (t.cb, t.opaque)));
+    let Some((cb, opaque)) = entry else {
+        // A tool spec outliving its registration (e.g. re-created runtime on
+        // this thread). Throw rather than hang on a promise nobody owns.
+        let msg = CString::new(format!("no such host tool: {name}")).unwrap_or_default();
+        return qjs::JS_ThrowTypeError(ctx, msg.as_ptr());
+    };
+
+    let c_args = CString::new(args_json).unwrap_or_default();
+    let out = cb(c_args.as_ptr(), call_id, opaque);
+    if out.is_null() {
+        if call_id != 0 {
+            if let Ok(mut p) = PENDING_HOST_CALLS.lock() {
+                p.push(call_id);
+            }
+        }
+        return qjs::sofuu_js_undefined(); // pending — completed by resolve
+    }
+
+    let s = CStr::from_ptr(out).to_string_lossy().into_owned();
+    let c_s = CString::new(s).unwrap_or_default();
+    qjs::sofuu_js_new_string(ctx, c_s.as_ptr())
+}
+
+/// Register a native host function as an agent tool (PLAN-EMBED-SDK E2).
+///
+/// The tool is visible to every agent of this runtime, including agents
+/// supplied through the `agents` config key — those are defined during
+/// sofuu_rt_new, before a host can register anything, which is why the tool
+/// is published into `globalThis.__sofuu_host_tools` (resolved at run time)
+/// as well as into `sofuu.tools.TOOLS` (resolved at define time).
+///
+/// Registering the same name twice replaces the earlier registration.
+/// Returns SOFUU_OK or a SOFUU_ERR_*.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_rt_register_host_tool(
+    rt: *mut CapiRuntime,
+    name: *const c_char,
+    description: *const c_char,
+    parameters_json: *const c_char,
+    cb: Option<SofuuHostToolFn>,
+    opaque: *mut c_void,
+) -> c_int {
+    if rt.is_null() || name.is_null() || cb.is_none() {
+        return -1; // SOFUU_ERR_INVALID_ARG
+    }
+    let rt_ref = &*rt;
+    let ctx = rt_ref.ffi_rt.engine_ctx() as *mut qjs::JSContext;
+    if ctx.is_null() {
+        return -6; // SOFUU_ERR_INTERNAL
+    }
+    let Some(name) = cstr_or_null(name).map(|s| s.trim().to_string()) else {
+        return -1;
+    };
+    if name.is_empty() {
+        return -1;
+    }
+    // The schema reaches the model verbatim; a malformed one would look like
+    // a model failure rather than an input error, so reject it here.
+    let params_json = match cstr_or_null(parameters_json) {
+        None | Some("") => r#"{"type":"object","properties":{}}"#.to_string(),
+        Some(s) => match serde_json::from_str::<JsonValue>(s) {
+            Ok(JsonValue::Object(_)) => s.to_string(),
+            _ => return -1,
+        },
+    };
+    let desc = cstr_or_null(description).unwrap_or("").to_string();
+
+    let cb = cb.unwrap();
+    HOST_TOOLS.with(|m| {
+        m.borrow_mut().insert(name.clone(), HostTool { cb, opaque });
+    });
+
+    install_host_tool_bridge(ctx);
+
+    let js = format!(
+        r#"(function(){{
+  var def = {{ name: {name_json}, description: {desc_json}, parameters: {params} }};
+  def.execute = function(args){{ return globalThis.__sofuu_host_tool_exec({name_json}, args); }};
+  globalThis.__sofuu_host_tools[{name_json}] = def;
+  if (sofuu.tools && sofuu.tools.TOOLS) sofuu.tools.TOOLS[{name_json}] = def;
+}})()"#,
+        name_json = serde_json::to_string(&name).unwrap_or_default(),
+        desc_json = serde_json::to_string(&desc).unwrap_or_default(),
+        params = params_json,
+    );
+    if let Ok(c) = CString::new(js) {
+        eval_init_snippet(ctx, &c, c"<host-tool-register>");
+    }
+
+    0
+}
+
+/// Complete a host tool call whose callback returned NULL. Callable from any
+/// thread — the completion is handed to the runtime's thread through its
+/// event loop; the runtime must outlive the call.
+///
+/// `result_json` is a JSON value the agent sees as the tool result. To fail
+/// the call instead, pass a message in `error` (result_json may then be
+/// NULL). Returns SOFUU_OK, or -1 when the id is unknown (already settled,
+/// never pending, or a zero id).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_rt_host_tool_resolve(
+    rt: *mut CapiRuntime,
+    call_id: u64,
+    result_json: *const c_char,
+    error: *const c_char,
+) -> c_int {
+    if rt.is_null() || call_id == 0 {
+        return -1;
+    }
+    let err = cstr_or_null(error).map(String::from);
+    let result = cstr_or_null(result_json).map(String::from);
+    if err.is_none() {
+        let Some(r) = result.as_deref() else {
+            return -1;
+        };
+        if serde_json::from_str::<JsonValue>(r).is_err() {
+            return -1;
+        }
+    }
+
+    // Only an outstanding call may settle: a double resolve or a mistyped id
+    // is a host bug, and -1 says so instead of resolving a stranger's promise.
+    let known = match PENDING_HOST_CALLS.lock() {
+        Ok(mut p) => match p.iter().position(|id| *id == call_id) {
+            Some(i) => {
+                p.remove(i);
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    };
+    if !known {
+        return -1;
+    }
+
+    let msg = match &err {
+        Some(e) => serde_json::json!({
+            "__sofuu_host_tool_result": 1,
+            "call_id": call_id,
+            "error": e,
+        }),
+        None => serde_json::json!({
+            "__sofuu_host_tool_result": 1,
+            "call_id": call_id,
+            "result": result,
+        }),
+    };
+    sofuu_core::rt::host_poke::host_poke_send(&msg.to_string());
+    0
 }
 
 // ── Internal helpers ──────────────────────────────────────────────
@@ -2127,6 +2469,410 @@ mod tests {
             "a SafeTensors directory should generate tokens locally, got {deltas} deltas, done: {done}"
         );
         assert!(!done.contains(r#""error""#), "stream must not fail: {done}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    // ── E2 (PLAN-EMBED-SDK): host-native tools ───────────────────────
+
+    /// A mock provider for the host-tool tests. It is injected as
+    /// `sofuu.ai.stream` because that is the one call the agent loop makes
+    /// (agent.js streamWithRetry), so the real loop, the real tool dispatch
+    /// and the real transcript assembly all run — only the model is fake.
+    ///
+    /// Round 1 asks for `tool`. Round 2 reports whether `token` (the tool's
+    /// result) is present in the messages the model would see, so a broken
+    /// bridge cannot pass by accident.
+    fn mock_tool_agent_js(token: &str, agent: &str, tool: &str) -> String {
+        format!(
+            r#"(function(){{
+  var TOKEN = {token_json};
+  var round = 0;
+  sofuu.ai.stream = function(opts) {{
+    round++;
+    var toolRound = (round === 1);
+    var chunks;
+    if (toolRound) {{ chunks = []; }}
+    else {{
+      var seen = JSON.stringify((opts && opts.messages) || []);
+      chunks = [{{ text: seen.indexOf(TOKEN) >= 0 ? "CONFIRMED-TOOL-RESULT" : "MISSING-TOOL-RESULT" }}];
+    }}
+    var i = 0;
+    var it = {{
+      usage: {{ promptTokens: 11, completionTokens: 3, finishReason: "stop" }},
+      toolCalls: toolRound
+        ? [{{ index: 0, id: "call_1", function: {{ name: {tool_json}, arguments: "{{}}" }} }}]
+        : [],
+      abort: function() {{}},
+      next: function() {{
+        if (i < chunks.length) return Promise.resolve({{ value: chunks[i++], done: false }});
+        return Promise.resolve({{ value: undefined, done: true }});
+      }}
+    }};
+    it[Symbol.asyncIterator] = function() {{ return it; }};
+    return it;
+  }};
+  sofuu.agent.define({{
+    name: {agent_json},
+    system: "You are a test agent.",
+    provider: "mock",
+    model: "mock-tool-test",
+    tools: [{{ builtin: {tool_json} }}],
+    budget: {{ maxSteps: 4 }}
+  }});
+}})()"#,
+            token_json = serde_json::to_string(token).unwrap_or_default(),
+            tool_json = serde_json::to_string(tool).unwrap_or_default(),
+            agent_json = serde_json::to_string(agent).unwrap_or_default(),
+        )
+    }
+
+    /// Drive `agent.run` over the streaming ABI and return every event.
+    fn run_agent_collect(rt: *mut CapiRuntime, target: &str) -> Vec<String> {
+        static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        EVENTS.lock().unwrap().clear();
+        unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            EVENTS.lock().unwrap().push(s);
+        }
+
+        let method = CString::new("agent.run").unwrap();
+        let args = CString::new(
+            serde_json::json!({ "target": target, "task": "take a photo" }).to_string(),
+        )
+        .unwrap();
+        let mut cancel_id: u64 = 0;
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect),
+                ptr::null_mut(),
+                &mut cancel_id,
+            )
+        };
+        assert_eq!(rc, 0, "agent.run should return OK");
+        EVENTS.lock().unwrap().clone()
+    }
+
+    /// E2: the headline case — a native function the host registered runs
+    /// inside a real agent turn, and its result reaches the conversation the
+    /// model sees.
+    #[test]
+    fn host_tool_runs_inside_an_agent_turn() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        static CALLS: Mutex<u32> = Mutex::new(0);
+        static ARGS: Mutex<String> = Mutex::new(String::new());
+        *CALLS.lock().unwrap() = 0;
+        ARGS.lock().unwrap().clear();
+
+        // Synchronous host tool: answer with a JSON object. The buffer is
+        // host-owned and static here, which is the cheapest legal shape of
+        // the contract (the library copies it before returning).
+        unsafe extern "C" fn take_photo(
+            args_json: *const c_char,
+            _call_id: u64,
+            _opaque: *mut c_void,
+        ) -> *const c_char {
+            let s = unsafe { CStr::from_ptr(args_json) }.to_string_lossy().into_owned();
+            *ARGS.lock().unwrap() = s;
+            *CALLS.lock().unwrap() += 1;
+            c"{\"path\":\"/tmp/TOOLRES-photo-9f3.jpg\"}".as_ptr()
+        }
+
+        let name = CString::new("take_photo").unwrap();
+        let desc = CString::new("Takes a photo with the device camera").unwrap();
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    desc.as_ptr(),
+                    ptr::null(),
+                    Some(take_photo),
+                    ptr::null_mut(),
+                )
+            },
+            0,
+            "registration should succeed"
+        );
+
+        let setup = CString::new(mock_tool_agent_js(
+            "TOOLRES-photo-9f3",
+            "photo-agent",
+            "take_photo",
+        ))
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        let events = run_agent_collect(rt, "photo-agent");
+        let joined = events.join("\n");
+
+        assert_eq!(*CALLS.lock().unwrap(), 1, "the host tool must run exactly once");
+        assert_eq!(*ARGS.lock().unwrap(), "{}", "the model's args reach the callback");
+        assert!(
+            joined.contains("CONFIRMED-TOOL-RESULT"),
+            "the tool result must reach the model's transcript; events: {joined}"
+        );
+        assert!(!joined.contains("MISSING-TOOL-RESULT"), "events: {joined}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E2: the async half — the callback returns NULL (the camera case: the
+    /// photo does not exist yet) and the host completes the call from
+    /// ANOTHER thread. uv_async_send carries it to the loop thread, where
+    /// the pending promise is settled and the agent turn resumes.
+    #[test]
+    fn host_tool_completes_from_another_thread() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        static ASYNC_RT: std::sync::atomic::AtomicPtr<CapiRuntime> =
+            std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+        ASYNC_RT.store(rt, Ordering::Release);
+
+        let (tx, rx) = std::sync::mpsc::channel::<c_int>();
+        let tx = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe extern "C" fn take_photo_later(
+            _args_json: *const c_char,
+            call_id: u64,
+            opaque: *mut c_void,
+        ) -> *const c_char {
+            assert!(call_id != 0, "a pending call must carry an id");
+            let tx = unsafe { (*(opaque as *const std::sync::mpsc::Sender<c_int>)).clone() };
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                let rt = ASYNC_RT.load(Ordering::Acquire);
+                let result = CString::new(r#""TOOLRES-photo-9f3""#).unwrap();
+                // SAFETY: the test keeps rt alive until the stream returns,
+                // and the stream cannot return before this line has run.
+                let rc = unsafe {
+                    sofuu_rt_host_tool_resolve(rt, call_id, result.as_ptr(), ptr::null())
+                };
+                let _ = tx.send(rc);
+            });
+            ptr::null() // pending — completed later
+        }
+
+        let name = CString::new("take_photo").unwrap();
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(take_photo_later),
+                    tx,
+                )
+            },
+            0
+        );
+
+        let setup = CString::new(mock_tool_agent_js(
+            "TOOLRES-photo-9f3",
+            "photo-agent",
+            "take_photo",
+        ))
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        let events = run_agent_collect(rt, "photo-agent");
+        let joined = events.join("\n");
+
+        let rc = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the deferred call must be resolvable from the host thread");
+        assert_eq!(rc, 0, "resolve must accept an outstanding call id");
+        assert!(
+            joined.contains("CONFIRMED-TOOL-RESULT"),
+            "the deferred result must reach the model's transcript; events: {joined}"
+        );
+
+        unsafe { drop(Box::from_raw(tx as *mut std::sync::mpsc::Sender<c_int>)) };
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E2: registration is validated up front (the schema reaches the model
+    /// verbatim, so a bad one must not travel), and only an outstanding call
+    /// may be settled — a mistyped or double-used id says so.
+    #[test]
+    fn host_tool_api_validates_its_inputs() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        unsafe extern "C" fn cb(_a: *const c_char, _c: u64, _o: *mut c_void) -> *const c_char {
+            ptr::null()
+        }
+
+        let name = CString::new("take_photo").unwrap();
+        let bad_schema = CString::new("[1,2,3]").unwrap();
+
+        // NULL runtime / name / callback.
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    ptr::null_mut(),
+                    name.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(cb),
+                    ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(cb),
+                    ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    None,
+                    ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        // A schema that is not a JSON object is refused.
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    ptr::null(),
+                    bad_schema.as_ptr(),
+                    Some(cb),
+                    ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        // The good shape (default schema) succeeds.
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(cb),
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+
+        // Registered tools publish into BOTH registries: the builtin one
+        // (resolved at define time) and the host one (resolved at run time).
+        let probe = CString::new(
+            "(sofuu.tools.TOOLS && sofuu.tools.TOOLS['take_photo'] && globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools['take_photo']) ? 'BOTH-REGISTERED' : 'MISSING'",
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, probe.as_ptr(), &mut out) }, 0);
+        let envelope = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+        assert!(envelope.contains("BOTH-REGISTERED"), "got {envelope}");
+
+        // Nothing is pending, so nothing can be settled.
+        let msg = CString::new("nothing pending").unwrap();
+        assert_eq!(unsafe { sofuu_rt_host_tool_resolve(rt, 0, ptr::null(), ptr::null()) }, -1);
+        assert_eq!(
+            unsafe { sofuu_rt_host_tool_resolve(rt, 4242, ptr::null(), msg.as_ptr()) },
+            -1
+        );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    /// E2: an agent supplied through the `agents` config key is defined while
+    /// sofuu_rt_new runs — before the host can register anything — so the
+    /// unknown-builtin check is deferred for that path (allowHostTools). This
+    /// is the regression guard: the agent must survive rt_new and find its
+    /// tool by run time. The callback answers with a JSON *string* here, which
+    /// also pins the shaping rule (text, not quoted JSON).
+    #[test]
+    fn host_tool_reaches_a_config_defined_agent() {
+        let _g = lock();
+        let cfg = CString::new(
+            r#"{"agents":[{"name":"cfg-photo","system":"You are a test agent.","provider":"mock","model":"mock-tool-test","tools":[{"builtin":"take_photo"}],"budget":{"maxSteps":4}}]}"#,
+        )
+        .unwrap();
+        let rt = unsafe { sofuu_rt_new(cfg.as_ptr()) };
+        assert!(!rt.is_null());
+
+        static CALLS: Mutex<u32> = Mutex::new(0);
+        *CALLS.lock().unwrap() = 0;
+        unsafe extern "C" fn take_photo(
+            _a: *const c_char,
+            _c: u64,
+            _o: *mut c_void,
+        ) -> *const c_char {
+            *CALLS.lock().unwrap() += 1;
+            c"\"TOOLRES-photo-9f3\"".as_ptr()
+        }
+
+        let name = CString::new("take_photo").unwrap();
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(take_photo),
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+
+        // The mock defines an unrelated agent; the config one is the target.
+        let setup = CString::new(mock_tool_agent_js(
+            "TOOLRES-photo-9f3",
+            "unused-agent",
+            "take_photo",
+        ))
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        let events = run_agent_collect(rt, "cfg-photo");
+        let joined = events.join("\n");
+
+        assert_eq!(*CALLS.lock().unwrap(), 1, "the config agent must call the tool");
+        assert!(
+            joined.contains("CONFIRMED-TOOL-RESULT"),
+            "the tool result must reach the model's transcript; events: {joined}"
+        );
 
         unsafe { sofuu_rt_free(rt) };
     }

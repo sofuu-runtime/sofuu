@@ -111,11 +111,33 @@ desktop-dev:
 desktop-clean:
 	rm -rf $(DESKTOP_DIR)/dist
 
+# ── header sync: one source of truth for the C ABI ───────────────
+# include/sofuu_embed.h is the contract. The mobile apps, the Android SDK
+# binding and the iOS typecheck stub carry copies because they build outside
+# this tree (Xcode, Gradle, Android Studio). Those copies drifted: the
+# Android one still advertised a config key the header had removed, and the
+# iOS stub lagged whole functions — so a binding could typecheck against a
+# contract that no longer existed. Copies are byte-identical and refreshed
+# here; never edit one by hand.
+HEADER_COPIES = dist/sofuu_embed.h \
+                sofuu-ios/.devstub/sofuu_embed.h \
+                bindings/android/sofuu/src/main/cpp/include/sofuu_embed.h \
+                sofuu-android/app/src/main/cpp/include/sofuu_embed.h
+
+header-sync:
+	@mkdir -p dist
+	@for f in $(HEADER_COPIES); do \
+		if [ -d "$$(dirname $$f)" ]; then \
+			cp include/sofuu_embed.h "$$f"; \
+			echo "  \033[36mSYNC\033[0m  $$f"; \
+		fi; \
+	done
+
 # ── libsofuu: embeddable library (PLAN-HEADLESS H1) ──────────────
 # Builds the capi crate as staticlib + cdylib, copies artifacts to dist/.
 # Usage:  make libsofuu
 # Output: dist/libsofuu.a  dist/libsofuu.dylib  dist/sofuu_embed.h
-libsofuu:
+libsofuu: header-sync
 	@echo "  \033[36mCARGO\033[0m  libsofuu  [arch=$(ARCH)]"
 	cargo build --release -p sofuu-capi
 	@mkdir -p dist
@@ -125,7 +147,6 @@ libsofuu:
 		cp target/release/libsofuu.dylib dist/libsofuu.dylib 2>/dev/null || \
 		cp target/release/libsofuu_capi.so dist/libsofuu.so 2>/dev/null || \
 		cp target/release/libsofuu.so dist/libsofuu.so 2>/dev/null || true
-	@cp include/sofuu_embed.h dist/sofuu_embed.h
 	@echo "  \033[32mBuilt:\033[0m"
 	@ls -lh dist/libsofuu.* dist/sofuu_embed.h 2>/dev/null
 	@echo ""
@@ -314,6 +335,15 @@ headless-test: libsofuu
 	@echo ""
 	@echo "\033[36m--- Run c_agent against the library ---\033[0m"
 	@examples/headless/c_agent
+	@echo ""
+	@echo "\033[36m--- Compile c_host_tool.c against libsofuu ---\033[0m"
+	@cc examples/headless/c_host_tool.c -Idist -Ldist -lsofuu -o examples/headless/c_host_tool \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_host_tool)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo ""
+	@echo "\033[36m--- Run c_host_tool against the library (E2 host tools) ---\033[0m"
+	@examples/headless/c_host_tool
 	@echo ""
 	@echo "\033[36m--- Compile c_llm.c against libsofuu (real LLM, mock in CI) ---\033[0m"
 	@cc examples/headless/c_llm.c -Idist -Ldist -lsofuu -o examples/headless/c_llm \

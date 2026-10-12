@@ -31,6 +31,8 @@ struct AppState {
     var drawerOpen = false
     var sheet: String? // "model" | "effort" | "layers" | "mode" | "permissions"
     var modelsCache: [String: ModelCacheEntry] = [:]
+    /// Absolute paths of the GGUF models imported into the container.
+    var localModels: [String] = []
 }
 
 /// One provider's cached model listing (the desktop's model cache).

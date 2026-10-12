@@ -78,6 +78,11 @@ public enum StreamEvent {
 public final class Sofuu {
     private let rt: OpaquePointer
 
+    /// Host tool handlers, retained for the runtime's lifetime: the C ABI
+    /// holds an opaque pointer to each box and will call it on every tool
+    /// invocation, so releasing one early would be a use-after-free.
+    private var toolBoxes: [HostToolBox] = []
+
     /// The embedding space ids this build knows. The default (used when you
     /// pass `nil`) is `hash-768` — the same space the brain stores in, so
     /// embed-then-remember needs no space argument.
@@ -253,12 +258,113 @@ public final class Sofuu {
     public func stream(_ method: String,
                        _ args: [String: Any] = [:],
                        onEvent: @escaping (StreamEvent) -> Void) -> StreamHandle {
+        stream(rawArgs: Sofuu.jsonString(args), method: method, onEvent: onEvent)
+    }
+
+    /// Streaming with POSITIONAL arguments: the ABI spreads a JSON array, so
+    /// `[modelPath, prompt, options]` reaches
+    /// `ai.streamLocal(modelPath, prompt, options?)` as written. Needed
+    /// because some methods take positional parameters rather than one
+    /// options object; `stream(_:_:)` covers everything else.
+    public func streamPositional(_ method: String,
+                                 _ args: [Any],
+                                 onEvent: @escaping (StreamEvent) -> Void) -> StreamHandle {
+        stream(rawArgs: Sofuu.jsonString(args), method: method, onEvent: onEvent)
+    }
+
+    /// Generate from a LOCAL model, streaming tokens as they decode.
+    ///
+    /// `modelPath` is a `.gguf` file or a model directory (SafeTensors /
+    /// PyTorch / NumPy with its `tokenizer.json`). No provider needs to be
+    /// configured: the path alone routes to in-process inference, entirely
+    /// offline.
+    public func streamLocal(modelPath: String,
+                            prompt: String,
+                            maxTokens: Int? = nil,
+                            temperature: Double? = nil,
+                            onEvent: @escaping (StreamEvent) -> Void) -> StreamHandle {
+        var opts: [String: Any] = [:]
+        if let maxTokens { opts["maxTokens"] = maxTokens }
+        if let temperature { opts["temperature"] = temperature }
+        return streamPositional("ai.streamLocal", [modelPath, prompt, opts], onEvent: onEvent)
+    }
+
+    // MARK: Host-native tools
+
+    /// Register a native Swift function the in-app agent can call as a tool
+    /// (camera, location, HealthKit, your app's own data…).
+    ///
+    /// The handler is `async`, so the runtime never blocks waiting for it:
+    /// the call is taken here and completed when the handler returns. It is
+    /// bounded by the agent's tool timeout (30 s per tool by default), so
+    /// long-running work should report progress rather than run past it.
+    ///
+    ///     try sofuu.registerTool(name: "get_user_location",
+    ///                            description: "Gets device GPS coordinates") { _ in
+    ///         let loc = await LocationManager.shared.currentLocation()
+    ///         return ["latitude": loc.lat, "longitude": loc.lon]
+    ///     }
+    ///
+    /// Returning a dictionary or array sends JSON to the model; returning a
+    /// String sends that text. Throwing sends the error to the model as a
+    /// tool failure rather than ending the turn.
+    public func registerTool(name: String,
+                             description: String,
+                             parameters: [String: Any]? = nil,
+                             handler: @escaping ([String: Any]) async throws -> Any) throws {
+        let box = HostToolBox(handler: handler, runtime: rt)
+        toolBoxes.append(box) // retained for the runtime's lifetime
+
+        let cb: @convention(c) (UnsafePointer<CChar>?, UInt64, UnsafeMutableRawPointer?) -> UnsafePointer<CChar>? =
+            { argsJSON, callID, opaque in
+                guard let opaque else { return nil }
+                let box = Unmanaged<HostToolBox>.fromOpaque(opaque).takeUnretainedValue()
+                let args: [String: Any] = {
+                    guard let argsJSON,
+                          let data = String(cString: argsJSON).data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else { return [:] }
+                    return obj
+                }()
+                // Async handler ⇒ the call is deferred. `resolve` is safe
+                // from any thread, so completing on a Task is fine.
+                Task {
+                    do {
+                        let value = try await box.handler(args)
+                        let json = Sofuu.jsonStringValue(value)
+                        json.withCString { _ = sofuu_rt_host_tool_resolve(box.runtime, callID, $0, nil) }
+                    } catch {
+                        let msg = "\(error)"
+                        msg.withCString { _ = sofuu_rt_host_tool_resolve(box.runtime, callID, nil, $0) }
+                    }
+                }
+                return nil // pending — the Task above settles it
+            }
+
+        let rc = Sofuu.withOptionalCString(Sofuu.jsonString(parameters ?? [:])) { params in
+            name.withCString { n in
+                description.withCString { d in
+                    sofuu_rt_register_host_tool(rt, n, d, parameters == nil ? nil : params,
+                                                cb, Unmanaged.passUnretained(box).toOpaque())
+                }
+            }
+        }
+        guard rc == 0 else {
+            throw SofuuError(code: "invalid_arg",
+                             message: "registerTool(\(name)) failed (rc=\(rc))")
+        }
+    }
+
+    /// The one streaming implementation: `rawArgs` is JSON text already, so
+    /// the object and the positional entry points above share it.
+    private func stream(rawArgs: String,
+                        method: String,
+                        onEvent: @escaping (StreamEvent) -> Void) -> StreamHandle {
         let box = EventBox(onEvent: onEvent, runtime: rt)
         // The box outlives this call via `StreamHandle.box` (strong) and the
         // local `box` during it, so an unretained pointer is correct here —
         // passRetained without a matching release would leak per stream.
         let boxPtr = Unmanaged.passUnretained(box).toOpaque()
-        let argsJSON = Sofuu.jsonString(args)
 
         let cb: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void =
             { json, opaque in
@@ -268,7 +374,7 @@ public final class Sofuu {
             }
 
         var cancelID: UInt64 = 0
-        let rc = argsJSON.withCString { a in
+        let rc = rawArgs.withCString { a in
             method.withCString { m in
                 sofuu_rt_call_stream(rt, m, a, cb, boxPtr, &cancelID)
             }
@@ -297,6 +403,43 @@ public final class Sofuu {
             return "{}"
         }
         return s
+    }
+
+    /// JSON text for a host tool result. A dictionary/array becomes JSON (the
+    /// model then reads real JSON), a String becomes a JSON string (the model
+    /// reads it as text), and anything else is sent as its description — a
+    /// tool result is never silently dropped.
+    static func jsonStringValue(_ value: Any) -> String {
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value),
+           let s = String(data: data, encoding: .utf8) {
+            return s
+        }
+        if let s = value as? String { return jsonQuote(s) }
+        return jsonString(["value": String(describing: value)])
+    }
+
+    /// A JSON string literal for `s` (quotes, backslashes and control
+    /// characters escaped — the result is fed to JSON.parse on the other
+    /// side, so it must be well-formed).
+    static func jsonQuote(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out + "\""
     }
 
     /// Call `body` with a C string for `value`, or NULL when `value` is nil
@@ -341,6 +484,18 @@ public struct StreamHandle {
     /// Ask the runtime to stop. The stream then ends with `.done(aborted: true)`.
     public func cancel() {
         sofuu_rt_cancel(runtime, cancelID)
+    }
+}
+
+/// Keeps a Swift tool handler (and the runtime it answers for) alive while
+/// the C ABI holds an opaque pointer to it.
+final class HostToolBox {
+    let handler: ([String: Any]) async throws -> Any
+    let runtime: OpaquePointer
+
+    init(handler: @escaping ([String: Any]) async throws -> Any, runtime: OpaquePointer) {
+        self.handler = handler
+        self.runtime = runtime
     }
 }
 

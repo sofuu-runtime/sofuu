@@ -160,6 +160,54 @@ int sofuu_rt_call_stream(SofuuRuntime *rt, const char *method,
  * Returns SOFUU_OK if the cancel ID was recognized, -1 if not found. */
 int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
 
+/* ── Host-native tools (PLAN-EMBED-SDK E2) ─────────────────────── */
+/* Register a native host function so an in-app agent can call it as a tool.
+ *
+ * `name` is what the model sees; `description` and `parameters_json` (a JSON
+ * Schema object, NULL/"" for {"type":"object","properties":{}}) are how the
+ * model decides to call it. `cb` runs ON THE RUNTIME'S THREAD (the same
+ * thread that drives sofuu_rt_call_stream), with the arguments the model
+ * produced as a JSON object string.
+ *
+ * The callback answers in one of two ways:
+ *   - return a NUL-terminated JSON string → synchronous result. The string is
+ *     host-owned and only needs to live for the duration of the call; the
+ *     library copies it. A JSON string result reaches the model as its text,
+ *     any other JSON value as JSON text.
+ *   - return NULL → the host has taken the call and will complete it later
+ *     with sofuu_rt_host_tool_resolve(rt, call_id, …). Use this when the work
+ *     cannot finish inline (camera, location, permissions, I/O).
+ *
+ * The async path is bounded by the agent's tool timeout (30 s per tool by
+ * default, `toolTimeoutMs` per agent), which is also what keeps the event
+ * loop alive while a call is outstanding: a host that never answers gets a
+ * tool-timeout error rather than a hung turn.
+ *
+ * The tool is visible to every agent of this runtime, including agents
+ * supplied through the `agents` config key — those are defined during
+ * sofuu_rt_new, before a host can register anything, so registration must be
+ * resolvable after the fact (it is). Registering a name twice replaces the
+ * earlier registration. Tools are scoped to the runtime's thread, per the
+ * one-runtime-per-thread rule above. Returns SOFUU_OK or a SOFUU_ERR_*. */
+typedef const char *(*sofuu_host_tool_fn)(const char *args_json,
+                                          uint64_t call_id, void *opaque);
+
+int sofuu_rt_register_host_tool(SofuuRuntime *rt, const char *name,
+                                const char *description,
+                                const char *parameters_json,
+                                sofuu_host_tool_fn cb, void *opaque);
+
+/* Complete a host tool call whose callback returned NULL.
+ *
+ * `result_json` is a JSON value the agent sees as the tool result; to fail
+ * the call instead, pass a message in `error` (result_json may be NULL then).
+ * Safe to call from ANY thread — the completion is delivered to the runtime's
+ * thread through its event loop — but the runtime must outlive the call.
+ * Returns SOFUU_OK, or -1 when the id is unknown (never pending, already
+ * settled, or a zero id). */
+int sofuu_rt_host_tool_resolve(SofuuRuntime *rt, uint64_t call_id,
+                               const char *result_json, const char *error);
+
 /* ── Eval escape hatch ─────────────────────────────────────────── */
 /* Evaluate arbitrary JS (full power when the funnel isn't enough). The
  * source is evaluated as a global script, the event loop is drained, and

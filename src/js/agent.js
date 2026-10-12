@@ -463,8 +463,14 @@
 
   /* ── Definitions ───────────────────────────────────────────────── */
 
-  function normalizeDef(def) {
+  function normalizeDef(def, opts) {
     if (!def || typeof def !== 'object') throw new Error('agent: definition object required');
+    /* E2 (PLAN-EMBED-SDK): an embedded host registers native tools AFTER the
+     * runtime exists, so an agent supplied through the C `agents` config can
+     * name a tool that is not registered yet. Only that path defers (the
+     * capi passes the flag); user code keeps the loud unknown-builtin throw,
+     * and a name that never arrives is reported when the agent runs. */
+    var allowHostTools = !!(opts && opts.allowHostTools);
     var name = String(def.name || '').trim();
     if (!name) throw new Error('agent.define: name is required');
     var d = {
@@ -558,6 +564,8 @@
           if (d.codeTools.indexOf(bn) < 0) d.codeTools.push(bn);
         } else if (globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[bn]) {
           if (d.hostTools.indexOf(bn) < 0) d.hostTools.push(bn);
+        } else if (allowHostTools) {
+          if (d.hostTools.indexOf(bn) < 0) d.hostTools.push(bn);
         } else {
           throw new Error("agent.define: unknown builtin tool '" + bn + "'");
         }
@@ -580,8 +588,8 @@
     return d;
   }
 
-  function define(def) {
-    var d = normalizeDef(def);
+  function define(def, opts) {
+    var d = normalizeDef(def, opts);
     if (REGISTRY[d.name]) throw new Error("agent.define: duplicate name '" + d.name + "'");
     REGISTRY[d.name] = d;
     return { name: d.name, _def: d };

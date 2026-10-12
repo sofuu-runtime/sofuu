@@ -263,6 +263,15 @@ int            sofuu_rt_cancel(SofuuRuntime *, uint64_t cancel_id);
 /* eval escape hatch (full JS power when the funnel isn't enough) */
 int            sofuu_rt_eval(SofuuRuntime *, const char *source,
                              char **out_json);
+/* host-native tools (E2): the agent calls into the host */
+int            sofuu_rt_register_host_tool(SofuuRuntime *, const char *name,
+                             const char *description,
+                             const char *parameters_json,
+                             const char *(*cb)(const char *args_json,
+                                               uint64_t call_id, void *opaque),
+                             void *opaque);
+int            sofuu_rt_host_tool_resolve(SofuuRuntime *, uint64_t call_id,
+                             const char *result_json, const char *error);
 /* host log sink for console.* when embedded (NULL clears) */
 void           sofuu_embed_set_log_cb(
                              void (*cb)(const char *level, const char *msg,
@@ -300,19 +309,63 @@ sofuu_rt_call(rt, "memory.recall", "{\"vec\":[…],\"k\":5}", &out);
 
 **Streaming**: `sofuu_rt_call_stream` supports two shapes with one driver.
 Methods that take an `onStep` option (`agent.run`) forward each step event;
-methods that return an async iterable (`ai.stream`) are drained, each chunk
-delivered as `{"kind":"delta",…}`. Either way the stream ends with exactly
-one terminal `{"kind":"done",…}` event — carrying `deltas`/`aborted` on
-success, or `error` on failure — so a host that waits for `done` is never
-left hanging. The signature has no `out_json`, so that terminal event is
-also where the final value arrives. `*out_cancel_id` is written *before* the
-stream starts, so a callback can cancel in flight; `sofuu_rt_cancel` stops
-both shapes.
+methods that return an async iterable (`ai.stream`, `ai.streamLocal`) are
+drained, each chunk delivered as `{"kind":"delta",…}`. Either way the stream
+ends with exactly one terminal `{"kind":"done",…}` event — carrying
+`deltas`/`aborted` on success, or `error` on failure — so a host that waits
+for `done` is never left hanging. The signature has no `out_json`, so that
+terminal event is also where the final value arrives. `*out_cancel_id` is
+written *before* the stream starts, so a callback can cancel in flight;
+`sofuu_rt_cancel` stops both shapes.
+
+**`args_json` is an object OR an array** — the same contract as
+`sofuu_rt_call`. An array is spread as positional arguments, which is how a
+positional method is reached at all:
+
+```c
+/* local, in-process generation: (modelPath, prompt, options?) */
+sofuu_rt_call_stream(rt, "ai.streamLocal",
+                     "[\"/models/qwen3-0.6b.gguf\",\"hello\",{\"maxTokens\":128}]",
+                     on_event, opaque, &cancel_id);
+```
+
+The driver injects `onStep` and the cancel token into the options object —
+for the array form, the trailing object, appended when the caller passed
+none — so cancel works in both shapes. A `.gguf` file, a SafeTensors /
+PyTorch / NumPy model *directory* (with its `tokenizer.json`), or a bare
+weights file routes to in-process inference from the path alone: no
+`provider` hint is needed.
 
 **Per-process agent definitions** (A7.3): supply agent definitions in
 `sofuu_rt_new` config as `"agents":[{"name":"…","system":"…",…}]`. No
 filesystem needed — `~/.sofuu/agents/*.js` is the convenience layer, never
 the only way.
+
+**Host-native tools** (E2, `sofuu_rt_register_host_tool`): the inverse
+direction — the agent calls *into the host*. A registered tool is visible to
+every agent of that runtime, including agents defined through the `agents`
+config key above (that path defers an unknown builtin name to run time,
+because registration cannot happen until `sofuu_rt_new` has returned).
+
+```c
+/* answer inline, or take the call and settle it later from any thread */
+static const char *take_photo(const char *args_json, uint64_t call_id,
+                              void *opaque) {
+    return "{\"path\":\"/var/tmp/frame.jpg\"}";   /* synchronous result */
+}
+sofuu_rt_register_host_tool(rt, "take_photo", "Takes a photo with the camera",
+                            NULL, take_photo, NULL);
+```
+
+Returning NULL instead means the host has taken the call and will complete it
+with `sofuu_rt_host_tool_resolve(rt, call_id, result_json, error)` — safe
+from any thread, delivered to the runtime's thread through its event loop.
+That is the shape async host work needs (camera, location, permissions). The
+wait is bounded by the agent's tool timeout — 30 s per tool by default,
+`toolTimeoutMs` per agent — which is also the timer that keeps the event loop
+alive while the call is outstanding; a host that never answers produces a
+tool-timeout error rather than a hung turn. A JSON string result reaches the
+model as its text; any other JSON value reaches it as JSON text.
 
 The eval escape hatch (`sofuu_rt_eval`) means the funnel is a convenience,
 not a cage: anything the JS API can do, a host can do today, and the
@@ -532,9 +585,14 @@ Every CI push/PR and release build runs:
    `libsofuu` and runs them. Proves the library works standalone (no TUI,
    no `~/.sofuu` touched unless configured).
 2. **`make abi-check`** — `nm` symbol diff against
-   `scripts/abi_symbols.txt` (30 exported symbols, of which 15 are the
-   documented `sofuu_embed.h` surface). Missing = breaking
-   change (fails CI). New = additive (warns; update the baseline).
+   `scripts/abi_symbols.txt` (32 exported symbols, of which 17 are the
+   documented `sofuu_embed.h` surface). Missing = breaking change (fails CI).
+   New = **also fails** until explicitly acknowledged with
+   `SOFUU_ABI_ALLOW_NEW=1`, which writes `scripts/abi_symbols.txt.new` for
+   review — an accidental `#[no_mangle]` cannot slip in on a warning. The
+   gate also asserts that every baseline symbol matches its own `PUBLIC_RE`
+   filter; a symbol the filter hides can never be reported as added *or*
+   removed.
 3. **`crates/fuzz/fuzz_targets/capi_call.rs`** — feeds arbitrary method/JSON
    to `sofuu_rt_call`; a crash or exit is a failed fuzz run.
 

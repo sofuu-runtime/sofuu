@@ -22,8 +22,10 @@ sofuu_rt_call_stream
 sofuu_rt_cancel
 sofuu_rt_eval
 sofuu_rt_free
+sofuu_rt_host_tool_resolve
 sofuu_rt_install_rejection_tracker
 sofuu_rt_new
+sofuu_rt_register_host_tool
 sofuu_rt_report_pending_rejections
 sofuu_run_jobs
 sofuu_voice_speak

@@ -140,7 +140,27 @@ class AssistantViewModel: ObservableObject {
   - Runtime RSS strictly $\le 30\text{ MB}$ (excluding memory-mapped model weights).
   - Model weights mapped via zero-copy clean mmap pages that the iOS kernel can page out on memory pressure.
   - Sliding Window Attention (SWA) bounding KV cache to a fixed context limit.
-* **Metal GPU Acceleration**: Shaders in `src/metal/kernels.metal` compile into `default.metallib` bundled within the XCFramework, executing matrix multiplications directly on Apple Silicon A16/A17/M-series GPUs.
+* **Metal GPU Acceleration**: macOS-only today. `crates/sofuu-ffi/build.rs:149`
+  compiles `src/metal/metal_engine.mm` only when `target_os == "macos"`, so the
+  iOS slices of the library carry **no Metal engine**, and `scripts/dist/ios.sh`
+  bundles no `default.metallib` — the shader that does ship is compiled into the
+  *sample app's* bundle by Xcode, not into the framework. Making this real on
+  iOS (platform-gate the engine, compile `kernels.metal` into a
+  `default.metallib`, ship it as a framework resource, route to it) is
+  milestone E3, not a verification step.
+* **Jetsam Memory Guard**: iOS kills apps that exceed strict memory budgets
+  (e.g. 500 MB–1.5 GB depending on device). What actually holds today:
+  - Model weights are mapped read-only and clean (`infer/mmap.rs:32`,
+    `PROT_READ | MAP_SHARED`), so the kernel can evict the pages under
+    pressure — this part is real and verifiable.
+  - The KV cache is **f32 and allocated for the full context at load**
+    (`infer/model.rs:391`), which is ~940 MB for Qwen3-0.6B at the 4096-token
+    default. It is not "model weights", so it counts against any RSS budget.
+    SWA bounds attention *compute*, not this allocation.
+  - There is no response to memory pressure anywhere (no
+    `didReceiveMemoryWarning`, no `onTrimMemory`, no cache trim, no unload).
+  - The old claim of "runtime RSS strictly ≤ 30 MB" is therefore unreachable as
+    written; E5 reframes it as measure-then-reduce rather than assert.
 * **App Lifecycle Handling**: Observes `scenePhase` transitions. When the app moves to background, active generation is either paused or finishes current token before suspending to prevent watchdog terminations.
 
 ---
@@ -229,22 +249,106 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
 
 ## 8. Milestone Roadmap for Embed SDK
 
-### Milestone E1: Native Local Inference in `sofuu_rt_call_stream`
-- [ ] Connect `sofuu.ai.streamLocal()` directly into the C ABI streaming pump in `crates/sofuu-capi/src/lib.rs`.
-- [ ] Allow SDK callers to pass local model paths (`.gguf` or `.safetensors` directory) and receive token deltas.
+> **Status updated 2026-10-12.** E1 and E2 ship in the C ABI, in the core JS
+> runtime, and in the Swift binding; the Android app carries its own
+> `registerHostTool`/`callStream` bridge. E3–E5 remain open, and their
+> premises are corrected below where the original text described something
+> that does not exist.
 
-### Milestone E2: Host-Native Tool Callback Bridge
-- [ ] Implement `sofuu_rt_register_host_tool(rt, name, desc, schema_json, callback, opaque)` in `include/sofuu_embed.h`.
-- [ ] Add Swift and Kotlin wrappers enabling mobile developers to register native functions as agent tools.
+### Milestone E1: Native Local Inference in `sofuu_rt_call_stream` — SHIPPED
+- [x] `sofuu_rt_call_stream` accepts an object **or an array** in `args_json`,
+      exactly like `sofuu_rt_call`. This is what makes positional methods
+      reachable at all: `ai.streamLocal` takes `(modelPath, prompt, options?)`
+      and the driver previously always called the method with a single object.
+      `onStep` and the cancel token are injected into the trailing options
+      object (appended when the caller passed none).
+- [x] A local model path routes in-process from the path alone — a `.gguf`
+      file, a SafeTensors / PyTorch / NumPy model *directory* with its
+      `tokenizer.json`, or a bare weights file. SafeTensors directories
+      previously required an explicit `provider:"local"`, so handing an
+      embedded host a directory sent the request to the network as if it were
+      a model name.
+- [x] Swift: `Sofuu.streamLocal(modelPath:prompt:maxTokens:temperature:onEvent:)`
+      and `Sofuu.streamPositional(_:_:onEvent:)` for any positional method.
+- [ ] Kotlin **SDK** binding (`bindings/android/sofuu`) — the app-level bridge
+      in `sofuu-android/` has `callStream`; the shipped SDK binding still has
+      no streaming method and its JNI layer exports no stream native.
+- [x] Verified with real models: a 0.6B GGUF streams token deltas through the
+      C ABI with a working mid-flight cancel, and an LFM2 SafeTensors directory
+      generates from its path alone (`cargo test -p sofuu-capi`);
+      both skip cleanly when the model is absent, since no model is checked in.
 
-### Milestone E3: iOS XCFramework Build & Metal GPU Validation
-- [ ] Verify `scripts/dist/ios.sh` compiling `libsofuu.xcframework` with Metal GPU shaders included.
-- [ ] Test real token generation on physical iPhone hardware via the `sofuu-ios/` SwiftUI sample app.
+### Milestone E2: Host-Native Tool Callback Bridge — SHIPPED (C ABI + Swift + Android app)
+- [x] `sofuu_rt_register_host_tool(rt, name, description, parameters_json, cb,
+      opaque)` in `include/sofuu_embed.h`, plus
+      `sofuu_rt_host_tool_resolve(rt, call_id, result_json, error)`.
+- [x] Callback contract: a JSON string is a synchronous result; **NULL means
+      the host took the call** and will settle it later from any thread via
+      resolve, delivered to the runtime's thread through `rt/host_poke.rs`
+      (`uv_async_send` — the one libuv call safe from another thread). No
+      buffer-ownership handoff either way.
+- [x] The wait is bounded by the agent's tool timeout (30 s per tool by
+      default, `toolTimeoutMs` per agent) — which is also the timer that keeps
+      the event loop alive while a call is outstanding, so no extra uv handle
+      is needed and a host that never answers gets a tool-timeout error rather
+      than a hung turn.
+- [x] Registered tools reach agents defined *after* registration (through
+      `sofuu.tools.TOOLS`) **and** agents defined from the `agents` config key
+      *before* it (that path defers the unknown-builtin check to run time via
+      `allowHostTools`, because registration cannot happen until
+      `sofuu_rt_new` returns).
+- [x] Swift: `Sofuu.registerTool(name:description:parameters:handler:)` with an
+      `async throws` handler — the async shape the camera/GPS examples need.
+- [x] Android: `SofuuBridge.registerHostTool` / `resolveHostTool` plus
+      `DeviceTools` (device_info, vibrate, …) in `sofuu-android/`.
+- [x] Verified: a registered host tool runs inside a real agent turn and its
+      result reaches the model's transcript (the mock provider reports
+      CONFIRMED only if it sees it); a call deferred to another thread resumes
+      the same turn; registration validation, unknown-id refusal and the
+      JSON-string-vs-object shaping rule are all asserted
+      (`cargo test -p sofuu-capi host_tool`).
 
-### Milestone E4: Android Gradle AAR Build & NDK Verification
-- [ ] Verify `sofuu-android/` CMake build generating `libsofuu.so` for `arm64-v8a`.
-- [ ] Test JNI token streaming in the Compose sample app on physical Android hardware.
+### Milestone E3: iOS XCFramework Build & Metal GPU Validation — OPEN
+- [ ] **Enable the Metal engine for iOS.** `crates/sofuu-ffi/build.rs:149`
+      compiles `src/metal/metal_engine.mm` only for `target_os == "macos"`, so
+      the library's iOS slices contain no Metal code at all. (The original
+      checkbox said "verify `ios.sh` includes Metal shaders" — it bundles none,
+      and cannot until this is done.)
+- [ ] Compile `src/metal/kernels.metal` into a `default.metallib` and ship it
+      as a framework resource (`Sofuu.framework/Resources/default.metallib`,
+      loaded with `MTLDevice.makeDefaultLibrary(bundle:)`).
+- [ ] Physical-device token generation through `sofuu-ios/`. Needs a signing
+      team: `project.yml` sets `CODE_SIGN_STYLE: Automatic` with no
+      `DEVELOPMENT_TEAM`, and nothing is provisioned. Simulator-only today.
 
-### Milestone E5: Mobile Soak & Jetsam Memory Validation
-- [ ] Run 1000-token continuous generation under Xcode Instruments (Allocations & Leaks) to verify RSS stays strictly $\le 30\text{ MB}$.
-- [ ] Verify zero App Store compliance warnings regarding executable memory.
+### Milestone E4: Android Gradle AAR & NDK Verification — OPEN
+- [x] The engine cross-builds for `arm64-v8a` / `x86_64`
+      (`scripts/mobile/build_engine_android.sh`, QTSQ-linked) and the app
+      assembles a debug APK containing both ABIs.
+- [ ] **Correcting the premise:** the app's CMake does *not* build
+      `libsofuu.so` — it imports the prebuilt `jniLibs/<abi>/libsofuu.so` and
+      compiles only the JNI shim. `-march=armv8.2-a+dotprod` is real but comes
+      from `crates/sofuu-ffi/build.rs:144` (cc crate, all aarch64 targets), not
+      from an NDK/CMake flag.
+- [ ] Publish a real AAR: `bindings/android/sofuu` has no `maven-publish`
+      block, so `com.sofuu:sofuu-android` resolves nowhere. Needs a Maven
+      repository (a Line-1 revenue prerequisite per `PLAN-POSITIONING` §6).
+- [ ] Physical-device or emulator JNI streaming run — needs hardware. No `adb`
+      session is recorded anywhere in the repo.
+
+### Milestone E5: Mobile Soak & Jetsam Memory Validation — OPEN, TARGET REFRAMED
+- The original target ("runtime RSS strictly ≤ 30 MB excluding memory-mapped
+  model weights") cannot hold as written: the KV cache is f32 and sized to the
+  full context at load — ~940 MB for Qwen3-0.6B at the 4096-token default —
+  and that is not model weights. Measure first, then reduce:
+- [ ] Instrument `phys_footprint` (the value Jetsam actually limits) through
+      the C ABI, report runtime / weights / KV separately, and replace this
+      target with the measured numbers.
+- [ ] Then reduce: f16 or quantized KV, a smaller mobile default context, an
+      engine unload path (`LOCAL_ENGINE` in `rt/ai.rs` has none today), and a
+      response to memory pressure (`didReceiveMemoryWarning`, `onTrimMemory`).
+- [ ] 1000-token soak under Instruments (Allocations & Leaks), plus a
+      `sofuu_rt_new`/`sofuu_rt_free` cycle loop. No soak harness exists today.
+- [ ] Verify zero App Store compliance warnings regarding executable memory
+      (QuickJS is a pure interpreter with no JIT, so this should hold — it just
+      has never been checked against a real submission).

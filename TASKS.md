@@ -2592,3 +2592,54 @@ replay) at 100/80/62 cols before/after; 9 new `rt/tui` unit tests; full
 - `cargo test --release -p sofuu-core`: **431 passing, 0 failing (100% green)**.
 - Raspberry Pi 5 (`10.53.147.78`): Static musl binary `dist/sofuu-linux-arm64` deployed and operating live.
 - Zero external runtime dependencies: no Python, Docker, CUDA, or Ollama.
+---
+
+## ✅ Completed — PLAN-EMBED-SDK.md E1 + E2 (2026-10-12)
+
+Scope: the embeddable SDK's local-inference and host-tool surface. Files:
+`crates/sofuu-capi/src/lib.rs`, `include/sofuu_embed.h`, `src/js/agent.js`,
+`crates/sofuu-core/src/rt/ai.rs`, `bindings/swift/…/SofuuBridge.swift`,
+`scripts/check_abi.sh`, `Makefile`, `docs/EMBEDDING.md`.
+
+- ✅ **E1a — positional args in the streaming ABI.** `sofuu_rt_call_stream`
+  now honors the documented object-OR-array `args_json` contract (array =
+  spread), so `ai.streamLocal(modelPath, prompt, options?)` is reachable at
+  all; `onStep` + the cancel token land in the trailing options object
+  (appended when none was passed). Before this, the driver always called the
+  method with one object, so the model path never arrived.
+- ✅ **E1b — local routing by path.** A SafeTensors / PyTorch / NumPy model
+  *directory* (tokenizer.json + weights) or a bare weights file routes to
+  in-process inference from the path alone; previously only `.gguf` did and
+  everything else needed an explicit `provider:"local"` or went to the network
+  as a model name.
+- ✅ **E1c — verified with real models.** A 0.6B GGUF streams deltas through the
+  C ABI with a mid-flight cancel; an LFM2 SafeTensors directory generates from
+  its path alone. Both skip cleanly when the model is absent (nothing
+  model-sized is checked in).
+- ✅ **E1d — Swift.** `streamLocal(...)` / `streamPositional(...)`; the binding
+  previously could only express object args.
+- ✅ **E2a/E2b — host-native tool bridge.** `sofuu_rt_register_host_tool` +
+  `sofuu_rt_host_tool_resolve`. A JSON string answer is synchronous; NULL means
+  the host took the call and settles it later **from any thread** (delivered to
+  the runtime's thread through `rt/host_poke.rs`). Bounded by the agent tool
+  timeout (30 s default) — the timer that also keeps the loop alive meanwhile,
+  so no extra uv handle was needed. Registered tools reach agents defined
+  before *or* after registration (the `agents` config path defers the
+  unknown-builtin check to run time).
+- ✅ **E2c — Swift `registerTool(name:description:parameters:handler:)`** with an
+  `async throws` handler; the Android app carries its own
+  `registerHostTool` / `resolveHostTool` + `DeviceTools`.
+- ✅ **E2d — ABI hygiene.** Baseline 30 → 32 symbols (both additions reviewed).
+  `check_abi.sh`: implemented the prefix-coverage assertion its own comment has
+  claimed since 2026-09-25 (a baseline symbol hidden by `PUBLIC_RE` is
+  invisible to the gate forever), and the ALLOW_NEW path now writes
+  `abi_symbols.txt.new` instead of deleting the file it told you to copy.
+  New `make header-sync` keeps the four shipped copies of `sofuu_embed.h`
+  byte-identical to `include/` (the Android copy had drifted to documenting a
+  config key the header removed; the iOS devstub lagged whole functions).
+- ⬜ **Left open:** Kotlin **SDK** binding streaming (`bindings/android/sofuu`),
+  E3 (iOS Metal engine + device run), E4 (real AAR via Maven, device run),
+  E5 (phys_footprint instrumentation, KV reduction, soak).
+- Note: the 30-symbol/15-documented line in `docs/EMBEDDING.md` §CI gates was
+  also stale (it described new symbols as "warns"; the gate has failed on them
+  since 2026-09-01).

@@ -16,6 +16,9 @@ final class AppStore: ObservableObject {
     let configs = ConfigStore()
     private let uiPrefs = UiPrefs()
 
+    /// The library's env-var knobs, applied before the runtime boots.
+    let runtimeEnv = RuntimeEnv()
+
     let engine: SofuuEngine
 
     @Published private(set) var state: AppState
@@ -58,10 +61,40 @@ final class AppStore: ObservableObject {
 
         // Load config + state immediately (cheap, no engine).
         state.config = configs.redacted()
+        // Engine environment knobs MUST be in place before the runtime is
+        // created: SOFUU_NO_ML gates module registration inside the
+        // library, so setting it afterwards silently does nothing.
+        let appliedEnv = runtimeEnv.apply()
+        NSLog("[sofuu-engine] env applied: \(appliedEnv)")
         engine.start()
+        state.localModels = LocalModels.list().map(\.path)
     }
 
     func shutdown() { engine.shutdown() }
+
+    /// Re-write the process environment from the current settings.
+    ///
+    /// Safe without a restart for everything the engine re-reads per turn
+    /// or per request — the tool set, the shell gate, the memory backend,
+    /// the web engine, the SSRF guard, the stall deadline. Those call
+    /// sites run inside the agent loop, not once at load.
+    func applyRuntimeEnv() { runtimeEnv.apply() }
+
+    /// Tear the engine down and boot it again so a registration-gated knob
+    /// takes effect. Only SOFUU_NO_ML needs this — sofuu-core registers
+    /// the whole `sofuu.ml` namespace at init, so without a restart the
+    /// namespace is simply absent and every gate is a silent no-op.
+    func restartEngineForEnv() {
+        if state.streaming {
+            // Freeing the runtime mid-turn would strand the open tool
+            // round-trip. Cancel first so the agent's abort path runs.
+            Task { await engine.cancelTurn() }
+        }
+        engine.shutdown()
+        runtimeEnv.apply()
+        state.engineReady = false
+        engine.start()
+    }
 
     // ── Engine event reducer ─────────────────────────────────────────
 
@@ -829,6 +862,78 @@ final class AppStore: ObservableObject {
         }
         patchConfig(["providers": updated, "active": provider, "provider": provider, "model": model])
         refreshModelCache()
+    }
+
+    // ── Local GGUF models ─────────────────────────────────────────────
+
+    var localModelURLs: [URL] { LocalModels.list() }
+
+    /// Point the runtime at an on-device GGUF.
+    ///
+    /// This is the whole of the local-inference switch, and it mirrors the
+    /// CLI's `/model x.gguf` branch (`crates/sofuu-core/src/chat.rs:987`).
+    /// A `.gguf` path forces `provider="local"` and clears `base_url`, so
+    /// the engine routes correctly: `agent.js` calls `sofuu.ai.stream`,
+    /// and `rt/ai.rs:4228` sends it to the in-process engine when the
+    /// provider is Local or the model path ends `.gguf`. Leaving the old
+    /// endpoint in place would send a filesystem path to an HTTP API.
+    ///
+    /// The harvested caps are applied only when the engine reports real
+    /// numbers — guessing a window for a model we have not opened is how a
+    /// turn ends in "maximum context length exceeded".
+    func pickLocalModel(_ path: String) async {
+        var patch: JSONObject = [
+            "provider": "local",
+            "active": "local",
+            "base_url": "",
+            "model": path,
+        ]
+        if let caps = await engine.localModelCaps(path),
+           let ok = caps["ok"] as? Bool, ok,
+           let c = caps["caps"] as? JSONObject {
+            let win = (c["ctx_window"] as? NSNumber)?.int64Value ?? 0
+            let maxOut = (c["max_output"] as? NSNumber)?.int64Value ?? 0
+            if win > 0 { patch["ctx_window"] = win }
+            if maxOut > 0 { patch["max_output"] = maxOut }
+            // A model with a thinking channel wants effort on; one without
+            // it must not be sent "high", which some kernels reject.
+            let thinking = (c["thinking"] as? Bool) ?? (c["thinking"] as? NSNumber)?.boolValue ?? false
+            patch["effort"] = thinking ? "high" : ""
+        }
+        do {
+            let merged = try configs.updateConfig(patch)
+            state.config = configs.redacted(merged)
+            // No provider entry to write: "local" is not a configured
+            // endpoint, so refreshModelCache would only fail on it.
+            state.localModels = LocalModels.list().map(\.path)
+        } catch {
+            systemRow("Could not switch to that model: \((error as? SofuuError)?.message ?? "\(error)")")
+        }
+    }
+
+    /// Import a picked model and select it, reporting the outcome as a
+    /// system row so a bad pick is visible rather than silent.
+    func importLocalModel(_ url: URL) async {
+        guard let file = LocalModels.importModel(from: url) else {
+            systemRow("Could not import that file — it needs to be a readable .gguf model.")
+            return
+        }
+        let sizeMB = Double(LocalModels.size(file) ?? 0) / 1_048_576.0
+        systemRow(String(format: "Imported %@ (%.0f MB) — checking it…", LocalModels.label(file), sizeMB))
+        if let probe = await engine.probeLocalModel(file.path),
+           let ok = probe["ok"] as? Bool, !ok {
+            let why = probe["error"] as? String ?? "the engine timed out"
+            systemRow("\(LocalModels.label(file)) did not load: \(why). The file is still in Settings → Models.")
+            return
+        }
+        await pickLocalModel(file.path)
+        systemRow("Model → \(LocalModels.label(file)) · running on this device, no network.")
+    }
+
+    func deleteLocalModel(_ path: String) {
+        if LocalModels.delete(URL(fileURLWithPath: path)) {
+            state.localModels = LocalModels.list().map(\.path)
+        }
     }
 
     /// The drawer "+": add the default app-internal workspace (a real folder

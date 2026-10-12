@@ -115,15 +115,28 @@ void sofuu_rt_free(SofuuRuntime *rt);
 int sofuu_rt_call(SofuuRuntime *rt, const char *method,
                   const char *args_json, char **out_json);
 
-/* Streaming / cancellable variant (agent.run, ai.stream, …).
+/* Streaming / cancellable variant (agent.run, ai.stream, ai.streamLocal).
+ *
+ * `args_json` follows the SAME contract as sofuu_rt_call: a JSON object is
+ * passed as one options argument, a JSON array is spread as positional
+ * arguments, and NULL/"" means none. The array form is what reaches
+ * positional methods — `ai.streamLocal` takes
+ * (modelPath, prompt, options?) — so a host streams a local model with
+ *   ["/path/to/model.gguf", "hello", {"maxTokens": 128}]
+ * and a local SafeTensors/PyTorch/NumPy model directory the same way (the
+ * path alone routes in-process; no provider hint is needed).
  *
  * Two shapes are supported, and one driver handles both:
  *
  *  1. Methods taking an `onStep` option (agent.run) forward each step
  *     event to the host. args_json should be
  *     {"target":"<name>","task":"…",…opts}.
- *  2. Methods returning an async iterable (ai.stream) are drained: each
- *     chunk is forwarded as {"kind":"delta", …}.
+ *  2. Methods returning an async iterable (ai.stream, ai.streamLocal) are
+ *     drained: each chunk is forwarded as {"kind":"delta", …}.
+ *
+ * In BOTH forms the driver injects `onStep` and the cancel token into the
+ * options object — for the array form that is the trailing object, and one is
+ * appended when the caller passed none — so sofuu_rt_cancel works either way.
  *
  * The stream ALWAYS ends with exactly one terminal event
  * {"kind":"done", …}:

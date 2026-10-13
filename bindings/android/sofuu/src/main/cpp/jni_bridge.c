@@ -9,8 +9,21 @@
 #include <jni.h>
 #include <string.h>
 #include <stdlib.h>
-#include <android/log.h>
 #include "sofuu_embed.h"
+
+/* <android/log.h> comes from the NDK, but this file is also compiled without
+ * one: CI syntax-checks it against the host JDK headers, and
+ * scripts/mobile/sdk_jvm_check.sh builds and runs it on the host. A bare
+ * `#include <android/log.h>` made that impossible ("fatal error: file not
+ * found"), so the log call goes through a macro with a host fallback — the
+ * diagnostic still reaches the terminal there, just not logcat. */
+#if __has_include(<android/log.h>)
+#include <android/log.h>
+#define SOFUU_JNI_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "sofuu-js", __VA_ARGS__)
+#else
+#include <stdio.h>
+#define SOFUU_JNI_LOGE(...) do { fprintf(stderr, "sofuu-js: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#endif
 
 /* Cache the JVM + class refs for callback threading. */
 static JavaVM *g_jvm = NULL;
@@ -479,8 +492,7 @@ static void stream_event_trampoline(const char *event_json, void *opaque) {
          * exception still armed. Clear it — and treat the throw as a stop,
          * because continuing means streaming into a host that has just
          * proven it cannot receive. */
-        __android_log_print(ANDROID_LOG_ERROR, "sofuu-js",
-                            "stream listener threw; stream cancelled and exception cleared");
+        SOFUU_JNI_LOGE("stream listener threw; stream cancelled and exception cleared");
         (*env)->ExceptionClear(env);
         keep = JNI_FALSE;
     }

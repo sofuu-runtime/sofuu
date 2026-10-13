@@ -8,10 +8,12 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr;
 
+// The zero-copy Metal buffer below exists on macOS + iOS (see the header
+// of infer/metal.rs).
 pub struct MmapFile {
     ptr: *const u8,
     len: usize,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_buf: std::sync::OnceLock<Option<std::sync::Arc<crate::infer::metal::MetalBuffer>>>,
 }
 
@@ -55,7 +57,7 @@ impl MmapFile {
         Ok(Self {
             ptr: ptr as *const u8,
             len,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_buf: std::sync::OnceLock::new(),
         })
     }
@@ -65,7 +67,7 @@ impl MmapFile {
         self.ptr
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn get_or_create_metal_buffer(
         &self,
         engine: &crate::infer::metal::MetalEngine,

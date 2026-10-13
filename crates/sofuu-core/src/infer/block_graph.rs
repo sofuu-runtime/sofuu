@@ -162,17 +162,19 @@ pub struct BlockGraphConfig {
 }
 
 /// MLX 4-bit affine quantized weight components
+// Metal items in this file: macOS + iOS — the GPU engine compiles for
+// both now (see the header of infer/metal.rs).
 #[derive(Clone)]
 pub struct Mlx4Weights {
     pub scales: UnifiedTensorData,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub scales_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub scales_metal_offset: usize,
     pub biases: UnifiedTensorData,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub biases_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub biases_metal_offset: usize,
     pub group_size: usize,
     pub is_bf16: bool,
@@ -185,9 +187,9 @@ pub struct WeightMatrix {
     pub cols: usize,
     pub dtype: TensorDType,
     pub data: UnifiedTensorData,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub metal_offset: usize,
     pub mlx4: Option<Mlx4Weights>,
 }
@@ -200,9 +202,9 @@ impl WeightMatrix {
             cols,
             dtype,
             data: UnifiedTensorData::Heap(Arc::new(slice.to_vec())),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_buf: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_offset: 0,
             mlx4: None,
         }
@@ -214,9 +216,9 @@ impl WeightMatrix {
             cols,
             dtype,
             data,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_buf: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_offset: 0,
             mlx4: None,
         }
@@ -236,20 +238,20 @@ impl WeightMatrix {
             cols,
             dtype: TensorDType::U32,
             data,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_buf: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_offset: 0,
             mlx4: Some(Mlx4Weights {
                 scales,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 scales_metal_buf: None,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 scales_metal_offset: 0,
                 biases,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 biases_metal_buf: None,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 biases_metal_offset: 0,
                 group_size,
                 is_bf16,
@@ -257,7 +259,7 @@ impl WeightMatrix {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn with_metal(mut self, engine: &crate::infer::metal::MetalEngine) -> Self {
         match &self.data {
             UnifiedTensorData::Mmap { mmap, offset, .. } => {
@@ -294,7 +296,7 @@ impl WeightMatrix {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn clear_metal(&mut self) {
         self.metal_buf = None;
         self.metal_offset = 0;
@@ -309,7 +311,7 @@ impl WeightMatrix {
     /// Matrix-vector multiplication: y = W * x
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
         if let Some(ref mlx4) = self.mlx4 {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             if let (Some(ref m_buf), Some(ref s_buf), Some(ref b_buf)) = (
                 &self.metal_buf,
                 &mlx4.scales_metal_buf,
@@ -338,7 +340,7 @@ impl WeightMatrix {
             return;
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(ref m_buf) = self.metal_buf {
             if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
                 match self.dtype {
@@ -801,7 +803,7 @@ pub struct BlockGraphModel {
     pub buf_tmp: Vec<f32>,
     pub buf_router: Vec<f32>,
     pub gpu_layers: usize,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub metal_engine: Option<crate::infer::metal::MetalEngine>,
 }
 
@@ -1316,7 +1318,7 @@ impl BlockGraphModel {
             tied_embeddings: lm_head.is_none(),
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let metal_engine = crate::infer::metal::MetalEngine::new();
 
         // Calculate maximum dimensions across all layer mixers (handling MLA and Attention)
@@ -1357,7 +1359,7 @@ impl BlockGraphModel {
             buf_tmp: vec![0.0f32; dim.max(inferred_head_dim).max(max_intermediate_dim).max(2048)],
             buf_router: vec![0.0f32; max_router_rows.max(64)],
             gpu_layers: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_engine,
         };
 
@@ -1367,7 +1369,7 @@ impl BlockGraphModel {
     /// Configure how many layers are offloaded to GPU (0 = all CPU, n_layers = all GPU).
     pub fn set_gpu_layers(&mut self, n: usize) {
         self.gpu_layers = n.min(self.layers.len());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(ref engine) = self.metal_engine {
             for (idx, layer) in self.layers.iter_mut().enumerate() {
                 if idx < self.gpu_layers {
@@ -1562,7 +1564,7 @@ impl BlockGraphModel {
         for l in start_layer..end {
             let layer = &self.layers[l];
             let is_gpu = l < self.gpu_layers;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let m_eng = if is_gpu { self.metal_engine.as_ref() } else { None };
 
             self.buf_res[..dim].copy_from_slice(&self.buf_x[..dim]);
@@ -1571,7 +1573,7 @@ impl BlockGraphModel {
             match &layer.mixer_weights {
                 BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
                     // Batched Q, K, V Projections
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let batched_qkv_done = if let (
                         Some(engine),
                         Some(ref q_b),
@@ -1654,7 +1656,7 @@ impl BlockGraphModel {
                         false
                     };
 
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let batched_qkv_done = false;
 
                     if !batched_qkv_done {
@@ -1741,7 +1743,7 @@ impl BlockGraphModel {
                     }
 
                     // Asynchronous GPU Attention Output Projection
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let async_o_done = if o_proj.mlx4.is_none() {
                         if let (Some(engine), Some(ref o_b)) = (m_eng, &o_proj.metal_buf) {
                             let dtype_code = match o_proj.dtype {
@@ -1764,13 +1766,13 @@ impl BlockGraphModel {
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let async_o_done = false;
 
                     if !async_o_done {
                         o_proj.gemv(&self.buf_attn_out[..o_proj.cols], &mut self.buf_x[..dim]);
                     } else {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
                         if let Some(engine) = m_eng {
                             engine.sync();
                         }
@@ -1924,7 +1926,7 @@ impl BlockGraphModel {
             // Channel mixer with Batched Gate/Up & Async Down projection
             match &layer.channel_mixer_weights {
                 BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let mlx4_gate_up_done = if let (Some(engine), Some(gb), Some(gsb), Some(gbb), Some(ub), Some(usb), Some(ubb)) = (
                         m_eng, &gate_proj.metal_buf, gate_proj.mlx4.as_ref().and_then(|g| g.scales_metal_buf.as_ref()), gate_proj.mlx4.as_ref().and_then(|g| g.biases_metal_buf.as_ref()),
                         &up_proj.metal_buf, up_proj.mlx4.as_ref().and_then(|u| u.scales_metal_buf.as_ref()), up_proj.mlx4.as_ref().and_then(|u| u.biases_metal_buf.as_ref()),
@@ -1945,9 +1947,9 @@ impl BlockGraphModel {
                             true
                         } else { false }
                     } else { false };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let mlx4_gate_up_done = false;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let batched_gate_up = if mlx4_gate_up_done { false } else if gate_proj.mlx4.is_none() && up_proj.mlx4.is_none() {
                         if let (Some(engine), Some(ref g_b), Some(ref u_b)) =
                             (m_eng, &gate_proj.metal_buf, &up_proj.metal_buf)
@@ -1974,7 +1976,7 @@ impl BlockGraphModel {
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let batched_gate_up = false;
 
                     if !batched_gate_up {
@@ -1984,7 +1986,7 @@ impl BlockGraphModel {
 
                     swiglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
 
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let async_down = if down_proj.mlx4.is_none() {
                         if let (Some(engine), Some(ref d_b)) = (m_eng, &down_proj.metal_buf) {
                             let dtype_code = match down_proj.dtype {
@@ -2007,13 +2009,13 @@ impl BlockGraphModel {
                         false
                     };
 
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let async_down = false;
 
                     if !async_down {
                         down_proj.gemv(&self.buf_gate[..down_proj.cols], &mut self.buf_ffn_out[..dim]);
                     } else {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
                         if let Some(engine) = m_eng {
                             engine.sync();
                         }
@@ -2123,6 +2125,17 @@ impl BlockGraphModel {
         }
     }
 
+    /// Embedding lookup for a token into out_hidden.
+    pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
+        let dim = self.config.dim;
+        self.embed_tokens.get_row(token as usize, &mut out_hidden[..dim]);
+        if let Some(scale) = self.graph_config.embed_scale {
+            for v in &mut out_hidden[..dim] {
+                *v *= scale;
+            }
+        }
+    }
+
     /// Forward pass through a subset of layers [start_layer, end_layer).
     /// Used for Sequential Layer-Wise Activation Pipelining across distributed edge swarm nodes.
     pub fn forward_layer_range(
@@ -2137,6 +2150,21 @@ impl BlockGraphModel {
         self.buf_x[..dim].copy_from_slice(&in_hidden[..dim]);
         self.execute_layers(pos, start_layer, end_layer);
         out_hidden[..dim].copy_from_slice(&self.buf_x[..dim]);
+    }
+
+    /// Final norm and LM head projection into out_logits.
+    pub fn forward_head(&mut self, in_hidden: &[f32], out_logits: &mut [f32]) {
+        let dim = self.config.dim;
+        self.buf_x[..dim].copy_from_slice(&in_hidden[..dim]);
+        self.graph_config.final_norm.apply(&self.buf_x[..dim], &self.final_norm_weight, &mut self.buf_norm[..dim]);
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.gemv(&self.buf_norm[..dim], out_logits);
+        } else {
+            self.embed_tokens.gemv(&self.buf_norm[..dim], out_logits);
+        }
+        if let Some(cap) = self.graph_config.final_logit_soft_cap {
+            soft_cap_in_place(out_logits, cap);
+        }
     }
 
     pub fn forward_prefill(&mut self, token: u32, pos: usize) {

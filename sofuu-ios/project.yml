@@ -40,6 +40,14 @@ targets:
         excludes:
           - "Info.plist"
           - "SofuuApp.entitlements"
+      # The engine's shader kernels, compiled into the app's
+      # default.metallib. The engine (src/metal/metal_engine.mm) prefers a
+      # bundled library over compiling its own copy at first init, and THIS
+      # is the copy that ships to our app. One source of truth:
+      # crates/sofuu-ffi/build.rs generates the runtime-fallback header from
+      # this same file, and scripts/dist/ios.sh compiles it into the
+      # framework's Resources/default.metallib for other consumers.
+      - path: ../src/metal/kernels.metal
     settings:
       base:
         PRODUCT_NAME: Sofuu
@@ -60,6 +68,17 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: SofuuApp/Info.plist
         CODE_SIGN_ENTITLEMENTS: SofuuApp/SofuuApp.entitlements
+        # The Metal language version for every .metal in this target.
+        #
+        # 3.1 is a floor, not a preference: the engine's bf16 kernels use
+        # `bfloat`, which MSL 3.0 does not have. Xcode's default is the
+        # newest std, which also works — pinning it keeps the app's
+        # default.metallib and the framework's Resources copy explicitly on
+        # the same version. Consequence: the precompiled kernels load on
+        # iOS 17+; on iOS 16 the engine logs the miss and runs CPU-only
+        # (sofuu_metal_init returns NULL → None → CPU path), which the
+        # deployment target of 16.0 still allows.
+        MTL_LANGUAGE_VERSION: "3.1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1,2"

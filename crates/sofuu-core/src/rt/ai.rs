@@ -3630,6 +3630,27 @@ fn require_model(m: Option<&str>) -> bool {
 }
 
 static LOCAL_ENGINE: std::sync::Mutex<Option<(String, crate::infer::InferEngine)>> = std::sync::Mutex::new(None);
+static CONTINUOUS_SERVER: std::sync::Mutex<Option<(String, std::sync::Arc<crate::infer::continuous::ContinuousBatchServer>)>> =
+    std::sync::Mutex::new(None);
+
+fn get_continuous_server(model_path: &str) -> Result<std::sync::Arc<crate::infer::continuous::ContinuousBatchServer>, String> {
+    let clean = crate::infer::clean_model_path(model_path);
+    let clean_str = clean.to_string_lossy().into_owned();
+    let mut guard = CONTINUOUS_SERVER.lock().unwrap_or_else(|p| p.into_inner());
+    let needs_reload = match &*guard {
+        Some((path, _)) => path != &clean_str,
+        None => true,
+    };
+    if needs_reload {
+        let eng = crate::infer::InferEngine::load(&clean_str)?;
+        let srv = std::sync::Arc::new(crate::infer::continuous::ContinuousBatchServer::new(
+            std::sync::Arc::new(std::sync::Mutex::new(eng)),
+        ));
+        *guard = Some((clean_str, srv));
+    }
+    let (_, srv) = guard.as_ref().unwrap();
+    Ok(srv.clone())
+}
 
 fn with_local_engine<R, F: FnOnce(&mut crate::infer::InferEngine) -> Result<R, String>>(
     model_path: &str,
@@ -4050,7 +4071,7 @@ unsafe fn launch_local_stream(
          * just before Done, so the JS driver reads them off the iterator. */
         let mut parser = ToolCallParser::new();
         let mut pending_calls: Vec<ParsedCall> = Vec::new();
-        let push_closure = |tok: &str| -> bool {
+        let mut push_closure = |tok: &str| -> bool {
             if aborted.load(std::sync::atomic::Ordering::Relaxed) {
                 return false;
             }
@@ -4083,19 +4104,48 @@ unsafe fn launch_local_stream(
         };
 
         let mut prompt_tokens = 0usize;
-        let res = with_local_engine(&model_path_str, |eng| {
-            prompt_tokens = eng.tokenizer.encode(&prompt_str).len();
-            eng.stream(
-                &prompt_str,
-                crate::infer::GenerateOptions {
-                    max_tokens,
-                    temperature,
-                    threads,
-                    ..Default::default()
-                },
-                push_closure,
-            )
-        });
+        let srv_res = get_continuous_server(&model_path_str);
+        let res = match srv_res {
+            Ok(srv) => {
+                let (chunk_tx, chunk_rx) = std::sync::mpsc::channel();
+                srv.submit(
+                    &prompt_str,
+                    crate::infer::GenerateOptions {
+                        max_tokens,
+                        temperature,
+                        threads,
+                        ..Default::default()
+                    },
+                    chunk_tx,
+                    aborted.clone(),
+                );
+                let mut stream_err = None;
+                while let Ok(out) = chunk_rx.recv() {
+                    match out {
+                        crate::infer::continuous::StreamOutput::Token(tok) => {
+                            if !push_closure(&tok) {
+                                break;
+                            }
+                        }
+                        crate::infer::continuous::StreamOutput::Done(p, g) => {
+                            prompt_tokens = p;
+                            token_count = g;
+                            break;
+                        }
+                        crate::infer::continuous::StreamOutput::Error(e) => {
+                            stream_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = stream_err {
+                    Err(err)
+                } else {
+                    Ok(String::new())
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         /* C1: end-of-stream flush — held-back text plus any final
          * unterminated tool-call block (models often drop the closing

@@ -304,19 +304,65 @@ build_target() {
 # The binary is named `Sofuu` (not libsofuu.a) because a framework's
 # executable name, its bundle name and its module name have to agree for
 # `-F` + `import Sofuu` to line up.
+#
+# THE METALLIB IN Resources/
+# --------------------------
+# kernels.metal is compiled into a `default.metallib` per slice and shipped
+# inside the framework. The engine (src/metal/metal_engine.mm) prefers a
+# bundled library and falls back to compiling its embedded copy of the SAME
+# source at first init, so this is a fast path — but shipping it is what
+# turns "the shader compiles on this SDK" into a BUILD-time fact: a shader
+# that fails here fails the pack, not a user's first prompt.
+#
+# -std=metal3.1 is a floor, not a preference. The bf16 kernels use `bfloat`,
+# which MSL 3.0 does not have (probed: `metal -std=metal3.0` rejects it for
+# macOS and iOS alike; metal3.1 accepts it). Consequence for consumers: the
+# metallib loads on iOS 17+; on iOS 16 the engine logs the miss and runs
+# CPU-only, which is the designed degradation.
+#
+# `link framework "Metal"` in the modulemap is what makes a consuming app
+# link: the archive references MTL* symbols, and a SWIFT app links Foundation
+# and libSystem automatically but NOT Metal. Without the autolink directive
+# every consumer's link dies on undefined _MTLCreateSystemDefaultDevice.
+ios_build_metallib() {
+    local slice="$1" out="$2"
+    local sdk_name="iphoneos"
+    [ "$slice" = "sim" ] && sdk_name="iphonesimulator"
+    local tmp
+    tmp="$(mktemp -d)"
+    xcrun -sdk "$sdk_name" metal -c "$REPO_ROOT/src/metal/kernels.metal" \
+        -o "$tmp/kernels.air" -std=metal3.1
+    xcrun -sdk "$sdk_name" metallib "$tmp/kernels.air" -o "$out"
+    rm -rf "$tmp"
+    # Every pipeline the engine loads must be in the library it will pick up
+    # first — a stale or truncated metallib is a pack failure here, not a nil
+    # pipeline state at inference time.
+    local fn
+    for fn in gemv_bf16 gemv_f16 gemv_f32 gemv_mlx4_affine_f16 \
+              gemv_mlx4_affine_bf16 rmsnorm swiglu conv1d_3; do
+        if ! strings "$out" | grep -qx "$fn"; then
+            echo "  \033[31m✗ $out is missing kernel $fn\033[0m"
+            exit 1
+        fi
+    done
+    echo "  metallib $slice: $(du -h "$out" | cut -f1), 8 kernels verified"
+}
+
 ios_make_framework() {
-    local archive="$1" outdir="$2"
+    local archive="$1" outdir="$2" slice="$3"
     local fw="$outdir/Sofuu.framework"
     rm -rf "$fw"
-    mkdir -p "$fw/Headers" "$fw/Modules"
+    mkdir -p "$fw/Headers" "$fw/Modules" "$fw/Resources"
     cp "$archive" "$fw/Sofuu"
     cp "$REPO_ROOT/include/sofuu_embed.h" "$fw/Headers/"
+    ios_build_metallib "$slice" "$fw/Resources/default.metallib"
 
     cat > "$fw/Modules/module.modulemap" << 'EOF'
 framework module Sofuu {
     umbrella header "sofuu_embed.h"
     export *
     module * { export * }
+    link framework "Metal"
 }
 EOF
 
@@ -337,7 +383,8 @@ EOF
 </plist>
 EOF
 
-    if [ ! -f "$fw/Sofuu" ] || [ ! -f "$fw/Modules/module.modulemap" ]; then
+    if [ ! -f "$fw/Sofuu" ] || [ ! -f "$fw/Modules/module.modulemap" ] \
+       || [ ! -f "$fw/Resources/default.metallib" ]; then
         echo "  \033[31m✗ framework assembly incomplete at $fw\033[0m"
         exit 1
     fi
@@ -369,8 +416,8 @@ build_xcframework() {
     local STAGE="$DIST/.xcframework-stage"
     rm -rf "$STAGE"
     mkdir -p "$STAGE/device" "$STAGE/sim"
-    ios_make_framework "$DEVICE_LIB" "$STAGE/device"
-    ios_make_framework "$SIM_LIB"    "$STAGE/sim"
+    ios_make_framework "$DEVICE_LIB" "$STAGE/device" "device"
+    ios_make_framework "$SIM_LIB"    "$STAGE/sim"    "sim"
 
     rm -rf "$DIST/libsofuu.xcframework"
     xcodebuild -create-xcframework \

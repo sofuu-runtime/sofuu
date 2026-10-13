@@ -4,16 +4,20 @@
 // into a lightweight, zero-dependency LLM engine for edge, laptop, and serverless environments.
 
 pub mod block_graph;
+pub mod continuous;
 pub mod gguf;
+pub mod gptx3;
 pub mod lfm2;
 pub mod metal;
 pub mod mmap;
 pub mod model;
 pub mod npy;
+pub mod paged_kv;
 pub mod pytorch;
 pub mod quant;
 pub mod safetensors;
 pub mod sampler;
+pub mod swarm;
 pub mod tensor_table;
 pub mod tokenizer;
 pub mod zip_reader;
@@ -22,6 +26,7 @@ use std::path::Path;
 
 use self::block_graph::BlockGraphModel;
 use self::gguf::GgufFile;
+use self::gptx3::Gptx3Model;
 use self::lfm2::Lfm2Model;
 use self::model::{ModelConfig, TransformerModel};
 use self::sampler::{Sampler, SamplerConfig};
@@ -65,6 +70,7 @@ pub enum ModelBackend {
     Gguf(TransformerModel),
     Lfm2(Lfm2Model),
     BlockGraph(BlockGraphModel),
+    Gptx3(Gptx3Model),
 }
 
 pub struct InferModel {
@@ -98,6 +104,15 @@ impl InferModel {
     }
 
     pub fn from_tensor_table(table: &UnifiedTensorTable, max_seq_len: usize) -> Result<Self, String> {
+        if let Ok(m) = Gptx3Model::from_tensor_table(table, max_seq_len) {
+            let config = m.config.clone();
+            return Ok(Self {
+                config,
+                backend: ModelBackend::Gptx3(m),
+                sliding_window: 0,
+                sink_tokens: 4,
+            });
+        }
         let m = BlockGraphModel::from_tensor_table(table, max_seq_len)?;
         let config = m.config.clone();
         Ok(Self {
@@ -111,7 +126,7 @@ impl InferModel {
     pub fn set_gpu_layers(&mut self, n: usize) {
         match &mut self.backend {
             ModelBackend::BlockGraph(m) => m.set_gpu_layers(n),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             ModelBackend::Lfm2(m) => m.set_gpu_layers(n),
             _ => {}
         }
@@ -122,6 +137,7 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.reset_cache(),
             ModelBackend::Lfm2(m) => m.reset_cache(),
             ModelBackend::BlockGraph(m) => m.reset_cache(),
+            ModelBackend::Gptx3(m) => m.reset_cache(),
         }
     }
 
@@ -130,6 +146,7 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::Lfm2(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::BlockGraph(m) => m.compact_kv_cache(cur_pos, sink, drop),
+            ModelBackend::Gptx3(m) => m.compact_kv_cache(cur_pos, sink, drop),
         }
     }
 
@@ -138,6 +155,7 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.forward(token, pos),
             ModelBackend::Lfm2(m) => m.forward(token, pos),
             ModelBackend::BlockGraph(m) => m.forward(token, pos),
+            ModelBackend::Gptx3(m) => m.forward(token, pos),
         }
     }
 
@@ -146,6 +164,7 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.forward_prefill(token, pos),
             ModelBackend::Lfm2(m) => m.forward_prefill(token, pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill(token, pos),
+            ModelBackend::Gptx3(m) => m.forward_prefill(token, pos),
         }
     }
 
@@ -154,6 +173,7 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.forward_prefill_batch(tokens, start_pos),
             ModelBackend::Lfm2(m) => m.forward_prefill_batch(tokens, start_pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill_batch(tokens, start_pos),
+            ModelBackend::Gptx3(m) => m.forward_prefill_batch(tokens, start_pos),
         }
     }
 
@@ -162,6 +182,46 @@ impl InferModel {
             ModelBackend::Gguf(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
             ModelBackend::Lfm2(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+            ModelBackend::Gptx3(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+        }
+    }
+
+    pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.forward_embed(token, out_hidden),
+            ModelBackend::BlockGraph(m) => m.forward_embed(token, out_hidden),
+            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
+                let dim = self.config.dim;
+                out_hidden[..dim].fill(0.0);
+            }
+        }
+    }
+
+    pub fn forward_layer_range(
+        &mut self,
+        pos: usize,
+        start_layer: usize,
+        end_layer: usize,
+        in_hidden: &[f32],
+        out_hidden: &mut [f32],
+    ) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden),
+            ModelBackend::BlockGraph(m) => m.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden),
+            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
+                let dim = self.config.dim;
+                out_hidden[..dim].copy_from_slice(&in_hidden[..dim]);
+            }
+        }
+    }
+
+    pub fn forward_head(&mut self, in_hidden: &[f32], out_logits: &mut [f32]) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.forward_head(in_hidden, out_logits),
+            ModelBackend::BlockGraph(m) => m.forward_head(in_hidden, out_logits),
+            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
+                out_logits.fill(0.0);
+            }
         }
     }
 }
@@ -235,6 +295,30 @@ impl InferEngine {
             if tokenizer_path.exists() {
                 let tokenizer = BpeTokenizer::from_hf_file(&tokenizer_path)
                     .map_err(|e| format!("failed to load tokenizer.json from {}: {}", clean_path.display(), e))?;
+
+                // GPT-X3's published tokenizer intentionally has no BOS token.
+                // The upstream usage example explicitly passes add_special_tokens=false.
+                let directory_architecture = if config_path.exists() {
+                    std::fs::read_to_string(&config_path)
+                        .ok()
+                        .and_then(|content| {
+                            serde_json::from_str::<serde_json::Value>(&content)
+                                .ok()
+                                .and_then(|cfg| {
+                                    cfg.get("architectures")
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|items| items.first())
+                                        .and_then(|item| item.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                        })
+                } else {
+                    None
+                };
+                let mut tokenizer = tokenizer;
+                if directory_architecture.as_deref() == Some("GPTX3ForCausalLM") {
+                    tokenizer.bos_token_id = None;
+                }
 
                 // Check for LFM2 SafeTensors directory
                 let is_lfm2 = if config_path.exists() {
@@ -371,7 +455,7 @@ impl InferEngine {
 
     #[allow(unused_variables)]
     fn finalize_device(mut engine: Self, enable_gpu: bool) -> Result<Self, String> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             engine.model.set_gpu_layers(if enable_gpu { usize::MAX } else { 0 });
         }
@@ -382,6 +466,25 @@ impl InferEngine {
     pub fn reset_cache(&mut self) {
         self.model.reset_cache();
         self.cached_tokens.clear();
+    }
+
+    pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
+        self.model.forward_embed(token, out_hidden);
+    }
+
+    pub fn forward_layer_range(
+        &mut self,
+        pos: usize,
+        start_layer: usize,
+        end_layer: usize,
+        in_hidden: &[f32],
+        out_hidden: &mut [f32],
+    ) {
+        self.model.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden);
+    }
+
+    pub fn forward_head(&mut self, in_hidden: &[f32], out_logits: &mut [f32]) {
+        self.model.forward_head(in_hidden, out_logits);
     }
 
     /// Generate text for a prompt, returning the complete generated string.
@@ -416,6 +519,11 @@ impl InferEngine {
 
         // 1. Tokenize prompt
         let input_tokens = self.tokenizer.encode(prompt);
+        if std::env::var("SOFUU_DEBUG_TOKENS").is_ok() {
+            eprintln!("[tokens] {:?} decoded={:?}",
+                input_tokens,
+                input_tokens.iter().filter_map(|&t| self.tokenizer.decode_token(t)).collect::<Vec<_>>());
+        }
         if input_tokens.is_empty() {
             return Err("prompt produced zero tokens".to_string());
         }

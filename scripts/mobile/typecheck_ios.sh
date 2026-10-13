@@ -58,3 +58,12 @@ echo "  \033[32m✓\033[0m Swift type-check clean"
 echo "  \033[36mCompiling SofuuCloud.metal against $SDK_NAME\033[0m"
 xcrun -sdk "$SDK_NAME" metal -c SofuuApp/Shaders/SofuuCloud.metal -o /dev/null -std=metal3.0
 echo "  \033[32m✓\033[0m Metal shader compiles"
+
+# The engine's kernels too (PLAN-EMBED-SDK E3). This is the fail-fast for
+# the GPU path: if kernels.metal does not compile for the iOS SDK, the
+# shipped default.metallib would be missing (or, worse, half-built) and the
+# engine would be silently CPU-only on device. -std=metal3.1 because the
+# bf16 kernels use `bfloat`, which MSL 3.0 rejects for every SDK.
+echo "  \033[36mCompiling src/metal/kernels.metal against $SDK_NAME\033[0m"
+xcrun -sdk "$SDK_NAME" metal -c "$REPO_ROOT/src/metal/kernels.metal" -o /dev/null -std=metal3.1
+echo "  \033[32m✓\033[0m Metal engine kernels compile"

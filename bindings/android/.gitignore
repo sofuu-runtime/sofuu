@@ -1,0 +1,8 @@
+# Android build outputs for the AAR module (mirrors sofuu-android/.gitignore)
+# Gradle project metadata, CMake/NDK intermediates, and packaged AARs.
+build/
+.gradle/
+.cxx/
+local.properties
+.idea/
+*.iml

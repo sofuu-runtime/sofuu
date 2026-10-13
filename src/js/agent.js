@@ -1134,8 +1134,9 @@
       }
       return;
     }
-    if (taskVec) cma.remember(taskVec, clip(task, STORE_CAP_CHARS), 'user', 0);
-    if (ansVec) cma.remember(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0);
+    /* B1.2 provenance: the source names the scope the memory came from. */
+    if (taskVec) cma.remember(taskVec, clip(task, STORE_CAP_CHARS), 'user', 0, 'chat');
+    if (ansVec) cma.remember(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0, 'chat');
     try { cma.flush(); } catch (e) {}
     if (entry.sem) {
       try {

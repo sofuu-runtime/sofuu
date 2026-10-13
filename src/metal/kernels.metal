@@ -1,10 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ── Apple Silicon Unified GPU Engine (Metal Shading Language) ─────────
-// Zero-copy compute shaders with arbitrary alignment offset rebasing for
-// Edge LLMs & Liquid Foundation Models.
-
 static inline uint read_u32(device const uchar* base, uint byte_offset) {
     device const uchar* p = base + byte_offset;
     if ((uintptr_t(p) & 3) == 0) {
@@ -34,7 +30,6 @@ static inline half read_f16(device const uchar* base, uint byte_offset) {
     }
 }
 
-// ── GEMV (BF16 weights, Float32 activations) ──────────────────────────
 kernel void gemv_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const float  *x              [[buffer(1)]],
@@ -71,7 +66,6 @@ kernel void gemv_bf16(
     }
 }
 
-// ── GEMV (FP16 weights, Float32 activations) ──────────────────────────
 kernel void gemv_f16(
     device const uchar *w_base          [[buffer(0)]],
     device const float *x               [[buffer(1)]],
@@ -108,7 +102,6 @@ kernel void gemv_f16(
     }
 }
 
-// ── GEMV (FP32 weights, Float32 activations) ──────────────────────────
 kernel void gemv_f32(
     device const uchar *w_base          [[buffer(0)]],
     device const float *x               [[buffer(1)]],
@@ -146,7 +139,6 @@ kernel void gemv_f32(
     }
 }
 
-// ── RMSNorm Kernel (Float32) ──────────────────────────────────────────
 kernel void rmsnorm(
     device const float  *x              [[buffer(0)]],
     device const uchar  *w_base         [[buffer(1)]],
@@ -169,7 +161,6 @@ kernel void rmsnorm(
     }
 }
 
-// ── SwiGLU Kernel (Elementwise Fused SiLU * Multiply) ─────────────────
 kernel void swiglu(
     device float       *g               [[buffer(0)]],
     device const float *u               [[buffer(1)]],
@@ -180,7 +171,6 @@ kernel void swiglu(
     g[id] = silu * u[id];
 }
 
-// ── Conv1D Kernel for Liquid Foundation Models (LFM-2) ────────────────
 kernel void conv1d_3(
     device const uchar *conv_w_base     [[buffer(0)]],
     device const float *state           [[buffer(1)]],
@@ -198,8 +188,48 @@ kernel void conv1d_3(
     out[c] = sum;
 }
 
-// ── MLX 4-Bit Affine Quantized GEMV ──────────────────────────────────
-kernel void gemv_mlx4_affine(
+kernel void gemv_mlx4_affine_f16(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const uchar  *scales_base    [[buffer(1)]],
+    device const uchar  *biases_base    [[buffer(2)]],
+    device const float  *x              [[buffer(3)]],
+    device float        *y              [[buffer(4)]],
+    constant uint       &cols           [[buffer(5)]],
+    constant uint       &group_size     [[buffer(6)]],
+    constant uint4      &rems           [[buffer(7)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float sum = 0.0f;
+    uint u32_cols = cols / 8;
+    uint n_groups = cols / group_size;
+
+    uint qw_row_byte = rems.x + row * (u32_cols * 4);
+    uint s_row_byte  = rems.y + row * (n_groups * 2);
+    uint b_row_byte  = rems.z + row * (n_groups * 2);
+
+    for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
+        uint val = read_u32(w_base, qw_row_byte + col_u32 * 4);
+        uint c_base = col_u32 * 8;
+        uint g_idx = c_base / group_size;
+        float s = float(read_f16(scales_base, s_row_byte + g_idx * 2));
+        float b = float(read_f16(biases_base, b_row_byte + g_idx * 2));
+
+        #pragma unroll
+        for (uint i = 0; i < 8; ++i) {
+            uint nibble = (val >> (i * 4)) & 0x0F;
+            float w_val = float(nibble) * s + b;
+            sum += w_val * x[c_base + i];
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
+
+kernel void gemv_mlx4_affine_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const uchar  *scales_base    [[buffer(1)]],
     device const uchar  *biases_base    [[buffer(2)]],

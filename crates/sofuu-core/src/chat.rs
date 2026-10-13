@@ -671,7 +671,7 @@ fn clamp_max_output(n: i64) -> i64 {
 
 /// Every slash command — the single source of truth for the C readline's
 /// TAB completion (`__chat_complete`) and for "did you mean" suggestions.
-const ALL_COMMANDS: [&str; 39] = [
+const ALL_COMMANDS: [&str; 41] = [
     "/help",
     "/version",
     "/model",
@@ -703,6 +703,8 @@ const ALL_COMMANDS: [&str; 39] = [
     // F1–F11 chat features (PLAN-CHAT-FEATURES.md)
     "/remember",
     "/why",
+    "/memory",
+    "/forget",
     "/resume",
     "/share",
     "/import",
@@ -758,6 +760,8 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     // F1–F11 chat features
     ("/remember", "Pin a fact to the brain + AGENTS.md", "<fact>"),
     ("/why", "Explain which memories shaped the last answer", ""),
+    ("/memory", "Browse the brain's memories", "[tier|query] [--page N]  (tiers: working|episodic|semantic|entity|forgotten)"),
+    ("/forget", "Delete one memory by id", "<id>  (shows the record first; add --yes to confirm)"),
     ("/resume", "Browse and resume a past session", "[id]  (bare = picker)"),
     ("/share", "Export brain as a plain JSON card (v1: metadata + pointers; not encrypted)", "[path.qtsq] [label]"),
     ("/import", "Import a brain card (merge)", "<path.qtsq>"),
@@ -1388,6 +1392,16 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             "remember"
         }
         "/why" => "why",
+        // ── B1: /memory + /forget (brain read-out) ─────────────────────
+        "/memory" => "memory",
+        "/forget" => {
+            if arg.is_empty() {
+                chat_out("  Usage: /forget <id>  (find ids with /memory)\n");
+                chat_out("  Shows the record first; add --yes to delete it.\n");
+                return "ok";
+            }
+            "forget"
+        }
         // ── F2: /resume ────────────────────────────────────────────────
         "/resume" => {
             if arg.is_empty() {
@@ -1543,6 +1557,8 @@ fn print_help() {
     h(&mut rows, "  Brain & memory");
     c(&mut rows, "/remember <fact>", "pin a fact directly to the brain");
     c(&mut rows, "/why", "which memories shaped the last answer");
+    c(&mut rows, "/memory [tier|query]", "browse stored memories (paginated)");
+    c(&mut rows, "/forget <id>", "delete one memory (shows it first; --yes confirms)");
     c(&mut rows, "/share [path]", "export a brain card (metadata + pointers)");
     c(&mut rows, "/import <path>", "import + merge a brain card");
     c(&mut rows, "/resume [id]", "browse + resume a past session");
@@ -3952,7 +3968,7 @@ const DRIVER: &str = r#"
     const vec = await embedText(fact);
     if (!vec) { out('\x1b[90m  Embeddings unavailable — cannot store fact\x1b[0m\n'); return; }
     try {
-      brain.remember(new Float32Array(vec), fact, 'user_pin', 0);
+      brain.remember(new Float32Array(vec), fact, 'user_pin', 0, 'pin');
       brain.flush();
       /* AGENTS.md (2026-09-12): the fact also lands in the project context
        * file so it rides EVERY request as standing context, not just via
@@ -3984,6 +4000,104 @@ const DRIVER: &str = r#"
       out('  \x1b[90m' + score + '\x1b[0m  ' + role + text);
     }
     out('');
+  }
+
+  /* ── B1.3/B1.4 (ROADMAP-BRAIN-CMA): /memory + /forget ──────────────
+   * Presentation over the cma.list/forget read-out API — the same JSON
+   * shape the brain server and the C ABI expose, so the browser can never
+   * drift from the store. */
+  const MEMORY_TIERS = { working: 0, episodic: 1, semantic: 2, forgotten: 3, entity: 4 };
+  const MEMORY_TIER_NAMES = ['working', 'episodic', 'semantic', 'forgotten', 'entity'];
+  function memoryAge(secs) {
+    if (!secs) return '—';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+    return Math.floor(secs / 86400) + 'd';
+  }
+  async function handleMemory(arg) {
+    if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
+    const brain = ensureDriverBrain();
+    if (!brain || typeof brain.list !== 'function') {
+      out('\x1b[90m  Brain read-out unavailable in this build\x1b[0m\n'); return;
+    }
+    const parts = String(arg || '').trim().split(/\s+/).filter(Boolean);
+    const opts = { limit: 20 };
+    let page = 1;
+    let label = '';
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p === '--page' && parts[i + 1]) {
+        page = Math.max(1, parseInt(parts[i + 1], 10) || 1);
+        i++;
+        continue;
+      }
+      if (MEMORY_TIERS[p] !== undefined && opts.tier === undefined && !opts.text) {
+        opts.tier = MEMORY_TIERS[p];
+        label = p;
+        continue;
+      }
+      opts.text = opts.text ? opts.text + ' ' + p : p;
+    }
+    if (opts.text) label = label ? label + ' "' + opts.text + '"' : '"' + opts.text + '"';
+    opts.offset = (page - 1) * opts.limit;
+    let res;
+    try { res = JSON.parse(brain.list(opts)); }
+    catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); return; }
+    if (!res || !res.records || !res.records.length) {
+      out('\x1b[90m  No memories' + (label ? ' matching ' + label : '') + '.\x1b[0m\n');
+      return;
+    }
+    const pages = Math.max(1, Math.ceil(res.total / opts.limit));
+    out('\n\x1b[1m  Memories' + (label ? ' · ' + label : '') + '\x1b[0m \x1b[2m(' +
+        res.total + ' total · page ' + page + '/' + pages + ')\x1b[0m');
+    for (const r of res.records) {
+      const tier = MEMORY_TIER_NAMES[r.tier] || ('tier' + r.tier);
+      const ent = r.entity ? ' \x1b[35m' + r.entity + '\x1b[0m' : '';
+      const src = r.source ? ' \x1b[2m· ' + r.source + '\x1b[0m' : '';
+      out('  \x1b[90m#' + r.id + '\x1b[0m \x1b[2m' + tier + '\x1b[0m' + ent +
+          ' \x1b[2m· s' + (r.strength || 0).toFixed(2) + ' · ' + memoryAge(r.age_seconds) + '\x1b[0m' + src);
+      out('    ' + clip1(r.text, 140));
+    }
+    if (pages > 1) {
+      out('\x1b[2m  /memory ' + (label ? label + ' ' : '') + '--page ' + (page + 1) + ' for more\x1b[0m');
+    }
+    out('');
+  }
+  async function handleForget(arg) {
+    if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
+    const brain = ensureDriverBrain();
+    if (!brain || typeof brain.list !== 'function' || typeof brain.forget !== 'function') {
+      out('\x1b[90m  Brain read-out unavailable in this build\x1b[0m\n'); return;
+    }
+    const parts = String(arg || '').trim().split(/\s+/).filter(Boolean);
+    const yes = parts.indexOf('--yes') >= 0;
+    const id = parseInt(parts[0], 10);
+    if (!(id >= 0)) { out('  Usage: /forget <id>  (find ids with /memory)\n'); return; }
+    /* ids are positions in the record table, so offset=id lands on it. */
+    let rec = null;
+    try {
+      const res = JSON.parse(brain.list({ offset: id, limit: 1 }));
+      const first = (res.records || [])[0];
+      if (first && first.id === id) rec = first;
+    } catch (e) {}
+    if (!rec) {
+      out('\x1b[90m  No memory with id ' + id +
+          ' — ids renumber when dead records are pruned; re-check with /memory.\x1b[0m\n');
+      return;
+    }
+    if (!yes) {
+      out('\n\x1b[1m  Delete this memory?\x1b[0m');
+      out('  \x1b[90m#' + rec.id + '\x1b[0m \x1b[2m' + (MEMORY_TIER_NAMES[rec.tier] || rec.tier) +
+          ' · s' + (rec.strength || 0).toFixed(2) + (rec.source ? ' · ' + rec.source : '') + '\x1b[0m');
+      out('    ' + clip1(rec.text, 200));
+      out('\x1b[2m  /forget ' + id + ' --yes  to confirm\x1b[0m\n');
+      return;
+    }
+    try {
+      brain.forget(id);
+      brain.flush();
+      out('\x1b[90m  ⏺ forgot #' + id + ' · pruned at the next turn boundary\x1b[0m\n');
+    } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
 
   /* ── Timestamped output archive ──────────────────────────────────── */
@@ -4338,64 +4452,130 @@ const DRIVER: &str = r#"
   }
 
   /* ── F5: /share + /import (brain cards) ──────────────────────────── */
+  /* B2 (ROADMAP-BRAIN-CMA): real brain cards. /share writes the full
+   * export (records + vectors + manifest); /import merges one back —
+   * re-embedding into the local space when the card came from another. */
+  function localEmbedderFor(spaceId) {
+    if (spaceId === 'semantic-projector-v1' && typeof sofuu.ai.embedLocalSemantic === 'function') {
+      return function (t) { return sofuu.ai.embedLocalSemantic(String(t)); };
+    }
+    if (spaceId === 'semantic-table-v2' && typeof sofuu.ai.embedLocalSemanticV2 === 'function') {
+      return function (t) { return sofuu.ai.embedLocalSemanticV2(String(t)); };
+    }
+    if (typeof sofuu.ai.embedLocal === 'function') {
+      return function (t) { return sofuu.ai.embedLocal(String(t)); };
+    }
+    return null;
+  }
+  /* The local store's space: the file's own manifest when it exists, else
+   * the backend the driver selected for a fresh brain. */
+  function localBrainSpace() {
+    try {
+      if (sofuu.memory && typeof sofuu.memory.inspect === 'function') {
+        const info = JSON.parse(sofuu.memory.inspect(brainPath()));
+        if (info && info.ok && info.dimension) {
+          return { id: info.id || 'hash-v1', dimension: info.dimension };
+        }
+      }
+    } catch (e) {}
+    const b = driverBackend();
+    if (b && b.id && b.dim) return { id: b.id, dimension: b.dim };
+    return { id: 'hash-v1', dimension: 768 };
+  }
   async function handleShare(arg) {
     if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
     const brain = ensureDriverBrain();
     if (!brain) { out('\x1b[90m  Brain unavailable\x1b[0m\n'); return; }
+    if (typeof brain.export !== 'function') {
+      out('\x1b[90m  Brain export unavailable in this build\x1b[0m\n'); return;
+    }
     const parts = arg ? arg.split(/\s+/).filter(Boolean) : [];
-    const path = parts[0] || (brainPath() + '.card.qtsq');
-    const label = parts.slice(1).join(' ') || '';
-    /* P2-18: only append .json when the user's path doesn't already carry
-     * it — "/share card.qtsq" used to write "card.qtsq.json" (double
-     * suffix). */
+    const path = parts[0] || (brainPath() + '.card.json');
+    const label = parts.slice(1).join(' ');
     const cardPath = /\.json$/i.test(path) ? path : path + '.json';
     try {
       const count = brain.count();
       if (count === 0) { out('\x1b[90m  Brain is empty — nothing to export\x1b[0m\n'); return; }
-      /* Write a simple JSON card (the QTSQ session machinery is the long-term
-       * format, but a JSON card works for v1 without extra FFI). */
-      const card = {
-        schema: 'sofuu-brain-card@1',
-        exported_at: Math.floor(Date.now() / 1000),
-        label: label,
-        brain_path: brainPath(),
-        record_count: count,
-      };
-      const cardJson = JSON.stringify(card, null, 2);
-      /* Write the card metadata JSON. */
-      if (sofuu.fs && typeof sofuu.fs.writeFile === 'function') {
-        try { sofuu.fs.writeFile(cardPath, cardJson); }
-        catch (e) { out('\x1b[33m  ⚠ Could not write card file: ' + String(e.message || e) + '\x1b[0m\n'); return; }
+      const card = JSON.parse(brain.export());
+      card.label = label;
+      const json = JSON.stringify(card);
+      if (!sofuu.fs || typeof sofuu.fs.writeFile !== 'function') {
+        out('\x1b[31m  ✗ fs.writeFile unavailable\x1b[0m\n'); return;
       }
-      out('\x1b[90m  ⏺ exported ' + count + ' memories → ' + cardPath + '\x1b[0m');
-      out('\x1b[90m  Card metadata written. Brain file: ' + brainPath() + '\x1b[0m');
-      out('\x1b[90m  Share both files; import with /import ' + cardPath + '\x1b[0m\n');
+      /* fs.readFile/writeFile are PROMISE-based — the pre-B2 /import never
+       * awaited them, so it always took the "not a text file" branch and
+       * merged nothing. Await both ends. */
+      await sofuu.fs.writeFile(cardPath, json);
+      const mb = (json.length / 1048576).toFixed(1);
+      out('\x1b[90m  ⏺ exported ' + card.total + ' memories · ' + mb + ' MB → ' + cardPath + '\x1b[0m');
+      out('\x1b[90m  Space: ' + (card.embedding && card.embedding.id) + ' · ' +
+          (card.embedding && card.embedding.dimension) + '-dim · import with /import ' + cardPath + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
   async function handleImport(arg) {
-    if (!arg) { out('  Usage: /import <path.qtsq>\n'); return; }
+    if (!arg) { out('  Usage: /import <path.json>\n'); return; }
     if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
     const brain = ensureDriverBrain();
-    if (!brain) { out('\x1b[90m  Brain unavailable\x1b[0m\n'); return; }
+    if (!brain || typeof brain.importRecords !== 'function') {
+      out('\x1b[90m  Brain import unavailable in this build\x1b[0m\n'); return;
+    }
     try {
       if (!sofuu.fs || typeof sofuu.fs.readFile !== 'function') {
         out('\x1b[31m  ✗ fs.readFile unavailable\x1b[0m\n'); return;
       }
       let cardJson;
-      try { cardJson = sofuu.fs.readFile(arg, 'utf8'); }
+      try { cardJson = await sofuu.fs.readFile(arg, 'utf8'); }
       catch (e) { out('\x1b[31m  ✗ Cannot read file: ' + arg + '\x1b[0m\n'); return; }
-      if (!cardJson || typeof cardJson !== 'string') {
+      if (typeof cardJson !== 'string') {
         out('\x1b[31m  ✗ Cannot read file (not a text file): ' + arg + '\x1b[0m\n'); return;
       }
       const card = JSON.parse(cardJson);
-      if (!card || card.schema !== 'sofuu-brain-card@1') {
-        out('\x1b[31m  ✗ Not a valid sofuu brain card\x1b[0m\n'); return;
+      if (!card || card.schema !== 'sofuu-brain-card@2') {
+        if (card && card.schema === 'sofuu-brain-card@1') {
+          out('\x1b[33m  ⚠ Card v1 is metadata-only (no records/vectors) — re-share from the source brain\x1b[0m\n');
+        } else {
+          out('\x1b[31m  ✗ Not a sofuu brain card (schema: ' + (card && card.schema) + ')\x1b[0m\n');
+        }
+        return;
       }
-      /* For v1, we report what would be merged — actual vector merge needs
-       * the records_json + vectors exports wired to JS. */
-      out('\x1b[90m  ⏺ Card: ' + (card.label || '(unlabeled)') + ' · ' + card.record_count + ' records\x1b[0m');
-      out('\x1b[90m  Source brain: ' + card.brain_path + '\x1b[0m');
-      out('\x1b[90m  Full vector-level merge requires the source brain file.\x1b[0m\n');
+      if (!Array.isArray(card.records) || !Array.isArray(card.vectors)) {
+        out('\x1b[31m  ✗ Card is missing records or vectors\x1b[0m\n'); return;
+      }
+      const local = localBrainSpace();
+      const dim = local.dimension;
+      if (card.records.length * dim !== card.vectors.length) {
+        const sameSpace = card.embedding && card.embedding.id === local.id &&
+                          card.embedding.dimension === dim;
+        if (sameSpace) {
+          out('\x1b[31m  ✗ Card vectors do not pair with its records (corrupt card)\x1b[0m\n');
+          return;
+        }
+      }
+      const sameSpace = card.embedding && card.embedding.id === local.id &&
+                        card.embedding.dimension === dim;
+      let vecs;
+      if (sameSpace) {
+        vecs = new Float32Array(card.vectors);
+      } else {
+        /* Cross-space: re-embed every text into the LOCAL space. */
+        const embed = localEmbedderFor(local.id);
+        if (!embed) { out('\x1b[31m  ✗ No local embedder for space ' + local.id + '\x1b[0m\n'); return; }
+        vecs = new Float32Array(card.records.length * dim);
+        for (let i = 0; i < card.records.length; i++) {
+          const v = embed(card.records[i].text || '');
+          if (!v || v.length !== dim) {
+            out('\x1b[31m  ✗ Re-embedding returned ' + (v ? v.length : 0) + ' dims, expected ' + dim + '\x1b[0m\n');
+            return;
+          }
+          vecs.set(v, i * dim);
+        }
+      }
+      const stats = JSON.parse(brain.importRecords(vecs, JSON.stringify({ records: card.records })));
+      brain.flush();
+      out('\x1b[90m  ⏺ imported ' + (card.label ? '"' + card.label + '" · ' : '') +
+          stats.added + ' added · ' + stats.merged + ' merged (duplicates) · ' +
+          stats.skipped + ' skipped' +
+          (sameSpace ? '' : ' · re-embedded into ' + local.id) + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
 
@@ -6884,6 +7064,8 @@ const DRIVER: &str = r#"
         // F1–F11 feature dispatch
         else if (r === 'remember') { await handleRemember(t.replace(/^\/remember\s*/, '').trim()); }
         else if (r === 'why') { handleWhy(); }
+        else if (r === 'memory') { await handleMemory(t.replace(/^\/memory\s*/, '').trim()); }
+        else if (r === 'forget') { await handleForget(t.replace(/^\/forget\s*/, '').trim()); }
         else if (r === 'resume') { await handleResume(t.replace(/^\/resume\s*/, '').trim()); }
         else if (r === 'sessions') { await handleSessions(t.replace(/^\/sessions\s*/, '').trim()); }
         else if (r === 'share') { await handleShare(t.replace(/^\/share\s*/, '').trim()); }

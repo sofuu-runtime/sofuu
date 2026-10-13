@@ -29,279 +29,11 @@ struct MetalContext {
     float* pending_y_dst;
 };
 
-static const char* METAL_KERNEL_SOURCE = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-static inline uint read_u32(device const uchar* base, uint byte_offset) {
-    device const uchar* p = base + byte_offset;
-    if ((uintptr_t(p) & 3) == 0) {
-        return *(device const uint*)p;
-    } else {
-        return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
-    }
-}
-
-static inline bfloat read_bf16(device const uchar* base, uint byte_offset) {
-    device const uchar* p = base + byte_offset;
-    if ((uintptr_t(p) & 1) == 0) {
-        return *(device const bfloat*)p;
-    } else {
-        ushort u = ushort(p[0]) | (ushort(p[1]) << 8);
-        return as_type<bfloat>(u);
-    }
-}
-
-static inline half read_f16(device const uchar* base, uint byte_offset) {
-    device const uchar* p = base + byte_offset;
-    if ((uintptr_t(p) & 1) == 0) {
-        return *(device const half*)p;
-    } else {
-        ushort u = ushort(p[0]) | (ushort(p[1]) << 8);
-        return as_type<half>(u);
-    }
-}
-
-kernel void gemv_bf16(
-    device const uchar  *w_base         [[buffer(0)]],
-    device const float  *x              [[buffer(1)]],
-    device float        *y              [[buffer(2)]],
-    constant uint       &cols           [[buffer(3)]],
-    constant uint       &w_rem          [[buffer(4)]],
-    uint row                            [[threadgroup_position_in_grid]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum = 0.0f;
-    uint row_byte = w_rem + row * cols * 2;
-
-    if (((uintptr_t(w_base) + w_rem) & 1) == 0) {
-        device const bfloat *row_w = (device const bfloat*)(w_base + row_byte);
-        uint i = lane * 4;
-        for (; i + 4 <= cols; i += 32 * 4) {
-            sum += float(row_w[i + 0]) * x[i + 0];
-            sum += float(row_w[i + 1]) * x[i + 1];
-            sum += float(row_w[i + 2]) * x[i + 2];
-            sum += float(row_w[i + 3]) * x[i + 3];
-        }
-        for (; i < cols; ++i) {
-            sum += float(row_w[i]) * x[i];
-        }
-    } else {
-        for (uint i = lane; i < cols; i += 32) {
-            sum += float(read_bf16(w_base, row_byte + i * 2)) * x[i];
-        }
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        y[row] = sum;
-    }
-}
-
-kernel void gemv_f16(
-    device const uchar *w_base          [[buffer(0)]],
-    device const float *x               [[buffer(1)]],
-    device float       *y               [[buffer(2)]],
-    constant uint      &cols            [[buffer(3)]],
-    constant uint      &w_rem           [[buffer(4)]],
-    uint row                            [[threadgroup_position_in_grid]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum = 0.0f;
-    uint row_byte = w_rem + row * cols * 2;
-
-    if (((uintptr_t(w_base) + w_rem) & 1) == 0) {
-        device const half *row_w = (device const half*)(w_base + row_byte);
-        uint i = lane * 4;
-        for (; i + 4 <= cols; i += 32 * 4) {
-            sum += float(row_w[i + 0]) * x[i + 0];
-            sum += float(row_w[i + 1]) * x[i + 1];
-            sum += float(row_w[i + 2]) * x[i + 2];
-            sum += float(row_w[i + 3]) * x[i + 3];
-        }
-        for (; i < cols; ++i) {
-            sum += float(row_w[i]) * x[i];
-        }
-    } else {
-        for (uint i = lane; i < cols; i += 32) {
-            sum += float(read_f16(w_base, row_byte + i * 2)) * x[i];
-        }
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        y[row] = sum;
-    }
-}
-
-kernel void gemv_f32(
-    device const uchar *w_base          [[buffer(0)]],
-    device const float *x               [[buffer(1)]],
-    device float       *y               [[buffer(2)]],
-    constant uint      &cols            [[buffer(3)]],
-    constant uint      &w_rem           [[buffer(4)]],
-    uint row                            [[threadgroup_position_in_grid]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum = 0.0f;
-    uint row_byte = w_rem + row * cols * 4;
-
-    if (((uintptr_t(w_base) + w_rem) & 3) == 0) {
-        device const float *row_w = (device const float*)(w_base + row_byte);
-        uint i = lane * 4;
-        for (; i + 4 <= cols; i += 32 * 4) {
-            sum += row_w[i + 0] * x[i + 0];
-            sum += row_w[i + 1] * x[i + 1];
-            sum += row_w[i + 2] * x[i + 2];
-            sum += row_w[i + 3] * x[i + 3];
-        }
-        for (; i < cols; ++i) {
-            sum += row_w[i] * x[i];
-        }
-    } else {
-        for (uint i = lane; i < cols; i += 32) {
-            float val = as_type<float>(read_u32(w_base, row_byte + i * 4));
-            sum += val * x[i];
-        }
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        y[row] = sum;
-    }
-}
-
-kernel void rmsnorm(
-    device const float  *x              [[buffer(0)]],
-    device const uchar  *w_base         [[buffer(1)]],
-    device float        *y              [[buffer(2)]],
-    constant uint       &dim            [[buffer(3)]],
-    constant float      &eps            [[buffer(4)]],
-    constant uint       &w_rem          [[buffer(5)]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum_sq = 0.0f;
-    for (uint i = lane; i < dim; i += 32) {
-        float val = x[i];
-        sum_sq += val * val;
-    }
-    sum_sq = simd_sum(sum_sq);
-    float rms = rsqrt(sum_sq / float(dim) + eps);
-
-    for (uint i = lane; i < dim; i += 32) {
-        y[i] = x[i] * rms * float(read_bf16(w_base, w_rem + i * 2));
-    }
-}
-
-kernel void swiglu(
-    device float       *g               [[buffer(0)]],
-    device const float *u               [[buffer(1)]],
-    uint id                             [[thread_position_in_grid]]
-) {
-    float val = g[id];
-    float silu = val / (1.0f + exp(-val));
-    g[id] = silu * u[id];
-}
-
-kernel void conv1d_3(
-    device const uchar *conv_w_base     [[buffer(0)]],
-    device const float *state           [[buffer(1)]],
-    device float       *out             [[buffer(2)]],
-    constant uint      &w_rem           [[buffer(3)]],
-    uint c                              [[thread_position_in_grid]]
-) {
-    uint base = w_rem + c * 3 * 2;
-    float w0 = float(read_bf16(conv_w_base, base + 0));
-    float w1 = float(read_bf16(conv_w_base, base + 2));
-    float w2 = float(read_bf16(conv_w_base, base + 4));
-
-    device const float *st = state + c * 3;
-    float sum = w0 * st[0] + w1 * st[1] + w2 * st[2];
-    out[c] = sum;
-}
-
-kernel void gemv_mlx4_affine_f16(
-    device const uchar  *w_base         [[buffer(0)]],
-    device const uchar  *scales_base    [[buffer(1)]],
-    device const uchar  *biases_base    [[buffer(2)]],
-    device const float  *x              [[buffer(3)]],
-    device float        *y              [[buffer(4)]],
-    constant uint       &cols           [[buffer(5)]],
-    constant uint       &group_size     [[buffer(6)]],
-    constant uint4      &rems           [[buffer(7)]],
-    uint row                            [[threadgroup_position_in_grid]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum = 0.0f;
-    uint u32_cols = cols / 8;
-    uint n_groups = cols / group_size;
-
-    uint qw_row_byte = rems.x + row * (u32_cols * 4);
-    uint s_row_byte  = rems.y + row * (n_groups * 2);
-    uint b_row_byte  = rems.z + row * (n_groups * 2);
-
-    for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
-        uint val = read_u32(w_base, qw_row_byte + col_u32 * 4);
-        uint c_base = col_u32 * 8;
-        uint g_idx = c_base / group_size;
-        float s = float(read_f16(scales_base, s_row_byte + g_idx * 2));
-        float b = float(read_f16(biases_base, b_row_byte + g_idx * 2));
-
-        #pragma unroll
-        for (uint i = 0; i < 8; ++i) {
-            uint nibble = (val >> (i * 4)) & 0x0F;
-            float w_val = float(nibble) * s + b;
-            sum += w_val * x[c_base + i];
-        }
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        y[row] = sum;
-    }
-}
-
-kernel void gemv_mlx4_affine_bf16(
-    device const uchar  *w_base         [[buffer(0)]],
-    device const uchar  *scales_base    [[buffer(1)]],
-    device const uchar  *biases_base    [[buffer(2)]],
-    device const float  *x              [[buffer(3)]],
-    device float        *y              [[buffer(4)]],
-    constant uint       &cols           [[buffer(5)]],
-    constant uint       &group_size     [[buffer(6)]],
-    constant uint4      &rems           [[buffer(7)]],
-    uint row                            [[threadgroup_position_in_grid]],
-    uint lane                           [[thread_index_in_simdgroup]]
-) {
-    float sum = 0.0f;
-    uint u32_cols = cols / 8;
-    uint n_groups = cols / group_size;
-
-    uint qw_row_byte = rems.x + row * (u32_cols * 4);
-    uint s_row_byte  = rems.y + row * (n_groups * 2);
-    uint b_row_byte  = rems.z + row * (n_groups * 2);
-
-    for (uint col_u32 = lane; col_u32 < u32_cols; col_u32 += 32) {
-        uint val = read_u32(w_base, qw_row_byte + col_u32 * 4);
-        uint c_base = col_u32 * 8;
-        uint g_idx = c_base / group_size;
-        float s = float(read_bf16(scales_base, s_row_byte + g_idx * 2));
-        float b = float(read_bf16(biases_base, b_row_byte + g_idx * 2));
-
-        #pragma unroll
-        for (uint i = 0; i < 8; ++i) {
-            uint nibble = (val >> (i * 4)) & 0x0F;
-            float w_val = float(nibble) * s + b;
-            sum += w_val * x[c_base + i];
-        }
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        y[row] = sum;
-    }
-}
-)";
+// The shader source lives in src/metal/kernels.metal; build.rs generates it
+// into this header so the RUNTIME-compiled path and the shipped
+// default.metallib (scripts/dist/ios.sh) can never disagree about which
+// kernels exist. See the note in crates/sofuu-ffi/build.rs.
+#include "kernels_metal.h"
 
 bool sofuu_metal_available(void) {
     @autoreleasepool {
@@ -321,12 +53,62 @@ void* sofuu_metal_init(void) {
         id<MTLCommandQueue> q = [dev newCommandQueue];
         if (q == nil) return NULL;
 
+        // Two ways to obtain the compute pipelines, tried in this order:
+        //
+        //   1. `default.metallib` in the app bundle — kernels.metal compiled
+        //      at BUILD time. Xcode compiles the .metal files in the app
+        //      target into the bundle's default library; the iOS framework
+        //      ships one in Resources/ as well (scripts/dist/ios.sh). No
+        //      runtime shader compilation, and a shader that fails to build
+        //      is caught by the build, not by a user's first prompt.
+        //   2. The same source compiled at RUNTIME. This is the only path
+        //      the macOS CLI has (it ships no bundle) and the fallback
+        //      everywhere else.
+        //
+        // A bundled library is accepted only when EVERY pipeline the engine
+        // loads is present: a stale or partial metallib must degrade to (2),
+        // never to a nil pipeline state at inference time.
+        //
+        // iOS floor note: the bf16 kernels use `bfloat`, which the Metal
+        // language gained in MSL 3.1 (iOS 17). On an older OS the bundled
+        // library will not load AND the runtime compiler does not know the
+        // type, so init returns NULL and the engine stays on the CPU path —
+        // the designed degradation, logged below.
+        NSArray<NSString*>* required = @[
+            @"gemv_bf16", @"gemv_f16", @"gemv_f32",
+            @"gemv_mlx4_affine_f16", @"gemv_mlx4_affine_bf16",
+            @"rmsnorm", @"swiglu", @"conv1d_3"
+        ];
+
+        id<MTLLibrary> lib = nil;
+        id<MTLLibrary> bundled = [dev newDefaultLibrary];
+        if (bundled != nil) {
+            BOOL complete = YES;
+            for (NSString* name in required) {
+                if ([bundled newFunctionWithName:name] == nil) {
+                    complete = NO;
+                    break;
+                }
+            }
+            if (complete) lib = bundled;
+        }
+
         NSError* error = nil;
-        NSString* src = [NSString stringWithUTF8String:METAL_KERNEL_SOURCE];
-        id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&error];
         if (lib == nil) {
-            NSLog(@"Sofuu Metal shader compile error: %@", error);
-            return NULL;
+            NSString* src = [NSString stringWithUTF8String:METAL_KERNEL_SOURCE];
+            lib = [dev newLibraryWithSource:src options:nil error:&error];
+            if (lib == nil) {
+                NSLog(@"Sofuu Metal: no usable shader library — bundled "
+                      @"default.metallib missing or incomplete, and runtime "
+                      @"compile failed (%@). bf16 kernels need MSL 3.1 / "
+                      @"iOS 17+; running on CPU.", error);
+                return NULL;
+            }
+            NSLog(@"Sofuu Metal: kernels compiled at runtime (no complete "
+                  @"default.metallib in the bundle)");
+        } else {
+            NSLog(@"Sofuu Metal: using the bundled default.metallib "
+                  @"(precompiled kernels)");
         }
 
         auto load_pso = [&](NSString* name) -> id<MTLComputePipelineState> {
@@ -372,6 +154,21 @@ void sofuu_metal_free(void* ctx_ptr) {
 
 void* sofuu_metal_buffer_create_zerocopy(void* ctx_ptr, const void* ptr, size_t size_bytes) {
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
+#if TARGET_OS_SIMULATOR
+    /* The simulator's Metal driver (MTLSimDriver) backs a no-copy buffer by
+     * exporting the memory over XPC shared memory, and it TRAPS rather than
+     * failing when that export is refused:
+     *
+     *   _xpc_api_misuse
+     *   _xpc_shmem_create_with_prot
+     *   -[MTLSimDevice newBufferWithLength:options:pointer:copyBytes:deallocator:]
+     *
+     * (crash report from an iOS-simulator run of test_metal_engine, 2 MiB
+     * page-aligned Vec). Returning NULL here makes the Rust wrapper fall
+     * back to a copying buffer — GPU math still runs, just without the
+     * zero-copy shortcut, which is the only thing the simulator cannot do. */
+    return NULL;
+#else
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     @autoreleasepool {
         size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
@@ -384,6 +181,7 @@ void* sofuu_metal_buffer_create_zerocopy(void* ctx_ptr, const void* ptr, size_t 
                                                       deallocator:nil];
         return (__bridge_retained void*)buf;
     }
+#endif
 }
 
 void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_bytes) {

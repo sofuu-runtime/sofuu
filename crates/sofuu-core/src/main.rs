@@ -82,6 +82,7 @@ fn print_help() {
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
+    println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
     println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
     println!("  sofuu version            Print version and exit");
     println!("  sofuu licenses           Print open-source licenses");
@@ -899,9 +900,11 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     eprintln!("\x1b[2m    POST /v1/chat/completions  (OpenAI SSE stream & json)\x1b[0m");
     eprintln!("\x1b[2m    POST /v1/completions       (text completions)\x1b[0m");
     eprintln!("\x1b[2m    POST /infer                (direct local infer)\x1b[0m");
-    eprintln!("\x1b[2m    POST /remember             {{text, role?, tier?}}\x1b[0m");
+    eprintln!("\x1b[2m    POST /remember             {{text, role?, source?}}\x1b[0m");
     eprintln!("\x1b[2m    GET  /recall?q=…&k=…\x1b[0m");
-    eprintln!("\x1b[2m    POST /share                (export card)\x1b[0m");
+    eprintln!("\x1b[2m    GET  /memories?tier=…&role=…&text=…&offset=…&limit=…\x1b[0m");
+    eprintln!("\x1b[2m    POST /forget               {{id}}\x1b[0m");
+    eprintln!("\x1b[2m    POST /share                (export card: records + vectors + manifest)\x1b[0m");
     eprintln!();
 
     let brain_path_js = serde_json::to_string(&brain_path).unwrap_or_else(|_| "\"\"".into());
@@ -919,8 +922,33 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
   var host = {host_js};
   var port = {port};
   var brain = null;
+  /* B1.5: open the file by ITS OWN manifest, not a hardcoded 768 — this
+   * server used to be able to serve hash brains only. `inspect` reads the
+   * manifest without opening; `embed` then follows the space so /remember
+   * and /recall produce vectors the store actually holds. */
+  var embed = function (t) {{ return sofuu.ai.embedLocal(String(t)); }};
   if (sofuu.memory && typeof sofuu.memory.open === 'function') {{
-    try {{ brain = sofuu.memory.open(brainPath, 768); }} catch (e) {{ console.error('brain open: ' + e); }}
+    var dim = 768;
+    var space = undefined;
+    try {{
+      if (typeof sofuu.memory.inspect === 'function') {{
+        var info = JSON.parse(sofuu.memory.inspect(brainPath));
+        if (info && info.ok) {{
+          if (info.dimension) dim = info.dimension;
+          if (info.id) space = info.id;
+        }}
+      }}
+    }} catch (e0) {{}}
+    try {{
+      brain = space === undefined
+        ? sofuu.memory.open(brainPath, dim)
+        : sofuu.memory.open(brainPath, dim, space);
+    }} catch (e) {{ console.error('brain open: ' + e); }}
+    if (space === 'semantic-projector-v1' && typeof sofuu.ai.embedLocalSemantic === 'function') {{
+      embed = function (t) {{ return sofuu.ai.embedLocalSemantic(String(t)); }};
+    }} else if (space === 'semantic-table-v2' && typeof sofuu.ai.embedLocalSemanticV2 === 'function') {{
+      embed = function (t) {{ return sofuu.ai.embedLocalSemanticV2(String(t)); }};
+    }}
   }}
   /* Pin the brain + server to globals: their JS objects' reachability
    * controls native lifetime (the finalizer closes the handle) — locals
@@ -1130,9 +1158,9 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
           res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
           return;
         }}
-        var vec = sofuu.ai.embedLocal(data.text);
+        var vec = embed(data.text);
         var role = data.role || 'user';
-        brain.remember(new Float32Array(vec), data.text, role, 0);
+        brain.remember(new Float32Array(vec), data.text, role, 0, data.source || 'server');
         brain.flush();
         res.writeHead(200, {{ 'Content-Type': 'application/json' }});
         res.end(JSON.stringify({{ ok: true, memories: brain.count() }}));
@@ -1159,16 +1187,80 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
         return;
       }}
-      var vec = sofuu.ai.embedLocal(qs.q);
+      var vec = embed(qs.q);
       var k = parseInt(qs.k || '5', 10);
       var results = brain.recall(new Float32Array(vec), k);
       res.writeHead(200, {{ 'Content-Type': 'application/json' }});
       res.end(JSON.stringify({{ ok: true, results: results }}));
       return;
     }}
+    if (req.method === 'GET' && path === '/memories') {{
+      if (!brain) {{
+        res.writeHead(503, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
+        return;
+      }}
+      var mqs = {{}};
+      var mq = (url.split('?')[1] || '').split('&');
+      for (var mi = 0; mi < mq.length; mi++) {{
+        var mkv = mq[mi].split('=');
+        if (mkv.length === 2) mqs[decodeURIComponent(mkv[0])] = decodeURIComponent(mkv[1]);
+      }}
+      var lopts = {{}};
+      if (mqs.tier !== undefined) lopts.tier = parseInt(mqs.tier, 10) || 0;
+      if (mqs.role) lopts.role = mqs.role;
+      if (mqs.entity) lopts.entity = mqs.entity;
+      if (mqs.text) lopts.text = mqs.text;
+      if (mqs.offset) lopts.offset = parseInt(mqs.offset, 10) || 0;
+      lopts.limit = mqs.limit ? (parseInt(mqs.limit, 10) || 20) : 20;
+      try {{
+        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+        res.end(brain.list(lopts));
+      }} catch (e) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
+      }}
+      return;
+    }}
+    if (req.method === 'POST' && path === '/forget') {{
+      var fbody = typeof req.body === 'string' ? req.body : '';
+      try {{
+        var fdata = JSON.parse(fbody || '{{}}');
+        if (!brain) {{
+          res.writeHead(503, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
+          return;
+        }}
+        var fid = parseInt(fdata.id, 10);
+        if (!(fid >= 0)) {{
+          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+          res.end(JSON.stringify({{ ok: false, error: 'id required' }}));
+          return;
+        }}
+        var forgot = brain.forget(fid);
+        brain.flush();
+        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: true, forgot: forgot, id: fid }}));
+      }} catch (e) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
+      }}
+      return;
+    }}
     if (req.method === 'POST' && path === '/share') {{
-      res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{ ok: true, message: 'share endpoint not yet implemented' }}));
+      /* B2.1: a real card — records + vectors + manifest. */
+      if (!brain) {{
+        res.writeHead(503, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
+        return;
+      }}
+      try {{
+        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+        res.end(brain.export());
+      }} catch (e) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
+      }}
       return;
     }}
     res.writeHead(404, {{ 'Content-Type': 'application/json' }});
@@ -1647,8 +1739,385 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "swarm" => cmd_swarm(&args),
         _ => {
             eprintln!("\x1b[31mError:\x1b[0m Unknown command '{}'\nRun 'sofuu help' for usage.\x1b[0m", cmd);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_swarm_help() {
+    println!("\x1b[1;36m  ┌────────────────────────────────────────────────────────┐");
+    println!("  │   ⚡ Sofuu Swarm — Distributed Edge AI Swarm Cluster    │");
+    println!("  │   Sequential Layer Pipelining across LAN Edge Nodes    │");
+    println!("  └────────────────────────────────────────────────────────┘\x1b[0m\n");
+    println!("\x1b[1mUsage:\x1b[0m");
+    println!("  sofuu swarm worker --model <path> [--listen <ip:port>] [--layers <range>] [--node <idx/total>]");
+    println!("  sofuu swarm leader --model <path> --workers <ip:port,...> \"<prompt>\" [--layers <range>]");
+    println!("  sofuu swarm run    --model <path> --workers <ip:port,...> \"<prompt>\" [--max-tokens <n>]");
+    println!("  sofuu swarm discover [--timeout <secs>]");
+    println!("\n\x1b[1mExamples:\x1b[0m");
+    println!("  # Start worker on second node (e.g. Raspberry Pi 5):");
+    println!("  sofuu swarm worker --model ./model.gguf --listen 0.0.0.0:9001 --layers 16..32\n");
+    println!("  # Run distributed inference from leader node (Mac / PC):");
+    println!("  sofuu swarm leader --model ./model.gguf --workers 192.168.1.50:9001 --layers 0..16 \"Explain gravity.\"\n");
+    println!("  # Auto-partitioning across 2 nodes:");
+    println!("  sofuu swarm worker --model ./model.gguf --listen 0.0.0.0:9001 --node 2/2");
+    println!("  sofuu swarm leader --model ./model.gguf --workers 192.168.1.50:9001 --node 1/2 \"Hello world\"");
+}
+
+fn cmd_swarm(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        print_swarm_help();
+        return ExitCode::SUCCESS;
+    }
+
+    let subcmd = args[2].as_str();
+    if subcmd == "--help" || subcmd == "-h" || subcmd == "help" {
+        print_swarm_help();
+        return ExitCode::SUCCESS;
+    }
+
+    match subcmd {
+        "discover" => {
+            println!("\x1b[36m⚡ Searching for Sofuu Swarm nodes on local network (UDP 9770)...\x1b[0m");
+            let peers = sofuu_core::infer::swarm::SwarmDiscovery::listen(std::time::Duration::from_secs(3));
+            if peers.is_empty() {
+                println!("\x1b[33mNo swarm nodes discovered on local subnet.\x1b[0m");
+            } else {
+                println!("\x1b[32m✓ Found {} swarm peer(s):\x1b[0m", peers.len());
+                for p in &peers {
+                    println!("  • \x1b[1m{}\x1b[0m ({}) — layers: {} | model: '{}'", p.addr, p.role, p.layers, p.model);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        "worker" | "join" => {
+            let mut model_path = String::new();
+            let mut listen_addr = format!("0.0.0.0:{}", sofuu_core::infer::swarm::DEFAULT_SWARM_PORT);
+            let mut layers_str = String::new();
+            let mut node_str = String::new();
+            let mut threads = 0usize;
+            let mut gpu_layers = 999usize;
+            let mut custom_ctx = 0usize;
+            let mut broadcast = true;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--model" | "-m" => {
+                        if i + 1 < args.len() { model_path = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--listen" | "-l" | "--port" | "-p" => {
+                        if i + 1 < args.len() {
+                            let val = &args[i + 1];
+                            if val.contains(':') {
+                                listen_addr = val.clone();
+                            } else {
+                                listen_addr = format!("0.0.0.0:{}", val);
+                            }
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--layers" => {
+                        if i + 1 < args.len() { layers_str = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--node" => {
+                        if i + 1 < args.len() { node_str = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--threads" | "-t" => {
+                        if i + 1 < args.len() { threads = args[i + 1].parse().unwrap_or(0); i += 2; } else { i += 1; }
+                    }
+                    "--gpu-layers" | "--ngl" => {
+                        if i + 1 < args.len() { gpu_layers = args[i + 1].parse().unwrap_or(999); i += 2; } else { i += 1; }
+                    }
+                    "--gpu" => { gpu_layers = 999; i += 1; }
+                    "--cpu" => { gpu_layers = 0; i += 1; }
+                    "--ctx" | "-c" => {
+                        if i + 1 < args.len() { custom_ctx = args[i + 1].parse().unwrap_or(0); i += 2; } else { i += 1; }
+                    }
+                    "--no-broadcast" => { broadcast = false; i += 1; }
+                    _ => { i += 1; }
+                }
+            }
+
+            if model_path.is_empty() {
+                eprintln!("\x1b[31mError:\x1b[0m --model <path> is required for swarm worker");
+                return ExitCode::FAILURE;
+            }
+
+            if threads > 0 {
+                sofuu_core::infer::quant::set_thread_count(threads);
+            }
+
+            eprintln!("\x1b[36mLoading model for swarm worker:\x1b[0m {}", model_path);
+            let load_res = if gpu_layers == 0 {
+                sofuu_core::infer::InferEngine::load_with_seq_len_cpu(&model_path, custom_ctx)
+            } else {
+                sofuu_core::infer::InferEngine::load_with_seq_len(&model_path, custom_ctx)
+            };
+            let mut engine = match load_res {
+                Ok(eng) => eng,
+                Err(e) => {
+                    eprintln!("\x1b[31mFailed to load model:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            #[cfg(target_os = "macos")]
+            engine.model.set_gpu_layers(gpu_layers);
+
+            let total_layers = engine.model.config.n_layers;
+
+            let (start_layer, end_layer, node_idx, total_nodes) = if !layers_str.is_empty() {
+                match sofuu_core::infer::swarm::LayerPartition::parse_range(&layers_str, total_layers) {
+                    Ok((s, e)) => (s, e, 1, 2),
+                    Err(e) => {
+                        eprintln!("\x1b[31mInvalid layer range:\x1b[0m {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else if !node_str.is_empty() {
+                if let Some((idx_str, tot_str)) = node_str.split_once('/') {
+                    let idx: usize = idx_str.parse().unwrap_or(2);
+                    let tot: usize = tot_str.parse().unwrap_or(2);
+                    let partitions = sofuu_core::infer::swarm::LayerPartition::auto_partition(total_layers, tot);
+                    if idx > 0 && idx <= partitions.len() {
+                        let (s, e) = partitions[idx - 1];
+                        (s, e, idx - 1, tot)
+                    } else {
+                        eprintln!("\x1b[31mInvalid node index {}/{} (valid: 1..={})\x1b[0m", idx, tot, tot);
+                        return ExitCode::FAILURE;
+                    }
+                } else {
+                    eprintln!("\x1b[31mInvalid --node format (expected '2/2')\x1b[0m");
+                    return ExitCode::FAILURE;
+                }
+            } else {
+                // Default: second half of model
+                let mid = total_layers / 2;
+                (mid, total_layers, 1, 2)
+            };
+
+            let partition = sofuu_core::infer::swarm::LayerPartition {
+                node_id: node_idx,
+                total_nodes,
+                start_layer,
+                end_layer,
+                total_layers,
+            };
+
+            if broadcast {
+                let service_port = listen_addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(sofuu_core::infer::swarm::DEFAULT_SWARM_PORT);
+                sofuu_core::infer::swarm::SwarmDiscovery::broadcast_beacon(
+                    "sofuu-default",
+                    "worker",
+                    service_port,
+                    &format!("{}..{}", start_layer, end_layer),
+                    &model_path,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                );
+            }
+
+            let mut worker = sofuu_core::infer::swarm::SwarmWorker::new(engine, partition);
+            if let Err(e) = worker.serve(&listen_addr, None) {
+                eprintln!("\x1b[31mWorker error:\x1b[0m {e}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        "leader" | "run" | "host" => {
+            let mut model_path = String::new();
+            let mut workers_raw = String::new();
+            let mut prompt = String::new();
+            let mut layers_str = String::new();
+            let mut node_str = String::new();
+            let mut max_tokens = 256;
+            let mut temperature = 0.7f32;
+            let mut threads = 0usize;
+            let mut gpu_layers = 999usize;
+            let mut custom_ctx = 0usize;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--model" | "-m" => {
+                        if i + 1 < args.len() { model_path = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--workers" | "--connect" | "-w" => {
+                        if i + 1 < args.len() { workers_raw = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--layers" => {
+                        if i + 1 < args.len() { layers_str = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--node" => {
+                        if i + 1 < args.len() { node_str = args[i + 1].clone(); i += 2; } else { i += 1; }
+                    }
+                    "--max-tokens" => {
+                        if i + 1 < args.len() { max_tokens = args[i + 1].parse().unwrap_or(256); i += 2; } else { i += 1; }
+                    }
+                    "--temp" => {
+                        if i + 1 < args.len() { temperature = args[i + 1].parse().unwrap_or(0.7); i += 2; } else { i += 1; }
+                    }
+                    "--threads" | "-t" => {
+                        if i + 1 < args.len() { threads = args[i + 1].parse().unwrap_or(0); i += 2; } else { i += 1; }
+                    }
+                    "--gpu-layers" | "--ngl" => {
+                        if i + 1 < args.len() { gpu_layers = args[i + 1].parse().unwrap_or(999); i += 2; } else { i += 1; }
+                    }
+                    "--gpu" => { gpu_layers = 999; i += 1; }
+                    "--cpu" => { gpu_layers = 0; i += 1; }
+                    "--ctx" | "-c" => {
+                        if i + 1 < args.len() { custom_ctx = args[i + 1].parse().unwrap_or(0); i += 2; } else { i += 1; }
+                    }
+                    other => {
+                        if !other.starts_with('-') && prompt.is_empty() {
+                            prompt = other.to_string();
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            if model_path.is_empty() {
+                eprintln!("\x1b[31mError:\x1b[0m --model <path> is required for swarm leader");
+                return ExitCode::FAILURE;
+            }
+            if workers_raw.is_empty() {
+                // Try auto-discovery
+                eprintln!("\x1b[33mNo --workers specified. Probing subnet for discovered peers...\x1b[0m");
+                let discovered = sofuu_core::infer::swarm::SwarmDiscovery::listen(std::time::Duration::from_millis(1500));
+                if !discovered.is_empty() {
+                    workers_raw = discovered.into_iter().map(|p| p.addr).collect::<Vec<_>>().join(",");
+                    eprintln!("\x1b[32m✓ Auto-discovered workers: {}\x1b[0m", workers_raw);
+                } else {
+                    eprintln!("\x1b[31mError:\x1b[0m --workers <ip:port> is required (or run 'sofuu swarm worker' on worker first)");
+                    return ExitCode::FAILURE;
+                }
+            }
+
+            if prompt.is_empty() {
+                prompt = "Why is the sky blue? Answer in 1 concise sentence.".to_string();
+            }
+
+            let worker_addrs: Vec<String> = workers_raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| if s.contains(':') { s } else { format!("{}:{}", s, sofuu_core::infer::swarm::DEFAULT_SWARM_PORT) })
+                .collect();
+
+            if threads > 0 {
+                sofuu_core::infer::quant::set_thread_count(threads);
+            }
+
+            eprintln!("\x1b[36m⚡ Sofuu Swarm Leader\x1b[0m — loading {}...", model_path);
+            let t0 = std::time::Instant::now();
+            let load_res = if gpu_layers == 0 {
+                sofuu_core::infer::InferEngine::load_with_seq_len_cpu(&model_path, custom_ctx)
+            } else {
+                sofuu_core::infer::InferEngine::load_with_seq_len(&model_path, custom_ctx)
+            };
+            let mut engine = match load_res {
+                Ok(eng) => eng,
+                Err(e) => {
+                    eprintln!("\x1b[31mFailed to load model:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            #[cfg(target_os = "macos")]
+            engine.model.set_gpu_layers(gpu_layers);
+
+            let total_layers = engine.model.config.n_layers;
+            let (start_layer, end_layer, node_idx, total_nodes) = if !layers_str.is_empty() {
+                match sofuu_core::infer::swarm::LayerPartition::parse_range(&layers_str, total_layers) {
+                    Ok((s, e)) => (s, e, 0, worker_addrs.len() + 1),
+                    Err(e) => {
+                        eprintln!("\x1b[31mInvalid layer range:\x1b[0m {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else if !node_str.is_empty() {
+                if let Some((idx_str, tot_str)) = node_str.split_once('/') {
+                    let idx: usize = idx_str.parse().unwrap_or(1);
+                    let tot: usize = tot_str.parse().unwrap_or(worker_addrs.len() + 1);
+                    let partitions = sofuu_core::infer::swarm::LayerPartition::auto_partition(total_layers, tot);
+                    if idx > 0 && idx <= partitions.len() {
+                        let (s, e) = partitions[idx - 1];
+                        (s, e, idx - 1, tot)
+                    } else {
+                        eprintln!("\x1b[31mInvalid node index {}/{} (valid: 1..={})\x1b[0m", idx, tot, tot);
+                        return ExitCode::FAILURE;
+                    }
+                } else {
+                    eprintln!("\x1b[31mInvalid --node format (expected '1/2')\x1b[0m");
+                    return ExitCode::FAILURE;
+                }
+            } else {
+                // Default: leader takes first half, workers take rest
+                let partitions = sofuu_core::infer::swarm::LayerPartition::auto_partition(total_layers, worker_addrs.len() + 1);
+                let (s, e) = partitions[0];
+                (s, e, 0, worker_addrs.len() + 1)
+            };
+
+            let partition = sofuu_core::infer::swarm::LayerPartition {
+                node_id: node_idx,
+                total_nodes,
+                start_layer,
+                end_layer,
+                total_layers,
+            };
+
+            eprintln!(
+                "\x1b[32m✓ Model loaded in {:.2?}\x1b[0m (dim={}, layers={}, leader layers: {}..{}/{})",
+                t0.elapsed(),
+                engine.model.config.dim,
+                total_layers,
+                start_layer,
+                end_layer,
+                total_layers
+            );
+
+            let mut leader = sofuu_core::infer::swarm::SwarmLeader::new(engine, partition);
+            if let Err(e) = leader.connect_workers(&worker_addrs) {
+                eprintln!("\x1b[31mFailed to connect swarm cluster:\x1b[0m {e}");
+                return ExitCode::FAILURE;
+            }
+
+            println!("\n\x1b[1;36mPrompt:\x1b[0m {}\n", prompt);
+            use std::io::Write;
+            let t_gen = std::time::Instant::now();
+            let mut token_count = 0usize;
+            let res = leader.stream(
+                &prompt,
+                sofuu_core::infer::GenerateOptions {
+                    max_tokens,
+                    temperature,
+                    threads,
+                    ..Default::default()
+                },
+                |tok| {
+                    token_count += 1;
+                    print!("{}", tok);
+                    std::io::stdout().flush().ok();
+                    true
+                },
+            );
+            println!();
+            let dur = t_gen.elapsed();
+            if let Err(e) = res {
+                eprintln!("\n\x1b[31mSwarm generation error:\x1b[0m {e}");
+                return ExitCode::FAILURE;
+            }
+            let rate = if dur.as_secs_f32() > 0.0 { token_count as f32 / dur.as_secs_f32() } else { 0.0 };
+            eprintln!(
+                "\n\x1b[90m── swarm generated: {} tk in {:.2?} ({:.1} tk/s) across {} node(s) ──\x1b[0m",
+                token_count, dur, rate, worker_addrs.len() + 1
+            );
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("\x1b[31mUnknown swarm subcommand '{}'\x1b[0m. Run 'sofuu swarm' for usage.", subcmd);
             ExitCode::FAILURE
         }
     }

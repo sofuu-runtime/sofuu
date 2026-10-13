@@ -34,6 +34,36 @@ struct Cand {
     id: u32,
 }
 
+/// Same payload as `Cand` but with NATURAL ordering (larger dist = greater),
+/// so a `BinaryHeap<FarCand>` pops/peeks the WORST candidate. The results
+/// heap needs that; `Cand`'s reversed Ord (a min-heap, correct for the
+/// candidate frontier) cannot express it. Sharing one reversed type for both
+/// heaps made `results` a min-heap used as a max-heap: it evicted the CLOSEST
+/// neighbours and broke the early-exit bound on the BEST one, collapsing
+/// recall as the graph grew (measured recall@10 0.82 → 0.07 from 50 to 2000
+/// vectors; 1.00/0.91 after this split).
+#[derive(Clone, Copy)]
+struct FarCand {
+    dist: f32,
+    id: u32,
+}
+impl PartialEq for FarCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.id == other.id
+    }
+}
+impl Eq for FarCand {}
+impl PartialOrd for FarCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.dist.partial_cmp(&other.dist).unwrap_or(Ordering::Equal))
+    }
+}
+impl Ord for FarCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist.partial_cmp(&other.dist).unwrap_or(Ordering::Equal)
+    }
+}
+
 impl PartialEq for Cand {
     fn eq(&self, other: &Self) -> bool {
         self.dist == other.dist && self.id == other.id
@@ -225,12 +255,12 @@ impl Hnsw {
     /// Greedy best-first search at a single level.
     fn search_layer(&self, q: &[f32], ep: u32, ef: usize, level: u8) -> Vec<u32> {
         let mut visited = std::collections::HashSet::new();
-        let mut candidates: BinaryHeap<Cand> = BinaryHeap::new();
-        let mut results: BinaryHeap<Cand> = BinaryHeap::new(); // max-heap by dist (worst on top)
+        let mut candidates: BinaryHeap<Cand> = BinaryHeap::new(); // min-heap: closest pops
+        let mut results: BinaryHeap<FarCand> = BinaryHeap::new(); // max-heap: worst on top
 
         let d0 = self.dist_query(q, ep);
         candidates.push(Cand { dist: d0, id: ep });
-        results.push(Cand { dist: d0, id: ep });
+        results.push(FarCand { dist: d0, id: ep });
         visited.insert(ep);
 
         while let Some(c) = candidates.pop() {
@@ -253,16 +283,16 @@ impl Hnsw {
                 let worst = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
                 if results.len() < ef || d < worst {
                     candidates.push(Cand { dist: d, id: nb });
-                    results.push(Cand { dist: d, id: nb });
+                    results.push(FarCand { dist: d, id: nb });
                     if results.len() > ef {
-                        results.pop();
+                        results.pop(); // evicts the FARTHEST — the heap's top
                     }
                 }
             }
         }
 
         // results is a max-heap (worst on top); drain into sorted-by-dist vec.
-        let mut out: Vec<Cand> = results.into_sorted_vec();
+        let mut out: Vec<FarCand> = results.into_sorted_vec();
         out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         out.into_iter().map(|c| c.id).collect()
     }
@@ -364,6 +394,94 @@ mod tests {
         // Distances ascending.
         for w in res.windows(2) {
             assert!(w[0].1 <= w[1].1);
+        }
+    }
+
+    /// Regression for the results-heap ordering bug: with one reversed `Ord`
+    /// shared by both heaps, `results` was a min-heap used as a max-heap, so
+    /// it evicted the CLOSEST neighbours and the early-exit bound compared
+    /// against the BEST distance. Small graphs hid it (ef >= n never trims);
+    /// measured recall@10 collapsed 0.82 → 0.24 → 0.07 at n = 50/200/2000.
+    /// This asserts recall against brute force at a size where the bug bites.
+    #[test]
+    fn recall_stays_high_as_the_graph_grows() {
+        let dim = 32usize;
+        let n = 300usize;
+        let k = 10usize;
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f32) / ((1u64 << 53) as f32)
+        };
+        let mut store: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut h = Hnsw::new(dim);
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            store.push(v.clone());
+            h.add_vector(&v);
+        }
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for _ in 0..20 {
+            let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let mut exact: Vec<(u32, f32)> = store
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = q.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (i as u32, d)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let want: Vec<u32> = exact.into_iter().take(k).map(|(i, _)| i).collect();
+            let got: Vec<u32> = h.search(&q, k).into_iter().map(|(i, _)| i).collect();
+            for w in &want {
+                total += 1;
+                if got.contains(w) {
+                    hits += 1;
+                }
+            }
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.90,
+            "recall@{k} at n={n} is {recall:.3} — the results heap is evicting near neighbours"
+        );
+    }
+
+    /// The exact stored vector must always come back as its own nearest
+    /// neighbour — the property the brain's recall depends on.
+    #[test]
+    fn exact_self_is_always_top1() {
+        let dim = 32usize;
+        let n = 300usize;
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f32) / ((1u64 << 53) as f32)
+        };
+        let mut h = Hnsw::new(dim);
+        let mut store: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            store.push(v.clone());
+            h.add_vector(&v);
+        }
+        /* k=32 mirrors the brain's own call (recall passes ef>=32, so the
+         * internal ef is >=128). At k=1 the internal ef floor is 8, which is
+         * too small for reliable 1-NN on a 300-node graph — that is the
+         * approximate-search trade, not the ordering bug this test pins. */
+        for (i, v) in store.iter().enumerate() {
+            let got = h.search(v, 32);
+            assert_eq!(
+                got.first().map(|(id, _)| *id),
+                Some(i as u32),
+                "vector {i} did not find itself"
+            );
         }
     }
 

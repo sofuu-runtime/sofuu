@@ -10,7 +10,9 @@
 use std::path::Path;
 use super::model::{AnonBuffer, ModelConfig};
 use super::safetensors::{SafeDType, SafeTensorView, SafeTensorsFile};
-#[cfg(target_os = "macos")]
+// Metal items in this file: macOS + iOS — the GPU engine compiles for
+// both now (see the header of infer/metal.rs).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::metal::{MetalBuffer, MetalEngine};
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -121,9 +123,9 @@ pub struct Lfm2Model {
     pub layers: Vec<Lfm2LayerWeights>,
 
     // Metal GPU Engine handle (if available on macOS)
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub metal_engine: Option<MetalEngine>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub metal_mmap_buf: Option<std::sync::Arc<MetalBuffer>>,
 
     // Working activation buffers
@@ -359,7 +361,7 @@ impl Lfm2Model {
         let ffn_up = vec![0.0f32; actual_hidden_dim];
         let ffn_out = vec![0.0f32; dim];
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let (metal_engine, metal_mmap_buf) = {
             if let Some(engine) = MetalEngine::new() {
                 let mmap_buf = sf.mmap.get_or_create_metal_buffer(&engine);
@@ -378,9 +380,9 @@ impl Lfm2Model {
             embedding_norm,
             layers,
 
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_engine,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_mmap_buf,
 
             x,
@@ -432,9 +434,9 @@ impl Lfm2Model {
     // Single vector-matrix multiply: y = W * x
     pub fn compute_matvec(
         mmap: &super::mmap::MmapFile,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         metal_engine: Option<&MetalEngine>,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         metal_mmap_buf: Option<&MetalBuffer>,
         lt: &LinearTensor,
         x: &[f32],
@@ -442,7 +444,7 @@ impl Lfm2Model {
     ) {
         match lt {
             LinearTensor::Bf16(tv) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let (Some(engine), Some(m_buf)) = (metal_engine, metal_mmap_buf) {
                     engine.gemv_bf16(m_buf, tv.data_offset, x, y, tv.shape[0], tv.shape[1]);
                     return;
@@ -455,7 +457,7 @@ impl Lfm2Model {
                 super::quant::gemv_bf16(slice, x, &mut y[..rows], rows, cols);
             }
             LinearTensor::Mlx4 { weight, scales, biases, group_size } => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let (Some(engine), Some(m_buf)) = (metal_engine, metal_mmap_buf) {
                     let rows = weight.shape[0];
                     let cols = x.len();
@@ -568,14 +570,14 @@ impl Lfm2Model {
         // 2. Decoder layers
         for layer_idx in 0..n_layers {
             let layer = self.layers[layer_idx].clone();
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let (m_eng, m_buf) = if layer_idx < self.gpu_layers {
                 (self.metal_engine.as_ref(), self.metal_mmap_buf.as_deref())
             } else {
                 (None, None)
             };
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             let layer_idx = layer_idx;
             match layer {
                 Lfm2LayerWeights::Conv {
@@ -594,8 +596,8 @@ impl Lfm2Model {
                     // BCx = in_proj(x_norm) [3 * dim]
                     Self::compute_matvec(
                         mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                         &in_proj,
                         &self.x_norm,
                         &mut self.bcx_buf,
@@ -633,8 +635,8 @@ impl Lfm2Model {
                     // out_proj(y)
                     Self::compute_matvec(
                         mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                         &out_proj,
                         &self.attn_out,
                         &mut self.x_norm,
@@ -649,7 +651,7 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &ffn_norm, &mut self.x_norm);
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let mlx4_gate_up_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
                         if let (
                             LinearTensor::Mlx4 { weight: g_w, scales: g_s, biases: g_b, group_size: g_g },
@@ -664,9 +666,9 @@ impl Lfm2Model {
                             true
                         } else { false }
                     } else { false };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let mlx4_gate_up_done = false;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let used_batched_gate_up = if mlx4_gate_up_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
                         engine.gemv_gate_up_bf16(
                             buf,
@@ -682,41 +684,41 @@ impl Lfm2Model {
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let used_batched_gate_up = false;
 
                     if !used_batched_gate_up {
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &w1,
                             &self.x_norm,
                             &mut self.ffn_gate,
                         );
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &w3,
                             &self.x_norm,
                             &mut self.ffn_up,
                         );
                     }
 
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     if let Some(engine) = m_eng {
                         engine.swiglu(&mut self.ffn_gate, &self.ffn_up);
                     } else {
                         super::quant::swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     super::quant::swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
 
                     Self::compute_matvec(
                         mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                         &w2,
                         &self.ffn_gate,
                         &mut self.ffn_out,
@@ -744,7 +746,7 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &operator_norm, &mut self.x_norm);
 
                     // Q, K, V projections
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let mlx4_qkv_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
                         if let (
                             LinearTensor::Mlx4 { weight: q_w, scales: q_s, biases: q_b, group_size: q_g },
@@ -761,9 +763,9 @@ impl Lfm2Model {
                             true
                         } else { false }
                     } else { false };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let mlx4_qkv_done = false;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let used_batched_qkv = if mlx4_qkv_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(q_tv), LinearTensor::Bf16(k_tv), LinearTensor::Bf16(v_tv)) = (m_eng, m_buf, &q_proj, &k_proj, &v_proj) {
                         engine.gemv_qkv_bf16(
                             buf,
@@ -783,30 +785,30 @@ impl Lfm2Model {
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let used_batched_qkv = false;
 
                     if !used_batched_qkv {
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &q_proj,
                             &self.x_norm,
                             &mut self.q,
                         );
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &k_proj,
                             &self.x_norm,
                             &mut self.k,
                         );
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &v_proj,
                             &self.x_norm,
                             &mut self.v,
@@ -920,8 +922,8 @@ impl Lfm2Model {
                     // Attention output projection
                     Self::compute_matvec(
                         mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                         &out_proj,
                         &self.head_out,
                         &mut self.attn_out,
@@ -936,7 +938,7 @@ impl Lfm2Model {
                     Self::compute_rmsnorm(mmap, norm_eps, &self.x, &ffn_norm, &mut self.x_norm);
 
                     // SwiGLU: w1 (gate), w3 (up), w2 (down)
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let mlx4_gate_up_done = if let (Some(engine), Some(buf)) = (m_eng, m_buf) {
                         if let (
                             LinearTensor::Mlx4 { weight: g_w, scales: g_s, biases: g_b, group_size: g_g },
@@ -951,9 +953,9 @@ impl Lfm2Model {
                             true
                         } else { false }
                     } else { false };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let mlx4_gate_up_done = false;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let used_batched_gate_up = if mlx4_gate_up_done { false } else if let (Some(engine), Some(buf), LinearTensor::Bf16(g_tv), LinearTensor::Bf16(u_tv)) = (m_eng, m_buf, &w1, &w3) {
                         engine.gemv_gate_up_bf16(
                             buf,
@@ -969,41 +971,41 @@ impl Lfm2Model {
                     } else {
                         false
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let used_batched_gate_up = false;
 
                     if !used_batched_gate_up {
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &w1,
                             &self.x_norm,
                             &mut self.ffn_gate,
                         );
                         Self::compute_matvec(
                             mmap,
-                            #[cfg(target_os = "macos")] m_eng,
-                            #[cfg(target_os = "macos")] m_buf,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                             &w3,
                             &self.x_norm,
                             &mut self.ffn_up,
                         );
                     }
 
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     if let Some(engine) = m_eng {
                         engine.swiglu(&mut self.ffn_gate, &self.ffn_up);
                     } else {
                         super::quant::swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     super::quant::swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
 
                     Self::compute_matvec(
                         mmap,
-                        #[cfg(target_os = "macos")] m_eng,
-                        #[cfg(target_os = "macos")] m_buf,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+                        #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
                         &w2,
                         &self.ffn_gate,
                         &mut self.ffn_out,
@@ -1021,7 +1023,7 @@ impl Lfm2Model {
         let norm_tensor = self.embedding_norm.clone();
         Self::compute_rmsnorm(mmap, norm_eps, &self.x, &norm_tensor, &mut self.x_norm);
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let (m_eng, m_buf) = if self.gpu_layers > 0 {
             (self.metal_engine.as_ref(), self.metal_mmap_buf.as_deref())
         } else {
@@ -1032,8 +1034,8 @@ impl Lfm2Model {
         // 4. Logits: tied embedding lm_head = embed_tokens @ x_norm
         Self::compute_matvec(
             mmap,
-            #[cfg(target_os = "macos")] m_eng,
-            #[cfg(target_os = "macos")] m_buf,
+            #[cfg(any(target_os = "macos", target_os = "ios"))] m_eng,
+            #[cfg(any(target_os = "macos", target_os = "ios"))] m_buf,
             &self.embed_tokens,
             &self.x_norm,
             &mut self.logits,

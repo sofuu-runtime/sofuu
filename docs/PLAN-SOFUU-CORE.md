@@ -75,8 +75,11 @@ Every capability an AI application needs is integrated directly into the core bi
 * **Ebbinghaus Forgetting Decay**: Memory retention decays exponentially over time:
   $$R = e^{-\frac{t}{S}}$$
   where $S$ is memory stability increased by positive recall reinforcement (`markPositive`).
-* **HNSW Vector Store (`hnsw.rs`)**: Pure-Rust Hierarchical Navigable Small World graph supporting high-dimensional nearest-neighbor search with logarithmic complexity.
+* **HNSW Vector Store (`hnsw.rs`)**: Pure-Rust Hierarchical Navigable Small World graph supporting high-dimensional nearest-neighbor search with logarithmic complexity. **Recall fixed 2026-10-13** — the results heap shared the candidate frontier's reversed ordering, so it evicted near neighbours as the graph grew (recall@10 0.82 → 0.07 from 50 to 2000 vectors); it now uses its own naturally-ordered type, with regression tests. See `AUDIT-2026-10-13-BRAIN-CMA.md`.
 * **TF-IDF Dream Consolidation**: Offline background consolidation passes summarize decaying episodic memories into compact semantic facts during idle cycles.
+
+> **Roadmap:** the audit-driven fix and upgrade sequence for §3.3/§3.4 lives in
+> [`ROADMAP-BRAIN-CMA.md`](ROADMAP-BRAIN-CMA.md) (B0–B7, dependency-ordered, each with an evidence gate).
 
 ### 3.4 QTSQ Encrypted Brain (`.qtsq`)
 * **Format Structure**:

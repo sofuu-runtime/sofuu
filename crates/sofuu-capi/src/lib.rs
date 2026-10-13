@@ -232,8 +232,23 @@ const MEMORY_FACADE_JS: &str = r#"
 
   M.remember = function (a) {
     a = a || {};
-    return one(a, 'remember', [f32(a.vec), a.text, a.role || 'user', a.kv_page_id | 0]);
+    return one(a, 'remember', [f32(a.vec), a.text, a.role || 'user', a.kv_page_id | 0,
+                               a.source === undefined ? undefined : String(a.source)]);
   };
+  /* B1.5: the read-out surface, same shape as the in-process API. */
+  M.list = function (a) {
+    a = a || {};
+    var opts = {};
+    if (a.tier !== undefined) opts.tier = a.tier | 0;
+    if (a.role !== undefined) opts.role = String(a.role);
+    if (a.entity !== undefined) opts.entity = String(a.entity);
+    if (a.text !== undefined) opts.text = String(a.text);
+    if (a.min_strength !== undefined) opts.minStrength = +a.min_strength;
+    if (a.offset !== undefined) opts.offset = a.offset | 0;
+    if (a.limit !== undefined) opts.limit = a.limit | 0;
+    return one(a, 'list', [opts]);
+  };
+  M.export = function (a) { return one(a || {}, 'export', []); };
   M.recall = function (a) {
     a = a || {};
     return one(a, 'recall', [f32(a.vec), a.k === undefined ? 5 : (a.k | 0)]);
@@ -3714,6 +3729,8 @@ mod tests {
             "memory.flush",
             "memory.forget",
             "memory.close",
+            "memory.list",
+            "memory.export",
             "mcp.connect",
             "mcp.call",
             "mcp.listTools",
@@ -3735,7 +3752,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            30,
+            32,
             "the funnel contract list changed length — update it deliberately"
         );
 
@@ -3789,7 +3806,7 @@ mod tests {
         //                 memory rows" would hide).
         //
         // Drift in the memory rows is still caught on any QTSQ build, and
-        // the `== 30` length assertion above keeps the list itself honest in
+        // the length assertion above keeps the list itself honest in
         // every build.
         let mut broken: Vec<&String> = Vec::new();
         let mut memory_resolved: Vec<&String> = Vec::new();

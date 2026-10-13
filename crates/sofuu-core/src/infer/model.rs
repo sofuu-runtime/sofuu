@@ -912,7 +912,12 @@ impl TransformerModel {
         self.forward_impl(token_id, pos, false);
     }
 
-    fn forward_impl(&mut self, token_id: u32, pos: usize, compute_logits: bool) {
+    pub fn forward_embed(&mut self, token_id: u32, out_hidden: &mut [f32]) {
+        let dim = self.config.dim;
+        Self::lookup_embedding(&self.gguf, &self.token_embd, token_id, dim, &mut out_hidden[..dim]);
+    }
+
+    pub fn execute_layers(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
@@ -921,14 +926,10 @@ impl TransformerModel {
         let norm_eps = self.config.norm_eps;
         let rope_freq_base = self.config.rope_freq_base;
         let max_seq_len = self.config.max_seq_len;
-
         let gguf = &self.gguf;
 
-        // 1. Embedding lookup
-        Self::lookup_embedding(gguf, &self.token_embd, token_id, dim, &mut self.x);
-
-        // 2. Transformer layers
-        for layer_idx in 0..self.config.n_layers {
+        let end = end_layer.min(self.config.n_layers);
+        for layer_idx in start_layer..end {
             let layer = &self.layers[layer_idx];
 
             // ── Attention Norm ──────────────────────────────
@@ -1108,17 +1109,63 @@ impl TransformerModel {
             // ── Residual Connection 2 ───────────────────────
             inline_mad(&mut self.x, &self.ffn_out, 1.0);
         }
+    }
+
+    pub fn forward_layer_range(
+        &mut self,
+        pos: usize,
+        start_layer: usize,
+        end_layer: usize,
+        in_hidden: &[f32],
+        out_hidden: &mut [f32],
+    ) {
+        let dim = self.config.dim;
+        self.x[..dim].copy_from_slice(&in_hidden[..dim]);
+        self.execute_layers(pos, start_layer, end_layer);
+        out_hidden[..dim].copy_from_slice(&self.x[..dim]);
+    }
+
+    pub fn forward_head(&mut self, in_hidden: &[f32], out_logits: &mut [f32]) {
+        let dim = self.config.dim;
+        let norm_eps = self.config.norm_eps;
+        self.x[..dim].copy_from_slice(&in_hidden[..dim]);
+        let out_norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
+        let out_norm_weights = unsafe {
+            std::slice::from_raw_parts(out_norm_bytes.as_ptr() as *const f32, dim)
+        };
+        rmsnorm_in_place(&mut self.x, out_norm_weights, norm_eps);
+
+        let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        matvec(
+            out_bytes,
+            self.output.tensor_type,
+            self.config.vocab_size,
+            dim,
+            &self.x,
+            out_logits,
+        );
+    }
+
+    fn forward_impl(&mut self, token_id: u32, pos: usize, compute_logits: bool) {
+        let dim = self.config.dim;
+
+        // 1. Embedding lookup
+        Self::lookup_embedding(&self.gguf, &self.token_embd, token_id, dim, &mut self.x);
+
+        // 2. Transformer layers
+        self.execute_layers(pos, 0, self.config.n_layers);
 
         if compute_logits {
+            let norm_eps = self.config.norm_eps;
             // 3. Final Output Norm
-            let out_norm_bytes = Self::tensor_slice(gguf, &self.output_norm);
+            let out_norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
             let out_norm_weights = unsafe {
                 std::slice::from_raw_parts(out_norm_bytes.as_ptr() as *const f32, dim)
             };
             rmsnorm_in_place(&mut self.x, out_norm_weights, norm_eps);
 
             // 4. Output Logits Projection
-            let out_bytes = Self::tensor_slice(gguf, &self.output);
+            let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
             matvec(
                 out_bytes,
                 self.output.tensor_type,

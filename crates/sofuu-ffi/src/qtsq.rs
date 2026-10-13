@@ -71,7 +71,8 @@ pub struct QtsqContext {
 }
 
 /// `sizeof(qtsq_context_t)` in the vendored checkout (qtsq_format.h).
-pub const QTSQ_CONTEXT_SIZE: usize = 5024;
+pub const QTSQ_CONTEXT_SIZE: usize = 5032;
+
 
 // Field offsets verified against qtsq_format.h with a C offsetof probe
 // while porting M9 (the packed 112-byte qtsq_header_t leads the struct).
@@ -188,12 +189,19 @@ extern "C" {
         name_buf_size: usize,
     ) -> c_int;
 
+    /// B0 (AUDIT-2026-10-13): the codec's 2.1.0 API added a trailing
+    /// `int level` (0 = full contest, the pre-2.1.0 behaviour; 1 = fast
+    /// subset; 2 = store). Declaring these with the old arity made the
+    /// callee read an undefined register as `level` on every brain and KV
+    /// compression — the struct-layout guard cannot see signatures, so the
+    /// drift was silent. Keep the arity in lockstep with qtsq.h.
     pub fn qtsq_compress_tensor(
         ctx: *mut QtsqContext,
         data: *const f32,
         count: usize,
         dimensions: *const c_uint,
         num_dims: u8,
+        level: c_int,
     ) -> c_int;
     pub fn qtsq_compress_tensor_quantized(
         ctx: *mut QtsqContext,
@@ -202,6 +210,7 @@ extern "C" {
         dimensions: *const c_uint,
         num_dims: u8,
         precision: QtsqTensorPrecision,
+        level: c_int,
     ) -> c_int;
     pub fn qtsq_decompress_tensor(
         ctx: *const QtsqContext,
@@ -585,7 +594,7 @@ mod tests {
         assert_eq!(OFF_IS_ENCRYPTED, 4908);
         assert_eq!(OFF_CODEC, 5016);
         assert_eq!(OFF_QUALITY, 5020);
-        assert_eq!(QTSQ_CONTEXT_SIZE, 5024);
+        assert_eq!(QTSQ_CONTEXT_SIZE, 5032);
     }
 
     #[test]

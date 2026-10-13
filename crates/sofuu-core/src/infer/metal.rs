@@ -1,4 +1,15 @@
 // crates/sofuu-core/src/infer/metal.rs — Safe Rust wrapper for Apple Silicon Metal GPU Engine.
+//
+// Target note (PLAN-EMBED-SDK E3): the engine behind this wrapper
+// (src/metal/metal_engine.mm) compiles for macOS AND iOS, so
+// `any(target_os = "macos", target_os = "ios")` appears throughout the
+// inference engine wherever a Metal item means "this target has the GPU
+// path". Before E3 the gates said macOS only and the iOS slices contained
+// no Metal code at all — an iPhone ran CPU-only no matter what the config
+// asked for. Widening them is what makes the same GPU path reachable on
+// both. On an iOS older than 17 the bf16 kernels cannot build (MSL 3.1
+// introduced `bfloat`); init then returns None and the caller runs CPU-only,
+// which is the designed degradation, not a crash.
 
 use std::ffi::c_void;
 use super::quant::*;
@@ -31,11 +42,16 @@ impl MetalEngine {
                 slice.as_ptr() as *const c_void,
                 slice.len(),
             );
-            if buf.is_null() {
-                None
-            } else {
-                Some(MetalBuffer { handle: buf })
+            if !buf.is_null() {
+                return Some(MetalBuffer { handle: buf });
             }
+            // No-copy is a shortcut, not a requirement: fall back to a
+            // copying buffer so a platform that cannot wrap this memory still
+            // gets the GPU path instead of losing it entirely. (The iOS
+            // simulator's XPC-backed MTLSimDriver refuses these buffers and
+            // TRAPS on the attempt — see the TARGET_OS_SIMULATOR note in
+            // src/metal/metal_engine.mm.)
+            self.create_buffer(slice)
         }
     }
 

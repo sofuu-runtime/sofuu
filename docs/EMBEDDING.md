@@ -287,7 +287,7 @@ through a real runtime, so it cannot drift from the implementation again:
 | namespace | methods |
 |---|---|
 | **ai** | `ai.complete`, `ai.stream`, `ai.embed`, `ai.embedLocal`, `ai.embedBatch`, `ai.embedImage`, `ai.embedInfo`, `ai.similarity`, `ai.transcribe`, `ai.speak` |
-| **memory** | `memory.open`, `memory.remember`, `memory.recall`, `memory.count`, `memory.flush`, `memory.forget`, `memory.close` |
+| **memory** | `memory.open`, `memory.remember`, `memory.recall`, `memory.count`, `memory.flush`, `memory.forget`, `memory.close`, `memory.list`, `memory.export` |
 | **mcp** | `mcp.connect`, `mcp.call`, `mcp.listTools`, `mcp.listResources`, `mcp.disconnect` |
 | **agent** | `agent.define`, `agent.run`, `agent.list`, `agent.cancel`, `agent.renderTrace` |
 | **rlm** | `rlm.query`, `rlm.route` |
@@ -521,6 +521,32 @@ dependencies { implementation 'com.sofuu:sofuu-android:0.2.0' }
 
 The AAR bundles the per-ABI `libsofuu.so` and the JNI bridge — no manual
 `.so` copying. Full setup and the manual fallback: `bindings/android/README.md`.
+
+**Streaming, cancel, and host tools** (E1/E2) are on the same wrapper.
+`callStream` blocks on the calling thread and delivers every event to the
+listener — return `false` to stop (there is no cross-thread cancel: the
+engine thread is inside the call, which is why the listener is the cancel):
+
+```kotlin
+val stop = java.util.concurrent.atomic.AtomicBoolean(false)   // UI "Stop"
+
+// Token-by-token generation from a local model, fully offline.
+sofuu.streamLocal("/models/qwen3-0.6b.gguf", "Once upon a time") { evt ->
+    if (evt.contains("\"kind\":\"delta\"")) render(evt)
+    !stop.get()
+}
+
+// A native capability the agent can call; null = "settle me later".
+sofuu.registerHostTool("take_photo", "Takes a photo", """{"type":"object"}""") { _, callId ->
+    camera.take { path -> sofuu.resolveHostTool(callId, """{"path":"$path"}""") } // any thread
+    null
+}
+```
+
+`make sdk-jvm-check` exercises this whole surface on the host JVM — no
+device attached: streaming deltas, mid-flight cancel, `streamLocal`'s
+positional contract, sync + deferred host tools inside a real agent turn,
+and `close()` semantics.
 
 <details>
 <summary>Android from source (Kotlin/JNI, manual)</summary>

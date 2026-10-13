@@ -249,11 +249,12 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
 
 ## 8. Milestone Roadmap for Embed SDK
 
-> **Status updated 2026-10-12.** E1 and E2 ship in the C ABI, in the core JS
-> runtime, and in the Swift binding; the Android app carries its own
-> `registerHostTool`/`callStream` bridge. E3–E5 remain open, and their
-> premises are corrected below where the original text described something
-> that does not exist.
+> **Status updated 2026-10-13.** E1 and E2 ship in the C ABI, in the core JS
+> runtime, in the Swift binding, and in the Kotlin AAR wrapper
+> (`bindings/android/sofuu`), which carries its own streaming and host-tool
+> surface verified on the host JVM (`make sdk-jvm-check`). E3–E5 remain
+> open, and their premises are corrected below where the original text
+> described something that does not exist.
 
 ### Milestone E1: Native Local Inference in `sofuu_rt_call_stream` — SHIPPED
 - [x] `sofuu_rt_call_stream` accepts an object **or an array** in `args_json`,
@@ -270,15 +271,40 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
       a model name.
 - [x] Swift: `Sofuu.streamLocal(modelPath:prompt:maxTokens:temperature:onEvent:)`
       and `Sofuu.streamPositional(_:_:onEvent:)` for any positional method.
-- [ ] Kotlin **SDK** binding (`bindings/android/sofuu`) — the app-level bridge
-      in `sofuu-android/` has `callStream`; the shipped SDK binding still has
-      no streaming method and its JNI layer exports no stream native.
+- [x] Kotlin **SDK** binding (`bindings/android/sofuu`):
+      `callStream(method, argsJson, listener)` with a `fun interface
+      StreamListener` whose `onStreamEvent` return value is the in-flight
+      cancel (the JNI slot holds a pointer to the cancel id, which
+      `sofuu_rt_call_stream` writes before the first event — readable only
+      from the callback, and the only thread `sofuu_rt_cancel` accepts), and
+      `streamLocal(modelPath, prompt, maxTokens, temperature)`. The
+      app-level bridge in `sofuu-android/` got `callStream` earlier.
+- [x] Two load-blockers found and fixed while wiring this up, both in the
+      shipped wrapper: it loaded `System.loadLibrary("sofuu")` — the runtime
+      `.so`, which contains *none* of the JNI natives (they are compiled
+      into `libsofuu_jni.so`, whose `DT_NEEDED` pulls the runtime) — so on a
+      device every call would have thrown `UnsatisfiedLinkError`; and the
+      shim's CMake lacked `-Wl,-z,max-page-size=16384`, which apps targeting
+      Android 15+ require on 16 KiB-page devices.
+- [x] The JNI text boundaries convert modified UTF-8 (JNI's "UTF-8" is
+      CESU-8 for anything outside the BMP: an emoji in a prompt arrived at
+      the runtime as invalid bytes and the engine saw **no arguments at
+      all**; probed and fixed in both directions for eval, call, streaming
+      and host tools).
 - [x] Verified with real models: a 0.6B GGUF streams token deltas through the
       C ABI with a working mid-flight cancel, and an LFM2 SafeTensors directory
       generates from its path alone (`cargo test -p sofuu-capi`);
       both skip cleanly when the model is absent, since no model is checked in.
+- [x] Kotlin verified without a device: `make sdk-jvm-check` compiles this
+      same `jni_bridge.c` for the host OS and runs 29 assertions through the
+      real wrapper and runtime (deltas, one terminal `done`, cancel after 3
+      deltas → `aborted:true`, positional `streamLocal`, the UTF-8
+      round-trip). The Android side is compile/link-gated separately: NDK
+      for `arm64-v8a` + `x86_64`, `:sofuu:compileDebugKotlin` under the
+      shipped Kotlin 1.9.24, and a full `:sofuu:assembleDebug` AAR with the
+      runtime staged.
 
-### Milestone E2: Host-Native Tool Callback Bridge — SHIPPED (C ABI + Swift + Android app)
+### Milestone E2: Host-Native Tool Callback Bridge — SHIPPED (C ABI + Swift + Android app + Android SDK)
 - [x] `sofuu_rt_register_host_tool(rt, name, description, parameters_json, cb,
       opaque)` in `include/sofuu_embed.h`, plus
       `sofuu_rt_host_tool_resolve(rt, call_id, result_json, error)`.
@@ -300,7 +326,11 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
 - [x] Swift: `Sofuu.registerTool(name:description:parameters:handler:)` with an
       `async throws` handler — the async shape the camera/GPS examples need.
 - [x] Android: `SofuuBridge.registerHostTool` / `resolveHostTool` plus
-      `DeviceTools` (device_info, vibrate, …) in `sofuu-android/`.
+      `DeviceTools` (device_info, vibrate, …) in `sofuu-android/`; the
+      shipped SDK AAR (`bindings/android/sofuu`) has the same pair with
+      `HostTool.invoke` returning null for the deferred case, and `close()`
+      releasing the JNI global refs the registrations pin on the host's
+      Activity.
 - [x] Verified: a registered host tool runs inside a real agent turn and its
       result reaches the model's transcript (the mock provider reports
       CONFIRMED only if it sees it); a call deferred to another thread resumes
@@ -308,18 +338,48 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
       JSON-string-vs-object shaping rule are all asserted
       (`cargo test -p sofuu-capi host_tool`).
 
-### Milestone E3: iOS XCFramework Build & Metal GPU Validation — OPEN
-- [ ] **Enable the Metal engine for iOS.** `crates/sofuu-ffi/build.rs:149`
-      compiles `src/metal/metal_engine.mm` only for `target_os == "macos"`, so
-      the library's iOS slices contain no Metal code at all. (The original
-      checkbox said "verify `ios.sh` includes Metal shaders" — it bundles none,
-      and cannot until this is done.)
-- [ ] Compile `src/metal/kernels.metal` into a `default.metallib` and ship it
-      as a framework resource (`Sofuu.framework/Resources/default.metallib`,
-      loaded with `MTLDevice.makeDefaultLibrary(bundle:)`).
+### Milestone E3: iOS XCFramework Build & Metal GPU Validation — SHIPPED (engine + simulator); device run parked
+- [x] **The Metal engine compiles for iOS.** `crates/sofuu-ffi/build.rs` now
+      builds `src/metal/metal_engine.mm` for `macos` **and** `ios` (device and
+      simulator both report `CARGO_CFG_TARGET_OS=ios`), and the 97
+      `#[cfg(target_os = "macos")]` gates across the inference engine
+      (`lfm2.rs`, `block_graph.rs`, `mmap.rs`, `infer/mod.rs`) widened to
+      `any(macos, ios)`. `nm` on the iOS device archive now shows the 40
+      defined `sofuu_metal_*` symbols; before this it had none, and even a
+      config that asked for GPU layers was a no-op on iOS — `finalize_device`
+      and the Lfm2 arm of `set_gpu_layers` were themselves macOS-gated, so
+      `with_local_engine` (the `ai.streamLocal` path, `enable_gpu = true`)
+      silently ran CPU-only on an iPhone.
+- [x] **The shader has one source of truth, and it is compiled ahead of
+      time.** The `.mm` used to carry its own copy of the shader as a C
+      string, and the copies had already drifted: `src/metal/kernels.metal`
+      was missing the two `gemv_mlx4_affine_f16/_bf16` kernels the engine
+      loads, so a metallib built from the file would have shipped without
+      exactly the pipelines the engine asks for. Now `kernels.metal` is
+      canonical — `build.rs` generates the runtime-fallback header from it,
+      and `scripts/dist/ios.sh` compiles it into
+      `Sofuu.framework/Resources/default.metallib` per slice (asserting all
+      eight kernel names are present). The engine prefers the bundled
+      library, verifies *every* pipeline it needs, and otherwise compiles
+      the embedded copy at init — a stale or partial metallib degrades to
+      the fallback instead of a nil pipeline at inference time.
+      `scripts/mobile/typecheck_ios.sh` now compiles kernels.metal against
+      the iOS SDK, so a shader that cannot build fails the check, not the
+      user's first prompt.
+- [x] **MSL 3.1 is the floor** (a premise correction): the bf16 kernels use
+      `bfloat`, which MSL 3.0 rejects for every SDK (probed) and MSL 3.1
+      accepts. The metallib therefore loads on iOS 17+; on iOS 16
+      `sofuu_metal_init` returns NULL, the engine logs why, and inference
+      runs on the CPU — the designed degradation, and the reason the app's
+      iOS 16 deployment target still holds. (Dropping `bfloat` from the
+      shader — the conversions are a shift by 16 bits — would lift the floor;
+      not needed yet.)
 - [ ] Physical-device token generation through `sofuu-ios/`. Needs a signing
       team: `project.yml` sets `CODE_SIGN_STYLE: Automatic` with no
-      `DEVELOPMENT_TEAM`, and nothing is provisioned. Simulator-only today.
+      `DEVELOPMENT_TEAM`, and nothing is provisioned. Verification today is
+      the iOS **simulator** — the real Metal API, GPU, and our iOS-compiled
+      engine — with `cargo test --target aarch64-apple-ios-sim` run through
+      `xcrun simctl spawn`.
 
 ### Milestone E4: Android Gradle AAR & NDK Verification — OPEN
 - [x] The engine cross-builds for `arm64-v8a` / `x86_64`

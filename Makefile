@@ -40,6 +40,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
+        sdk-jvm-check \
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
@@ -365,6 +366,15 @@ else
 	@echo "\033[32m✓ Headless tests passed\033[0m"
 	@echo ""
 endif
+
+# ── SDK JVM check: the Android AAR wrapper on the host JVM ─────────
+# Compiles the AAR's JNI shim for the host OS and drives the real Kotlin
+# wrapper through the real runtime — streaming deltas, mid-flight cancel,
+# the UTF-8 boundary, host tools (sync + deferred) — with no device
+# attached. Needs `make libsofuu` first; skips cleanly (exit 0, yellow
+# line) when a host toolchain piece is missing.
+sdk-jvm-check:
+	@bash scripts/mobile/sdk_jvm_check.sh
 
 abi-check: libsofuu
 	@# Use the dylib/.so (public symbols are resolved at link time, not in the .a archive).

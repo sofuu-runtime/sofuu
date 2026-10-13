@@ -44,6 +44,23 @@ pub struct Record {
     pub corecall_ids: Vec<u32>,
     pub total_recalls: u16,
     pub positive_recalls: u16,
+    /// B1.2 provenance (ROADMAP-BRAIN-CMA): unix seconds. 0 = unknown
+    /// (legacy files written before the fields existed).
+    pub created_at: u32,
+    /// Last time recall() returned this record; 0 = never.
+    pub last_recalled_at: u32,
+    /// Where the memory came from ("chat", "agent:researcher", "pin", …).
+    /// Empty = unknown.
+    pub source: String,
+}
+
+/// B1.2: unix seconds, saturating at u32 (the same width the page index
+/// uses). A clock before the epoch reads as 0 = unknown.
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
 }
 
 impl Record {
@@ -62,8 +79,27 @@ impl Record {
             corecall_ids: Vec::new(),
             total_recalls: 0,
             positive_recalls: 0,
+            created_at: now_secs(),
+            last_recalled_at: 0,
+            source: String::new(),
         }
     }
+}
+
+/// B1.1 read-out filter (ROADMAP-BRAIN-CMA). Every field is optional;
+/// `limit == 0` means "no limit". `offset` pages through the filtered set
+/// in record order.
+#[derive(Clone, Debug, Default)]
+pub struct ListFilter {
+    pub tier: Option<u8>,
+    pub role: Option<String>,
+    pub entity: Option<String>,
+    /// Case-insensitive substring match over the record text (the chat
+    /// browser's `/memory <query>`).
+    pub text: Option<String>,
+    pub min_strength: Option<f32>,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 /// A recall result.
@@ -80,6 +116,17 @@ pub struct RecallHit {
     /// belongs to (e.g. "agent:researcher"). Lets JS-side consumers filter
     /// per-agent scopes out of one physical brain (PLAN-AGENTS A3).
     pub entity: Option<String>,
+}
+
+/// B2.2: what a card merge did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportStats {
+    pub added: usize,
+    /// Near-duplicates of existing records — reinforced, not duplicated.
+    pub merged: usize,
+    /// Records the card carried that could not be used (no text, or a
+    /// tombstone).
+    pub skipped: usize,
 }
 
 pub struct Cma {
@@ -116,6 +163,14 @@ struct RecordJson {
     // with them still parse.
     total_recalls: u16,
     positive_recalls: u16,
+    /* B1.2 provenance — optional so every brain written before this
+     * existed still hydrates (0 / "" = unknown). */
+    #[serde(default)]
+    created_at: u32,
+    #[serde(default)]
+    last_recalled_at: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source: String,
 }
 
 fn default_half_life() -> u32 {
@@ -170,6 +225,9 @@ impl Cma {
                 rec.corecall_ids = rj.corecall_ids.clone();
                 rec.total_recalls = rj.total_recalls;
                 rec.positive_recalls = rj.positive_recalls;
+                rec.created_at = rj.created_at;
+                rec.last_recalled_at = rj.last_recalled_at;
+                rec.source = rj.source.clone();
             } else {
                 rec.text = "(corrupt record)".to_string();
             }
@@ -205,6 +263,9 @@ impl Cma {
                 corecall_ids: r.corecall_ids.clone(),
                 total_recalls: r.total_recalls,
                 positive_recalls: r.positive_recalls,
+                created_at: r.created_at,
+                last_recalled_at: r.last_recalled_at,
+                source: r.source.clone(),
             })
             .collect();
         serde_json::json!({ "records": arr })
@@ -237,6 +298,197 @@ impl Cma {
         out
     }
 
+    /// B1.1 read-out: the filtered, paginated record view every surface
+    /// (chat browser, brain server, C ABI) shares. Returns a JSON object
+    /// `{total, offset, limit, records:[…]}` — `total` is the FILTERED
+    /// count before pagination, so a caller can render "N of M".
+    pub fn list_json(&self, filter: &ListFilter) -> String {
+        let filtered: Vec<&Record> = self
+            .records
+            .iter()
+            /* Tombstones are hidden unless explicitly asked for — a
+             * browser listing "forgotten" rows by default is noise, and
+             * they are pruned at the next turn boundary anyway. */
+            .filter(|r| match filter.tier {
+                Some(t) => r.tier == t,
+                None => r.tier != TIER_FORGOTTEN,
+            })
+            .filter(|r| filter.role.as_deref().map_or(true, |role| r.role == role))
+            .filter(|r| {
+                filter
+                    .entity
+                    .as_deref()
+                    .map_or(true, |e| r.entity_name.as_deref() == Some(e))
+            })
+            .filter(|r| {
+                filter.text.as_deref().map_or(true, |needle| {
+                    !needle.is_empty()
+                        && r.text.to_lowercase().contains(&needle.to_lowercase())
+                })
+            })
+            .filter(|r| filter.min_strength.map_or(true, |m| r.strength >= m))
+            .collect();
+        let total = filtered.len();
+        let page: Vec<serde_json::Value> = filtered
+            .into_iter()
+            .skip(filter.offset)
+            .take(if filter.limit == 0 { usize::MAX } else { filter.limit })
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "tier": r.tier,
+                    "strength": r.strength,
+                    "role": r.role,
+                    "text": r.text,
+                    "entity": r.entity_name,
+                    "entity_type": r.entity_type,
+                    "created_at": r.created_at,
+                    "last_recalled_at": r.last_recalled_at,
+                    "source": r.source,
+                    "age_seconds": r.age_seconds,
+                    "total_recalls": r.total_recalls,
+                    "positive_recalls": r.positive_recalls,
+                    "kv_page_id": r.kv_page_id,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "total": total,
+            "offset": filter.offset,
+            "limit": filter.limit,
+            "records": page,
+        })
+        .to_string()
+    }
+
+    /// B2.2: merge a card's records + vectors into this store. The caller
+    /// has ALREADY re-embedded the texts when the card's space differs (the
+    /// embedder lives at the binding layer), so `vecs` here are always in
+    /// THIS store's space. Merge policy: a near-duplicate reinforces the
+    /// existing record (max strength, earliest created_at wins, original
+    /// text/role/source kept); everything else inserts with the card's tier,
+    /// role, entity and provenance. Tombstones are never imported.
+    pub fn import_records(
+        &mut self,
+        vecs: &[f32],
+        n: usize,
+        dim: usize,
+        records_json: &str,
+    ) -> ImportStats {
+        let mut stats = ImportStats::default();
+        if dim != self.vec_dim || vecs.len() < n * dim {
+            return stats;
+        }
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(records_json) else {
+            return stats;
+        };
+        let Some(arr) = root.get("records").and_then(|r| r.as_array()) else {
+            return stats;
+        };
+        for (i, rj) in arr.iter().enumerate().take(n) {
+            let v = &vecs[i * dim..(i + 1) * dim];
+            let Some(text) = rj.get("text").and_then(|t| t.as_str()) else {
+                stats.skipped += 1;
+                continue;
+            };
+            if text.trim().is_empty() {
+                stats.skipped += 1;
+                continue;
+            }
+            let their_tier = rj
+                .get("tier")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(TIER_EPISODIC as u64) as u8;
+            if their_tier == TIER_FORGOTTEN {
+                stats.skipped += 1;
+                continue;
+            }
+            let their_strength = rj
+                .get("strength")
+                .and_then(|s| s.as_f64())
+                .unwrap_or(1.0) as f32;
+            let their_created = rj
+                .get("created_at")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0) as u32;
+
+            /* Dedup: a near-duplicate of an existing live record merges. */
+            let dup = if self.records.is_empty() {
+                None
+            } else {
+                self.index
+                    .search(v, 1)
+                    .first()
+                    .copied()
+                    .filter(|(id, d)| {
+                        *d < DUP_DISTANCE
+                            && self.records[*id as usize].tier != TIER_FORGOTTEN
+                    })
+            };
+            if let Some((dup_id, _)) = dup {
+                let rec = &mut self.records[dup_id as usize];
+                if their_strength > rec.strength {
+                    rec.strength = their_strength;
+                }
+                if their_created > 0 && (rec.created_at == 0 || their_created < rec.created_at) {
+                    rec.created_at = their_created; /* earliest sighting wins */
+                }
+                stats.merged += 1;
+                continue;
+            }
+
+            let id = self.records.len() as u32;
+            let role = rj.get("role").and_then(|r| r.as_str()).unwrap_or("imported");
+            let mut rec = Record::new(id, text, role, 0);
+            rec.tier = their_tier;
+            rec.strength = their_strength.clamp(0.0, 1.0);
+            rec.created_at = their_created;
+            rec.source = rj
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or("import")
+                .to_string();
+            rec.entity_name = rj.get("entity").and_then(|e| e.as_str()).map(str::to_string);
+            rec.entity_type = rj
+                .get("entity_type")
+                .and_then(|e| e.as_str())
+                .map(str::to_string);
+            if rec.tier == TIER_ENTITY {
+                rec.half_life = 86400 * 365;
+            }
+            self.records.push(rec);
+            self.index.add_vector(v);
+            stats.added += 1;
+        }
+        stats
+    }
+
+    /// The row-major flat f32 table for EVERY record (n × vec_dim) — the
+    /// brain-file shape, where the table stays aligned with `records_value`
+    /// (tombstones included: the file is the store, not a view).
+    pub fn flat_vectors(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.records.len() * self.vec_dim);
+        for i in 0..self.records.len() {
+            out.extend_from_slice(self.index.vector(i as u32));
+        }
+        out
+    }
+
+    /// B2: the flat table for the records a VIEW selects, in view order —
+    /// an export card must pair `list_json(filter).records[i]` with
+    /// `vectors[i*dim..]`. Using the unfiltered table here silently
+    /// misaligned every card that had tombstones in the store.
+    pub fn flat_vectors_for(&self, filter: &ListFilter) -> Vec<f32> {
+        let mut out = Vec::new();
+        for r in self.records.iter().filter(|r| match filter.tier {
+            Some(t) => r.tier == t,
+            None => r.tier != TIER_FORGOTTEN,
+        }) {
+            out.extend_from_slice(self.index.vector(r.id));
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -247,6 +499,19 @@ impl Cma {
 
     /// Remember a fact. Near-duplicate detection reinforces instead.
     pub fn remember(&mut self, vec: &[f32], text: &str, role: &str, kv_page_id: u32) -> i32 {
+        self.remember_with_source(vec, text, role, kv_page_id, "")
+    }
+
+    /// B1.2: remember + record where the memory came from. A near-duplicate
+    /// keeps its ORIGINAL source (the first sighting is the provenance).
+    pub fn remember_with_source(
+        &mut self,
+        vec: &[f32],
+        text: &str,
+        role: &str,
+        kv_page_id: u32,
+        source: &str,
+    ) -> i32 {
         debug_assert_eq!(vec.len(), self.vec_dim);
         // Near-duplicate gate: reinforce if a very close memory exists.
         if !self.records.is_empty() {
@@ -263,7 +528,8 @@ impl Cma {
             }
         }
         let id = self.records.len() as u32;
-        let rec = Record::new(id, text, role, kv_page_id);
+        let mut rec = Record::new(id, text, role, kv_page_id);
+        rec.source = source.to_string();
         self.records.push(rec);
         self.index.add_vector(vec);
         id as i32
@@ -321,6 +587,7 @@ impl Cma {
             // Reinforce + track recall.
             let rec = &mut self.records[id as usize];
             rec.strength = (rec.strength * 1.1).min(1.0);
+            rec.last_recalled_at = now_secs();
             if rec.total_recalls < 65535 {
                 rec.total_recalls += 1;
             }
@@ -896,6 +1163,222 @@ mod ffi_format_tests {
         let hits = c2.recall(&v, 3);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "hello world");
+    }
+
+    /* ── B1.1 / B1.2: read-out + provenance ─────────────────────── */
+
+    /// One-hot vector for the 4-dim test space.
+    fn unit(n: usize, dim: usize) -> Vec<f32> {
+        let mut v = vec![0.0; dim];
+        v[n % dim] = 1.0;
+        v
+    }
+
+    #[test]
+    fn provenance_is_recorded_and_round_trips() {
+        let mut cma = Cma::new(4);
+        let v = unit(0, 4);
+        let id = cma.remember_with_source(&v, "deploy bucket is sofuu-dist", "user", 0, "chat");
+        assert!(id >= 0);
+        let rec = &cma.records[id as usize];
+        assert_eq!(rec.source, "chat");
+        assert!(rec.created_at > 0, "created_at must be stamped at write time");
+        assert_eq!(rec.last_recalled_at, 0, "never recalled yet");
+
+        /* recall stamps last_recalled_at */
+        let hits = cma.recall(&v, 1);
+        assert_eq!(hits.len(), 1);
+        assert!(cma.records[id as usize].last_recalled_at > 0);
+
+        /* round trip through the file shape */
+        let json = cma.records_json();
+        let mut c2 = Cma::new(4);
+        assert!(c2.hydrate(&v, 1, 4, &json));
+        assert_eq!(c2.records[0].source, "chat");
+        assert_eq!(c2.records[0].created_at, cma.records[0].created_at);
+        assert_eq!(
+            c2.records[0].last_recalled_at,
+            cma.records[0].last_recalled_at
+        );
+    }
+
+    #[test]
+    fn legacy_records_hydrate_without_provenance() {
+        /* A brain written before B1.2: no created_at / source keys. */
+        let meta = r#"{"records":[{"vector_index":0,"kv_page_id":0,"strength":1.0,
+            "age_seconds":0,"half_life":86400,"tier":1,"text":"old fact",
+            "role":"user","total_recalls":0,"positive_recalls":0}]}"#;
+        let mut cma = Cma::new(4);
+        assert!(cma.hydrate(&unit(0, 4), 1, 4, meta));
+        assert_eq!(cma.records[0].text, "old fact");
+        assert_eq!(cma.records[0].created_at, 0, "unknown for legacy records");
+        assert_eq!(cma.records[0].source, "");
+    }
+
+    #[test]
+    fn list_json_filters_and_paginates() {
+        /* 16 dims so six one-hot vectors stay distinct — a 4-dim space
+         * would collide and the duplicate gate would reinforce instead. */
+        let mut cma = Cma::new(16);
+        for i in 0..6 {
+            let v = unit(i, 16);
+            cma.remember(&v, &format!("episode {i}"), "user", 0);
+        }
+        cma.remember_entity(&unit(7, 16), "Barnaby is a dog", "Barnaby", "pet");
+
+        /* no filter: everything, with the filtered total */
+        let all: serde_json::Value =
+            serde_json::from_str(&cma.list_json(&ListFilter::default())).unwrap();
+        assert_eq!(all["total"], 7);
+        assert_eq!(all["records"].as_array().unwrap().len(), 7);
+
+        /* tier filter */
+        let entities: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            tier: Some(TIER_ENTITY),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(entities["total"], 1);
+        assert_eq!(entities["records"][0]["entity"], "Barnaby");
+
+        /* role filter */
+        let users: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            role: Some("user".to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(users["total"], 6);
+
+        /* pagination: total stays the FILTERED count */
+        let page: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            offset: 2,
+            limit: 3,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(page["total"], 7);
+        assert_eq!(page["records"].as_array().unwrap().len(), 3);
+        assert_eq!(page["records"][0]["text"], "episode 2");
+
+        /* text filter (case-insensitive substring) */
+        let hits: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            text: Some("EPISODE 3".to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(hits["total"], 1);
+        assert_eq!(hits["records"][0]["text"], "episode 3");
+
+        /* forgotten tombstones are hidden by default, visible on request */
+        let victim = all["records"][0]["id"].as_u64().unwrap() as u32;
+        assert!(cma.forget(victim));
+        let after: serde_json::Value =
+            serde_json::from_str(&cma.list_json(&ListFilter::default())).unwrap();
+        assert_eq!(after["total"], 6, "the tombstone must leave the default view");
+        let tombstones: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            tier: Some(TIER_FORGOTTEN),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(tombstones["total"], 1, "requesting the tier shows it");
+
+        /* min_strength filter */
+        cma.decay_tick(86400 * 3);
+        let strong: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            min_strength: Some(0.5),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(strong["total"].as_u64().unwrap() < 7, "decay must thin the list");
+    }
+
+    #[test]
+    fn export_view_pairs_records_with_vectors() {
+        let mut cma = Cma::new(16);
+        for i in 0..4 {
+            cma.remember(&unit(i, 16), &format!("m{i}"), "user", 0);
+        }
+        assert!(cma.forget(1));
+        let filter = ListFilter::default();
+        let view: serde_json::Value = serde_json::from_str(&cma.list_json(&filter)).unwrap();
+        let n = view["records"].as_array().unwrap().len();
+        let flat = cma.flat_vectors_for(&filter);
+        assert_eq!(n, 3, "tombstone hidden from the view");
+        assert_eq!(
+            flat.len(),
+            n * 16,
+            "vectors must pair 1:1 with the view's records"
+        );
+        /* The unfiltered table stays aligned with the FILE (4 records). */
+        assert_eq!(cma.flat_vectors().len(), 4 * 16);
+    }
+
+    #[test]
+    fn import_merges_duplicates_and_keeps_provenance() {
+        let mut dst = Cma::new(16);
+        dst.remember(&unit(0, 16), "existing fact", "user", 0);
+
+        /* A card: one duplicate of the existing fact (stronger, older) and
+         * one new record with provenance. */
+        let card = serde_json::json!({
+            "records": [
+                {"text": "existing fact", "tier": 1, "strength": 0.9,
+                 "created_at": 1000, "role": "user", "source": "card"},
+                {"text": "imported fact", "tier": 2, "strength": 0.5,
+                 "created_at": 2000, "role": "system", "source": "card"}
+            ]
+        })
+        .to_string();
+        let mut vecs = unit(0, 16);
+        vecs.extend_from_slice(&unit(5, 16));
+        let stats = dst.import_records(&vecs, 2, 16, &card);
+        assert_eq!(stats.added, 1, "one new record");
+        assert_eq!(stats.merged, 1, "the duplicate merged");
+        assert_eq!(dst.len(), 2);
+
+        /* The merged record kept its identity but took the earlier date. */
+        let merged = &dst.records[0];
+        assert_eq!(merged.text, "existing fact");
+        assert_eq!(merged.created_at, 1000, "earliest sighting wins");
+        assert_eq!(merged.source, "", "original provenance kept");
+
+        /* The new record carried the card's tier + provenance. */
+        let imported = &dst.records[1];
+        assert_eq!(imported.tier, TIER_SEMANTIC);
+        assert_eq!(imported.source, "card");
+        assert_eq!(imported.created_at, 2000);
+        assert!((imported.strength - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn import_skips_tombstones_and_dim_mismatch() {
+        let mut cma = Cma::new(16);
+        let card = serde_json::json!({
+            "records": [
+                {"text": "dead", "tier": 3},
+                {"text": "live", "tier": 1}
+            ]
+        })
+        .to_string();
+        let vecs = [unit(1, 16), unit(2, 16)].concat();
+        let stats = cma.import_records(&vecs, 2, 16, &card);
+        assert_eq!(stats.skipped, 1, "tombstones never import");
+        assert_eq!(stats.added, 1);
+
+        /* A card in another space is refused wholesale, not half-merged. */
+        let before = cma.len();
+        let bad = cma.import_records(&vecs, 2, 8, &card);
+        assert_eq!(bad, ImportStats::default());
+        assert_eq!(cma.len(), before);
+    }
+
+    #[test]
+    fn flat_vectors_matches_records() {
+        let mut cma = Cma::new(4);
+        cma.remember(&[1.0, 0.0, 0.0, 0.0], "a", "user", 0);
+        cma.remember(&[0.0, 1.0, 0.0, 0.0], "b", "user", 0);
+        let flat = cma.flat_vectors();
+        assert_eq!(flat, vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]

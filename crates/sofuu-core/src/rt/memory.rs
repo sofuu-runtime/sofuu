@@ -61,6 +61,14 @@ mod impl_qtsq {
     /// at-rest obfuscation, so a fixed password avoids all prompts).
     const SOFUU_QTSQ_LOCAL_PASSWORD: &str = "sofuu-kv-local-v1";
 
+    /// B0 (AUDIT-2026-10-13): the codec's tensor-compression level.
+    /// 0 = full contest — the best ratio and the behaviour every brain/KV
+    /// file was written with before the parameter existed (the codec's
+    /// 2.1.0 API added it; the FFI used to omit it, leaving the callee to
+    /// read an undefined register). Levels 1 (fast) and 2 (store) are
+    /// available for future tuning; nothing uses them yet.
+    const QTSQ_LEVEL_FULL: std::os::raw::c_int = 0;
+
     unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
         if p.is_null() {
             None
@@ -137,7 +145,7 @@ mod impl_qtsq {
                     }
                     unsafe { (*sub).set_codec(qtsq::QTSQ_CODEC_QTC) };
                     let dims: [u32; 2] = [n_memories as u32, vec_dim as u32];
-                    r = qtsq::qtsq_compress_tensor(sub, vecs.as_ptr(), n_memories * vec_dim, dims.as_ptr(), 2);
+                    r = qtsq::qtsq_compress_tensor(sub, vecs.as_ptr(), n_memories * vec_dim, dims.as_ptr(), 2, QTSQ_LEVEL_FULL);
                     if r == QTSQ_OK {
                         r = qtsq::qtsq_container_add_stream(container, sub, c"memories".as_ptr());
                     }
@@ -404,7 +412,7 @@ mod impl_qtsq {
         unsafe { (*ctx_k).set_codec(qtsq::QTSQ_CODEC_QTC) };
         let name_k = format!("kv_{:08}_K", page_id);
         let cname_k = CString::new(name_k).unwrap_or_default();
-        let mut r = qtsq::qtsq_compress_tensor_quantized(ctx_k, k, count, dims.as_ptr(), 4, k_precision);
+        let mut r = qtsq::qtsq_compress_tensor_quantized(ctx_k, k, count, dims.as_ptr(), 4, k_precision, QTSQ_LEVEL_FULL);
         if r == QTSQ_OK {
             r = qtsq::qtsq_container_add_stream(container, ctx_k, cname_k.as_ptr());
         }
@@ -423,7 +431,7 @@ mod impl_qtsq {
         unsafe { (*ctx_v).set_codec(qtsq::QTSQ_CODEC_QTC) };
         let name_v = format!("kv_{:08}_V", page_id);
         let cname_v = CString::new(name_v).unwrap_or_default();
-        r = qtsq::qtsq_compress_tensor_quantized(ctx_v, v, count, dims.as_ptr(), 4, v_precision);
+        r = qtsq::qtsq_compress_tensor_quantized(ctx_v, v, count, dims.as_ptr(), 4, v_precision, QTSQ_LEVEL_FULL);
         if r == QTSQ_OK {
             r = qtsq::qtsq_container_add_stream(container, ctx_v, cname_v.as_ptr());
         }
@@ -1064,11 +1072,14 @@ mod impl_qtsq {
         text: Option<&str>,
         role: Option<&str>,
         kv_page_id: u32,
+        source: Option<&str>,
     ) -> c_int {
         let Some(text) = text else {
             return -1;
         };
-        shell.cma.remember(vec, text, role.unwrap_or("unknown"), kv_page_id)
+        shell
+            .cma
+            .remember_with_source(vec, text, role.unwrap_or("unknown"), kv_page_id, source.unwrap_or(""))
     }
 
     /// recall → JSON array string (same shape ffi_exports.rs documents:
@@ -1169,6 +1180,56 @@ mod impl_qtsq {
         obj
     }
 
+    /// B1.5: read a brain file's manifest — `{ok, id, input, dimension,
+    /// artifact, records}` — WITHOUT opening it. A host picks its embedder
+    /// from this before `open`; the brain server used to hardcode dim 768
+    /// and could therefore only ever serve hash brains.
+    unsafe extern "C" fn js_memory_inspect(
+        ctx: *mut JSContext,
+        _this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected path".as_ptr());
+        }
+        let path = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let path_s = cstr_opt(path);
+        if !path.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, path);
+        }
+        let Some(path_s) = path_s else {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected path string".as_ptr());
+        };
+        let out = match cma_qtsq_load(&path_s) {
+            Ok(brain) => {
+                let manifest = brain.meta.as_deref().and_then(embedding_manifest);
+                let (id, input, dimension, artifact) = match manifest {
+                    Some(m) => (m.id, m.input, m.dimension, m.artifact),
+                    None => (
+                        inferred_legacy_embedding_id(brain.dim)
+                            .unwrap_or("")
+                            .to_string(),
+                        String::new(),
+                        brain.dim,
+                        String::new(),
+                    ),
+                };
+                serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "input": input,
+                    "dimension": dimension,
+                    "artifact": artifact,
+                    "records": brain.n,
+                })
+            }
+            Err(rc) => serde_json::json!({"ok": false, "error": rc}),
+        };
+        let c = CString::new(out.to_string()).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
     /// Mirrors the C's JS_GetOpaque2 + null check → JS_EXCEPTION.
     unsafe fn shell_from_this<'a>(
         ctx: *mut JSContext,
@@ -1211,6 +1272,13 @@ mod impl_qtsq {
         let role = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
         let mut page_id: u32 = 0;
         qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        /* B1.2 provenance: optional 5th arg = where this memory came from
+         * ("chat", "agent:researcher", "pin", …). Absent → unknown. */
+        let source = if argc >= 5 && qjs::sofuu_js_is_string(*argv.add(4)) != 0 {
+            qjs::sofuu_js_to_cstring(ctx, *argv.add(4))
+        } else {
+            std::ptr::null_mut()
+        };
 
         let idx = cma_remember(
             cma,
@@ -1218,6 +1286,7 @@ mod impl_qtsq {
             cstr_opt(text).as_deref(),
             cstr_opt(role).as_deref(),
             page_id,
+            cstr_opt(source).as_deref(),
         );
 
         if !text.is_null() {
@@ -1225,6 +1294,9 @@ mod impl_qtsq {
         }
         if !role.is_null() {
             qjs::sofuu_js_free_cstring(ctx, role);
+        }
+        if !source.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, source);
         }
         qjs::sofuu_js_new_int32(ctx, idx)
     }
@@ -1436,6 +1508,194 @@ mod impl_qtsq {
         qjs::sofuu_js_new_uint32(ctx, dropped as u32)
     }
 
+    /// B1.1 read-out: `cma.list({tier?, role?, entity?, minStrength?,
+    /// offset?, limit?})` → JSON `{total, offset, limit, records:[…]}`.
+    /// The same shape every surface (chat browser, brain server, C ABI)
+    /// renders — one contract, four callers.
+    unsafe extern "C" fn js_cma_list(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let mut filter = crate::memory::cma::ListFilter::default();
+        if argc >= 1 && qjs::is_object(*argv) {
+            let opts = *argv;
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"tier".as_ptr());
+            if qjs::sofuu_js_is_number(v) != 0 {
+                let mut t: u32 = 0;
+                qjs::sofuu_js_to_uint32(ctx, &mut t, v);
+                filter.tier = Some(t.min(u8::MAX as u32) as u8);
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"role".as_ptr());
+            if qjs::sofuu_js_is_string(v) != 0 {
+                let s = qjs::sofuu_js_to_cstring(ctx, v);
+                filter.role = cstr_opt(s);
+                if !s.is_null() {
+                    qjs::sofuu_js_free_cstring(ctx, s);
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"entity".as_ptr());
+            if qjs::sofuu_js_is_string(v) != 0 {
+                let s = qjs::sofuu_js_to_cstring(ctx, v);
+                filter.entity = cstr_opt(s);
+                if !s.is_null() {
+                    qjs::sofuu_js_free_cstring(ctx, s);
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"text".as_ptr());
+            if qjs::sofuu_js_is_string(v) != 0 {
+                let s = qjs::sofuu_js_to_cstring(ctx, v);
+                filter.text = cstr_opt(s);
+                if !s.is_null() {
+                    qjs::sofuu_js_free_cstring(ctx, s);
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"minStrength".as_ptr());
+            if qjs::sofuu_js_is_number(v) != 0 {
+                let mut m: f64 = 0.0;
+                qjs::JS_ToFloat64(ctx, &mut m, v);
+                filter.min_strength = Some(m as f32);
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"offset".as_ptr());
+            if qjs::sofuu_js_is_number(v) != 0 {
+                let mut o: u32 = 0;
+                qjs::sofuu_js_to_uint32(ctx, &mut o, v);
+                filter.offset = o as usize;
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+
+            let v = qjs::sofuu_js_get_property_str(ctx, opts, c"limit".as_ptr());
+            if qjs::sofuu_js_is_number(v) != 0 {
+                let mut l: u32 = 0;
+                qjs::sofuu_js_to_uint32(ctx, &mut l, v);
+                /* Clamp: an unbounded page would serialize the whole brain
+                 * into one JSON string (an accidental 100 MB reply). */
+                filter.limit = (l as usize).min(10_000);
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+        }
+        let json = cma.cma.list_json(&filter);
+        let c = CString::new(json).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
+    /// B2.2: `cma.importRecords(vecsFloat32, recordsJson)` → JSON
+    /// `{added, merged, skipped}`. `vecs` must already be in THIS store's
+    /// space (the caller re-embeds when a card came from another space).
+    unsafe extern "C" fn js_cma_import(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vecs(Float32Array) and recordsJson".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let (vecs, vlen) = cma_vec_arg(ctx, *argv);
+        if vecs.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        let json = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        let json_s = cstr_opt(json);
+        if !json.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, json);
+        }
+        let Some(json_s) = json_s else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 2 must be a JSON string".as_ptr());
+        };
+        let dim = cma.vec_dim;
+        let n = vlen / dim.max(1);
+        let stats = cma.cma.import_records(
+            std::slice::from_raw_parts(vecs, vlen),
+            n,
+            dim,
+            &json_s,
+        );
+        let out = serde_json::json!({
+            "added": stats.added,
+            "merged": stats.merged,
+            "skipped": stats.skipped,
+        });
+        let c = CString::new(out.to_string()).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
+    /// B1.1 export: the full record view plus the flat vector table and the
+    /// embedding manifest — the portable payload B2's brain cards build on.
+    /// `{schema, exported_at, embedding:{id,dimension,artifact}, total,
+    /// records:[…], vectors:[…]}`.
+    unsafe extern "C" fn js_cma_export(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let filter = crate::memory::cma::ListFilter::default();
+        let records: serde_json::Value =
+            serde_json::from_str(&cma.cma.list_json(&filter))
+                .unwrap_or_else(|_| serde_json::json!({"records":[]}));
+        /* The SAME view's vectors — records[i] pairs with vectors[i*dim..]
+         * (the unfiltered table would misalign any store with tombstones). */
+        let vectors = cma.cma.flat_vectors_for(&filter);
+        let (input, artifact) = if cma.embedding_id == crate::embedding::MODEL_ID {
+            (
+                crate::embedding::INPUT_EMBEDDER_ID,
+                crate::embedding::model_artifact_id(),
+            )
+        } else if cma.embedding_id == crate::embedding::semantic_v2::MODEL_ID_V2 {
+            (
+                crate::embedding::semantic_v2::INPUT_EMBEDDER_ID_V2,
+                crate::embedding::semantic_v2::model_artifact_id_v2(),
+            )
+        } else {
+            ("", String::new())
+        };
+        let out = serde_json::json!({
+            "schema": "sofuu-brain-card@2",
+            "exported_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "embedding": {
+                "id": cma.embedding_id,
+                "input": input,
+                "dimension": cma.vec_dim,
+                "artifact": artifact,
+            },
+            /* The view's count — the card must describe what it carries,
+             * not the store's raw record count (tombstones excluded). */
+            "total": vectors.len() / cma.vec_dim.max(1),
+            "records": records.get("records").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "vectors": vectors,
+        });
+        let c = CString::new(out.to_string()).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
     unsafe extern "C" fn js_cma_forget(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -1596,8 +1856,11 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 11] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 14] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
+            cfunc_entry(c"list", 1, js_cma_list),
+            cfunc_entry(c"export", 0, js_cma_export),
+            cfunc_entry(c"importRecords", 2, js_cma_import),
             cfunc_entry(c"rememberEntity", 4, js_cma_remember_entity),
             cfunc_entry(c"recall", 2, js_cma_recall),
             cfunc_entry(c"kvHints", 2, js_cma_kv_hints),
@@ -1609,10 +1872,11 @@ mod impl_qtsq {
             cfunc_entry(c"count", 0, js_cma_count),
             cfunc_entry(c"markPositive", 1, js_cma_mark_positive),
         ];
-        static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 3] = [
+        static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 4] = [
             cfunc_entry(c"open", 2, js_cma_open),
             cfunc_entry(c"migrate", 1, js_memory_migrate),
             cfunc_entry(c"embeddingInfo", 0, js_memory_embedding_info),
+            cfunc_entry(c"inspect", 1, js_memory_inspect),
         ];
     }
 
@@ -2772,7 +3036,7 @@ mod impl_qtsq {
         .expect("fresh semantic shell on a nonexistent file");
         for text in texts {
             let v = crate::embedding::semantic_v1(text).expect("baked model");
-            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7) };
+            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7, None) };
             assert!(r >= 0);
         }
         assert_eq!(unsafe { cma_flush_to(&mut shell, p) }, 0);
@@ -2864,7 +3128,7 @@ mod impl_qtsq {
         assert_eq!(shell.embedding_id, v2::MODEL_ID_V2);
         for text in &texts {
             let v = v2::semantic_v2(text).expect("baked SEM2 model");
-            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7) };
+            let r = unsafe { cma_remember(&mut shell, &v, Some(text), Some("memory"), 7, None) };
             assert!(r >= 0);
         }
         assert_eq!(unsafe { cma_flush_to(&mut shell, &p) }, 0);
@@ -3093,7 +3357,7 @@ mod impl_qtsq {
         /* And it round-trips like any other store. */
         let v = crate::embedding::hash_v1_features("first real memory");
         assert!(unsafe {
-            cma_remember(&mut shell, &v, Some("first real memory"), Some("memory"), 1)
+            cma_remember(&mut shell, &v, Some("first real memory"), Some("memory"), 1, None)
         } >= 0);
         assert_eq!(unsafe { cma_flush_to(&mut shell, p) }, 0);
         let reloaded = unsafe { cma_qtsq_load(p) }.unwrap();
@@ -3223,7 +3487,7 @@ mod impl_qtsq {
         }
         .expect("fresh brain");
         let v = crate::embedding::hash_v1_features("the deploy checklist lives here");
-        assert!(unsafe { cma_remember(&mut shell, &v, Some("deploy"), Some("memory"), 5) } >= 0);
+        assert!(unsafe { cma_remember(&mut shell, &v, Some("deploy"), Some("memory"), 5, None) } >= 0);
         assert_eq!(unsafe { cma_flush_to(&mut shell, &p) }, 0);
 
         let entries = dir_entries(&dir);
@@ -3249,7 +3513,7 @@ mod impl_qtsq {
         /* Old committed state: one record. */
         let mut old = unsafe { cma_open(&p, crate::embedding::HASH_DIM, None) }.expect("old brain");
         let v1 = crate::embedding::hash_v1_features("first record");
-        assert!(unsafe { cma_remember(&mut old, &v1, Some("one"), Some("memory"), 5) } >= 0);
+        assert!(unsafe { cma_remember(&mut old, &v1, Some("one"), Some("memory"), 5, None) } >= 0);
         assert_eq!(unsafe { cma_flush_to(&mut old, &p) }, 0);
 
         /* Newer state staged to a sibling and never renamed (the crash). */
@@ -3258,7 +3522,7 @@ mod impl_qtsq {
         let mut newer = unsafe { cma_open(&staged, crate::embedding::HASH_DIM, None) }.expect("staged brain");
         for text in ["first record", "second record"] {
             let v = crate::embedding::hash_v1_features(text);
-            assert!(unsafe { cma_remember(&mut newer, &v, Some(text), Some("memory"), 5) } >= 0);
+            assert!(unsafe { cma_remember(&mut newer, &v, Some(text), Some("memory"), 5, None) } >= 0);
         }
         assert_eq!(unsafe { cma_flush_to(&mut newer, &staged) }, 0);
 
@@ -3333,6 +3597,213 @@ mod impl_qtsq {
                 b"orphan",
                 "adoption must not rewrite the orphan file"
             );
+        }
+    }
+
+    /* ── B0.3 / B0.4 (ROADMAP-BRAIN-CMA): codec stress + FFI surface ── */
+
+    /// B0.3 — codec-regression guard. The unit tests never pushed more than
+    /// a handful of records through the real codec, so the 2026-10-13 codec
+    /// heap corruption (SIGABRT inside qtc_compress at ~17 records) went
+    /// unnoticed until a live flush. This drives 120 records through the
+    /// real save path, reloads, and verifies count + recall — a codec that
+    /// corrupts memory aborts the test process instead of shipping.
+    #[test]
+    fn codec_stress_flush_reload_120_records() {
+        let dir = fresh_test_dir("b0-codec-stress");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+
+        let mut shell = unsafe { cma_open(&p, crate::embedding::HASH_DIM, None) }
+            .expect("fresh brain");
+        let texts: Vec<String> = (0..120)
+            .map(|i| format!("stress record {i} about subsystem {}", i % 17))
+            .collect();
+        for t in &texts {
+            let v = crate::embedding::hash_v1_features(t);
+            assert!(
+                unsafe { cma_remember(&mut shell, &v, Some(t), Some("memory"), 0, None) } >= 0
+            );
+        }
+        assert_eq!(
+            unsafe { cma_flush_to(&mut shell, &p) },
+            0,
+            "flush must survive the real codec"
+        );
+
+        let mut reloaded = unsafe { cma_open(&p, crate::embedding::HASH_DIM, None) }
+            .expect("reload after stress flush");
+        assert_eq!(reloaded.cma.len(), 120, "every record must survive the round trip");
+
+        let probe = &texts[73];
+        let q = crate::embedding::hash_v1_features(probe);
+        let hits = reloaded.cma.recall(&q, 5);
+        assert!(
+            hits.iter().any(|h| h.text == *probe),
+            "recall must find the record after a codec round trip"
+        );
+    }
+
+    /// B0.4 — FFI surface smoke. Every `qtsq_*` function the memory
+    /// subsystem binds is exercised once against a real container, so a
+    /// future signature drift (the class B0.1 fixed: the codec added a
+    /// trailing `level`, the Rust declaration did not) fails loudly here
+    /// instead of corrupting memory in production. The struct-layout guard
+    /// in sofuu-ffi/build.rs cannot see function signatures; this can.
+    #[test]
+    fn ffi_surface_smoke_every_bound_function() {
+        let dir = fresh_test_dir("b0-ffi-smoke");
+        let path = dir.join("surface.qtsq");
+        let path_s = path.to_str().unwrap().to_string();
+
+        unsafe {
+            // qtsq_sha256 — known vector.
+            let mut digest = [0u8; 32];
+            qtsq::qtsq_sha256(b"abc".as_ptr(), 3, digest.as_mut_ptr());
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                hex,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+
+            // qtsq_init + qtsq_container_create + codec.
+            let container = qtsq::qtsq_ctx_alloc();
+            assert!(!container.is_null());
+            assert_eq!(qtsq::qtsq_init(container), QTSQ_OK);
+            assert_eq!(qtsq::qtsq_container_create(container), QTSQ_OK);
+            (*container).set_codec(qtsq::QTSQ_CODEC_QTC);
+
+            // qtsq_compress_tensor + qtsq_container_add_stream.
+            let vals: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let dims: [u32; 2] = [2, 4];
+            let sub = qtsq::qtsq_ctx_alloc();
+            assert_eq!(qtsq::qtsq_init(sub), QTSQ_OK);
+            (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            assert_eq!(
+                qtsq::qtsq_compress_tensor(sub, vals.as_ptr(), 8, dims.as_ptr(), 2, QTSQ_LEVEL_FULL),
+                QTSQ_OK
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, sub, c"memories".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(sub);
+            qtsq::qtsq_ctx_free(sub);
+
+            // qtsq_compress_tensor_quantized — F16 precision path.
+            let qsub = qtsq::qtsq_ctx_alloc();
+            assert_eq!(qtsq::qtsq_init(qsub), QTSQ_OK);
+            (*qsub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            let qdims: [u32; 2] = [2, 4];
+            assert_eq!(
+                qtsq::qtsq_compress_tensor_quantized(
+                    qsub,
+                    vals.as_ptr(),
+                    8,
+                    qdims.as_ptr(),
+                    2,
+                    qtsq::QTSQ_TENSOR_F16,
+                    QTSQ_LEVEL_FULL,
+                ),
+                QTSQ_OK
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, qsub, c"kv_00000001_K".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(qsub);
+            qtsq::qtsq_ctx_free(qsub);
+
+            // qtsq_compress_json + qtsq_container_add_stream.
+            let meta = br#"{"records":[],"schema":"sofuu-cma@2"}"#;
+            let jsub = qtsq::qtsq_ctx_alloc();
+            assert_eq!(qtsq::qtsq_init(jsub), QTSQ_OK);
+            (*jsub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            assert_eq!(
+                qtsq::qtsq_compress_json(jsub, meta.as_ptr() as *const c_char, meta.len()),
+                QTSQ_OK
+            );
+            assert_eq!(
+                qtsq::qtsq_container_add_stream(container, jsub, c"metadata".as_ptr()),
+                QTSQ_OK
+            );
+            qtsq::qtsq_free(jsub);
+            qtsq::qtsq_ctx_free(jsub);
+
+            // qtsq_container_pack + qtsq_vault_encrypt_password + qtsq_write.
+            assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
+            let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap();
+            assert_eq!(
+                qtsq::qtsq_vault_encrypt_password(container, pw.as_ptr()),
+                QTSQ_OK
+            );
+            let cpath = CString::new(path_s.clone()).unwrap();
+            assert_eq!(qtsq::qtsq_write(container, cpath.as_ptr()), QTSQ_OK);
+            qtsq::qtsq_free(container);
+            qtsq::qtsq_ctx_free(container);
+
+            // qtsq_read + qtsq_vault_is_encrypted + qtsq_vault_decrypt_password.
+            let reader = qtsq::qtsq_ctx_alloc();
+            assert_eq!(qtsq::qtsq_init(reader), QTSQ_OK);
+            assert_eq!(qtsq::qtsq_read(reader, cpath.as_ptr()), QTSQ_OK);
+            assert_ne!(qtsq::qtsq_vault_is_encrypted(reader), 0, "file must be encrypted");
+            assert_eq!(
+                qtsq::qtsq_vault_decrypt_password(reader, pw.as_ptr()),
+                QTSQ_OK
+            );
+
+            // qtsq_container_get_count + qtsq_container_get_stream, then
+            // qtsq_decompress_tensor and qtsq_decompress_horizon on the
+            // extracted streams.
+            let mut n_streams: std::os::raw::c_uint = 0;
+            assert_eq!(qtsq::qtsq_container_get_count(reader, &mut n_streams), QTSQ_OK);
+            assert_eq!(n_streams, 3, "memories + kv K + metadata");
+
+            let mut seen_tensor = false;
+            let mut seen_json = false;
+            for i in 0..n_streams {
+                let sub = qtsq::qtsq_ctx_alloc();
+                assert_eq!(qtsq::qtsq_init(sub), QTSQ_OK);
+                let mut name_buf = [0u8; 256];
+                let rc = qtsq::qtsq_container_get_stream(
+                    reader,
+                    i,
+                    sub,
+                    name_buf.as_mut_ptr() as *mut c_char,
+                    name_buf.len(),
+                );
+                assert_eq!(rc, QTSQ_OK);
+                let name = CStr::from_ptr(name_buf.as_ptr() as *const c_char).to_bytes();
+                if name == b"memories" {
+                    let mut data: *mut f32 = ptr::null_mut();
+                    let mut count: usize = 0;
+                    assert_eq!(
+                        qtsq::qtsq_decompress_tensor(sub, &mut data, &mut count),
+                        QTSQ_OK
+                    );
+                    let got = std::slice::from_raw_parts(data, count).to_vec();
+                    libc::free(data as *mut c_void);
+                    assert_eq!(got, vals.to_vec(), "f32 tensor must round-trip exactly");
+                    seen_tensor = true;
+                } else if name == b"metadata" {
+                    let mut data: *mut u8 = ptr::null_mut();
+                    let mut size: usize = 0;
+                    assert_eq!(
+                        qtsq::qtsq_decompress_horizon(sub, &mut data, &mut size),
+                        QTSQ_OK
+                    );
+                    let got = std::slice::from_raw_parts(data, size).to_vec();
+                    libc::free(data as *mut c_void);
+                    let text = String::from_utf8_lossy(&got);
+                    assert!(text.contains("sofuu-cma@2"), "json must round-trip: {text}");
+                    seen_json = true;
+                }
+                qtsq::qtsq_free(sub);
+                qtsq::qtsq_ctx_free(sub);
+            }
+            assert!(seen_tensor && seen_json, "both streams must be readable");
+            qtsq::qtsq_free(reader);
+            qtsq::qtsq_ctx_free(reader);
         }
     }
 
@@ -3440,7 +3911,7 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
             let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
             let dims: [u32; 2] = [1000, 1000];
             assert_eq!(
-                qtsq::qtsq_compress_tensor(sub, data.as_ptr(), 6, dims.as_ptr(), 2),
+                qtsq::qtsq_compress_tensor(sub, data.as_ptr(), 6, dims.as_ptr(), 2, QTSQ_LEVEL_FULL),
                 QTSQ_OK,
                 "the C compressor accepts the hostile header (no product check)"
             );
@@ -3495,7 +3966,7 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
             let k: [f32; 8] = [0.5; 8];
             let kdims: [u32; 4] = [999_999, 1, 999_999, 1];
             assert_eq!(
-                qtsq::qtsq_compress_tensor(ksub, k.as_ptr(), 8, kdims.as_ptr(), 4),
+                qtsq::qtsq_compress_tensor(ksub, k.as_ptr(), 8, kdims.as_ptr(), 4, QTSQ_LEVEL_FULL),
                 QTSQ_OK
             );
             assert_eq!(
@@ -3512,7 +3983,7 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
             let v: [f32; 8] = [1.0; 8];
             let vdims: [u32; 4] = [1, 1, 1, 8];
             assert_eq!(
-                qtsq::qtsq_compress_tensor(vsub, v.as_ptr(), 8, vdims.as_ptr(), 4),
+                qtsq::qtsq_compress_tensor(vsub, v.as_ptr(), 8, vdims.as_ptr(), 4, QTSQ_LEVEL_FULL),
                 QTSQ_OK
             );
             assert_eq!(
@@ -3559,7 +4030,7 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
                 (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
                 let dims: [u32; 4] = [1, 1, 2, 4];
                 assert_eq!(
-                    qtsq::qtsq_compress_tensor(sub, vals.as_ptr(), 8, dims.as_ptr(), 4),
+                    qtsq::qtsq_compress_tensor(sub, vals.as_ptr(), 8, dims.as_ptr(), 4, QTSQ_LEVEL_FULL),
                     QTSQ_OK
                 );
                 let name = CString::new(format!("kv_00000003{suffix}")).unwrap();

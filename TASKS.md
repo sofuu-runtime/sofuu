@@ -4,6 +4,110 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-13 — Distributed Edge Swarms (`sofuu swarm`), Virtual Block Paging & Continuous Batching complete.**
+> Shipped Stage 9-11 in the Sofuu neural inference engine.
+> - **Distributed Edge Swarms (`swarm.rs`)**: High-performance framed binary wire protocol (`SwarmProto`, `SFSW`) with CRC32 integrity verification. Sequential layer-wise pipelining across LAN edge nodes (`SwarmLeader` embedding + coordinator + sampler, `SwarmWorker` partitioned layers e.g. `--layers 16..32` or `--node 2/2`). Zero-config UDP discovery on port 9770 (`sofuu swarm discover`).
+> - **Virtual Block Paging & Paged KV Table (`paged_kv.rs`)**: 16-token page tables with block allocator and prefix sharing.
+> - **Continuous Batching Server (`continuous.rs`)**: In-process scheduler interleaving prefill and decode phases with OpenAI-compatible SSE `/v1/chat/completions`.
+> - **Architectural Completeness (`gptx3.rs`)**: DeepSeek V2/V3 MoE routed experts, LLaMA 3 / Mistral / Qwen 2.5 RoPE + SwiGLU, Whisper V3, and CLIP ViT vision backbones.
+> - **Strict Standalone Size Gate**: Stripped release binary strictly **4.8 MB** ($\le 5.0\text{ MB}$ budget). Workspace test suite passing: **552 passed, 0 failed**.
+>
+> **2026-10-13 — B2 complete: real brain cards.**
+> `ROADMAP-BRAIN-CMA.md` B2 shipped — the README's "portable brain cards" promise is now true.
+> **B2.1** `/share` writes `sofuu-brain-card@2` (records + vectors + manifest + label) through the new
+> `cma.export()`. **B2.2** `/import` merges via `Cma::import_records` + `cma.importRecords(vecs, json)`:
+> same-space cards reuse their vectors, cross-space cards re-embed every text into the local space,
+> near-duplicates reinforce (max strength, earliest `created_at`, original text/role/source kept),
+> tombstones never import, and re-importing the same card is idempotent. Found and fixed on the way:
+> `sofuu.fs.readFile/writeFile` are promise-based and the pre-B2 `/import` never awaited them — it
+> always took the "not a text file" branch and merged nothing, which is why the stub never worked.
+> **B2.3** the brain server's `POST /share` returns the real card (with `GET /memories` + `POST /forget`
+> from B1). **B2.4** `docs/BRAIN-CARD.md` documents the format, the records↔vectors pairing rule,
+> spaces, import semantics and versioning (v1 refused by name). Evidence: live round-trip
+> (export → import added 2 → import again merged 2 → reload keeps provenance), the chat e2e now drives
+> `/share` in one project and `/import` + `/memory` in a second (**9/9** on a real pty), and the full
+> suite is **500/0** in both QTSQ-enabled and QTSQ-free builds.
+>
+> **2026-10-13 — B1 complete: brain read-out, provenance & forget.**
+> `ROADMAP-BRAIN-CMA.md` B1 shipped — the brain is inspectable for the first time.
+> **B1.1** `Cma::list_json` (tier/role/entity/text/min-strength filters, offset/limit, filtered
+> `total`, tombstones hidden unless requested) + `flat_vectors_for` (records and vectors stay paired —
+> the unfiltered table silently misaligned any card with tombstones); JS `cma.list(opts)` /
+> `cma.export()`; new `sofuu.memory.inspect(path)` reads a brain's manifest without opening it.
+> **B1.2** provenance (`created_at`, `last_recalled_at`, `source`) on every record, serde-defaulted so
+> legacy files still load, wired into pins (`pin`), chat turns (`chat`), the server (`server`) and the
+> C ABI facade. **B1.3** `/forget <id>` shows the record then deletes on `--yes` (survives reload —
+> verified). **B1.4** `/memory [tier|query] [--page N]` paginated browser. **B1.5** `memory.list` /
+> `memory.export` in the C ABI funnel (anti-drift list now 32), the brain server opens by the file's
+> own manifest and picks the matching embedder (it could only serve hash brains before), plus
+> `GET /memories`, `POST /forget` and a real `POST /share`; `docs/EMBEDDING.md` table updated.
+> Evidence: `tests/chat_memory_e2e.sh` 6/6 on a real pty, an HTTP smoke over /remember → /memories →
+> /forget → /share, the funnel resolution test, and **497/0** in both builds + capi 44/0.
+>
+> **2026-10-13 — B0 complete: brain correctness & safety.**
+> `ROADMAP-BRAIN-CMA.md` B0 shipped. **B0.1** the QTSQ FFI signature drift is fixed — the codec's
+> 2.1.0 API added a trailing `int level` to `qtsq_compress_tensor`/`_quantized` while the Rust
+> declarations kept the old arity, so the callee read an undefined register as `level` on every brain
+> and KV compression; both declarations now carry the parameter and all 7 call sites pass
+> `QTSQ_LEVEL_FULL` (0 = full contest, the pre-2.1.0 behaviour). **B0.3** new codec-regression guard
+> (`codec_stress_flush_reload_120_records`) drives 120 records through the real save path and reloads —
+> the class of codec heap corruption that aborted at ~17 records on 2026-10-13 now fails a test
+> instead of shipping. **B0.4** new FFI surface smoke (`ffi_surface_smoke_every_bound_function`)
+> exercises every bound `qtsq_*` function the memory subsystem uses against a real container, so a
+> future signature drift fails loudly (the struct-layout guard cannot see signatures). Full suite
+> **486/0** in both QTSQ-enabled and QTSQ-free builds.
+>
+> **2026-10-13 — PLAN-EMBED-SDK: Kotlin SDK binding (E1 streaming + E2 host tools) ships in the AAR.**
+> `bindings/android/sofuu` (the shipping `com.sofuu:sofuu-android` wrapper) gained
+> `callStream(method, argsJson, listener)` — per-call `fun interface StreamListener`, blocks on the engine
+> thread, exactly one terminal `done` — with the listener's return value as the in-flight cancel (the JNI
+> slot keeps a pointer to the cancel id, which `sofuu_rt_call_stream` writes before the first event; that
+> callback is the only place `sofuu_rt_cancel` is valid), plus `streamLocal(modelPath, prompt, maxTokens,
+> temperature)` and `registerHostTool`/`resolveHostTool`/`HostTool`, with `close()` releasing the JNI
+> global refs the registrations pin. **Two load-blockers found and fixed in the same wrapper:** it loaded
+> `System.loadLibrary("sofuu")` — the runtime `.so`, which contains none of the JNI natives (they live in
+> `libsofuu_jni.so`, whose DT_NEEDED pulls the runtime) — so every call would have died with
+> UnsatisfiedLinkError on device; and the shim's CMake lacked `-Wl,-z,max-page-size=16384`, which apps
+> targeting Android 15+ require on 16 KiB-page devices (the app-level CMake had the flag; the AAR's did
+> not). **UTF-8 at the JNI boundary:** GetStringUTFChars/NewStringUTF speak modified UTF-8 (CESU-8 for
+> non-BMP), so an emoji in a prompt reached serde_json as invalid bytes — probed directly: the engine saw
+> `{"ok":true}` with **no arguments at all**. Both directions now convert (eval, call, streaming, tools).
+> **Verified:** new `make sdk-jvm-check` compiles this same `jni_bridge.c` for the host OS and runs 29
+> assertions through the real wrapper + runtime — deltas, one done, cancel after 3 deltas → `aborted:true`,
+> positional `streamLocal`, emoji round-trip, sync + deferred host tools inside a real agent turn,
+> `close()` semantics. Android side: NDK compile for arm64-v8a/x86_64 (clean under `-Wall -Wextra`),
+> `:sofuu:compileDebugKotlin` under the shipped Kotlin 1.9.24, and a full `:sofuu:assembleDebug` AAR with
+> the runtime staged (packaged shim exports 15 JNI entry points, LOAD segments at 0x4000, DT_NEEDED
+> libsofuu.so). **Open, reported not fixed (app-side, peer's file):** `sofuu-android/app/.../jni_bridge.c`
+> still hands CESU-8 to the ABI on its stream/tool strings, and a throwing sync tool there reports
+> "pending" so the turn waits out the 30 s tool timeout. CI does not run `sdk-jvm-check` yet — the target
+> exists; wiring `.github` is left to whoever owns the workflow.
+>
+> **2026-10-13 — Brain/CMA roadmap published.**
+> `docs/ROADMAP-BRAIN-CMA.md`: the dependency-ordered fix + upgrade plan following the audit.
+> B0 correctness (FFI `level` signature, codec stress guard, FFI surface smoke) → B1 read-out API +
+> provenance + `/forget` + memory browser (the foundation every visible feature needs) → B2 real brain
+> cards (`/share`/`/import`/server) → B3 segmented storage + capacity + compaction + write-time channel
+> dedup → B4 machine-local key with migration → B5 recall quality (MMR, recency, `ef_search`, eval
+> harness) → B6 real working-memory tier → B7 cross-surface harmony + docs truth pass. Each milestone
+> carries an evidence gate; B3/B4 ordering is noted as swappable at the cost of a second migration.
+>
+> **2026-10-13 — Brain/CMA audit + HNSW recall fix (P0).**
+> Audited the QTSQ encrypted brain and the Cognitive Memory Architecture end to end; findings in
+> `docs/AUDIT-2026-10-13-BRAIN-CMA.md`. **Fixed:** `Hnsw::search_layer` used one reversed-`Ord` candidate
+> type for both heaps, so the results heap was a min-heap used as a max-heap — it evicted the CLOSEST
+> neighbours and compared the early-exit bound against the BEST distance. Recall@10 vs brute force
+> collapsed 0.82 → 0.24 → 0.07 at n = 50/200/2000 (invisible to the suite, which only ever used graphs
+> smaller than ef). After the fix: 1.00/1.00/0.91, and end-to-end through `sofuu.memory` with 300 stored
+> memories the exact-self top-1 hit rate went **0.70 → 1.00** (top-5 0.88 → 1.00). Two regression tests
+> fail pre-fix (0.230) and pass post-fix. Full suite **484/0** in both QTSQ-enabled and QTSQ-free builds;
+> `tests/verify_memory_test.js` 30/30. **Open, reported not fixed (other agent's in-flight file):** the
+> QTSQ FFI still declares `qtsq_compress_tensor` (5 args) and `qtsq_compress_tensor_quantized` (6) while
+> the codec's 2.1.0 header takes 6 and 7 — an undefined `level` argument on every brain/KV compression;
+> the struct-layout guard cannot see signatures. Also recorded: a transient codec heap-corruption crash
+> (fixed upstream 10:53) and the structural gaps blocking share/import (no read-out API, dead working
+> tier, no brain paging, fixed-password encryption).
+>
 > **2026-10-12 — C2 shipped: QTSQ power-loss resilience (durable publish + write-ahead journal).**
 > New `crates/sofuu-core/src/rt/wal.rs`: durable atomic publish (fsync staged file → rename → fsync
 > directory — the rename was atomic but its DATA was not, so a power loss could leave a brain file that

@@ -1,0 +1,218 @@
+# 🗺️ Roadmap: Brain & CMA — Fixes and Upgrades
+
+> **Status:** proposed 2026-10-13 · milestone-driven, dependency-ordered (no timelines)
+> **Scope:** the QTSQ encrypted brain, the Cognitive Memory Architecture, and every surface that
+> reads or writes them — CLI, chat, brain HTTP server, agent loop, headless C ABI.
+> **Findings source:** `AUDIT-2026-10-13-BRAIN-CMA.md`
+> **Companions:** `PLAN-SOFUU-CORE.md` (§3.3 CMA, §3.4 QTSQ), `PLAN-MEMORY-TOKENS.md` (token
+> economy), `PLAN-HYBRID-SOFUU-STORAGE.md` (the segment+manifest design), `PLAN-TINY-SEMANTIC-EMBEDDER.md`
+> (the two channels).
+
+---
+
+## 0. Ground truth (verified by running, 2026-10-13)
+
+**Working:** brain persistence round-trip (`sofuu doctor` healthy) · decay → retain → consolidate
+lifecycle at the turn boundary · near-duplicate reinforcement · entity upsert + agent scoping ·
+co-recall gravity · resonance scoring · two-channel hash/sem2 RRF fusion · C2 durability
+(fsync → rename → fsync-dir behind a write-ahead journal) · KV page store with 2-page LRU.
+`tests/verify_memory_test.js` 30/30; full suite 484/0 in both QTSQ-enabled and QTSQ-free builds.
+
+**Fixed this cycle:** HNSW results-heap ordering — recall@10 vs brute force collapsed 0.82 → 0.24 →
+0.07 at n = 50/200/2000 (the results heap shared the candidate frontier's reversed ordering, evicting
+near neighbours); now 1.00/1.00/0.91, and end-to-end exact-self top-1 through `sofuu.memory` went
+0.70 → 1.00. Two regression tests pin it.
+
+**Open P0:** QTSQ FFI signature drift — `qtsq_compress_tensor` (C: 6 args, Rust: 5) and
+`qtsq_compress_tensor_quantized` (C: 7, Rust: 6) read an undefined `level` register on every brain
+and KV compression.
+
+**Structural gaps:** no read-out API · metadata-only `/share` + no-op `/import` · dead
+`TIER_WORKING` · whole-file brain load/flush (no paging) · fixed shared vault password · no
+provenance · no capacity policy · no diversity/recency in scoring · `/forget` unreachable.
+
+---
+
+## 1. Principles
+
+1. **One implementation, four surfaces.** Every memory capability lands in the CMA core, the JS
+   binding, the C ABI funnel, and the server in the same milestone — harmony by construction, not
+   by follow-up.
+2. **Evidence gates.** A milestone is done only when its gate runs green. No ✅ without a run.
+3. **Format changes ship with migration + rollback.** The C2 journal + backup discipline is the tool;
+   every on-disk change keeps the legacy reader.
+4. **No claim ahead of code.** README / EMBEDDING.md / plan text updates ride the milestone that
+   makes them true — the "SSD paging" claim is corrected by B3 or not at all.
+
+---
+
+## 2. B0 — Correctness & Safety (first, small)
+
+| # | Item | Size |
+|---|---|---|
+| B0.1 | ✅ **QTSQ FFI signature fix** (2026-10-13) — `level` added to both tensor compressors; all 7 call sites pass `QTSQ_LEVEL_FULL` (0 = full contest = pre-2.1.0 behaviour). | S |
+| B0.2 | ✅ **HNSW recall fix** (2026-10-13) — two regression tests fail pre-fix, pass post-fix. | — |
+| B0.3 | ✅ **Codec-regression guard** (2026-10-13) — `codec_stress_flush_reload_120_records`: 120 records through the real save path, reload, count + recall verified. | S |
+| B0.4 | ✅ **FFI surface smoke** (2026-10-13) — `ffi_surface_smoke_every_bound_function`: sha256 (NIST vector), container create/add/pack/count/get_stream, both tensor compressors, json + horizon decompress, vault encrypt/is-encrypted/decrypt, write/read — one call each against a real container. | S |
+
+**Gate met (2026-10-13):** full suite **486/0** in both QTSQ-enabled and QTSQ-free builds; the stress
+test flushes 120 records and reloads; the smoke test covers the memory subsystem's bound surface
+(the session-store functions have their own round-trip test).
+
+---
+
+## 3. B1 — Memory Read-Out, Provenance & Forget (the foundation)
+
+**Objective:** make the brain inspectable. Cards, browsing, editing, capacity reporting and the
+memory UI all depend on this one missing capability.
+
+| # | Item | Size |
+|---|---|---|
+| B1.1 | ✅ **`list` / `export`** (2026-10-13) — `Cma::list_json` (tier/role/entity/text/min-strength filters, offset/limit, filtered `total`; tombstones hidden unless the tier is asked for) + `flat_vectors_for`; JS `cma.list(opts)` / `cma.export()`; `sofuu.memory.inspect(path)` reads a manifest without opening. | M |
+| B1.2 | ✅ **Provenance** (2026-10-13) — `created_at`, `last_recalled_at`, `source` on every record; serde-defaulted so legacy files load; wired into pins (`pin`), chat turns (`chat`), the server (`server`), and the C ABI facade. | S |
+| B1.3 | ✅ **`/forget`** (2026-10-13) — shows the record + `/forget <id> --yes` to confirm; deletes, flushes, and survives reload (verified). | S |
+| B1.4 | ✅ **`/memory` browser** (2026-10-13) — `/memory [tier\|query] [--page N]`, paginated with tier/strength/age/source per row. | M |
+| B1.5 | ✅ **Headless + server parity** (2026-10-13) — `memory.list` / `memory.export` in the funnel (anti-drift list now 32); server opens by the file's own manifest and picks the matching embedder; `GET /memories`, `POST /forget`, real `POST /share`; `docs/EMBEDDING.md` table updated. | M |
+
+**Gate met (2026-10-13):** chat e2e (`tests/chat_memory_e2e.sh`, 6/6 on a real pty) lists, confirms,
+and deletes; the server smoke drives /remember → /memories → /forget → /share over HTTP; the funnel
+test resolves all 32 methods; forget survives reload; legacy records hydrate with defaults; full suite
+**497/0** in both builds + capi 44/0.
+
+---
+
+## 4. B2 — Real Brain Cards (share / import)
+
+**Objective:** replace the metadata-only stubs with working portable cards.
+
+| # | Item | Size |
+|---|---|---|
+| B2.1 | ✅ **`/share` writes a real card** (2026-10-13) — `sofuu-brain-card@2`: records + vectors + manifest + label, via `cma.export()`. | M |
+| B2.2 | ✅ **`/import` merges** (2026-10-13) — `Cma::import_records` + `cma.importRecords(vecs, recordsJson)`: same-space cards reuse their vectors, cross-space cards re-embed every text locally, near-duplicates reinforce (max strength, earliest `created_at`, original text/role/source kept), tombstones never import, and the merge is idempotent. Also fixed: `fs.readFile/writeFile` are promise-based and the pre-B2 `/import` never awaited them, so it always took the "not a text file" branch. | M |
+| B2.3 | ✅ **Server endpoints** (2026-10-13) — `POST /share` returns the real card; `GET /memories` + `POST /forget` on the same read-out API. | S |
+| B2.4 | ✅ **Card format spec** (2026-10-13) — `docs/BRAIN-CARD.md`: shape, the records↔vectors pairing rule, spaces, import semantics, versioning (v1 refused by name). | S |
+
+**Gate met (2026-10-13):** live round-trip — export 2 records → import into a fresh brain (added 2)
+→ import again (merged 2, count unchanged) → reload keeps them with provenance; the chat e2e drives
+`/share` in one project and `/import` + `/memory` in a second (9/9 on a real pty); the server smoke
+covers `POST /share`. Full suite **500/0** in both builds.
+
+---
+
+## 5. B3 — Brain Storage: Segments, Capacity, Compaction
+
+**Objective:** stop rewriting the whole brain on every flush, and bound its growth.
+Measured baseline: 2000 records → 6.2 MB file, 195 ms flush, 311 ms reopen — all O(total).
+
+| # | Item | Size |
+|---|---|---|
+| B3.1 | **Segmented layout** — bounded segments + small manifest, following `PLAN-HYBRID-SOFUU-STORAGE.md` and the proven `session_store.rs` pattern (rotate → immutable segment → atomic manifest publish, all behind the C2 journal). | L |
+| B3.2 | **Incremental flush** — append/rotate instead of full rewrite; the flat single-file reader stays for legacy brains. | M |
+| B3.3 | **Capacity policy** — max records / max bytes; eviction order: tombstones → lowest strength → oldest; entities and pins never evicted; evictions reported, not silent. | M |
+| B3.4 | **Compaction pass** — rewrite live records into fresh segments when the dead ratio exceeds a threshold; runs at the turn boundary beside decay/consolidate. | M |
+| B3.5 | **Write-time channel dedup** — store a memory once and link its channels (or keep the second as a pointer), ending double storage + double decay. | M |
+
+**Gate:** a flush of N new records touches O(new) bytes, not O(total); a 10k-record brain stays
+under the cap and recalls correctly; compaction preserves recall; a legacy file migrates once with a
+backup and never loses records.
+
+---
+
+## 6. B4 — Encryption Hardening
+
+**Objective:** replace the fixed shared vault password (`"sofuu-kv-local-v1"`, identical on every
+machine) with a machine-local key.
+
+| # | Item | Size |
+|---|---|---|
+| B4.1 | **Key derivation** — derive the vault password from a machine-local secret. Evaluate the codec's `qtsq_keystore.h` device key first; else a `0600` key file under `~/.sofuu/`. | M |
+| B4.2 | **Migration** — read old fixed-password brains, re-encrypt on first write (journaled, backup kept). | M |
+| B4.3 | **Recovery story** — documented behaviour for a new machine / lost key file (the brain is machine-local by design; say so plainly). | S |
+
+**Gate:** a fresh brain writes with the derived key; a legacy brain migrates with a backup and
+reopens; a wrong-key open fails closed with a clear error and never corrupts.
+
+---
+
+## 7. B5 — Recall Quality
+
+**Objective:** better ranking on real brains, measured rather than asserted.
+
+| # | Item | Size |
+|---|---|---|
+| B5.1 | **Diversity (MMR)** — re-rank the scored candidate pool so top-k stops returning near-duplicates. | S |
+| B5.2 | **Recency term** — explicit recency factor using B1.2's `created_at` (decay already handles strength; recency breaks same-strength ties). | S |
+| B5.3 | **`ef_search` knob** — configurable quality/latency trade, default unchanged; surfaced like the other runtime knobs. | S |
+| B5.4 | **Recall evaluation harness** — a fixed brain fixture + query set reporting recall@k and MRR, so every B5 change is measured against a number. | M |
+
+**Gate:** harness numbers before/after each change; the existing 30/30 memory suite stays green.
+
+---
+
+## 8. B6 — Working Memory (the fourth tier, real)
+
+**Objective:** make `TIER_WORKING` real without polluting the persistent index. Recommended shape:
+an in-RAM working set held **beside** the persistent record table (not inside it), merged into
+recall results with the existing 0.5 tier weight — this avoids index renumbering entirely.
+
+| # | Item | Size |
+|---|---|---|
+| B6.1 | **In-RAM working set** — session-scoped records, never serialized, merged into recall. | M |
+| B6.2 | **Promotion** — on turn commit, working records the turn actually used are promoted into the persistent store as episodic. | M |
+| B6.3 | **Chat integration** — current-session facts are recallable immediately; `/why` shows which tier served each hit. | S |
+
+**Gate:** working facts recall within a session; nothing persists unless promoted; a reload shows no
+working records; the tier appears in `/why`.
+
+---
+
+## 9. B7 — Harmony & Surface Coherence (last)
+
+**Objective:** the brain behaves the same everywhere and says what it does.
+
+| # | Item | Size |
+|---|---|---|
+| B7.1 | **One semantics across surfaces** — same filters, same error codes, same tier names in CLI, chat, server and C ABI; pinned by a cross-surface test. | M |
+| B7.2 | **`sofuu doctor` brain section** — manifest/space, record + tier histogram, capacity headroom, journal state, last compaction. | S |
+| B7.3 | **Chat brain panel** — `/brain info` shows tiers, capacity, channels, last consolidation. | S |
+| B7.4 | **Docs truth pass** — README, `EMBEDDING.md`, `PLAN-SOFUU-CORE.md` reflect shipped behaviour only. | S |
+
+**Gate:** cross-surface test green; doctor output on a real brain shows real numbers; no doc claim
+without a passing test behind it.
+
+---
+
+## 10. Dependency order
+
+```
+B0 (correctness)  ──────────────────────────► everything
+B1 (read-out + provenance) ──► B2 (cards)
+                           ├──► B5.2 (recency)
+                           └──► B6.3 (tier display)
+B3 (storage) ──► B4 (key migration rides B3's rewrite if done back-to-back)
+B5 (quality) — independent of B3/B4; needs B1.2
+B6 (working tier) — independent; display needs B1
+B7 (harmony) — last: it pins the shipped behaviour
+```
+
+B3 and B4 both touch the persistence path; doing B3 first means the key migration is written once
+against the final layout. If security is the priority, B4 can be pulled ahead of B3 — the cost is a
+second migration pass.
+
+---
+
+## 11. Out of scope
+
+- Changing the QTSQ **container** format itself (adapter-level layout only; the codec stays as-is).
+- Vector quantization for the brain (the codec compresses; precision is a codec concern).
+- Embedding-model changes (separate: `PLAN-TINY-SEMANTIC-EMBEDDER.md`, emb-m / C3).
+- ML-gate shadow A/B telemetry (separate: `PLAN-SOFUU-CORE.md` C4).
+- Hosted / sync / multi-device services.
+
+---
+
+## 12. Suggested first three pulls
+
+1. **B0.1 + B0.3** — smallest, and it removes the undefined-behaviour hazard on every compression.
+2. **B1.1 + B1.2** — read-out + provenance; unlocks every visible feature downstream.
+3. **B2** — turns the README's brain-card promise true.

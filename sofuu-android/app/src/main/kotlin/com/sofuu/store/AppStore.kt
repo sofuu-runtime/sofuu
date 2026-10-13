@@ -9,7 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.sofuu.engine.EngineEvent
 import com.sofuu.engine.SofuuEngine
 import com.sofuu.engine.Usage as EngineUsage
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -157,7 +157,12 @@ val runtimeEnv = RuntimeEnv(app)
     init {
         // Engine events → state.
         viewModelScope.launch {
-            engine.events.collectLatest { ev ->
+            // collect, NOT collectLatest: handleEvent is a reducer, not a
+            // suspending computation, and collectLatest cancels the PREVIOUS
+            // handler when a new event arrives. An event landing between the
+            // two statements of TurnFinished left `streaming=false` with the
+            // assistant bubble still marked streaming and no notification.
+            engine.events.collect { ev ->
                 handleEvent(ev)
                 if (ev is EngineEvent.TurnFinished) refreshSessions()
             }
@@ -899,8 +904,18 @@ val runtimeEnv = RuntimeEnv(app)
 
     /** Live chat.state() for the settings engine card. Blocking-safe: it
      *  never runs on the main thread — the caller owns the coroutine. */
-    fun engineChatState(): JSONObject? =
-        if (!engine.isReady) null else engine.chatState().get(2, TimeUnit.SECONDS)
+    fun engineChatState(): JSONObject? {
+        if (!engine.isReady) return null
+        // A 2s deadline will expire whenever the engine is mid-turn, which
+        // is the normal state while someone is chatting. That is a "no
+        // update", not a failure — returning null lets the card keep its
+        // last value instead of throwing out of the caller's LaunchedEffect.
+        return try {
+            engine.chatState().get(2, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     /** Vector-embedding manifest (default space + per-space manifest).
      *  Blocking: callers must be off the main thread. */
@@ -1074,8 +1089,12 @@ val runtimeEnv = RuntimeEnv(app)
     /** Import a picked model and select it. Reports the outcome as a
      *  system row so a bad pick is visible in the transcript, not silent. */
     fun importLocalModel(uri: android.net.Uri) {
+        // viewModelScope is Dispatchers.Main.immediate, so a blocking .get()
+        // here is a main-thread block: a 180 s probe on a slow model is a
+        // 180 s frozen UI and an ANR. Only the import touches the disk;
+        // the engine query yields.
         viewModelScope.launch {
-            val file = localModels.import(uri)
+            val file = withContext(Dispatchers.IO) { localModels.import(uri) }
             if (file == null) {
                 systemRow("Could not import that file — it needs to be a readable .gguf model.")
                 return@launch
@@ -1083,7 +1102,9 @@ val runtimeEnv = RuntimeEnv(app)
             val sizeMb = file.length() / (1024.0 * 1024.0)
             systemRow("Imported ${localModels.label(file)} (${"%.0f".format(sizeMb)} MB) — checking it…")
             val probe = try {
-                engine.probeLocalModel(file.absolutePath).get(180, TimeUnit.SECONDS)
+                withContext(Dispatchers.IO) {
+                    engine.probeLocalModel(file.absolutePath).get(180, TimeUnit.SECONDS)
+                }
             } catch (e: Exception) {
                 null
             }

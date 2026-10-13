@@ -87,11 +87,16 @@ final class AppStore: ObservableObject {
     func restartEngineForEnv() {
         if state.streaming {
             // Freeing the runtime mid-turn would strand the open tool
-            // round-trip. Cancel first so the agent's abort path runs.
-            Task { await engine.cancelTurn() }
+            // round-trip, so poke the agent's abort path first.
+            engine.cancelTurn()
         }
         engine.shutdown()
         runtimeEnv.apply()
+        // The old runtime can emit no further `done`, so nothing else would
+        // ever clear this — the composer would stay on the stop button for
+        // the rest of the session.
+        state.streaming = false
+        state.phase = nil
         state.engineReady = false
         engine.start()
     }
@@ -900,14 +905,17 @@ final class AppStore: ObservableObject {
             let thinking = (c["thinking"] as? Bool) ?? (c["thinking"] as? NSNumber)?.boolValue ?? false
             patch["effort"] = thinking ? "high" : ""
         }
-        do {
-            let merged = try configs.updateConfig(patch)
-            state.config = configs.redacted(merged)
-            // No provider entry to write: "local" is not a configured
-            // endpoint, so refreshModelCache would only fail on it.
-            state.localModels = LocalModels.list().map(\.path)
-        } catch {
-            systemRow("Could not switch to that model: \((error as? SofuuError)?.message ?? "\(error)")")
+        // updateConfig does not throw and writeConfig swallows its own
+        // errors, so a failed write cannot be detected here — but the
+        // config on disk is the only thing that decides whether the NEXT
+        // turn is local, so verify it landed rather than assume.
+        let merged = configs.updateConfig(patch)
+        state.config = configs.redacted(merged)
+        // No provider entry to write: "local" is not a configured endpoint,
+        // so refreshModelCache would only fail on it.
+        state.localModels = LocalModels.list().map(\.path)
+        if state.config?.model != path {
+            systemRow("Could not switch to that model — the config did not take. Try again, or pick it from Models.")
         }
     }
 
@@ -920,9 +928,12 @@ final class AppStore: ObservableObject {
         }
         let sizeMB = Double(LocalModels.size(file) ?? 0) / 1_048_576.0
         systemRow(String(format: "Imported %@ (%.0f MB) — checking it…", LocalModels.label(file), sizeMB))
-        if let probe = await engine.probeLocalModel(file.path),
-           let ok = probe["ok"] as? Bool, !ok {
-            let why = probe["error"] as? String ?? "the engine timed out"
+        let probe = await engine.probeLocalModel(file.path)
+        // A nil probe is a real failure too: the engine hung, was torn down,
+        // or the reply got out of step. Treating that as success claimed a
+        // model was working without ever having run it.
+        guard let probe, let ok = probe["ok"] as? Bool, ok else {
+            let why = probe?["error"] as? String ?? "the engine did not answer"
             systemRow("\(LocalModels.label(file)) did not load: \(why). The file is still in Settings → Models.")
             return
         }

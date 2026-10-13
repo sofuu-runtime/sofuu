@@ -22,7 +22,7 @@ import Foundation
 /// The only structural difference from Android: `CompletableFuture` becomes
 /// Swift `async`/`await` (checked continuations), and the mailbox is an
 /// `NSCondition` instead of a `LinkedBlockingQueue`.
-final class SofuuEngine {
+final class SofuuEngine: @unchecked Sendable {
 
     let homeDir: String
     /// The active workspace. Mutated by `setProject` so session-file cleanup
@@ -51,7 +51,9 @@ final class SofuuEngine {
     /// `armed` is what makes a timeout safe: whichever of the reply and the
     /// timer gets there first flips it, so a late reply is dropped instead
     /// of being handed to whichever query happens to be next.
-    private final class ReplySlot {
+    private final class ReplySlot: @unchecked Sendable {
+        // Only ever touched under replyLock, so handing the slot to the
+        // timer queue is safe even though the compiler cannot see that.
         let cont: CheckedContinuation<Any?, Never>
         var armed = true
         init(_ cont: CheckedContinuation<Any?, Never>) { self.cont = cont }

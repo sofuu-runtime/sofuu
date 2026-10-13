@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.util.concurrent.TimeUnit
 import com.sofuu.store.AppStore
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.theme.LocalSofuuColors
@@ -488,16 +489,21 @@ private fun EngineEnvCard(store: AppStore) {
     ToggleRow("Context gates (ML)", "Drop the whole sofuu.ml gate layer. This one needs a restart — it is decided when the engine loads.", noMl)
     { noMl = it; env.noMl = it; store.restartEngineForEnv() }
     ToggleRow("Allow private addresses", "Let web.open reach loopback and LAN addresses. The SSRF guard blocks them otherwise.", allowInternal)
-    { allowInternal = it; env.webAllowInternal = it }
+    // M4: these three only wrote the SharedPreference, so the process
+    // environment — and therefore the engine — kept the old value until
+    // an unrelated restart. Every knob below re-applies.
+    { allowInternal = it; env.webAllowInternal = it; store.applyRuntimeEnv() }
 
     Row_("Memory backend", "Auto uses the semantic projector when its artifact is present, else hash-768.") {
         Segmented(listOf("auto", "hash", "semantic"), backend.ifEmpty { "auto" }) {
             backend = it; env.memoryBackend = if (it == "auto") "" else it
+            store.applyRuntimeEnv()
         }
     }
     Row_("Web search engine", "Default engine for web_search. Blank picks the keyless one.") {
         Segmented(listOf("auto", "brave", "tavily"), engine.ifEmpty { "auto" }) {
             engine = it; env.webEngine = if (it == "auto") "" else it
+            store.applyRuntimeEnv()
         }
     }
     Row_("Turn step budget", "Tool rounds allowed per turn. 0 uses the engine default (200).") {
@@ -839,7 +845,11 @@ private fun UsagePane(store: AppStore) {
     val c = LocalSofuuColors.current
     var usage by remember { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(Unit) {
-        usage = store.engine.usageReport().get()
+        // Bounded and guarded: this had no deadline at all, so an engine
+        // that never answered left the pane spinning for the whole visit.
+        usage = runCatching {
+            store.engine.usageReport().get(10, TimeUnit.SECONDS)
+        }.getOrNull()
     }
     Column(Modifier.verticalScroll(rememberScrollState())) {
         val totals = usage?.optJSONObject("totals")
@@ -953,7 +963,9 @@ private fun BrainPane(store: AppStore) {
             if (img == null) {
                 imgNote = "Could not import that image."
             } else {
-                val r = withContext(Dispatchers.IO) { surface.embedImage(img).get() }
+                val r = withContext(Dispatchers.IO) {
+                    runCatching { surface.embedImage(img).get(30, TimeUnit.SECONDS) }.getOrNull()
+                }
                 if (r?.optBoolean("ok") == true) {
                     imgNote = "${img.substringAfterLast('/')} · ${r.optInt("dim")}-dim img1 vector"
                     imgPath = img
@@ -1385,8 +1397,12 @@ private fun AgentsPane(store: AppStore) {
                 if (running || task.isBlank()) return@SmallButton
                 running = true; answer = null
                 scope.launch {
-                    val r = withContext(Dispatchers.IO) { surface.runAgent(name.trim(), task.trim(), 300_000).get() }
-                    answer = r
+                    val r = withContext(Dispatchers.IO) {
+                        runCatching {
+                            surface.runAgent(name.trim(), task.trim(), 300_000).get(300, TimeUnit.SECONDS)
+                        }.getOrNull()
+                    }
+                    answer = r ?: JSONObject().put("ok", false).put("error", "the run did not finish in 5 minutes")
                     running = false
                 }
             }

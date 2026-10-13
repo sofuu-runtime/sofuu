@@ -94,20 +94,16 @@ enum DeviceTools {
                 description: r.description,
                 parametersJson: r.parameters
             ) { argsJson, _ in
-                do {
-                    let raw = argsJson.isEmpty ? "{}" : argsJson
-                    guard let data = raw.data(using: .utf8),
-                          let parsed = try? JSONSerialization.jsonObject(with: data),
-                          let obj = parsed as? JSONObject else {
-                        return err("arguments were not a JSON object")
-                    }
-                    return r.handler(obj)
-                } catch {
-                    // A throwing tool would surface to the model as a hang
-                    // (the trampoline returns nil on error), so report it
-                    // as a failed call instead.
-                    return err("invalid arguments: \(error.localizedDescription)")
+                // No `do`/`catch` needed: the parse is already optional, and
+                // a `catch` around a body that cannot throw was unreachable
+                // code that a reviewer had to reason about for nothing.
+                let raw = argsJson.isEmpty ? "{}" : argsJson
+                guard let data = raw.data(using: .utf8),
+                      let parsed = try? JSONSerialization.jsonObject(with: data),
+                      let obj = parsed as? JSONObject else {
+                    return err("arguments were not a JSON object")
                 }
+                return r.handler(obj)
             }
             if ok { registered.append(r.name) }
         }
@@ -116,32 +112,39 @@ enum DeviceTools {
 
     // MARK: - Handlers
 
+    /// Everything here touches UIDevice / UIApplication, which are
+    /// main-thread-only. The host-tool callback runs on the RUNTIME's
+    /// thread (sofuu_embed.h), so the UIKit reads have to hop — reading
+    /// them off-main is undefined behaviour, not merely stale.
     private static func deviceInfo() -> String {
         var d: JSONObject = [:]
         d["model"] = deviceModelName()
-        d["system"] = "iOS \(UIDevice.current.systemVersion)"
         d["is_simulator"] = isSimulator
 
-        if #available(iOS 16.0, *) {
-            // ProcessInfo reports the OS's own view of the battery; it is
-            // only meaningful while the app is foregrounded, which is the
-            // only time this tool can be called anyway.
+        let ui: JSONObject = DispatchQueue.main.sync {
+            var out: JSONObject = [:]
+            out["system"] = "iOS \(UIDevice.current.systemVersion)"
+            out["foreground"] = UIApplication.shared.applicationState == .active
             UIDevice.current.isBatteryMonitoringEnabled = true
             let level = UIDevice.current.batteryLevel
-            if level >= 0 { d["battery_percent"] = Int((level * 100).rounded()) }
+            // -1 means "unknown"; it is only populated after monitoring has
+            // been on for a moment, so a first read legitimately has none.
+            if level >= 0 { out["battery_percent"] = Int((level * 100).rounded()) }
             let state = UIDevice.current.batteryState
-            if state != .unknown { d["battery_state"] = batteryStateName(state) }
-        }
-        if #available(iOS 16.0, *) {
+            if state != .unknown { out["battery_state"] = batteryStateName(state) }
             UIDevice.current.isBatteryMonitoringEnabled = false
+            return out
         }
+        d["system"] = ui["system"]
+        d["foreground"] = ui["foreground"]
+        if let b = ui["battery_percent"] { d["battery_percent"] = b }
+        if let b = ui["battery_state"] { d["battery_state"] = b }
 
         let url = URL(fileURLWithPath: NSHomeDirectory())
         if let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
            let free = values.volumeAvailableCapacityForImportantUsage {
             d["storage_free_gb"] = (Double(free) / 1_073_741_824.0).rounded(toPlaces: 2)
         }
-        d["foreground"] = UIApplication.shared.applicationState == .active
         return jsonEncode(d)
     }
 
@@ -165,8 +168,12 @@ enum DeviceTools {
         guard let text = args["text"] as? String, !text.isEmpty else {
             return err("share_text needs text")
         }
-        let ok = DispatchQueue.main.sync { () -> Bool in
+        // A presented controller (or one mid-dismissal) cannot present
+        // again, and UIKit drops the attempt SILENTLY — so the presence of
+        // something is not success. The presentation itself must succeed.
+        let presented = DispatchQueue.main.sync { () -> Bool in
             guard let root = UIApplication.shared.topViewController() else { return false }
+            guard root.presentedViewController == nil, !root.isBeingDismissed else { return false }
             let sheet = UIActivityViewController(activityItems: [text], applicationActivities: nil)
             sheet.popoverPresentationController?.sourceView = root.view
             sheet.popoverPresentationController?.sourceRect = CGRect(
@@ -176,12 +183,16 @@ enum DeviceTools {
             root.present(sheet, animated: true)
             return true
         }
-        return ok ? ok_("share sheet opened") : err("could not present the share sheet")
+        return presented ? ok_("share sheet opened") : err("another sheet is already open — try again in a moment")
     }
 
     private static func vibrate(_ args: JSONObject) -> String {
         let style = (args["style"] as? String ?? "medium").lowercased()
-        DispatchQueue.main.async {
+        // sync, not async: the generator must actually fire before the tool
+        // answers, and "scheduled" is not the same as done. The engine
+        // thread is never the main thread here, so this cannot self-deadlock.
+        let fired = DispatchQueue.main.sync { () -> Bool in
+            guard UIApplication.shared.applicationState == .active else { return false }
             switch style {
             case "light": UIImpactFeedbackGenerator(style: .light).impactOccurred()
             case "heavy": UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
@@ -190,8 +201,9 @@ enum DeviceTools {
             case "error": UINotificationFeedbackGenerator().notificationOccurred(.error)
             default: UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
+            return true
         }
-        return ok_("haptic \(style)")
+        return fired ? ok_("haptic \(style)") : err("the app is in the background, so nothing will be felt")
     }
 
     // MARK: - Helpers

@@ -113,10 +113,16 @@ class Speech(private val context: Context) {
     fun play(bytes: ByteArray, format: String) {
         if (bytes.isEmpty()) return
         stopPlayback()
+        // The previous clip's file was only deleted on the failure path, so
+        // every successful read-aloud left a few hundred KB in the cache
+        // for the life of the install.
+        playingFile?.delete()
+        playingFile = null
         val ext = format.ifBlank { "mp3" }.take(6).filter { it.isLetterOrDigit() }.ifEmpty { "mp3" }
         val f = File(context.cacheDir, "sofuu-say-${System.currentTimeMillis()}.$ext")
         return try {
             f.writeBytes(bytes)
+            playingFile = f
             player = MediaPlayer().apply {
                 setDataSource(f.absolutePath)
                 setOnCompletionListener { stopPlayback() }
@@ -134,9 +140,16 @@ class Speech(private val context: Context) {
         player?.let { runCatching { it.stop() } }
         player?.let { runCatching { it.release() } }
         player = null
+        // MediaPlayer holds the source open until it is released, so the
+        // temp file can only go once release() has run.
+        playingFile?.delete()
+        playingFile = null
     }
 
     val isPlaying: Boolean get() = player?.isPlaying == true
+
+    /** The clip currently loaded into [player], if any. */
+    private var playingFile: File? = null
 
     companion object {
         /** Matches AUDIO_MAX_INPUT in the engine (32 MB). */

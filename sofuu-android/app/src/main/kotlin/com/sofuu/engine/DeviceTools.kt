@@ -94,7 +94,10 @@ class DeviceTools(private val context: Context) {
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "?")
         bm?.let {
-            data.put("battery_percent", it.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY))
+            // Integer.MIN_VALUE when the property is unsupported — reported
+            // straight to the model as a level, so drop it instead.
+            val level = it.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            if (level != Int.MIN_VALUE && level in 0..100) data.put("battery_percent", level)
         }
         runCatching {
             val stat = Environment.getDataDirectory()

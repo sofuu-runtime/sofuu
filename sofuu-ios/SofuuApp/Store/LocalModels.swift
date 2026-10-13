@@ -52,14 +52,21 @@ enum LocalModels {
         let dest = dir.appendingPathComponent(name)
         let fm = FileManager.default
         do {
-            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            // Copy to a temp name and move into place. Removing the old
+            // file FIRST meant a failed copy — disk full, a security-scoped
+            // read denied, the user cancelling — left the user with neither
+            // the new model nor the old one.
+            let tmp = dir.appendingPathComponent(".\(name).incoming")
+            try? fm.removeItem(at: tmp)
             // A picked document may be outside the sandbox and security-
             // scoped; startAccessing makes it readable for the copy.
             let scoped = source.startAccessingSecurityScopedResource()
             defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-            try fm.copyItem(at: source, to: dest)
+            try fm.copyItem(at: source, to: tmp)
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.moveItem(at: tmp, to: dest)
         } catch {
-            try? fm.removeItem(at: dest)
+            try? fm.removeItem(at: dir.appendingPathComponent(".\(name).incoming"))
             return nil
         }
         return dest

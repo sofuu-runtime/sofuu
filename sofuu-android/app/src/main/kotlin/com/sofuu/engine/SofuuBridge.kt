@@ -204,5 +204,18 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
         @JvmStatic private external fun nativeHostToolResolve(
             rt: Long, callId: Long, resultJson: String?, error: String?,
         ): Boolean
+
+        /**
+         * Release every host-tool registration made in this process —
+         * the C slot, the strdup'd name, and the JNI global ref pinning
+         * the Kotlin receiver. Returns how many were freed.
+         *
+         * Must be called AFTER the runtime that used them has been freed.
+         * Until then the ABI still holds its own pointers, so releasing
+         * early would be a use-after-free.
+         */
+        @JvmStatic fun freeHostTools(): Int = nativeFreeHostTools()
+
+        @JvmStatic private external fun nativeFreeHostTools(): Int
     }
 }

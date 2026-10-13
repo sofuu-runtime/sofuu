@@ -23,7 +23,7 @@ class RuntimeSurface(private val engine: SofuuEngine) {
      * Count, backend id and recall health for the active brain, or null
      * when memory is off or the artifact is unavailable.
      */
-    fun brainInfo(): JSONObject? = engine.evalJson(
+    fun brainInfo(): JSONObject? = engine.evalJsonOnEngine(
         """
         (function(){ try {
           var b = sofuu.agent.brainFor({ memory: 'auto' });
@@ -37,7 +37,7 @@ class RuntimeSurface(private val engine: SofuuEngine) {
           };
         } catch(e) { return { ok:false, error:String(e&&e.message||e) }; } })()
         """.trimIndent()
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /**
      * Nearest memories for [query].
@@ -47,7 +47,7 @@ class RuntimeSurface(private val engine: SofuuEngine) {
      * stored in — mixing spaces is the one way to get confidently wrong
      * recall results.
      */
-    fun brainRecall(query: String, k: Int = 8): JSONObject? = engine.evalJson(
+    fun brainRecall(query: String, k: Int = 8): JSONObject? = engine.evalJsonOnEngine(
         """
         (function(){ try {
           var b = sofuu.agent.brainFor({ memory: 'auto' });
@@ -60,10 +60,10 @@ class RuntimeSurface(private val engine: SofuuEngine) {
           return { ok:true, hits: Array.isArray(hits) ? hits : Array.prototype.slice.call(hits) };
         } catch(e) { return { ok:false, error:String(e&&e.message||e) }; } })()
         """.trimIndent()
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Drop one memory by id. The id comes from a recall hit. */
-    fun brainForget(id: Int): JSONObject? = engine.evalJson(
+    fun brainForget(id: Int): JSONObject? = engine.evalJsonOnEngine(
         """
         (function(){ try {
           var b = sofuu.agent.brainFor({ memory: 'auto' });
@@ -72,10 +72,10 @@ class RuntimeSurface(private val engine: SofuuEngine) {
           return { ok:true, count: b.cma.count() };
         } catch(e) { return { ok:false, error:String(e&&e.message||e) }; } })()
         """.trimIndent()
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Merge and de-duplicate stored memories. Irreversible. */
-    fun brainConsolidate(): JSONObject? = engine.evalJson(
+    fun brainConsolidate(): JSONObject? = engine.evalJsonOnEngine(
         """
         (function(){ try {
           var b = sofuu.agent.brainFor({ memory: 'auto' });
@@ -85,10 +85,10 @@ class RuntimeSurface(private val engine: SofuuEngine) {
           return { ok:true, merged:n, before:before, after:b.cma.count() };
         } catch(e) { return { ok:false, error:String(e&&e.message||e) }; } })()
         """.trimIndent()
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Run one Ebbinghaus decay/consolidation tick. */
-    fun brainDecay(): JSONObject? = engine.evalJson(
+    fun brainDecay(): JSONObject? = engine.evalJsonOnEngine(
         """
         (function(){ try {
           var b = sofuu.agent.brainFor({ memory: 'auto' });
@@ -98,21 +98,21 @@ class RuntimeSurface(private val engine: SofuuEngine) {
           return { ok:true, before:before, after:b.cma.count() };
         } catch(e) { return { ok:false, error:String(e&&e.message||e) }; } })()
         """.trimIndent()
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Identity of the active embedding spaces: hash + semantic. */
-    fun embeddingInfo(): JSONObject? = engine.evalJson(
+    fun embeddingInfo(): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, info: sofuu.memory.embeddingInfo() }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     // ── ML gates ─────────────────────────────────────────────────
 
     /** Gate states, working-set counters, online-learner status. */
-    fun mlState(): JSONObject? = engine.evalJson(
+    fun mlState(): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, info: sofuu.ml.info(), workset: sofuu.ml.workset() }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /**
      * Teach a gate from an outcome.
@@ -206,24 +206,24 @@ class RuntimeSurface(private val engine: SofuuEngine) {
      * projector artifact, and that is missing on most builds rather than
      * failing at call time.
      */
-    fun spaces(): JSONObject? = engine.evalJson(
+    fun spaces(): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, info: sofuu.ai.embedInfo(), v2: sofuu.ai.embedInfoV2() }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Encode a message with the model's own chat template. */
-    fun applyChatTemplate(messages: JSONArray): JSONObject? = engine.evalJson(
+    fun applyChatTemplate(messages: JSONArray): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, text: sofuu.ai.applyChatTemplate(${SofuuEngine.quote(messages.toString())}) }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     // ── Agents ─────────────────────────────────────────────────────
 
     /** Registered agents with their tools, budgets and sub-agent fan-out. */
-    fun agents(): JSONArray? = engine.evalJson(
+    fun agents(): JSONArray? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, agents: sofuu.agent.list() }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )?.optJSONArray("agents")
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)?.optJSONArray("agents")
 
     /**
      * Register an agent from the phone.
@@ -291,22 +291,22 @@ class RuntimeSurface(private val engine: SofuuEngine) {
         )
 
     /** Cancel a run, and its sub-tree, by run id. */
-    fun cancelAgent(runId: String): Boolean = engine.evalJson(
+    fun cancelAgent(runId: String): Boolean = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, n: sofuu.agent.cancel(${SofuuEngine.quote(runId)}) }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )?.optBoolean("ok") ?: false
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)?.optBoolean("ok") ?: false
 
     /** Caps for a model id, without switching to it. */
-    fun modelCaps(model: String): JSONObject? = engine.evalJson(
+    fun modelCaps(model: String): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, caps: sofuu.ai.modelCaps(${SofuuEngine.quote(model)}) }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
     /** Load agent definitions from a directory of `.js` files. */
-    fun loadAgentDir(dir: String): JSONObject? = engine.evalJson(
+    fun loadAgentDir(dir: String): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return sofuu.agent.loadDir(${SofuuEngine.quote(dir)}); } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
 /**
  * Embed a picked image with the multimodal tower.
@@ -328,7 +328,7 @@ fun embedImage(path: String): java.util.concurrent.CompletableFuture<JSONObject?
 
 /** Cosine between an image vector and a text vector, both in img1's space. */
 fun imageTextSimilarity(imagePath: String, text: String): JSONObject? {
-    val f = embedImage(imagePath).get()
+    val f = embedImage(imagePath).get(30, java.util.concurrent.TimeUnit.SECONDS)
     if (f?.optBoolean("ok") != true) return f
     val img = f.optJSONArray("vec") ?: return null
     val tv = engine.embedLocal(text, "img1").get(5, java.util.concurrent.TimeUnit.SECONDS) ?: return null
@@ -357,9 +357,9 @@ fun imageTextSimilarity(imagePath: String, text: String): JSONObject? {
      * process lifetime, so nothing else would ever run the collector at
      * the right moment.
      */
-    fun collectGarbage(): Boolean = engine.evalJson(
+    fun collectGarbage(): Boolean = engine.evalJsonOnEngine(
         "(function(){ try { globalThis.__sofuu_gc(); return { ok:true }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    )?.optBoolean("ok") ?: false
+    ).get(30, java.util.concurrent.TimeUnit.SECONDS)?.optBoolean("ok") ?: false
 }
 

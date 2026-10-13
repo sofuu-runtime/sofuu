@@ -192,7 +192,10 @@ struct RuntimeSurface {
         guard let vec = SofuuBridge.embedImage([UInt8](data)) else {
             return ["ok": false, "error": "the image projector is not in this build"]
         }
-        return ["ok": true, "dim": vec.count, "vec": vec]
+        // Doubles, not Floats: JSON has no float type, and a downstream
+        // `as? [Double]` on a [Float] is NOT element-wise — it is nil, so
+        // the vector silently looked unusable.
+        return ["ok": true, "dim": vec.count, "vec": vec.map(Double.init)]
     }
 
     /// Cosine between an image vector and a text vector, both in img1's space.

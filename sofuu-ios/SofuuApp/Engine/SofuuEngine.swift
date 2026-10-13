@@ -46,7 +46,18 @@ final class SofuuEngine {
     private var mailbox: [() -> Void] = []
 
     private let replyLock = NSLock()
-    private var pendingReplies: [CheckedContinuation<Any?, Never>] = []
+    /// One parked caller waiting for the engine's reply.
+    ///
+    /// `armed` is what makes a timeout safe: whichever of the reply and the
+    /// timer gets there first flips it, so a late reply is dropped instead
+    /// of being handed to whichever query happens to be next.
+    private final class ReplySlot {
+        let cont: CheckedContinuation<Any?, Never>
+        var armed = true
+        init(_ cont: CheckedContinuation<Any?, Never>) { self.cont = cont }
+    }
+
+    private var pendingReplies: [ReplySlot] = []
 
     private let runLock = NSLock()
     private var _running = false
@@ -63,7 +74,18 @@ final class SofuuEngine {
     }
 
     private var thread: Thread?
-    private var bridge: SofuuBridge?
+    /// The live runtime. Written on the engine thread at boot and cleared
+    /// there at shutdown, but READ from any caller thread — so it needs a
+    /// lock. Without one, a caller between `start()` and the new thread's
+    /// boot can pick up the PREVIOUS runtime and evaluate on it from the
+    /// wrong thread, which the ABI forbids outright.
+    private let bridgeLock = NSLock()
+    private var _bridge: SofuuBridge?
+
+    private var bridge: SofuuBridge? {
+        get { bridgeLock.lock(); defer { bridgeLock.unlock() }; return _bridge }
+        set { bridgeLock.lock(); _bridge = newValue; bridgeLock.unlock() }
+    }
 
     /// The C ABI version of the linked libsofuu.
     var abiVersion: Int { SofuuBridge.abiVersion() }
@@ -132,6 +154,7 @@ final class SofuuEngine {
             log("boot: rt_new")
             let rt = try SofuuBridge.create(jsonEncode(cfg))
             bridge = rt
+            hostToolsLock.lock(); _hostTools.removeAll(); hostToolsLock.unlock()
             log("boot: rt created")
 
             // Bootstrap (event + reply queues) and chat.init must land before
@@ -148,6 +171,10 @@ final class SofuuEngine {
                 // defined), and registering after init would leave the
                 // first turn's agent without them.
                 let registered = DeviceTools.registerAll(into: rt)
+                // Recorded here rather than through registerHostTool: boot
+                // hands the bridge straight to DeviceTools, so the engine
+                // wrapper was never on the path and the list stayed empty.
+                hostToolsLock.lock(); _hostTools = registered; hostToolsLock.unlock()
                 self.log("boot: host tools = \(registered)")
                 var initCfg: JSONObject = [:]
                 initCfg["host"] = "ios"
@@ -175,9 +202,42 @@ final class SofuuEngine {
                 drainEvents(rt)
             }
             log("pump exit")
+
+            // Free the runtime HERE, while this is still the thread that
+            // created it — docs/EMBEDDING.md: a runtime belongs to exactly
+            // one thread, so it has to be released from that thread. Not
+            // doing this leaked an entire QuickJS heap + libuv loop on
+            // every shutdown, and restartEngineForEnv() can be tapped
+            // repeatedly from Settings.
+            releaseRuntime()
         } catch {
             emit(.bootError("\(error)"))
             readyLock.lock(); _ready = false; readyLock.unlock()
+            releaseRuntime()
+        }
+    }
+
+    /// Tear the runtime down and strand nothing.
+    ///
+    /// The free itself must happen on the engine thread (see above), so
+    /// `engineMain` is what calls this. What it does here is unblock
+    /// every caller still parked on a reply: without that, a `Task` that
+    /// was awaiting when the engine went away waits forever, and the
+    /// `importLocalModel` flow would sit at "checking it…" indefinitely.
+    private func releaseRuntime() {
+        bridgeLock.lock()
+        let rt = bridge
+        bridge = nil
+        bridgeLock.unlock()
+        rt?.close()
+
+        replyLock.lock()
+        let stranded = pendingReplies
+        pendingReplies.removeAll()
+        replyLock.unlock()
+        for slot in stranded where slot.armed {
+            slot.armed = false
+            slot.cont.resume(returning: nil)
         }
     }
 
@@ -233,9 +293,11 @@ final class SofuuEngine {
 
     private func completeNext(_ value: Any?) {
         replyLock.lock()
-        let cont = pendingReplies.isEmpty ? nil : pendingReplies.removeFirst()
+        let slot = pendingReplies.isEmpty ? nil : pendingReplies.removeFirst()
         replyLock.unlock()
-        cont?.resume(returning: value)
+        guard let slot, slot.armed else { return }
+        slot.armed = false
+        slot.cont.resume(returning: value)
     }
 
     /// Deliver to observers on the main thread (UI state lives there).
@@ -470,19 +532,35 @@ final class SofuuEngine {
         let urlJs = jsonQuote(url)
         let keyJs = jsonQuote(key)
         return await queryObject(
-            "(function(){ var url = \(urlJs); var key = \(keyJs); " +
-                "var headers = key ? { 'Authorization': 'Bearer ' + key } : {}; " +
-                "var timer = setTimeout(function () { __reply_put(JSON.stringify({ok:false, error:'timeout', models:[]})); }, 12000); " +
-                "try { " +
-                "fetch(url, { headers: headers }).then(function (res) { " +
-                "if (!res.ok) { clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:'HTTP ' + res.status, models:[]})); return; } " +
-                "return res.json(); }).then(function (j) { " +
-                "clearTimeout(timer); " +
-                "var raw = (j && j.data && Array.isArray(j.data)) ? j.data : (j && j.models && Array.isArray(j.models)) ? j.models : []; " +
-                "var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; }).filter(function (x) { return x && String(x).trim(); }); " +
-                "__reply_put(JSON.stringify({ok:true, models: arr, raw: JSON.stringify(j)})); }).catch(function (e) { " +
-                "clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e), models:[]})); }); " +
-                "} catch (e) { clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e), models:[]})); } })()")
+            """
+            (function(){ var url = \(urlJs); var key = \(keyJs);
+              var headers = key ? { 'Authorization': 'Bearer ' + key } : {};
+              /* Exactly one answer per query, whichever arrives first. A
+                 second one would be consumed by the NEXT caller: replies
+                 are matched by arrival order, not by query, so a slow
+                 provider's late timeout frame would hand its error to an
+                 unrelated query and shift every later answer by one. */
+              var done = false, timer = null;
+              function settle(o){ if (done) return; done = true; if (timer) clearTimeout(timer); __reply_put(JSON.stringify(o)); }
+              timer = setTimeout(function () { settle({ok:false, error:'timeout', models:[]}); }, 12000);
+              try {
+                fetch(url, { headers: headers }).then(function (res) {
+                  if (!res.ok) { settle({ok:false, error:'HTTP ' + res.status, models:[]}); return; }
+                  return res.json();
+                }).then(function (j) {
+                  var raw = (j && j.data && Array.isArray(j.data)) ? j.data
+                          : (j && j.models && Array.isArray(j.models)) ? j.models : [];
+                  var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; })
+                                 .filter(function (x) { return x && String(x).trim(); });
+                  settle({ok:true, models: arr, raw: JSON.stringify(j)});
+                }).catch(function (e) {
+                  settle({ok:false, error:String(e&&e.message||e), models:[]});
+                });
+              } catch (e) {
+                settle({ok:false, error:String(e&&e.message||e), models:[]});
+              } })()
+            """
+        )
     }
 
     // ── Query plumbing ───────────────────────────────────────────────
@@ -492,7 +570,7 @@ final class SofuuEngine {
     private func query(_ expr: String) async -> Any? {
         await withCheckedContinuation { (cont: CheckedContinuation<Any?, Never>) in
             replyLock.lock()
-            pendingReplies.append(cont)
+            pendingReplies.append(ReplySlot(cont))
             replyLock.unlock()
             enqueue { [weak self] in
                 guard let self else { return }
@@ -551,7 +629,7 @@ final class SofuuEngine {
 
         return await withCheckedContinuation { (cont: CheckedContinuation<Any?, Never>) in
             replyLock.lock()
-            pendingReplies.append(cont)
+            pendingReplies.append(ReplySlot(cont))
             replyLock.unlock()
             enqueue { [weak self] in
                 guard let self else { return }
@@ -564,18 +642,46 @@ final class SofuuEngine {
         }
     }
 
-    /// `query` with a deadline. The engine thread keeps running either way;
-    /// this only stops the caller waiting on a turn that will never answer.
+    /// `query` with a deadline.
+    ///
+    /// Deliberately NOT `withTaskGroup`: `query` parks on
+    /// `withCheckedContinuation`, which is not cancellable, and a task
+    /// group waits for every child before returning — so the group could
+    /// not return until the continuation was resumed anyway, and the
+    /// timeout never fired. Instead the continuation itself is resumed by
+    /// whichever arrives first: the engine's reply, or the timer.
+    ///
+    /// `pendingReplies` keeps the entry either way. If the timer wins, the
+    /// late reply is consumed by the next `completeNext`, so the slot is
+    /// removed here and the reply is dropped rather than handed to an
+    /// unrelated caller — a stale reply would otherwise shift every
+    /// subsequent answer by one.
     private func query(_ expr: String, timeout: TimeInterval) async -> Any? {
-        await withTaskGroup(of: Any?.self) { group in
-            group.addTask { await self.query(expr) }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                return nil
+        let deadline = timeout <= 0 ? .distantFuture : DispatchTime.now() + timeout
+        return await withCheckedContinuation { (cont: CheckedContinuation<Any?, Never>) in
+            let slot = ReplySlot(cont)
+
+            replyLock.lock()
+            pendingReplies.append(slot)
+            replyLock.unlock()
+
+            DispatchQueue.global().asyncAfter(deadline: deadline) { [weak self] in
+                guard let self else { return }
+                self.replyLock.lock()
+                let won = slot.armed
+                slot.armed = false
+                if won, let idx = self.pendingReplies.firstIndex(where: { $0 === slot }) {
+                    self.pendingReplies.remove(at: idx)
+                }
+                self.replyLock.unlock()
+                if won { cont.resume(returning: nil) }
             }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+
+            self.enqueue { [weak self] in
+                guard let self else { return }
+                guard let rt = self.bridge else { self.completeNext(nil); return }
+                _ = rt.eval(self.queryScript(expr))
+            }
         }
     }
 

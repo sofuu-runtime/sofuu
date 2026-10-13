@@ -163,6 +163,18 @@ static void on_stream_event(const char *event_json, void *opaque) {
     if (s == NULL) return;
     (*env)->CallVoidMethod(env, g_stream_listener, g_stream_on_event, s);
     (*env)->DeleteLocalRef(env, s);
+    /* A listener that throws leaves a pending exception on this thread,
+     * and every later JNI call on it then runs with that exception still
+     * armed — undefined behaviour. Clear it: the event is lost, which is
+     * far better than corrupting the engine thread. */
+    if ((*env)->ExceptionCheck(env)) {
+        /* JNI has no "describe the pending exception" call (that is JVMTI),
+         * and the engine log already carries whatever the listener wrote.
+         * Naming the event is the useful part. */
+        __android_log_print(ANDROID_LOG_ERROR, "sofuu-js",
+                            "stream listener threw; event dropped and exception cleared");
+        (*env)->ExceptionClear(env);
+    }
 }
 
 /* SofuuBridge.nativeSetStreamListener(listener | null) */
@@ -452,11 +464,19 @@ Java_com_sofuu_engine_SofuuBridge_nativeVoiceSpeak(JNIEnv *env, jclass cls, jlon
  *    the call and settles it with nativeHostToolResolve, from any thread.
  */
 
-typedef struct {
+typedef struct SofuuHostToolSlot {
     char *name;
     jobject listener;   /* global ref to the Kotlin HostTool */
     jmethodID method;   /* invoke(String, long) -> String? */
+    struct SofuuHostToolSlot *next;
 } SofuuHostToolSlot;
+
+/* Every slot ever allocated for this process. The ABI keeps the C side of
+ * a registration forever and gives no "runtime destroyed" callback, so the
+ * JNI global ref would otherwise pin its Kotlin receiver — and through it
+ * the Activity's Context — for the life of the app. One list, torn down by
+ * nativeFreeHostTools() once the runtime that owns them is gone. */
+static SofuuHostToolSlot *g_host_tools = NULL;
 
 /* One slot per host-tool call thread; see note 2 above. */
 static __thread char *g_host_result = NULL;
@@ -541,6 +561,8 @@ Java_com_sofuu_engine_SofuuBridge_nativeRegisterHostTool(JNIEnv *env, jclass cls
     slot->name = strdup(name_c);
     slot->listener = (*env)->NewGlobalRef(env, listener);
     slot->method = mid;
+    slot->next = g_host_tools;
+    g_host_tools = slot;
 
     const char *desc_c = NULL, *params_c = NULL;
     if (description != NULL) desc_c = (*env)->GetStringUTFChars(env, description, NULL);
@@ -610,4 +632,36 @@ Java_com_sofuu_engine_SofuuBridge_nativeSetEnv(JNIEnv *env, jclass cls, jstring 
         }
     }
     (*env)->ReleaseStringUTFChars(env, name, n);
+}
+
+/* SofuuBridge.nativeFreeHostTools() — release every host-tool registration.
+ *
+ * Call this AFTER the runtime that used them has been freed. The JNI global
+ * refs have to go through a JNIEnv; by this point the engine thread is
+ * gone, so attach for the duration rather than assume. Returns how many
+ * were released. */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeFreeHostTools(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    int n = 0;
+    JNIEnv *e = env;
+    int attached = 0;
+    if (g_jvm != NULL &&
+        (*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &e, NULL) != JNI_OK) { e = NULL; }
+        else { attached = 1; }
+    }
+    SofuuHostToolSlot *s = g_host_tools;
+    g_host_tools = NULL;
+    while (s != NULL) {
+        SofuuHostToolSlot *next = s->next;
+        if (e != NULL && s->listener != NULL) (*e)->DeleteGlobalRef(e, s->listener);
+        free(s->name);
+        free(s);
+        s = next;
+        n++;
+    }
+    if (g_host_result != NULL) { free(g_host_result); g_host_result = NULL; g_host_result_cap = 0; }
+    if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+    return n;
 }

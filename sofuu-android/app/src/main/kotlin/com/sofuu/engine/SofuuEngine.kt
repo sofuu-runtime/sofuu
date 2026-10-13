@@ -78,8 +78,16 @@ class SofuuEngine(
 
     fun shutdown() {
         if (!running.getAndSet(false)) return
-        thread?.join(4000)
+        val t = thread
         thread = null
+        t?.join(4000)
+        // A thread that did not stop in time is still holding `bridge`, and
+        // a later start() would spawn a second worker against the same
+        // runtime. Refuse rather than hand one runtime to two threads —
+        // that is the use-after-free this used to allow.
+        if (t != null && t.isAlive) {
+            log("shutdown: engine thread still alive after 4s; leaving it as the sole owner")
+        }
     }
 
     private fun log(msg: String) = android.util.Log.i("sofuu-engine", msg)
@@ -144,36 +152,53 @@ class SofuuEngine(
             })
 
             // Pump loop: commands first, then a drain of both JS queues.
-            while (running.get()) {
-                val cmd = mailbox.poll(50, TimeUnit.MILLISECONDS)
-                if (!running.get()) break
-                try {
-                    cmd?.run()
-                } catch (e: Throwable) {
-                    emit(EngineEvent.BootError(e.message ?: e.toString()))
-                }
-                drainEvents(rt)
-            }
-            log("pump exit")
-            // Release the runtime HERE, while this is still the thread that
-            // created it (docs/EMBEDDING.md: a runtime belongs to exactly
-            // one thread). shutdown() used to only join the worker, so the
-            // whole QuickJS + libuv engine leaked on every process death.
             try {
-                bridge?.close()
-                log("runtime freed")
-            } catch (e: Throwable) {
-                log("sofuu_rt_free failed: ${e.message ?: e.toString()}")
-            }
-            bridge = null
-            ready.set(false)
-            // Anything still queued will never be evaluated now, so release
-            // its callers with null instead of leaving a future that hangs
-            // whoever is blocking on it.
-            synchronized(replyLock) {
-                val stranded = pendingReplies.toList()
-                pendingReplies.clear()
-                stranded.forEach { if (!it.isDone) it.complete(null) }
+                while (running.get()) {
+                    val cmd = mailbox.poll(50, TimeUnit.MILLISECONDS)
+                    if (!running.get()) break
+                    try {
+                        cmd?.run()
+                    } catch (e: Throwable) {
+                        emit(EngineEvent.BootError(e.message ?: e.toString()))
+                    }
+                    // Its own guard: drainEvents runs JS through the runtime,
+                    // so a throw here must not skip the cleanup below. It
+                    // used to be outside every catch, so one bad eval leaked
+                    // the entire engine and wedged every future caller.
+                    try {
+                        drainEvents(rt)
+                    } catch (e: Throwable) {
+                        log("drain failed: ${e.message ?: e.toString()}")
+                    }
+                }
+                log("pump exit")
+            } finally {
+                // Release the runtime HERE, while this is still the thread
+                // that created it (docs/EMBEDDING.md: a runtime belongs to
+                // exactly one thread).
+                try {
+                    bridge?.close()
+                    log("runtime freed")
+                } catch (e: Throwable) {
+                    log("sofuu_rt_free failed: ${e.message ?: e.toString()}")
+                }
+                bridge = null
+                // The runtime is gone, so nothing can reach these any more.
+                // Dropping the JNI global refs here is what stops each
+                // registration from pinning its receiver for the process
+                // lifetime.
+                val released = SofuuBridge.freeHostTools()
+                if (released > 0) log("host tools released: $released")
+                hostTools.clear()
+                ready.set(false)
+                // Anything still queued will never be evaluated now, so
+                // release its callers with null instead of leaving a future
+                // that hangs whoever is blocking on it.
+                synchronized(replyLock) {
+                    val stranded = pendingReplies.toList()
+                    pendingReplies.clear()
+                    stranded.forEach { if (!it.isDone) it.complete(null) }
+                }
             }
         } catch (e: Throwable) {
             emit(EngineEvent.BootError(e.message ?: e.toString()))
@@ -465,19 +490,37 @@ class SofuuEngine(
         val urlJs = jsonString(url)
         val keyJs = jsonString(key)
         return query(
-            "(function(){ var url = $urlJs; var key = $keyJs; " +
-                "var headers = key ? { 'Authorization': 'Bearer ' + key } : {}; " +
-                "var timer = setTimeout(function () { __reply_put(JSON.stringify({ok:false, error:'timeout', models:[]})); }, 12000); " +
-                "try { " +
-                "fetch(url, { headers: headers }).then(function (res) { " +
-                "if (!res.ok) { clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:'HTTP ' + res.status, models:[]})); return; } " +
-                "return res.json(); }).then(function (j) { " +
-                "clearTimeout(timer); " +
-                "var raw = (j && j.data && Array.isArray(j.data)) ? j.data : (j && j.models && Array.isArray(j.models)) ? j.models : []; " +
-                "var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; }).filter(function (x) { return x && String(x).trim(); }); " +
-                "__reply_put(JSON.stringify({ok:true, models: arr, raw: JSON.stringify(j)})); }).catch(function (e) { " +
-                "clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e), models:[]})); }); " +
-                "} catch (e) { clearTimeout(timer); __reply_put(JSON.stringify({ok:false, error:String(e&&e.message||e), models:[]})); } })()"
+            """
+            (function(){ var url = $urlJs; var key = $keyJs;
+              var headers = key ? { 'Authorization': 'Bearer ' + key } : {};
+              /* Exactly one answer per query, whichever arrives first. This
+                 script answers ITSELF via __reply_put, and query() wraps
+                 every expression in another __reply_put — so before this
+                 guard a slow provider pushed two replies, the second of
+                 which was consumed by the NEXT query and shifted every
+                 later answer by one. That is why refreshModelCache never
+                 populated: its future was resolved by the wrapper's
+                 JSON.stringify(undefined). */
+              var done = false, timer = null;
+              function settle(o){ if (done) return; done = true; if (timer) clearTimeout(timer); __reply_put(JSON.stringify(o)); }
+              timer = setTimeout(function () { settle({ok:false, error:'timeout', models:[]}); }, 12000);
+              try {
+                fetch(url, { headers: headers }).then(function (res) {
+                  if (!res.ok) { settle({ok:false, error:'HTTP ' + res.status, models:[]}); return; }
+                  return res.json();
+                }).then(function (j) {
+                  var raw = (j && j.data && Array.isArray(j.data)) ? j.data
+                          : (j && j.models && Array.isArray(j.models)) ? j.models : [];
+                  var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; })
+                                 .filter(function (x) { return x && String(x).trim(); });
+                  settle({ok:true, models: arr, raw: JSON.stringify(j)});
+                }).catch(function (e) {
+                  settle({ok:false, error:String(e&&e.message||e), models:[]});
+                });
+              } catch (e) {
+                settle({ok:false, error:String(e&&e.message||e), models:[]});
+              } })()
+            """.trimIndent()
         ).thenObject()
     }
 
@@ -552,13 +595,41 @@ class SofuuEngine(
      * `{ok:..., error:...}` object so a failure inside the brain or the
      * ML gates is reported rather than collapsing to null — which is the
      * whole difference between "the brain is off" and "the call threw".
+     *
+     * It MUST go through the mailbox. The runtime belongs to the engine
+     * thread, and `sofuu_rt_eval` takes no lock, so calling it from a
+     * caller thread while the pump is draining would run two JS contexts
+     * on one QuickJS state — a native crash, not a wrong answer.
+     *
+     * Synchronous, so callers must be off the main thread.
      */
+    @Synchronized
     fun evalJson(script: String): JSONObject? =
         try {
             JSONObject(bridge?.eval(script))
         } catch (e: Throwable) {
             null
         }
+
+    /** The mailbox-routed form of [evalJson]: never touches the runtime
+     *  from the caller's thread. Same contract, same returned object. */
+    fun evalJsonOnEngine(script: String): CompletableFuture<JSONObject?> {
+        val f = CompletableFuture<JSONObject?>()
+        mailbox.put(Runnable {
+            val rt = bridge
+            if (rt == null) {
+                if (!f.isDone) f.complete(null)
+                return@Runnable
+            }
+            try {
+                val raw = rt.eval(script)
+                if (!f.isDone) f.complete(if (raw == null) null else try { JSONObject(raw) } catch (e: Throwable) { null })
+            } catch (e: Throwable) {
+                if (!f.isDone) f.complete(null)
+            }
+        })
+        return f
+    }
 
     companion object {
         private val BOOTSTRAP_JS = """

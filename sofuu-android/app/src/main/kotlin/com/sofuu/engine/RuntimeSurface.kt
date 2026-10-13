@@ -100,12 +100,6 @@ class RuntimeSurface(private val engine: SofuuEngine) {
         """.trimIndent()
     ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
-    /** Identity of the active embedding spaces: hash + semantic. */
-    fun embeddingInfo(): JSONObject? = engine.evalJsonOnEngine(
-        "(function(){ try { return { ok:true, info: sofuu.memory.embeddingInfo() }; } " +
-            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
-
     // ── ML gates ─────────────────────────────────────────────────
 
     /** Gate states, working-set counters, online-learner status. */
@@ -164,15 +158,6 @@ class RuntimeSurface(private val engine: SofuuEngine) {
         )
     }
 
-    /** The loop-boundary verdict: spinning, over-budget, wasted effort. */
-    fun mlLoop(run: String, step: Int, budget: Int): JSONObject? {
-        val payload = JSONObject().put("run", run).put("step", step).put("budget", budget)
-        return engine.evalJson(
-            "(function(){ try { return sofuu.ml.supervisor.loop(${SofuuEngine.quote(payload.toString())}); } " +
-                "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-        )
-    }
-
     // ── Vectors ──────────────────────────────────────────────────
 
     /**
@@ -208,12 +193,6 @@ class RuntimeSurface(private val engine: SofuuEngine) {
      */
     fun spaces(): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, info: sofuu.ai.embedInfo(), v2: sofuu.ai.embedInfoV2() }; } " +
-            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
-
-    /** Encode a message with the model's own chat template. */
-    fun applyChatTemplate(messages: JSONArray): JSONObject? = engine.evalJsonOnEngine(
-        "(function(){ try { return { ok:true, text: sofuu.ai.applyChatTemplate(${SofuuEngine.quote(messages.toString())}) }; } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
     ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
@@ -290,21 +269,9 @@ class RuntimeSurface(private val engine: SofuuEngine) {
             timeoutMs,
         )
 
-    /** Cancel a run, and its sub-tree, by run id. */
-    fun cancelAgent(runId: String): Boolean = engine.evalJsonOnEngine(
-        "(function(){ try { return { ok:true, n: sofuu.agent.cancel(${SofuuEngine.quote(runId)}) }; } " +
-            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    ).get(30, java.util.concurrent.TimeUnit.SECONDS)?.optBoolean("ok") ?: false
-
     /** Caps for a model id, without switching to it. */
     fun modelCaps(model: String): JSONObject? = engine.evalJsonOnEngine(
         "(function(){ try { return { ok:true, caps: sofuu.ai.modelCaps(${SofuuEngine.quote(model)}) }; } " +
-            "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
-    ).get(30, java.util.concurrent.TimeUnit.SECONDS)
-
-    /** Load agent definitions from a directory of `.js` files. */
-    fun loadAgentDir(dir: String): JSONObject? = engine.evalJsonOnEngine(
-        "(function(){ try { return sofuu.agent.loadDir(${SofuuEngine.quote(dir)}); } " +
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
     ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 

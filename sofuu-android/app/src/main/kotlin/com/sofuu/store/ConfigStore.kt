@@ -187,7 +187,6 @@ class ConfigStore(private val context: Context) {
         prefs.edit().remove("key:$provider").apply()
     }
 
-    fun hasKey(provider: String): Boolean = !keyFor(provider).isNullOrEmpty()
 }
 
 /** UI preferences that persist across launches (the desktop's

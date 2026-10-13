@@ -27,11 +27,20 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
     fun call(method: String, argsJson: String? = null): String? =
         nativeRtCall(rtPtr, method, argsJson)
 
-    /** Run a streamable funnel call (agent.run / ai.stream). Events are
-     *  delivered to [listener].onStreamEvent on the engine thread.
-     *  Returns the cancel id (0 = dispatch failed). */
-    fun callStream(method: String, argsJson: String?, listener: StreamListener): Long =
-        nativeRtCallStream(rtPtr, method, argsJson)
+    /**
+     * Run a streamable funnel call (agent.run / ai.stream).
+     *
+     * The ABI hands events to a single process-global listener rather than
+     * a per-call one, so [listener] is installed here rather than ignored.
+     * The C side used to drop it on the floor, which made the promise below
+     * untrue and the call silently returned 0 (no listener installed).
+     *
+     * Returns the cancel id; 0 means the dispatch failed.
+     */
+    fun callStream(method: String, argsJson: String?, listener: StreamListener): Long {
+        nativeSetStreamListener(listener)
+        return nativeRtCallStream(rtPtr, method, argsJson)
+    }
 
     /** Cancel a streaming call by its id. */
     fun cancel(cancelId: Long): Boolean = nativeRtCancel(rtPtr, cancelId)

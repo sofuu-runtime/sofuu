@@ -161,6 +161,7 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                     mode = state.mode,
                     permissions = state.permissions,
                     config = state.config,
+                    localModelLabels = state.localModelLabels,
                     ctx = state.ctx,
                     images = state.pickedImages,
                     pendingMentions = state.pendingMentions,

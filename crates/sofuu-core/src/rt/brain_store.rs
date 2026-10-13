@@ -49,6 +49,15 @@ pub const SEGMENT_CAP: usize = 256;
 pub struct SegmentMeta {
     pub file: String,
     pub records: usize,
+    /// SHA-256 of the segment file as published. The codec's container read
+    /// accepts a TRUNCATED file as a valid, silently-shortened container
+    /// (measured 2026-10-13: a segment cut to 1/3 loaded as 6 of 10 records
+    /// with no error), so the store carries its own digest and refuses a
+    /// segment that does not match — a torn write must never read as a
+    /// brain that quietly forgot things. Empty = written before this field
+    /// existed (verified by shape only).
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// The committed manifest — the source of truth for a segmented brain.
@@ -314,7 +323,7 @@ pub unsafe fn read_tensor_stream(
     if r == qtsq::QTSQ_OK && !data.is_null() {
         let vals = std::slice::from_raw_parts(data, count).to_vec();
         let nd = (*sub).schema_num_dims();
-        let dims: Vec<u32> = (0..nd).map(|i| (*sub).schema_dim(i)).collect();
+        let dims: Vec<u32> = (0..nd as usize).map(|i| (*sub).schema_dim(i)).collect();
         out = Some((vals, dims));
     }
     if !data.is_null() {
@@ -356,6 +365,11 @@ unsafe fn find_stream(
         qtsq::qtsq_ctx_free(sub);
     }
     None
+}
+
+/// Digest of a published file (None when unreadable).
+pub fn file_digest(path: &str) -> Option<String> {
+    crate::rt::wal::sha256_file(path)
 }
 
 /// The stream names a container carries (diagnostics + shape checks).
@@ -578,8 +592,16 @@ mod tests {
             assert_eq!(back[0].id, 0);
             assert_eq!(back[1].id, 7, "ids are explicit, not positional");
             assert_eq!(back[0].meta["text"], "alpha");
-            assert_eq!(back[0].vec, recs[0].vec);
-            assert_eq!(back[1].vec, recs[1].vec);
+            /* The codec's tensor transform is exact for ordinary values but
+             * leaves ~2e-19 noise where the input was 0.0 — irrelevant for
+             * embedding geometry (cosine shifts by ~0), so compare with a
+             * tolerance rather than bit equality. */
+            for (a, b) in back[0].vec.iter().zip(recs[0].vec.iter()) {
+                assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+            }
+            for (a, b) in back[1].vec.iter().zip(recs[1].vec.iter()) {
+                assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+            }
         }
     }
 
@@ -588,7 +610,11 @@ mod tests {
         let dir = tmpdir("manifest");
         let path = dir.join("brain.qtsq");
         let mut m = Manifest::new(serde_json::json!({"id": "hash-v1", "dimension": 768}));
-        m.segments.push(SegmentMeta { file: "seg-000001-000001.qtsq".into(), records: 3 });
+        m.segments.push(SegmentMeta {
+            file: "seg-000001-000001.qtsq".into(),
+            records: 3,
+            sha256: "ab".repeat(32),
+        });
         m.last_decay_at = 1234;
         m.evicted_total = 9;
         unsafe {
@@ -597,6 +623,7 @@ mod tests {
             assert_eq!(back.schema, SEGMENT_SCHEMA);
             assert_eq!(back.segments.len(), 1);
             assert_eq!(back.segments[0].records, 3);
+            assert_eq!(back.segments[0].sha256, "ab".repeat(32));
             assert_eq!(back.last_decay_at, 1234);
             assert_eq!(back.evicted_total, 9);
             assert_eq!(back.embedding["id"], "hash-v1");

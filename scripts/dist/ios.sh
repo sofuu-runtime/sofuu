@@ -314,11 +314,13 @@ build_target() {
 # turns "the shader compiles on this SDK" into a BUILD-time fact: a shader
 # that fails here fails the pack, not a user's first prompt.
 #
-# -std=metal3.1 is a floor, not a preference. The bf16 kernels use `bfloat`,
-# which MSL 3.0 does not have (probed: `metal -std=metal3.0` rejects it for
-# macOS and iOS alike; metal3.1 accepts it). Consequence for consumers: the
-# metallib loads on iOS 17+; on iOS 16 the engine logs the miss and runs
-# CPU-only, which is the designed degradation.
+# -std=metal3.0 matches the app's own deployment target (iOS 16.0). The
+# shader needs no newer MSL: the one thing that did, the `bfloat` builtin,
+# was replaced by the shift-and-bit-cast that conversion compiles to anyway
+# (see src/metal/kernels.metal), and the whole file now compiles at
+# metal3.0 for macOS, the simulator and the device. Compiling higher would
+# ship a metallib an iOS 16 device cannot load, leaving the engine CPU-only
+# there for no gain.
 #
 # `link framework "Metal"` in the modulemap is what makes a consuming app
 # link: the archive references MTL* symbols, and a SWIFT app links Foundation
@@ -331,7 +333,7 @@ ios_build_metallib() {
     local tmp
     tmp="$(mktemp -d)"
     xcrun -sdk "$sdk_name" metal -c "$REPO_ROOT/src/metal/kernels.metal" \
-        -o "$tmp/kernels.air" -std=metal3.1
+        -o "$tmp/kernels.air" -std=metal3.0
     xcrun -sdk "$sdk_name" metallib "$tmp/kernels.air" -o "$out"
     rm -rf "$tmp"
     # Every pipeline the engine loads must be in the library it will pick up

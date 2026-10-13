@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sofuu.store.AppStore
+import com.sofuu.store.fallbackModelLabel
 import com.sofuu.ui.theme.LocalSofuuColors
 import org.json.JSONArray
 import org.json.JSONObject
@@ -112,7 +113,22 @@ private fun ModelSheet(store: AppStore) {
     val providers = state.config?.providers ?: emptyList()
 
     if (provider == null) {
-        SheetTitle("Select a provider")
+        SheetTitle("Select a model")
+        // On-device GGUF models route by absolute path (rt/ai.rs sends local
+        // models to the in-process engine), so they need no provider entry —
+        // but not being listed here meant the model sheet could never reach
+        // them, and a local-only setup saw just "＋ Add provider".
+        if (state.localModels.isNotEmpty()) {
+            state.localModels.forEach { path ->
+                val label = state.localModelLabels[path] ?: fallbackModelLabel(path)
+                SheetRow(label, null, path == state.config?.model) {
+                    store.pickLocalModel(path)
+                    store.closeSheet()
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+        }
+        if (providers.isNotEmpty()) SheetTitle("Cloud providers")
         providers.forEach { p ->
             SheetRow(p.name, p.model.ifEmpty { null }, p.name == state.config?.active) { provider = p.name }
         }
@@ -217,6 +233,10 @@ private fun ModelSheet(store: AppStore) {
 }
 
 private fun onCloseSheet(store: AppStore) {
+    // The composer sheet renders ABOVE Settings in the z-order — opening
+    // Settings without first dropping the sheet buried the providers pane
+    // under the still-visible sheet.
+    store.closeSheet()
     store.openSettings(true, "providers")
 }
 

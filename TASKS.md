@@ -4,6 +4,33 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-13 — SnapKV Observation Pooling & Lookahead Tree Decoding complete.**
+> Shipped Stage 12 memory bandwidth optimizations in the Sofuu neural inference engine.
+> - **SnapKV Observation Window Pooling (`paged_kv.rs`)**: `SnapKvProfiler` and `compact_with_snapkv` on `SequenceBlockTable`. Retains 16 sink tokens (Block 0) + tail observation window ($W=32$) and keeps top 25% middle blocks, freeing 75% of inactive blocks back to `BlockPool`. Slashes KV cache DRAM bandwidth reads by $4\times$ to $5\times$.
+> - **Jacobi / Lookahead Parallel Tree Decoding (`lookahead.rs`)**: `NgramCache` learning 2-gram and 3-gram projection tables from prompts and generated tokens; `CandidateTree` formulating candidate continuation branches with 2D block-causal ancestor attention masks; speculative tree verification integrated into `InferEngine::stream`.
+> - **CLI Options**: Added `--lookahead` and `--snapkv` flags to `sofuu infer`.
+> - **Strict Size Budget & Verification**: Stripped release binary strictly **4.9 MB** ($\le 5.0\text{ MB}$ gate). Workspace tests passing: **571 passed, 0 failed**.
+>
+> **2026-10-13 — B3 complete: segmented brain storage.**
+> `ROADMAP-BRAIN-CMA.md` B3 shipped (B3.5 deferred — see below). The brain's canonical path now holds
+> a small MANIFEST and the records live in bounded segments beside it (`<path>.d/`), following the
+> `session_store.rs` contract: one committed manifest, immutable sealed segments, at most one mutable
+> active segment, every publish behind the C2 journal. **B3.2** the CMA tracks dirty ids and the flush
+> appends only what changed — measured live, 5 new records cost **548 bytes** where the old full
+> rewrite cost ~80 KB; decay is not written at all (the manifest carries `last_decay_at` and a load
+> replays the elapsed decay, capped at 7 days). **B3.3** capacity policy (`SOFUU_BRAIN_MAX_RECORDS`,
+> default 100k): over the cap the weakest live records are tombstoned — never pins, never entities —
+> and reported in `cma.stats().evicted_total`; tombstoning keeps ids stable so a caller holding recall
+> ids across the flush cannot be handed a wrong record. **B3.4** compaction (automatic at 2× live + 64
+> versions, or via `cma.compact()`) rewrites one version per live record into a fresh epoch and
+> preserves recall. Six new tests cover the gate — sealed segments byte-identical during an
+> incremental flush, 10k records reload + recall, capacity eviction, compaction, legacy migration with
+> backup, and torn-segment refusal. Full suite **512/0** in both QTSQ-enabled and QTSQ-free builds.
+> **Found while testing:** the QTSQ container read accepts a TRUNCATED file as a valid, shortened
+> container (10 records → 6, no error); the store now carries a per-segment SHA-256 and refuses a
+> mismatch. **Deferred:** B3.5 (hash/sem2 channel dedup) needs the two-channel write + RRF fusion in
+> `src/js/agent.js`, another agent's active file — recorded in the roadmap.
+>
 > **2026-10-13 — Distributed Edge Swarms (`sofuu swarm`), Virtual Block Paging & Continuous Batching complete.**
 > Shipped Stage 9-11 in the Sofuu neural inference engine.
 > - **Distributed Edge Swarms (`swarm.rs`)**: High-performance framed binary wire protocol (`SwarmProto`, `SFSW`) with CRC32 integrity verification. Sequential layer-wise pipelining across LAN edge nodes (`SwarmLeader` embedding + coordinator + sampler, `SwarmWorker` partitioned layers e.g. `--layers 16..32` or `--node 2/2`). Zero-config UDP discovery on port 9770 (`sofuu swarm discover`).

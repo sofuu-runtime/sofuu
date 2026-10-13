@@ -59,7 +59,7 @@ mod impl_qtsq {
     /// (qtsq_adapter.c:23-41: an unsigned binary would trigger a macOS
     /// Keychain prompt on EVERY launch; brain files are machine-local
     /// at-rest obfuscation, so a fixed password avoids all prompts).
-    const SOFUU_QTSQ_LOCAL_PASSWORD: &str = "sofuu-kv-local-v1";
+    const SOFUU_QTSQ_LOCAL_PASSWORD: &str = crate::rt::brain_store::LOCAL_PASSWORD;
 
     /// B0 (AUDIT-2026-10-13): the codec's tensor-compression level.
     /// 0 = full contest — the best ratio and the behaviour every brain/KV
@@ -67,7 +67,7 @@ mod impl_qtsq {
     /// 2.1.0 API added it; the FFI used to omit it, leaving the callee to
     /// read an undefined register). Levels 1 (fast) and 2 (store) are
     /// available for future tuning; nothing uses them yet.
-    const QTSQ_LEVEL_FULL: std::os::raw::c_int = 0;
+    const QTSQ_LEVEL_FULL: std::os::raw::c_int = crate::rt::brain_store::QTSQ_LEVEL_FULL;
 
     unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
         if p.is_null() {
@@ -607,6 +607,134 @@ mod impl_qtsq {
         /// interchangeable, so the manifest is checked on every open.
         embedding_id: String,
         cma: crate::memory::cma::Cma,
+        /// B3: segmented-store state. `None` until the first segmented
+        /// load/flush — a fresh brain, or a legacy single-file brain that
+        /// has not been migrated yet.
+        layout: Option<BrainLayout>,
+    }
+
+    /// B3.1: the on-disk layout of a segmented brain.
+    struct BrainLayout {
+        /// `<path>.d` — where the segments live.
+        dir: String,
+        segments: Vec<crate::rt::brain_store::SegmentMeta>,
+        /// Generation counter; segment names carry it so a compaction never
+        /// collides with the files it replaces.
+        epoch: u64,
+        /// Records the store has already persisted (ids below this are on
+        /// disk; ids at or above it are new).
+        persisted: usize,
+        /// Unix seconds the persisted strengths were current as of — a load
+        /// replays the decay that happened while the process was down.
+        last_decay_at: u64,
+        /// Lifetime capacity evictions (reported, never silent).
+        evicted_total: u64,
+        /// The incremental path cannot express the current state (a legacy
+        /// file that has not been migrated, or retain() renumbered ids):
+        /// the next flush rewrites every live record into fresh segments.
+        needs_compaction: bool,
+    }
+
+    impl BrainLayout {
+        /// Placeholder used while the real layout is carried alongside the
+        /// loaded data (the loader returns them together).
+        fn empty() -> Self {
+            Self {
+                dir: String::new(),
+                segments: Vec::new(),
+                epoch: 1,
+                persisted: 0,
+                last_decay_at: 0,
+                evicted_total: 0,
+                needs_compaction: false,
+            }
+        }
+    }
+
+    /// Default record cap for a segmented brain. Overridable with
+    /// SOFUU_BRAIN_MAX_RECORDS; 0 disables the cap. 100k × 768 dims is
+    /// already ~300 MB of resident vectors, so this is a safety net, not a
+    /// working limit.
+    const BRAIN_MAX_RECORDS_DEFAULT: usize = 100_000;
+
+    fn brain_max_records() -> usize {
+        /* Tests override per-thread: the env is process-global and cargo
+         * runs tests in parallel, so an env-based override would leak into
+         * every other brain test in flight. */
+        #[cfg(test)]
+        if let Some(v) = BRAIN_CAP_OVERRIDE.with(|c| c.get()) {
+            return v;
+        }
+        match std::env::var("SOFUU_BRAIN_MAX_RECORDS") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(BRAIN_MAX_RECORDS_DEFAULT),
+            Err(_) => BRAIN_MAX_RECORDS_DEFAULT,
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static BRAIN_CAP_OVERRIDE: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(test)]
+    fn set_brain_cap_override(v: Option<usize>) {
+        BRAIN_CAP_OVERRIDE.with(|c| c.set(v));
+    }
+
+    /// The embedding block the manifest carries (same shape as a legacy
+    /// brain's metadata `embedding` object).
+    fn embedding_block(shell: &CmaShell) -> serde_json::Value {
+        let (input, artifact) = if shell.embedding_id == crate::embedding::MODEL_ID {
+            (
+                crate::embedding::INPUT_EMBEDDER_ID,
+                crate::embedding::model_artifact_id(),
+            )
+        } else if shell.embedding_id == crate::embedding::semantic_v2::MODEL_ID_V2 {
+            (
+                crate::embedding::semantic_v2::INPUT_EMBEDDER_ID_V2,
+                crate::embedding::semantic_v2::model_artifact_id_v2(),
+            )
+        } else {
+            ("", String::new())
+        };
+        serde_json::json!({
+            "id": shell.embedding_id,
+            "input": input,
+            "dimension": shell.vec_dim,
+            "artifact": artifact,
+        })
+    }
+
+    /// One record's metadata as the store writes it (the RecordJson shape,
+    /// minus vector_index — a segment carries the id explicitly).
+    fn record_meta(shell: &CmaShell, id: u32) -> serde_json::Value {
+        let r = &shell.cma.records[id as usize];
+        serde_json::json!({
+            "kv_page_id": r.kv_page_id,
+            "strength": r.strength,
+            "age_seconds": r.age_seconds,
+            "half_life": r.half_life,
+            "tier": r.tier,
+            "text": r.text,
+            "role": r.role,
+            "entity_name": r.entity_name,
+            "entity_type": r.entity_type,
+            "corecall_ids": r.corecall_ids,
+            "total_recalls": r.total_recalls,
+            "positive_recalls": r.positive_recalls,
+            "created_at": r.created_at,
+            "last_recalled_at": r.last_recalled_at,
+            "source": r.source,
+        })
+    }
+
+    unsafe fn seg_record(shell: &CmaShell, id: u32) -> crate::rt::brain_store::SegRecord {
+        crate::rt::brain_store::SegRecord {
+            id,
+            vec: shell.cma.index.vector(id).to_vec(),
+            meta: record_meta(shell, id),
+        }
     }
 
     static CMA_CLASS_ID: AtomicU32 = AtomicU32::new(0);
@@ -928,6 +1056,7 @@ mod impl_qtsq {
             vec_dim,
             embedding_id: embedding_id.clone(),
             cma: crate::memory::cma::Cma::new(vec_dim),
+            layout: None,
         });
 
         /* C2: replay any write-ahead journal a crashed commit left behind
@@ -944,8 +1073,36 @@ mod impl_qtsq {
             }
         }
 
+        /* B3: a segmented brain is a MANIFEST at <path> plus segments in
+         * <path>.d — load it through the segment log (later entries win).
+         * Anything else (or no file yet) falls through to the legacy
+         * single-file reader below. */
+        let mut segmented: Option<(BrainData, BrainLayout)> = None;
+        let mut segmented_layout: Option<BrainLayout> = None;
+        if let Some(m) = crate::rt::brain_store::read_manifest(path) {
+            match load_segmented(path, &m) {
+                Ok((mut brain, layout)) => {
+                    /* The manifest carries the dimension; hydrate needs it. */
+                    let dim = m
+                        .embedding
+                        .get("dimension")
+                        .and_then(|d| d.as_u64())
+                        .unwrap_or(vec_dim as u64) as usize;
+                    brain.dim = dim;
+                    segmented_layout = Some(layout);
+                    segmented = Some((brain, BrainLayout::empty()));
+                }
+                Err(rc) => {
+                    eprintln!(
+                        "[sofuu/cma] segmented brain at {path} failed to load (rc {rc}) — refusing to open"
+                    );
+                    return None;
+                }
+            }
+        }
+
         /* Hydrate from the QTSQ brain file (vectors + metadata JSON). */
-        match cma_qtsq_load(path) {
+        match segmented.map(|(b, _)| Ok(b)).unwrap_or_else(|| cma_qtsq_load(path)) {
             Ok(brain) => {
                 if !brain.vecs.is_empty() && brain.n > 0 {
                     let manifest = brain.meta.as_deref().and_then(embedding_manifest);
@@ -971,6 +1128,20 @@ mod impl_qtsq {
                         } else {
                             eprintln!("[sofuu/cma] brain has no metadata — open refused");
                             return None;
+                        }
+                        /* B3: a segmented brain persists strengths as of the
+                         * last flush and replays the decay that happened
+                         * while the process was down — capped at 7 days,
+                         * the same bound the turn-boundary tick uses. */
+                        if let Some(layout) = segmented_layout.take() {
+                            if layout.last_decay_at > 0 {
+                                let now = now_u32() as u64;
+                                let dt = now.saturating_sub(layout.last_decay_at);
+                                if dt > 0 {
+                                    shell.cma.decay_tick(dt.min(7 * 86400) as u32);
+                                }
+                            }
+                            shell.layout = Some(layout);
                         }
                     } else if embedding_id == crate::embedding::MODEL_ID
                         && brain.dim == crate::embedding::HASH_DIM
@@ -1037,6 +1208,12 @@ mod impl_qtsq {
                 }
             }
         }
+        /* B3: a segmented brain keeps its layout so the next flush is
+         * incremental; a legacy/fresh brain stays `None` and migrates on
+         * its first segmented flush. */
+        if shell.layout.is_none() {
+            shell.layout = segmented_layout.take();
+        }
         Some(shell)
     }
 
@@ -1061,9 +1238,362 @@ mod impl_qtsq {
         }
     }
 
-    unsafe fn cma_flush(shell: &mut CmaShell) -> c_int {
+    /* ══════════════════════════════════════════════════════════════
+     * B3 (ROADMAP-BRAIN-CMA): segmented brain store
+     * ══════════════════════════════════════════════════════════════ */
+
+    /// Load a segmented brain: every segment in manifest order, later
+    /// entries overriding earlier ones by id (the append-only update log).
+    unsafe fn load_segmented(
+        path: &str,
+        m: &crate::rt::brain_store::Manifest,
+    ) -> Result<(BrainData, BrainLayout), c_int> {
+        let dir = crate::rt::brain_store::segments_dir(path);
+        let mut by_id: std::collections::BTreeMap<u32, crate::rt::brain_store::SegRecord> =
+            std::collections::BTreeMap::new();
+        for seg in &m.segments {
+            let file = format!("{dir}/{}", seg.file);
+            /* Verify the published digest BEFORE reading: the codec accepts
+             * a truncated container as a valid, silently-shortened one, so
+             * without this a torn segment would read as a brain that
+             * quietly lost records. */
+            if !seg.sha256.is_empty() {
+                match crate::rt::brain_store::file_digest(&file) {
+                    Some(d) if d == seg.sha256 => {}
+                    _ => {
+                        eprintln!(
+                            "[sofuu/cma] segment {} failed its digest check — refusing to open",
+                            seg.file
+                        );
+                        return Err(qtsq::QTSQ_ERR_FORMAT);
+                    }
+                }
+            }
+            let recs = crate::rt::brain_store::read_segment(&file)?;
+            for r in recs {
+                by_id.insert(r.id, r);
+            }
+        }
+        let n = by_id.len();
+        let mut flat: Vec<f32> = Vec::new();
+        let mut metas: Vec<serde_json::Value> = Vec::with_capacity(n);
+        for (expected, (id, r)) in by_id.iter().enumerate() {
+            /* Ids must be dense: the HNSW store indexes vectors by position,
+             * and hydrate assigns ids by position. A gap means the store is
+             * corrupt (or was written by something that does not compact) —
+             * refuse rather than silently renumber. */
+            if *id as usize != expected {
+                return Err(qtsq::QTSQ_ERR_FORMAT);
+            }
+            flat.extend_from_slice(&r.vec);
+            let mut meta = r.meta.clone();
+            if let Some(o) = meta.as_object_mut() {
+                o.insert("vector_index".into(), serde_json::json!(expected));
+            }
+            metas.push(meta);
+        }
+        let meta_json = serde_json::json!({
+            "schema": "sofuu-cma@2",
+            "embedding": m.embedding,
+            "records": metas,
+        })
+        .to_string();
+        let layout = BrainLayout {
+            dir,
+            segments: m.segments.clone(),
+            epoch: m.epoch.max(1),
+            persisted: n,
+            last_decay_at: m.last_decay_at,
+            evicted_total: m.evicted_total,
+            needs_compaction: false,
+        };
+        Ok((
+            BrainData {
+                vecs: flat,
+                n,
+                dim: 0, /* filled by the caller from the manifest */
+                meta: Some(meta_json),
+                found_memories: n > 0,
+            },
+            layout,
+        ))
+    }
+
+    /// Write `recs` as one or more bounded segments, each published
+    /// atomically (tmp → fsync → rename → fsync dir).
+    unsafe fn write_segment_chunks(
+        dir: &str,
+        epoch: u64,
+        start_seq: u64,
+        dim: usize,
+        recs: &[crate::rt::brain_store::SegRecord],
+    ) -> Result<Vec<crate::rt::brain_store::SegmentMeta>, c_int> {
+        let mut out = Vec::new();
+        for (i, chunk) in recs.chunks(crate::rt::brain_store::SEGMENT_CAP).enumerate() {
+            let name = crate::rt::brain_store::segment_file(epoch, start_seq + i as u64);
+            let final_path = format!("{dir}/{name}");
+            let tmp = format!("{final_path}.tmp");
+            crate::rt::brain_store::write_segment(&tmp, dim, chunk)?;
+            /* Digest the staged file (the bytes that will be renamed in). */
+            let sha256 = crate::rt::brain_store::file_digest(&tmp).unwrap_or_default();
+            if !crate::rt::wal::publish(&tmp, &final_path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(qtsq::QTSQ_ERR_FORMAT);
+            }
+            out.push(crate::rt::brain_store::SegmentMeta {
+                file: name,
+                records: chunk.len(),
+                sha256,
+            });
+        }
+        Ok(out)
+    }
+
+    /// B3.3: capacity policy. Over the cap, the WEAKEST live records are
+    /// tombstoned (never pins, never entities) — oldest first among equals.
+    /// Tombstoning rather than removing keeps ids stable, so a caller
+    /// holding recall ids across the flush cannot be handed a wrong record;
+    /// retain() physically drops them at the next turn boundary.
+    unsafe fn enforce_brain_capacity(shell: &mut CmaShell, layout: &mut BrainLayout) -> usize {
+        let cap = brain_max_records();
+        if cap == 0 {
+            return 0;
+        }
+        let live = shell
+            .cma
+            .records
+            .iter()
+            .filter(|r| r.tier != crate::memory::cma::TIER_FORGOTTEN)
+            .count();
+        if live <= cap {
+            return 0;
+        }
+        let over = live - cap;
+        let mut candidates: Vec<(u32, f32, u32)> = shell
+            .cma
+            .records
+            .iter()
+            .filter(|r| {
+                r.tier != crate::memory::cma::TIER_FORGOTTEN
+                    && r.role != crate::memory::cma::PIN_ROLE
+                    && r.tier != crate::memory::cma::TIER_ENTITY
+            })
+            .map(|r| (r.id, r.strength, r.created_at))
+            .collect();
+        /* Weakest first; among equals the oldest (smallest created_at, with
+         * 0 = unknown sorting first). */
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.2.cmp(&b.2))
+        });
+        let mut evicted = 0usize;
+        for (id, _, _) in candidates.into_iter().take(over) {
+            if shell.cma.forget(id) {
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            layout.evicted_total += evicted as u64;
+            eprintln!(
+                "[sofuu/cma] capacity: tombstoned {evicted} weak record(s) over the {cap}-record cap"
+            );
+        }
+        evicted
+    }
+
+    /// Rewrite every live record into fresh segments (B3.4). Ids are
+    /// preserved (records are written in id order, one version each), so
+    /// recall and any outstanding id references stay valid.
+    unsafe fn compact_segments(shell: &mut CmaShell, layout: &mut BrainLayout) -> c_int {
+        let dim = shell.vec_dim;
+        let recs: Vec<crate::rt::brain_store::SegRecord> = (0..shell.cma.len() as u32)
+            .map(|id| seg_record(shell, id))
+            .collect();
+        layout.epoch += 1;
+        match write_segment_chunks(&layout.dir, layout.epoch, 1, dim, &recs) {
+            Ok(segs) => {
+                layout.segments = segs;
+                layout.persisted = recs.len();
+                layout.needs_compaction = false;
+                0
+            }
+            Err(_) => -1,
+        }
+    }
+
+    /// B3.2: append only what changed — new records plus the dirty set —
+    /// to the bounded active segment. Everything else on disk is untouched.
+    unsafe fn append_segments(shell: &mut CmaShell, layout: &mut BrainLayout) -> c_int {
+        let dim = shell.vec_dim;
+        let mut ids: Vec<u32> = (layout.persisted..shell.cma.len())
+            .map(|i| i as u32)
+            .collect();
+        for id in shell.cma.take_dirty() {
+            if (id as usize) >= layout.persisted {
+                continue; /* already covered as new */
+            }
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return 0;
+        }
+        let fresh: Vec<crate::rt::brain_store::SegRecord> =
+            ids.iter().map(|id| seg_record(shell, *id)).collect();
+
+        /* The active segment is the last one, while it has room. Rewriting
+         * it is bounded by SEGMENT_CAP records — the whole point of the
+         * segmented layout. */
+        let active = layout.segments.last().cloned();
+        if let Some(meta) = active {
+            if meta.records < crate::rt::brain_store::SEGMENT_CAP {
+                let file = format!("{}/{}", layout.dir, meta.file);
+                if let Ok(mut existing) = crate::rt::brain_store::read_segment(&file) {
+                    let fresh_ids: std::collections::HashSet<u32> =
+                        ids.iter().copied().collect();
+                    existing.retain(|r| !fresh_ids.contains(&r.id));
+                    existing.extend(fresh.iter().cloned());
+                    if existing.len() <= crate::rt::brain_store::SEGMENT_CAP {
+                        let tmp = format!("{file}.tmp");
+                        if crate::rt::brain_store::write_segment(&tmp, dim, &existing).is_err() {
+                            let _ = std::fs::remove_file(&tmp);
+                            return -1;
+                        }
+                        let sha256 = crate::rt::brain_store::file_digest(&tmp).unwrap_or_default();
+                        if !crate::rt::wal::publish(&tmp, &file) {
+                            let _ = std::fs::remove_file(&tmp);
+                            return -1;
+                        }
+                        if let Some(last) = layout.segments.last_mut() {
+                            last.records = existing.len();
+                            last.sha256 = sha256;
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+        /* No active segment (fresh store, or the last one is full): write
+         * the changed records as new bounded segments. */
+        let seq = layout.segments.len() as u64 + 1;
+        match write_segment_chunks(&layout.dir, layout.epoch, seq, dim, &fresh) {
+            Ok(segs) => {
+                layout.segments.extend(segs);
+                0
+            }
+            Err(_) => -1,
+        }
+    }
+
+    /// B3: the canonical flush — segmented store at `<path>`.
+    unsafe fn brain_flush_segmented(shell: &mut CmaShell) -> c_int {
         let path = shell.mind_path.clone();
-        cma_flush_to(shell, &path)
+        let dir = crate::rt::brain_store::segments_dir(&path);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return -1;
+        }
+        let mut layout = match shell.layout.take() {
+            Some(l) => l,
+            None => {
+                /* First segmented flush. A legacy single-file brain is
+                 * preserved as a backup before the store moves on. */
+                if std::path::Path::new(&path).exists() {
+                    let bak = unique_sidecar(&path, "segmented.bak");
+                    if std::fs::copy(&path, &bak).is_ok() {
+                        eprintln!("[sofuu/cma] migrating to segmented storage (backup: {bak})");
+                    } else {
+                        eprintln!("[sofuu/cma] refusing to migrate: could not back up {path}");
+                        return -1;
+                    }
+                }
+                BrainLayout {
+                    dir: dir.clone(),
+                    segments: Vec::new(),
+                    epoch: 1,
+                    persisted: 0,
+                    last_decay_at: 0,
+                    evicted_total: 0,
+                    needs_compaction: true,
+                }
+            }
+        };
+        layout.dir = dir.clone();
+
+        /* A structural change the incremental path cannot express (retain()
+         * renumbered ids, an explicit cma.compact(), an eviction) forces a
+         * full rewrite — the Cma flag is the source of truth, the layout
+         * mirrors it. */
+        if shell.cma.layout_dirty {
+            layout.needs_compaction = true;
+        }
+        if enforce_brain_capacity(shell, &mut layout) > 0 {
+            shell.cma.layout_dirty = true;
+            layout.needs_compaction = true;
+        }
+
+        let live = shell.cma.len();
+        let versions: usize = layout.segments.iter().map(|s| s.records).sum();
+        let dead_ratio = versions > live.saturating_mul(2) + 64;
+        let rc = if layout.needs_compaction || dead_ratio {
+            compact_segments(shell, &mut layout)
+        } else {
+            append_segments(shell, &mut layout)
+        };
+        if rc != 0 {
+            shell.layout = Some(layout);
+            return rc;
+        }
+
+        layout.last_decay_at = now_u32() as u64;
+        let manifest = crate::rt::brain_store::Manifest {
+            schema: crate::rt::brain_store::SEGMENT_SCHEMA.to_string(),
+            embedding: embedding_block(shell),
+            segments: layout.segments.clone(),
+            epoch: layout.epoch,
+            last_decay_at: layout.last_decay_at,
+            evicted_total: layout.evicted_total,
+        };
+        let tmp = format!("{path}.tmp");
+        if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            shell.layout = Some(layout);
+            return -1;
+        }
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let mut journal = crate::rt::wal::Journal::begin(&parent);
+        let recorded = journal
+            .as_mut()
+            .map(|j| j.record(&tmp, &path))
+            .unwrap_or(false);
+        if crate::rt::wal::publish(&tmp, &path) {
+            if recorded {
+                if let Some(j) = journal {
+                    j.commit();
+                }
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            shell.layout = Some(layout);
+            return -1;
+        }
+
+        /* Sweep segments a crashed compaction left behind (age-guarded). */
+        let keep: Vec<String> = layout.segments.iter().map(|s| s.file.clone()).collect();
+        crate::rt::brain_store::remove_orphan_segments(&dir, &keep, 600);
+
+        shell.cma.mark_persisted();
+        layout.persisted = live;
+        shell.layout = Some(layout);
+        0
+    }
+
+    unsafe fn cma_flush(shell: &mut CmaShell) -> c_int {
+        brain_flush_segmented(shell)
     }
 
     unsafe fn cma_remember(
@@ -1641,6 +2171,70 @@ mod impl_qtsq {
         qjs::sofuu_js_new_string(ctx, c.as_ptr())
     }
 
+    /// B3: `cma.stats()` → JSON diagnostics for the store — records,
+    /// segments, versions on disk, bytes, evictions, decay stamp. The
+    /// capacity policy reports here instead of silently shrinking a brain.
+    unsafe extern "C" fn js_cma_stats(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let layout = cma.layout.as_ref();
+        let segments = layout.map(|l| l.segments.len()).unwrap_or(0);
+        let versions: usize = layout
+            .map(|l| l.segments.iter().map(|s| s.records).sum())
+            .unwrap_or(0);
+        /* Referenced segments only: a compaction leaves the previous
+         * generation on disk until the age-guarded orphan sweep can prove
+         * no concurrent reader holds it, and counting that would report a
+         * store twice its real size. */
+        let bytes: u64 = layout
+            .map(|l| {
+                l.segments
+                    .iter()
+                    .map(|s| {
+                        std::fs::metadata(format!("{}/{}", l.dir, s.file))
+                            .map(|md| md.len())
+                            .unwrap_or(0)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let out = serde_json::json!({
+            "records": cma.cma.len(),
+            "segmented": layout.is_some(),
+            "segments": segments,
+            "versions": versions,
+            "bytes": bytes,
+            "evicted_total": layout.map(|l| l.evicted_total).unwrap_or(0),
+            "last_decay_at": layout.map(|l| l.last_decay_at).unwrap_or(0),
+            "needs_compaction": cma.cma.layout_dirty,
+            "dirty": cma.cma.dirty_count(),
+        });
+        let c = CString::new(out.to_string()).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
+    /// B3.4: `cma.compact()` — force a rewrite of the live records into
+    /// fresh segments (drops superseded versions and tombstones the store
+    /// no longer needs). Returns 0 on success.
+    unsafe extern "C" fn js_cma_compact(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        cma.cma.layout_dirty = true;
+        qjs::sofuu_js_new_int32(ctx, cma_flush(cma))
+    }
+
     /// B1.1 export: the full record view plus the flat vector table and the
     /// embedding manifest — the portable payload B2's brain cards build on.
     /// `{schema, exported_at, embedding:{id,dimension,artifact}, total,
@@ -1824,6 +2418,7 @@ mod impl_qtsq {
             vec_dim: crate::embedding::SEMANTIC_DIM,
             embedding_id: crate::embedding::MODEL_ID.to_string(),
             cma: crate::memory::cma::Cma::new(crate::embedding::SEMANTIC_DIM),
+            layout: None,
         });
         match migrate_legacy_hash_brain(&path, &brain, &mut shell) {
             Ok((records, backup)) => {
@@ -1856,11 +2451,13 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 14] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 16] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
             cfunc_entry(c"importRecords", 2, js_cma_import),
+            cfunc_entry(c"stats", 0, js_cma_stats),
+            cfunc_entry(c"compact", 0, js_cma_compact),
             cfunc_entry(c"rememberEntity", 4, js_cma_remember_entity),
             cfunc_entry(c"recall", 2, js_cma_recall),
             cfunc_entry(c"kvHints", 2, js_cma_kv_hints),
@@ -3598,6 +4195,338 @@ mod impl_qtsq {
                 "adoption must not rewrite the orphan file"
             );
         }
+    }
+
+    /* ── B3 (ROADMAP-BRAIN-CMA): segmented storage ─────────────────── */
+
+    /// Every file under `dir` with its size — a flush's write footprint is
+    /// the sum of the size deltas plus any new files.
+    fn dir_sizes(dir: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                out.insert(name, len);
+            }
+        }
+        out
+    }
+
+    fn bytes_touched(
+        before: &std::collections::BTreeMap<String, u64>,
+        after: &std::collections::BTreeMap<String, u64>,
+    ) -> u64 {
+        let mut touched = 0u64;
+        for (name, size) in after {
+            match before.get(name) {
+                Some(prev) if prev == size => {}
+                Some(prev) => touched += size.abs_diff(*prev),
+                None => touched += *size,
+            }
+        }
+        touched
+    }
+
+    /// B3 gate: a flush of N new records touches O(active segment) bytes,
+    /// not O(total). 600 records at dim 64 = ~154 KB of vectors; one
+    /// segment holds 256, so the second flush must stay far below the
+    /// whole-store size.
+    #[test]
+    fn incremental_flush_touches_only_the_active_segment() {
+        let dir = fresh_test_dir("b3-incremental");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        for i in 0..600 {
+            let v = crate::embedding::hash_features_at(&format!("record {i}"), dim);
+            assert!(unsafe { cma_remember(&mut shell, &v, Some(&format!("record {i}")), Some("user"), 0, None) } >= 0);
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "first flush (migration)");
+
+        let seg_dir = std::path::PathBuf::from(crate::rt::brain_store::segments_dir(&p));
+        let before = dir_sizes(&seg_dir);
+        let total_bytes: u64 = before.values().sum();
+        let sealed: Vec<String> =
+            crate::rt::brain_store::list_segment_files(&seg_dir.to_string_lossy());
+        assert!(
+            sealed.len() >= 3,
+            "600 records must span several segments: {sealed:?}"
+        );
+
+        /* Five more records — the incremental path. */
+        for i in 600..605 {
+            let v = crate::embedding::hash_features_at(&format!("record {i}"), dim);
+            assert!(unsafe { cma_remember(&mut shell, &v, Some(&format!("record {i}")), Some("user"), 0, None) } >= 0);
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "incremental flush");
+        let after = dir_sizes(&seg_dir);
+
+        /* The precise claim: only the ACTIVE segment (the last one) and the
+         * manifest changed — every sealed segment is byte-identical. */
+        let active = sealed.last().cloned();
+        let mut rewritten: Vec<String> = Vec::new();
+        for (name, size) in &after {
+            match before.get(name) {
+                Some(prev) if prev == size => {}
+                _ => {
+                    if sealed.contains(name) && Some(name) != active.as_ref() {
+                        rewritten.push(name.clone());
+                    }
+                }
+            }
+        }
+        assert!(
+            rewritten.is_empty(),
+            "sealed segments were rewritten by an incremental flush: {rewritten:?}"
+        );
+        let touched = bytes_touched(&before, &after);
+        assert!(
+            touched < total_bytes,
+            "an incremental flush touched {touched} of {total_bytes} bytes — that is not incremental"
+        );
+
+        /* And the data is really there after a reload. */
+        let reloaded = unsafe { cma_open(&p, dim, None) }.expect("reload");
+        assert_eq!(
+            reloaded.cma.len(),
+            shell.cma.len(),
+            "every record must survive the reload"
+        );
+    }
+
+    /// B3 gate: a 10k-record brain stays under the cap, reloads whole, and
+    /// recalls a known record.
+    #[test]
+    fn ten_thousand_records_reload_and_recall() {
+        let dir = fresh_test_dir("b3-10k");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 32;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        for i in 0..10_000u32 {
+            let text = format!("note {i} about subsystem {}", i % 97);
+            let v = crate::embedding::hash_features_at(&text, dim);
+            assert!(unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) } >= 0);
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+
+        /* The dedup gate merges near-identical vectors, so the live count
+         * is the truth to compare against — not the number of calls. */
+        let stored = shell.cma.len();
+        assert!(stored >= 9_900, "the store must hold ~10k records: {stored}");
+        let mut reloaded = unsafe { cma_open(&p, dim, None) }.expect("reload 10k");
+        assert_eq!(reloaded.cma.len(), stored, "every record must survive");
+        let probe = "note 4242 about subsystem 71";
+        let q = crate::embedding::hash_features_at(probe, dim);
+        let hits = reloaded.cma.recall(&q, 5);
+        assert!(
+            hits.iter().any(|h| h.text == probe),
+            "recall must find a known record in a 10k store"
+        );
+    }
+
+    /// B3.3: over the cap, the WEAKEST non-pin non-entity records are
+    /// tombstoned and the eviction is reported — never silent.
+    #[test]
+    fn capacity_evicts_weakest_and_reports() {
+        set_brain_cap_override(Some(20));
+        let dir = fresh_test_dir("b3-cap");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        /* 30 weak records + 1 pin + 1 entity that must survive. */
+        for i in 0..30u32 {
+            let text = format!("weak {i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        let pin_text = "deploy bucket is sofuu-dist";
+        let pin_v = crate::embedding::hash_features_at(pin_text, dim);
+        unsafe { cma_remember(&mut shell, &pin_v, Some(pin_text), Some(crate::memory::cma::PIN_ROLE), 0, None) };
+        let ent_text = "Barnaby is a dog";
+        let ent_v = crate::embedding::hash_features_at(ent_text, dim);
+        unsafe { cma_remember_entity(&mut shell, &ent_v, Some(ent_text), Some("Barnaby"), Some("pet")) };
+
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        set_brain_cap_override(None);
+
+        let live = shell
+            .cma
+            .records
+            .iter()
+            .filter(|r| r.tier != crate::memory::cma::TIER_FORGOTTEN)
+            .count();
+        assert!(live <= 20, "the cap must be enforced: {live} live");
+        assert!(
+            shell
+                .cma
+                .records
+                .iter()
+                .any(|r| r.role == crate::memory::cma::PIN_ROLE
+                    && r.tier != crate::memory::cma::TIER_FORGOTTEN),
+            "pins are never evicted"
+        );
+        assert!(
+            shell
+                .cma
+                .records
+                .iter()
+                .any(|r| r.tier == crate::memory::cma::TIER_ENTITY),
+            "entities are never evicted"
+        );
+        let layout = shell.layout.as_ref().expect("layout");
+        assert!(layout.evicted_total > 0, "the eviction must be reported");
+    }
+
+    /// B3.4: compaction rewrites the live records, drops superseded
+    /// versions, and preserves recall.
+    #[test]
+    fn compaction_preserves_recall_and_shrinks_versions() {
+        let dir = fresh_test_dir("b3-compact");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 32;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        /* Exactly two FULL segments: the last one has no room, so updates
+         * to sealed records spill into a new segment — which is where
+         * superseded versions pile up. */
+        for i in 0..512u32 {
+            let text = format!("fact {i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+
+        /* Churn records that live in the SEALED first segment. */
+        for i in 0..40u32 {
+            let q = crate::embedding::hash_features_at(&format!("fact {i}"), dim);
+            shell.cma.recall(&q, 3);
+        }
+        shell.cma.forget(3);
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        /* Measure only the REFERENCED segments: a compaction leaves the
+         * previous generation on disk until the age-guarded orphan sweep
+         * (10 min) can prove no concurrent reader holds it. */
+        let referenced_bytes = |manifest_path: &str| -> u64 {
+            let m = unsafe { crate::rt::brain_store::read_manifest(manifest_path) }
+                .expect("manifest");
+            m.segments
+                .iter()
+                .map(|s| {
+                    std::fs::metadata(format!("{seg_dir}/{}", s.file))
+                        .map(|md| md.len())
+                        .unwrap_or(0)
+                })
+                .sum()
+        };
+        let before_bytes = referenced_bytes(&p);
+
+        shell.cma.layout_dirty = true; /* what cma.compact() sets */
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "compaction");
+        let after_bytes = referenced_bytes(&p);
+        assert!(
+            after_bytes < before_bytes,
+            "compaction must shrink the store: {after_bytes} vs {before_bytes}"
+        );
+
+        let mut reloaded = unsafe { cma_open(&p, dim, None) }.expect("reload after compaction");
+        assert_eq!(reloaded.cma.len(), shell.cma.len(), "no record lost");
+        let q2 = crate::embedding::hash_features_at("fact 7", dim);
+        let hits = reloaded.cma.recall(&q2, 5);
+        assert!(
+            hits.iter().any(|h| h.text == "fact 7"),
+            "recall survives compaction"
+        );
+        assert!(
+            reloaded.cma.records[3].tier == crate::memory::cma::TIER_FORGOTTEN,
+            "the tombstone survives compaction"
+        );
+    }
+
+    /// B3 gate: a legacy single-file brain migrates once, with a backup,
+    /// losing nothing.
+    #[test]
+    fn legacy_brain_migrates_with_backup_and_keeps_records() {
+        let dir = fresh_test_dir("b3-migrate");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 32;
+
+        /* A legacy brain: the single-file writer. */
+        let mut legacy = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..25u32 {
+            let text = format!("legacy {i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut legacy, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush_to(&mut legacy, &p) }, 0, "legacy write");
+        assert!(
+            !std::path::Path::new(&crate::rt::brain_store::segments_dir(&p)).exists(),
+            "the legacy writer must not create segments"
+        );
+
+        /* Open + flush → segmented, with a backup of the legacy file. */
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("open legacy");
+        let stored = shell.cma.len();
+        assert!(stored >= 20, "the legacy brain must hold its records: {stored}");
+        assert!(shell.layout.is_none(), "a legacy brain starts unsegmented");
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "migrating flush");
+
+        let entries = dir_entries(&dir);
+        assert!(
+            entries.iter().any(|e| e.ends_with("segmented.bak")),
+            "the legacy file must be backed up: {entries:?}"
+        );
+        assert!(
+            std::path::Path::new(&crate::rt::brain_store::segments_dir(&p)).exists(),
+            "segments must exist after the migration"
+        );
+
+        let reloaded = unsafe { cma_open(&p, dim, None) }.expect("reload migrated");
+        assert_eq!(reloaded.cma.len(), stored, "no record lost in the migration");
+        assert!(reloaded.layout.is_some(), "the reload must be segmented");
+    }
+
+    /// B3: a torn segment is refused, not loaded as garbage.
+    #[test]
+    fn torn_segment_is_refused() {
+        let dir = fresh_test_dir("b3-torn");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..10u32 {
+            let text = format!("r{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        let files = crate::rt::brain_store::list_segment_files(&seg_dir);
+        assert!(!files.is_empty());
+        let victim = format!("{seg_dir}/{}", files[0]);
+        /* Truncate to a fraction of its size — a torn write. */
+        let len = std::fs::metadata(&victim).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        f.set_len(len / 3).unwrap();
+        drop(f);
+
+        let reopened = unsafe { cma_open(&p, dim, None) };
+        assert!(
+            reopened.is_none(),
+            "a torn segment must refuse the open, not load garbage"
+        );
     }
 
     /* ── B0.3 / B0.4 (ROADMAP-BRAIN-CMA): codec stress + FFI surface ── */

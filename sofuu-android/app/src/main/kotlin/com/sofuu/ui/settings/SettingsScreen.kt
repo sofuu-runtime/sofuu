@@ -60,6 +60,11 @@ private val TABS = listOf("general", "appearance", "models", "providers", "agent
 fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
     val c = LocalSofuuColors.current
     var tab by remember { mutableStateOf(store.state.settingsTab) }
+    // External tab requests (ModelSheet → "＋ Add provider", composer rows)
+    // fire while Settings is already composed — a remember-once initial
+    // value would silently ignore them. Local tab taps never write the
+    // store, so this only fires on external change.
+    LaunchedEffect(store.state.settingsTab) { tab = store.state.settingsTab }
     Box(Modifier.fillMaxSize().background(c.bgApp).statusBarsPadding()) {
         Column(Modifier.fillMaxSize()) {
             // Header + tab bar.
@@ -596,7 +601,9 @@ private fun ModelsPane(store: AppStore) {
             )
         } else {
             for (path in state.localModels) {
-                val label = path.substringAfterLast('/').removeSuffix(".gguf")
+                // Header-derived label ("Llama 3.2 1B Instruct · Q8_0"),
+                // identical to the composer pill; file-name fallback.
+                val label = state.localModelLabels[path] ?: com.sofuu.store.fallbackModelLabel(path)
                 val active = state.config?.model == path
                 Row(
                     Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(vertical = 6.dp),

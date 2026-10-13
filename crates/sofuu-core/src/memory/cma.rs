@@ -133,7 +133,20 @@ pub struct Cma {
     pub vec_dim: usize,
     pub index: Hnsw,
     pub records: Vec<Record>,
+    /// B3.2 (ROADMAP-BRAIN-CMA): ids whose persisted snapshot is stale —
+    /// recall reinforcement, a tier change, a tombstone, an entity upsert.
+    /// A segmented flush appends exactly these (plus records the store has
+    /// never seen), so a flush costs O(changed) instead of O(total).
+    dirty_ids: Vec<u32>,
+    /// A structural change the incremental path cannot express: retain()
+    /// renumbered ids, or a store-side eviction. The next flush rewrites
+    /// the live records into fresh segments (compaction).
+    pub layout_dirty: bool,
 }
+
+/// Above this many dirty ids, tracking per-record stops paying — the next
+/// flush compacts instead (one pass over live records).
+const DIRTY_TRACK_CAP: usize = 4096;
 
 /// One record's JSON metadata — exactly the format the C brain files use
 /// (`cma_flush` in mod_memory.c), so files stay interchangeable.
@@ -183,7 +196,43 @@ impl Cma {
             vec_dim,
             index: Hnsw::new(vec_dim),
             records: Vec::new(),
+            dirty_ids: Vec::new(),
+            layout_dirty: false,
         }
+    }
+
+    /// Mark one record's persisted snapshot stale (B3.2).
+    fn mark_dirty(&mut self, id: u32) {
+        if self.layout_dirty {
+            return; /* a compaction will cover it anyway */
+        }
+        if self.dirty_ids.len() >= DIRTY_TRACK_CAP {
+            self.layout_dirty = true;
+            self.dirty_ids.clear();
+            return;
+        }
+        if !self.dirty_ids.contains(&id) {
+            self.dirty_ids.push(id);
+        }
+    }
+
+    /// Ids changed since the last flush, ascending.
+    pub fn take_dirty(&mut self) -> Vec<u32> {
+        let mut out = std::mem::take(&mut self.dirty_ids);
+        out.sort_unstable();
+        out
+    }
+
+    /// How many records carry an unpersisted change (diagnostics).
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_ids.len()
+    }
+
+    /// The store has persisted everything up to (and including) the current
+    /// records — clear the dirty set.
+    pub fn mark_persisted(&mut self) {
+        self.dirty_ids.clear();
+        self.layout_dirty = false;
     }
 
     /// Hydrate from a loaded brain file: the flat f32 vector table + the
@@ -522,7 +571,9 @@ impl Cma {
                     if rec.tier != TIER_FORGOTTEN {
                         rec.strength = 1.0;
                         rec.age_seconds = 0;
-                        return *dup_id as i32;
+                        let id = *dup_id;
+                        self.mark_dirty(id);
+                        return id as i32;
                     }
                 }
             }
@@ -532,6 +583,7 @@ impl Cma {
         rec.source = source.to_string();
         self.records.push(rec);
         self.index.add_vector(vec);
+        self.mark_dirty(id);
         id as i32
     }
 
@@ -602,6 +654,9 @@ impl Cma {
                 strength: rec.strength,
                 entity: rec.entity_name.clone(),
             });
+            /* After the record borrow ends: its persisted snapshot is now
+             * stale (strength + recall counters moved). */
+            self.mark_dirty(id);
         }
         self.update_gravity(&recalled_ids);
         out
@@ -635,6 +690,9 @@ impl Cma {
                     marked += 1;
                 }
             }
+            if (id as usize) < self.records.len() {
+                self.mark_dirty(id);
+            }
         }
         marked
     }
@@ -642,6 +700,7 @@ impl Cma {
     pub fn forget(&mut self, id: u32) -> bool {
         if let Some(rec) = self.records.get_mut(id as usize) {
             rec.tier = TIER_FORGOTTEN;
+            self.mark_dirty(id);
             true
         } else {
             false
@@ -697,6 +756,10 @@ impl Cma {
         for v in &kept_vectors {
             self.index.add_vector(v);
         }
+        /* B3.2: survivors renumbered — every persisted id is stale, so the
+         * incremental path cannot express this. The next flush compacts. */
+        self.dirty_ids.clear();
+        self.layout_dirty = true;
         before - self.records.len()
     }
 
@@ -722,7 +785,9 @@ impl Cma {
                 // coordinates; neighbor links keep old-geometry decisions,
                 // the same trade C makes by memcpying without re-adding).
                 self.index.set_vector(rec.id, vec);
-                return rec.id as i32;
+                let id = rec.id;
+                self.mark_dirty(id);
+                return id as i32;
             }
         }
         let idx = self.remember(vec, text, "entity", 0);
@@ -820,6 +885,7 @@ impl Cma {
         // Mark originals forgotten.
         for &wid in &weak {
             self.records[wid as usize].tier = TIER_FORGOTTEN;
+            self.mark_dirty(wid);
         }
         consolidated
     }

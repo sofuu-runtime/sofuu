@@ -77,6 +77,17 @@ flush of 2000 records succeeds). Recorded here because it is the class of
 failure — codec-side, surfacing in the brain path — that the brain's own tests
 cannot catch.
 
+### 2.4 [OPEN — codec] A truncated container reads as a valid, shortened one
+
+Measured 2026-10-13 while building B3: a `.qtsq` container truncated to a third of its size
+(`set_len(len/3)`) still reads back through `qtsq_read` + `qtsq_decompress_*` as a VALID container
+with fewer records — a 10-record segment loaded as 6 records with no error. Whatever the mechanism
+(the read path appears to return the streams it can still parse), the consequence for a store is
+severe: a torn write would read as a brain that quietly forgot records. The segmented store defends
+itself by carrying a per-segment SHA-256 in the manifest and refusing a mismatch
+(`torn_segment_is_refused`), but the codec's own read path should reject a truncated file — the
+header carries the sizes it would need. Reported for the codec owner.
+
 ## 3. Structural gaps vs the plan and README
 
 | Gap | Detail |

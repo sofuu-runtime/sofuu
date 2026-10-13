@@ -524,9 +524,14 @@ impl Gptx3Model {
 
         let mut qg = vec![0.0f32; 2 * n_heads * head_dim];
         q_gate.gemv(&self.x_norm, &mut qg);
-        self.q.copy_from_slice(&qg[..n_heads * head_dim]);
-        self.gate.copy_from_slice(&qg[n_heads * head_dim..]);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 3 {
+        for h in 0..n_heads {
+            let src = h * 2 * head_dim;
+            self.q[h * head_dim..(h + 1) * head_dim]
+                .copy_from_slice(&qg[src..src + head_dim]);
+            self.gate[h * head_dim..(h + 1) * head_dim]
+                .copy_from_slice(&qg[src + head_dim..src + 2 * head_dim]);
+        }
+        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
             eprintln!("[gqa raw] layer={} q0..8={:?} qnorm0..8={:?}", layer_idx, &self.q[..8], &q_norm[..8]);
         }
         k_proj.gemv(&self.x_norm, &mut self.k);
@@ -546,15 +551,22 @@ impl Gptx3Model {
         let seq_len = pos + 1;
         let kv_dim = n_kv * head_dim;
         let cache_base = layer_idx * self.config.max_seq_len * kv_dim;
-        self.k_cache[cache_base + pos * kv_dim..cache_base + (pos + 1) * kv_dim]
-            .copy_from_slice(&self.k);
-        self.v_cache[cache_base + pos * kv_dim..cache_base + (pos + 1) * kv_dim]
-            .copy_from_slice(&self.v);
+        for kv_h in 0..n_kv {
+            let head_base = cache_base + kv_h * self.config.max_seq_len * head_dim + pos * head_dim;
+            self.k_cache[head_base..head_base + head_dim]
+                .copy_from_slice(&self.k[kv_h * head_dim..(kv_h + 1) * head_dim]);
+            self.v_cache[head_base..head_base + head_dim]
+                .copy_from_slice(&self.v[kv_h * head_dim..(kv_h + 1) * head_dim]);
+        }
 
         let mut scores = vec![0.0f32; seq_len];
         for h in 0..n_heads {
             let kv_h = h / rep;
             let q_head = &self.q[h * head_dim..(h + 1) * head_dim];
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 && h < 4 {
+                let score0 = q_head.iter().zip(&self.k_cache[cache_base + (h / rep) * self.config.max_seq_len * head_dim..cache_base + (h / rep) * self.config.max_seq_len * head_dim + head_dim]).map(|(a,b)|a*b).sum::<f32>() / (head_dim as f32).sqrt();
+                eprintln!("[gqa head] layer={} h={} q0..4={:?} score0={}", layer_idx,h,&q_head[..4],score0);
+            }
             let head_base = cache_base + kv_h * self.config.max_seq_len * head_dim;
             let mut max_score = f32::NEG_INFINITY;
             for p in 0..seq_len {
@@ -577,15 +589,25 @@ impl Gptx3Model {
                     *o += weight * v;
                 }
             }
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 && h == 0 {
+                let dbg = out_head[..8].to_vec();
+                eprintln!("[gqa pre-gate] layer={} out0..8={:?}", layer_idx, dbg);
+            }
             for (o, g) in out_head.iter_mut().zip(&self.gate[h * head_dim..(h + 1) * head_dim]) {
                 *o *= 1.0 / (1.0 + (-g).exp());
             }
         }
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 3 {
-            eprintln!("[gqa] layer={} q0..8={:?} k0..8={:?} v0..8={:?} out0..8={:?}", layer_idx, &self.q[..8], &self.k[..8], &self.v[..8], &self.head_out[..8]);
+        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
+            let vb = layer_idx * self.config.max_seq_len * n_kv * head_dim + pos * n_kv * head_dim;
+            eprintln!("[gqa cache] layer={} v0={:?} v1={:?} v2={:?}", layer_idx, &self.v_cache[vb..vb+8], &self.v_cache[vb+head_dim..vb+head_dim+8], &self.v_cache[vb+2*head_dim..vb+2*head_dim+8]);
+            eprintln!("[gqa] layer={} q0..8={:?} k0..8={:?} v0..8={:?} out0..576={:?}", layer_idx, &self.q[..8], &self.k[..8], &self.v[..8], &self.head_out[..576]);
+        }
+        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
+            let manual: f32 = o_proj.data.as_slice()[..576].chunks_exact(4).map(|b| f32::from_ne_bytes(b.try_into().unwrap()) * self.head_out[0]).sum();
+            eprintln!("[gqa oproj] layer={} manual_row0={} input0={}", layer_idx, manual, self.head_out[0]);
         }
         o_proj.gemv(&self.head_out, &mut self.attn_out);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 3 {
+        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
             eprintln!("[gqa attn] layer={} attn0..8={:?}", layer_idx, &self.attn_out[..8]);
         }
     }
@@ -624,16 +646,28 @@ impl Gptx3Model {
             self.layers[layer_idx].up.gemv(&self.x_norm, &mut self.ffn_up);
             swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
             self.layers[layer_idx].down.gemv(&self.ffn_gate, &mut self.ffn_out);
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 0 {
-                eprintln!("[gptx3 mlp] layer={} postnorm0..8={:?} gate0..8={:?} up0..8={:?} swiglu0..8={:?} out0..8={:?}", layer_idx, &self.x[..8], &self.ffn_gate[..8], &self.ffn_up[..8], &self.ffn_gate[..8], &self.ffn_out[..576]);
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && (layer_idx == 0 || layer_idx == 23) {
+                eprintln!("[gptx3 mlp] layer={} postnorm0..8={:?} gate0..8={:?} up0..8={:?} swiglu0..8={:?} out0..8={:?}", layer_idx, &self.x_norm[..8], &self.ffn_gate[..8], &self.ffn_up[..8], &self.ffn_gate[..8], &self.ffn_out[..576]);
+            }
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
+                eprintln!("[gptx3 residual] layer={} pre0..8={:?} ffn0..8={:?}", layer_idx, &self.x[..8], &self.ffn_out[..8]);
             }
             for (x, f) in self.x.iter_mut().zip(&self.ffn_out) {
                 *x += f;
+            }
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
+                eprintln!("[gptx3 residual] layer={} post0..8={:?}", layer_idx, &self.x[..8]);
+            }
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
+                eprintln!("[hidden] layer={} x0..8={:?}", layer_idx, &self.x[..576]);
             }
         }
         if compute_logits {
             rmsnorm_local(&mut self.x, &self.final_norm, self.config.norm_eps);
             self.x_norm.copy_from_slice(&self.x);
+            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
+                eprintln!("[final norm] x0..8={:?}", &self.x_norm[..8]);
+            }
             self.embed.gemv(&self.x, &mut self.logits);
         }
     }

@@ -155,18 +155,12 @@ void sofuu_metal_free(void* ctx_ptr) {
 void* sofuu_metal_buffer_create_zerocopy(void* ctx_ptr, const void* ptr, size_t size_bytes) {
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
 #if TARGET_OS_SIMULATOR
-    /* The simulator's Metal driver (MTLSimDriver) backs a no-copy buffer by
-     * exporting the memory over XPC shared memory, and it TRAPS rather than
-     * failing when that export is refused:
-     *
-     *   _xpc_api_misuse
-     *   _xpc_shmem_create_with_prot
-     *   -[MTLSimDevice newBufferWithLength:options:pointer:copyBytes:deallocator:]
-     *
-     * (crash report from an iOS-simulator run of test_metal_engine, 2 MiB
-     * page-aligned Vec). Returning NULL here makes the Rust wrapper fall
-     * back to a copying buffer — GPU math still runs, just without the
-     * zero-copy shortcut, which is the only thing the simulator cannot do. */
+    /* A no-copy buffer here exports the memory over XPC shared memory, and
+     * libxpc aborts the process (_xpc_api_misuse) instead of failing when
+     * the range cannot be exported as one mapping — which is the case for
+     * the allocator memory callers pass in. See the measured note in
+     * sofuu_metal_buffer_create. Returning NULL sends the caller there,
+     * where the driver's copying path runs instead. */
     return NULL;
 #else
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -188,6 +182,31 @@ void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_byte
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     @autoreleasepool {
+#if TARGET_OS_SIMULATOR
+        /* MTLSimDriver exports every buffer's storage over XPC shared memory.
+         * Its no-copy path hands our pointer straight to xpc_shmem_create,
+         * and libxpc TRAPS (_xpc_api_misuse — it aborts the process rather
+         * than returning an error) unless [ptr, ptr+length) lies inside one
+         * exportable mapping. Memory from the system allocator does not
+         * qualify: measured in a simulator probe, a 2 MiB malloc returns a
+         * page-aligned pointer whose enclosing vm region reports as a single
+         * 16 KiB page, and the export aborts. Every Rust Vec the engine
+         * copies from is such an allocation, so the whole no-copy path is
+         * unusable here.
+         *
+         * Its copying path is safe because the driver mmaps its own
+         * MAP_SHARED|MAP_ANON region for the storage and exports that
+         * instead — verified up to 32 MiB, including lengths that are not
+         * page multiples. The simulator therefore gets a copied buffer: GPU
+         * math still runs, and the only thing lost is the zero-copy
+         * shortcut MTLSimDriver cannot honour for allocator memory.
+         * (Reached from sofuu_metal_buffer_create_zerocopy too — it returns
+         * NULL under TARGET_OS_SIMULATOR and the Rust wrapper falls back
+         * here.) */
+        return (__bridge_retained void*)[ctx->device newBufferWithBytes:ptr
+                                                                 length:size_bytes
+                                                                options:MTLResourceStorageModeShared];
+#else
         size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
         if (page_size == 0) page_size = 16384;
         if (((uintptr_t)ptr % page_size) == 0) {
@@ -204,6 +223,7 @@ void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_byte
                                                      length:size_bytes
                                                     options:MTLResourceStorageModeShared];
         return (__bridge_retained void*)buf;
+#endif
     }
 }
 
@@ -213,6 +233,20 @@ void sofuu_metal_buffer_free(void* buf_ptr) {
     @autoreleasepool {
         id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buf_ptr;
         (void)buf;
+    }
+}
+
+/* waitUntilCompleted returns whether or not the GPU accepted the work:
+ * an unsupported instruction, an out-of-range access or a failed allocation
+ * leaves status == Error and the output buffer untouched. Without this check
+ * the callers read that untouched buffer back and return zeros as if they
+ * were results — silent wrong answers instead of a loud failure. (Measured:
+ * a bf16 kernel on the iOS simulator fails this way with
+ * MTLCommandBufferErrorInternal, while f16/f32 kernels complete.) */
+static inline void wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel) {
+    [cmd waitUntilCompleted];
+    if (cmd.status == MTLCommandBufferStatusError) {
+        NSLog(@"Sofuu Metal: %s command buffer failed: %@", kernel, cmd.error);
     }
 }
 
@@ -267,7 +301,7 @@ void sofuu_metal_gemv_bf16(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_bf16");
 
         std::memcpy(y, ctx->y_buf.contents, y_bytes);
     }
@@ -352,7 +386,7 @@ void sofuu_metal_gemv_qkv_bf16(
 
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_qkv_bf16");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         if (q_out && q_rows > 0) {
@@ -425,7 +459,7 @@ void sofuu_metal_gemv_gate_up_bf16(
 
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_gate_up_bf16");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         if (gate_out) {
@@ -477,7 +511,7 @@ void sofuu_metal_gemv_f16(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_f16");
 
         std::memcpy(y, ctx->y_buf.contents, y_bytes);
     }
@@ -523,7 +557,7 @@ void sofuu_metal_gemv_f32(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_f32");
 
         std::memcpy(y, ctx->y_buf.contents, y_bytes);
     }
@@ -568,7 +602,7 @@ void sofuu_metal_rmsnorm(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "rmsnorm");
 
         std::memcpy(y, ctx->y_buf.contents, bytes);
     }
@@ -602,7 +636,7 @@ void sofuu_metal_swiglu(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "swiglu");
 
         std::memcpy(g, ctx->x_buf.contents, bytes);
     }
@@ -645,7 +679,7 @@ void sofuu_metal_conv1d_3(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "conv1d_3");
 
         std::memcpy(out, ctx->y_buf.contents, out_bytes);
     }
@@ -711,7 +745,7 @@ void sofuu_metal_gemv_mlx4(
         [enc endEncoding];
 
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, is_bf16 ? "gemv_mlx4_bf16" : "gemv_mlx4_f16");
 
         std::memcpy(y, ctx->y_buf.contents, y_bytes);
     }
@@ -805,7 +839,7 @@ void sofuu_metal_gemv_qkv_mlx4(
             ctx->x_buf, ctx->y_buf, q_slot + k_slot, v_rows, cols, group_size);
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, is_bf16 ? "gemv_qkv_mlx4_bf16" : "gemv_qkv_mlx4_f16");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         std::memcpy(q_out, y_ptr, q_bytes);
@@ -856,7 +890,7 @@ void sofuu_metal_gemv_gate_up_mlx4(
             ctx->x_buf, ctx->y_buf, gate_slot, up_rows, cols, group_size);
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, is_bf16 ? "gemv_gate_up_mlx4_bf16" : "gemv_gate_up_mlx4_f16");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         std::memcpy(gate_out, y_ptr, gate_bytes);
@@ -943,7 +977,7 @@ void sofuu_metal_gemv_qkv_multi(
 
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_qkv_multi (f16/f32 by dtype)");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         if (q_out && q_rows > 0) std::memcpy(q_out, y_ptr, q_bytes);
@@ -1014,7 +1048,7 @@ void sofuu_metal_gemv_gate_up_multi(
 
         [enc endEncoding];
         [cmd commit];
-        [cmd waitUntilCompleted];
+        wait_and_report(cmd, "gemv_gate_up_multi (f16/f32 by dtype)");
 
         const char* y_ptr = (const char*)ctx->y_buf.contents;
         if (gate_out) std::memcpy(gate_out, y_ptr, row_bytes);
@@ -1028,7 +1062,7 @@ void sofuu_metal_sync(void* ctx_ptr) {
     if (ctx->pending_cmd != nil) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = ctx->pending_cmd;
-            [cmd waitUntilCompleted];
+            wait_and_report(cmd, "async gemv (deferred)");
             if (ctx->pending_y_dst && ctx->pending_y_bytes > 0) {
                 std::memcpy(ctx->pending_y_dst, ctx->y_buf.contents, ctx->pending_y_bytes);
             }

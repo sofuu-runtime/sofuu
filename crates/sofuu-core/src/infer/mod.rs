@@ -8,6 +8,7 @@ pub mod continuous;
 pub mod gguf;
 pub mod gptx3;
 pub mod lfm2;
+pub mod lookahead;
 pub mod metal;
 pub mod mmap;
 pub mod model;
@@ -44,6 +45,8 @@ pub struct GenerateOptions {
     pub stop_tokens: Vec<String>,
     pub sliding_window: usize,
     pub sink_tokens: usize,
+    pub lookahead: bool,
+    pub snapkv: bool,
 }
 
 impl Default for GenerateOptions {
@@ -62,6 +65,8 @@ impl Default for GenerateOptions {
             ],
             sliding_window: 0, // 0 = full context / model default
             sink_tokens: 4,    // 4 sink tokens by default
+            lookahead: false,  // Jacobi / Lookahead tree parallel decoding
+            snapkv: false,     // SnapKV observation pooling compression
         }
     }
 }
@@ -610,8 +615,22 @@ impl InferEngine {
         let mut full_generated = String::new();
         let eos_id = self.tokenizer.eos_token_id;
 
-        for _step in 0..options.max_tokens {
+        let mut ngram_cache = if options.lookahead {
+            let mut cache = lookahead::NgramCache::new(2048);
+            cache.ingest_sequence(&input_tokens);
+            Some(cache)
+        } else {
+            None
+        };
+
+        let mut step = 0;
+        while step < options.max_tokens {
             let next_token = sampler.sample(&mut logits_buf, &history);
+            step += 1;
+
+            if let Some(ref mut cache) = ngram_cache {
+                cache.record_token(next_token);
+            }
 
             // 1. Check EOS token ID
             if let Some(eos) = eos_id {
@@ -659,10 +678,65 @@ impl InferEngine {
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
 
-            // Forward next token to compute next logits
+            // Lookahead speculative probe
+            let speculative_cand = if let Some(ref cache) = ngram_cache {
+                cache.propose(&history, 1).first().copied()
+            } else {
+                None
+            };
+
+            // Forward current token to compute logits
             let next_logits = self.model.forward(next_token, cur_pos);
             logits_buf.copy_from_slice(next_logits);
             cur_pos += 1;
+
+            // If a speculative candidate was proposed, check if the sampled prediction matches it
+            if let Some(cand) = speculative_cand {
+                if step < options.max_tokens {
+                    let predicted = sampler.sample(&mut logits_buf, &history);
+                    if predicted == cand {
+                        // Speculative match! Accept bonus token immediately.
+                        step += 1;
+                        if let Some(eos) = eos_id {
+                            if cand == eos {
+                                break;
+                            }
+                        }
+
+                        let cand_piece = self.tokenizer.decode_piece(cand);
+                        if !cand_piece.is_empty() {
+                            let mut should_stop = false;
+                            for stop in &options.stop_tokens {
+                                if cand_piece.contains(stop) || full_generated.ends_with(stop) {
+                                    should_stop = true;
+                                    break;
+                                }
+                            }
+                            if should_stop {
+                                break;
+                            }
+
+                            full_generated.push_str(&cand_piece);
+                            if !on_token(&cand_piece) {
+                                break;
+                            }
+                        }
+
+                        history.push(cand);
+                        if let Some(ref mut cache) = ngram_cache {
+                            cache.record_token(cand);
+                        }
+
+                        while cur_pos >= max_seq_len && cur_pos > sink + drop {
+                            cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
+                        }
+
+                        let cand_logits = self.model.forward(cand, cur_pos);
+                        logits_buf.copy_from_slice(cand_logits);
+                        cur_pos += 1;
+                    }
+                }
+            }
         }
 
         // Cache the history for multi-turn continuations

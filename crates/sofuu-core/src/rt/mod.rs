@@ -27,6 +27,8 @@ pub mod cjs; // M7: CommonJS shim (cjs.c)
 pub mod ai; // M8: sofuu.ai.* (mod_ai.c + tfidf_embed.c; SIMD kernels stay C)
 pub mod local_tools; // C1: local-model tool calling (prompt protocol + stream parser)
 pub mod wal; // C2: durable atomic publish + write-ahead journal (brain/KV persistence)
+#[cfg(has_qtsq)]
+pub mod brain_store; // B3: segmented brain storage (manifest + bounded segments)
 pub mod model_caps; // per-model capability registry (ctx/max-output/thinking)
 pub mod model_caps_discovered; // caps harvested from endpoint model listings (provider-agnostic)
 pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agent.c + qtsq_adapter.c)

@@ -48,9 +48,10 @@ impl MetalEngine {
             // No-copy is a shortcut, not a requirement: fall back to a
             // copying buffer so a platform that cannot wrap this memory still
             // gets the GPU path instead of losing it entirely. (The iOS
-            // simulator's XPC-backed MTLSimDriver refuses these buffers and
-            // TRAPS on the attempt — see the TARGET_OS_SIMULATOR note in
-            // src/metal/metal_engine.mm.)
+            // simulator's MTLSimDriver exports buffer storage over XPC shared
+            // memory, and libxpc aborts the process rather than failing when
+            // allocator memory cannot be exported as one mapping — see the
+            // TARGET_OS_SIMULATOR notes in src/metal/metal_engine.mm.)
             self.create_buffer(slice)
         }
     }

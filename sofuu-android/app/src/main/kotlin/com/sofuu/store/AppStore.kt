@@ -56,6 +56,10 @@ data class AppState(
 
     /** Absolute paths of the GGUF models imported into filesDir/models. */
     val localModels: List<String> = emptyList(),
+
+    /** path → display label ("Llama 3.2 1B Instruct · Q8_0"), read from the
+     *  GGUF header on refresh. Companion to [localModels]. */
+    val localModelLabels: Map<String, String> = emptyMap(),
 )
 
 /** One provider's cached model listing (the desktop's model cache). */
@@ -694,7 +698,7 @@ val runtimeEnv = RuntimeEnv(app)
         refreshModelCache()
         // The on-device model list is just a directory read — no engine
         // round-trip, so it is correct to do before the first frame.
-        state = state.copy(localModels = localModels.list().map { it.absolutePath })
+        refreshLocalModels()
     }
 
     fun refreshSessions(resumeNewest: Boolean = false) {
@@ -1081,8 +1085,24 @@ val runtimeEnv = RuntimeEnv(app)
             // No provider entry to write: "local" is not a configured
             // endpoint, so refreshModelCache would only 404 on it.
             state = state.copy(config = configs.redacted(merged))
-            state = state.copy(localModels = localModels.list().map { it.absolutePath })
+            refreshLocalModels()
             refreshSessions(resumeNewest = true)
+        }
+    }
+
+    /** Re-read the on-device GGUF list with display labels derived from
+     *  each header (general.name + quant class). Off the main thread — a
+     *  4 MB header read per model is disk I/O. Called from engine-ready,
+     *  after any import/delete/pick, and when the model sheet opens, since
+     *  the private models dir can change underneath the cached state. */
+    private fun refreshLocalModels() {
+        viewModelScope.launch {
+            val (paths, labels) = withContext(Dispatchers.IO) {
+                val files = localModels.list()
+                files.map { it.absolutePath } to
+                    files.associate { it.absolutePath to localModels.label(it) }
+            }
+            state = state.copy(localModels = paths, localModelLabels = labels)
         }
     }
 
@@ -1120,7 +1140,7 @@ val runtimeEnv = RuntimeEnv(app)
     fun deleteLocalModel(path: String) {
         val f = File(path)
         if (localModels.delete(f)) {
-            state = state.copy(localModels = localModels.list().map { it.absolutePath })
+            refreshLocalModels()
         }
     }
 
@@ -1333,6 +1353,9 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun openSheet(which: String) {
+        // The model sheet must never show a stale list — the models dir can
+        // change outside the app entirely (adb, file manager, a re-import).
+        if (which == "model") refreshLocalModels()
         state = state.copy(sheet = which)
     }
 

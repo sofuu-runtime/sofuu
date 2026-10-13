@@ -106,15 +106,23 @@ Measured baseline: 2000 records → 6.2 MB file, 195 ms flush, 311 ms reopen —
 
 | # | Item | Size |
 |---|---|---|
-| B3.1 | **Segmented layout** — bounded segments + small manifest, following `PLAN-HYBRID-SOFUU-STORAGE.md` and the proven `session_store.rs` pattern (rotate → immutable segment → atomic manifest publish, all behind the C2 journal). | L |
-| B3.2 | **Incremental flush** — append/rotate instead of full rewrite; the flat single-file reader stays for legacy brains. | M |
-| B3.3 | **Capacity policy** — max records / max bytes; eviction order: tombstones → lowest strength → oldest; entities and pins never evicted; evictions reported, not silent. | M |
-| B3.4 | **Compaction pass** — rewrite live records into fresh segments when the dead ratio exceeds a threshold; runs at the turn boundary beside decay/consolidate. | M |
-| B3.5 | **Write-time channel dedup** — store a memory once and link its channels (or keep the second as a pointer), ending double storage + double decay. | M |
+| B3.1 | ✅ **Segmented layout** (2026-10-13) — `rt/brain_store.rs`: `<path>` is a manifest container, records live in `<path>.d/seg-<epoch>-<seq>.qtsq` (tensor + meta streams). One committed manifest, immutable sealed segments, at most one mutable active segment — the `session_store.rs` contract, behind the C2 journal. | L |
+| B3.2 | ✅ **Incremental flush** (2026-10-13) — the CMA tracks dirty ids (recall reinforcement, tier changes, tombstones, upserts) and the flush appends exactly those plus never-persisted records; the active segment is rewritten only while it has room. Measured live: 5 new records cost **548 bytes** where the old full rewrite cost ~80 KB. Decay is not written at all — the manifest carries `last_decay_at` and a load replays the elapsed decay (capped at 7 days, the same bound the turn tick uses). Legacy single-file brains still load. | M |
+| B3.3 | ✅ **Capacity policy** (2026-10-13) — `SOFUU_BRAIN_MAX_RECORDS` (default 100k, 0 disables). Over the cap the weakest live records are tombstoned (never pins, never entities; oldest first among equals) and the count is reported in `cma.stats().evicted_total`. Tombstoning rather than removing keeps ids stable, so a caller holding recall ids across the flush cannot be handed a wrong record; `retain()` drops them at the next turn boundary. | M |
+| B3.4 | ✅ **Compaction** (2026-10-13) — automatic when superseded versions exceed 2× live + 64, or when `retain()` renumbered / `cma.compact()` was called; rewrites one version per live record into a fresh epoch and preserves recall (verified). Old generations stay on disk until the age-guarded orphan sweep (10 min) can prove no concurrent reader holds them. | M |
+| ⬜ | **B3.5 write-time channel dedup — deferred.** The hash store and the sem2 sibling each hold a copy of every text; deduping them means changing the two-channel write and the RRF fusion in `src/js/agent.js`, which is another agent's active file. Recorded here so it is not lost; it is a cross-store redesign, not a storage-layer change. | M |
 
-**Gate:** a flush of N new records touches O(new) bytes, not O(total); a 10k-record brain stays
-under the cap and recalls correctly; compaction preserves recall; a legacy file migrates once with a
-backup and never loses records.
+**Gate met (2026-10-13):** `incremental_flush_touches_only_the_active_segment` (sealed segments
+byte-identical, only the active one + manifest change); `ten_thousand_records_reload_and_recall`
+(10k records, reload, recall); `capacity_evicts_weakest_and_reports` (pins and entities survive);
+`compaction_preserves_recall_and_shrinks_versions`; `legacy_brain_migrates_with_backup_and_keeps_records`;
+`torn_segment_is_refused`. Full suite **512/0** in both builds. Live probe: 600 records → 3 segments,
+605 records → +548 bytes, reload + recall + compact all correct.
+
+**Found while testing (codec-level, reported not fixed):** the QTSQ container read accepts a
+TRUNCATED file as a valid, silently-shortened container — a segment cut to 1/3 loaded as 6 of 10
+records with no error. The store therefore carries a per-segment SHA-256 in the manifest and refuses
+a mismatch, so a torn write can never read as a brain that quietly forgot things.
 
 ---
 

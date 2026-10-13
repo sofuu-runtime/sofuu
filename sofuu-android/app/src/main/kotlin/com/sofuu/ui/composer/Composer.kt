@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sofuu.store.CtxMeter
@@ -55,6 +56,7 @@ fun Composer(
     mode: String,
     permissions: String,
     config: SofuuConfig?,
+    localModelLabels: Map<String, String> = emptyMap(),
     ctx: CtxMeter?,
     images: List<String>,
     pendingMentions: String,
@@ -82,10 +84,16 @@ fun Composer(
         else SLASH_COMMANDS.filter { slashQuery.isEmpty() || it.name.contains(slashQuery) || it.desc.lowercase().contains(slashQuery) }
     }
 
-    val model = config?.model?.takeIf { it.isNotEmpty() }
+    val model = config?.model?.takeIf { it.isNotEmpty() }?.let { modelLabel(it, localModelLabels) }
         ?: (if (config?.providers?.isNotEmpty() == true) "Choose model" else "No model")
-    val effort = config?.effort?.takeIf { it.isNotEmpty() } ?: "high"
-    val effortLabel = if (effort == "off") "Off" else effort.replaceFirstChar { it.uppercase() }
+    val effortValue = config?.effort.orEmpty()
+    // Mirror the Effort sheet's truth: an empty effort IS off (pickLocalModel
+    // clears it for non-thinking models), so the pill must not read "High"
+    // while the sheet highlights "Off" and the engine sends nothing.
+    val effortLabel = when {
+        effortValue.isEmpty() || effortValue == "off" -> "Off"
+        else -> effortValue.replaceFirstChar { it.uppercase() }
+    }
     val rlmState = config?.rlm ?: "off"
 
     // @mentions spliced by the file picker land in the input.
@@ -183,7 +191,14 @@ fun Composer(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(top = 8.dp),
                 ) {
-                    Pill(model, Icons2.Spark) { onSheet(ComposerSheet.Model) }
+                    // weight(1f, fill=false): a local-model label derives from a
+                    // long file path and must never push the send button off
+                    // the right edge — cap the pill, ellipsize its text.
+                    Pill(
+                        model, Icons2.Spark,
+                        modifier = Modifier.weight(1f, fill = false),
+                        flexibleLabel = true,
+                    ) { onSheet(ComposerSheet.Model) }
                     Spacer(Modifier.width(6.dp))
                     Pill(effortLabel, null) { onSheet(ComposerSheet.Effort) }
                     Spacer(Modifier.weight(1f))
@@ -251,12 +266,29 @@ private fun permissionsLabel(p: String): String = when (p) {
     else -> "Ask me"
 }
 
+/** Composer pill label for the active model. Local models keep an
+ *  absolute path in config.model (the engine opens the file by path), so
+ *  show the header-derived label from the store's cache when present
+ *  ("Llama 3.2 1B Instruct · Q8_0"); fall back to a name-only split of the
+ *  file name. Cloud model ids pass through untouched. */
+private fun modelLabel(model: String?, labels: Map<String, String>): String? {
+    if (model.isNullOrEmpty()) return null
+    labels[model]?.let { return it }
+    return if (model.endsWith(".gguf")) com.sofuu.store.fallbackModelLabel(model) else model
+}
+
 @Composable
-private fun Pill(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector?, onClick: () -> Unit) {
+private fun Pill(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector?,
+    modifier: Modifier = Modifier,
+    flexibleLabel: Boolean = false,
+    onClick: () -> Unit,
+) {
     val c = LocalSofuuColors.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(999.dp))
             .background(c.bgCardHover)
             .clickable { onClick() }
@@ -267,7 +299,14 @@ private fun Pill(label: String, icon: androidx.compose.ui.graphics.vector.ImageV
             Icon(icon, null, tint = c.accent, modifier = Modifier.size(14.dp))
             Spacer(Modifier.width(5.dp))
         }
-        Text(label, fontSize = 13.sp, color = c.text, maxLines = 1)
+        Text(
+            label,
+            fontSize = 13.sp,
+            color = c.text,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = if (flexibleLabel) Modifier.weight(1f, fill = false) else Modifier,
+        )
         Spacer(Modifier.width(3.dp))
         Icon(Icons2.Caret, null, tint = c.textFaint, modifier = Modifier.size(13.dp))
     }

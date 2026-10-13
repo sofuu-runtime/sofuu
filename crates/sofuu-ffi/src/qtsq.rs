@@ -5,7 +5,7 @@
 // (src/memory/qtsq_adapter.c) declared `qtsq_context_t ctx;` on its stack
 // and let the library initialize it in place; Rust cannot see the struct
 // layout, so this module:
-//   - allocates the context's exact storage (sizeof = 5024, align = 8 in
+//   - allocates the context's exact storage (sizeof = 5032, align = 8 in
 //     the vendored checkout — qtsq_format.h, verified with an offsetof
 //     probe while porting) via calloc and hands the pointer to libqtsq;
 //   - reads the few fields the adapter pokes directly (header.data_type,
@@ -84,9 +84,10 @@ const OFF_SCHEMA_NUM_DIMS: usize = 100; // qtsq_schema_t.num_dims
 const OFF_IS_ENCRYPTED: usize = 4908; // qtsq_context_t.is_encrypted (int)
 const OFF_CODEC: usize = 5016; // qtsq_context_t.codec (uint8, Phase 6a)
 const OFF_QUALITY: usize = 5020; // qtsq_context_t.quality (float, after codec)
+const OFF_STREAM_CODEC_ID: usize = 5024; // qtsq_context_t.stream_codec_id (uint32, Phase 1)
 
 // Compile-time sanity net for the layout facts above.
-const _: () = assert!(QTSQ_CONTEXT_SIZE >= OFF_CODEC + 4);
+const _: () = assert!(QTSQ_CONTEXT_SIZE >= OFF_STREAM_CODEC_ID + 4);
 
 impl QtsqContext {
     /// # Safety
@@ -584,7 +585,7 @@ mod tests {
     fn context_layout_offsets_match_vendored_header() {
         // (the header probe printed: data_type=10, schema=112,
         //  schema.dimensions=68, schema.num_dims=100, is_encrypted=4908,
-        //  codec=5016, quality=5020, sizeof=5024 align=8 — a future
+        //  codec=5016, quality=5020, sizeof=5032 align=8 — a future
         //  checkout may change these)
         assert_eq!(OFF_HEADER_DATA_TYPE, 10);
         assert_eq!(OFF_HEADER_STRATEGY, 5);
@@ -594,6 +595,7 @@ mod tests {
         assert_eq!(OFF_IS_ENCRYPTED, 4908);
         assert_eq!(OFF_CODEC, 5016);
         assert_eq!(OFF_QUALITY, 5020);
+        assert_eq!(OFF_STREAM_CODEC_ID, 5024);
         assert_eq!(QTSQ_CONTEXT_SIZE, 5032);
     }
 

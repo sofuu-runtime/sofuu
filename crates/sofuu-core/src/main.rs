@@ -1491,6 +1491,8 @@ fn main() -> ExitCode {
             let mut sliding_window = 0usize;
             let mut custom_ctx = 0usize;
             let mut gpu_layers = 999usize;
+            let mut lookahead = false;
+            let mut snapkv = false;
 
             let mut i = 4;
             while i < args.len() {
@@ -1529,6 +1531,12 @@ fn main() -> ExitCode {
                     i += 1;
                 } else if args[i] == "--cpu" {
                     gpu_layers = 0;
+                    i += 1;
+                } else if args[i] == "--lookahead" {
+                    lookahead = true;
+                    i += 1;
+                } else if args[i] == "--snapkv" {
+                    snapkv = true;
                     i += 1;
                 } else {
                     i += 1;
@@ -1579,6 +1587,8 @@ fn main() -> ExitCode {
                     temperature,
                     threads,
                     sliding_window,
+                    lookahead,
+                    snapkv,
                     ..Default::default()
                 },
                 |tok| {

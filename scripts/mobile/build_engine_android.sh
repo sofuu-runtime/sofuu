@@ -87,6 +87,17 @@ for abi in "${ABIS[@]}"; do
     stage="$REPO_ROOT/sofuu-android/app/src/main/jniLibs/$MOBILE_ABI_NAME"
     mkdir -p "$stage"
     cp "$REPO_ROOT/$local_so" "$stage/libsofuu.so"
+    # The Rust cdylib NEEDs libc++_shared.so, but AGP only bundles it when a
+    # native build target links it — the app's only CMake target (jni_bridge.c)
+    # is pure C, so nothing pulled it in and dlopen failed on device. Stage the
+    # NDK's copy next to libsofuu.so (NDK 27 ships it 16KB-aligned).
+    cxx_shared="$MOBILE_NDK_HOME/toolchains/llvm/prebuilt/$MOBILE_HOST_TAG/sysroot/usr/lib/$MOBILE_RUST_TARGET/libc++_shared.so"
+    if [ -f "$cxx_shared" ]; then
+        cp "$cxx_shared" "$stage/libc++_shared.so"
+    else
+        echo "⚠ libc++_shared.so not found at $cxx_shared — APK will fail to load libsofuu.so"
+        exit 1
+    fi
     size=$(du -h "$stage/libsofuu.so" | cut -f1)
     echo "✓ staged $stage/libsofuu.so ($size)"
 done

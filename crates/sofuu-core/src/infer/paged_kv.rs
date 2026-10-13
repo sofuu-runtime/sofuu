@@ -200,6 +200,7 @@ impl BlockPool {
 pub struct SequenceBlockTable {
     pub block_ids: Vec<usize>,
     pub num_tokens: usize,
+    pub sparse_block_indices: Option<Vec<usize>>,
 }
 
 impl SequenceBlockTable {
@@ -207,6 +208,7 @@ impl SequenceBlockTable {
         Self {
             block_ids: Vec::new(),
             num_tokens: 0,
+            sparse_block_indices: None,
         }
     }
 
@@ -321,6 +323,181 @@ impl SequenceBlockTable {
             self.block_ids.truncate(needed_blocks);
         }
     }
+
+    /// Compact the table using SnapKV observation window pooling.
+    ///
+    /// Evaluates cumulative attention scores computed over the observation window.
+    /// Preserves attention sink blocks (head), local rolling window blocks (tail),
+    /// and selects the top-K scoring middle blocks based on `retention_ratio`.
+    /// Unselected middle blocks are freed back to `pool`.
+    pub fn compact_with_snapkv(
+        &mut self,
+        pool: &mut BlockPool,
+        token_scores: &[f32],
+        config: &SnapKvConfig,
+    ) -> SnapKvStats {
+        let total_blocks = self.block_ids.len();
+        if self.num_tokens < config.min_prompt_tokens || total_blocks <= 3 {
+            return SnapKvStats {
+                original_blocks: total_blocks,
+                retained_blocks: total_blocks,
+                pruned_blocks: 0,
+                bytes_saved: 0,
+            };
+        }
+
+        let sink_blocks_count = (config.sink_tokens + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+        let sink_blocks_count = sink_blocks_count.min(total_blocks);
+
+        let window_blocks_count = (config.window_size + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+        let window_blocks_count = window_blocks_count.min(total_blocks.saturating_sub(sink_blocks_count));
+
+        let middle_start = sink_blocks_count;
+        let middle_end = total_blocks.saturating_sub(window_blocks_count);
+
+        if middle_end <= middle_start {
+            return SnapKvStats {
+                original_blocks: total_blocks,
+                retained_blocks: total_blocks,
+                pruned_blocks: 0,
+                bytes_saved: 0,
+            };
+        }
+
+        // Score middle blocks: take the maximum token attention score within each block
+        let mut middle_scored: Vec<(usize, usize, f32)> = Vec::new(); // (logical_block_idx, phys_block_id, max_score)
+        for b_idx in middle_start..middle_end {
+            let phys_id = self.block_ids[b_idx];
+            let token_start = b_idx * KV_BLOCK_SIZE;
+            let token_end = (token_start + KV_BLOCK_SIZE).min(token_scores.len());
+            let mut max_s = 0.0f32;
+            if token_start < token_scores.len() {
+                for &s in &token_scores[token_start..token_end] {
+                    if s > max_s {
+                        max_s = s;
+                    }
+                }
+            }
+            middle_scored.push((b_idx, phys_id, max_s));
+        }
+
+        // Sort descending by score
+        middle_scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let num_middle = middle_scored.len();
+        let retain_k = ((num_middle as f32 * config.retention_ratio).ceil() as usize).max(1).min(num_middle);
+
+        let mut kept_middle: Vec<(usize, usize)> = middle_scored[..retain_k]
+            .iter()
+            .map(|&(l_idx, p_id, _)| (l_idx, p_id))
+            .collect();
+
+        // Sort kept middle blocks back into ascending logical order
+        kept_middle.sort_by_key(|&(l_idx, _)| l_idx);
+
+        // Free unselected blocks back to the pool
+        let to_free: Vec<usize> = middle_scored[retain_k..]
+            .iter()
+            .map(|&(_, p_id, _)| p_id)
+            .collect();
+        pool.free_blocks(&to_free);
+
+        // Reconstruct table
+        let mut new_block_ids = Vec::new();
+        let mut sparse_indices = Vec::new();
+
+        // 1. Attention Sinks (Head)
+        for b_idx in 0..sink_blocks_count {
+            new_block_ids.push(self.block_ids[b_idx]);
+            sparse_indices.push(b_idx);
+        }
+
+        // 2. Kept Middle
+        for (l_idx, p_id) in kept_middle {
+            new_block_ids.push(p_id);
+            sparse_indices.push(l_idx);
+        }
+
+        // 3. Observation Window (Tail)
+        for b_idx in middle_end..total_blocks {
+            new_block_ids.push(self.block_ids[b_idx]);
+            sparse_indices.push(b_idx);
+        }
+
+        let pruned_count = to_free.len();
+        let retained_count = new_block_ids.len();
+
+        let block_bytes = if pool.is_latent {
+            KV_BLOCK_SIZE * pool.latent_dim * std::mem::size_of::<f32>()
+        } else {
+            KV_BLOCK_SIZE * pool.n_kv_heads * pool.head_dim * std::mem::size_of::<f32>() * 2
+        };
+
+        self.block_ids = new_block_ids;
+        self.sparse_block_indices = Some(sparse_indices);
+
+        SnapKvStats {
+            original_blocks: total_blocks,
+            retained_blocks: retained_count,
+            pruned_blocks: pruned_count,
+            bytes_saved: pruned_count * block_bytes,
+        }
+    }
+}
+
+/// Configuration for SnapKV observation window pooling.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapKvConfig {
+    /// Number of tokens in observation window at prompt end (default: 32).
+    pub window_size: usize,
+    /// Number of initial prompt tokens to keep as attention sinks (default: 16 = 1 block).
+    pub sink_tokens: usize,
+    /// Ratio of middle blocks to retain based on cumulative attention (default: 0.25 = top 25%).
+    pub retention_ratio: f32,
+    /// Minimum prompt token threshold to activate SnapKV pooling (default: 64).
+    pub min_prompt_tokens: usize,
+}
+
+impl Default for SnapKvConfig {
+    fn default() -> Self {
+        Self {
+            window_size: 32,
+            sink_tokens: 16,
+            retention_ratio: 0.25,
+            min_prompt_tokens: 64,
+        }
+    }
+}
+
+/// Statistics returned after a SnapKV pooling pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapKvStats {
+    pub original_blocks: usize,
+    pub retained_blocks: usize,
+    pub pruned_blocks: usize,
+    pub bytes_saved: usize,
+}
+
+/// Profiler accumulating attention scores over an observation window.
+#[derive(Debug, Clone, Default)]
+pub struct SnapKvProfiler {
+    pub token_scores: Vec<f32>,
+}
+
+impl SnapKvProfiler {
+    pub fn new(prompt_len: usize) -> Self {
+        Self {
+            token_scores: vec![0.0f32; prompt_len],
+        }
+    }
+
+    /// Accumulate attention weights for a prompt token position.
+    #[inline]
+    pub fn record_attention(&mut self, token_pos: usize, weight: f32) {
+        if token_pos < self.token_scores.len() {
+            self.token_scores[token_pos] += weight;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -391,5 +568,57 @@ mod tests {
 
         table.clear(&mut pool);
         assert_eq!(pool.allocated_blocks_count(), 0);
+    }
+
+    #[test]
+    fn test_snapkv_observation_pooling() {
+        // Pool of 10 blocks (16 tokens each = 160 tokens capacity)
+        let mut pool = BlockPool::new(2, 64, 4, 16);
+        let mut table = SequenceBlockTable::new();
+        let k_dummy = vec![1.0f32; 2 * 64];
+        let v_dummy = vec![2.0f32; 2 * 64];
+
+        // Append 128 prompt tokens -> 8 blocks allocated (blocks 0..7)
+        for i in 0..128 {
+            table.append_token(&mut pool, &k_dummy, &v_dummy).unwrap();
+        }
+        assert_eq!(table.num_tokens, 128);
+        assert_eq!(table.block_ids.len(), 8);
+        assert_eq!(pool.allocated_blocks_count(), 8);
+
+        // Construct synthetic token attention scores over 128 tokens
+        // Let block 0 be sinks (tokens 0..15).
+        // Let middle blocks be 1, 2, 3, 4, 5.
+        // Let tail window be blocks 6, 7 (tokens 96..127, window_size = 32).
+        // We set high scores on block 3 (tokens 48..63) and block 5 (tokens 80..95),
+        // and low/zero scores on blocks 1, 2, 4.
+        let mut profiler = SnapKvProfiler::new(128);
+        for t in 48..64 {
+            profiler.record_attention(t, 10.0);
+        }
+        for t in 80..96 {
+            profiler.record_attention(t, 20.0);
+        }
+
+        let config = SnapKvConfig {
+            window_size: 32,      // blocks 6, 7
+            sink_tokens: 16,      // block 0
+            retention_ratio: 0.40, // 5 middle blocks * 0.40 = 2 blocks kept (blocks 3, 5)
+            min_prompt_tokens: 64,
+        };
+
+        let stats = table.compact_with_snapkv(&mut pool, &profiler.token_scores, &config);
+
+        // Expected retained: Block 0 (sink) + Blocks 3, 5 (middle) + Blocks 6, 7 (window) = 5 blocks
+        // Expected pruned: Blocks 1, 2, 4 = 3 blocks
+        assert_eq!(stats.original_blocks, 8);
+        assert_eq!(stats.retained_blocks, 5);
+        assert_eq!(stats.pruned_blocks, 3);
+        assert_eq!(table.block_ids.len(), 5);
+        assert_eq!(pool.allocated_blocks_count(), 5);
+        assert_eq!(pool.free_blocks_count(), 3);
+
+        // Verify that sparse indices reflect the retained logical positions
+        assert_eq!(table.sparse_block_indices, Some(vec![0, 3, 5, 6, 7]));
     }
 }

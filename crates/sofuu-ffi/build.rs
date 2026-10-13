@@ -512,6 +512,7 @@ _Static_assert(offsetof(qtsq_schema_t, num_dims) == 100, "OFF_SCHEMA_NUM_DIMS dr
 _Static_assert(offsetof(qtsq_context_t, is_encrypted) == 4908, "OFF_IS_ENCRYPTED drifted");
 _Static_assert(offsetof(qtsq_context_t, codec) == 5016, "OFF_CODEC drifted");
 _Static_assert(offsetof(qtsq_context_t, quality) == 5020, "OFF_QUALITY drifted");
+_Static_assert(offsetof(qtsq_context_t, stream_codec_id) == 5024, "OFF_STREAM_CODEC_ID drifted");
 "#,
         )
         .expect("write qtsq layout guard");
@@ -524,7 +525,7 @@ _Static_assert(offsetof(qtsq_context_t, quality) == 5020, "OFF_QUALITY drifted")
         if let Err(e) = compiled {
             panic!(
                 "QTSQ layout guard failed: the checkout's qtsq_context_t no \
-                 longer matches the Rust mirrors in qtsq.rs (sizeof=5024, \
+                 longer matches the Rust mirrors in qtsq.rs (sizeof=5032, \
                  offsets 10/112/68/100/4908). Update the mirrors and this \
                  guard together.\n{e}"
             );

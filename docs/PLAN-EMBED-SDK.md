@@ -338,14 +338,15 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
       JSON-string-vs-object shaping rule are all asserted
       (`cargo test -p sofuu-capi host_tool`).
 
-### Milestone E3: iOS XCFramework Build & Metal GPU Validation — SHIPPED (engine + simulator); device run parked
+### Milestone E3: iOS XCFramework Build & Metal GPU Validation — SHIPPED (engine, frameworks, simulator); device run parked
 - [x] **The Metal engine compiles for iOS.** `crates/sofuu-ffi/build.rs` now
       builds `src/metal/metal_engine.mm` for `macos` **and** `ios` (device and
       simulator both report `CARGO_CFG_TARGET_OS=ios`), and the 97
       `#[cfg(target_os = "macos")]` gates across the inference engine
       (`lfm2.rs`, `block_graph.rs`, `mmap.rs`, `infer/mod.rs`) widened to
-      `any(macos, ios)`. `nm` on the iOS device archive now shows the 40
-      defined `sofuu_metal_*` symbols; before this it had none, and even a
+      `any(macos, ios)`. `nm` on the iOS device archive now shows the 21
+      defined `sofuu_metal_*` functions (40 symbol mentions in all); before
+      this it had none, and even a
       config that asked for GPU layers was a no-op on iOS — `finalize_device`
       and the Lfm2 arm of `set_gpu_layers` were themselves macOS-gated, so
       `with_local_engine` (the `ai.streamLocal` path, `enable_gpu = true`)
@@ -366,20 +367,68 @@ This turns Sofuu into an intelligent in-app copilot that can take actions direct
       `scripts/mobile/typecheck_ios.sh` now compiles kernels.metal against
       the iOS SDK, so a shader that cannot build fails the check, not the
       user's first prompt.
-- [x] **MSL 3.1 is the floor** (a premise correction): the bf16 kernels use
-      `bfloat`, which MSL 3.0 rejects for every SDK (probed) and MSL 3.1
-      accepts. The metallib therefore loads on iOS 17+; on iOS 16
-      `sofuu_metal_init` returns NULL, the engine logs why, and inference
-      runs on the CPU — the designed degradation, and the reason the app's
-      iOS 16 deployment target still holds. (Dropping `bfloat` from the
-      shader — the conversions are a shift by 16 bits — would lift the floor;
-      not needed yet.)
+- [x] **The MSL floor is 3.0, and the bf16 kernels run on the simulator.**
+      Two premise corrections from probing, in order. First: the bf16 kernels
+      originally used the MSL `bfloat` builtin, which `-std=metal3.0` rejects
+      (probed for both SDKs) but which *also* fails at execution on the iOS
+      simulator's GPU — the pipeline compiles and loads, then the command
+      buffer ends `MTLCommandBufferErrorInternal` (status 5) and the output
+      buffer is left untouched. Second: `bfloat` is not needed at all.
+      bf16→f32 is a shift by 16 bits, and `kernels.metal` now spells that out
+      (`as_type<float>((uint)h << 16)`), which is the same value for every bit
+      pattern and executes everywhere. The shader therefore compiles at
+      `-std=metal3.0` for macOS, the simulator and the device — matching the
+      app's iOS 16.0 deployment target instead of shipping a metallib an
+      iOS 16 device cannot load — and the engine prefers the precompiled
+      library on every platform.
+- [x] **Bugs this validation found in the engine, fixed.** (1) A failed
+      command buffer was silent: every GPU entry point read its output buffer
+      back after `waitUntilCompleted` without checking the status, so the
+      bf16 failure above surfaced as *zeros returned as results*. All 14 wait
+      sites now go through `wait_and_report()`, which logs the kernel name and
+      driver error. (2) `MTLSimDriver` (the simulator's Metal driver) exports
+      buffer storage over XPC shared memory, and its no-copy path hands the
+      caller's pointer straight to `xpc_shmem_create`, which **aborts the
+      process** (`_xpc_api_misuse`, SIGTRAP — not an error return) when the
+      range is not one exportable mapping. Allocator memory is exactly that
+      case: measured in a simulator probe, a 2 MiB `malloc` returns a
+      page-aligned pointer whose enclosing vm region reports as a single
+      16 KiB page. So `sofuu_metal_buffer_create` takes the driver's copying
+      path under `TARGET_OS_SIMULATOR` (the driver mmaps its own region for
+      it, verified 1 KiB…32 MiB including non-page-multiple lengths), and
+      `register_zerocopy_buffer` falls back to a copy whenever no-copy is
+      unavailable instead of dropping the GPU path.
+- [x] **Verified on the iOS simulator, end to end.** `cargo test
+      --target aarch64-apple-ios-sim` (through `xcrun simctl spawn booted`,
+      with a `default.metallib` next to the test binary) is green:
+      `test_metal_engine` logs "using the bundled default.metallib
+      (precompiled kernels)", which only prints after every one of the eight
+      pipeline states was created from it, and then passes bf16 GEMV
+      (y[0] = y[500] = 1024.0), SwiGLU (5.284783), batched QKV and the
+      asynchronous-overlap check in 0.52 s. An independent probe against the
+      *shipped* metallib confirms `gemv_f32`, `gemv_f16` and `swiglu` return
+      exact results with every command buffer Completed; macOS stays green
+      with the same assertions (0.06 s).
+- [x] **The framework and the app ship the library.** `scripts/dist/ios.sh
+      all` builds both slices' `default.metallib` (40 KB each, all eight
+      kernel names asserted present at pack time) into
+      `Sofuu.framework/Resources/`, and the modulemap's
+      `link framework "Metal"` is what lets a consumer link at all —
+      `make ios-app` now reports BUILD SUCCEEDED with `Sofuu.debug.dylib`
+      defining all 21 `sofuu_metal_*` functions and linking
+      `Metal.framework` while never passing `-framework Metal` itself. The
+      app bundle also carries its own `default.metallib` (8/8 kernels), so a
+      real app takes the precompiled path, and the built app installs and
+      launches on the simulator.
 - [ ] Physical-device token generation through `sofuu-ios/`. Needs a signing
       team: `project.yml` sets `CODE_SIGN_STYLE: Automatic` with no
       `DEVELOPMENT_TEAM`, and nothing is provisioned. Verification today is
       the iOS **simulator** — the real Metal API, GPU, and our iOS-compiled
-      engine — with `cargo test --target aarch64-apple-ios-sim` run through
-      `xcrun simctl spawn`.
+      engine (see above) — and the *device slice* is verified as a build
+      artifact only: the archive defines the same 21 `sofuu_metal_*`
+      functions, reports `platform: IOS`, and carries no macOS objects. Note
+      that iOS 15/16 GPU support is now *permitted* (MSL 3.0) but untested on
+      real older hardware — nothing has run on a device.
 
 ### Milestone E4: Android Gradle AAR & NDK Verification — OPEN
 - [x] The engine cross-builds for `arm64-v8a` / `x86_64`

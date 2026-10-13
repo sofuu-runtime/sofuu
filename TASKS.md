@@ -4,6 +4,42 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-13 — PLAN-EMBED-SDK E3: the Metal engine runs on iOS, and the frameworks ship its kernels.**
+> `crates/sofuu-ffi/build.rs` now compiles `src/metal/metal_engine.mm` for `ios` as well as `macos`, and
+> the 97 `#[cfg(target_os = "macos")]` gates in the inference engine (`lfm2.rs`, `block_graph.rs`,
+> `mmap.rs`, `infer/mod.rs`) widened to `any(macos, ios)` — which is the functional unlock: `enable_gpu`
+> from `ai.streamLocal` had been a no-op on iOS, with `finalize_device` and the Lfm2 arm of
+> `set_gpu_layers` themselves macOS-gated. `src/metal/kernels.metal` is now the single shader source
+> (`build.rs` generates the runtime-fallback header from it; the `.mm`'s stale duplicate — already
+> missing the two `gemv_mlx4_affine_*` kernels the engine loads — is gone), and `scripts/dist/ios.sh`
+> compiles it per slice into `Sofuu.framework/Resources/default.metallib`, asserting all eight kernel
+> names at pack time; the modulemap's `link framework "Metal"` is what lets a consumer link at all.
+> **The MSL floor dropped from 3.1 to 3.0, which is the app's own deployment target:** the `bfloat`
+> builtin was the only thing forcing 3.1, and it turned out to be worse than a version floor — on the
+> simulator a `bfloat` kernel compiles, loads, and then *fails at execution*
+> (`MTLCommandBufferErrorInternal`, status 5) with the output buffer untouched. bf16→f32 is a shift by 16
+> bits, so the shader now spells out `as_type<float>((uint)h << 16)`: identical values (same assertions
+> pass on macOS), and it executes everywhere.
+> **Two engine bugs this validation found, both fixed.** A failed command buffer was silent — every GPU
+> entry point read its output back without checking status, so that bf16 failure surfaced as *zeros
+> returned as results*; all 14 wait sites now go through `wait_and_report()`, which logs the kernel and
+> the driver error. And `MTLSimDriver` exports buffer storage over XPC shared memory, where the no-copy
+> path hands the caller's pointer to `xpc_shmem_create`, which **aborts the process**
+> (`_xpc_api_misuse`, SIGTRAP) rather than failing when the range is not one exportable mapping —
+> measured in a sim probe, a 2 MiB `malloc` returns a page-aligned pointer whose enclosing vm region
+> reports as a single 16 KiB page. The simulator now takes the driver's copying path, and
+> `register_zerocopy_buffer` falls back to a copy instead of losing the GPU path.
+> **Verified:** `test_metal_engine` on `aarch64-apple-ios-sim` (via `xcrun simctl spawn booted`) is green
+> from the bundled precompiled library — the "using the bundled default.metallib" line only prints after
+> all eight pipeline states were created from it — with bf16 GEMV 1024.0, SwiGLU 5.284783, batched QKV
+> and async overlap, 0.52 s; an independent probe against the shipped metallib returns exact f32/f16
+> GEMV and SwiGLU with every command buffer Completed; macOS stays green (0.06 s); `ios.sh all` produces
+> the xcframework with 8/8 kernels in both slices; `make ios-app` BUILD SUCCEEDED with
+> `Sofuu.debug.dylib` defining all 21 `sofuu_metal_*` functions, linking `Metal.framework` without any
+> explicit `-framework Metal`, and an app-bundle `default.metallib` with 8/8 kernels (installs and
+> launches on the simulator). **Open:** the physical-device run (needs a signing team), and iOS 16 GPU
+> use is now permitted by MSL 3.0 but untested on hardware.
+>
 > **2026-10-13 — SnapKV Observation Pooling & Lookahead Tree Decoding complete.**
 > Shipped Stage 12 memory bandwidth optimizations in the Sofuu neural inference engine.
 > - **SnapKV Observation Window Pooling (`paged_kv.rs`)**: `SnapKvProfiler` and `compact_with_snapkv` on `SequenceBlockTable`. Retains 16 sink tokens (Block 0) + tail observation window ($W=32$) and keeps top 25% middle blocks, freeing 75% of inactive blocks back to `BlockPool`. Slashes KV cache DRAM bandwidth reads by $4\times$ to $5\times$.

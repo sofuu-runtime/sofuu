@@ -400,3 +400,25 @@ Anything macOS-only referenced outside its `#[cfg]` will fail here. A new
 Metal or MLX fast path has to keep its CPU fallback unconditional and gate
 only the GPU branch — `block_graph.rs` and `lfm2.rs` both now compile for
 macOS, iOS and the Android targets from the same source.
+
+## The GPU path is live on iOS
+
+Compiling for iOS was the precondition; as of PLAN-EMBED-SDK E3 the engine
+actually *uses* Metal on iOS: `enable_gpu` reaches the Metal engine, and the
+shader ships twice.
+
+- `Sofuu.framework/Resources/default.metallib` — `scripts/dist/ios.sh`
+  compiles `src/metal/kernels.metal` per slice and asserts all eight kernel
+  names are in the library. The engine loads this with `newDefaultLibrary`
+  and only accepts it if every pipeline it needs is present.
+- The app's own `default.metallib` — this project lists
+  `../src/metal/kernels.metal` as a source, so Xcode compiles it into the app
+  bundle. That is what our app loads; a *consumer* of the static framework
+  gets no resources copied for it, and falls back to the engine's embedded
+  shader (compiled at first init — slower first load, same results).
+
+Both are compiled at `-std=metal3.0` to match the deployment target. The
+simulator runs the whole suite (init from the precompiled library, bf16 GEMV,
+SwiGLU, batched QKV, async overlap) — see `docs/PLAN-EMBED-SDK.md` §E3 for the
+measured results and the two simulator driver behaviours the engine works
+around.

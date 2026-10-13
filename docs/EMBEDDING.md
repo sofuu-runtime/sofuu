@@ -491,6 +491,14 @@ make dist-ios    # → dist/libsofuu.xcframework (device + simulator)
 Then add the xcframework to your Xcode project (General → Frameworks), or
 call the C ABI directly — see `examples/headless/SwiftSample/SofuuBridge.swift`.
 
+GPU inference on iOS: the engine's Metal kernels ship inside the framework as
+`Sofuu.framework/Resources/default.metallib`, but a *static* framework's
+resources are not copied into your app for you. Add the file to your target
+(or compile `src/metal/kernels.metal` yourself) to get the precompiled path;
+without it the engine compiles its embedded copy of the same shader at first
+init — same results, one slower first load. Verification status and the MSL
+floor are in `docs/PLAN-EMBED-SDK.md` §E3.
+
 ### macOS / Linux (C)
 
 ```bash

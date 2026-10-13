@@ -376,7 +376,11 @@ impl BpeTokenizer {
         }
 
         let normalized = match self.space_style {
-            SpaceStyle::Gpt2 => text.replace(' ', "Ġ"),
+            SpaceStyle::Gpt2 => {
+                // GPT-2/Llama BPE is byte-level. Mapping only spaces corrupts
+                // prompts containing newlines, tabs, quotes, and non-ASCII text.
+                text.bytes().map(gpt2_byte_to_char).collect()
+            }
             SpaceStyle::SentencePiece => text.replace(' ', "\u{2581}"),
             SpaceStyle::None => text.to_string(),
         };
@@ -496,6 +500,37 @@ fn gpt2_bytes_table() -> [Option<u8>; 512] {
         }
     }
     table
+}
+
+fn gpt2_byte_to_char(b: u8) -> char {
+    static ENCODER: std::sync::OnceLock<[char; 256]> = std::sync::OnceLock::new();
+    let table = ENCODER.get_or_init(|| {
+        let mut bs = Vec::with_capacity(256);
+        for byte in b'!'..=b'~' {
+            bs.push(byte);
+        }
+        for byte in 0xa1..=0xac {
+            bs.push(byte);
+        }
+        for byte in 0xae..=0xff {
+            bs.push(byte);
+        }
+        let mut cs: Vec<u32> = bs.iter().map(|&byte| byte as u32).collect();
+        let mut n = 0u32;
+        for byte in 0..=255u8 {
+            if !bs.contains(&byte) {
+                bs.push(byte);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        let mut encoder = ['\0'; 256];
+        for (byte, code) in bs.into_iter().zip(cs.into_iter()) {
+            encoder[byte as usize] = char::from_u32(code).unwrap_or('\0');
+        }
+        encoder
+    });
+    table[b as usize]
 }
 
 pub fn decode_byte_level(s: &str) -> String {

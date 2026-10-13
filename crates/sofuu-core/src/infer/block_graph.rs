@@ -100,11 +100,25 @@ pub struct Conv1dSpec {
     pub kernel_size: usize,
 }
 
-/// Sequence Mixer kind: Attention or Short Conv
+/// DeepSeek Multi-Head Latent Attention (MLA) specification
+#[derive(Debug, Clone)]
+pub struct MlaSpec {
+    pub n_heads: usize,
+    pub kv_lora_rank: usize,      // Compressed latent dim d_c (e.g. 512)
+    pub qk_nope_head_dim: usize,  // Unrotated query/key head dim d_nope (e.g. 128)
+    pub qk_rope_head_dim: usize,  // Decoupled RoPE head dim d_R (e.g. 64)
+    pub v_head_dim: usize,        // Value head dim d_v (e.g. 128)
+    pub q_lora_rank: Option<usize>, // Low-rank query compression (e.g. 1536)
+    pub rope_theta: f32,
+    pub softmax_scale: f32,
+}
+
+/// Sequence Mixer kind: Attention, Short Conv, or DeepSeek Latent Attention
 #[derive(Debug, Clone)]
 pub enum MixerSpec {
     Attention(AttentionSpec),
     Conv1d(Conv1dSpec),
+    LatentAttention(MlaSpec),
 }
 
 /// Channel Mixer (FFN) specification
@@ -119,6 +133,7 @@ pub enum ChannelMixerSpec {
         intermediate_dim: usize,
         num_experts: usize,
         top_k: usize,
+        shared_intermediate_dim: Option<usize>,
     },
 }
 
@@ -152,9 +167,13 @@ pub struct Mlx4Weights {
     pub scales: UnifiedTensorData,
     #[cfg(target_os = "macos")]
     pub scales_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    #[cfg(target_os = "macos")]
+    pub scales_metal_offset: usize,
     pub biases: UnifiedTensorData,
     #[cfg(target_os = "macos")]
     pub biases_metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    #[cfg(target_os = "macos")]
+    pub biases_metal_offset: usize,
     pub group_size: usize,
     pub is_bf16: bool,
 }
@@ -168,6 +187,8 @@ pub struct WeightMatrix {
     pub data: UnifiedTensorData,
     #[cfg(target_os = "macos")]
     pub metal_buf: Option<Arc<crate::infer::metal::MetalBuffer>>,
+    #[cfg(target_os = "macos")]
+    pub metal_offset: usize,
     pub mlx4: Option<Mlx4Weights>,
 }
 
@@ -181,6 +202,8 @@ impl WeightMatrix {
             data: UnifiedTensorData::Heap(Arc::new(slice.to_vec())),
             #[cfg(target_os = "macos")]
             metal_buf: None,
+            #[cfg(target_os = "macos")]
+            metal_offset: 0,
             mlx4: None,
         }
     }
@@ -193,6 +216,8 @@ impl WeightMatrix {
             data,
             #[cfg(target_os = "macos")]
             metal_buf: None,
+            #[cfg(target_os = "macos")]
+            metal_offset: 0,
             mlx4: None,
         }
     }
@@ -213,13 +238,19 @@ impl WeightMatrix {
             data,
             #[cfg(target_os = "macos")]
             metal_buf: None,
+            #[cfg(target_os = "macos")]
+            metal_offset: 0,
             mlx4: Some(Mlx4Weights {
                 scales,
                 #[cfg(target_os = "macos")]
                 scales_metal_buf: None,
+                #[cfg(target_os = "macos")]
+                scales_metal_offset: 0,
                 biases,
                 #[cfg(target_os = "macos")]
                 biases_metal_buf: None,
+                #[cfg(target_os = "macos")]
+                biases_metal_offset: 0,
                 group_size,
                 is_bf16,
             }),
@@ -228,15 +259,51 @@ impl WeightMatrix {
 
     #[cfg(target_os = "macos")]
     pub fn with_metal(mut self, engine: &crate::infer::metal::MetalEngine) -> Self {
-        let slice = self.data.as_slice();
-        self.metal_buf = engine.create_buffer(slice).map(Arc::new);
+        match &self.data {
+            UnifiedTensorData::Mmap { mmap, offset, .. } => {
+                self.metal_buf = mmap.get_or_create_metal_buffer(engine);
+                self.metal_offset = *offset;
+            }
+            UnifiedTensorData::Heap(vec) => {
+                self.metal_buf = engine.create_buffer(vec.as_slice()).map(Arc::new);
+                self.metal_offset = 0;
+            }
+        }
         if let Some(ref mut mlx4) = self.mlx4 {
-            let s_slice = mlx4.scales.as_slice();
-            mlx4.scales_metal_buf = engine.create_buffer(s_slice).map(Arc::new);
-            let b_slice = mlx4.biases.as_slice();
-            mlx4.biases_metal_buf = engine.create_buffer(b_slice).map(Arc::new);
+            match &mlx4.scales {
+                UnifiedTensorData::Mmap { mmap, offset, .. } => {
+                    mlx4.scales_metal_buf = mmap.get_or_create_metal_buffer(engine);
+                    mlx4.scales_metal_offset = *offset;
+                }
+                UnifiedTensorData::Heap(vec) => {
+                    mlx4.scales_metal_buf = engine.create_buffer(vec.as_slice()).map(Arc::new);
+                    mlx4.scales_metal_offset = 0;
+                }
+            }
+            match &mlx4.biases {
+                UnifiedTensorData::Mmap { mmap, offset, .. } => {
+                    mlx4.biases_metal_buf = mmap.get_or_create_metal_buffer(engine);
+                    mlx4.biases_metal_offset = *offset;
+                }
+                UnifiedTensorData::Heap(vec) => {
+                    mlx4.biases_metal_buf = engine.create_buffer(vec.as_slice()).map(Arc::new);
+                    mlx4.biases_metal_offset = 0;
+                }
+            }
         }
         self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clear_metal(&mut self) {
+        self.metal_buf = None;
+        self.metal_offset = 0;
+        if let Some(ref mut mlx4) = self.mlx4 {
+            mlx4.scales_metal_buf = None;
+            mlx4.scales_metal_offset = 0;
+            mlx4.biases_metal_buf = None;
+            mlx4.biases_metal_offset = 0;
+        }
     }
 
     /// Matrix-vector multiplication: y = W * x
@@ -250,9 +317,9 @@ impl WeightMatrix {
             ) {
                 if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
                     engine.gemv_mlx4(
-                        m_buf, 0,
-                        s_buf, 0,
-                        b_buf, 0,
+                        m_buf, self.metal_offset,
+                        s_buf, mlx4.scales_metal_offset,
+                        b_buf, mlx4.biases_metal_offset,
                         x, y,
                         self.rows, self.cols, mlx4.group_size, mlx4.is_bf16,
                     );
@@ -276,21 +343,22 @@ impl WeightMatrix {
             if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
                 match self.dtype {
                     TensorDType::BF16 => {
-                        engine.gemv_bf16(m_buf, 0, x, y, self.rows, self.cols);
+                        engine.gemv_bf16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
                         return;
                     }
                     TensorDType::F16 => {
-                        engine.gemv_f16(m_buf, 0, x, y, self.rows, self.cols);
+                        engine.gemv_f16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
                         return;
                     }
                     TensorDType::F32 => {
-                        engine.gemv_f32(m_buf, 0, x, y, self.rows, self.cols);
+                        engine.gemv_f32(m_buf, self.metal_offset, x, y, self.rows, self.cols);
                         return;
                     }
                     _ => {}
                 }
             }
         }
+
 
         let slice = self.data.as_slice();
         match self.dtype {
@@ -441,13 +509,15 @@ pub fn soft_cap_in_place(scores: &mut [f32], cap: f32) {
     }
 }
 
-/// KV Cache for a single composable block
+/// KV Cache for a single composable block (supports standard MHA/GQA and DeepSeek MLA latent cache)
 pub struct BlockKvCache {
     pub k: Vec<f32>, // [kv_heads, max_seq_len, head_dim]
     pub v: Vec<f32>, // [kv_heads, max_seq_len, head_dim]
+    pub latent_kv: Option<Vec<f32>>, // [max_seq_len, latent_dim] where latent_dim = kv_lora_rank + qk_rope_head_dim
     pub max_seq_len: usize,
     pub head_dim: usize,
     pub n_kv_heads: usize,
+    pub latent_dim: usize,
 }
 
 impl BlockKvCache {
@@ -456,9 +526,24 @@ impl BlockKvCache {
         Self {
             k: vec![0.0f32; cap],
             v: vec![0.0f32; cap],
+            latent_kv: None,
             max_seq_len,
             head_dim,
             n_kv_heads,
+            latent_dim: 0,
+        }
+    }
+
+    pub fn new_latent(max_seq_len: usize, latent_dim: usize) -> Self {
+        let cap = max_seq_len * latent_dim;
+        Self {
+            k: Vec::new(),
+            v: Vec::new(),
+            latent_kv: Some(vec![0.0f32; cap]),
+            max_seq_len,
+            head_dim: 0,
+            n_kv_heads: 0,
+            latent_dim,
         }
     }
 
@@ -479,6 +564,25 @@ impl BlockKvCache {
     pub fn get_v(&self, kv_head: usize, pos: usize) -> &[f32] {
         let offset = (kv_head * self.max_seq_len + pos) * self.head_dim;
         &self.v[offset..offset + self.head_dim]
+    }
+
+    #[inline]
+    pub fn store_latent(&mut self, pos: usize, latent_vec: &[f32]) {
+        if let Some(ref mut l) = self.latent_kv {
+            let offset = pos * self.latent_dim;
+            let len = latent_vec.len().min(self.latent_dim);
+            l[offset..offset + len].copy_from_slice(&latent_vec[..len]);
+        }
+    }
+
+    #[inline]
+    pub fn get_latent(&self, pos: usize) -> &[f32] {
+        if let Some(ref l) = self.latent_kv {
+            let offset = pos * self.latent_dim;
+            &l[offset..offset + self.latent_dim]
+        } else {
+            &[]
+        }
     }
 }
 
@@ -510,6 +614,19 @@ pub enum BlockMixerWeights {
         spec: Conv1dSpec,
         conv_weight: Vec<f32>,
     },
+    LatentAttention {
+        spec: MlaSpec,
+        q_a_proj: Option<WeightMatrix>,
+        q_a_norm: Option<NormKind>,
+        q_a_norm_weight: Option<Vec<f32>>,
+        q_b_proj: WeightMatrix,
+        kv_a_proj: WeightMatrix,
+        kv_a_norm: Option<NormKind>,
+        kv_a_norm_weight: Option<Vec<f32>>,
+        w_uk: WeightMatrix,
+        w_uv: WeightMatrix,
+        o_proj: WeightMatrix,
+    },
 }
 
 pub enum BlockChannelMixerWeights {
@@ -530,6 +647,9 @@ pub enum BlockChannelMixerWeights {
         experts_gate: Vec<WeightMatrix>,
         experts_up: Vec<WeightMatrix>,
         experts_down: Vec<WeightMatrix>,
+        shared_gate: Option<WeightMatrix>,
+        shared_up: Option<WeightMatrix>,
+        shared_down: Option<WeightMatrix>,
     },
 }
 
@@ -636,6 +756,26 @@ struct HfConfig {
     final_logit_soft_cap: Option<f32>,
     #[serde(default)]
     attn_logit_soft_cap: Option<f32>,
+    #[serde(default)]
+    sliding_window: Option<usize>,
+    #[serde(default)]
+    num_local_experts: Option<usize>,
+    #[serde(default)]
+    num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    n_routed_experts: Option<usize>,
+    #[serde(default)]
+    n_shared_experts: Option<usize>,
+    #[serde(default)]
+    q_lora_rank: Option<usize>,
+    #[serde(default)]
+    kv_lora_rank: Option<usize>,
+    #[serde(default)]
+    qk_rope_head_dim: Option<usize>,
+    #[serde(default)]
+    qk_nope_head_dim: Option<usize>,
+    #[serde(default)]
+    v_head_dim: Option<usize>,
 }
 
 pub struct BlockGraphModel {
@@ -659,6 +799,7 @@ pub struct BlockGraphModel {
     pub buf_ffn_out: Vec<f32>,
     pub buf_scores: Vec<f32>,
     pub buf_tmp: Vec<f32>,
+    pub buf_router: Vec<f32>,
     pub gpu_layers: usize,
     #[cfg(target_os = "macos")]
     pub metal_engine: Option<crate::infer::metal::MetalEngine>,
@@ -743,6 +884,7 @@ impl BlockGraphModel {
         let mut inferred_n_kv_heads = 0;
         let mut inferred_head_dim = 0;
         let mut max_intermediate_dim = 0;
+        let mut max_router_rows = 0;
 
         for i in 0..n_layers {
             // Pre-norm
@@ -753,93 +895,204 @@ impl BlockGraphModel {
             ];
             let pre_norm_weight = find_and_load_vec(table, &pre_norm_cands)?;
 
-            // Attention projections
-            let q_cands = [
-                format!("model.layers.{i}.self_attn.q_proj.weight"),
-                format!("layers.{i}.self_attn.q_proj.weight"),
-                format!("layers.{i}.attention.wq.weight"),
+            // Sequence mixer: check for DeepSeek Multi-Head Latent Attention (MLA) or standard Attention
+            let mla_cands = [
+                format!("model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight"),
+                format!("layers.{i}.self_attn.kv_a_proj_with_mqa.weight"),
+                format!("model.layers.{i}.self_attn.w_uk.weight"),
             ];
-            let q_proj = find_and_load_weight(table, &q_cands)?;
+            let is_mla = mla_cands.iter().any(|c| table.get_tensor_data(c).is_some());
 
-            let k_cands = [
-                format!("model.layers.{i}.self_attn.k_proj.weight"),
-                format!("layers.{i}.self_attn.k_proj.weight"),
-                format!("layers.{i}.attention.wk.weight"),
-            ];
-            let k_proj = find_and_load_weight(table, &k_cands)?;
+            let mixer_weights = if is_mla {
+                let kv_lora_rank = hf_cfg.as_ref().and_then(|c| c.kv_lora_rank).unwrap_or(512);
+                let qk_nope_head_dim = hf_cfg.as_ref().and_then(|c| c.qk_nope_head_dim).unwrap_or(128);
+                let qk_rope_head_dim = hf_cfg.as_ref().and_then(|c| c.qk_rope_head_dim).unwrap_or(64);
+                let v_head_dim = hf_cfg.as_ref().and_then(|c| c.v_head_dim).unwrap_or(128);
+                let n_heads = hf_cfg.as_ref().and_then(|c| c.num_attention_heads).unwrap_or(inferred_n_heads.max(16));
+                let q_lora_rank = hf_cfg.as_ref().and_then(|c| c.q_lora_rank);
+                let rope_theta = hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0);
+                let softmax_scale = 1.0f32 / ((qk_nope_head_dim + qk_rope_head_dim) as f32).sqrt();
 
-            let v_cands = [
-                format!("model.layers.{i}.self_attn.v_proj.weight"),
-                format!("layers.{i}.self_attn.v_proj.weight"),
-                format!("layers.{i}.attention.wv.weight"),
-            ];
-            let v_proj = find_and_load_weight(table, &v_cands)?;
-
-            let o_cands = [
-                format!("model.layers.{i}.self_attn.o_proj.weight"),
-                format!("layers.{i}.self_attn.o_proj.weight"),
-                format!("layers.{i}.attention.wo.weight"),
-            ];
-            let o_proj = find_and_load_weight(table, &o_cands)?;
-
-            if i == 0 {
-                let q_rows = q_proj.rows;
-                let k_rows = k_proj.rows;
-                inferred_head_dim = if let Some(hd) = hf_cfg.as_ref().and_then(|c| c.head_dim) {
-                    hd
-                } else if is_gemma {
-                    256
-                } else if q_rows >= 128 && q_rows % 128 == 0 && q_rows / 128 <= 64 {
-                    128
-                } else if q_rows >= 64 && q_rows % 64 == 0 {
-                    64
-                } else {
-                    q_rows.min(dim).max(1)
+                let spec = MlaSpec {
+                    n_heads,
+                    kv_lora_rank,
+                    qk_nope_head_dim,
+                    qk_rope_head_dim,
+                    v_head_dim,
+                    q_lora_rank,
+                    rope_theta,
+                    softmax_scale,
                 };
-                inferred_n_heads = if let Some(nh) = hf_cfg.as_ref().and_then(|c| c.num_attention_heads) {
-                    nh
+
+                let kv_a_cands = [
+                    format!("model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight"),
+                    format!("layers.{i}.self_attn.kv_a_proj_with_mqa.weight"),
+                    format!("model.layers.{i}.self_attn.kv_a_proj.weight"),
+                ];
+                let kv_a_proj = find_and_load_weight(table, &kv_a_cands)?;
+
+                let kv_a_norm_cands = [
+                    format!("model.layers.{i}.self_attn.kv_a_layernorm.weight"),
+                    format!("layers.{i}.self_attn.kv_a_layernorm.weight"),
+                ];
+                let kv_a_norm_weight = find_and_load_vec(table, &kv_a_norm_cands).ok();
+                let kv_a_norm = if kv_a_norm_weight.is_some() { Some(norm_kind) } else { None };
+
+                let w_uk_cands = [
+                    format!("model.layers.{i}.self_attn.w_uk.weight"),
+                    format!("layers.{i}.self_attn.w_uk.weight"),
+                    format!("model.layers.{i}.self_attn.kv_b_proj.weight"),
+                ];
+                let w_uk = find_and_load_weight(table, &w_uk_cands)?;
+
+                let w_uv_cands = [
+                    format!("model.layers.{i}.self_attn.w_uv.weight"),
+                    format!("layers.{i}.self_attn.w_uv.weight"),
+                ];
+                let w_uv = find_and_load_weight(table, &w_uv_cands).unwrap_or_else(|_| w_uk.clone());
+
+                let q_a_cands = [
+                    format!("model.layers.{i}.self_attn.q_a_proj.weight"),
+                    format!("layers.{i}.self_attn.q_a_proj.weight"),
+                ];
+                let q_a_proj = find_and_load_weight(table, &q_a_cands).ok();
+
+                let q_a_norm_cands = [
+                    format!("model.layers.{i}.self_attn.q_a_layernorm.weight"),
+                    format!("layers.{i}.self_attn.q_a_layernorm.weight"),
+                ];
+                let q_a_norm_weight = find_and_load_vec(table, &q_a_norm_cands).ok();
+                let q_a_norm = if q_a_norm_weight.is_some() { Some(norm_kind) } else { None };
+
+                let q_b_cands = [
+                    format!("model.layers.{i}.self_attn.q_b_proj.weight"),
+                    format!("layers.{i}.self_attn.q_b_proj.weight"),
+                    format!("model.layers.{i}.self_attn.q_proj.weight"),
+                ];
+                let q_b_proj = find_and_load_weight(table, &q_b_cands)?;
+
+                let o_cands = [
+                    format!("model.layers.{i}.self_attn.o_proj.weight"),
+                    format!("layers.{i}.self_attn.o_proj.weight"),
+                    format!("layers.{i}.attention.wo.weight"),
+                ];
+                let o_proj = find_and_load_weight(table, &o_cands)?;
+
+                BlockMixerWeights::LatentAttention {
+                    spec,
+                    q_a_proj,
+                    q_a_norm,
+                    q_a_norm_weight,
+                    q_b_proj,
+                    kv_a_proj,
+                    kv_a_norm,
+                    kv_a_norm_weight,
+                    w_uk,
+                    w_uv,
+                    o_proj,
+                }
+            } else {
+                // Standard Attention projections
+                let q_cands = [
+                    format!("model.layers.{i}.self_attn.q_proj.weight"),
+                    format!("layers.{i}.self_attn.q_proj.weight"),
+                    format!("layers.{i}.attention.wq.weight"),
+                ];
+                let q_proj = find_and_load_weight(table, &q_cands)?;
+
+                let k_cands = [
+                    format!("model.layers.{i}.self_attn.k_proj.weight"),
+                    format!("layers.{i}.self_attn.k_proj.weight"),
+                    format!("layers.{i}.attention.wk.weight"),
+                ];
+                let k_proj = find_and_load_weight(table, &k_cands)?;
+
+                let v_cands = [
+                    format!("model.layers.{i}.self_attn.v_proj.weight"),
+                    format!("layers.{i}.self_attn.v_proj.weight"),
+                    format!("layers.{i}.attention.wv.weight"),
+                ];
+                let v_proj = find_and_load_weight(table, &v_cands)?;
+
+                let o_cands = [
+                    format!("model.layers.{i}.self_attn.o_proj.weight"),
+                    format!("layers.{i}.self_attn.o_proj.weight"),
+                    format!("layers.{i}.attention.wo.weight"),
+                ];
+                let o_proj = find_and_load_weight(table, &o_cands)?;
+
+                if i == 0 {
+                    let q_rows = q_proj.rows;
+                    let k_rows = k_proj.rows;
+                    inferred_head_dim = if let Some(hd) = hf_cfg.as_ref().and_then(|c| c.head_dim) {
+                        hd
+                    } else if is_gemma {
+                        256
+                    } else if q_rows >= 128 && q_rows % 128 == 0 && q_rows / 128 <= 64 {
+                        128
+                    } else if q_rows >= 64 && q_rows % 64 == 0 {
+                        64
+                    } else {
+                        q_rows.min(dim).max(1)
+                    };
+                    inferred_n_heads = if let Some(nh) = hf_cfg.as_ref().and_then(|c| c.num_attention_heads) {
+                        nh
+                    } else {
+                        (q_rows / inferred_head_dim).max(1)
+                    };
+                    inferred_n_kv_heads = if let Some(nkv) = hf_cfg.as_ref().and_then(|c| c.num_key_value_heads) {
+                        nkv
+                    } else {
+                        (k_rows / inferred_head_dim).max(1)
+                    };
+                }
+
+                // Q/K norms (Qwen 2.5 / 3)
+                let q_norm_cands = [
+                    format!("model.layers.{i}.self_attn.q_norm.weight"),
+                    format!("layers.{i}.self_attn.q_norm.weight"),
+                ];
+                let q_norm_weight = find_and_load_vec(table, &q_norm_cands).ok();
+
+                let k_norm_cands = [
+                    format!("model.layers.{i}.self_attn.k_norm.weight"),
+                    format!("layers.{i}.self_attn.k_norm.weight"),
+                ];
+                let k_norm_weight = find_and_load_vec(table, &k_norm_cands).ok();
+
+                // Gemma 2 alternates: even layers (0, 2, 4...) have sliding window (4096),
+                // odd layers (1, 3, 5...) have full global attention.
+                // Mistral applies uniform sliding window across all layers.
+                let layer_sliding_window = if is_gemma_2 {
+                    if i % 2 == 0 {
+                        Some(hf_cfg.as_ref().and_then(|c| c.sliding_window).unwrap_or(4096))
+                    } else {
+                        None
+                    }
                 } else {
-                    (q_rows / inferred_head_dim).max(1)
+                    hf_cfg.as_ref().and_then(|c| c.sliding_window)
                 };
-                inferred_n_kv_heads = if let Some(nkv) = hf_cfg.as_ref().and_then(|c| c.num_key_value_heads) {
-                    nkv
-                } else {
-                    (k_rows / inferred_head_dim).max(1)
+
+                let spec = AttentionSpec {
+                    n_heads: inferred_n_heads,
+                    n_kv_heads: inferred_n_kv_heads,
+                    head_dim: inferred_head_dim,
+                    rope_theta: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
+                    sliding_window: layer_sliding_window,
+                    q_norm: if q_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
+                    k_norm: if k_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
+                    attn_logit_soft_cap: attn_soft_cap,
                 };
-            }
 
-            // Q/K norms (Qwen 2.5 / 3)
-            let q_norm_cands = [
-                format!("model.layers.{i}.self_attn.q_norm.weight"),
-                format!("layers.{i}.self_attn.q_norm.weight"),
-            ];
-            let q_norm_weight = find_and_load_vec(table, &q_norm_cands).ok();
-
-            let k_norm_cands = [
-                format!("model.layers.{i}.self_attn.k_norm.weight"),
-                format!("layers.{i}.self_attn.k_norm.weight"),
-            ];
-            let k_norm_weight = find_and_load_vec(table, &k_norm_cands).ok();
-
-            let spec = AttentionSpec {
-                n_heads: inferred_n_heads,
-                n_kv_heads: inferred_n_kv_heads,
-                head_dim: inferred_head_dim,
-                rope_theta: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
-                sliding_window: None,
-                q_norm: if q_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
-                k_norm: if k_norm_weight.is_some() { Some(NormKind::RmsNorm { eps: 1e-6 }) } else { None },
-                attn_logit_soft_cap: attn_soft_cap,
-            };
-
-            let mixer_weights = BlockMixerWeights::Attention {
-                spec,
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                q_norm_weight,
-                k_norm_weight,
+                BlockMixerWeights::Attention {
+                    spec,
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    q_norm_weight,
+                    k_norm_weight,
+                }
             };
 
             // Post-attention norm:
@@ -864,40 +1117,127 @@ impl BlockGraphModel {
             ];
             let ffn_norm_weight = find_and_load_vec(table, &ffn_norm_cands)?;
 
-            // FFN Channel Mixer
-            let gate_cands = [
-                format!("model.layers.{i}.mlp.gate_proj.weight"),
-                format!("layers.{i}.mlp.gate_proj.weight"),
-                format!("layers.{i}.feed_forward.w1.weight"),
+            // FFN Channel Mixer: Sparse MoE or dense SwiGLU / GeGLU
+            let router_cands = [
+                format!("model.layers.{i}.block_sparse_moe.gate.weight"),
+                format!("layers.{i}.block_sparse_moe.gate.weight"),
+                format!("model.layers.{i}.mlp.router.weight"),
+                format!("layers.{i}.feed_forward.router.weight"),
             ];
-            let gate_proj = find_and_load_weight(table, &gate_cands)?;
-            max_intermediate_dim = max_intermediate_dim.max(gate_proj.rows);
+            let is_moe = router_cands.iter().any(|c| table.get_tensor_data(c).is_some());
 
-            let up_cands = [
-                format!("model.layers.{i}.mlp.up_proj.weight"),
-                format!("layers.{i}.mlp.up_proj.weight"),
-                format!("layers.{i}.feed_forward.w3.weight"),
-            ];
-            let up_proj = find_and_load_weight(table, &up_cands)?;
+            let channel_mixer_weights = if is_moe {
+                let router = find_and_load_weight(table, &router_cands)?;
+                max_router_rows = max_router_rows.max(router.rows);
+                let num_experts = hf_cfg.as_ref().and_then(|c| c.num_local_experts.or(c.n_routed_experts)).unwrap_or(router.rows);
+                let top_k = hf_cfg.as_ref().and_then(|c| c.num_experts_per_tok).unwrap_or(2);
+                let mut experts_gate = Vec::with_capacity(num_experts);
+                let mut experts_up = Vec::with_capacity(num_experts);
+                let mut experts_down = Vec::with_capacity(num_experts);
 
-            let down_cands = [
-                format!("model.layers.{i}.mlp.down_proj.weight"),
-                format!("layers.{i}.mlp.down_proj.weight"),
-                format!("layers.{i}.feed_forward.w2.weight"),
-            ];
-            let down_proj = find_and_load_weight(table, &down_cands)?;
+                for e in 0..num_experts {
+                    let eg_cands = [
+                        format!("model.layers.{i}.block_sparse_moe.experts.{e}.w1.weight"),
+                        format!("model.layers.{i}.mlp.experts.{e}.gate_proj.weight"),
+                        format!("layers.{i}.block_sparse_moe.experts.{e}.gate_proj.weight"),
+                        format!("layers.{i}.feed_forward.experts.{e}.w1.weight"),
+                    ];
+                    let eg = find_and_load_weight(table, &eg_cands)?;
+                    max_intermediate_dim = max_intermediate_dim.max(eg.rows);
 
-            let channel_mixer_weights = if is_gemma {
-                BlockChannelMixerWeights::GeGLU {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
+                    let eu_cands = [
+                        format!("model.layers.{i}.block_sparse_moe.experts.{e}.w3.weight"),
+                        format!("model.layers.{i}.mlp.experts.{e}.up_proj.weight"),
+                        format!("layers.{i}.block_sparse_moe.experts.{e}.up_proj.weight"),
+                        format!("layers.{i}.feed_forward.experts.{e}.w3.weight"),
+                    ];
+                    let eu = find_and_load_weight(table, &eu_cands)?;
+
+                    let ed_cands = [
+                        format!("model.layers.{i}.block_sparse_moe.experts.{e}.w2.weight"),
+                        format!("model.layers.{i}.mlp.experts.{e}.down_proj.weight"),
+                        format!("layers.{i}.block_sparse_moe.experts.{e}.down_proj.weight"),
+                        format!("layers.{i}.feed_forward.experts.{e}.w2.weight"),
+                    ];
+                    let ed = find_and_load_weight(table, &ed_cands)?;
+
+                    experts_gate.push(eg);
+                    experts_up.push(eu);
+                    experts_down.push(ed);
+                }
+
+                // Shared experts (Qwen-MoE / DeepSeek MoE)
+                let shared_gate_cands = [
+                    format!("model.layers.{i}.mlp.shared_expert.gate_proj.weight"),
+                    format!("layers.{i}.block_sparse_moe.shared_experts.gate_proj.weight"),
+                    format!("layers.{i}.feed_forward.shared_expert.w1.weight"),
+                ];
+                let shared_gate = find_and_load_weight(table, &shared_gate_cands).ok();
+
+                let shared_up_cands = [
+                    format!("model.layers.{i}.mlp.shared_expert.up_proj.weight"),
+                    format!("layers.{i}.block_sparse_moe.shared_experts.up_proj.weight"),
+                    format!("layers.{i}.feed_forward.shared_expert.w3.weight"),
+                ];
+                let shared_up = find_and_load_weight(table, &shared_up_cands).ok();
+
+                let shared_down_cands = [
+                    format!("model.layers.{i}.mlp.shared_expert.down_proj.weight"),
+                    format!("layers.{i}.block_sparse_moe.shared_experts.down_proj.weight"),
+                    format!("layers.{i}.feed_forward.shared_expert.w2.weight"),
+                ];
+                let shared_down = find_and_load_weight(table, &shared_down_cands).ok();
+
+                if let Some(ref sg) = shared_gate {
+                    max_intermediate_dim = max_intermediate_dim.max(sg.rows);
+                }
+
+                BlockChannelMixerWeights::SparseMoE {
+                    num_experts,
+                    top_k,
+                    router,
+                    experts_gate,
+                    experts_up,
+                    experts_down,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
                 }
             } else {
-                BlockChannelMixerWeights::SwiGLU {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
+                let gate_cands = [
+                    format!("model.layers.{i}.mlp.gate_proj.weight"),
+                    format!("layers.{i}.mlp.gate_proj.weight"),
+                    format!("layers.{i}.feed_forward.w1.weight"),
+                ];
+                let gate_proj = find_and_load_weight(table, &gate_cands)?;
+                max_intermediate_dim = max_intermediate_dim.max(gate_proj.rows);
+
+                let up_cands = [
+                    format!("model.layers.{i}.mlp.up_proj.weight"),
+                    format!("layers.{i}.mlp.up_proj.weight"),
+                    format!("layers.{i}.feed_forward.w3.weight"),
+                ];
+                let up_proj = find_and_load_weight(table, &up_cands)?;
+
+                let down_cands = [
+                    format!("model.layers.{i}.mlp.down_proj.weight"),
+                    format!("layers.{i}.mlp.down_proj.weight"),
+                    format!("layers.{i}.feed_forward.w2.weight"),
+                ];
+                let down_proj = find_and_load_weight(table, &down_cands)?;
+
+                if is_gemma {
+                    BlockChannelMixerWeights::GeGLU {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    }
+                } else {
+                    BlockChannelMixerWeights::SwiGLU {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    }
                 }
             };
 
@@ -940,8 +1280,14 @@ impl BlockGraphModel {
 
         let seq_len = if max_seq_len > 0 { max_seq_len } else { 2048 };
 
-        let kv_caches = (0..n_layers)
-            .map(|_| BlockKvCache::new(inferred_n_kv_heads, seq_len, inferred_head_dim))
+        let kv_caches = layers
+            .iter()
+            .map(|l| match &l.mixer_weights {
+                BlockMixerWeights::LatentAttention { spec, .. } => {
+                    BlockKvCache::new_latent(seq_len, spec.kv_lora_rank + spec.qk_rope_head_dim)
+                }
+                _ => BlockKvCache::new(inferred_n_kv_heads, seq_len, inferred_head_dim),
+            })
             .collect();
 
         let config = ModelConfig {
@@ -956,6 +1302,7 @@ impl BlockGraphModel {
             rope_freq_base: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
             max_seq_len: seq_len,
             sliding_window: 0,
+            rope_interleaved: false,
         };
 
         let graph_config = BlockGraphConfig {
@@ -972,6 +1319,21 @@ impl BlockGraphModel {
         #[cfg(target_os = "macos")]
         let metal_engine = crate::infer::metal::MetalEngine::new();
 
+        // Calculate maximum dimensions across all layer mixers (handling MLA and Attention)
+        let mut max_q_dim = inferred_n_heads * inferred_head_dim;
+        let mut max_k_dim = inferred_n_kv_heads * inferred_head_dim;
+        let mut max_v_dim = inferred_n_kv_heads * inferred_head_dim;
+        let mut max_attn_out_dim = (inferred_n_heads * inferred_head_dim).max(dim);
+
+        for l in &layers {
+            if let BlockMixerWeights::LatentAttention { spec, .. } = &l.mixer_weights {
+                max_q_dim = max_q_dim.max(spec.n_heads * (spec.qk_nope_head_dim + spec.qk_rope_head_dim));
+                max_k_dim = max_k_dim.max(spec.kv_lora_rank + spec.qk_rope_head_dim);
+                max_v_dim = max_v_dim.max(spec.kv_lora_rank + spec.qk_rope_head_dim);
+                max_attn_out_dim = max_attn_out_dim.max(spec.n_heads * spec.v_head_dim);
+            }
+        }
+
         let model = Self {
             config,
             graph_config,
@@ -984,15 +1346,16 @@ impl BlockGraphModel {
             buf_x: vec![0.0f32; dim],
             buf_norm: vec![0.0f32; dim],
             buf_res: vec![0.0f32; dim],
-            buf_attn_out: vec![0.0f32; (inferred_n_heads * inferred_head_dim).max(dim)],
-            buf_q: vec![0.0f32; inferred_n_heads * inferred_head_dim],
-            buf_k: vec![0.0f32; inferred_n_kv_heads * inferred_head_dim],
-            buf_v: vec![0.0f32; inferred_n_kv_heads * inferred_head_dim],
-            buf_gate: vec![0.0f32; max_intermediate_dim],
-            buf_up: vec![0.0f32; max_intermediate_dim],
+            buf_attn_out: vec![0.0f32; max_attn_out_dim],
+            buf_q: vec![0.0f32; max_q_dim],
+            buf_k: vec![0.0f32; max_k_dim],
+            buf_v: vec![0.0f32; max_v_dim],
+            buf_gate: vec![0.0f32; max_intermediate_dim.max(dim)],
+            buf_up: vec![0.0f32; max_intermediate_dim.max(dim)],
             buf_ffn_out: vec![0.0f32; dim],
             buf_scores: vec![0.0f32; seq_len],
-            buf_tmp: vec![0.0f32; dim.max(inferred_head_dim)],
+            buf_tmp: vec![0.0f32; dim.max(inferred_head_dim).max(max_intermediate_dim).max(2048)],
+            buf_router: vec![0.0f32; max_router_rows.max(64)],
             gpu_layers: 0,
             #[cfg(target_os = "macos")]
             metal_engine,
@@ -1017,6 +1380,20 @@ impl BlockGraphModel {
                                 *o_proj = o_proj.clone().with_metal(engine);
                             }
                         }
+                        BlockMixerWeights::LatentAttention { q_a_proj, q_b_proj, kv_a_proj, w_uk, w_uv, o_proj, .. } => {
+                            if let Some(qa) = q_a_proj {
+                                if qa.metal_buf.is_none() {
+                                    *qa = qa.clone().with_metal(engine);
+                                }
+                            }
+                            if q_b_proj.metal_buf.is_none() {
+                                *q_b_proj = q_b_proj.clone().with_metal(engine);
+                                *kv_a_proj = kv_a_proj.clone().with_metal(engine);
+                                *w_uk = w_uk.clone().with_metal(engine);
+                                *w_uv = w_uv.clone().with_metal(engine);
+                                *o_proj = o_proj.clone().with_metal(engine);
+                            }
+                        }
                         _ => {}
                     }
                     match &mut layer.channel_mixer_weights {
@@ -1028,26 +1405,52 @@ impl BlockGraphModel {
                                 *down_proj = down_proj.clone().with_metal(engine);
                             }
                         }
-                        _ => {}
+                        BlockChannelMixerWeights::SparseMoE { router, experts_gate, experts_up, experts_down, shared_gate, shared_up, shared_down, .. } => {
+                            if router.metal_buf.is_none() {
+                                *router = router.clone().with_metal(engine);
+                                for g in experts_gate.iter_mut() { *g = g.clone().with_metal(engine); }
+                                for u in experts_up.iter_mut() { *u = u.clone().with_metal(engine); }
+                                for d in experts_down.iter_mut() { *d = d.clone().with_metal(engine); }
+                                if let Some(sg) = shared_gate { *sg = sg.clone().with_metal(engine); }
+                                if let Some(su) = shared_up { *su = su.clone().with_metal(engine); }
+                                if let Some(sd) = shared_down { *sd = sd.clone().with_metal(engine); }
+                            }
+                        }
                     }
                 } else {
                     match &mut layer.mixer_weights {
                         BlockMixerWeights::Attention { q_proj, k_proj, v_proj, o_proj, .. } => {
-                            q_proj.metal_buf = None;
-                            k_proj.metal_buf = None;
-                            v_proj.metal_buf = None;
-                            o_proj.metal_buf = None;
+                            q_proj.clear_metal();
+                            k_proj.clear_metal();
+                            v_proj.clear_metal();
+                            o_proj.clear_metal();
+                        }
+                        BlockMixerWeights::LatentAttention { q_a_proj, q_b_proj, kv_a_proj, w_uk, w_uv, o_proj, .. } => {
+                            if let Some(qa) = q_a_proj { qa.clear_metal(); }
+                            q_b_proj.clear_metal();
+                            kv_a_proj.clear_metal();
+                            w_uk.clear_metal();
+                            w_uv.clear_metal();
+                            o_proj.clear_metal();
                         }
                         _ => {}
                     }
                     match &mut layer.channel_mixer_weights {
                         BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj }
                         | BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
-                            gate_proj.metal_buf = None;
-                            up_proj.metal_buf = None;
-                            down_proj.metal_buf = None;
+                            gate_proj.clear_metal();
+                            up_proj.clear_metal();
+                            down_proj.clear_metal();
                         }
-                        _ => {}
+                        BlockChannelMixerWeights::SparseMoE { router, experts_gate, experts_up, experts_down, shared_gate, shared_up, shared_down, .. } => {
+                            router.clear_metal();
+                            for g in experts_gate.iter_mut() { g.clear_metal(); }
+                            for u in experts_up.iter_mut() { u.clear_metal(); }
+                            for d in experts_down.iter_mut() { d.clear_metal(); }
+                            if let Some(sg) = shared_gate { sg.clear_metal(); }
+                            if let Some(su) = shared_up { su.clear_metal(); }
+                            if let Some(sd) = shared_down { sd.clear_metal(); }
+                        }
                     }
                 }
             }
@@ -1064,10 +1467,11 @@ impl BlockGraphModel {
                 }
             } else {
                 if let Some(ref mut lm) = self.lm_head {
-                    lm.metal_buf = None;
+                    lm.clear_metal();
                 }
-                self.embed_tokens.metal_buf = None;
+                self.embed_tokens.clear_metal();
             }
+
         }
     }
 
@@ -1075,6 +1479,9 @@ impl BlockGraphModel {
         for cache in &mut self.kv_caches {
             cache.k.fill(0.0);
             cache.v.fill(0.0);
+            if let Some(ref mut l) = cache.latent_kv {
+                l.fill(0.0);
+            }
         }
     }
 
@@ -1087,14 +1494,25 @@ impl BlockGraphModel {
         let head_dim = self.config.head_dim;
         let max_seq_len = self.config.max_seq_len;
         for cache in &mut self.kv_caches {
-            for kv_h in 0..cache.n_kv_heads {
-                let base = kv_h * max_seq_len * head_dim;
+            if cache.n_kv_heads > 0 && head_dim > 0 {
+                for kv_h in 0..cache.n_kv_heads {
+                    let base = kv_h * max_seq_len * head_dim;
+                    for p in sink..new_len {
+                        let old_p = p + drop;
+                        let dst_off = base + p * head_dim;
+                        let src_off = base + old_p * head_dim;
+                        cache.k.copy_within(src_off..src_off + head_dim, dst_off);
+                        cache.v.copy_within(src_off..src_off + head_dim, dst_off);
+                    }
+                }
+            }
+            if let Some(ref mut l) = cache.latent_kv {
+                let l_dim = cache.latent_dim;
                 for p in sink..new_len {
                     let old_p = p + drop;
-                    let dst_off = base + p * head_dim;
-                    let src_off = base + old_p * head_dim;
-                    cache.k.copy_within(src_off..src_off + head_dim, dst_off);
-                    cache.v.copy_within(src_off..src_off + head_dim, dst_off);
+                    let dst_off = p * l_dim;
+                    let src_off = old_p * l_dim;
+                    l.copy_within(src_off..src_off + l_dim, dst_off);
                 }
             }
         }
@@ -1154,7 +1572,61 @@ impl BlockGraphModel {
                 BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
                     // Batched Q, K, V Projections
                     #[cfg(target_os = "macos")]
-                    let batched_qkv_done = if q_proj.mlx4.is_none() && k_proj.mlx4.is_none() && v_proj.mlx4.is_none() {
+                    let batched_qkv_done = if let (
+                        Some(engine),
+                        Some(ref q_b),
+                        Some(ref k_b),
+                        Some(ref v_b),
+                        Some(ref q_m),
+                        Some(ref k_m),
+                        Some(ref v_m),
+                    ) = (
+                        m_eng,
+                        &q_proj.metal_buf,
+                        &k_proj.metal_buf,
+                        &v_proj.metal_buf,
+                        &q_proj.mlx4,
+                        &k_proj.mlx4,
+                        &v_proj.mlx4,
+                    ) {
+                        if let (
+                            Some(ref qs_b),
+                            Some(ref qb_b),
+                            Some(ref ks_b),
+                            Some(ref kb_b),
+                            Some(ref vs_b),
+                            Some(ref vb_b),
+                        ) = (
+                            &q_m.scales_metal_buf,
+                            &q_m.biases_metal_buf,
+                            &k_m.scales_metal_buf,
+                            &k_m.biases_metal_buf,
+                            &v_m.scales_metal_buf,
+                            &v_m.biases_metal_buf,
+                        ) {
+                            engine.gemv_qkv_mlx4(
+                                q_b, q_proj.metal_offset, q_proj.rows,
+                                qs_b, q_m.scales_metal_offset,
+                                qb_b, q_m.biases_metal_offset,
+                                k_b, k_proj.metal_offset, k_proj.rows,
+                                ks_b, k_m.scales_metal_offset,
+                                kb_b, k_m.biases_metal_offset,
+                                v_b, v_proj.metal_offset, v_proj.rows,
+                                vs_b, v_m.scales_metal_offset,
+                                vb_b, v_m.biases_metal_offset,
+                                &self.buf_norm[..dim],
+                                &mut self.buf_q[..n_heads * head_dim],
+                                &mut self.buf_k[..n_kv_heads * head_dim],
+                                &mut self.buf_v[..n_kv_heads * head_dim],
+                                dim,
+                                q_m.group_size,
+                                q_m.is_bf16,
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else if q_proj.mlx4.is_none() && k_proj.mlx4.is_none() && v_proj.mlx4.is_none() {
                         if let (Some(engine), Some(ref q_b), Some(ref k_b), Some(ref v_b)) =
                             (m_eng, &q_proj.metal_buf, &k_proj.metal_buf, &v_proj.metal_buf)
                         {
@@ -1164,9 +1636,9 @@ impl BlockGraphModel {
                                 _ => 0,
                             };
                             engine.gemv_qkv_multi(
-                                q_b, 0, q_proj.rows,
-                                k_b, 0, k_proj.rows,
-                                v_b, 0, v_proj.rows,
+                                q_b, q_proj.metal_offset, q_proj.rows,
+                                k_b, k_proj.metal_offset, k_proj.rows,
+                                v_b, v_proj.metal_offset, v_proj.rows,
                                 &self.buf_norm[..dim],
                                 &mut self.buf_q[..n_heads * head_dim],
                                 &mut self.buf_k[..n_kv_heads * head_dim],
@@ -1181,6 +1653,7 @@ impl BlockGraphModel {
                     } else {
                         false
                     };
+
                     #[cfg(not(target_os = "macos"))]
                     let batched_qkv_done = false;
 
@@ -1221,12 +1694,18 @@ impl BlockGraphModel {
                     let inv_sqrt_head_dim = 1.0f32 / (head_dim as f32).sqrt();
                     let group_size = (n_heads / n_kv_heads).max(1);
 
+                    let min_t = if let Some(w) = spec.sliding_window {
+                        if w > 0 { pos.saturating_sub(w - 1) } else { 0 }
+                    } else {
+                        0
+                    };
+
                     for h in 0..n_heads {
                         let kv_h = h / group_size;
                         let q_h = &self.buf_q[h * head_dim..(h + 1) * head_dim];
 
                         let mut max_score = -f32::INFINITY;
-                        for t in 0..=pos {
+                        for t in min_t..=pos {
                             let k_t = kv_cache.get_k(kv_h, t);
                             let mut dot = 0.0f32;
                             for d in 0..head_dim {
@@ -1243,7 +1722,7 @@ impl BlockGraphModel {
                         }
 
                         let mut exp_sum = 0.0f32;
-                        for t in 0..=pos {
+                        for t in min_t..=pos {
                             let s = (self.buf_scores[t] - max_score).exp();
                             self.buf_scores[t] = s;
                             exp_sum += s;
@@ -1252,7 +1731,7 @@ impl BlockGraphModel {
 
                         let h_out = &mut self.buf_attn_out[h * head_dim..(h + 1) * head_dim];
                         h_out.fill(0.0);
-                        for t in 0..=pos {
+                        for t in min_t..=pos {
                             let w = self.buf_scores[t] * inv_sum;
                             let v_t = kv_cache.get_v(kv_h, t);
                             for d in 0..head_dim {
@@ -1271,12 +1750,13 @@ impl BlockGraphModel {
                                 _ => 0,
                             };
                             engine.gemv_async(
-                                o_b, 0,
+                                o_b, o_proj.metal_offset,
                                 &self.buf_attn_out[..o_proj.cols],
                                 &mut self.buf_x[..dim],
                                 o_proj.rows, o_proj.cols,
                                 dtype_code,
                             );
+
                             true
                         } else {
                             false
@@ -1298,6 +1778,129 @@ impl BlockGraphModel {
                 }
                 BlockMixerWeights::Conv1d { .. } => {
                     self.buf_x[..dim].copy_from_slice(&self.buf_norm[..dim]);
+                }
+                BlockMixerWeights::LatentAttention {
+                    spec,
+                    q_a_proj,
+                    q_a_norm,
+                    q_a_norm_weight,
+                    q_b_proj,
+                    kv_a_proj,
+                    kv_a_norm,
+                    kv_a_norm_weight,
+                    w_uk,
+                    w_uv,
+                    o_proj,
+                } => {
+                    let d_c = spec.kv_lora_rank;
+                    let d_nope = spec.qk_nope_head_dim;
+                    let d_r = spec.qk_rope_head_dim;
+                    let d_v = spec.v_head_dim;
+                    let n_heads = spec.n_heads;
+                    let latent_dim = d_c + d_r;
+
+                    // 1. KV Down-Projection: c_t^{KV} (first d_c) and k_t^R (last d_r)
+                    kv_a_proj.gemv(&self.buf_norm[..dim], &mut self.buf_k[..latent_dim]);
+                    if let (Some(norm), Some(nw)) = (kv_a_norm, kv_a_norm_weight) {
+                        norm.apply(&self.buf_k[..d_c], nw, &mut self.buf_tmp[..d_c]);
+                        self.buf_k[..d_c].copy_from_slice(&self.buf_tmp[..d_c]);
+                    }
+                    rope(&mut self.buf_k[d_c..latent_dim], 1, d_r, pos, spec.rope_theta);
+
+                    let kv_cache = &mut self.kv_caches[l];
+                    kv_cache.store_latent(pos, &self.buf_k[..latent_dim]);
+
+                    // 2. Query Computation
+                    let q_total_dim = n_heads * (d_nope + d_r);
+                    if let Some(qa) = q_a_proj {
+                        qa.gemv(&self.buf_norm[..dim], &mut self.buf_tmp[..qa.rows]);
+                        if let (Some(norm), Some(nw)) = (q_a_norm, q_a_norm_weight) {
+                            norm.apply(&self.buf_tmp[..qa.rows], nw, &mut self.buf_gate[..qa.rows]);
+                            q_b_proj.gemv(&self.buf_gate[..qa.rows], &mut self.buf_q[..q_total_dim]);
+                        } else {
+                            q_b_proj.gemv(&self.buf_tmp[..qa.rows], &mut self.buf_q[..q_total_dim]);
+                        }
+                    } else {
+                        q_b_proj.gemv(&self.buf_norm[..dim], &mut self.buf_q[..q_total_dim]);
+                    }
+
+                    for h in 0..n_heads {
+                        let base = h * (d_nope + d_r);
+                        let q_r = &mut self.buf_q[base + d_nope..base + d_nope + d_r];
+                        rope(q_r, 1, d_r, pos, spec.rope_theta);
+                    }
+
+                    // 3. Absorbed Query Attention & Softmax:
+                    // For each head h: absorb W_h^{UK} into query q'_{t, h} = (q_nope)^T * W_h^{UK} in R^{d_c}
+                    for h in 0..n_heads {
+                        let q_base = h * (d_nope + d_r);
+                        let q_nope = &self.buf_q[q_base..q_base + d_nope];
+                        let q_r = &self.buf_q[q_base + d_nope..q_base + d_nope + d_r];
+
+                        let q_absorbed = &mut self.buf_gate[..d_c];
+                        q_absorbed.fill(0.0);
+                        for i in 0..d_nope {
+                            let qi = q_nope[i];
+                            let row_idx = h * d_nope + i;
+                            w_uk.get_row(row_idx, &mut self.buf_tmp[..d_c]);
+                            for c in 0..d_c {
+                                q_absorbed[c] += qi * self.buf_tmp[c];
+                            }
+                        }
+
+                        let mut max_score = -f32::INFINITY;
+                        for t in 0..=pos {
+                            let cached = kv_cache.get_latent(t);
+                            let c_kv = &cached[..d_c];
+                            let k_r = &cached[d_c..latent_dim];
+
+                            let mut dot_c = 0.0f32;
+                            for c in 0..d_c {
+                                dot_c += q_absorbed[c] * c_kv[c];
+                            }
+                            let mut dot_r = 0.0f32;
+                            for r in 0..d_r {
+                                dot_r += q_r[r] * k_r[r];
+                            }
+                            let score = (dot_c + dot_r) * spec.softmax_scale;
+                            if score > max_score {
+                                max_score = score;
+                            }
+                            self.buf_scores[t] = score;
+                        }
+
+                        let mut exp_sum = 0.0f32;
+                        for t in 0..=pos {
+                            let s = (self.buf_scores[t] - max_score).exp();
+                            self.buf_scores[t] = s;
+                            exp_sum += s;
+                        }
+                        let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
+
+                        let v_latent = &mut self.buf_up[..d_c];
+                        v_latent.fill(0.0);
+                        for t in 0..=pos {
+                            let w = self.buf_scores[t] * inv_sum;
+                            let cached = kv_cache.get_latent(t);
+                            let c_kv = &cached[..d_c];
+                            for c in 0..d_c {
+                                v_latent[c] += w * c_kv[c];
+                            }
+                        }
+
+                        let h_out = &mut self.buf_attn_out[h * d_v..(h + 1) * d_v];
+                        for j in 0..d_v {
+                            let row_idx = h * d_v + j;
+                            w_uv.get_row(row_idx, &mut self.buf_tmp[..d_c]);
+                            let mut sum = 0.0f32;
+                            for c in 0..d_c {
+                                sum += self.buf_tmp[c] * v_latent[c];
+                            }
+                            h_out[j] = sum;
+                        }
+                    }
+
+                    o_proj.gemv(&self.buf_attn_out[..n_heads * d_v], &mut self.buf_x[..dim]);
                 }
             }
 
@@ -1328,8 +1931,12 @@ impl BlockGraphModel {
                     ) {
                         if let (Some(g), Some(_u)) = (&gate_proj.mlx4, &up_proj.mlx4) {
                             engine.gemv_gate_up_mlx4(
-                                gb, 0, gate_proj.rows, gsb, 0, gbb, 0,
-                                ub, 0, up_proj.rows, usb, 0, ubb, 0,
+                                gb, gate_proj.metal_offset, gate_proj.rows,
+                                gsb, g.scales_metal_offset,
+                                gbb, g.biases_metal_offset,
+                                ub, up_proj.metal_offset, up_proj.rows,
+                                usb, _u.scales_metal_offset,
+                                ubb, _u.biases_metal_offset,
                                 &self.buf_norm[..dim],
                                 &mut self.buf_gate[..gate_proj.rows],
                                 &mut self.buf_up[..up_proj.rows],
@@ -1351,8 +1958,8 @@ impl BlockGraphModel {
                                 _ => 0,
                             };
                             engine.gemv_gate_up_multi(
-                                g_b, 0,
-                                u_b, 0,
+                                g_b, gate_proj.metal_offset,
+                                u_b, up_proj.metal_offset,
                                 &self.buf_norm[..dim],
                                 &mut self.buf_gate[..gate_proj.rows],
                                 &mut self.buf_up[..up_proj.rows],
@@ -1386,7 +1993,7 @@ impl BlockGraphModel {
                                 _ => 0,
                             };
                             engine.gemv_async(
-                                d_b, 0,
+                                d_b, down_proj.metal_offset,
                                 &self.buf_gate[..down_proj.cols],
                                 &mut self.buf_ffn_out[..dim],
                                 down_proj.rows, down_proj.cols,
@@ -1399,6 +2006,7 @@ impl BlockGraphModel {
                     } else {
                         false
                     };
+
                     #[cfg(not(target_os = "macos"))]
                     let async_down = false;
 
@@ -1417,16 +2025,87 @@ impl BlockGraphModel {
                     geglu_in_place(&mut self.buf_gate[..gate_proj.rows], &self.buf_up[..up_proj.rows]);
                     down_proj.gemv(&self.buf_gate[..gate_proj.rows], &mut self.buf_ffn_out[..dim]);
                 }
-                BlockChannelMixerWeights::SparseMoE { router, experts_gate, experts_up, experts_down, .. } => {
-                    let mut router_logits = vec![0.0f32; router.rows];
-                    router.gemv(&self.buf_norm[..dim], &mut router_logits);
+                BlockChannelMixerWeights::SparseMoE {
+                    top_k,
+                    router,
+                    experts_gate,
+                    experts_up,
+                    experts_down,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    ..
+                } => {
+                    // 1. Router logits into preallocated buf_router (zero heap allocations)
+                    router.gemv(&self.buf_norm[..dim], &mut self.buf_router[..router.rows]);
+
+                    // 2. Select Top-K experts on the stack
+                    let actual_k = (*top_k).min(8).min(experts_gate.len());
+                    let mut top_indices = [0usize; 8];
+                    let mut top_logits = [-f32::INFINITY; 8];
+
+                    for k in 0..actual_k {
+                        let mut best_idx = 0;
+                        let mut best_val = -f32::INFINITY;
+                        for idx in 0..router.rows.min(experts_gate.len()) {
+                            let mut already = false;
+                            for prev in 0..k {
+                                if top_indices[prev] == idx {
+                                    already = true;
+                                    break;
+                                }
+                            }
+                            if !already && self.buf_router[idx] > best_val {
+                                best_val = self.buf_router[idx];
+                                best_idx = idx;
+                            }
+                        }
+                        top_indices[k] = best_idx;
+                        top_logits[k] = best_val;
+                    }
+
+                    // 3. Numerically stable softmax over Top-K logits
+                    let max_l = top_logits[0];
+                    let mut sum_exp = 0.0f32;
+                    let mut weights = [0.0f32; 8];
+                    for k in 0..actual_k {
+                        let e = (top_logits[k] - max_l).exp();
+                        weights[k] = e;
+                        sum_exp += e;
+                    }
+                    let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+                    for k in 0..actual_k {
+                        weights[k] *= inv_sum;
+                    }
+
+                    // 4. Weighted accumulation across Top-K routed experts
                     self.buf_ffn_out[..dim].fill(0.0);
-                    let best_expert = router_logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(idx, _)| idx).unwrap_or(0);
-                    if best_expert < experts_gate.len() {
-                        experts_gate[best_expert].gemv(&self.buf_norm[..dim], &mut self.buf_gate[..experts_gate[best_expert].rows]);
-                        experts_up[best_expert].gemv(&self.buf_norm[..dim], &mut self.buf_up[..experts_up[best_expert].rows]);
-                        swiglu_in_place(&mut self.buf_gate[..experts_gate[best_expert].rows], &self.buf_up[..experts_up[best_expert].rows]);
-                        experts_down[best_expert].gemv(&self.buf_gate[..experts_gate[best_expert].rows], &mut self.buf_ffn_out[..dim]);
+                    for k in 0..actual_k {
+                        let exp_idx = top_indices[k];
+                        let w = weights[k];
+                        if exp_idx < experts_gate.len() && w > 0.0 {
+                            let eg = &experts_gate[exp_idx];
+                            let eu = &experts_up[exp_idx];
+                            let ed = &experts_down[exp_idx];
+                            eg.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..eg.rows]);
+                            eu.gemv(&self.buf_norm[..dim], &mut self.buf_up[..eu.rows]);
+                            swiglu_in_place(&mut self.buf_gate[..eg.rows], &self.buf_up[..eu.rows]);
+                            ed.gemv(&self.buf_gate[..ed.cols], &mut self.buf_tmp[..dim]);
+                            for i in 0..dim {
+                                self.buf_ffn_out[i] += w * self.buf_tmp[i];
+                            }
+                        }
+                    }
+
+                    // 5. Shared expert accumulation (unweighted, as in Qwen-MoE and DeepSeek)
+                    if let (Some(sg), Some(su), Some(sd)) = (shared_gate, shared_up, shared_down) {
+                        sg.gemv(&self.buf_norm[..dim], &mut self.buf_gate[..sg.rows]);
+                        su.gemv(&self.buf_norm[..dim], &mut self.buf_up[..su.rows]);
+                        swiglu_in_place(&mut self.buf_gate[..sg.rows], &self.buf_up[..su.rows]);
+                        sd.gemv(&self.buf_gate[..sd.cols], &mut self.buf_tmp[..dim]);
+                        for i in 0..dim {
+                            self.buf_ffn_out[i] += self.buf_tmp[i];
+                        }
                     }
                 }
             }
@@ -1551,5 +2230,110 @@ mod tests {
         // y[1] = 4*1 + 5*2 + 6*3 = 32
         assert!((y[0] - 14.0).abs() < 1e-5);
         assert!((y[1] - 32.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_block_graph_sliding_window_bounding() {
+        let mut cache = BlockKvCache::new(1, 16, 4);
+        for p in 0..10 {
+            let k = vec![p as f32; 4];
+            let v = vec![p as f32; 4];
+            cache.store(0, p, &k, &v);
+        }
+        // If window is 4 at pos 8, min_t = 8 - (4 - 1) = 5
+        let pos: usize = 8;
+        let window: usize = 4;
+        let min_t = pos.saturating_sub(window - 1);
+        assert_eq!(min_t, 5);
+        // Only tokens 5..=8 should be in the window
+        assert_eq!(cache.get_k(0, min_t), &[5.0, 5.0, 5.0, 5.0]);
+        assert_eq!(cache.get_k(0, pos), &[8.0, 8.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn test_top_k_moe_routing_and_accumulation() {
+        let router_data = vec![
+            0.2f32, 0.0,
+            0.9f32, 0.0,
+            0.1f32, 0.0,
+            0.8f32, 0.0,
+        ];
+        let mut raw_router = Vec::new();
+        for &w in &router_data {
+            raw_router.extend_from_slice(&w.to_le_bytes());
+        }
+        let router = WeightMatrix::new(4, 2, TensorDType::F32, Arc::new(raw_router), 0);
+
+        let mut buf_router = vec![0.0f32; 4];
+        let x = vec![1.0f32, 0.0];
+        router.gemv(&x, &mut buf_router);
+
+        let top_k = 2;
+        let actual_k = top_k.min(8).min(4);
+        let mut top_indices = [0usize; 8];
+        let mut top_logits = [-f32::INFINITY; 8];
+
+        for k in 0..actual_k {
+            let mut best_idx = 0;
+            let mut best_val = -f32::INFINITY;
+            for idx in 0..4 {
+                let mut already = false;
+                for prev in 0..k {
+                    if top_indices[prev] == idx {
+                        already = true;
+                        break;
+                    }
+                }
+                if !already && buf_router[idx] > best_val {
+                    best_val = buf_router[idx];
+                    best_idx = idx;
+                }
+            }
+            top_indices[k] = best_idx;
+            top_logits[k] = best_val;
+        }
+
+        assert_eq!(top_indices[0], 1); // 0.9
+        assert_eq!(top_indices[1], 3); // 0.8
+
+        let max_l = top_logits[0];
+        let mut sum_exp = 0.0f32;
+        let mut weights = [0.0f32; 8];
+        for k in 0..actual_k {
+            let e = (top_logits[k] - max_l).exp();
+            weights[k] = e;
+            sum_exp += e;
+        }
+        let inv_sum = 1.0 / sum_exp;
+        for k in 0..actual_k {
+            weights[k] *= inv_sum;
+        }
+
+        assert!((weights[0] + weights[1] - 1.0).abs() < 1e-5);
+        assert!(weights[0] > weights[1]);
+    }
+
+    #[test]
+    fn test_mla_latent_cache_and_absorption() {
+        let max_seq_len = 16;
+        let d_c = 8;
+        let d_r = 4;
+        let latent_dim = d_c + d_r;
+        let mut cache = BlockKvCache::new_latent(max_seq_len, latent_dim);
+
+        let mut latent_vec = vec![0.0f32; latent_dim];
+        for i in 0..latent_dim {
+            latent_vec[i] = (i + 1) as f32;
+        }
+
+        cache.store_latent(2, &latent_vec);
+        let retrieved = cache.get_latent(2);
+        assert_eq!(retrieved.len(), latent_dim);
+        assert_eq!(retrieved, &latent_vec[..]);
+
+        let c_kv = &retrieved[..d_c];
+        let k_r = &retrieved[d_c..latent_dim];
+        assert_eq!(c_kv.len(), 8);
+        assert_eq!(k_r.len(), 4);
     }
 }

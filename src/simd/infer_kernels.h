@@ -78,7 +78,6 @@ void sofuu_rmsnorm(float *out, const float *x, const float *weight, size_t n, fl
  * head_dim: dimension of each head (e.g. 64, 128)
  * pos: sequence token index
  * freq_base: base frequency (typically 10000.0 or 500000.0 for Llama 3 / Qwen) */
-void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float freq_base);
 
 /* Fused SwiGLU feed-forward activation:
  * out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i] */
@@ -109,7 +108,8 @@ void sofuu_vec_mad_f32(float *dst, const float *src, float scalar, size_t n);
 /* Shift RoPE position of key vectors by delta_pos (can be negative for left shift / compaction).
  * Rotates each 2D sub-vector by (delta_pos * freq).
  * Exactly equivalent to embedding the token at (original_pos + delta_pos). */
-void sofuu_rope_shift(float *vec, size_t n_heads, size_t head_dim, int64_t delta_pos, float freq_base);
+void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float freq_base, int rope_style);
+void sofuu_rope_shift(float *vec, size_t n_heads, size_t head_dim, int64_t delta_pos, float freq_base, int rope_style);
 
 /* Compact the KV cache across all layers in place:
  * Retains sink_tokens at [0 .. sink_tokens), drops drop_tokens from the middle,
@@ -125,7 +125,8 @@ void sofuu_kv_compact(
     size_t current_seq_len,
     size_t sink_tokens,
     size_t drop_tokens,
-    float freq_base
+    float freq_base,
+    int rope_style
 );
 
 /* Multi-core parallel causal self-attention for batched prefill and autoregressive decode:

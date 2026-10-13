@@ -272,6 +272,29 @@ impl InferEngine {
                         }
                     }
                 }
+
+                let architecture = if config_path.exists() {
+                    std::fs::read_to_string(&config_path)
+                        .ok()
+                        .and_then(|content| {
+                            serde_json::from_str::<serde_json::Value>(&content)
+                                .ok()
+                                .and_then(|cfg| {
+                                    cfg.get("architectures")
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|items| items.first())
+                                        .and_then(|item| item.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                        })
+                } else {
+                    None
+                };
+                return Err(format!(
+                    "unsupported model architecture in {}: {:?}; Sofuu currently supports LFM2 directories and standard GGUF decoder architectures",
+                    clean_path.display(),
+                    architecture.unwrap_or_else(|| "unknown".to_string())
+                ));
             }
         }
 

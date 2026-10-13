@@ -3,6 +3,7 @@
 #include "metal_engine.h"
 #include <cstring>
 #include <iostream>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 
@@ -373,8 +374,12 @@ void* sofuu_metal_buffer_create_zerocopy(void* ctx_ptr, const void* ptr, size_t 
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     @autoreleasepool {
+        size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        if (page_size == 0) page_size = 16384;
+        if (((uintptr_t)ptr % page_size) != 0) return NULL;
+        size_t aligned_len = ((size_bytes + page_size - 1) / page_size) * page_size;
         id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:(void*)ptr
-                                                           length:size_bytes
+                                                           length:aligned_len
                                                           options:MTLResourceStorageModeShared
                                                       deallocator:nil];
         return (__bridge_retained void*)buf;
@@ -385,9 +390,12 @@ void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_byte
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     @autoreleasepool {
-        if (((uintptr_t)ptr % 4096) == 0) {
+        size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        if (page_size == 0) page_size = 16384;
+        if (((uintptr_t)ptr % page_size) == 0) {
+            size_t aligned_len = ((size_bytes + page_size - 1) / page_size) * page_size;
             id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:(void*)ptr
-                                                               length:size_bytes
+                                                               length:aligned_len
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
             if (buf != nil) {
@@ -400,6 +408,7 @@ void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_byte
         return (__bridge_retained void*)buf;
     }
 }
+
 
 void sofuu_metal_buffer_free(void* buf_ptr) {
     if (!buf_ptr) return;

@@ -125,15 +125,20 @@ impl UnifiedTensorTable {
             }
             TensorSource::Gguf(gg) => {
                 let info = gg.tensors.get(name)?;
-                let slice = gg.mmap.slice(info.offset, info.size_bytes)?;
+                let abs_offset = gg.data_offset + info.offset;
+                let _slice = gg.mmap.slice(abs_offset, info.size_bytes)?;
                 let meta = UnifiedTensorMeta {
                     name: name.to_string(),
                     dtype: ggml_type_to_tensor_dtype(info.tensor_type),
                     shape: info.shape.clone(),
-                    data_offset: info.offset,
+                    data_offset: abs_offset,
                     size_bytes: info.size_bytes,
                 };
-                Some((meta, UnifiedTensorData::Heap(Arc::new(slice.to_vec()))))
+                Some((meta, UnifiedTensorData::Mmap {
+                    mmap: gg.mmap.clone(),
+                    offset: abs_offset,
+                    size: info.size_bytes,
+                }))
             }
             TensorSource::PyTorch(pt) => {
                 let (tv, slice) = pt.get_tensor(name)?;
@@ -176,12 +181,13 @@ impl UnifiedTensorTable {
             }
             TensorSource::Gguf(gg) => {
                 let info = gg.tensors.get(name)?;
-                let slice = gg.mmap.slice(info.offset, info.size_bytes)?;
+                let abs_offset = gg.data_offset + info.offset;
+                let slice = gg.mmap.slice(abs_offset, info.size_bytes)?;
                 let meta = UnifiedTensorMeta {
                     name: name.to_string(),
                     dtype: ggml_type_to_tensor_dtype(info.tensor_type),
                     shape: info.shape.clone(),
-                    data_offset: info.offset,
+                    data_offset: abs_offset,
                     size_bytes: info.size_bytes,
                 };
                 Some((meta, slice))

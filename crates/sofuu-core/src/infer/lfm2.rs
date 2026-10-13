@@ -124,7 +124,7 @@ pub struct Lfm2Model {
     #[cfg(target_os = "macos")]
     pub metal_engine: Option<MetalEngine>,
     #[cfg(target_os = "macos")]
-    pub metal_mmap_buf: Option<MetalBuffer>,
+    pub metal_mmap_buf: Option<std::sync::Arc<MetalBuffer>>,
 
     // Working activation buffers
     pub x: Vec<f32>,
@@ -225,6 +225,7 @@ impl Lfm2Model {
             rope_freq_base,
             max_seq_len: effective_max_seq_len,
             sliding_window: 0,
+            rope_interleaved: false,
         };
 
         // Helper to load linear tensor (supports BF16 or MLX 4-bit)
@@ -361,13 +362,13 @@ impl Lfm2Model {
         #[cfg(target_os = "macos")]
         let (metal_engine, metal_mmap_buf) = {
             if let Some(engine) = MetalEngine::new() {
-                let mmap_slice = sf.mmap.as_slice();
-                let mmap_buf = engine.register_zerocopy_buffer(mmap_slice);
+                let mmap_buf = sf.mmap.get_or_create_metal_buffer(&engine);
                 (Some(engine), mmap_buf)
             } else {
                 (None, None)
             }
         };
+
 
         Ok(Self {
             config,
@@ -569,10 +570,11 @@ impl Lfm2Model {
             let layer = self.layers[layer_idx].clone();
             #[cfg(target_os = "macos")]
             let (m_eng, m_buf) = if layer_idx < self.gpu_layers {
-                (self.metal_engine.as_ref(), self.metal_mmap_buf.as_ref())
+                (self.metal_engine.as_ref(), self.metal_mmap_buf.as_deref())
             } else {
                 (None, None)
             };
+
             #[cfg(not(target_os = "macos"))]
             let layer_idx = layer_idx;
             match layer {
@@ -1021,10 +1023,11 @@ impl Lfm2Model {
 
         #[cfg(target_os = "macos")]
         let (m_eng, m_buf) = if self.gpu_layers > 0 {
-            (self.metal_engine.as_ref(), self.metal_mmap_buf.as_ref())
+            (self.metal_engine.as_ref(), self.metal_mmap_buf.as_deref())
         } else {
             (None, None)
         };
+
 
         // 4. Logits: tied embedding lm_head = embed_tokens @ x_norm
         Self::compute_matvec(

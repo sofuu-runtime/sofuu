@@ -10,9 +10,11 @@
 static inline int detect_optimal_threads() {
     int p_cores = 0;
     size_t size = sizeof(p_cores);
-    // Prefer physical performance cores (e.g. 6 P-cores on M2 Pro) to avoid E-core barrier stalling
+    // Four threads is the best measured default for dense CPU decode on
+    // M-series laptops: it saturates memory bandwidth without adding
+    // barrier/scheduling overhead from the remaining performance cores.
     if (sysctlbyname("hw.perflevel0.physicalcpu", &p_cores, &size, NULL, 0) == 0 && p_cores > 0) {
-        return p_cores;
+        return p_cores < 4 ? p_cores : 4;
     }
     int phys_cores = 0;
     if (sysctlbyname("hw.physicalcpu", &phys_cores, &size, NULL, 0) == 0 && phys_cores > 0) {

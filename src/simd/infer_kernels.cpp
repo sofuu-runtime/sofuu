@@ -2177,7 +2177,7 @@ void sofuu_softmax(float *scores, size_t n) {
 }
 
 // ── Rotary Position Embedding (RoPE - NEOX / Qwen / LLaMA style) ─────
-void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float freq_base) {
+void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float freq_base, int rope_style) {
     size_t half_dim = head_dim / 2;
     for (size_t h = 0; h < n_heads; ++h) {
         float *head = vec + h * head_dim;
@@ -2187,16 +2187,27 @@ void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float f
             float c = cosf(theta);
             float s = sinf(theta);
 
-            float v0 = head[i];
-            float v1 = head[i + half_dim];
-            head[i]            = v0 * c - v1 * s;
-            head[i + half_dim] = v0 * s + v1 * c;
+            if (rope_style == 1) {
+                // GGUF "normal" RoPE: consecutive head values form a pair.
+                size_t even = 2 * i;
+                size_t odd = even + 1;
+                float v0 = head[even];
+                float v1 = head[odd];
+                head[even] = v0 * c - v1 * s;
+                head[odd]  = v1 * c + v0 * s;
+            } else {
+                // NeoX/Gemma/Qwen-style RoPE: halves form a pair.
+                float v0 = head[i];
+                float v1 = head[i + half_dim];
+                head[i]            = v0 * c - v1 * s;
+                head[i + half_dim] = v0 * s + v1 * c;
+            }
         }
     }
 }
 
 // ── Shift RoPE Position (delta_pos can be negative for left compaction) ──
-void sofuu_rope_shift(float *vec, size_t n_heads, size_t head_dim, int64_t delta_pos, float freq_base) {
+void sofuu_rope_shift(float *vec, size_t n_heads, size_t head_dim, int64_t delta_pos, float freq_base, int rope_style) {
     if (delta_pos == 0 || n_heads == 0 || head_dim == 0) return;
     size_t half_dim = head_dim / 2;
     for (size_t h = 0; h < n_heads; ++h) {
@@ -2207,10 +2218,19 @@ void sofuu_rope_shift(float *vec, size_t n_heads, size_t head_dim, int64_t delta
             float c = cosf(theta);
             float s = sinf(theta);
 
-            float v0 = head[i];
-            float v1 = head[i + half_dim];
-            head[i]            = v0 * c - v1 * s;
-            head[i + half_dim] = v0 * s + v1 * c;
+            if (rope_style == 1) {
+                size_t even = 2 * i;
+                size_t odd = even + 1;
+                float v0 = head[even];
+                float v1 = head[odd];
+                head[even] = v0 * c - v1 * s;
+                head[odd]  = v1 * c + v0 * s;
+            } else {
+                float v0 = head[i];
+                float v1 = head[i + half_dim];
+                head[i]            = v0 * c - v1 * s;
+                head[i + half_dim] = v0 * s + v1 * c;
+            }
         }
     }
 }
@@ -2226,7 +2246,8 @@ void sofuu_kv_compact(
     size_t current_seq_len,
     size_t sink_tokens,
     size_t drop_tokens,
-    float freq_base
+    float freq_base,
+    int rope_style
 ) {
     if (drop_tokens == 0 || current_seq_len <= sink_tokens + drop_tokens) return;
     size_t surviving_recent = current_seq_len - sink_tokens - drop_tokens;
@@ -2251,7 +2272,7 @@ void sofuu_kv_compact(
 
                 // 3. Shift RoPE position on moved K cache keys
                 for (size_t t = 0; t < surviving_recent; ++t) {
-                    sofuu_rope_shift(k_dst + t * head_dim, 1, head_dim, delta_pos, freq_base);
+                    sofuu_rope_shift(k_dst + t * head_dim, 1, head_dim, delta_pos, freq_base, rope_style);
                 }
             }
         }

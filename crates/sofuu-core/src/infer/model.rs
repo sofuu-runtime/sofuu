@@ -13,8 +13,8 @@ use std::ops::{Deref, DerefMut};
 use super::gguf::GgufFile;
 use super::quant::{
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
-    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact, matmat, matvec,
-    rmsnorm, rmsnorm_in_place, rope, swiglu_in_place, type_row_size,
+    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
+    rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, type_row_size,
     GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
 };
@@ -174,6 +174,9 @@ pub struct ModelConfig {
     pub rope_freq_base: f32,
     pub max_seq_len: usize,
     pub sliding_window: usize,
+    /// GGUF has two common RoPE pairings. Llama-family uses consecutive pairs;
+    /// Qwen/Gemma-family uses split-half pairs.
+    pub rope_interleaved: bool,
 }
 
 #[derive(Clone)]
@@ -244,6 +247,7 @@ pub struct TransformerModel {
     // Sliding Window Attention & Attention Sinks
     pub sliding_window: usize,
     pub sink_tokens: usize,
+    pub is_gemma2: bool,
 }
 
 impl TransformerModel {
@@ -251,6 +255,7 @@ impl TransformerModel {
         // 1. Detect architecture prefix
         let arch = gguf.get_str("general.architecture").unwrap_or("llama");
         let prefix = format!("{arch}.");
+        let is_gemma2 = arch == "gemma2" || arch.contains("gemma2");
 
         // 2. Read model hyperparameters
         let dim = gguf
@@ -272,13 +277,26 @@ impl TransformerModel {
             .unwrap_or(dim / n_heads);
         let hidden_dim = gguf
             .get_u32(&format!("{prefix}feed_forward_length"))
-            .ok_or_else(|| "missing feed_forward_length".to_string())? as usize;
+            .ok_or_else(|| {
+                if gguf.get_u32(&format!("{prefix}expert_count")).is_some() {
+                    format!("unsupported GGUF architecture '{arch}': MoE models require a dedicated expert-routing graph")
+                } else {
+                    format!("missing feed_forward_length for GGUF architecture '{arch}'")
+                }
+            })? as usize;
         let norm_eps = gguf
             .get_f32(&format!("{prefix}attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
         let rope_freq_base = gguf
             .get_f32(&format!("{prefix}rope.freq_base"))
             .unwrap_or(10000.0);
+        let rope_interleaved = matches!(
+            arch,
+            "llama" | "llada" | "llama4" | "deci" | "baichuan" | "starcoder"
+                | "internlm2" | "minicpm" | "xverse" | "command_r" | "cohere2"
+                | "olmo" | "arctic" | "deepseek" | "deepseek2" | "granite"
+                | "chameleon" | "smollm3" | "ernie4_5" | "mistral3"
+        );
 
         // Vocab size from tokenizer or metadata fallback
         let vocab_size = if vocab_size > 0 {
@@ -319,6 +337,7 @@ impl TransformerModel {
             rope_freq_base,
             max_seq_len: final_seq_len,
             sliding_window: detected_sliding_window,
+            rope_interleaved,
         };
 
         // Helper to find tensor
@@ -427,7 +446,30 @@ impl TransformerModel {
             kv_dim,
             sliding_window: detected_sliding_window,
             sink_tokens: 4,
+            is_gemma2,
         })
+    }
+
+    /// Returns the effective sliding window for a given layer.
+    /// Gemma 2 alternates: even layers (0, 2, 4...) use local sliding window (4096),
+    /// while odd layers (1, 3, 5...) use full global attention (sliding_window = 0).
+    /// Mistral and other models apply uniform sliding window across all layers.
+    #[inline]
+    pub fn layer_sliding_window(&self, layer_idx: usize) -> usize {
+        Self::calc_layer_sliding_window(self.is_gemma2, self.sliding_window, layer_idx)
+    }
+
+    #[inline]
+    pub fn calc_layer_sliding_window(is_gemma2: bool, sliding_window: usize, layer_idx: usize) -> usize {
+        if is_gemma2 {
+            if layer_idx % 2 == 0 {
+                if sliding_window > 0 { sliding_window } else { 4096 }
+            } else {
+                0
+            }
+        } else {
+            sliding_window
+        }
     }
 
     #[inline]
@@ -457,7 +499,7 @@ impl TransformerModel {
         if drop_tokens == 0 || current_seq_len <= sink_tokens + drop_tokens {
             return current_seq_len;
         }
-        kv_compact(
+        kv_compact_style(
             &mut self.k_cache,
             &mut self.v_cache,
             self.config.n_layers,
@@ -468,6 +510,7 @@ impl TransformerModel {
             sink_tokens,
             drop_tokens,
             self.config.rope_freq_base,
+            if self.config.rope_interleaved { 1 } else { 0 },
         );
         current_seq_len - drop_tokens
     }
@@ -731,8 +774,9 @@ impl TransformerModel {
                 let pos = start_pos + b;
                 let q_slice = &mut self.q_batch[b * q_dim..(b + 1) * q_dim];
                 let k_slice = &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim];
-                rope(q_slice, n_heads, head_dim, pos, rope_freq_base);
-                rope(k_slice, n_kv_heads, head_dim, pos, rope_freq_base);
+                let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
+                rope_style(q_slice, n_heads, head_dim, pos, rope_freq_base, rope_mode);
+                rope_style(k_slice, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
 
                 let cache_pos = pos % max_seq_len;
                 let v_slice = &self.v_batch[b * kv_dim..(b + 1) * kv_dim];
@@ -746,6 +790,7 @@ impl TransformerModel {
             }
 
             // ── Multi-Head / Grouped-Query Attention for batch ───
+            let sliding_window = self.layer_sliding_window(layer_idx);
             batched_attention_ext(
                 &self.q_batch[0..b_size * q_dim],
                 &self.k_cache,
@@ -758,7 +803,7 @@ impl TransformerModel {
                 n_kv_heads,
                 head_dim,
                 max_seq_len,
-                self.sliding_window,
+                sliding_window,
                 self.sink_tokens,
             );
 
@@ -974,8 +1019,9 @@ impl TransformerModel {
             }
 
             // ── RoPE (Rotary Position Embeddings) ───────────
-            rope(&mut self.q, n_heads, head_dim, pos, rope_freq_base);
-            rope(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base);
+            let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
+            rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
+            rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
 
             // ── Store to KV-Cache at slot pos ───────────────
             let cache_pos = pos % max_seq_len;
@@ -988,6 +1034,7 @@ impl TransformerModel {
             }
 
             // ── Multi-Head / Grouped-Query Attention ────────
+            let sliding_window = self.layer_sliding_window(layer_idx);
             batched_attention_ext(
                 &self.q,
                 &self.k_cache,
@@ -1000,7 +1047,7 @@ impl TransformerModel {
                 n_kv_heads,
                 head_dim,
                 max_seq_len,
-                self.sliding_window,
+                sliding_window,
                 self.sink_tokens,
             );
 
@@ -1081,6 +1128,26 @@ impl TransformerModel {
                 &mut self.logits,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_layer_sliding_window_gemma2_vs_uniform() {
+        // Gemma 2 model: alternates between 4096 (even) and 0 (odd)
+        assert_eq!(TransformerModel::calc_layer_sliding_window(true, 4096, 0), 4096);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(true, 4096, 1), 0);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(true, 4096, 2), 4096);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(true, 4096, 3), 0);
+
+        // Mistral model: uniform across all layers
+        assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 0), 4096);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 1), 4096);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 2), 4096);
+        assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 3), 4096);
     }
 }
 

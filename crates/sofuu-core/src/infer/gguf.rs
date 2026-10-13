@@ -38,7 +38,7 @@ pub struct TensorInfo {
 }
 
 pub struct GgufFile {
-    pub mmap: MmapFile,
+    pub mmap: std::sync::Arc<MmapFile>,
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: HashMap<String, TensorInfo>,
@@ -47,7 +47,7 @@ pub struct GgufFile {
 
 impl GgufFile {
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let mmap = MmapFile::open(path)?;
+        let mmap = std::sync::Arc::new(MmapFile::open(path)?);
         let bytes = mmap.as_slice();
         let mut r = ByteReader::new(bytes);
 

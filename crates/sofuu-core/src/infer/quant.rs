@@ -248,8 +248,8 @@ extern "C" {
     fn sofuu_rmsnorm(out: *mut f32, x: *const f32, weight: *const f32, n: usize, eps: f32);
     fn sofuu_swiglu(out: *mut f32, gate: *const f32, up: *const f32, n: usize);
     fn sofuu_softmax(scores: *mut f32, n: usize);
-    fn sofuu_rope(vec: *mut f32, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32);
-    fn sofuu_rope_shift(vec: *mut f32, n_heads: usize, head_dim: usize, delta_pos: i64, freq_base: f32);
+    fn sofuu_rope(vec: *mut f32, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32, rope_style: i32);
+    fn sofuu_rope_shift(vec: *mut f32, n_heads: usize, head_dim: usize, delta_pos: i64, freq_base: f32, rope_style: i32);
     fn sofuu_vec_dot_f32(a: *const f32, b: *const f32, n: usize) -> f32;
     fn sofuu_vec_mad_f32(dst: *mut f32, src: *const f32, scalar: f32, n: usize);
     fn sofuu_kv_compact(
@@ -263,6 +263,7 @@ extern "C" {
         sink_tokens: usize,
         drop_tokens: usize,
         freq_base: f32,
+        rope_style: i32,
     );
     fn sofuu_batched_attention(
         q_batch: *const f32,
@@ -499,8 +500,19 @@ extern "C" {
 
 /// Shift RoPE position of key vectors by `delta_pos` (negative shifts left).
 pub fn rope_shift(vec: &mut [f32], n_heads: usize, head_dim: usize, delta_pos: i64, freq_base: f32) {
+    rope_shift_style(vec, n_heads, head_dim, delta_pos, freq_base, 0);
+}
+
+pub fn rope_shift_style(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    delta_pos: i64,
+    freq_base: f32,
+    rope_style: i32,
+) {
     unsafe {
-        sofuu_rope_shift(vec.as_mut_ptr(), n_heads, head_dim, delta_pos, freq_base);
+        sofuu_rope_shift(vec.as_mut_ptr(), n_heads, head_dim, delta_pos, freq_base, rope_style);
     }
 }
 
@@ -517,6 +529,35 @@ pub fn kv_compact(
     drop_tokens: usize,
     freq_base: f32,
 ) {
+    kv_compact_style(
+        k_cache,
+        v_cache,
+        n_layers,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        current_seq_len,
+        sink_tokens,
+        drop_tokens,
+        freq_base,
+        0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn kv_compact_style(
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    n_layers: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    current_seq_len: usize,
+    sink_tokens: usize,
+    drop_tokens: usize,
+    freq_base: f32,
+    rope_style: i32,
+) {
     unsafe {
         sofuu_kv_compact(
             k_cache.as_mut_ptr(),
@@ -529,6 +570,7 @@ pub fn kv_compact(
             sink_tokens,
             drop_tokens,
             freq_base,
+            rope_style,
         );
     }
 }
@@ -846,9 +888,20 @@ pub fn softmax(scores: &mut [f32]) {
 /// Rotary Position Embedding (RoPE) via C++ SIMD.
 #[inline]
 pub fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, freq_base: f32) {
+    rope_style(vec, n_heads, head_dim, pos, freq_base, 0);
+}
+
+pub fn rope_style(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    rope_style: i32,
+) {
     assert_eq!(vec.len(), n_heads * head_dim);
     unsafe {
-        sofuu_rope(vec.as_mut_ptr(), n_heads, head_dim, pos, freq_base);
+        sofuu_rope(vec.as_mut_ptr(), n_heads, head_dim, pos, freq_base, rope_style);
     }
 }
 

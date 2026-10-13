@@ -11,6 +11,8 @@ use std::ptr;
 pub struct MmapFile {
     ptr: *const u8,
     len: usize,
+    #[cfg(target_os = "macos")]
+    metal_buf: std::sync::OnceLock<Option<std::sync::Arc<crate::infer::metal::MetalBuffer>>>,
 }
 
 // SAFETY: MmapFile provides read-only access to immutable mapped bytes.
@@ -53,7 +55,28 @@ impl MmapFile {
         Ok(Self {
             ptr: ptr as *const u8,
             len,
+            #[cfg(target_os = "macos")]
+            metal_buf: std::sync::OnceLock::new(),
         })
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn get_or_create_metal_buffer(
+        &self,
+        engine: &crate::infer::metal::MetalEngine,
+    ) -> Option<std::sync::Arc<crate::infer::metal::MetalBuffer>> {
+        self.metal_buf
+            .get_or_init(|| {
+                engine
+                    .register_zerocopy_buffer(self.as_slice())
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
     }
 
     #[inline]

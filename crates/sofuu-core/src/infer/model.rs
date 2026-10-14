@@ -266,6 +266,7 @@ pub struct TransformerModel {
     pub sink_tokens: usize,
     pub is_gemma2: bool,
     pub dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig,
+    pub kivi: Option<super::kivi::KiviCache>,
 }
 
 impl TransformerModel {
@@ -482,6 +483,7 @@ impl TransformerModel {
             sink_tokens: 4,
             is_gemma2,
             dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig::default(),
+            kivi: None,
         })
     }
 
@@ -519,6 +521,51 @@ impl TransformerModel {
     pub fn reset_cache(&mut self) {
         self.k_cache.fill(0.0);
         self.v_cache.fill(0.0);
+        self.kivi = None;
+    }
+
+    /// Enable KIVI 2-bit or 4-bit Asymmetric Quantized KV Cache.
+    /// Ingests any prefilled tokens from `k_cache` and `v_cache` into historical quantized blocks.
+    pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
+        let kivi_bits = match bits {
+            2 => super::kivi::KiviBits::Two,
+            _ => super::kivi::KiviBits::Four,
+        };
+        let config = super::kivi::KiviConfig {
+            enabled: true,
+            bits: kivi_bits,
+            residual_window: 32,
+            group_size: 32,
+        };
+        let mut kivi = super::kivi::KiviCache::new(
+            self.config.n_layers,
+            self.config.n_kv_heads,
+            self.config.head_dim,
+            config,
+        );
+
+        let n_layers = self.config.n_layers;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let max_seq_len = self.config.max_seq_len;
+
+        // Ingest prefilled tokens from k_cache & v_cache
+        if cur_pos > 0 {
+            for layer_idx in 0..n_layers {
+                for p in 0..cur_pos {
+                    let cache_pos = p % max_seq_len;
+                    for kv_h in 0..n_kv_heads {
+                        let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+                        let k_slice = &self.k_cache[slot..slot + head_dim];
+                        let v_slice = &self.v_cache[slot..slot + head_dim];
+                        let head_idx = layer_idx * n_kv_heads + kv_h;
+                        kivi.heads[head_idx].append(k_slice, v_slice);
+                    }
+                }
+            }
+        }
+
+        self.kivi = Some(kivi);
     }
 
     /// In-place compact the KV cache when context window is full.
@@ -1174,22 +1221,27 @@ impl TransformerModel {
             }
 
             // ── Multi-Head / Grouped-Query Attention ────────
-            let sliding_window = self.layer_sliding_window(layer_idx);
-            batched_attention_ext(
-                &self.q,
-                &self.k_cache,
-                &self.v_cache,
-                &mut self.head_out,
-                1,
-                pos,
-                layer_idx,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq_len,
-                sliding_window,
-                self.sink_tokens,
-            );
+            if let Some(ref mut kivi) = self.kivi {
+                kivi.append_token(layer_idx, &self.k, &self.v);
+                kivi.compute_layer_attention(layer_idx, n_heads, &self.q, &mut self.head_out);
+            } else {
+                let sliding_window = self.layer_sliding_window(layer_idx);
+                batched_attention_ext(
+                    &self.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &mut self.head_out,
+                    1,
+                    pos,
+                    layer_idx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    sliding_window,
+                    self.sink_tokens,
+                );
+            }
 
             // ── Attention Output Projection ─────────────────
             let attn_out_bytes = Self::tensor_slice(gguf, &layer.attn_output);

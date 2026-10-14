@@ -1505,6 +1505,8 @@ fn main() -> ExitCode {
             let mut lookahead = false;
             let mut snapkv = false;
             let mut dynamic_ffn = false;
+            let mut kivi = false;
+            let mut kivi_bits = 4usize;
 
             let mut i = 4;
             while i < args.len() {
@@ -1553,6 +1555,15 @@ fn main() -> ExitCode {
                 } else if args[i] == "--dynamic-ffn" {
                     dynamic_ffn = true;
                     i += 1;
+                } else if args[i] == "--kivi" {
+                    kivi = true;
+                    i += 1;
+                } else if args[i] == "--kivi-bits" && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        kivi_bits = v;
+                    }
+                    kivi = true;
+                    i += 2;
                 } else {
                     i += 1;
                 }
@@ -1605,6 +1616,8 @@ fn main() -> ExitCode {
                     lookahead,
                     snapkv,
                     dynamic_ffn,
+                    kivi,
+                    kivi_bits,
                     ..Default::default()
                 },
                 |tok| {

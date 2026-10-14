@@ -10,6 +10,7 @@ pub mod gguf;
 pub mod gptx3;
 pub mod qwen35;
 pub mod lfm2;
+pub mod kivi;
 pub mod lookahead;
 pub mod metal;
 pub mod mmap;
@@ -53,6 +54,8 @@ pub struct GenerateOptions {
     pub lookahead: bool,
     pub snapkv: bool,
     pub dynamic_ffn: bool,
+    pub kivi: bool,
+    pub kivi_bits: usize,
 }
 
 impl Default for GenerateOptions {
@@ -75,6 +78,8 @@ impl Default for GenerateOptions {
             lookahead: false,  // Jacobi / Lookahead tree parallel decoding
             snapkv: false,     // SnapKV observation pooling compression
             dynamic_ffn: false, // Dynamic FFN Sparsity (PowerInfer / DejaVu style)
+            kivi: false,       // KIVI / TurboKV asymmetric 2-bit & 4-bit KV cache
+            kivi_bits: 4,      // 4-bit (Four) or 2-bit (Two)
         }
     }
 }
@@ -193,6 +198,12 @@ impl InferModel {
     pub fn set_dynamic_ffn(&mut self, enabled: bool) {
         if let ModelBackend::Gguf(m) = &mut self.backend {
             m.dynamic_ffn.enabled = enabled;
+        }
+    }
+
+    pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.enable_kivi(bits, cur_pos);
         }
     }
 
@@ -698,6 +709,10 @@ impl InferEngine {
 
         if options.dynamic_ffn {
             self.model.set_dynamic_ffn(true);
+        }
+
+        if options.kivi {
+            self.model.enable_kivi(options.kivi_bits, cur_pos);
         }
 
         // 4. Decode Phase

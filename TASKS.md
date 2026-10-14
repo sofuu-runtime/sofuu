@@ -4,6 +4,32 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Mac CPU: LFM2 batched prefill landed — register-tiled row-panel GEMM, liquid-1.3B prefill 20.5 → 47.8 tk/s (2.3×); GPTX3 token-1+ divergence closed (no repro, parity tests pinned).**
+> `forward_prefill_batch`/`forward_prefill_all_with_logits` in `lfm2.rs` no longer loop
+> per-token (each token re-streamed ~0.9 GB of weights). Batched path: per layer one weight
+> stream feeds every token — panels of 16 dequantized rows × 4-token tiles in a NEON 4×4
+> register kernel (`gemm_tile4x4_neon`, 0.125 loads/MAC vs 0.5 for dot-based inners), row
+> fan-out via the `dynamic_ffn` worker pool on P-core count only (`sysctl
+> hw.perflevel0.physicalcpu`). Conv state, KV cache and attention stay token-sequential, and
+> batch vs per-token logits are gated by tests (`batched_prefill_matches_per_token_bf16`,
+> `..._mlx4`, `tile4x4_matches_reference_dots`; full suite 564/0). Measured on liquid-1.3B,
+> 200-token prompt, 6 P-cores: per-token loop 20.5 tk/s vs batched **47.8 tk/s (2.33×)** —
+> llama.cpp was at ~35 for this size (older table); liquid-350 rides the same path.
+> The iteration trail is worth keeping: scalar-chained dot 1.3 tk/s → 4-chain NEON dot 15.9
+> → dot4-sharing and 16-row panels added nothing (the dot was load-port bound at 0.5
+> loads/MAC, proven by `dot_f32_neon` micro at 11 GMAC/s) → the 4×4 tile kernel doubled it.
+> Also fixed on the way: edition-2021 precise closure capture silently lifts raw-pointer
+> fields out of Send-wrappers (destructuring the wrapper forces whole-struct capture).
+> **GPTX3**: a torch re-implementation of `modeling_gptx3.py`'s CPU path
+> (`/tmp/gptx3_torch_golden.py`) picks the same top-1 for all 6 probe tokens; Sofuu's decode
+> and `forward_prefill_all_with_logits` agree with it AND with each other **bit-exactly**
+> (abs RMS 0.0), 12-token greedy continuation identical. The recorded token-1+ divergence
+> does not reproduce on current `gptx3.rs` — closed as no-repro (earlier debug-hook fixes by
+> peers or a mischaracterization); two pinned tests (`token_sequence_top1_matches_torch_golden`,
+> `prefill_all_with_logits_matches_decode_path`) guard it. Thread-default note: the Pi-5 wave
+> already capped macOS defaults at 4 P-Cores; the LFM2 path independently uses the full
+> P-cluster (6), where the per-token curve had peaked.
+
 > **2026-10-14 — Mac CPU / Cross-Surface: CMA Working Memory Tier, /brain info Panel, Store Health Doctor & NEON Quantizer Parity.**
 > - B6 in-RAM working memory set (`rememberWorking`, `promoteWorking`, `clearWorking`, `stats`) exposed across Rust, C-ABI funnel, and JS facades.
 > - Interactive `/brain info` slash command renders live tier distribution, capacity headroom, and journal health.

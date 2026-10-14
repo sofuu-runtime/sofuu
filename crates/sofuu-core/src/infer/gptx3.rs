@@ -596,3 +596,103 @@ impl Gptx3Model {
         &self.logits
     }
 }
+
+#[cfg(test)]
+mod gptx3_divergence_tests {
+    use super::*;
+
+    /// Arbiter for the token-1+ divergence: the torch golden
+    /// (/tmp/gptx3_torch_golden.py, mirroring modeling_gptx3.py's CPU path)
+    /// predicts these top-1 ids for tokens [1, 791, 6864, 315, 9822, 374].
+    #[test]
+    #[ignore = "needs gpt-x3-150m on disk; run explicitly"]
+    fn token_sequence_top1_matches_torch_golden() {
+        let table = UnifiedTensorTable::open("/Users/priyanshuboruah/Downloads/gpt-x3-150m/model.safetensors")
+            .expect("open gpt-x3-150m");
+        let mut m = Gptx3Model::from_tensor_table(&table, 0).expect("build gptx3 model");
+        let tokens = [1u32, 791, 6864, 315, 9822, 374];
+        let want_top1 = [521, 521, 521, 521, 785, 521];
+        for (pos, &t) in tokens.iter().enumerate() {
+            let logits = m.forward(t, pos);
+            let mut best: usize = 0;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > logits[best] {
+                    best = i;
+                }
+            }
+            eprintln!("TOK{} top1={} ({}, expected {})", pos, best, logits[best], want_top1[pos]);
+            assert_eq!(best, want_top1[pos], "token {} diverged from torch golden", pos);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gptx3_prefill_consistency_tests {
+    use super::*;
+
+    /// Does the batched prefill entrypoint leave the same state (and logits)
+    /// as the per-token decode path it must equal?
+    #[test]
+    #[ignore = "needs gpt-x3-150m on disk; run explicitly"]
+    fn prefill_all_with_logits_matches_decode_path() {
+        let table = UnifiedTensorTable::open("/Users/priyanshuboruah/Downloads/gpt-x3-150m/model.safetensors")
+            .expect("open gpt-x3-150m");
+        let tokens = [1u32, 791, 6864, 315, 9822, 374];
+        let want_top1 = [521usize, 521, 521, 521, 785, 521];
+
+        // Path A: pure token-by-token decode.
+        let mut a = Gptx3Model::from_tensor_table(&table, 0).unwrap();
+        for (pos, &t) in tokens.iter().enumerate() {
+            a.forward(t, pos);
+        }
+
+        // Path B: one prefill over the whole sequence, then continue greedy.
+        let mut b = Gptx3Model::from_tensor_table(&table, 0).unwrap();
+        let logits_b = b.forward_prefill_all_with_logits(&tokens, 0).to_vec();
+        let mut ra: usize = 0;
+        let mut rb: usize = 0;
+        let mut sum_sq = 0.0f32;
+        let mut ref_sq = 0.0f32;
+        for i in 0..logits_b.len() {
+            let d = logits_b[i] - a.logits[i];
+            sum_sq += d * d;
+            ref_sq += a.logits[i] * a.logits[i];
+            if a.logits[i] > a.logits[ra] {
+                ra = i;
+            }
+            if logits_b[i] > logits_b[rb] {
+                rb = i;
+            }
+        }
+        let rms = (sum_sq / logits_b.len() as f32).sqrt();
+        let rms_rel = rms / (ref_sq / logits_b.len() as f32).sqrt().max(1e-9);
+        eprintln!("prefill-vs-decode last-token logits: abs RMS {:.3e} rel {:.3e}", rms, rms_rel);
+        eprintln!("prefill top1={} decode top1={}", rb, ra);
+        assert_eq!(ra, want_top1[5], "decode path golden top1");
+        assert_eq!(rb, want_top1[5], "prefill path golden top1");
+
+        // Greedy continuation from both states must stay identical.
+        let mut tok = ra as u32;
+        let mut pos = tokens.len();
+        for step in 0..12 {
+            let la = a.forward(tok, pos);
+            let mut ta: usize = 0;
+            for (i, &v) in la.iter().enumerate() {
+                if v > la[ta] {
+                    ta = i;
+                }
+            }
+            let lb = b.forward(tok, pos);
+            let mut tb: usize = 0;
+            for (i, &v) in lb.iter().enumerate() {
+                if v > lb[tb] {
+                    tb = i;
+                }
+            }
+            assert_eq!(ta, tb, "greedy step {} diverged (decode {} vs prefill-state {})", step, ta, tb);
+            tok = ta as u32;
+            pos += 1;
+        }
+        eprintln!("greedy 12-step continuation identical from both states");
+    }
+}

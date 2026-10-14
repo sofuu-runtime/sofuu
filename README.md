@@ -199,7 +199,7 @@ sofuu version / help
 
 ```text
 /help  /model <name>  /provider <name>  /effort <low|medium|high|max>
-/compact  /clear  /brain [on|off]  /rlm [on|off|auto]
+/compact  /clear  /brain [on|off|info]  /rlm [on|off|auto]
 /tools  /agents  /version  /exit
 
 /remember <fact>  /why  /share [path]  /import <path>  /cost  /ghost [on|off]
@@ -208,7 +208,7 @@ sofuu version / help
 /work <desc>  /done  /note <msg>  /notify <msg>  /sync [on|off]
 ```
 
-`sofuu doctor` verifies the binary is healthy — QTSQ linked, brain write→read round-trip passes, and the current model's context window resolves. A non-zero exit means a hard dependency is missing.
+`sofuu doctor` verifies the binary is healthy — QTSQ linked, brain write→read round-trip passes, and the current model's context window resolves. On a QTSQ build it also inspects the real brain store: vector space, segment manifest, per-tier histogram, capacity headroom, journal state, and last compaction. A non-zero exit means a hard dependency is missing.
 
 ---
 

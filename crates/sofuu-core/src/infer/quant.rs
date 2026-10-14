@@ -861,6 +861,14 @@ pub mod prof {
     pub static GEMV_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EMBED_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static GLUE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GLUE_CALLS: AtomicU64 = AtomicU64::new(0);
     static CHUNK_NS: AtomicU64 = AtomicU64::new(0);
     static CHUNK_TOK: AtomicU64 = AtomicU64::new(0);
 
@@ -927,16 +935,25 @@ pub mod prof {
         let gemv = ms(&GEMV_NS);
         let attn = ms(&ATTN_NS);
         let tok = CHUNK_TOK.load(Ordering::Relaxed);
-        let other = chunk - gemm - gemv - attn;
+        let norm = ms(&NORM_NS);
+        let rope = ms(&ROPE_NS);
+        let embed = ms(&EMBED_NS);
+        let glue = ms(&GLUE_NS);
+        let other = chunk - gemm - gemv - attn - norm - rope - embed - glue;
         eprintln!(
-            "[prof] prefilled {tok} tok in {chunk:.0}ms | gemm {gemm:.0}ms ({}) | gemv {gemv:.0}ms ({}) | attn {attn:.0}ms ({}) | other {other:.0}ms",
+            "[prof] prefilled {tok} tok in {chunk:.0}ms | gemm {gemm:.0}ms ({}) | gemv {gemv:.0}ms ({}) | attn {attn:.0}ms ({}) | norm {norm:.0}ms({}) rope {rope:.0}ms({}) embed {embed:.0}ms({}) glue {glue:.0}ms({}) | other {other:.0}ms",
             GEMM_CALLS.load(Ordering::Relaxed),
             GEMV_CALLS.load(Ordering::Relaxed),
             ATTN_CALLS.load(Ordering::Relaxed),
+            NORM_CALLS.load(Ordering::Relaxed),
+            ROPE_CALLS.load(Ordering::Relaxed),
+            EMBED_CALLS.load(Ordering::Relaxed),
+            GLUE_CALLS.load(Ordering::Relaxed),
         );
         for a in [
-            &GEMM_NS, &GEMM_CALLS, &GEMV_NS, &GEMV_CALLS, &ATTN_NS, &ATTN_CALLS, &CHUNK_NS,
-            &CHUNK_TOK,
+            &GEMM_NS, &GEMM_CALLS, &GEMV_NS, &GEMV_CALLS, &ATTN_NS, &ATTN_CALLS,
+            &NORM_NS, &NORM_CALLS, &ROPE_NS, &ROPE_CALLS, &EMBED_NS, &EMBED_CALLS,
+            &GLUE_NS, &GLUE_CALLS, &CHUNK_NS, &CHUNK_TOK,
         ] {
             a.store(0, Ordering::Relaxed);
         }
@@ -1227,6 +1244,7 @@ pub fn matmat(
 /// Out-place Root Mean Square Normalization (RMSNorm) via C++ SIMD.
 #[inline]
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+    let _p = prof::Scope::new(&prof::NORM_NS, &prof::NORM_CALLS);
     assert_eq!(out.len(), x.len());
     assert_eq!(out.len(), weight.len());
     unsafe {
@@ -1237,6 +1255,7 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
 /// In-place Root Mean Square Normalization (RMSNorm) via C++ SIMD.
 #[inline]
 pub fn rmsnorm_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
+    let _p = prof::Scope::new(&prof::NORM_NS, &prof::NORM_CALLS);
     assert_eq!(x.len(), weight.len());
     unsafe {
         sofuu_rmsnorm(x.as_mut_ptr(), x.as_ptr(), weight.as_ptr(), x.len(), eps);
@@ -1276,6 +1295,7 @@ pub fn batched_rmsnorm_in_place(x: &mut [f32], weight: &[f32], rows: usize, cols
 /// Batched in-place multiply-accumulate: `dst[r] += alpha * src[r]` per row.
 #[inline]
 pub fn batched_mad(dst: &mut [f32], src: &[f32], alpha: f32, rows: usize, cols: usize) {
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     debug_assert_eq!(dst.len(), rows * cols);
     debug_assert_eq!(src.len(), rows * cols);
     unsafe {

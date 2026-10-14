@@ -68,7 +68,7 @@ Every capability an AI application needs is integrated directly into the core bi
 
 ### 3.3 Cognitive Memory Architecture (CMA) & HNSW
 * **4-Tier Cognitive Hierarchy**:
-  1. **Working Memory**: Active session context, short-term buffer with immediate recall.
+  1. **Working Memory**: Active session context, short-term buffer with immediate recall (B6: an in-RAM working set beside the persistent store — recallable immediately, promoted to episodic only when a turn actually uses it, never serialized).
   2. **Episodic Memory**: Specific conversation turns and tool events, subject to Ebbinghaus forgetting decay.
   3. **Semantic Memory**: Consolidated facts and knowledge extracted from episodes via k-means clustering.
   4. **Entity Memory**: Named entities, user preferences, and stable identities pinned indefinitely.

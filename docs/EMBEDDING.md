@@ -287,7 +287,7 @@ through a real runtime, so it cannot drift from the implementation again:
 | namespace | methods |
 |---|---|
 | **ai** | `ai.complete`, `ai.stream`, `ai.embed`, `ai.embedLocal`, `ai.embedBatch`, `ai.embedImage`, `ai.embedInfo`, `ai.similarity`, `ai.transcribe`, `ai.speak` |
-| **memory** | `memory.open`, `memory.remember`, `memory.recall`, `memory.count`, `memory.flush`, `memory.forget`, `memory.close`, `memory.list`, `memory.export` |
+| **memory** | `memory.open`, `memory.remember`, `memory.recall`, `memory.count`, `memory.flush`, `memory.forget`, `memory.close`, `memory.list`, `memory.export`, `memory.stats`, `memory.rememberWorking`, `memory.promoteWorking`, `memory.clearWorking` |
 | **mcp** | `mcp.connect`, `mcp.call`, `mcp.listTools`, `mcp.listResources`, `mcp.disconnect` |
 | **agent** | `agent.define`, `agent.run`, `agent.list`, `agent.cancel`, `agent.renderTrace` |
 | **rlm** | `rlm.query`, `rlm.route` |

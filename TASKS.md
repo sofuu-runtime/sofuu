@@ -4,6 +4,13 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Mac CPU / Cross-Surface: CMA Working Memory Tier, /brain info Panel, Store Health Doctor & NEON Quantizer Parity.**
+> - B6 in-RAM working memory set (`rememberWorking`, `promoteWorking`, `clearWorking`, `stats`) exposed across Rust, C-ABI funnel, and JS facades.
+> - Interactive `/brain info` slash command renders live tier distribution, capacity headroom, and journal health.
+> - `sofuu doctor` verifies real QTSQ vector space, segment manifest, per-tier histograms, capacity headroom, and last compaction.
+> - C++ SIMD NEON bit-exact 4x4 matrix quantizer parity verified (`test_quant_q8_k_4x4_neon_bit_exact`).
+> - Full cross-surface unit tests pass (45/45 `sofuu-capi` tests, 5/5 lookahead tests, stripped release binary 4.0 MB <= 5.0 MB gate).
+>
 > **2026-10-14 — Mac CPU / Apple Silicon: Multi-Path Lookahead Tree Speculation with 2D Block-Causal Attention.**
 > Branching candidate tree evaluation (`CandidateTree`, up to 6 speculative nodes across 3 depths) in a single DRAM weight forward pass.
 > Hardware microkernels `sofuu_tree_attention` (2D block-causal ancestor attention with sibling masking) and `sofuu_tree_rope` in SIMD NEON/C++ and Rust FFI.

@@ -7864,6 +7864,7 @@ mod tests {
         assert!(c.effort.is_empty());
         // Bare config commands open their picker panel (DRIVER handles it).
         assert_eq!(handle_slash(&mut c, "/brain"), "pick_brain");
+        assert_eq!(handle_slash(&mut c, "/brain info"), "brain_info");
         assert_eq!(handle_slash(&mut c, "/brain on"), "ok");
         assert!(c.brain);
         // /ml: bare prints status (no picker); on/off persist.

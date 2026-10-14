@@ -4,6 +4,28 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — agents/tools: remaining audit fixes (P2 read jail + route log, P3 alignment).**
+> (1) `read_file` is jailed to the project directory like grep/glob/list_dir — it was the
+> one AUTO_PASS reader that accepted any absolute path into the provider transcript (and
+> gained the description note so models self-correct). (2) Plain-route RLM decisions now
+> log to `routing_log.jsonl` beside the rlm ones — the learned router's dataset was
+> rlm-side-only (collection bias; RLM turns still log below with real latency/calls).
+> (3) The RLM sandbox prompt documents at most `max_tool_calls` tools (hard cap stays 32;
+> the old 32-vs-16 mismatch let the model plan toward calls the budget would refuse) —
+> unit test `tool_prompt_documents_at_most_the_call_budget`. (4) `mergeStreamToolCalls`
+> skips a fragment the accumulated name already ENDS WITH — gateways that mirror the full
+> name on every delta no longer concatenate ("read_fileread_file"); split names still
+> append. (5) The breach report's tool histogram is counted live at emit time — the old
+> trace re-scan degraded to '?' on long runs (TRACE_CAP payload demotion). (6) Readers
+> refuse extensionless SSH keys (id_rsa/id_ed25519/id_ecdsa/id_dsa) and
+> `.aws/credentials`; `.env` stays deliberately readable (mixed, often task-necessary).
+> (7) tools.js header truth: bash max timeout is 600s. Evidence: cargo --lib 574 (incl.
+> new episode test); agent_test new checks (read jail in/out, key refusals, grep skip,
+> plain-route log line) — bin-build verification pending the concurrent simd edit (the
+> C tree was mid-edit; lib target verified). Deliberately NOT changed: host-side
+> `mapContext` chunk cap (trusted-host path, documented) and the RLM recursion stub
+> (documented v1 boundary).
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

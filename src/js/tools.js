@@ -9,12 +9,17 @@
 // Safety rails (v1):
 //   - write_file/edit_file are jailed to the process cwd (lexical resolve,
 //     ".." and absolute escapes rejected).
-//   - bash runs /bin/sh -c with a hard timeout (default 60s, max 180s) and
+//   - read_file/grep/glob/list_dir are read-only but jailed to cwd the same
+//     way (2026-10-15: read_file was the odd one out — any absolute path
+//     outside the project reached the provider transcript under every
+//     permission profile).
+//   - bash runs /bin/sh -c with a hard timeout (default 60s, max 600s) and
 //     kills the child on expiry; stdout capped. A shell can still touch
 //     anything the user can — set SOFUU_NO_SHELL=1 to strip bash entirely.
-//   - read/grep/glob are read-only (like cat/rg) but refuse credential
-//     stores — .sofuu/config.json, .ssh/*, *.pem|.key|.p12|.pfx (js-5:
-//     grep/glob skip them so keys never reach the provider transcript).
+//   - All readers refuse credential stores — .sofuu/config.json, .ssh/*,
+//     extensionless SSH keys (id_rsa/id_ed25519/id_ecdsa), .aws/credentials,
+//     *.pem|.key|.p12|.pfx — and grep/glob skip them entirely (js-5: keys
+//     never reach the provider transcript).
 //   - Every result is additionally capped by the agent loop's P3
 //     tool-result truncation.
 
@@ -199,7 +204,11 @@
    * must not read, null otherwise. read_file throws on it; grep/glob skip
    * the file (they used to walk and print it — both auto-approved — so a
    * routine scan exfiltrated keys into the provider transcript). The user
-   * can still paste credentials manually if a task truly needs them. */
+   * can still paste credentials manually if a task truly needs them.
+   * 2026-10-15: extensionless SSH private keys outside .ssh/ and
+   * .aws/credentials are unambiguous key material — added; `.env` and
+   * similar app config deliberately stay readable (mixed content, often
+   * task-necessary). */
   function sensitiveReason(p) {
     var abs = lexNorm(p);
     var base = basename(abs);
@@ -208,6 +217,12 @@
     }
     if (/(^|\/)\.ssh\//.test(abs + '/')) {
       return 'SSH keys are off-limits';
+    }
+    if (/^(id_rsa|id_ed25519|id_ecdsa|id_dsa)$/.test(base)) {
+      return 'SSH private key material — ask the user';
+    }
+    if (/(^|\/)\.aws\/credentials$/.test(abs)) {
+      return 'holds cloud credentials — ask the user';
     }
     if (/\.(pem|key|p12|pfx)$/i.test(base)) {
       return 'private key material — ask the user';
@@ -224,7 +239,7 @@
 
   TOOLS.read_file = {
     name: 'read_file',
-    description: 'Read a text file. Returns cat -n style numbered lines so exact text can be quoted into edit_file. For large files pass start/end (1-based, inclusive).',
+    description: 'Read a text file (jailed to the project directory, like the other readers). Returns cat -n style numbered lines so exact text can be quoted into edit_file. For large files pass start/end (1-based, inclusive).',
     parameters: {
       type: 'object',
       properties: {
@@ -235,7 +250,15 @@
       required: ['path'],
     },
     execute: async function (a) {
+      /* Jailed to the project directory like grep/glob/list_dir (2026-10-15):
+       * an absolute path outside cwd — /etc/passwd, a sibling repo's config —
+       * used to stream straight into the provider transcript under every
+       * permission profile, while the sibling readers already refused it. */
       var p = lexNorm(a && a.path);
+      var cwdRoot = lexNorm('.');
+      if (p !== cwdRoot && p.indexOf(cwdRoot + '/') !== 0) {
+        throw new Error('read_file: path escapes the project directory (reads are jailed to cwd): ' + (a && a.path));
+      }
       assertNotSensitive(p);
       var text = await sofuu.fs.readFile(p, 'utf8');
       var lines = text.split('\n');

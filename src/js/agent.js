@@ -1470,7 +1470,12 @@
       var e = byIndex[idx];
       if (t.id) e.id = String(t.id);
       var fn = t.function || {};
-      if (fn.name) e.name = e.name + String(fn.name);
+      /* P3 (audit 2026-10-15): gateways that mirror the FULL name on every
+       * index-keyed delta used to concatenate it ("read_fileread_file…").
+       * Split names ("read_" + "file") are appended as before; only a
+       * fragment the accumulated name already ENDS WITH is treated as a
+       * re-send and skipped. */
+      if (fn.name && !e.name.endsWith(String(fn.name))) e.name = e.name + String(fn.name);
       if (fn.arguments) e.args = e.args + String(fn.arguments);
       if (!fn.name && t.name) e.name = String(t.name);
       if (t.arguments && typeof t.arguments === 'object') {
@@ -1711,6 +1716,12 @@
     var tree = opts._treeUsage || { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmCalls: 0, toolCalls: 0 };
     var trace = [];
     var subRuns = [];
+    /* Live per-tool histogram for the breach report — (2026-10-15) the
+     * report used to re-scan the trace for kind:'tool' entries, but
+     * TRACE_CAP demotion deletes old payloads, so a long run's report read
+     * every counter as '?'. Counted here at emit time, immune to trace
+     * trimming. */
+    var toolHist = {};
     var steps = 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
      * renewal, so this is what "how long did this actually run" means. */
@@ -1875,17 +1886,10 @@
          * it matters, and it is the only place the numbers still exist. */
         breach: stopped && String(stopped).indexOf('budget_') === 0
           ? (function () {
-              /* trace entries are {t, kind, payload}; tool calls are
-               * emitted as kind:'tool' with payload.name. Reading .name off
-               * the entry reported '?' for every tool, which made the
-               * histogram useless exactly when it was needed. */
-              var hist = {}, top = '';
-              for (var ti = 0; ti < trace.length; ti++) {
-                var e = trace[ti] || {};
-                if (e.kind !== 'tool') continue;
-                var nm = (e.payload && (e.payload.name || e.payload.tool)) || '?';
-                hist[nm] = (hist[nm] || 0) + 1;
-              }
+              /* toolHist is counted live at emit time — the old re-scan of
+               * the trace read payloads that TRACE_CAP demotion deleted, so
+               * a long run's report degraded every tool to '?'. */
+              var hist = toolHist, top = '';
               for (var k in hist) { if (!top || hist[k] > hist[top]) top = k; }
               return {
                 kind: stopped,
@@ -2455,6 +2459,20 @@
           var tokens = estTok(ctxText);
           var win = d.ctxWindow > 0 ? d.ctxWindow : contextWindow(d.model, d.baseUrl);
           var route = (d.rlm === 'on') ? 'rlm' : sofuu.rlm.route(tokens, win, String(task));
+          /* Both sides of the decision go to the log (2026-10-15): the
+           * routing_log.jsonl exists as training data for the future
+           * learned router (router.rs's stated purpose), and the old
+           * rlm-branch-only logging fed it a systematically biased dataset
+           * — it could only ever see the turns the heuristic already
+           * routed to RLM, never the plain ones. RLM-routed turns are
+           * logged below with their real latency/call counts; only the
+           * plain decision logs here. */
+          if (route !== 'rlm') {
+            try {
+              sofuu.rlm.logRoute({ ctxTokens: tokens, windowTokens: win, question: String(task),
+                                   route: 'plain', latencyMs: 0, rlmCalls: 0 });
+            } catch (eLogP) {}
+          }
           if (route === 'rlm') {
             /* Token budget (2026-10-14): the episode is metered. It runs
              * inside this run's REMAINING allowance and is stopped
@@ -2537,6 +2555,7 @@
 
       async function execOneTool(name, args, callId) {
         own.toolCalls++; tree.toolCalls++;
+        toolHist[name] = (toolHist[name] || 0) + 1;
         emit('tool', { name: name, args: clip(JSON.stringify(args || {}), 200) });
         /* Permission profile (see permissionBlocked above): a gated tool
          * never executes — the model gets the same explanatory string the

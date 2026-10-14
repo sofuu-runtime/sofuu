@@ -74,8 +74,15 @@ for sub-questions over big slices. final(answer) as soon as you can.";
 
 /// Appended to the system prompt when the episode carries an agent tool
 /// whitelist (PLAN-AGENTS A4 full form): the sandbox gains tool()/toolBatch().
-fn tool_prompt(tools: &[ToolSpec]) -> String {
-    if tools.is_empty() {
+///
+/// `max_prompt_tools` caps how many tools the prompt documents (2026-10-15,
+/// audit P3): the hard schema ceiling stays 32, but a whitelist larger than
+/// the episode's `max_tool_calls` budget used to be fully documented — the
+/// model could see and plan toward tools it would never be able to call
+/// before `budget=max_tool_calls` stopped the episode.
+fn tool_prompt(tools: &[ToolSpec], max_prompt_tools: usize) -> String {
+    let documented = max_prompt_tools.min(32);
+    if tools.is_empty() || documented == 0 {
         return String::new();
     }
     let mut docs = String::new();
@@ -85,7 +92,7 @@ fn tool_prompt(tools: &[ToolSpec]) -> String {
          toolBatch([{name,args}]) → batch calls; returns the array of results\n\n\
          Available tools:\n",
     );
-    for t in tools.iter().take(32) {
+    for t in tools.iter().take(documented) {
         let params = if t.parameters.is_null() || &t.parameters == &serde_json::Value::default() {
             String::new()
         } else {
@@ -191,7 +198,9 @@ impl Episode {
             sandbox.context_chars(),
             req.question.trim()
         );
-        let system = format!("{}{}", SYSTEM_PROMPT, tool_prompt(&req.opts.tools));
+        let system = format!("{}{}",
+            SYSTEM_PROMPT,
+            tool_prompt(&req.opts.tools, req.opts.max_tool_calls as usize));
         Ok(Self {
             sandbox,
             opts: req.opts,
@@ -755,6 +764,29 @@ mod tests {
         // The default budget (3) leaves the JS driver's depth-0 episodes
         // untouched.
         assert!(Episode::new(request("short context"), 0).is_ok());
+    }
+
+    /// Audit P3 (2026-10-15): the sandbox system prompt documents at most
+    /// `max_tool_calls` tools — a whitelist larger than the call budget
+    /// used to be fully documented, so the model could see (and plan
+    /// toward) tools the episode could never call before the budget
+    /// stopped it. The hard documentation ceiling stays 32.
+    #[test]
+    fn tool_prompt_documents_at_most_the_call_budget() {
+        let specs: Vec<ToolSpec> = (0..40)
+            .map(|i| ToolSpec {
+                name: format!("tool{i}"),
+                description: "d".into(),
+                parameters: serde_json::Value::Null,
+            })
+            .collect();
+        // Default budget (16) → exactly 16 documented, not all 40.
+        let doc = tool_prompt(&specs, 16);
+        assert_eq!(doc.matches("\n  - tool").count(), 16);
+        // A zero budget documents nothing: no call could ever run.
+        assert_eq!(tool_prompt(&specs, 0), "");
+        // The hard documentation ceiling stays 32.
+        assert_eq!(tool_prompt(&specs, 500).matches("\n  - tool").count(), 32);
     }
 
     /// A4 full form: a snippet calling tool() suspends with the parsed

@@ -495,6 +495,35 @@ extern "C" {
         sliding_window: usize,
         sink_tokens: usize,
     );
+    fn sofuu_tree_rope(
+        q_batch: *mut f32,
+        k_batch: *mut f32,
+        node_positions: *const usize,
+        tree_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        freq_base: f32,
+        rope_style: i32,
+    );
+    fn sofuu_tree_attention(
+        q_batch: *const f32,
+        k_batch: *const f32,
+        v_batch: *const f32,
+        k_cache: *const f32,
+        v_cache: *const f32,
+        head_out_batch: *mut f32,
+        ancestry_mask: *const u8,
+        tree_size: usize,
+        start_pos: usize,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        sliding_window: usize,
+        sink_tokens: usize,
+    );
 
     // Apple Silicon Metal Unified GPU Engine
     pub fn sofuu_metal_available() -> bool;
@@ -854,6 +883,28 @@ pub mod prof {
         CHUNK_TOK.fetch_add(tokens as u64, Ordering::Relaxed);
     }
 
+    /// One generated-token step, recorded on drop so every early-return and
+    /// break path in the decode loop is covered. Decode steps share the
+    /// prefill buckets; the label in `report()` says "prefilled" either way.
+    pub struct TokenScope(Option<Instant>);
+    impl TokenScope {
+        pub fn new() -> Self {
+            TokenScope(enabled().then(Instant::now))
+        }
+    }
+    impl Default for TokenScope {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Drop for TokenScope {
+        fn drop(&mut self) {
+            if let Some(t0) = self.0.take() {
+                record_chunk(t0.elapsed(), 1);
+            }
+        }
+    }
+
     /// Print accumulated profile buckets and reset them.
     pub fn report() {
         if !enabled() {
@@ -904,6 +955,52 @@ pub fn batched_attention_ext(
             v_cache.as_ptr(),
             head_out_batch.as_mut_ptr(),
             b_size,
+            start_pos,
+            layer_idx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            sliding_window,
+            sink_tokens,
+        );
+    }
+}
+
+/// Multi-path speculative tree attention across historical KV cache plus candidate tree nodes.
+#[allow(clippy::too_many_arguments)]
+pub fn tree_attention(
+    q_batch: &[f32],
+    k_batch: &[f32],
+    v_batch: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    head_out_batch: &mut [f32],
+    ancestry_mask: &[u8],
+    tree_size: usize,
+    start_pos: usize,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    sliding_window: usize,
+    sink_tokens: usize,
+) {
+    if tree_size == 0 {
+        return;
+    }
+    let _prof = prof::Scope::new(&prof::ATTN_NS, &prof::ATTN_CALLS);
+    unsafe {
+        sofuu_tree_attention(
+            q_batch.as_ptr(),
+            k_batch.as_ptr(),
+            v_batch.as_ptr(),
+            k_cache.as_ptr(),
+            v_cache.as_ptr(),
+            head_out_batch.as_mut_ptr(),
+            ancestry_mask.as_ptr(),
+            tree_size,
             start_pos,
             layer_idx,
             n_heads,
@@ -1234,6 +1331,38 @@ pub fn batched_rope_kv(
     }
 }
 
+/// Rotates Q and K for speculative tree candidate nodes at their specific positions without committing to KV cache.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn tree_rope(
+    q_batch: &mut [f32],
+    k_batch: &mut [f32],
+    node_positions: &[usize],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    rope_mode: i32,
+) {
+    let tree_size = node_positions.len();
+    if tree_size == 0 {
+        return;
+    }
+    unsafe {
+        sofuu_tree_rope(
+            q_batch.as_mut_ptr(),
+            k_batch.as_mut_ptr(),
+            node_positions.as_ptr(),
+            tree_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            freq_base,
+            rope_mode,
+        );
+    }
+}
+
 /// Fused SwiGLU activation: out = SiLU(gate) * up via C++ SIMD.
 #[inline]
 pub fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32]) {
@@ -1508,6 +1637,45 @@ mod tests {
                         want += p;
                     }
                     assert!((a - want).abs() <= 0.05 * l1 + 1e-3, "({b},{r}): {a} vs {want}");
+                }
+            }
+        }
+    }
+
+    /// Small speculative batches (2, 3, 5 rows) are padded to a 4-multiple
+    /// inside the gemm dispatch; the pad must not perturb the real rows, so
+    /// the padded result is bit-equal to an explicit zero-padded batch-4 (or
+    /// batch-8) tile computation on the shared rows. Warms explicitly and
+    /// uses a shape unlike the sidecar test's fixtures: tests run in
+    /// parallel and the tile registry keys on (pointer, shape, fingerprint),
+    /// so an identical sibling fixture could alias mid-test.
+    #[test]
+    fn test_tile_gemm_small_batch_pad_bit_exact() {
+        let rows = 24usize;
+        let cols = 256usize;
+        let w_bytes = build_q4_k_fixture(rows, cols);
+        tile_warm(w_bytes.as_ptr(), rows, cols, GGML_TYPE_Q4_K);
+
+        for (small, big) in [(2usize, 4usize), (3usize, 4usize), (5usize, 8usize)] {
+            let big_x: Vec<f32> = (0..big * cols)
+                .map(|i| if i >= small * cols { 0.0 } else { ((i % 37) as f32) * 0.098 - 1.4 })
+                .collect();
+            let small_x = big_x[..small * cols].to_vec();
+
+            let mut out_big = vec![0f32; big * rows];
+            matmat(&w_bytes, GGML_TYPE_Q4_K, rows, cols, &big_x, big, &mut out_big);
+            let mut out_small = vec![0f32; small * rows];
+            matmat(&w_bytes, GGML_TYPE_Q4_K, rows, cols, &small_x, small, &mut out_small);
+
+            for b in 0..small {
+                for r in 0..rows {
+                    assert_eq!(
+                        out_small[b * rows + r].to_bits(),
+                        out_big[b * rows + r].to_bits(),
+                        "pad({small}->{big}) ({b},{r}): {:?} vs {:?}",
+                        out_small[b * rows + r],
+                        out_big[b * rows + r]
+                    );
                 }
             }
         }

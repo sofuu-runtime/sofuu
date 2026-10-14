@@ -17,7 +17,7 @@ use super::quant::{
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
     prefetch_streaming_slice, prefetch_temporal_slice, prof,
-    rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, type_row_size,
+    rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, tree_attention, tree_rope, type_row_size,
     GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
 };
@@ -269,6 +269,9 @@ pub struct TransformerModel {
     pub dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig,
     pub kivi: Option<super::kivi::KiviCache>,
     pub streaming_weights: bool,
+    pub tree_k_layers: Vec<f32>,
+    pub tree_v_layers: Vec<f32>,
+    pub tree_max_nodes: usize,
 }
 
 impl TransformerModel {
@@ -487,6 +490,9 @@ impl TransformerModel {
             dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig::default(),
             kivi: None,
             streaming_weights: false,
+            tree_k_layers: vec![0.0f32; n_layers * 16 * kv_dim],
+            tree_v_layers: vec![0.0f32; n_layers * 16 * kv_dim],
+            tree_max_nodes: 16,
         })
     }
 
@@ -1109,6 +1115,347 @@ impl TransformerModel {
         self.logits.copy_from_slice(&out_logits[0..vocab_size]);
     }
 
+    /// Multi-Path Lookahead Tree Speculation:
+    /// Evaluates root token and all candidate tree branches in parallel in a single forward pass,
+    /// streaming model weights from DRAM exactly ONCE.
+    ///
+    /// Tokens: [root_token, cand_1, cand_2, ...] (length M)
+    /// Positions: [pos_0, pos_1, pos_2, ...] (length M)
+    /// Ancestry mask: [M * M] u8 row-major matrix: 1 if col j is ancestor of row i or j == i, 0 otherwise.
+    ///
+    /// Computes and returns logits for token 0 (root). If any candidate branch matches,
+    /// `forward_speculative_head_item` computes logits for the accepted branch nodes lazily,
+    /// and `commit_speculative_candidates` commits only the accepted branch KV vectors to persistent cache.
+    #[inline(never)]
+    pub fn forward_speculative_tree(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        ancestry_mask: &[u8],
+        start_pos: usize,
+        out_logits: &mut [f32],
+    ) {
+        let b_size = tokens.len();
+        if b_size == 0 {
+            return;
+        }
+        let vocab_size = self.config.vocab_size;
+        let dim = self.config.dim;
+        let norm_eps = self.config.norm_eps;
+
+        if b_size == 1 {
+            let l = self.forward(tokens[0], start_pos);
+            out_logits[0..vocab_size].copy_from_slice(l);
+            return;
+        }
+
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let kv_dim = self.kv_dim;
+        let q_dim = n_heads * head_dim;
+        let gguf = &self.gguf;
+
+        // 1. Batched Embedding lookup
+        for (b, &tok) in tokens.iter().enumerate() {
+            let dst = &mut self.x_batch[b * dim..(b + 1) * dim];
+            Self::lookup_embedding(gguf, &self.token_embd, tok, dim, dst);
+        }
+
+        // 2. Transformer layers
+        for layer_idx in 0..self.config.n_layers {
+            let layer = &self.layers[layer_idx];
+
+            // ── Attention Norm for tree batch ───────────────────────
+            let attn_norm_bytes = Self::tensor_slice(gguf, &layer.attn_norm);
+            let attn_norm_weights = unsafe {
+                std::slice::from_raw_parts(attn_norm_bytes.as_ptr() as *const f32, dim)
+            };
+            batched_rmsnorm(
+                &mut self.x_norm_batch[0..b_size * dim],
+                &self.x_batch[0..b_size * dim],
+                attn_norm_weights,
+                b_size,
+                dim,
+                norm_eps,
+            );
+
+            // ── Batched Q, K, V Projections via matmat ──────────────
+            let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
+            matmat(
+                q_bytes,
+                layer.attn_q.tensor_type,
+                q_dim,
+                dim,
+                &self.x_norm_batch[0..b_size * dim],
+                b_size,
+                &mut self.q_batch[0..b_size * q_dim],
+            );
+            if let Some(ref bias) = layer.attn_q_bias {
+                let b_bytes = Self::tensor_slice(gguf, bias);
+                let b_f32 = unsafe {
+                    std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, q_dim)
+                };
+                batched_add_bias(&mut self.q_batch[0..b_size * q_dim], b_f32, b_size, q_dim);
+            }
+
+            let k_bytes = Self::tensor_slice(gguf, &layer.attn_k);
+            matmat(
+                k_bytes,
+                layer.attn_k.tensor_type,
+                kv_dim,
+                dim,
+                &self.x_norm_batch[0..b_size * dim],
+                b_size,
+                &mut self.k_batch[0..b_size * kv_dim],
+            );
+            if let Some(ref bias) = layer.attn_k_bias {
+                let b_bytes = Self::tensor_slice(gguf, bias);
+                let b_f32 = unsafe {
+                    std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, kv_dim)
+                };
+                batched_add_bias(&mut self.k_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
+            }
+
+            let v_bytes = Self::tensor_slice(gguf, &layer.attn_v);
+            matmat(
+                v_bytes,
+                layer.attn_v.tensor_type,
+                kv_dim,
+                dim,
+                &self.x_norm_batch[0..b_size * dim],
+                b_size,
+                &mut self.v_batch[0..b_size * kv_dim],
+            );
+            if let Some(ref bias) = layer.attn_v_bias {
+                let b_bytes = Self::tensor_slice(gguf, bias);
+                let b_f32 = unsafe {
+                    std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, kv_dim)
+                };
+                batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
+            }
+
+            // ── Per-token QK-Norm ───────────────────────────────────
+            if let Some(ref q_norm) = layer.attn_q_norm {
+                let q_norm_bytes = Self::tensor_slice(gguf, q_norm);
+                let q_norm_w = unsafe {
+                    std::slice::from_raw_parts(q_norm_bytes.as_ptr() as *const f32, head_dim)
+                };
+                batched_rmsnorm_in_place(
+                    &mut self.q_batch[0..b_size * q_dim],
+                    q_norm_w,
+                    b_size * n_heads,
+                    head_dim,
+                    norm_eps,
+                );
+            }
+            if let Some(ref k_norm) = layer.attn_k_norm {
+                let k_norm_bytes = Self::tensor_slice(gguf, k_norm);
+                let k_norm_w = unsafe {
+                    std::slice::from_raw_parts(k_norm_bytes.as_ptr() as *const f32, head_dim)
+                };
+                batched_rmsnorm_in_place(
+                    &mut self.k_batch[0..b_size * kv_dim],
+                    k_norm_w,
+                    b_size * n_kv_heads,
+                    head_dim,
+                    norm_eps,
+                );
+            }
+
+            // ── Tree RoPE for each candidate position ───────────────
+            let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
+            tree_rope(
+                &mut self.q_batch[0..b_size * q_dim],
+                &mut self.k_batch[0..b_size * kv_dim],
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope_freq_base,
+                rope_mode,
+            );
+
+            // ── Save candidate keys and values to tree_k_layers & tree_v_layers ───
+            for b in 0..b_size {
+                let base = (layer_idx * self.tree_max_nodes + b) * kv_dim;
+                self.tree_k_layers[base..base + kv_dim]
+                    .copy_from_slice(&self.k_batch[b * kv_dim..(b + 1) * kv_dim]);
+                self.tree_v_layers[base..base + kv_dim]
+                    .copy_from_slice(&self.v_batch[b * kv_dim..(b + 1) * kv_dim]);
+            }
+
+            // ── Node 0 is the root token: commit its K and V to persistent KV cache directly ───
+            let cache_pos = start_pos % max_seq_len;
+            for kv_h in 0..n_kv_heads {
+                let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+                let k_src = &self.k_batch[kv_h * head_dim..(kv_h + 1) * head_dim];
+                let v_src = &self.v_batch[kv_h * head_dim..(kv_h + 1) * head_dim];
+                self.k_cache[slot..slot + head_dim].copy_from_slice(k_src);
+                self.v_cache[slot..slot + head_dim].copy_from_slice(v_src);
+            }
+
+            // ── 2D Block-Causal Tree Self-Attention ─────────────────
+            let sliding_window = self.layer_sliding_window(layer_idx);
+            tree_attention(
+                &self.q_batch[0..b_size * q_dim],
+                &self.k_batch[0..b_size * kv_dim],
+                &self.v_batch[0..b_size * kv_dim],
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.head_out_batch[0..b_size * q_dim],
+                ancestry_mask,
+                b_size,
+                start_pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                sliding_window,
+                self.sink_tokens,
+            );
+
+            // ── Attention Output Projection via matmat ───────────────
+            let attn_out_bytes = Self::tensor_slice(gguf, &layer.attn_output);
+            matmat(
+                attn_out_bytes,
+                layer.attn_output.tensor_type,
+                dim,
+                q_dim,
+                &self.head_out_batch[0..b_size * q_dim],
+                b_size,
+                &mut self.attn_out_batch[0..b_size * dim],
+            );
+
+            // ── Residual Connection 1 ───────────────────────────────
+            batched_mad(
+                &mut self.x_batch[0..b_size * dim],
+                &self.attn_out_batch[0..b_size * dim],
+                1.0,
+                b_size,
+                dim,
+            );
+
+            // ── FFN Norm for tree batch ─────────────────────────────
+            let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
+            let ffn_norm_weights = unsafe {
+                std::slice::from_raw_parts(ffn_norm_bytes.as_ptr() as *const f32, dim)
+            };
+            batched_rmsnorm(
+                &mut self.x_norm_batch[0..b_size * dim],
+                &self.x_batch[0..b_size * dim],
+                ffn_norm_weights,
+                b_size,
+                dim,
+                norm_eps,
+            );
+
+            // ── Batched SwiGLU FFN via matmat ───────────────────────
+            let gate_bytes = Self::tensor_slice(gguf, &layer.ffn_gate);
+            matmat(
+                gate_bytes,
+                layer.ffn_gate.tensor_type,
+                hidden_dim,
+                dim,
+                &self.x_norm_batch[0..b_size * dim],
+                b_size,
+                &mut self.ffn_gate_batch[0..b_size * hidden_dim],
+            );
+
+            let up_bytes = Self::tensor_slice(gguf, &layer.ffn_up);
+            matmat(
+                up_bytes,
+                layer.ffn_up.tensor_type,
+                hidden_dim,
+                dim,
+                &self.x_norm_batch[0..b_size * dim],
+                b_size,
+                &mut self.ffn_up_batch[0..b_size * hidden_dim],
+            );
+
+            batched_swiglu(
+                &mut self.ffn_gate_batch[0..b_size * hidden_dim],
+                &self.ffn_up_batch[0..b_size * hidden_dim],
+                b_size,
+                hidden_dim,
+            );
+
+            let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
+            matmat(
+                down_bytes,
+                layer.ffn_down.tensor_type,
+                dim,
+                hidden_dim,
+                &self.ffn_gate_batch[0..b_size * hidden_dim],
+                b_size,
+                &mut self.ffn_out_batch[0..b_size * dim],
+            );
+
+            // ── Residual Connection 2 ───────────────────────────────
+            batched_mad(
+                &mut self.x_batch[0..b_size * dim],
+                &self.ffn_out_batch[0..b_size * dim],
+                1.0,
+                b_size,
+                dim,
+            );
+        }
+
+        // ── Output Norm for all tree nodes ──────────────────────────
+        let norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
+        let norm_w = unsafe {
+            std::slice::from_raw_parts(norm_bytes.as_ptr() as *const f32, dim)
+        };
+        for b in 0..b_size {
+            let x_b = &self.x_batch[b * dim..(b + 1) * dim];
+            let x_norm_b = &mut self.x_norm_batch[b * dim..(b + 1) * dim];
+            rmsnorm(x_norm_b, x_b, norm_w, norm_eps);
+        }
+
+        // ── Compute LM head ONLY for token 0 (the root token) ───────
+        let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        matvec(
+            out_bytes,
+            self.output.tensor_type,
+            vocab_size,
+            dim,
+            &self.x_norm_batch[0..dim],
+            &mut out_logits[0..vocab_size],
+        );
+        self.logits.copy_from_slice(&out_logits[0..vocab_size]);
+    }
+
+    /// Commit accepted candidate nodes from `tree_k_layers` and `tree_v_layers`
+    /// into the persistent KV cache starting at `start_pos + 1`.
+    pub fn commit_speculative_candidates(&mut self, accepted_batch_indices: &[usize], start_pos: usize) {
+        let n_layers = self.config.n_layers;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let max_seq_len = self.config.max_seq_len;
+        let kv_dim = self.kv_dim;
+
+        for (offset, &batch_idx) in accepted_batch_indices.iter().enumerate() {
+            let dest_pos = (start_pos + 1 + offset) % max_seq_len;
+            for l in 0..n_layers {
+                let base = (l * self.tree_max_nodes + batch_idx) * kv_dim;
+                let k_cand = &self.tree_k_layers[base..base + kv_dim];
+                let v_cand = &self.tree_v_layers[base..base + kv_dim];
+
+                for kv_h in 0..n_kv_heads {
+                    let slot = (l * n_kv_heads + kv_h) * max_seq_len * head_dim + dest_pos * head_dim;
+                    self.k_cache[slot..slot + head_dim]
+                        .copy_from_slice(&k_cand[kv_h * head_dim..(kv_h + 1) * head_dim]);
+                    self.v_cache[slot..slot + head_dim]
+                        .copy_from_slice(&v_cand[kv_h * head_dim..(kv_h + 1) * head_dim]);
+                }
+            }
+        }
+    }
+
     /// Prefill a token: updates KV cache for the token without computing logits.
     pub fn forward_prefill(&mut self, token_id: u32, pos: usize) {
         self.forward_impl(token_id, pos, false);
@@ -1221,25 +1568,22 @@ impl TransformerModel {
             }
 
             // ── QK-Norm (per-head RMSNorm for Qwen 2.5 / 3) ──
+            // One batched call per tensor instead of per-head FFI rounds:
+            // at 128-wide heads and 24 heads per layer these were ~670
+            // near-empty C calls per decode token.
             if let Some(ref q_norm) = layer.attn_q_norm {
                 let q_norm_bytes = Self::tensor_slice(gguf, q_norm);
                 let q_norm_w = unsafe {
                     std::slice::from_raw_parts(q_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                for h in 0..n_heads {
-                    let head_slice = &mut self.q[h * head_dim..(h + 1) * head_dim];
-                    rmsnorm_in_place(head_slice, q_norm_w, norm_eps);
-                }
+                batched_rmsnorm_in_place(&mut self.q, q_norm_w, n_heads, head_dim, norm_eps);
             }
             if let Some(ref k_norm) = layer.attn_k_norm {
                 let k_norm_bytes = Self::tensor_slice(gguf, k_norm);
                 let k_norm_w = unsafe {
                     std::slice::from_raw_parts(k_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                for kv_h in 0..n_kv_heads {
-                    let head_slice = &mut self.k[kv_h * head_dim..(kv_h + 1) * head_dim];
-                    rmsnorm_in_place(head_slice, k_norm_w, norm_eps);
-                }
+                batched_rmsnorm_in_place(&mut self.k, k_norm_w, n_kv_heads, head_dim, norm_eps);
             }
 
             // ── RoPE (Rotary Position Embeddings) ───────────

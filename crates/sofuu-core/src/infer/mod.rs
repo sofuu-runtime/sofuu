@@ -281,6 +281,33 @@ impl InferModel {
         }
     }
 
+    pub fn forward_speculative_tree(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        ancestry_mask: &[u8],
+        start_pos: usize,
+        out_logits: &mut [f32],
+    ) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => {
+                m.forward_speculative_tree(tokens, positions, ancestry_mask, start_pos, out_logits);
+            }
+            _ => {
+                let vocab_size = self.config.vocab_size;
+                let l = self.forward(tokens[0], start_pos);
+                out_logits[..vocab_size].copy_from_slice(l);
+            }
+        }
+    }
+
+    pub fn commit_speculative_candidates(&mut self, accepted_batch_indices: &[usize], start_pos: usize) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.commit_speculative_candidates(accepted_batch_indices, start_pos),
+            _ => {}
+        }
+    }
+
     pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_embed(token, out_hidden),
@@ -739,7 +766,11 @@ impl InferEngine {
         let mut full_generated = String::new();
         let eos_id = self.tokenizer.eos_token_id;
 
-        let mut ngram_cache = if options.lookahead {
+        // Lookahead's speculative batches (2-3 rows) cost a single weight
+        // stream only on the Gguf backend's batched tile path; every other
+        // backend falls back to a serial per-token speculative loop that
+        // multiplies weight streams, so the flag is ignored there.
+        let mut ngram_cache = if options.lookahead && matches!(self.model.backend, ModelBackend::Gguf(_)) {
             let mut cache = lookahead::NgramCache::new(2048);
             cache.ingest_sequence(&input_tokens);
             Some(cache)
@@ -753,6 +784,12 @@ impl InferEngine {
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
 
         while step < options.max_tokens {
+            // Per-token profile scope (SOFUU_PROFILE): dropped at every
+            // break path; report() prints every 32 steps with fresh buckets.
+            let _tok_prof = quant::prof::TokenScope::new();
+            if quant::prof::enabled() && step % 32 == 0 {
+                quant::prof::report();
+            }
             let next_token = cur_token;
             step += 1;
 
@@ -810,10 +847,15 @@ impl InferEngine {
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
 
-            // Propose speculative candidate continuation from n-gram cache
-            let speculative_cand = if let Some(ref cache) = ngram_cache {
-                if cur_pos + 2 < max_seq_len && step < options.max_tokens {
-                    cache.propose(&history, 1).first().copied()
+            // Propose multi-path speculative candidate tree from n-gram cache
+            let speculative_tree = if let Some(ref cache) = ngram_cache {
+                if cur_pos + 6 < max_seq_len && step < options.max_tokens {
+                    let tree = lookahead::CandidateTree::build(cache, &history, 5, 3);
+                    if !tree.is_empty() {
+                        Some(tree)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -821,43 +863,73 @@ impl InferEngine {
                 None
             };
 
-            if let Some(cand) = speculative_cand {
-                // TRUE BATCHED TREE EVALUATION:
-                // Evaluates [next_token, cand] in parallel in a single forward pass!
+            if let Some(tree) = speculative_tree {
+                // MULTI-PATH LOOKAHEAD TREE SPECULATION:
+                // Evaluates [next_token, tree.tokens()...] in parallel in a single forward pass!
                 // Model weights are read from DRAM ONLY ONCE.
-                let batch = [next_token, cand];
-                self.model.forward_speculative_batch(&batch, cur_pos, &mut spec_logits_buf);
+                let mut batch_tokens = Vec::with_capacity(1 + tree.size());
+                batch_tokens.push(next_token);
+                batch_tokens.extend(tree.tokens());
 
-                // 1. Verify next_token's prediction
-                logits_buf.copy_from_slice(&spec_logits_buf);
-                let predicted = sampler.sample(&mut logits_buf, &history);
+                let positions = tree.build_positions(cur_pos);
+                let ancestry_mask = tree.build_full_batch_ancestry_mask();
 
-                if predicted == cand {
-                    // SPECULATIVE HIT! Accept bonus candidate token immediately.
-                    cur_pos += 1;
+                self.model.forward_speculative_tree(
+                    &batch_tokens,
+                    &positions,
+                    &ancestry_mask,
+                    cur_pos,
+                    &mut spec_logits_buf,
+                );
+
+                // Sample prediction for root token (item 0 in batch)
+                logits_buf.copy_from_slice(&spec_logits_buf[0..vocab_size]);
+                let root_predicted = sampler.sample(&mut logits_buf, &history);
+
+                // Greedily traverse the tree along matching branches with lazy LM head projection
+                let (accepted_tokens, accepted_batch_indices, next_sampled) = tree.verify_path(
+                    root_predicted,
+                    |batch_idx| {
+                        self.model.forward_speculative_head_item(batch_idx, &mut spec_logits_buf);
+                        sampler.sample(&mut spec_logits_buf[0..vocab_size], &history)
+                    },
+                );
+
+                // Commit accepted candidate KV vectors to persistent KV cache
+                if !accepted_batch_indices.is_empty() {
+                    self.model.commit_speculative_candidates(&accepted_batch_indices, cur_pos);
+                }
+
+                // Advance cur_pos by 1 (root) + accepted candidate count
+                cur_pos += 1 + accepted_batch_indices.len();
+
+                // Process bonus speculative accepted candidate tokens
+                let mut early_stopped = false;
+                for &acc_tok in accepted_tokens.iter().take(accepted_batch_indices.len()) {
                     step += 1;
-
                     if let Some(ref mut cache) = ngram_cache {
-                        cache.record_token(cand);
+                        cache.record_token(acc_tok);
                     }
 
                     if let Some(eos) = eos_id {
-                        if cand == eos {
+                        if acc_tok == eos {
+                            early_stopped = true;
                             break;
                         }
                     }
 
-                    if let Some(raw_tok) = self.tokenizer.decode_token(cand) {
+                    if let Some(raw_tok) = self.tokenizer.decode_token(acc_tok) {
                         let is_stop = raw_tok == "<|im_end|>"
                             || raw_tok == "<|endoftext|>"
                             || raw_tok == "<|eot_id|>"
                             || options.stop_tokens.iter().any(|s| s == raw_tok);
                         if is_stop {
+                            early_stopped = true;
                             break;
                         }
                     }
 
-                    let cand_piece = self.tokenizer.decode_piece(cand);
+                    let cand_piece = self.tokenizer.decode_piece(acc_tok);
                     if !cand_piece.is_empty() {
                         let mut should_stop = false;
                         for stop in &options.stop_tokens {
@@ -867,28 +939,29 @@ impl InferEngine {
                             }
                         }
                         if should_stop {
+                            early_stopped = true;
                             break;
                         }
 
                         full_generated.push_str(&cand_piece);
                         if !on_token(&cand_piece) {
+                            early_stopped = true;
                             break;
                         }
                     }
 
-                    history.push(cand);
-
-                    // Candidate was valid in slot cur_pos.
-                    // Compute LM head for cand from already-normalized activations!
-                    self.model.forward_speculative_head_item(1, &mut logits_buf);
-                    cur_token = sampler.sample(&mut logits_buf, &history);
-                    cur_pos += 1;
-                } else {
-                    // Speculative miss: cand rejected.
-                    // next_token is accepted in slot cur_pos.
-                    cur_token = predicted;
-                    cur_pos += 1;
+                    history.push(acc_tok);
+                    if step >= options.max_tokens {
+                        early_stopped = true;
+                        break;
+                    }
                 }
+
+                if early_stopped {
+                    break;
+                }
+
+                cur_token = next_sampled;
             } else {
                 // Standard baseline forward pass (1 token)
                 let next_logits = self.model.forward(next_token, cur_pos);

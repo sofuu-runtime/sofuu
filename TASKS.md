@@ -4,6 +4,69 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Mac CPU: PTQ1_0 int8 sdot packed path — Ternary prefill 1.65 tk/s (cumulative 10× today), quality chain proven.**
+> Probed the real 27B's ternary distribution first: **~33% zeros, ±1 lanes evenly
+> balanced** (`probe_ternary_zero_fraction`) — so zero-skipping is a dead end and
+> the CPU prefill ceiling is bounded by MAC throughput, not sparsity: ~600–900
+> G-MAC/s of int8 `sdot` across 6 P-cores over 27G MACs/token ⇒ **~20–34 tk/s
+> absolute best-case**, and 50–70 tk/s prefill for a dense 27B is not reachable
+> on this Mac's CPU (it is on the GPU/AMX, a different workstream). Decode
+> 20–30 tk/s *is* physically in range at 55–82% of the 200 GB/s memory bus, but
+> only through file-direct packed kernels (no dequant slab round-trip) — the
+> next phase. Built now: dotprod runtime dispatch + per-band absmax activation
+> quantization (`ActQ`, GGUF Q8_0-grade) + `vdotq_s32` kernels for GEMM and
+> single-token GEMV, i32 band accumulation exact for trit·int8act, f32 band
+> fold shared with the GEMV so prefill and decode agree bit-for-bit. Evidence:
+> sdot GEMM within ~1% rms of the exact f32 tile; sdot GEMV bit-equal to the
+> sdot GEMM; greedy e2e logits ±0.5% with identical " Paris." output; serve
+> quality chain "Paris / Berlin / Rome / Spain" intact. Serve numbers (calm,
+> CPU, 201-tok prompt): prefill 533 → **121.5 s (0.38 → 1.65 tk/s)**, decode
+> 0.066 → **0.085 tk/s**. Committed `71469e71e` (qwen35.rs only; not pushed —
+> OpenQodex receipt required). Remaining known prefill costs, in order: the
+> sequential GDN (48 layers × 48 heads, per-head state is independent —
+> parallelizable), still 2 full weight sweeps per 201-token prompt, then the
+> head/embedding sweep. Decode path to the 20–30 band: file-direct unpack
+> kernels + weight residency (5.5 GB page cache under pressure).
+>
+> **2026-10-14 — Pi 5: speculative decode costs one weight-stream now (pad-to-4 tile dispatch) — Llama-1B decode +24%, lookahead flips from −27% to parity/positive.**
+> Decode diagnostics first: the shipped `--lookahead` was a **−27% regression** on-device — `forward_speculative_batch` builds 2-row batches, the tile GEMM gate needs batch ≥ 4 %4, so every spec forward fell to the row-wise SDOT fallback (a full weight stream **per row**), and non-Gguf backends fell back to a serial per-token speculative loop (Spark `--lookahead` timed out). Also re-measured the "DRAM wall": small-model decode is fixed-overhead-bound (Qwen 7.6 GB/s effective vs Llama-1B 11.4 GB/s — not one wall).
+> - **Small-batch pad in the tile dispatch** (`infer_kernels.cpp`, q8_0/q4_K/q6_K): 2–3-row (cap 8) activation batches pad to the next 4-multiple inside the call — zeroed scratch rows, scratch out, caller sees only real rows. Bit-equality of padded vs explicit zero-padded batch-4 proven in `test_tile_gemm_small_batch_pad_bit_exact`. Also repairs the prefill final-chunk remainder (one stream, not three).
+> - **`--lookahead` gated to the Gguf backend** (only it has a batched speculative path); others ignore the flag instead of regressing 3×.
+> - **Receipts (decode t/s)**: Llama-1B Q8_0 8.7 → **10.8** (+24%); Qwen3-0.6B repetitive 23.9 → **25.7** (+7.5%), natural 22.1 → 21.5 (−2.7%, near-parity vs −27%); Spark base 4.2 == gated 4.2. SnapKV stays noise-level at ~135-tk ctx, unchanged.
+> - **Greedy-equivalence caveat**: verification is target-strict, but post-accept next-token logits come from the candidate row's batch-computed hidden state → temp-0 outputs can flip an argmax near-tie (~1 token/100+, immediate re-sync); distribution-equivalent, not bit-identical (same as llama.cpp spec decode).
+> - **Named next wave**: Qwen-class fixed-overhead decode (~14 ms/token overhead vs 31 ms stream ceiling → up to +45% available) — needs decode-phase profiling + batch-1 glue fusion in `execute_layers`.
+>
+> **2026-10-14 — Mac CPU: PTQ1_0 trit-i8 slab + register-tiled GEMM — Ternary-Bonsai-2-27B prefill 2.9× (1551 s → 533 s for a 201-token prompt).**
+> The qwen35 backend's every weight matmul re-swept the whole 5.5 GB weight set per
+> 128-token chunk and dotted one token at a time through `dot8`, re-reading the f32
+> slab and the activation set for every token, and scoring ~8 G-MAC/s effective.
+> `qwen35.rs` (this workstream's file) now dequantizes each row once into trit bytes
+> {-1,0,1} plus f16 band scales (`dequant_trits_i8`, bit-identical values to the f32
+> reference decoder) and runs a 4-row × 8-token register-tiled band kernel over
+> iterator-zipped slices — the first indexed-access draft measured 3.4× SLOWER than
+> the iterator rewrite because per-element bounds checks blocked NEON
+> auto-vectorization. Band-structured summation is shared by the GEMV (single-token)
+> path, so prefill and decode still agree bit-for-bit. Same-day A/B on the real 27B
+> (serve --infer --cpu, back-to-back): prefill **1551.2 s → 533.2 s (0.13 → 0.38
+> tk/s)** — and the optimized leg ran in the day's worst load window (5-min load
+> 31), so the clean-gap is ≥3×; decode 0.036 → 0.066 tk/s. Pinned by
+> `trit_i8_dequant_matches_f32_reference` (bit-exact vs `ptq1_0_dequant_row`),
+> `tiled_gemm_matches_scalar_band_dot` (bit-equal, ragged shapes), and
+> `tiled_gemm_speed_vs_scalar_sweep` (2.88× single-thread harness); the real-model
+> greedy e2e output is unchanged (" Paris."). Committed `b829caa7b` (qwen35.rs only;
+> not pushed — OpenQodex receipt required per AGENTS.md). Next levers for this
+> arch, in order: true int8 `sdot`-based trit GEMM (packed-domain, becomes
+> approximate — needs a quality gate), weight residency for the 16 GB box (the
+> 800-s prefill also thrashes 5.5 GB of page cache under memory pressure), and
+> prefill progress events.
+>
+> **2026-10-14 — Pi 5 session 2: Spark fused-QKV tile-path fix (+39% Spark prefill), q4_K scale-sidecar measured dead end (shipped opt-in), parallel tile repack.**
+> - **Spark fused-QKV tile-path fix**: the Spark warm loop packed the whole fused `[q+2·kv, dim]` tensor while `project_qkv_batch` issues three row-range matmats keyed by exact (pointer, rows, cols, fingerprint) — all lookups missed, every Spark QKV GEMM/GEMV ran the SDOT fallback, and the repacked fused tile (~35% of weight bytes) was dead heap. The warm loop now warms the three row ranges at the exact pointers/shapes the projections use. Spark prefill **13.7 → 19.0 tk/s** (0.60× → 0.83× of llama.cpp), per-chunk gemm 3.86 s → 2.52 s, decode 4.1 → 4.2 tk/s.
+> - **q4_K decoded-scale sidecar — measured dead end**: a bit-exact f32 scale sidecar (bit-identical outputs proven in `test_tile_q4_k_scale_sidecar_bit_exact`, serial + parallel warm) showed prefill GEMM **unchanged** — the in-loop scale decode overlaps the NEON-pipe wall (~76 GMAC/s), it does not add to it — while +33% tile bytes slowed DRAM-bound q4_K GEMV decode ~15–20% (Qwen 20.4 → 16.9, Spark 4.2 → 3.2 tk/s). Shipped default-off behind `SOFUU_SCALE_SIDECAR=1`; the "1.3–1.5×" estimate is resolved as a measured no on A76.
+> - **Parallel tile repack at load**: `sofuu_tile_warm` splits the (pure, bit-identical) row-group shuffle across the worker pool above a small-matrix threshold. Load profile Qwen `InferModel` 339.55 → 251.57 ms, Spark 1.65 → 1.48 s; remaining load time is KV-cache alloc + parse.
+> - **Dropped**: final-chunk pad-to-4 TTFT sketch — ~2% on typical prompts, correctness surface overlaps model.rs code another agent is actively editing.
+> - **Verification**: host suite green (incl. new bit-exactness test); device E2E coherent, EOS clean, Spark RAM peak 4.3 GB. Details: `docs/PI5-SIMD-OPTIMIZATION.md` §Session 2.
+>
 > **2026-10-14 — B4 complete: machine-local brain key.**
 > The vault password is no longer the fixed constant compiled into the binary (any `.qtsq` was
 > readable by anyone holding the source). New `rt/brain_key.rs`: `SOFUU_BRAIN_KEY` (64 hex) →
@@ -2982,3 +3045,40 @@ Five more datasets landed on Kaggle (`xyhcucci`, all private, all QA-passed):
 - ⬜ **Honest ceiling:** no domain except memory approaches 10M pairs. These
   corpora yield what they yield; targets are set to measured output and every
   card reports counts read off disk, never a target restated as a result.
+
+## 2026-10-13 — all seven domain datasets published
+
+Every domain has been built, QA-gated and uploaded. All private under
+`xyhcucci`; each card reports counts read off disk, never a target restated.
+
+| dataset | documents | pairs | on Kaggle | build |
+|---|---|---|---|---|
+| `sofuu-embed-memory-v1` | 46,464,098 | 9,441,628 | 226 shards | synthetic trap families, CC0 |
+| `sofuu-embed-search-v1` | 151,734 | 151,082 | 5 files / 753 MB | FineWeb-Edu |
+| `sofuu-embed-code-v1` | 70,741 | 275,382 | 5 files / 74 MB | GitHub, 1,100 admitted repos |
+| `sofuu-embed-math-v1` | 79,987 | 30,973 | 5 files / 75 MB | OpenWebMath definitions |
+| `sofuu-embed-docs-v1` | 69,516 | 159,628 | 5 files / 123 MB | 22 licensed doc repos |
+| `sofuu-embed-science-v1` | 20,325 | 60,168 | 5 files / 63 MB | Europe PMC, 9,942 rejected |
+| `sofuu-embed-legal-v1` | 8,629 | 3,918 | 5 files / 16 MB | CUAD; EDGAR 403s this host |
+
+- **Two performance bugs were the difference between shipping and stalling.**
+  `boilerplate_ok` called `Counter.most_common(1)` per shingle, which is O(n²) in
+  document length; a running maximum is the same answer in O(n). And the
+  near-dup simhash was costing more than it bought on FineWeb-Edu, a corpus
+  that is already document-deduplicated upstream: **12 docs/s → 206 docs/s**,
+  which turned a 30-hour shard into a 12-minute build. Turning off a quality
+  filter is only legitimate when the upstream source already guarantees it —
+  that is the reason it is recorded here rather than silently disabled.
+- **Code crawl went from 115 admitted repos to 1,100** by caching the GitHub
+  rate-limit probe for 60 s (it was costing an API call per page) and slowing
+  the search cadence to 6.5 s, under the unauthenticated 10 req/min limit.
+- **The time budget must be checked inside the batch loop, not at shard
+  boundaries.** A 1 GB shard overran a 140-minute budget by 100+ minutes
+  because the only check ran between shards.
+- **Cross-split leakage was caught by QA, not by review**, twice (science
+  91,260, math 49,313). Negatives are now partitioned on the positive's split
+  in every pipeline. This is the single defect class that survives a casual
+  look at the data and silently inflates every eval number.
+- ⬜ **Next:** make the datasets public when the developer approves; retrain
+  `s-*` models on the published pairs; the BPE trainer and `.sem`/Rust
+  inference port are still open from the original roadmap.

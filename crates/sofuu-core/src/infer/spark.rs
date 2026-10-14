@@ -301,24 +301,37 @@ impl Spark25Model {
         let kv_cache_size = n_layers * final_seq_len * kv_dim;
 
         // Warm packed-tile GEMM cache (Spark matrices are q4_K/q6_K/q8_0).
-        for (tv, rows_hint, cols_hint) in std::iter::once((&token_embd, head_dim, dim)).chain(
-            layers
-                .iter()
-                .flat_map(|l| {
-                    [
-                        (&l.attn_qkv, q_dim + 2 * kv_dim, dim),
-                        (&l.attn_gate, n_heads, dim),
-                        (&l.attn_output, dim, q_dim),
-                        (&l.ffn_gate, hidden_dim, dim),
-                        (&l.ffn_up, hidden_dim, dim),
-                        (&l.ffn_down, dim, hidden_dim),
-                    ]
-                })
-                .map(|(tv, r, c)| (tv, r, c)),
-        ) {
-            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K) && tv.shape.len() == 2 {
-                if let Some(slice) = gguf.mmap.slice(gguf.data_offset + tv.offset, 64) {
-                    super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
+        // token_embd doubles as the tied LM head and is GEMV'd at its full
+        // tensor shape.
+        if matches!(token_embd.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K)
+            && token_embd.shape.len() == 2
+        {
+            if let Some(slice) = gguf.mmap.slice(gguf.data_offset + token_embd.offset, 64) {
+                super::quant::tile_warm(slice.as_ptr(), token_embd.shape[1], token_embd.shape[0], token_embd.tensor_type);
+            }
+        }
+        for l in &layers {
+            for tv in [&l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down] {
+                if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K) && tv.shape.len() == 2 {
+                    if let Some(slice) = gguf.mmap.slice(gguf.data_offset + tv.offset, 64) {
+                        super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
+                    }
+                }
+            }
+            // project_qkv_batch projects the fused QKV tensor as three
+            // zero-copy row-range matmats, and the tile map keys entries by
+            // exact (pointer, rows, cols, fingerprint) — a whole fused-tensor
+            // entry can never match those lookups. Warm each row range at the
+            // exact pointer and shape projection calls pass.
+            if matches!(l.attn_qkv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K)
+                && l.attn_qkv.shape.len() == 2
+            {
+                let row_stride = super::quant::type_row_size(l.attn_qkv.tensor_type, dim);
+                let base = gguf.data_offset + l.attn_qkv.offset;
+                for (row_off, rows) in [(0usize, q_dim), (q_dim, kv_dim), (q_dim + kv_dim, kv_dim)] {
+                    if let Some(slice) = gguf.mmap.slice(base + row_off * row_stride, 64) {
+                        super::quant::tile_warm(slice.as_ptr(), rows, dim, l.attn_qkv.tensor_type);
+                    }
                 }
             }
         }

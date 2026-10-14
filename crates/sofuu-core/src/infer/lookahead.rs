@@ -238,6 +238,101 @@ impl CandidateTree {
         mask
     }
 
+    /// Construct a full batch 2D block-causal ancestry mask of shape `[M, M]`
+    /// where `M = 1 + nodes.len()`.
+    ///
+    /// Row 0 is the root token (attends only to itself).
+    /// Row `i + 1` is candidate node `i`: attends to root (col 0), itself (col `i + 1`),
+    /// and any node `j` that is an ancestor of `i` in the tree. Sibling branches are 0.
+    pub fn build_full_batch_ancestry_mask(&self) -> Vec<u8> {
+        let m = 1 + self.nodes.len();
+        let mut mask = vec![0u8; m * m];
+        // Root attends only to itself
+        mask[0] = 1;
+        for i in 0..self.nodes.len() {
+            let row = i + 1;
+            // Every candidate in the tree descends from the root token
+            mask[row * m + 0] = 1;
+            // Every node attends to itself
+            mask[row * m + row] = 1;
+            // Attend to in-tree ancestors
+            for j in 0..self.nodes.len() {
+                if self.is_ancestor(j, i) {
+                    mask[row * m + (j + 1)] = 1;
+                }
+            }
+        }
+        mask
+    }
+
+    /// Construct position sequence for the full tree batch:
+    /// Slot 0 is at `start_pos`.
+    /// Candidate slot `i + 1` is at `start_pos + node[i].depth`.
+    pub fn build_positions(&self, start_pos: usize) -> Vec<usize> {
+        let mut positions = Vec::with_capacity(1 + self.nodes.len());
+        positions.push(start_pos);
+        for node in &self.nodes {
+            positions.push(start_pos + node.depth);
+        }
+        positions
+    }
+
+    /// Greedily traverse the tree verifying candidate branches with lazy LM head sampling.
+    ///
+    /// `root_predicted`: token sampled from root node (index 0 in batch).
+    /// `sample_child`: callback `FnMut(batch_idx) -> u32` to lazily sample logits for an accepted node.
+    ///
+    /// Returns:
+    /// - `accepted_tokens`: all accepted tokens in sequence (starts with root_predicted).
+    /// - `accepted_batch_indices`: corresponding batch indices of accepted candidate nodes.
+    /// - `next_token`: final sampled token to decode in the next step.
+    pub fn verify_path<F>(
+        &self,
+        root_predicted: u32,
+        mut sample_child: F,
+    ) -> (Vec<u32>, Vec<usize>, u32)
+    where
+        F: FnMut(usize) -> u32,
+    {
+        let mut accepted_tokens = vec![root_predicted];
+        let mut accepted_batch_indices = Vec::new();
+
+        // 1. Check if root_predicted matches any depth 1 node (parent_idx == None)
+        let mut curr_node_idx = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.parent_idx.is_none() && node.token == root_predicted {
+                curr_node_idx = Some(i);
+                break;
+            }
+        }
+
+        let mut final_token = root_predicted;
+
+        // 2. Greedily descend the tree along the matching branch
+        while let Some(node_idx) = curr_node_idx {
+            let batch_idx = node_idx + 1;
+            accepted_batch_indices.push(batch_idx);
+
+            // Lazily sample LM head logits for this accepted candidate
+            let predicted = sample_child(batch_idx);
+            final_token = predicted;
+
+            // Search for a child of node_idx matching predicted
+            let mut next_child = None;
+            for (i, node) in self.nodes.iter().enumerate() {
+                if node.parent_idx == Some(node_idx) && node.token == predicted {
+                    next_child = Some(i);
+                    accepted_tokens.push(predicted);
+                    break;
+                }
+            }
+
+            curr_node_idx = next_child;
+        }
+
+        (accepted_tokens, accepted_batch_indices, final_token)
+    }
+
     /// Verify tree candidate outputs against model predictions.
     ///
     /// `predicted_tokens`: slice of length `K` where `predicted_tokens[i]` is the token
@@ -373,5 +468,90 @@ mod tests {
         let (accepted_c, indices_c) = tree.verify(999, &[999, 999, 999, 999]);
         assert_eq!(accepted_c, vec![999]);
         assert!(indices_c.is_empty());
+    }
+
+    #[test]
+    fn test_tree_ancestry_mask_and_positions() {
+        let mut tree = CandidateTree::new();
+        // Candidate 0: token 100, depth 1, child of root
+        tree.nodes.push(TreeNode { token: 100, parent_idx: None, depth: 1 });
+        // Candidate 1: token 200, depth 2, child of 0
+        tree.nodes.push(TreeNode { token: 200, parent_idx: Some(0), depth: 2 });
+        // Candidate 2: token 150, depth 1, child of root (sibling of 0)
+        tree.nodes.push(TreeNode { token: 150, parent_idx: None, depth: 1 });
+
+        let m = 1 + tree.nodes.len(); // 4
+        let mask = tree.build_full_batch_ancestry_mask();
+        assert_eq!(mask.len(), 16);
+
+        // Row 0 (root): only attends to itself
+        assert_eq!(mask[0 * m + 0], 1);
+        assert_eq!(mask[0 * m + 1], 0);
+        assert_eq!(mask[0 * m + 2], 0);
+        assert_eq!(mask[0 * m + 3], 0);
+
+        // Row 1 (cand 0): attends to root (col 0) and cand 0 (col 1)
+        assert_eq!(mask[1 * m + 0], 1);
+        assert_eq!(mask[1 * m + 1], 1);
+        assert_eq!(mask[1 * m + 2], 0); // child
+        assert_eq!(mask[1 * m + 3], 0); // sibling
+
+        // Row 2 (cand 1): attends to root (col 0), parent cand 0 (col 1), and cand 1 (col 2)
+        assert_eq!(mask[2 * m + 0], 1);
+        assert_eq!(mask[2 * m + 1], 1);
+        assert_eq!(mask[2 * m + 2], 1);
+        assert_eq!(mask[2 * m + 3], 0); // sibling
+
+        // Row 3 (cand 2): attends to root (col 0) and cand 2 (col 3)
+        assert_eq!(mask[3 * m + 0], 1);
+        assert_eq!(mask[3 * m + 1], 0); // sibling
+        assert_eq!(mask[3 * m + 2], 0); // sibling descendant
+        assert_eq!(mask[3 * m + 3], 1);
+
+        let positions = tree.build_positions(10);
+        assert_eq!(positions, vec![10, 11, 12, 11]);
+    }
+
+    #[test]
+    fn test_verify_path_multi_branch() {
+        let mut tree = CandidateTree::new();
+        // Candidate 0: token 100, depth 1, child of root (batch idx 1)
+        tree.nodes.push(TreeNode { token: 100, parent_idx: None, depth: 1 });
+        // Candidate 1: token 200, depth 2, child of 0 (batch idx 2)
+        tree.nodes.push(TreeNode { token: 200, parent_idx: Some(0), depth: 2 });
+        // Candidate 2: token 150, depth 1, child of root (batch idx 3)
+        tree.nodes.push(TreeNode { token: 150, parent_idx: None, depth: 1 });
+
+        // Case 1: Root predicts 100 -> branch 0 matched. Cand 0 predicts 200 -> Cand 1 matched. Cand 1 predicts 333 (no match)
+        let (tokens, batch_idxs, next_tok) = tree.verify_path(100, |batch_idx| {
+            match batch_idx {
+                1 => 200,
+                2 => 333,
+                _ => 0,
+            }
+        });
+        assert_eq!(tokens, vec![100, 200]);
+        assert_eq!(batch_idxs, vec![1, 2]);
+        assert_eq!(next_tok, 333);
+
+        // Case 2: Root predicts 150 -> alternative branch (Cand 2) matched. Cand 2 predicts 444 (no match)
+        let (tokens_b, batch_idxs_b, next_tok_b) = tree.verify_path(150, |batch_idx| {
+            assert_eq!(batch_idx, 3);
+            444
+        });
+        assert_eq!(tokens_b, vec![150]);
+        assert_eq!(batch_idxs_b, vec![3]);
+        assert_eq!(next_tok_b, 444);
+
+        // Case 3: Root predicts 999 -> no candidate matches
+        let mut called = false;
+        let (tokens_c, batch_idxs_c, next_tok_c) = tree.verify_path(999, |_| {
+            called = true;
+            0
+        });
+        assert_eq!(tokens_c, vec![999]);
+        assert!(batch_idxs_c.is_empty());
+        assert_eq!(next_tok_c, 999);
+        assert!(!called); // Zero lazy LM head evaluations on miss!
     }
 }

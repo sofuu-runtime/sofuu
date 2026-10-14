@@ -180,6 +180,45 @@ void sofuu_batched_attention_ext(
     size_t sink_tokens
 );
 
+/* Speculative Tree Rotary Position Embedding (RoPE):
+ * Rotates Q and K for each candidate node at its specific depth position node_positions[i].
+ * Unlike batched_rope_kv, does not commit to persistent KV cache. */
+void sofuu_tree_rope(
+    float *q_batch,
+    float *k_batch,
+    const size_t *node_positions,
+    size_t tree_size,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    float freq_base,
+    int rope_style
+);
+
+/* 2D Block-Causal Tree Self-Attention:
+ * Evaluates attention across historical KV cache (0 .. start_pos) PLUS in-batch candidate nodes.
+ * ancestry_mask is a [tree_size * tree_size] matrix where ancestry_mask[i * tree_size + j] is 1
+ * if node j is an ancestor of node i or j == i, and 0 otherwise. Non-ancestor sibling branches
+ * are masked to -infinity. */
+void sofuu_tree_attention(
+    const float *q_batch,
+    const float *k_batch,
+    const float *v_batch,
+    const float *k_cache,
+    const float *v_cache,
+    float *head_out_batch,
+    const uint8_t *ancestry_mask,
+    size_t tree_size,
+    size_t start_pos,
+    size_t layer_idx,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    size_t max_seq_len,
+    size_t sliding_window,
+    size_t sink_tokens
+);
+
 #ifdef __cplusplus
 }
 #endif

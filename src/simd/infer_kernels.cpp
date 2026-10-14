@@ -3084,5 +3084,77 @@ void sofuu_tree_attention(
     }
 }
 
+// ── Micro-bench: attribute prefill GEMM cost between the activation-quantize
+// prologue and the tile kernel (Pi 5 diagnostics; SOFUU_BENCH_GEMM env hook).
+// Synthetic bit-pattern weights (throughput is value-independent); the tile
+// warm is excluded from timing.
+extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, int iters) {
+#if defined(__aarch64__)
+    if (batch < 4 || batch % 4 != 0 || iters < 1) return;
+    const bool qk = (type == 12);
+    if (!qk && type != 8) return;
+    const size_t row_size = qk ? (size_t)(cols / 256) * 144 : (size_t)(cols / 32) * 34;
+    std::vector<uint8_t> w((size_t)rows * row_size);
+    std::vector<float> x((size_t)batch * cols);
+    std::vector<float> out((size_t)batch * rows);
+    uint32_t rng = 12345;
+    for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
+    if (sofuu_tile_warm(w.data(), rows, cols, qk ? 12 : 8) != 0) {
+        fprintf(stderr, "[bench] tile warm failed\n");
+        return;
+    }
+    double t_quant = 0, t_kernel = 0;
+    for (int it = 0; it < iters; it++) {
+        auto t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point t1;
+        if (qk) {
+            const size_t nb = cols / 256;
+            tile_block_q8_Kx4 *qa = tile_scratch<tile_block_q8_Kx4>((batch / 4) * nb);
+            for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+                ggml_quantize_mat_q8_K_4x4_generic(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
+            }
+            t1 = std::chrono::steady_clock::now();
+            const uint8_t *sc = nullptr;
+            const uint8_t *tile = sofuu_tile_lookup_sc(w.data(), 12, rows, cols, &sc);
+            g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    const uint8_t *t = tile + g * nb * sizeof(tile_block_q4_Kx8);
+                    if (sc) {
+                        ggml_gemm_q4_K_8x4_q8_K_sc(cols, out.data() + g * 8, rows, t, qa, batch, 8,
+                            sc + g * nb * sizeof(tile_sc_q4_Kx8));
+                    } else {
+                        ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows, t, qa, batch, 8);
+                    }
+                }
+            });
+        } else {
+            const size_t nb = cols / 32;
+            tile_block_q8_0x4 *qa = tile_scratch<tile_block_q8_0x4>((batch / 4) * nb);
+            for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+                ggml_quantize_mat_q8_0_4x4(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
+            }
+            t1 = std::chrono::steady_clock::now();
+            const uint8_t *tile = sofuu_tile_lookup(w.data(), 8, rows, cols);
+            g_pool.parallel_for(0, rows / 4, [&](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemm_q8_0_4x4_q8_0(cols, out.data() + g * 4, rows,
+                        tile + g * nb * sizeof(tile_block_q8_0x4), qa, batch, 4);
+                }
+            });
+        }
+        auto t2 = std::chrono::steady_clock::now();
+        t_quant += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t_kernel += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    }
+    const double macs = (double)batch * rows * cols * iters;
+    fprintf(stderr,
+        "[bench] %s %dx%d batch=%d iters=%d: quant %.1fms (%.2fms/iter) | kernel %.1fms (%.2fms/iter) = %.1f GMAC/s | quant share %.1f%%\n",
+        qk ? "q4_K" : "q8_0", rows, cols, batch, iters,
+        t_quant, t_quant / iters, t_kernel, t_kernel / iters,
+        macs / (t_kernel * 1e6), 100.0 * t_quant / (t_quant + t_kernel));
+#endif
+}
+
 } // extern "C"
 

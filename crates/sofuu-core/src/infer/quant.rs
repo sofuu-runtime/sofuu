@@ -262,6 +262,15 @@ pub fn tile_scale_sidecar_disable(on: bool) {
     }
 }
 
+/// Device GEMM micro-bench (SOFUU_BENCH_GEMM diagnostics): splits the q4_K /
+/// q8_0 tile prefill cost between the activation-quantize prologue and the
+/// kernel, printing GMAC/s to stderr.
+pub fn gemm_bench(ty: u32, rows: usize, cols: usize, batch: usize, iters: usize) {
+    unsafe {
+        sofuu_bench_gemm(ty, rows as i32, cols as i32, batch as i32, iters as i32);
+    }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -392,6 +401,7 @@ extern "C" {
     fn sofuu_get_threads() -> i32;
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
+    fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);

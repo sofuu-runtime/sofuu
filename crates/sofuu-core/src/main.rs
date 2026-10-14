@@ -1488,6 +1488,18 @@ fn main() -> ExitCode {
             }
         }
         "infer" => {
+            if let Ok(spec) = std::env::var("SOFUU_BENCH_GEMM") {
+                let parts: Vec<usize> = spec
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>().unwrap_or(0))
+                    .collect();
+                if parts.len() == 4 && parts.iter().all(|&v| v > 0) {
+                    eprintln!("[bench] SOFUU_BENCH_GEMM rows={} cols={} batch={} iters={}", parts[0], parts[1], parts[2], parts[3]);
+                    sofuu_core::infer::quant::gemm_bench(12, parts[0], parts[1], parts[2], parts[3]);
+                    sofuu_core::infer::quant::gemm_bench(8, parts[0], parts[1], parts[2], parts[3]);
+                    return ExitCode::SUCCESS;
+                }
+            }
             if args.len() < 4 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu infer' requires a model file and a prompt");
                 eprintln!("Usage: sofuu infer <model.gguf> \"<prompt>\" [--max-tokens <n>] [--temp <f>]");

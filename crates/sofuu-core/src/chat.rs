@@ -4083,7 +4083,7 @@ const DRIVER: &str = r#"
           ' \x1b[2m· s' + (r.strength || 0).toFixed(2) + ' · ' + memoryAge(r.age_seconds) + '\x1b[0m' + src);
       out('    ' + clip1(r.text, 140));
     }
-    if (pages > 1) {
+    if (page < pages) {
       out('\x1b[2m  /memory ' + (label ? label + ' ' : '') + '--page ' + (page + 1) + ' for more\x1b[0m');
     }
     out('');

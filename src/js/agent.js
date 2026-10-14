@@ -502,7 +502,14 @@
        * 'hash' (default) | 'semantic' (opt-in 64-dim projector).
        * SOFUU_MEMORY_BACKEND env selects when the def is silent. */
       embedding: (typeof def.embedding === 'string') ? def.embedding : '',
-      memory: (def.memory === 'shared' || def.memory === 'off') ? def.memory : 'agent',
+      /* P2 (audit 2026-10-14): scope matching is case-insensitive — a def
+       * that says 'Shared' used to silently become a PRIVATE agent scope
+       * (the strict === fell through to the 'agent' default). Unknown
+       * values still default to 'agent' (safer than sharing). */
+      memory: (function (ms) {
+        ms = String(ms === undefined || ms === null ? '' : ms).toLowerCase();
+        return (ms === 'shared' || ms === 'off') ? ms : 'agent';
+      })(def.memory),
       brainPath: def.brainPath || '',
       rlm: (def.rlm === 'on' || def.rlm === 'off') ? def.rlm : 'auto',
       /* PLAN-ML-GATES: the context-economy gates (date fix, supervisor

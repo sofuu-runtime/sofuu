@@ -389,7 +389,6 @@ pub unsafe extern "C" fn sofuu_embed_set_log_cb(
 ///     "config_root": "/path",     // replaces $HOME/.sofuu derivations
 ///     "brain_path": "/path.qtsq", // explicit brain file
 ///     "api_keys": {"openai": …},  // provider keys, used ahead of env vars
-///     "qtsq": true,               // QTSQ brain/KV (build-gated)
 ///     "enable_signals": false }   // signal handlers (default off)
 /// Returns NULL on failure.
 /// Android-only observability: route Rust panics (silent worker-thread
@@ -1826,8 +1825,9 @@ pub unsafe extern "C" fn sofuu_embed_batch(
 
 /// Embed image bytes (PNG/JPEG) into `*out` (malloc'd 64 floats, img1-64
 /// space — joint with sem2-64 text geometry). `rt` is reserved and may be
-/// NULL. Errors: -1 invalid arg, -3 model-unavailable (also covers
-/// undecodable bytes: no vector exists for them), -9 nomem.
+/// NULL. Errors: -1 invalid arg, -8 model-unavailable (also covers
+/// undecodable bytes: no vector exists for them; SOFUU_ERR_MODEL_UNAVAIL
+/// per sofuu_embed.h), -9 nomem.
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_embed_image(
     _rt: *mut CapiRuntime,

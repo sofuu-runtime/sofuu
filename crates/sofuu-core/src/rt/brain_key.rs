@@ -61,6 +61,21 @@ fn resolve_password() -> String {
     if let Ok(v) = std::env::var(KEY_ENV) {
         let v = v.trim().to_string();
         if !v.is_empty() {
+            /* The documented format is 64 hex chars (32 bytes). Refusing a
+             * non-conforming value would strand brains already written
+             * under it, so keep it usable — but say it is a typo, since
+             * one wrong character quietly becomes a different brain set
+             * on the next run. */
+            let is_hex64 = v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_hex64 {
+                eprintln!(
+                    "[sofuu/brain] {KEY_ENV} is set but not 64 hex characters \
+                     ({} chars) — using it as given; a typo here is a different \
+                     key, and brains written under it will only reopen with \
+                     the exact same value",
+                    v.len()
+                );
+            }
             return v;
         }
     }

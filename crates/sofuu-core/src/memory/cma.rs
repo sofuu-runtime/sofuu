@@ -556,14 +556,24 @@ impl Cma {
         let ef = (n * 3).max(16);
         let hits = self.index.search(query, ef);
         for (id, _) in hits {
-            let rec = &mut self.records[id as usize];
-            if rec.tier == TIER_FORGOTTEN {
+            if self.records[id as usize].tier == TIER_FORGOTTEN {
                 continue;
             }
-            if rec.kv_page_id > 0 && seen.insert(rec.kv_page_id) {
-                rec.strength = 1.0;
-                rec.half_life = (rec.half_life as f32 * 1.2) as u32;
-                out.push(rec.kv_page_id);
+            let kv = self.records[id as usize].kv_page_id;
+            if kv == 0 {
+                continue;
+            }
+            if seen.insert(kv) {
+                /* The use-refresh must mark the snapshot stale too — a
+                 * flush-less mutation would persist stale strengths when
+                 * nothing else dirtied the record this turn. */
+                {
+                    let rec = &mut self.records[id as usize];
+                    rec.strength = 1.0;
+                    rec.half_life = (rec.half_life as f32 * 1.2) as u32;
+                }
+                self.mark_dirty(id);
+                out.push(kv);
                 if out.len() >= n {
                     break;
                 }
@@ -677,14 +687,29 @@ impl Cma {
                 stats.skipped += 1;
                 continue;
             }
+            /* A card cannot import session state or an unknown tier:
+             * working (0) is a process-local construct by design, and a
+             * hostile tier > 4 would render as garbage in every reader.
+             * Both land episodic. */
+            let their_tier = if their_tier == TIER_WORKING || their_tier > TIER_ENTITY {
+                TIER_EPISODIC
+            } else {
+                their_tier
+            };
             let their_strength = rj
                 .get("strength")
                 .and_then(|s| s.as_f64())
                 .unwrap_or(1.0) as f32;
-            let their_created = rj
+            /* A FUTURE created_at is hostile (saturating_sub in the
+             * recency factor would grant it the maximum freshness boost
+             * forever) — treat it as unknown, the neutral value. */
+            let mut their_created = rj
                 .get("created_at")
                 .and_then(|c| c.as_u64())
                 .unwrap_or(0) as u32;
+            if their_created > now_secs() {
+                their_created = 0;
+            }
 
             /* Dedup: a near-duplicate of an existing live record merges. */
             let dup = if self.records.is_empty() {
@@ -1235,8 +1260,15 @@ impl Cma {
             }
         }
 
-        // Re-assign final + build clusters; dream-summarize each.
-        let mut consolidated = 0usize;
+        // Re-assign final + build clusters; dream-summarize each. NOTE the
+        // order: summarize FIRST (while the originals' texts are still
+        // here), TOMBSTONE the originals, and only then remember the
+        // summaries. The old order (remember, then tombstone) let a
+        // centroid inside DUP_DISTANCE of a weak original hit remember's
+        // dup gate, RE-TIER that original to semantic, and then tombstone
+        // it — losing the facts AND the summary. Remembering after the
+        // tombstones keeps the dup gate off them.
+        let mut summaries: Vec<(usize, String)> = Vec::new();
         for ci in 0..k {
             if counts[ci] == 0 {
                 continue;
@@ -1248,19 +1280,28 @@ impl Cma {
                 }
             }
             let summary = dream_extract(&texts);
+            summaries.push((ci, summary));
+        }
+        for &wid in &weak {
+            self.records[wid as usize].tier = TIER_FORGOTTEN;
+            self.mark_dirty(wid);
+        }
+        let mut consolidated = 0usize;
+        for (ci, summary) in summaries {
+            let before = self.records.len();
             let new_idx = self.remember(&centroids[ci], &summary, "system", 0);
-            if new_idx >= 0 {
+            if new_idx < 0 {
+                continue;
+            }
+            /* Re-tier only a genuinely FRESH insert: a merge into an
+             * existing (alive) record reinforced it — re-tiering that
+             * record here would overwrite whatever it was. */
+            if self.records.len() > before && (new_idx as usize) == before {
                 let rec = &mut self.records[new_idx as usize];
                 rec.tier = TIER_SEMANTIC;
                 rec.half_life = 86400 * 30;
                 consolidated += 1;
             }
-        }
-
-        // Mark originals forgotten.
-        for &wid in &weak {
-            self.records[wid as usize].tier = TIER_FORGOTTEN;
-            self.mark_dirty(wid);
         }
         consolidated
     }
@@ -1662,6 +1703,75 @@ mod tests {
         assert!(n >= 1, "should consolidate at least one cluster");
         // Originals forgotten, semantic added.
         assert!(cma.records.iter().any(|r| r.tier == TIER_SEMANTIC));
+    }
+
+    /// P2 (audit 2026-10-14): a centroid that lands inside DUP_DISTANCE of
+    /// one of its own (weak) members used to hit remember's dup gate —
+    /// the summary re-tiered that member semantic and the tombstone loop
+    /// then erased it: no cluster survives at all. Summaries are now
+    /// written AFTER the originals are tombstoned, so a fresh semantic
+    /// record always exists, and re-tiering only happens on fresh inserts.
+    #[test]
+    fn consolidate_never_retiers_a_member_via_the_dup_gate() {
+        let mut cma = Cma::new(16);
+        // Cluster A: 10 separated-but-tight weak records. Pairwise offsets
+        // are 0.07 apart (above DUP_DISTANCE — they stay distinct records)
+        // while the cluster's CENTROID (mean offset 0.315) sits 0.035 from
+        // its nearest members — inside the gate. Cluster B: same shape,
+        // far away, so k-means keeps the two apart.
+        for i in 0..10 {
+            let mut v = vec![0.0; 16];
+            v[0] = 1.0;
+            v[3] = i as f32 * 0.07;
+            let id = cma.remember(&v, &format!("tight fact {i}"), "user", 0);
+            cma.records[id as usize].strength = 0.1;
+            cma.records[id as usize].age_seconds = 90000;
+        }
+        for i in 0..10 {
+            let mut v = vec![0.0; 16];
+            v[1] = 1.0;
+            v[5] = i as f32 * 0.07;
+            let id = cma.remember(&v, &format!("far fact {i}"), "user", 0);
+            cma.records[id as usize].strength = 0.1;
+            cma.records[id as usize].age_seconds = 90000;
+        }
+        assert_eq!(cma.len(), 20, "the tight pairs must stay distinct records");
+        let n = cma.consolidate();
+        assert!(n >= 1, "should consolidate at least one cluster");
+        // The summaries must exist as REAL semantic records — under the old
+        // ordering every cluster was tombstoned through the dup gate and
+        // this count was 0.
+        assert!(
+            cma.records.iter().any(|r| r.tier == TIER_SEMANTIC && r.text.contains("tight")),
+            "cluster A's summary must survive as semantic, tiers: {:?}",
+            cma.records.iter().map(|r| r.tier).collect::<Vec<_>>()
+        );
+    }
+
+    /// P2 (audit 2026-10-14): an imported card cannot carry session state
+    /// (tier 0) or an unknown tier (> 4) — both land episodic; a FUTURE
+    /// created_at is hostile (it would grant the maximum recency boost
+    /// forever via saturating_sub) and reads as unknown (0).
+    #[test]
+    fn import_clamps_hostile_tier_and_future_created_at() {
+        let mut cma = Cma::new(16);
+        let future = now_secs() + 100_000;
+        let card = serde_json::json!({
+            "records": [
+                {"text": "working-state import", "tier": 0, "created_at": future},
+                {"text": "unknown-tier import", "tier": 9, "created_at": 100}
+            ]
+        })
+        .to_string();
+        let vecs = [unit(1, 16), unit(2, 16)].concat();
+        let stats = cma.import_records(&vecs, 2, 16, &card);
+        assert_eq!(stats.added, 2);
+        let w = cma.records.iter().find(|r| r.text == "working-state import").unwrap();
+        assert_eq!(w.tier, TIER_EPISODIC, "working tier cannot be imported");
+        assert_eq!(w.created_at, 0, "a future timestamp reads as unknown");
+        let b = cma.records.iter().find(|r| r.text == "unknown-tier import").unwrap();
+        assert_eq!(b.tier, TIER_EPISODIC, "tier > 4 clamps to episodic");
+        assert_eq!(b.created_at, 100, "a sane timestamp is kept");
     }
 
     #[test]

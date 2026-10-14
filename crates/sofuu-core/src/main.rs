@@ -1186,8 +1186,14 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
       try {{
         var q = (url.split('?')[1] || '').split('&');
         for (var i = 0; i < q.length; i++) {{
-          var kv = q[i].split('=');
-          if (kv.length === 2) qs[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+          if (!q[i]) continue;
+          /* P2 (audit): split on the FIRST '=' only — a value containing
+           * '=' (base64, predicates) used to be silently dropped — and
+           * '+' means space before percent-decoding. */
+          var eq = q[i].indexOf('=');
+          if (eq < 0) continue;
+          qs[decodeURIComponent(q[i].slice(0, eq))] =
+            decodeURIComponent(q[i].slice(eq + 1).replace(/\+/g, ' '));
         }}
       }} catch (eQ) {{
         /* P1 (audit 2026-10-14): a malformed %sequence used to throw
@@ -1229,8 +1235,11 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
       try {{
         var mq = (url.split('?')[1] || '').split('&');
         for (var mi = 0; mi < mq.length; mi++) {{
-          var mkv = mq[mi].split('=');
-          if (mkv.length === 2) mqs[decodeURIComponent(mkv[0])] = decodeURIComponent(mkv[1]);
+          if (!mq[mi]) continue;
+          var meq = mq[mi].indexOf('=');
+          if (meq < 0) continue;
+          mqs[decodeURIComponent(mq[mi].slice(0, meq))] =
+            decodeURIComponent(mq[mi].slice(meq + 1).replace(/\+/g, ' '));
         }}
       }} catch (eM) {{
         res.writeHead(400, {{ 'Content-Type': 'application/json' }});

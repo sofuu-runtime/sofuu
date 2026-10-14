@@ -99,9 +99,6 @@
   function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
   function emit(ev) {
-    if (typeof console !== 'undefined' && console.log) {
-      try { console.log('DBG emit kind=' + (ev && ev.kind)); } catch (eL) {}
-    }
     if (typeof S.onEvent === 'function') {
       try { S.onEvent(ev); } catch (e) {} /* a dead sink never kills a turn */
     }

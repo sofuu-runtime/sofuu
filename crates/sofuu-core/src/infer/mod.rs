@@ -5,6 +5,7 @@
 
 pub mod block_graph;
 pub mod continuous;
+pub mod dynamic_ffn;
 pub mod gguf;
 pub mod gptx3;
 pub mod qwen35;
@@ -51,6 +52,7 @@ pub struct GenerateOptions {
     pub sink_tokens: usize,
     pub lookahead: bool,
     pub snapkv: bool,
+    pub dynamic_ffn: bool,
 }
 
 impl Default for GenerateOptions {
@@ -72,6 +74,7 @@ impl Default for GenerateOptions {
             sink_tokens: 4,    // 4 sink tokens by default
             lookahead: false,  // Jacobi / Lookahead tree parallel decoding
             snapkv: false,     // SnapKV observation pooling compression
+            dynamic_ffn: false, // Dynamic FFN Sparsity (PowerInfer / DejaVu style)
         }
     }
 }
@@ -184,6 +187,12 @@ impl InferModel {
             ModelBackend::Gptx3(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::Spark(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::Qwen35(m) => m.compact_kv_cache(cur_pos, sink, drop),
+        }
+    }
+
+    pub fn set_dynamic_ffn(&mut self, enabled: bool) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.dynamic_ffn.enabled = enabled;
         }
     }
 
@@ -685,6 +694,10 @@ impl InferEngine {
                 let drop = (middle * 3) / 4;
                 cur_pos = self.model.compact_kv_cache(cur_pos, snap_sink, drop);
             }
+        }
+
+        if options.dynamic_ffn {
+            self.model.set_dynamic_ffn(true);
         }
 
         // 4. Decode Phase

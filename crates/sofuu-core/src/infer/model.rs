@@ -265,6 +265,7 @@ pub struct TransformerModel {
     pub sliding_window: usize,
     pub sink_tokens: usize,
     pub is_gemma2: bool,
+    pub dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig,
 }
 
 impl TransformerModel {
@@ -480,6 +481,7 @@ impl TransformerModel {
             sliding_window: detected_sliding_window,
             sink_tokens: 4,
             is_gemma2,
+            dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig::default(),
         })
     }
 
@@ -894,15 +896,28 @@ impl TransformerModel {
             );
 
             let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
-            matmat(
-                down_bytes,
-                layer.ffn_down.tensor_type,
-                dim,
-                hidden_dim,
-                &self.ffn_gate_batch[0..b_size * hidden_dim],
-                b_size,
-                &mut self.ffn_out_batch[0..b_size * dim],
-            );
+            if self.dynamic_ffn.enabled {
+                for item in 0..b_size {
+                    self.dynamic_ffn.sparse_down_proj(
+                        down_bytes,
+                        layer.ffn_down.tensor_type,
+                        dim,
+                        hidden_dim,
+                        &self.ffn_gate_batch[item * hidden_dim..(item + 1) * hidden_dim],
+                        &mut self.ffn_out_batch[item * dim..(item + 1) * dim],
+                    );
+                }
+            } else {
+                matmat(
+                    down_bytes,
+                    layer.ffn_down.tensor_type,
+                    dim,
+                    hidden_dim,
+                    &self.ffn_gate_batch[0..b_size * hidden_dim],
+                    b_size,
+                    &mut self.ffn_out_batch[0..b_size * dim],
+                );
+            }
 
             // ── Residual Connection 2 ───────────────────────────
             batched_mad(
@@ -1221,14 +1236,25 @@ impl TransformerModel {
             swiglu_in_place(&mut self.ffn_gate_buf, &self.ffn_up_buf);
 
             let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
-            matvec(
-                down_bytes,
-                layer.ffn_down.tensor_type,
-                dim,
-                hidden_dim,
-                &self.ffn_gate_buf,
-                &mut self.ffn_out,
-            );
+            if self.dynamic_ffn.enabled {
+                self.dynamic_ffn.sparse_down_proj(
+                    down_bytes,
+                    layer.ffn_down.tensor_type,
+                    dim,
+                    hidden_dim,
+                    &self.ffn_gate_buf,
+                    &mut self.ffn_out,
+                );
+            } else {
+                matvec(
+                    down_bytes,
+                    layer.ffn_down.tensor_type,
+                    dim,
+                    hidden_dim,
+                    &self.ffn_gate_buf,
+                    &mut self.ffn_out,
+                );
+            }
 
             // ── Residual Connection 2 ───────────────────────
             inline_mad(&mut self.x, &self.ffn_out, 1.0);

@@ -263,6 +263,31 @@ pub fn get_thread_count() -> usize {
     }
 }
 
+#[inline(always)]
+pub fn vec_dot_raw_q4_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32 {
+    unsafe { sofuu_vec_dot_q4_0(weight_bytes, x, n_blocks) }
+}
+
+#[inline(always)]
+pub fn vec_dot_raw_q8_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32 {
+    unsafe { sofuu_vec_dot_q8_0(weight_bytes, x, n_blocks) }
+}
+
+#[inline(always)]
+pub fn vec_dot_raw_q4_k(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32 {
+    unsafe { sofuu_vec_dot_q4_k(weight_bytes, x, n_blocks) }
+}
+
+#[inline(always)]
+pub fn vec_dot_raw_q6_k(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32 {
+    unsafe { sofuu_vec_dot_q6_k(weight_bytes, x, n_blocks) }
+}
+
+#[inline(always)]
+pub fn vec_dot_raw_f32(a: *const f32, b: *const f32, n: usize) -> f32 {
+    unsafe { sofuu_vec_dot_f32(a, b, n) }
+}
+
 extern "C" {
     fn sofuu_set_threads(n: i32);
     fn sofuu_get_threads() -> i32;

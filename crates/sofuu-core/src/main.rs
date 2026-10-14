@@ -1504,6 +1504,7 @@ fn main() -> ExitCode {
             let mut gpu_layers = 999usize;
             let mut lookahead = false;
             let mut snapkv = false;
+            let mut dynamic_ffn = false;
 
             let mut i = 4;
             while i < args.len() {
@@ -1548,6 +1549,9 @@ fn main() -> ExitCode {
                     i += 1;
                 } else if args[i] == "--snapkv" {
                     snapkv = true;
+                    i += 1;
+                } else if args[i] == "--dynamic-ffn" {
+                    dynamic_ffn = true;
                     i += 1;
                 } else {
                     i += 1;
@@ -1600,6 +1604,7 @@ fn main() -> ExitCode {
                     sliding_window,
                     lookahead,
                     snapkv,
+                    dynamic_ffn,
                     ..Default::default()
                 },
                 |tok| {

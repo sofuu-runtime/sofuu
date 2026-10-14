@@ -36,7 +36,7 @@ strip = true
 panic = "abort"
 
 [profile.release.package.sofuu-core]
-opt-level = "s"
+opt-level = "z"
 
 # Debug builds stay fast to compile.
 [profile.dev]

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use super::gguf::{GgufFile, GgufValue};
 use super::model::ModelConfig;
-use super::quant::{bf16_to_f32, ptq1_0_dequant_row};
+use super::quant::{bf16_to_f32, f16_to_f32, ptq1_0_dequant_row};
 
 /// GGML tensor type id for PTQ1_0 (prism ternary, 28 bytes per 128 values).
 const GGML_TYPE_PTQ1_0: u32 = 143;
@@ -305,31 +305,110 @@ fn gdn_perm(dst: &mut [f32], src: &[f32]) {
     }
 }
 
+/// Dequantize a PTQ1_0 row into per-value trits in {-1, 0, +1} plus the
+/// per-128-value f16 block scale. The trit walk is the frozen decoder from
+/// `ptq1_0_dequant_row` (quant.rs) with the final `· d` folded into `scales`,
+/// so the two agree value-for-value: `trits[i] as f32 · scales[i / 128]` equals
+/// the f32-dequant output bit for bit. Storing trits instead of scaled f32
+/// quarters the slab write/read traffic the GEMV/GEMM kernels pay per sweep.
+fn dequant_trits_i8(src: &[u8], trits: &mut [i8], scales: &mut [f32]) {
+    const QS_LEN: usize = (PTQ1_0_BLOCK_VALUES - 4 * PTQ1_0_BLOCK_VALUES / 64) / 5; // 24
+    const QH_LEN: usize = PTQ1_0_BLOCK_VALUES / 64; // 2
+    const BLOCK: usize = QS_LEN + QH_LEN + 2; // qs | qh | f16 scale = 28
+    const STAGES: [usize; 3] = [32, 16, 8];
+    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+
+    let n_blocks = trits.len() / PTQ1_0_BLOCK_VALUES;
+    debug_assert!(src.len() >= n_blocks * BLOCK);
+    debug_assert_eq!(scales.len(), n_blocks);
+
+    for blk in 0..n_blocks {
+        let b_offset = blk * BLOCK;
+        scales[blk] = f16_to_f32(u16::from_le_bytes([
+            src[b_offset + QS_LEN + QH_LEN],
+            src[b_offset + QS_LEN + QH_LEN + 1],
+        ]));
+        let mut o = blk * PTQ1_0_BLOCK_VALUES;
+
+        let mut j = 0;
+        for s in 0..STAGES.len() {
+            let c = STAGES[s];
+            while j + c <= QS_LEN {
+                for n in 0..5usize {
+                    for m in 0..c {
+                        let q = src[b_offset + j + m].wrapping_mul(POW3[n]);
+                        let xi = ((q as u16) * 3) >> 8;
+                        trits[o] = (xi as i16 - 1) as i8;
+                        o += 1;
+                    }
+                }
+                j += c;
+            }
+        }
+        for n in 0..4usize {
+            for h in 0..QH_LEN {
+                let q = src[b_offset + QS_LEN + h].wrapping_mul(POW3[n]);
+                let xi = ((q as u16) * 3) >> 8;
+                trits[o] = (xi as i16 - 1) as i8;
+                o += 1;
+            }
+        }
+        debug_assert_eq!(o, (blk + 1) * PTQ1_0_BLOCK_VALUES);
+    }
+}
+
+/// Dot product of one trit row against one activation vector: per 128-value
+/// band the raw trit·act partial is accumulated and then scaled by that
+/// band's f16 scale — the same value set as `dot8(dequant_row, act)`, only a
+/// different (band-structured) f32 summation order.
+#[inline]
+fn trit_row_dot(trits: &[i8], scales: &[f32], act: &[f32]) -> f32 {
+    let blocks = scales.len();
+    debug_assert_eq!(trits.len(), blocks * PTQ1_0_BLOCK_VALUES);
+    let mut acc = 0.0f32;
+    for c in 0..blocks {
+        let col0 = c * PTQ1_0_BLOCK_VALUES;
+        let mut bacc = 0.0f32;
+        for i in col0..col0 + PTQ1_0_BLOCK_VALUES {
+            bacc += trits[i] as f32 * act[i];
+        }
+        // Same two-op fold as the tile kernel's band step, bit for bit, so
+        // the single-token GEMV and the tiled GEMM agree exactly.
+        bacc *= scales[c];
+        acc += bacc;
+    }
+    acc
+}
+
 /// GEMV against a PTQ1_0 matrix still in the mmap: dequantize each row into
-/// `scratch` (must hold n_in f32) and dot with the prepared activation. Jobs
-/// at or above PAR_MAC_THRESHOLD split the output rows into contiguous
-/// deterministic chunks via `std::thread::scope` (one spawn per chunk); each
-/// thread allocates its own n_in-wide row scratch — the shared `scratch` is
-/// only used by the single-thread path. Every row runs the same
-/// dequantize-then-dot8 sequence as the sequential version, so results are
-/// bit-identical regardless of thread count.
-fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32], scratch: &mut [f32]) {
+/// trit bytes plus band scales (quarter the traffic of an f32 slab) and dot
+/// with the prepared activation via `trit_row_dot`. Jobs at or above
+/// PAR_MAC_THRESHOLD split the output rows into contiguous deterministic
+/// chunks via `std::thread::scope`; each worker allocates its own row
+/// scratch (two small vecs per call, noise next to a multi-second decode
+/// step). Every row runs the same dequantize-then-band-dot sequence, so
+/// results are thread-count independent.
+fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
+    let n_in = m.n_in;
+    let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+    debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
     let n_out = out.len();
-    let threads = if n_out * m.n_in >= PAR_MAC_THRESHOLD {
+    let threads = if n_out * n_in >= PAR_MAC_THRESHOLD {
         thread_budget().min(n_out)
     } else {
         1
     };
     if threads <= 1 {
-        let act = &act[..m.n_in];
+        let mut trits = vec![0i8; n_in];
+        let mut rowd = vec![0.0f32; blocks];
+        let act = &act[..n_in];
         for (r, o) in out.iter_mut().enumerate() {
-            let row = m.row_slice(data, r);
-            ptq1_0_dequant_row(row, &mut scratch[..m.n_in]);
-            *o = dot8(&scratch[..m.n_in], act);
+            dequant_trits_i8(m.row_slice(data, r), &mut trits, &mut rowd);
+            *o = trit_row_dot(&trits, &rowd, act);
         }
         return;
     }
-    let act = &act[..m.n_in];
+    let act = &act[..n_in];
     std::thread::scope(|scope| {
         let mut rest: &mut [f32] = out;
         let mut r0 = 0usize;
@@ -340,10 +419,11 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32], scratch: &mu
             rest = tail;
             let rows = r0;
             scope.spawn(move || {
-                let mut row = vec![0.0f32; m.n_in];
+                let mut trits = vec![0i8; n_in];
+                let mut rowd = vec![0.0f32; blocks];
                 for (i, o) in chunk.iter_mut().enumerate() {
-                    ptq1_0_dequant_row(m.row_slice(data, rows + i), &mut row);
-                    *o = dot8(&row, act);
+                    dequant_trits_i8(m.row_slice(data, rows + i), &mut trits, &mut rowd);
+                    *o = trit_row_dot(&trits, &rowd, act);
                 }
             });
             r0 += take;
@@ -351,11 +431,16 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32], scratch: &mu
     });
 }
 
-/// One deterministic row range of the batched GEMM: weight rows
-/// [r_off, r_off + rows) are dequantized exactly once each into per-pass
-/// slabs (bounded by GEMM_SLAB_BYTES) and each slab row is dotted, with the
-/// same dot8 call gemv_t143 makes, against every token's activation. Returns
-/// the r-major tile [rows][n_tok].
+/// Register-tiled PTQ1_0 GEMM core: weight rows [r_off, r_off + rows) are
+/// dequantized exactly once each (trit bytes + band scales into per-pass
+/// slabs bounded by GEMM_SLAB_BYTES) and every row is dotted, one
+/// 128-value band at a time, against every token's activation from a
+/// 4-row × 8-token register tile. The old per-(row, token) `dot8` sweep
+/// re-read the whole f32 slab and the whole activation set for every token;
+/// the tile loads the slab once per 8 tokens and the activations once per
+/// 4 rows, and keeps 32 independent FMA chains in registers. Value set is
+/// unchanged (trit·d == dequant value); only the f32 summation order
+/// differs from the scalar path, so results match to rounding, not bitwise.
 fn gemm_rows_t143(
     data: &[u8],
     m: &RawMat,
@@ -364,24 +449,90 @@ fn gemm_rows_t143(
     r_off: usize,
     rows: usize,
 ) -> Vec<f32> {
+    const TR: usize = 4;
+    const TT: usize = 8;
     let n_in = m.n_in;
+    let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+    debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
     let mut res = vec![0.0f32; rows * n_tok];
-    let rows_per_pass = (GEMM_SLAB_BYTES / (n_in * 4)).clamp(1, rows.max(1));
-    let mut slab = vec![0.0f32; rows_per_pass * n_in];
+    let rows_per_pass = (GEMM_SLAB_BYTES / n_in).clamp(1, rows.max(1));
+    let mut slab_t = vec![0i8; rows_per_pass * n_in];
+    let mut slab_d = vec![0.0f32; rows_per_pass * blocks];
     let mut base = 0usize;
     while base < rows {
         let take = rows_per_pass.min(rows - base);
         for i in 0..take {
-            ptq1_0_dequant_row(
+            dequant_trits_i8(
                 m.row_slice(data, r_off + base + i),
-                &mut slab[i * n_in..(i + 1) * n_in],
+                &mut slab_t[i * n_in..(i + 1) * n_in],
+                &mut slab_d[i * blocks..(i + 1) * blocks],
             );
         }
-        for i in 0..take {
-            let w = &slab[i * n_in..(i + 1) * n_in];
-            let tile = &mut res[(base + i) * n_tok..(base + i + 1) * n_tok];
-            for (t, o) in tile.iter_mut().enumerate() {
-                *o = dot8(w, &acts[t * n_in..(t + 1) * n_in]);
+        let rows_full = take - take % TR;
+        let toks_full = n_tok - n_tok % TT;
+        for rb in (0..rows_full).step_by(TR) {
+            for tb in (0..toks_full).step_by(TT) {
+                let mut acc = [0.0f32; TR * TT]; // acc[t * TR + r]
+                for c in 0..blocks {
+                    let col0 = c * PTQ1_0_BLOCK_VALUES;
+                    let col1 = col0 + PTQ1_0_BLOCK_VALUES;
+                    // Iterator windows, not indexed access: the zips let the
+                    // optimizer drop every per-element bounds check, which is
+                    // what kept the inner loop scalar in earlier drafts.
+                    let w0 = &slab_t[rb * n_in + col0..rb * n_in + col1];
+                    let w1 = &slab_t[(rb + 1) * n_in + col0..(rb + 1) * n_in + col1];
+                    let w2 = &slab_t[(rb + 2) * n_in + col0..(rb + 2) * n_in + col1];
+                    let w3 = &slab_t[(rb + 3) * n_in + col0..(rb + 3) * n_in + col1];
+                    let d = [
+                        slab_d[rb * blocks + c],
+                        slab_d[(rb + 1) * blocks + c],
+                        slab_d[(rb + 2) * blocks + c],
+                        slab_d[(rb + 3) * blocks + c],
+                    ];
+                    for t in 0..TT {
+                        let arow = &acts[(tb + t) * n_in + col0..(tb + t) * n_in + col1];
+                        let (mut b0, mut b1, mut b2, mut b3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                        for (((av, t0), t1), (t2, t3)) in arow
+                            .iter()
+                            .zip(w0.iter())
+                            .zip(w1.iter())
+                            .zip(w2.iter().zip(w3.iter()))
+                        {
+                            b0 += *t0 as f32 * *av;
+                            b1 += *t1 as f32 * *av;
+                            b2 += *t2 as f32 * *av;
+                            b3 += *t3 as f32 * *av;
+                        }
+                        // Same two-op band fold as trit_row_dot, bit for bit.
+                        acc[t * TR] += d[0] * b0;
+                        acc[t * TR + 1] += d[1] * b1;
+                        acc[t * TR + 2] += d[2] * b2;
+                        acc[t * TR + 3] += d[3] * b3;
+                    }
+                }
+                for t in 0..TT {
+                    for r in 0..TR {
+                        res[(base + rb + r) * n_tok + tb + t] = acc[t * TR + r];
+                    }
+                }
+            }
+            // tail tokens for this row tile
+            for r in 0..TR {
+                let row = &slab_t[(rb + r) * n_in..(rb + r + 1) * n_in];
+                let rowd = &slab_d[(rb + r) * blocks..(rb + r + 1) * blocks];
+                for t in toks_full..n_tok {
+                    let v = trit_row_dot(row, rowd, &acts[t * n_in..(t + 1) * n_in]);
+                    res[(base + rb + r) * n_tok + t] = v;
+                }
+            }
+        }
+        // tail rows for every token
+        for r in rows_full..take {
+            let row = &slab_t[r * n_in..(r + 1) * n_in];
+            let rowd = &slab_d[r * blocks..(r + 1) * blocks];
+            for t in 0..n_tok {
+                let v = trit_row_dot(row, rowd, &acts[t * n_in..(t + 1) * n_in]);
+                res[(base + r) * n_tok + t] = v;
             }
         }
         base += take;
@@ -965,18 +1116,16 @@ impl Qwen35Model {
         // Folded projections read the sign+hadamard transformed hidden;
         // alpha/beta (unfolded) read the raw normalized hidden.
         let mut prep = std::mem::take(&mut self.prep512);
-        let mut rowbuf = std::mem::take(&mut self.rowbuf);
         match (s_dim, &self.signs) {
             (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
         let data = self.gguf.mmap.as_slice();
-        gemv_t143(data, qkv_mat, &prep, &mut self.qkv, &mut rowbuf);
-        gemv_t143(data, gate_mat, &prep, &mut self.zg, &mut rowbuf);
+        gemv_t143(data, qkv_mat, &prep, &mut self.qkv);
+        gemv_t143(data, gate_mat, &prep, &mut self.zg);
         gemv_f32(alpha, dim, &self.hbuf, &mut self.g48a);
         gemv_f32(beta, dim, &self.hbuf, &mut self.g48b);
         self.prep512 = prep;
-        self.rowbuf = rowbuf;
 
         // Causal conv over qkv_mixed (pre-activation) + silu, 3-deep ring.
         let cs_base = gi * conv_dim * conv_depth;
@@ -1032,13 +1181,11 @@ impl Qwen35Model {
         // ssm_out fold: GDN perm first, then signs+hadamard, then gemv.
         gdn_perm(&mut self.prep_mid, &self.gdn_out);
         let data = self.gguf.mmap.as_slice();
-        let mut rowbuf = std::mem::take(&mut self.rowbuf);
         match (out_mat.sign_idx(), &self.signs) {
             (Some(i), table) => hadamard_prep_in_place(&mut self.prep_mid, &table[i].1),
             _ => {}
         }
-        gemv_t143(data, out_mat, &self.prep_mid, &mut self.mix_out, &mut rowbuf);
-        self.rowbuf = rowbuf;
+        gemv_t143(data, out_mat, &self.prep_mid, &mut self.mix_out);
     }
 
     fn attn_forward(&mut self, li: usize, ai: usize, pos: usize) {
@@ -1056,17 +1203,15 @@ impl Qwen35Model {
 
         // Prepared hidden shared by q/k/v projections (fork memoization).
         let mut prep = std::mem::take(&mut self.prep512);
-        let mut rowbuf = std::mem::take(&mut self.rowbuf);
         match (q_mat.sign_idx(), &self.signs) {
             (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
         let data = self.gguf.mmap.as_slice();
-        gemv_t143(data, q_mat, &prep, &mut self.qg, &mut rowbuf);
-        gemv_t143(data, k_mat, &prep, &mut self.kh, &mut rowbuf);
-        gemv_t143(data, v_mat, &prep, &mut self.vh, &mut rowbuf);
+        gemv_t143(data, q_mat, &prep, &mut self.qg);
+        gemv_t143(data, k_mat, &prep, &mut self.kh);
+        gemv_t143(data, v_mat, &prep, &mut self.vh);
         self.prep512 = prep;
-        self.rowbuf = rowbuf;
 
         // Split fused q+gate; per-head q RMS norm, rope, and gate staging.
         for h in 0..n_heads {
@@ -1135,9 +1280,7 @@ impl Qwen35Model {
             _ => {}
         }
         let data = self.gguf.mmap.as_slice();
-        let mut rowbuf = std::mem::take(&mut self.rowbuf);
-        gemv_t143(data, o_mat, &self.attn3, &mut self.mix_out, &mut rowbuf);
-        self.rowbuf = rowbuf;
+        gemv_t143(data, o_mat, &self.attn3, &mut self.mix_out);
     }
 
     fn forward_impl(&mut self, token: u32, pos: usize, compute_logits: bool) {
@@ -1182,16 +1325,14 @@ impl Qwen35Model {
 
             {
                 let mut prep = std::mem::take(&mut self.prep512);
-                let mut rowbuf = std::mem::take(&mut self.rowbuf);
                 match (self.layers[li].ffn_gate.sign_idx(), &self.signs) {
                     (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
                     _ => prep.copy_from_slice(&self.hbuf),
                 }
                 let data = self.gguf.mmap.as_slice();
-                gemv_t143(data, &self.layers[li].ffn_gate, &prep, &mut self.ffn_g, &mut rowbuf);
-                gemv_t143(data, &self.layers[li].ffn_up, &prep, &mut self.ffn_u, &mut rowbuf);
+                gemv_t143(data, &self.layers[li].ffn_gate, &prep, &mut self.ffn_g);
+                gemv_t143(data, &self.layers[li].ffn_up, &prep, &mut self.ffn_u);
                 self.prep512 = prep;
-                self.rowbuf = rowbuf;
             }
             for (g, &u) in self.ffn_g.iter_mut().zip(self.ffn_u.iter()) {
                 *g = silu(*g) * u;
@@ -1199,15 +1340,13 @@ impl Qwen35Model {
 
             {
                 let mut prep = std::mem::take(&mut self.prep_ff);
-                let mut rowbuf = std::mem::take(&mut self.rowbuf);
                 match (self.layers[li].ffn_down.sign_idx(), &self.signs) {
                     (Some(i), table) => hadamard_prep(&mut prep, &self.ffn_g, &table[i].1),
                     _ => prep.copy_from_slice(&self.ffn_g),
                 }
                 let data = self.gguf.mmap.as_slice();
-                gemv_t143(data, &self.layers[li].ffn_down, &prep, &mut self.mix_out, &mut rowbuf);
+                gemv_t143(data, &self.layers[li].ffn_down, &prep, &mut self.mix_out);
                 self.prep_ff = prep;
-                self.rowbuf = rowbuf;
             }
             for (x, f) in self.x.iter_mut().zip(&self.mix_out) {
                 *x += f;
@@ -1221,9 +1360,7 @@ impl Qwen35Model {
                 _ => {}
             }
             let data = self.gguf.mmap.as_slice();
-            let mut rowbuf = std::mem::take(&mut self.rowbuf);
-            gemv_t143(data, &self.output, &self.x, &mut self.logits, &mut rowbuf);
-            self.rowbuf = rowbuf;
+            gemv_t143(data, &self.output, &self.x, &mut self.logits);
         }
 
         // Debug hook: one env-gated top-5 print per logits computation.
@@ -1590,9 +1727,7 @@ impl Qwen35Model {
                 (Some(i), table) => hadamard_prep_in_place(&mut self.x, &table[i].1),
                 _ => {}
             }
-            let mut rowbuf = std::mem::take(&mut self.rowbuf);
-            gemv_t143(data, &self.output, &self.x, &mut self.logits, &mut rowbuf);
-            self.rowbuf = rowbuf;
+            gemv_t143(data, &self.output, &self.x, &mut self.logits);
 
             if std::env::var_os("SOFUU_DEBUG_QWEN35").is_some() {
                 let mut idx: Vec<u32> = (0..self.logits.len() as u32).collect();
@@ -1710,5 +1845,143 @@ mod tests {
         println!("PROMPT: The capital of France is");
         println!("GENERATED: {generated}");
         assert!(!generated.is_empty());
+    }
+
+    /// LCG noise for synthetic packed rows (deterministic, no rand dep).
+    fn noise_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// The trit-i8 dequant must agree value-for-value with the frozen f32
+    /// reference decoder: trits[i] · scales[i/128] == out[i] exactly.
+    #[test]
+    fn trit_i8_dequant_matches_f32_reference() {
+        let rows = 6usize;
+        let n_in = 3 * PTQ1_0_BLOCK_VALUES; // 3 bands
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let data = noise_bytes(0x9E3779B97F4A7C15, rows * row_bytes);
+        for r in 0..rows {
+            let src = &data[r * row_bytes..(r + 1) * row_bytes];
+            let mut want = vec![0.0f32; n_in];
+            ptq1_0_dequant_row(src, &mut want);
+            let mut trits = vec![0i8; n_in];
+            let mut scales = vec![0.0f32; n_in / PTQ1_0_BLOCK_VALUES];
+            dequant_trits_i8(src, &mut trits, &mut scales);
+            for i in 0..n_in {
+                let got = trits[i] as f32 * scales[i / PTQ1_0_BLOCK_VALUES];
+                assert_eq!(got.to_bits(), want[i].to_bits(), "row {r} value {i}");
+            }
+        }
+    }
+
+    /// The tiled GEMM must reproduce the scalar per-(row, token) band dot
+    /// path for every element, tail shapes included (37 rows × 19 tokens is
+    /// ragged on both axes).
+    #[test]
+    fn tiled_gemm_matches_scalar_band_dot() {
+        let n_in = 2 * PTQ1_0_BLOCK_VALUES;
+        let rows = 37usize;
+        let n_tok = 19usize;
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let mut data = noise_bytes(0xDEADBEEFCAFEBABE, rows * row_bytes);
+        // Pin f16 scales to 1.0: random scale words are sometimes NaN/inf,
+        // and a NaN row makes bit comparisons meaningless noise.
+        for blk in 0..(rows * (n_in / PTQ1_0_BLOCK_VALUES)) {
+            let off = blk * PTQ1_0_BLOCK_BYTES;
+            data[off + PTQ1_0_BLOCK_BYTES - 2] = 0x00;
+            data[off + PTQ1_0_BLOCK_BYTES - 1] = 0x3C;
+        }
+        let acts: Vec<f32> = noise_bytes(0x1234567890ABCDEF, n_tok * n_in)
+            .iter()
+            .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
+            .collect();
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+
+        // Expected: per row, per token — the same band-ordered scalar dot.
+        let mut want = vec![0.0f32; rows * n_tok];
+        let mut trits = vec![0i8; n_in];
+        let mut rowd = vec![0.0f32; n_in / PTQ1_0_BLOCK_VALUES];
+        for r in 0..rows {
+            dequant_trits_i8(&data[r * row_bytes..(r + 1) * row_bytes], &mut trits, &mut rowd);
+            for t in 0..n_tok {
+                want[r * n_tok + t] = trit_row_dot(&trits, &rowd, &acts[t * n_in..(t + 1) * n_in]);
+            }
+        }
+        // Pass the full matrix through the tiled kernel in uneven row slabs
+        // to exercise the slab-boundary tail as well (rows_per_pass clamps to
+        // GEMM_SLAB_BYTES / n_in — huge here — so split manually).
+        let mut got = vec![0.0f32; rows * n_tok];
+        for (off, len) in [(0usize, 7usize), (7, 13), (20, 17)] {
+            let tile = gemm_rows_t143(&data, &m, n_tok, &acts, off, len);
+            got[off * n_tok..(off + len) * n_tok].copy_from_slice(&tile);
+        }
+        assert_eq!(got.len(), want.len());
+        for i in 0..want.len() {
+            assert_eq!(got[i].to_bits(), want[i].to_bits(), "elem {i}");
+        }
+    }
+
+    /// Speed harness (run with --release -- --ignored --nocapture): the
+    /// register-tiled sweep should be several times faster than the old
+    /// per-(row, token) dot8 sweep on PTQ1_0-shaped work.
+    #[test]
+    #[ignore]
+    fn tiled_gemm_speed_vs_scalar_sweep() {
+        let n_in = 5120usize;
+        let rows = 17408usize;
+        let n_tok = 128usize;
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let mut data = noise_bytes(0xFEED, rows * row_bytes);
+        // Random bytes make a few percent of f16 scales NaN/inf, which
+        // poisons whole rows and makes any comparison meaningless — pin the
+        // scale word of every block to 1.0 and exercise only the trit path.
+        for blk in 0..(rows * (n_in / PTQ1_0_BLOCK_VALUES)) {
+            let off = blk * PTQ1_0_BLOCK_BYTES;
+            data[off + PTQ1_0_BLOCK_BYTES - 2] = 0x00;
+            data[off + PTQ1_0_BLOCK_BYTES - 1] = 0x3C;
+        }
+        let acts: Vec<f32> = noise_bytes(0xBEEF, n_tok * n_in)
+            .iter()
+            .map(|&b| (b as f32 / 255.0 - 0.5) * 2.0)
+            .collect();
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+
+        let t0 = std::time::Instant::now();
+        let mut scalar = vec![0.0f32; rows * n_tok];
+        let mut slab = vec![0.0f32; n_in];
+        let mut rowd = vec![0.0f32; n_in / PTQ1_0_BLOCK_VALUES];
+        let mut trits = vec![0i8; n_in];
+        for r in 0..rows {
+            dequant_trits_i8(&data[r * row_bytes..(r + 1) * row_bytes], &mut trits, &mut rowd);
+            for t in 0..n_tok {
+                scalar[r * n_tok + t] = trit_row_dot(&trits, &rowd, &acts[t * n_in..(t + 1) * n_in]);
+            }
+        }
+        let t_scalar = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let tiled = gemm_rows_t143(&data, &m, n_tok, &acts, 0, rows);
+        let t_tiled = t1.elapsed();
+
+        let mut ok = 0usize;
+        for (a, b) in scalar.iter().zip(tiled.iter()) {
+            if (a - b).abs() <= a.abs().max(1.0) * 1e-4 {
+                ok += 1;
+            }
+        }
+        println!(
+            "scalar band-dot sweep: {t_scalar:?} | tiled: {t_tiled:?} | speedup {:.2}x | agree {ok}/{}",
+            t_scalar.as_secs_f64() / t_tiled.as_secs_f64().max(1e-9),
+            scalar.len()
+        );
+        assert!(ok == scalar.len(), "tile differs from scalar beyond 1e-4 on {}/{}", scalar.len() - ok, scalar.len());
     }
 }

@@ -4,6 +4,26 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — B4 complete: machine-local brain key.**
+> The vault password is no longer the fixed constant compiled into the binary (any `.qtsq` was
+> readable by anyone holding the source). New `rt/brain_key.rs`: `SOFUU_BRAIN_KEY` (64 hex) →
+> `~/.sofuu/brain.key` (32 random bytes, mode 0600, written to a private temp sibling and renamed,
+> cached per process); no usable key prints why and uses a process-local one rather than silently
+> downgrading. The codec's `qtsq_keystore.h` was evaluated first and rejected — macOS Keychain prompts
+> an unsigned binary on every launch (the friction the fixed password existed to avoid) and its
+> ML-KEM path is a different on-disk scheme; reasoning recorded in `docs/BRAIN-KEY.md`. **Migration:**
+> reads try the machine key then the legacy password (the codec verifies the HMAC before touching the
+> ciphertext, so the retry is free); a legacy-opened brain is backed up to `<path>.legacy-key.bak` on
+> its first write — refusing the write if the backup fails — and re-encrypted through the compaction
+> path. **Recovery story** documented in `docs/BRAIN-KEY.md` (situation/action table; says plainly
+> that the brain is machine-local by design and a lost key with no backup is unrecoverable).
+> **Found while testing:** a wrong-key SEGMENTED brain used to fall through to the single-file reader
+> and open as EMPTY — `read_manifest_ex` now separates "not a container" (the corrupt-file backup
+> path) from "a container this key cannot open" (refuse, file untouched). Evidence:
+> `fresh_brain_uses_the_machine_key`, `legacy_encrypted_brain_migrates_with_backup`,
+> `wrong_key_fails_closed_without_corrupting`, plus three `brain_key` unit tests. Full suite **532/0**
+> in both QTSQ-enabled and QTSQ-free builds.
+>
 > **2026-10-14 — Extreme Memory Bandwidth Optimization: Lookahead Tree Decoding & SnapKV Observation Pooling.**
 > - **Lookahead Parallel Tree Speculative Decoding**: Implemented `NgramCache`, `CandidateTree`, `forward_speculative_batch`, and `forward_speculative_head_item` in `crates/sofuu-core/src/infer/`. Streams model weights from DRAM **only once** for candidate tokens via batched GEMM, with lazy LM head projection that completely eliminates the miss penalty.
 > - **SnapKV Observation Window Pooling**: Implemented `SnapKvProfiler`, `compact_with_snapkv`, and automatic post-prefill KV compaction in `InferEngine::stream`. Evicts 75% of inactive middle KV cache blocks on contexts > 64 tokens, boosting decode speed from 80.6 tk/s to 88.1 tk/s on long prompts.

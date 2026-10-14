@@ -59,7 +59,12 @@ mod impl_qtsq {
     /// (qtsq_adapter.c:23-41: an unsigned binary would trigger a macOS
     /// Keychain prompt on EVERY launch; brain files are machine-local
     /// at-rest obfuscation, so a fixed password avoids all prompts).
-    const SOFUU_QTSQ_LOCAL_PASSWORD: &str = crate::rt::brain_store::LOCAL_PASSWORD;
+    /// B4: the vault password is the machine-local key (rt/brain_key.rs).
+    /// The legacy fixed password is read-only, for migrating pre-B4 files.
+    fn sofuu_qtsq_password() -> String {
+        crate::rt::brain_store::vault_password()
+    }
+    const SOFUU_QTSQ_LEGACY_PASSWORD: &str = crate::rt::brain_store::LEGACY_PASSWORD;
 
     /// B0 (AUDIT-2026-10-13): the codec's tensor-compression level.
     /// 0 = full contest — the best ratio and the behaviour every brain/KV
@@ -82,17 +87,36 @@ mod impl_qtsq {
      * ══════════════════════════════════════════════════════════════ */
 
     unsafe fn qtsq_adapter_encrypt(ctx: *mut QtsqContext) -> c_int {
-        let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap_or_default();
+        let pw = CString::new(sofuu_qtsq_password()).unwrap_or_default();
         qtsq::qtsq_vault_encrypt_password(ctx, pw.as_ptr())
     }
 
     /// Decrypt a context loaded with qtsq_read when its header says encrypted.
-    unsafe fn qtsq_adapter_decrypt(ctx: *mut QtsqContext) -> c_int {
+    /// B4: the machine key first, then the legacy fixed password — returning
+    /// whether the LEGACY one opened it, so the caller re-encrypts on the
+    /// next write. Retrying on the same context is safe: the codec verifies
+    /// the HMAC before touching the ciphertext (qtsq_vault.c).
+    unsafe fn qtsq_adapter_decrypt_ex(ctx: *mut QtsqContext) -> Result<bool, c_int> {
         if !(*ctx).is_encrypted() {
-            return QTSQ_OK;
+            return Ok(false);
         }
-        let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap_or_default();
-        qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr())
+        let pw = CString::new(sofuu_qtsq_password()).unwrap_or_default();
+        if qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr()) == QTSQ_OK {
+            return Ok(false);
+        }
+        let legacy = CString::new(SOFUU_QTSQ_LEGACY_PASSWORD).unwrap_or_default();
+        if qtsq::qtsq_vault_decrypt_password(ctx, legacy.as_ptr()) == QTSQ_OK {
+            return Ok(true);
+        }
+        Err(qtsq::QTSQ_ERR_FORMAT)
+    }
+
+    /// The pre-B4 call shape: decrypt, discarding the legacy flag.
+    unsafe fn qtsq_adapter_decrypt(ctx: *mut QtsqContext) -> c_int {
+        match qtsq_adapter_decrypt_ex(ctx) {
+            Ok(_) => QTSQ_OK,
+            Err(e) => e,
+        }
     }
 
     /// cma_qtsq_save — write the "memories" f32 tensor + "metadata" JSON
@@ -261,6 +285,9 @@ mod impl_qtsq {
         dim: usize,
         meta: Option<String>,
         found_memories: bool, /* the "memories" stream was present */
+        /// B4: the LEGACY fixed password opened this file — the next write
+        /// re-encrypts it under the machine key (backup kept first).
+        legacy_encryption: bool,
     }
 
     /// cma_qtsq_load — read + decrypt a container, extract the "memories"
@@ -279,8 +306,12 @@ mod impl_qtsq {
         if r == QTSQ_OK {
             r = qtsq::qtsq_read(container, cpath.as_ptr());
         }
+        let mut legacy_encryption = false;
         if r == QTSQ_OK {
-            r = qtsq_adapter_decrypt(container);
+            match qtsq_adapter_decrypt_ex(container) {
+                Ok(l) => legacy_encryption = l,
+                Err(e) => r = e,
+            }
         }
         if r == QTSQ_OK && (*container).data_type() != qtsq::QTSQ_TYPE_CONTAINER {
             r = qtsq::QTSQ_ERR_TYPE;
@@ -366,7 +397,14 @@ mod impl_qtsq {
         if r != QTSQ_OK {
             return Err(r);
         }
-        Ok(BrainData { vecs, n, dim, meta, found_memories })
+        Ok(BrainData {
+            vecs,
+            n,
+            dim,
+            meta,
+            found_memories,
+            legacy_encryption,
+        })
     }
 
     /// kv_qtsq_save_page — quantized K/V tensors as kv_%08u_{K,V} streams.
@@ -611,6 +649,9 @@ mod impl_qtsq {
         /// load/flush — a fresh brain, or a legacy single-file brain that
         /// has not been migrated yet.
         layout: Option<BrainLayout>,
+        /// B4: this brain was opened with the LEGACY fixed password — the
+        /// next write backs it up and re-encrypts under the machine key.
+        legacy_encryption: bool,
     }
 
     /// B3.1: the on-disk layout of a segmented brain.
@@ -1057,6 +1098,7 @@ mod impl_qtsq {
             embedding_id: embedding_id.clone(),
             cma: crate::memory::cma::Cma::new(vec_dim),
             layout: None,
+            legacy_encryption: false,
         });
 
         /* C2: replay any write-ahead journal a crashed commit left behind
@@ -1079,7 +1121,27 @@ mod impl_qtsq {
          * single-file reader below. */
         let mut segmented: Option<(BrainData, BrainLayout)> = None;
         let mut segmented_layout: Option<BrainLayout> = None;
-        if let Some(m) = crate::rt::brain_store::read_manifest(path) {
+        /* B4: whether the LEGACY password opened whatever we load. */
+        let mut legacy_encryption = false;
+        /* Three outcomes, and the difference matters: a manifest we can
+         * read (segmented), a file that is NOT a manifest (legacy
+         * single-file brain), and a container we cannot open (wrong key,
+         * torn file). Only the middle one may fall through — treating the
+         * third as absent would open a wrong-key brain as EMPTY. */
+        let manifest = if !std::path::Path::new(path).exists() {
+            None /* no file yet → a fresh brain */
+        } else {
+            match crate::rt::brain_store::read_manifest_ex(path) {
+                Ok(m) => m,
+                Err(rc) => {
+                    eprintln!(
+                        "[sofuu/cma] {path} is a container this key cannot open (rc {rc}) — refusing to open"
+                    );
+                    return None;
+                }
+            }
+        };
+        if let Some((m, _)) = manifest {
             match load_segmented(path, &m) {
                 Ok((mut brain, layout)) => {
                     /* The manifest carries the dimension; hydrate needs it. */
@@ -1089,6 +1151,7 @@ mod impl_qtsq {
                         .and_then(|d| d.as_u64())
                         .unwrap_or(vec_dim as u64) as usize;
                     brain.dim = dim;
+                    legacy_encryption = brain.legacy_encryption;
                     segmented_layout = Some(layout);
                     segmented = Some((brain, BrainLayout::empty()));
                 }
@@ -1102,7 +1165,11 @@ mod impl_qtsq {
         }
 
         /* Hydrate from the QTSQ brain file (vectors + metadata JSON). */
-        match segmented.map(|(b, _)| Ok(b)).unwrap_or_else(|| cma_qtsq_load(path)) {
+        let loaded = segmented.map(|(b, _)| Ok(b)).unwrap_or_else(|| cma_qtsq_load(path));
+        if let Ok(b) = &loaded {
+            legacy_encryption |= b.legacy_encryption;
+        }
+        match loaded {
             Ok(brain) => {
                 if !brain.vecs.is_empty() && brain.n > 0 {
                     let manifest = brain.meta.as_deref().and_then(embedding_manifest);
@@ -1214,6 +1281,9 @@ mod impl_qtsq {
         if shell.layout.is_none() {
             shell.layout = segmented_layout.take();
         }
+        /* B4: a brain the LEGACY password opened is re-encrypted on its
+         * next write (backup first) — see brain_flush_segmented. */
+        shell.legacy_encryption = legacy_encryption;
         Some(shell)
     }
 
@@ -1251,6 +1321,7 @@ mod impl_qtsq {
         let dir = crate::rt::brain_store::segments_dir(path);
         let mut by_id: std::collections::BTreeMap<u32, crate::rt::brain_store::SegRecord> =
             std::collections::BTreeMap::new();
+        let mut any_legacy = false;
         for seg in &m.segments {
             let file = format!("{dir}/{}", seg.file);
             /* Verify the published digest BEFORE reading: the codec accepts
@@ -1269,7 +1340,8 @@ mod impl_qtsq {
                     }
                 }
             }
-            let recs = crate::rt::brain_store::read_segment(&file)?;
+            let (recs, legacy) = crate::rt::brain_store::read_segment_ex(&file)?;
+            any_legacy |= legacy;
             for r in recs {
                 by_id.insert(r.id, r);
             }
@@ -1305,7 +1377,10 @@ mod impl_qtsq {
             persisted: n,
             last_decay_at: m.last_decay_at,
             evicted_total: m.evicted_total,
-            needs_compaction: false,
+            /* B4: a legacy-encrypted store rewrites under the machine key on
+             * its next flush — the same full-rewrite path a compaction uses,
+             * so the re-encryption needs no separate machinery. */
+            needs_compaction: any_legacy,
         };
         Ok((
             BrainData {
@@ -1314,6 +1389,7 @@ mod impl_qtsq {
                 dim: 0, /* filled by the caller from the manifest */
                 meta: Some(meta_json),
                 found_memories: n > 0,
+                legacy_encryption: any_legacy,
             },
             layout,
         ))
@@ -1521,6 +1597,25 @@ mod impl_qtsq {
         };
         layout.dir = dir.clone();
 
+        /* B4: a brain the LEGACY password opened is re-encrypted under the
+         * machine key. That is a full rewrite (every segment), so it rides
+         * the compaction path; the old generation stays on disk as the
+         * rollback copy until the age-guarded orphan sweep, and the
+         * manifest itself is preserved beside it. */
+        if shell.legacy_encryption {
+            let bak = unique_sidecar(&path, "legacy-key.bak");
+            if std::fs::copy(&path, &bak).is_ok() {
+                eprintln!(
+                    "[sofuu/cma] re-encrypting a legacy-key brain under the machine key (backup: {bak})"
+                );
+            } else {
+                eprintln!("[sofuu/cma] refusing to re-encrypt: could not back up {path}");
+                shell.layout = Some(layout);
+                return -1;
+            }
+            layout.needs_compaction = true;
+        }
+
         /* A structural change the incremental path cannot express (retain()
          * renumbered ids, an explicit cma.compact(), an eviction) forces a
          * full rewrite — the Cma flag is the source of truth, the layout
@@ -1589,6 +1684,8 @@ mod impl_qtsq {
         shell.cma.mark_persisted();
         layout.persisted = live;
         shell.layout = Some(layout);
+        /* The rewrite above used the machine key — the flag's job is done. */
+        shell.legacy_encryption = false;
         0
     }
 
@@ -2466,6 +2563,7 @@ mod impl_qtsq {
             embedding_id: crate::embedding::MODEL_ID.to_string(),
             cma: crate::memory::cma::Cma::new(crate::embedding::SEMANTIC_DIM),
             layout: None,
+            legacy_encryption: false,
         });
         match migrate_legacy_hash_brain(&path, &brain, &mut shell) {
             Ok((records, backup)) => {
@@ -4245,6 +4343,224 @@ mod impl_qtsq {
         }
     }
 
+    /* ── B4 (ROADMAP-BRAIN-CMA): machine-local key ─────────────────── */
+
+    /// Write a single-file brain the way the PRE-B4 code did: encrypted with
+    /// the legacy fixed password. Used to prove the migration path.
+    unsafe fn write_legacy_encrypted_brain(path: &str, dim: usize, texts: &[&str]) {
+        let n = texts.len();
+        let mut flat: Vec<f32> = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            let mut v = vec![0.0f32; dim];
+            v[i % dim] = 1.0;
+            flat.extend_from_slice(&v);
+            let _ = t;
+        }
+        let dims: [u32; 2] = [n as u32, dim as u32];
+        let records: Vec<serde_json::Value> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                serde_json::json!({
+                    "vector_index": i, "kv_page_id": 0, "strength": 1.0,
+                    "age_seconds": 0, "half_life": 86400, "tier": 1,
+                    "text": t, "role": "user", "total_recalls": 0, "positive_recalls": 0,
+                    "created_at": 0, "last_recalled_at": 0, "source": "",
+                })
+            })
+            .collect();
+        let meta = serde_json::json!({
+            "schema": "sofuu-cma@2",
+            "embedding": {
+                "id": crate::embedding::INPUT_EMBEDDER_ID,
+                "input": crate::embedding::INPUT_EMBEDDER_ID,
+                "dimension": dim,
+                "artifact": "",
+            },
+            "records": records,
+        })
+        .to_string();
+
+        let container = qtsq::qtsq_ctx_alloc();
+        assert!(!container.is_null());
+        assert_eq!(qtsq::qtsq_container_create(container), QTSQ_OK);
+        (*container).set_codec(qtsq::QTSQ_CODEC_QTC);
+
+        let sub = qtsq::qtsq_ctx_alloc();
+        assert_eq!(qtsq::qtsq_init(sub), QTSQ_OK);
+        (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
+        assert_eq!(
+            qtsq::qtsq_compress_tensor(sub, flat.as_ptr(), flat.len(), dims.as_ptr(), 2, QTSQ_LEVEL_FULL),
+            QTSQ_OK
+        );
+        assert_eq!(
+            qtsq::qtsq_container_add_stream(container, sub, c"memories".as_ptr()),
+            QTSQ_OK
+        );
+        qtsq::qtsq_free(sub);
+        qtsq::qtsq_ctx_free(sub);
+
+        let jsub = qtsq::qtsq_ctx_alloc();
+        assert_eq!(qtsq::qtsq_init(jsub), QTSQ_OK);
+        (*jsub).set_codec(qtsq::QTSQ_CODEC_QTC);
+        let cmeta = CString::new(meta).unwrap();
+        assert_eq!(
+            qtsq::qtsq_compress_json(jsub, cmeta.as_ptr(), cmeta.as_bytes().len()),
+            QTSQ_OK
+        );
+        assert_eq!(
+            qtsq::qtsq_container_add_stream(container, jsub, c"metadata".as_ptr()),
+            QTSQ_OK
+        );
+        qtsq::qtsq_free(jsub);
+        qtsq::qtsq_ctx_free(jsub);
+
+        assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
+        let legacy = CString::new(SOFUU_QTSQ_LEGACY_PASSWORD).unwrap();
+        assert_eq!(
+            qtsq::qtsq_vault_encrypt_password(container, legacy.as_ptr()),
+            QTSQ_OK
+        );
+        let cpath = CString::new(path).unwrap();
+        assert_eq!(qtsq::qtsq_write(container, cpath.as_ptr()), QTSQ_OK);
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+    }
+
+    /// Can `password` open this file? (Read-only probe.)
+    unsafe fn opens_with(path: &str, password: &str) -> bool {
+        let cpath = CString::new(path).unwrap();
+        let ctx = qtsq::qtsq_ctx_alloc();
+        if ctx.is_null() {
+            return false;
+        }
+        let mut ok = qtsq::qtsq_init(ctx) == QTSQ_OK
+            && qtsq::qtsq_read(ctx, cpath.as_ptr()) == QTSQ_OK;
+        if ok && (*ctx).is_encrypted() {
+            let pw = CString::new(password).unwrap();
+            ok = qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr()) == QTSQ_OK;
+        }
+        qtsq::qtsq_free(ctx);
+        qtsq::qtsq_ctx_free(ctx);
+        ok
+    }
+
+    /// B4 gate: a FRESH brain is encrypted with the machine key — the legacy
+    /// fixed password alone cannot open it.
+    #[test]
+    fn fresh_brain_uses_the_machine_key() {
+        crate::rt::brain_key::set_test_key(Some("aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"));
+        let dir = fresh_test_dir("b4-fresh");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        let v = crate::embedding::hash_features_at("the deploy bucket is sofuu-dist", dim);
+        unsafe { cma_remember(&mut shell, &v, Some("the deploy bucket is sofuu-dist"), Some("user"), 0, None) };
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+
+        unsafe {
+            assert!(
+                !opens_with(&p, SOFUU_QTSQ_LEGACY_PASSWORD),
+                "the legacy password must NOT open a fresh brain"
+            );
+            assert!(
+                opens_with(&p, "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"),
+                "the machine key must open it"
+            );
+        }
+        crate::rt::brain_key::set_test_key(None);
+    }
+
+    /// B4 gate: a legacy-encrypted brain opens, migrates with a backup, and
+    /// reopens under the machine key with nothing lost.
+    #[test]
+    fn legacy_encrypted_brain_migrates_with_backup() {
+        crate::rt::brain_key::set_test_key(Some("bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233aa44"));
+        let dir = fresh_test_dir("b4-migrate");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+        let texts = ["legacy one", "legacy two", "legacy three"];
+
+        unsafe { write_legacy_encrypted_brain(&p, dim, &texts) };
+        unsafe {
+            assert!(
+                opens_with(&p, SOFUU_QTSQ_LEGACY_PASSWORD),
+                "the fixture must be legacy-encrypted"
+            );
+        }
+
+        /* Open: the machine key fails, the legacy one succeeds. */
+        let mut shell = unsafe { cma_open(&p, dim, Some(crate::embedding::INPUT_EMBEDDER_ID)) }
+            .expect("legacy brain opens");
+        assert_eq!(shell.cma.len(), 3, "no record lost on open");
+        assert!(shell.legacy_encryption, "the open must record the legacy key");
+
+        /* Flush: backup, rewrite under the machine key. */
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "migrating flush");
+        assert!(!shell.legacy_encryption, "the flag clears once rewritten");
+
+        let entries = dir_entries(&dir);
+        assert!(
+            entries.iter().any(|e| e.ends_with("legacy-key.bak")),
+            "the legacy file must be backed up: {entries:?}"
+        );
+
+        /* Reopen: now the machine key opens it and the legacy one does not. */
+        let mut again = unsafe { cma_open(&p, dim, Some(crate::embedding::INPUT_EMBEDDER_ID)) }
+            .expect("reopen after migration");
+        assert_eq!(again.cma.len(), 3, "no record lost in the migration");
+        assert!(!again.legacy_encryption);
+        let q = crate::embedding::hash_features_at("legacy two", dim);
+        assert!(
+            again.cma.recall(&q, 3).iter().any(|h| h.text == "legacy two"),
+            "recall survives the migration"
+        );
+        assert_eq!(unsafe { cma_flush(&mut again) }, 0);
+        unsafe {
+            assert!(
+                !opens_with(&p, SOFUU_QTSQ_LEGACY_PASSWORD),
+                "after migration the legacy password must not open the manifest"
+            );
+        }
+        crate::rt::brain_key::set_test_key(None);
+    }
+
+    /// B4 gate: a brain written under a different key fails closed and is
+    /// left byte-identical — never a half-read or half-written brain.
+    #[test]
+    fn wrong_key_fails_closed_without_corrupting() {
+        crate::rt::brain_key::set_test_key(Some("cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233aa44bb55"));
+        let dir = fresh_test_dir("b4-wrongkey");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        let v = crate::embedding::hash_features_at("a secret worth keeping", dim);
+        unsafe { cma_remember(&mut shell, &v, Some("a secret worth keeping"), Some("user"), 0, None) };
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        drop(shell);
+
+        let before = std::fs::read(&path).unwrap();
+
+        /* A different machine key: the open must refuse. */
+        crate::rt::brain_key::set_test_key(Some("dd44ee55ff6600112233445566778899aabbccddeeff00112233aa44bb55cc66"));
+        let refused = unsafe { cma_open(&p, dim, None) };
+        assert!(refused.is_none(), "a wrong key must refuse the open");
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "a refused open must not touch the file");
+
+        /* And the original key still opens it. */
+        crate::rt::brain_key::set_test_key(Some("cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233aa44bb55"));
+        let ok = unsafe { cma_open(&p, dim, None) };
+        assert!(ok.is_some(), "the right key still opens it");
+        crate::rt::brain_key::set_test_key(None);
+    }
+
     /* ── B3.5 (ROADMAP-BRAIN-CMA): channel dedup ───────────────────── */
 
     /// The SEM2 sibling is a derived index: `retainAgainst(canonical)`
@@ -4781,7 +5097,7 @@ mod impl_qtsq {
 
             // qtsq_container_pack + qtsq_vault_encrypt_password + qtsq_write.
             assert_eq!(qtsq::qtsq_container_pack(container), QTSQ_OK);
-            let pw = CString::new(SOFUU_QTSQ_LOCAL_PASSWORD).unwrap();
+            let pw = CString::new(sofuu_qtsq_password()).unwrap();
             assert_eq!(
                 qtsq::qtsq_vault_encrypt_password(container, pw.as_ptr()),
                 QTSQ_OK

@@ -25,11 +25,23 @@ use std::ptr;
 
 use sofuu_ffi::qtsq;
 
-/// The deterministic local vault password. Same value the legacy single-file
-/// adapter uses (rt/memory.rs aliases this constant) — brain files are
-/// machine-local at-rest obfuscation, and a fixed password avoids macOS
-/// Keychain prompts on every launch.
-pub const LOCAL_PASSWORD: &str = "sofuu-kv-local-v1";
+/// B4 (ROADMAP-BRAIN-CMA): the vault password is the MACHINE-LOCAL key
+/// (rt/brain_key.rs) — a 0600 key file under the user's home, or the
+/// SOFUU_BRAIN_KEY override. Every brain written before B4 carries the
+/// legacy fixed password instead; reads fall back to it and the first write
+/// re-encrypts (see `decrypt_with_fallback`).
+pub fn vault_password() -> String {
+    crate::rt::brain_key::local_vault_password()
+}
+
+/// The password every pre-B4 brain file carries. Read-only: it exists to
+/// migrate those files, never to write new ones.
+pub const LEGACY_PASSWORD: &str = crate::rt::brain_key::LEGACY_PASSWORD;
+
+/// Not a QTSQ container at all (garbage bytes, a foreign file). Distinct
+/// from a decrypt failure: a caller may fall back to another reader for
+/// this, but must REFUSE a container it cannot open.
+pub const ERR_NOT_CONTAINER: c_int = -1001;
 
 /// Codec tensor-compression level: 0 = full contest (see rt/memory.rs).
 pub const QTSQ_LEVEL_FULL: c_int = 0;
@@ -156,16 +168,31 @@ pub enum Stream<'a> {
 }
 
 unsafe fn encrypt(ctx: *mut qtsq::QtsqContext) -> c_int {
-    let pw = CString::new(LOCAL_PASSWORD).unwrap_or_default();
+    let pw = CString::new(vault_password()).unwrap_or_default();
     qtsq::qtsq_vault_encrypt_password(ctx, pw.as_ptr())
 }
 
-unsafe fn decrypt(ctx: *mut qtsq::QtsqContext) -> c_int {
+/// Decrypt with the machine key, falling back to the legacy fixed password.
+/// Returns `Ok(true)` when the LEGACY password opened it — the caller then
+/// re-encrypts on the next write. Both failing is `Err`: fail closed, never
+/// a half-read brain.
+///
+/// Retrying on the same context is safe: the codec verifies the HMAC before
+/// touching `singularity` (qtsq_vault.c `vault_sym_decrypt`), so a wrong
+/// password returns without modifying the ciphertext.
+unsafe fn decrypt_with_fallback(ctx: *mut qtsq::QtsqContext) -> Result<bool, c_int> {
     if !(*ctx).is_encrypted() {
-        return qtsq::QTSQ_OK;
+        return Ok(false);
     }
-    let pw = CString::new(LOCAL_PASSWORD).unwrap_or_default();
-    qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr())
+    let pw = CString::new(vault_password()).unwrap_or_default();
+    if qtsq::qtsq_vault_decrypt_password(ctx, pw.as_ptr()) == qtsq::QTSQ_OK {
+        return Ok(false);
+    }
+    let legacy = CString::new(LEGACY_PASSWORD).unwrap_or_default();
+    if qtsq::qtsq_vault_decrypt_password(ctx, legacy.as_ptr()) == qtsq::QTSQ_OK {
+        return Ok(true);
+    }
+    Err(qtsq::QTSQ_ERR_FORMAT)
 }
 
 /// Build a container from `streams`, pack → encrypt → write to `path`.
@@ -260,6 +287,13 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
 
 /// Open + decrypt a container. The caller frees it with `container_free`.
 pub unsafe fn container_open(path: &str) -> Result<*mut qtsq::QtsqContext, c_int> {
+    container_open_ex(path).map(|(ctx, _)| ctx)
+}
+
+/// `container_open`, also reporting whether the LEGACY password opened it.
+pub unsafe fn container_open_ex(
+    path: &str,
+) -> Result<(*mut qtsq::QtsqContext, bool), c_int> {
     let cpath = CString::new(path).unwrap_or_default();
     let container = qtsq::qtsq_ctx_alloc();
     if container.is_null() {
@@ -269,18 +303,27 @@ pub unsafe fn container_open(path: &str) -> Result<*mut qtsq::QtsqContext, c_int
     if r == qtsq::QTSQ_OK {
         r = qtsq::qtsq_read(container, cpath.as_ptr());
     }
-    if r == qtsq::QTSQ_OK {
-        r = decrypt(container);
+    if r != qtsq::QTSQ_OK {
+        /* The bytes are not a QTSQ file — a foreign file the caller may
+         * still want to back up and replace (the corrupt-brain path). */
+        qtsq::qtsq_free(container);
+        qtsq::qtsq_ctx_free(container);
+        return Err(ERR_NOT_CONTAINER);
+    }
+    let mut legacy = false;
+    match decrypt_with_fallback(container) {
+        Ok(l) => legacy = l,
+        Err(e) => r = e,
     }
     if r == qtsq::QTSQ_OK && (*container).data_type() != qtsq::QTSQ_TYPE_CONTAINER {
-        r = qtsq::QTSQ_ERR_TYPE;
+        r = ERR_NOT_CONTAINER;
     }
     if r != qtsq::QTSQ_OK {
         qtsq::qtsq_free(container);
         qtsq::qtsq_ctx_free(container);
         return Err(r);
     }
-    Ok(container)
+    Ok((container, legacy))
 }
 
 pub unsafe fn container_free(container: *mut qtsq::QtsqContext) {
@@ -449,7 +492,14 @@ pub unsafe fn write_segment(
 
 /// Read one segment back. Records come out in file order.
 pub unsafe fn read_segment(path: &str) -> Result<Vec<SegRecord>, c_int> {
-    let container = container_open(path)?;
+    read_segment_ex(path).map(|(recs, _)| recs)
+}
+
+/// `read_segment`, also reporting whether the LEGACY password opened it.
+pub unsafe fn read_segment_ex(
+    path: &str,
+) -> Result<(Vec<SegRecord>, bool), c_int> {
+    let (container, legacy) = container_open_ex(path)?;
     let meta_json = read_json_stream(container, SEGMENT_META_STREAM);
     let tensor = read_tensor_stream(container, SEGMENT_TENSOR_STREAM);
     container_free(container);
@@ -498,7 +548,7 @@ pub unsafe fn read_segment(path: &str) -> Result<Vec<SegRecord>, c_int> {
             meta,
         });
     }
-    Ok(out)
+    Ok((out, legacy))
 }
 
 /// Write the manifest container (caller publishes it atomically).
@@ -516,15 +566,38 @@ pub unsafe fn write_manifest(path: &str, m: &Manifest) -> Result<(), c_int> {
 /// Read a manifest, or None when `path` is missing, unreadable, or a LEGACY
 /// brain (which carries memories/metadata streams instead).
 pub unsafe fn read_manifest(path: &str) -> Option<Manifest> {
-    let container = container_open(path).ok()?;
+    read_manifest_ex(path).ok().flatten().map(|(m, _)| m)
+}
+
+/// `read_manifest`, also reporting whether the LEGACY password opened it.
+///
+/// `Ok(None)` means "this is not a segmented brain" (no manifest stream, or
+/// a foreign schema). `Err` means "this IS a container we could not open" —
+/// a wrong key, a torn file — which the caller MUST NOT treat as an absent
+/// manifest: falling through to the single-file reader would open a
+/// wrong-key brain as an EMPTY one, silently forgetting everything.
+pub unsafe fn read_manifest_ex(
+    path: &str,
+) -> Result<Option<(Manifest, bool)>, c_int> {
+    let (container, legacy) = match container_open_ex(path) {
+        Ok(v) => v,
+        /* Not a container: the caller's single-file reader owns this file
+         * (backup + fresh start). A decrypt failure stays an Err. */
+        Err(e) if e == ERR_NOT_CONTAINER => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let body = read_json_stream(container, MANIFEST_STREAM);
     container_free(container);
-    let body = body?;
-    let m: Manifest = serde_json::from_str(&body).ok()?;
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    let Ok(m) = serde_json::from_str::<Manifest>(&body) else {
+        return Ok(None);
+    };
     if m.schema != SEGMENT_SCHEMA {
-        return None;
+        return Ok(None);
     }
-    Some(m)
+    Ok(Some((m, legacy)))
 }
 
 /// Delete segment files the manifest does not reference — the leftovers a

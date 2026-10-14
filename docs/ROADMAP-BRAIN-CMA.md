@@ -141,12 +141,17 @@ machine) with a machine-local key.
 
 | # | Item | Size |
 |---|---|---|
-| B4.1 | **Key derivation** — derive the vault password from a machine-local secret. Evaluate the codec's `qtsq_keystore.h` device key first; else a `0600` key file under `~/.sofuu/`. | M |
-| B4.2 | **Migration** — read old fixed-password brains, re-encrypt on first write (journaled, backup kept). | M |
-| B4.3 | **Recovery story** — documented behaviour for a new machine / lost key file (the brain is machine-local by design; say so plainly). | S |
+| B4.1 | ✅ **Key derivation** (2026-10-14) — `rt/brain_key.rs`: `SOFUU_BRAIN_KEY` (64 hex) → `~/.sofuu/brain.key` (32 random bytes, `0600`, written to a private temp sibling and renamed, cached per process). The codec's device keystore was evaluated first and rejected — macOS Keychain prompts unsigned binaries on every launch, and its ML-KEM path is a different on-disk scheme; the reasoning is recorded in `BRAIN-KEY.md`. | M |
+| B4.2 | ✅ **Migration** (2026-10-14) — reads try the machine key then the legacy password (the codec verifies the HMAC before touching the ciphertext, so the retry is free). A legacy-opened brain is marked, backed up to `<path>.legacy-key.bak` on its first write (refusing the write if the backup fails), and re-encrypted through the compaction path. | M |
+| B4.3 | ✅ **Recovery story** (2026-10-14) — `docs/BRAIN-KEY.md`: resolution order, migration, and a situation/action table for a new machine, a lost key file, and sharing. Says plainly that the brain is machine-local by design and that a lost key with no backup is unrecoverable. | S |
 
-**Gate:** a fresh brain writes with the derived key; a legacy brain migrates with a backup and
-reopens; a wrong-key open fails closed with a clear error and never corrupts.
+**Gate met (2026-10-14):** `fresh_brain_uses_the_machine_key` (the legacy password cannot open a new
+brain), `legacy_encrypted_brain_migrates_with_backup` (opens, backs up, re-encrypts, recalls, and the
+legacy password stops working), `wrong_key_fails_closed_without_corrupting` (refuses, file
+byte-identical, the right key still opens). Also fixed while testing: a wrong-key **segmented** brain
+used to fall through to the single-file reader and open as EMPTY — `read_manifest_ex` now separates
+"not a container" (the corrupt-file backup path) from "a container this key cannot open" (refuse).
+Full suite **532/0** in both builds.
 
 ---
 

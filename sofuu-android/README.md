@@ -1,3 +1,5 @@
+<p align="center"><img src="../sofuu-landing/public/logo.png" width="118" alt="Sofuu logo"></p>
+
 # Sofuu for Android
 
 The Sofuu runtime as a native Android app — Kotlin + Jetpack Compose UI

@@ -1,3 +1,5 @@
+<p align="center"><img src="../sofuu-landing/public/logo.png" width="118" alt="Sofuu logo"></p>
+
 # Sofuu for iOS
 
 The iOS sibling of `sofuu-android/`: the same product, the same engine, the

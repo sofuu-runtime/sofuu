@@ -1,3 +1,5 @@
+<p align="center"><img src="../sofuu-landing/public/logo.png" width="118" alt="Sofuu logo"></p>
+
 # Sofuu Desktop
 
 Tauri 2 desktop shell for the Sofuu runtime. The engine (`sofuu-core` + the

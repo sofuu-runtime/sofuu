@@ -4,6 +4,24 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
+> Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
+> ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —
+> ~10M powf + 20M sincos per prompt. Fix 1: freq/sincos RoPE table built from the identical
+> libm calls on identical float args → bit-identical logits (test_rope_table_bit_exact);
+> one live table per (half_dim, freq_base), lazy mutex-guarded row fill, grow-by-copy with
+> retired tables parked. (First cut had a per-call re-grow pathology — scan matched a
+> zero-cap entry, ~250 KB alloc+fill per rope call, everything 3-4× slower; rope-dbg log
+> caught `grew=1` per call; fixed by create-with-capacity + replace-in-place.) Fix 2:
+> x4-position attention inner loops (QK 2 positions × 4 lanes matching the single-dot
+> reduction exactly; V pass 4 positions per chunk group) — a 4-position QK variant spilled
+> registers on A76 (decode attn 7.2 → 8.5 ms/tok) and was reworked to 2 positions;
+> bit-exact per test_attention_x4_bit_exact (plain/SWA/sinks). Rope bucket 100 → 15 ms per
+> chunk, `other` zeroed. Battery (llama.cpp same-session): Qwen 158.2/20.6 vs 177.3/24.0
+> (0.89×, was 0.75×); Llama-1B Q8_0 133.2/8.6 vs 58.5/8.7 (**2.28×**, was 2.1×); Spark
+> 20.8/4.0 vs 22.8/4.2. Decode parity everywhere; host suite 571/0. Committed by peer
+> sweep in f35638971; follow-on prefill programme drafted in docs/PLAN-CPU-PREFILL-PEAK.md.
+
 > **2026-10-14 — agents/RLM: episodes are now metered — fixes the open AUDIT-2026-08-22
 > P2 "RLM turns are invisible to token budgets and /cost".** `rlm.js` banks every ask's
 > real usage into the episode record (stream `st.usage` — abandoned streams included,

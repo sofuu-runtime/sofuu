@@ -279,3 +279,46 @@ R1 numbers anywhere; decode parity everywhere). Anomaly: liquid-350 BF16
 battery decode now EOSes at token 1 (was 80 tks @ 5.4 t/s) with prefill
 16 → 44 t/s — safetensors path (no tile involvement); flagged to the liquid
 peer, not reproduced on GGUF models.
+
+### Session 3 wave 2 (2026-10-14 late night): attention + rope — Qwen prefill 128 → 158 t/s
+
+The R2 profile said the Qwen prefill residual vs llama.cpp was attention+glue
+(ours ~2.7-3.7 ms/token combined vs their ~0.7). Fresh profile split it:
+attn bucket 246 ms per 234-token prompt and `other` ~500 ms (27% of prefill).
+Two fixes, both bit-exact by construction:
+
+1. **RoPE sincos/freq table** (`sofuu_rope`). The old loop computed
+   `1/powf(freq_base, 2i/hd)` + `cosf` + `sinf` per (head, i) — ≈10M powf +
+   20M sincos per Qwen prompt, nearly all inside "other". Tables cache freq
+   per (half_dim, freq_base) and cos/sin per (pos, i), computed with the
+   identical libm calls on the identical float arguments (`(float)pos * freq`)
+   → rotation results and logits are bit-identical (proven by
+   `test_rope_table_bit_exact`, both RoPE styles × 3 freq bases incl. table
+   growth). One live table per key; grow copies the valid prefix, retired
+   tables stay alive for in-flight readers; rows fill lazily under a mutex,
+   never move. First implementation had a per-call re-grow pathology (the
+   scan matched a zero-capacity entry and re-grew every call — ~250 KB alloc
+   + fill per rope call, everything 3-4× slower; debug log showed
+   `grew=1` on call N); fixed by creating tables with capacity immediately
+   and replacing the live slot in place. Rope bucket: 100 → 14-16 ms per
+   64-token chunk; the whole "other" bucket zeroed out.
+2. **x4-position attention inner loops** (`sofuu_attn_qk_range` /
+   `sofuu_attn_vacc_range`). QK dots process 2 positions per strip (4 lanes ×
+   16-float strides exactly as `sofuu_vec_dot_f32`, combine → 4-stride tail →
+   `vaddvq` → scalar tail) and the V pass applies 4 positions per chunk group
+   with one dst round-trip. A first 4-position QK variant measured WORSE on
+   decode (8.5 vs 7.2 ms/token — 16 live accumulators spill on A76); 2
+   positions is spill-free. Bit-identical (`test_attention_x4_bit_exact`,
+   plain/SWA/sinks, 6 configs per call).
+
+Receipts (same binary, `pi_bench.sh`, llama.cpp same-session refs): Qwen
+**158.2/20.6** vs llama.cpp 177.3/24.0 (0.89×, was 0.75× at session start);
+Llama-1B Q8_0 **133.2/8.6** vs 58.5/8.7 (**2.28×** prefill, was 2.1×);
+Spark 20.8/4.0 vs 22.8/4.2 (0.91×, within a ±0.5 t/s band of session-3's
+0.96×). Host suite 571/0 on the merged state. Profiler split of a 64-token
+prefill chunk after both fixes: gemm 276 ms, attn 28-79 ms (grows with seq),
+norm 4, rope 14-16, glue 34, other 0.
+
+Remaining Qwen prefill gap is ~8% and now truly kernel-side (attention
+prefill at long seq + gemm scale-apply chain); `docs/PLAN-CPU-PREFILL-PEAK.md`
+(plan, awaiting approval) covers the follow-on programme.

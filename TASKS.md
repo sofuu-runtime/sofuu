@@ -4,6 +4,22 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Pi 5: q4_K prefill attribution + NEON act-quant (Qwen 111 → 128 t/s) + nibble-plane verdict (opt-in).**
+> R0 split the q4_K tile prefill cost 22-37% scalar-act-quant / rest kernel (the generic
+> quantizer ran single-threaded in the serial prologue of every GEMM). R1 shipped the bit-exact
+> NEON `ggml_quantize_mat_q8_K_4x4_neon` port + pool-parallel prologue: Qwen prefill 111 → 128
+> (+15%), Spark 18.9 → 21.4 (0.95× of llama.cpp 22.1), Llama-1B Q8_0 steady at 122 (2.2× of
+> llama.cpp 55.6); decode unchanged (DRAM wall). R2 added NORM/ROPE/EMBED/GLUE prof scopes +
+> TokenScope. R3 built the nibble-plane q4_K GEMM (nibbles pre-expanded to int8 planes at warm,
+> vand/vshr removed from the hot loop) — bit-exact (parity test), measured 129-130 vs 121
+> GMAC/s (+5.3-7.8%, real Qwen shapes) → only ~+1% E2E → **below the ≥15% ship bar; shipped
+> opt-in** `SOFUU_NIBBLE_PLANES=1` as bit-exact infra. Falsified the aux-op attribution: the
+> remaining q4_K-vs-q8_0 gap (130 vs 185 GMAC/s) is the per-subblock scale-apply chain
+> (vmulq/vmovl/vcvtq int lanes), not nibble unpacks. Battery vs same-session llama.cpp: Qwen
+> 128/20.3 vs 171.2/23.3; Llama 122/8.5 vs 55.6/8.3; Spark 21.3/4.1 vs 22.1/4.2 (prefill/decode).
+> Anomaly flagged for the liquid peer: liquid-350 BF16 battery decode now EOS at token 1
+> (was 80 tokens @ 5.4); prefill jumped 16 → 44 t/s — safetensors path, no q4_K involvement.
+
 > **2026-10-14 — Mac CPU: PTQ1_0 27B decode 10× — file-direct packed trit dot + opt-in weight residency (0.1 → 0.7-1.0 tk/s); sample-first, not grep-first.**
 > Decode was 7-11 s/token. Two compounding causes, found by sampling the live process (not
 > by reading code): the GEMV dequantized every row into an i8 slab per token (27 GB of slab

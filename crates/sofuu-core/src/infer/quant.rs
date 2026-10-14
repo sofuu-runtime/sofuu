@@ -271,6 +271,20 @@ pub fn gemm_bench(ty: u32, rows: usize, cols: usize, batch: usize, iters: usize)
     }
 }
 
+/// Device micro-bench for the q4_K nibble-plane prefill kernel vs the packed
+/// one (kernel-only, identical synthetic tensors); prints both GMAC/s rates.
+pub fn gemm_bench_plane(rows: usize, cols: usize, batch: usize, iters: usize) {
+    unsafe {
+        sofuu_bench_gemm_plane(rows as i32, cols as i32, batch as i32, iters as i32);
+    }
+}
+
+/// Bit-parity gate for the q4_K nibble-plane GEMM vs the packed kernel.
+/// Returns 0 when outputs are bit-identical.
+pub fn gemm_plane_parity(rows: usize, cols: usize, batch: usize) -> i32 {
+    unsafe { sofuu_test_gemm_q4_k_plane_parity(rows as i32, cols as i32, batch as i32) }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -402,7 +416,9 @@ extern "C" {
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
+    fn sofuu_bench_gemm_plane(rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_test_quant_q8_K_parity(cols: i32, iters: i32) -> i32;
+    fn sofuu_test_gemm_q4_k_plane_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
@@ -1682,6 +1698,17 @@ mod tests {
         for cols in [256usize, 1024, 3072] {
             let r = unsafe { sofuu_test_quant_q8_K_parity(cols as i32, 25) };
             assert_eq!(r, 0, "NEON q8_K quantizer diverged at cols={cols}");
+        }
+    }
+
+    /// The nibble-plane q4_K GEMM (R3) must be bit-identical to the packed
+    /// kernel: the plane expansion relocates the vand/vshr nibble unpack to
+    /// warm time and must not change the int math.
+    #[test]
+    fn test_gemm_q4_k_nibble_plane_bit_exact() {
+        for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
+            let r = gemm_plane_parity(rows, cols, 8);
+            assert_eq!(r, 0, "nibble-plane q4_K GEMM diverged at {rows}x{cols}");
         }
     }
 

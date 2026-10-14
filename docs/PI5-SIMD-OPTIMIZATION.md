@@ -209,3 +209,73 @@ candidate-tree/`tree_rope` machinery is the right vehicle for
 multi-candidate steps — same-position candidate rows would overwrite each
 other's KV without it), SnapKV at long context, KV quantization (KIVI),
 and controller-level DRAM efficiency (shared wall with llama.cpp).
+
+## Session 3 (2026-10-14 night): q4_K prefill attribution, NEON act-quant, nibble-plane verdict
+
+Same device. llama.cpp same-session refs (build 11041, `-t 4`): Qwen 171.2/23.3,
+Llama-1B 55.6/8.3, Spark 22.1/4.2 (prefill/decode t/s).
+
+| Model                  | After session 3 (prefill / decode) | Prior best | llama.cpp        |
+|------------------------|------------------------------------|------------|------------------|
+| Qwen3-0.6B Q4_K_M      | **128.0 / 20.3**                   | 111.5 / 20.4 | 171.2 / 23.3   |
+| Llama-3.2-1B Q8_0      | 122.0 / 8.5                        | 120.5 / 8.5  | 55.6 / 8.3     |
+| Spark-X2.5-4B Q4_K_M   | **21.3 / 4.1** (0.96× of llama.cpp)| 19.0 / 4.2   | 22.1 / 4.2     |
+
+### R0 — attribution (`SOFUU_BENCH_GEMM`)
+
+Split the q4_K tile GEMM at Qwen shapes (batch 64): the activation quantize
+prologue — scalar `_generic` quantizer, single-threaded, serial before
+dispatch — was **22-37%** of the whole call; the kernel itself ran 121 vs the
+q8_0 kernel's 185 GMAC/s.
+
+### R1 — NEON q8_K 4×4 act quantizer + parallel prologue (shipped, bit-exact)
+
+Ported llama.cpp's NEON `ggml_quantize_mat_q8_K_4x4` (amax via `vmaxvq`,
+magic-number rounding `(x + 12582912.0f)` → low-byte truncation via
+`vmovn`, order-free exact bsums via `vpaddq`) and parallelized the quantize
+prologue across the worker pool in the q4_K/q6_K tile dispatch. Proved
+bit-identical to the scalar generic (`test_quant_q8_k_4x4_neon_bit_exact`);
+quant share collapsed 22-37% → 5.5%. Qwen prefill 111 → 128 (+15%); Spark
+18.9 → 21.4.
+
+### R2 — glue/attention scopes
+
+`prof` module gained NORM/ROPE/EMBED/GLUE buckets + `TokenScope`; QK-norm
+per-head FFI batching (672 → 56 calls/token) landed, within noise. Attention
+prefill sub-bucket is the next measurement surface for the Qwen prefill
+deficit (128 vs llama.cpp 171: the residual is attention+glue, not GEMM).
+
+### R3 — nibble-plane q4_K GEMM: measured, below the ship bar, shipped opt-in
+
+The packed q4_K kernel runs 4 aux NEON ops per 16 `vdot`s (two `vand`/`vshr`
+nibble unpacks). R3 pre-expanded both nibbles into int8 planes at warm
+(`tile_block_q4_Kx8p`: `qs_lo`/`qs_hi` 1024 B each, 2176 B/block = +89% tile
+bytes; `sofuu_repack_q4k_8bl_planes_range`, parallel by row group) so the
+hot loop is pure `vdot`. Bit-identical by construction (each plane byte holds
+exactly the nibble the packed kernel materialized) and proven by
+`test_gemm_q4_k_nibble_plane_bit_exact` (3 shapes).
+
+Device verdict — the +27% instruction-slot prediction was **wrong**:
+kernel-only 129-130 vs 120-122 GMAC/s = **+5.3-7.8%** across real Qwen shapes
+(2048×1024, 3072×1024, 1024×4096, batch 64/128), and only ~+1% E2E prefill
+(129-130 vs 128) with ~+250 MB RAM. The remaining q4_K-vs-q8_0 gap (130 vs
+185 GMAC/s) is the per-subblock scale-application chain (`vmulq_s32` scale
+FMULs, `vmovl/vcvtq`, bsums-bias `vmlal`s) that the plane kernel still
+carries — nibble unpacks were not the bottleneck. Below the ≥15% bar from the
+approved plan: **shipped opt-in** (`SOFUU_NIBBLE_PLANES=1`), gated per tensor
+(≤16M elements) with a global 768 MB budget (`SOFUU_NIBBLE_PLANES_MB`),
+GEMV decode stays on packed tiles (DRAM-bound, planes would cost bytes).
+Bench: `SOFUU_BENCH_GEMM=rows,cols,batch,iters,plane_iters`.
+
+New next lever implied by the measurement: fold the scale-apply chain (e.g.
+pre-scaled int accumulators or delayed combined scaling) — that is where the
+quantized GEMM rate now actually lives.
+
+### Verification
+
+Host suite green (incl. all three new bit-exactness tests); full device
+battery above on the shipped binary (planes default-off, no regression vs
+R1 numbers anywhere; decode parity everywhere). Anomaly: liquid-350 BF16
+battery decode now EOSes at token 1 (was 80 tks @ 5.4 t/s) with prefill
+16 → 44 t/s — safetensors path (no tile involvement); flagged to the liquid
+peer, not reproduced on GGUF models.

@@ -1499,6 +1499,15 @@ fn main() -> ExitCode {
                     sofuu_core::infer::quant::gemm_bench(8, parts[0], parts[1], parts[2], parts[3]);
                     return ExitCode::SUCCESS;
                 }
+                // 5th element = iters>0: additionally A/B the q4_K nibble-plane
+                // kernel vs the packed one on the same shape.
+                if parts.len() == 5 && parts.iter().all(|&v| v > 0) {
+                    eprintln!("[bench] SOFUU_BENCH_GEMM rows={} cols={} batch={} iters={} (+planes)", parts[0], parts[1], parts[2], parts[3]);
+                    sofuu_core::infer::quant::gemm_bench(12, parts[0], parts[1], parts[2], parts[3]);
+                    sofuu_core::infer::quant::gemm_bench_plane(parts[0], parts[1], parts[2], parts[4]);
+                    sofuu_core::infer::quant::gemm_bench(8, parts[0], parts[1], parts[2], parts[3]);
+                    return ExitCode::SUCCESS;
+                }
             }
             if args.len() < 4 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu infer' requires a model file and a prompt");

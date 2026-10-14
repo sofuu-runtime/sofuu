@@ -348,10 +348,12 @@ static inline uint16_t f32_to_f16_val(float val) {
 struct sofuu_tile_entry {
     std::vector<uint8_t> data;
     std::vector<uint8_t> sc;   // q4_K decoded-scale sidecar (tile_sc_q4_Kx8 per block)
+    std::vector<uint8_t> data_p;  // q4_K nibble-plane tile (tile_block_q4_Kx8p per block)
     unsigned type;
     size_t rows, cols;
     uint64_t fp;
     bool has_sc = false;
+    bool has_p = false;
 };
 static std::mutex g_tile_mutex;
 static std::unordered_map<const void *, sofuu_tile_entry> g_tile_map;
@@ -375,6 +377,45 @@ static uint64_t sofuu_tile_fingerprint(const void *w) {
 
 extern "C" void sofuu_tile_scale_sidecar_mode(int disable) {
     scale_sidecar_disabled_state() = disable ? 1 : 0;
+}
+
+// Nibble-plane q4_K tiles (prefill GEMM only). OPT-IN via SOFUU_NIBBLE_PLANES=1:
+// measured on Pi 5 (2026-10-14) at +5.3-7.8% over the packed kernel (129-130 vs
+// 120-122 GMAC/s) across real Qwen GEMM shapes — well short of the ≥15% ship
+// bar. The remaining q4_K-vs-q8_0 gap (130 vs 185 GMAC/s) lives in the
+// per-subblock scale-application chain (vmulq/vmovl/vcvtq int lanes), not the
+// vand/vshr nibble unpacks the planes remove. Kept as bit-exact infrastructure
+// (parity-tested; bench via SOFUU_BENCH_GEMM rows,cols,batch,iters,plane_iters).
+// Planes cost +0.5 weight bytes/element over the packed tile, so the auto gate
+// would cap each tensor at 16M elements with a global default budget of 768 MB
+// (SOFUU_NIBBLE_PLANES_MB overrides; 0 = unlimited) — relevant only when opted in.
+static bool nibble_planes_enabled() {
+    static const int v = [] {
+        const char * e = getenv("SOFUU_NIBBLE_PLANES");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v != 0;
+}
+static size_t nibble_planes_budget_bytes() {
+    static const size_t v = [] {
+        const char * e = getenv("SOFUU_NIBBLE_PLANES_MB");
+        if (!e) return (size_t)768 << 20;
+        return (size_t)strtoull(e, nullptr, 10) << 20;
+    }();
+    return v;
+}
+static bool nibble_planes_auto(size_t rows, size_t cols) {
+    if (!nibble_planes_enabled()) return false;
+    const size_t elems = rows * cols;
+    if (elems > (size_t)16 << 20) return false;
+    static std::atomic<size_t> used{0};
+    const size_t need = elems / 2;  // one extra byte per element (lo+hi vs packed nibble)
+    const size_t budget = nibble_planes_budget_bytes();
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
 }
 
 extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned type) {
@@ -408,6 +449,23 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
             });
         } else {
             sofuu_repack_q4k_8bl(dst, src, rows, nb, 4);
+        }
+        // Nibble-plane expansion for the prefill GEMM (bit-identical math,
+        // vand/vshr unpack moved out of the hot loop). Gated per tensor; the
+        // packed tile above always exists for the GEMV.
+        if (nibble_planes_auto(rows, cols)) {
+            static_assert(sizeof(tile_block_q4_Kx8p) == 2176, "q4_K plane tile layout drift");
+            const size_t np = (size_t)r8 * nb;
+            e.data_p.resize(np * sizeof(tile_block_q4_Kx8p));
+            uint8_t * dstp = e.data_p.data();
+            if (r8 >= 16) {
+                g_pool.parallel_for(0, (size_t)r8, [=](size_t g0, size_t g1) {
+                    sofuu_repack_q4k_8bl_planes_range(dstp, src, nb, g0, g1, 4);
+                });
+            } else {
+                sofuu_repack_q4k_8bl_planes(dstp, src, rows, nb, 4);
+            }
+            e.has_p = true;
         }
 #if defined(__ARM_FEATURE_DOTPROD)
         if (want_sc) {
@@ -488,6 +546,18 @@ static const uint8_t * sofuu_tile_lookup_sc(const void *w, unsigned type, size_t
         *sc_out = e.has_sc ? e.sc.data() : nullptr;
         return e.data.data();
     }
+    return nullptr;
+}
+
+// Nibble-plane tile for the q4_K prefill GEMM (same keying; only present
+// when warm built one under the size/budget gate).
+static const uint8_t * sofuu_tile_lookup_p(const void *w, size_t rows, size_t cols) {
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    auto it = g_tile_map.find(w);
+    if (it == g_tile_map.end()) return nullptr;
+    const sofuu_tile_entry &e = it->second;
+    if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_p) return e.data_p.data();
     return nullptr;
 }
 
@@ -2178,6 +2248,38 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
     // activations to a 4-multiple inside the call.
     const size_t tile_batch = batch_size % 4 == 0 ? batch_size : gemm_tile_pad_batch(batch_size);
     if (tile_batch >= 4 && tile_batch % 4 == 0 && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(12)) {
+        // Nibble-plane tiles first: same act-quant prologue, aux-op-free kernel.
+        if (const uint8_t *ptile = sofuu_tile_lookup_p(weight_bytes, rows, cols)) {
+            const size_t nb = cols / 256;
+            const size_t g4n = tile_batch / 4;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
+            const float *gr = x;
+            if (tile_batch != batch_size) {
+                float *p = tile_scratch<float>(tile_batch * cols);
+                std::memset(p, 0, tile_batch * cols * sizeof(float));
+                std::memcpy(p, x, batch_size * cols * sizeof(float));
+                gr = p;
+            }
+            if (g4n >= 2) {
+                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                    for (size_t g4 = a; g4 < b; ++g4) {
+                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                    }
+                });
+            } else {
+                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
+            }
+            float *out_dst = out;
+            if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    const uint8_t *t = ptile + g * nb * sizeof(tile_block_q4_Kx8p);
+                    ggml_gemm_q4_K_8x4_q8_K_p(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8);
+                }
+            });
+            if (tile_batch != batch_size) std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+            return;
+        }
         const uint8_t *sc = nullptr;
         if (const uint8_t *tile = sofuu_tile_lookup_sc(weight_bytes, 12, rows, cols, &sc)) {
             const size_t nb = cols / 256;
@@ -3206,6 +3308,117 @@ extern "C" int sofuu_test_quant_q8_K_parity(int cols, int iters) {
     return 0;
 #else
     (void) cols; (void) iters;
+    return 0;
+#endif
+}
+
+// ── R3 bench: q4_K nibble-plane kernel vs packed kernel, kernel-only on
+// identical synthetic weights/activations. rows*cols must satisfy the auto
+// plane gate (<= 16M elems) so warm builds the plane tile.
+extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters) {
+#if defined(__aarch64__)
+    if (batch < 4 || batch % 4 != 0 || iters < 1) return;
+    const size_t row_size = (size_t)(cols / 256) * 144;
+    std::vector<uint8_t> w((size_t)rows * row_size);
+    std::vector<float> x((size_t)batch * cols);
+    std::vector<float> out((size_t)batch * rows);
+    uint32_t rng = 12345;
+    for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
+    if (sofuu_tile_warm(w.data(), rows, cols, 12) != 0) {
+        fprintf(stderr, "[bench-p] tile warm failed\n");
+        return;
+    }
+    const uint8_t *ptile = sofuu_tile_lookup_p(w.data(), rows, cols);
+    const uint8_t *ktile = sofuu_tile_lookup(w.data(), 12, rows, cols);
+    if (!ptile || !ktile) {
+        fprintf(stderr, "[bench-p] missing tiles (plane gate: rows*cols <= 16M elems)\n");
+        return;
+    }
+    const size_t nb = cols / 256;
+    tile_block_q8_Kx4 *qa = tile_scratch<tile_block_q8_Kx4>((batch / 4) * nb);
+    for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+        ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
+    }
+    double t_k = 0, t_p = 0;
+    for (int it = 0; it < iters; ++it) {
+        auto t0 = std::chrono::steady_clock::now();
+        g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+            for (size_t g = g0; g < g1; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows,
+                    ktile + g * nb * sizeof(tile_block_q4_Kx8), qa, batch, 8);
+            }
+        });
+        auto t1 = std::chrono::steady_clock::now();
+        t_k += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    for (int it = 0; it < iters; ++it) {
+        auto t0 = std::chrono::steady_clock::now();
+        g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+            for (size_t g = g0; g < g1; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K_p(cols, out.data() + g * 8, rows,
+                    ptile + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8);
+            }
+        });
+        auto t1 = std::chrono::steady_clock::now();
+        t_p += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    const double macs = (double)batch * rows * cols * iters;
+    fprintf(stderr, "[bench-p] q4_K %dx%d batch=%d iters=%d: packed %.1f GMAC/s | planes %.1f GMAC/s (%+.1f%%)\n",
+        rows, cols, batch, iters, macs / (t_k * 1e6), macs / (t_p * 1e6), 100.0 * (t_k - t_p) / t_k);
+#else
+    (void) rows; (void) cols; (void) batch; (void) iters;
+#endif
+}
+
+// ── Parity test: the nibble-plane q4_K GEMM must be bit-identical to the
+// packed kernel on deterministic synthetic weights + activations (a few
+// activation rounds incl. zeros and mixed magnitudes).
+extern "C" int sofuu_test_gemm_q4_k_plane_parity(int rows, int cols, int batch) {
+#if defined(__aarch64__)
+    if (rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;
+    const size_t nb = cols / 256;
+    const size_t r8 = rows / 8;
+    std::vector<uint8_t> wsrc((size_t)rows * nb * 144);
+    std::vector<uint8_t> wpack(r8 * nb * sizeof(tile_block_q4_Kx8));
+    std::vector<uint8_t> wplane(r8 * nb * sizeof(tile_block_q4_Kx8p));
+    uint32_t rng = 4242;
+    for (auto &b : wsrc) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    sofuu_repack_q4k_8bl(wpack.data(), wsrc.data(), rows, nb, 4);
+    sofuu_repack_q4k_8bl_planes(wplane.data(), wsrc.data(), rows, nb, 4);
+    std::vector<float> x((size_t)batch * cols);
+    for (int it = 0; it < 3; ++it) {
+        for (auto &v : x) {
+            rng = rng * 1664525u + 1013904223u;
+            v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f;
+            if ((rng & 7) == 0) v = 0.0f;
+        }
+        std::vector<tile_block_q8_Kx4> qa((batch / 4) * nb);
+        for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+            ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa.data() + g4 * nb, cols);
+        }
+        std::vector<float> oa((size_t)batch * rows, -1e30f), ob((size_t)batch * rows, -1e30f);
+        for (size_t g = 0; g < r8; ++g) {
+            ggml_gemm_q4_K_8x4_q8_K(cols, oa.data() + g * 8, rows,
+                wpack.data() + g * nb * sizeof(tile_block_q4_Kx8), qa.data(), batch, 8);
+        }
+        for (size_t g = 0; g < r8; ++g) {
+            ggml_gemm_q4_K_8x4_q8_K_p(cols, ob.data() + g * 8, rows,
+                wplane.data() + g * nb * sizeof(tile_block_q4_Kx8p), qa.data(), batch, 8);
+        }
+        if (memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) != 0) {
+            for (size_t i = 0; i < oa.size(); ++i) {
+                if (memcmp(&oa[i], &ob[i], sizeof(float)) != 0) {
+                    fprintf(stderr, "[parity-p] iter %d: out[%zu] %.9g vs %.9g\n", it, i, oa[i], ob[i]);
+                    return 1;
+                }
+            }
+            return 2;
+        }
+    }
+    return 0;
+#else
+    (void) rows; (void) cols; (void) batch;
     return 0;
 #endif
 }

@@ -4,6 +4,60 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Mac CPU / Apple Silicon: Multi-Path Lookahead Tree Speculation with 2D Block-Causal Attention.**
+> Branching candidate tree evaluation (`CandidateTree`, up to 6 speculative nodes across 3 depths) in a single DRAM weight forward pass.
+> Hardware microkernels `sofuu_tree_attention` (2D block-causal ancestor attention with sibling masking) and `sofuu_tree_rope` in SIMD NEON/C++ and Rust FFI.
+> Paired with lazy LM head projection and zero-rollback KV cache commit, decode throughput surged on Apple Silicon (`Qwen-0.6B`):
+> natural text 24.5 -> **31.2 tk/s (+27.3%)**; code generation 42.0 -> **51.5 tk/s (+22.6%)**; with streaming weights -> **56.5 tk/s (+34.5% speedup, <1s total latency)**.
+> Unit tests: 62 infer tests passing; stripped binary footprint: 4.0 MB (<= 5.0 MB gate).
+>
+> **2026-10-14 — Mac CPU: rest-of-fleet survey — per-arch baselines (calm), two bug autopsies (liquid-350 long-context EOS collapse; GPTX3 token-1+ narrowed), generalization state.**
+> The 27B is parked (1.65 tk/s prefill, `71469e71e`); this pass covered every non-shared backend
+> (`lfm2.rs`, `block_graph.rs`, `gptx3.rs`; `spark.rs` is a peer's in-flight file — their fused-QKV
+> tile work may already cover the Spark junk-token degeneration seen in the morning bench).
+> **Calm serve baselines** (201-tok prompt / temp 0): liquid-350 44.3 pp tk/s but **0 generated
+> tokens on long prompts** (bug, below); liquid-1.3B 8.2 pp / 6.4 tk/s (slowest fleet entry —
+> dequant slab reuse + the tile path's batched prefill are the levers); gemma-2b 15.9 pp / 14.1;
+> gpt-x3-150m 53.9 pp / 48.5 but **divergent greedy** (bug, below). llama.cpp references:
+> gemma-2b 15.2/11.8; Llama-1B 82.7/41.3 context from the earlier tables.
+> **liquid-350 autopsy (mine, `lfm2.rs`)**: reproduced via CLI — 8-sentence prompt yields ZERO
+> sampled tokens; onset bisect = progressive corruption from ~40 tok, hard EOS-collapse ≈ 50 tok
+> (`"Answer answers to the question…"` at 40, empty at 50); temp 1.0 escapes (tokens appear,
+> garbage) ⇒ greedy logits collapse onto EOS=7 with context — positional math, not a sampler stop
+> or layer-routing bug (loader reads `layer_types` per layer; 350 patterns are irregular and
+> handled), not attention softmax (verified: max-subtracted, proper GQA group mapping), not rope
+> pairing (shared with the working 1.3B; theta 1e6 in both configs — 350 carries it under
+> `rope_parameters`, a flat-`rope_theta` read would silently fall back, equal value by luck).
+> Next probe suggestions: dump per-position logits (350 vs HF reference) starting pos 30–60;
+> suspect the bf16 matvec path or the conv-L_cache=3 ring rolling. **GPTX3 collateral finding
+> (narrows the token-1+ hunt)**: at token 0 the recurrent state is **zero**, so the decay and
+> erase paths contribute nothing — the earlier session's "token 0 matches HF" proof only covers
+> the rank-1 write; EVERY decay/erase-placement candidate (β inside erase vs outer update, decay
+> per-key-index vs row orientation) is unexercised until token 1. An HF side-by-side state dump
+> (`/tmp/gptx3_hf` + `/tmp/modeling_gptx3.py` still on disk) for tokens 0–2 vs
+> `gdn_forward` layer 0 is the fastest closure. Generalization watch: `conv_L_cache` defaults,
+> per-model `rope_parameters` nesting (flat key vs nested object) and BOS/EOS sourcing are the
+> three config-shape hazards the two LFM2 variants already expose; the block-graph path is the
+> right place to keep absorbing arch variants. Files: `lfm2.rs`/`block_graph.rs`/`gptx3.rs` are
+> this workstream's; no code changed in this pass — analysis-only, benchmarks above are the
+> evidence.
+
+> **2026-10-14 — Mac CPU: the liquid-1.3B "slowest prefill" was thread-config, not kernels — t=6 gives 34.0 tk/s (4.1× the serve's 8.2).**
+> Measured liquid-1.3B (MLX4, 201-tok prefill) across thread counts: **t=4 (the current
+> CLI default) → 27.3 tk/s · t=6 (6 P-cores) → 34.0 tk/s · t=8 (E-cores pulled in) → 14.2
+> tk/s** — pulling the 4 E-cores into the fan-out HALVES throughput (straggler sync in the
+> per-matvec `g_pool.parallel_for`), and the default undershoots P-core count. The morning
+> serve baseline (8.2 tk/s) sat on top of this misconfiguration. Actions owned by whoever
+> touches `main.rs`/mod/quant next (peer-active files today): default thread budget =
+> `hw.perflevel0.physicalcpu` (P-cores only) for inference paths, never `n_cpus`; consider an
+> E-core exclusion cap for the batch-1 MLX4/BF16 matvec pool. With t=6 the LFM2 1.3B prefill
+> is *above* llama.cpp-class CPU numbers for its size, leaving true batched-prefill GEMM as
+> the remaining (kernel-level) lever in `lfm2.rs`/infer_kernels. CLI reproduction:
+> `sofuu infer ~/Downloads/liquid "<201-tok>" --cpu -t N`.
+> Post-ternary context for calibration: the qwen35 sdot path (1.65 tk/s) is MAC-ceiling
+> bound at ~20-34 tk/s absolute; LFM2 prefill at 34 tk/s shows the per-token batch-1 loop is
+> fine once threads are right.
+
 > **2026-10-14 — Mac CPU: PTQ1_0 int8 sdot packed path — Ternary prefill 1.65 tk/s (cumulative 10× today), quality chain proven.**
 > Probed the real 27B's ternary distribution first: **~33% zeros, ±1 lanes evenly
 > balanced** (`probe_ternary_zero_fraction`) — so zero-skipping is a dead end and

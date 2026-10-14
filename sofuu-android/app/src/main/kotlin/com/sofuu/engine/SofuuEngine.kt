@@ -73,6 +73,11 @@ class SofuuEngine(
 
     fun start() {
         if (running.getAndSet(true)) return
+        // Instance tag: two engines in one process would silently split the
+        // event pipeline (the pump drains one runtime's queues while turns
+        // push into the other's). The boot line pins each instance so a twin
+        // is impossible to miss.
+        log("start: engine#0x${Integer.toHexString(hashCode())} thread=${Thread.currentThread().name}")
         thread = Thread({ engineMain() }, "sofuu-engine").also { it.start() }
     }
 
@@ -361,21 +366,34 @@ class SofuuEngine(
         // queue splices MUST stay instant — a draining eval here is what
         // locked the thread until the turn finished.
         val raw = rt.evalNb(DRAIN_JS) ?: return
+        // evalNb wraps EVERY result in {ok, result} — the actual drain
+        // payload ({ev, rp, rc, pc}) sits inside `result` as a JSON STRING
+        // and must be unwrapped first. Reading ev/pc off the OUTER envelope
+        // made every field null/0 forever: turns streamed below while the
+        // app discarded each one of their events at this line.
         val obj = try {
             JSONObject(raw)
         } catch (e: Throwable) {
-            log("drain: unparsable raw=${raw.take(120)}")
+            log("drain: unparsable envelope raw=${raw.take(120)}")
             return
         }
-        // TEMPORARY deep telemetry — unconditional: a DRAIN_JS exception
-        // surfaces as an error envelope (no ev/rp/rc), and pushes surface
-        // as pc drift; both printed verbatim until the reply-loss bug is
-        // confirmed fixed. Remove once streaming is verified.
-        val ev = obj.optJSONArray("ev")
-        val rp = obj.optJSONArray("rp")
-        val rc = obj.optInt("rc")
-        val pc = obj.optInt("pc")
-        val errText = if (obj.has("error")) obj.optString("error").take(160) else null
+        if (!obj.optBoolean("ok", false)) {
+            log("drain: envelope error ${obj.optString("error").take(160)}")
+            return
+        }
+        val payload = obj.optString("result")
+        if (payload.isEmpty()) return
+        val obj2 = try {
+            JSONObject(payload)
+        } catch (e: Throwable) {
+            log("drain: unparsable payload raw=${payload.take(120)}")
+            return
+        }
+        val ev = obj2.optJSONArray("ev")
+        val rp = obj2.optJSONArray("rp")
+        val rc = obj2.optInt("rc")
+        val pc = obj2.optInt("pc")
+        val errText = if (obj2.has("error")) obj2.optString("error").take(160) else null
         val now = android.os.SystemClock.elapsedRealtime()
         // Beacon: log EVERY drain at least once per 2 s, even the all-zero
         // ones. A fully-silent channel used to be invisible by construction
@@ -384,13 +402,10 @@ class SofuuEngine(
         if (errText != null || (ev?.length() ?: 0) > 0 || rc != lastSeenRc || pc != lastSeenPc ||
             now - lastBeaconMs > 2_000L
         ) {
-            // Full kinds list + pc/rc: the anatomy of the turn. Events were
-            // previously invisible behind the 120-char raw take, which is
-            // exactly how a missing 'start'/'done' could not be distinguished
-            // from a missing push.
+            // Full kinds list + pc/rc: the anatomy of the turn.
             val kinds = (0 until (ev?.length() ?: 0)).mapNotNull { ev?.optJSONObject(it)?.optString("kind") }
             log("drain: n=${ev?.length() ?: 0} kinds=[${kinds.joinToString(",")}] rp=${rp?.length() ?: 0} rc=$rc pc=$pc err=$errText")
-            if (errText != null) log("drain: raw=${raw.take(400)}")
+            if (errText != null) log("drain: raw=${payload.take(400)}")
             lastSeenRc = rc
             lastSeenPc = pc
             lastBeaconMs = now

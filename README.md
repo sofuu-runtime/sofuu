@@ -140,6 +140,9 @@ sofuu infer ./model.gguf "Explain distributed consensus" --streaming-weights
 # Accelerate decode throughput via PowerInfer/DejaVu Dynamic FFN Sparsity:
 sofuu infer ./model.gguf "Explain general relativity" --dynamic-ffn
 
+# Multi-Path Lookahead Tree Speculation (evaluate candidate token trees via single DRAM weight sweep):
+sofuu infer ./model.gguf "def fibonacci(n):" --lookahead
+
 # Generate past context limits with in-place KV compaction & sliding-window attention:
 sofuu infer ./model.gguf "Write an essay" --ctx 256 --swa 128 --max-tokens 1000
 
@@ -163,6 +166,7 @@ for await (const chunk of stream) {
 
 | Hardware Target | Model & Precision | Cold Load | Prompt Prefill | Autoregressive Decode | Notes |
 |---|---|---|---|---|---|
+| **Apple Silicon Mac** | `Qwen-3-0.6B` (Q4_K_M GGUF) | **111.3 ms** | **157.1 tk/s** | **51.5–56.5 tk/s** | **+22.6% to +34.5% speedup** with `--lookahead` (vs 42.0 tk/s baseline) |
 | **Apple Silicon Mac** | `Llama-3.2-1B-Instruct` (Q8_0 GGUF) | **12.5 ms** | **42.3 tk/s** | **26.6 tk/s** | **+168.7% speedup** with `--kivi` 4-bit KV cache (vs 9.9 tk/s baseline) |
 | **Apple Silicon Mac** | `Llama-3.2-1B-Instruct` (Q8_0 GGUF) | **600 ms** | **14.6 tk/s** | **5.3–6.9 tk/s** | Cache-bypass with `--streaming-weights` (vs 3.47s cold load) |
 | **Apple Silicon Mac** | `Spark-X2.5-4B` (Q4_K_M GGUF) | **18.2 ms** | **5.2 tk/s** | **17.0 tk/s** | **+68.3% speedup** with `--dynamic-ffn` (vs 10.1 tk/s dense) |

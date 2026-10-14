@@ -4,6 +4,25 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — Mac CPU: PTQ1_0 27B decode 10× — file-direct packed trit dot + opt-in weight residency (0.1 → 0.7-1.0 tk/s); sample-first, not grep-first.**
+> Decode was 7-11 s/token. Two compounding causes, found by sampling the live process (not
+> by reading code): the GEMV dequantized every row into an i8 slab per token (27 GB of slab
+> writes + 11 s decode), and — once that was fixed — the 5.9 GB mmap re-page-faulted every
+> token under peer memory pressure (three 78 s passes with *zero* warm-cache gain ruled out
+> the page-cache hypothesis; the packed kernel only moved 6.36 → 5.9 s).
+> Shipped: `packed_block_dot_t143` expands the 24B+2B mixed-radix trit bytes in NEON
+> digit-planes straight into `sdot` against the per-128-band ActQ activations — the band
+> integer sums are order-independent, so the packed path is **bit-identical** to the
+> dequant+sdot path (pinned by `packed_row_dot_bitmatches_dequant_sdot_path`); and
+> `SOFUU_RESIDENT_WEIGHTS=1` reads the model into anonymous RSS at load (`GgufFile::as_bytes`,
+> parse stays on mmap). Resident steady state: decode **1.0 tk/s** (first token pays a
+> compressor warm-up), "capital of France → Paris" chain intact, 565/565 suite. On an
+> unloaded machine decode-bound should be ~2-3 tk/s (the kernel's arithmetic density still
+> has headroom); residency off = per-token slab+fault storm, so the flag stays opt-in.
+> Process lesson of the day: the "token budget" surveys kept being wrong until I sampled —
+> `/usr/bin/sample <pid> 5 -file …` against a running bench catches what code reading
+> mis predicts (both today's flat-at-0.98× GEMM and the 70%-in-gemv decode came from that).
+
 > **2026-10-14 — Mac CPU: LFM2 batched prefill landed — register-tiled row-panel GEMM, liquid-1.3B prefill 20.5 → 47.8 tk/s (2.3×); GPTX3 token-1+ divergence closed (no repro, parity tests pinned).**
 > `forward_prefill_batch`/`forward_prefill_all_with_logits` in `lfm2.rs` no longer loop
 > per-token (each token re-streamed ~0.9 GB of weights). Batched path: per layer one weight

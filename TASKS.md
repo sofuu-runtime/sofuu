@@ -4,6 +4,24 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — agents/RLM: episodes are now metered — fixes the open AUDIT-2026-08-22
+> P2 "RLM turns are invisible to token budgets and /cost".** `rlm.js` banks every ask's
+> real usage into the episode record (stream `st.usage` — abandoned streams included,
+> P1-2 parity — `ai.complete` results, recurseVia child runs) and reports the sum as
+> `res.usage`; `sofuu.rlm.query` gains `opts.tokenLimit`, and the driver stops the
+> episode mid-flight with `stopped:'budget_tokens'` once prompt+completion crosses it
+> (the 100ms watcher aborts in-flight asks on the same latch). The agent gate passes
+> the run's REMAINING allowance (`budget.maxTokens − tree spend`) as the limit, falls
+> through to the plain loop's breach+salvage path at zero headroom, credits the
+> episode's usage into own/tree via `absorbUsage` (even on stopped/errored episodes),
+> maps `stopped:'budget_tokens'` onto the run so `finish()` builds its full breach
+> report, and emits one llm-shaped event so chat's ctx/cost meter sees the RLM spend
+> like any streamed round (chat's `/cost` already sums `res.usage`). JS-only — no Rust
+> seam change. Evidence: `rlm_mock_test.js` (f) — usage banked ≥8 tokens (mock bills
+> 1+1/ask over 3 rounds + 1 sub-call) and `tokenLimit:3` stops with `budget_tokens`
+> billing >3; `agent_test.js` A4 — routed turn carries `r.usage.promptTokens>0`, and a
+> `maxTokens:5` turn stops `budget_tokens` with `breach.kind==='budget_tokens'`.
+>
 > **2026-10-14 — Pi 5: q4_K prefill attribution + NEON act-quant (Qwen 111 → 128 t/s) + nibble-plane verdict (opt-in).**
 > R0 split the q4_K tile prefill cost 22-37% scalar-act-quant / rest kernel (the generic
 > quantizer ran single-threaded in the serial prologue of every GEMM). R1 shipped the bit-exact

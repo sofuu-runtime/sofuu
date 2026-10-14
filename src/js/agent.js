@@ -2449,9 +2449,23 @@
           var win = d.ctxWindow > 0 ? d.ctxWindow : contextWindow(d.model, d.baseUrl);
           var route = (d.rlm === 'on') ? 'rlm' : sofuu.rlm.route(tokens, win, String(task));
           if (route === 'rlm') {
+            /* Token budget (2026-10-14): the episode is metered. It runs
+             * inside this run's REMAINING allowance and is stopped
+             * mid-flight with stopped:'budget_tokens' when the sum of its
+             * asks' real usage crosses it — so budget_tokens binds during
+             * an RLM turn too, and the spend reaches tree/own (and through
+             * them /cost) instead of vanishing into the episode. With zero
+             * headroom left, fall through to the plain loop: its breach
+             * check + salvage produce a usable answer; an episode that
+             * cannot send a single ask cannot. */
+            var tokRemain = d.budget.maxTokens - (tree.promptTokens + tree.completionTokens);
+            if (!(tokRemain > 0)) {
+              emit('rlm:fallback', { error: 'no token headroom under budget_tokens' });
+            } else {
             emit('rlm:route', { ctxTokens: tokens, windowTokens: win, route: 'rlm' });
             var ro = { provider: d.provider, model: d.model, effort: d.effort,
-                       base_url: d.baseUrl, api_key: d.apiKey, profile: d.profile, trace: true };
+                       base_url: d.baseUrl, api_key: d.apiKey, profile: d.profile, trace: true,
+                       tokenLimit: tokRemain };
             var mo = (opts && opts.max_tokens) || d.maxTokensOut || 0;
             if (mo <= 0) mo = maxOutputFor(d);
             if (mo > 0) ro.max_tokens = mo;
@@ -2469,7 +2483,19 @@
              * driver checks __rlm_aborted at every action). */
             state.aborts.push(function () { try { g.__rlm_aborted = true; } catch (eAb) {} });
             var res = await withCancelGuard(state, sofuu.rlm.query(ctxText, String(task), ro));
+            /* The episode's real usage (every ask, llm() sub-call and
+             * recurseVia child) lands in own + tree here — P1-2-style:
+             * even a stopped/errored episode billed what it spent.
+             * absorbUsage is a no-op on absent/zero usage, so the shape is
+             * forward/backward compatible. */
+            absorbUsage(res);
             if (res && res.stopped === 'aborted') { stopped = 'cancelled'; return finish('(cancelled)'); }
+            if (res && res.stopped === 'budget_tokens') {
+              /* The budget won mid-episode. finish() builds the full
+               * breach detail from this marker (it starts with 'budget_'),
+               * and the episode's partial answer still surfaces. */
+              stopped = 'budget_tokens';
+            }
             var rlmTrace = (res && res.trace) || [];
             for (var ri = 0; ri < rlmTrace.length; ri++) {
               emit('rlm:' + rlmTrace[ri].kind, rlmTrace[ri].repr ? clip(String(rlmTrace[ri].repr), 200) : undefined);
@@ -2479,12 +2505,23 @@
             if (res && res.ms) { own.wallMs = res.ms; }
             try { sofuu.rlm.logRoute({ ctxTokens: tokens, windowTokens: win, question: String(task),
                                        route: 'rlm', latencyMs: (res && res.ms) || 0, rlmCalls: (res && res.calls) || 0 }); } catch (e) {}
+            var rlmUsage = (res && res.usage) || {};
             emit('rlm:done', { calls: (res && res.calls) || 0, toolCalls: (res && (res.toolCalls || res.tool_calls)) || 0,
                                rounds: (res && res.rounds) || 0,
-                               ms: (res && res.ms) || 0, stopped: (res && res.stopped) || null });
+                               ms: (res && res.ms) || 0, stopped: (res && res.stopped) || null,
+                               tokens: (rlmUsage.promptTokens | 0) + (rlmUsage.completionTokens | 0) });
+            /* One llm-shaped event so drivers' meters see the RLM spend the
+             * same way they see a streamed round (chat.js calibrates its
+             * ctx meter and totals off llm events' payload.usage). */
+            if ((rlmUsage.promptTokens | 0) + (rlmUsage.completionTokens | 0) > 0) {
+              emit('llm', { round: own.llmCalls, usage: {
+                promptTokens: rlmUsage.promptTokens | 0, completionTokens: rlmUsage.completionTokens | 0,
+                cacheReadTokens: rlmUsage.cacheReadTokens | 0, cacheWriteTokens: rlmUsage.cacheWriteTokens | 0 } });
+            }
             var rlmAnswer = String((res && res.answer) || '(no response)');
             await storeAndFinish(rlmAnswer);
             return finish(rlmAnswer);
+            }
           }
         } catch (e) {
           emit('rlm:fallback', { error: clip(String((e && e.message) || e), 160) });

@@ -126,6 +126,28 @@
     return !!ep.aborted;
   }
 
+  /* ── Token metering (2026-10-14, fixes the AUDIT-2026-08-22 blindspot) ──
+   * Every ask's real usage is banked into the episode record: streams
+   * deliver st.usage after the loop (ai.rs hands the provider's own
+   * numbers over — abandoned streams too, per the P1-2 accounting rule),
+   * ai.complete resolves {text, usage}, and recurseVia child runs carry
+   * usage in their result. query() reports the sum in out.usage, and —
+   * when the caller passes opts.tokenLimit — stops the episode mid-flight
+   * with stopped:'budget_tokens' once prompt+completion crosses it. An
+   * RLM-routed turn therefore spends inside the caller's token budget
+   * and reaches the cost meters, instead of being invisible to both. */
+  function noteUsage(ep, u) {
+    if (!u) return;
+    ep.usage.promptTokens += u.promptTokens || 0;
+    ep.usage.completionTokens += u.completionTokens || 0;
+    ep.usage.cacheReadTokens += u.cacheReadTokens || 0;
+    ep.usage.cacheWriteTokens += u.cacheWriteTokens || 0;
+  }
+  function overTokenLimit(ep, tokenLimit) {
+    if (!(tokenLimit > 0)) return false;
+    return (ep.usage.promptTokens + ep.usage.completionTokens) > tokenLimit;
+  }
+
   async function ask(opts, messages, ep) {
     /* alloc gate Layer 1 — error learning: if the provider rejects the
      * ask over a limit, cache the real limit for this model and retry
@@ -147,6 +169,7 @@
     if (opts.recurseVia && messages.length === 1 && messages[0].role === 'user' &&
         g.sofuu && g.sofuu.agent && typeof g.sofuu.agent.run === 'function') {
       var r2 = await g.sofuu.agent.run(String(opts.recurseVia.agent), messages[0].content, { plain: true });
+      noteUsage(ep, r2 && r2.usage);
       return (r2 && r2.answer) ? r2.answer : '';
     }
     var o = allocFit(completeOpts(opts, messages));
@@ -160,6 +183,9 @@
           if (ch && ch.text) text += ch.text;
         }
       } catch (eS) {
+        /* A cut stream still billed its prompt tokens (P1-2 parity) — bank
+         * whatever usage landed before rethrowing or swallowing the abort. */
+        noteUsage(ep, st.usage);
         /* Aborted mid-flight: swallow so the episode loop's top-of-loop
          * check reports stopped:'aborted' instead of rejecting the whole
          * query (agent.js would otherwise fall back to the plain loop). */
@@ -169,9 +195,11 @@
         var ix = ACTIVE_ASKS.indexOf(entry);
         if (ix >= 0) ACTIVE_ASKS.splice(ix, 1);
       }
+      noteUsage(ep, st.usage);
       return text;
     }
     var r = await sofuu.ai.complete(o);
+    noteUsage(ep, r && r.usage);
     if (r && typeof r === 'object' && typeof r.text === 'string') return r.text;
     if (typeof r === 'string') return r;
     return r ? String(r) : '';
@@ -179,11 +207,13 @@
 
   /**
    * sofuu.rlm.query(context, question, opts) → Promise resolving to
-   * { answer, calls, toolCalls, rounds, ms, stopped, depthReached, trace? }
+   * { answer, calls, toolCalls, rounds, ms, stopped, depthReached, usage?, trace? }
    * opts: { provider, model, effort, base_url, api_key,
    *         maxDepth, maxLlmCalls, maxWallMs, maxRounds, chunkChars, trace,
    *         tools: [{name, description, parameters}],   (A4: sandbox whitelist)
    *         maxToolCalls,
+   *         tokenLimit,                                  (2026-10-14: ceiling on the
+   *           episode's prompt+completion tokens; crossed → stopped:'budget_tokens')
    *         execTool: async (name, args) => string }    (A4: executor — runs
    *           in the ENGINE context through the agent's normal tool path;
    *           never inside the sandbox, so tool code has no context access) }
@@ -226,16 +256,21 @@
     var started = Date.now();
     /* Per-episode abort record (P2-8): the host flag stays the SIGNAL, but
      * each episode latches it into its own token — episodes no longer
-     * reset or clear each other's cancels. */
-    var ep = { aborted: false };
+     * reset or clear each other's cancels. The same record banks the
+     * episode's token usage and its over-budget latch (2026-10-14). */
+    var ep = { aborted: false, over: false,
+               usage: { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } };
     EPISODES.push(ep);
     /* Mid-request abort: poll the host-set flag and kill any in-flight ask
      * streams (Esc during a long LLM call — previously only noticed at the
      * next round boundary). 100ms poll ≈ the chat's Esc disambiguation
-     * timer; the flag itself is set synchronously by agent.cancel. */
+     * timer; the flag itself is set synchronously by agent.cancel. The
+     * token limit latches the same way: once crossed, in-flight asks are
+     * killed and the loop stops at the next boundary. */
     var watcher = setInterval(function () {
-      if (!g.__rlm_aborted) return;
-      ep.aborted = true;
+      if (overTokenLimit(ep, opts.tokenLimit)) { ep.over = true; }
+      if (!g.__rlm_aborted && !ep.over) return;
+      if (g.__rlm_aborted) ep.aborted = true;
       var list = ACTIVE_ASKS.slice();
       for (var i = 0; i < list.length; i++) {
         if (list[i].episode === ep) list[i].abort();
@@ -244,10 +279,19 @@
     try {
       var action = parseHostJson(__rlm_start(id), 'action');
       for (;;) {
-        if (episodeAborted(ep)) {
+        /* Boundary enforcement is INLINE at every action return — a fast
+         * mock (or a fast provider round) can finish several rounds inside
+         * one watcher tick; the watcher exists to kill asks mid-flight
+         * (host abort, or a single ask that drips past the limit), not to
+         * be the only enforcement point. */
+        if (overTokenLimit(ep, opts.tokenLimit)) { ep.over = true; }
+        if (episodeAborted(ep) || ep.over) {
           return {
-            answer: '(aborted)', calls: 0, toolCalls: 0, rounds: 0,
-            ms: Date.now() - started, stopped: 'aborted', depthReached: 0
+            answer: ep.over ? '(budget stop)' : '(aborted)',
+            calls: 0, toolCalls: 0, rounds: 0,
+            ms: Date.now() - started, stopped: ep.over ? 'budget_tokens' : 'aborted',
+            depthReached: 0,
+            usage: Object.assign({}, ep.usage)
           };
         }
         if (action.kind === 'messages') {
@@ -287,7 +331,11 @@
             rounds: r.rounds,
             ms: r.ms,
             stopped: r.stopped,
-            depthReached: r.depth_reached /* camelCase here, snake in trace */
+            depthReached: r.depth_reached /* camelCase here, snake in trace */,
+            /* Real usage banked from every ask + sub-call + child run —
+             * the caller (agent gate) credits it into its own/token budget
+             * accounting and the cost meters. */
+            usage: Object.assign({}, ep.usage)
           };
           if (r.trace !== undefined) out.trace = r.trace;
           return out;

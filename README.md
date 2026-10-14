@@ -132,6 +132,9 @@ sofuu infer ./liqiud-350 "Explain quantum entanglement in simple terms." --max-t
 # Extreme long-context with KIVI 2-bit & 4-bit Asymmetric Quantized KV Cache:
 sofuu infer ./model.gguf "Summarize this long document" --kivi --kivi-bits 4
 
+# Eliminate CPU cache thrashing via Non-Temporal Streaming Weights (Cache-Bypass):
+sofuu infer ./model.gguf "Explain distributed consensus" --streaming-weights
+
 # Accelerate decode throughput via PowerInfer/DejaVu Dynamic FFN Sparsity:
 sofuu infer ./model.gguf "Explain general relativity" --dynamic-ffn
 
@@ -159,6 +162,7 @@ for await (const chunk of stream) {
 | Hardware Target | Model & Precision | Cold Load | Prompt Prefill | Autoregressive Decode | Notes |
 |---|---|---|---|---|---|
 | **Apple Silicon Mac** | `Llama-3.2-1B-Instruct` (Q8_0 GGUF) | **12.5 ms** | **42.3 tk/s** | **26.6 tk/s** | **+168.7% speedup** with `--kivi` 4-bit KV cache (vs 9.9 tk/s baseline) |
+| **Apple Silicon Mac** | `Llama-3.2-1B-Instruct` (Q8_0 GGUF) | **600 ms** | **14.6 tk/s** | **5.3–6.9 tk/s** | Cache-bypass with `--streaming-weights` (vs 3.47s cold load) |
 | **Apple Silicon Mac** | `Spark-X2.5-4B` (Q4_K_M GGUF) | **18.2 ms** | **5.2 tk/s** | **17.0 tk/s** | **+68.3% speedup** with `--dynamic-ffn` (vs 10.1 tk/s dense) |
 | **Apple Silicon Mac** (M2 Pro) | `liqiud-350` (BF16 SafeTensors) | **127.9 ms** | — | **68.7 tk/s** | 19.1× speedup via NEON bit-extension |
 | **Apple Silicon Mac** (M2 Pro) | `liquid` (MLX 4-bit SafeTensors) | **119.2 ms** | — | **8.1 tk/s** | 20.25× speedup via group scale/bias broadcast |

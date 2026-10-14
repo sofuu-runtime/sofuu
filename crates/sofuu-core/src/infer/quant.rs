@@ -250,6 +250,18 @@ pub fn tile_warm(ptr: *const u8, rows: usize, cols: usize, ty: u32) {
     }
 }
 
+/// Force the q4_K decoded-scale sidecar off (`on = true`) or back on
+/// (`on = false`) for the next tile warm. Tests use this to drive the
+/// original kernels and the sidecar kernels on identical tiles. The
+/// sidecar is opt-in at runtime via `SOFUU_SCALE_SIDECAR=1`: on Pi 5 the
+/// prefill GEMM is unchanged by it (scale decode overlaps the NEON wall)
+/// while its extra bytes slow DRAM-bound GEMV decode, so it ships disabled.
+pub fn tile_scale_sidecar_disable(on: bool) {
+    unsafe {
+        sofuu_tile_scale_sidecar_mode(on as i32);
+    }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -262,6 +274,93 @@ pub fn get_thread_count() -> usize {
         sofuu_get_threads() as usize
     }
 }
+
+/// Non-temporal streaming prefetch for single-use weight buffers.
+///
+/// On ARM64 (aarch64), executes `prfm pldl1strm` (Prefetch Load L1 Streaming),
+/// which instructs the memory controller and hardware prefetcher to stream data
+/// without allocating or evicting long-lived cache lines in L2/L3 unified caches.
+/// On x86_64, executes `_mm_prefetch` with `_MM_HINT_NTA` (Non-Temporal Access hint).
+///
+/// Limits prefetch length to `bytes.min(64 * 1024)` to avoid saturating hardware
+/// Miss Status Holding Registers (MSHRs).
+#[inline]
+pub fn prefetch_streaming_bytes(ptr: *const u8, bytes: usize) {
+    if ptr.is_null() || bytes == 0 {
+        return;
+    }
+    let prefetch_len = bytes.min(64 * 1024);
+    const STEP: usize = 64;
+    let mut offset = 0;
+    while offset < prefetch_len {
+        let p = unsafe { ptr.add(offset) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1strm, [{x}]",
+                x = in(reg) p,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_NTA);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = p;
+        }
+        offset += STEP;
+    }
+}
+
+/// Temporal prefetch for recurrently accessed data (KV Cache and working activation buffers).
+///
+/// On ARM64 (aarch64), executes `prfm pldl1keep` (Prefetch Load L1 Retain / Keep),
+/// pinning the cache lines in L1/L2 caches with high temporal locality.
+/// On x86_64, executes `_mm_prefetch` with `_MM_HINT_T0` (Temporal locality in all cache levels).
+#[inline]
+pub fn prefetch_temporal_bytes(ptr: *const u8, bytes: usize) {
+    if ptr.is_null() || bytes == 0 {
+        return;
+    }
+    let prefetch_len = bytes.min(64 * 1024);
+    const STEP: usize = 64;
+    let mut offset = 0;
+    while offset < prefetch_len {
+        let p = unsafe { ptr.add(offset) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{x}]",
+                x = in(reg) p,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = p;
+        }
+        offset += STEP;
+    }
+}
+
+/// Non-temporal streaming prefetch for a byte slice.
+#[inline(always)]
+pub fn prefetch_streaming_slice(slice: &[u8]) {
+    prefetch_streaming_bytes(slice.as_ptr(), slice.len());
+}
+
+/// Temporal prefetch for a typed slice (e.g. KV Cache or f32 activations).
+#[inline(always)]
+pub fn prefetch_temporal_slice<T>(slice: &[T]) {
+    prefetch_temporal_bytes(slice.as_ptr() as *const u8, slice.len() * std::mem::size_of::<T>());
+}
+
 
 #[inline(always)]
 pub fn vec_dot_raw_q4_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32 {
@@ -292,6 +391,7 @@ extern "C" {
     fn sofuu_set_threads(n: i32);
     fn sofuu_get_threads() -> i32;
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
+    fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
@@ -1275,6 +1375,144 @@ mod tests {
         }
     }
 
+    /// GGUF-layout q4_K fixture: per 256-elem super-block an f16 d/dmin, the
+    /// 12-byte 6-bit scales/mins pack (inverse of get_scale_min_k4), and
+    /// nibbles stored as low = element g*64+e, high = element g*64+32+e —
+    /// the layout the tile kernels and the SDOT fallback both decode.
+    fn build_q4_k_fixture(rows: usize, cols: usize) -> Vec<u8> {
+        const QK: usize = 256;
+        assert_eq!(cols % QK, 0);
+        let blks_per_row = cols / QK;
+        let row_len = blks_per_row * 144;
+        let mut bytes = vec![0u8; rows * row_len];
+        for r in 0..rows {
+            for sb in 0..blks_per_row {
+                let base = r * row_len + sb * 144;
+                let d_bits: u16 = (8u16 << 10) | (((r * 2 + sb) % 16) as u16 * 64);
+                let dmin_bits: u16 = (6u16 << 10) | (((r + 2 * sb + 3) % 8) as u16 * 128);
+                bytes[base] = (d_bits & 0xff) as u8;
+                bytes[base + 1] = (d_bits >> 8) as u8;
+                bytes[base + 2] = (dmin_bits & 0xff) as u8;
+                bytes[base + 3] = (dmin_bits >> 8) as u8;
+                let sc: Vec<u8> = (0..8).map(|j| 1 + ((r * 7 + sb * 5 + j * 11) % 63) as u8).collect();
+                let mn: Vec<u8> = (0..8).map(|j| ((r * 3 + sb * 13 + j * 29) % 64) as u8).collect();
+                for j in 0..4 {
+                    bytes[base + 4 + j] = sc[j] | ((sc[j + 4] & 0x30) << 2);
+                    bytes[base + 8 + j] = mn[j] | ((mn[j + 4] & 0x30) << 2);
+                    bytes[base + 12 + j] = (sc[j + 4] & 0x0F) | ((mn[j + 4] & 0x0F) << 4);
+                }
+                for g in 0..4 {
+                    for e in 0..32 {
+                        let lo = ((r * 71 + sb * 37 + g * 19 + e * 5) % 16) as u8;
+                        let hi = ((r * 23 + sb * 41 + g * 7 + e * 3) % 16) as u8;
+                        bytes[base + 16 + g * 32 + e] = lo | (hi << 4);
+                    }
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Dot-convention q4_K reference: w = d·sc·q4 − dmin·mn per 32-element
+    /// sub-block (matches the runtime kernels and SDOT vecdot).
+    fn q4_k_reference_weights(w_bytes: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+        let mut weights = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let sb = c / 256;
+                let t = c % 256;
+                let grp = t / 32;
+                let base = r * (cols / 256) * 144 + sb * 144;
+                let d = f16_to_f32(((w_bytes[base + 1] as u16) << 8) | w_bytes[base] as u16);
+                let dmin = f16_to_f32(((w_bytes[base + 3] as u16) << 8) | w_bytes[base + 2] as u16);
+                let j = grp % 4;
+                let sc = if grp < 4 {
+                    w_bytes[base + 4 + j] & 0x3F
+                } else {
+                    (w_bytes[base + 12 + j] & 0x0F) | ((w_bytes[base + 4 + j] >> 6) << 4)
+                };
+                let mn = if grp < 4 {
+                    w_bytes[base + 8 + j] & 0x3F
+                } else {
+                    (w_bytes[base + 12 + j] >> 4) | ((w_bytes[base + 8 + j] >> 6) << 4)
+                };
+                let g = t / 64;
+                let e = t % 64;
+                let byte = w_bytes[base + 16 + g * 32 + (e % 32)];
+                let q = if e < 32 { byte & 0x0F } else { byte >> 4 };
+                weights[r * cols + c] = d * (sc as f32) * (q as f32) - dmin * (mn as f32);
+            }
+        }
+        weights
+    }
+
+    #[test]
+    fn test_tile_q4_k_scale_sidecar_bit_exact() {
+        // (16, 256) takes the serial warm path (2 row groups); (128, 256)
+        // crosses the parallel thresholds (16 row groups, 16 tile blocks)
+        // so the ranged repack + sidecar fill are covered too.
+        for (rows, cols) in [(16usize, 256usize), (128usize, 256usize)] {
+            let batch = 8usize;
+            let w_bytes = build_q4_k_fixture(rows, cols);
+            let weights = q4_k_reference_weights(&w_bytes, rows, cols);
+
+            let x: Vec<f32> =
+                (0..batch * cols).map(|i| ((i % 37) as f32) * 0.098 - 1.4).collect();
+
+            let run = |out: &mut Vec<f32>, outv: &mut Vec<f32>| {
+                tile_warm(w_bytes.as_ptr(), rows, cols, GGML_TYPE_Q4_K);
+                *out = vec![0f32; batch * rows];
+                matmat(&w_bytes, GGML_TYPE_Q4_K, rows, cols, &x, batch, out);
+                *outv = vec![0f32; rows];
+                matvec(&w_bytes, GGML_TYPE_Q4_K, rows, cols, &x[..cols], outv);
+            };
+
+            tile_scale_sidecar_disable(false);
+            let mut out_sc = Vec::new();
+            let mut outv_sc = Vec::new();
+            run(&mut out_sc, &mut outv_sc);
+
+            // Rebuild the entry without a sidecar so the same tiles are
+            // computed by the original kernels; outputs must be bit-identical.
+            tile_scale_sidecar_disable(true);
+            let mut out_nosc = Vec::new();
+            let mut outv_nosc = Vec::new();
+            run(&mut out_nosc, &mut outv_nosc);
+            tile_scale_sidecar_disable(false);
+
+            for i in 0..out_sc.len() {
+                assert_eq!(
+                    out_sc[i].to_bits(),
+                    out_nosc[i].to_bits(),
+                    "gemm ({rows}x{cols}, {}, row {}): sidecar {:?} vs {}",
+                    i / rows,
+                    i % rows,
+                    out_sc[i],
+                    out_nosc[i]
+                );
+            }
+            for r in 0..rows {
+                assert_eq!(outv_sc[r].to_bits(), outv_nosc[r].to_bits(), "gemv row {r}");
+            }
+
+            // Sanity: both paths agree with the dequant reference within the
+            // usual int8-activation tolerance, guarding against fixture drift.
+            for b in 0..batch {
+                for r in 0..rows {
+                    let a = out_sc[b * rows + r];
+                    let mut l1 = 0f32;
+                    let mut want = 0f32;
+                    for c in 0..cols {
+                        let p = weights[r * cols + c] * x[b * cols + c];
+                        l1 += p.abs();
+                        want += p;
+                    }
+                    assert!((a - want).abs() <= 0.05 * l1 + 1e-3, "({b},{r}): {a} vs {want}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_cpp_rmsnorm() {
         let x = [1.0f32, 2.0, 3.0, 4.0];
@@ -1784,5 +2022,33 @@ mod tests {
             assert_eq!(v, expected[i], "element {i}");
         }
     }
+
+    #[test]
+    fn test_prefetch_streaming_and_temporal_safety() {
+        // Null and zero bytes
+        prefetch_streaming_bytes(std::ptr::null(), 0);
+        prefetch_streaming_bytes(std::ptr::null(), 1024);
+        prefetch_temporal_bytes(std::ptr::null(), 0);
+        prefetch_temporal_bytes(std::ptr::null(), 1024);
+
+        let empty: [u8; 0] = [];
+        prefetch_streaming_slice(&empty);
+        prefetch_temporal_slice(&empty);
+
+        // Small buffer (< 64 bytes)
+        let small = [42u8; 16];
+        prefetch_streaming_slice(&small);
+        prefetch_temporal_slice(&small);
+
+        // Multi-page buffer (> 64 KB, exercises capping and multi-cacheline stepping)
+        let buffer = vec![0x5au8; 128 * 1024];
+        prefetch_streaming_slice(&buffer);
+        prefetch_temporal_slice(&buffer);
+
+        // Typed f32 slice
+        let f32_buf = vec![1.234f32; 4096];
+        prefetch_temporal_slice(&f32_buf);
+    }
 }
+
 

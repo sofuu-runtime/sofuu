@@ -1507,6 +1507,7 @@ fn main() -> ExitCode {
             let mut dynamic_ffn = false;
             let mut kivi = false;
             let mut kivi_bits = 4usize;
+            let mut streaming_weights = false;
 
             let mut i = 4;
             while i < args.len() {
@@ -1564,6 +1565,9 @@ fn main() -> ExitCode {
                     }
                     kivi = true;
                     i += 2;
+                } else if args[i] == "--streaming-weights" || args[i] == "--cache-bypass" {
+                    streaming_weights = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
@@ -1618,6 +1622,7 @@ fn main() -> ExitCode {
                     dynamic_ffn,
                     kivi,
                     kivi_bits,
+                    streaming_weights,
                     ..Default::default()
                 },
                 |tok| {

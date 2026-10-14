@@ -106,6 +106,39 @@ impl MmapFile {
             None
         }
     }
+
+    /// Advise the OS kernel that model weights will be read sequentially.
+    /// On Unix (macOS, Linux), this triggers MADV_SEQUENTIAL, enabling aggressive
+    /// kernel readahead while freeing read pages immediately to prevent multi-gigabyte
+    /// weights from polluting the OS page cache and evicting hot inference memory.
+    pub fn advise_sequential(&self) {
+        #[cfg(unix)]
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                libc::madvise(self.ptr as *mut libc::c_void, self.len, libc::MADV_SEQUENTIAL);
+            }
+        }
+    }
+
+    /// Advise the OS kernel to restore normal page caching behavior.
+    pub fn advise_normal(&self) {
+        #[cfg(unix)]
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                libc::madvise(self.ptr as *mut libc::c_void, self.len, libc::MADV_NORMAL);
+            }
+        }
+    }
+
+    /// Advise sequential access for a specific byte range.
+    pub fn advise_sequential_range(&self, offset: usize, length: usize) {
+        #[cfg(unix)]
+        if !self.ptr.is_null() && offset.checked_add(length).map_or(false, |end| end <= self.len) {
+            unsafe {
+                libc::madvise(self.ptr.add(offset) as *mut libc::c_void, length, libc::MADV_SEQUENTIAL);
+            }
+        }
+    }
 }
 
 impl Drop for MmapFile {

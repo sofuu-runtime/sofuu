@@ -15,7 +15,8 @@ use super::quant::{
     batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
     batched_swiglu,
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
-    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec, prof,
+    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
+    prefetch_streaming_slice, prefetch_temporal_slice, prof,
     rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, type_row_size,
     GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
@@ -267,6 +268,7 @@ pub struct TransformerModel {
     pub is_gemma2: bool,
     pub dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig,
     pub kivi: Option<super::kivi::KiviCache>,
+    pub streaming_weights: bool,
 }
 
 impl TransformerModel {
@@ -484,6 +486,7 @@ impl TransformerModel {
             is_gemma2,
             dynamic_ffn: super::dynamic_ffn::DynamicFfnConfig::default(),
             kivi: None,
+            streaming_weights: false,
         })
     }
 
@@ -522,6 +525,19 @@ impl TransformerModel {
         self.k_cache.fill(0.0);
         self.v_cache.fill(0.0);
         self.kivi = None;
+    }
+
+    /// Configure Non-Temporal Streaming Weights (Cache-Bypass).
+    /// When enabled, advises the OS kernel sequentially via libc::madvise(MADV_SEQUENTIAL)
+    /// and activates non-temporal streaming prefetch in the layer execution pipeline to bypass
+    /// CPU cache thrashing during single-token autoregressive decoding.
+    pub fn set_streaming_weights(&mut self, enabled: bool) {
+        self.streaming_weights = enabled;
+        if enabled {
+            self.gguf.mmap.advise_sequential();
+        } else {
+            self.gguf.mmap.advise_normal();
+        }
     }
 
     /// Enable KIVI 2-bit or 4-bit Asymmetric Quantized KV Cache.
@@ -1115,18 +1131,38 @@ impl TransformerModel {
         let gguf = &self.gguf;
 
         let end = end_layer.min(self.config.n_layers);
+        let streaming = self.streaming_weights;
         for layer_idx in start_layer..end {
             let layer = &self.layers[layer_idx];
 
-            // ── Attention Norm ──────────────────────────────
             let attn_norm_bytes = Self::tensor_slice(gguf, &layer.attn_norm);
+            let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
+            let k_bytes = Self::tensor_slice(gguf, &layer.attn_k);
+            let v_bytes = Self::tensor_slice(gguf, &layer.attn_v);
+            let attn_out_bytes = Self::tensor_slice(gguf, &layer.attn_output);
+            let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
+            let gate_bytes = Self::tensor_slice(gguf, &layer.ffn_gate);
+            let up_bytes = Self::tensor_slice(gguf, &layer.ffn_up);
+            let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
+
+            if streaming {
+                // Non-temporal prefetch Q & K projection weights
+                prefetch_streaming_slice(q_bytes);
+                prefetch_streaming_slice(k_bytes);
+                // Temporal prefetch working hidden states
+                prefetch_temporal_slice(&self.x);
+            }
+
+            // ── Attention Norm ──────────────────────────────
             let attn_norm_weights = unsafe {
                 std::slice::from_raw_parts(attn_norm_bytes.as_ptr() as *const f32, dim)
             };
             rmsnorm(&mut self.x_norm, &self.x, attn_norm_weights, norm_eps);
 
             // ── Q, K, V Projections ─────────────────────────
-            let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
+            if streaming {
+                prefetch_streaming_slice(v_bytes);
+            }
             matvec(
                 q_bytes,
                 layer.attn_q.tensor_type,
@@ -1145,7 +1181,9 @@ impl TransformerModel {
                 }
             }
 
-            let k_bytes = Self::tensor_slice(gguf, &layer.attn_k);
+            if streaming {
+                prefetch_streaming_slice(attn_out_bytes);
+            }
             matvec(
                 k_bytes,
                 layer.attn_k.tensor_type,
@@ -1164,7 +1202,6 @@ impl TransformerModel {
                 }
             }
 
-            let v_bytes = Self::tensor_slice(gguf, &layer.attn_v);
             matvec(
                 v_bytes,
                 layer.attn_v.tensor_type,
@@ -1221,6 +1258,16 @@ impl TransformerModel {
             }
 
             // ── Multi-Head / Grouped-Query Attention ────────
+            if streaming {
+                let cache_len = (cache_pos + 1).min(max_seq_len);
+                let slot_start = layer_idx * n_kv_heads * max_seq_len * head_dim;
+                let slot_len = n_kv_heads * cache_len * head_dim;
+                prefetch_temporal_slice(&self.k_cache[slot_start..slot_start + slot_len]);
+                prefetch_temporal_slice(&self.v_cache[slot_start..slot_start + slot_len]);
+                prefetch_temporal_slice(&self.q);
+                prefetch_streaming_slice(gate_bytes);
+                prefetch_streaming_slice(up_bytes);
+            }
             if let Some(ref mut kivi) = self.kivi {
                 kivi.append_token(layer_idx, &self.k, &self.v);
                 kivi.compute_layer_attention(layer_idx, n_heads, &self.q, &mut self.head_out);
@@ -1244,7 +1291,6 @@ impl TransformerModel {
             }
 
             // ── Attention Output Projection ─────────────────
-            let attn_out_bytes = Self::tensor_slice(gguf, &layer.attn_output);
             matvec(
                 attn_out_bytes,
                 layer.attn_output.tensor_type,
@@ -1258,14 +1304,15 @@ impl TransformerModel {
             inline_mad(&mut self.x, &self.attn_out, 1.0);
 
             // ── FFN Norm ────────────────────────────────────
-            let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
             let ffn_norm_weights = unsafe {
                 std::slice::from_raw_parts(ffn_norm_bytes.as_ptr() as *const f32, dim)
             };
             rmsnorm(&mut self.x_norm, &self.x, ffn_norm_weights, norm_eps);
 
             // ── SwiGLU FFN ──────────────────────────────────
-            let gate_bytes = Self::tensor_slice(gguf, &layer.ffn_gate);
+            if streaming {
+                prefetch_streaming_slice(down_bytes);
+            }
             matvec(
                 gate_bytes,
                 layer.ffn_gate.tensor_type,
@@ -1275,7 +1322,6 @@ impl TransformerModel {
                 &mut self.ffn_gate_buf,
             );
 
-            let up_bytes = Self::tensor_slice(gguf, &layer.ffn_up);
             matvec(
                 up_bytes,
                 layer.ffn_up.tensor_type,
@@ -1287,7 +1333,15 @@ impl TransformerModel {
 
             swiglu_in_place(&mut self.ffn_gate_buf, &self.ffn_up_buf);
 
-            let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
+            if streaming {
+                if layer_idx + 1 < end {
+                    let next_layer = &self.layers[layer_idx + 1];
+                    prefetch_streaming_slice(Self::tensor_slice(gguf, &next_layer.attn_q));
+                } else {
+                    prefetch_streaming_slice(Self::tensor_slice(gguf, &self.output));
+                }
+            }
+
             if self.dynamic_ffn.enabled {
                 self.dynamic_ffn.sparse_down_proj(
                     down_bytes,
@@ -1338,6 +1392,10 @@ impl TransformerModel {
         rmsnorm_in_place(&mut self.x, out_norm_weights, norm_eps);
 
         let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        if self.streaming_weights {
+            prefetch_streaming_slice(out_bytes);
+            prefetch_temporal_slice(&self.x);
+        }
         matvec(
             out_bytes,
             self.output.tensor_type,
@@ -1368,6 +1426,10 @@ impl TransformerModel {
 
             // 4. Output Logits Projection
             let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+            if self.streaming_weights {
+                prefetch_streaming_slice(out_bytes);
+                prefetch_temporal_slice(&self.x);
+            }
             matvec(
                 out_bytes,
                 self.output.tensor_type,

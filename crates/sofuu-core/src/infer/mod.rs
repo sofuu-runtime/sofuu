@@ -56,6 +56,7 @@ pub struct GenerateOptions {
     pub dynamic_ffn: bool,
     pub kivi: bool,
     pub kivi_bits: usize,
+    pub streaming_weights: bool,
 }
 
 impl Default for GenerateOptions {
@@ -80,6 +81,7 @@ impl Default for GenerateOptions {
             dynamic_ffn: false, // Dynamic FFN Sparsity (PowerInfer / DejaVu style)
             kivi: false,       // KIVI / TurboKV asymmetric 2-bit & 4-bit KV cache
             kivi_bits: 4,      // 4-bit (Four) or 2-bit (Two)
+            streaming_weights: false, // Non-temporal streaming weights (cache-bypass)
         }
     }
 }
@@ -204,6 +206,12 @@ impl InferModel {
     pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
         if let ModelBackend::Gguf(m) = &mut self.backend {
             m.enable_kivi(bits, cur_pos);
+        }
+    }
+
+    pub fn set_streaming_weights(&mut self, enabled: bool) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.set_streaming_weights(enabled);
         }
     }
 
@@ -713,6 +721,10 @@ impl InferEngine {
 
         if options.kivi {
             self.model.enable_kivi(options.kivi_bits, cur_pos);
+        }
+
+        if options.streaming_weights {
+            self.model.set_streaming_weights(true);
         }
 
         // 4. Decode Phase

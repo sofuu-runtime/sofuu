@@ -1402,6 +1402,23 @@ fn prof_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SOFUU_LFM2_PROF").is_ok())
 }
 
+static RMS_PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADD_PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SWI_PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EMBED_PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+macro_rules! prof_section {
+    ($atom:expr, $body:expr) => {{
+        let on = prof_enabled();
+        let t0 = if on { Some(std::time::Instant::now()) } else { None };
+        let v = $body;
+        if let Some(t0) = t0 {
+            $atom.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        v
+    }};
+}
+
 fn gemm_batched(
     lt: &LinearTensor,
     mmap: &super::mmap::MmapFile,
@@ -1422,7 +1439,7 @@ fn gemm_batched(
     let x_ptr = SendPtr(x.as_ptr());
     let y_ptr = SendMutPtr(y.as_mut_ptr());
     let t_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
-    const ROW_PANEL: usize = 16;
+    const ROW_PANEL: usize = 32;
     let panels = rows.div_ceil(ROW_PANEL);
     super::dynamic_ffn::parallel_for(0, panels, threads, move |p0, p1| unsafe {
         run_gemm_panels(lt_ptr, mmap_ptr, x_ptr, y_ptr, t_count, rows, cols, p0, p1);
@@ -1451,7 +1468,7 @@ unsafe fn run_gemm_panels(
     if p0 >= p1 {
         return;
     }
-    const ROW_PANEL: usize = 16;
+    const ROW_PANEL: usize = 32;
     let lt: &LinearTensor = unsafe { &*lt_ptr.0 };
     let mmap: &super::mmap::MmapFile = unsafe { &*mmap_ptr.0 };
     let x: &[f32] = unsafe { std::slice::from_raw_parts(x_ptr.0, t_count * cols) };
@@ -1530,6 +1547,22 @@ fn batched_rmsnorm(
     out: &mut [f32],
     threads: usize,
 ) {
+    prof_section! {
+        RMS_PROF_NS,
+        prof_batched_rmsnorm(x, t_count, dim, mmap, tv, eps, out, threads)
+    }
+}
+
+fn prof_batched_rmsnorm(
+    x: &[f32],
+    t_count: usize,
+    dim: usize,
+    mmap: &super::mmap::MmapFile,
+    tv: &SafeTensorView,
+    eps: f32,
+    out: &mut [f32],
+    threads: usize,
+) {
     let slice = mmap.slice(tv.data_offset, tv.size_bytes).unwrap();
     let w_ptr = SendPtr(slice.as_ptr());
     let x_ptr = SendPtr(x.as_ptr());
@@ -1555,6 +1588,13 @@ fn batched_rmsnorm(
 }
 
 fn batched_swiglu(gate: &mut [f32], up: &[f32], t_count: usize, hidden: usize, threads: usize) {
+    prof_section! {
+        SWI_PROF_NS,
+        prof_batched_swiglu(gate, up, t_count, hidden, threads)
+    }
+}
+
+fn prof_batched_swiglu(gate: &mut [f32], up: &[f32], t_count: usize, hidden: usize, threads: usize) {
     let g_ptr = SendMutPtr(gate.as_mut_ptr());
     let u_ptr = SendPtr(up.as_ptr());
     super::dynamic_ffn::parallel_for(0, t_count, threads, move |t0, t1| {
@@ -1570,13 +1610,30 @@ fn batched_swiglu(gate: &mut [f32], up: &[f32], t_count: usize, hidden: usize, t
 }
 
 fn batched_add_in_place(x: &mut [f32], add: &[f32]) {
-    for (xv, av) in x.iter_mut().zip(add.iter()) {
-        *xv += *av;
+    prof_section! {
+        ADD_PROF_NS,
+        for (xv, av) in x.iter_mut().zip(add.iter()) {
+            *xv += *av;
+        }
     }
 }
 
 /// Gather token embeddings into token-major `out` (rows dequantized in parallel).
 fn embed_tokens_batched(
+    lt: &LinearTensor,
+    mmap: &super::mmap::MmapFile,
+    tokens: &[u32],
+    dim: usize,
+    out: &mut [f32],
+    threads: usize,
+) {
+    prof_section! {
+        EMBED_PROF_NS,
+        prof_embed_tokens_batched(lt, mmap, tokens, dim, out, threads)
+    }
+}
+
+fn prof_embed_tokens_batched(
     lt: &LinearTensor,
     mmap: &super::mmap::MmapFile,
     tokens: &[u32],
@@ -1606,6 +1663,302 @@ fn embed_tokens_batched(
     });
 }
 
+thread_local! {
+    static ATT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn attention_prep_tokens(
+    q_ptr: SendMutPtr<f32>,
+    k_ptr: SendMutPtr<f32>,
+    v_ptr: SendMutPtr<f32>,
+    kc_ptr: SendMutPtr<f32>,
+    vc_ptr: SendMutPtr<f32>,
+    qln_ptr: SendPtr<u8>,
+    kln_ptr: SendPtr<u8>,
+    t0: usize,
+    t1: usize,
+    start_pos: usize,
+    q_rows: usize,
+    k_rows: usize,
+    v_rows: usize,
+    layer_idx: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq_len: usize,
+    freq_base: f32,
+    eps: f32,
+) {
+    if t0 >= t1 {
+        return;
+    }
+    let dim_half = head_dim / 2;
+    for t in t0..t1 {
+        let pos = start_pos + t;
+        for h in 0..n_heads {
+            let off = t * q_rows + h * head_dim;
+            let q_head = unsafe { std::slice::from_raw_parts_mut(q_ptr.0.add(off), head_dim) };
+            Lfm2Model::head_rmsnorm(q_head, qln_ptr.0, head_dim, eps);
+        }
+        for kv in 0..n_kv_heads {
+            let off = t * k_rows + kv * head_dim;
+            let k_head = unsafe { std::slice::from_raw_parts_mut(k_ptr.0.add(off), head_dim) };
+            Lfm2Model::head_rmsnorm(k_head, kln_ptr.0, head_dim, eps);
+        }
+        for h in 0..n_heads {
+            let off = t * q_rows + h * head_dim;
+            let q_head = unsafe { std::slice::from_raw_parts_mut(q_ptr.0.add(off), head_dim) };
+            for j in 0..dim_half {
+                let theta = pos as f32 / freq_base.powf((2 * j) as f32 / head_dim as f32);
+                let cos = theta.cos();
+                let sin = theta.sin();
+                let q0 = q_head[j];
+                let q1 = q_head[j + dim_half];
+                q_head[j] = q0 * cos - q1 * sin;
+                q_head[j + dim_half] = q1 * cos + q0 * sin;
+            }
+        }
+        for kv in 0..n_kv_heads {
+            let off = t * k_rows + kv * head_dim;
+            let k_head = unsafe { std::slice::from_raw_parts_mut(k_ptr.0.add(off), head_dim) };
+            for j in 0..dim_half {
+                let theta = pos as f32 / freq_base.powf((2 * j) as f32 / head_dim as f32);
+                let cos = theta.cos();
+                let sin = theta.sin();
+                let k0 = k_head[j];
+                let k1 = k_head[j + dim_half];
+                k_head[j] = k0 * cos - k1 * sin;
+                k_head[j + dim_half] = k1 * cos + k0 * sin;
+            }
+        }
+
+        let cur_seq = pos.min(max_seq_len - 1);
+        for kv in 0..n_kv_heads {
+            let cache_offset =
+                (layer_idx * n_kv_heads + kv) * (max_seq_len * head_dim) + cur_seq * head_dim;
+            unsafe {
+                std::ptr::copy_nonoverlapping(k_ptr.0.add(t * k_rows + kv * head_dim), kc_ptr.0.add(cache_offset), head_dim);
+                std::ptr::copy_nonoverlapping(v_ptr.0.add(t * v_rows + kv * head_dim), vc_ptr.0.add(cache_offset), head_dim);
+            }
+        }
+    }
+}
+
+/// Attention mix over the cache: REQUIRES every token's KV write complete
+/// first (two-phase with `attention_prep_tokens` — the serial version read
+/// columns that earlier tokens in the batch had just written, so fusing prep
+/// and mix would race the cache).
+#[allow(clippy::too_many_arguments)]
+unsafe fn attention_mix_tokens(
+    q_ptr: SendPtr<f32>,
+    hb_ptr: SendMutPtr<f32>,
+    kc_ptr: SendPtr<f32>,
+    vc_ptr: SendPtr<f32>,
+    t0: usize,
+    t1: usize,
+    start_pos: usize,
+    q_rows: usize,
+    layer_idx: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq_len: usize,
+) {
+    if t0 >= t1 {
+        return;
+    }
+    let scale = (head_dim as f32).sqrt().recip();
+    let kv_group_size = n_heads / n_kv_heads;
+    for t in t0..t1 {
+        let pos = start_pos + t;
+        let cur_seq = pos.min(max_seq_len - 1);
+        for h in 0..n_heads {
+            let kv_idx = h / kv_group_size;
+            let q_off = t * q_rows + h * head_dim;
+            let q_head: &[f32] = unsafe { std::slice::from_raw_parts(q_ptr.0.add(q_off), head_dim) };
+            let kv_base = (layer_idx * n_kv_heads + kv_idx) * (max_seq_len * head_dim);
+            let seq_len = cur_seq + 1;
+            let mut max_score = f32::NEG_INFINITY;
+            let h_out = unsafe {
+                std::slice::from_raw_parts_mut(hb_ptr.0.add(t * q_rows + h * head_dim), head_dim)
+            };
+            ATT_SCRATCH.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.resize(seq_len.max(1), 0.0f32);
+                let scores = &mut buf[..seq_len];
+                let mut sum_exp = 0.0f32;
+                for tt in 0..seq_len {
+                    let k_t = unsafe {
+                        std::slice::from_raw_parts(kc_ptr.0.add(kv_base + tt * head_dim), head_dim)
+                    };
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_head[d] * k_t[d];
+                    }
+                    let score = dot * scale;
+                    scores[tt] = score;
+                    if score > max_score {
+                        max_score = score;
+                    }
+                }
+                for tt in 0..seq_len {
+                    let e = (scores[tt] - max_score).exp();
+                    scores[tt] = e;
+                    sum_exp += e;
+                }
+                let inv_sum = sum_exp.recip();
+                h_out.fill(0.0f32);
+                for tt in 0..seq_len {
+                    let weight = scores[tt] * inv_sum;
+                    let v_t = unsafe {
+                        std::slice::from_raw_parts(vc_ptr.0.add(kv_base + tt * head_dim), head_dim)
+                    };
+                    for d in 0..head_dim {
+                        h_out[d] += weight * v_t[d];
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Gate + up projections in one panel pass: they share the same activation
+/// sweep, so x is streamed once per row-pair instead of once per matrix and
+/// the pool is dispatched once instead of twice.
+fn gemm_pair_batched(
+    lt_a: &LinearTensor,
+    lt_b: &LinearTensor,
+    mmap: &super::mmap::MmapFile,
+    x: &[f32],
+    t_count: usize,
+    y_a: &mut [f32],
+    y_b: &mut [f32],
+    threads: usize,
+) {
+    let rows = lt_a.rows();
+    let cols = lt_a.cols();
+    debug_assert_eq!(lt_b.rows(), rows);
+    debug_assert_eq!(lt_b.cols(), cols);
+    debug_assert_eq!(x.len(), t_count * cols);
+    debug_assert_eq!(y_a.len(), t_count * rows);
+    debug_assert_eq!(y_b.len(), t_count * rows);
+    if t_count == 0 || rows == 0 {
+        return;
+    }
+    let a_ptr = SendPtr(lt_a as *const LinearTensor);
+    let b_ptr = SendPtr(lt_b as *const LinearTensor);
+    let mmap_ptr = SendPtr(mmap as *const super::mmap::MmapFile);
+    let x_ptr = SendPtr(x.as_ptr());
+    let ya_ptr = SendMutPtr(y_a.as_mut_ptr());
+    let yb_ptr = SendMutPtr(y_b.as_mut_ptr());
+    const ROW_PANEL: usize = 32;
+    let panels = rows.div_ceil(ROW_PANEL);
+    let t_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
+    super::dynamic_ffn::parallel_for(0, panels, threads, move |p0, p1| unsafe {
+        // Destructure the wrappers whole so edition-2021 capture doesn't lift
+        // the raw pointer fields out of them.
+        let (SendPtr(a_ptr), SendPtr(b_ptr), SendPtr(mmap_ptr), SendPtr(x_ptr), SendMutPtr(ya_ptr), SendMutPtr(yb_ptr)) =
+            (a_ptr, b_ptr, mmap_ptr, x_ptr, ya_ptr, yb_ptr);
+        let lt_a: &LinearTensor = &*a_ptr;
+        let lt_b: &LinearTensor = &*b_ptr;
+        let mmap: &super::mmap::MmapFile = &*mmap_ptr;
+        let x: &[f32] = std::slice::from_raw_parts(x_ptr, t_count * cols);
+        let ya: &mut [f32] = std::slice::from_raw_parts_mut(ya_ptr, t_count * rows);
+        let yb: &mut [f32] = std::slice::from_raw_parts_mut(yb_ptr, t_count * rows);
+        ROW_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.resize(2 * ROW_PANEL * cols, 0.0f32);
+            for p in p0..p1 {
+                let row0 = p * ROW_PANEL;
+                let panel_rows = ROW_PANEL.min(rows - row0);
+                for ri in 0..panel_rows {
+                    dequant_linear_row(lt_a, mmap, row0 + ri, cols, &mut buf[ri * cols..(ri + 1) * cols]);
+                    dequant_linear_row(
+                        lt_b,
+                        mmap,
+                        row0 + ri,
+                        cols,
+                        &mut buf[(ROW_PANEL + ri) * cols..(ROW_PANEL + ri + 1) * cols],
+                    );
+                }
+                let mut t = 0usize;
+                while t + 4 <= t_count {
+                    let mut ri = 0usize;
+                    while ri + 4 <= panel_rows {
+                        let mut out = [0.0f32; 16];
+                        gemm_tile4x4_neon(
+                            buf.as_ptr().add(ri * cols),
+                            x.as_ptr().add(t * cols),
+                            cols,
+                            &mut out,
+                        );
+                        for ti in 0..4 {
+                            for tk in 0..4 {
+                                ya[(t + tk) * rows + row0 + ri + ti] = out[ti * 4 + tk];
+                            }
+                        }
+                        let mut outb = [0.0f32; 16];
+                        gemm_tile4x4_neon(
+                            buf.as_ptr().add((ROW_PANEL + ri) * cols),
+                            x.as_ptr().add(t * cols),
+                            cols,
+                            &mut outb,
+                        );
+                        for ti in 0..4 {
+                            for tk in 0..4 {
+                                yb[(t + tk) * rows + row0 + ri + ti] = outb[ti * 4 + tk];
+                            }
+                        }
+                        ri += 4;
+                    }
+                    // Scalar-dot tail rows of the panel (panel % 4).
+                    for r1 in ri..panel_rows {
+                        for tk in 0..4 {
+                            let xr = &x[(t + tk) * cols..(t + tk + 1) * cols];
+                            #[cfg(target_arch = "aarch64")]
+                            let acca = unsafe { dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols) };
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let acca = dot_f32_neon(&buf[r1 * cols..(r1 + 1) * cols], xr);
+                            ya[(t + tk) * rows + row0 + r1] = acca;
+                            #[cfg(target_arch = "aarch64")]
+                            let accb = unsafe {
+                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols)
+                            };
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let accb = dot_f32_neon(&buf[(ROW_PANEL + r1) * cols..(ROW_PANEL + r1 + 1) * cols], xr);
+                            yb[(t + tk) * rows + row0 + r1] = accb;
+                        }
+                    }
+                    t += 4;
+                }
+                while t < t_count {
+                    let xr = &x[t * cols..(t + 1) * cols];
+                    for ri in 0..panel_rows {
+                        #[cfg(target_arch = "aarch64")]
+                        let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let acc = dot_f32_neon(&buf[ri * cols..(ri + 1) * cols], xr);
+                        ya[t * rows + row0 + ri] = acc;
+                        #[cfg(target_arch = "aarch64")]
+                        let accb = unsafe {
+                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols)
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let accb = dot_f32_neon(&buf[(ROW_PANEL + ri) * cols..(ROW_PANEL + ri + 1) * cols], xr);
+                        yb[t * rows + row0 + ri] = accb;
+                    }
+                    t += 1;
+                }
+            }
+        });
+    });
+    if let Some(t0) = t_start {
+        GEMM_PROF_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        GEMM_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// SwiGLU FFN on a token batch: gate = w1·x, up = w3·x, down = w2·swiglu(gate, up).
 #[allow(clippy::too_many_arguments)]
 fn batched_ffn(
@@ -1632,8 +1985,7 @@ fn batched_ffn(
     if down.len() < needed_down {
         down.resize(needed_down, 0.0f32);
     }
-    gemm_batched(w1, mmap, x, t_count, &mut gate[..needed_gate], threads);
-    gemm_batched(w3, mmap, x, t_count, &mut up[..needed_gate], threads);
+    gemm_pair_batched(w1, w3, mmap, x, t_count, &mut gate[..needed_gate], &mut up[..needed_gate], threads);
     batched_swiglu(gate, up, t_count, hidden, threads);
     gemm_batched(w2, mmap, &gate[..needed_gate], t_count, &mut down[..needed_down], threads);
 }
@@ -1751,99 +2103,42 @@ impl Lfm2Model {
                     let kl_slice = self.sf.mmap.slice(k_layernorm.data_offset, k_layernorm.size_bytes).unwrap();
                     let q_ln_ptr = ql_slice.as_ptr();
                     let k_ln_ptr = kl_slice.as_ptr();
-                    let dim_half = head_dim / 2;
 
                     let t_att = if prof { Some(std::time::Instant::now()) } else { None };
-                    for t in 0..t_count {
-                        let pos = start_pos + t;
-                        for h in 0..n_heads {
-                            let off = t * q_rows + h * head_dim;
-                            let q_head = &mut qbuf[off..off + head_dim];
-                            Self::head_rmsnorm(q_head, q_ln_ptr, head_dim, norm_eps);
-                        }
-                        for kv in 0..n_kv_heads {
-                            let off = t * k_rows + kv * head_dim;
-                            let k_head = &mut kbuf[off..off + head_dim];
-                            Self::head_rmsnorm(k_head, k_ln_ptr, head_dim, norm_eps);
-                        }
-                        for h in 0..n_heads {
-                            let off = t * q_rows + h * head_dim;
-                            let q_head = &mut qbuf[off..off + head_dim];
-                            for j in 0..dim_half {
-                                let theta = pos as f32 / freq_base.powf((2 * j) as f32 / head_dim as f32);
-                                let cos = theta.cos();
-                                let sin = theta.sin();
-                                let q0 = q_head[j];
-                                let q1 = q_head[j + dim_half];
-                                q_head[j] = q0 * cos - q1 * sin;
-                                q_head[j + dim_half] = q1 * cos + q0 * sin;
-                            }
-                        }
-                        for kv in 0..n_kv_heads {
-                            let off = t * k_rows + kv * head_dim;
-                            let k_head = &mut kbuf[off..off + head_dim];
-                            for j in 0..dim_half {
-                                let theta = pos as f32 / freq_base.powf((2 * j) as f32 / head_dim as f32);
-                                let cos = theta.cos();
-                                let sin = theta.sin();
-                                let k0 = k_head[j];
-                                let k1 = k_head[j + dim_half];
-                                k_head[j] = k0 * cos - k1 * sin;
-                                k_head[j + dim_half] = k1 * cos + k0 * sin;
-                            }
-                        }
-
-                        let cur_seq = pos.min(max_seq_len - 1);
-                        for kv in 0..n_kv_heads {
-                            let cache_offset =
-                                (layer_idx * n_kv_heads + kv) * (max_seq_len * head_dim) + cur_seq * head_dim;
-                            self.k_cache[cache_offset..cache_offset + head_dim]
-                                .copy_from_slice(&kbuf[t * k_rows + kv * head_dim..t * k_rows + (kv + 1) * head_dim]);
-                            self.v_cache[cache_offset..cache_offset + head_dim]
-                                .copy_from_slice(&vbuf[t * v_rows + kv * head_dim..t * v_rows + (kv + 1) * head_dim]);
-                        }
-
-                        let scale = (head_dim as f32).sqrt().recip();
-                        let kv_group_size = n_heads / n_kv_heads;
-                        for h in 0..n_heads {
-                            let kv_idx = h / kv_group_size;
-                            let q_off = t * q_rows + h * head_dim;
-                            let q_head = &qbuf[q_off..q_off + head_dim];
-                            let kv_base = (layer_idx * n_kv_heads + kv_idx) * (max_seq_len * head_dim);
-                            let seq_len = cur_seq + 1;
-                            let mut max_score = f32::NEG_INFINITY;
-                            for tt in 0..seq_len {
-                                let k_t = &self.k_cache[kv_base + tt * head_dim..kv_base + (tt + 1) * head_dim];
-                                let mut dot = 0.0f32;
-                                for d in 0..head_dim {
-                                    dot += q_head[d] * k_t[d];
-                                }
-                                let score = dot * scale;
-                                self.attn_scores[tt] = score;
-                                if score > max_score {
-                                    max_score = score;
-                                }
-                            }
-                            let mut sum_exp = 0.0f32;
-                            for tt in 0..seq_len {
-                                let e = (self.attn_scores[tt] - max_score).exp();
-                                self.attn_scores[tt] = e;
-                                sum_exp += e;
-                            }
-                            let inv_sum = sum_exp.recip();
-                            for tt in 0..seq_len {
-                                self.attn_scores[tt] *= inv_sum;
-                            }
-                            let h_out = &mut hb[t * q_rows + h * head_dim..t * q_rows + (h + 1) * head_dim];
-                            h_out.fill(0.0f32);
-                            for tt in 0..seq_len {
-                                let weight = self.attn_scores[tt];
-                                let v_t = &self.v_cache[kv_base + tt * head_dim..kv_base + (tt + 1) * head_dim];
-                                for d in 0..head_dim {
-                                    h_out[d] += weight * v_t[d];
-                                }
-                            }
-                        }
+                    {
+                        let qp = SendMutPtr(qbuf.as_mut_ptr());
+                        let kp = SendMutPtr(kbuf.as_mut_ptr());
+                        let vp = SendMutPtr(vbuf.as_mut_ptr());
+                        let hbp = SendMutPtr(hb.as_mut_ptr());
+                        let kcp = SendMutPtr((&mut *self.k_cache).as_mut_ptr());
+                        let vcp = SendMutPtr((&mut *self.v_cache).as_mut_ptr());
+                        let qlp = SendPtr(q_ln_ptr);
+                        let klp = SendPtr(k_ln_ptr);
+                        let q_rows_r = q_rows;
+                        let k_rows_r = k_rows;
+                        let v_rows_r = v_rows;
+                        // Phase 1: head norms + RoPE + KV writes (each token's
+                        // writes land in its own column).
+                        super::dynamic_ffn::parallel_for(0, t_count, threads, move |t0, t1| unsafe {
+                            attention_prep_tokens(
+                                qp, kp, vp, kcp, vcp, qlp, klp,
+                                t0, t1, start_pos,
+                                q_rows_r, k_rows_r, v_rows_r, layer_idx,
+                                head_dim, n_heads, n_kv_heads, max_seq_len, freq_base, norm_eps,
+                            );
+                        });
+                        // Phase 2: attention over the COMPLETE cache.
+                        let qp_read = SendPtr(qp.0);
+                        let kcp_read = SendPtr(kcp.0);
+                        let vcp_read = SendPtr(vcp.0);
+                        let hbp2 = SendMutPtr(hb.as_mut_ptr());
+                        super::dynamic_ffn::parallel_for(0, t_count, threads, move |t0, t1| unsafe {
+                            attention_mix_tokens(
+                                qp_read, hbp2, kcp_read, vcp_read,
+                                t0, t1, start_pos,
+                                q_rows_r, layer_idx, head_dim, n_heads, n_kv_heads, max_seq_len,
+                            );
+                        });
                     }
                     if let Some(t0) = t_att {
                         attn_ns += t0.elapsed().as_nanos() as u64;
@@ -1878,15 +2173,16 @@ impl Lfm2Model {
         if let Some(t0) = t_wall {
             let gemm_ms = GEMM_PROF_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
             let calls = GEMM_PROF_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let rms_ms = RMS_PROF_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let add_ms = ADD_PROF_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let swi_ms = SWI_PROF_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let emb_ms = EMBED_PROF_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+            let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "[lfm2-prof] t={} wall={:.1}ms gemm={:.1}ms/calls={} conv={:.1}ms attn={:.1}ms other={:.1}ms",
-                t_count,
-                t0.elapsed().as_secs_f64() * 1e3,
-                gemm_ms,
-                calls,
-                conv_ns as f64 / 1e6,
-                attn_ns as f64 / 1e6,
-                t0.elapsed().as_secs_f64() * 1e3 - gemm_ms - conv_ns as f64 / 1e6 - attn_ns as f64 / 1e6
+                "[lfm2-prof] t={} wall={:.1}ms gemm={:.1}ms/calls={} rms={:.1} add={:.1} swiglu={:.1} embed={:.1} conv={:.1}ms attn={:.1}ms other={:.1}ms",
+                t_count, wall_ms, gemm_ms, calls, rms_ms, add_ms, swi_ms, emb_ms,
+                conv_ns as f64 / 1e6, attn_ns as f64 / 1e6,
+                wall_ms - gemm_ms - rms_ms - add_ms - swi_ms - emb_ms - conv_ns as f64 / 1e6 - attn_ns as f64 / 1e6
             );
         }
     }

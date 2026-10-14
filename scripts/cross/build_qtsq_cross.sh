@@ -85,7 +85,8 @@ done
 QTSQ_CRYPTO="$(printf '%s\n' $QTSQ_CRYPTO | sort)"
 QTC_SRC="qtc_model qtc_ans qtc_order1 qtc_lz qtc_image qtc_audio qtc_detect \
 qtc_mdct qtc_audio_mdct qtc_audio_mdct2 qtc_audio_float qtc_delaunay \
-qtc_image_mesh qtc_accretion qtc_image_dct qtc_tensor qtc_video qtc_core"
+qtc_image_mesh qtc_accretion qtc_image_dct qtc_tensor qtc_video qtc_core \
+qtc_text"
 
 # zlib objects (vendored; no gz* — the QTSQ callers only use the raw
 # compress/uncompress/deflate/inflate/crc32 surface).

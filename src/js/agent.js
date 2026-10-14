@@ -958,7 +958,6 @@
       try {
         var semPath = semPathFor(path);
         entry.sem = sofuu.memory.open(semPath, SEM2_DIM, SEM2_BACKEND_ID) || null;
-        entry.semLastDecay = Date.now();
       } catch (e2) { entry.sem = null; }
     }
     BRAINS[cacheKey] = entry;
@@ -985,26 +984,29 @@
   function brainDecayTick(entry) {
     if (!entry || !entry.cma || typeof entry.cma.decayTick !== 'function') return 0;
     var consolidated = 0;
+    var dropped = 0;
     try {
       var nowMs = Date.now();
       var dt = Math.floor((nowMs - entry.lastDecay) / 1000);
       if (dt > 0) entry.cma.decayTick(Math.min(dt, 7 * 86400));
       entry.lastDecay = nowMs;
-      if (typeof entry.cma.retain === 'function') entry.cma.retain();
+      if (typeof entry.cma.retain === 'function') dropped = entry.cma.retain() || 0;
       consolidated = brainConsolidateIfDue(entry);
     } catch (e) {}
-    /* Time-based lifecycle mirrored onto the SEM2 channel (decay + prune,
-     * then flush so a crash keeps it). Deliberate divergence: NO
-     * consolidation there — cluster-merge semantics were only ever
-     * validated on the canonical hash store. */
-    if (entry.sem && typeof entry.sem.decayTick === 'function') {
+    /* B3.5 (ROADMAP-BRAIN-CMA): the SEM2 channel is a DERIVED index over
+     * the canonical records — it no longer runs its own decay or retain
+     * (the double decay that let the two channels drift apart, one keeping
+     * a memory the other had pruned). When the canonical store actually
+     * dropped something — a prune, or a consolidation that tombstoned its
+     * sources — the sibling is pruned to the same live set by text, the
+     * cross-channel join key. A tick that pruned nothing costs one pass
+     * and no flush. */
+    if (entry.sem && typeof entry.sem.retainAgainst === 'function') {
       try {
-        var sNow = Date.now();
-        var sdt = Math.floor((sNow - (entry.semLastDecay || sNow)) / 1000);
-        if (sdt > 0) entry.sem.decayTick(Math.min(sdt, 7 * 86400));
-        entry.semLastDecay = sNow;
-        if (typeof entry.sem.retain === 'function') entry.sem.retain();
-        try { entry.sem.flush(); } catch (e3) {}
+        if (dropped > 0 || consolidated > 0) {
+          var pruned = entry.sem.retainAgainst(entry.cma) || 0;
+          if (pruned > 0) { try { entry.sem.flush(); } catch (e3) {} }
+        }
       } catch (e) {}
     }
     return consolidated;

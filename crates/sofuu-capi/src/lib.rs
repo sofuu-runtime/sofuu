@@ -375,8 +375,63 @@ pub unsafe extern "C" fn sofuu_embed_set_log_cb(
 ///     "qtsq": true,               // QTSQ brain/KV (build-gated)
 ///     "enable_signals": false }   // signal handlers (default off)
 /// Returns NULL on failure.
+/// Android-only observability: route Rust panics (silent worker-thread
+/// deaths — an inference worker panicking looks like "thinking forever,
+/// no output" because stderr is not persisted on device) into logcat
+/// under the `sofuu-panic` tag. Installed once, at first rt_new.
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn __android_log_print(prio: i32, tag: *const std::os::raw::c_char, fmt: *const std::os::raw::c_char, ...) -> i32;
+}
+
+#[cfg(target_os = "android")]
+fn install_android_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let msg = format!("RUST PANIC at {} — {}", loc, payload);
+        unsafe {
+            let cmsg = std::ffi::CString::new(msg.clone()).unwrap_or_default();
+            let tag = std::ffi::CString::new("sofuu-panic").unwrap_or_default();
+            // 6 = ANDROID_LOG_ERROR. liblog is already a linked dependency
+            // of the engine (.so NEEDS liblog).
+            __android_log_print(6, tag.as_ptr(), cmsg.as_ptr());
+        }
+        eprintln!("{}", msg);
+        default_hook(info);
+    }));
+}
+
+#[cfg(target_os = "android")]
+static ANDROID_PANIC_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(target_os = "android"))]
+fn install_android_panic_hook() {
+    // Desktop hosts keep default panic reporting on stderr.
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRuntime {
+    #[cfg(target_os = "android")]
+    if !ANDROID_PANIC_HOOK.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        install_android_panic_hook();
+    }
+
     // Parse config (NULL → empty object → all defaults).
     let config_str = cstr_or_null(config_json).unwrap_or("{}");
     let config_val: JsonValue = match serde_json::from_str(config_str) {
@@ -711,6 +766,95 @@ pub unsafe extern "C" fn sofuu_rt_eval(
     // {ok:false, error:{...}}. JSON.stringify it and return.
     let json_str = value_to_json(ctx, result);
 
+    if !out_json.is_null() {
+        *out_json = malloc_cstr(&json_str);
+    }
+
+    0 // SOFUU_OK
+}
+
+/// Non-blocking variant of [`sofuu_rt_eval`] for hosts that drive the
+/// runtime incrementally from their own loop (the Android chat pump).
+///
+/// Same JS semantics as `sofuu_rt_eval` (wrapper envelope, sync result
+/// JSON-serialized), but instead of `drain_loop` — which blocks until all
+/// promises settle and all I/O completes, and would hold the runtime
+/// thread for a whole chat turn — it performs exactly ONE non-blocking
+/// loop tick: microtasks, `UV_RUN_NOWAIT`, microtasks. An async feature
+/// started here (its eval result is a pending promise, serialized as
+/// `{}`) progresses across repeated tick evals while the thread stays
+/// free for the host's pump, cancel pokes, and bounded queries.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_rt_eval_nb(
+    rt: *mut CapiRuntime,
+    source: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    if rt.is_null() || source.is_null() {
+        if !out_json.is_null() {
+            *out_json = error_envelope("invalid_arg", "NULL runtime or source");
+        }
+        return -1;
+    }
+
+    let rt = &*rt;
+    let src = match cstr_or_null(source) {
+        Some(s) => s,
+        None => {
+            if !out_json.is_null() {
+                *out_json = error_envelope("invalid_arg", "source is not valid UTF-8");
+            }
+            return -1;
+        }
+    };
+
+    let ctx = rt.ffi_rt.engine_ctx() as *mut qjs::JSContext;
+    if ctx.is_null() {
+        if !out_json.is_null() {
+            *out_json = error_envelope("internal", "engine context is null");
+        }
+        return -6; // SOFUU_ERR_INTERNAL
+    }
+
+    // Same wrapper as sofuu_rt_eval: always a JSON envelope, sync results
+    // captured, async results left as a pending promise object.
+    let wrapper = format!(
+        r#"(function(){{try{{return{{ok:true,result:eval({src_json})}}}}catch(e){{return{{ok:false,error:{{code:"js_exception",message:e.message||String(e)}}}}}}}})()"#,
+        src_json = serde_json::to_string(src).unwrap_or_default(),
+    );
+    let c_wrapper = CString::new(wrapper).unwrap_or_default();
+    let result = qjs::JS_Eval(
+        ctx,
+        c_wrapper.as_ptr(),
+        c_wrapper.as_bytes().len(),
+        c"<capi-eval-nb>".as_ptr(),
+        qjs::JS_EVAL_TYPE_GLOBAL,
+    );
+
+    if qjs::is_exception(result) {
+        let exc = qjs::JS_GetException(ctx);
+        let msg = qjs::sofuu_js_to_cstring(ctx, exc);
+        let err_msg = if msg.is_null() {
+            "unknown eval error".to_string()
+        } else {
+            let s = CStr::from_ptr(msg).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, msg);
+            s
+        };
+        qjs::sofuu_js_free_value(ctx, exc);
+        qjs::sofuu_js_free_value(ctx, result);
+        if !out_json.is_null() {
+            *out_json = error_envelope("js_exception", &err_msg);
+        }
+        return -4; // SOFUU_ERR_JS_EXCEPTION
+    }
+
+    // Exactly ONE non-blocking tick instead of drain_loop: microtasks,
+    // one UV_RUN_NOWAIT poll, microtasks again (sofuu_loop_tick_nb does
+    // all three and never waits).
+    sofuu_core::rt::event_loop::sofuu_loop_tick_nb(ctx);
+
+    let json_str = value_to_json(ctx, result);
     if !out_json.is_null() {
         *out_json = malloc_cstr(&json_str);
     }

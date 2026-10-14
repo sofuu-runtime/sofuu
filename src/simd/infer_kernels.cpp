@@ -339,6 +339,98 @@ static inline uint16_t f32_to_f16_val(float val) {
 
 #include "arch/arm_cortex_a76.h"
 
+// ── Packed-tile GEMM/GEMV kernels (ported from llama.cpp repack *_generic) ──
+#if defined(__aarch64__)
+#include "arch/a76_repack.h"
+#include <mutex>
+#include <unordered_map>
+
+struct sofuu_tile_entry {
+    std::vector<uint8_t> data;
+    unsigned type;
+    size_t rows, cols;
+    uint64_t fp;
+};
+static std::mutex g_tile_mutex;
+static std::unordered_map<const void *, sofuu_tile_entry> g_tile_map;
+
+static uint64_t sofuu_tile_fingerprint(const void *w) {
+    const uint64_t *p = (const uint64_t *)w;
+    return p[0] ^ (p[1] * 3) ^ (p[2] * 7) ^ (p[3] * 11);
+}
+
+extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned type) {
+    if (getenv("SOFUU_NO_TILES")) return -1; // runtime kill-switch
+    bool aligned;
+    if (type == 12 || type == 14) aligned = (rows % 8 == 0 && cols % 256 == 0);
+    else if (type == 8) aligned = (rows % 4 == 0 && cols % 32 == 0);
+    else return -1;
+    if (!aligned || rows == 0 || cols == 0) return -1;
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    {
+        std::lock_guard<std::mutex> lk(g_tile_mutex);
+        auto it = g_tile_map.find(w);
+        if (it != g_tile_map.end() && it->second.type == type && it->second.rows == rows &&
+            it->second.cols == cols && it->second.fp == fp) return 0;
+    }
+    sofuu_tile_entry e;
+    e.type = type; e.rows = rows; e.cols = cols; e.fp = fp;
+    if (type == 12) {
+        e.data.resize((rows / 8) * (cols / 256) * sizeof(tile_block_q4_Kx8));
+        sofuu_repack_q4k_8bl(e.data.data(), (const uint8_t *)w, rows, cols / 256, 4);
+    } else if (type == 14) {
+        e.data.resize((rows / 8) * (cols / 256) * sizeof(tile_block_q6_Kx8));
+        sofuu_repack_q6k_8bl(e.data.data(), (const uint8_t *)w, rows, cols / 256, 4);
+    } else {
+        e.data.resize((rows / 4) * (cols / 32) * sizeof(tile_block_q8_0x4));
+        sofuu_repack_q8_0_4bl(e.data.data(), (const uint8_t *)w, rows, cols / 32, 4);
+    }
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    g_tile_map[w] = std::move(e);
+    return 0;
+}
+
+static const uint8_t * sofuu_tile_lookup(const void *w, unsigned type, size_t rows, size_t cols) {
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    auto it = g_tile_map.find(w);
+    if (it == g_tile_map.end()) return nullptr;
+    const sofuu_tile_entry &e = it->second;
+    if (e.type == type && e.rows == rows && e.cols == cols && e.fp == fp) return e.data.data();
+    return nullptr;
+}
+
+// Row quantizer for the plain q8_0 tile-block layout (decode GEMV path).
+static inline void sofuu_quantize_row_q8_0_tile(const float * __restrict x, tile_block_q8_0 * __restrict y, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float *xb = x + i * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = MAX(amax, fabsf(xb[j]));
+        const float d = amax / 127.0f;
+        const float id = d > 0.0f ? 127.0f / amax : 0.0f;
+        y[i].d = GGML_CPU_FP32_TO_FP16(d);
+        for (int j = 0; j < 32; ++j) y[i].qs[j] = (int8_t)nearest_int(xb[j] * id);
+    }
+}
+
+#define SOFUU_TILE_TYPES_OK(t) ((t) == 12 || (t) == 14 || (t) == 8)
+#endif  // __aarch64__
+
+#include <vector>
+
+// Reusable per-thread scratch for batched GEMM paths: avoids a fresh
+// zero-filled vector allocation (and its page faults) on every
+// weight-matrix call during prefill.
+// Templates must have C++ linkage, so this helper lives outside the
+// extern "C" block below; the extern "C" kernel functions still call it.
+template <typename T>
+static T *tile_scratch(size_t n) {
+    static thread_local std::vector<T> buf;
+    buf.resize(n);
+    return buf.data();
+}
+
 extern "C" {
 
 void sofuu_set_threads(int n) {
@@ -1279,6 +1371,24 @@ void sofuu_gemv_q8_0(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q8_0);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__aarch64__)
+    if (sofuu_cpu_has_dotprod() && rows % 4 == 0 && cols % 32 == 0 && SOFUU_TILE_TYPES_OK(8)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 8, rows, cols)) {
+            std::vector<tile_block_q8_0> qa(cols / 32);
+            sofuu_quantize_row_q8_0_tile(x, qa.data(), cols);
+            const tile_block_q8_0 *qa_ptr = qa.data();
+            const size_t nb = cols / 32;
+            g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemv_q8_0_4x4_q8_0(cols, out + g * 4, rows,
+                        tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, 1, 4);
+                }
+            });
+            return;
+        }
+    }
+#endif
+
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     // Compiled in, but only taken on a cpu that implements SDOT — see
     // sofuu_cpu_has_dotprod(). Anything older falls through to the generic
@@ -1311,6 +1421,24 @@ void sofuu_gemv_q4_k(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q4_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__aarch64__)
+    if (sofuu_cpu_has_dotprod() && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(12)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 12, rows, cols)) {
+            std::vector<tile_block_q8_K> qa(cols / 256);
+            sofuu_quantize_row_q8_K(x, qa.data(), cols);
+            const tile_block_q8_K *qa_ptr = qa.data();
+            const size_t nb = cols / 256;
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemv_q4_K_8x4_q8_K(cols, out + g * 8, rows,
+                        tile + g * nb * sizeof(tile_block_q4_Kx8), qa_ptr, 1, 8);
+                }
+            });
+            return;
+        }
+    }
+#endif
+
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if (sofuu_cpu_has_dotprod()) {
         size_t q8_blocks = cols / 32;
@@ -1340,6 +1468,24 @@ void sofuu_gemv_q6_k(const void *weight_bytes, const float *x, float *out, size_
     size_t n_blocks = cols / 256;
     size_t row_size = n_blocks * sizeof(block_q6_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
+
+#if defined(__aarch64__)
+    if (sofuu_cpu_has_dotprod() && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(14)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 14, rows, cols)) {
+            std::vector<tile_block_q8_K> qa(cols / 256);
+            sofuu_quantize_row_q8_K(x, qa.data(), cols);
+            const tile_block_q8_K *qa_ptr = qa.data();
+            const size_t nb = cols / 256;
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemv_q6_K_8x4_q8_K(cols, out + g * 8, rows,
+                        tile + g * nb * sizeof(tile_block_q6_Kx8), qa_ptr, 1, 8);
+                }
+            });
+            return;
+        }
+    }
+#endif
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if (sofuu_cpu_has_dotprod()) {
@@ -1627,7 +1773,7 @@ void sofuu_gemv_mlx4(
     bool bf16_flag = is_bf16 != 0;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if (!bf16_flag && sofuu_cpu_has_dotprod()) {
+    if (sofuu_cpu_has_dotprod()) {
         size_t q8_blocks = cols / 32;
         thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
         if (tls_x_q8.size() < q8_blocks) {
@@ -1637,7 +1783,7 @@ void sofuu_gemv_mlx4(
         const sofuu_q8_block_ext *x_q8_ptr = tls_x_q8.data();
         g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
             for (size_t r = start; r < end; ++r) {
-                out[r] = sofuu_vec_dot_mlx4_dotprod_a76(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, x_q8_ptr);
+                out[r] = sofuu_vec_dot_mlx4_dotprod_a76(w + r * w_row_bytes, s + r * grp_row_bytes, b + r * grp_row_bytes, x, cols, group_size, x_q8_ptr, bf16_flag);
             }
         });
         return;
@@ -1677,7 +1823,7 @@ void sofuu_gemv_mlx4_multi(
     bool bf16_flag = is_bf16 != 0;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if (!bf16_flag && sofuu_cpu_has_dotprod()) {
+    if (sofuu_cpu_has_dotprod()) {
         size_t q8_blocks = cols / 32;
         thread_local std::vector<sofuu_q8_block_ext> tls_x_q8;
         if (tls_x_q8.size() < q8_blocks) tls_x_q8.resize(q8_blocks);
@@ -1699,7 +1845,7 @@ void sofuu_gemv_mlx4_multi(
                     (const uint8_t *)w_bytes[mat] + local * w_row_bytes,
                     (const uint8_t *)scales_bytes[mat] + local * grp_row_bytes,
                     (const uint8_t *)biases_bytes[mat] + local * grp_row_bytes,
-                    x, cols, group_size, x_q8_ptr);
+                    x, cols, group_size, x_q8_ptr, bf16_flag);
             }
         });
         return;
@@ -1805,6 +1951,48 @@ void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q8_0);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__aarch64__)
+    // Packed-tile prefill (q8_0 4x8).
+    if (batch_size >= 4 && batch_size % 4 == 0 && rows % 4 == 0 && cols % 32 == 0 && SOFUU_TILE_TYPES_OK(8)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 8, rows, cols)) {
+            const size_t nb = cols / 32;
+            tile_block_q8_0x4 *qa_ptr = tile_scratch<tile_block_q8_0x4>((batch_size / 4) * nb);
+            for (size_t g4 = 0; g4 < batch_size / 4; ++g4) {
+                ggml_quantize_mat_q8_0_4x4(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            }
+            g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemm_q8_0_4x4_q8_0(cols, out + g * 4, rows,
+                        tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, batch_size, 4);
+                }
+            });
+            return;
+        }
+    }
+#endif
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    // Prefill via int8 SDOT (optionally tiled 8x8 by gemm_q8_0_tile below).
+    // Small-col matrices stay on the f32 x8 path: with cols < 2048 the
+    // dequant-once + register-reuse pattern beats weight re-reads.
+    if (sofuu_cpu_has_dotprod() && (cols % 32 == 0) && cols >= 2048) {
+        const size_t q8_blocks = cols / 32;
+        sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
+        for (size_t b = 0; b < batch_size; ++b) {
+            sofuu_quantize_row_q8_a76(x + b * cols, xq8_base + b * q8_blocks, q8_blocks);
+        }
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                const block_q8_0 *row = (const block_q8_0 *)(w + r * row_size);
+                for (size_t b = 0; b < batch_size; ++b) {
+                    out[b * rows + r] = sofuu_vec_dot_q8_0_dotprod_a76(row, xq8_base + b * q8_blocks, q8_blocks);
+                }
+            }
+        });
+        return;
+    }
+#endif
+
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         alignas(32) float stack_buf[4096];
         std::vector<float> heap_buf;
@@ -1865,6 +2053,45 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
     size_t row_size = n_blocks * sizeof(block_q4_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
 
+#if defined(__aarch64__)
+    // Packed-tile prefill: repacked 8-row weight tiles + q8_K batch activations.
+    if (batch_size >= 4 && batch_size % 4 == 0 && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(12)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 12, rows, cols)) {
+            const size_t nb = cols / 256;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((batch_size / 4) * nb);
+            for (size_t g4 = 0; g4 < batch_size / 4; ++g4) {
+                ggml_quantize_mat_q8_K_4x4_generic(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            }
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemm_q4_K_8x4_q8_K(cols, out + g * 8, rows,
+                        tile + g * nb * sizeof(tile_block_q4_Kx8), qa_ptr, batch_size, 8);
+                }
+            });
+            return;
+        }
+    }
+#endif
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    // Prefill via int8 SDOT (see gemm_q8_0 note): cols >= 2048 only.
+    if (sofuu_cpu_has_dotprod() && (cols % 256 == 0) && cols >= 2048) {
+        const size_t q8_blocks = cols / 32;
+        sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
+        for (size_t b = 0; b < batch_size; ++b) {
+            sofuu_quantize_row_q8_a76(x + b * cols, xq8_base + b * q8_blocks, q8_blocks);
+        }
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                const block_q4_K *row = (const block_q4_K *)(w + r * row_size);
+                for (size_t b = 0; b < batch_size; ++b) {
+                    out[b * rows + r] = sofuu_vec_dot_q4_k_dotprod_a76(row, xq8_base + b * q8_blocks, n_blocks);
+                }
+            }
+        });
+        return;
+    }
+#endif
+
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         alignas(32) float stack_buf[4096];
         std::vector<float> heap_buf;
@@ -1924,6 +2151,46 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
     size_t n_blocks = cols / 256;
     size_t row_size = n_blocks * sizeof(block_q6_K);
     const uint8_t *w = (const uint8_t *)weight_bytes;
+
+#if defined(__aarch64__)
+    // Packed-tile prefill (q6_K 8x8).
+    if (batch_size >= 4 && batch_size % 4 == 0 && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(14)) {
+        if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 14, rows, cols)) {
+            const size_t nb = cols / 256;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((batch_size / 4) * nb);
+            for (size_t g4 = 0; g4 < batch_size / 4; ++g4) {
+                ggml_quantize_mat_q8_K_4x4_generic(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            }
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    ggml_gemm_q6_K_8x4_q8_K(cols, out + g * 8, rows,
+                        tile + g * nb * sizeof(tile_block_q6_Kx8), qa_ptr, batch_size, 8);
+                }
+            });
+            return;
+        }
+    }
+#endif
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    // Prefill via int8 SDOT (see gemm_q8_0 note): cols >= 2048 only.
+    if (sofuu_cpu_has_dotprod() && (cols % 256 == 0) && cols >= 2048) {
+        const size_t q8_blocks = cols / 32;
+        sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
+        for (size_t b = 0; b < batch_size; ++b) {
+            sofuu_quantize_row_q8_a76(x + b * cols, xq8_base + b * q8_blocks, q8_blocks);
+        }
+        g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
+            for (size_t r = start; r < end; ++r) {
+                const block_q6_K *row = (const block_q6_K *)(w + r * row_size);
+                for (size_t b = 0; b < batch_size; ++b) {
+                    out[b * rows + r] = sofuu_vec_dot_q6_k_dotprod_a76(row, xq8_base + b * q8_blocks, n_blocks);
+                }
+            }
+        });
+        return;
+    }
+#endif
 
     g_pool.parallel_for(0, rows, [=](size_t start, size_t end) {
         alignas(32) float stack_buf[4096];
@@ -2158,6 +2425,74 @@ void sofuu_swiglu(float *out, const float *gate, const float *up, size_t n) {
 }
 
 // ── Numerically Stable Softmax ───────────────────────────────────────
+// ── Batched elementwise glue: one FFI call per layer instead of one per
+// token; internally parallel over rows. Kills per-call FFI overhead that
+// dominates small-elementwork in batched prefill. ─────────────────────────
+void sofuu_batched_rmsnorm(float *out, const float *in, const float *weight, size_t rows, size_t cols, float eps) {
+    if (rows == 0 || cols == 0) return;
+    g_pool.parallel_for(0, rows, [=](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+            sofuu_rmsnorm(out + r * cols, in + r * cols, weight, cols, eps);
+        }
+    });
+}
+
+void sofuu_batched_mad(float *dst, const float *src, float alpha, size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0) return;
+    g_pool.parallel_for(0, rows, [=](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+            sofuu_vec_mad_f32(dst + r * cols, src + r * cols, alpha, cols);
+        }
+    });
+}
+
+void sofuu_batched_add_bias(float *x, const float *bias, size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0) return;
+    g_pool.parallel_for(0, rows, [=](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+            float *row = x + r * cols;
+            for (size_t i = 0; i < cols; ++i) {
+                row[i] += bias[i];
+            }
+        }
+    });
+}
+
+void sofuu_batched_swiglu(float *gate, const float *up, size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0) return;
+    g_pool.parallel_for(0, rows, [=](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+            sofuu_swiglu(gate + r * cols, gate + r * cols, up + r * cols, cols);
+        }
+    });
+}
+
+void sofuu_batched_rope_kv(
+    float *q_batch, float *k_batch, const float *v_batch,
+    float *k_cache, float *v_cache,
+    size_t b_size, size_t start_pos, size_t layer_idx,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t max_seq_len, float freq_base, int rope_mode
+) {
+    if (b_size == 0) return;
+    size_t q_dim = n_heads * head_dim;
+    size_t kv_dim = n_kv_heads * head_dim;
+    g_pool.parallel_for(0, b_size, [=](size_t b0, size_t b1) {
+        for (size_t b = b0; b < b1; ++b) {
+            size_t pos = start_pos + b;
+            sofuu_rope(q_batch + b * q_dim, n_heads, head_dim, pos, freq_base, rope_mode);
+            sofuu_rope(k_batch + b * kv_dim, n_kv_heads, head_dim, pos, freq_base, rope_mode);
+            size_t cache_pos = pos % max_seq_len;
+            const float *v_row = v_batch + b * kv_dim;
+            for (size_t kv_h = 0; kv_h < n_kv_heads; ++kv_h) {
+                size_t slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+                memcpy(k_cache + slot, k_batch + b * kv_dim + kv_h * head_dim, head_dim * sizeof(float));
+                memcpy(v_cache + slot, v_row + kv_h * head_dim, head_dim * sizeof(float));
+            }
+        }
+    });
+}
+
 void sofuu_softmax(float *scores, size_t n) {
     if (n == 0) return;
     float max_val = scores[0];

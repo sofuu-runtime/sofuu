@@ -208,6 +208,14 @@ int sofuu_rt_register_host_tool(SofuuRuntime *rt, const char *name,
 int sofuu_rt_host_tool_resolve(SofuuRuntime *rt, uint64_t call_id,
                                const char *result_json, const char *error);
 
+/* Non-blocking eval: same JS semantics as sofuu_rt_eval, but after the
+ * eval it performs exactly ONE non-blocking loop tick (microtasks +
+ * UV_RUN_NOWAIT + microtasks) instead of draining until idle. Use it to
+ * drive async features across repeated calls (a chat turn) while the
+ * runtime thread stays schedulable; the eval itself never waits on I/O.
+ * Returns SOFUU_OK or a SOFUU_ERR_*. */
+int sofuu_rt_eval_nb(SofuuRuntime *rt, const char *source, char **out_json);
+
 /* ── Eval escape hatch ─────────────────────────────────────────── */
 /* Evaluate arbitrary JS (full power when the funnel isn't enough). The
  * source is evaluated as a global script, the event loop is drained, and

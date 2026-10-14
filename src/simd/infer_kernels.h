@@ -83,6 +83,22 @@ void sofuu_rmsnorm(float *out, const float *x, const float *weight, size_t n, fl
  * out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i] */
 void sofuu_swiglu(float *out, const float *gate, const float *up, size_t n);
 
+/* Batched elementwise glue: one FFI call per layer, internally parallel over
+ * `rows` contiguous rows of `cols` floats. */
+void sofuu_batched_rmsnorm(float *out, const float *in, const float *weight, size_t rows, size_t cols, float eps);
+void sofuu_batched_mad(float *dst, const float *src, float alpha, size_t rows, size_t cols);
+void sofuu_batched_add_bias(float *x, const float *bias, size_t rows, size_t cols);
+void sofuu_batched_swiglu(float *gate, const float *up, size_t rows, size_t cols);
+
+/* Batched RoPE + KV-cache scatter for a token batch (parallel over tokens). */
+void sofuu_batched_rope_kv(
+    float *q_batch, float *k_batch, const float *v_batch,
+    float *k_cache, float *v_cache,
+    size_t b_size, size_t start_pos, size_t layer_idx,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t max_seq_len, float freq_base, int rope_mode
+);
+
 /* In-place numerically stable Softmax:
  * scores[i] = exp(scores[i] - max) / sum(exp(scores - max)) */
 void sofuu_softmax(float *scores, size_t n);

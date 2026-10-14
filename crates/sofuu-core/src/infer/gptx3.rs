@@ -10,7 +10,6 @@ use super::quant::{bf16_to_f32, f16_to_f32, swiglu_in_place};
 use super::npy::TensorDType;
 use super::tensor_table::UnifiedTensorTable;
 
-
 #[derive(Clone)]
 enum Gptx3Mixer {
     Gdn {
@@ -176,9 +175,7 @@ impl Gptx3Model {
         let hidden_dim = 1584;
         let vocab_size = 65536;
         let norm_eps = 1e-6;
-        let gdn_norm_eps = 1e-5;
         let rope_base = 100000.0;
-        let rotary_dim = 32;
         let conv_size = 4;
         let effective_seq = if max_seq_len > 0 { max_seq_len.min(8192) } else { 4096 };
 
@@ -343,7 +340,7 @@ impl Gptx3Model {
         }
     }
 
-    fn gdn_forward(&mut self, layer_idx: usize, pos: usize) {
+    fn gdn_forward(&mut self, layer_idx: usize, _pos: usize) {
         let dim = self.config.dim;
         let gdn_dim = 64;
         let heads = dim / gdn_dim;
@@ -362,22 +359,9 @@ impl Gptx3Model {
         q_proj.gemv(&xn, &mut qr);
         k_proj.gemv(&xn, &mut kr);
         v_proj.gemv(&xn, &mut vr);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            eprintln!("[gdn proj] layer={} xn0..4={:?} q0..4={:?} k0..4={:?} v0..4={:?}", layer_idx, &xn[..4], &qr[..4], &kr[..4], &vr[..4]);
-        }
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            let bad = |v: &[f32]| v.iter().any(|x| !x.is_finite());
-            eprintln!(
-                "[gdn in] layer={} xn={} qr={} kr={} vr={}",
-                layer_idx, bad(&xn), bad(&qr), bad(&kr), bad(&vr)
-            );
-        }
         let qr_in = qr.clone(); self.depthwise_conv(&qr_in, &q_conv, layer_idx, 0, &mut qr);
         let kr_in = kr.clone(); self.depthwise_conv(&kr_in, &k_conv, layer_idx, 1, &mut kr);
         let vr_in = vr.clone(); self.depthwise_conv(&vr_in, &v_conv, layer_idx, 2, &mut vr);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            eprintln!("[gdn conv] layer={} q0..4={:?} k0..4={:?} v0..4={:?}", layer_idx, &qr[..4], &kr[..4], &vr[..4]);
-        }
 
         f_down.gemv(&xn, &mut self.low);
         f_up.gemv(&self.low, &mut self.x_norm);
@@ -386,20 +370,13 @@ impl Gptx3Model {
             *v = value.max(0.0) + (1.0 + (-value.abs()).exp()).ln();
         }
         for h in 0..heads {
-            let decay_factor = -(-a_log[h]).exp();
+            let decay_factor = -(a_log[h]).exp();
             for v in self.x_norm[h * gdn_dim..(h + 1) * gdn_dim].iter_mut() {
                 *v *= decay_factor;
             }
         }
         b_proj.gemv(&xn, &mut self.b);
         w_proj.gemv(&xn, &mut self.w);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            let bad = |v: &[f32]| v.iter().any(|x| !x.is_finite());
-            eprintln!(
-                "[gdn mid] layer={} low={} g={} b={} w={} qr={} kr={} vr={}",
-                layer_idx, bad(&self.low), bad(&self.x_norm), bad(&self.b), bad(&self.w), bad(&qr), bad(&kr), bad(&vr)
-            );
-        }
 
         let state_base = layer_idx * dim * gdn_dim * gdn_dim;
         for h in 0..heads {
@@ -411,9 +388,6 @@ impl Gptx3Model {
             for v in q_head.iter_mut() {
                 *v *= scale;
             }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 1 && h == 0 {
-                eprintln!("[gdn qnorm] layer={} head={} q0..8={:?} norm={}", layer_idx, h, &q_head[..8], q_head.iter().map(|v| v*v).sum::<f32>());
-            }
         }
 
         for h in 0..heads {
@@ -421,11 +395,6 @@ impl Gptx3Model {
                 .iter()
                 .map(|&v| v.exp())
                 .collect();
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-                let dmin = decay.iter().cloned().fold(f32::INFINITY, f32::min);
-                let dmax = decay.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                eprintln!("[gdn decay] layer={} head={} decay=({dmin},{dmax}) g=({},{})", layer_idx, h, self.x_norm[h * gdn_dim..(h + 1) * gdn_dim].iter().cloned().fold(f32::INFINITY, f32::min), self.x_norm[h * gdn_dim..(h + 1) * gdn_dim].iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-            }
             let state_start = state_base + h * gdn_dim * gdn_dim;
             let mut decayed = vec![0.0f32; gdn_dim * gdn_dim];
             for i in 0..gdn_dim {
@@ -444,9 +413,6 @@ impl Gptx3Model {
             for j in 0..gdn_dim {
                 update[j] = sigmoid(self.w[h * gdn_dim + j]) * vr[h * gdn_dim + j] - erase[j];
             }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && h == 0 {
-                eprintln!("[gdn upd] layer={} k0..4={:?} v0..4={:?} b0..4={:?} w0..4={:?} erase0..4={:?} update0..4={:?}", layer_idx, &kr[..4], &vr[..4], &self.b[..4], &self.w[..4], &erase[..4], &update[..4]);
-            }
             for i in 0..gdn_dim {
                 for j in 0..gdn_dim {
                     self.recurrent[state_start + i * gdn_dim + j] =
@@ -460,14 +426,8 @@ impl Gptx3Model {
                 }
                 self.head_out[h * gdn_dim + d] = sum;
             }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && h == 0 {
-                eprintln!("[gdn state] layer={} first={:?} out_first={:?}", layer_idx, &self.recurrent[state_start..state_start + 8], &self.head_out[..8]);
-            }
         }
 
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 0 {
-            eprintln!("[gdn raw] layer={} out={:?} onorm={:?} len={}", layer_idx, &self.head_out[..64], &o_norm[..8], o_norm.len());
-        }
         for h in 0..heads {
             let out = &mut self.head_out[h * gdn_dim..(h + 1) * gdn_dim];
             let sum_sq: f32 = out.iter().map(|v| v * v).sum::<f32>();
@@ -477,18 +437,8 @@ impl Gptx3Model {
             }
         }
 
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 0 {
-            eprintln!("[gdn norm] layer={} out0..8={:?}", layer_idx, &self.head_out[..8]);
-        }
         g_down.gemv(&xn, &mut self.low);
         g_up.gemv(&self.low, &mut self.x_norm);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 0 {
-            eprintln!("[gdn gate] layer={} gate0..8={:?} gated0..8={:?}", layer_idx, &self.x_norm[..8], {
-                let mut z = self.head_out.clone();
-                for h in 0..heads { for d in 0..gdn_dim { let idx=h*gdn_dim+d; z[idx] *= sigmoid(self.x_norm[idx]+g_bias[idx]); } }
-                z[..8].to_vec()
-            });
-        }
         for h in 0..heads {
             for d in 0..gdn_dim {
                 let idx = h * gdn_dim + d;
@@ -497,20 +447,9 @@ impl Gptx3Model {
             }
         }
         o_proj.gemv(&self.head_out, &mut self.attn_out);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            eprintln!("[gdn sample] layer={} {:?}", layer_idx, &self.attn_out[..8]);
-            let bad = |v: &[f32]| v.iter().any(|x| !x.is_finite());
-            let min = self.head_out.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = self.head_out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let state = &self.recurrent[state_base..state_base + dim * 64 * 64];
-            let smin = state.iter().cloned().fold(f32::INFINITY, f32::min);
-            let smax = state.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            eprintln!("[gdn out] layer={} out={} attn={} out_range=({min},{max}) state_bad={} state_range=({smin},{smax})", layer_idx, bad(&self.head_out), bad(&self.attn_out), bad(state));
-        }
     }
 
     fn attention_forward(&mut self, layer_idx: usize, pos: usize) {
-        let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv = self.config.n_kv_heads;
         let head_dim = self.config.head_dim;
@@ -530,9 +469,6 @@ impl Gptx3Model {
                 .copy_from_slice(&qg[src..src + head_dim]);
             self.gate[h * head_dim..(h + 1) * head_dim]
                 .copy_from_slice(&qg[src + head_dim..src + 2 * head_dim]);
-        }
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-            eprintln!("[gqa raw] layer={} q0..8={:?} qnorm0..8={:?}", layer_idx, &self.q[..8], &q_norm[..8]);
         }
         k_proj.gemv(&self.x_norm, &mut self.k);
         v_proj.gemv(&self.x_norm, &mut self.v);
@@ -563,10 +499,6 @@ impl Gptx3Model {
         for h in 0..n_heads {
             let kv_h = h / rep;
             let q_head = &self.q[h * head_dim..(h + 1) * head_dim];
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 && h < 4 {
-                let score0 = q_head.iter().zip(&self.k_cache[cache_base + (h / rep) * self.config.max_seq_len * head_dim..cache_base + (h / rep) * self.config.max_seq_len * head_dim + head_dim]).map(|(a,b)|a*b).sum::<f32>() / (head_dim as f32).sqrt();
-                eprintln!("[gqa head] layer={} h={} q0..4={:?} score0={}", layer_idx,h,&q_head[..4],score0);
-            }
             let head_base = cache_base + kv_h * self.config.max_seq_len * head_dim;
             let mut max_score = f32::NEG_INFINITY;
             for p in 0..seq_len {
@@ -589,56 +521,36 @@ impl Gptx3Model {
                     *o += weight * v;
                 }
             }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 && h == 0 {
-                let dbg = out_head[..8].to_vec();
-                eprintln!("[gqa pre-gate] layer={} out0..8={:?}", layer_idx, dbg);
-            }
             for (o, g) in out_head.iter_mut().zip(&self.gate[h * head_dim..(h + 1) * head_dim]) {
                 *o *= 1.0 / (1.0 + (-g).exp());
             }
         }
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-            let vb = layer_idx * self.config.max_seq_len * n_kv * head_dim + pos * n_kv * head_dim;
-            eprintln!("[gqa cache] layer={} v0={:?} v1={:?} v2={:?}", layer_idx, &self.v_cache[vb..vb+8], &self.v_cache[vb+head_dim..vb+head_dim+8], &self.v_cache[vb+2*head_dim..vb+2*head_dim+8]);
-            eprintln!("[gqa] layer={} q0..8={:?} k0..8={:?} v0..8={:?} out0..576={:?}", layer_idx, &self.q[..8], &self.k[..8], &self.v[..8], &self.head_out[..576]);
-        }
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-            let manual: f32 = o_proj.data.as_slice()[..576].chunks_exact(4).map(|b| f32::from_ne_bytes(b.try_into().unwrap()) * self.head_out[0]).sum();
-            eprintln!("[gqa oproj] layer={} manual_row0={} input0={}", layer_idx, manual, self.head_out[0]);
-        }
         o_proj.gemv(&self.head_out, &mut self.attn_out);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-            eprintln!("[gqa attn] layer={} attn0..8={:?}", layer_idx, &self.attn_out[..8]);
-        }
     }
 
     fn forward_impl(&mut self, token: u32, pos: usize, compute_logits: bool) {
+        // A zero-position forward is the start of a brand-new context. The
+        // recurrent state (GDN state + conv history) cannot be positionally
+        // overwritten the way a KV cache can, and the continuous-batching
+        // scheduler reuses this engine across requests without an explicit
+        // reset — so start fresh whenever the first position is requested.
+        // Decode steps always run at pos >= 1, and prefix-continuation
+        // prefills start above the reused prefix, so neither path resets.
+        if pos == 0 {
+            self.reset_cache();
+        }
         let mut x = vec![0.0f32; self.config.dim];
         self.embedding_row(token, &mut x);
         self.x.copy_from_slice(&x);
-        if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-            eprintln!("[embed] token={} x0..4={:?} norm0..4={:?}", token, &self.x[..576], &self.layers[0].pre_norm[..4]);
-        }
         for layer_idx in 0..self.config.n_layers {
             self.x_norm.copy_from_slice(&self.x);
             rmsnorm_local(&mut self.x_norm, &self.layers[layer_idx].pre_norm, self.config.norm_eps);
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx < 2 {
-                eprintln!("[after norm] layer={} residual0..8={:?} xnorm0..8={:?}", layer_idx, &self.x[..576], &self.x_norm[..8]);
-            }
             match &self.layers[layer_idx].mixer {
                 Gptx3Mixer::Gdn { .. } => self.gdn_forward(layer_idx, pos),
                 Gptx3Mixer::Attention { .. } => self.attention_forward(layer_idx, pos),
             }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 0 {
-                eprintln!("[gptx3 attnres] layer={} attn0..16={:?} residual0..16={:?}", layer_idx, &self.attn_out[..576], {
-                    let mut z=self.x.clone(); for (x,a) in z.iter_mut().zip(&self.attn_out) {*x+=a;} z[..16].to_vec()
-                });
-            }
             for (x, a) in self.x.iter_mut().zip(&self.attn_out) {
                 *x += a;
-            }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && self.x.iter().any(|v| !v.is_finite()) {
-                eprintln!("[gptx3 nan] layer={} pos={}", layer_idx, pos);
             }
             self.x_norm.copy_from_slice(&self.x);
             rmsnorm_local(&mut self.x_norm, &self.layers[layer_idx].post_norm, self.config.norm_eps);
@@ -646,40 +558,19 @@ impl Gptx3Model {
             self.layers[layer_idx].up.gemv(&self.x_norm, &mut self.ffn_up);
             swiglu_in_place(&mut self.ffn_gate, &self.ffn_up);
             self.layers[layer_idx].down.gemv(&self.ffn_gate, &mut self.ffn_out);
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && (layer_idx == 0 || layer_idx == 23) {
-                eprintln!("[gptx3 mlp] layer={} postnorm0..8={:?} gate0..8={:?} up0..8={:?} swiglu0..8={:?} out0..8={:?}", layer_idx, &self.x_norm[..8], &self.ffn_gate[..8], &self.ffn_up[..8], &self.ffn_gate[..8], &self.ffn_out[..576]);
-            }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-                eprintln!("[gptx3 residual] layer={} pre0..8={:?} ffn0..8={:?}", layer_idx, &self.x[..8], &self.ffn_out[..8]);
-            }
             for (x, f) in self.x.iter_mut().zip(&self.ffn_out) {
                 *x += f;
-            }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() && layer_idx == 23 {
-                eprintln!("[gptx3 residual] layer={} post0..8={:?}", layer_idx, &self.x[..8]);
-            }
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-                eprintln!("[hidden] layer={} x0..8={:?}", layer_idx, &self.x[..576]);
             }
         }
         if compute_logits {
             rmsnorm_local(&mut self.x, &self.final_norm, self.config.norm_eps);
             self.x_norm.copy_from_slice(&self.x);
-            if std::env::var("SOFUU_DEBUG_GPTX3").is_ok() {
-                eprintln!("[final norm] x0..8={:?}", &self.x_norm[..8]);
-            }
             self.embed.gemv(&self.x, &mut self.logits);
         }
     }
 
     pub fn forward(&mut self, token: u32, pos: usize) -> &[f32] {
         self.forward_impl(token, pos, true);
-        if std::env::var("SOFUU_DEBUG_TOPK").is_ok() {
-            let mut top: Vec<(u32, f32)> = self.logits.iter().enumerate().map(|(i, v)| (i as u32, *v)).collect();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top.truncate(5);
-            eprintln!("[gptx3 top] {:?}", top);
-        }
         &self.logits
     }
 

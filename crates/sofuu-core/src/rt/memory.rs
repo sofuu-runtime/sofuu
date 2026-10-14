@@ -2171,6 +2171,53 @@ mod impl_qtsq {
         qjs::sofuu_js_new_string(ctx, c.as_ptr())
     }
 
+    /// B3.5 (ROADMAP-BRAIN-CMA): `cma.retainAgainst(canonical)` — keep only
+    /// records whose text appears in `canonical`'s live set, renumbering
+    /// survivors exactly like `retain()`. The SEM2 sibling channel is a
+    /// DERIVED index over the canonical store, so its lifecycle follows the
+    /// canonical one instead of decaying on its own: this ends the double
+    /// decay and the drift where one channel kept a memory the other had
+    /// pruned. Returns the number of records removed.
+    unsafe extern "C" fn js_cma_retain_against(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected the canonical sofuu.memory handle".as_ptr(),
+            );
+        }
+        let Some(this_shell) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let other = qjs::JS_GetOpaque2(ctx, *argv, CMA_CLASS_ID.load(Ordering::Relaxed))
+            as *mut CmaShell;
+        if other.is_null() {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Argument 1 must be a sofuu.memory handle".as_ptr(),
+            );
+        }
+        /* Aliasing guard: the same handle would make `keep` borrow the very
+         * records we drain — refuse instead of reading freed memory. */
+        if std::ptr::eq(other, this_shell as *mut CmaShell) {
+            return qjs::sofuu_js_new_int32(ctx, 0);
+        }
+        let other_shell = &*other;
+        let keep: std::collections::HashSet<&str> = other_shell
+            .cma
+            .records
+            .iter()
+            .filter(|r| r.tier != crate::memory::cma::TIER_FORGOTTEN)
+            .map(|r| r.text.as_str())
+            .collect();
+        let dropped = this_shell.cma.retain_matching(&keep);
+        qjs::sofuu_js_new_int32(ctx, dropped as i32)
+    }
+
     /// B3: `cma.stats()` → JSON diagnostics for the store — records,
     /// segments, versions on disk, bytes, evictions, decay stamp. The
     /// capacity policy reports here instead of silently shrinking a brain.
@@ -2451,13 +2498,14 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 16] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 17] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
             cfunc_entry(c"importRecords", 2, js_cma_import),
             cfunc_entry(c"stats", 0, js_cma_stats),
             cfunc_entry(c"compact", 0, js_cma_compact),
+            cfunc_entry(c"retainAgainst", 1, js_cma_retain_against),
             cfunc_entry(c"rememberEntity", 4, js_cma_remember_entity),
             cfunc_entry(c"recall", 2, js_cma_recall),
             cfunc_entry(c"kvHints", 2, js_cma_kv_hints),
@@ -4194,6 +4242,78 @@ mod impl_qtsq {
                 b"orphan",
                 "adoption must not rewrite the orphan file"
             );
+        }
+    }
+
+    /* ── B3.5 (ROADMAP-BRAIN-CMA): channel dedup ───────────────────── */
+
+    /// The SEM2 sibling is a derived index: `retainAgainst(canonical)`
+    /// prunes it to the canonical store's live set, so the two channels
+    /// can never disagree about which memories exist. Also pins the
+    /// aliasing guard (a store against itself must not read freed memory).
+    #[test]
+    fn retain_against_prunes_the_sibling_to_the_canonical_set() {
+        use sofuu_ffi::qjs::CtxPtr;
+
+        let dir = fresh_test_dir("b35-dedup");
+        let canon = dir.join("brain.qtsq");
+        let sib = dir.join("brain-v2.qtsq");
+        let _loop_guard = crate::rt::test_loop_lock();
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+            memory_register(ctx);
+
+            let script = format!(
+                "var a = sofuu.memory.open('{canon}', 16);\n\
+                 var b = sofuu.memory.open('{sib}', 16);\n\
+                 function v(i) {{ var x = new Float32Array(16); x[i] = 1.0; return x; }}\n\
+                 for (var i = 0; i < 5; i++) {{ a.remember(v(i), 'm' + i, 'user', 0); }}\n\
+                 for (var j = 0; j < 5; j++) {{ b.remember(v(j), 'm' + j, 'user', 0); }}\n\
+                 a.forget(1); a.forget(3);\n\
+                 var dropped = a.retain();\n\
+                 var pruned = b.retainAgainst(a);\n\
+                 var again = b.retainAgainst(a);\n\
+                 var self = b.retainAgainst(b);\n\
+                 var texts = [];\n\
+                 var listed = JSON.parse(b.list({{}}));\n\
+                 for (var t = 0; t < listed.records.length; t++) texts.push(listed.records[t].text);\n\
+                 globalThis.out = JSON.stringify({{a: a.count(), b: b.count(), dropped: dropped,\n\
+                   pruned: pruned, again: again, self: self, texts: texts}});",
+                canon = canon.to_str().unwrap(),
+                sib = sib.to_str().unwrap()
+            );
+            let script_c = CString::new(script).unwrap();
+            let r = qjs::JS_Eval(
+                ctx,
+                script_c.as_ptr(),
+                script_c.as_bytes().len(),
+                c"<b35-dedup>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "dedup script threw");
+
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let v = qjs::sofuu_js_get_property_str(ctx, global, c"out".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+            let p = qjs::sofuu_js_to_cstring(ctx, v);
+            qjs::sofuu_js_free_value(ctx, v);
+            assert!(!p.is_null(), "script did not set globalThis.out");
+            let out = CStr::from_ptr(p).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, p);
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+
+            let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(j["dropped"], 2, "the canonical store pruned two");
+            assert_eq!(j["a"], 3);
+            assert_eq!(j["pruned"], 2, "the sibling follows the canonical set");
+            assert_eq!(j["b"], 3, "both channels hold the same live set");
+            assert_eq!(j["again"], 0, "a synced sibling prunes nothing");
+            assert_eq!(j["self"], 0, "a store against itself is a no-op, not UB");
+            let texts: Vec<String> = serde_json::from_value(j["texts"].clone()).unwrap();
+            assert_eq!(texts, vec!["m0", "m2", "m4"]);
         }
     }
 

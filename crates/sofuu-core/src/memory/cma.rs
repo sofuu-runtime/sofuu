@@ -763,6 +763,56 @@ impl Cma {
         before - self.records.len()
     }
 
+    /// B3.5 (ROADMAP-BRAIN-CMA): keep only records whose text appears in
+    /// `keep`, renumbering survivors exactly like `retain()`. The SEM2
+    /// sibling channel is a DERIVED index over the canonical store, so it
+    /// calls this with the canonical store's live texts: its lifecycle then
+    /// FOLLOWS the canonical one instead of decaying on its own — the drift
+    /// where one channel kept a memory the other had pruned, and the double
+    /// decay that produced it. Tombstones are dropped (they are never in a
+    /// live set). Returns the number of records removed.
+    pub fn retain_matching(&mut self, keep: &std::collections::HashSet<&str>) -> usize {
+        let before = self.records.len();
+        if before == 0 {
+            return 0;
+        }
+        let is_dead = |rec: &Record| !keep.contains(rec.text.as_str());
+        /* Nothing to drop → leave records/vectors/index untouched (the
+         * cheap no-op path a synced sibling hits every turn). */
+        if !self.records.iter().any(is_dead) {
+            return 0;
+        }
+        let mut kept_records: Vec<Record> = Vec::with_capacity(before);
+        let mut kept_vectors: Vec<Vec<f32>> = Vec::with_capacity(before);
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        for rec in self.records.drain(..) {
+            if is_dead(&rec) {
+                continue;
+            }
+            remap.insert(rec.id, kept_records.len() as u32);
+            kept_vectors.push(self.index.vector(rec.id).to_vec());
+            kept_records.push(rec);
+        }
+        for (new_id, rec) in kept_records.iter_mut().enumerate() {
+            rec.id = new_id as u32;
+            rec.corecall_ids = rec
+                .corecall_ids
+                .iter()
+                .filter_map(|id| remap.get(id).copied())
+                .collect();
+        }
+        self.records = kept_records;
+        self.index = Hnsw::new(self.vec_dim);
+        for v in &kept_vectors {
+            self.index.add_vector(v);
+        }
+        /* Survivors renumbered — the incremental store path cannot express
+         * this, so the next flush rewrites (same contract as retain()). */
+        self.dirty_ids.clear();
+        self.layout_dirty = true;
+        before - self.records.len()
+    }
+
     /// Entity upsert: update in place if name exists, else insert.
     pub fn remember_entity(
         &mut self,
@@ -1004,6 +1054,13 @@ fn rand_u32() -> u32 {
 mod tests {
     use super::*;
 
+    /// One-hot vector for the small test spaces.
+    fn unit(n: usize, dim: usize) -> Vec<f32> {
+        let mut v = vec![0.0; dim];
+        v[n % dim] = 1.0;
+        v
+    }
+
     #[test]
     fn remember_and_recall() {
         let mut cma = Cma::new(8);
@@ -1038,6 +1095,50 @@ mod tests {
         assert!((cma.records[0].strength - 1.0).abs() < 1e-6);
         cma.decay_tick(86400); // one half-life (1 day)
         assert!(cma.records[0].strength < 0.5);
+    }
+
+    #[test]
+    fn retain_matching_follows_the_canonical_set() {
+        let mut cma = Cma::new(16);
+        for i in 0..5u32 {
+            let v = unit(i as usize, 16);
+            cma.remember(&v, &format!("m{i}"), "user", 0);
+        }
+        /* Canonical live set keeps m0, m2, m4 (m1/m3 pruned there). */
+        let keep: std::collections::HashSet<&str> = ["m0", "m2", "m4"].into_iter().collect();
+        let dropped = cma.retain_matching(&keep);
+        assert_eq!(dropped, 2);
+        assert_eq!(cma.len(), 3);
+        let texts: Vec<&str> = cma.records.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["m0", "m2", "m4"]);
+        /* Survivors renumber densely and the index follows. */
+        assert_eq!(cma.records[0].id, 0);
+        assert_eq!(cma.records[2].id, 2);
+        assert_eq!(cma.index.len(), 3);
+        assert!(cma.layout_dirty, "a prune forces the next flush to rewrite");
+
+        /* A second call with the same set is a no-op. */
+        assert_eq!(cma.retain_matching(&keep), 0);
+
+        /* Everything gone → empty store. */
+        let none: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        assert_eq!(cma.retain_matching(&none), 3);
+        assert!(cma.is_empty());
+    }
+
+    #[test]
+    fn retain_matching_remaps_corecall_partners() {
+        let mut cma = Cma::new(16);
+        for i in 0..4u32 {
+            let v = unit(i as usize, 16);
+            cma.remember(&v, &format!("m{i}"), "user", 0);
+        }
+        /* Give m0 a co-recall partner that survives, and one that does not. */
+        cma.records[0].corecall_ids = vec![1, 2];
+        let keep: std::collections::HashSet<&str> = ["m0", "m2"].into_iter().collect();
+        assert_eq!(cma.retain_matching(&keep), 2);
+        /* m1 (id 1) was dropped; m2 renumbered to 1 and stays linked. */
+        assert_eq!(cma.records[0].corecall_ids, vec![1]);
     }
 
     #[test]

@@ -38,6 +38,21 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Persist Java crashes to app-private storage: a crash that happens
+        // with the cable unplugged still leaves a full stack on-device
+        // (readable via `adb shell run-as com.sofuu cat files/app-crash.log`).
+        val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                java.io.File(filesDir, "app-crash.log").appendText(
+                    "\n===== " + t.name + " @ " + java.lang.System.currentTimeMillis() + " =====\n" +
+                        android.util.Log.getStackTraceString(e) + "\n"
+                )
+            } catch (_: Throwable) {
+            }
+            prevHandler?.uncaughtException(t, e)
+        }
+
         Notifier.ensureChannel(this)
         store.notifier = { title, body -> Notifier.post(this, title, body) }
 

@@ -115,6 +115,39 @@ Java_com_sofuu_engine_SofuuBridge_nativeRtEval(JNIEnv *env, jclass cls, jlong rt
     return result;
 }
 
+/* SofuuBridge.nativeRtEvalNb(rt, source) → String?
+ * Non-blocking eval: identical JS semantics to nativeRtEval, but the
+ * loop only ticks once (UV_RUN_NOWAIT) instead of draining until idle.
+ * Returns the JSON-stringified completion value; NULL on failure. */
+JNIEXPORT jstring JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeRtEvalNb(JNIEnv *env, jclass cls, jlong rt_ptr, jstring source) {
+    (void)cls;
+    if (rt_ptr == 0 || source == NULL) return NULL;
+
+    const char *source_c = (*env)->GetStringUTFChars(env, source, NULL);
+    if (source_c == NULL) return NULL;
+
+    char *out = NULL;
+    int rc = sofuu_rt_eval_nb((SofuuRuntime *)(intptr_t)rt_ptr, source_c, &out);
+    (*env)->ReleaseStringUTFChars(env, source, source_c);
+
+    /* Never HIDE a JS exception behind null here: the envelope carries the
+     * error text and the Kotlin side logs it. A caller that filters on
+     * "ev"/"rp" treats the envelope as an empty drain. */
+    if (rc != SOFUU_OK || out == NULL) {
+        if (out) {
+            jstring errEnv = (*env)->NewStringUTF(env, out);
+            sofuu_free(out);
+            return errEnv;
+        }
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"runtime returned no result\"}}");
+    }
+    jstring result = (*env)->NewStringUTF(env, out);
+    sofuu_free(out);
+    return result;
+}
+
 /* SofuuBridge.nativeRtCall(rt, method, args) → String? (JSON envelope) */
 JNIEXPORT jstring JNICALL
 Java_com_sofuu_engine_SofuuBridge_nativeRtCall(JNIEnv *env, jclass cls, jlong rt_ptr,

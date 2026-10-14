@@ -171,6 +171,11 @@ unsafe extern "C" fn timer_free_cb(handle: *mut UvHandle) {
 /// net-3: (re)arm the per-connection deadline. Called on the loop thread
 /// only (accept, parser callbacks, response writes).
 unsafe fn client_arm_timer(c: *mut Client, ms: u64) {
+    if ms == 0 {
+        /* Embedder-requested "no deadline" (see apply_deadline_env_once):
+         * mirrors the OOM-at-accept path below — run without a deadline. */
+        return;
+    }
     if (*c).hdr_timer.is_null() {
         return; /* OOM at accept — run without a deadline, as before */
     }
@@ -852,12 +857,35 @@ unsafe extern "C" fn js_server_listen(
 
 // ── createServer(handler) ───────────────────────────────────────────
 
+/// net-3: an embedder (e.g. `serve --infer`, whose local-inference prefill
+/// can legitimately stay silent for many minutes on large models) may widen
+/// the connection deadlines once, before the first server is created, via
+/// SOFUU_HTTP_HEADERS_MS / SOFUU_HTTP_IDLE_MS (milliseconds, "0" = never).
+/// Defaults stay 30000/75000 for every other embedding, so the slowloris
+/// posture is unchanged.
+fn apply_deadline_env_once() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        if let Ok(v) = std::env::var("SOFUU_HTTP_HEADERS_MS") {
+            if let Ok(ms) = v.trim().parse::<u64>() {
+                HEADERS_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+            }
+        }
+        if let Ok(v) = std::env::var("SOFUU_HTTP_IDLE_MS") {
+            if let Ok(ms) = v.trim().parse::<u64>() {
+                IDLE_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 unsafe extern "C" fn js_create_server(
     ctx: *mut JSContext,
     _this: JSValueConst,
     argc: c_int,
     argv: *const JSValueConst,
 ) -> JSValue {
+    apply_deadline_env_once();
     if argc < 1 || qjs::JS_IsFunction(ctx, *argv) == 0 {
         return qjs::JS_ThrowTypeError(ctx, c"createServer: function required".as_ptr());
     }
@@ -886,6 +914,7 @@ unsafe extern "C" fn js_serve(
     argc: c_int,
     argv: *const JSValueConst,
 ) -> JSValue {
+    apply_deadline_env_once();
     if argc < 2 || qjs::JS_IsFunction(ctx, *argv.add(1)) == 0 {
         return qjs::JS_ThrowTypeError(ctx, c"serve(port, fn)".as_ptr());
     }

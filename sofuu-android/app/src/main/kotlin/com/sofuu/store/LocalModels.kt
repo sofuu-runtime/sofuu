@@ -28,7 +28,7 @@ class LocalModels(private val context: Context) {
     val dir: File get() = File(context.filesDir, "models").apply { mkdirs() }
 
     fun list(): List<File> =
-        dir.listFiles { f -> f.isFile && f.name.endsWith(".gguf", ignoreCase = true) }
+        dir.listFiles { f -> f.isFile && (f.name.endsWith(".gguf", ignoreCase = true) || f.name.endsWith(".safetensors", ignoreCase = true)) }
             ?.sortedBy { it.lastModified() }
             ?.reversed()
             ?: emptyList()
@@ -45,7 +45,10 @@ class LocalModels(private val context: Context) {
         val name = displayName(uri) ?: return null
         val safe = File(name).name
         if (safe.isEmpty() || safe == "." || safe == ".." || safe.startsWith(".")) return null
-        if (!safe.endsWith(".gguf", ignoreCase = true)) return null
+        // GGUF is the native format; single-file SafeTensors also routes
+        // (rt::ai::looks_like_local_model accepts a .safetensors path). A
+        // Multi-file HF directory cannot come through a single-file picker.
+        if (!safe.endsWith(".gguf", ignoreCase = true) && !safe.endsWith(".safetensors", ignoreCase = true)) return null
 
         val dest = File(dir, safe)
         return try {
@@ -144,6 +147,11 @@ private fun readGgufMeta(file: File): Pair<String?, Long?>? = try {
             while (i < kvCount && (name == null || ftype == null) && bb.hasRemaining()) {
                 i++
                 val key = ggufString(bb) ?: break
+                // llama.cpp writers emit every general.* key before the
+                // tokenizer arrays; the first non-general key means nothing
+                // ahead can change the label — stop instead of walking
+                // 150k token strings to the end of the window.
+                if (!key.startsWith("general.")) break
                 when (val vt = (bb.int.toLong() and 0xFFFFFFFFL).toInt()) {
                     8 -> {
                         val s = ggufString(bb) ?: throw GgufHeaderException()

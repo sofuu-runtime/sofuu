@@ -39,7 +39,8 @@ qtsq_keystore qtsq_seal qtsq_surfel qtsq_tsdf qtsq_seal_freqdct qtsq_turbo \
 qtsq_ionic qtsq_mf_merge qtsq_c2pa"
 QTC_SRC="qtc_model qtc_ans qtc_order1 qtc_lz qtc_image qtc_audio qtc_detect \
 qtc_mdct qtc_audio_mdct qtc_audio_mdct2 qtc_audio_float qtc_delaunay \
-qtc_image_mesh qtc_accretion qtc_image_dct qtc_tensor qtc_video qtc_core"
+qtc_image_mesh qtc_accretion qtc_image_dct qtc_tensor qtc_video qtc_core \
+qtc_text"
 ZLIB_OBJS="adler32 compress crc32 deflate inflate infback inftrees \
 inffast trees uncompr zutil"
 

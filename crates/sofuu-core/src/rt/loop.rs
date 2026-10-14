@@ -275,6 +275,30 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
     sofuu_flush_jobs(ctx);
 }
 
+/// One non-blocking turn of the engine loop: flush JS microtasks, poll
+/// libuv ONCE without waiting (UV_RUN_NOWAIT — never blocks on handles
+/// or timers), then flush microtasks again so an I/O callback's
+/// continuations land in the same call.
+///
+/// This is the incremental pump embedded hosts need to drive an async
+/// feature (a chat turn) to completion across repeated calls while the
+/// runtime thread stays schedulable — a cancel poke or a host query must
+/// never wait behind an until-idle drain. The full-drain variants
+/// (`sofuu_loop_run` / `_bounded`) keep their block-until-idle semantics
+/// for hosts that evaluate complete one-shot features.
+///
+/// # Safety
+/// `ctx` must be the live runtime context (loop thread).
+pub unsafe extern "C" fn sofuu_loop_tick_nb(ctx: *mut JSContext) {
+    if loop_ptr().is_null() {
+        return;
+    }
+    sofuu_flush_jobs(ctx);
+    uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
+    process_dispatch_pending_signals();
+    sofuu_flush_jobs(ctx);
+}
+
 /// Walk callback: closes any handle that is still active.
 unsafe extern "C" fn walk_close_cb(handle: *mut UvHandle, _arg: *mut c_void) {
     // SAFETY: handle is a live handle visited by uv_walk.

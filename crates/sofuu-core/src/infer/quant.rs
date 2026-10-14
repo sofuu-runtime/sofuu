@@ -9,10 +9,13 @@ pub const GGML_TYPE_Q4_1: u32 = 3;
 pub const GGML_TYPE_Q8_0: u32 = 8;
 pub const GGML_TYPE_Q4_K: u32 = 12;
 pub const GGML_TYPE_Q6_K: u32 = 14;
+/// Prism-private ternary at group size 128 (ggml type 143).
+pub const GGML_TYPE_PTQ1_0: u32 = 143;
 
 pub const QK4_0: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
+pub const QK_PTQ1_0: usize = 128;
 
 /// Convert IEEE 754 half-precision (16-bit) float to 32-bit single precision.
 #[inline(always)]
@@ -120,6 +123,59 @@ pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Dequantize a PTQ1_0 (GGML type 143, Prism ternary at group 128) row into
+/// destination f32 buffer. 28-byte block per 128 values: qs[24] (120 values,
+/// 5 base-3 trits per byte) + qh[2] (8 values, 4 trits per byte) + f16 scale
+/// `d` last. Same base-3 trit packing as upstream TQ1_0 with the 32-then-16
+/// byte staging generalised to 32/16/8, so a 24-byte qs region walks chunks
+/// of 16 then 8; each byte stores its trits pre-scaled (ceil q*256/243), and
+/// the decoder re-extracts them via the modular trick `(byte * 3^n)` with u8
+/// wrapping, then `(q * 3) >> 8`. `out.len()` must be a multiple of 128.
+pub fn ptq1_0_dequant_row(src: &[u8], out: &mut [f32]) {
+    const QS_LEN: usize = (QK_PTQ1_0 - 4 * QK_PTQ1_0 / 64) / 5; // 24
+    const QH_LEN: usize = QK_PTQ1_0 / 64; // 2
+    const BLOCK: usize = QS_LEN + QH_LEN + 2; // qs | qh | f16 scale = 28
+    const STAGES: [usize; 3] = [32, 16, 8];
+    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+
+    let n_blocks = out.len() / QK_PTQ1_0;
+    debug_assert!(src.len() >= n_blocks * BLOCK);
+
+    for blk in 0..n_blocks {
+        let b_offset = blk * BLOCK;
+        let d = f16_to_f32(u16::from_le_bytes([
+            src[b_offset + QS_LEN + QH_LEN],
+            src[b_offset + QS_LEN + QH_LEN + 1],
+        ]));
+        let mut o = blk * QK_PTQ1_0;
+
+        let mut j = 0;
+        for s in 0..STAGES.len() {
+            let c = STAGES[s];
+            while j + c <= QS_LEN {
+                for n in 0..5usize {
+                    for m in 0..c {
+                        let q = src[b_offset + j + m].wrapping_mul(POW3[n]);
+                        let xi = ((q as u16) * 3) >> 8;
+                        out[o] = (xi as i16 - 1) as f32 * d;
+                        o += 1;
+                    }
+                }
+                j += c;
+            }
+        }
+        for n in 0..4usize {
+            for h in 0..QH_LEN {
+                let q = src[b_offset + QS_LEN + h].wrapping_mul(POW3[n]);
+                let xi = ((q as u16) * 3) >> 8;
+                out[o] = (xi as i16 - 1) as f32 * d;
+                o += 1;
+            }
+        }
+        debug_assert_eq!(o, (blk + 1) * QK_PTQ1_0);
+    }
+}
+
 /// Dot-product of Q4_0 quantized weight row with float32 activation vector.
 #[inline]
 pub fn vec_dot_q4_0(weight_bytes: &[u8], x: &[f32]) -> f32 {
@@ -185,6 +241,15 @@ pub fn dequantize_q6_k_row(src: &[u8], dst: &mut [f32]) {
 
 /// Configure the number of CPU threads used for matrix-vector compute.
 /// If `n == 0`, defaults to all available CPU cores.
+/// Warm the packed-tile GEMM/GEMV cache for one weight matrix (q4_K/q6_K/q8_0).
+/// Subsequent matvec/matmat calls on this weight pointer route to the tile
+/// kernels. `ty` is the GGML type id (8 = q8_0, 12 = q4_K, 14 = q6_K).
+pub fn tile_warm(ptr: *const u8, rows: usize, cols: usize, ty: u32) {
+    unsafe {
+        sofuu_tile_warm(ptr, rows, cols, ty);
+    }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -201,6 +266,7 @@ pub fn get_thread_count() -> usize {
 extern "C" {
     fn sofuu_set_threads(n: i32);
     fn sofuu_get_threads() -> i32;
+    fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
@@ -246,6 +312,17 @@ extern "C" {
     fn sofuu_gemm_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_f16(weight_bytes: *const u16, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_rmsnorm(out: *mut f32, x: *const f32, weight: *const f32, n: usize, eps: f32);
+    fn sofuu_batched_rmsnorm(out: *mut f32, x: *const f32, weight: *const f32, rows: usize, cols: usize, eps: f32);
+    fn sofuu_batched_mad(dst: *mut f32, src: *const f32, alpha: f32, rows: usize, cols: usize);
+    fn sofuu_batched_add_bias(x: *mut f32, bias: *const f32, rows: usize, cols: usize);
+    fn sofuu_batched_swiglu(gate: *mut f32, up: *const f32, rows: usize, cols: usize);
+    fn sofuu_batched_rope_kv(
+        q_batch: *mut f32, k_batch: *mut f32, v_batch: *const f32,
+        k_cache: *mut f32, v_cache: *mut f32,
+        b_size: usize, start_pos: usize, layer_idx: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, freq_base: f32, rope_mode: i32,
+    );
     fn sofuu_swiglu(out: *mut f32, gate: *const f32, up: *const f32, n: usize);
     fn sofuu_softmax(scores: *mut f32, n: usize);
     fn sofuu_rope(vec: *mut f32, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32, rope_style: i32);
@@ -607,6 +684,78 @@ pub fn batched_attention(
 }
 
 /// Multi-core parallel causal self-attention with Sliding Window Attention (SWA) and Attention Sinks.
+/// Profiling hooks (enabled with `SOFUU_PROFILE=1`): split prefill wall time
+/// into gemm / gemv / attention buckets; `report` prints and clears them.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static GEMM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static GEMV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GEMV_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
+    static CHUNK_NS: AtomicU64 = AtomicU64::new(0);
+    static CHUNK_TOK: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("SOFUU_PROFILE").is_some())
+    }
+
+    /// RAII bucket: accumulates wall time (and one call) while on the stack.
+    pub struct Scope(&'static AtomicU64, &'static AtomicU64, Option<Instant>);
+    impl Scope {
+        pub fn new(ns: &'static AtomicU64, calls: &'static AtomicU64) -> Self {
+            Scope(ns, calls, enabled().then(Instant::now))
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if let Some(t0) = self.2.take() {
+                self.0.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Record a prefill chunk's total time and token count.
+    pub fn record_chunk(elapsed: std::time::Duration, tokens: usize) {
+        if !enabled() {
+            return;
+        }
+        CHUNK_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        CHUNK_TOK.fetch_add(tokens as u64, Ordering::Relaxed);
+    }
+
+    /// Print accumulated profile buckets and reset them.
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
+        let chunk = ms(&CHUNK_NS);
+        let gemm = ms(&GEMM_NS);
+        let gemv = ms(&GEMV_NS);
+        let attn = ms(&ATTN_NS);
+        let tok = CHUNK_TOK.load(Ordering::Relaxed);
+        let other = chunk - gemm - gemv - attn;
+        eprintln!(
+            "[prof] prefilled {tok} tok in {chunk:.0}ms | gemm {gemm:.0}ms ({}) | gemv {gemv:.0}ms ({}) | attn {attn:.0}ms ({}) | other {other:.0}ms",
+            GEMM_CALLS.load(Ordering::Relaxed),
+            GEMV_CALLS.load(Ordering::Relaxed),
+            ATTN_CALLS.load(Ordering::Relaxed),
+        );
+        for a in [
+            &GEMM_NS, &GEMM_CALLS, &GEMV_NS, &GEMV_CALLS, &ATTN_NS, &ATTN_CALLS, &CHUNK_NS,
+            &CHUNK_TOK,
+        ] {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 pub fn batched_attention_ext(
     q_batch: &[f32],
     k_cache: &[f32],
@@ -622,6 +771,7 @@ pub fn batched_attention_ext(
     sliding_window: usize,
     sink_tokens: usize,
 ) {
+    let _prof = prof::Scope::new(&prof::ATTN_NS, &prof::ATTN_CALLS);
     unsafe {
         sofuu_batched_attention_ext(
             q_batch.as_ptr(),
@@ -749,6 +899,7 @@ pub fn matvec(w_bytes: &[u8], type_id: u32, rows: usize, cols: usize, x: &[f32],
     assert_eq!(x.len(), cols, "x.len() must match cols");
     assert_eq!(y.len(), rows, "y.len() must match rows");
 
+    let _prof = prof::Scope::new(&prof::GEMV_NS, &prof::GEMV_CALLS);
     match type_id {
         GGML_TYPE_Q4_0 => {
             unsafe {
@@ -812,6 +963,7 @@ pub fn matmat(
         return;
     }
 
+    let _prof = prof::Scope::new(&prof::GEMM_NS, &prof::GEMM_CALLS);
     match type_id {
         GGML_TYPE_Q4_0 => unsafe {
             sofuu_gemm_q4_0(w_bytes.as_ptr(), x_batch.as_ptr(), y_batch.as_mut_ptr(), rows, cols, batch_size);
@@ -855,6 +1007,94 @@ pub fn rmsnorm_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
     assert_eq!(x.len(), weight.len());
     unsafe {
         sofuu_rmsnorm(x.as_mut_ptr(), x.as_ptr(), weight.as_ptr(), x.len(), eps);
+    }
+}
+
+/// Batched (out-place) RMSNorm over `rows` contiguous rows of `cols` floats;
+/// one FFI call, internally parallel. `out` may alias `x`.
+#[inline]
+pub fn batched_rmsnorm(
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) {
+    debug_assert_eq!(out.len(), rows * cols);
+    debug_assert_eq!(x.len(), rows * cols);
+    debug_assert_eq!(weight.len(), cols);
+    unsafe {
+        sofuu_batched_rmsnorm(out.as_mut_ptr(), x.as_ptr(), weight.as_ptr(), rows, cols, eps);
+    }
+}
+
+/// Batched in-place multiply-accumulate: `dst[r] += alpha * src[r]` per row.
+#[inline]
+pub fn batched_mad(dst: &mut [f32], src: &[f32], alpha: f32, rows: usize, cols: usize) {
+    debug_assert_eq!(dst.len(), rows * cols);
+    debug_assert_eq!(src.len(), rows * cols);
+    unsafe {
+        sofuu_batched_mad(dst.as_mut_ptr(), src.as_ptr(), alpha, rows, cols);
+    }
+}
+
+/// Batched per-row bias add: `x[r][c] += bias[c]`.
+#[inline]
+pub fn batched_add_bias(x: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
+    debug_assert_eq!(x.len(), rows * cols);
+    debug_assert_eq!(bias.len(), cols);
+    unsafe {
+        sofuu_batched_add_bias(x.as_mut_ptr(), bias.as_ptr(), rows, cols);
+    }
+}
+
+/// Batched in-place SwiGLU over `rows` rows of `cols` floats.
+#[inline]
+pub fn batched_swiglu(gate: &mut [f32], up: &[f32], rows: usize, cols: usize) {
+    debug_assert_eq!(gate.len(), rows * cols);
+    debug_assert_eq!(up.len(), rows * cols);
+    unsafe {
+        sofuu_batched_swiglu(gate.as_mut_ptr(), up.as_ptr(), rows, cols);
+    }
+}
+
+/// Batched RoPE on q/k rows + KV-cache scatter, parallel over tokens.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn batched_rope_kv(
+    q_batch: &mut [f32],
+    k_batch: &mut [f32],
+    v_batch: &[f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    b_size: usize,
+    start_pos: usize,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    freq_base: f32,
+    rope_mode: i32,
+) {
+    unsafe {
+        sofuu_batched_rope_kv(
+            q_batch.as_mut_ptr(),
+            k_batch.as_mut_ptr(),
+            v_batch.as_ptr(),
+            k_cache.as_mut_ptr(),
+            v_cache.as_mut_ptr(),
+            b_size,
+            start_pos,
+            layer_idx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            freq_base,
+            rope_mode,
+        );
     }
 }
 
@@ -908,6 +1148,96 @@ pub fn rope_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tile_gemv_q8_0_matches_reference() {
+        // 16 rows x 32 cols (single q8_0 block per row, one 4-row tile pair).
+        let rows = 16usize;
+        let cols = 32usize;
+        let mut w_bytes = vec![0u8; rows * (cols + 2)]; // 32 qs + 2 d per row
+        let mut weights = vec![0f32; rows * cols];
+        for r in 0..rows {
+            // f16-exact delta (exp 8, mantissa r*64), matching the gemm test below
+            let d_bits: u16 = (8u16 << 10) | ((r as u16) * 64);
+            let d = f16_to_f32(d_bits);
+            let bytes = &mut w_bytes[r * (cols + 2)..(r + 1) * (cols + 2)];
+            bytes[0] = (d_bits & 0xff) as u8;
+            bytes[1] = (d_bits >> 8) as u8;
+            for c in 0..cols {
+                let v = ((r * 13 + c * 7) % 30) as i8 - 15;
+                bytes[2 + c] = v as u8;
+                weights[r * cols + c] = v as f32 * d;
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.11 - 1.5).sin()).collect();
+
+        let mut ref_out = vec![0f32; rows];
+        for r in 0..rows {
+            let mut sum = 0f32;
+            for c in 0..cols {
+                sum += weights[r * cols + c] * x[c];
+            }
+            ref_out[r] = sum;
+        }
+
+        tile_warm(w_bytes.as_ptr(), rows, cols, GGML_TYPE_Q8_0);
+
+        let mut out = vec![0f32; rows];
+        matvec(&w_bytes, GGML_TYPE_Q8_0, rows, cols, &x, &mut out);
+
+        for r in 0..rows {
+            let a = out[r];
+            let b = ref_out[r];
+            // Tolerance is relative to the row's L1 magnitude (Σ|w·x|): int8
+            // activation quantization is ≤0.4% per element, which only shows
+            // up against the net sum when signs cancel.
+            let l1: f32 = (0..cols).map(|c| (weights[r * cols + c] * x[c]).abs()).sum();
+            let ok = (a - b).abs() <= 0.02 * l1 + 1e-4;
+            assert!(ok, "row {r}: tile {a} vs ref {b}");
+        }
+    }
+
+    #[test]
+    fn test_tile_gemm_q8_0_matches_reference() {
+        let rows = 16usize;
+        let cols = 32usize;
+        let batch = 8usize;
+        let mut w_bytes = vec![0u8; rows * (cols + 2)];
+        let mut weights = vec![0f32; rows * cols];
+        for r in 0..rows {
+            // f16-exact delta (exp 8, mantissa r*64)
+            let d_bits: u16 = (8u16 << 10) | ((r as u16) * 64);
+            let d = f16_to_f32(d_bits);
+            let bytes = &mut w_bytes[r * (cols + 2)..(r + 1) * (cols + 2)];
+            bytes[0] = (d_bits & 0xff) as u8;
+            bytes[1] = (d_bits >> 8) as u8;
+            for c in 0..cols {
+                let v = ((r * 13 + c * 7) % 30) as i8 - 15;
+                bytes[2 + c] = v as u8;
+                weights[r * cols + c] = v as f32 * d;
+            }
+        }
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|i| (((i % 17) as f32) * 0.13 - 1.0).cos())
+            .collect();
+
+        tile_warm(w_bytes.as_ptr(), rows, cols, GGML_TYPE_Q8_0);
+
+        let mut out = vec![0f32; batch * rows];
+        matmat(&w_bytes, GGML_TYPE_Q8_0, rows, cols, &x, batch, &mut out);
+
+        for b in 0..batch {
+            for r in 0..rows {
+                let a = out[b * rows + r];
+                let mut b_ref = 0f32;
+                for c in 0..cols {
+                    b_ref += weights[r * cols + c] * x[b * cols + c];
+                }
+                let ok = (a - b_ref).abs() <= 0.05 * b_ref.abs().max(1e-3) + 1e-2;
+                assert!(ok, "({b},{r}): tile {a} vs ref {b_ref}");
+            }
+        }
+    }
 
     #[test]
     fn test_cpp_rmsnorm() {
@@ -1332,6 +1662,90 @@ mod tests {
         for val in &head_out_batch {
             assert!(val.is_finite(), "expected finite output from attention");
             assert!(*val > 0.0, "expected positive attention output");
+        }
+    }
+
+    #[test]
+    fn test_ptq1_0_dequant_known_block() {
+        // Hand-built one-block PTQ1_0 row: block = qs[24] | qh[2] | f16 d.
+        // The reference quantizer packs 5 (qs) / 4 (qh) base-3 trits per byte
+        // and pre-scales to a byte with ceiling division:
+        //   qs byte = (q*256 + 242) / 243, qh byte = (q*3*256 + 242) / 243
+        // (one extra *=3 shifts qh's 4 trits up). At stage level n the kernel
+        // recovers trit floor(q/3^(4-n)) % 3 (qs) / floor(q/3^(3-n)) % 3 (qh)
+        // as value (trit - 1) * d: the trit decomposition of the pre-scale q,
+        // NOT of the byte itself (byte 3 encodes q=2, i.e. trits 2,0,0,0,0
+        // msb-first, while base-3(3) would read 0,1,0,0,0).
+        const D: f32 = 0.5;
+        let mut block = [0u8; 28];
+        block[27] = 0x38; // d = f16 0x3800 = 0.5 (little-endian, last 2 bytes)
+
+        // Element m + n*c of a c-wide chunk carries trit (4-n) of its byte's
+        // pre-scale q: stage 1 covers elements 0..80 (c=16), stage 2 covers
+        // 80..120 (c=8, byte offset 16), qh pairs elements 120..128.
+        //   q=0   (byte 0)   -> trits all 0      -> -d at 0,16,32,48,64
+        //   q=242 (byte 255) -> trits all 2      -> +d at 1,17,33,49,65
+        //   q=114 (byte 121) -> trits 1,1,0,2,0  -> 0, 0, -d, +d, -d
+        //                                            at 2,18,34,50,66
+        //   q=229 (byte 242) -> trits 2,2,1,1,1  -> +d, +d, 0, 0, 0
+        //                                            at 80,88,96,104,112
+        //   qh[0]=193 (qH=61)  -> trits 2,0,2,1  -> +d, -d, +d, 0
+        //                                            at 120,122,124,126
+        //   qh[1]=0   (qH=0)                     -> -d at 121,123,125,127
+        block[0] = 0;
+        block[1] = ((242 * 256 + 242) / 243) as u8; // 255
+        block[2] = ((114 * 256 + 242) / 243) as u8; // 121
+        block[16] = ((229 * 256 + 242) / 243) as u8; // 242
+        block[24] = ((61 * 3 * 256 + 242) / 243) as u8; // 193
+
+        let mut out = [0f32; 128];
+        ptq1_0_dequant_row(&block, &mut out);
+
+        // The modular extraction rule must reproduce the base-3 digits of the
+        // byte's pre-image q at significance 3^(4-n) for a few bytes/levels:
+        let pow3 = [1u8, 3, 9, 27, 81];
+        let pow3hi = [81u32, 27, 9, 3, 1];
+        for &(b, q) in &[(0u8, 0u32), (255, 242), (121, 114), (242, 229)] {
+            for n in 0..5usize {
+                let xi = ((b.wrapping_mul(pow3[n]) as u16) * 3 >> 8) as i32 - 1;
+                let want = ((q / pow3hi[n]) % 3) as i32 - 1;
+                assert_eq!(xi, want, "byte {b} trit {n}");
+            }
+        }
+        let pow3h = [1u8, 3, 9, 27];
+        let pow3hih = [27u32, 9, 3, 1];
+        for n in 0..4usize {
+            let xi = ((193u8.wrapping_mul(pow3h[n]) as u16) * 3 >> 8) as i32 - 1;
+            let want = ((61 / pow3hih[n]) % 3) as i32 - 1;
+            assert_eq!(xi, want, "qh byte 193 trit {n}");
+        }
+
+        // Full-row check against the hand-decoded values (every position not
+        // listed decodes a zero byte -> -d):
+        let mut expected = [-D; 128];
+        for &i in &[1usize, 17, 33, 49, 65] {
+            expected[i] = D;
+        }
+        for &(i, v) in &[
+            (2usize, 0.0f32),
+            (18, 0.0),
+            (34, -D),
+            (50, D),
+            (66, -D),
+            (80, D),
+            (88, D),
+            (96, 0.0),
+            (104, 0.0),
+            (112, 0.0),
+            (120, D),
+            (122, -D),
+            (124, D),
+            (126, 0.0),
+        ] {
+            expected[i] = v;
+        }
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, expected[i], "element {i}");
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod block_graph;
 pub mod continuous;
 pub mod gguf;
 pub mod gptx3;
+pub mod qwen35;
 pub mod lfm2;
 pub mod lookahead;
 pub mod metal;
@@ -18,6 +19,7 @@ pub mod pytorch;
 pub mod quant;
 pub mod safetensors;
 pub mod sampler;
+pub mod spark;
 pub mod swarm;
 pub mod tensor_table;
 pub mod tokenizer;
@@ -31,6 +33,8 @@ use self::gptx3::Gptx3Model;
 use self::lfm2::Lfm2Model;
 use self::model::{ModelConfig, TransformerModel};
 use self::sampler::{Sampler, SamplerConfig};
+use self::spark::Spark25Model;
+use self::qwen35::Qwen35Model;
 use self::tensor_table::UnifiedTensorTable;
 use self::tokenizer::BpeTokenizer;
 
@@ -62,6 +66,7 @@ impl Default for GenerateOptions {
                 "<|im_end|>".to_string(),
                 "<|endoftext|>".to_string(),
                 "<|eot_id|>".to_string(),
+                "<｜end▁of▁sentence｜>".to_string(),
             ],
             sliding_window: 0, // 0 = full context / model default
             sink_tokens: 4,    // 4 sink tokens by default
@@ -76,6 +81,8 @@ pub enum ModelBackend {
     Lfm2(Lfm2Model),
     BlockGraph(BlockGraphModel),
     Gptx3(Gptx3Model),
+    Spark(Spark25Model),
+    Qwen35(Qwen35Model),
 }
 
 pub struct InferModel {
@@ -87,6 +94,27 @@ pub struct InferModel {
 
 impl InferModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
+        let arch = gguf.get_str("general.architecture").unwrap_or("llama").to_string();
+        if arch == "spark2_5" {
+            let m = Spark25Model::from_gguf(gguf, max_seq_len, vocab_size)?;
+            let config = m.config.clone();
+            return Ok(Self {
+                config,
+                backend: ModelBackend::Spark(m),
+                sliding_window: 0,
+                sink_tokens: 4,
+            });
+        }
+        if arch == "qwen35" {
+            let m = Qwen35Model::from_gguf(gguf, max_seq_len)?;
+            let config = m.config.clone();
+            return Ok(Self {
+                config,
+                backend: ModelBackend::Qwen35(m),
+                sliding_window: 0,
+                sink_tokens: 4,
+            });
+        }
         let m = TransformerModel::from_gguf(gguf, max_seq_len, vocab_size)?;
         let config = m.config.clone();
         Ok(Self {
@@ -143,6 +171,8 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.reset_cache(),
             ModelBackend::BlockGraph(m) => m.reset_cache(),
             ModelBackend::Gptx3(m) => m.reset_cache(),
+            ModelBackend::Spark(m) => m.reset_cache(),
+            ModelBackend::Qwen35(m) => m.reset_cache(),
         }
     }
 
@@ -152,6 +182,8 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::BlockGraph(m) => m.compact_kv_cache(cur_pos, sink, drop),
             ModelBackend::Gptx3(m) => m.compact_kv_cache(cur_pos, sink, drop),
+            ModelBackend::Spark(m) => m.compact_kv_cache(cur_pos, sink, drop),
+            ModelBackend::Qwen35(m) => m.compact_kv_cache(cur_pos, sink, drop),
         }
     }
 
@@ -161,6 +193,8 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.forward(token, pos),
             ModelBackend::BlockGraph(m) => m.forward(token, pos),
             ModelBackend::Gptx3(m) => m.forward(token, pos),
+            ModelBackend::Spark(m) => m.forward(token, pos),
+            ModelBackend::Qwen35(m) => m.forward(token, pos),
         }
     }
 
@@ -170,6 +204,8 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.forward_prefill(token, pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill(token, pos),
             ModelBackend::Gptx3(m) => m.forward_prefill(token, pos),
+            ModelBackend::Spark(m) => m.forward_prefill(token, pos),
+            ModelBackend::Qwen35(m) => m.forward_prefill(token, pos),
         }
     }
 
@@ -179,6 +215,8 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.forward_prefill_batch(tokens, start_pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill_batch(tokens, start_pos),
             ModelBackend::Gptx3(m) => m.forward_prefill_batch(tokens, start_pos),
+            ModelBackend::Spark(m) => m.forward_prefill_batch(tokens, start_pos),
+            ModelBackend::Qwen35(m) => m.forward_prefill_batch(tokens, start_pos),
         }
     }
 
@@ -188,6 +226,23 @@ impl InferModel {
             ModelBackend::Lfm2(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
             ModelBackend::BlockGraph(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
             ModelBackend::Gptx3(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+            ModelBackend::Spark(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+            ModelBackend::Qwen35(m) => m.forward_prefill_all_with_logits(tokens, start_pos),
+        }
+    }
+
+    pub fn forward_speculative_batch(&mut self, tokens: &[u32], start_pos: usize, out_logits: &mut [f32]) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.forward_speculative_batch(tokens, start_pos, out_logits),
+            _ => {
+                let vocab_size = self.config.vocab_size;
+                let mut pos = start_pos;
+                for (b, &tok) in tokens.iter().enumerate() {
+                    let logits = self.forward(tok, pos);
+                    out_logits[b * vocab_size..(b + 1) * vocab_size].copy_from_slice(logits);
+                    pos += 1;
+                }
+            }
         }
     }
 
@@ -195,6 +250,11 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_embed(token, out_hidden),
             ModelBackend::BlockGraph(m) => m.forward_embed(token, out_hidden),
+            ModelBackend::Spark(m) => m.forward_embed(token, out_hidden),
+            ModelBackend::Qwen35(_) => {
+                let dim = self.config.dim;
+                out_hidden[..dim].fill(0.0);
+            }
             ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
                 let dim = self.config.dim;
                 out_hidden[..dim].fill(0.0);
@@ -213,7 +273,8 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden),
             ModelBackend::BlockGraph(m) => m.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden),
-            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
+            ModelBackend::Spark(m) => m.forward_layer_range(pos, start_layer, end_layer, in_hidden, out_hidden),
+            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) | ModelBackend::Qwen35(_) => {
                 let dim = self.config.dim;
                 out_hidden[..dim].copy_from_slice(&in_hidden[..dim]);
             }
@@ -224,7 +285,8 @@ impl InferModel {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_head(in_hidden, out_logits),
             ModelBackend::BlockGraph(m) => m.forward_head(in_hidden, out_logits),
-            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) => {
+            ModelBackend::Spark(m) => m.forward_head(in_hidden, out_logits),
+            ModelBackend::Lfm2(_) | ModelBackend::Gptx3(_) | ModelBackend::Qwen35(_) => {
                 out_logits.fill(0.0);
             }
         }
@@ -441,6 +503,15 @@ impl InferEngine {
         let t_tok = t1.elapsed();
 
         let t2 = std::time::Instant::now();
+        let mut tokenizer = tokenizer;
+        // Some GGUFs (e.g. spark2_5) explicitly disable BOS; honoring the flag
+        // avoids injecting <unk> as a bogus sentence start.
+        if matches!(
+            gguf.metadata.get("tokenizer.ggml.add_bos_token"),
+            Some(self::gguf::GgufValue::Bool(false))
+        ) {
+            tokenizer.bos_token_id = None;
+        }
         let vocab_size = tokenizer.vocab.len();
         let model = InferModel::from_gguf(gguf, max_seq_len, vocab_size)?;
         let t_model = t2.elapsed();
@@ -524,11 +595,6 @@ impl InferEngine {
 
         // 1. Tokenize prompt
         let input_tokens = self.tokenizer.encode(prompt);
-        if std::env::var("SOFUU_DEBUG_TOKENS").is_ok() {
-            eprintln!("[tokens] {:?} decoded={:?}",
-                input_tokens,
-                input_tokens.iter().filter_map(|&t| self.tokenizer.decode_token(t)).collect::<Vec<_>>());
-        }
         if input_tokens.is_empty() {
             return Err("prompt produced zero tokens".to_string());
         }
@@ -551,7 +617,7 @@ impl InferEngine {
 
         let sink = self.model.sink_tokens.min(max_seq_len / 4).max(1);
         let drop = ((max_seq_len - sink) / 4).max(1).min((max_seq_len - sink).saturating_sub(1));
-        let chunk_size = self::model::MAX_PREFILL_BATCH.min((max_seq_len - sink).saturating_sub(drop).max(1));
+        let chunk_size = self::model::max_prefill_batch().min((max_seq_len - sink).saturating_sub(drop).max(1));
 
         // 3. Prefill phase for new tokens
         let mut cur_pos = common_prefix;
@@ -603,6 +669,17 @@ impl InferEngine {
         }
         self.last_prefill_duration = t_prefill.elapsed();
 
+        // SnapKV Observation Window Compaction (Prunes inactive middle blocks after prefill)
+        if options.snapkv && cur_pos > 64 {
+            let snap_sink = self.model.sink_tokens.max(16).min(cur_pos / 4);
+            let keep_recent = 32.min(cur_pos - snap_sink);
+            let middle = cur_pos.saturating_sub(snap_sink + keep_recent);
+            if middle >= 16 {
+                let drop = (middle * 3) / 4;
+                cur_pos = self.model.compact_kv_cache(cur_pos, snap_sink, drop);
+            }
+        }
+
         // 4. Decode Phase
         let mut sampler = Sampler::new(SamplerConfig {
             temperature: options.temperature,
@@ -623,9 +700,13 @@ impl InferEngine {
             None
         };
 
+        let mut spec_logits_buf = vec![0.0f32; 2 * vocab_size];
+
         let mut step = 0;
+        let mut cur_token = sampler.sample(&mut logits_buf, &history);
+
         while step < options.max_tokens {
-            let next_token = sampler.sample(&mut logits_buf, &history);
+            let next_token = cur_token;
             step += 1;
 
             if let Some(ref mut cache) = ngram_cache {
@@ -673,69 +754,100 @@ impl InferEngine {
 
             history.push(next_token);
 
+            if step >= options.max_tokens {
+                break;
+            }
+
             // KV Cache auto-compaction before advancing
             while cur_pos >= max_seq_len && cur_pos > sink + drop {
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
 
-            // Lookahead speculative probe
+            // Propose speculative candidate continuation from n-gram cache
             let speculative_cand = if let Some(ref cache) = ngram_cache {
-                cache.propose(&history, 1).first().copied()
+                if cur_pos + 2 < max_seq_len && step < options.max_tokens {
+                    cache.propose(&history, 1).first().copied()
+                } else {
+                    None
+                }
             } else {
                 None
             };
 
-            // Forward current token to compute logits
-            let next_logits = self.model.forward(next_token, cur_pos);
-            logits_buf.copy_from_slice(next_logits);
-            cur_pos += 1;
-
-            // If a speculative candidate was proposed, check if the sampled prediction matches it
             if let Some(cand) = speculative_cand {
-                if step < options.max_tokens {
-                    let predicted = sampler.sample(&mut logits_buf, &history);
-                    if predicted == cand {
-                        // Speculative match! Accept bonus token immediately.
-                        step += 1;
-                        if let Some(eos) = eos_id {
-                            if cand == eos {
-                                break;
-                            }
-                        }
+                // TRUE BATCHED TREE EVALUATION:
+                // Evaluates [next_token, cand] in parallel in a single forward pass!
+                // Model weights are read from DRAM ONLY ONCE.
+                let batch = [next_token, cand];
+                self.model.forward_speculative_batch(&batch, cur_pos, &mut spec_logits_buf[0..2 * vocab_size]);
 
-                        let cand_piece = self.tokenizer.decode_piece(cand);
-                        if !cand_piece.is_empty() {
-                            let mut should_stop = false;
-                            for stop in &options.stop_tokens {
-                                if cand_piece.contains(stop) || full_generated.ends_with(stop) {
-                                    should_stop = true;
-                                    break;
-                                }
-                            }
-                            if should_stop {
-                                break;
-                            }
+                // 1. Verify next_token's prediction
+                logits_buf.copy_from_slice(&spec_logits_buf[0..vocab_size]);
+                let predicted = sampler.sample(&mut logits_buf, &history);
 
-                            full_generated.push_str(&cand_piece);
-                            if !on_token(&cand_piece) {
-                                break;
-                            }
-                        }
+                if predicted == cand {
+                    // SPECULATIVE HIT! Accept bonus candidate token immediately.
+                    cur_pos += 1;
+                    step += 1;
 
-                        history.push(cand);
-                        if let Some(ref mut cache) = ngram_cache {
-                            cache.record_token(cand);
-                        }
-
-                        while cur_pos >= max_seq_len && cur_pos > sink + drop {
-                            cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
-                        }
-
-                        let cand_logits = self.model.forward(cand, cur_pos);
-                        logits_buf.copy_from_slice(cand_logits);
-                        cur_pos += 1;
+                    if let Some(ref mut cache) = ngram_cache {
+                        cache.record_token(cand);
                     }
+
+                    if let Some(eos) = eos_id {
+                        if cand == eos {
+                            break;
+                        }
+                    }
+
+                    if let Some(raw_tok) = self.tokenizer.decode_token(cand) {
+                        let is_stop = raw_tok == "<|im_end|>"
+                            || raw_tok == "<|endoftext|>"
+                            || raw_tok == "<|eot_id|>"
+                            || options.stop_tokens.iter().any(|s| s == raw_tok);
+                        if is_stop {
+                            break;
+                        }
+                    }
+
+                    let cand_piece = self.tokenizer.decode_piece(cand);
+                    if !cand_piece.is_empty() {
+                        let mut should_stop = false;
+                        for stop in &options.stop_tokens {
+                            if cand_piece.contains(stop) || full_generated.ends_with(stop) {
+                                should_stop = true;
+                                break;
+                            }
+                        }
+                        if should_stop {
+                            break;
+                        }
+
+                        full_generated.push_str(&cand_piece);
+                        if !on_token(&cand_piece) {
+                            break;
+                        }
+                    }
+
+                    history.push(cand);
+
+                    // Candidate was valid in slot cur_pos.
+                    // Sample continuation following cand from cand's logits:
+                    logits_buf.copy_from_slice(&spec_logits_buf[vocab_size..2 * vocab_size]);
+                    cur_token = sampler.sample(&mut logits_buf, &history);
+                    cur_pos += 1;
+                } else {
+                    // Speculative miss: cand rejected.
+                    // next_token is accepted in slot cur_pos.
+                    cur_token = predicted;
+                    cur_pos += 1;
                 }
+            } else {
+                // Standard baseline forward pass (1 token)
+                let next_logits = self.model.forward(next_token, cur_pos);
+                logits_buf.copy_from_slice(next_logits);
+                cur_pos += 1;
+                cur_token = sampler.sample(&mut logits_buf, &history);
             }
         }
 

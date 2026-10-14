@@ -2849,3 +2849,55 @@ Scope: the embeddable SDK's local-inference and host-tool surface. Files:
 - Note: the 30-symbol/15-documented line in `docs/EMBEDDING.md` §CI gates was
   also stale (it described new symbols as "warns"; the gate has failed on them
   since 2026-09-01).
+
+## 2026-10-13 — emb-m dataset v1: memory published
+
+- ✅ **`sofuu-embed-memory-v1` published to Kaggle** (`xyhcucci`, private,
+  1.3 GB). Measured: **46,464,098 documents, 9,441,628 pairs**, 226 shards,
+  7 hard negatives on every pair, 100% CC0-1.0, 17,861 structural combos.
+  QA passed with zero orphan references, zero cross-split references and zero
+  combo leakage; train/eval/test = 88%/7.8%/4.2%.
+- **Closed 558,372 pairs short of the 10M target (94.4%)** — the 130,000-world
+  budget was exhausted, not the target hit. Cause is recorded, not hidden:
+  `dup_exact_dup=20,438,674` (30.6% of generated docs were exact duplicates
+  because the name and value pools are small) and `pair_dropped_no_pos=3,558,372`
+  (pairs whose positive doc was deduplicated away). Both are in
+  `build_config.json` on the dataset.
+- **Decided: accepted as final for v1.** Generation is seeded and deterministic,
+  so worlds 130,000+ could be appended with a `doc_id` offset for ~25 min, but
+  the shortfall is understood and does not justify a second pass yet.
+- Family shares drifted up to 2.3pp from target at full scale (F6 13.1% vs 10%,
+  F2 13.8% vs 15%). Reuse families lose more to dedup than append families do;
+  the deterministic per-world allocation holds to ±0.35pp *before* dedup.
+- **Infrastructure built** in `emb-m/prep/`: `_lib/sofuu_prep.py` (license gate,
+  dedup, structural splits, attribution registry, card renderer, uploader),
+  `_lib/pool.py` (bounded worker pool), `_lib/guard.py` (resource guard),
+  `_lib/qa_dataset.py` (integrity QA), seven domain pipelines, `run_domain.sh`,
+  `run_chain.sh`.
+- **The overload root cause was found, not guessed.** `ex.map(chunksize=64)`
+  submits every task up front; when producers outran the consumer, completed
+  futures accumulated unbounded — 12.7 GB RSS at 400k docs, projecting past 1 TB.
+  The bounded window cut that to **113 MB** *and* raised throughput 2,140 → 4,150
+  pairs/s. All pipelines now run 6 of 8 cores under a 20 GB address-space cap.
+- **Pipeline bugs fixed (each caught by a gate, not by inspection):** docs
+  `INLINE_FENCE` referenced `\1` with no capture group, killing every run;
+  FineWeb-Edu repo prefix never stripped from the HF path (404 on all 50 shards);
+  `emit_pairs` defined after its call site; one unparseable file aborted a
+  26,710-file run (now isolated per file); `snapshot_download` over OpenWebMath
+  would have pulled ~228 GB (now per-shard); legal queries depended only on the
+  clause label so 8,629 clauses collapsed to 21 pairs; CUAD's
+  `full_contract_txt` holds `Part_I`/`Part_II` directories, not files; and
+  `CUAD_v1.json` is a pretty-printed object, not JSONL.
+- **Two sources rejected on evidence, not preference:** `export.arxiv.org`
+  answers this host with HTTP 429 even after 48 s backoff, and the NCBI
+  `oa_comm` bulk tree now 404s (only `PMC-ids.csv.gz` is served). Science was
+  re-sourced onto the Europe PMC REST API, which serves the same PMC Open
+  Access corpus *with* a per-record license field, so the register's CC-BY/CC0
+  rule is still enforced record-wise (observed rejecting `cc-by-nc`,
+  `cc-by-nc-nd`, `cc-by-nc-sa`).
+- ⬜ **EDGAR refuses this host** — `data.sec.gov` returns 403 for every
+  User-Agent variant, so legal rests on CUAD alone (3,918 pairs). Retry from a
+  different egress IP if clause volume matters.
+- ⬜ **Remaining:** docs, math, science, search, code are queued on
+  `run_chain.sh`. None of them can reach 10M pairs from these corpora; targets
+  are set to measured yield and the card reports only what is on disk.

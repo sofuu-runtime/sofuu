@@ -99,6 +99,9 @@
   function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
   function emit(ev) {
+    if (typeof console !== 'undefined' && console.log) {
+      try { console.log('DBG emit kind=' + (ev && ev.kind)); } catch (eL) {}
+    }
     if (typeof S.onEvent === 'function') {
       try { S.onEvent(ev); } catch (e) {} /* a dead sink never kills a turn */
     }
@@ -167,7 +170,11 @@
     var c = cfg();
     if (!c.provider || !c.model) return false;
     if (KNOWN_PROVIDERS.indexOf(c.provider) < 0 && !c.base_url) return false;
-    if (c.provider === 'local') return false; /* not shipped yet */
+    /* provider=local IS usable: the model path routes to the in-process
+     * engine (rt::ai::looks_like_local_model) before any network is
+     * considered, and the CLI driver (chat.rs usableConfig) accepts it
+     * the same way. The old "not shipped yet" predates that route and
+     * made Android local-only setups throw "No usable model" on send. */
     return true;
   }
 

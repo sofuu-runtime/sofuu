@@ -724,6 +724,17 @@ fn cmd_outputs(args: &[String]) -> i32 {
 /// through the normal runtime — endpoints: GET /health, POST /remember,
 /// GET /recall, POST /share. Auth: Bearer token (generated or supplied).
 fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    // Local-inference prefill on large models can legitimately produce no
+    // response bytes for many minutes (e.g. a 27B ternary prompt decode).
+    // Widen the http_server connection deadlines for this embedder unless
+    // the operator pinned them explicitly; http_server reads these once at
+    // the first createServer/serve call. "0" disables the deadline.
+    if std::env::var_os("SOFUU_HTTP_HEADERS_MS").is_none() {
+        std::env::set_var("SOFUU_HTTP_HEADERS_MS", "0");
+    }
+    if std::env::var_os("SOFUU_HTTP_IDLE_MS").is_none() {
+        std::env::set_var("SOFUU_HTTP_IDLE_MS", "0");
+    }
     let mut brain_path = String::new();
     let mut model_path = String::new();
     let mut port: u16 = 7707;

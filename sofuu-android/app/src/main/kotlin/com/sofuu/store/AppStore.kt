@@ -447,10 +447,13 @@ val runtimeEnv = RuntimeEnv(app)
     // ── Submit + slash commands ───────────────────────────────────
 
     fun submit(text: String, images: List<String> = emptyList()) {
+        touchEngineUse()
         val trimmed = text.trim()
         if (trimmed.isEmpty() && images.isEmpty()) return
         if (trimmed.startsWith("/")) {
-            handleCommand(trimmed)
+            // Slash commands run engine queries; they are bounded now but
+            // even a bounded wait must not sit on the Main dispatcher.
+            viewModelScope.launch(Dispatchers.Default) { handleCommand(trimmed) }
             return
         }
         val userText = if (trimmed.isEmpty() && images.isNotEmpty()) "[image]" else trimmed
@@ -458,9 +461,13 @@ val runtimeEnv = RuntimeEnv(app)
             messages = state.messages + ChatMessage(nextId("m"), MsgRole.USER, userText) +
                 ChatMessage(nextId("m"), MsgRole.ASSISTANT, status = "streaming"),
             streaming = true,
-            phase = "Thinking",
+            // Truthful label: with effort off (all local non-thinking models)
+            // nothing "thinks" — the model answers directly.
+            phase = if (state.config?.effort.isNullOrEmpty()) "Generating" else "Thinking",
         )
-        viewModelScope.launch {
+        // Off-main: a first send mints a session via engine.newSession().get()
+        // — bounded, but a bounded wait is still a frozen UI on Main.
+        viewModelScope.launch(Dispatchers.Default) {
             try {
                 var activeId = state.activeSessionId
                 if (activeId == null && state.sessions.isNotEmpty()) {
@@ -691,7 +698,21 @@ val runtimeEnv = RuntimeEnv(app)
         task = null,
     )
 
+    /** Engine-use timestamps for the idle unload. Touched on every send,
+     *  turn event, and boot. */
+    @Volatile private var lastEngineUse = android.os.SystemClock.elapsedRealtime()
+
+    /** Unload the mapped model after this much idle time. */
+    private val IDLE_UNLOAD_MS = 10 * 60_000L
+
+    private fun touchEngineUse() {
+        lastEngineUse = android.os.SystemClock.elapsedRealtime()
+    }
+
+    private fun logIdle(msg: String) = android.util.Log.i("sofuu-engine", msg)
+
     private fun onEngineReady() {
+        touchEngineUse()
         refreshSessions(resumeNewest = true)
         engine.setPermissions(state.permissions)
         // Prefetch every provider's model list in the background.
@@ -699,12 +720,45 @@ val runtimeEnv = RuntimeEnv(app)
         // The on-device model list is just a directory read — no engine
         // round-trip, so it is correct to do before the first frame.
         refreshLocalModels()
+        startIdleUnloadWatch()
+    }
+
+    /**
+     * Load-on-demand + idle unload. Selecting a model only writes config
+     * (a 20 s caps probe reads the header); the weights map in on the FIRST
+     * turn. A model that stays mapped holds GBs of KV + weights, so after
+     * 10 idle minutes the engine restarts — memory drops back to the
+     * process baseline (~tens of MB for the runtime itself) and the next
+     * send cold-loads again in a second or two. Chat history survives:
+     * sessions are encrypted on disk, in-memory bubbles stay in the store.
+     */
+    private fun startIdleUnloadWatch() {
+        viewModelScope.launch(Dispatchers.Default) {
+            while (true) {
+                kotlinx.coroutines.delay(60_000)
+                val idle = android.os.SystemClock.elapsedRealtime() - lastEngineUse
+                if (engine.isReady && !state.streaming && state.approvals.isEmpty() &&
+                    idle > IDLE_UNLOAD_MS
+                ) {
+                    systemRow("Idle ${IDLE_UNLOAD_MS / 60_000} min — unloading the model (memory back to baseline).")
+                    logIdle("idle unload: restarting engine (idle=${idle / 1000}s)")
+                    engine.shutdown()
+                    engine.start()
+                    lastEngineUse = android.os.SystemClock.elapsedRealtime()
+                }
+            }
+        }
     }
 
     fun refreshSessions(resumeNewest: Boolean = false) {
         val ws = state.projectDir
+        // Off-main: engine queries are bounded now, but even a bounded wait
+        // is a UI freeze on Main — and one unbounded .get() here WAS the
+        // boot ANR (dropbox trace: refreshSessions → get).
         viewModelScope.launch {
-            val fetched = engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) } ?: return@launch
+            val fetched = withContext(Dispatchers.Default) {
+                engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) }
+            } ?: return@launch
             // Merge, never clobber: the fetched list may be stale.
             val byId = LinkedHashMap<String, SessionInfo>()
             fetched.forEach { byId[it.id] = it }
@@ -1155,7 +1209,9 @@ val runtimeEnv = RuntimeEnv(app)
     // ── Model cache (prefetched, never on click) ──────────────────
 
     fun refreshModelCache() {
-        viewModelScope.launch {
+        // Off-main: per-provider fetches each hold an engine query; a slow
+        // or hung endpoint must never sit on the UI thread.
+        viewModelScope.launch(Dispatchers.Default) {
             for (p in state.config?.providers ?: emptyList()) {
                 val key = configs.keyFor(p.name).orEmpty()
                 val r = engine.fetchProviderModels(p.name, p.endpoint, p.profile, key).get()

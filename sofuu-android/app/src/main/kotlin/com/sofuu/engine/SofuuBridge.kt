@@ -19,8 +19,17 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
         get() = nativeAbiVersion()
 
     /** Evaluate arbitrary JS — the eval escape hatch. Returns the
-     *  JSON-stringified completion value, or null on failure. */
+     *  JSON-stringified completion value, or null on failure.
+     *  DRAINS the loop: an eval that starts async work holds the runtime
+     *  thread until everything settles. Only for bounded one-shot calls. */
     fun eval(source: String): String? = nativeRtEval(rtPtr, source)
+
+    /** Non-blocking eval: identical JS semantics, but the loop ticks ONCE
+     *  (UV_RUN_NOWAIT) instead of draining until idle. Use for anything
+     *  that may run while an async feature (a chat turn) is in flight —
+     *  a turn progresses across repeated ticks, and this call never
+     *  waits for it. */
+    fun evalNb(source: String): String? = nativeRtEvalNb(rtPtr, source)
 
     /** Call a funnel method (e.g. "ai.complete", "agent.run").
      *  Returns the JSON envelope, or null on failure. */
@@ -194,6 +203,7 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
         @JvmStatic private external fun nativeRtNew(config: String?): Long
         @JvmStatic private external fun nativeRtFree(rt: Long)
         @JvmStatic private external fun nativeRtEval(rt: Long, source: String): String?
+        @JvmStatic private external fun nativeRtEvalNb(rt: Long, source: String): String?
         @JvmStatic private external fun nativeRtCall(rt: Long, method: String, args: String?): String?
         @JvmStatic private external fun nativeRtCallStream(rt: Long, method: String, args: String?): Long
         @JvmStatic private external fun nativeRtCancel(rt: Long, cancelId: Long): Boolean

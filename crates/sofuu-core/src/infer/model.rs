@@ -12,14 +12,30 @@ use std::ops::{Deref, DerefMut};
 
 use super::gguf::GgufFile;
 use super::quant::{
+    batched_add_bias, batched_mad, batched_rmsnorm, batched_rope_kv, batched_swiglu,
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
-    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
+    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec, prof,
     rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, type_row_size,
     GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
 };
 
-pub const MAX_PREFILL_BATCH: usize = 64;
+pub const DEFAULT_PREFILL_BATCH: usize = 64;
+
+/// Cap on tokens per prefill batch chunk. Overridable at process start with
+/// `SOFUU_PREFILL_BATCH` (snapped to a multiple of 4 so the tiled GEMM path
+/// stays eligible); read once per process.
+pub fn max_prefill_batch() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("SOFUU_PREFILL_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 4)
+            .map(|v| (v / 4) * 4)
+            .unwrap_or(DEFAULT_PREFILL_BATCH)
+    })
+}
 
 /// An anonymous virtual memory buffer allocated directly via OS mmap.
 ///
@@ -409,6 +425,22 @@ impl TransformerModel {
         let kv_dim = n_kv_heads * head_dim;
         let kv_cache_size = n_layers * final_seq_len * kv_dim;
 
+        // Warm packed-tile GEMM/GEMV cache for all quantized 2-D matrices
+        // (q8_0 / q4_K / q6_K). Non-quantized or odd-geometry tensors are
+        // ignored by the tile layer and fall back to the generic kernels.
+        for tv in std::iter::once(&token_embd)
+            .chain(std::iter::once(&output))
+            .chain(layers.iter().flat_map(|l| {
+                [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
+            }))
+        {
+            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K) && tv.shape.len() == 2 {
+                if let Some(slice) = gguf.mmap.slice(gguf.data_offset + tv.offset, 64) {
+                    super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
+                }
+            }
+        }
+
         Ok(Self {
             config,
             gguf,
@@ -430,16 +462,16 @@ impl TransformerModel {
             ffn_out: vec![0.0f32; dim],
             logits: vec![0.0f32; vocab_size],
 
-            x_batch: vec![0.0f32; MAX_PREFILL_BATCH * dim],
-            x_norm_batch: vec![0.0f32; MAX_PREFILL_BATCH * dim],
-            q_batch: vec![0.0f32; MAX_PREFILL_BATCH * q_dim],
-            k_batch: vec![0.0f32; MAX_PREFILL_BATCH * kv_dim],
-            v_batch: vec![0.0f32; MAX_PREFILL_BATCH * kv_dim],
-            head_out_batch: vec![0.0f32; MAX_PREFILL_BATCH * q_dim],
-            attn_out_batch: vec![0.0f32; MAX_PREFILL_BATCH * dim],
-            ffn_gate_batch: vec![0.0f32; MAX_PREFILL_BATCH * hidden_dim],
-            ffn_up_batch: vec![0.0f32; MAX_PREFILL_BATCH * hidden_dim],
-            ffn_out_batch: vec![0.0f32; MAX_PREFILL_BATCH * dim],
+            x_batch: vec![0.0f32; max_prefill_batch() * dim],
+            x_norm_batch: vec![0.0f32; max_prefill_batch() * dim],
+            q_batch: vec![0.0f32; max_prefill_batch() * q_dim],
+            k_batch: vec![0.0f32; max_prefill_batch() * kv_dim],
+            v_batch: vec![0.0f32; max_prefill_batch() * kv_dim],
+            head_out_batch: vec![0.0f32; max_prefill_batch() * q_dim],
+            attn_out_batch: vec![0.0f32; max_prefill_batch() * dim],
+            ffn_gate_batch: vec![0.0f32; max_prefill_batch() * hidden_dim],
+            ffn_up_batch: vec![0.0f32; max_prefill_batch() * hidden_dim],
+            ffn_out_batch: vec![0.0f32; max_prefill_batch() * dim],
 
             k_cache: AnonBuffer::new(kv_cache_size),
             v_cache: AnonBuffer::new(kv_cache_size),
@@ -576,7 +608,8 @@ impl TransformerModel {
 
     /// Prefill a batch of tokens: updates KV cache for the tokens without computing logits.
     /// Uses batched GEMM to reuse model weights across all tokens in the batch, eliminating
-    /// redundant memory bandwidth stalls. Slices large token streams into MAX_PREFILL_BATCH tiles.
+    /// redundant memory bandwidth stalls. Slices large token streams into max_prefill_batch() tiles,
+    /// snapped to a multiple of 4 so the packed-tile GEMM path stays eligible for every chunk.
     pub fn forward_prefill_batch(&mut self, tokens: &[u32], mut start_pos: usize) {
         if tokens.is_empty() {
             return;
@@ -585,7 +618,7 @@ impl TransformerModel {
             self.forward_prefill(tokens[0], start_pos);
             return;
         }
-        for chunk in tokens.chunks(MAX_PREFILL_BATCH) {
+        for chunk in tokens.chunks(max_prefill_batch()) {
             self.forward_prefill_batch_chunk(chunk, start_pos);
             start_pos += chunk.len();
         }
@@ -601,20 +634,27 @@ impl TransformerModel {
             return self.forward(tokens[0], start_pos);
         }
 
-        let n_chunks = (tokens.len() + MAX_PREFILL_BATCH - 1) / MAX_PREFILL_BATCH;
+        let batch = max_prefill_batch();
         let mut cur_pos = start_pos;
+        let mut off = 0;
 
-        for (chunk_idx, chunk) in tokens.chunks(MAX_PREFILL_BATCH).enumerate() {
-            let is_last_chunk = chunk_idx + 1 == n_chunks;
-            if is_last_chunk {
-                if chunk.len() == 1 {
-                    return self.forward(chunk[0], cur_pos);
-                }
-                return self.forward_prefill_batch_chunk_internal(chunk, cur_pos, true);
-            } else {
-                self.forward_prefill_batch_chunk(chunk, cur_pos);
-                cur_pos += chunk.len();
+        while off < tokens.len() {
+            let take = (tokens.len() - off).min(batch);
+            if off + take < tokens.len() {
+                self.forward_prefill_batch_chunk(&tokens[off..off + take], cur_pos);
+                cur_pos += take;
+                off += take;
+                continue;
             }
+            // Final chunk: keep the main body a multiple of 4 (tile-eligible) and
+            // push any 1-3 row remainder through the per-row/small-batch path.
+            let main = take - (take % 4);
+            if main == take {
+                return self.forward_prefill_batch_chunk_internal(&tokens[off..off + take], cur_pos, true);
+            }
+            self.forward_prefill_batch_chunk_internal(&tokens[off..off + main], cur_pos, false);
+            cur_pos += main;
+            return self.forward_prefill_batch_chunk_internal(&tokens[off + main..off + take], cur_pos, true);
         }
         &self.logits
     }
@@ -623,18 +663,10 @@ impl TransformerModel {
         self.forward_prefill_batch_chunk_internal(tokens, start_pos, false);
     }
 
-    fn forward_prefill_batch_chunk_internal(&mut self, tokens: &[u32], start_pos: usize, compute_last_logits: bool) -> &[f32] {
+    fn forward_batch_layers_chunk(&mut self, tokens: &[u32], start_pos: usize) {
         let b_size = tokens.len();
         if b_size == 0 {
-            return &self.logits;
-        }
-        if b_size == 1 {
-            if compute_last_logits {
-                return self.forward(tokens[0], start_pos);
-            } else {
-                self.forward_prefill(tokens[0], start_pos);
-                return &self.logits;
-            }
+            return;
         }
 
         let dim = self.config.dim;
@@ -665,11 +697,14 @@ impl TransformerModel {
             let attn_norm_weights = unsafe {
                 std::slice::from_raw_parts(attn_norm_bytes.as_ptr() as *const f32, dim)
             };
-            for b in 0..b_size {
-                let x_in = &self.x_batch[b * dim..(b + 1) * dim];
-                let x_norm_out = &mut self.x_norm_batch[b * dim..(b + 1) * dim];
-                rmsnorm(x_norm_out, x_in, attn_norm_weights, norm_eps);
-            }
+            batched_rmsnorm(
+                &mut self.x_norm_batch[0..b_size * dim],
+                &self.x_batch[0..b_size * dim],
+                attn_norm_weights,
+                b_size,
+                dim,
+                norm_eps,
+            );
 
             // ── Batched Q, K, V Projections via matmat ──────────
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
@@ -687,12 +722,7 @@ impl TransformerModel {
                 let b_f32 = unsafe {
                     std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, q_dim)
                 };
-                for b in 0..b_size {
-                    let q_slice = &mut self.q_batch[b * q_dim..(b + 1) * q_dim];
-                    for i in 0..q_dim {
-                        q_slice[i] += b_f32[i];
-                    }
-                }
+                batched_add_bias(&mut self.q_batch[0..b_size * q_dim], b_f32, b_size, q_dim);
             }
 
             let k_bytes = Self::tensor_slice(gguf, &layer.attn_k);
@@ -710,12 +740,7 @@ impl TransformerModel {
                 let b_f32 = unsafe {
                     std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, kv_dim)
                 };
-                for b in 0..b_size {
-                    let k_slice = &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim];
-                    for i in 0..kv_dim {
-                        k_slice[i] += b_f32[i];
-                    }
-                }
+                batched_add_bias(&mut self.k_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
 
             let v_bytes = Self::tensor_slice(gguf, &layer.attn_v);
@@ -733,12 +758,7 @@ impl TransformerModel {
                 let b_f32 = unsafe {
                     std::slice::from_raw_parts(b_bytes.as_ptr() as *const f32, kv_dim)
                 };
-                for b in 0..b_size {
-                    let v_slice = &mut self.v_batch[b * kv_dim..(b + 1) * kv_dim];
-                    for i in 0..kv_dim {
-                        v_slice[i] += b_f32[i];
-                    }
-                }
+                batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
 
             // ── Per-token QK-Norm ────────────────────────────────
@@ -747,47 +767,48 @@ impl TransformerModel {
                 let q_norm_w = unsafe {
                     std::slice::from_raw_parts(q_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                for b in 0..b_size {
-                    let q_b = &mut self.q_batch[b * q_dim..(b + 1) * q_dim];
-                    for h in 0..n_heads {
-                        let head_slice = &mut q_b[h * head_dim..(h + 1) * head_dim];
-                        rmsnorm_in_place(head_slice, q_norm_w, norm_eps);
-                    }
-                }
+                batched_rmsnorm(
+                    &mut self.q_batch[0..b_size * q_dim],
+                    &self.q_batch[0..b_size * q_dim],
+                    q_norm_w,
+                    b_size * n_heads,
+                    head_dim,
+                    norm_eps,
+                );
             }
             if let Some(ref k_norm) = layer.attn_k_norm {
                 let k_norm_bytes = Self::tensor_slice(gguf, k_norm);
                 let k_norm_w = unsafe {
                     std::slice::from_raw_parts(k_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                for b in 0..b_size {
-                    let k_b = &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim];
-                    for kv_h in 0..n_kv_heads {
-                        let head_slice = &mut k_b[kv_h * head_dim..(kv_h + 1) * head_dim];
-                        rmsnorm_in_place(head_slice, k_norm_w, norm_eps);
-                    }
-                }
+                batched_rmsnorm(
+                    &mut self.k_batch[0..b_size * kv_dim],
+                    &self.k_batch[0..b_size * kv_dim],
+                    k_norm_w,
+                    b_size * n_kv_heads,
+                    head_dim,
+                    norm_eps,
+                );
             }
 
             // ── RoPE & KV-Cache Storage for batch ────────────────
-            for b in 0..b_size {
-                let pos = start_pos + b;
-                let q_slice = &mut self.q_batch[b * q_dim..(b + 1) * q_dim];
-                let k_slice = &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim];
-                let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-                rope_style(q_slice, n_heads, head_dim, pos, rope_freq_base, rope_mode);
-                rope_style(k_slice, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
-
-                let cache_pos = pos % max_seq_len;
-                let v_slice = &self.v_batch[b * kv_dim..(b + 1) * kv_dim];
-                for kv_h in 0..n_kv_heads {
-                    let k_in = &k_slice[kv_h * head_dim..(kv_h + 1) * head_dim];
-                    let v_in = &v_slice[kv_h * head_dim..(kv_h + 1) * head_dim];
-                    let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
-                    self.k_cache[slot..slot + head_dim].copy_from_slice(k_in);
-                    self.v_cache[slot..slot + head_dim].copy_from_slice(v_in);
-                }
-            }
+            let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
+            batched_rope_kv(
+                &mut self.q_batch[0..b_size * q_dim],
+                &mut self.k_batch[0..b_size * kv_dim],
+                &self.v_batch[0..b_size * kv_dim],
+                &mut self.k_cache,
+                &mut self.v_cache,
+                b_size,
+                start_pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                rope_freq_base,
+                rope_mode,
+            );
 
             // ── Multi-Head / Grouped-Query Attention for batch ───
             let sliding_window = self.layer_sliding_window(layer_idx);
@@ -820,22 +841,27 @@ impl TransformerModel {
             );
 
             // ── Residual Connection 1 ───────────────────────────
-            for b in 0..b_size {
-                let x_slice = &mut self.x_batch[b * dim..(b + 1) * dim];
-                let out_slice = &self.attn_out_batch[b * dim..(b + 1) * dim];
-                inline_mad(x_slice, out_slice, 1.0);
-            }
+            batched_mad(
+                &mut self.x_batch[0..b_size * dim],
+                &self.attn_out_batch[0..b_size * dim],
+                1.0,
+                b_size,
+                dim,
+            );
 
             // ── FFN Norm for batch ──────────────────────────────
             let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
             let ffn_norm_weights = unsafe {
                 std::slice::from_raw_parts(ffn_norm_bytes.as_ptr() as *const f32, dim)
             };
-            for b in 0..b_size {
-                let x_in = &self.x_batch[b * dim..(b + 1) * dim];
-                let x_norm_out = &mut self.x_norm_batch[b * dim..(b + 1) * dim];
-                rmsnorm(x_norm_out, x_in, ffn_norm_weights, norm_eps);
-            }
+            batched_rmsnorm(
+                &mut self.x_norm_batch[0..b_size * dim],
+                &self.x_batch[0..b_size * dim],
+                ffn_norm_weights,
+                b_size,
+                dim,
+                norm_eps,
+            );
 
             // ── Batched SwiGLU FFN via matmat ───────────────────
             let gate_bytes = Self::tensor_slice(gguf, &layer.ffn_gate);
@@ -860,11 +886,12 @@ impl TransformerModel {
                 &mut self.ffn_up_batch[0..b_size * hidden_dim],
             );
 
-            for b in 0..b_size {
-                let g = &mut self.ffn_gate_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                let u = &self.ffn_up_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                swiglu_in_place(g, u);
-            }
+            batched_swiglu(
+                &mut self.ffn_gate_batch[0..b_size * hidden_dim],
+                &self.ffn_up_batch[0..b_size * hidden_dim],
+                b_size,
+                hidden_dim,
+            );
 
             let down_bytes = Self::tensor_slice(gguf, &layer.ffn_down);
             matmat(
@@ -878,23 +905,46 @@ impl TransformerModel {
             );
 
             // ── Residual Connection 2 ───────────────────────────
-            for b in 0..b_size {
-                let x_slice = &mut self.x_batch[b * dim..(b + 1) * dim];
-                let out_slice = &self.ffn_out_batch[b * dim..(b + 1) * dim];
-                inline_mad(x_slice, out_slice, 1.0);
+            batched_mad(
+                &mut self.x_batch[0..b_size * dim],
+                &self.ffn_out_batch[0..b_size * dim],
+                1.0,
+                b_size,
+                dim,
+            );
+        }
+    }
+
+    fn forward_prefill_batch_chunk_internal(&mut self, tokens: &[u32], start_pos: usize, compute_last_logits: bool) -> &[f32] {
+        let b_size = tokens.len();
+        if b_size == 0 {
+            return &self.logits;
+        }
+        if b_size == 1 {
+            if compute_last_logits {
+                return self.forward(tokens[0], start_pos);
+            } else {
+                self.forward_prefill(tokens[0], start_pos);
+                return &self.logits;
             }
         }
 
+        let chunk_t0 = prof::enabled().then(std::time::Instant::now);
+
+        self.forward_batch_layers_chunk(tokens, start_pos);
+
         if compute_last_logits {
+            let dim = self.config.dim;
+            let norm_eps = self.config.norm_eps;
             let last_b = b_size - 1;
             let x_last = &self.x_batch[last_b * dim..(last_b + 1) * dim];
-            let norm_bytes = Self::tensor_slice(gguf, &self.output_norm);
+            let norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
             let norm_w = unsafe {
                 std::slice::from_raw_parts(norm_bytes.as_ptr() as *const f32, dim)
             };
             rmsnorm(&mut self.x_norm, x_last, norm_w, norm_eps);
 
-            let out_bytes = Self::tensor_slice(gguf, &self.output);
+            let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
             matvec(
                 out_bytes,
                 self.output.tensor_type,
@@ -904,7 +954,64 @@ impl TransformerModel {
                 &mut self.logits,
             );
         }
+
+        if let Some(t0) = chunk_t0 {
+            prof::record_chunk(t0.elapsed(), b_size);
+            prof::report();
+        }
         &self.logits
+    }
+
+    /// Evaluates speculative candidate tokens in parallel in a single forward pass,
+    /// streaming model weights from DRAM exactly ONCE.
+    ///
+    /// Computes and returns logits for every token in `tokens`:
+    /// `out_logits[b * vocab_size .. (b + 1) * vocab_size]` is the logits predicted by token `b`.
+    pub fn forward_speculative_batch(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        out_logits: &mut [f32],
+    ) {
+        let b_size = tokens.len();
+        if b_size == 0 {
+            return;
+        }
+        let vocab_size = self.config.vocab_size;
+        let dim = self.config.dim;
+        let norm_eps = self.config.norm_eps;
+
+        if b_size == 1 {
+            let l = self.forward(tokens[0], start_pos);
+            out_logits[0..vocab_size].copy_from_slice(l);
+            return;
+        }
+
+        self.forward_batch_layers_chunk(tokens, start_pos);
+
+        let norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
+        let norm_w = unsafe {
+            std::slice::from_raw_parts(norm_bytes.as_ptr() as *const f32, dim)
+        };
+        for b in 0..b_size {
+            let x_b = &self.x_batch[b * dim..(b + 1) * dim];
+            let x_norm_b = &mut self.x_norm_batch[b * dim..(b + 1) * dim];
+            rmsnorm(x_norm_b, x_b, norm_w, norm_eps);
+        }
+
+        let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        matmat(
+            out_bytes,
+            self.output.tensor_type,
+            vocab_size,
+            dim,
+            &self.x_norm_batch[0..b_size * dim],
+            b_size,
+            &mut out_logits[0..b_size * vocab_size],
+        );
+
+        let last_b = b_size - 1;
+        self.logits.copy_from_slice(&out_logits[last_b * vocab_size..(last_b + 1) * vocab_size]);
     }
 
     /// Prefill a token: updates KV cache for the token without computing logits.

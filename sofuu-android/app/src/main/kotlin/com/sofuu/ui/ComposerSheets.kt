@@ -136,6 +136,13 @@ private fun ModelSheet(store: AppStore) {
         // Always offered, not only when the list is empty — otherwise a
         // configured provider leaves no way to add a second one from here.
         SheetRow("＋ Add provider", null, false) { onCloseSheet(store) }
+        // Add a model FILE (the on-device list above is import/delete); a
+        // picked .gguf/.safetensors lands in filesDir/models and appears
+        // here on the next open.
+        SheetRow("＋ Add a model file from this device", null, false) {
+            store.closeSheet()
+            store.openSettings(true, "models")
+        }
     } else {
         val prov = provider!!
         val entry = providers.firstOrNull { it.name == prov }

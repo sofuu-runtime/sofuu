@@ -34,6 +34,13 @@ static inline uint16_t sofuu_arch_f32_to_f16(float val) {
     return (uint16_t)((sign<<15)|(exp<<10)|mant);
 }
 
+static inline float sofuu_arch_bf16_to_f32(uint16_t v) {
+    uint32_t bits = ((uint32_t)v) << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
 static inline void sofuu_arch_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     if (j < 4) { *d=q[j]&63; *m=q[j+4]&63; }
     else { *d=(q[j+4]&0x0F)|((q[j-4]>>6)<<4); *m=(q[j+4]>>4)|((q[j-0]>>6)<<4); }
@@ -124,7 +131,7 @@ static inline float sofuu_vec_dot_q4_k_dotprod_a76(const struct block_q4_K *bloc
     return total_sum;
 }
 
-static inline float sofuu_vec_dot_mlx4_dotprod_a76(const uint8_t *w_row, const uint8_t *s_row, const uint8_t *b_row, const float *x, size_t cols, size_t group_size, const sofuu_q8_block_ext *x_blocks) {
+static inline float sofuu_vec_dot_mlx4_dotprod_a76(const uint8_t *w_row, const uint8_t *s_row, const uint8_t *b_row, const float *x, size_t cols, size_t group_size, const sofuu_q8_block_ext *x_blocks, bool is_bf16) {
     float total = 0.0f;
     const size_t groups = cols / group_size;
     const size_t u32_per_group = group_size / 8;
@@ -136,8 +143,8 @@ static inline float sofuu_vec_dot_mlx4_dotprod_a76(const uint8_t *w_row, const u
         uint16_t b_raw = 0;
         memcpy(&s_raw, s_row + g * 2, 2);
         memcpy(&b_raw, b_row + g * 2, 2);
-        const float scale = sofuu_arch_f16_to_f32(s_raw);
-        const float bias = sofuu_arch_f16_to_f32(b_raw);
+        const float scale = is_bf16 ? sofuu_arch_bf16_to_f32(s_raw) : sofuu_arch_f16_to_f32(s_raw);
+        const float bias = is_bf16 ? sofuu_arch_bf16_to_f32(b_raw) : sofuu_arch_f16_to_f32(b_raw);
         const uint8_t *wg = w_row + g * u32_per_group * 4;
         const sofuu_q8_block_ext *xg = x_blocks + g * q8_per_group;
 

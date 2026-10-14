@@ -380,6 +380,169 @@ fn trit_row_dot(trits: &[i8], scales: &[f32], act: &[f32]) -> f32 {
     acc
 }
 
+// ── packed-domain int8 path (arm64 dotprod) ──────────────────────────
+//
+// Trits ∈ {-1,0,1} multiply int8-quantized activations exactly: per 128-value
+// band, `iacc = Σ trit·act_q` is an exact i32 (|acc| ≤ 127·128 ≪ 2^31) and the
+// band folds as w_scale · a_scale · iacc — the same two-sided per-group
+// scaling GGUF Q8_0 uses, bounded by absmax quantization (~1/254 relative
+// error worst case). Every token's activation is quantized once per call and
+// reused across all weight rows, and the MAC stream goes through the dotprod
+// `sdot` instruction (16 int8 MACs per instruction) instead of 4-lane f32.
+
+fn dotprod_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        static DOTPROD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DOTPROD.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Signed int8 dot of two 128-byte groups: 8 × `vsdotq_s32` (16 MACs each)
+/// on dotprod cores, plain i32 widening loop otherwise. Callers pass windows
+/// of exactly PTQ1_0_BLOCK_VALUES bytes on both sides.
+#[inline]
+fn sdot_group(w: &[i8], a: &[i8]) -> i32 {
+    debug_assert_eq!(w.len(), PTQ1_0_BLOCK_VALUES);
+    debug_assert_eq!(a.len(), PTQ1_0_BLOCK_VALUES);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dotprod_available() {
+            // SAFETY: both slices are exactly 128 bytes (checked above) and
+            // i8 is always properly aligned.
+            return unsafe { sdot_128_neon(w.as_ptr(), a.as_ptr()) };
+        }
+    }
+    let mut acc = 0i32;
+    for k in 0..PTQ1_0_BLOCK_VALUES {
+        acc += w[k] as i32 * a[k] as i32;
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_128_neon(w: *const i8, a: *const i8) -> i32 {
+    use std::arch::aarch64::*;
+    let mut acc = vdupq_n_s32(0);
+    for k in 0..(PTQ1_0_BLOCK_VALUES / 16) {
+        let wv = vld1q_s8(w.add(k * 16));
+        let av = vld1q_s8(a.add(k * 16));
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {wv:v}.16b, {av:v}.16b",
+            acc = inout(vreg) acc,
+            wv = in(vreg) wv,
+            av = in(vreg) av,
+            options(pure, nomem, nostack)
+        );
+    }
+    vaddvq_s32(acc)
+}
+
+/// A token activation set quantized per PTQ1_0 band: `q[row * n_in + i]` is
+/// the signed int8 code, `scales[row * blocks + c] = band_absmax / 127`.
+struct ActQ {
+    q: Vec<i8>,
+    scales: Vec<f32>,
+}
+
+fn quantize_acts(acts: &[f32], n_tok: usize, n_in: usize, blocks: usize) -> ActQ {
+    debug_assert_eq!(acts.len(), n_tok * n_in);
+    let mut q = vec![0i8; n_tok * n_in];
+    let mut scales = vec![1.0f32; n_tok * blocks];
+    for t in 0..n_tok {
+        let row = &acts[t * n_in..(t + 1) * n_in];
+        let qrow = &mut q[t * n_in..(t + 1) * n_in];
+        for c in 0..blocks {
+            let band = &row[c * PTQ1_0_BLOCK_VALUES..(c + 1) * PTQ1_0_BLOCK_VALUES];
+            let mut absmax = 0.0f32;
+            for &v in band {
+                absmax = absmax.max(v.abs());
+            }
+            let srow = t * blocks + c;
+            if absmax == 0.0 || !absmax.is_finite() {
+                scales[srow] = 1.0;
+                continue;
+            }
+            let scale = absmax / 127.0;
+            scales[srow] = scale;
+            for (qb, &v) in qrow[c * PTQ1_0_BLOCK_VALUES..(c + 1) * PTQ1_0_BLOCK_VALUES]
+                .iter_mut()
+                .zip(band.iter())
+            {
+                let x = (v / scale).round();
+                *qb = x.clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+    ActQ { q, scales }
+}
+
+/// Single-row dot with a per-band-quantized activation: the sdot counterpart
+/// of `trit_row_dot` with the identical band-fold order.
+#[inline]
+fn trit_row_dot_q(trits: &[i8], wscales: &[f32], actq: &ActQ, arow: usize, n_in: usize) -> f32 {
+    let blocks = wscales.len();
+    let mut acc = 0.0f32;
+    for c in 0..blocks {
+        let col0 = c * PTQ1_0_BLOCK_VALUES;
+        let w = &trits[col0..col0 + PTQ1_0_BLOCK_VALUES];
+        let a = &actq.q[arow * n_in + col0..arow * n_in + col0 + PTQ1_0_BLOCK_VALUES];
+        let iacc = sdot_group(w, a);
+        acc += wscales[c] * actq.scales[arow * blocks + c] * iacc as f32;
+    }
+    acc
+}
+
+/// Register-tiled PTQ1_0 GEMM over the int8 path: activations quantized per
+/// band once per call, rows dequantized once to the trit slab, the MAC stream
+/// through `sdot_group`. Same band/fold order as `trit_row_dot_q`, so tiled
+/// prefill and single-token decode agree bit for bit on this path too.
+fn gemm_rows_t143_sdot(
+    data: &[u8],
+    m: &RawMat,
+    n_tok: usize,
+    acts: &[f32],
+    r_off: usize,
+    rows: usize,
+) -> Vec<f32> {
+    const TR: usize = 4;
+    const TT: usize = 8;
+    let n_in = m.n_in;
+    let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+    debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
+    let aq = quantize_acts(acts, n_tok, n_in, blocks);
+    let mut res = vec![0.0f32; rows * n_tok];
+    let rows_per_pass = (GEMM_SLAB_BYTES / n_in).clamp(1, rows.max(1));
+    let mut slab_t = vec![0i8; rows_per_pass * n_in];
+    let mut slab_d = vec![0.0f32; rows_per_pass * blocks];
+    let mut base = 0usize;
+    while base < rows {
+        let take = rows_per_pass.min(rows - base);
+        for i in 0..take {
+            dequant_trits_i8(
+                m.row_slice(data, r_off + base + i),
+                &mut slab_t[i * n_in..(i + 1) * n_in],
+                &mut slab_d[i * blocks..(i + 1) * blocks],
+            );
+        }
+        for r in 0..take {
+            let row = &slab_t[r * n_in..(r + 1) * n_in];
+            let rowd = &slab_d[r * blocks..(r + 1) * blocks];
+            for t in 0..n_tok {
+                let v = trit_row_dot_q(row, rowd, &aq, t, n_in);
+                res[(base + r) * n_tok + t] = v;
+            }
+        }
+        base += take;
+    }
+    res
+}
+
 /// GEMV against a PTQ1_0 matrix still in the mmap: dequantize each row into
 /// trit bytes plus band scales (quarter the traffic of an f32 slab) and dot
 /// with the prepared activation via `trit_row_dot`. Jobs at or above
@@ -393,12 +556,30 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
     let blocks = n_in / PTQ1_0_BLOCK_VALUES;
     debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
     let n_out = out.len();
+    let use_sdot = dotprod_available();
+    let empty = ActQ { q: Vec::new(), scales: Vec::new() };
+    // Quantize the activation once (one row) and share it across workers.
+    let aq = if use_sdot {
+        quantize_acts(&act[..n_in], 1, n_in, blocks)
+    } else {
+        empty
+    };
     let threads = if n_out * n_in >= PAR_MAC_THRESHOLD {
         thread_budget().min(n_out)
     } else {
         1
     };
     if threads <= 1 {
+        if use_sdot {
+            let mut trits = vec![0i8; n_in];
+            let mut rowd = vec![0.0f32; blocks];
+            let act = &act[..n_in];
+            for (r, o) in out.iter_mut().enumerate() {
+                dequant_trits_i8(m.row_slice(data, r), &mut trits, &mut rowd);
+                *o = trit_row_dot_q(&trits, &rowd, &aq, 0, n_in);
+            }
+            return;
+        }
         let mut trits = vec![0i8; n_in];
         let mut rowd = vec![0.0f32; blocks];
         let act = &act[..n_in];
@@ -418,12 +599,17 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
             let (chunk, tail) = tmp.split_at_mut(take);
             rest = tail;
             let rows = r0;
+            let aq_ref = &aq;
             scope.spawn(move || {
                 let mut trits = vec![0i8; n_in];
                 let mut rowd = vec![0.0f32; blocks];
                 for (i, o) in chunk.iter_mut().enumerate() {
                     dequant_trits_i8(m.row_slice(data, rows + i), &mut trits, &mut rowd);
-                    *o = trit_row_dot(&trits, &rowd, act);
+                    *o = if use_sdot {
+                        trit_row_dot_q(&trits, &rowd, aq_ref, 0, n_in)
+                    } else {
+                        trit_row_dot(&trits, &rowd, act)
+                    };
                 }
             });
             r0 += take;
@@ -556,6 +742,7 @@ fn gemm_t143(data: &[u8], m: &RawMat, n_tok: usize, acts: &[f32], out: &mut [f32
     debug_assert_eq!(acts.len(), n_tok * m.n_in);
     debug_assert_eq!(out.len(), n_tok * m.n_out);
     let rows = m.n_out;
+    let use_sdot = dotprod_available();
     let threads = if rows * m.n_in * n_tok >= PAR_MAC_THRESHOLD {
         thread_budget().min(rows)
     } else {
@@ -567,7 +754,11 @@ fn gemm_t143(data: &[u8], m: &RawMat, n_tok: usize, acts: &[f32], out: &mut [f32
             let r0 = rows * t / threads;
             let r1 = rows * (t + 1) / threads;
             handles.push((r0, scope.spawn(move || {
-                gemm_rows_t143(data, m, n_tok, acts, r0, r1 - r0)
+                if use_sdot {
+                    gemm_rows_t143_sdot(data, m, n_tok, acts, r0, r1 - r0)
+                } else {
+                    gemm_rows_t143(data, m, n_tok, acts, r0, r1 - r0)
+                }
             })));
         }
         for (r0, h) in handles {
@@ -1983,5 +2174,127 @@ mod tests {
             scalar.len()
         );
         assert!(ok == scalar.len(), "tile differs from scalar beyond 1e-4 on {}/{}", scalar.len() - ok, scalar.len());
+    }
+
+    /// Probe the real model's ternary sparsity: zero-trit fraction, sign
+    /// balance and f16-scale sanity over sampled rows from several weight
+    /// classes. Run with --ignored --nocapture. The zero fraction decides
+    /// whether a zero-skipping packed GEMM can chase 50+ tk/s prefill on CPU.
+    #[test]
+    #[ignore]
+    fn probe_ternary_zero_fraction() {
+        let gguf = GgufFile::open(MODEL_PATH).expect("open gguf");
+        let data = gguf.mmap.as_slice();
+        let probes: &[(&str, usize)] = &[
+            ("token_embd.weight", 2000),
+            ("blk.0.ffn_gate.weight", 4000),
+            ("blk.47.ffn_up.weight", 2000),
+            ("blk.10.attn_qkv.weight", 2000),
+            ("blk.63.attn_out.weight", 600),
+        ];
+        let mut trits: Vec<i8> = vec![0; 5120];
+        let mut rowd: Vec<f32> = vec![0.0; 5120 / PTQ1_0_BLOCK_VALUES];
+        for &(want, max_rows) in probes {
+            let Some(info) = gguf.tensors.get(want) else {
+                println!("  {want}: not found");
+                continue;
+            };
+            if info.tensor_type != GGML_TYPE_PTQ1_0 {
+                println!("  {want}: type {} (not PTQ1_0)", info.tensor_type);
+                continue;
+            }
+            let n_in = info.shape[0];
+            if trits.len() < n_in {
+                trits.resize(n_in, 0);
+                rowd.resize(n_in / PTQ1_0_BLOCK_VALUES, 0.0);
+            }
+            let row_bytes = row_bytes_ptq1_0(n_in);
+            let rows = info.shape[1].min(max_rows);
+            let off0 = gguf.data_offset + info.offset;
+            let (mut z, mut pos, mut neg) = (0u64, 0u64, 0u64);
+            let mut nonfinite_scales = 0u64;
+            for r in 0..rows {
+                let off = off0 + r * row_bytes;
+                dequant_trits_i8(&data[off..off + row_bytes], &mut trits[..n_in], &mut rowd[..n_in / PTQ1_0_BLOCK_VALUES]);
+                for (b, &d) in rowd[..n_in / PTQ1_0_BLOCK_VALUES].iter().enumerate() {
+                    if !d.is_finite() {
+                        nonfinite_scales += 1;
+                    }
+                }
+                for &v in &trits[..n_in] {
+                    match v {
+                        0 => z += 1,
+                        1 => pos += 1,
+                        -1 => neg += 1,
+                        _ => {}
+                    }
+                }
+            }
+            let total = rows as u64 * n_in as u64;
+            let pct = |x: u64| (x as f64 * 100.0 / total.max(1) as f64);
+            println!(
+                "{want}: rows {rows} | zeros {:.1}% | +1 {:.1}% | -1 {:.1}% | non-finite scales {nonfinite_scales}",
+                pct(z),
+                pct(pos),
+                pct(neg)
+            );
+        }
+    }
+
+    /// The int8 sdot path must stay within per-band absmax activation
+    /// quantization error of the exact f32 path, and the sdot GEMV must agree
+    /// bit-for-bit with the sdot GEMM (same band/fold order).
+    #[test]
+    fn sdot_path_matches_f32_within_quantization_error() {
+        let n_in = 2 * PTQ1_0_BLOCK_VALUES;
+        let rows = 23usize;
+        let n_tok = 5usize;
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let mut data = noise_bytes(0xA5A5_5A5A_A5A5_5A5A, rows * row_bytes);
+        for blk in 0..(rows * (n_in / PTQ1_0_BLOCK_VALUES)) {
+            let off = blk * PTQ1_0_BLOCK_BYTES;
+            data[off + PTQ1_0_BLOCK_BYTES - 2] = 0x00;
+            data[off + PTQ1_0_BLOCK_BYTES - 1] = 0x3C; // f16 scale 1.0
+        }
+        let acts: Vec<f32> = noise_bytes(0x0F1E_2D3C_4B5A_6978, n_tok * n_in)
+            .iter()
+            .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
+            .collect();
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+
+        let exact = gemm_rows_t143(&data, &m, n_tok, &acts, 0, rows);
+        let approx = gemm_rows_t143_sdot(&data, &m, n_tok, &acts, 0, rows);
+        // Per-element relative error is meaningless where the exact dot
+        // cancels near zero; absmax band quantization bounds the error
+        // relative to the signal RMS (~0.4% by construction).
+        let (mut se, mut ss) = (0.0f64, 0.0f64);
+        for i in 0..approx.len() {
+            let d = (approx[i] - exact[i]) as f64;
+            se += d * d;
+            ss += exact[i] as f64 * exact[i] as f64;
+        }
+        let rel = (se / ss.max(1e-12)).sqrt();
+        assert!(
+            rel < 0.02,
+            "sdot path deviates {rel} rms-relative from the exact path (> 0.02)"
+        );
+
+        // GEMV (single-token path) must reproduce the GEMM's sdot column
+        // bit-for-bit: same quantization, same band fold order.
+        let aq = quantize_acts(&acts, n_tok, n_in, n_in / PTQ1_0_BLOCK_VALUES);
+        let mut trits = vec![0i8; n_in];
+        let mut rowd = vec![0.0f32; n_in / PTQ1_0_BLOCK_VALUES];
+        for r in 0..rows {
+            dequant_trits_i8(&data[r * row_bytes..(r + 1) * row_bytes], &mut trits, &mut rowd);
+            for t in 0..n_tok {
+                let gemv_result = trit_row_dot_q(&trits, &rowd, &aq, t, n_in);
+                let gemm_result = approx[r * n_tok + t];
+                assert_eq!(
+                    gemv_result.to_bits(),
+                    gemm_result.to_bits(),
+                    "row {r} token {t} disagrees between GEMV and GEMM sdot paths"
+                );
+            }
+        }
     }
 }

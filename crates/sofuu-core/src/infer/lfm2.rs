@@ -2064,3 +2064,88 @@ mod lfm2_tile_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lfm2_ceiling_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "timing probe; run explicitly"]
+    fn tile4x4_gflops_single_thread() {
+        if !cfg!(target_arch = "aarch64") {
+            return;
+        }
+        let cols = 2048usize;
+        let w: Vec<f32> = (0..4 * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+        let x: Vec<f32> = (0..4 * cols).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let tiles = 100_000usize; // 100k tiles x 16 dots x 2048 MAC = 3.28 TMAC
+        let mut out = [0f32; 16];
+        let start = std::time::Instant::now();
+        let mut sink = 0f32;
+        for t in 0..tiles {
+            let off = (t * 4) % (cols - 2048 + 2048); // vary inputs slightly
+            let o = (t % 8) as f32;
+            let _ = o;
+            unsafe {
+                gemm_tile4x4_neon(w.as_ptr(), x.as_ptr().add(off.min(cols)), cols, &mut out);
+            }
+            sink += out[5];
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let gmac = tiles as f64 * 16.0 * cols as f64 / 1e9;
+        eprintln!(
+            "tile4x4: {:.1} GMAC/s = {:.1} GFLOP/s single-thread (sink {:.4})",
+            gmac / secs, 2.0 * gmac / secs, sink
+        );
+    }
+}
+
+#[cfg(test)]
+mod lfm2_mt_ceiling_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "timing probe; run explicitly"]
+    fn tile4x4_gflops_six_threads() {
+        if !cfg!(target_arch = "aarch64") {
+            return;
+        }
+        let cols = 2048usize;
+        let w: Vec<f32> = (0..4 * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+        let x: Vec<f32> = (0..4 * cols).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let tiles_per_thread = 100_000usize;
+        let mut sink = 0f32;
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..6 {
+                let (w, x) = (&w, &x);
+                s.spawn(move || {
+                    let mut local = 0f32;
+                    let mut out = [0f32; 16];
+                    for k in 0..tiles_per_thread {
+                        let off = (t * 509 + k) % 8;
+                        unsafe {
+                            gemm_tile4x4_neon(
+                                w.as_ptr().add(off & 0),
+                                x.as_ptr().add(off * (cols / 8)),
+                                cols,
+                                &mut out,
+                            );
+                        }
+                        local += out[5];
+                    }
+                    local
+                });
+            }
+        });
+        let secs = start.elapsed().as_secs_f64();
+        let gmac = 6.0 * tiles_per_thread as f64 * 16.0 * cols as f64 / 1e9;
+        let _ = sink;
+        eprintln!(
+            "tile4x4 6 threads: {:.1} GMAC/s aggregate = {:.1} GFLOP/s ({:.2}x vs single)",
+            gmac / secs,
+            2.0 * gmac / secs,
+            (gmac / secs) / 42.6
+        );
+    }
+}

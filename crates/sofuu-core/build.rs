@@ -44,15 +44,17 @@ fn main() {
         None => PathBuf::new(),
     };
     let has_qtsq = qtsq_dir.is_some() && qtsq_lib.exists();
-    if has_qtsq {
-        let dir = qtsq_dir.as_ref().unwrap();
-        println!("cargo:rustc-cfg=has_qtsq");
-        // Mirror sofuu-ffi: rebuild when the checkout's artifacts change,
-        // so a refreshed archive re-runs this probe instead of keeping a
-        // stale cfg.
+    // B7 (ROADMAP-BRAIN-CMA): watch the probed paths on EVERY outcome —
+    // emitting them only on success let a failed probe cache forever (the
+    // codec owner rebuilds libqtsq.a, cargo never re-probes, and the build
+    // stays silently memory-less until a manual `touch build.rs`).
+    if let Some(dir) = &qtsq_dir {
         println!("cargo:rerun-if-changed={}", qtsq_lib.display());
         println!("cargo:rerun-if-changed={}", dir.join("include/qtsq_format.h").display());
         println!("cargo:rerun-if-changed={}", dir.join("include/qtsq.h").display());
+    }
+    if has_qtsq {
+        println!("cargo:rustc-cfg=has_qtsq");
     } else if let Some(dir) = &qtsq_dir {
         println!(
             "cargo:warning={} not found at {} — building WITHOUT QTSQ \

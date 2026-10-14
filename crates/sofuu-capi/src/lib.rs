@@ -3681,6 +3681,229 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
+    /// B7.1 (ROADMAP-BRAIN-CMA): one semantics across surfaces, pinned.
+    ///
+    /// A record written by the IN-PROCESS API must be visible through the
+    /// C-ABI FUNNEL with the same filters, the same tier numbers, and the
+    /// same error behaviour — and the working-set contract must hold on
+    /// both: a working record recalls (tier 0) but never appears in the
+    /// persistent read-out until `promoteWorking` moves it to episodic.
+    /// Tier numbers are pinned against the CMA constants — every surface
+    /// (chat /memory, /why, server /memories, this funnel) passes and
+    /// renders the SAME numbers; the names are presentation over them.
+    #[test]
+    fn cross_surface_semantics_funnel_matches_in_process() {
+        require_qtsq!();
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        // Tier numbers are the contract every surface shares.
+        assert_eq!(sofuu_core::memory::cma::TIER_WORKING, 0);
+        assert_eq!(sofuu_core::memory::cma::TIER_EPISODIC, 1);
+        assert_eq!(sofuu_core::memory::cma::TIER_SEMANTIC, 2);
+        assert_eq!(sofuu_core::memory::cma::TIER_FORGOTTEN, 3);
+        assert_eq!(sofuu_core::memory::cma::TIER_ENTITY, 4);
+
+        // 1. Write through the IN-PROCESS API (the surface chat's JS
+        //    driver uses): one episodic + one entity record, flushed.
+        let path = std::env::temp_dir().join(format!(
+            "sofuu-cross-surface-{}-{}.qtsq",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let path_js = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let seed = format!(
+            r#"(function () {{
+  var out = {{ memType: typeof sofuu.memory }};
+  try {{
+    var b = sofuu.memory.open("{p}", 768);
+    var v0 = new Float32Array(768); v0[0] = 1.0;
+    var v1 = new Float32Array(768); v1[1] = 1.0;
+    var i0 = b.remember(v0, "the sky is blue", "user", 0, "chat");
+    var i1 = b.rememberEntity(v1, "agent researcher stores findings", "agent:researcher", "agent");
+    b.flush();
+    out.i0 = i0; out.i1 = i1; out.count = b.count();
+  }} catch (e) {{ out.error = String((e && e.message) || e); }}
+  return JSON.stringify(out);
+}})()"#,
+            p = path_js
+        );
+        let seeded = eval_json(rt, &seed);
+        let seeded_str = seeded.as_str().unwrap_or_else(|| panic!("seed must return a JSON string, got {seeded}"));
+        let seeded_v: JsonValue = serde_json::from_str(seeded_str)
+            .unwrap_or_else(|e| panic!("seed JSON unreadable ({e}): {seeded_str}"));
+        assert!(
+            seeded_v.get("error").is_none(),
+            "the in-process seed must not error: {seeded_v}"
+        );
+        assert_eq!(
+            seeded_v.get("count").and_then(|c| c.as_i64()),
+            Some(2),
+            "the in-process seed must write exactly two records, got {seeded_v}"
+        );
+
+        // 2. The FUNNEL (the headless C-ABI surface) sees both records
+        //    with the same read-out shape. (list returns its JSON as a
+        //    string — the same string the server writes and chat parses —
+        //    so the helper re-parses it; that IS the cross-surface shape.)
+        let open_args = format!(
+            r#"{{"path":{},"dim":768,"embed_id":"hash-v1"}}"#,
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        );
+        let h = call(rt, "memory.open", &open_args);
+        let hid = h.get("handle").and_then(|h| h.as_i64()).unwrap();
+        let list = |filter: &str| -> JsonValue {
+            let raw = call(rt, "memory.list", &format!(r#"{{"handle":{hid}{f}}}"#, f = filter));
+            match &raw {
+                JsonValue::String(s) => serde_json::from_str(s)
+                    .unwrap_or_else(|e| panic!("memory.list string is not JSON ({e}): {s}")),
+                v => v.clone(),
+            }
+        };
+        let all = list("");
+        let all_arr = all
+            .get("records")
+            .and_then(|r| r.as_array())
+            .unwrap_or_else(|| panic!("memory.list must return {{records}}, got {all}"));
+        assert_eq!(all.get("total").and_then(|t| t.as_i64()), Some(2));
+        let texts: Vec<&str> = all_arr
+            .iter()
+            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+            .collect();
+        assert!(texts.contains(&"the sky is blue"), "episodic visible: {texts:?}");
+        assert!(
+            texts.contains(&"agent researcher stores findings"),
+            "entity visible: {texts:?}"
+        );
+
+        // 3. Tier filters are the same numbers on both surfaces.
+        let tier_of = |filter: &str| -> Vec<u8> {
+            let v = list(&format!(",{f}", f = filter));
+            v.get("records")
+                .and_then(|r| r.as_array())
+                .unwrap_or_else(|| panic!("list({filter}) must return records, got {v}"))
+                .iter()
+                .map(|r| r.get("tier").and_then(|t| t.as_u64()).unwrap_or(255) as u8)
+                .collect()
+        };
+        assert_eq!(tier_of(r#""tier":1"#), vec![sofuu_core::memory::cma::TIER_EPISODIC]);
+        assert_eq!(tier_of(r#""tier":4"#), vec![sofuu_core::memory::cma::TIER_ENTITY]);
+        assert!(
+            tier_of(r#""tier":0"#).is_empty(),
+            "nothing is working-tier in a fresh persistent read-out"
+        );
+        assert!(
+            tier_of(r#""tier":5"#).is_empty(),
+            "an unknown tier filters to empty, not everything"
+        );
+
+        // 4. Working-set parity through the funnel: recallable (tier 0),
+        //    absent from the persistent read-out, promotable.
+        let mut wv = vec![0.0f64; 768];
+        wv[2] = 1.0;
+        let wv_js: Vec<String> = wv.iter().map(|f| f.to_string()).collect();
+        let wargs = format!(
+            r#"{{"handle":{hid},"vec":[{}],"text":"session scratch fact","role":"user","kv_page_id":0,"source":"chat"}}"#,
+            wv_js.join(",")
+        );
+        let wid = call(rt, "memory.rememberWorking", &wargs);
+        let wid = wid
+            .as_i64()
+            .unwrap_or_else(|| panic!("rememberWorking must return an id, got {wid}"));
+        assert!(
+            wid >= 0x4000_0000,
+            "a working id carries the B6 flag and stays positive, got {wid}"
+        );
+        let rargs = format!(r#"{{"handle":{hid},"vec":[{}],"k":3}}"#, wv_js.join(","));
+        let hits = call(rt, "memory.recall", &rargs);
+        let working_hit = hits
+            .as_array()
+            .and_then(|a| a.iter().find(|h| h.get("id").and_then(|i| i.as_i64()) == Some(wid)))
+            .unwrap_or_else(|| panic!("recall must find the working record {wid}, got {hits}"));
+        assert_eq!(
+            working_hit.get("tier").and_then(|t| t.as_u64()),
+            Some(0),
+            "the working hit serves as tier 0, got {working_hit}"
+        );
+        let after_w = list("");
+        let wtexts: Vec<String> = after_w
+            .get("records")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r.get("text").and_then(|t| t.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !wtexts.contains(&"session scratch fact".to_string()),
+            "an unpromoted working record must not appear in the persistent read-out: {wtexts:?}"
+        );
+
+        // 5. Promotion moves it to episodic on BOTH surfaces (flush, then
+        //    a fresh in-process open — the same thing a reload is).
+        let pr = call(
+            rt,
+            "memory.promoteWorking",
+            &format!(r#"{{"handle":{hid},"ids":[{wid}]}}"#),
+        );
+        let pr_val: JsonValue = match &pr {
+            JsonValue::String(s) => serde_json::from_str(s).unwrap_or(JsonValue::Null),
+            v => v.clone(),
+        };
+        assert_eq!(
+            pr_val.get("promoted").and_then(|p| p.as_i64()),
+            Some(1),
+            "promotion must move the working record, got {pr}"
+        );
+        call(rt, "memory.flush", &format!(r#"{{"handle":{hid}}}"#));
+        let reload = format!(
+            r#"(function () {{
+  var b = sofuu.memory.open("{p}", 768);
+  var res = b.list({{ tier: 1 }});
+  var parsed = JSON.parse(res);
+  return parsed.records.map(function (r) {{ return r.text; }});
+}})()"#,
+            p = path_js
+        );
+        let reloaded = eval_json(rt, &reload);
+        let names: Vec<String> = match &reloaded {
+            JsonValue::String(s) => serde_json::from_str(s).unwrap_or_default(),
+            v => serde_json::from_value(v.clone()).unwrap_or_default(),
+        };
+        assert!(
+            names.contains(&"session scratch fact".to_string()),
+            "the promoted record must survive a reload as episodic, got {reloaded}"
+        );
+
+        // 6. Error behaviour parity: a bad forget id is `false`, not an
+        //    exception — the same answer the direct API gives.
+        let bad = call(rt, "memory.forget", r#"{"handle":0,"index":99999}"#);
+        assert_eq!(bad.as_bool(), Some(false), "a bad forget id returns false, got {bad}");
+
+        let _ = hid;
+        unsafe { sofuu_rt_free(rt) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Evaluate a JS expression and return its parsed result value
+    /// (sofuu_rt_eval wraps it in the {ok, result} envelope).
+    fn eval_json(rt: *mut CapiRuntime, src: &str) -> JsonValue {
+        let s = CString::new(src).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval(rt, s.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "eval should succeed");
+        let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+        let envelope: JsonValue = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("eval result is not JSON ({e}): {json}"));
+        envelope.get("result").cloned().unwrap_or(JsonValue::Null)
+    }
+
     #[test]
     fn memory_funnel_recall_before_open_is_a_clear_error() {
         let _g = lock();

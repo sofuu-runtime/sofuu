@@ -2181,7 +2181,8 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
         const uint8_t *sc = nullptr;
         if (const uint8_t *tile = sofuu_tile_lookup_sc(weight_bytes, 12, rows, cols, &sc)) {
             const size_t nb = cols / 256;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((tile_batch / 4) * nb);
+            const size_t g4n = tile_batch / 4;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch<float>(tile_batch * cols);
@@ -2189,8 +2190,17 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            for (size_t g4 = 0; g4 < tile_batch / 4; ++g4) {
-                ggml_quantize_mat_q8_K_4x4_generic(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            // Act-quant on the pool: the scalar generic quantizer was the
+            // single-threaded serial prologue (~22-37% of the q4_K path at
+            // batch 64 on Pi 5).
+            if (g4n >= 2) {
+                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                    for (size_t g4 = a; g4 < b; ++g4) {
+                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                    }
+                });
+            } else {
+                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
@@ -2297,7 +2307,8 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
     if (tile_batch >= 4 && tile_batch % 4 == 0 && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(14)) {
         if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 14, rows, cols)) {
             const size_t nb = cols / 256;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((tile_batch / 4) * nb);
+            const size_t g4n = tile_batch / 4;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch<float>(tile_batch * cols);
@@ -2305,8 +2316,17 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            for (size_t g4 = 0; g4 < tile_batch / 4; ++g4) {
-                ggml_quantize_mat_q8_K_4x4_generic(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            // Act-quant on the pool: the scalar generic quantizer was the
+            // single-threaded serial prologue (~22-37% of the q4_K path at
+            // batch 64 on Pi 5).
+            if (g4n >= 2) {
+                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                    for (size_t g4 = a; g4 < b; ++g4) {
+                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                    }
+                });
+            } else {
+                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
@@ -3112,7 +3132,7 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
             const size_t nb = cols / 256;
             tile_block_q8_Kx4 *qa = tile_scratch<tile_block_q8_Kx4>((batch / 4) * nb);
             for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
-                ggml_quantize_mat_q8_K_4x4_generic(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
+                ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
             }
             t1 = std::chrono::steady_clock::now();
             const uint8_t *sc = nullptr;
@@ -3153,6 +3173,40 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
         qk ? "q4_K" : "q8_0", rows, cols, batch, iters,
         t_quant, t_quant / iters, t_kernel, t_kernel / iters,
         macs / (t_kernel * 1e6), 100.0 * t_quant / (t_quant + t_kernel));
+#endif
+}
+
+// ── Parity test: NEON q8_K 4x4 quantizer must be bit-identical to the
+// scalar generic (qs bytes, d floats, bsums). Deterministic mixed-magnitude
+// activations including negative amax signs and zero rows.
+extern "C" int sofuu_test_quant_q8_K_parity(int cols, int iters) {
+#if defined(__aarch64__)
+    if (cols % 256 != 0 || iters < 1) return -1;
+    const size_t qsz = sizeof(tile_block_q8_Kx4) * (cols / 256);
+    std::vector<float> x(4 * (size_t)cols);
+    std::vector<uint8_t> a(qsz), b(qsz);
+    uint32_t rng = 987;
+    for (int it = 0; it < iters; it++) {
+        for (auto &v : x) {
+            rng = rng * 1664525u + 1013904223u;
+            v = ((int)(rng >> 12) % 4000 - 2000) / 500.0f;
+            if ((rng & 7) == 0) v = 0.0f;                       // zeros
+            if ((rng & 31) == 5) v = ((rng >> 5) & 1) ? 12.75f : -12.75f; // signed maxes
+        }
+        memset(a.data(), 0xAA, qsz); memset(b.data(), 0x55, qsz);
+        ggml_quantize_mat_q8_K_4x4_generic(x.data(), a.data(), cols);
+        ggml_quantize_mat_q8_K_4x4_neon(x.data(), b.data(), cols);
+        if (memcmp(a.data(), b.data(), qsz) != 0) {
+            for (size_t i = 0; i < qsz; i++) {
+                if (a[i] != b[i]) { fprintf(stderr, "[parity] byte %zu: %02x vs %02x\n", i, a[i], b[i]); break; }
+            }
+            return 1;
+        }
+    }
+    return 0;
+#else
+    (void) cols; (void) iters;
+    return 0;
 #endif
 }
 

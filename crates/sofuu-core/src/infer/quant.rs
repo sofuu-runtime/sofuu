@@ -402,6 +402,7 @@ extern "C" {
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
+    fn sofuu_test_quant_q8_K_parity(cols: i32, iters: i32) -> i32;
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
@@ -1649,6 +1650,18 @@ mod tests {
                     assert!((a - want).abs() <= 0.05 * l1 + 1e-3, "({b},{r}): {a} vs {want}");
                 }
             }
+        }
+    }
+
+    use super::sofuu_test_quant_q8_K_parity;
+
+    /// The NEON q8_K 4x4 activation quantizer must stay bit-identical to the
+    /// scalar generic (qs/d/bsums) — guards the prefill numerics.
+    #[test]
+    fn test_quant_q8_k_4x4_neon_bit_exact() {
+        for cols in [256usize, 1024, 3072] {
+            let r = unsafe { sofuu_test_quant_q8_K_parity(cols as i32, 25) };
+            assert_eq!(r, 0, "NEON q8_K quantizer diverged at cols={cols}");
         }
     }
 

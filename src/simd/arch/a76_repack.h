@@ -945,6 +945,75 @@ void ggml_quantize_mat_q8_0_4x4_generic(const float * __restrict x, void * __res
     }
 }
 
+// NEON activation quantizer for the 4-row q8_K tile — bit-identical to
+// ggml_quantize_mat_q8_K_4x4_generic below. The generic was the
+// single-threaded serial prologue of every q4_K/q6_K prefill GEMM (measured
+// 22-37% of the path at batch 64 on Pi 5, ~10 scalar ops + div/mod per
+// element). Design notes for exactness:
+//  - amax via vmaxvq (max is exact/associative), then max's SIGN recovered
+//    with an early-break scan for the first |x| == amax — identical to the
+//    generic's strict `>` update (first attainer wins on ties).
+//  - iscale/d use the same scalar expressions (4 divisions per block).
+//  - Rounding: nearest_int(f) = bit pattern of (f + 12582912.0f); lanes go
+//    f*iscale -> +magic -> vsub magic in int32 -> narrow-low bytes, which is
+//    that same bit trick without the scalar float<->int bottleneck (values
+//    |q| <= 127 so every narrowing is exact).
+//  - bsums: all four j-runs in a (t, row) step share one slot; int16 adds
+//    are exact (|sums| <= 16*127), so lane order cannot change results.
+//  - Rewrite of the per-element index math: for j = 16t + 4s + u (t<64,
+//    s<4, u<4): src_id = s, src_offset = 4t + u (a contiguous vld1q), and
+//    bsums-index = 4s + (t>>4)*16 + ((t>>2)&3).
+static inline void ggml_quantize_mat_q8_K_4x4_neon(const float * __restrict x, void * __restrict vy, int64_t k) {
+#if defined(__ARM_NEON)
+    assert(QK_K == 256);
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    tile_block_q8_Kx4 * __restrict y = (tile_block_q8_Kx4 *) vy;
+    const float32x4_t f32_magic = vdupq_n_f32(12582912.0f);
+    const int32x4_t i32_magic = vreinterpretq_s32_f32(f32_magic); // 0x4B400000 bit pattern
+
+    for (int i = 0; i < nb; i++) {
+        float iscale[4];
+        for (int row_iter = 0; row_iter < 4; row_iter++) {
+            const float *row = x + row_iter * k + i * QK_K;
+            float32x4_t va = vabsq_f32(vld1q_f32(row));
+            for (int j = 4; j < QK_K; j += 4) {
+                va = vmaxq_f32(va, vabsq_f32(vld1q_f32(row + j)));
+            }
+            const float amax = vmaxvq_f32(va);
+
+            float max = 0.0f;
+            if (amax > 0.0f) {
+                for (int j = 0; j < QK_K; j++) {
+                    if (fabsf(row[j]) == amax) { max = row[j]; break; }
+                }
+            }
+            iscale[row_iter] = amax ? -127.f / max : 0;
+            y[i].d[row_iter] = amax ? 1 / iscale[row_iter] : 0;
+        }
+
+        memset(y[i].bsums, 0, sizeof(y[i].bsums));
+
+        for (int t = 0; t < QK_K / 4; t++) {
+            int16x4_t qs16[4];
+            int16_t badd[4];
+            for (int s = 0; s < 4; s++) {
+                const float32x4_t q = vmulq_n_f32(vld1q_f32(x + s * k + i * QK_K + 4 * t), iscale[s]);
+                const int32x4_t val = vsubq_s32(vreinterpretq_s32_f32(vaddq_f32(q, f32_magic)), i32_magic);
+                qs16[s] = vmovn_s32(val);
+                badd[s] = (int16_t) vaddvq_s32(val);
+                const int idx = 4 * s + (t >> 4) * 16 + ((t >> 2) & 3);
+                y[i].bsums[idx] += badd[s];
+            }
+            vst1_s8(y[i].qs + 16 * t, vmovn_s16(vcombine_s16(qs16[0], qs16[1])));
+            vst1_s8(y[i].qs + 16 * t + 8, vmovn_s16(vcombine_s16(qs16[2], qs16[3])));
+        }
+    }
+#else
+    ggml_quantize_mat_q8_K_4x4_generic(x, vy, k);
+#endif
+}
+
 void ggml_quantize_mat_q8_K_4x4_generic(const float * __restrict x, void * __restrict vy, int64_t k) {
     assert(QK_K == 256);
     assert(k % QK_K == 0);

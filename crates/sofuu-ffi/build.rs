@@ -60,6 +60,15 @@ fn main() {
     // has_qtsq can only be true when qtsq_dir is Some — the gated blocks
     // below unwrap on exactly that invariant.
     let has_qtsq = qtsq_dir.is_some() && qtsq_lib.exists();
+    // B7 (ROADMAP-BRAIN-CMA): watch the probed paths on EVERY outcome —
+    // emitting them only on success let a failed probe cache forever (the
+    // codec owner rebuilds libqtsq.a, cargo never re-probes, and the build
+    // stays silently memory-less until a manual `touch build.rs`).
+    if let Some(dir) = &qtsq_dir {
+        println!("cargo:rerun-if-changed={}", qtsq_lib.display());
+        println!("cargo:rerun-if-changed={}", dir.join("include/qtsq_format.h").display());
+        println!("cargo:rerun-if-changed={}", dir.join("include/qtsq.h").display());
+    }
 
     // ── Compiler flags ──────────────────────────────────────────
     // M10: the only C left in this build is the engine layer itself —
@@ -408,12 +417,6 @@ fn main() {
         // branch only adds the cfg itself. (A second rustc-check-cfg here was
         // a duplicate, removed per AUDIT-2026-09-07 ffi-4.)
         println!("cargo:rustc-cfg=has_qtsq");
-        // Rebuild when the checkout's artifacts change — without these a
-        // refreshed libqtsq.a silently keeps the stale probe cfg and (until
-        // some downstream crate edits) the stale link inputs.
-        println!("cargo:rerun-if-changed={}", qtsq_lib.display());
-        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq_format.h").display());
-        println!("cargo:rerun-if-changed={}", qtsq_dir.join("include/qtsq.h").display());
     } else if qtsq_dir.is_some() {
         println!(
             "cargo:warning=QTSQ static lib not found at {} — building WITHOUT QTSQ \

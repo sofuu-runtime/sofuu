@@ -188,6 +188,179 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         info("no brain_path override — using the project-local default");
     }
 
+    /* ── 2b. The brain store itself (B7.2, ROADMAP-BRAIN-CMA): manifest,
+     * space, tier histogram, capacity headroom, journal state, last
+     * compaction — the same numbers /brain info and cma.stats() report,
+     * read from the real file. (brain_store is QTSQ-gated; so is this.) */
+    #[cfg(has_qtsq)]
+    if qtsq_linked && bp.exists() {
+        section("brain store");
+        // Journal state first (the same recovery an open runs): a crashed
+        // commit that is rolled forward here is a fix, not a problem —
+        // but the user should see it happened.
+        if let Some(dir) = bp.parent() {
+            let report = sofuu_core::rt::wal::recover(&dir.to_string_lossy());
+            if report.journal_found {
+                ok("write-ahead journal found — a crashed commit was rolled forward (recovered)");
+            } else {
+                info("journal state clean (no interrupted commits)");
+            }
+        }
+        // Manifest: space + segments + compaction generation. A legacy
+        // (pre-B3) brain has no manifest — still healthy, just unsegmented.
+        let manifest = unsafe { sofuu_core::rt::brain_store::read_manifest(&bp.to_string_lossy()) };
+        match &manifest {
+            Some(m) => {
+                let space = m
+                    .embedding
+                    .get("id")
+                    .and_then(|v: &serde_json::Value| v.as_str())
+                    .unwrap_or("unknown");
+                let dim = m.embedding.get("dimension").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0);
+                let bytes: u64 = m
+                    .segments
+                    .iter()
+                    .filter_map(|s| {
+                        std::fs::metadata(format!(
+                            "{}/{}",
+                            sofuu_core::rt::brain_store::segments_dir(&bp.to_string_lossy()),
+                            s.file
+                        ))
+                        .ok()
+                        .map(|md| md.len())
+                    })
+                    .sum();
+                ok(&format!(
+                    "segmented store: {} segment(s), {} record version(s), epoch {} ({})",
+                    m.segments.len(),
+                    m.total_versions(),
+                    m.epoch,
+                    human(bytes)
+                ));
+                info(&format!("vector space: {space} · {dim} dims"));
+                if m.last_decay_at > 0 {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs().saturating_sub(m.last_decay_at))
+                        .unwrap_or(0);
+                    info(&format!(
+                        "last decay pass: {}s ago (strengths current as of then)",
+                        age
+                    ));
+                }
+                if m.evicted_total > 0 {
+                    info(&format!(
+                        "lifetime capacity evictions: {} (reported, never silent)",
+                        m.evicted_total
+                    ));
+                }
+            }
+            None => {
+                info("legacy single-file brain (no segment manifest) — still healthy; the next compaction rewrites it segmented");
+            }
+        }
+        // Live stats + tier histogram through the REAL store (the same
+        // surface /brain info reads). Open runs the recovery + decay
+        // replay; nothing here flushes, so doctor never writes.
+        let bp_js = bp.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let probe = format!(
+            r#"(function () {{
+  var out = {{}};
+  try {{
+    var b = sofuu.memory.open("{p}");
+    var s = JSON.parse(b.stats());
+    out.records = s.records;
+    out.working = s.working;
+    out.epoch = s.epoch;
+    out.needs_compaction = s.needs_compaction;
+    out.dirty = s.dirty;
+    out.ef_search = s.ef_search;
+    out.diversity_floor = s.diversity_floor;
+    out.tiers = [];
+    for (var t = 0; t <= 4; t++) {{
+      var r = JSON.parse(b.list({{ tier: t, limit: 1 }}));
+      out.tiers.push(r.total | 0);
+    }}
+  }} catch (e) {{
+    out.error = String((e && e.message) || e);
+  }}
+  return JSON.stringify(out);
+}})()"#,
+            p = bp_js
+        );
+        let out = rt.eval_repl(&probe).unwrap_or_default();
+        rt.run_jobs();
+        let parse = |key: &str| -> Option<serde_json::Value> {
+            let marker = format!("\"{key}\":");
+            let at = out.find(&marker)? + marker.len();
+            let rest = out[at..].trim_start();
+            let end = rest
+                .find(|c: char| c == ',' || c == '}')
+                .unwrap_or(rest.len());
+            serde_json::from_str(rest[..end].trim_end_matches(',')).ok()
+        };
+        if let Some(err) = js_error(&out) {
+            warn(&format!("brain store probe failed: {err}"));
+            failures += 1;
+        } else {
+            let records = parse("records").and_then(|v| v.as_i64()).unwrap_or(0);
+            let working = parse("working").and_then(|v| v.as_i64()).unwrap_or(0);
+            let dirty = parse("dirty").and_then(|v| v.as_i64()).unwrap_or(0);
+            let needs_compaction = parse("needs_compaction")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tiers: Vec<i64> = parse("tiers")
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .collect();
+            let names = ["working", "episodic", "semantic", "forgotten", "entity"];
+            let hist: Vec<String> = names
+                .iter()
+                .zip(tiers.iter())
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect();
+            ok(&format!("records: {records} · tiers: {}", hist.join(" · ")));
+            if working > 0 {
+                info(&format!("session working records: {working} (in-RAM only — gone on reload unless promoted)"));
+            }
+            // Capacity headroom: the same policy the store enforces.
+            let cap = std::env::var("SOFUU_BRAIN_MAX_RECORDS")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(100_000);
+            if cap == 0 {
+                info("capacity cap disabled (SOFUU_BRAIN_MAX_RECORDS=0)");
+            } else {
+                let headroom = (cap - records).max(0);
+                let pct = if cap > 0 {
+                    (records as f64 / cap as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                info(&format!(
+                    "capacity: {records}/{cap} records ({pct:.1}% full · {headroom} headroom)"
+                ));
+                if pct >= 90.0 {
+                    warn("brain is near its capacity cap — weakest records will be evicted (never pins or entities)");
+                }
+            }
+            if needs_compaction {
+                info(&format!("compaction pending ({dirty} dirty record(s)) — the next turn-boundary flush rewrites the store"));
+            } else {
+                info("no compaction pending");
+            }
+            info(&format!(
+                "recall knobs: ef_search {} (0 = default) · diversity floor {}",
+                parse("ef_search").and_then(|v| v.as_i64()).unwrap_or(0),
+                parse("diversity_floor")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "off".into())
+            ));
+        }
+    }
+
     // ── 3. Context window resolution (F1/F2 surface) ────────────────
     section("context window");
     if cfg.model.is_empty() {

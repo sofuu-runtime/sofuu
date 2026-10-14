@@ -736,7 +736,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/effort", "Set the thinking/reasoning effort", "off | low | medium | high | max  (unsupported levels fall back to the model's highest; budgets scale with the model)"),
     ("/compact", "Summarize the conversation into context", ""),
     ("/clear", "Reset this session (keep settings)", ""),
-    ("/brain", "Toggle the memory/brain integration", "on | off"),
+    ("/brain", "Toggle the memory/brain integration", "on | off | info"),
     ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
     ("/mode", "View/set the permission mode", "full | edit | plan  (bare = show · TAB cycles)"),
@@ -1107,9 +1107,14 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         "/clear" => "clear",
         "/compact" => "compact",
         "/brain" => {
-            // /brain → config panel (DRIVER handles "pick_brain")
+            // /brain → config panel (DRIVER handles "pick_brain");
+            // /brain info → store panel (DRIVER handles "brain_info" — it
+            // owns the shared brain handle, so the panel reads the SAME
+            // store the turns recall from).
             if arg.is_empty() {
                 "pick_brain"
+            } else if arg == "info" {
+                "brain_info"
             } else if arg == "off" {
                 cfg.brain = false;
                 cfg.save();
@@ -1121,7 +1126,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 chat_out("  ✓ Brain enabled\n");
                 "ok"
             } else {
-                chat_out("  Usage: /brain [on|off]\n");
+                chat_out("  Usage: /brain [on|off|info]\n");
                 "ok"
             }
         }
@@ -1543,7 +1548,7 @@ fn print_help() {
     c(&mut rows, "/effort", "reasoning-effort picker (off/low…max)");
     c(&mut rows, "/compact", "summarize the conversation into context");
     c(&mut rows, "/clear", "reset this session (keep settings)");
-    c(&mut rows, "/brain [on|off]", "toggle memory/brain integration");
+    c(&mut rows, "/brain [on|off|info]", "toggle memory/brain integration · info = store panel");
     c(&mut rows, "/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
     c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
@@ -4083,6 +4088,69 @@ const DRIVER: &str = r#"
     }
     out('');
   }
+  /* B7.3 (ROADMAP-BRAIN-CMA): /brain info — the store panel. Reads the
+   * SAME cached handle the turns recall from (never a second open: a
+   * flush from a second handle would clobber newer turns), and reports
+   * the same numbers `sofuu doctor`'s brain section does: tiers,
+   * capacity, channels, compaction state, ranking knobs. */
+  function handleBrainInfo() {
+    if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
+    let brain = null, sem = null, backendId = 'unknown';
+    try {
+      const entry = sofuu.agent && typeof sofuu.agent.brainFor === 'function'
+        ? sofuu.agent.brainFor(brainDef()) : null;
+      if (entry && entry.cma) { brain = entry.cma; sem = entry.sem || null; }
+      if (driverBrainBackend && driverBrainBackend.id) backendId = driverBrainBackend.id;
+      else if (entry && entry.backend && entry.backend.id) backendId = entry.backend.id;
+    } catch (e) {}
+    if (!brain || typeof brain.stats !== 'function') {
+      out('\x1b[90m  Brain unavailable (QTSQ not linked?)\x1b[0m\n'); return;
+    }
+    let s;
+    try { s = JSON.parse(brain.stats()); }
+    catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); return; }
+    const TIER_NAMES = ['working', 'episodic', 'semantic', 'forgotten', 'entity'];
+    const tiers = [];
+    for (let t = 0; t <= 4; t++) {
+      let total = 0;
+      try { total = (JSON.parse(brain.list({ tier: t, limit: 1 })).total) | 0; } catch (e) {}
+      tiers.push(total);
+    }
+    const hist = TIER_NAMES.map((n, i) => n + ' ' + tiers[i]).join(' · ');
+    out('\n\x1b[1m  Brain\x1b[0m \x1b[2m' + brainPath() + '\x1b[0m');
+    out('  records: ' + (s.records | 0) + ' · ' + hist);
+    if ((s.working | 0) > 0) {
+      out('  \x1b[36m  session working: ' + (s.working | 0) +
+          ' (in-RAM — promoted when a turn uses them)\x1b[0m');
+    }
+    let cap = 100000;
+    try { cap = parseInt(process.env.SOFUU_BRAIN_MAX_RECORDS, 10); } catch (e) {}
+    if (!(cap > 0 || cap === 0)) cap = 100000;
+    if (cap === 0) out('  \x1b[2m  capacity: cap disabled (SOFUU_BRAIN_MAX_RECORDS=0)\x1b[0m');
+    else {
+      const pct = Math.min(100, (s.records | 0) / cap * 100);
+      out('  \x1b[2m  capacity: ' + (s.records | 0) + '/' + cap + ' (' + pct.toFixed(1) +
+          '% full)' + (pct >= 90 ? ' · near cap — weakest records evict first' : '') + '\x1b[0m');
+    }
+    const chan = 'hash ' + backendId + (sem ? ' · sem2 channel on' : '');
+    out('  \x1b[2m  channels: ' + chan + '\x1b[0m');
+    const store = s.segmented
+      ? s.segments + ' segment(s) · epoch ' + (s.epoch | 0) +
+        ' · ' + ((s.bytes || 0) / 1048576).toFixed(1) + ' MB'
+      : 'legacy single-file store';
+    out('  \x1b[2m  store: ' + store +
+        (s.needs_compaction ? ' · compaction pending (' + (s.dirty | 0) + ' dirty)' : ' · no compaction pending') +
+        '\x1b[0m');
+    if (s.last_decay_at > 0) {
+      const age = Math.max(0, Math.floor(Date.now() / 1000) - s.last_decay_at);
+      const ageTxt = age < 3600 ? Math.floor(age / 60) + 'm' : age < 86400 ? Math.floor(age / 3600) + 'h' : Math.floor(age / 86400) + 'd';
+      out('  \x1b[2m  last decay/consolidation pass: ' + ageTxt + ' ago\x1b[0m');
+    }
+    out('  \x1b[2m  recall: ef_search ' + ((s.ef_search | 0) || 'default') +
+        ' · diversity floor ' + (s.diversity_floor == null ? 'off' : s.diversity_floor) + '\x1b[0m');
+    out('');
+  }
+
   async function handleForget(arg) {
     if (!cfg.brain) { out('\x1b[90m  Brain is off — /brain on to enable\x1b[0m\n'); return; }
     const brain = ensureDriverBrain();
@@ -7053,7 +7121,9 @@ const DRIVER: &str = r#"
           else out('\x1b[90m  Usage: /maxout <tokens|default>  (0-' + (cfg.max_output_cap || 0) + '; current: ' + (cfg.max_output || 'provider default') + ')\x1b[0m\n');
         } else if (r === 'pick_brain') {
           if (TTY) await pickBrain();
-          else out('\x1b[90m  Usage: /brain <on|off>  (current: ' + (cfg.brain ? 'on' : 'off') + ')\x1b[0m\n');
+          else out('\x1b[90m  Usage: /brain <on|off|info>  (current: ' + (cfg.brain ? 'on' : 'off') + ')\x1b[0m\n');
+        } else if (r === 'brain_info') {
+          handleBrainInfo();
         } else if (r === 'pick_sync') {
           if (TTY) await pickSync();
           else out('\x1b[90m  Usage: /sync <on|off>  (current: ' + (cfg.sync ? 'on' : 'off') + ')\x1b[0m\n');

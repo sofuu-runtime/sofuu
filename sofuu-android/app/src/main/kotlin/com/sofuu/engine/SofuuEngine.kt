@@ -191,7 +191,7 @@ class SofuuEngine(
                     Thread.sleep(1500)
                     mailbox.put(Runnable {
                         val rt2 = bridge ?: return@Runnable
-                        rt2.eval("globalThis.__probe_flag='sync_ok'")
+                        rt2.evalNb("globalThis.__probe_flag='sync_ok'")
                         val r1 = rt2.evalNb(
                             "(function(){ new Promise(function(r){ setTimeout(r, 150); }).then(function(){ globalThis.__probe_flag='async_ok'; }); return 'scheduled'; })()"
                         )
@@ -203,8 +203,78 @@ class SofuuEngine(
                     Thread.sleep(2500)
                     mailbox.put(Runnable {
                         val rt2 = bridge ?: return@Runnable
-                        val v = rt2.eval("JSON.stringify({flag: globalThis.__probe_flag || 'unset', pure: globalThis.__probe_pure || 'unset'})")
+                        val v = rt2.evalNb("JSON.stringify({flag: globalThis.__probe_flag || 'unset', pure: globalThis.__probe_pure || 'unset'})")
                         log("probe: RESULT ${v?.take(140) ?: "NULL"}")
+                    })
+                    // Probe 3 — the engine's local stream in isolation, no
+                    // chat.js/agent.js driver: if THIS stalls, the bug is in
+                    // the engine stream path; if it completes, the turn
+                    // driver stalls.
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val r = rt2.evalNb(
+                            "(function(){ globalThis.__probe3='starting';" +
+                                "(async function(){ try { var n=0, t0=Date.now(), last='';" +
+                                "for await (var c of sofuu.ai.stream('Reply with exactly: ok', {model:'/data/user/0/com.sofuu/files/models/qwen3-0.6b-i1-q4_k_m.gguf'})) { n++; last=String(c&&c.text||''); if (n>500) break; }" +
+                                "globalThis.__probe3='DONE n='+n+' last='+last+' ms='+(Date.now()-t0);" +
+                                "} catch(e) { globalThis.__probe3='ERR '+String(e&&e&&e.message||e); } })();" +
+                                "return 'launched'; })()"
+                        )
+                        log("probe3: ${r?.take(80) ?: "NULL"}")
+                        // Probe 5 — cold-load stream with a 5-token cap:
+                        // if THIS wedges too, the first load never reaches a
+                        // single token and it is not a long-run scheduler
+                        // issue.
+                        val r5 = rt2.evalNb(
+                            "(function(){ globalThis.__p5='starting';" +
+                                "(async function(){ try { var n=0, t0=Date.now();" +
+                                "for await (var c of sofuu.ai.stream('hi', {model:'/data/user/0/com.sofuu/files/models/qwen3-0.6b-i1-q4_k_m.gguf', maxTokens:5})) { n++; }" +
+                                "globalThis.__p5='DONE n='+n+' ms='+(Date.now()-t0);" +
+                                "} catch(e) { globalThis.__p5='ERR '+String(e&&e&&e.message||e); } })();" +
+                                "return 'launched'; })()"
+                        )
+                        log("probe5: ${r5?.take(60) ?: "NULL"}")
+                    })
+                    Thread.sleep(35000)
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val v = rt2.evalNb("JSON.stringify({p3: globalThis.__probe3 || 'unset', p5: globalThis.__p5 || 'unset'})")
+                        log("probe3/5: T35 ${v?.take(200) ?: "NULL"}")
+                    })
+                    Thread.sleep(45000)
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val v = rt2.evalNb("String(globalThis.__probe3 || 'unset')")
+                        log("probe3: T80 ${v?.take(160) ?: "NULL"}")
+                    })
+                    // Probe 8 — the REAL chat turn, but noTools and under the
+                    // probe's control: submit() + its resolution flag, then
+                    // chat.state() polling. A tool-less turn that never
+                    // resolves convicts chat.js's core; a resolved one
+                    // convicts the tool dispatch path.
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val r = rt2.evalNb(
+                            "(function(){ globalThis.__p8='submitting';" +
+                                "globalThis.__p8t0 = Date.now();" +
+                                "sofuu.chat.submit('Count to three in words', {onEvent: globalThis.__sofuu_push, noTools: true}).then(" +
+                                "function(v){ globalThis.__p8='RESOLVED '+JSON.stringify(v)+' ms='+(Date.now()-globalThis.__p8t0); }," +
+                                "function(e){ globalThis.__p8='REJECTED '+String(e&&e.message||e)+' ms='+(Date.now()-globalThis.__p8t0); });" +
+                                "return 'k'; })()"
+                        )
+                        log("probe8: ${r?.take(60) ?: "NULL"}")
+                    })
+                    Thread.sleep(20000)
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val st = rt2.evalNb("JSON.stringify((function(){ var s=(sofuu.chat&&sofuu.chat.state)?sofuu.chat.state():{}; return {p8: globalThis.__p8||'unset', streaming: s.streaming, steps: s.steps, tool: s.lastTool||null, err: s.lastError||null}; })())")
+                        log("probe8: T20 ${st?.take(220) ?: "NULL"}")
+                    })
+                    Thread.sleep(30000)
+                    mailbox.put(Runnable {
+                        val rt2 = bridge ?: return@Runnable
+                        val st = rt2.evalNb("JSON.stringify((function(){ var s=(sofuu.chat&&sofuu.chat.state)?sofuu.chat.state():{}; return {p8: globalThis.__p8||'unset', streaming: s.streaming, steps: s.steps, tool: s.lastTool||null, err: s.lastError||null}; })())")
+                        log("probe8: T50 ${st?.take(220) ?: "NULL"}")
                     })
                 } catch (_: InterruptedException) {
                 }
@@ -314,7 +384,13 @@ class SofuuEngine(
         if (errText != null || (ev?.length() ?: 0) > 0 || rc != lastSeenRc || pc != lastSeenPc ||
             now - lastBeaconMs > 2_000L
         ) {
-            log("drain: ev=${ev?.length() ?: 0} rp=${rp?.length() ?: 0} rc=$rc pc=$pc err=$errText raw=${raw.take(120)}")
+            // Full kinds list + pc/rc: the anatomy of the turn. Events were
+            // previously invisible behind the 120-char raw take, which is
+            // exactly how a missing 'start'/'done' could not be distinguished
+            // from a missing push.
+            val kinds = (0 until (ev?.length() ?: 0)).mapNotNull { ev?.optJSONObject(it)?.optString("kind") }
+            log("drain: n=${ev?.length() ?: 0} kinds=[${kinds.joinToString(",")}] rp=${rp?.length() ?: 0} rc=$rc pc=$pc err=$errText")
+            if (errText != null) log("drain: raw=${raw.take(400)}")
             lastSeenRc = rc
             lastSeenPc = pc
             lastBeaconMs = now

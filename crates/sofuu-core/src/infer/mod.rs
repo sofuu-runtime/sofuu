@@ -246,6 +246,13 @@ impl InferModel {
         }
     }
 
+    pub fn forward_speculative_head_item(&mut self, item_idx: usize, out_logits: &mut [f32]) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.forward_speculative_head_item(item_idx, out_logits),
+            _ => {}
+        }
+    }
+
     pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_embed(token, out_hidden),
@@ -700,7 +707,7 @@ impl InferEngine {
             None
         };
 
-        let mut spec_logits_buf = vec![0.0f32; 2 * vocab_size];
+        let mut spec_logits_buf = vec![0.0f32; vocab_size];
 
         let mut step = 0;
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
@@ -779,10 +786,10 @@ impl InferEngine {
                 // Evaluates [next_token, cand] in parallel in a single forward pass!
                 // Model weights are read from DRAM ONLY ONCE.
                 let batch = [next_token, cand];
-                self.model.forward_speculative_batch(&batch, cur_pos, &mut spec_logits_buf[0..2 * vocab_size]);
+                self.model.forward_speculative_batch(&batch, cur_pos, &mut spec_logits_buf);
 
                 // 1. Verify next_token's prediction
-                logits_buf.copy_from_slice(&spec_logits_buf[0..vocab_size]);
+                logits_buf.copy_from_slice(&spec_logits_buf);
                 let predicted = sampler.sample(&mut logits_buf, &history);
 
                 if predicted == cand {
@@ -832,8 +839,8 @@ impl InferEngine {
                     history.push(cand);
 
                     // Candidate was valid in slot cur_pos.
-                    // Sample continuation following cand from cand's logits:
-                    logits_buf.copy_from_slice(&spec_logits_buf[vocab_size..2 * vocab_size]);
+                    // Compute LM head for cand from already-normalized activations!
+                    self.model.forward_speculative_head_item(1, &mut logits_buf);
                     cur_token = sampler.sample(&mut logits_buf, &history);
                     cur_pos += 1;
                 } else {

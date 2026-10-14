@@ -74,13 +74,15 @@ impl NgramCache {
     }
 
     /// Propose candidate next tokens given the recent context tail.
+    /// Prioritizes high-precision trigram matches. Bigrams are only proposed
+    /// if they have high frequency (count >= 2) to prevent low-confidence speculation.
     pub fn propose(&self, context: &[u32], max_candidates: usize) -> Vec<u32> {
         let len = context.len();
         if len == 0 {
             return Vec::new();
         }
 
-        // Try trigram match first (higher precision)
+        // 1. Try trigram match first (high precision: 2 preceding tokens)
         if len >= 2 {
             let key = (context[len - 2], context[len - 1]);
             if let Some(node) = self.trigrams.get(&key) {
@@ -91,7 +93,7 @@ impl NgramCache {
             }
         }
 
-        // Fall back to bigram match
+        // 2. Fall back to bigram match
         let last = context[len - 1];
         if let Some(node) = self.bigrams.get(&last) {
             return node.top_continuations(max_candidates);

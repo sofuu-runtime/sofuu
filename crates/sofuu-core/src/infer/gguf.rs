@@ -39,6 +39,9 @@ pub struct TensorInfo {
 
 pub struct GgufFile {
     pub mmap: std::sync::Arc<MmapFile>,
+    /// Full file content in anonymous RSS (`SOFUU_RESIDENT_WEIGHTS=1`):
+    /// decode then never page-faults, at the cost of pinning ~model-size RAM.
+    pub resident: Option<Vec<u8>>,
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: HashMap<String, TensorInfo>,
@@ -46,8 +49,22 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
+    /// Bytes backing tensor offsets: the resident copy when enabled, else the mmap.
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.resident {
+            Some(v) => v,
+            None => self.mmap.as_slice(),
+        }
+    }
+
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let mmap = std::sync::Arc::new(MmapFile::open(path)?);
+        let path_ref = path.as_ref();
+        let mmap = std::sync::Arc::new(MmapFile::open(path_ref)?);
+        let resident = if std::env::var("SOFUU_RESIDENT_WEIGHTS").as_deref() == Ok("1") {
+            Some(std::fs::read(path_ref)?)
+        } else {
+            None
+        };
         let bytes = mmap.as_slice();
         let mut r = ByteReader::new(bytes);
 
@@ -118,6 +135,7 @@ impl GgufFile {
         let data_offset = (current_pos + alignment - 1) & !(alignment - 1);
 
         Ok(Self {
+            resident,
             mmap,
             version,
             metadata,

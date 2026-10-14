@@ -30,6 +30,8 @@ const PTQ1_0_BLOCK_VALUES: usize = 128;
 /// Minimum row·input product (MACs) before a PTQ1_0 GEMV/GEMM fans out to
 /// threads; below it the single-thread path is cheaper than spawning.
 const PAR_MAC_THRESHOLD: usize = 2_000_000;
+/// One 128-value PTQ1_0 block on the wire: 24B qs + 2B qh + 2B f16 scale.
+const PTQ1_0_ROW_BLOCK_BYTES: usize = 28;
 /// f32 byte budget of one thread's dequantized row slab in the batched GEMM.
 /// Measured on 6P+4E Apple Silicon: 8 MB beats 1 MB (act streams beat slab
 /// streaming); the slab is dequantize-once per row, so this only sets the
@@ -443,6 +445,105 @@ unsafe fn sdot_128_neon(w: *const i8, a: *const i8) -> i32 {
     vaddvq_s32(acc)
 }
 
+/// File-direct band dot for one packed PTQ1_0 block (24B qs + 2B qh + 2B f16
+/// scale): the mixed-radix trits are expanded in NEON digit-planes and fed
+/// straight into `sdot` against the activation band — no i8 slab round-trip.
+/// The band's integer sum is order-independent (|iacc| <= 127*128 << 2^31),
+/// so this yields the same i32 as `sdot_group` on the dequantized row.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn packed_block_dot_t143(block: *const u8, mut aq_band: *const i8) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let qs0 = vld1q_u8(block); // qs bytes [0..16) => o = n*16+m, m in 0..16
+        let mut acc = vdupq_n_s32(0);
+        let mut r = qs0; // r holds byte * 3^n (mod 256)
+        for _n in 0..5u32 {
+            // Expand both 8-lane halves: t = ((r16 * 3) >> 8) - 1 in u16,
+            // saturate-narrowed to u8 (255 == -1 as i8).
+            let lo = vmulq_u8(r, vdupq_n_u8(1)); // no-op split for clarity below
+            let r_lo = vget_low_u8(lo);
+            let r_hi = vget_high_u8(lo);
+            let w16_lo = vshrq_n_u16(vmulq_u16(vmovl_u8(r_lo), vdupq_n_u16(3)), 8);
+            let w16_hi = vshrq_n_u16(vmulq_u16(vmovl_u8(r_hi), vdupq_n_u16(3)), 8);
+            let t_lo = vqmovn_u16(vsubq_u16(w16_lo, vdupq_n_u16(1)));
+            let t_hi = vqmovn_u16(vsubq_u16(w16_hi, vdupq_n_u16(1)));
+            let wv = vcombine_s8(vreinterpret_s8_u8(t_lo), vreinterpret_s8_u8(t_hi));
+            let av = vld1q_s8(aq_band);
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {wv:v}.16b, {av:v}.16b",
+                acc = inout(vreg) acc,
+                wv = in(vreg) wv,
+                av = in(vreg) av,
+                options(pure, nomem, nostack)
+            );
+            r = vmulq_u8(r, vdupq_n_u8(3)); // advance mixed-radix digit
+            aq_band = aq_band.add(16);
+        }
+        // qs bytes [16..24): 8 lanes => o = 80 + n*8 + m, m in 0..8.
+        // Zero-extend the 8-lane planes to 16 so `sdot` still applies.
+        let qs1 = vld1_u8(block.add(16));
+        let mut r2 = qs1;
+        let zeros_u8 = vdup_n_u8(0);
+        for _n in 0..5u32 {
+            let r_lo2 = vmul_u8(r2, vdup_n_u8(1));
+            let w16 = vshrq_n_u16(vmulq_u16(vmovl_u8(r_lo2), vdupq_n_u16(3)), 8);
+            let t8 = vqmovn_u16(vsubq_u16(w16, vdupq_n_u16(1)));
+            let wv8 = vreinterpret_s8_u8(t8);
+            let av8 = vld1_s8(aq_band);
+            let wv = vcombine_s8(wv8, vreinterpret_s8_u8(zeros_u8));
+            let av = vcombine_s8(av8, vreinterpret_s8_u8(zeros_u8));
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {wv:v}.16b, {av:v}.16b",
+                acc = inout(vreg) acc,
+                wv = in(vreg) wv,
+                av = in(vreg) av,
+                options(pure, nomem, nostack)
+            );
+            r2 = vmul_u8(r2, vdup_n_u8(3));
+            aq_band = aq_band.add(8);
+        }
+        // qh: 2 bytes x 4 digits => o = 120 + n*2 + h.
+        let mut acc_i = vaddvq_s32(acc);
+        for n in 0..4usize {
+            for h in 0..2usize {
+                let b = block.add(24 + h).read();
+                let q = b.wrapping_mul(POW3_PACKET[n]);
+                let xi = ((q as u16) * 3) >> 8;
+                let t = (xi as i16 - 1) as i8;
+                acc_i += t as i32 * aq_band.read() as i32;
+                aq_band = aq_band.add(1);
+            }
+        }
+        acc_i
+    }
+}
+
+const POW3_PACKET: [u8; 4] = [1, 3, 9, 27];
+
+/// Whole-row file-direct dot over packed blocks. Fold mirrors
+/// `trit_row_dot_q` exactly (wscale * ascale * iacc as f32), and the block
+/// scale is read from the block's trailing f16 — the same value
+/// `dequant_trits_i8` would produce — so results are bit-identical.
+#[cfg(target_arch = "aarch64")]
+unsafe fn packed_row_dot_t143(row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -> f32 {
+    let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+    debug_assert_eq!(row.len(), blocks * PTQ1_0_ROW_BLOCK_BYTES);
+    let mut acc = 0.0f32;
+    for c in 0..blocks {
+        let blk = &row[c * 28..c * 28 + 28];
+        let scale = f16_to_f32(u16::from_le_bytes([blk[26], blk[27]]));
+        let iacc = unsafe {
+            packed_block_dot_t143(
+                blk.as_ptr(),
+                aq.q[arow * n_in + c * PTQ1_0_BLOCK_VALUES..].as_ptr(),
+            )
+        };
+        acc += scale * aq.scales[arow * blocks + c] * iacc as f32;
+    }
+    acc
+}
+
 /// A token activation set quantized per PTQ1_0 band: `q[row * n_in + i]` is
 /// the signed int8 code, `scales[row * blocks + c] = band_absmax / 127`.
 struct ActQ {
@@ -571,12 +672,8 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
     };
     if threads <= 1 {
         if use_sdot {
-            let mut trits = vec![0i8; n_in];
-            let mut rowd = vec![0.0f32; blocks];
-            let act = &act[..n_in];
             for (r, o) in out.iter_mut().enumerate() {
-                dequant_trits_i8(m.row_slice(data, r), &mut trits, &mut rowd);
-                *o = trit_row_dot_q(&trits, &rowd, &aq, 0, n_in);
+                *o = unsafe { packed_row_dot_t143(m.row_slice(data, r), &aq, 0, n_in) };
             }
             return;
         }
@@ -601,15 +698,17 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
             let rows = r0;
             let aq_ref = &aq;
             scope.spawn(move || {
+                if use_sdot {
+                    for (i, o) in chunk.iter_mut().enumerate() {
+                        *o = unsafe { packed_row_dot_t143(m.row_slice(data, rows + i), aq_ref, 0, n_in) };
+                    }
+                    return;
+                }
                 let mut trits = vec![0i8; n_in];
                 let mut rowd = vec![0.0f32; blocks];
                 for (i, o) in chunk.iter_mut().enumerate() {
                     dequant_trits_i8(m.row_slice(data, rows + i), &mut trits, &mut rowd);
-                    *o = if use_sdot {
-                        trit_row_dot_q(&trits, &rowd, aq_ref, 0, n_in)
-                    } else {
-                        trit_row_dot(&trits, &rowd, act)
-                    };
+                    *o = trit_row_dot(&trits, &rowd, act);
                 }
             });
             r0 += take;
@@ -1269,7 +1368,7 @@ impl Qwen35Model {
     fn embed_token(&mut self, token: u32) {
         let dim = self.config.dim;
         let t = (token as usize).min(self.embd.n_out.saturating_sub(1));
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         let row = self.embd.row_slice(data, t);
         ptq1_0_dequant_row(row, &mut self.rowbuf[..dim]);
         match self.embd.xform {
@@ -1311,7 +1410,7 @@ impl Qwen35Model {
             (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         gemv_t143(data, qkv_mat, &prep, &mut self.qkv);
         gemv_t143(data, gate_mat, &prep, &mut self.zg);
         gemv_f32(alpha, dim, &self.hbuf, &mut self.g48a);
@@ -1371,7 +1470,7 @@ impl Qwen35Model {
 
         // ssm_out fold: GDN perm first, then signs+hadamard, then gemv.
         gdn_perm(&mut self.prep_mid, &self.gdn_out);
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         match (out_mat.sign_idx(), &self.signs) {
             (Some(i), table) => hadamard_prep_in_place(&mut self.prep_mid, &table[i].1),
             _ => {}
@@ -1398,7 +1497,7 @@ impl Qwen35Model {
             (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         gemv_t143(data, q_mat, &prep, &mut self.qg);
         gemv_t143(data, k_mat, &prep, &mut self.kh);
         gemv_t143(data, v_mat, &prep, &mut self.vh);
@@ -1470,7 +1569,7 @@ impl Qwen35Model {
             (Some(i), table) => hadamard_prep_in_place(&mut self.attn3, &table[i].1),
             _ => {}
         }
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         gemv_t143(data, o_mat, &self.attn3, &mut self.mix_out);
     }
 
@@ -1520,7 +1619,7 @@ impl Qwen35Model {
                     (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
                     _ => prep.copy_from_slice(&self.hbuf),
                 }
-                let data = self.gguf.mmap.as_slice();
+                let data = self.gguf.as_bytes();
                 gemv_t143(data, &self.layers[li].ffn_gate, &prep, &mut self.ffn_g);
                 gemv_t143(data, &self.layers[li].ffn_up, &prep, &mut self.ffn_u);
                 self.prep512 = prep;
@@ -1535,7 +1634,7 @@ impl Qwen35Model {
                     (Some(i), table) => hadamard_prep(&mut prep, &self.ffn_g, &table[i].1),
                     _ => prep.copy_from_slice(&self.ffn_g),
                 }
-                let data = self.gguf.mmap.as_slice();
+                let data = self.gguf.as_bytes();
                 gemv_t143(data, &self.layers[li].ffn_down, &prep, &mut self.mix_out);
                 self.prep_ff = prep;
             }
@@ -1550,7 +1649,7 @@ impl Qwen35Model {
                 (Some(i), table) => hadamard_prep_in_place(&mut self.x, &table[i].1),
                 _ => {}
             }
-            let data = self.gguf.mmap.as_slice();
+            let data = self.gguf.as_bytes();
             gemv_t143(data, &self.output, &self.x, &mut self.logits);
         }
 
@@ -1672,7 +1771,7 @@ impl Qwen35Model {
         let mut scores = vec![0.0f32; max_seq];
         let mut escratch = vec![0.0f32; dim];
 
-        let data = self.gguf.mmap.as_slice();
+        let data = self.gguf.as_bytes();
         for (t, &tok) in tokens.iter().enumerate() {
             let tid = (tok as usize).min(self.embd.n_out.saturating_sub(1));
             let row = self.embd.row_slice(data, tid);
@@ -1948,6 +2047,48 @@ mod tests {
 
     /// The Hadamard side of the fold must compute exactly the specified
     /// normalized Sylvester WH: H[i][j] = (±1)^popcount(i&j) / sqrt(1024).
+    #[test]
+    fn packed_row_dot_bitmatches_dequant_sdot_path() {
+        // Random packed PTQ1_0 rows (f16 scales set to values that survive
+        // f32 folding) must produce bit-identical dots to the
+        // dequantize-then-sdot reference, because per-band integer sums are
+        // exact regardless of accumulation order.
+        let blocks = 7usize;
+        let n_in = blocks * PTQ1_0_BLOCK_VALUES;
+        let mut row = vec![0u8; blocks * PTQ1_0_ROW_BLOCK_BYTES];
+        let mut state = 987654321u64;
+        let mut rand = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for c in 0..blocks {
+            let base = c * PTQ1_0_ROW_BLOCK_BYTES;
+            for b in 0..26 {
+                row[base + b] = rand();
+            }
+            // Scale f16 = 0x3C00 (1.0): int sums stay exactly representable.
+            row[base + 26] = 0x00;
+            row[base + 27] = 0x3C;
+        }
+        let acts: Vec<f32> = (0..n_in)
+            .map(|i| (((i * 37 % 201) as f32) - 100.0) / 50.0)
+            .collect();
+        let aq = quantize_acts(&acts, 1, n_in, blocks);
+
+        let mut trits = vec![0i8; n_in];
+        let mut rowd = vec![0.0f32; blocks];
+        dequant_trits_i8(&row, &mut trits, &mut rowd);
+        let ref_dot = trit_row_dot_q(&trits, &rowd, &aq, 0, n_in);
+        let packed_dot = unsafe { packed_row_dot_t143(&row, &aq, 0, n_in) };
+        assert_eq!(
+            ref_dot.to_bits(),
+            packed_dot.to_bits(),
+            "packed dot {packed_dot} != dequant+sdot reference {ref_dot}"
+        );
+    }
+
     #[test]
     fn wht_matches_sylvester_hadamard_matrix() {
         let n = HAD_BLOCK;

@@ -4,6 +4,24 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-14 — B3.5 complete: channel lifecycle dedup (the brain roadmap is now B0–B3 done).**
+> The SEM2 sibling channel is a DERIVED index over the canonical records and no longer runs its own
+> decay or retain. New cross-store binding `cma.retainAgainst(canonical)` (aliasing-guarded; renumbers
+> exactly like `retain()`) prunes the sibling to the canonical live set by text at the turn boundary,
+> once the canonical store has pruned or consolidated. One decay, one prune — the two channels can no
+> longer disagree about which memories exist, the drift the audit flagged (each channel decayed
+> independently and could keep a memory the other had dropped). **Honest scope:** the two VECTORS
+> cannot be deduped — a 768-dim hash vector and a 64-dim semantic vector are different spaces and both
+> are needed for the two search channels; what is deduped is the lifecycle (the duplicated per-turn
+> decay/retain work and the drift it produced). Evidence:
+> `retain_against_prunes_the_sibling_to_the_canonical_set` + two core tests, and a live probe through
+> real agent turns (a record forgotten in the canonical store is still in the sibling before the turn
+> boundary and gone after it, live sets identical). Full suite **526/0** in both QTSQ-enabled and
+> QTSQ-free builds; the agent battery and the 30/30 memory suite stay green. **Note:**
+> `tests/abi_script_test.js` fails on `sofuu_rt_eval_nb` — an ABI symbol added by another agent's
+> committed work without a `scripts/abi_symbols.txt` baseline bump; unrelated to this change (no C ABI
+> surface was touched).
+>
 > **2026-10-13 — PLAN-EMBED-SDK E3: the Metal engine runs on iOS, and the frameworks ship its kernels.**
 > `crates/sofuu-ffi/build.rs` now compiles `src/metal/metal_engine.mm` for `ios` as well as `macos`, and
 > the 97 `#[cfg(target_os = "macos")]` gates in the inference engine (`lfm2.rs`, `block_graph.rs`,
@@ -2901,3 +2919,40 @@ Scope: the embeddable SDK's local-inference and host-tool surface. Files:
 - ⬜ **Remaining:** docs, math, science, search, code are queued on
   `run_chain.sh`. None of them can reach 10M pairs from these corpora; targets
   are set to measured yield and the card reports only what is on disk.
+
+## 2026-10-13 — emb-m dataset v1: docs, legal, science, code, math published
+
+Five more datasets landed on Kaggle (`xyhcucci`, all private, all QA-passed):
+
+| dataset | documents | pairs | notes |
+|---|---|---|---|
+| `sofuu-embed-memory-v1` | 46,464,098 | 9,441,628 | synthetic trap families, CC0 |
+| `sofuu-embed-docs-v1` | 69,516 | 159,628 | 22 of 23 repos passed the license gate |
+| `sofuu-embed-science-v1` | 20,325 | 60,168 | Europe PMC; 9,942 NC/SA/ND records rejected |
+| `sofuu-embed-math-v1` | 79,987 | 30,973 | OpenWebMath definition mining |
+| `sofuu-embed-legal-v1` | 8,629 | 3,918 | CUAD only; EDGAR 403s this host |
+| `sofuu-embed-code-v1` | 9,537 | 40,156 | first pass; superseded by a larger run |
+
+- **The QA gate earned its keep twice.** Science and math both shipped a first
+  build that the gate refused: science had **91,260** cross-split references and
+  math had **49,313**. Root cause in both was hard negatives drawn from a pool
+  that ignored the positive's split — science from a journal window, math from a
+  batch spanning many source URLs while the split is derived per URL. Fixed by
+  partitioning the negative pool on the positive's split. Search carried the
+  same latent bug (an arbitrary id window) and was fixed before it ran.
+  **A dataset that leaks eval into train cannot be detected by looking at it.**
+- **Science license gate observed rejecting** `cc-by-nc` 4,658, `cc-by-nc-nd`
+  5,060, `cc-by-nc-sa` 146, `cc-by-nd` 76, `cc-by-sa` 2 — ~9,942 records kept
+  out by the register's per-record rule.
+- **Code crawl was throttled to 115 repos**, not the 8,000 configured: the rate
+  limit was polled on every page, doubling API cost and pushing past GitHub's
+  unauthenticated 10 req/min search limit. Cached the check for 60 s and slowed
+  the page cadence to 6.5 s; a larger pass is queued.
+- **Two more of my own bugs, both caught by gates rather than review:** the math
+  shard walk excluded the very OpenWebMath files it was meant to read
+  (`"openwebmath" not in root`), and `gen_docs_from_definitions` had four
+  required parameters against a two-argument call.
+- ⬜ **Still queued:** a larger `code` pass, and `search` is running.
+- ⬜ **Honest ceiling:** no domain except memory approaches 10M pairs. These
+  corpora yield what they yield; targets are set to measured output and every
+  card reports counts read off disk, never a target restated as a result.

@@ -1615,7 +1615,14 @@ Deployment shape (faithful mirror of the graded §11 fused pipeline):
   at 2 inside the first 5 slots (graded rule, `agent.js` `fuseRecall`).
 - Writes mirror byte-identical clipped text to both stores (text is the
   cross-channel join key); markPositive splits by contributing channel;
-  decay/retain run on both; consolidation runs on the hash store only.
+  consolidation runs on the hash store only. **Lifecycle (B3.5, 2026-10-14):
+  the sibling no longer decays or retains on its own** — it is a derived
+  index over the canonical records, so at the turn boundary, once the
+  canonical store has pruned (or consolidated), the sibling is pruned to
+  the same live set by text (`cma.retainAgainst(canonical)`). One decay,
+  one prune, and the two channels can never disagree about which memories
+  exist (previously each decayed independently and could keep a memory the
+  other had dropped).
 - Fallback is real: probe/embed/open failure of v2 ⇒ channel absent ⇒
   hash-only, never memory-off.  `SOFUU_MEMORY_BACKEND=hash` forces it.
 

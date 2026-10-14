@@ -56,6 +56,23 @@
 > Anomaly flagged for the liquid peer: liquid-350 BF16 battery decode now EOS at token 1
 > (was 80 tokens @ 5.4); prefill jumped 16 → 44 t/s — safetensors path, no q4_K involvement.
 
+> **2026-10-14 — Mac CPU: prefill Phase 1 glue fusion shipped — liquid-1.3B 47.8 → 72.1 tk/s (calm); gemm is now ~90% of prefill wall.**
+> Phase 1 of `docs/PLAN-CPU-PREFILL-PEAK.md` (`19c0c61d2`): (1) gate+up run as ONE paired
+> panel sweep (`gemm_pair_batched`) — x is streamed once per row-pair instead of once per
+> matrix, one pool dispatch less, same 4×4 register tile on both halves; (2) the attention
+> segment (575 ms serial @200 tok) split into two parallel phases — prep (head norms + RoPE +
+> KV write) then mix (attention) — **required a barrier**: the serial loop read cache columns
+> earlier same-batch tokens had just written, so fusing prep+mix races the cache; (3) row
+> panels 16→32. Kernel scaling confirmed perfect (493 GFLOP/s @6T), so gemm now runs at
+> ~88-92% of that in-model (1195 ms of a 2772 ms prefill profile, wall −36%); all remaining
+> glue (rms 14, add 25, swiglu 36, conv 57, attn 95 ms + ~190 ms alloc/dispatch) is env-gated
+> profiled via `SOFUU_LFM2_PROF`. Correctness: batched-vs-per-token gates pass on bf16+mlx4,
+> suite 571/0. Receipts: 72.1 tk/s calm (load ~5); 52.8 tk/s at peer load 24 (3.59× the
+> per-token path there — batching is load-resilient). One Phase-1 lesson: the missing `ri`
+> row-tile loop in the first pair cut half the rows silent — the bf16 gate caught it, and the
+> gates keep earning their keep. Next per plan: Phase 2 (int8 activations) when the
+> developer says go.
+
 > **2026-10-14 — Mac CPU: PTQ1_0 27B decode 10× — file-direct packed trit dot + opt-in weight residency (0.1 → 0.7-1.0 tk/s); sample-first, not grep-first.**
 > Decode was 7-11 s/token. Two compounding causes, found by sampling the live process (not
 > by reading code): the GEMV dequantized every row into an i8 slab per token (27 GB of slab

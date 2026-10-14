@@ -522,6 +522,8 @@ extern "C" {
         sliding_window: usize,
         sink_tokens: usize,
     );
+    fn sofuu_test_attention_x4_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
+    fn sofuu_test_rope_table_parity(n_heads: i32, head_dim: i32, max_pos: i32) -> i32;
     fn sofuu_tree_rope(
         q_batch: *mut f32,
         k_batch: *mut f32,
@@ -988,28 +990,40 @@ pub fn batched_attention_ext(
     n_kv_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
-    sliding_window: usize,
-    sink_tokens: usize,
-) {
-    let _prof = prof::Scope::new(&prof::ATTN_NS, &prof::ATTN_CALLS);
-    unsafe {
-        sofuu_batched_attention_ext(
-            q_batch.as_ptr(),
-            k_cache.as_ptr(),
-            v_cache.as_ptr(),
-            head_out_batch.as_mut_ptr(),
-            b_size,
-            start_pos,
-            layer_idx,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            sliding_window,
-            sink_tokens,
-        );
+        sliding_window: usize,
+        sink_tokens: usize,
+    ) {
+        let _prof = prof::Scope::new(&prof::ATTN_NS, &prof::ATTN_CALLS);
+        unsafe {
+            sofuu_batched_attention_ext(
+                q_batch.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                head_out_batch.as_mut_ptr(),
+                b_size,
+                start_pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                sliding_window,
+                sink_tokens,
+            );
+        }
     }
-}
+
+    /// Bit-parity gate for the x4-position attention inner loops vs the
+    /// original per-position dot/mad path. Returns 0 when outputs match.
+    pub fn attention_x4_parity(n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> i32 {
+        unsafe { sofuu_test_attention_x4_parity(n_heads as i32, n_kv_heads as i32, head_dim as i32, max_seq as i32) }
+    }
+
+    /// Bit-parity gate for the RoPE sincos table vs the inline
+    /// powf/cosf/sinf computation. Returns 0 when outputs match.
+    pub fn rope_table_parity(n_heads: usize, head_dim: usize, max_pos: usize) -> i32 {
+        unsafe { sofuu_test_rope_table_parity(n_heads as i32, head_dim as i32, max_pos as i32) }
+    }
 
 /// Multi-path speculative tree attention across historical KV cache plus candidate tree nodes.
 #[allow(clippy::too_many_arguments)]
@@ -1289,6 +1303,7 @@ pub fn batched_rmsnorm(
     cols: usize,
     eps: f32,
 ) {
+    let _p = prof::Scope::new(&prof::NORM_NS, &prof::NORM_CALLS);
     debug_assert_eq!(out.len(), rows * cols);
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(weight.len(), cols);
@@ -1300,6 +1315,7 @@ pub fn batched_rmsnorm(
 /// Batched in-place RMSNorm (single buffer, aliased through the kernel).
 #[inline]
 pub fn batched_rmsnorm_in_place(x: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+    let _p = prof::Scope::new(&prof::NORM_NS, &prof::NORM_CALLS);
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(weight.len(), cols);
     unsafe {
@@ -1322,6 +1338,7 @@ pub fn batched_mad(dst: &mut [f32], src: &[f32], alpha: f32, rows: usize, cols: 
 /// Batched per-row bias add: `x[r][c] += bias[c]`.
 #[inline]
 pub fn batched_add_bias(x: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(bias.len(), cols);
     unsafe {
@@ -1332,6 +1349,7 @@ pub fn batched_add_bias(x: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
 /// Batched in-place SwiGLU over `rows` rows of `cols` floats.
 #[inline]
 pub fn batched_swiglu(gate: &mut [f32], up: &[f32], rows: usize, cols: usize) {
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     debug_assert_eq!(gate.len(), rows * cols);
     debug_assert_eq!(up.len(), rows * cols);
     unsafe {
@@ -1358,6 +1376,7 @@ pub fn batched_rope_kv(
     freq_base: f32,
     rope_mode: i32,
 ) {
+    let _p = prof::Scope::new(&prof::ROPE_NS, &prof::ROPE_CALLS);
     unsafe {
         sofuu_batched_rope_kv(
             q_batch.as_mut_ptr(),
@@ -2133,6 +2152,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The x4-position attention inner loops (QK dot + weighted V sum) must be
+    /// bit-identical to the original per-position loops — covers plain, SWA,
+    /// and SWA-with-sinks shapes (the C harness runs 6 configs per call).
+    #[test]
+    fn test_attention_x4_bit_exact() {
+        assert_eq!(attention_x4_parity(4, 2, 32, 64), 0, "small SWA shapes diverged");
+        assert_eq!(attention_x4_parity(16, 8, 128, 256), 0, "Qwen3-0.6B attention shapes diverged");
+        assert_eq!(attention_x4_parity(6, 2, 48, 100), 0, "odd head_dim/seq shapes diverged");
+    }
+
+    /// The RoPE sincos table must be bit-identical to the inline
+    /// powf/cosf/sinf path across both RoPE styles and freq bases.
+    #[test]
+    fn test_rope_table_bit_exact() {
+        assert_eq!(rope_table_parity(4, 32, 64), 0, "small rope shapes diverged");
+        assert_eq!(rope_table_parity(16, 128, 264), 0, "Qwen3-0.6B rope shapes diverged");
     }
 
     #[test]

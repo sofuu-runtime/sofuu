@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single ≤5 MB binary (4.4 MB shipped). Zero daemons, zero external deps.*
+> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single < 5 MB binary (4.0 MB stripped release). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()

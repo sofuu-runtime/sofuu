@@ -9,7 +9,7 @@
 The Sofuu Inference Engine (`crates/sofuu-core/src/infer/`, `src/simd/`, and `src/metal/`) is an in-process, zero-dependency LLM execution subsystem built directly into the runtime binary. It eliminates the need for separate inference daemons (Ollama, vLLM, llama-server) and heavy runtime dependencies (Python, Docker, CUDA toolkits).
 
 It delivers:
-* **Strict Binary Footprint**: Shipped inside a **4.4 MB** stripped binary (strictly $\le 5.0\text{ MB}$ ceiling).
+* **Strict Binary Footprint**: Shipped inside a **4.0 MB** stripped binary (strictly $< 5.0\text{ MB}$ ceiling).
 * **Instant Cold Load**: Zero-copy memory-mapped tensor tables load models in **17–38 ms**.
 * **Universal Multi-Format Support**: Ingests **GGUF**, **SafeTensors**, **PyTorch checkpoints (`.pt` / `.pth` / `.bin`)**, and **NumPy arrays (`.npy` / `.npz`)** directly with zero Python and zero file conversion.
 * **Universal Architecture Generalization**: A composable block graph dynamically executing any edge model (LLaMA, Qwen, SmolLM, Mistral, Gemma 1/2, Phi-3/4, Liquid LFM-2, and Edge MoE).

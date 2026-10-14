@@ -17,6 +17,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstdio>
+#include <memory>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -2784,15 +2785,146 @@ void sofuu_softmax(float *scores, size_t n) {
 }
 
 // ── Rotary Position Embedding (RoPE - NEOX / Qwen / LLaMA style) ─────
+// RoPE recomputed 1/powf(freq_base, 2i/hd) + cosf + sinf per head per element
+// — ~10M powf + 20M sincos for a 234-token Qwen prefill (~27% of prefill wall
+// inside the profiler's "other" bucket). The table caches freq per
+// (half_dim, freq_base) and cos/sin per (pos, i), computed with the exact
+// same libm calls on the exact same float arguments ((float)pos * freq), so
+// rotation results — and the model's logits — are bit-identical. Tables are
+// shared across q/k heads and layers; rows fill lazily and never move, and a
+// grow copies the valid prefix into a fresh larger table (kept alive in the
+// list), so concurrent readers stay safe.
+struct sofuu_rope_table {
+    size_t half_dim = 0;
+    float  freq_base = 0.0f;
+    uint32_t fb_bits = 0;
+    std::vector<float> freqs;   // half_dim
+    std::vector<float> coss;    // cap * half_dim, rows [0, filled) valid
+    std::vector<float> sins;
+    size_t cap = 0;
+    size_t filled = 0;
+};
+static std::mutex g_rope_tables_mutex;
+// Exactly one LIVE table per (half_dim, freq_base) key. Retired tables are
+// parked (never freed) for readers that still hold their row pointers.
+static std::vector<std::shared_ptr<sofuu_rope_table>> g_rope_live;
+static std::vector<std::shared_ptr<sofuu_rope_table>> g_rope_retired;
+
+static uint32_t sofuu_float_bits(float f) {
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    return b;
+}
+
+static void sofuu_rope_fill_rows(sofuu_rope_table *t, size_t from, size_t to) {
+    const size_t hd = t->half_dim;
+    for (size_t pos = from; pos < to; ++pos) {
+        float *c = t->coss.data() + pos * hd;
+        float *s = t->sins.data() + pos * hd;
+        for (size_t i = 0; i < hd; ++i) {
+            const float theta = (float)pos * t->freqs[i];
+            c[i] = cosf(theta);
+            s[i] = sinf(theta);
+        }
+    }
+    t->filled = to;
+}
+
+// Returns cos/sin rows for `pos`; fills the table up to pos+margin as needed.
+// Returned pointers stay valid for the duration of the call.
+static void sofuu_rope_lookup(size_t half_dim, float freq_base, size_t pos,
+                              const float ** cos_row, const float ** sin_row) {
+    const bool rope_debug = getenv("SOFUU_ROPE_DEBUG") != nullptr;
+    static std::atomic<uint64_t> dbg_calls{0};
+    std::lock_guard<std::mutex> lk(g_rope_tables_mutex);
+    const uint32_t fb = sofuu_float_bits(freq_base);
+    size_t live_idx = (size_t)-1;
+    for (size_t i = 0; i < g_rope_live.size(); ++i) {
+        if (g_rope_live[i]->half_dim == half_dim && g_rope_live[i]->fb_bits == fb) {
+            live_idx = i;
+            break;
+        }
+    }
+    if (live_idx == (size_t)-1) {
+        auto t = std::make_shared<sofuu_rope_table>();
+        t->half_dim = half_dim;
+        t->freq_base = freq_base;
+        t->fb_bits = fb;
+        t->freqs.resize(half_dim);
+        for (size_t i = 0; i < half_dim; ++i) {
+            t->freqs[i] = 1.0f / powf(freq_base, (float)(2 * i) / (float)(half_dim * 2));
+        }
+        t->cap = pos + pos / 2 + 1024;
+        t->coss.resize(t->cap * half_dim);
+        t->sins.resize(t->cap * half_dim);
+        live_idx = g_rope_live.size();
+        g_rope_live.push_back(std::move(t));
+    }
+    sofuu_rope_table * fit = g_rope_live[live_idx].get();
+    size_t grew = 0;
+    if (pos >= fit->cap) {
+        // Grow: copy the valid prefix into a fresh, larger table. The old one
+        // is parked (kept alive) for any reader still holding its rows.
+        auto t = std::make_shared<sofuu_rope_table>();
+        t->half_dim = fit->half_dim;
+        t->freq_base = fit->freq_base;
+        t->fb_bits = fit->fb_bits;
+        t->freqs = fit->freqs;
+        t->cap = pos + pos / 2 + 1024;
+        t->coss.resize(t->cap * half_dim);
+        t->sins.resize(t->cap * half_dim);
+        if (fit->filled > 0) {
+            memcpy(t->coss.data(), fit->coss.data(), fit->filled * half_dim * sizeof(float));
+            memcpy(t->sins.data(), fit->sins.data(), fit->filled * half_dim * sizeof(float));
+            t->filled = fit->filled;
+        }
+        g_rope_retired.push_back(std::move(g_rope_live[live_idx]));
+        fit = t.get();
+        g_rope_live[live_idx] = std::move(t);
+        grew = 1;
+    }
+    const size_t want = pos + 1;
+    size_t did_fill = 0;
+    if (want > fit->filled) {
+        const size_t to = std::min(fit->cap, want + 256);
+        const size_t from = fit->filled;
+        sofuu_rope_fill_rows(fit, from, to);
+        did_fill = to - from;
+    }
+    if (rope_debug) {
+        const uint64_t n = dbg_calls.fetch_add(1, std::memory_order_relaxed);
+        if (n < 40 || n % 20000 == 0) {
+            fprintf(stderr, "[rope-dbg] call %llu: pos=%zu hd=%zu live=%zu cap=%zu filled=%zu grew=%zu fill=%zu\n",
+                    (unsigned long long)n, pos, half_dim, g_rope_live.size(), fit->cap, fit->filled, grew, did_fill);
+        }
+    }
+    *cos_row = fit->coss.data() + pos * half_dim;
+    *sin_row = fit->sins.data() + pos * half_dim;
+}
+
 void sofuu_rope(float *vec, size_t n_heads, size_t head_dim, size_t pos, float freq_base, int rope_style) {
+    if (head_dim < 2) return;
     size_t half_dim = head_dim / 2;
+    static const bool no_rope_table = getenv("SOFUU_NO_ROPE_TABLE") != nullptr;
+    const float *cos_row = nullptr;
+    const float *sin_row = nullptr;
+    if (!no_rope_table) {
+        sofuu_rope_lookup(half_dim, freq_base, pos, &cos_row, &sin_row);
+    }
     for (size_t h = 0; h < n_heads; ++h) {
         float *head = vec + h * head_dim;
         for (size_t i = 0; i < half_dim; ++i) {
-            float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
-            float theta = (float)pos * freq;
-            float c = cosf(theta);
-            float s = sinf(theta);
+            float c;
+            float s;
+            if (cos_row) {
+                c = cos_row[i];
+                s = sin_row[i];
+            } else {
+                float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+                float theta = (float)pos * freq;
+                c = cosf(theta);
+                s = sinf(theta);
+            }
 
             if (rope_style == 1) {
                 // GGUF "normal" RoPE: consecutive head values form a pair.
@@ -2948,6 +3080,124 @@ void sofuu_vec_mad_f32(float *dst, const float *src, float scalar, size_t n) {
 #endif
 }
 
+// ── Attention QK/V inner loops, 4 positions per iteration ────────────
+// Prefill attention was per-position single dots/mads; batching 4 positions
+// keeps every per-position reduction chain identical to
+// sofuu_vec_dot_f32/sofuu_vec_mad_f32 (4 lanes × 16-float strides, in-order
+// position application), so results are bit-identical — the win is ILP (16
+// independent FMA chains) and one shared Q load / dst round-trip per strip.
+// K rows for a position range are contiguous (p·head_dim); `scores_out` are
+// dense over the range. SWA callers use two ranges (sink, window).
+static void sofuu_attn_qk_range(const float * __restrict q, const float * __restrict k_base,
+                                size_t k_stride, size_t head_dim, size_t p_begin, size_t count,
+                                float scale, float * __restrict scores_out) {
+#if defined(SOFUU_NEON)
+    // 2 positions × 4 lanes: same per-position reduction as sofuu_vec_dot_f32,
+    // 16-float strips shared by both K rows. 8 live accumulators avoids the
+    // register spilling that made a 4-position variant slower on A76.
+    size_t p = 0;
+    for (; p + 2 <= count; p += 2) {
+        const float *k0 = k_base + (p_begin + p) * k_stride;
+        const float *k1 = k_base + (p_begin + p + 1) * k_stride;
+        float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
+        float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
+        float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
+        float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t qv0 = vld1q_f32(q + i);
+            const float32x4_t qv1 = vld1q_f32(q + i + 4);
+            const float32x4_t qv2 = vld1q_f32(q + i + 8);
+            const float32x4_t qv3 = vld1q_f32(q + i + 12);
+            a0s0 = vfmaq_f32(a0s0, qv0, vld1q_f32(k0 + i));
+            a0s1 = vfmaq_f32(a0s1, qv1, vld1q_f32(k0 + i + 4));
+            a0s2 = vfmaq_f32(a0s2, qv2, vld1q_f32(k0 + i + 8));
+            a0s3 = vfmaq_f32(a0s3, qv3, vld1q_f32(k0 + i + 12));
+            a1s0 = vfmaq_f32(a1s0, qv0, vld1q_f32(k1 + i));
+            a1s1 = vfmaq_f32(a1s1, qv1, vld1q_f32(k1 + i + 4));
+            a1s2 = vfmaq_f32(a1s2, qv2, vld1q_f32(k1 + i + 8));
+            a1s3 = vfmaq_f32(a1s3, qv3, vld1q_f32(k1 + i + 12));
+        }
+        // Exactly the single-dot tail sequence per position: combine the four
+        // lanes, continue the 4-stride loop into the combined vector, vaddvq,
+        // then scalar tail.
+        float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+        float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t qv = vld1q_f32(q + j);
+            c0 = vfmaq_f32(c0, qv, vld1q_f32(k0 + j));
+            c1 = vfmaq_f32(c1, qv, vld1q_f32(k1 + j));
+        }
+        float t0 = vaddvq_f32(c0);
+        float t1 = vaddvq_f32(c1);
+        for (; j < head_dim; ++j) {
+            t0 += q[j] * k0[j];
+            t1 += q[j] * k1[j];
+        }
+        scores_out[p]     = t0 * scale;
+        scores_out[p + 1] = t1 * scale;
+    }
+    for (; p < count; ++p) {
+        scores_out[p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        scores_out[p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+    }
+#endif
+}
+
+static void sofuu_attn_vacc_range(float * __restrict out, const float * __restrict v_base,
+                                  size_t v_stride, size_t head_dim, size_t p_begin, size_t count,
+                                  const float * __restrict s) {
+#if defined(SOFUU_NEON)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t d0 = vld1q_f32(out + i);
+            float32x4_t d1 = vld1q_f32(out + i + 4);
+            float32x4_t d2 = vld1q_f32(out + i + 8);
+            float32x4_t d3 = vld1q_f32(out + i + 12);
+            for (int a = 0; a < 4; ++a) {
+                const float32x4_t sv   = vdupq_n_f32(s[p + a]);
+                const float *     vrow = v_base + (p_begin + p + a) * v_stride;
+                d0 = vmlaq_f32(d0, vld1q_f32(vrow + i), sv);
+                d1 = vmlaq_f32(d1, vld1q_f32(vrow + i + 4), sv);
+                d2 = vmlaq_f32(d2, vld1q_f32(vrow + i + 8), sv);
+                d3 = vmlaq_f32(d3, vld1q_f32(vrow + i + 12), sv);
+            }
+            vst1q_f32(out + i, d0);
+            vst1q_f32(out + i + 4, d1);
+            vst1q_f32(out + i + 8, d2);
+            vst1q_f32(out + i + 12, d3);
+        }
+        // Tail exactly like sofuu_vec_mad_f32 per position, positions in order.
+        for (int a = 0; a < 4; ++a) {
+            const float *     vrow = v_base + (p_begin + p + a) * v_stride;
+            const float32x4_t sv   = vdupq_n_f32(s[p + a]);
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                float32x4_t d = vld1q_f32(out + it);
+                d = vmlaq_f32(d, vld1q_f32(vrow + it), sv);
+                vst1q_f32(out + it, d);
+            }
+            for (; it < head_dim; ++it) {
+                out[it] += vrow[it] * s[p + a];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        sofuu_vec_mad_f32(out, v_base + (p_begin + p) * v_stride, s[p], head_dim);
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        sofuu_vec_mad_f32(out, v_base + (p_begin + p) * v_stride, s[p], head_dim);
+    }
+#endif
+}
+
 // ── Multi-core Parallel Attention with Sliding Window & Attention Sinks ──
 void sofuu_batched_attention_ext(
     const float *q_batch,
@@ -2994,40 +3244,29 @@ void sofuu_batched_attention_ext(
             if (sliding_window > 0 && seq_len > sliding_window) {
                 size_t window_start = seq_len - sliding_window;
                 size_t sink_end = (sink_tokens < window_start) ? sink_tokens : window_start;
-                size_t active_count = 0;
+                size_t active_count = sink_end + (seq_len - window_start);
 
-                for (size_t p = 0; p < sink_end; ++p) {
-                    scores[active_count++] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
-                }
-                for (size_t p = window_start; p < seq_len; ++p) {
-                    scores[active_count++] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
-                }
+                sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, 0, sink_end, inv_sqrt_head_dim, scores);
+                sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, window_start, seq_len - window_start,
+                                    inv_sqrt_head_dim, scores + sink_end);
 
                 sofuu_softmax(scores, active_count);
 
                 float *out_head = head_out_batch + b * q_dim + h * head_dim;
                 std::memset(out_head, 0, head_dim * sizeof(float));
 
-                size_t score_idx = 0;
-                for (size_t p = 0; p < sink_end; ++p) {
-                    sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[score_idx++], head_dim);
-                }
-                for (size_t p = window_start; p < seq_len; ++p) {
-                    sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[score_idx++], head_dim);
-                }
+                sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0, sink_end, scores);
+                sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, window_start, seq_len - window_start,
+                                      scores + sink_end);
             } else {
-                for (size_t p = 0; p < seq_len; ++p) {
-                    scores[p] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
-                }
+                sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, 0, seq_len, inv_sqrt_head_dim, scores);
 
                 sofuu_softmax(scores, seq_len);
 
                 float *out_head = head_out_batch + b * q_dim + h * head_dim;
                 std::memset(out_head, 0, head_dim * sizeof(float));
 
-                for (size_t p = 0; p < seq_len; ++p) {
-                    sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[p], head_dim);
-                }
+                sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0, seq_len, scores);
             }
         }
     };
@@ -3421,6 +3660,157 @@ extern "C" int sofuu_test_gemm_q4_k_plane_parity(int rows, int cols, int batch) 
     (void) rows; (void) cols; (void) batch;
     return 0;
 #endif
+}
+
+// ── Parity: the x4-position attention inner loops must be bit-identical to
+// the original per-position dot/mad/softmax loops. Deterministic fixtures,
+// several (batch, start, window, sinks) configs; compares full head_out_batch.
+static void sofuu_attn_ref_slot(const float *q_head, const float *k_past, const float *v_past,
+                                float *out_head, float *scores, size_t seq_len, size_t head_dim,
+                                float inv_sqrt_head_dim, size_t sliding_window, size_t sink_tokens) {
+    if (sliding_window > 0 && seq_len > sliding_window) {
+        size_t window_start = seq_len - sliding_window;
+        size_t sink_end = (sink_tokens < window_start) ? sink_tokens : window_start;
+        size_t active_count = 0;
+        for (size_t p = 0; p < sink_end; ++p)
+            scores[active_count++] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
+        for (size_t p = window_start; p < seq_len; ++p)
+            scores[active_count++] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
+        sofuu_softmax(scores, active_count);
+        std::memset(out_head, 0, head_dim * sizeof(float));
+        size_t score_idx = 0;
+        for (size_t p = 0; p < sink_end; ++p)
+            sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[score_idx++], head_dim);
+        for (size_t p = window_start; p < seq_len; ++p)
+            sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[score_idx++], head_dim);
+    } else {
+        for (size_t p = 0; p < seq_len; ++p)
+            scores[p] = sofuu_vec_dot_f32(q_head, k_past + p * head_dim, head_dim) * inv_sqrt_head_dim;
+        sofuu_softmax(scores, seq_len);
+        std::memset(out_head, 0, head_dim * sizeof(float));
+        for (size_t p = 0; p < seq_len; ++p)
+            sofuu_vec_mad_f32(out_head, v_past + p * head_dim, scores[p], head_dim);
+    }
+}
+
+// ── Parity: the RoPE sincos table must be bit-identical to the inline
+// powf/cosf/sinf computation across positions, styles and freq bases.
+extern "C" int sofuu_test_rope_table_parity(int n_heads, int head_dim, int max_pos) {
+    if (n_heads < 1 || head_dim < 4 || max_pos < 4) return -1;
+    std::vector<float> a((size_t)n_heads * head_dim), b((size_t)n_heads * head_dim);
+    const float bases[3] = {10000.0f, 500000.0f, 27.5f};
+    const int styles[2] = {0, 1};
+    uint32_t rng = 606;
+    for (int st = 0; st < 2; ++st) {
+        for (int bi = 0; bi < 3; ++bi) {
+            for (size_t i = 0; i < a.size(); ++i) {
+                rng = rng * 1664525u + 1013904223u;
+                a[i] = b[i] = ((int)(rng >> 8) % 2000 - 1000) / 128.0f;
+            }
+            for (int pos = 0; pos < max_pos; pos += 1) {
+                sofuu_rope(a.data(), (size_t)n_heads, (size_t)head_dim, (size_t)pos, bases[bi], styles[st]);
+                // reference: the original inline per-(head,i) computation
+                const size_t half_dim = (size_t)head_dim / 2;
+                for (size_t h = 0; h < (size_t)n_heads; ++h) {
+                    float *head = b.data() + h * (size_t)head_dim;
+                    for (size_t i = 0; i < half_dim; ++i) {
+                        float freq = 1.0f / powf(bases[bi], (float)(2 * i) / (float)head_dim);
+                        float theta = (float)pos * freq;
+                        float c = cosf(theta);
+                        float s = sinf(theta);
+                        if (styles[st] == 1) {
+                            size_t even = 2 * i, odd = even + 1;
+                            float v0 = head[even];
+                            float v1 = head[odd];
+                            head[even] = v0 * c - v1 * s;
+                            head[odd]  = v1 * c + v0 * s;
+                        } else {
+                            float v0 = head[i];
+                            float v1 = head[i + half_dim];
+                            head[i]            = v0 * c - v1 * s;
+                            head[i + half_dim] = v0 * s + v1 * c;
+                        }
+                    }
+                }
+                if (memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0) {
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        if (a[i] != b[i]) {
+                            fprintf(stderr, "[parity-rope] style=%d base=%g pos=%d: out[%zu] %.9g vs %.9g\n",
+                                    styles[st], bases[bi], pos, i, a[i], b[i]);
+                            return 1;
+                        }
+                    }
+                    return 2;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+extern "C" int sofuu_test_attention_x4_parity(int n_heads, int n_kv_heads, int head_dim, int max_seq) {    if (n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 32 || max_seq < 8) return -1;
+    const size_t H = (size_t)n_heads, KV = (size_t)n_kv_heads, HD = (size_t)head_dim;
+    const size_t rep = H / KV, qd = H * HD, kvd = KV * HD, ms = (size_t)max_seq;
+    std::vector<float> q(2 * qd), kc(ms * kvd), vc(ms * kvd), oref(2 * qd), onew(2 * qd);
+    struct Cfg { size_t b, start, window, sinks; };
+    const Cfg cfgs[] = {
+        {2, 0, 0, 0},
+        {2, ms - 3, 0, 0},
+        {2, ms - 3, 8, 3},
+        {2, ms - 7, 16, 2},
+        {1, ms - 1, ms / 2 + 1, 4},  // sink_end clipped by window_start
+        {2, 11, 5, 0},
+        {2, 13, 0, 0},
+    };
+    uint32_t rng = 777;
+    for (auto &v : q)  { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    for (auto &v : kc) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    for (auto &v : vc) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    std::vector<float> scores(ms + 16);
+    const float inv_sqrt = 1.0f / sqrtf((float)HD);
+    for (const Cfg &c : cfgs) {
+        for (size_t i = 0; i < oref.size(); ++i) { oref[i] = -1e30f; onew[i] = -1e30f; }
+        for (size_t b = 0; b < c.b; ++b) {
+            const size_t pos = c.start + b;
+            const size_t seq_len = (pos + 1 < ms) ? (pos + 1) : ms;
+            for (size_t h = 0; h < H; ++h) {
+                const size_t kv_h = h / rep;
+                const float *q_head = q.data() + b * qd + h * HD;
+                const float *kp = kc.data() + kv_h * ms * HD;
+                const float *vp = vc.data() + kv_h * ms * HD;
+                float *ro = oref.data() + b * qd + h * HD;
+                float *no = onew.data() + b * qd + h * HD;
+                if (c.window > 0 && seq_len > c.window) {
+                    const size_t ws = seq_len - c.window;
+                    const size_t se = (c.sinks < ws) ? c.sinks : ws;
+                    const size_t ac = se + (seq_len - ws);
+                    sofuu_attn_qk_range(q_head, kp, HD, HD, 0, se, inv_sqrt, scores.data());
+                    sofuu_attn_qk_range(q_head, kp, HD, HD, ws, seq_len - ws, inv_sqrt, scores.data() + se);
+                    sofuu_softmax(scores.data(), ac);
+                    std::memset(no, 0, HD * sizeof(float));
+                    sofuu_attn_vacc_range(no, vp, HD, HD, 0, se, scores.data());
+                    sofuu_attn_vacc_range(no, vp, HD, HD, ws, seq_len - ws, scores.data() + se);
+                } else {
+                    sofuu_attn_qk_range(q_head, kp, HD, HD, 0, seq_len, inv_sqrt, scores.data());
+                    sofuu_softmax(scores.data(), seq_len);
+                    std::memset(no, 0, HD * sizeof(float));
+                    sofuu_attn_vacc_range(no, vp, HD, HD, 0, seq_len, scores.data());
+                }
+                sofuu_attn_ref_slot(q_head, kp, vp, ro, scores.data(), seq_len, HD, inv_sqrt, c.window, c.sinks);
+            }
+        }
+        if (memcmp(onew.data(), oref.data(), oref.size() * sizeof(float)) != 0) {
+            for (size_t i = 0; i < oref.size(); ++i) {
+                if (onew[i] != oref[i]) {
+                    fprintf(stderr, "[parity-attn] b=%zu start=%zu win=%zu sinks=%zu: out[%zu] %.9g vs %.9g\n",
+                            c.b, c.start, c.window, c.sinks, i, onew[i], oref[i]);
+                    return 1;
+                }
+            }
+            return 2;
+        }
+    }
+    return 0;
 }
 
 } // extern "C"

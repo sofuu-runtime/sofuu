@@ -1,7 +1,7 @@
 # sofuu (npm)
 
 The private, offline AI runtime — offline embeddings, an encrypted local
-brain, agents, and MCP in a ~3 MB binary. No API key to ship, no telemetry.
+brain, agents, and MCP in a standalone binary strictly under 5 MB (< 5.0 MB, 4.0 MB stripped). No API key to ship, no telemetry.
 
 ```bash
 npx sofuu                 # interactive chat with memory that persists

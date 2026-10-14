@@ -1,3 +1,5 @@
+<p align="center"><img src="sofuu-landing/public/logo.png" width="118" alt="Sofuu logo"></p>
+
 # ⚡ Sofuu (素風)
 
 > *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single ≤5 MB binary (4.4 MB shipped). Zero daemons, zero external deps.*
@@ -388,7 +390,7 @@ Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-F
 
 ## Project and founder
 
-Built by **Prianshu Boruah** (publishes as **Haruhito**) — early-stage, bootstrapped, open-core, in active development.
+Built by **Haruhito** — early-stage, bootstrapped, open-core, in active development.
 
 - Website: [sofuu.xyz](https://sofuu.xyz)
 - Source: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu)
@@ -400,4 +402,4 @@ Built by **Prianshu Boruah** (publishes as **Haruhito**) — early-stage, bootst
 
 MIT — see [LICENSE](LICENSE). The QTSQ format spec stays proprietary per [LICENSES/QTSQ-FORMAT.txt](LICENSES/QTSQ-FORMAT.txt).
 
-© 2026 Prianshu Boruah (Haruhito)
+© 2026 Haruhito

@@ -2,7 +2,7 @@
 
 > **Document Type:** Master Product Strategy, Architecture, & Growth Plan  
 > **Target:** Y Combinator / Pre-Seed Acceleration & Developer Adoption  
-> **Founder / Architect:** Prianshu Boruah (*Haruhito*)  
+> **Founder / Architect:** Haruhito  
 > **Repository Baseline:** `sofuu v0.2.0-beta` (Rust-first shell, QuickJS/libuv core, SIMD kernels, QTSQ persistent brain, in-process CPU inference shipped 2026-10-11)
 >
 > **Vision update 2026-10-11 — Edge & Mobile Standard (canonical):** Sofuu is the

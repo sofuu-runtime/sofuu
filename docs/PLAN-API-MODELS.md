@@ -3,7 +3,7 @@
 > **Status:** PRODUCT & ARCHITECTURAL SPECIFICATION  
 > **Phase:** Commercial Growth (Phase 2 / Phase 3)  
 > **Target:** Exclusive Proprietary Models Served via Hosted API  
-> **Author:** Project Sofuu Taskforce (Prianshu Boruah / Haruhito)
+> **Author:** Project Sofuu Taskforce (Haruhito)
 
 ---
 

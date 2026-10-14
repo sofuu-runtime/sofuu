@@ -3,7 +3,7 @@
 > **Status:** ENGINEERING SPECIFICATION & TRAINING PLAN  
 > **Component:** `crates/sofuu-core/src/ml/` & `crates/ml-train/`  
 > **Target:** Upgrading the 5 On-Device Tiny ML Models with Real-World Trajectory Data  
-> **Author:** Project Sofuu Taskforce (Prianshu Boruah / Haruhito)
+> **Author:** Project Sofuu Taskforce (Haruhito)
 
 ---
 

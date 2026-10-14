@@ -188,12 +188,16 @@ recall results with the existing 0.5 tier weight — this avoids index renumberi
 
 | # | Item | Size |
 |---|---|---|
-| B6.1 | **In-RAM working set** — session-scoped records, never serialized, merged into recall. | M |
-| B6.2 | **Promotion** — on turn commit, working records the turn actually used are promoted into the persistent store as episodic. | M |
-| B6.3 | **Chat integration** — current-session facts are recallable immediately; `/why` shows which tier served each hit. | S |
+| B6.1 | ✅ **In-RAM working set** (2026-10-14) — `Cma::working` beside the persistent table: never in `records`, never in the HNSW index, never serialized, capped at 256 (oldest evicted). Recall merges it with the 0.5 working tier weight + the B5.2 recency boost and no resonance history; the B5.1 diversity floor suppresses a working twin of a persistent fact. Ids carry bit 30 (positive through i32/JSON; persistent ids can never reach 2^30), so every consumer can tell which tier served a hit. | M |
+| B6.2 | ✅ **Promotion** (2026-10-14) — at the turn commit, the turn's recall-hit ids (channel-split exactly like markPositive: canonical ids → the canonical store, sem-only ids → the sem store) promote via `promoteWorking` into the persistent store as episodic. A near-duplicate of a persistent record reinforces it (merged) instead of duplicating; the promoted record keeps its ORIGINAL `created_at` and source. Turn facts (task/answer) now land in the working set first — a fact no turn ever recalls dies with the session. | M |
+| B6.3 | ✅ **Chat integration** (2026-10-14) — current-session facts are recallable immediately; `/why` labels each hit with the tier that served it (`[working]` highlighted, `[episodic]`/`[semantic]`/`[entity]` dim). JS surface: `rememberWorking` / `promoteWorking` / `clearWorking` / `stats().working`; C ABI: `sofuu_cma_remember_working` / `sofuu_cma_promote_working`. An older binary without the bindings falls back to direct persistent writes. | S |
 
-**Gate:** working facts recall within a session; nothing persists unless promoted; a reload shows no
-working records; the tier appears in `/why`.
+**Gate met (2026-10-14):** working facts recall within a session (16/16 JS gate test: immediate
+recall on an empty store; flush + reload shows none; promotion reports `promoted`/`merged`, moves
+the record to episodic with the original write time preserved, merges a persistent duplicate;
+`clearWorking` drops unpromoted facts); full suite **549/0** in both QTSQ-enabled and QTSQ-free
+builds; `tests/verify_memory_test.js` 30/30; `tests/chat_memory_e2e.sh` 9/9 on a real pty
+(mock LLM, no network).
 
 ---
 

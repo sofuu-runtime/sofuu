@@ -389,6 +389,86 @@ pub unsafe extern "C" fn sofuu_cma_remember(
     cma.remember(v, text, role, kv_page_id)
 }
 
+/// B6.1: `sofuu_cma_remember_working(p, vec, text, role, kv_page_id, source)`
+/// → working id (high bit set), or -1 on error. Session-scoped: never
+/// serialized, merged into recall, gone on reload unless promoted.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_remember_working(
+    p: *mut std::os::raw::c_void,
+    vec: *const f32,
+    text: *const c_char,
+    role: *const c_char,
+    kv_page_id: u32,
+    source: *const c_char,
+) -> i64 {
+    if p.is_null() || vec.is_null() || text.is_null() {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let text = match std::ffi::CStr::from_ptr(text).to_str() {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+    let role = if role.is_null() {
+        "unknown"
+    } else {
+        match std::ffi::CStr::from_ptr(role).to_str() {
+            Ok(r) => r,
+            Err(_) => return -1,
+        }
+    };
+    let source = if source.is_null() {
+        ""
+    } else {
+        match std::ffi::CStr::from_ptr(source).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let v = std::slice::from_raw_parts(vec, cma.vec_dim);
+    cma.remember_working(v, text, role, kv_page_id, source) as i64
+}
+
+/// B6.2: `sofuu_cma_promote_working(p, ids_json, out_buf, out_cap)` —
+/// promote the working records with these ids (JSON array of recall-hit
+/// ids) into the persistent store as episodic; persistent ids are ignored.
+/// Writes `{"promoted":n,"merged":m}` into out_buf; returns its length or
+/// -1.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_promote_working(
+    p: *mut std::os::raw::c_void,
+    ids_json: *const c_char,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> std::os::raw::c_int {
+    if p.is_null() || ids_json.is_null() || out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let Ok(json) = std::ffi::CStr::from_ptr(ids_json).to_str() else {
+        return -1;
+    };
+    let mut ids: Vec<u32> = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                if let Some(n) = item.as_u64() {
+                    ids.push(n as u32);
+                }
+            }
+        }
+    }
+    let (promoted, merged) = cma.promote_working_by_ids(&ids);
+    let out = format!("{{\"promoted\":{},\"merged\":{}}}", promoted, merged);
+    let bytes = out.as_bytes();
+    if bytes.len() + 1 > out_cap {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out_buf, bytes.len());
+    *out_buf.add(bytes.len()) = 0;
+    bytes.len() as std::os::raw::c_int
+}
+
 /// `sofuu_cma_recall(p, query, top_k, out_buf, out_cap)` — writes the recall
 /// JSON array into out_buf (malloc'd by the C caller, cap-bounded) and returns
 /// the JSON string length (or -1 on error/truncation). Recall JSON:

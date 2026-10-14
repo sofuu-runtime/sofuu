@@ -2321,6 +2321,113 @@ mod impl_qtsq {
     /// B3: `cma.stats()` → JSON diagnostics for the store — records,
     /// segments, versions on disk, bytes, evictions, decay stamp. The
     /// capacity policy reports here instead of silently shrinking a brain.
+    /// B6.1: `cma.rememberWorking(vec, text, role, kvPageId, source)` →
+    /// working id (high bit set). Session-scoped: recallable immediately,
+    /// never serialized, gone on reload unless promoted.
+    unsafe extern "C" fn js_cma_remember_working(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 4 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vec(Float32Array), text, role, kv_page_id[, source]".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen != cma.vec_dim {
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+        let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        let role = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let mut page_id: u32 = 0;
+        qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        let source = if argc >= 5 && qjs::sofuu_js_is_string(*argv.add(4)) != 0 {
+            qjs::sofuu_js_to_cstring(ctx, *argv.add(4))
+        } else {
+            std::ptr::null_mut()
+        };
+        let id = cma.cma.remember_working(
+            std::slice::from_raw_parts(vec, vlen),
+            cstr_opt(text).as_deref().unwrap_or(""),
+            cstr_opt(role).as_deref().unwrap_or("unknown"),
+            page_id,
+            cstr_opt(source).as_deref().unwrap_or(""),
+        );
+        if !text.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, text);
+        }
+        if !role.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, role);
+        }
+        if !source.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, source);
+        }
+        qjs::sofuu_js_new_int32(ctx, id as i32)
+    }
+
+    /// B6.2: `cma.promoteWorking(idsJson)` — promote the session working
+    /// records with these ids (a JSON array of recall-hit ids) into the
+    /// persistent store as episodic. Persistent ids are ignored. Returns
+    /// `{promoted, merged}`.
+    unsafe extern "C" fn js_cma_promote_working(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected ids (JSON array of numbers)".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let json_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let Some(json) = cstr_opt(json_ptr) else {
+            if !json_ptr.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, json_ptr);
+            }
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be a JSON array string".as_ptr());
+        };
+        qjs::sofuu_js_free_cstring(ctx, json_ptr);
+        let mut ids: Vec<u32> = Vec::new();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+            if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(n) = item.as_u64() {
+                        ids.push(n as u32);
+                    }
+                }
+            }
+        }
+        let (promoted, merged) = cma.cma.promote_working_by_ids(&ids);
+        let out = serde_json::json!({ "promoted": promoted, "merged": merged });
+        let c = CString::new(out.to_string()).unwrap_or_default();
+        qjs::sofuu_js_new_string(ctx, c.as_ptr())
+    }
+
+    /// B6: `cma.clearWorking()` — drop the session working set (session
+    /// end). Returns how many records were dropped.
+    unsafe extern "C" fn js_cma_clear_working(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        qjs::sofuu_js_new_int32(ctx, cma.cma.clear_working() as i32)
+    }
+
     unsafe extern "C" fn js_cma_stats(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -2364,6 +2471,8 @@ mod impl_qtsq {
             /* B5: ranking knobs, so a brain can report how it ranks. */
             "ef_search": cma.cma.ef_search.unwrap_or(0),
             "diversity_floor": cma.cma.diversity_floor,
+            /* B6: session working set (never serialized). */
+            "working": cma.cma.working_len(),
         });
         let c = CString::new(out.to_string()).unwrap_or_default();
         qjs::sofuu_js_new_string(ctx, c.as_ptr())
@@ -2602,7 +2711,7 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 17] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 20] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
@@ -2620,6 +2729,9 @@ mod impl_qtsq {
             cfunc_entry(c"consolidate", 0, js_cma_consolidate),
             cfunc_entry(c"count", 0, js_cma_count),
             cfunc_entry(c"markPositive", 1, js_cma_mark_positive),
+            cfunc_entry(c"rememberWorking", 5, js_cma_remember_working),
+            cfunc_entry(c"promoteWorking", 1, js_cma_promote_working),
+            cfunc_entry(c"clearWorking", 0, js_cma_clear_working),
         ];
         static CMA_MODULE_FUNCS: [qjs::JSCFunctionListEntry; 4] = [
             cfunc_entry(c"open", 2, js_cma_open),

@@ -1118,7 +1118,7 @@
    * fused SEM2 channel mirrors the SAME clipped strings (the text is the
    * cross-channel join key at recall) with its own vectors; a sem-side
    * failure never affects the canonical write. */
-  function scopeStore(d, entry, taskVec, ansVec, task, answer) {
+  function scopeStore(d, entry, taskVec, ansVec, task, answer, usedHashIds, usedSemIds) {
     var cma = entry.cma;
     if (d.memory === 'agent') {
       var ent = 'agent:' + d.name;
@@ -1136,17 +1136,55 @@
       }
       return;
     }
+    /* B6 (ROADMAP-BRAIN-CMA): turn facts land in the session WORKING set —
+     * recallable immediately (the 0.5 working tier weight + recency boost),
+     * never serialized. At this same commit, the working records THIS turn
+     * actually used (this turn's recall-hit ids, channel-split exactly like
+     * markPositive) are promoted into the persistent store as episodic; a
+     * fact no turn ever recalled dies with the session. */
+    var promotedHash = 0;
+    var recalledHashIdsForStore = usedHashIds || [];
+    var recalledSemIdsForStore = usedSemIds || [];
+    if (recalledHashIdsForStore.length && typeof cma.promoteWorking === 'function') {
+      try {
+        var pr = JSON.parse(cma.promoteWorking(JSON.stringify(recalledHashIdsForStore)));
+        promotedHash = ((pr && pr.promoted) | 0) + ((pr && pr.merged) | 0);
+      } catch (eP) {}
+    }
     /* B1.2 provenance: the source names the scope the memory came from. */
-    if (taskVec) cma.remember(taskVec, clip(task, STORE_CAP_CHARS), 'user', 0, 'chat');
-    if (ansVec) cma.remember(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0, 'chat');
-    try { cma.flush(); } catch (e) {}
+    if (taskVec && typeof cma.rememberWorking === 'function') {
+      cma.rememberWorking(taskVec, clip(task, STORE_CAP_CHARS), 'user', 0, 'chat');
+    } else if (taskVec) {
+      cma.remember(taskVec, clip(task, STORE_CAP_CHARS), 'user', 0, 'chat');
+    }
+    if (ansVec && typeof cma.rememberWorking === 'function') {
+      cma.rememberWorking(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0, 'chat');
+    } else if (ansVec) {
+      cma.remember(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0, 'chat');
+    }
+    if (promotedHash > 0) { try { cma.flush(); } catch (e) {} }
     if (entry.sem) {
       try {
+        var promotedSem = 0;
+        if (recalledSemIdsForStore.length && typeof entry.sem.promoteWorking === 'function') {
+          try {
+            var spr = JSON.parse(entry.sem.promoteWorking(JSON.stringify(recalledSemIdsForStore)));
+            promotedSem = ((spr && spr.promoted) | 0) + ((spr && spr.merged) | 0);
+          } catch (e4) {}
+        }
         var su = taskVec ? embedSemV2(clip(task, STORE_CAP_CHARS)) : null;
         var av = ansVec ? embedSemV2(clip(answer, STORE_CAP_CHARS)) : null;
-        if (su) entry.sem.remember(su, clip(task, STORE_CAP_CHARS), 'user', 0);
-        if (av) entry.sem.remember(av, clip(answer, STORE_CAP_CHARS), 'assistant', 0);
-        entry.sem.flush();
+        if (su && typeof entry.sem.rememberWorking === 'function') {
+          entry.sem.rememberWorking(su, clip(task, STORE_CAP_CHARS), 'user', 0);
+        } else if (su) {
+          entry.sem.remember(su, clip(task, STORE_CAP_CHARS), 'user', 0);
+        }
+        if (av && typeof entry.sem.rememberWorking === 'function') {
+          entry.sem.rememberWorking(av, clip(answer, STORE_CAP_CHARS), 'assistant', 0);
+        } else if (av) {
+          entry.sem.remember(av, clip(answer, STORE_CAP_CHARS), 'assistant', 0);
+        }
+        if (promotedSem > 0) entry.sem.flush();
       } catch (e3) {}
     }
   }
@@ -1480,8 +1518,12 @@
        * default for single-channel recalls). */
       chans: kept.map(function (x) { return x._ch === 's' ? 'sem' : 'hash'; }),
       lines: kept.map(function (x) { return '- ' + clip(x.text, 300); }),
+      /* B6.3: the tier rides the hit so /why can say which tier served it
+       * (0 working = this session's scratch, 1 episodic, 2 semantic,
+       * 4 entity). Absent tier (old store) reads as episodic. */
       hits: kept.map(function (x) { return { id: x.id, score: x.score,
-                                              role: x.role || '', text: clip(x.text, 120) }; }),
+                                              role: x.role || '', text: clip(x.text, 120),
+                                              tier: (typeof x.tier === 'number') ? x.tier : 1 }; }),
       dropped: dropped, budgetCut: budgetCut,
     };
   }
@@ -3369,7 +3411,7 @@
             ? qvec
             : ((await embedTextFor(d, backend, String(task))) || {}).vec || null;
           var va = ((await embedTextFor(d, backend, ansText)) || {}).vec || null;
-          scopeStore(d, brainEntry, vu, va, String(task), ansText);
+          scopeStore(d, brainEntry, vu, va, String(task), ansText, recalledIds, recalledSemIds);
           /* Channel-split reinforcement: a hash-store id belongs to the
            * canonical brain, a sem-only id to the v2 store. A hit present
            * in both carries its hash id → reinforced on hash only (the

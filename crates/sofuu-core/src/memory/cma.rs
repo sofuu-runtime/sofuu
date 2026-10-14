@@ -33,6 +33,45 @@ pub const RECENCY_MAX_BOOST: f32 = 0.15;
 /// B5.2: recency time constant (seven days).
 pub const RECENCY_TAU_SECONDS: f32 = 7.0 * 86400.0;
 
+/// B6 (ROADMAP-BRAIN-CMA): bit 30 flags a WORKING-SET id. Working records
+/// live beside the persistent table (never in `records`, never in the HNSW
+/// index, never serialized), so their ids must never collide with a
+/// persistent record id — the flag makes a working id distinguishable
+/// everywhere an id travels (recall hits, mark_positive, promotion). Bit
+/// 30 rather than 31 so the id stays POSITIVE through every width it
+/// crosses (i32 JS values, JSON numbers): 0x80000000 reads as negative in
+/// JS and a JSON round-trip of it would drop the flag on the floor.
+/// Persistent ids can never reach 2^30 (the store cap is 100k).
+pub const WORKING_ID_FLAG: u32 = 0x4000_0000;
+/// B6: session working-set cap. A runaway session cannot pin RAM: over
+/// this, the OLDEST working records are dropped (they were never recalled
+/// often enough to matter — promotion is what earns persistence).
+pub const WORKING_MAX_RECORDS: usize = 256;
+
+/// B6: a session-scoped working record. Held beside the persistent table:
+/// not in `records`, not in the HNSW index, never written to disk. It is
+/// recallable immediately (merged into recall with the 0.5 working tier
+/// weight) and disappears on reload unless promoted.
+#[derive(Clone, Debug)]
+pub struct WorkingRecord {
+    /// Stable session-local id (`WORKING_ID_FLAG | seq`) — stable because
+    /// the cap evicts by created_at, which would renumber positions.
+    pub id: u32,
+    pub vector: Vec<f32>,
+    pub text: String,
+    pub role: String,
+    pub kv_page_id: u32,
+    /// B1.2 provenance carried through promotion (the persistent record
+    /// keeps the ORIGINAL write time, not the promotion time).
+    pub created_at: u32,
+    pub source: String,
+}
+
+/// B6: `true` when `id` refers to the working set, not the persistent table.
+pub fn is_working_id(id: u32) -> bool {
+    id & WORKING_ID_FLAG != 0
+}
+
 /// M3 (PLAN-MEMORY-TOKENS): records below this strength are already
 /// invisible to recall (the same floor filters in recall()); retain()
 /// physically drops them so RAM and brain files stop accumulating
@@ -185,6 +224,12 @@ pub struct Cma {
     pub ef_search: Option<usize>,
     /// B5.1: near-duplicate suppression floor (None = off, pure relevance).
     pub diversity_floor: Option<f32>,
+    /// B6: the session working set — beside the persistent table, never
+    /// serialized, merged into recall, promoted on use.
+    pub working: Vec<WorkingRecord>,
+    /// B6: monotonically increasing working-id sequence (eviction must not
+    /// renumber ids a caller still holds).
+    working_next_seq: u32,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -243,6 +288,8 @@ impl Cma {
             layout_dirty: false,
             ef_search: None,
             diversity_floor: Some(DIVERSITY_FLOOR_DEFAULT),
+            working: Vec::new(),
+            working_next_seq: 0,
         }
     }
 
@@ -254,6 +301,129 @@ impl Cma {
     /// B5.1: set the near-duplicate suppression floor (None = off).
     pub fn set_diversity_floor(&mut self, floor: Option<f32>) {
         self.diversity_floor = floor.map(|f| f.clamp(0.0, 1.0));
+    }
+
+    /// B6.1: write a session working record. Recallable immediately (recall
+    /// merges the working set with the 0.5 tier weight), never serialized —
+    /// a reload shows no working records. A near-duplicate WITHIN the
+    /// working set reinforces the existing copy (same fact said twice in a
+    /// session is one fact); a near-duplicate in the PERSISTENT store is
+    /// deliberately not gated here — the twin is suppressed at recall by
+    /// the diversity floor, and promotion merges it on use.
+    pub fn remember_working(
+        &mut self,
+        vec: &[f32],
+        text: &str,
+        role: &str,
+        kv_page_id: u32,
+        source: &str,
+    ) -> u32 {
+        debug_assert_eq!(vec.len(), self.vec_dim);
+        /* Working-set near-dup gate (same DUP_DISTANCE as the persistent
+         * one): the newer sighting refreshes the timestamp so the fact
+         * stays fresh, and the caller gets the SAME id back. */
+        for w in &mut self.working {
+            let d = sq_dist(w.vector.as_slice(), vec).sqrt();
+            if d < DUP_DISTANCE {
+                w.created_at = now_secs();
+                if !source.is_empty() {
+                    w.source = source.to_string();
+                }
+                return w.id;
+            }
+        }
+        let id = WORKING_ID_FLAG | self.working_next_seq;
+        self.working_next_seq = self.working_next_seq.wrapping_add(1);
+        self.working.push(WorkingRecord {
+            id,
+            vector: vec.to_vec(),
+            text: text.to_string(),
+            role: role.to_string(),
+            kv_page_id,
+            created_at: now_secs(),
+            source: source.to_string(),
+        });
+        /* Cap: drop the OLDEST (never-promoted scratch, by definition —
+         * promotion removes records as it promotes them). */
+        if self.working.len() > WORKING_MAX_RECORDS {
+            let oldest = self
+                .working
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| (w.created_at, w.id))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.working.remove(oldest);
+        }
+        id
+    }
+
+    /// B6: how many session working records are live.
+    pub fn working_len(&self) -> usize {
+        self.working.len()
+    }
+
+    /// B6: drop the whole working set (session end). Returns how many
+    /// records were dropped. Unpromoted facts die here — that is the
+    /// design: nothing persists unless a turn actually used it.
+    pub fn clear_working(&mut self) -> usize {
+        let n = self.working.len();
+        self.working.clear();
+        n
+    }
+
+    /// B6.2: promote the working records with these ids into the persistent
+    /// store as episodic — the turn-commit hook for "working records the
+    /// turn actually used". The ids are the recall-hit ids of this turn
+    /// (channel-split by the caller, exactly like markPositive: canonical
+    /// ids go to the canonical store, sem-only ids to the sem store).
+    /// Persistent ids in the list are ignored (already persisted). A
+    /// near-duplicate of an existing persistent record reinforces it
+    /// (merged) instead of duplicating; a promoted record keeps its
+    /// ORIGINAL created_at and source. Returns (promoted, merged); the
+    /// working copies are removed either way.
+    pub fn promote_working_by_ids(&mut self, ids: &[u32]) -> (usize, usize) {
+        if ids.is_empty() || self.working.is_empty() {
+            return (0, 0);
+        }
+        let mut promoted = 0usize;
+        let mut merged = 0usize;
+        /* Collect then promote: remember_with_source mutates `records`,
+         * not `working`, so borrowing the vectors first is enough. */
+        let matches: Vec<WorkingRecord> = self
+            .working
+            .iter()
+            .filter(|w| ids.contains(&w.id))
+            .cloned()
+            .collect();
+        for w in matches {
+            let before = self.records.len();
+            let new_id = self.remember_with_source(
+                &w.vector,
+                &w.text,
+                &w.role,
+                w.kv_page_id,
+                &w.source,
+            );
+            if new_id < 0 {
+                continue;
+            }
+            let id = new_id as u32;
+            if self.records.len() > before && (id as usize) == before {
+                /* A fresh record — remember_with_source stamped now, so
+                 * restore the working record's ORIGINAL write time:
+                 * provenance (and the recency factor) reflect when the
+                 * fact was actually said, not when it graduated. */
+                self.records[id as usize].created_at = w.created_at;
+                self.mark_dirty(id);
+                promoted += 1;
+            } else {
+                /* The dup gate reinforced an existing persistent record. */
+                merged += 1;
+            }
+            self.working.retain(|w2| w2.id != w.id);
+        }
+        (promoted, merged)
     }
 
     /// Mark one record's persisted snapshot stale (B3.2).
@@ -645,7 +815,7 @@ impl Cma {
     /// Recall top-k memories with composite scoring (strength × tier ×
     /// resonance), gravity boost, and reinforcement.
     pub fn recall(&mut self, query: &[f32], top_k: usize) -> Vec<RecallHit> {
-        if self.records.is_empty() {
+        if self.records.is_empty() && self.working.is_empty() {
             return Vec::new();
         }
         /* Candidate pool: the search returns the closest `pool` records.
@@ -684,10 +854,23 @@ impl Cma {
             }
             scored.push((id, dist, score));
         }
+        /* B6.1: merge the session working set. It is small (capped at
+         * WORKING_MAX_RECORDS), so a linear scan beats indexing it; the
+         * scoring is the same composite (strength 1.0, the 0.5 working
+         * tier weight, the recency boost — no resonance history). */
+        for w in &self.working {
+            let dist = sq_dist(w.vector.as_slice(), query).sqrt();
+            let norm = dist / (dist + 1.0);
+            let mut score = (1.0 - norm) * 1.0 * 0.5; /* TIER_WORKING weight */
+            let age = now.saturating_sub(w.created_at) as f32;
+            score *= 1.0 + RECENCY_MAX_BOOST * (-age / RECENCY_TAU_SECONDS).exp();
+            scored.push((w.id, dist, score));
+        }
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Gravity: co-recall partners of the top-1 get a boost.
-        if scored.len() > 1 {
+        // Gravity: co-recall partners of the top-1 get a boost. Working
+        // records have no corecall field — only persistent ids take part.
+        if scored.len() > 1 && !is_working_id(scored[0].0) {
             let top1 = scored[0].0;
             let partners: Vec<u32> = self.records[top1 as usize].corecall_ids.clone();
             for (id, _, score) in scored.iter_mut().skip(1) {
@@ -709,8 +892,27 @@ impl Cma {
 
         let n = scored.len().min(top_k);
         let mut out = Vec::with_capacity(n);
-        let mut recalled_ids = Vec::with_capacity(n);
+        let mut recalled_ids: Vec<u32> = Vec::with_capacity(n);
         for (id, dist, score) in scored.into_iter().take(n) {
+            if is_working_id(id) {
+                /* B6.1: a working hit — no reinforcement (the record dies
+                 * with the session unless promoted), no gravity, no dirty
+                 * tracking. The id stays flagged so every consumer can
+                 * tell which tier served it. */
+                if let Some(w) = self.working.iter().find(|w| w.id == id) {
+                    out.push(RecallHit {
+                        id,
+                        distance: dist,
+                        score,
+                        role: w.role.clone(),
+                        text: w.text.clone(),
+                        tier: TIER_WORKING,
+                        strength: 1.0,
+                        entity: None,
+                    });
+                }
+                continue;
+            }
             // Reinforce + track recall.
             let rec = &mut self.records[id as usize];
             rec.strength = (rec.strength * 1.1).min(1.0);
@@ -733,8 +935,26 @@ impl Cma {
              * stale (strength + recall counters moved). */
             self.mark_dirty(id);
         }
+        /* Gravity only ever sees persistent ids (working ids are filtered
+         * above, so update_gravity cannot index out of bounds). */
         self.update_gravity(&recalled_ids);
         out
+    }
+
+    /// B6: the vector behind a recall id — the HNSW store for persistent
+    /// records, the working record's own copy for working ids (the
+    /// diversity re-rank compares across both tiers).
+    fn vector_of(&self, id: u32) -> &[f32] {
+        if is_working_id(id) {
+            /* An evicted working id reads as unrelated (empty slice). */
+            return self
+                .working
+                .iter()
+                .find(|w| w.id == id)
+                .map(|w| w.vector.as_slice())
+                .unwrap_or(&[]);
+        }
+        self.index.vector(id)
     }
 
     /// B5.1: fill the top-k from the relevance-ordered pool, skipping any
@@ -758,7 +978,7 @@ impl Cma {
                 break;
             }
             let dup = out.iter().any(|(sid, _, _)| {
-                cosine_sim(self.index.vector(cand.0), self.index.vector(*sid)) >= floor
+                cosine_sim(self.vector_of(cand.0), self.vector_of(*sid)) >= floor
             });
             if !dup {
                 out.push(cand);
@@ -1231,6 +1451,137 @@ mod tests {
             hits[1].text == "b" || hits[1].text == "c",
             "without the floor a near-duplicate fills the slot, got {}",
             hits[1].text
+        );
+    }
+
+    /* ── B6 (ROADMAP-BRAIN-CMA): working memory ──────────────────────── */
+
+    #[test]
+    fn working_fact_recalls_within_the_session() {
+        let mut cma = Cma::new(8);
+        /* The persistent table is EMPTY — a fresh brain with only a
+         * working fact must still recall it (the old early-return keyed
+         * on records alone would have returned nothing). */
+        assert!(cma.is_empty());
+        let v = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let id = cma.remember_working(&v, "session fact", "user", 0, "chat");
+        assert!(is_working_id(id), "working ids carry the flag");
+        assert!(id < 0x8000_0000, "working ids stay positive through i32/JSON");
+
+        let hits = cma.recall(&v, 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].tier, TIER_WORKING);
+        assert_eq!(hits[0].text, "session fact");
+        /* Nothing touched the persistent table. */
+        assert!(cma.records.is_empty());
+        assert_eq!(cma.working_len(), 1);
+        /* The working near-dup gate returns the SAME id (one fact). */
+        let again = cma.remember_working(&v, "session fact again", "user", 0, "chat");
+        assert_eq!(again, id);
+        assert_eq!(cma.working_len(), 1);
+    }
+
+    #[test]
+    fn working_records_never_persist() {
+        let mut cma = Cma::new(4);
+        let v = [0.0f32, 1.0, 0.0, 0.0];
+        cma.remember_working(&v, "ephemeral", "user", 0, "chat");
+        /* The serialized record table has no working rows. */
+        let json = cma.records_json();
+        assert!(!json.contains("ephemeral"), "working records must not serialize");
+        /* A reload (fresh store hydrated from the file) has none. */
+        let mut reloaded = Cma::new(4);
+        assert!(reloaded.working.is_empty());
+        let hits = reloaded.recall(&v, 3);
+        assert!(hits.is_empty(), "a reload shows no working records");
+        /* And the live store's recall no longer sees them after an
+         * explicit session end. */
+        let dropped = cma.clear_working();
+        assert_eq!(dropped, 1);
+        assert!(cma.recall(&v, 3).is_empty());
+    }
+
+    #[test]
+    fn promotion_moves_working_to_episodic() {
+        let mut cma = Cma::new(4);
+        let v = [1.0f32, 0.0, 0.0, 0.0];
+        let id = cma.remember_working(&v, "used fact", "user", 0, "chat");
+        /* Backdate the working record so promotion must PRESERVE the
+         * original write time (provenance, not promotion time). */
+        let wrote_at = now_secs() - 3600;
+        if let Some(w) = cma.working.iter_mut().find(|w| w.id == id) {
+            w.created_at = wrote_at;
+        }
+
+        let (promoted, merged) = cma.promote_working_by_ids(&[id]);
+        assert_eq!(promoted, 1);
+        assert_eq!(merged, 0);
+        assert_eq!(cma.records.len(), 1);
+        assert!(cma.working.is_empty());
+        let rec = &cma.records[0];
+        assert_eq!(rec.tier, TIER_EPISODIC);
+        assert_eq!(rec.created_at, wrote_at, "original write time survives");
+        assert_eq!(rec.source, "chat");
+        /* Still recallable — now from the persistent store. */
+        let hits = cma.recall(&v, 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tier, TIER_EPISODIC);
+        /* Promoting again is a no-op (the working copy is gone). */
+        let (promoted, merged) = cma.promote_working_by_ids(&[id]);
+        assert_eq!((promoted, merged), (0, 0));
+    }
+
+    #[test]
+    fn promotion_merges_a_persistent_duplicate() {
+        let mut cma = Cma::new(4);
+        let v = [1.0f32, 0.0, 0.0, 0.0];
+        let persistent = cma.remember(&v, "already stored", "user", 0) as u32;
+        let working = cma.remember_working(&v, "already stored", "user", 0, "chat");
+        let (promoted, merged) = cma.promote_working_by_ids(&[working]);
+        assert_eq!((promoted, merged), (0, 1));
+        assert_eq!(cma.records.len(), 1, "no duplicate row");
+        assert_eq!(cma.records[persistent as usize].strength, 1.0, "reinforced");
+        assert!(cma.working.is_empty());
+    }
+
+    #[test]
+    fn working_ids_are_inert_on_persistent_mutators() {
+        let mut cma = Cma::new(4);
+        let v = [1.0f32, 0.0, 0.0, 0.0];
+        let id = cma.remember_working(&v, "w", "user", 0, "chat");
+        /* A flagged id must never reach the record table. */
+        assert_eq!(cma.mark_positive(&[id]), 0);
+        assert!(!cma.forget(id), "forget on a working id is a no-op");
+        assert!(cma.records.is_empty());
+        assert_eq!(cma.working_len(), 1);
+        /* Persistent ids in a promote list are ignored. */
+        let p = cma.remember(&v, "p", "user", 0) as u32;
+        let (promoted, merged) = cma.promote_working_by_ids(&[p]);
+        assert_eq!((promoted, merged), (0, 0));
+    }
+
+    #[test]
+    fn working_cap_evicts_the_oldest() {
+        let mut cma = Cma::new(8);
+        let mut first_id = 0u32;
+        for i in 0..(WORKING_MAX_RECORDS + 5) {
+            /* All-distinct vectors, pairwise L2 >= 0.5 so the near-dup
+             * gate never collapses them (this test exercises eviction,
+             * not dedup): a rotating one-hot plus a drifting second
+             * component repeats only every 8 slots, 0.5 apart. */
+            let mut v = [0.0f32; 8];
+            v[i % 8] = 1.0;
+            v[(i + 1) % 8] = ((i / 8) as f32) * 0.5;
+            let id = cma.remember_working(&v, &format!("w{i}"), "user", 0, "chat");
+            if i == 0 {
+                first_id = id;
+            }
+        }
+        assert_eq!(cma.working_len(), WORKING_MAX_RECORDS);
+        assert!(
+            !cma.working.iter().any(|w| w.id == first_id),
+            "the oldest scratch record was evicted"
         );
     }
 

@@ -2040,12 +2040,23 @@ static LAST_RECALL: Mutex<Vec<RecallHit>> = Mutex::new(Vec::new());
 // F6: per-session cost tracking (the driver reports usage each turn).
 static SESSION_COST: Mutex<SessionCost> = Mutex::new(SessionCost::new());
 
-/// F1: one recalled memory hit (for /why).
+/// F1: one recalled memory hit (for /why). B6.3: `tier` says which tier
+/// served the hit (0 working, 1 episodic, 2 semantic, 4 entity) — 0 is
+/// also the serde default so older driver JSON (no tier) reads as working
+/// only when the driver actually sent tier 0; absent tiers from old
+/// drivers read as episodic (1) — the pre-B6 everything-is-persistent
+/// world. The driver always sends the tier now.
 #[derive(Clone, serde::Serialize)]
 struct RecallHit {
     text: String,
     score: f64,
     role: String,
+    #[serde(default = "default_recall_tier")]
+    tier: u8,
+}
+
+fn default_recall_tier() -> u8 {
+    1 /* episodic — the pre-B6 default for hits without a tier */
 }
 
 /// F6: per-session cost tracking.
@@ -2544,6 +2555,7 @@ unsafe extern "C" fn js_chat_set_recall(
                             text: item.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
                             score: item.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
                             role: item.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string(),
+                            tier: item.get("tier").and_then(|t| t.as_u64()).unwrap_or(1) as u8,
                         })
                     }).collect();
                     *LAST_RECALL.lock().unwrap() = hits;
@@ -3993,11 +4005,19 @@ const DRIVER: &str = r#"
       return;
     }
     out('\n\x1b[1m  Memories that shaped the last answer:\x1b[0m');
+    /* B6.3: label the tier that served each hit — a working hit is this
+     * session's scratch (never persisted unless promoted), everything
+     * else came off disk. */
+    const WHY_TIER_NAMES = ['working', 'episodic', 'semantic', 'forgotten', 'entity'];
     for (const h of hits) {
       const score = (h.score || 0).toFixed(3);
       const role = h.role ? '\x1b[2m(' + h.role + ')\x1b[0m ' : '';
+      const tier = WHY_TIER_NAMES[h.tier] || ('tier' + h.tier);
+      const tierTag = h.tier === 0
+        ? '\x1b[36m[' + tier + ']\x1b[0m '
+        : '\x1b[2m[' + tier + ']\x1b[0m ';
       const text = clip1(h.text, 120);
-      out('  \x1b[90m' + score + '\x1b[0m  ' + role + text);
+      out('  \x1b[90m' + score + '\x1b[0m ' + tierTag + role + text);
     }
     out('');
   }

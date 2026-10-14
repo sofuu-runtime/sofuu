@@ -19,6 +19,20 @@ pub const GRAVITY_G: f32 = 0.05;
 pub const CORECALL_MAX: usize = 8;
 pub const DUP_DISTANCE: f32 = 0.05;
 
+/// B5.1 (ROADMAP-BRAIN-CMA): diversity floor. While filling top-k, a
+/// candidate whose cosine to an already-picked hit is >= this is skipped
+/// as a near-duplicate. The default is measured, not guessed -- see
+/// `memory::recall_eval`. (The roadmap called this "MMR"; the harness
+/// measured the textbook linear trade-off promoting unrelated records on
+/// this scoring scale, so the shipped mechanism is MMR-family diversity by
+/// suppression: relevance order is never inverted, near-duplicates are.)
+pub const DIVERSITY_FLOOR_DEFAULT: f32 = 0.6;
+/// B5.2: recency boost ceiling -- a just-written memory scores up to this
+/// much above an equally-strong stale one, decaying with RECENCY_TAU.
+pub const RECENCY_MAX_BOOST: f32 = 0.15;
+/// B5.2: recency time constant (seven days).
+pub const RECENCY_TAU_SECONDS: f32 = 7.0 * 86400.0;
+
 /// M3 (PLAN-MEMORY-TOKENS): records below this strength are already
 /// invisible to recall (the same floor filters in recall()); retain()
 /// physically drops them so RAM and brain files stop accumulating
@@ -61,6 +75,30 @@ fn now_secs() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
         .unwrap_or(0)
+}
+
+/// B5.3: the recall search width from the environment
+/// (`SOFUU_BRAIN_EF_SEARCH`); unset / 0 keeps the built-in default. Shared
+/// by every surface that opens a brain (JS shell, C ABI facade).
+pub fn ef_search_from_env() -> Option<usize> {
+    std::env::var("SOFUU_BRAIN_EF_SEARCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// B5.1: cosine similarity, clamped to [-1, 1]; a zero-norm vector reads
+/// as unrelated (0.0) instead of dividing by zero.
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..n {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = (na.sqrt() * nb.sqrt()).max(1e-12);
+    (dot / denom).clamp(-1.0, 1.0)
 }
 
 impl Record {
@@ -142,6 +180,11 @@ pub struct Cma {
     /// renumbered ids, or a store-side eviction. The next flush rewrites
     /// the live records into fresh segments (compaction).
     pub layout_dirty: bool,
+    /// B5.3: HNSW search width for recall. None = the built-in default
+    /// (`(pool * 4).max(8)`); larger trades latency for recall.
+    pub ef_search: Option<usize>,
+    /// B5.1: near-duplicate suppression floor (None = off, pure relevance).
+    pub diversity_floor: Option<f32>,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -198,7 +241,19 @@ impl Cma {
             records: Vec::new(),
             dirty_ids: Vec::new(),
             layout_dirty: false,
+            ef_search: None,
+            diversity_floor: Some(DIVERSITY_FLOOR_DEFAULT),
         }
+    }
+
+    /// B5.3: set the HNSW recall search width (None = built-in default).
+    pub fn set_ef_search(&mut self, ef: Option<usize>) {
+        self.ef_search = ef.filter(|n| *n > 0);
+    }
+
+    /// B5.1: set the near-duplicate suppression floor (None = off).
+    pub fn set_diversity_floor(&mut self, floor: Option<f32>) {
+        self.diversity_floor = floor.map(|f| f.clamp(0.0, 1.0));
     }
 
     /// Mark one record's persisted snapshot stale (B3.2).
@@ -593,8 +648,13 @@ impl Cma {
         if self.records.is_empty() {
             return Vec::new();
         }
-        let ef = (top_k * 3).max(32);
-        let mut hits = self.index.search(query, ef);
+        /* Candidate pool: the search returns the closest `pool` records.
+         * B5.3: SOFUU_BRAIN_EF_SEARCH (or set_ef_search) widens the search
+         * itself; unset keeps the pre-B5 width exactly. */
+        let pool = (top_k * 3).max(32);
+        let ef = self.ef_search.unwrap_or((pool * 4).max(8));
+        let mut hits = self.index.search_with_ef(query, pool, ef);
+        let now = now_secs();
         // Filter forgotten + too-weak, score.
         let mut scored: Vec<(u32, f32, f32)> = Vec::new(); // (id, dist, score)
         for (id, dist) in hits.drain(..) {
@@ -616,6 +676,12 @@ impl Cma {
                     / ((rec.total_recalls as f32 + 2.0).ln());
                 score *= 1.0 + ratio * 0.3;
             }
+            /* B5.2: recency — a fresh memory outranks an equally-strong
+             * stale one. created_at == 0 (legacy / unknown) is neutral. */
+            if rec.created_at > 0 {
+                let age = now.saturating_sub(rec.created_at) as f32;
+                score *= 1.0 + RECENCY_MAX_BOOST * (-age / RECENCY_TAU_SECONDS).exp();
+            }
             scored.push((id, dist, score));
         }
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -632,6 +698,15 @@ impl Cma {
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         }
 
+        /* B5.1: diversity — the top-k should not be five paraphrases of
+         * one fact. Fills from the relevance-ordered pool, skipping
+         * near-duplicates of records already picked. */
+        if let Some(floor) = self.diversity_floor {
+            if scored.len() > 1 {
+                scored = self.diversify(scored, top_k, floor);
+            }
+        }
+
         let n = scored.len().min(top_k);
         let mut out = Vec::with_capacity(n);
         let mut recalled_ids = Vec::with_capacity(n);
@@ -639,7 +714,7 @@ impl Cma {
             // Reinforce + track recall.
             let rec = &mut self.records[id as usize];
             rec.strength = (rec.strength * 1.1).min(1.0);
-            rec.last_recalled_at = now_secs();
+            rec.last_recalled_at = now;
             if rec.total_recalls < 65535 {
                 rec.total_recalls += 1;
             }
@@ -659,6 +734,36 @@ impl Cma {
             self.mark_dirty(id);
         }
         self.update_gravity(&recalled_ids);
+        out
+    }
+
+    /// B5.1: fill the top-k from the relevance-ordered pool, skipping any
+    /// candidate that is a near-duplicate (cosine >= floor) of a record
+    /// already picked. Relevance order is never inverted: a clearly better
+    /// record is never displaced by a worse but dissimilar one. (The
+    /// textbook linear MMR trade-off did exactly that on the evaluation
+    /// fixture -- recall 1.00 -> 0.17 with unrelated records promoted; the
+    /// numbers are in `memory::recall_eval`.) A pool that is all
+    /// near-duplicates returns fewer than top_k, which is the honest
+    /// answer -- padding with paraphrases is what B5.1 removes.
+    fn diversify(
+        &self,
+        pool: Vec<(u32, f32, f32)>,
+        top_k: usize,
+        floor: f32,
+    ) -> Vec<(u32, f32, f32)> {
+        let mut out: Vec<(u32, f32, f32)> = Vec::with_capacity(top_k.min(pool.len()));
+        for cand in pool {
+            if out.len() >= top_k {
+                break;
+            }
+            let dup = out.iter().any(|(sid, _, _)| {
+                cosine_sim(self.index.vector(cand.0), self.index.vector(*sid)) >= floor
+            });
+            if !dup {
+                out.push(cand);
+            }
+        }
         out
     }
 
@@ -1095,6 +1200,38 @@ mod tests {
         assert!((cma.records[0].strength - 1.0).abs() < 1e-6);
         cma.decay_tick(86400); // one half-life (1 day)
         assert!(cma.records[0].strength < 0.5);
+    }
+
+    #[test]
+    fn diversity_floor_suppresses_near_duplicates() {
+        let mut cma = Cma::new(8);
+        /* Three paraphrases of one direction (cos ~0.99, above
+         * DUP_DISTANCE so they stay separate records) + one distinct fact. */
+        let a = [1.0f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let b = [1.0f32, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let c = [1.0f32, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0];
+        let d = [0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for (v, t) in [(&a, "a"), (&b, "b"), (&c, "c"), (&d, "d")] {
+            cma.remember(v, t, "user", 0);
+        }
+        let q = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        /* Default: the paraphrase is skipped, the distinct fact gets the
+         * second slot. */
+        let hits = cma.recall(&q, 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "a", "top-1 is still the best relevance");
+        assert_eq!(hits[1].text, "d", "a near-duplicate must not take a slot");
+
+        /* Off: the pre-B5 relevance order — a paraphrase takes the slot
+         * (b or c; the three are equidistant, so which one is HNSW order). */
+        cma.set_diversity_floor(None);
+        let hits = cma.recall(&q, 2);
+        assert!(
+            hits[1].text == "b" || hits[1].text == "c",
+            "without the floor a near-duplicate fills the slot, got {}",
+            hits[1].text
+        );
     }
 
     #[test]

@@ -299,14 +299,23 @@ impl Hnsw {
 
     /// Search the whole graph for the `k` nearest neighbors of `q`.
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(u32, f32)> {
-        if self.nodes.is_empty() {
+        self.search_with_ef(q, k, (k * 4).max(8))
+    }
+
+    /// B5.3 (ROADMAP-BRAIN-CMA): the same search with an explicit candidate
+    /// width. `ef` is the size of the best-first frontier kept at each
+    /// level -- larger trades latency for recall, `ef <= k` behaves like
+    /// `ef = k`. `search` is `search_with_ef(q, k, (k*4).max(8))`, so the
+    /// default behaviour is unchanged.
+    pub fn search_with_ef(&self, q: &[f32], k: usize, ef: usize) -> Vec<(u32, f32)> {
+        if self.nodes.is_empty() || k == 0 {
             return Vec::new();
         }
+        let ef = ef.max(k);
         // Greedy best-first descent from the enter point down to level 0,
         // using ef candidates at each level (better recall than pure greedy).
         let mut ep = self.enter_node;
         let mut top = self.max_level;
-        let ef = (k * 4).max(8); // ef > k for recall, trim at the end
         while top > 0 {
             let candidates = self.search_layer(q, ep, ef, top);
             ep = candidates.first().copied().unwrap_or(ep);

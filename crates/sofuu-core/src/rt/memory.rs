@@ -1100,6 +1100,9 @@ mod impl_qtsq {
             layout: None,
             legacy_encryption: false,
         });
+        /* B5.3: SOFUU_BRAIN_EF_SEARCH widens the recall search; unset keeps
+         * the built-in default. */
+        shell.cma.set_ef_search(crate::memory::cma::ef_search_from_env());
 
         /* C2: replay any write-ahead journal a crashed commit left behind
          * BEFORE the load — a staged brain that was fully written but never
@@ -2358,6 +2361,9 @@ mod impl_qtsq {
             "last_decay_at": layout.map(|l| l.last_decay_at).unwrap_or(0),
             "needs_compaction": cma.cma.layout_dirty,
             "dirty": cma.cma.dirty_count(),
+            /* B5: ranking knobs, so a brain can report how it ranks. */
+            "ef_search": cma.cma.ef_search.unwrap_or(0),
+            "diversity_floor": cma.cma.diversity_floor,
         });
         let c = CString::new(out.to_string()).unwrap_or_default();
         qjs::sofuu_js_new_string(ctx, c.as_ptr())

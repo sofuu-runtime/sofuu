@@ -30,6 +30,8 @@ and KV compression.
 **Structural gaps:** no read-out API · metadata-only `/share` + no-op `/import` · dead
 `TIER_WORKING` · whole-file brain load/flush (no paging) · fixed shared vault password · no
 provenance · no capacity policy · no diversity/recency in scoring · `/forget` unreachable.
+*(B1–B5 closed the read-out, share/import, paging, key, provenance, capacity and ranking
+items; B6 working memory and B7 harmony remain.)*
 
 ---
 
@@ -161,12 +163,20 @@ Full suite **532/0** in both builds.
 
 | # | Item | Size |
 |---|---|---|
-| B5.1 | **Diversity (MMR)** — re-rank the scored candidate pool so top-k stops returning near-duplicates. | S |
-| B5.2 | **Recency term** — explicit recency factor using B1.2's `created_at` (decay already handles strength; recency breaks same-strength ties). | S |
-| B5.3 | **`ef_search` knob** — configurable quality/latency trade, default unchanged; surfaced like the other runtime knobs. | S |
-| B5.4 | **Recall evaluation harness** — a fixed brain fixture + query set reporting recall@k and MRR, so every B5 change is measured against a number. | M |
+| B5.4 | ✅ **Recall evaluation harness** (2026-10-14) — `memory::recall_eval`: a deterministic fixture (one chatty topic of five paraphrases, two sparse topics, 40 noise records, dim 256) + a query touching all three, reporting recall@k, MRR, topic coverage@k and redundancy@k; plus an ef sweep against brute force and a recency tie-break. Run with `cargo test -p sofuu-core --lib recall_eval -- --nocapture`. | M |
+| B5.1 | ✅ **Diversity** (2026-10-14) — near-duplicate suppression while filling top-k (`diversify`, floor 0.6 cosine). The roadmap said MMR; the harness measured the textbook linear trade-off promoting *unrelated* records on this scoring scale (relevance 1.00 → 0.17 with noise pulled above the secondary topics), so the shipped mechanism is MMR-family diversity by suppression: relevance order is never inverted, near-duplicates are skipped. | S |
+| B5.2 | ✅ **Recency term** (2026-10-14) — `+0.15 · exp(-age/7d)` on the composite score from B1.2's `created_at`; fresh records outrank equally-strong stale ones, `created_at == 0` (legacy) stays neutral. | S |
+| B5.3 | ✅ **`ef_search` knob** (2026-10-14) — `Hnsw::search_with_ef` + `Cma::set_ef_search`, read from `SOFUU_BRAIN_EF_SEARCH` on every surface that opens a brain (JS shell, C ABI facade), reported in `cma.stats()`. Default unchanged. | S |
 
-**Gate:** harness numbers before/after each change; the existing 30/30 memory suite stays green.
+**Measured (harness, k=6):** baseline (diversity off) recall@6 **1.000**, MRR **1.000**, topic
+coverage **0.667**, redundancy **0.667** → shipped defaults recall@6 **0.500**, MRR **1.000**,
+coverage **1.000**, redundancy **0.500** — the top-k stops returning five paraphrases of one fact
+and touches all three topics, at the cost of two slots that held redundant copies. The floor sweep
+is flat across 0.4–0.7 (0.80 behaves like off), so 0.6 sits mid-plateau. ef sweep (n=600, k=10):
+ef 8 → 0.685, default 40 → 0.975, ef 512 → 1.000 against brute force.
+
+**Gate met (2026-10-14):** harness numbers above; full suite **543/0** in both QTSQ-enabled and
+QTSQ-free builds; `tests/verify_memory_test.js` **30/30** on a real QTSQ binary.
 
 ---
 

@@ -320,7 +320,10 @@ pub unsafe extern "C" fn sofuu_ts_strip_rs(
 
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_cma_new(vec_dim: usize) -> *mut std::os::raw::c_void {
-    let cma = Box::new(crate::memory::cma::Cma::new(vec_dim));
+    let mut cma = Box::new(crate::memory::cma::Cma::new(vec_dim));
+    /* B5.3: the same recall knob the JS surface reads, so a headless
+     * embedder ranks identically to the CLI. */
+    cma.set_ef_search(crate::memory::cma::ef_search_from_env());
     Box::into_raw(cma) as *mut std::os::raw::c_void
 }
 

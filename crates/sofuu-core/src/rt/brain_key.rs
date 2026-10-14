@@ -103,39 +103,69 @@ fn resolve_password() -> String {
 }
 
 /// Read the key file, or create it (0600) on first use.
+///
+/// P2 (audit 2026-10-14): two processes creating the key on FIRST use
+/// raced on ONE shared `{path}.tmp` — interleaved writes could tear it,
+/// and rename-order stratification left the losing process holding a key
+/// that never landed in the file (brains it wrote were unreadable after
+/// exit). Now: per-process tmp siblings, and after OUR rename lands we
+/// re-read the file — if another process's rename overwrote ours in the
+/// window, we adopt THEIR key before this process has written any brain
+/// with ours, so every writer converges on the surviving file's key.
 fn load_or_create_key(path: &str) -> Result<String, String> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+    for _attempt in 0..8 {
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                #[cfg(unix)]
+                {
+                    /* Best-effort tightening: an old copy may sit at 0644
+                     * (created before the 0600 contract). Never loosens. */
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                return Ok(trimmed.to_string());
+            }
         }
-    }
-    let key = random_hex(32);
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    /* Write to a 0600 tmp sibling and rename: a reader never sees a partial
-     * key, and the file is never briefly world-readable. */
-    let tmp = format!("{path}.tmp");
-    {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
+        let key = random_hex(32);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        /* 0600 tmp sibling unique to this process — a reader never sees a
+         * partial key, and concurrent creators cannot tear one file. */
+        let tmp = format!("{path}.tmp.{}", std::process::id());
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).map_err(|e| e.to_string())?;
+            f.write_all(key.as_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(b"\n").map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
         }
-        let mut f = opts.open(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(key.as_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(b"\n").map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
+        /* THE commit check: the file must now hold OUR key. If the read
+         * fails or disagrees, another rename won the race — loop, and the
+         * next read adopts theirs. No brain has been written with ours:
+         * resolution happens before any flush. */
+        if let Ok(now) = std::fs::read_to_string(path) {
+            if now.trim() == key {
+                return Ok(key);
+            }
+        }
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })?;
-    Ok(key)
+    Err("could not create a stable machine key after 8 attempts (concurrent first runs?) — refusing instead of writing brains that cannot reopen".to_string())
 }
 
 /// 32+ bytes of hex from the OS entropy source.

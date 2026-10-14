@@ -3916,8 +3916,35 @@ const DRIVER: &str = r#"
       const entry = sofuu.agent.brainFor(brainDef());
       if (!entry || !entry.cma) return null;
       if (entry.backend) driverBrainBackend = entry.backend;
+      driverSemBrain = entry.sem || null;
       return entry.cma;
     } catch (e) { return null; }
+  }
+  /* Mirror ONE canonical text into the SEM2 sibling (P2, audit 2026-10-14).
+   * The caller guarantees `text` exists in the canonical store as a live
+   * record — the cross-channel join key is the exact stored string, so a
+   * variant wording here would land a sem-only hit the NEXT retainAgainst
+   * prunes. Returns true when a row landed. */
+  function mirrorToSem2(text, role, source) {
+    try {
+      const sem = driverSemBrain;
+      if (!sem || typeof sofuu.ai.embedLocalSemanticV2 !== 'function') return false;
+      const sv = sofuu.ai.embedLocalSemanticV2(String(text));
+      if (!sv || !sv.length) return false;
+      const id = sem.remember(new Float32Array(sv), String(text),
+                              String(role || 'imported'), 0, String(source || 'import'));
+      if (id >= 0) sem.flush();
+      return id >= 0;
+    } catch (eS) { return false; }
+  }
+  /* Exact-text membership in the canonical store (list's text filter is a
+   * case-insensitive SUBSTRING match — the equality check here is the
+   * precision). */
+  async function canonicalHasExactText(brain, text) {
+    try {
+      const res = JSON.parse(brain.list({ text: String(text), limit: 20 }));
+      return (res.records || []).some(r => r.text === text);
+    } catch (eL) { return false; }
   }
   /* Driver-side embedding backend (PLAN-TINY-SEMANTIC-EMBEDDER §7) —
    * mirrors agent.js selection; now only a FALLBACK identity source for
@@ -3926,6 +3953,12 @@ const DRIVER: &str = r#"
    * Dims come from sofuu.ai.embedInfo(), never literals. Null = the
    * selected backend is unavailable (memory declines, never substitutes). */
   let driverBrainBackend = null;
+  /* P2 (audit 2026-10-14): the SEM2 sibling of the driver's brain — the
+   * fused recall channel. /remember, /import and /forget now maintain it
+   * too: without /forget mirroring, a forgotten text stayed recallable
+   * through the sem-only channel; without mirrors on writes, pins only
+   * ever surfaced via the hash side of the fusion. */
+  let driverSemBrain = null;
   function driverBackend() {
     try {
       if (cfg.embed_provider && cfg.embed_model) {
@@ -3985,8 +4018,22 @@ const DRIVER: &str = r#"
     const vec = await embedText(fact);
     if (!vec) { out('\x1b[90m  Embeddings unavailable — cannot store fact\x1b[0m\n'); return; }
     try {
-      brain.remember(new Float32Array(vec), fact, 'user_pin', 0, 'pin');
+      const id = brain.remember(new Float32Array(vec), fact, 'user_pin', 0, 'pin');
       brain.flush();
+      /* P2 (audit 2026-10-14): mirror the CANONICAL row's exact text into
+       * the SEM2 sibling — the dup gate may have kept an older wording of
+       * this fact, and the cross-channel join key is the exact text. So
+       * the mirror reads the row back before embedding it. */
+      let semNote = '';
+      try {
+        if (id >= 0) {
+          const row = JSON.parse(brain.list({ offset: id, limit: 1 }));
+          const r0 = (row.records || [])[0];
+          if (r0 && r0.id === id && await canonicalHasExactText(brain, r0.text)) {
+            if (mirrorToSem2(r0.text, 'user_pin', 'pin')) semNote = ' · mirrored to v2';
+          }
+        }
+      } catch (eM) {}
       /* AGENTS.md (2026-09-12): the fact also lands in the project context
        * file so it rides EVERY request as standing context, not just via
        * semantic recall. Never fatal — the brain pin above already held. */
@@ -3998,7 +4045,7 @@ const DRIVER: &str = r#"
           else if (r === 'exists') fileNote = ' · already in AGENTS.md';
         } catch (eP) {}
       }
-      out('\x1b[90m  ⏺ remembered · ' + brain.count() + ' memories · ' + brainPath() + fileNote + '\x1b[0m\n');
+      out('\x1b[90m  ⏺ remembered · ' + brain.count() + ' memories · ' + brainPath() + fileNote + semNote + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
   function handleWhy() {
@@ -4184,6 +4231,19 @@ const DRIVER: &str = r#"
     try {
       brain.forget(id);
       brain.flush();
+      /* P2 (audit 2026-10-14): forget the SAME text in the SEM2 sibling —
+       * a forgotten text left in the sem channel stays recallable there
+       * (fused recall surfaces sem-only hits by exact text). Never fatal:
+       * retainAgainst prunes the drift at the next turn boundary anyway. */
+      try {
+        const sem = driverSemBrain;
+        if (sem && typeof sem.forget === 'function') {
+          const rows = JSON.parse(sem.list({ text: rec.text, limit: 20 })).records || [];
+          let f = 0;
+          for (const r of rows) { if (r.text === rec.text && sem.forget(r.id)) f++; }
+          if (f) sem.flush();
+        }
+      } catch (eS) {}
       out('\x1b[90m  ⏺ forgot #' + id + ' · pruned at the next turn boundary\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
@@ -4660,9 +4720,23 @@ const DRIVER: &str = r#"
       }
       const stats = JSON.parse(brain.importRecords(vecs, JSON.stringify({ records: card.records })));
       brain.flush();
+      /* P2 (audit 2026-10-14): mirror what landed into the SEM2 sibling —
+       * only texts that are LIVE in the canonical store (added or merged),
+       * so the sem channel stays a derived index, never a sidestore. */
+      let mirrored = 0;
+      try {
+        for (const r of card.records) {
+          const t = String(r.text || '');
+          if (!t.trim() || (r.tier | 0) === 3) continue;
+          if (await canonicalHasExactText(brain, t)) {
+            if (mirrorToSem2(t, r.role, r.source || 'import')) mirrored++;
+          }
+        }
+      } catch (eM) {}
       out('\x1b[90m  ⏺ imported ' + (card.label ? '"' + card.label + '" · ' : '') +
           stats.added + ' added · ' + stats.merged + ' merged (duplicates) · ' +
           stats.skipped + ' skipped' +
+          (mirrored ? ' · ' + mirrored + ' mirrored to v2' : '') +
           (sameSpace ? '' : ' · re-embedded into ' + local.id) + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }

@@ -1441,6 +1441,11 @@
       embed_provider: c.embed_provider || undefined,
       embed_model: c.embed_model || undefined,
       memory: c.brain ? 'shared' : 'off',
+      /* P2 (audit 2026-10-14): the TUI driver passes cfg.memory_backend
+       * through — this driver dropped it, so a desktop user who configured
+       * the semantic projector silently stayed on hash. Same field name
+       * agent.js resolves (def.embedding). */
+      embedding: c.memory_backend || undefined,
       /* Project-local brain (P: no global) — every project carries its
        * own memories under .sofuu/brain/. */
       brainPath: S.project ? S.project + '/.sofuu/brain/brain.qtsq' : undefined,

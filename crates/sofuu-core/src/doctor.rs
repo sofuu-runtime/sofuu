@@ -195,6 +195,54 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     #[cfg(has_qtsq)]
     if qtsq_linked && bp.exists() {
         section("brain store");
+        // P2 (audit 2026-10-14): WHICH key would the next flush use — the
+        // env override, the key file, or a process-local one that never
+        // reopens? Observation only: this never creates the key file.
+        let env_key = std::env::var("SOFUU_BRAIN_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        match &env_key {
+            Some(v) => {
+                let hex64 = v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit());
+                if hex64 {
+                    info("SOFUU_BRAIN_KEY override in use (64 hex chars)");
+                } else {
+                    warn(&format!(
+                        "SOFUU_BRAIN_KEY used as given ({} chars, not the documented 64-hex shape) — keep it byte-exact; brains written under it reopen only with the same value",
+                        v.len()
+                    ));
+                }
+            }
+            None => match sofuu_core::rt::brain_key::key_file_path()
+                .and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m)))
+            {
+                Some((p, md)) => {
+                    #[cfg(unix)]
+                    let mode: u32 = {
+                        use std::os::unix::fs::PermissionsExt;
+                        md.permissions().mode() & 0o777
+                    };
+                    #[cfg(not(unix))]
+                    let mode: u32 = 0o600;
+                    if mode == 0o600 {
+                        ok(&format!("machine key present: {} (0600)", p));
+                    } else {
+                        warn(&format!(
+                            "machine key present but mode {:o} (expected 600): {}",
+                            mode, p
+                        ));
+                    }
+                }
+                None => {
+                    warn(&format!(
+                        "no machine key yet ({} missing) — the FIRST brain write creates one; a key written this run is process-local and will not reopen",
+                        sofuu_core::rt::brain_key::key_file_path()
+                            .unwrap_or_else(|| "~/.sofuu/brain.key".into())
+                    ));
+                }
+            },
+        }
         // Journal state first (the same recovery an open runs): a crashed
         // commit that is rolled forward here is a fix, not a problem —
         // but the user should see it happened.
@@ -208,7 +256,27 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         }
         // Manifest: space + segments + compaction generation. A legacy
         // (pre-B3) brain has no manifest — still healthy, just unsegmented.
-        let manifest = unsafe { sofuu_core::rt::brain_store::read_manifest(&bp.to_string_lossy()) };
+        // `_ex` distinguishes "not segmented" from "a container no known
+        // key opens" — a wrong-key brain used to read as a healthy ✓.
+        let manifest_ex = unsafe { sofuu_core::rt::brain_store::read_manifest_ex(&bp.to_string_lossy()) };
+        match &manifest_ex {
+            Ok(Some((_, true))) => info(
+                "legacy-password encryption (pre-B4) — re-encrypts under the machine key on its next write (backup kept)",
+            ),
+            Ok(Some((_, false))) => info("encrypted under this machine's key"),
+            _ => {}
+        }
+        let manifest = match &manifest_ex {
+            Ok(Some((m, _))) => Some(m.clone()),
+            Ok(None) => None,
+            Err(rc) => {
+                warn(&format!(
+                    "brain file cannot be opened with any known key (qtsq error {rc}) — restore ~/.sofuu/brain.key or set SOFUU_BRAIN_KEY to its original value"
+                ));
+                failures += 1;
+                None
+            }
+        };
         match &manifest {
             Some(m) => {
                 let space = m
@@ -256,7 +324,28 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                 }
             }
             None => {
-                info("legacy single-file brain (no segment manifest) — still healthy; the next compaction rewrites it segmented");
+                // Not segmented: a legacy single-file brain (or a plain
+                // fresh file). Probe its encryption directly — B4 migration
+                // state is invisible to the manifest reader. Observation
+                // only: the container is closed without any write.
+                unsafe {
+                    match sofuu_core::rt::brain_store::container_open_ex(&bp.to_string_lossy()) {
+                        Ok((ctx, legacy)) => {
+                            sofuu_core::rt::brain_store::container_free(ctx);
+                            if legacy {
+                                info("legacy-password encrypted single-file brain (pre-B4) — the next flush re-encrypts under the machine key (backups kept)");
+                            } else {
+                                info("single-file brain, encrypted under this machine's key");
+                            }
+                        }
+                        Err(rc) => {
+                            warn(&format!(
+                                "brain file cannot be opened with any known key (qtsq error {rc}) — restore ~/.sofuu/brain.key or set SOFUU_BRAIN_KEY to its original value"
+                            ));
+                            failures += 1;
+                        }
+                    }
+                }
             }
         }
         // Live stats + tier histogram through the REAL store (the same

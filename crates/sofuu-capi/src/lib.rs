@@ -259,6 +259,23 @@ const MEMORY_FACADE_JS: &str = r#"
     a = a || {};
     return one(a, 'forget', [a.index | 0]);
   };
+  /* B6 (ROADMAP-BRAIN-CMA): the session working set, same shapes as the
+   * in-process API — a headless embedder promotes exactly like the chat
+   * driver does. */
+  M.rememberWorking = function (a) {
+    a = a || {};
+    return one(a, 'rememberWorking', [f32(a.vec), a.text || '',
+                                      a.role || 'user', a.kv_page_id | 0,
+                                      a.source === undefined ? undefined : String(a.source)]);
+  };
+  M.promoteWorking = function (a) {
+    a = a || {};
+    return one(a, 'promoteWorking', [JSON.stringify(Array.isArray(a.ids) ? a.ids : [])]);
+  };
+  M.clearWorking = function (a) { return one(a || {}, 'clearWorking', []); };
+  /* B7.1: stats is part of the read-out parity (doctor and /brain info
+   * read the same numbers a headless host does). */
+  M.stats = function (a) { return one(a || {}, 'stats', []); };
   M.close = function (a) {
     var inst = pick(a || {});
     var id = live.indexOf(inst);
@@ -3875,6 +3892,10 @@ mod tests {
             "memory.close",
             "memory.list",
             "memory.export",
+            "memory.stats",
+            "memory.rememberWorking",
+            "memory.promoteWorking",
+            "memory.clearWorking",
             "mcp.connect",
             "mcp.call",
             "mcp.listTools",
@@ -3896,7 +3917,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            32,
+            36,
             "the funnel contract list changed length — update it deliberately"
         );
 

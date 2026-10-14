@@ -263,11 +263,38 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         // surface /brain info reads). Open runs the recovery + decay
         // replay; nothing here flushes, so doctor never writes.
         let bp_js = bp.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        /* P1 (audit 2026-10-14): open the real brain with the shape the
+         * manifest declares — the probe used to call sofuu.memory.open(path)
+         * with ONE argument, which the native binding rejects (it needs a
+         * vector dimension), so this section failed on every healthy
+         * install. Candidates are tried in order: the manifest's space,
+         * then the two built-in shapes for legacy/unmanifested brains. */
+        let mut cands: Vec<serde_json::Value> = Vec::new();
+        if let Some(m) = &manifest {
+            cands.push(serde_json::json!({
+                "dim": m.embedding.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0),
+                "space": m.embedding.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            }));
+        }
+        cands.push(serde_json::json!({"dim": 768, "space": ""}));
+        cands.push(serde_json::json!({"dim": 64, "space": ""}));
+        let cands_json = serde_json::to_string(&cands).unwrap_or_else(|_| "[]".into());
         let probe = format!(
             r#"(function () {{
   var out = {{}};
   try {{
-    var b = sofuu.memory.open("{p}");
+    var cands = {cands};
+    var b = null, used = null, lastErr = "";
+    for (var ci = 0; ci < cands.length && !b; ci++) {{
+      try {{
+        b = cands[ci].space
+          ? sofuu.memory.open("{p}", cands[ci].dim, cands[ci].space)
+          : sofuu.memory.open("{p}", cands[ci].dim);
+        used = cands[ci];
+      }} catch (eC) {{ lastErr = String((eC && eC.message) || eC); }}
+    }}
+    if (!b) throw new Error(lastErr || "sofuu.memory.open refused every known shape");
+    out.shape = (used && used.space ? used.space : "inferred") + "@" + (used && used.dim);
     var s = JSON.parse(b.stats());
     out.records = s.records;
     out.working = s.working;
@@ -286,6 +313,7 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
   }}
   return JSON.stringify(out);
 }})()"#,
+            cands = cands_json,
             p = bp_js
         );
         let out = rt.eval_repl(&probe).unwrap_or_default();
@@ -294,9 +322,15 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             let marker = format!("\"{key}\":");
             let at = out.find(&marker)? + marker.len();
             let rest = out[at..].trim_start();
-            let end = rest
-                .find(|c: char| c == ',' || c == '}')
-                .unwrap_or(rest.len());
+            /* An ARRAY value must read to its closing bracket — stopping at
+             * the first ',' inside "[0,16,0,0,0]" left a fragment that
+             * never parsed (the histogram rendered empty). */
+            let end = if rest.starts_with('[') {
+                rest.find(']')? + 1
+            } else {
+                rest.find(|c: char| c == ',' || c == '}')
+                    .unwrap_or(rest.len())
+            };
             serde_json::from_str(rest[..end].trim_end_matches(',')).ok()
         };
         if let Some(err) = js_error(&out) {
@@ -321,6 +355,9 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                 .zip(tiers.iter())
                 .map(|(n, c)| format!("{n} {c}"))
                 .collect();
+            if let Some(shape) = parse("shape").and_then(|v| v.as_str().map(str::to_string)) {
+                info(&format!("opened as {shape}"));
+            }
             ok(&format!("records: {records} · tiers: {}", hist.join(" · ")));
             if working > 0 {
                 info(&format!("session working records: {working} (in-RAM only — gone on reload unless promoted)"));
@@ -355,7 +392,8 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                 "recall knobs: ef_search {} (0 = default) · diversity floor {}",
                 parse("ef_search").and_then(|v| v.as_i64()).unwrap_or(0),
                 parse("diversity_floor")
-                    .map(|v| v.to_string())
+                    .and_then(|v| v.as_f64())
+                    .map(|f| format!("{f:.2}"))
                     .unwrap_or_else(|| "off".into())
             ));
         }

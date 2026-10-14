@@ -94,6 +94,14 @@ pub struct Manifest {
     /// Lifetime count of capacity evictions (reported, never silent).
     #[serde(default)]
     pub evicted_total: u64,
+    /// Live record count as of the last flush — the record table's row
+    /// count, tombstones included (the number `count()` reports). Append
+    /// segments can carry several VERSIONS of one record, so
+    /// `total_versions()` overstates what a reader actually sees.
+    /// Manifests written before this field existed carry 0; callers fall
+    /// back to `total_versions()`.
+    #[serde(default)]
+    pub records: u64,
 }
 
 impl Manifest {
@@ -105,6 +113,7 @@ impl Manifest {
             epoch: 1,
             last_decay_at: 0,
             evicted_total: 0,
+            records: 0,
         }
     }
 
@@ -690,6 +699,7 @@ mod tests {
         });
         m.last_decay_at = 1234;
         m.evicted_total = 9;
+        m.records = 7;
         unsafe {
             write_manifest(&path.to_string_lossy(), &m).expect("write");
             let back = read_manifest(&path.to_string_lossy()).expect("read");
@@ -699,7 +709,33 @@ mod tests {
             assert_eq!(back.segments[0].sha256, "ab".repeat(32));
             assert_eq!(back.last_decay_at, 1234);
             assert_eq!(back.evicted_total, 9);
+            assert_eq!(back.records, 7);
             assert_eq!(back.embedding["id"], "hash-v1");
+        }
+    }
+
+    /// A manifest written before `records` existed (no such key on disk)
+    /// must still load — the field defaults to 0 and callers fall back to
+    /// `total_versions()`.
+    #[test]
+    fn manifest_without_records_field_loads() {
+        let dir = tmpdir("manifest-legacy-field");
+        let path = dir.join("brain.qtsq");
+        let raw = r#"{"schema":"sofuu-cma-segments@1","embedding":{"id":"hash-v1","dimension":768},"segments":[{"file":"seg-000001-000001.qtsq","records":4}],"epoch":1}"#;
+        unsafe {
+            container_write(
+                &path.to_string_lossy(),
+                &[Stream::Json {
+                    name: MANIFEST_STREAM,
+                    body: raw,
+                }],
+            )
+            .expect("write");
+            let mut back = read_manifest(&path.to_string_lossy()).expect("read");
+            assert_eq!(back.segments[0].records, 4);
+            assert_eq!(back.records, 0, "the key was absent on disk → 0");
+            back.records = back.total_versions() as u64;
+            assert_eq!(back.records, 4, "fallback is total_versions");
         }
     }
 

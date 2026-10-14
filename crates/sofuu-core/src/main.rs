@@ -1183,10 +1183,19 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }}
     if (req.method === 'GET' && path === '/recall') {{
       var qs = {{}};
-      var q = (url.split('?')[1] || '').split('&');
-      for (var i = 0; i < q.length; i++) {{
-        var kv = q[i].split('=');
-        if (kv.length === 2) qs[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+      try {{
+        var q = (url.split('?')[1] || '').split('&');
+        for (var i = 0; i < q.length; i++) {{
+          var kv = q[i].split('=');
+          if (kv.length === 2) qs[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+        }}
+      }} catch (eQ) {{
+        /* P1 (audit 2026-10-14): a malformed %sequence used to throw
+         * outside any handler → the promise rejected → no bytes written
+         * and serve runs without deadlines → the socket hung forever. */
+        res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: 'bad query encoding' }}));
+        return;
       }}
       if (!qs.q) {{
         res.writeHead(400, {{ 'Content-Type': 'application/json' }});
@@ -1198,11 +1207,16 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
         return;
       }}
-      var vec = embed(qs.q);
-      var k = parseInt(qs.k || '5', 10);
-      var results = brain.recall(new Float32Array(vec), k);
-      res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{ ok: true, results: results }}));
+      try {{
+        var vec = embed(qs.q);
+        var k = parseInt(qs.k || '5', 10);
+        var results = brain.recall(new Float32Array(vec), k);
+        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: true, results: results }}));
+      }} catch (eR) {{
+        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: String(eR.message || eR) }}));
+      }}
       return;
     }}
     if (req.method === 'GET' && path === '/memories') {{
@@ -1212,10 +1226,16 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         return;
       }}
       var mqs = {{}};
-      var mq = (url.split('?')[1] || '').split('&');
-      for (var mi = 0; mi < mq.length; mi++) {{
-        var mkv = mq[mi].split('=');
-        if (mkv.length === 2) mqs[decodeURIComponent(mkv[0])] = decodeURIComponent(mkv[1]);
+      try {{
+        var mq = (url.split('?')[1] || '').split('&');
+        for (var mi = 0; mi < mq.length; mi++) {{
+          var mkv = mq[mi].split('=');
+          if (mkv.length === 2) mqs[decodeURIComponent(mkv[0])] = decodeURIComponent(mkv[1]);
+        }}
+      }} catch (eM) {{
+        res.writeHead(400, {{ 'Content-Type': 'application/json' }});
+        res.end(JSON.stringify({{ ok: false, error: 'bad query encoding' }}));
+        return;
       }}
       var lopts = {{}};
       if (mqs.tier !== undefined) lopts.tier = parseInt(mqs.tier, 10) || 0;

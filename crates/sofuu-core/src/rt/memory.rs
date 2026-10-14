@@ -1600,6 +1600,32 @@ mod impl_qtsq {
         };
         layout.dir = dir.clone();
 
+        /* P1 (audit 2026-10-14): writer arbitration. The manifest is the
+         * only serialization point between processes. Two writers, each
+         * appending their own segment and publishing their own manifest,
+         * would strand the loser's records as unreferenced files — which
+         * the age-guarded orphan sweep then DELETES (silent record loss).
+         * The store is single-writer by contract; a manifest that moved
+         * under this shell (any epoch bump, or a segment it has never
+         * seen) means another live writer: refuse, keep this shell's
+         * state in memory, and let the operator reopen to adopt. */
+        if let Ok(Some(disk)) = crate::rt::brain_store::read_manifest_ex(&path) {
+            let moved = disk.0.epoch != layout.epoch
+                || disk
+                    .0
+                    .segments
+                    .iter()
+                    .any(|s| !layout.segments.iter().any(|mine| mine.file == s.file));
+            if moved {
+                eprintln!(
+                    "[sofuu/cma] brain store at {path} moved under this process (another writer?) — \
+                     flush refused to avoid dropping its records; reopen to adopt them"
+                );
+                shell.layout = Some(layout);
+                return -1;
+            }
+        }
+
         /* B4: a brain the LEGACY password opened is re-encrypted under the
          * machine key. That is a full rewrite (every segment), so it rides
          * the compaction path; the old generation stays on disk as the
@@ -1652,6 +1678,9 @@ mod impl_qtsq {
             epoch: layout.epoch,
             last_decay_at: layout.last_decay_at,
             evicted_total: layout.evicted_total,
+            /* The live row count (tombstones included) — the number a
+             * fresh open's count() reports, not total_versions(). */
+            records: live as u64,
         };
         let tmp = format!("{path}.tmp");
         if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
@@ -1831,6 +1860,52 @@ mod impl_qtsq {
         let Some(path_s) = path_s else {
             return qjs::JS_ThrowTypeError(ctx, c"Expected path string".as_ptr());
         };
+        /* B3 (audit 2026-10-14): a segmented brain's MANIFEST is the true,
+         * cheap answer. The legacy single-file reader below sees only a
+         * metadata-only container there, and reported {dimension:0, id:""}
+         * for every post-B3 brain — and the brain server picks its
+         * embedder from this, so a 64-dim semantic brain got opened as
+         * hash-768, was refused, and every memory route answered 503.
+         * `Ok(None)` = not segmented (missing file, foreign bytes, legacy
+         * single-file brain) — fall through to the legacy reader. `Err` =
+         * a container we cannot open (wrong key, torn file): fail loudly,
+         * never as ok:true. */
+        match crate::rt::brain_store::read_manifest_ex(&path_s) {
+            Err(rc) => {
+                let c = CString::new(
+                    serde_json::json!({ "ok": false, "error": rc }).to_string(),
+                )
+                .unwrap_or_default();
+                return qjs::sofuu_js_new_string(ctx, c.as_ptr());
+            }
+            Ok(Some((m, _legacy))) => {
+                let emb = &m.embedding;
+                let s = |k: &str| {
+                    emb.get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let records = if m.records > 0 {
+                    m.records
+                } else {
+                    m.total_versions() as u64
+                };
+                let out = serde_json::json!({
+                    "ok": true,
+                    "id": s("id"),
+                    "input": s("input"),
+                    "dimension": emb.get("dimension").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "artifact": s("artifact"),
+                    /* Append segments carry superseded VERSIONS of one
+                     * record; prefer the live count the flush stamped. */
+                    "records": records,
+                });
+                let c = CString::new(out.to_string()).unwrap_or_default();
+                return qjs::sofuu_js_new_string(ctx, c.as_ptr());
+            }
+            Ok(None) => { /* legacy or absent — the reader below owns it */ }
+        }
         let out = match cma_qtsq_load(&path_s) {
             Ok(brain) => {
                 let manifest = brain.meta.as_deref().and_then(embedding_manifest);
@@ -4851,6 +4926,79 @@ mod impl_qtsq {
             shell.cma.len(),
             "every record must survive the reload"
         );
+    }
+
+    /// P1 (audit 2026-10-14): the flush stamps the LIVE record-row count
+    /// into the manifest; superseded append-versions must not count, so
+    /// inspect()/the brain server report what a fresh open would hold.
+    #[test]
+    fn manifest_records_stamps_the_live_row_count() {
+        let dir = fresh_test_dir("b3-manifest-records");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        for i in 0..3 {
+            let v = crate::embedding::hash_features_at(&format!("row {i}"), dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&format!("row {i}")), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        let manifest = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        assert_eq!(manifest.records, 3);
+
+        /* A recall-reinforced record appends a NEW version of itself. The
+         * active-segment rewrite replaces that version IN PLACE (versions
+         * only pile up at segment rotation), which is exactly why a
+         * consumer must not derive the record count from total_versions() —
+         * the stamped live count is the truth in both cases. */
+        let q = crate::embedding::hash_features_at("row 1", dim);
+        let hits = shell.cma.recall(&q, 1);
+        assert_eq!(hits.len(), 1, "self-recall for the reinforcement");
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        let manifest = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        assert_eq!(manifest.records, 3, "live rows, not versions");
+        assert_eq!(manifest.total_versions(), 3, "the in-place update replaced the version");
+    }
+
+    /// P1 (audit 2026-10-14): a second writer whose manifest view went
+    /// stale must have its flush REFUSED instead of publishing a manifest
+    /// that strands the first writer's segments for the orphan sweep.
+    #[test]
+    fn concurrent_writer_flush_is_refused() {
+        let dir = fresh_test_dir("b3-arbitration");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 16;
+
+        let mut a = unsafe { cma_open(&p, dim, None) }.expect("writer A (fresh)");
+        let mut b = unsafe { cma_open(&p, dim, None) }.expect("writer B (also fresh — A has no file yet)");
+
+        let va = crate::embedding::hash_features_at("a-record", dim);
+        assert!(unsafe { cma_remember(&mut a, &va, Some("a-record"), Some("user"), 0, None) } >= 0);
+        assert_eq!(unsafe { cma_flush(&mut a) }, 0, "A publishes");
+
+        let vb = crate::embedding::hash_features_at("b-record", dim);
+        assert!(unsafe { cma_remember(&mut b, &vb, Some("b-record"), Some("user"), 0, None) } >= 0);
+        assert_eq!(
+            unsafe { cma_flush(&mut b) },
+            -1,
+            "B's flush must be refused — its view never saw A's segment"
+        );
+
+        /* Nothing B held was published; nothing A published was lost. */
+        let re = unsafe { cma_open(&p, dim, None) }.expect("reload");
+        assert!(re.cma.records.iter().any(|r| r.text == "a-record"), "A's record survives");
+        assert!(!re.cma.records.iter().any(|r| r.text == "b-record"), "B's stale view was not published");
+
+        /* Once B reopens (adopting A's manifest), its flushes work again. */
+        let mut b2 = unsafe { cma_open(&p, dim, None) }.expect("writer B reopened");
+        let vb2 = crate::embedding::hash_features_at("b-record-2", dim);
+        assert!(unsafe { cma_remember(&mut b2, &vb2, Some("b-record-2"), Some("user"), 0, None) } >= 0);
+        assert_eq!(unsafe { cma_flush(&mut b2) }, 0, "a fresh view flushes normally");
+        let re2 = unsafe { cma_open(&p, dim, None) }.expect("reload 2");
+        assert!(re2.cma.records.iter().any(|r| r.text == "a-record"));
+        assert!(re2.cma.records.iter().any(|r| r.text == "b-record-2"));
     }
 
     /// B3 gate: a 10k-record brain stays under the cap, reloads whole, and

@@ -971,6 +971,12 @@
       /* insertion order IS recency in JS object semantics — the oldest
        * inserted key is the least recently used (re-hits do not reorder,
        * which is fine: 8 slots of hysteresis). */
+      /* P1 (audit 2026-10-14): the finalizer never flushes, so a dirty
+       * evicted handle lost its unreached changes (recall reinforcement,
+       * a prune). Flush before dropping — a clean store's flush is a
+       * no-op, and a failed one only delays to the next open. */
+      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].cma) BRAINS[keys[0]].cma.flush(); } catch (eV1) {}
+      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].sem) BRAINS[keys[0]].sem.flush(); } catch (eV2) {}
       delete BRAINS[keys[0]];
     }
     return entry;
@@ -993,6 +999,16 @@
       if (typeof entry.cma.retain === 'function') dropped = entry.cma.retain() || 0;
       consolidated = brainConsolidateIfDue(entry);
     } catch (e) {}
+    /* P1 (audit 2026-10-14): the canonical prune must reach disk. Only
+     * consolidation flushes itself, so a tick whose only change was the
+     * retain() drop left the tombstones in the FILE — a fresh open
+     * (doctor, another process, a test) still counted and listed the dead
+     * records. When consolidation did not flush this tick, flush here; a
+     * failed flush is safe (the prune stays in memory and the next
+     * successful flush persists it). */
+    if (dropped > 0 && consolidated === 0) {
+      try { entry.cma.flush(); } catch (eF) {}
+    }
     /* B3.5 (ROADMAP-BRAIN-CMA): the SEM2 channel is a DERIVED index over
      * the canonical records — it no longer runs its own decay or retain
      * (the double decay that let the two channels drift apart, one keeping
@@ -3421,6 +3437,15 @@
           }
           if (semCma && recalledSemIds.length && ansText.trim()) {
             try { semCma.markPositive(recalledSemIds); } catch (e) {}
+          }
+          /* P1 (audit 2026-10-14): reinforcement and the recall counters
+           * are DIRTY state written after this turn's flushes — the
+           * finalizer never flushes and the engine has no shutdown flush,
+           * so a session that ended here lost every mark. Flush both
+           * stores; a clean store's flush is a no-op. */
+          if ((recalledIds.length || (semCma && recalledSemIds.length)) && ansText.trim()) {
+            try { cma.flush(); } catch (eF1) {}
+            if (semCma) { try { semCma.flush(); } catch (eF2) {} }
           }
           emit('stored', { scope: d.memory });
         } catch (e) {}

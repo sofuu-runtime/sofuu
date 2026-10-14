@@ -798,10 +798,38 @@ unsafe fn do_listen(srv: *mut Server, host: *const c_char, port: c_int) -> c_int
         crate::rt::event_loop::track_handle((*srv).ctx, tcp as *mut UvHandle, Some(srv_close_cb))
     };
 
+    /* P1 (audit 2026-10-14): resolve the bind host BEFORE touching libuv.
+     * The old code ignored uv_ip4_addr's return — and a failed parse
+     * ZEROES the sockaddr, so any host that is not a numeric IPv4 address
+     * ("localhost", a typo, a DNS name) silently bound 0.0.0.0 while the
+     * CLI treated "localhost" as local-only. Only the two documented
+     * shapes are accepted; everything else fails CLOSED (never listen, so
+     * nothing is exposed), and the caller reports the libuv error. */
+    let host_str = if host.is_null() || *host == 0 {
+        "0.0.0.0".to_string()
+    } else {
+        std::ffi::CStr::from_ptr(host).to_string_lossy().into_owned()
+    };
+    let bind_ip: std::borrow::Cow<'_, str> = match host_str.as_str() {
+        "localhost" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "" => std::borrow::Cow::Borrowed("0.0.0.0"),
+        other => std::borrow::Cow::Borrowed(other),
+    };
+    let cbind = match std::ffi::CString::new(bind_ip.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return libc::EINVAL as c_int,
+    };
     let mut a: uv::SockaddrIn = std::mem::zeroed();
-    let ip = if host.is_null() || *host == 0 { c"0.0.0.0".as_ptr() } else { host };
-    uv::uv_ip4_addr(ip, port, &mut a);
-    uv::uv_tcp_bind(tcp, &a as *const _ as *const libc::sockaddr, 0);
+    let parsed = uv::uv_ip4_addr(cbind.as_ptr(), port, &mut a);
+    if parsed != 0 {
+        eprintln!(
+            "[sofuu/http] cannot bind host '{host_str}' (only numeric IPv4 addresses and 'localhost' are supported) — refusing to listen on every interface"
+        );
+        return parsed;
+    }
+    if uv::uv_tcp_bind(tcp, &a as *const _ as *const libc::sockaddr, 0) != 0 {
+        return -1;
+    }
     uv::uv_listen(tcp as *mut UvStream, 128, Some(on_connection))
 }
 

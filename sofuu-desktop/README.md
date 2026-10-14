@@ -1,4 +1,4 @@
-<p align="center"><img src="../sofuu-landing/public/logo.png" width="118" alt="Sofuu logo"></p>
+<p align="center"><img src="../docs/sofuu-logo.png" width="118" alt="Sofuu logo"></p>
 
 # Sofuu Desktop
 

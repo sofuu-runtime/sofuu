@@ -12,7 +12,8 @@ use std::ops::{Deref, DerefMut};
 
 use super::gguf::GgufFile;
 use super::quant::{
-    batched_add_bias, batched_mad, batched_rmsnorm, batched_rope_kv, batched_swiglu,
+    batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
+    batched_swiglu,
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec, prof,
     rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, type_row_size,
@@ -663,6 +664,7 @@ impl TransformerModel {
         self.forward_prefill_batch_chunk_internal(tokens, start_pos, false);
     }
 
+    #[inline(never)]
     fn forward_batch_layers_chunk(&mut self, tokens: &[u32], start_pos: usize) {
         let b_size = tokens.len();
         if b_size == 0 {
@@ -767,9 +769,8 @@ impl TransformerModel {
                 let q_norm_w = unsafe {
                     std::slice::from_raw_parts(q_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                batched_rmsnorm(
+                batched_rmsnorm_in_place(
                     &mut self.q_batch[0..b_size * q_dim],
-                    &self.q_batch[0..b_size * q_dim],
                     q_norm_w,
                     b_size * n_heads,
                     head_dim,
@@ -781,9 +782,8 @@ impl TransformerModel {
                 let k_norm_w = unsafe {
                     std::slice::from_raw_parts(k_norm_bytes.as_ptr() as *const f32, head_dim)
                 };
-                batched_rmsnorm(
+                batched_rmsnorm_in_place(
                     &mut self.k_batch[0..b_size * kv_dim],
-                    &self.k_batch[0..b_size * kv_dim],
                     k_norm_w,
                     b_size * n_kv_heads,
                     head_dim,
@@ -965,8 +965,10 @@ impl TransformerModel {
     /// Evaluates speculative candidate tokens in parallel in a single forward pass,
     /// streaming model weights from DRAM exactly ONCE.
     ///
-    /// Computes and returns logits for every token in `tokens`:
-    /// `out_logits[b * vocab_size .. (b + 1) * vocab_size]` is the logits predicted by token `b`.
+    /// Computes and returns logits for token 0 (the base token to verify candidate).
+    /// If candidate matches, `forward_speculative_head_item` computes logits for the candidate
+    /// without re-evaluating any transformer layers!
+    #[inline(never)]
     pub fn forward_speculative_batch(
         &mut self,
         tokens: &[u32],
@@ -999,19 +1001,34 @@ impl TransformerModel {
             rmsnorm(x_norm_b, x_b, norm_w, norm_eps);
         }
 
+        // Compute LM head ONLY for token 0 (saving 150k-300k dot products if candidate misses!)
         let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
-        matmat(
+        matvec(
             out_bytes,
             self.output.tensor_type,
             vocab_size,
             dim,
-            &self.x_norm_batch[0..b_size * dim],
-            b_size,
-            &mut out_logits[0..b_size * vocab_size],
+            &self.x_norm_batch[0..dim],
+            &mut out_logits[0..vocab_size],
         );
+        self.logits.copy_from_slice(&out_logits[0..vocab_size]);
+    }
 
-        let last_b = b_size - 1;
-        self.logits.copy_from_slice(&out_logits[last_b * vocab_size..(last_b + 1) * vocab_size]);
+    /// Compute LM head logits for an already normalized speculative batch item (e.g. candidate upon hit).
+    #[inline(never)]
+    pub fn forward_speculative_head_item(&mut self, item_idx: usize, out_logits: &mut [f32]) {
+        let dim = self.config.dim;
+        let vocab_size = self.config.vocab_size;
+        let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        matvec(
+            out_bytes,
+            self.output.tensor_type,
+            vocab_size,
+            dim,
+            &self.x_norm_batch[item_idx * dim..(item_idx + 1) * dim],
+            &mut out_logits[0..vocab_size],
+        );
+        self.logits.copy_from_slice(&out_logits[0..vocab_size]);
     }
 
     /// Prefill a token: updates KV cache for the token without computing logits.

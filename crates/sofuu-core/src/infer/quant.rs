@@ -1029,6 +1029,17 @@ pub fn batched_rmsnorm(
     }
 }
 
+/// Batched in-place RMSNorm (single buffer, aliased through the kernel).
+#[inline]
+pub fn batched_rmsnorm_in_place(x: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+    debug_assert_eq!(x.len(), rows * cols);
+    debug_assert_eq!(weight.len(), cols);
+    unsafe {
+        let p = x.as_mut_ptr();
+        sofuu_batched_rmsnorm(p, p, weight.as_ptr(), rows, cols, eps);
+    }
+}
+
 /// Batched in-place multiply-accumulate: `dst[r] += alpha * src[r]` per row.
 #[inline]
 pub fn batched_mad(dst: &mut [f32], src: &[f32], alpha: f32, rows: usize, cols: usize) {

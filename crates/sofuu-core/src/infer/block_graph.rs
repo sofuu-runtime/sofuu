@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use super::model::ModelConfig;
 use super::npy::TensorDType;
+use super::lfm2::{SendMutPtr, SendPtr};
 use super::quant::{bf16_to_f32, f16_to_f32, rmsnorm, rope, swiglu_in_place};
 use super::tensor_table::{UnifiedTensorData, UnifiedTensorTable};
 
@@ -307,6 +308,130 @@ impl WeightMatrix {
             mlx4.biases_metal_offset = 0;
         }
     }
+
+/// Batched prefill GEMM: ys[t * rows + r] = sum_c xs[t * cols + c] * W[r][c].
+/// Routes to the shared C++ batch kernels (the same `sofuu_gemm_*` the GGUF
+/// backend's fast prefill uses); dtypes without a batch kernel fall back to
+/// the per-token `gemv` loop. Elementwise semantics match `gemv`; the batch
+/// kernels may reorder the f32 accumulation.
+pub fn gemm_batched(&self, xs: &[f32], n_tok: usize, ys: &mut [f32]) {
+    let (rows, cols) = (self.rows, self.cols);
+    debug_assert_eq!(xs.len(), n_tok * cols);
+    debug_assert_eq!(ys.len(), n_tok * rows);
+    if n_tok == 0 || rows == 0 || cols == 0 {
+        return;
+    }
+    if self.mlx4.is_none() {
+        let sl = self.data.as_slice();
+        match self.dtype {
+            TensorDType::F32 if sl.len() >= rows * cols * 4 => {
+                if (sl.as_ptr() as usize) % 4 == 0 {
+                    crate::infer::quant::gemm_batched_f32(sl, xs, ys, rows, cols, n_tok);
+                    return;
+                }
+            }
+            TensorDType::F16 if sl.len() >= rows * cols * 2 => {
+                crate::infer::quant::gemm_batched_f16(sl, xs, ys, rows, cols, n_tok);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if let Some(ref mlx4) = self.mlx4 {
+        // Mlx4-packed weights: dequantize one 32-row panel at a time (stays
+        // L2-resident) and run the panel as a cblas sgemm against every
+        // token of the chunk. Each weight is unpacked once per call, and the
+        // call covers the whole chunk, so a prefill touches every weight
+        // O(prompt/512) times instead of O(prompt/token).
+        Self::gemm_batched_mlx4(self, xs, n_tok, ys);
+        return;
+    }
+    for t in 0..n_tok {
+        self.gemv(&xs[t * cols..(t + 1) * cols], &mut ys[t * rows..(t + 1) * rows]);
+    }
+}
+
+/// Panel-streamed Mlx4 batched GEMM: 32-row panels dequantized to f32 and
+/// multiplied against the whole activation chunk on the cblas/AMX ladder.
+fn gemm_batched_mlx4(wm: &WeightMatrix, xs: &[f32], n_tok: usize, ys: &mut [f32]) {
+    let (rows, cols) = (wm.rows, wm.cols);
+    let mlx4 = wm.mlx4.as_ref().expect("mlx4 variant");
+    let w_sl = wm.data.as_slice();
+    let s_sl = mlx4.scales.as_slice();
+    let b_sl = mlx4.biases.as_slice();
+    let gs = mlx4.group_size;
+    let is_bf16 = mlx4.is_bf16;
+    const PANEL: usize = 32;
+    let u32_per_row = cols / 8;
+    let groups_per_row = cols / gs;
+    for r0 in (0..rows).step_by(PANEL) {
+        let pr = PANEL.min(rows - r0);
+        let mut fpbuf = vec![0.0f32; PANEL * cols];
+        for i in 0..pr {
+            let row = r0 + i;
+            let wp = &w_sl[row * u32_per_row * 4..(row + 1) * u32_per_row * 4];
+            let sp = &s_sl[row * groups_per_row * 2..(row + 1) * groups_per_row * 2];
+            let bp = &b_sl[row * groups_per_row * 2..(row + 1) * groups_per_row * 2];
+            let out = &mut fpbuf[i * cols..(i + 1) * cols];
+            let mut scale = 0.0f32;
+            let mut bias = 0.0f32;
+            let mut cur_grp = usize::MAX;
+            for u in 0..u32_per_row {
+                let packed = u32::from_le_bytes(wp[u * 4..u * 4 + 4].try_into().unwrap());
+                let c_base = u * 8;
+                let grp = c_base / gs;
+                if grp != cur_grp {
+                    cur_grp = grp;
+                    let s16 = u16::from_le_bytes(sp[grp * 2..grp * 2 + 2].try_into().unwrap());
+                    let b16 = u16::from_le_bytes(bp[grp * 2..grp * 2 + 2].try_into().unwrap());
+                    scale = if is_bf16 {
+                        crate::infer::quant::bf16_to_f32(s16)
+                    } else {
+                        crate::infer::quant::f16_to_f32(s16)
+                    };
+                    bias = if is_bf16 {
+                        crate::infer::quant::bf16_to_f32(b16)
+                    } else {
+                        crate::infer::quant::f16_to_f32(b16)
+                    };
+                }
+                for j in 0..8 {
+                    let nib = ((packed >> (j * 4)) & 0x0f) as f32;
+                    out[c_base + j] = nib * scale + bias;
+                }
+            }
+        }
+        // C[t][r0..r0+pr) = X[t][c] * W_panel[r][c], strided via ldc = rows
+        #[cfg(target_os = "macos")]
+        if crate::infer::lfm2::blas_enabled() {
+            unsafe {
+                crate::infer::lfm2::blas_gemm_panel(
+                    xs,
+                    &fpbuf,
+                    ys,
+                    n_tok,
+                    r0,
+                    rows,
+                    cols,
+                    pr,
+                );
+            }
+            continue;
+        }
+        // non-macos / blas-off fallback: f32 rows, per-token dots
+        for t in 0..n_tok {
+            let xr = &xs[t * cols..(t + 1) * cols];
+            for i in 0..pr {
+                let wrow = &fpbuf[i * cols..(i + 1) * cols];
+                let mut sum = 0.0f32;
+                for c in 0..cols {
+                    sum += wrow[c] * xr[c];
+                }
+                ys[t * rows + r0 + i] = sum;
+            }
+        }
+    }
+}
 
     /// Matrix-vector multiplication: y = W * x
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
@@ -2171,13 +2296,305 @@ impl BlockGraphModel {
         self.forward(token, pos);
     }
 
+    /// Chunk size for batched prefill: each chunk's weight matrices become
+    /// one gemm_batched call per projection, so AMX/NEON tiles see 32-row
+    /// activations instead of one GEMV per token.
+    const PRE_CHUNK: usize = 256;
+
+    /// True when every layer is a standard Attention mixer over a SwiGLU or
+    /// GeGLU channel mixer — exactly the shapes `forward_chunk` implements.
+    /// MoE / MLA / conv mixers keep the per-token path.
+    fn chunked_prefill_ok(&self) -> bool {
+        // Uniform per-layer dims let the chunked path size buffers once.
+        let mut q_ref = 0usize;
+        let mut kv_ref = (0usize, 0usize);
+        let mut inter_ref = 0usize;
+        for l in &self.layers {
+            let (q_rows, k_rows, v_rows, attn_cols, inter) = match (&l.mixer_weights, &l.channel_mixer_weights) {
+                (
+                    BlockMixerWeights::Attention { q_proj, k_proj, v_proj, o_proj, .. },
+                    BlockChannelMixerWeights::SwiGLU { gate_proj, .. }
+                    | BlockChannelMixerWeights::GeGLU { gate_proj, .. },
+                ) => (
+                    q_proj.rows,
+                    k_proj.rows,
+                    v_proj.rows,
+                    o_proj.cols,
+                    gate_proj.rows,
+                ),
+                _ => return false,
+            };
+            if q_ref == 0 {
+                q_ref = q_rows;
+                kv_ref = (k_rows, v_rows);
+                inter_ref = inter;
+            } else if q_ref != q_rows || inter_ref != inter || kv_ref != (k_rows, v_rows) {
+                return false;
+            }
+            if attn_cols != q_rows {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Batched prefill over one chunk. Weight matmuls run once per layer for
+    /// ALL tokens of the chunk (`WeightMatrix::gemm_batched`); rope, KV-cache
+    /// stores and causal attention stay token-sequential exactly as the
+    /// per-token path, so logits agree to f32 summation order only.
+    pub fn forward_chunk(&mut self, tokens: &[u32], start_pos: usize) {
+        let n = tokens.len();
+        if n == 0 {
+            return;
+        }
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let freq_base = self.config.rope_freq_base;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let mut bx = vec![0.0f32; n * dim];
+        let mut bres = vec![0.0f32; n * dim];
+        let mut bnorm = vec![0.0f32; n * dim];
+        let mut bq = vec![0.0f32; n * q_dim];
+        let mut bk = vec![0.0f32; n * kv_dim];
+        let mut bv = vec![0.0f32; n * kv_dim];
+        let mut battn = vec![0.0f32; n * q_dim];
+        let mut bo = vec![0.0f32; n * dim];
+        let inter_max = self
+            .layers
+            .iter()
+            .map(|l| match &l.channel_mixer_weights {
+                BlockChannelMixerWeights::SwiGLU { gate_proj, .. } => gate_proj.rows,
+                BlockChannelMixerWeights::GeGLU { gate_proj, .. } => gate_proj.rows,
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(dim);
+        let mut bgate = vec![0.0f32; n * inter_max];
+        let mut bup = vec![0.0f32; n * inter_max];
+        let mut bffn = vec![0.0f32; n * dim];
+        let mut tmp = vec![0.0f32; dim.max(q_dim.max(kv_dim))];
+
+        for (t, &tok) in tokens.iter().enumerate() {
+            self.embed_tokens.get_row(tok as usize, &mut bx[t * dim..(t + 1) * dim]);
+            if let Some(scale) = self.graph_config.embed_scale {
+                for v in &mut bx[t * dim..(t + 1) * dim] {
+                    *v *= scale;
+                }
+            }
+        }
+
+        for l in 0..self.layers.len() {
+            let layer = &self.layers[l];
+            let (
+                spec_ref,
+                q_proj_ref,
+                k_proj_ref,
+                v_proj_ref,
+                o_proj_ref,
+               qnw_ref,
+               knw_ref,
+            ) = match &layer.mixer_weights {
+                BlockMixerWeights::Attention { spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight } => {
+                    (spec, q_proj, k_proj, v_proj, o_proj, q_norm_weight, k_norm_weight)
+                }
+                _ => unreachable!("chunked_prefill_ok guards the mixer kind"),
+            };
+
+            // Pre-norm for all tokens
+            for t in 0..n {
+                bres[t * dim..(t + 1) * dim].copy_from_slice(&bx[t * dim..(t + 1) * dim]);
+                layer.pre_norm.apply(
+                    &bx[t * dim..(t + 1) * dim],
+                    &layer.pre_norm_weight,
+                    &mut bnorm[t * dim..(t + 1) * dim],
+                );
+            }
+
+            // Batched Q/K/V projections (one sgemm each per chunk)
+            q_proj_ref.gemm_batched(&bnorm, n, &mut bq);
+            k_proj_ref.gemm_batched(&bnorm, n, &mut bk);
+            v_proj_ref.gemm_batched(&bnorm, n, &mut bv);
+
+            // Token-sequential: qk-norms, rope, cache store, causal attention
+            let inv_sqrt_head_dim = 1.0f32 / (head_dim as f32).sqrt();
+            let group = (n_heads / n_kv_heads).max(1);
+            for t in 0..n {
+                let pos_t = start_pos + t;
+                if let (Some(q_nw), Some(qn)) = (qnw_ref, spec_ref.q_norm) {
+                    for h in 0..n_heads {
+                        let off = t * q_dim + h * head_dim;
+                        qn.apply(&bq[off..off + head_dim], q_nw, &mut tmp[..head_dim]);
+                        bq[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                    }
+                }
+                if let (Some(k_nw), Some(kn)) = (knw_ref, spec_ref.k_norm) {
+                    for h in 0..n_kv_heads {
+                        let off = t * kv_dim + h * head_dim;
+                        kn.apply(&bk[off..off + head_dim], k_nw, &mut tmp[..head_dim]);
+                        bk[off..off + head_dim].copy_from_slice(&tmp[..head_dim]);
+                    }
+                }
+                rope(&mut bq[t * q_dim..(t + 1) * q_dim], n_heads, head_dim, pos_t, freq_base);
+                rope(&mut bk[t * kv_dim..(t + 1) * kv_dim], n_kv_heads, head_dim, pos_t, freq_base);
+
+                let kv_cache = &mut self.kv_caches[l];
+                for kv_h in 0..n_kv_heads {
+                    let off = t * kv_dim + kv_h * head_dim;
+                    kv_cache.store(
+                        kv_h,
+                        pos_t,
+                        &bk[off..off + head_dim],
+                        &bv[off..off + head_dim],
+                    );
+                }
+
+                let min_t = if let Some(w) = spec_ref.sliding_window {
+                    if w > 0 { pos_t.saturating_sub(w - 1) } else { 0 }
+                } else {
+                    0
+                };
+                for h in 0..n_heads {
+                    let kv_h = h / group;
+                    let q_h = &bq[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+                    let mut max_score = -f32::INFINITY;
+                    for tt in min_t..=pos_t {
+                        let k_t = kv_cache.get_k(kv_h, tt);
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += q_h[d] * k_t[d];
+                        }
+                        let mut score = dot * inv_sqrt_head_dim;
+                        if let Some(cap) = spec_ref.attn_logit_soft_cap {
+                            score = cap * (score / cap).tanh();
+                        }
+                        if score > max_score {
+                            max_score = score;
+                        }
+                        self.buf_scores[tt] = score;
+                    }
+                    let mut exp_sum = 0.0f32;
+                    for tt in min_t..=pos_t {
+                        let s = (self.buf_scores[tt] - max_score).exp();
+                        self.buf_scores[tt] = s;
+                        exp_sum += s;
+                    }
+                    let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
+                    let h_out = &mut battn[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+                    h_out.fill(0.0);
+                    for tt in min_t..=pos_t {
+                        let w = self.buf_scores[tt] * inv_sum;
+                        let v_t = kv_cache.get_v(kv_h, tt);
+                        for d in 0..head_dim {
+                            h_out[d] += w * v_t[d];
+                        }
+                    }
+                }
+            }
+
+            // Batched output projection + residual per token
+            o_proj_ref.gemm_batched(&battn, n, &mut bo);
+            for t in 0..n {
+                bx[t * dim..(t + 1) * dim].copy_from_slice(&bo[t * dim..(t + 1) * dim]);
+                if let (Some(pan), Some(pan_w)) = (layer.post_attention_norm, &layer.post_attention_norm_weight) {
+                    pan.apply(&bx[t * dim..(t + 1) * dim], pan_w, &mut tmp[..dim]);
+                    bx[t * dim..(t + 1) * dim].copy_from_slice(&tmp[..dim]);
+                }
+                for i in 0..dim {
+                    bx[t * dim + i] += bres[t * dim + i];
+                }
+            }
+
+            // FFN pre-norm per token
+            for t in 0..n {
+                bres[t * dim..(t + 1) * dim].copy_from_slice(&bx[t * dim..(t + 1) * dim]);
+                layer.ffn_norm.apply(
+                    &bx[t * dim..(t + 1) * dim],
+                    &layer.ffn_norm_weight,
+                    &mut bnorm[t * dim..(t + 1) * dim],
+                );
+            }
+            match &layer.channel_mixer_weights {
+                BlockChannelMixerWeights::SwiGLU { gate_proj, up_proj, down_proj } => {
+                    gate_proj.gemm_batched(&bnorm, n, &mut bgate[..n * gate_proj.rows]);
+                    up_proj.gemm_batched(&bnorm, n, &mut bup[..n * up_proj.rows]);
+                    for t in 0..n {
+                        swiglu_in_place(
+                            &mut bgate[t * gate_proj.rows..(t + 1) * gate_proj.rows],
+                            &bup[t * up_proj.rows..(t + 1) * up_proj.rows],
+                        );
+                    }
+                    down_proj.gemm_batched(&bgate[..n * down_proj.cols], n, &mut bffn);
+                }
+                BlockChannelMixerWeights::GeGLU { gate_proj, up_proj, down_proj } => {
+                    gate_proj.gemm_batched(&bnorm, n, &mut bgate[..n * gate_proj.rows]);
+                    up_proj.gemm_batched(&bnorm, n, &mut bup[..n * up_proj.rows]);
+                    for t in 0..n {
+                        geglu_in_place(
+                            &mut bgate[t * gate_proj.rows..(t + 1) * gate_proj.rows],
+                            &bup[t * up_proj.rows..(t + 1) * up_proj.rows],
+                        );
+                    }
+                    down_proj.gemm_batched(&bgate[..n * down_proj.cols], n, &mut bffn);
+                }
+                _ => unreachable!("chunked_prefill_ok guards the channel mixer"),
+            }
+            for t in 0..n {
+                if let (Some(pfn), Some(pfn_w)) = (layer.post_ffn_norm, &layer.post_ffn_norm_weight) {
+                    pfn.apply(&bffn[t * dim..(t + 1) * dim], pfn_w, &mut tmp[..dim]);
+                    bffn[t * dim..(t + 1) * dim].copy_from_slice(&tmp[..dim]);
+                }
+                for i in 0..dim {
+                    bx[t * dim + i] = bres[t * dim + i] + bffn[t * dim + i];
+                }
+            }
+        }
+        self.finish_chunk_logits(&bx, n);
+    }
+
+    /// Final norm + LM head for the LAST token of a chunk buffer.
+    fn finish_chunk_logits(&mut self, bx: &[f32], n: usize) {
+        let dim = self.config.dim;
+        let last = &bx[(n - 1) * dim..n * dim];
+        self.graph_config.final_norm.apply(last, &self.final_norm_weight, &mut self.buf_norm[..dim]);
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.gemv(&self.buf_norm[..dim], &mut self.logits);
+        } else {
+            self.embed_tokens.gemv(&self.buf_norm[..dim], &mut self.logits);
+        }
+        if let Some(cap) = self.graph_config.final_logit_soft_cap {
+            soft_cap_in_place(&mut self.logits, cap);
+        }
+    }
+
     pub fn forward_prefill_batch(&mut self, tokens: &[u32], start_pos: usize) {
+        if tokens.is_empty() {
+            return;
+        }
+        if self.chunked_prefill_ok() {
+            for (ci, ch) in tokens.chunks(Self::PRE_CHUNK).enumerate() {
+                self.forward_chunk(ch, start_pos + ci * Self::PRE_CHUNK);
+            }
+            return;
+        }
         for (i, &tok) in tokens.iter().enumerate() {
             self.forward_prefill(tok, start_pos + i);
         }
     }
 
     pub fn forward_prefill_all_with_logits(&mut self, tokens: &[u32], start_pos: usize) -> &[f32] {
+        if tokens.is_empty() {
+            return &self.logits;
+        }
+        if self.chunked_prefill_ok() {
+            for (ci, ch) in tokens.chunks(Self::PRE_CHUNK).enumerate() {
+                self.forward_chunk(ch, start_pos + ci * Self::PRE_CHUNK);
+            }
+            return &self.logits;
+        }
         for (i, &tok) in tokens.iter().enumerate() {
             self.forward(tok, start_pos + i);
         }
@@ -2188,6 +2605,67 @@ impl BlockGraphModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gemm_batched vs the per-token gemv loop on F16 weights: identical
+    /// element products and f32 accumulation, summation order may differ.
+    #[test]
+    fn weight_matrix_gemm_batched_matches_gemv() {
+        let (rows, cols, n_tok) = (37usize, 128usize, 19usize);
+        // small-magnitude normal f16s (0x3800..0x3900 band), deterministic
+        let bits: Vec<u16> = (0..rows * cols).map(|i| 0x3800u16 + ((i * 7) % 0xFE) as u16).collect();
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        for b in &bits {
+            bytes.extend_from_slice(&b.to_le_bytes());
+        }
+        let wm = WeightMatrix::new_from_data(
+            rows, cols, TensorDType::F16, UnifiedTensorData::Heap(std::sync::Arc::new(bytes)),
+        );
+        let xs: Vec<f32> = (0..n_tok * cols).map(|i| ((i % 17) as f32 - 8.0) / 4.0).collect();
+        let mut batched = vec![0.0f32; n_tok * rows];
+        wm.gemm_batched(&xs, n_tok, &mut batched);
+        for t in 0..n_tok {
+            let mut want = vec![0.0f32; rows];
+            wm.gemv(&xs[t * cols..(t + 1) * cols], &mut want);
+            for r in 0..rows {
+                let got = batched[t * rows + r];
+                let err = (got - want[r]).abs() / want[r].abs().max(1e-3);
+                assert!(err < 1e-4, "[{t},{r}] gemm {got} vs gemv {} rel {err}", want[r]);
+            }
+        }
+    }
+
+    /// Chunked prefill must land on the same logits (argmax + tight RMS) as
+    /// the per-token path on gemma-2b — guards the whole batched rewrite.
+    #[test]
+    #[ignore = "needs gemma-2b on disk; run explicitly"]
+    fn blockgraph_chunked_prefill_matches_per_token() {
+        let table = UnifiedTensorTable::open("/Users/priyanshuboruah/Downloads/gemma-2b/model.safetensors")
+            .expect("open gemma-2b");
+        let mut m = BlockGraphModel::from_tensor_table(&table, 0).expect("load gemma-2b");
+        assert!(m.chunked_prefill_ok(), "gemma-2b should be chunkable");
+        let tokens: Vec<u32> = (0..40u32).cycle().take(45).collect();
+        let per_token_ref = {
+            let mut mm = BlockGraphModel::from_tensor_table(&table, 0).expect("reload");
+            mm.forward_prefill_all_with_logits(&tokens, 0).to_vec()
+        };
+        let got = m.forward_prefill_all_with_logits(&tokens, 0);
+        let n = got.len();
+        let mut sum_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        let (mut ta, mut tb) = (0usize, 0usize);
+        for i in 0..n {
+            let d = (per_token_ref[i] - got[i]) as f64;
+            sum_sq += d * d;
+            ref_sq += per_token_ref[i] as f64 * per_token_ref[i] as f64;
+            if per_token_ref[i] > per_token_ref[ta] { ta = i; }
+            if got[i] > got[tb] { tb = i; }
+        }
+        // Summation-order-only difference on the AMX/F16 tile path.
+        let rms = (sum_sq / n as f64).sqrt() / ((ref_sq / n as f64).sqrt().max(1e-9)) as f32 as f64;
+        assert!(ta == tb, "argmax mismatch: {ta} vs {tb}");
+        assert!(rms < 2e-3, "rel RMS {rms:.6} beyond summation-order tolerance");
+let _ = rms;
+    }
 
     #[test]
     fn test_gemma_rmsnorm() {

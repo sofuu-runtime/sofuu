@@ -1088,7 +1088,7 @@ pub(crate) const LFM2_BATCH_MIN: usize = 8;
 
 // Manual Clone/Copy without a `T: Copy` bound: the wrapper must stay
 // copyable no matter what it points at.
-struct SendPtr<T>(*const T);
+pub(crate) struct SendPtr<T>(pub *const T);
 impl<T> Clone for SendPtr<T> {
     fn clone(&self) -> Self {
         SendPtr(self.0)
@@ -1098,7 +1098,7 @@ impl<T> Copy for SendPtr<T> {}
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
-struct SendMutPtr<T>(*mut T);
+pub(crate) struct SendMutPtr<T>(pub *mut T);
 impl<T> Clone for SendMutPtr<T> {
     fn clone(&self) -> Self {
         SendMutPtr(self.0)
@@ -1762,7 +1762,43 @@ pub(crate) mod accelerate {
 /// C[t][r] = X[t][c] · W[r][c] on the AMX path: A = X (t×cols, NoTrans),
 /// B = W (rows×cols, Trans since W is row-major), C row-major (t×rows).
 #[cfg(target_os = "macos")]
-fn blas_gemm(x: &[f32], w32: &[f32], y: &mut [f32], t_count: usize, rows: usize, cols: usize) {
+/// Panel variant for streamed dequant callers: computes
+/// y[t][r0..r0+n_panel] = X[t]·W_panel[r]^T with the output strided by
+/// `rows` (the caller's full matrix row count), leaving other columns
+/// untouched. Same AMX ladder as blas_gemm.
+pub(crate) fn blas_gemm_panel(
+    x: &[f32],
+    w_panel: &[f32],
+    y: &mut [f32],
+    t_count: usize,
+    r0: usize,
+    rows: usize,
+    cols: usize,
+    n_panel: usize,
+) {
+    debug_assert_eq!(x.len(), t_count * cols);
+    debug_assert_eq!(w_panel.len(), n_panel * cols);
+    unsafe {
+        accelerate::cblas_sgemm(
+            accelerate::ROW_MAJOR,
+            accelerate::NO_TRANS,
+            accelerate::TRANS,
+            t_count as i32,
+            n_panel as i32,
+            cols as i32,
+            1.0,
+            x.as_ptr(),
+            cols as i32,
+            w_panel.as_ptr(),
+            cols as i32,
+            0.0,
+            y.as_mut_ptr().add(r0),
+            rows as i32,
+        );
+    }
+}
+
+pub(crate) fn blas_gemm(x: &[f32], w32: &[f32], y: &mut [f32], t_count: usize, rows: usize, cols: usize) {
     debug_assert_eq!(x.len(), t_count * cols);
     debug_assert_eq!(w32.len(), rows * cols);
     debug_assert_eq!(y.len(), t_count * rows);

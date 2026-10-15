@@ -2491,4 +2491,22 @@ mod tests {
     }
 }
 
+/// Batched prefill GEMM entries for the shared C++ kernels — the same ones
+/// the GGUF backend's fast prefill uses — exposed for the other backends
+/// (block_graph / gptx3 WeightMatrix). w is [rows][cols] row-major little-
+/// endian; out is [batch][rows] token-major. Additive wrappers only.
+pub(crate) fn gemm_batched_f32(
+    w: &[u8], x: &[f32], out: &mut [f32], rows: usize, cols: usize, batch: usize,
+) {
+    unsafe {
+        sofuu_gemm_f32(w.as_ptr() as *const f32, x.as_ptr(), out.as_mut_ptr(), rows, cols, batch);
+    }
+}
 
+pub(crate) fn gemm_batched_f16(
+    w: &[u8], x: &[f32], out: &mut [f32], rows: usize, cols: usize, batch: usize,
+) {
+    unsafe {
+        sofuu_gemm_f16(w.as_ptr() as *const u16, x.as_ptr(), out.as_mut_ptr(), rows, cols, batch);
+    }
+}

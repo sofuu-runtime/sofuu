@@ -1,0 +1,155 @@
+# PLAN-CPU-DECODE-PEAK
+
+**Status: DRAFT — awaiting approval. Do not start any phase until the user says go.**
+(2026-10-15. Companion to `PLAN-CPU-PREFILL-PEAK.md`, which is complete: prefill
+ladder shipped and default-on. This plan targets the decode side of the same
+budget using the already-proven recipes and new structural levers.)
+
+---
+
+## Ground truth (measured 2026-10-15, M2 Pro 6P+4E, calm unless noted)
+
+Decode = one full weight sweep per token, strictly serial across layers.
+Realistic streaming ceiling for a dependent GEMV chain ≈ 80 GB/s (llama.cpp's
+own numbers agree; the 200 GB/s bus spec is not reachable for M=1 chains).
+
+| Model | Bytes/token | Ceiling | Sofuu now (short ctx) | Battery ctx (~1300) | % of ceiling |
+|---|---|---|---|---|---|
+| Qwen-0.6B Q4 | ~0.35 GB | ~230 t/s | 55–65 | 55.4 | ~25% |
+| Llama-1B Q8 | ~1.1 GB | ~72 t/s | 40 | 37.8 | ~55% |
+| liquid-1.3B mlx4 | ~0.8 GB | ~97 t/s | 30 | 8.9 | ~31% |
+| gemma-2b mlx4 | ~1.1 GB | ~75 t/s | 16 | 5.4 | ~21% |
+| Spark-4B Q4 | ~2.4 GB | ~33 t/s | 28.6 | 15.6 | ~87% |
+| Qwen3-8B Q4 | ~4.9 GB | ~16 t/s | 13.6 | 9.5 | ~85% |
+| 27B ternary | 5.5 GB (2.75 GB slab) | ~29 t/s | ~1.0 (resident) | 0.61 | ~3–5% |
+
+Reference (same box, llama.cpp CPU, calm): 0.6B 60.4 · 1B 41.3 · Spark 13.3 ·
+8B 7.8 — we are at 0.9–2.2× llama.cpp everywhere on GGUF. The gap that remains
+is to the bandwidth wall, not to llama.cpp.
+
+## The four walls (what the samples showed)
+
+1. **Serial glue fraction** — norm/RoPE/softmax/SwiGLU/sampler + GEMV
+   fan-out/join quanta run single-threaded between the big calls. Dominates
+   small models: 0.6B token ≈ 16 ms of which the weight sweep is ~4 ms.
+2. **O(context) attention, mostly single-threaded** — KV re-read per token per
+   layer; the 2–3× short→battery-T drop on every model.
+3. **Dispatch quanta** — 40–140 GEMVs/token each split across 6 cores with a
+   fixed join cost; hard floor for tiny models (~55–65 t/s).
+4. **27B specifics** — per-token trit expansion (slab shipped, receipt
+   pending), sequential GDN recurrence (48 independent heads), whole output
+   head read every token.
+
+Every escape below breaks exactly one term: tokens-per-sweep, bytes-per-sweep,
+speed-of-sweep, or sidesteps the sweep.
+
+---
+
+## Phase D0 — receipts closure (housekeeping, ~1 calm window)
+
+- [ ] 27B slab sustained-rate receipt: `SOFUU_T143_SLAB=1` serve, one
+      `max_tokens=40` request after the ~6-min 1262-token prefill (the short
+      counting prompt EOSes after 1 token). Record vs the 1.0 t/s packed-dot
+      baseline. Calm box required (prepass thrashed at <100 MB free).
+- [ ] Calm-window battery re-run and TASKS.md comparison row (battery #4 ran
+      at load 8–10 mid-run; #3 was load-poisoned — the standing record needs
+      one clean pass).
+
+## Phase D1 — speculative decoding (tokens per sweep; walls 1+3)
+
+- **Expected: 1.8–2.5× per-request decode on 8B / Spark / 27B; quality exactly
+  unchanged (rejection sampling).** Small models draft about as fast as they
+  decode, so pairs are big-draft←small-draft only.
+- Design: draft model (Qwen-0.6B, liquid-350) proposes k∈{4,8} tokens greedily;
+  target verifies all k in one weight sweep through its existing prefill path
+  (AMX/batched — verification IS prefill shape, and prefill is our strongest
+  lane by 1.7–2× vs llama.cpp). Accept the longest verified prefix by the
+  standard reject/resample rule on the target's logits. Per-request adaptive k
+  (acceptance-rate accumulator, no ML).
+- Files: serve/eval loop + a draft/target coordinator in `infer/`
+  (new `speculative.rs`), model-agnostic via existing backend traits. Peer
+  files read-only.
+- Flag: `SOFUU_SPEC=1` (+ `SOFUU_SPEC_K`, draft model path). Default-off until
+  receipts.
+- Acceptance: (a) greedy streams from target-only vs spec-decoded are
+  token-identical on a 500-token chain test (quality gate, pinned); (b) ≥1.7×
+  wall on 8B and Spark calm A/B; (c) acceptance-rate logged per run in the
+  JSONL.
+- Review stop: after (a) passes on one pair, before fleet roll-out.
+
+## Phase D2 — megakernel fused decode layer (walls 1+3)
+
+- **Expected: the 20–30%-of-ceiling models (liquid, gemma, 0.6B) to 50–70% of
+  ceiling** — liquid 30 → ~60 short-T; battery-context ~2×. Same class of win
+  as prefill glue fusion (47.8 → 72.1).
+- Design: one C++ (or Rust+NEON) per-layer call with resident threads and
+  internal barriers — norm → qkv → RoPE → attention → output → FFN — no return
+  to the dispatcher between stages. Reuses existing pieces: fused QKV (Spark
+  has it), paired gate+up sweeps (LFM2 prefims), pool as persistent barrier
+  group rather than per-GEMV dispatch. Attention prep/mix split stays
+  token-sequential-safe (prefill lesson).
+- Per-arch ports, one at a time, each bit-exactness-gated vs today's path
+  (env-gated, default new path only after gates+receipts).
+- Acceptance: per-arch batch-vs-fused equivalence test (bit-identical logits)
+  + calm A/B ≥1.5× on liquid-1.3B before moving to the next arch.
+- Review stop: liquid receipt before porting #2.
+
+## Phase D3 — cheap decode kernels: repacked q4_K, KV quant, threaded heads (wall 2 + scale chain)
+
+- **Expected: long-context decode +25–50% on GGUF fleet; matches the Pi-5 T1
+  work.**
+- Design: (a) repack q4_K at load time so decode GEMV reads pre-decoded
+  sub-block scales (the peer's Pi-5 repack trick pointed at the GEMV lane);
+  (b) KV cache quantization hooks (q4/q8 KV as opt-in, model.rs peer
+  lane — coordinate); (c) split attention over independent heads across the
+  pool (heads are data-independent; deterministic row split like the GEMV
+  split).
+- Acceptance: bit-exact vs per-token decode for (c) (same fold order);
+  tolerance-gated for (a)/(b) quantized paths with recorded drift; calm
+  battery-context A/B on 8B + Llama-1B.
+
+## Phase D4 — MoE GGUF backend (sidestep)
+
+- **Expected: 30B-total/3B-active-class models decode at 3B-dense rates
+  (30–40 t/s) on this box** — the biggest absolute jump available.
+- Design: GGUF MoE parser (expert tensor layout, router softmax + top-k),
+  per-expert GEMV through the existing vectorized kernels (decode lane is
+  already exactly the right shape — fewer matrices per token), page-cache-aware
+  expert loading (16 GB box will not hold a full 30B file; touch-rate-aware
+  mmap + optional expert cache).
+- Note: the nemotron MoE GGUF was deleted 2026-10-14 as unsupported; re-acquire
+  one test model when the parser exists.
+- Flag: `SOFUU_MOE=1` until receipts.
+
+## Phase D5 — 2-bit weights + LUT kernels (bytes term; plan P4 continued)
+
+- **Expected: 8B ceiling 16 → ~30 t/s (IQ2-class GGUF); 27B T-MAC path to the
+  20–40 t/s band.**
+- Design: adopt/complement i-quants for decode-heavy GGUFs; T-MAC-style LUT
+  bit-parallel kernels where dequant arithmetic (not bandwidth) binds —
+  primarily the 27B ternary path (bit-identical-to-sdot requirement from P4
+  stands).
+- Large effort; only after D1–D3 receipts; keep on the researched notes in
+  PLAN-CPU-PREFILL-PEAK.md (arXiv 2407.00088).
+
+---
+
+## Rules (same as the prefill plan)
+
+- One phase at a time; D0 first, D1 next in line.
+- Calm-machine receipts (`uptime` recorded) — battery rows only from calm runs.
+- Env-gate every behavior change; default-on only after receipts.
+- Bit-exactness gates pinned per path where the math allows; tolerance gates
+  for genuinely quantized paths, with drift recorded.
+- Peer files read-only; narrow staging; commits straight to main.
+- Deliberate review stop after each phase's first receipt.
+
+## What D1–D5 do NOT do
+
+- Single-request dense decode past ~2–3× its bandwidth ceiling is physically
+  closed; spec-decode works by changing the ratio of tokens to sweeps, not by
+  breaking bandwidth. The honest per-request ceiling sequence on this box is:
+  D2 kernel efficiency → D1 tokens-per-sweep → D3/D5 bytes-per-sweep.
+- GPU offload (fused whole-graph Metal submission) is deliberately out of
+  scope: it reopens the CPU-only constraint. Available if that constraint is
+  ever relaxed as a product decision.

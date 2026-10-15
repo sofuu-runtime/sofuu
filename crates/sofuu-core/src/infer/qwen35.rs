@@ -729,6 +729,80 @@ fn gemm_rows_t143_sdot(
 /// scratch (two small vecs per call, noise next to a multi-second decode
 /// step). Every row runs the same dequantize-then-band-dot sequence, so
 /// results are thread-count independent.
+/// Lazy dequantized weight slab for PTQ1_0 matrices. Decoding re-runs the
+/// NEON trit digit-expansion over every weight byte on every token; with the
+/// slab built once (SOFUU_T143_SLAB=1) the per-token sweep is a plain sdot
+/// stream over i8 trits through `trit_row_dot_q` — the same pinned reference
+/// fold the prefill path uses, so decode results are bit-identical to the
+/// file-direct path. A 27B slab is ~2.9 GB anonymous vs 5.9 GB for the packed
+/// residency copy, and the packed pages stay file-backed (evictable).
+struct SlabT143 {
+    trits: Vec<i8>, // n_out * n_in
+    rowd: Vec<f32>, // n_out * blocks band scales
+}
+
+static T143_SLABS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), std::sync::Arc<SlabT143>>>,
+> = std::sync::OnceLock::new();
+
+fn t143_slab_enabled() -> bool {
+    std::env::var_os("SOFUU_T143_SLAB").is_some_and(|v| v != "0")
+}
+
+fn ensure_t143_slab(data: &[u8], m: &RawMat) -> Option<std::sync::Arc<SlabT143>> {
+    if m.n_in % PTQ1_0_BLOCK_VALUES != 0 || m.n_out == 0 {
+        return None;
+    }
+    let key = (m.off, m.n_in, m.n_out);
+    let map = T143_SLABS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = map.lock() {
+        if let Some(s) = guard.get(&key) {
+            return Some(s.clone());
+        }
+    }
+    let blocks = m.n_in / PTQ1_0_BLOCK_VALUES;
+    let n_in = m.n_in;
+    let rows = m.n_out;
+    let mut trits = vec![0i8; rows * m.n_in];
+    let mut rowd = vec![0.0f32; rows * blocks];
+    let threads = thread_budget().min(rows.max(1));
+    // Row ranges are disjoint per worker — same split as gemv_t143's dot loop.
+    std::thread::scope(|scope| {
+        let mut rest_t: &mut [i8] = trits.as_mut_slice();
+        let mut rest_d: &mut [f32] = rowd.as_mut_slice();
+        for t in 0..threads.max(1) {
+            let lo = rows * t / threads.max(1);
+            let hi = rows * (t + 1) / threads.max(1);
+            let take = hi - lo;
+            if take == 0 {
+                continue;
+            }
+            let tmp_t = rest_t;
+            let (chunk_t, tail_t) = tmp_t.split_at_mut(take * n_in);
+            rest_t = tail_t;
+            let tmp_d = rest_d;
+            let (chunk_d, tail_d) = tmp_d.split_at_mut(take * blocks);
+            rest_d = tail_d;
+            scope.spawn(move || {
+                for i in 0..take {
+                    let r = lo + i;
+                    dequant_trits_i8(
+                        m.row_slice(data, r),
+                        &mut chunk_t[i * n_in..(i + 1) * n_in],
+                        &mut chunk_d[i * blocks..(i + 1) * blocks],
+                    );
+                }
+            });
+        }
+    });
+    let arc = std::sync::Arc::new(SlabT143 { trits, rowd });
+    if let Ok(mut guard) = map.lock() {
+        guard.insert(key, arc.clone());
+    }
+    Some(arc)
+}
+
 fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
     let n_in = m.n_in;
     let blocks = n_in / PTQ1_0_BLOCK_VALUES;
@@ -747,6 +821,40 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
     } else {
         1
     };
+    // SOFUU_T143_SLAB: dequantize each matrix once, then decode as a plain
+    // i8 trit sdot sweep (bit-identical fold; saves the per-token digit-gen).
+    if t143_slab_enabled() && n_out * n_in >= PAR_MAC_THRESHOLD {
+        if let Some(slab) = ensure_t143_slab(data, m) {
+            let act = &act[..n_in];
+            std::thread::scope(|scope| {
+                let mut rest: &mut [f32] = out;
+                let mut r0 = 0usize;
+                for t in 0..threads.max(1) {
+                    let take = n_out * (t + 1) / threads.max(1) - r0;
+                    let tmp = rest;
+                    let (chunk, tail) = tmp.split_at_mut(take);
+                    rest = tail;
+                    let rows = r0;
+                    let slab_ref = slab.clone();
+                    let aq_ref = &aq;
+                    scope.spawn(move || {
+                        for (i, o) in chunk.iter_mut().enumerate() {
+                            let r = rows + i;
+                            let row = &slab_ref.trits[r * n_in..(r + 1) * n_in];
+                            let rowd = &slab_ref.rowd[r * blocks..(r + 1) * blocks];
+                            *o = if use_sdot {
+                                trit_row_dot_q(row, rowd, aq_ref, 0, n_in)
+                            } else {
+                                trit_row_dot(row, rowd, act)
+                            };
+                        }
+                    });
+                    r0 += take;
+                }
+            });
+            return;
+        }
+    }
     if threads <= 1 {
         if use_sdot {
             for (r, o) in out.iter_mut().enumerate() {
@@ -2379,6 +2487,46 @@ mod tests {
                 let got = trits[i] as f32 * scales[i / PTQ1_0_BLOCK_VALUES];
                 assert_eq!(got.to_bits(), want[i].to_bits(), "row {r} value {i}");
             }
+        }
+    }
+
+    /// The resident trit slab (SOFUU_T143_SLAB decode path) must dot to
+    /// bit-identical results as the file-direct packed path, because the
+    /// slab row is exactly `dequant_trits_i8`'s output and both fold through
+    /// `trit_row_dot_q`'s band order. Threshold-sized so the slab path is
+    /// what a real 27B decode takes (n_out*n_in >= PAR_MAC_THRESHOLD).
+    #[test]
+    fn t143_slab_dot_bitmatches_file_direct_gemv() {
+        let n_in = 8 * PTQ1_0_BLOCK_VALUES;
+        let rows = 2112usize; // 2112 * 1024 = 2,162,688 MACs >= threshold
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let mut data = noise_bytes(0xBA5EBA11F00DFACE, rows * row_bytes);
+        let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+        for blk in 0..(rows * blocks) {
+            let off = blk * PTQ1_0_BLOCK_BYTES;
+            data[off + PTQ1_0_BLOCK_BYTES - 2] = 0x00;
+            data[off + PTQ1_0_BLOCK_BYTES - 1] = 0x3C;
+        }
+        let acts: Vec<f32> = noise_bytes(0x0123456789ABCDEF, n_in)
+            .iter()
+            .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
+            .collect();
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+
+        let mut file_direct = vec![0.0f32; rows];
+        gemv_t143(&data, &m, &acts, &mut file_direct);
+
+        let slab = ensure_t143_slab(&data, &m).expect("slab build");
+        let aq = quantize_acts(&acts, 1, n_in, blocks);
+        for r in 0..rows {
+            let row = &slab.trits[r * n_in..(r + 1) * n_in];
+            let rowd = &slab.rowd[r * blocks..(r + 1) * blocks];
+            let got = trit_row_dot_q(row, rowd, &aq, 0, n_in);
+            assert_eq!(
+                got.to_bits(),
+                file_direct[r].to_bits(),
+                "slab row {r} != file-direct"
+            );
         }
     }
 

@@ -4,6 +4,20 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — Mac CPU: prefill Phase 3, AMX via Accelerate (`SOFUU_PREFILL_BLAS=1`) — liquid-1.3B warm prefill 79.0 → 104.5 tk/s (4.23× the per-token loop; gemm stage 2937 → 1607 ms).**
+> The batched-prefill GEMM hands the MAC sweep to `cblas_sgemm` (Accelerate links as a
+> dylib — the release binary is byte-identical at 5,097,392 bytes, so the 5 MB size gate
+> holds; Windows/Linux never link it). Per call: whole-tensor dequantization still runs on
+> the dynamic_ffn worker pool (`blas_dequant_full`, 64-row panels), then one row-major
+> sgemm per tensor (`C = X · Wᵀ`) drives the CPU-die AMX coprocessor on Accelerate's own
+> thread pool — our pool never nests into it, which is why dequant and sweep are split at
+> a barrier. Numerically exact-f32 (logit RMS under the 2e-2 gate with no relaxation note;
+> bf16/mlx4 batch-vs-per-token gates pass in the same run), so it beats Phase 2's int8 on
+> quality AND speed — branch order prefers `SOFUU_PREFILL_BLAS` when both flags are set.
+> Same calm window: f32-N 68.1 · int8 79.0 · AMX 104.5 tk/s warm. Known headroom left on
+> the table: ~104 ms/call of f32-slab allocation churn (buffer reuse would shave ~3-4%).
+> Suite 575/0 with the BLAS code in tree; default path (no env flag) untouched.
+>
 > **2026-10-15 — Mac CPU: prefill Phase 2, int8 activations+weights GEMM (`SOFUU_PRE8=1`) — liquid-1.3B warm prefill 68.1 → 79.0 tk/s (+16% over Phase-1 f32 in the same calm window).**
 > Both sides of the batched-prefill GEMM quantize symmetrically in 32-element groups
 > (`PRE8_GROUP`; per-group absmax/127 on activations and on dequantized weight rows).

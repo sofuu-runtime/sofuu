@@ -90,6 +90,11 @@ fn main() {
         Err(_) => {}
     }
     println!("cargo:rerun-if-env-changed=SOFUU_EMB_H");
+    // Prefill Phase 3: AMX via Accelerate's cblas_sgemm (macOS only; the NEON
+    // tile path stays as fallback and Windows/Linux never link the framework).
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
     println!("cargo:rerun-if-changed=build.rs");
     // M1: stage the trained image-projector artifact (weights_img.sem) into
     // OUT_DIR for include_bytes!. Absent until first training → stage an

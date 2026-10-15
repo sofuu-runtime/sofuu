@@ -1439,6 +1439,16 @@ fn gemm_batched(
     let x_ptr = SendPtr(x.as_ptr());
     let y_ptr = SendMutPtr(y.as_mut_ptr());
     let t_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
+    #[cfg(target_os = "macos")]
+    if blas_enabled() {
+        let w32 = blas_dequant_full(lt, mmap, rows, cols, threads);
+        blas_gemm(x, &w32, y, t_count, rows, cols);
+        if let Some(t0) = t_start {
+            GEMM_PROF_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            GEMM_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
     if pre8_enabled() && cols % PRE8_GROUP == 0 {
         let panels = rows.div_ceil(32);
         let (xq, ascale) = quantize_acts_i8(x, t_count, cols);
@@ -1712,6 +1722,112 @@ thread_local! {
 fn pre8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SOFUU_PRE8").as_deref() == Ok("1"))
+}
+
+/// ── Phase 3: AMX via Accelerate (`SOFUU_PREFILL_BLAS=1`) ──
+///
+/// The dequantized panel trick from the f32 path, but the MAC sweep hands off
+/// to cblas_sgemm, which dispatches to the CPU-die AMX coprocessor on Apple
+/// Silicon. Dequantization still runs on the dynamic_ffn worker pool; the one
+/// big sgemm per tensor then runs on Accelerate's own pool (no nesting —
+/// our pool must not call into it per panel).
+#[cfg(target_os = "macos")]
+mod accelerate {
+    pub const ROW_MAJOR: i32 = 101; // CblasRowMajor
+    pub const NO_TRANS: i32 = 111; // CblasNoTrans
+    pub const TRANS: i32 = 112; // CblasTrans
+
+    extern "C" {
+        pub fn cblas_sgemm(
+            layout: i32,
+            transa: i32,
+            transb: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+}
+
+/// C[t][r] = X[t][c] · W[r][c] on the AMX path: A = X (t×cols, NoTrans),
+/// B = W (rows×cols, Trans since W is row-major), C row-major (t×rows).
+#[cfg(target_os = "macos")]
+fn blas_gemm(x: &[f32], w32: &[f32], y: &mut [f32], t_count: usize, rows: usize, cols: usize) {
+    debug_assert_eq!(x.len(), t_count * cols);
+    debug_assert_eq!(w32.len(), rows * cols);
+    debug_assert_eq!(y.len(), t_count * rows);
+    unsafe {
+        accelerate::cblas_sgemm(
+            accelerate::ROW_MAJOR,
+            accelerate::NO_TRANS,
+            accelerate::TRANS,
+            t_count as i32,
+            rows as i32,
+            cols as i32,
+            1.0,
+            x.as_ptr(),
+            cols as i32,
+            w32.as_ptr(),
+            cols as i32,
+            0.0,
+            y.as_mut_ptr(),
+            rows as i32,
+        );
+    }
+}
+
+/// Dequantize the whole tensor to f32 once per call, split across the worker
+/// pool; the sgemm then sees a plain row-major weight matrix.
+#[cfg(target_os = "macos")]
+fn blas_dequant_full(
+    lt: &LinearTensor,
+    mmap: &super::mmap::MmapFile,
+    rows: usize,
+    cols: usize,
+    threads: usize,
+) -> Vec<f32> {
+    let mut w = vec![0.0f32; rows * cols];
+    let w_ptr = SendMutPtr(w.as_mut_ptr());
+    let lt_ptr = SendPtr(lt as *const LinearTensor);
+    let mmap_ptr = SendPtr(mmap as *const super::mmap::MmapFile);
+    const ROW_PANEL: usize = 64;
+    let panels = rows.div_ceil(ROW_PANEL);
+    super::dynamic_ffn::parallel_for(0, panels, threads, move |p0, p1| unsafe {
+        let (SendPtr(lt2), SendPtr(mm2), SendMutPtr(wp2)) = (lt_ptr, mmap_ptr, w_ptr);
+        let lt2: &LinearTensor = &*lt2;
+        let mm2: &super::mmap::MmapFile = &*mm2;
+        for p in p0..p1 {
+            let row0 = p * ROW_PANEL;
+            let panel_rows = ROW_PANEL.min(rows - row0);
+            for ri in 0..panel_rows {
+                dequant_linear_row(
+                    lt2,
+                    mm2,
+                    row0 + ri,
+                    cols,
+                    std::slice::from_raw_parts_mut(wp2.add((row0 + ri) * cols), cols),
+                );
+            }
+        }
+    });
+    w
+}
+
+fn blas_enabled() -> bool {
+    // The Accelerate framework is linked at build time on macOS, so the
+    // cblas symbol is always present there; elsewhere the flag is a no-op.
+    if std::env::var("SOFUU_PREFILL_BLAS").as_deref() != Ok("1") {
+        return false;
+    }
+    cfg!(target_os = "macos")
 }
 
 /// Symmetric int8 quantization of one PRE8_GROUP slice: SIMD absmax, one
@@ -2553,6 +2669,19 @@ fn gemm_pair_batched(
     let x_ptr = SendPtr(x.as_ptr());
     let ya_ptr = SendMutPtr(y_a.as_mut_ptr());
     let yb_ptr = SendMutPtr(y_b.as_mut_ptr());
+    #[cfg(target_os = "macos")]
+    if blas_enabled() {
+        let t_start_blas = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
+        let w32a = blas_dequant_full(lt_a, mmap, rows, cols, threads);
+        let w32b = blas_dequant_full(lt_b, mmap, rows, cols, threads);
+        blas_gemm(x, &w32a, y_a, t_count, rows, cols);
+        blas_gemm(x, &w32b, y_b, t_count, rows, cols);
+        if let Some(t0) = t_start_blas {
+            GEMM_PROF_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            GEMM_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
     if pre8_enabled() && cols % PRE8_GROUP == 0 {
         let panels = rows.div_ceil(32);
         let (xq, ascale) = quantize_acts_i8(x, t_count, cols);

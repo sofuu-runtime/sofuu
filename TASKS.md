@@ -3408,3 +3408,32 @@ Every domain has been built, QA-gated and uploaded. All private under
 - ⬜ **Next:** make the datasets public when the developer approves; retrain
   `s-*` models on the published pairs; the BPE trainer and `.sem`/Rust
   inference port are still open from the original roadmap.
+
+### 2026-10-15 — decode pass (CPU, all archs)
+
+Sampled live serves per arch, then fixed what the samples showed — not
+what code reading suggested:
+
+- **Decode was running on Metal even under `--cpu`.** lfm2's compute_matvec
+  and block_graph's gemv both preferred a per-matvec Metal dispatch; for
+  ~30 calls/token that is launch-overhead-bound. Flipped both to the
+  threaded CPU GEMV on macOS (iOS unchanged, `SOFUU_METAL_DECODE=1`
+  restores the hybrid). Liquid-1.3B decode 10.9 → 30.6 tok/s (short-T)
+  and 7.66 → 12.74 tok/s (T≈1300); gemma-2b is a wash (16.6 vs 15.8) so
+  no regression; `--cpu` now means CPU. 834c7cfd7.
+- **Battery decode numbers were load-poisoned.** Calm re-measure: Spark-4B
+  28.6 tok/s coherent (battery said 2.7), Qwen3-8B 13.6 tok/s (battery
+  said 5.2; ~1.75× the llama.cpp CPU reference). The battery rows need a
+  calm-window re-run before anyone compares them to llama.cpp.
+- **27B decode is 100% `packed_row_dot_t143`** (resident serve sample).
+  Shipped the opt-in dequantized trit slab (`SOFUU_T143_SLAB`):
+  dequantize each matrix once, decode via `trit_row_dot_q` (the pinned
+  reference fold; bit-identical test added). ~2.9 GB anon vs 5.9 GB
+  packed residency. Sustained-rate receipt pending: a calm window matters
+  here — under peer memory pressure the one-time slab prepass thrashes
+  against the packed mmap (22 min for ~600 MB once; ~30-60 s calm), and
+  the counting prompt EOSes after 1 token so the sustained probe needs
+  the 1262-token prefill (~6 min at 3.5 tok/s) in front of it. 1db43dca7.
+- Liquid-350 remains EOS-collapsed ≥ ~50 tokens (untouched, known bug).
+- Not started this pass: 27B GDN head parallelization, gptx3 chunked
+  prefill port (both queued).

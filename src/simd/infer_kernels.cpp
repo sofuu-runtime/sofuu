@@ -3361,6 +3361,136 @@ static void sofuu_attn_vacc_range(float * __restrict out, const float * __restri
 #endif
 }
 
+// ── FA2-style block-tiled attention (online softmax) ─────────────────
+// The previous per-slot path materialized all seq_len scores and made three
+// scalar passes over them (dot / max+exp+sum / normalize) before a separate
+// V-weighted-sum pass. The tiled path never materializes the full score
+// vector: per 128-position K/V block it computes block scores (same x2
+// lanes), one NEON block max, rescales the running max/sum/output once per
+// block (FlashAttention-2's online-softmax identity), accumulates P·V into
+// the output register set, and normalizes once at the end. Shared by every
+// backend + Spark. Measured on Pi 5: LOSES to the two-pass everywhere (the
+// scores vector never leaves L1 at our seq lengths, so FA2's
+// don't-materialize-scores advantage is void and the block bookkeeping is
+// pure overhead) — default OFF, `SOFUU_FA2=1` opts in (§Session 4 addendum 2).
+static bool fa2_enabled() {
+    static int v = getenv("SOFUU_FA2") ? strcmp(getenv("SOFUU_FA2"), "1") == 0 ? 1 : 0 : 0;
+    return v != 0;
+}
+
+static inline float sofuu_f32_max_neon(const float * v, size_t n) {
+#if defined(SOFUU_NEON)
+    float32x4_t m = vdupq_n_f32(-3.4e38f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        m = vmaxq_f32(m, vmaxq_f32(vld1q_f32(v + i), vmaxq_f32(vld1q_f32(v + i + 4), vmaxq_f32(vld1q_f32(v + i + 8), vld1q_f32(v + i + 12)))));
+    }
+    float r = vmaxvq_f32(m);
+    for (; i < n; ++i) r = r > v[i] ? r : v[i];
+    return r;
+#else
+    float r = v[0];
+    for (size_t i = 1; i < n; ++i) r = r > v[i] ? r : v[i];
+    return r;
+#endif
+}
+
+static inline float sofuu_f32_sum_neon(const float * v, size_t n) {
+#if defined(SOFUU_NEON)
+    float32x4_t s = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s = vaddq_f32(s, vaddq_f32(vld1q_f32(v + i), vaddq_f32(vaddq_f32(vld1q_f32(v + i + 4), vld1q_f32(v + i + 8)), vld1q_f32(v + i + 12))));
+    }
+    float r = vaddvq_f32(s);
+    for (; i < n; ++i) r += v[i];
+    return r;
+#else
+    float r = 0.0f;
+    for (size_t i = 0; i < n; ++i) r += v[i];
+    return r;
+#endif
+}
+
+// One tiled online-softmax range over [p_begin, p_begin+count). Updates the
+// running (m, l, acc_triuple) carried across ranges + blocks. exp: libm
+// expf per position (block max keeps exponents ≤ 0 — no overflow, stable).
+static void sofuu_attn_fa2_range(
+    const float * __restrict q,
+    const float * __restrict k_base,
+    const float * __restrict v_base,
+    size_t k_stride, size_t head_dim,
+    size_t p_begin, size_t count,
+    float scale,
+    float * block_scores,   // ≥ 128 floats
+    float * acc,            // head_dim accumulator
+    float * m_run, float * l_run, int * have_max
+) {
+    size_t off = 0;
+    while (off < count) {
+        const size_t blk = (count - off) > 128 ? 128 : (count - off);
+        sofuu_attn_qk_range(q, k_base, k_stride, head_dim, p_begin + off, blk, scale, block_scores);
+        const float bm = sofuu_f32_max_neon(block_scores, blk);
+        if (!*have_max) {
+            *m_run = bm;
+            *have_max = 1;
+        }
+        const float m_new = bm > *m_run ? bm : *m_run;
+        const float rf = expf(*m_run - m_new); // 1.0 when m unchanged or first block (m==bm)
+        for (size_t j = 0; j < blk; ++j) {
+            block_scores[j] = expf(block_scores[j] - m_new);
+        }
+        // rescale running state
+        if (rf != 1.0f) {
+#if defined(SOFUU_NEON)
+            const float32x4_t rf4 = vdupq_n_f32(rf);
+            for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+                vst1q_f32(acc + i,      vmulq_f32(vld1q_f32(acc + i),      rf4));
+                vst1q_f32(acc + i + 4,  vmulq_f32(vld1q_f32(acc + i + 4),  rf4));
+                vst1q_f32(acc + i + 8,  vmulq_f32(vld1q_f32(acc + i + 8),  rf4));
+                vst1q_f32(acc + i + 12, vmulq_f32(vld1q_f32(acc + i + 12), rf4));
+            }
+            for (size_t i = head_dim - (head_dim & 15); i < head_dim; ++i) acc[i] *= rf;
+#else
+            for (size_t i = 0; i < head_dim; ++i) acc[i] *= rf;
+#endif
+            *l_run *= rf;
+        }
+        *l_run += sofuu_f32_sum_neon(block_scores, blk);
+#if defined(SOFUU_NEON)
+        // P·V accumulate in place (position-ordered chunked FMAs, same op as
+        // sofuu_attn_vacc_range but on the running acc — exp weights, unnormalized)
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i < i16; i += 16) {
+            float32x4_t d0 = vld1q_f32(acc + i), d1 = vld1q_f32(acc + i + 4);
+            float32x4_t d2 = vld1q_f32(acc + i + 8), d3 = vld1q_f32(acc + i + 12);
+            for (size_t b = 0; b < blk; ++b) {
+                const float32x4_t sv = vdupq_n_f32(block_scores[b]);
+                const float * vrow = v_base + (p_begin + off + b) * k_stride;
+                d0 = vmlaq_f32(d0, vld1q_f32(vrow + i), sv);
+                d1 = vmlaq_f32(d1, vld1q_f32(vrow + i + 4), sv);
+                d2 = vmlaq_f32(d2, vld1q_f32(vrow + i + 8), sv);
+                d3 = vmlaq_f32(d3, vld1q_f32(vrow + i + 12), sv);
+            }
+            vst1q_f32(acc + i, d0); vst1q_f32(acc + i + 4, d1);
+            vst1q_f32(acc + i + 8, d2); vst1q_f32(acc + i + 12, d3);
+        }
+        for (int a = 0; a < (int)blk; ++a) { // tail floats, position-ordered
+            const float * vrow = v_base + (p_begin + off + a) * k_stride;
+            for (size_t i = i16; i < head_dim; ++i) {
+                acc[i] += vrow[i] * block_scores[a];
+            }
+        }
+#else
+        for (size_t b = 0; b < blk; ++b) {
+            sofuu_vec_mad_f32(acc, v_base + (p_begin + off + b) * k_stride, block_scores[b], head_dim);
+        }
+#endif
+        *m_run = m_new;
+        off += blk;
+    }
+}
+
 // ── Multi-core Parallel Attention with Sliding Window & Attention Sinks ──
 void sofuu_batched_attention_ext(
     const float *q_batch,
@@ -3391,6 +3521,7 @@ void sofuu_batched_attention_ext(
             heap_scores.resize(max_seq_len);
             scores = heap_scores.data();
         }
+        const bool use_fa2 = fa2_enabled() && head_dim <= 4096;
 
         for (size_t work_idx = start; work_idx < end; ++work_idx) {
             size_t b = work_idx / n_heads;
@@ -3408,7 +3539,39 @@ void sofuu_batched_attention_ext(
                 size_t window_start = seq_len - sliding_window;
                 size_t sink_end = (sink_tokens < window_start) ? sink_tokens : window_start;
                 size_t active_count = sink_end + (seq_len - window_start);
+                (void)active_count;
 
+                if (use_fa2) {
+                    // FA2 tile pass over the union softmax (sinks + window share
+                    // one running max/sum), then one normalize.
+                    alignas(32) float fa2_acc_stack[4096];
+                    std::vector<float> fa2_acc_heap;
+                    float *acc = fa2_acc_stack;
+                    if (head_dim > 4096) {
+                        fa2_acc_heap.resize(head_dim);
+                        acc = fa2_acc_heap.data();
+                    }
+                    std::memset(acc, 0, head_dim * sizeof(float));
+                    float m_run = 0.0f, l_run = 0.0f;
+                    int have_max = 0;
+                    sofuu_attn_fa2_range(q_head, k_past, v_past, head_dim, head_dim, 0, sink_end,
+                                         inv_sqrt_head_dim, scores, acc, &m_run, &l_run, &have_max);
+                    sofuu_attn_fa2_range(q_head, k_past, v_past, head_dim, head_dim, window_start,
+                                         seq_len - window_start, inv_sqrt_head_dim, scores, acc, &m_run, &l_run, &have_max);
+                    float *out_head = head_out_batch + b * q_dim + h * head_dim;
+                    const float inv_l = 1.0f / (l_run > 0.0f ? l_run : 1e-8f);
+                    for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+#if defined(SOFUU_NEON)
+                        vst1q_f32(out_head + i,      vmulq_f32(vld1q_f32(acc + i),      vdupq_n_f32(inv_l)));
+                        vst1q_f32(out_head + i + 4,  vmulq_f32(vld1q_f32(acc + i + 4),  vdupq_n_f32(inv_l)));
+                        vst1q_f32(out_head + i + 8,  vmulq_f32(vld1q_f32(acc + i + 8),  vdupq_n_f32(inv_l)));
+                        vst1q_f32(out_head + i + 12, vmulq_f32(vld1q_f32(acc + i + 12), vdupq_n_f32(inv_l)));
+#else
+                        for (size_t k = 0; k < 16; ++k) out_head[i + k] = acc[i + k] * inv_l;
+#endif
+                    }
+                    for (size_t i = head_dim - (head_dim & 15); i < head_dim; ++i) out_head[i] = acc[i] * inv_l;
+                } else {
                 sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, 0, sink_end, inv_sqrt_head_dim, scores);
                 sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, window_start, seq_len - window_start,
                                     inv_sqrt_head_dim, scores + sink_end);
@@ -3421,6 +3584,33 @@ void sofuu_batched_attention_ext(
                 sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0, sink_end, scores);
                 sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, window_start, seq_len - window_start,
                                       scores + sink_end);
+                }
+            } else if (use_fa2) {
+                alignas(32) float fa2_acc_stack[4096];
+                std::vector<float> fa2_acc_heap;
+                float *acc = fa2_acc_stack;
+                if (head_dim > 4096) {
+                    fa2_acc_heap.resize(head_dim);
+                    acc = fa2_acc_heap.data();
+                }
+                std::memset(acc, 0, head_dim * sizeof(float));
+                float m_run = 0.0f, l_run = 0.0f;
+                int have_max = 0;
+                sofuu_attn_fa2_range(q_head, k_past, v_past, head_dim, head_dim, 0, seq_len,
+                                     inv_sqrt_head_dim, scores, acc, &m_run, &l_run, &have_max);
+                float *out_head = head_out_batch + b * q_dim + h * head_dim;
+                const float inv_l = 1.0f / (l_run > 0.0f ? l_run : 1e-8f);
+                for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+#if defined(SOFUU_NEON)
+                    vst1q_f32(out_head + i,      vmulq_f32(vld1q_f32(acc + i),      vdupq_n_f32(inv_l)));
+                    vst1q_f32(out_head + i + 4,  vmulq_f32(vld1q_f32(acc + i + 4),  vdupq_n_f32(inv_l)));
+                    vst1q_f32(out_head + i + 8,  vmulq_f32(vld1q_f32(acc + i + 8),  vdupq_n_f32(inv_l)));
+                    vst1q_f32(out_head + i + 12, vmulq_f32(vld1q_f32(acc + i + 12), vdupq_n_f32(inv_l)));
+#else
+                    for (size_t k = 0; k < 16; ++k) out_head[i + k] = acc[i + k] * inv_l;
+#endif
+                }
+                for (size_t i = head_dim - (head_dim & 15); i < head_dim; ++i) out_head[i] = acc[i] * inv_l;
             } else {
                 sofuu_attn_qk_range(q_head, k_past, head_dim, head_dim, 0, seq_len, inv_sqrt_head_dim, scores);
 
@@ -3971,6 +4161,75 @@ extern "C" int sofuu_test_attention_x4_parity(int n_heads, int n_kv_heads, int h
                 }
             }
             return 2;
+        }
+    }
+    return 0;
+}
+
+// ── Parity: FA2 tiled online-softmax vs the two-pass reference. NOT bit-exact
+// (block-wise max/exp reassociates the float rounding): gate is relative
+// element error ≤ 1e-4 on the same SWA/plain config matrix as the x4 test. ──
+extern "C" int sofuu_test_attention_fa2_parity(int n_heads, int n_kv_heads, int head_dim, int max_seq) {
+    if (n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 32 || max_seq < 8) return -1;
+    const size_t H = (size_t)n_heads, KV = (size_t)n_kv_heads, HD = (size_t)head_dim;
+    const size_t rep = H / KV, qd = H * HD, kvd = KV * HD, ms = (size_t)max_seq;
+    std::vector<float> q(2 * qd), kc(ms * kvd), vc(ms * kvd), oref(2 * qd), onew(2 * qd);
+    struct Cfg { size_t b, start, window, sinks; };
+    const Cfg cfgs[] = {
+        {2, 0, 0, 0},
+        {2, ms - 3, 0, 0},
+        {2, ms - 3, 8, 3},
+        {2, ms - 7, 16, 2},
+        {1, ms - 1, ms / 2 + 1, 4},  // sink_end clipped by window_start
+        {2, 11, 5, 0},
+        {2, 13, 0, 0},
+    };
+    uint32_t rng = 777;
+    for (auto &v : q)  { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    for (auto &v : kc) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    for (auto &v : vc) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 8) % 2000 - 1000) / 512.0f; }
+    std::vector<float> scores(ms + 16), acc(HD, 0.0f);
+    const float inv_sqrt = 1.0f / sqrtf((float)HD);
+    const float tol = 1e-4f;
+    for (const Cfg &c : cfgs) {
+        for (size_t i = 0; i < oref.size(); ++i) { oref[i] = -1e30f; onew[i] = -1e30f; }
+        for (size_t b = 0; b < c.b; ++b) {
+            const size_t pos = c.start + b;
+            const size_t seq_len = (pos + 1 < ms) ? (pos + 1) : ms;
+            for (size_t h = 0; h < H; ++h) {
+                const size_t kv_h = h / rep;
+                const float *q_head = q.data() + b * qd + h * HD;
+                const float *kp = kc.data() + kv_h * ms * HD;
+                const float *vp = vc.data() + kv_h * ms * HD;
+                float *ro = oref.data() + b * qd + h * HD;
+                float *no = onew.data() + b * qd + h * HD;
+                std::fill(acc.begin(), acc.end(), 0.0f);
+                float m_run = 0.0f, l_run = 0.0f;
+                int have_max = 0;
+                if (c.window > 0 && seq_len > c.window) {
+                    const size_t ws = seq_len - c.window;
+                    const size_t se = (c.sinks < ws) ? c.sinks : ws;
+                    sofuu_attn_fa2_range(q_head, kp, vp, HD, HD, 0, se, inv_sqrt, scores.data(),
+                                         acc.data(), &m_run, &l_run, &have_max);
+                    sofuu_attn_fa2_range(q_head, kp, vp, HD, HD, ws, seq_len - ws, inv_sqrt, scores.data(),
+                                         acc.data(), &m_run, &l_run, &have_max);
+                } else {
+                    sofuu_attn_fa2_range(q_head, kp, vp, HD, HD, 0, seq_len, inv_sqrt, scores.data(),
+                                         acc.data(), &m_run, &l_run, &have_max);
+                }
+                const float inv_l = 1.0f / (l_run > 0.0f ? l_run : 1e-8f);
+                for (size_t i = 0; i < HD; ++i) no[i] = acc[i] * inv_l;
+                sofuu_attn_ref_slot(q_head, kp, vp, ro, scores.data(), seq_len, HD, inv_sqrt, c.window, c.sinks);
+                for (size_t i = 0; i < HD; ++i) {
+                    const float rel = fabsf(no[i] - ro[i]) / (fabsf(ro[i]) > 1e-3f ? fabsf(ro[i]) : 1e-3f);
+                    if (!(rel <= tol)) {
+                        fprintf(stderr,
+                                "[parity-fa2] b=%zu start=%zu win=%zu sinks=%zu: out[%zu] %.9g vs %.9g (rel %.3g)\n",
+                                c.b, c.start, c.window, c.sinks, i, no[i], ro[i], rel);
+                        return 1;
+                    }
+                }
+            }
         }
     }
     return 0;

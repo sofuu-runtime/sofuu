@@ -394,4 +394,54 @@ below the plan's own ≥1.8× acceptance bar. Phase 2 parked as bit-gated
 infrastructure (`SOFUU_PRE8=1`, default off, suite 577/0); revisit only if
 the liquid float fleet becomes a product surface, or fold the same
 two-sided-scale eight into the q4_K scale-apply-chain work, which shares the
-math.
+math. (2026-10-15 follow-up: the ladder owner's `6605a2ed3` later removed
+this parked SDOT block during the double-merge cleanup — their 32-group
+per-load-slab ladder is now the one `SOFUU_PRE8` path on main, with amx
+defaults; the SDOT variant is preserved in `9848995df` history for
+re-landing.)
+
+### Session 4 addendum 2: Phase-5a FA2 tiled attention — correct, measured slower → parked default-off (`SOFUU_FA2=1`)
+
+Implemented the plan's Phase 5 (the one lever the portability assessment
+called the real remaining candidate) in the shared attention kernel
+(`sofuu_batched_attention_ext` — every GGUF backend + Spark): per
+128-position K/V blocks, block scores via the proven x2-lane
+`sofuu_attn_qk_range`, one NEON block max, online-softmax rescale of the
+running (max, sum, acc) with per-position `expf (≤ 0 exponents)`, in-place
+P·V accumulate in position order, one normalize at the end. SWA's sink and
+window ranges share the same running state (they are one union softmax), so
+the FA2 branch is a drop-in for both the SWA and plain two-pass branches.
+Not bit-exact by design — block-wise max/exp reassociates float rounding —
+so the new harness `sofuu_test_attention_fa2_parity` gates relative element
+error ≤ 1e-4 against the two-pass reference (`sofuu_attn_ref_slot`) over the
+same 7-config plain/SWA/sink matrix as the x4 test
+(`test_attention_fa2_rel_gates` in quant.rs, seq past the 128-block boundary
+so multi-block rescale is exercised). Suite 580/0.
+
+**Measured verdict: FA2 loses on the Pi 5, and the loss is structural — no
+tuning flips it.** Same-session device A/B (Qwen3-0.6B, 234-token prompt):
+attention bucket per 64-token chunk 33/61 ms → **47/80 ms**, decode attn
+8 → **13 ms** per token, E2E prefill 157.8 → **146.4 t/s** and decode
+20.6 → **17.3 t/s** (GEMM bucket identical, so the regression is fully
+attention-attributed). Three reasons, in order of weight:
+
+1. At our sequence lengths the scores vector is ~1 KB per head and never
+   leaves L1. FA2's reason to exist — never materializing scores to DRAM —
+   is void here, and the existing two-pass is already memory-optimal.
+2. The two-pass loops it would replace are A76-register-tuned (x2-lane QK,
+   4-position V pass) and do strictly less work: the block max, block sum,
+   and per-block rescale of (m, l, acc) are pure overhead on top of the
+   same dots, exps, and FMAs.
+3. Attention is only 8-15% of prefill at these shapes, so even a
+   zero-overhead FA2 caps at a few percent E2E — below the ≥15% acceptance
+   bar every shipped lever this session cleared.
+
+Shipped state: kernel + harness kept as `SOFUU_FA2=1` opt-in, default off;
+the default path is byte-for-byte the pre-FA2 behavior (final-binary
+receipts: Qwen 155.5-157.1 prefill / 20.6-20.7 decode, Spark 22.2/4.4 — all
+inside the session band). Second lesson of the session alongside Phase-2's:
+the M2 plan's phase ranking prices levers by M2-Pro economics; on the Pi,
+the denominator is what actually reaches DRAM at small-seq × small-head —
+score materialization doesn't, so eliminating it buys nothing, while the
+QK/V dot shapes that are already register-tuned can't be beaten by
+re-fusing.

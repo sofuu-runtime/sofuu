@@ -528,6 +528,7 @@ extern "C" {
         sink_tokens: usize,
     );
     fn sofuu_test_attention_x4_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
+    fn sofuu_test_attention_fa2_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
     fn sofuu_test_rope_table_parity(n_heads: i32, head_dim: i32, max_pos: i32) -> i32;
     fn sofuu_test_gemm_resid_pair_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_tree_rope(
@@ -1023,6 +1024,14 @@ pub fn batched_attention_ext(
     /// original per-position dot/mad path. Returns 0 when outputs match.
     pub fn attention_x4_parity(n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> i32 {
         unsafe { sofuu_test_attention_x4_parity(n_heads as i32, n_kv_heads as i32, head_dim as i32, max_seq as i32) }
+    }
+
+    /// Numerical gate for the FA2 tiled online-softmax attention vs the
+    /// two-pass reference (not bit-exact: block max/exp reassociates float
+    /// rounding; the C harness enforces rel element error ≤ 1e-4). Returns 0
+    /// when within tolerance.
+    pub fn attention_fa2_parity(n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> i32 {
+        unsafe { sofuu_test_attention_fa2_parity(n_heads as i32, n_kv_heads as i32, head_dim as i32, max_seq as i32) }
     }
 
     /// Bit-parity gate for the RoPE sincos table vs the inline
@@ -2255,6 +2264,16 @@ mod tests {
         assert_eq!(attention_x4_parity(4, 2, 32, 64), 0, "small SWA shapes diverged");
         assert_eq!(attention_x4_parity(16, 8, 128, 256), 0, "Qwen3-0.6B attention shapes diverged");
         assert_eq!(attention_x4_parity(6, 2, 48, 100), 0, "odd head_dim/seq shapes diverged");
+    }
+
+    /// The FA2 tiled online-softmax kernel must track the two-pass reference
+    /// within rel 1e-4 across plain, SWA, and SWA-with-sinks shapes — keeping
+    /// seq_len past the 128-block boundary so multi-block rescale is exercised.
+    #[test]
+    fn test_attention_fa2_rel_gates() {
+        assert_eq!(attention_fa2_parity(4, 2, 32, 64), 0, "small SWA shapes out of tolerance");
+        assert_eq!(attention_fa2_parity(16, 8, 128, 300), 0, "multi-block Qwen shapes out of tolerance");
+        assert_eq!(attention_fa2_parity(6, 2, 48, 259), 0, "odd head_dim/seq shapes out of tolerance");
     }
 
     /// The RoPE sincos table must be bit-identical to the inline

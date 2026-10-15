@@ -172,8 +172,14 @@ unsafe extern "C" fn timer_free_cb(handle: *mut UvHandle) {
 /// only (accept, parser callbacks, response writes).
 unsafe fn client_arm_timer(c: *mut Client, ms: u64) {
     if ms == 0 {
-        /* Embedder-requested "no deadline" (see apply_deadline_env_once):
-         * mirrors the OOM-at-accept path below — run without a deadline. */
+        /* "No deadline" must also CLEAR a previously armed one: the accept
+         * path arms HEADERS_TIMEOUT_MS, and the parser callbacks re-arm
+         * with IDLE_TIMEOUT_MS once headers are in. Returning early left
+         * the headers timer ticking — serve's idle-free long prefill would
+         * have been killed by the (new) 30s accept deadline mid-completion. */
+        if !(*c).hdr_timer.is_null() {
+            uv::uv_timer_stop((*c).hdr_timer);
+        }
         return;
     }
     if (*c).hdr_timer.is_null() {
@@ -198,12 +204,20 @@ unsafe extern "C" fn on_deadline_timeout(_t: *mut UvTimer) {
 
 fn status_text(status: c_int) -> &'static str {
     match status {
+        200 => "OK",
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
-        _ => "OK",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        // An unlisted code still needs A reason; "Unknown" no longer lies
+        // about a 4xx/5xx the way a blanket "OK" did. (P2, audit 2026.)
+        _ => "Unknown",
     }
 }
 

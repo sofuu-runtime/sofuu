@@ -725,12 +725,15 @@ fn cmd_outputs(args: &[String]) -> i32 {
 /// GET /recall, POST /share. Auth: Bearer token (generated or supplied).
 fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     // Local-inference prefill on large models can legitimately produce no
-    // response bytes for many minutes (e.g. a 27B ternary prompt decode).
-    // Widen the http_server connection deadlines for this embedder unless
-    // the operator pinned them explicitly; http_server reads these once at
-    // the first createServer/serve call. "0" disables the deadline.
+    // response bytes for many minutes (e.g. a 27B ternary prompt decode) —
+    // SOFUU_HTTP_IDLE_MS stays 0 (no deadline at all once a request is in).
+    // P2 (audit 2026-10-14): the pre-AUTH window is what must stay bounded
+    // — an accepted connection that never sends its headers ("silent" or
+    // dribbling) used to be able to hold an fd forever before any auth
+    // check ran. Default HEADERS deadline: 30s (a legit client sends in
+    // milliseconds; the operator can still pin either value explicitly).
     if std::env::var_os("SOFUU_HTTP_HEADERS_MS").is_none() {
-        std::env::set_var("SOFUU_HTTP_HEADERS_MS", "0");
+        std::env::set_var("SOFUU_HTTP_HEADERS_MS", "30000");
     }
     if std::env::var_os("SOFUU_HTTP_IDLE_MS").is_none() {
         std::env::set_var("SOFUU_HTTP_IDLE_MS", "0");
@@ -959,6 +962,17 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
       embed = function (t) {{ return sofuu.ai.embedLocalSemantic(String(t)); }};
     }} else if (space === 'semantic-table-v2' && typeof sofuu.ai.embedLocalSemanticV2 === 'function') {{
       embed = function (t) {{ return sofuu.ai.embedLocalSemanticV2(String(t)); }};
+    }}
+    /* P2 (audit 2026-10-14): a manifest space this server cannot embed
+     * LOCALLY (a remote provider space, a custom agent space) used to fall
+     * through to the default hash embedder — hash-768 vectors stored under
+     * a foreign-space manifest, mislabeled in /share cards and useless at
+     * recall. Refuse instead: the store simply stays unavailable (503s
+     * below) with the reason on stderr. hash-v1 needs no switch. */
+    if (brain && space && space !== 'hash-v1' &&
+        space !== 'semantic-projector-v1' && space !== 'semantic-table-v2') {{
+      console.error("brain space '" + space + "' has no local embedder in this server — refusing to serve (hash vectors would be mislabeled in a '" + space + "' store)");
+      brain = null;
     }}
   }}
   /* Pin the brain + server to globals: their JS objects' reachability

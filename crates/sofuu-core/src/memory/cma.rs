@@ -906,6 +906,21 @@ impl Cma {
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         }
 
+        /* M0 (Brain Core II): REFLEXIVITY — a query vector that (nearly)
+         * equals a stored record's vector IS that record's question, so it
+         * outranks every inexact hit no matter how its strength decayed.
+         * Without this, fresh high-tier neighbors (entities weigh 1.5) bury
+         * an exact match once decay pulls its strength under ~0.4: the fuzz
+         * showed a 5-day-old fact missing from its OWN top-8 while unrelated
+         * entities filled it. Ties inside a bucket stay score-ordered. */
+        const REFLEX_EPS: f32 = 0.02;
+        scored.sort_by(|a, b| {
+            let ea = a.1 <= REFLEX_EPS;
+            let eb = b.1 <= REFLEX_EPS;
+            eb.cmp(&ea)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
         /* B5.1: diversity — the top-k should not be five paraphrases of
          * one fact. Fills from the relevance-ordered pool, skipping
          * near-duplicates of records already picked. */
@@ -1190,8 +1205,16 @@ impl Cma {
                 return id as i32;
             }
         }
+        /* Entity identity lands ONLY on a genuinely fresh insert. If the
+         * dup gate merged us into an existing row, re-tiering it here
+         * would kidnap that row into the entity class and rename it on
+         * the next upsert of the same name — the M0 fuzz caught a pin
+         * (vectors accidentally identical) converted this way, then its
+         * text replaced. A merged result is a reinforcement of the
+         * survivor; its identity is not ours to rewrite. */
+        let before = self.records.len();
         let idx = self.remember(vec, text, "entity", 0);
-        if idx >= 0 {
+        if idx >= 0 && (idx as usize) == before && self.records.len() == before + 1 {
             let rec = &mut self.records[idx as usize];
             rec.tier = TIER_ENTITY;
             rec.half_life = 86400 * 365; // entities never decay
@@ -1199,6 +1222,30 @@ impl Cma {
             rec.entity_type = Some(etype.to_string());
         }
         idx
+    }
+
+    /// M0 (Brain Core II): entity-NAMESPACED turn record. Same entity_name
+    /// / entity_type fields as remember_entity (so scoped recall by
+    /// namespace prefix keeps working), but the row ranks and decays as
+    /// EPISODIC — the namespace is a privacy address, not an immortality
+    /// badge. agent-scope turn storage used rememberEntity with the agent's
+    /// bare name, which UPSERTS: every turn overwrote the previous one, so
+    /// agent private memory never accumulated (the soak caught 200 turns →
+    /// 1 row). Distinct texts never merge (the dup gate keys on vector
+    /// distance; identical restatements still reinforce, by design). The
+    /// namespace stamp only lands on a FRESH insert — if the dup gate
+    /// merged into an existing row, re-labeling it here would migrate
+    /// another namespace's row across the privacy boundary.
+    pub fn remember_entity_scoped(&mut self, vec: &[f32], text: &str, name: &str, etype: &str) -> i32 {
+        let before = self.records.len();
+        let id = self.remember(vec, text, "agent_turn", 0);
+        if id >= 0 && (id as usize) == before && self.records.len() == before + 1 {
+            let rec = &mut self.records[id as usize];
+            rec.entity_name = Some(name.to_string());
+            rec.entity_type = Some(etype.to_string());
+            rec.tier = TIER_EPISODIC; // decays on the 1-day curve, capacity-evictable
+        }
+        id
     }
 
     /// Consolidate weak episodic memories into semantic clusters (k-means +
@@ -1209,10 +1256,19 @@ impl Cma {
             return 0;
         }
         // Find weak episodic memories (strength < 0.25, age > 1 day).
+        // Pinned facts stay out of the sweep: retain()'s contract says
+        // they survive unconditionally, and consolidation must not reach
+        // around it by tombstoning them here (the M0 fuzz caught exactly
+        // that — a 1-day-old pin folded into a dream cluster and gone).
         let weak: Vec<u32> = self
             .records
             .iter()
-            .filter(|r| r.tier == TIER_EPISODIC && r.strength < 0.25 && r.age_seconds > 86400)
+            .filter(|r| {
+                r.tier == TIER_EPISODIC
+                    && r.role != PIN_ROLE
+                    && r.strength < 0.25
+                    && r.age_seconds > 86400
+            })
             .map(|r| r.id)
             .collect();
         if weak.len() < 10 {
@@ -1748,6 +1804,105 @@ mod tests {
         );
     }
 
+    /// Brain Core II M0 (fuzz finding): consolidation's weak-episodic
+    /// sweep had no pin guard, so an aged, decayed `user_pin` was folded
+    /// into a dream cluster and tombstoned — consolidation reaching
+    /// around retain()'s "pinned facts survive unconditionally" contract.
+    /// A pin adds nothing to a dream summary anyway: it is immortal by
+    /// choice.
+    #[test]
+    fn consolidate_never_tombstones_a_pin() {
+        let mut cma = Cma::new(16);
+        // The 10 weak old episodic rows consolidation needs to activate,
+        // plus a pin in exactly the same weak state.
+        for i in 0..10 {
+            let mut v = vec![0.0; 16];
+            v[0] = 1.0;
+            v[2 + i] = 0.1 + (i as f32) * 0.01;
+            let id = cma.remember(&v, &format!("episode {i} about project alpha"), "user", 0);
+            cma.records[id as usize].strength = 0.1;
+            cma.records[id as usize].age_seconds = 90000;
+        }
+        let mut pv = vec![0.0; 16];
+        pv[15] = 1.0;
+        let pin = cma.remember(&pv, "the deploy bucket is sofuu-dist", PIN_ROLE, 0) as usize;
+        cma.records[pin].strength = 0.1;
+        cma.records[pin].age_seconds = 90000;
+
+        let n = cma.consolidate();
+        assert!(n >= 1, "the non-pinned cluster must still consolidate");
+        let pr = &cma.records[pin];
+        assert!(
+            pr.tier != TIER_FORGOTTEN && pr.text == "the deploy bucket is sofuu-dist",
+            "the pin must survive consolidation untouched: tier {}, text {:?}",
+            pr.tier,
+            pr.text
+        );
+        assert!(
+            !cma.records.iter().any(|r| r.tier == TIER_SEMANTIC && r.text.contains("sofuu-dist")),
+            "the pin must not be folded into a summary"
+        );
+    }
+
+    /// Brain Core II M0 (fuzz finding): remember_entity's insert arm used
+    /// to apply entity identity (tier 4 + name) to whatever row the dup
+    /// gate returned — including a MERGED row. A new entity whose vector
+    /// exactly matched an existing row kidnapped it: the row left its own
+    /// tier/namespace, and the next upsert of that entity name replaced
+    /// its text. Identity lands only on fresh inserts.
+    #[test]
+    fn entity_insert_never_kidnaps_a_merged_row() {
+        let mut cma = Cma::new(16);
+        let mut pv = vec![0.0; 16];
+        pv[3] = 1.0;
+        pv[9] = 0.5;
+        let pin = cma.remember(&pv, "the deploy bucket is sofuu-dist", PIN_ROLE, 0) as usize;
+        // An entity whose vector EXACTLY equals the pin's: the dup gate
+        // merges, and the pin row must come out untouched.
+        let got = cma.remember_entity(&pv, "entity kidnap fact", "ent-X", "fuzz");
+        assert_eq!(got as usize, pin, "identical vector must merge, not insert");
+        let pr = &cma.records[pin];
+        assert_eq!(pr.tier, TIER_EPISODIC, "the merged row keeps its tier");
+        assert_eq!(pr.entity_name, None, "the merged row keeps its identity");
+        assert_eq!(pr.text, "the deploy bucket is sofuu-dist", "the merged row keeps its text");
+        assert_eq!(pr.role, PIN_ROLE);
+        // ... and an ent-X fact after the name went unheld inserts fresh
+        // with its identity, without touching the pin again.
+        let mut hv = vec![0.0; 16];
+        hv[7] = 1.0;
+        let x1 = cma.remember_entity(&hv, "entity X fact", "ent-X", "fuzz") as usize;
+        assert_eq!(cma.records[x1].tier, TIER_ENTITY);
+        assert_eq!(cma.records[pin].text, "the deploy bucket is sofuu-dist");
+    }
+
+    /// Brain Core II M0 (same fuzz finding, namespace form): a scoped turn
+    /// whose content merges into an existing row must not re-label that
+    /// row into the caller's namespace — the namespace is a privacy
+    /// address, so a merge leaves the survivor's identity alone.
+    #[test]
+    fn scoped_turn_never_relabels_a_merged_row() {
+        let mut cma = Cma::new(16);
+        let mut v = vec![0.0; 16];
+        v[5] = 1.0;
+        let a = cma.remember_entity_scoped(&v, "the plan is archived Monday", "agent:a:t1", "agent") as usize;
+        // Identical content arriving from namespace B: merges into A's row.
+        let b = cma.remember_entity_scoped(&v, "the plan is archived Monday", "agent:b:t1", "agent") as usize;
+        assert_eq!(b, a, "identical content merges to one row");
+        let r = &cma.records[a];
+        assert_eq!(
+            r.entity_name.as_deref(),
+            Some("agent:a:t1"),
+            "the row keeps its original namespace"
+        );
+        assert_eq!(r.tier, TIER_EPISODIC);
+        // A genuinely fresh scoped turn still lands stamped episodic.
+        let mut v2 = vec![0.0; 16];
+        v2[11] = 1.0;
+        let c = cma.remember_entity_scoped(&v2, "namespace b note", "agent:b:t2", "agent") as usize;
+        assert_eq!(cma.records[c].entity_name.as_deref(), Some("agent:b:t2"));
+        assert_eq!(cma.records[c].tier, TIER_EPISODIC);
+    }
+
     /// P2 (audit 2026-10-14): an imported card cannot carry session state
     /// (tier 0) or an unknown tier (> 4) — both land episodic; a FUTURE
     /// created_at is hostile (it would grant the maximum recency boost
@@ -1877,6 +2032,30 @@ mod tests {
         cma.decay_tick(86400);
         assert_eq!(cma.records[0].strength, 1.0, "exp(-inf) must not multiply in");
         assert_eq!(cma.records[0].age_seconds, 86400, "age still advances");
+    }
+
+    /// M0: remember_entity_scoped ACCUMULATES turn facts inside a nested
+    /// namespace while decaying as episodic — the exact property agent-scope
+    /// memory lost when every turn re-checked into remember_entity's
+    /// upsert-by-name (200 turns → 1 surviving row, the soak's finding).
+    #[test]
+    fn scoped_entity_turns_accumulate_and_decay() {
+        let mut cma = Cma::new(8);
+        let v1 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v2 = [0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v3 = [0.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let r1 = cma.remember_entity_scoped(&v1, "turn 1 fact", "agent:qa:t:1", "agent");
+        let r2 = cma.remember_entity_scoped(&v2, "turn 2 fact", "agent:qa:a:2", "agent");
+        let r3 = cma.remember_entity_scoped(&v3, "turn 3 fact", "agent:qa:t:3", "agent");
+        assert_eq!((r1, r2, r3), (0, 1, 2), "three turn facts must be THREE rows");
+        // The namespace join survives (entity_name set), but the row is
+        // episodic: it decays and capacity-evicts like any turn fact.
+        assert_eq!(cma.records[1].entity_name.as_deref(), Some("agent:qa:a:2"));
+        assert_eq!(cma.records[1].tier, TIER_EPISODIC);
+        assert_eq!(cma.records[1].half_life, 86400);
+        // Scope prefixes remain separable: if id 1 renumbers it stays dense.
+        cma.decay_tick(86400);
+        assert!(cma.records[0].strength < 0.5, "turn facts must decay");
     }
 
     /// ml-5: an entity upsert must replace the vector in the one true

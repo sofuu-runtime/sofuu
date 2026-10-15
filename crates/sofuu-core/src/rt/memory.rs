@@ -2787,8 +2787,56 @@ mod impl_qtsq {
         qjs::sofuu_js_new_string(ctx, CString::new(json).unwrap_or_default().as_ptr())
     }
 
+    /// M0 (Brain Core II): entity-namespaced TURN record — the agent
+    /// scope's private memory accumulates: same namespace join
+    /// (entity_name) as rememberEntity, but episodic decay/capacity
+    /// treatment (the bare-name rememberEntity upsert collapsed every
+    /// turn into one overwritten row).
+    unsafe extern "C" fn js_cma_remember_entity_turn(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 4 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vec(Float32Array), text, entityName, entityType".as_ptr(),
+            );
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        let (vec, vlen) = cma_vec_arg(ctx, *argv);
+        if vec.is_null() {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
+        }
+        if vlen != cma.vec_dim {
+            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        }
+        let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        let entity_name = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let entity_type = qjs::sofuu_js_to_cstring(ctx, *argv.add(3));
+        let idx = cma.cma.remember_entity_scoped(
+            std::slice::from_raw_parts(vec, vlen),
+            cstr_opt(text).as_deref().unwrap_or(""),
+            cstr_opt(entity_name).as_deref().unwrap_or(""),
+            cstr_opt(entity_type).as_deref().unwrap_or("unknown"),
+        );
+        if !text.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, text);
+        }
+        if !entity_name.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, entity_name);
+        }
+        if !entity_type.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, entity_type);
+        }
+        qjs::sofuu_js_new_int32(ctx, idx)
+    }
+
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 20] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 21] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
@@ -2807,6 +2855,7 @@ mod impl_qtsq {
             cfunc_entry(c"count", 0, js_cma_count),
             cfunc_entry(c"markPositive", 1, js_cma_mark_positive),
             cfunc_entry(c"rememberWorking", 5, js_cma_remember_working),
+            cfunc_entry(c"rememberEntityTurn", 4, js_cma_remember_entity_turn),
             cfunc_entry(c"promoteWorking", 1, js_cma_promote_working),
             cfunc_entry(c"clearWorking", 0, js_cma_clear_working),
         ];

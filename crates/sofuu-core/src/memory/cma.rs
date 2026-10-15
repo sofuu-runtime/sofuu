@@ -1003,9 +1003,15 @@ impl Cma {
     /// record is never displaced by a worse but dissimilar one. (The
     /// textbook linear MMR trade-off did exactly that on the evaluation
     /// fixture -- recall 1.00 -> 0.17 with unrelated records promoted; the
-    /// numbers are in `memory::recall_eval`.) A pool that is all
-    /// near-duplicates returns fewer than top_k, which is the honest
-    /// answer -- padding with paraphrases is what B5.1 removes.
+    /// numbers are in `memory::recall_eval`.)
+    ///
+    /// M1 (Brain Core II): once the distinct directions run out, the
+    /// remaining slots take the suppressed candidates in relevance order
+    /// instead of going home early. Returning fewer than top_k was the B5.1
+    /// cure for paraphrase crowding, but on the flipped side of the same
+    /// coin it STARVES recall whenever distinct topics are scarce relative
+    /// to k -- the evaluated trade is now recall full-width, with the
+    /// diversity pass first in line so crowding only re-enters at the tail.
     fn diversify(
         &self,
         pool: Vec<(u32, f32, f32)>,
@@ -1013,6 +1019,7 @@ impl Cma {
         floor: f32,
     ) -> Vec<(u32, f32, f32)> {
         let mut out: Vec<(u32, f32, f32)> = Vec::with_capacity(top_k.min(pool.len()));
+        let mut deferred: Vec<(u32, f32, f32)> = Vec::new();
         for cand in pool {
             if out.len() >= top_k {
                 break;
@@ -1020,9 +1027,17 @@ impl Cma {
             let dup = out.iter().any(|(sid, _, _)| {
                 cosine_sim(self.vector_of(cand.0), self.vector_of(*sid)) >= floor
             });
-            if !dup {
+            if dup {
+                deferred.push(cand);
+            } else {
                 out.push(cand);
             }
+        }
+        for cand in deferred {
+            if out.len() >= top_k {
+                break;
+            }
+            out.push(cand);
         }
         out
     }

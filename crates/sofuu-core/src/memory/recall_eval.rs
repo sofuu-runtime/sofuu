@@ -16,9 +16,13 @@ use super::cma::Cma;
 use super::hnsw::Hnsw;
 
 const DIM: usize = 256;
-/// One chatty topic (five paraphrases of the same fact) beside two sparse
-/// ones — the shape where pure relevance fills top-k with one topic.
-const TOPIC_SIZES: [usize; 3] = [5, 2, 1];
+/// One chatty topic (five paraphrases of the same fact) beside a spread of
+/// sparse ones. Plenty of topics is what makes redundancy MEANINGFUL: with
+/// only three topics, k=6 slots can carry at most three distinct topics, so
+/// the redundancy@k metric could never read below 0.5 no matter how good
+/// the selection is. Seven topics (15 relevant records) give the target
+/// (redundancy ≤ 0.20 = at most one repeated topic among the six) room.
+const TOPIC_SIZES: [usize; 7] = [6, 2, 2, 2, 1, 1, 1];
 const NOISE: usize = 40;
 const TOP_K: usize = 6;
 /// Per-component paraphrase jitter, scaled so a member stays ~0.87-aligned
@@ -207,14 +211,25 @@ fn recall_eval_diversity_beats_baseline() {
         "the best hit stays first: {:.3} vs baseline {:.3}",
         tuned_metrics.mrr, baseline.mrr
     );
-    /* Suppression swaps paraphrases for the next-best distinct records, so
-     * recall@k cannot stay at 1.0 on this fixture (six relevant records
-     * where five are the same fact). The floor is the measured trade-off:
-     * at least half the slots must still be relevant. */
+    /* M1 (Brain Core II) targets — the precision bar for the ranking path:
+     * with enough topics in the fixture, the top-k fills with DISTINCT
+     * relevant records — every slot relevant (recall), the best first
+     * (MRR), every topic reachable (coverage), and at most one repeat
+     * across the six (redundancy). */
     assert!(
-        tuned_metrics.recall >= 0.49,
-        "diversity must not collapse retrieval: {:.3}",
-        tuned_metrics.recall
+        tuned_metrics.recall >= 0.95,
+        "M1: the top-{} must be (nearly) all relevant: {:.3}",
+        TOP_K, tuned_metrics.recall
+    );
+    assert!(
+        tuned_metrics.mrr >= 0.99,
+        "M1: the first hit must be the right one: {:.3}",
+        tuned_metrics.mrr
+    );
+    assert!(
+        tuned_metrics.redundancy <= 0.20,
+        "M1: at most one repeated topic across the top-{}: {:.3}",
+        TOP_K, tuned_metrics.redundancy
     );
 }
 

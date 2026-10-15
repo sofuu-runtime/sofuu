@@ -4,6 +4,27 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — Mac CPU: prefill Phase 2, int8 activations+weights GEMM (`SOFUU_PRE8=1`) — liquid-1.3B warm prefill 68.1 → 79.0 tk/s (+16% over Phase-1 f32 in the same calm window).**
+> Both sides of the batched-prefill GEMM quantize symmetrically in 32-element groups
+> (`PRE8_GROUP`; per-group absmax/127 on activations and on dequantized weight rows).
+> The NEON kernel (`gemm_tile4x4_i8`, sdot via inline asm) is proven **bit-exact against an
+> i64 integer reference** with unit scales (`tile4x4_i8_matches_exact_int_reference`); the
+> 4×4 tile folds `ws[row][g]·as[tok][g]·vaddvq_lanes` per group, and tail rows/tokens keep
+> exact f32 dots. Logit rel-RMS vs the per-token f32 reference: 0.05 (bf16 350M) / 0.049
+> (mlx4 1.3B), argmax + 8-step greedy identical — the earlier 128-band scheme broke greedy
+> at pos 24; 32-groups fix it.
+> Two perf lessons on the way: (1) the isolated i8 kernel is 24% faster/core than the f32
+> one (50.7 vs 40.8 GMAC/s), but e2e first regressed ~15% because every prefill paid a
+> **scalar** quantization pass over all 2.6B dequantized weight elements — vectorizing the
+> group-quantizer (SIMD absmax, one reciprocal per group, saturating narrow chain) made gemm
+> time equal, and (2) caching the quantized weights (`Pre8Slab`, built once per model load,
+> keyed by mmap identity + tensor span + content fingerprint) recovers the promised win:
+> gemm stage 2937 → 2310 ms, wall 79.0 tk/s warm (first prefill after load pays a one-time
+> ~1.6 s slab build; a 4 GiB cap falls back to per-prefill quantization). Flag-gated at
+> `SOFUU_PRE8=1` pending multi-model soak; default f32 path untouched (full suite 574/0).
+> Next: Phase 3 AMX via Accelerate (`SOFUU_PREFILL_BLAS`), which attacks the f32/i8 compute
+> ceiling itself.
+>
 > **2026-10-15 — agents/tools: remaining audit fixes (P2 read jail + route log, P3 alignment).**
 > (1) `read_file` is jailed to the project directory like grep/glob/list_dir — it was the
 > one AUTO_PASS reader that accepted any absolute path into the provider transcript (and

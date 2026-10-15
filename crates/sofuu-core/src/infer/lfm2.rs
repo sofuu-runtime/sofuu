@@ -363,7 +363,16 @@ impl Lfm2Model {
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let (metal_engine, metal_mmap_buf) = {
-            if let Some(engine) = MetalEngine::new() {
+            // Measured 2026-10-15 (M2 Pro, liquid-1.3B): the threaded CPU GEMV
+            // beats per-matvec Metal dispatch for decode at every context
+            // length (short-T 30.6 vs 10.9 tps, T~1300 12.7 vs 7.7 tps), so
+            // macOS decodes on CPU by default; SOFUU_METAL_DECODE=1 restores
+            // the Metal hybrid GEMV. iOS keeps Metal (unmeasured there).
+            let metal_decode_wanted = cfg!(target_os = "ios")
+                || std::env::var_os("SOFUU_METAL_DECODE").is_some();
+            if !metal_decode_wanted {
+                (None, None)
+            } else if let Some(engine) = MetalEngine::new() {
                 let mmap_buf = sf.mmap.get_or_create_metal_buffer(&engine);
                 (Some(engine), mmap_buf)
             } else {
@@ -1766,7 +1775,6 @@ pub(crate) mod accelerate {
 /// y[t][r0..r0+n_panel] = X[t]·W_panel[r]^T with the output strided by
 /// `rows` (the caller's full matrix row count), leaving other columns
 /// untouched. Same AMX ladder as blas_gemm.
-#[cfg(target_os = "macos")]
 pub(crate) fn blas_gemm_panel(
     x: &[f32],
     w_panel: &[f32],
@@ -1799,6 +1807,9 @@ pub(crate) fn blas_gemm_panel(
     }
 }
 
+// Android: the Accelerate framework does not exist here and every caller
+// sits behind #[cfg(target_os = "macos")] — mirror that on the callee so
+// the Android engine build compiles again (2026-10-15, else-bot fix).
 #[cfg(target_os = "macos")]
 pub(crate) fn blas_gemm(x: &[f32], w32: &[f32], y: &mut [f32], t_count: usize, rows: usize, cols: usize) {
     debug_assert_eq!(x.len(), t_count * cols);

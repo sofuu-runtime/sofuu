@@ -435,22 +435,31 @@ fn gemm_batched_mlx4(wm: &WeightMatrix, xs: &[f32], n_tok: usize, ys: &mut [f32]
 
     /// Matrix-vector multiplication: y = W * x
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        // Decode GEMV: on M2 Pro (2026-10-15) the threaded CPU GEMV beats
+        // per-matvec Metal dispatch (same lfm2 decode finding), so macOS
+        // decodes on CPU by default; SOFUU_METAL_DECODE=1 restores the Metal
+        // hybrid. iOS keeps Metal.
+        #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(unused_variables))]
+        let metal_decode_wanted = cfg!(target_os = "ios")
+            || std::env::var_os("SOFUU_METAL_DECODE").is_some();
         if let Some(ref mlx4) = self.mlx4 {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if let (Some(ref m_buf), Some(ref s_buf), Some(ref b_buf)) = (
-                &self.metal_buf,
-                &mlx4.scales_metal_buf,
-                &mlx4.biases_metal_buf,
-            ) {
-                if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
-                    engine.gemv_mlx4(
-                        m_buf, self.metal_offset,
-                        s_buf, mlx4.scales_metal_offset,
-                        b_buf, mlx4.biases_metal_offset,
-                        x, y,
-                        self.rows, self.cols, mlx4.group_size, mlx4.is_bf16,
-                    );
-                    return;
+            if metal_decode_wanted {
+                if let (Some(ref m_buf), Some(ref s_buf), Some(ref b_buf)) = (
+                    &self.metal_buf,
+                    &mlx4.scales_metal_buf,
+                    &mlx4.biases_metal_buf,
+                ) {
+                    if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
+                        engine.gemv_mlx4(
+                            m_buf, self.metal_offset,
+                            s_buf, mlx4.scales_metal_offset,
+                            b_buf, mlx4.biases_metal_offset,
+                            x, y,
+                            self.rows, self.cols, mlx4.group_size, mlx4.is_bf16,
+                        );
+                        return;
+                    }
                 }
             }
 
@@ -466,22 +475,24 @@ fn gemm_batched_mlx4(wm: &WeightMatrix, xs: &[f32], n_tok: usize, ys: &mut [f32]
         }
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ref m_buf) = self.metal_buf {
-            if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
-                match self.dtype {
-                    TensorDType::BF16 => {
-                        engine.gemv_bf16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
-                        return;
+        if metal_decode_wanted {
+            if let Some(ref m_buf) = self.metal_buf {
+                if let Some(engine) = crate::infer::metal::get_or_init_global_metal() {
+                    match self.dtype {
+                        TensorDType::BF16 => {
+                            engine.gemv_bf16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
+                            return;
+                        }
+                        TensorDType::F16 => {
+                            engine.gemv_f16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
+                            return;
+                        }
+                        TensorDType::F32 => {
+                            engine.gemv_f32(m_buf, self.metal_offset, x, y, self.rows, self.cols);
+                            return;
+                        }
+                        _ => {}
                     }
-                    TensorDType::F16 => {
-                        engine.gemv_f16(m_buf, self.metal_offset, x, y, self.rows, self.cols);
-                        return;
-                    }
-                    TensorDType::F32 => {
-                        engine.gemv_f32(m_buf, self.metal_offset, x, y, self.rows, self.cols);
-                        return;
-                    }
-                    _ => {}
                 }
             }
         }

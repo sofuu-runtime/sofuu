@@ -4,6 +4,24 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — Mac CPU / 27B: prefill Phase 4a, token-tiled direct sdot GEMM (`SOFUU_T143_DIRECT=1`) — Ternary-27B serve prefill 2.85 → 3.50 tk/s (+23%), output bit-identical.**
+> `gemm_rows_t143_direct` replaces the per-(row, token) `trit_row_dot_q` walks with a
+> 4-token tile: one weighted `sdot_group_4_neon` band pass (weight chunk loaded once,
+> four sdot chains) plus a per-worker slab shrunk 8 MiB → 2 MiB so slab + ActQ stay inside
+> the shared 16 MB P-cluster L2 instead of re-reading L3/DRAM every token. Raw GEMM stage:
+> **2.14× (819 → 383 ms on a 17,408×5120×128 synthetic)**, BIT-identical across all
+> 2.2 M outputs (`direct_tile_bitmatches_sdot_path` pinned; per-band fold order unchanged,
+> tail tokens keep the single-token dot). Found by sampling the live serve
+> (`/usr/bin/sample`): the old path was 87% `trit_row_dot_q`/slab traffic.
+> **Serve wiring finding:** the 27B's serve prefill runs `InferEngine::stream` →
+> `forward_prefill_all_with_logits` (batched `gemm_t143` — good), but the JS
+> `streamLocal`-driven generation had used a per-token loop; sampling decode vs prefill
+> TTFT arithmetic (0.357 s/tok prefill vs 7.6 s/tok decode) confirms batching is engaged
+> after the binary was rebuilt (`cargo test` does NOT rebuild the `sofuu` serve binary —
+> always `cargo build --release` before serve-level A/B; the first A/B silently compared
+> two stale binaries). Remaining prefill wall is serial GDN recurrence + embedding
+> sweep, not GEMM; T-MAC LUT (4b) only pays if run after those move.
+>
 > **2026-10-15 — Mac CPU: prefill Phase 3, AMX via Accelerate (`SOFUU_PREFILL_BLAS=1`) — liquid-1.3B warm prefill 79.0 → 104.5 tk/s (4.23× the per-token loop; gemm stage 2937 → 1607 ms).**
 > The batched-prefill GEMM hands the MAC sweep to `cblas_sgemm` (Accelerate links as a
 > dylib — the release binary is byte-identical at 5,097,392 bytes, so the 5 MB size gate

@@ -445,6 +445,83 @@ unsafe fn sdot_128_neon(w: *const i8, a: *const i8) -> i32 {
     vaddvq_s32(acc)
 }
 
+/// 4-token variant of `sdot_128_neon`: the 128-byte weight band is loaded
+/// once into registers and each of the four activation bands gets its own
+/// sdot chain. Band i32 sums are order-independent, so this returns exactly
+/// what four separate `sdot_group` calls return (each accumulator walks the
+/// same lane pattern as the single-token kernel).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline(never)]
+unsafe fn sdot_group_4_neon(
+    w: *const i8,
+    a0: *const i8,
+    a1: *const i8,
+    a2: *const i8,
+    a3: *const i8,
+) -> [i32; 4] {
+    use std::arch::aarch64::*;
+    let (mut acc0, mut acc1, mut acc2, mut acc3) =
+        (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+    let mut k = 0usize;
+    while k < PTQ1_0_BLOCK_VALUES {
+        let wv = vld1q_s8(w.add(k));
+        let av0 = vld1q_s8(a0.add(k));
+        let av1 = vld1q_s8(a1.add(k));
+        let av2 = vld1q_s8(a2.add(k));
+        let av3 = vld1q_s8(a3.add(k));
+        std::arch::asm!(
+            "sdot {acc0:v}.4s, {wv:v}.16b, {av0:v}.16b",
+            "sdot {acc1:v}.4s, {wv:v}.16b, {av1:v}.16b",
+            "sdot {acc2:v}.4s, {wv:v}.16b, {av2:v}.16b",
+            "sdot {acc3:v}.4s, {wv:v}.16b, {av3:v}.16b",
+            acc0 = inout(vreg) acc0,
+            acc1 = inout(vreg) acc1,
+            acc2 = inout(vreg) acc2,
+            acc3 = inout(vreg) acc3,
+            wv = in(vreg) wv,
+            av0 = in(vreg) av0,
+            av1 = in(vreg) av1,
+            av2 = in(vreg) av2,
+            av3 = in(vreg) av3,
+            options(pure, nomem, nostack)
+        );
+        k += 16;
+    }
+    [
+        vaddvq_s32(acc0),
+        vaddvq_s32(acc1),
+        vaddvq_s32(acc2),
+        vaddvq_s32(acc3),
+    ]
+}
+
+fn sdot_group_4(w: &[i8], a0: &[i8], a1: &[i8], a2: &[i8], a3: &[i8]) -> [i32; 4] {
+    debug_assert_eq!(w.len(), PTQ1_0_BLOCK_VALUES);
+    debug_assert_eq!(a0.len(), PTQ1_0_BLOCK_VALUES);
+    debug_assert_eq!(a1.len(), PTQ1_0_BLOCK_VALUES);
+    debug_assert_eq!(a2.len(), PTQ1_0_BLOCK_VALUES);
+    debug_assert_eq!(a3.len(), PTQ1_0_BLOCK_VALUES);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dotprod_available() {
+            // SAFETY: all five slices are exactly 128 bytes (checked above).
+            return unsafe {
+                sdot_group_4_neon(w.as_ptr(), a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr())
+            };
+        }
+    }
+    let mut out = [0i32; 4];
+    for (k, wv) in w.iter().enumerate() {
+        let wv = *wv as i32;
+        out[0] += wv * a0[k] as i32;
+        out[1] += wv * a1[k] as i32;
+        out[2] += wv * a2[k] as i32;
+        out[3] += wv * a3[k] as i32;
+    }
+    out
+}
+
 /// File-direct band dot for one packed PTQ1_0 block (24B qs + 2B qh + 2B f16
 /// scale): the mixed-radix trits are expanded in NEON digit-planes and fed
 /// straight into `sdot` against the activation band — no i8 slab round-trip.
@@ -825,6 +902,90 @@ fn gemm_rows_t143(
     res
 }
 
+fn direct_tile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SOFUU_T143_DIRECT").as_deref() == Ok("1"))
+}
+
+/// Phase 4a: token-tiled sdot GEMM over the trit slab. Two changes vs
+/// `gemm_rows_t143_sdot`, both invisible in output:
+/// (1) every weight band is loaded once and sdot'ed against a 4-token tile of
+///     activation bands (`sdot_group_4`) instead of one full
+///     `trit_row_dot_q` walk per (row, token) — the per-band call overhead
+///     (slice bounds, dotprod re-check, re-loads) was paid ~rows×tokens×bands
+///     times before;
+/// (2) the dequant slab is sized for the SHARED P-cluster L2 (~2 MiB per
+///     worker) instead of 8 MiB — at 6 workers the old slab re-read every
+///     token only from L3/DRAM, which dominated the whole prefill.
+/// Fold order per band (`wscale * ascale * iacc`, bands ascending) is the
+/// same as `trit_row_dot_q`, so results are bit-identical on the dotprod
+/// path (pinned by `direct_tile_bitmatches_sdot_path`).
+fn gemm_rows_t143_direct(
+    data: &[u8],
+    m: &RawMat,
+    n_tok: usize,
+    acts: &[f32],
+    r_off: usize,
+    rows: usize,
+) -> Vec<f32> {
+    const TT: usize = 4; // activation bands of the tile stay in L1
+    const L2_TILE_BYTES: usize = 2 << 20;
+    let n_in = m.n_in;
+    let blocks = n_in / PTQ1_0_BLOCK_VALUES;
+    debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
+    let aq = quantize_acts(acts, n_tok, n_in, blocks);
+    let mut res = vec![0.0f32; rows * n_tok];
+    let rows_per_pass = (L2_TILE_BYTES / n_in).clamp(1, rows.max(1));
+    let mut slab_t = vec![0i8; rows_per_pass * n_in];
+    let mut slab_d = vec![0.0f32; rows_per_pass * blocks];
+    let toks_full = n_tok - n_tok % TT;
+    let mut base = 0usize;
+    while base < rows {
+        let take = rows_per_pass.min(rows - base);
+        for i in 0..take {
+            dequant_trits_i8(
+                m.row_slice(data, r_off + base + i),
+                &mut slab_t[i * n_in..(i + 1) * n_in],
+                &mut slab_d[i * blocks..(i + 1) * blocks],
+            );
+        }
+        for r in 0..take {
+            let row = &slab_t[r * n_in..(r + 1) * n_in];
+            let rowd = &slab_d[r * blocks..(r + 1) * blocks];
+            let mut t = 0usize;
+            while t < toks_full {
+                let mut acc = [0.0f32; TT];
+                for c in 0..blocks {
+                    let col0 = c * PTQ1_0_BLOCK_VALUES;
+                    let w = &row[col0..col0 + PTQ1_0_BLOCK_VALUES];
+                    let band_base = t * n_in + col0;
+                    let iacc = sdot_group_4(
+                        w,
+                        &aq.q[band_base..band_base + PTQ1_0_BLOCK_VALUES],
+                        &aq.q[band_base + n_in..band_base + n_in + PTQ1_0_BLOCK_VALUES],
+                        &aq.q[band_base + 2 * n_in..band_base + 2 * n_in + PTQ1_0_BLOCK_VALUES],
+                        &aq.q[band_base + 3 * n_in..band_base + 3 * n_in + PTQ1_0_BLOCK_VALUES],
+                    );
+                    acc[0] += rowd[c] * aq.scales[t * blocks + c] * iacc[0] as f32;
+                    acc[1] += rowd[c] * aq.scales[(t + 1) * blocks + c] * iacc[1] as f32;
+                    acc[2] += rowd[c] * aq.scales[(t + 2) * blocks + c] * iacc[2] as f32;
+                    acc[3] += rowd[c] * aq.scales[(t + 3) * blocks + c] * iacc[3] as f32;
+                }
+                for j in 0..TT {
+                    res[(base + r) * n_tok + t + j] = acc[j];
+                }
+                t += TT;
+            }
+            for t in toks_full..n_tok {
+                let v = trit_row_dot_q(row, rowd, &aq, t, n_in);
+                res[(base + r) * n_tok + t] = v;
+            }
+        }
+        base += take;
+    }
+    res
+}
+
 /// Batched GEMM against a PTQ1_0 matrix: `acts` holds `n_tok` contiguous
 /// activation rows of m.n_in f32 and out receives, token-major,
 /// out[t * m.n_out + r] = dot8(dequant(m.row r), acts[t..t + n_in]). Each
@@ -854,7 +1015,11 @@ fn gemm_t143(data: &[u8], m: &RawMat, n_tok: usize, acts: &[f32], out: &mut [f32
             let r1 = rows * (t + 1) / threads;
             handles.push((r0, scope.spawn(move || {
                 if use_sdot {
-                    gemm_rows_t143_sdot(data, m, n_tok, acts, r0, r1 - r0)
+                    if direct_tile_enabled() && n_tok >= 8 {
+                        gemm_rows_t143_direct(data, m, n_tok, acts, r0, r1 - r0)
+                    } else {
+                        gemm_rows_t143_sdot(data, m, n_tok, acts, r0, r1 - r0)
+                    }
                 } else {
                     gemm_rows_t143(data, m, n_tok, acts, r0, r1 - r0)
                 }
@@ -2261,6 +2426,38 @@ mod tests {
         }
     }
 
+    /// Phase 4a: the token-tiled direct runner must be BIT-identical to the
+    /// slab sdot path it replaces (same band/fold order, same lane pattern).
+    #[test]
+    fn direct_tile_bitmatches_sdot_path() {
+        let n_in = 2 * PTQ1_0_BLOCK_VALUES;
+        let rows = 37usize;
+        let n_tok = 19usize; // uneven: exercises the 4-token tail
+        let row_bytes = row_bytes_ptq1_0(n_in);
+        let mut data = noise_bytes(0xDEADBEEFCAFEBABE, rows * row_bytes);
+        for blk in 0..(rows * (n_in / PTQ1_0_BLOCK_VALUES)) {
+            let off = blk * PTQ1_0_BLOCK_BYTES;
+            data[off + PTQ1_0_BLOCK_BYTES - 2] = 0x00;
+            data[off + PTQ1_0_BLOCK_BYTES - 1] = 0x3C;
+        }
+        let acts: Vec<f32> = noise_bytes(0x1234567890ABCDEF, n_tok * n_in)
+            .iter()
+            .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
+            .collect();
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let want = gemm_rows_t143_sdot(&data, &m, n_tok, &acts, 0, rows);
+        let got = gemm_rows_t143_direct(&data, &m, n_tok, &acts, 0, rows);
+        for i in 0..want.len() {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "elem {i}: direct {} vs sdot {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
     /// Speed harness (run with --release -- --ignored --nocapture): the
     /// register-tiled sweep should be several times faster than the old
     /// per-(row, token) dot8 sweep on PTQ1_0-shaped work.
@@ -2303,16 +2500,38 @@ mod tests {
         let tiled = gemm_rows_t143(&data, &m, n_tok, &acts, 0, rows);
         let t_tiled = t1.elapsed();
 
+        let t2 = std::time::Instant::now();
+        let direct = gemm_rows_t143_direct(&data, &m, n_tok, &acts, 0, rows);
+        let t_direct = t2.elapsed();
+
+        // The path actually used on dotprod cores today — the fair A/B for
+        // the direct runner (both int8): these must agree BIT for BIT.
+        let t3 = std::time::Instant::now();
+        let sdot = gemm_rows_t143_sdot(&data, &m, n_tok, &acts, 0, rows);
+        let t_sdot = t3.elapsed();
+        let bit = direct
+            .iter()
+            .zip(sdot.iter())
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count();
+
         let mut ok = 0usize;
         for (a, b) in scalar.iter().zip(tiled.iter()) {
             if (a - b).abs() <= a.abs().max(1.0) * 1e-4 {
                 ok += 1;
             }
         }
+        let agree_direct = direct
+            .iter()
+            .zip(scalar.iter())
+            .filter(|(a, b)| (**a - **b).abs() <= a.abs().max(1.0) * 1e-4)
+            .count();
         println!(
-            "scalar band-dot sweep: {t_scalar:?} | tiled: {t_tiled:?} | speedup {:.2}x | agree {ok}/{}",
-            t_scalar.as_secs_f64() / t_tiled.as_secs_f64().max(1e-9),
-            scalar.len()
+            "scalar band-dot sweep: {t_scalar:?} | tiled(f32): {t_tiled:?} | sdot-slab: {t_sdot:?} | direct: {t_direct:?} | direct {:.2}x vs sdot-slab | agree(f32 paths) {ok}/{} | direct-vs-scalar (int8, quant err expected) {agree_direct}/{} | direct-vs-sdot BIT {bit}/{}",
+            t_sdot.as_secs_f64() / t_direct.as_secs_f64().max(1e-9),
+            scalar.len(),
+            scalar.len(),
+            direct.len()
         );
         assert!(ok == scalar.len(), "tile differs from scalar beyond 1e-4 on {}/{}", scalar.len() - ok, scalar.len());
     }

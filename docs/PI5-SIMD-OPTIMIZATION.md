@@ -491,3 +491,60 @@ Lesson of the pass: the last compile-flag-level percent is splitting the
 difference between paths (decode gains, prefill gives a little back) — the
 remaining real gains are the T1 GEMM math and the T2 format work, per the
 deep-edge programme.
+
+## Session 6 (2026-10-15): T1 q4_K scale-apply chain — repack-time pre-decoded sub-block scales (separate 192 B/block region), default-on, bit-exact; kernel +5.0%, E2E-neutral ≤233 tok
+
+The stock q4_K tile kernels spend ~150% of their vdot count on aux ops: the
+12-byte 6-bit scale-group unpack (~80 NEON ops per 256-block) plus the
+int-multiply scale chain (`a76_repack.h` gemv/gemm both decode
+`decode_q_Kx8_6bit_scales` in the hot loop). T0's f32 sidecar proved the
+decode is removable (+51% kernel) but its +267% tile bytes were DRAM-neutral
+E2E. T1 is the bytes-sweet-spot version: at repack time, decode each sub-block
+ONCE into a separate `tile_ss_q4_Kx8s` region — f16 col scales (ints 0..63,
+exact round-trip) + raw widen-byte mins, **192 B per 1152 B stock block
+(+16.7%)** — and the prefill GEMM (`ggml_gemm_q4_K_8x4_q8_K_s`) loads it as a
+second stream. The decode GEMV never reads the region, so the band-bound
+decode path keeps the unbroken stock layout (appending the region to the tile
+was measured at −10% decode via 192-byte holes in the gemv stream — two
+regions instead).
+
+Bit-exactness by construction: the fill runs the stock decode itself; every
+f32 scale product (< 2^24) and pair sum (< 2^23) is exactly representable, so
+the f32 apply chain (`vmulq_f32`+`vfmaq_f32`) reproduces the stock
+int16-widen + `vmulq_s32` chain bit-for-bit. Suite gates it via
+`test_gemm_q4_k_s_tiles_bit_exact` and the resid/pair tests (581/0 on the
+Mac host). Kill switch `SOFUU_Q4_SS=0`; per-tensor eligibility ≤16M elems;
+global fill budget 768 MB (`SOFUU_Q4_SS_MB`).
+
+Device receipts (Pi 5, 2.8 GHz sustained, governor performance, .t1 binary =
+tip + T1 tuned-codegen no-LTO):
+
+- **Kernel** (`SOFUU_BENCH_GEMM 3072,1024,64,30`): q4_K **125.5 GMAC/s** with
+  SS on vs **119.5** off (the T0 sidecar path) — **+5.0%**; q8_0 unchanged
+  (180.7/182.2 — noise). The 75.7→125.2 earlier figure was against
+  pre-sidecar stock; T1's honest step is +5% on the current default.
+- **Qwen E2E prefill**: 75-tok 163.3-165.3 (T1) vs 163.3-164.8 (off);
+  233-tok 157.3-164.7 vs 155.7-160.9 — **neutral within noise**, decode
+  identical (23.7-23.9 t/s both). Same story as the f32 sidecar: the q4_K
+  GEMM is ~1/3 of prefill, so a +5% kernel is ~+1.7% E2E — sub-noise at
+  current prompt depths; the win banks for large-prompt/chunked paths.
+- **Spark-X2.5-4B**: with the C++ tile path
+  (`SOFUU_SPARK_CPP_GEMM=1`, peer commit c600c3df6's coherence kill-switch)
+  22.4 prefill / 4.5 decode — vs 22.5/4.4 without T1 — neutral. Two findings
+  from the A/B: (1) **output-token equality SS-on ≡ SS-off** (live inference,
+  identical text — the E2E bit-exactness proof); (2) the DEFAULT Spark path
+  (peer's safe pure-Rust prefill from c600c3df6) runs 0.3 tk/s prefill on the
+  Pi in BOTH configs — pre-existing on the tip, unrelated to T1 (Standing
+  binary c600c3df6-limits documented under TASKS 2026-10-15 Spark entry).
+
+Debug war-story worth keeping: the first on-device A/B showed NaN and
+non-determinism in the resid tests. Two real defects surfaced and were fixed:
+(1) `sofuu_tile_lookup_s` had its return value and out-param inverted relative
+to the `lookup_sc` convention — dispatch and bench were handed the tile and
+the scale section CROSSED (cache bytes were individually perfect, which kept
+byte-compare diagnostics green); (2) random-byte test fixtures reinterpret
+GGUF `d`/`dmin` headers as f16, so ~3% of blocks are NaN/inf — bitwise
+comparisons degenerate to NaN-payload matching (kernel-vs-kernel passes
+vacuously, kernel-vs-scalar-add fails on payload drift, and pass/fail flaps
+with codegen). All fixtures are now sanitized
+(`sanitize_block_scale_headers`) so bitwise parity gates test real numbers.

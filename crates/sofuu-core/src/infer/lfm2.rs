@@ -1766,6 +1766,7 @@ pub(crate) mod accelerate {
 /// y[t][r0..r0+n_panel] = X[t]·W_panel[r]^T with the output strided by
 /// `rows` (the caller's full matrix row count), leaving other columns
 /// untouched. Same AMX ladder as blas_gemm.
+#[cfg(target_os = "macos")]
 pub(crate) fn blas_gemm_panel(
     x: &[f32],
     w_panel: &[f32],
@@ -1798,6 +1799,7 @@ pub(crate) fn blas_gemm_panel(
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn blas_gemm(x: &[f32], w32: &[f32], y: &mut [f32], t_count: usize, rows: usize, cols: usize) {
     debug_assert_eq!(x.len(), t_count * cols);
     debug_assert_eq!(w32.len(), rows * cols);

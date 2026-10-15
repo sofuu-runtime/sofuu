@@ -4191,4 +4191,54 @@
       return brainFor(d, backend);
     } catch (e) { return null; }
   };
+  /* M3 (Brain Core II): land a compacted session's distilled gist in the
+   * brain — shared scope stores it as a first-class record with provenance
+   * 'compact'; agent scope namespaces it like any turn. The SEM2 mirror
+   * rides along (the exact text is the cross-channel join key). Gists
+   * decay like any episodic fact — use keeps them alive (M2), and the
+   * DeathLedger says when one goes. */
+  A.rememberGist = async function (target, text) {
+    try {
+      var d = resolveDef(target);
+      if (d.memory === 'off') return { ok: false, reason: 'memory off' };
+      text = String(text == null ? '' : text).trim().slice(0, STORE_CAP_CHARS);
+      if (!text) return { ok: false, reason: 'empty gist' };
+      var backend = resolveBackend(d);
+      if (!backend) return { ok: false, reason: 'no embed backend' };
+      var entry = brainFor(d, backend);
+      if (!entry || !entry.cma) return { ok: false, reason: 'no brain' };
+      var qemb = await embedTextFor(d, backend, text);
+      if (!qemb || !qemb.vec) return { ok: false, reason: 'no embedding' };
+      var gist, ns = null;
+      if (d.memory === 'agent') {
+        ns = nsTurnKey('agent:' + d.name);
+        if (typeof entry.cma.rememberEntityTurn === 'function') {
+          gist = entry.cma.rememberEntityTurn(qemb.vec, text, ns, 'compact');
+        } else {
+          gist = entry.cma.rememberEntity(qemb.vec, text, ns, 'compact');
+        }
+      } else {
+        gist = entry.cma.remember(qemb.vec, text, 'user', 0, 'compact');
+      }
+      try { entry.cma.flush(); } catch (eF) {}
+      if (entry.sem) {
+        try {
+          var sv = embedSemV2(text);
+          if (sv) {
+            if (ns && typeof entry.sem.rememberEntityTurn === 'function') {
+              entry.sem.rememberEntityTurn(sv, text, ns, 'compact');
+            } else if (ns && typeof entry.sem.rememberEntity === 'function') {
+              entry.sem.rememberEntity(sv, text, ns, 'compact');
+            } else {
+              entry.sem.remember(sv, text, 'user', 0, 'compact');
+            }
+            entry.sem.flush();
+          }
+        } catch (eS) {}
+      }
+      return { ok: typeof gist === 'number', id: gist, ns: ns };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  };
 })();

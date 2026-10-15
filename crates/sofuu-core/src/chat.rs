@@ -6526,6 +6526,17 @@ const DRIVER: &str = r#"
       usedCtx = ctxMeter();
       out('\x1b[90m  [Compacted → context (' + fmtTk(Math.max(0, before - historyTokens())) +
           ' tk saved, meter ' + fmtTk(m0) + '→' + fmtTk(usedCtx) + ')]\x1b[0m\n');
+      /* M3 (Brain Core II): the folded summary is the session's distilled
+       * gist — land it in the brain (source 'compact') so it stays
+       * recallable after the turn it compacted. Compaction never blocks
+       * on the brain. */
+      try {
+        const gistText = String((history[0] && history[0].content) || '')
+          .replace(/^Prior conversation summary: /, '');
+        if (sofuu.agent && typeof sofuu.agent.rememberGist === 'function' && gistText) {
+          await sofuu.agent.rememberGist(brainDef(), gistText);
+        }
+      } catch (eG) {}
       refreshStatus(lastChip); /* meter drops visibly right away */
     } catch (e) { out('\x1b[31m  [Compact failed: ' + String(e.message || e) + ']\x1b[0m\n'); }
   }

@@ -2071,6 +2071,24 @@
       return { ok: false, error: 'compact failed: ' + String((e && e.message) || e) };
     }
     if (!folded) return { ok: false, error: 'nothing older than one turn to fold' };
+    /* M3 (Brain Core II): the folded summary is the session's distilled
+     * gist — land it in the brain (source 'compact') so it stays
+     * recallable AFTER the turn it compacted. Silent in both directions
+     * of failure: compaction must never block on the brain. */
+    try {
+      var gistText = String((S.history[0] && S.history[0].content) || '')
+        .replace(/^Prior conversation summary: /, '');
+      if (sofuu.agent && typeof sofuu.agent.rememberGist === 'function' && gistText) {
+        var gc = cfg();
+        await sofuu.agent.rememberGist(
+          { name: 'chat', memory: gc.brain ? 'shared' : 'off',
+            brainPath: S.project ? S.project + '/.sofuu/brain/brain.qtsq' : undefined,
+            embed_provider: gc.embed_provider || undefined,
+            embed_model: gc.embed_model || undefined,
+            embedding: gc.memory_backend || undefined },
+          gistText);
+      }
+    } catch (eG) {}
     return { ok: true, savedTokens: Math.max(0, before - historyTokens()) };
   }
 

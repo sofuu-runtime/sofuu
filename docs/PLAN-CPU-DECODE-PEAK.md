@@ -77,6 +77,35 @@ speed-of-sweep, or sidesteps the sweep.
   JSONL.
 - Review stop: after (a) passes on one pair, before fleet roll-out.
 
+### D1b — self-speculative, same model as its own draft (EXPERIMENTAL, user direction 2026-10-15)
+
+**Status: experimental only — do not build until D1 (separate-draft) receipts
+exist or the user okays it explicitly.** The idea: draft with part of the
+target model itself instead of a second model. This is the family the field
+converged on — layer-skip Draft & Verify (Elhoushi 2024), early-exit/Kangaroo,
+Medusa/EAGLE extra heads, and training-free n-gram/Jacobi Lookahead decoding
+(Fu 2024). Note the repo already carries two relevant pieces:
+`infer/lookahead.rs` (n-gram propose + 2D tree-causal candidate evaluation,
+from 49be50eff) and a lazy-LM-head speculative-decoding commit (5b453f772).
+
+Why it is attractive on this box: zero extra memory, same tokenizer, shared
+KV/mmap (page-cache friendly), and the verifier rides our strongest lane.
+Why it stays experimental: a same-model draft is not free — a shallow pass
+that keeps a fraction p of the layers still sweeps p of every byte, per draft
+token. Break-even: accepted Σα over a k-token cycle must beat (k·p + 1)/k
+sweeps; with p=0.5, k=4 that needs α ≈ 0.63 average, which half-model drafts
+rarely hold across positions; realistic configs (p≤0.25, or multi-token
+drafting in one pass via the Medusa/Lookahead shapes) are the only ones the
+math favors. CPU bonus: verification arithmetic rides AMX, and ternary sdot
+is arithmetically cheap — the 27B self-spec math is the most favorable of the
+fleet (after the D0 slab receipt, not before).
+
+Gate before anything gets built: the offline α-study — log per-position
+acceptance of truncated-model drafts vs the full model on real prompts
+(probe script + a layers-skip env on one target, no infra). If Σα per cycle
+does not clear break-even with margin, this phase closes with the receipt
+recorded.
+
 ## Phase D2 — megakernel fused decode layer (walls 1+3)
 
 - **Expected: the 20–30%-of-ceiling models (liquid, gemma, 0.6B) to 50–70% of

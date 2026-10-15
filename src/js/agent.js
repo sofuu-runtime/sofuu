@@ -172,6 +172,20 @@
   var TOOL_RESULT_CAP_CHARS = 4000; /* floor for tiny windows */
   var TOOL_RESULT_HEAD_RATIO = 0.7;
   var TOOL_RESULT_TAIL_RATIO = 0.2;
+  /* P1.4 progressive tool schemas: when the serialized toolset (usually a
+   * big MCP list) costs more than this roughly-many tokens, the WIRE
+   * carries slim specs (name + one-liner, empty schema) for the large
+   * tail plus a `tool_schema` meta-tool; calling a slim tool escalates it
+   * to a full schema and the round re-streams once. Core/inline tools
+   * always ride full. d.toolsMode: 'auto' (default, threshold) |
+   * 'progressive' (always) | 'full' (never). */
+  var PROGRESSIVE_TOOL_THRESHOLD_TK = 1200;
+  var PROGRESSIVE_SLIM_DESC_CHARS = 110;
+  /* Always-full specs: user-authored inline tools, the injected meta/
+   * delegate layer, and the checklist tool — small and load-bearing. */
+  var PROGRESSIVE_KEEP_FULL = {
+    remember: 1, delegate: 1, map_context: 1, todo_write: 1, tool_schema: 1,
+  };
   /* Recall gating — similarity floor + block token budget (defaults;
    * per-def recallMin / recallBudget override). Calibrated for the bundled
    * TF-IDF embedder where unrelated text scores ~0.27 and paraphrases >0.35
@@ -548,6 +562,18 @@
      * so test with 'in' rather than falling back to the default. */
     d.budget.maxContinuations = ('maxContinuations' in b)
       ? Math.max(0, (b.maxContinuations | 0)) : BUDGET_DEFAULTS.maxContinuations;
+    /* Token-economy pack (2026-10-15, default-on — see PLAN agentic core):
+     * reuseLedger — identical tool re-calls enter context as a marker;
+     * midRunCompaction — structural transcript compaction at the alloc
+     * plan's compactAt cliff. Both are correctness-neutral (strict
+     * content equality / provider-safe cuts) so they default ON. */
+    d.budget.reuseLedger = ('reuseLedger' in b) ? !!b.reuseLedger : true;
+    d.budget.midRunCompaction = ('midRunCompaction' in b) ? !!b.midRunCompaction : true;
+    /* Tool-schema mode: 'auto' (default — slim only when the serialized
+     * toolset crosses PROGRESSIVE_TOOL_THRESHOLD_TK) | 'progressive'
+     * (always slim) | 'full' (never). */
+    d.toolsMode = (def.toolsMode === 'progressive' || def.toolsMode === 'full' || def.toolsMode === 'auto')
+      ? String(def.toolsMode) : 'auto';
 
     var tools = def.tools || [];
     if (!Array.isArray(tools)) throw new Error('agent.define: tools must be an array');
@@ -1059,7 +1085,13 @@
     var hits = cma.recall(vec, topK || 15) || [];
     if (d.memory === 'agent') {
       var want = 'agent:' + d.name;
-      hits = hits.filter(function (h) { return h && h.entity === want; });
+      /* M0: the root name is the identity row; nested 'agent:<name>:<fp>'
+       * keys are this agent's turn facts. Colon-delimited prefix, so
+       * 'agent:memA' never leaks into 'agent:memA2'. */
+      var wantPrefix = want + ':';
+      hits = hits.filter(function (h) {
+        return h && h.entity && (h.entity === want || String(h.entity).indexOf(wantPrefix) === 0);
+      });
     }
     return hits;
   }
@@ -1136,6 +1168,18 @@
     }
     return res;
   }
+  /* M0 (Brain Core II): per-fact namespace key. Agent-scoped turn facts
+   * are entity rows named 'agent:<name>:<fp>' — a NESTED namespace — so
+   * remember_entity's upsert-by-name can no longer collapse the agent's
+   * whole history into one overwritten row (the soak measured 200 turns
+   * → 1 surviving row). rememberEntityTurn keeps the nested name for
+   * scoped recall while the row itself decays as episodic. */
+  var NS_SEQ = 0;
+  function nsTurnKey(ent) {
+    NS_SEQ = (NS_SEQ + 1) | 0;
+    return ent + ':' + Date.now().toString(36) + '-' + (NS_SEQ >>> 0).toString(36) +
+           '-' + Math.floor(Math.random() * 1e9).toString(36);
+  }
   /* P4: distilled writes — clip to STORE_CAP_CHARS (the head of an answer
    * carries the conclusion; recall can't use the elaboration tail). The
    * fused SEM2 channel mirrors the SAME clipped strings (the text is the
@@ -1145,15 +1189,33 @@
     var cma = entry.cma;
     if (d.memory === 'agent') {
       var ent = 'agent:' + d.name;
-      if (taskVec) cma.rememberEntity(taskVec, clip(task, STORE_CAP_CHARS), ent, 'agent');
-      if (ansVec) cma.rememberEntity(ansVec, clip(answer, STORE_CAP_CHARS), ent, 'agent');
+      /* M0: task and answer each take their own nested key — two rows per
+       * turn, both inside this agent's namespace, both decaying as
+       * episodic. Older engines without rememberEntityTurn fall back to
+       * rememberEntity (with the nested name, so accumulation still holds). */
+      var entTask = nsTurnKey(ent);
+      var entAns = nsTurnKey(ent);
+      if (taskVec) {
+        if (typeof cma.rememberEntityTurn === 'function') {
+          cma.rememberEntityTurn(taskVec, clip(task, STORE_CAP_CHARS), entTask, 'agent');
+        } else {
+          cma.rememberEntity(taskVec, clip(task, STORE_CAP_CHARS), entTask, 'agent');
+        }
+      }
+      if (ansVec) {
+        if (typeof cma.rememberEntityTurn === 'function') {
+          cma.rememberEntityTurn(ansVec, clip(answer, STORE_CAP_CHARS), entAns, 'agent');
+        } else {
+          cma.rememberEntity(ansVec, clip(answer, STORE_CAP_CHARS), entAns, 'agent');
+        }
+      }
       try { cma.flush(); } catch (e) {}
       if (entry.sem) {
         try {
           var stu = taskVec ? embedSemV2(clip(task, STORE_CAP_CHARS)) : null;
           var sa = ansVec ? embedSemV2(clip(answer, STORE_CAP_CHARS)) : null;
-          if (stu) entry.sem.rememberEntity(stu, clip(task, STORE_CAP_CHARS), ent, 'agent');
-          if (sa) entry.sem.rememberEntity(sa, clip(answer, STORE_CAP_CHARS), ent, 'agent');
+          if (stu) entry.sem.rememberEntity(stu, clip(task, STORE_CAP_CHARS), entTask, 'agent');
+          if (sa) entry.sem.rememberEntity(sa, clip(answer, STORE_CAP_CHARS), entAns, 'agent');
           entry.sem.flush();
         } catch (e2) {}
       }
@@ -1398,8 +1460,15 @@
 
   /* ── The loop (A1) ─────────────────────────────────────────────── */
 
-  function aiOpts(d, opts, messages, withTools) {
+  function aiOpts(d, opts, messages, withTools, cacheAnchor) {
     var o = { messages: messages };
+    /* P1.2 (2026-10-15): the rolling Anthropic cache breakpoint — the
+     * count of messages already sent on the previous request; ai.rs marks
+     * that message's content block with cache_control so every round
+     * re-bills only the tail. 0/undefined = no anchor (first round, or
+     * the prefix was rewritten and the anchor would be a lie). OpenAI/
+     * local wires ignore the field (auto prefix caching). */
+    if (cacheAnchor > 0) o.cacheAnchorCount = cacheAnchor | 0;
     function pick(key, jsKey) {
       if (opts && opts[key]) { o[jsKey] = opts[key]; return; }
       if (d[key]) o[jsKey] = d[key];
@@ -1722,6 +1791,39 @@
      * every counter as '?'. Counted here at emit time, immune to trace
      * trimming. */
     var toolHist = {};
+    /* ── Token-economy pack (2026-10-15) ───────────────────────────────
+     * reuseLedger — per-run, keyed tool + canonical target, valued by
+     * strict content equality (fnv1a + length) of the capped result.
+     * Cycle per key on identical results: 1st call full → 2nd marker
+     * ("unchanged since step N") → 3rd full (a model that insists gets
+     * its bytes; no tool-coupled force flag needed budget.reuseLedger:
+     * false in normalizeDef disables). Write tools/bash invalidate
+     * affected targets.
+     * sentLen/prefixRewritten — the rolling Anthropic cache anchor
+     * (P1.2): the count of messages the PREVIOUS request carried; unset
+     * whenever the prefix is structurally rewritten (fitGuard drop/
+     * truncate, staged compaction) — a stale anchor would be a cache
+     * lie. progressiveEscalated — slim tools promoted to full schemas. */
+    var reuseLedger = d.budget.reuseLedger ? {} : null;
+    function ledgerhash(s) {
+      var h = 0x811c9dc5, i;
+      for (i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = (h * 0x01000193) & 0xffffffff;
+      }
+      return h;
+    }
+    function ledgerInvalidateTarget(target) {
+      if (!reuseLedger) return;
+      var suffix = '\u0001' + String(target || '');
+      for (var k in reuseLedger) {
+        if (reuseLedger.hasOwnProperty(k) && k.indexOf(suffix, k.length - suffix.length) >= 0) {
+          delete reuseLedger[k];
+        }
+      }
+    }
+    var sentLen = 0, prefixRewritten = false;
+    var progressiveEscalated = {};
     var steps = 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
      * renewal, so this is what "how long did this actually run" means. */
@@ -2039,7 +2141,7 @@
       var win = (lastPlan && lastPlan.window > 0) ? lastPlan.window
               : (d.ctxWindow > 0 ? d.ctxWindow
               : contextWindow(d.model, d.baseUrl, !mlEnabled(d)));
-      if (!(win > 0)) return msgs;
+      if (!(win > 0)) return { msgs: msgs, structural: false };
       function promptTk(ms) {
         var t = 0;
         for (var i = 0; i < ms.length; i++) {
@@ -2053,7 +2155,7 @@
       }
       var reserve = o.max_tokens > 0 ? o.max_tokens : Math.max(512, Math.floor(win * 0.05));
       var est = promptTk(msgs);
-      if (est + reserve <= win) return msgs;
+      if (est + reserve <= win) return { msgs: msgs, structural: false };
       var out = msgs.slice();
       var actions = [];
       /* Rung 1 — re-cap tool results (the largest uncontrolled blobs). */
@@ -2129,7 +2231,12 @@
       if (actions.length) {
         emit('allocgate', { fit: est + '/' + win, actions: actions.join('; ') });
       }
-      return out;
+      /* P1.2: the cache anchor counts array positions — a drop/truncate
+       * rewritten the prefix, so the caller must not send the anchor this
+       * round (a stale anchor would be a cache lie). Re-caps (rung 1) and
+       * the output clamp mutate contents in place: positions hold, the
+       * provider misses the prefix naturally, keep the anchor. */
+      return { msgs: out, structural: dropped > 0 || big >= 0 };
     }
 
     /* P1-2: a stream abandoned mid-transfer still consumed its tokens —
@@ -2438,6 +2545,84 @@
         }
       }
       var tools = toolset.specs.length ? toolset.specs : null;
+      /* P1.4 — progressive tool schemas (2026-10-15). When the serialized
+       * toolset crosses the threshold ('auto', the default) or always
+       * ('progressive'), requests carry a SLIM wire list: full schemas for
+       * the keep-full core + inline tools (plus anything already
+       * escalated), name + one-liner for the rest, and a small
+       * `tool_schema` meta-tool the model uses to load a real schema. A
+       * call to a still-slim name escalates it (sticky for the run,
+       * capped per round) and the round re-streams with the full wire.
+       * `tools` stays the FULL spec list — execution never sees slim
+       * shapes; only the wire does. */
+      var inlineFull = {};
+      for (var infI = 0; infI < d.inlineTools.length; infI++) inlineFull[d.inlineTools[infI].name] = 1;
+      var toolsCostTk = 0;
+      if (tools) toolsCostTk = estTok(JSON.stringify(tools));
+      var progressive = false;
+      if (tools && d.toolsMode !== 'full') {
+        progressive = (d.toolsMode === 'progressive') || toolsCostTk > PROGRESSIVE_TOOL_THRESHOLD_TK;
+      }
+      var slimNames = {};
+      if (progressive) {
+        for (var sp2 = 0; sp2 < tools.length; sp2++) {
+          var sp2n = String(tools[sp2].name || '');
+          if (sp2n && !PROGRESSIVE_KEEP_FULL[sp2n] && !inlineFull[sp2n]) slimNames[sp2n] = 1;
+        }
+        var metaSpec = {
+          name: 'tool_schema',
+          description: 'Load the full parameter schema for one of the listed tools. Call this ONCE for any tool you need exact argument shapes for.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'The tool name exactly as listed' },
+            },
+            required: ['name'],
+          },
+        };
+        toolset.specs.push(metaSpec);
+        toolset.exec['tool_schema'] = function (margs) {
+          var nm = String((margs && margs.name) || '');
+          for (var li = 0; li < toolset.specs.length; li++) {
+            if (toolset.specs[li].name === nm) {
+              return JSON.stringify(toolset.specs[li]);
+            }
+          }
+          return 'tool_schema: no such tool \'' + clip(nm, 60) + '\'';
+        };
+        tools.push(metaSpec);
+        /* a slim list always names the meta-tool in full so the model can
+         * discover the loader. */
+        delete slimNames['tool_schema'];
+      }
+      /* buildWireToolsNow(): the wire list for THIS round — escalations are
+       * sticky, everything still-slim rides compact. Stable order keeps the
+       * provider prefix cache anchored (the slim/full flip changes bytes at
+       * that row only). */
+      function buildWireToolsNow() {
+        if (!progressive) return tools;
+        var wire = [];
+        for (var wi = 0; wi < tools.length; wi++) {
+          var spec = tools[wi];
+          var wn = String(spec.name || '');
+          if (slimNames[wn] && !progressiveEscalated[wn]) {
+            wire.push({
+              name: spec.name,
+              description: clip(String(spec.description || ''), PROGRESSIVE_SLIM_DESC_CHARS) +
+                ' (schema omitted — call tool_schema to load exact arguments)',
+              parameters: { type: 'object', properties: {} },
+            });
+          } else {
+            wire.push(spec);
+          }
+        }
+        return wire;
+      }
+      /* Slim names still riding the wire this round — the escalation
+       * trigger. Names already escalated AND core tools return false. */
+      function stillSlim(nm) {
+        return !!(progressive && slimNames[nm] && !progressiveEscalated[nm]);
+      }
 
       var answer = '';
       /* First-request section weights for the ring's hover card (captured
@@ -2681,6 +2866,46 @@
         /* P3: uniform cap at the boundary (delegate answers included — the
          * child already capped its own answer; no double truncation). */
         var cappedR = capToolResult(allocToolCap(), result);
+        /* P1 token economy — reuse ledger (2026-10-15): an identical
+         * re-call of the same tool on the same target enters the model
+         * transcript as a marker. Strict equality (fnv1a + length) on
+         * the CAPPED text — a provider that returns anything different
+         * bypasses the ledger. Cycle: 1st full → 2nd marker → 3rd full
+         * (an insisting model gets its bytes; sub-512-char results never
+         * bother). The marker replaces ONLY what flows to the model next;
+         * the normal path below still wraps + emits the real result for
+         * the host UI and the gates. */
+        if (reuseLedger && !errored && typeof cappedR.text === 'string' && cappedR.text.length >= 512) {
+          var lkey = name + '\u0001' + mlTarget(args);
+          var lhv = ledgerhash(cappedR.text);
+          var lprev = reuseLedger[lkey];
+          if (lprev && lprev.len === cappedR.text.length && lprev.hash === lhv) {
+            if (lprev.hits === 0) {
+              lprev.hits = 1;
+              cappedR.text = '[unchanged since step ' + lprev.step + ' — identical ' +
+                cappedR.text.length + '-char result, already shown above. Call once more ' +
+                'only if you truly need the full bytes re-sent.]';
+              emit('tool_result', { name: name, reuseLedger: true, target: mlTarget(args) });
+            } else {
+              lprev.hits = 0; /* third identical: full resend, cycle restarts */
+            }
+          } else {
+            reuseLedger[lkey] = { len: cappedR.text.length, hash: lhv, step: stepsTotal, hits: 0 };
+          }
+        }
+        /* Write tools / bash invalidate ledger entries: an edit_file or
+         * write_file drops the entries for that exact target; bash can
+         * touch anything, so it clears the whole ledger (correctness
+         * first — a stale "unchanged" is a hallucination factory). */
+        if (reuseLedger && !errored) {
+          if (name === 'write_file' || name === 'edit_file') {
+            ledgerInvalidateTarget(mlTarget(args));
+          } else if (name === 'bash') {
+            for (var lk in reuseLedger) {
+              if (reuseLedger.hasOwnProperty(lk)) delete reuseLedger[lk];
+            }
+          }
+        }
         /* P2-2: tool results (web pages, file contents, MCP servers, sub-
          * agents) are UNTRUSTED DATA — instructions found inside them are
          * observations to report, not commands to follow. Wrap them the same
@@ -2961,6 +3186,7 @@
        * run scope (shared with turnTranscript) since 2026-09-03 e. */
       for (;;) {
         state.emptyRetriesRound = 0; /* LONG-HORIZON: fresh empty-stream allowance per round */
+        state.progressiveRetriesRound = 0; /* P1.4: fresh escalation allowance per round */
         var breach0 = budgetBreach();
         /* Renew instead of stopping, while renewal is still allowed and
          * the run is not cancelled. `steps` is per-window; stepsTotal
@@ -3024,7 +3250,31 @@
          * then run the Layer-1 pre-flight fit check — the request that goes
          * out always fits the selected model's window. */
         refreshPlan();
-        var so = aiOpts(d, opts, messages.concat(loopMsgs), tools);
+        /* P1 token economy — staged mid-run compaction (2026-10-15): the
+         * alloc plan has produced `compactAt` (0.50 tight → 0.70 slack, a
+         * fraction of the window) since its first landing, but the agent
+         * loop only ever consumed it in chat.js — in a run the transcript
+         * ballooned until fitGuard's SEND-TIME trims, which are the most
+         * cache-hostile possible cuts. Structural compaction at the round
+         * boundary instead (same provider-safe cut compactLoop always
+         * made; no LLM summary — paying tokens to save tokens is
+         * self-defeating here). budget.midRunCompaction:false opts out. */
+        if (d.budget.midRunCompaction && lastPlan && lastPlan.compactAt > 0 && lastPlan.window > 0) {
+          var stagedChars = 0;
+          for (var scI = 0; scI < loopMsgs.length; scI++) stagedChars += msgChars(loopMsgs[scI]);
+          if ((stagedChars / 4) > lastPlan.compactAt * lastPlan.window) {
+            var stagedCompact = compactLoop();
+            if (stagedCompact) {
+              loopMsgs = stagedCompact.msgs;
+              prefixRewritten = true; /* the cache anchor would be a lie from here on */
+              emit('plan', { compacted: true, staged: true,
+                             droppedMsgs: stagedCompact.droppedMsgs,
+                             savedChars: stagedCompact.savedChars,
+                             cliff: Math.floor(lastPlan.compactAt * lastPlan.window) });
+            }
+          }
+        }
+        var so = aiOpts(d, opts, messages.concat(loopMsgs), buildWireToolsNow(), prefixRewritten ? 0 : sentLen);
         /* The plan's output reserve is feasibility-checked against the
          * resolved caps (registry → learned limits → conservative
          * defaults): clamp DOWN to it — an explicit /maxout above the
@@ -3034,7 +3284,12 @@
           if (so.max_tokens > 0 && so.max_tokens > lastPlan.maxOutput) so.max_tokens = lastPlan.maxOutput;
           else if (!(so.max_tokens > 0)) so.max_tokens = lastPlan.maxOutput;
         }
-        so.messages = fitGuard(so, so.messages);
+        var fg = fitGuard(so, so.messages);
+        so.messages = fg.msgs;
+        if (fg.structural) {
+          prefixRewritten = true;
+          delete so.cacheAnchorCount; /* never mark a rewritten prefix */
+        }
         if (!own.llmCalls) turnSections = reqSections(so.messages, so.tools, toolset.mcpNames);
         var sres;
         try {
@@ -3094,6 +3349,11 @@
         }
         var st = sres.st;
         var sparts = sres.parts;
+        /* P1.2: this request went out intact — its length becomes the
+         * next round's rolling cache anchor (reset only by a structural
+         * prefix rewrite). */
+        sentLen = so.messages.length;
+        prefixRewritten = false;
         var su = st.usage || {};
         own.promptTokens += su.promptTokens || 0;
         own.completionTokens += su.completionTokens || 0;
@@ -3116,6 +3376,31 @@
           cacheReadTokens: su.cacheReadTokens || 0, cacheWriteTokens: su.cacheWriteTokens || 0 },
           sections: (turnSections && own.llmCalls === 1) ? turnSections : undefined });
         var stcs = mergeStreamToolCalls(st.toolCalls || []);
+        /* P1.4 escalation: the model called a still-slim tool — promote it
+         * to a full schema (sticky for the run), re-bill this attempt's
+         * tokens + call, and re-stream with the expanded wire. Capped at
+         * 2 escalations per round; after that the call executes with
+         * whatever arguments arrived. The first attempt's answer text was
+         * already forwarded live — on the retry the model repeats itself
+         * into that tail, bounded by the escalation cap. */
+        if (progressive && stcs.length) {
+          var needFull = [];
+          for (var escI = 0; escI < stcs.length; escI++) {
+            var escN = String((stcs[escI] && stcs[escI].name) || '');
+            if (stillSlim(escN) && needFull.indexOf(escN) < 0) needFull.push(escN);
+          }
+          if (needFull.length && (state.progressiveRetriesRound | 0) < 2) {
+            state.progressiveRetriesRound = (state.progressiveRetriesRound | 0) + 1;
+            absorbUsage(st);
+            own.llmCalls++; tree.llmCalls++;
+            for (var escJ = 0; escJ < needFull.length; escJ++) {
+              progressiveEscalated[needFull[escJ]] = 1;
+            }
+            emit('plan', { progressive: 'escalated', tools: needFull,
+                           note: 'full schemas injected — re-streaming' });
+            continue;
+          }
+        }
         if (!stcs.length) {
           answer = sparts.join('').trim() || (state.cancelled ? '(cancelled)' : '(no response)');
           if (state.cancelled) stopped = stopped || 'cancelled';
@@ -3366,15 +3651,23 @@
       async function finalAnswer(msgs, salvageMode) {
         /* alloc gate (§14): resolve the plan first so the clamp + fit
          * check below see the selected model's real limits — finalAnswer
-         * is the plain no-tool path AND the salvage round, and both must
+         * is the plain no-tools path AND the salvage round, and both must
          * fit exactly like the tool loop does. */
         refreshPlan();
-        var o = aiOpts(d, opts, msgs);
+        /* P1.2 anchor for the plain path: everything except the task
+         * message (the last) was already sent on a previous round/turn —
+         * one rolling breakpoint just before the task. structural=false
+         * means fitGuard touched nothing; prefixRewritten covers compaction. */
+        var faAnchor = (prefixRewritten || salvageMode) ? 0 : (msgs.length - 1);
+        var o = aiOpts(d, opts, msgs, null, faAnchor);
         if (lastPlan && lastPlan.maxOutput > 0) {
           if (o.max_tokens > 0 && o.max_tokens > lastPlan.maxOutput) o.max_tokens = lastPlan.maxOutput;
           else if (!(o.max_tokens > 0)) o.max_tokens = lastPlan.maxOutput;
         }
-        o.messages = fitGuard(o, o.messages);
+        var fgF = fitGuard(o, o.messages);
+        o.messages = fgF.msgs;
+        if (fgF.structural) faAnchor = 0;
+        o.cacheAnchorCount = faAnchor > 0 ? faAnchor : undefined;
         /* Plain path = the turn's first (only) request: measure the same
          * section breakdown the tool loop captures. Salvage rounds (llm
          * calls already spent) skip it — chat.js keeps the first. */
@@ -3405,7 +3698,9 @@
               if (lastPlan && lastPlan.maxOutput > 0 && o.max_tokens > lastPlan.maxOutput) {
                 o.max_tokens = lastPlan.maxOutput;
               }
-              o.messages = fitGuard(o, o.messages);
+              var fgR = fitGuard(o, o.messages);
+              o.messages = fgR.msgs;
+              if (fgR.structural) o.cacheAnchorCount = undefined;
               continue;
             }
             throw eF;

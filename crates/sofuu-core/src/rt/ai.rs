@@ -177,6 +177,13 @@ struct AiRequestConfig {
     timeout_ms: c_long,              /* 0 = unlimited (default); >0 = ms timeout */
     messages: Vec<AiMessage>,
     tools: Vec<AiToolDef>,
+    /* P1.2 (2026-10-15): rolling Anthropic cache breakpoint — the count of
+     * messages the caller's PREVIOUS request carried (1-based). The message
+     * at that boundary (index count-1, after plain-turn merging) gets one
+     * `cache_control` on its last content block; every later round re-bills
+     * only the growth. None/absent = no anchor (first round, or the prefix
+     * was rewritten and marking a stale boundary would cache a lie). */
+    cache_anchor: Option<usize>,
 }
 
 impl Default for AiRequestConfig {
@@ -198,6 +205,7 @@ impl Default for AiRequestConfig {
             timeout_ms: 0,
             messages: Vec::new(),
             tools: Vec::new(),
+            cache_anchor: None,
         }
     }
 }
@@ -599,6 +607,11 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
             && m.tool_call_id.as_deref().map_or(true, |t| t.is_empty())
     }
     let mut merged: Vec<AiMessage> = Vec::with_capacity(cfg.messages.len());
+    /* P1.2: map the anchor's cfg position (0-based index anchor-1) to its
+     * merged row — plain same-role messages merge backward, so the anchor
+     * lands on the row it joined. */
+    let mut cfg_pos: usize = start_idx;
+    let mut anchor_merged: Option<usize> = None;
     for m in &cfg.messages[start_idx..] {
         if is_plain(m) {
             if let Some(prev) = merged.last_mut() {
@@ -610,20 +623,32 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
                     }
                     joined.push_str(&add);
                     prev.content = Some(joined);
+                    if Some(cfg_pos) == cfg.cache_anchor.map(|a| a - 1) {
+                        anchor_merged = Some(merged.len() - 1);
+                    }
+                    cfg_pos += 1;
                     continue;
                 }
             }
         }
         merged.push(m.clone());
+        if Some(cfg_pos) == cfg.cache_anchor.map(|a| a - 1) {
+            anchor_merged = Some(merged.len() - 1);
+        }
+        cfg_pos += 1;
     }
 
     body.push_str(",\"messages\":[");
     let mut first = true;
-    for m in &merged {
+    /* P1.2: one cache_control on the anchored row's LAST content block —
+     * the rolling breakpoint so every later round re-bills only the tail. */
+    let mut anchor_emitted = false;
+    for (row, m) in merged.iter().enumerate() {
         /* Anthropic only supports 'user' or 'assistant'. Default to user if
          * role is missing OR not stringifiable (ToCString returned NULL). */
         let role = eff_role(m);
         let es = json_escape(m.content.as_deref());
+        let anchored = !anchor_emitted && Some(row) == anchor_merged;
         if !first {
             body.push(',');
         }
@@ -671,6 +696,14 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
                     ));
                     tc_first = false;
                 }
+                if anchored {
+                    /* insert inside the LAST tool_use block object — the
+                     * body currently ends `…"input":{…}}`; splicing before
+                     * the final '}' puts the marker inside that block. */
+                    let cut = body.len() - 1;
+                    body.insert_str(cut, ",\"cache_control\":{\"type\":\"ephemeral\"}");
+                    anchor_emitted = true;
+                }
                 body.push(']');
                 body.push('}');
                 first = false;
@@ -680,11 +713,20 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
         if let Some(tid) = &m.tool_call_id {
             if !tid.is_empty() {
                 /* tool result → user message with tool_result block */
-                body.push_str(&format!(
-                    "{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}]}}",
-                    json_escape(Some(tid)),
-                    es
-                ));
+                if anchored {
+                    body.push_str(&format!(
+                        "{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\",\"cache_control\":{{\"type\":\"ephemeral\"}}}}]}}",
+                        json_escape(Some(tid)),
+                        es
+                    ));
+                    anchor_emitted = true;
+                } else {
+                    body.push_str(&format!(
+                        "{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}]}}",
+                        json_escape(Some(tid)),
+                        es
+                    ));
+                }
                 first = false;
                 continue;
             }
@@ -694,7 +736,15 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
          * (data URL "data:<mime>;base64,<b64>" split apart). */
         if !m.images.is_empty() {
             body.push_str(&format!("{{\"role\":\"{}\",\"content\":[", role));
-            body.push_str(&format!("{{\"type\":\"text\",\"text\":\"{}\"}}", es));
+            if anchored {
+                body.push_str(&format!(
+                    "{{\"type\":\"text\",\"text\":\"{}\",\"cache_control\":{{\"type\":\"ephemeral\"}}}}",
+                    es
+                ));
+                anchor_emitted = true;
+            } else {
+                body.push_str(&format!("{{\"type\":\"text\",\"text\":\"{}\"}}", es));
+            }
             for img in &m.images {
                 // data:image/png;base64,AAAA → media_type + b64 payload
                 let (mime, b64) = match img.strip_prefix("data:") {
@@ -715,7 +765,15 @@ fn build_anthropic_body_v2(cfg: &AiRequestConfig) -> String {
             first = false;
             continue;
         }
-        body.push_str(&format!("{{\"role\":\"{}\",\"content\":\"{}\"}}", role, es));
+        if anchored {
+            body.push_str(&format!(
+                "{{\"role\":\"{}\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\",\"cache_control\":{{\"type\":\"ephemeral\"}}}}]}}",
+                role, es
+            ));
+            anchor_emitted = true;
+        } else {
+            body.push_str(&format!("{{\"role\":\"{}\",\"content\":\"{}\"}}", role, es));
+        }
         first = false;
     }
 
@@ -3419,6 +3477,23 @@ unsafe fn parse_ai_args(
         }
         if qjs::sofuu_js_is_string(v) != 0 {
             cfg.response_format = cstr_opt(ctx, v);
+        }
+        qjs::sofuu_js_free_value(ctx, v);
+
+        /* P1.2: rolling Anthropic cache breakpoint — count of messages the
+         * caller's previous request carried. camelCase from the agent loop,
+         * snake_case accepted for parity with the other opts. */
+        v = qjs::sofuu_js_get_property_str(ctx, opts, c"cacheAnchorCount".as_ptr());
+        if qjs::is_undefined(v) {
+            qjs::sofuu_js_free_value(ctx, v);
+            v = qjs::sofuu_js_get_property_str(ctx, opts, c"cache_anchor".as_ptr());
+        }
+        if qjs::is_number(v) {
+            let mut n: i32 = 0;
+            qjs::JS_ToInt32(ctx, &mut n, v);
+            if n > 0 {
+                cfg.cache_anchor = Some(n as usize);
+            }
         }
         qjs::sofuu_js_free_value(ctx, v);
 
@@ -6861,6 +6936,7 @@ mod tests {
             threads: 0,
             messages: msgs.clone(),
             tools: vec![],
+            cache_anchor: None,
         };
 
         // OpenAI-compatible
@@ -6908,6 +6984,7 @@ mod tests {
                     "data:image/jpeg;base64,BBBB".into(),
                 ],
             }],
+            cache_anchor: None,
         };
         let oa = build_openai_body_v2(&mk(Provider::OpenAi));
         assert!(oa.contains("\"content\":[{\"type\":\"text\",\"text\":\"what is this?\"}"), "openai text part: {oa}");
@@ -6965,6 +7042,7 @@ mod tests {
                 tool_call_id: None,
                 images: Vec::new(),
             }],
+            cache_anchor: None,
         };
         let body = build_openai_body_v2(&mk(Provider::OpenAi));
         assert!(!body.contains("\"max_tokens\""), "flat cap must be omitted for a zero-evidence model: {body}");
@@ -7048,6 +7126,7 @@ mod tests {
                     parameters_json: Some("{}".into()),
                 },
             ],
+            cache_anchor: None,
         };
 
         let an = build_anthropic_body_v2(&mk(Provider::Anthropic));
@@ -7078,6 +7157,102 @@ mod tests {
         assert!(!oa.contains("cache_control"), "openai wire stays cache-free: {oa}");
     }
 
+    /// P1.2 (2026-10-15): the rolling cache breakpoint. With
+    /// `cache_anchor = Some(n)`, exactly ONE extra marker rides the last
+    /// content block of the n-th message (after plain-turn merging), so
+    /// every round re-bills only the growth. Without an anchor: the
+    /// historical 2 markers (system + last tool). OpenAI stays cache-free
+    /// either way. Anchor points at a merged-away plain row: the marker
+    /// lands on the row it joined.
+    #[test]
+    fn anthropic_rolling_cache_breakpoint() {
+        let mk = |anchor: Option<usize>| AiRequestConfig {
+            provider: Provider::Anthropic,
+            model: Some("m".into()),
+            api_key: None,
+            base_url: None,
+            profile: None,
+            system_prompt: None,
+            response_format: None,
+            effort: None,
+            max_tokens: 0,
+            temperature: -1.0,
+            top_p: -1.0,
+            stream: false,
+            timeout_ms: 0,
+            threads: 0,
+            messages: vec![
+                AiMessage {
+                    role: Some("system".into()),
+                    content: Some("Sofuu coding agent.".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                },
+                /* two adjacent plain user messages → merged into one turn;
+                 * an anchor at count 3 points at the row they joined. */
+                AiMessage {
+                    role: Some("user".into()),
+                    content: Some("part one.".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                },
+                AiMessage {
+                    role: Some("user".into()),
+                    content: Some("part two.".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                },
+                AiMessage {
+                    role: Some("assistant".into()),
+                    content: Some("done.".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                },
+            ],
+            tools: Vec::new(),
+            cache_anchor: anchor,
+        };
+
+        // Anchor at count 3 → the merged user turn carries the marker next
+        // to the system marker; the trailing assistant turn does not.
+        let an = build_anthropic_body_v2(&mk(Some(3)));
+        assert_eq!(
+            an.matches("\"cache_control\"").count(),
+            2,
+            "system + merged-user-turn marker only: {an}"
+        );
+        let merged_row = an.find("part one.").unwrap();
+        let marker_in_row = an[merged_row..an.find("done.").unwrap()]
+            .contains("\"cache_control\":{\"type\":\"ephemeral\"}");
+        assert!(marker_in_row, "marker on the merged row the anchor points at: {an}");
+        // It is a content-BLOCK form (marker inside one block), not a bare string.
+        assert!(
+            an.contains("\"content\":[{\"type\":\"text\",\"text\":\"part one.\\n\\npart two.\",\"cache_control\":{\"type\":\"ephemeral\"}}]"),
+            "anchored plain row emitted as a marked block: {an}"
+        );
+
+        // No anchor → the historical 2 markers (system + last tool; here
+        // no tools → just the system marker).
+        let an_none = build_anthropic_body_v2(&mk(None));
+        assert_eq!(
+            an_none.matches("\"cache_control\"").count(),
+            1,
+            "no anchor → no message markers: {an_none}"
+        );
+        assert!(
+            an_none.contains("\"content\":\"part one.\\n\\npart two.\""),
+            "unanchored plain rows stay bare-string content: {an_none}"
+        );
+
+        // OpenAI wire never carries the marker, anchor or not.
+        let oa = build_openai_body_v2(&mk(Some(3)));
+        assert!(!oa.contains("cache_control"), "openai stays cache-free: {oa}");
+    }
+
     /// Anthropic requires alternating user/assistant turns. Adjacent plain
     /// same-role messages (ephemeral context + task on an empty history,
     /// compaction summary + user turn) must merge into ONE turn; structured
@@ -7101,6 +7276,7 @@ mod tests {
             threads: 0,
             messages: msgs,
             tools: vec![],
+            cache_anchor: None,
         };
         let plain = |role: &str, content: &str| AiMessage {
             role: Some(role.into()),
@@ -7215,6 +7391,7 @@ mod tests {
                 description: Some("read a file".into()),
                 parameters_json: Some("{}".into()),
             }],
+            cache_anchor: None,
         };
 
         for (name, provider, build) in [
@@ -7265,6 +7442,7 @@ mod tests {
             threads: 0,
             messages: vec![],
             tools: vec![],
+            cache_anchor: None,
         };
         // sonnet: thinking from ctx 200k*0.30=60k, max 90% => 54000, output stays 64k (output-only)
         let b = build_anthropic_body_v2(&base("max", "claude-sonnet-4-6", 0));
@@ -7326,6 +7504,7 @@ mod tests {
             threads: 0,
             messages: vec![],
             tools: vec![],
+            cache_anchor: None,
         };
         let b = build_openai_body_v2(&cfg("gpt-5", Some("max")));
         assert!(b.contains("\"reasoning_effort\":\"high\""), "max falls back to high: {b}");
@@ -7390,6 +7569,7 @@ mod tests {
             threads: 0,
             messages: vec![],
             tools: vec![],
+            cache_anchor: None,
         };
 
         // The liquid-400 class: unknown model + config maxout 384000 vs an
@@ -7449,6 +7629,7 @@ mod tests {
             threads: 0,
             messages: vec![],
             tools: vec![],
+            cache_anchor: None,
         };
 
         // A NON-OpenAI model over the OpenAI endpoint (the common case):

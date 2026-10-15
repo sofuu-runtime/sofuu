@@ -101,7 +101,33 @@
 > **Close-out (same day, commit 3 of this stream): both leftovers closed, on the healed
 > tree.** Host `agent.mapContext` gained the 256-chunk fan-out cap (`opts.maxChunks`
 > lifts it; the battery's 8-25-chunk path unaffected). The agent loop's core contract
-> is now COMMITTED coverage — capi funnel test
+> **AGENTIC CORE Phase 1 — token economy (2026-10-15, plan-approved 4-phase stream).**
+> (1) **Tool-result reuse ledger** (default-on, `budget.reuseLedger:false` opts out):
+> identical re-calls of the same tool+target enter the transcript as
+> `[unchanged since step N]` (strict fnv1a+length equality on the capped result; cycle
+> full → marker → full so an insisting model still gets bytes; write/edit drop the
+> target's entries, bash clears all). (2) **Rolling Anthropic cache breakpoint**:
+> `aiOpts` passes `cacheAnchorCount` (messages sent last round); `rt/ai.rs`
+> `AiRequestConfig.cache_anchor` marks that row's last content block with
+> `cache_control` after plain-turn merging — every round re-bills only the tail;
+> suppressed whenever fitGuard drops/truncates or staged compaction rewrote the prefix
+> (never mark a rewrite). OpenAI/local stay cache-free. Pinned by
+> `anthropic_rolling_cache_breakpoint`. (3) **Staged mid-run compaction**: the alloc
+> plan's `compactAt` (0.50-0.70 of window) now triggers `compactLoop()` at the round
+> boundary in agent.js (it was consumed only by chat.js) — structural cuts at round
+> boundaries instead of send-time fitGuard trims; `budget.midRunCompaction:false` opts
+> out. (4) **Progressive tool schemas** (`toolsMode:'auto'|'progressive'|'full'`, auto
+> default): when the serialized toolset crosses 1200 tk the wire carries slim specs
+> (name + one-liner, empty schema) + a `tool_schema` meta-tool; calling a slim tool
+> escalates it (sticky, ≤2/round) and re-streams once. Inline/remember/delegate/
+> map_context/todo_write always full. Evidence: battery ALL PASSED incl. 7 new P1
+> checks (ledger marker/fulls=4, staged cliff event, slim wire props=[]+meta,
+> escalation, post-escalation execution); cargo --lib 583/1 (the 1 =
+> `memory::invariant_test::fuzz_cma_product_invariants` — brain workstream's in-flight
+> cma.rs, not this stream); capi 46/46; rlm mock+latch green.
+> **Close-out recap (same day, commit 3):** both leftovers closed on the healed tree —
+> host `agent.mapContext` 256-chunk fan-out cap (`opts.maxChunks` lifts it), and the
+> agent loop's core contract is now COMMITTED coverage — capi funnel test
 > `agent_loop_core_contract_runs_through_shipped_js` drives real shipped JS with a
 > scripted provider seam (no network, no model) and pins: inline tool round with usage
 > accounting, delegate-cycle guard with a bounded call count, token-budget stop with

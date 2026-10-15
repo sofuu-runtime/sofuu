@@ -193,6 +193,12 @@
    * (≈ 2% of it) between sane bounds. */
   var RECALL_MIN_SCORE = 0.30;
   var RECALL_BUDGET_TOK = 1024; /* floor for tiny windows */
+  /* M1 (Brain Core II): the live-window ceiling — recall may spend at
+   * most the MEASURED free window minus this safety margin (estimator
+   * error + per-step growth), and stays silent below this much free
+   * window: under real pressure memory yields to the conversation. */
+  var RECALL_SAFETY_TK = 512;
+  var RECALL_MIN_FREE_TK = 768;
   function recallBudgetTok(d) {
     if (d && d.recallBudget > 0) return d.recallBudget;
     if (d && d.provider === 'local') return 256;
@@ -506,9 +512,12 @@
       profile: def.profile || '',
       maxTokensOut: (def.max_tokens || def.maxTokensOut || 0) | 0,
       ctxWindow: (def.ctx_window || def.ctxWindow || 0) | 0,
-      /* P2: recall gating knobs — 0 = scale with the model's window. */
+      /* P2: recall gating knobs — 0 = scale with the model's window.
+       * M1: unset is `undefined`, not 0 — 0 now means "the live window
+       * says inject nothing this turn" and must never arise from a
+       * default. */
       recallMin: (typeof def.recallMin === 'number') ? def.recallMin : RECALL_MIN_SCORE,
-      recallBudget: (def.recallBudget | 0) || 0,
+      recallBudget: (def.recallBudget | 0) > 0 ? (def.recallBudget | 0) : undefined,
       /* Optional REMOTE embeddings for the brain (local-first without). */
       embedProvider: def.embed_provider || def.embedProvider || '',
       embedModel: def.embed_model || def.embedModel || '',
@@ -1598,10 +1607,19 @@
       if (alreadyVisible(passed[j].text)) { dropped++; continue; }
       deduped.push(passed[j]);
     }
-    /* Highest-score-first fill until the block's token budget is spent. */
-    var budget = d.recallBudget > 0 ? d.recallBudget : recallBudgetTok(d);
+    /* Highest-score-first fill until the block's token budget is spent.
+     * An explicit 0 budget (M1 live-window pressure) injects nothing at
+     * all — the old `>= 0` first-line allowance made zero mean one line. */
+    var budget = typeof d.recallBudget === 'number'
+      ? d.recallBudget : recallBudgetTok(d);
     var used = estTok('Context from the shared brain (may be relevant):');
     var kept = [], budgetCut = 0;
+    if (budget <= 0) {
+      return {
+        ids: [], chans: [], lines: [], hits: [],
+        dropped: dropped, budgetCut: deduped.length,
+      };
+    }
     for (var n2 = 0; n2 < deduped.length; n2++) {
       var line = '- ' + clip(deduped[n2].text, 300);
       if (kept.length > 0 && used + estTok(line) > budget) { budgetCut++; continue; }
@@ -2062,13 +2080,18 @@
     var mlLoopNoticed = {};
 
 
-    /* ── alloc gate state for this run (§14) ─────────────────────────
-     * lastPlan is re-resolved before every LLM call: caps come from the
-     * registry/learned limits inside Rust, pressure from the live session
-     * shape below. null ⇒ ML off ⇒ every consumer falls back to the
-     * legacy ratios, exactly as before the gate existed. */
-    var lastPlan = null;
-    var allocMem = { sawLengthStop: false, maxAnswerTk: 0 };
+  /* ── alloc gate state for this run (§14) ─────────────────────────
+   * lastPlan is re-resolved before every LLM call: caps come from the
+   * registry/learned limits inside Rust, pressure from the live session
+   * shape below. null ⇒ ML off ⇒ every consumer falls back to the
+   * legacy ratios, exactly as before the gate existed. lastExactFreeTk
+   * (M1, Brain Core II) is the MEASURED free window of the upcoming
+   * request — resolved window minus every input component minus the
+   * answer reserve — the exact arithmetic the learned pressure only
+   * approximates. -1 ⇒ unknown (ML off) ⇒ consumers keep legacy shape. */
+  var lastPlan = null;
+  var lastExactFreeTk = -1;
+  var allocMem = { sawLengthStop: false, maxAnswerTk: 0 };
     function refreshPlan() {
       if (!mlEnabled(d)) { lastPlan = null; return null; }
       var hist = Array.isArray(opts.history) ? opts.history : [];
@@ -2096,6 +2119,10 @@
       if (tools && tools.length) {
         try { overheadTk += estTok(JSON.stringify(tools)); } catch (eT) {}
       }
+      var taskTk = estTok(String(task == null ? '' : task));
+      var attachTk = estTok(String(opts.context || '')) +
+                     ((opts.images && opts.images.length)
+                       ? opts.images.length * IMAGE_TOKEN_TAX : 0);
       lastPlan = allocPlan(d, {
         overheadTk: overheadTk, calibrated: false,
         historyTk: histTk,
@@ -2103,10 +2130,8 @@
         toolFrac: hist.length ? toolMsgs / hist.length : 0,
         summary: false,
         growthTk: growthTk, growthAccel: accel,
-        taskTk: estTok(String(task == null ? '' : task)),
-        attachTk: estTok(String(opts.context || '')) +
-                  ((opts.images && opts.images.length)
-                    ? opts.images.length * IMAGE_TOKEN_TAX : 0),
+        taskTk: taskTk,
+        attachTk: attachTk,
         toolHeavy: !!(tools && tools.length),
         writing: /\b(write|writing|essay|article|blog|story|draft|documentation|report)\b/i
           .test(String(task == null ? '' : task)),
@@ -2114,14 +2139,36 @@
         maxAnswerTk: allocMem.maxAnswerTk,
         sawLengthStop: allocMem.sawLengthStop,
       });
+      /* M1: exact free window = resolved window − everything the request
+       * already carries − the answer reserve. Shapes nothing; it only
+       * ceilings the recall budget below. */
+      if (lastPlan && lastPlan.window > 0) {
+        var reserve = lastPlan.maxOutput > 0 ? lastPlan.maxOutput
+          : ((opts && opts.max_tokens) || d.maxTokensOut > 0 ? d.maxTokensOut : 0);
+        lastExactFreeTk = lastPlan.window - overheadTk - histTk - taskTk - attachTk - reserve;
+        if (lastExactFreeTk < 0) lastExactFreeTk = 0;
+      } else {
+        lastExactFreeTk = -1;
+      }
       return lastPlan;
     }
     /* Budget consumers — plan first, legacy ratio fallback second. */
     function allocToolCap() {
       return (lastPlan && lastPlan.toolCapChars > 0) ? lastPlan.toolCapChars : toolResultCapChars(d);
     }
+    /* Recall budget: the plan's shaped number, hard-ceilinged by the
+     * M1 measured free window. Under real pressure (free window under
+     * RECALL_MIN_FREE_TK) recall injects NOTHING this turn rather than
+     * doing exactly backwards what the fitGuard ladder would do — trim
+     * real conversation to make room for memory. */
     function allocRecallBudget() {
-      return (lastPlan && lastPlan.recallBudgetTok > 0) ? lastPlan.recallBudgetTok : recallBudgetTok(d);
+      var b = (lastPlan && lastPlan.recallBudgetTok > 0) ? lastPlan.recallBudgetTok : recallBudgetTok(d);
+      if (lastExactFreeTk >= 0) {
+        if (lastExactFreeTk < RECALL_MIN_FREE_TK) return 0;
+        var ceil = lastExactFreeTk - RECALL_SAFETY_TK;
+        if (ceil < b) b = ceil;
+      }
+      return b;
     }
     /* Layer 1 pre-flight fit check: estimate the assembled prompt, and if
      * prompt + output reserve does not fit the resolved window, walk the
@@ -2399,7 +2446,14 @@
            * def.recallBudget still wins. */
           refreshPlan();
           var gated = gateRecall(
-            Object.assign({}, d, { recallBudget: d.recallBudget > 0 ? d.recallBudget : allocRecallBudget() }),
+            /* alloc gate (§14) + M1: an explicit number (including 0 —
+             * live-window pressure says "nothing this turn") is
+             * authoritative; only undefined falls back to the legacy
+             * nominal-window budget. */
+            Object.assign({}, d, {
+              recallBudget: typeof d.recallBudget === 'number'
+                ? d.recallBudget : allocRecallBudget(),
+            }),
             hits, String(task), opts.history || []);
           if (gated.lines.length) {
             for (var gi = 0; gi < gated.ids.length; gi++) {
@@ -2415,6 +2469,13 @@
                              dropped: gated.dropped, budgetCut: gated.budgetCut,
                              scope: d.memory,
                              hits: gated.hits });
+          } else if (gated.budgetCut > 0) {
+            /* M1: recall was gated to nothing by the live-window pressure
+             * — say so, for the trace and the tests. Silent suppression
+             * would be indistinguishable from an empty brain. */
+            emit('recall', { count: 0, dropped: gated.dropped,
+                             budgetCut: gated.budgetCut, scope: d.memory,
+                             hits: [], skipped: 'window' });
           }
         } catch (e) {}
       }

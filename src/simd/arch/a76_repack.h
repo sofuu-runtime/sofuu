@@ -60,6 +60,22 @@ struct tile_block_q4_Kx8 {
     uint8_t scales[96];
     uint8_t qs[1024];
 };
+// T1: q4_K repack-time pre-decoded sub-block scales, as a SEPARATE region
+// (192 B per stock 1152 B block, +16.7% weight bytes) rather than appended
+// to the tile. Measured on Pi 5 (2026-10-15): appending to the tile block
+// cost the decode GEMV -10% (the 192-byte holes break its contiguous
+// stream) while prefill stayed flat; two regions keep the gemv on an
+// unbroken stock layout and give the compute-bound GEMM the section as a
+// second stream. sb_scale holds the col scales as f16 (ints 0..63 — exact)
+// per (sb, half) in col order; sb_min holds the raw widen bytes the decode
+// obtains from its u32 lanes (kernel does the same vmovl_u8 the decode
+// did). All f32 scale products stay < 2^24 (acc lane sums <= ~2^16, scales
+// <= 63, pair sums < 2^23), so the f32-multiply apply chain is
+// bit-identical to the stock int-multiply chain.
+struct tile_ss_q4_Kx8s {
+    __fp16  sb_scale[(QK_K / 64) * 2 * 8];  // 64 f16, group g = sb*2+half
+    uint8_t sb_min[(QK_K / 64) * 2 * 8];    // 64 u8, same order
+};
 struct tile_block_q6_Kx8 {
     uint16_t d[8];
     int8_t scales[QK_K / 16 * 8];
@@ -1550,6 +1566,31 @@ static inline void decode_q_Kx8_6bit_scales(const uint8_t * scales_in, int16x8_t
     memcpy(out_scales, scales_u32, 8);
 }
 #endif
+
+// T1 fill: derive the pre-decoded scale section from an already interleaved
+// stock tile block. Runs the stock 12-byte-group decode once per (subblock,
+// half) so the stored bytes are what the stock kernels' hot loop computes —
+// correctness by construction.
+static inline void fill_q4k_s_block(tile_ss_q4_Kx8s * __restrict out, const tile_block_q4_Kx8 * __restrict in) {
+    for (int g = 0; g < (QK_K / 64) * 2; g++) {
+        int8_t    aux[8];
+        int16x8_t mins;
+        decode_q_Kx8_6bit_scales(&in->scales[g * 12], &mins, aux);
+        __fp16 * sp = out->sb_scale + g * 8;
+        for (int r = 0; r < 8; r++) {
+            // GGML_CPU_FP32_TO_FP16 returns the f16 BIT PATTERN as uint16_t —
+            // must memcpy it into the __fp16 slot (a plain assignment would
+            // value-convert the pattern instead of reinterpreting it).
+            uint16_t bits = ggml_cpu_fp32_to_fp16((float)aux[r]);
+            memcpy(&sp[r], &bits, 2);
+        }
+        vst1_u8(out->sb_min + g * 8, vqmovn_u16(vreinterpretq_u16_s16(mins)));
+    }
+}
+
+void ggml_gemm_q4_K_8x4_q8_K_s(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                               const void * __restrict ss, const void * __restrict vy, int nr, int nc,
+                               const float * in_acc);
 void ggml_gemv_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
 void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc);
 void ggml_gemv_q6_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
@@ -1891,6 +1932,184 @@ void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void 
     }  // for y
     return;
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// ── T1: pre-decoded-scale GEMM (stock tile + separate scale section) ──
+// Same reduction order and accumulator layout as the stock kernel; the
+// 6-bit group unpack is replaced by direct f16/byte scale loads from the
+// ss region (structure comment above). Scale products stay < 2^24 and pair
+// sums < 2^23, so the f32 apply chain is bit-identical to the stock
+// vmulq_s32 chain.
+
+void ggml_gemm_q4_K_8x4_q8_K_s(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                               const void * __restrict ss, const void * __restrict vy, int nr, int nc,
+                               const float * in_acc) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    constexpr int qk = QK_K;
+    const int     nb = n / qk;
+
+    constexpr int q8_k_blocklen = 4;
+    constexpr int acc_size      = 2 * 4;
+    const uint8x16_t m4b        = vdupq_n_u8(0x0f);
+
+    float32x4_t acc_f32[acc_size];
+
+    for (int y = 0; y < nr / q8_k_blocklen; y++) {
+        const tile_block_q8_Kx4 * __restrict    q8_ptr = (const tile_block_q8_Kx4 *) vy + (y * nb);
+        for (int x = 0; x < nc / 8; x++) {
+            const tile_block_q4_Kx8 * __restrict  q4_ptr = (const tile_block_q4_Kx8 *) vx + ((size_t)x * nb);
+            const tile_ss_q4_Kx8s * __restrict    ss_ptr = (const tile_ss_q4_Kx8s *) ss + ((size_t)x * nb);
+
+            for (int i = 0; i < acc_size; i++) {
+                acc_f32[i] = vdupq_n_f32(0);
+            }
+
+            for (int b = 0; b < nb; b++) {
+                float32x4_t q4_d_0123    = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].d));
+                float32x4_t q4_d_4567    = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].d + 4));
+                float32x4_t q8_d_0123    = vld1q_f32(q8_ptr[b].d);
+                float32x4_t q4_dmin_0123 = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].dmin));
+                float32x4_t q4_dmin_4567 = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].dmin + 4));
+
+                float32x4_t sbd_scale_0123[q8_k_blocklen];
+                float32x4_t sbd_scale_4567[q8_k_blocklen];
+                float32x4_t sbd_min_0123[q8_k_blocklen];
+                float32x4_t sbd_min_4567[q8_k_blocklen];
+
+                sbd_scale_0123[0] = vmulq_laneq_f32(q4_d_0123, q8_d_0123, 0);
+                sbd_scale_4567[0] = vmulq_laneq_f32(q4_d_4567, q8_d_0123, 0);
+                sbd_min_0123[0]   = vmulq_laneq_f32(q4_dmin_0123, q8_d_0123, 0);
+                sbd_min_4567[0]   = vmulq_laneq_f32(q4_dmin_4567, q8_d_0123, 0);
+
+                sbd_scale_0123[1] = vmulq_laneq_f32(q4_d_0123, q8_d_0123, 1);
+                sbd_scale_4567[1] = vmulq_laneq_f32(q4_d_4567, q8_d_0123, 1);
+                sbd_min_0123[1]   = vmulq_laneq_f32(q4_dmin_0123, q8_d_0123, 1);
+                sbd_min_4567[1]   = vmulq_laneq_f32(q4_dmin_4567, q8_d_0123, 1);
+
+                sbd_scale_0123[2] = vmulq_laneq_f32(q4_d_0123, q8_d_0123, 2);
+                sbd_scale_4567[2] = vmulq_laneq_f32(q4_d_4567, q8_d_0123, 2);
+                sbd_min_0123[2]   = vmulq_laneq_f32(q4_dmin_0123, q8_d_0123, 2);
+                sbd_min_4567[2]   = vmulq_laneq_f32(q4_dmin_4567, q8_d_0123, 2);
+
+                sbd_scale_0123[3] = vmulq_laneq_f32(q4_d_0123, q8_d_0123, 3);
+                sbd_scale_4567[3] = vmulq_laneq_f32(q4_d_4567, q8_d_0123, 3);
+                sbd_min_0123[3]   = vmulq_laneq_f32(q4_dmin_0123, q8_d_0123, 3);
+                sbd_min_4567[3]   = vmulq_laneq_f32(q4_dmin_4567, q8_d_0123, 3);
+
+                const int16x8_t bsums[q8_k_blocklen] = {
+                    vpaddq_s16(vld1q_s16(q8_ptr[b].bsums + 16 * 0), vld1q_s16(q8_ptr[b].bsums + 16 * 0 + 8)),
+                    vpaddq_s16(vld1q_s16(q8_ptr[b].bsums + 16 * 1), vld1q_s16(q8_ptr[b].bsums + 16 * 1 + 8)),
+                    vpaddq_s16(vld1q_s16(q8_ptr[b].bsums + 16 * 2), vld1q_s16(q8_ptr[b].bsums + 16 * 2 + 8)),
+                    vpaddq_s16(vld1q_s16(q8_ptr[b].bsums + 16 * 3), vld1q_s16(q8_ptr[b].bsums + 16 * 3 + 8)),
+                };
+                int16_t bsums_arr[QK_K / 64][8];
+                for (int q8_row = 0; q8_row < 4; q8_row++) {
+                    vst1q_s16(bsums_arr[q8_row], bsums[q8_row]);
+                }
+
+                int32x4_t bias_acc[acc_size];
+                for (int i = 0; i < acc_size; i++) {
+                    bias_acc[i] = vdupq_n_s32(0);
+                }
+
+                for (int sb = 0; sb < QK_K / 64; sb++) {
+                    int32x4_t acc_lo[acc_size];
+                    int32x4_t acc_hi[acc_size];
+                    for (int i = 0; i < acc_size; i++) {
+                        acc_lo[i] = vdupq_n_s32(0);
+                        acc_hi[i] = vdupq_n_s32(0);
+                    }
+                    const __fp16 * sbp = ss_ptr[b].sb_scale + (size_t)sb * 16;
+                    const float32x4_t sc_h0_0123 = vcvt_f32_f16(vld1_f16(sbp));
+                    const float32x4_t sc_h0_4567 = vcvt_f32_f16(vld1_f16(sbp + 4));
+                    const float32x4_t sc_h1_0123 = vcvt_f32_f16(vld1_f16(sbp + 8));
+                    const float32x4_t sc_h1_4567 = vcvt_f32_f16(vld1_f16(sbp + 12));
+                    const int16x8_t   mins_h0    = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ss_ptr[b].sb_min + (size_t)sb * 16)));
+                    const int16x8_t   mins_h1    = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ss_ptr[b].sb_min + (size_t)sb * 16 + 8)));
+
+                    constexpr int reads_per_sb = 8;
+                    for (int k = 0; k < reads_per_sb; k++) {
+                        const int8x16_t q8_blk0 = vld1q_s8(q8_ptr[b].qs + sb * 256 + 16 * k);
+                        const int8x16_t q8_blk1 = vld1q_s8(q8_ptr[b].qs + sb * 256 + 16 * k + 128);
+
+                        const uint8x16_t q4_0123 = vld1q_u8(q4_ptr[b].qs + sb * QK_K + 32 * k);
+                        const uint8x16_t q4_4567 = vld1q_u8(q4_ptr[b].qs + sb * QK_K + 32 * k + 16);
+
+                        const int8x16_t q4_0123_lo = vreinterpretq_s8_u8(vandq_u8(q4_0123, m4b));
+                        const int8x16_t q4_0123_hi = vreinterpretq_s8_u8(vshrq_n_u8(q4_0123, 4));
+
+                        acc_lo[0] = vdotq_laneq_s32(acc_lo[0], q4_0123_lo, q8_blk0, 0);
+                        acc_lo[1] = vdotq_laneq_s32(acc_lo[1], q4_0123_lo, q8_blk0, 1);
+                        acc_lo[2] = vdotq_laneq_s32(acc_lo[2], q4_0123_lo, q8_blk0, 2);
+                        acc_lo[3] = vdotq_laneq_s32(acc_lo[3], q4_0123_lo, q8_blk0, 3);
+
+                        acc_hi[0] = vdotq_laneq_s32(acc_hi[0], q4_0123_hi, q8_blk1, 0);
+                        acc_hi[1] = vdotq_laneq_s32(acc_hi[1], q4_0123_hi, q8_blk1, 1);
+                        acc_hi[2] = vdotq_laneq_s32(acc_hi[2], q4_0123_hi, q8_blk1, 2);
+                        acc_hi[3] = vdotq_laneq_s32(acc_hi[3], q4_0123_hi, q8_blk1, 3);
+
+                        const int8x16_t q4_4567_lo = vreinterpretq_s8_u8(vandq_u8(q4_4567, m4b));
+                        const int8x16_t q4_4567_hi = vreinterpretq_s8_u8(vshrq_n_u8(q4_4567, 4));
+
+                        acc_lo[4] = vdotq_laneq_s32(acc_lo[4], q4_4567_lo, q8_blk0, 0);
+                        acc_lo[5] = vdotq_laneq_s32(acc_lo[5], q4_4567_lo, q8_blk0, 1);
+                        acc_lo[6] = vdotq_laneq_s32(acc_lo[6], q4_4567_lo, q8_blk0, 2);
+                        acc_lo[7] = vdotq_laneq_s32(acc_lo[7], q4_4567_lo, q8_blk0, 3);
+
+                        acc_hi[4] = vdotq_laneq_s32(acc_hi[4], q4_4567_hi, q8_blk1, 0);
+                        acc_hi[5] = vdotq_laneq_s32(acc_hi[5], q4_4567_hi, q8_blk1, 1);
+                        acc_hi[6] = vdotq_laneq_s32(acc_hi[6], q4_4567_hi, q8_blk1, 2);
+                        acc_hi[7] = vdotq_laneq_s32(acc_hi[7], q4_4567_hi, q8_blk1, 3);
+                    }
+
+                    for (int row = 0; row < q8_k_blocklen; row++) {
+                        const float32x4_t sumf_0123 =
+                            vaddq_f32(vmulq_f32(sc_h0_0123, vcvtq_f32_s32(acc_lo[row])),
+                                      vmulq_f32(sc_h1_0123, vcvtq_f32_s32(acc_hi[row])));
+                        acc_f32[2 * row] = vfmaq_f32(acc_f32[2 * row], sbd_scale_0123[row], sumf_0123);
+
+                        const float32x4_t sumf_4567 =
+                            vaddq_f32(vmulq_f32(sc_h0_4567, vcvtq_f32_s32(acc_lo[row + 4])),
+                                      vmulq_f32(sc_h1_4567, vcvtq_f32_s32(acc_hi[row + 4])));
+                        acc_f32[2 * row + 1] = vfmaq_f32(acc_f32[2 * row + 1], sbd_scale_4567[row], sumf_4567);
+
+                        const int16x4_t bsums_vec_lo = vdup_n_s16(bsums_arr[sb][row * 2]);
+                        const int16x4_t bsums_vec_hi = vdup_n_s16(bsums_arr[sb][row * 2 + 1]);
+
+                        bias_acc[2 * row] = vmlal_s16(bias_acc[2 * row], bsums_vec_lo, vget_low_s16(mins_h0));
+                        bias_acc[2 * row] = vmlal_s16(bias_acc[2 * row], bsums_vec_hi, vget_low_s16(mins_h1));
+
+                        bias_acc[2 * row + 1] =
+                            vmlal_s16(bias_acc[2 * row + 1], bsums_vec_lo, vget_high_s16(mins_h0));
+                        bias_acc[2 * row + 1] =
+                            vmlal_s16(bias_acc[2 * row + 1], bsums_vec_hi, vget_high_s16(mins_h1));
+                    }
+                }  // for sb
+
+                for (int row = 0; row < q8_k_blocklen; row++) {
+                    acc_f32[2 * row] = vmlsq_f32(acc_f32[2 * row], vcvtq_f32_s32(bias_acc[2 * row]), sbd_min_0123[row]);
+                    acc_f32[2 * row + 1] =
+                        vmlsq_f32(acc_f32[2 * row + 1], vcvtq_f32_s32(bias_acc[2 * row + 1]), sbd_min_4567[row]);
+                }
+            }  // for b
+
+            for (int i = 0; i < q8_k_blocklen; i++) {
+                int row = y * q8_k_blocklen + i;
+                for (int j = 0; j < 2; j++) {
+                    int col    = x * 8 + j * 4;
+                    int offset = row * bs + col;
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
+                }
+            }
+        }  // for x
+    }  // for y
+    return;
+#endif
     ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }
 

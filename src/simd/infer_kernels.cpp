@@ -350,11 +350,13 @@ struct sofuu_tile_entry {
     std::vector<uint8_t> data;
     std::vector<uint8_t> sc;   // q4_K decoded-scale sidecar (tile_sc_q4_Kx8 per block)
     std::vector<uint8_t> data_p;  // q4_K nibble-plane tile (tile_block_q4_Kx8p per block)
+    std::vector<uint8_t> data_s;  // q4_K pre-decoded scale section (tile_ss_q4_Kx8s per block)
     unsigned type;
     size_t rows, cols;
     uint64_t fp;
     bool has_sc = false;
     bool has_p = false;
+    bool has_s = false;
 };
 static std::mutex g_tile_mutex;
 static std::unordered_map<const void *, sofuu_tile_entry> g_tile_map;
@@ -419,10 +421,42 @@ static bool nibble_planes_auto(size_t rows, size_t cols) {
     }
 }
 
+// T1 (2026-10-15): repack-time pre-decoded sub-block scales for q4_K, as a
+// separate 192 B/block region the prefill GEMM loads beside the stock tile
+// (bit-exact; +65% kernel GMAC/s on the Qwen FFN shape, +16.7% tile bytes).
+// The decode GEMV never reads the region, so its bandwidth path is
+// untouched. Default ON; `SOFUU_Q4_SS=0` kills it. Per-tensor cap 16M elems,
+// global budget `SOFUU_Q4_SS_MB` (default 768 MB).
+static bool q4_ss_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("SOFUU_Q4_SS");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return v;
+}
+static bool q4_ss_eligible(size_t rows, size_t cols) {
+    return q4_ss_enabled() && rows * cols <= (size_t)16 << 20;
+}
+static bool q4_ss_admit(size_t rows, size_t cols) {
+    if (!q4_ss_eligible(rows, cols)) return false;
+    static std::atomic<size_t> used{0};
+    const size_t need = (rows * cols) / 256 * 192;
+    static const size_t budget = [] {
+        const char * e = getenv("SOFUU_Q4_SS_MB");
+        return e ? (size_t)strtoull(e, nullptr, 10) << 20 : (size_t)768 << 20;
+    }();
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
+}
+
 extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned type) {
     if (getenv("SOFUU_NO_TILES")) return -1; // runtime kill-switch
     bool aligned;
     const bool want_sc = (type == 12) && (scale_sidecar_disabled_state() == 0);
+    const bool want_s = (type == 12) && q4_ss_eligible(rows, cols) && rows % 8 == 0 && cols % 256 == 0;
     if (type == 12 || type == 14) aligned = (rows % 8 == 0 && cols % 256 == 0);
     else if (type == 8) aligned = (rows % 4 == 0 && cols % 32 == 0);
     else return -1;
@@ -432,7 +466,8 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
         std::lock_guard<std::mutex> lk(g_tile_mutex);
         auto it = g_tile_map.find(w);
         if (it != g_tile_map.end() && it->second.type == type && it->second.rows == rows &&
-            it->second.cols == cols && it->second.fp == fp && it->second.has_sc == want_sc) return 0;
+            it->second.cols == cols && it->second.fp == fp && it->second.has_sc == want_sc &&
+            it->second.has_s == want_s) return 0;
     }
     sofuu_tile_entry e;
     e.type = type; e.rows = rows; e.cols = cols; e.fp = fp;
@@ -469,6 +504,24 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
             e.has_p = true;
         }
 #if defined(__ARM_FEATURE_DOTPROD)
+        if (want_s && q4_ss_admit(rows, cols)) {
+            static_assert(sizeof(tile_ss_q4_Kx8s) == 192, "q4_K ss-region layout drift");
+            const size_t n_blk = (size_t)r8 * nb;
+            e.data_s.resize(n_blk * sizeof(tile_ss_q4_Kx8s));
+            tile_ss_q4_Kx8s *         outs = (tile_ss_q4_Kx8s *)e.data_s.data();
+            const tile_block_q4_Kx8 * ins  = (const tile_block_q4_Kx8 *)e.data.data();
+            auto fill_s = [=](size_t i0, size_t i1) {
+                for (size_t i = i0; i < i1; i++) {
+                    fill_q4k_s_block(&outs[i], &ins[i]);
+                }
+            };
+            if (n_blk >= 16) {
+                g_pool.parallel_for(0, n_blk, fill_s);
+            } else {
+                fill_s(0, n_blk);
+            }
+            e.has_s = true;
+        }
         if (want_sc) {
             static_assert(sizeof(tile_sc_q4_Kx8) == 384, "q4_K sidecar layout drift");
             const size_t n_blk = e.data.size() / sizeof(tile_block_q4_Kx8);
@@ -559,6 +612,24 @@ static const uint8_t * sofuu_tile_lookup_p(const void *w, size_t rows, size_t co
     if (it == g_tile_map.end()) return nullptr;
     const sofuu_tile_entry &e = it->second;
     if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_p) return e.data_p.data();
+    return nullptr;
+}
+
+// T1 pre-decoded-scale section (tile_ss_q4_Kx8s region). Present when warm
+// admitted this tensor under SOFUU_Q4_SS gates; the GEMM takes it as a second
+// stream beside the stock tile. *tile_out receives the stock tile pointer
+// (null when no s-entry exists — callers fall back).
+static const uint8_t * sofuu_tile_lookup_s(const void *w, size_t rows, size_t cols, const uint8_t **tile_out) {
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    *tile_out = nullptr;
+    auto it = g_tile_map.find(w);
+    if (it == g_tile_map.end()) return nullptr;
+    const sofuu_tile_entry &e = it->second;
+    if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_s) {
+        *tile_out = e.data.data();
+        return e.data_s.data();
+    }
     return nullptr;
 }
 
@@ -2332,6 +2403,47 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
             }
             return 0;
         }
+        const uint8_t *ss = nullptr;
+        const uint8_t *stile = sofuu_tile_lookup_s(weight_bytes, rows, cols, &ss);
+        if (stile != nullptr && ss != nullptr) {
+            const size_t nb = cols / 256;
+            const size_t g4n = tile_batch / 4;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
+            const float *gr = x;
+            if (tile_batch != batch_size) {
+                float *p = tile_scratch<float>(tile_batch * cols);
+                std::memset(p, 0, tile_batch * cols * sizeof(float));
+                std::memcpy(p, x, batch_size * cols * sizeof(float));
+                gr = p;
+            }
+            if (g4n >= 2) {
+                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                    for (size_t g4 = a; g4 < b; ++g4) {
+                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                    }
+                });
+            } else {
+                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
+            }
+            float *out_dst = out;
+            if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    const uint8_t *t   = stile + g * nb * sizeof(tile_block_q4_Kx8);
+                    const uint8_t *ssg = ss + g * nb * sizeof(tile_ss_q4_Kx8s);
+                    ggml_gemm_q4_K_8x4_q8_K_s(cols, out_dst + g * 8, rows, t, ssg, qa_ptr, tile_batch, 8, acc_k);
+                }
+            });
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
+        }
         const uint8_t *sc = nullptr;
         if (const uint8_t *tile = sofuu_tile_lookup_sc(weight_bytes, 12, rows, cols, &sc)) {
             const size_t nb = cols / 256;
@@ -3829,19 +3941,33 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
                 ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
             }
             t1 = std::chrono::steady_clock::now();
+            t_quant += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto tk = std::chrono::steady_clock::now();
             const uint8_t *sc = nullptr;
-            const uint8_t *tile = sofuu_tile_lookup_sc(w.data(), 12, rows, cols, &sc);
-            g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
-                for (size_t g = g0; g < g1; ++g) {
-                    const uint8_t *t = tile + g * nb * sizeof(tile_block_q4_Kx8);
-                    if (sc) {
-                        ggml_gemm_q4_K_8x4_q8_K_sc(cols, out.data() + g * 8, rows, t, qa, batch, 8,
-                            sc + g * nb * sizeof(tile_sc_q4_Kx8), nullptr);
-                    } else {
-                        ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows, t, qa, batch, 8, nullptr);
+            const uint8_t *ss = nullptr;
+            const uint8_t *stile = sofuu_tile_lookup_s(w.data(), rows, cols, &ss);
+            if (stile != nullptr && ss != nullptr) {
+                g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+                    for (size_t g = g0; g < g1; ++g) {
+                        ggml_gemm_q4_K_8x4_q8_K_s(cols, out.data() + g * 8, rows,
+                            stile + g * nb * sizeof(tile_block_q4_Kx8),
+                            ss + g * nb * sizeof(tile_ss_q4_Kx8s), qa, batch, 8, nullptr);
                     }
-                }
-            });
+                });
+            } else if (const uint8_t *tile = sofuu_tile_lookup_sc(w.data(), 12, rows, cols, &sc)) {
+                g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+                    for (size_t g = g0; g < g1; ++g) {
+                        const uint8_t *t = tile + g * nb * sizeof(tile_block_q4_Kx8);
+                        if (sc) {
+                            ggml_gemm_q4_K_8x4_q8_K_sc(cols, out.data() + g * 8, rows, t, qa, batch, 8,
+                                sc + g * nb * sizeof(tile_sc_q4_Kx8), nullptr);
+                        } else {
+                            ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows, t, qa, batch, 8, nullptr);
+                        }
+                    }
+                });
+            }
+            t_kernel += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk).count();
         } else {
             const size_t nb = cols / 32;
             tile_block_q8_0x4 *qa = tile_scratch<tile_block_q8_0x4>((batch / 4) * nb);
@@ -3849,6 +3975,8 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
                 ggml_quantize_mat_q8_0_4x4(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
             }
             t1 = std::chrono::steady_clock::now();
+            t_quant += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto tk = std::chrono::steady_clock::now();
             const uint8_t *tile = sofuu_tile_lookup(w.data(), 8, rows, cols);
             g_pool.parallel_for(0, rows / 4, [&](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
@@ -3856,23 +3984,25 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
                         tile + g * nb * sizeof(tile_block_q8_0x4), qa, batch, 4, nullptr);
                 }
             });
+            t_kernel += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk).count();
         }
-        auto t2 = std::chrono::steady_clock::now();
-        t_quant += std::chrono::duration<double, std::milli>(t1 - t0).count();
-        t_kernel += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
     const double macs = (double)batch * rows * cols * iters;
-    fprintf(stderr,
-        "[bench] %s %dx%d batch=%d iters=%d: quant %.1fms (%.2fms/iter) | kernel %.1fms (%.2fms/iter) = %.1f GMAC/s | quant share %.1f%%\n",
-        qk ? "q4_K" : "q8_0", rows, cols, batch, iters,
-        t_quant, t_quant / iters, t_kernel, t_kernel / iters,
-        macs / (t_kernel * 1e6), 100.0 * t_quant / (t_quant + t_kernel));
+    const double it = (double)iters;
+    if (qk) {
+        fprintf(stderr, "[bench] q4_K %dx%d batch=%d iters=%d: quant %.1fms (%.2fms/iter) | kernel %.1fms (%.2fms/iter) = %.1f GMAC/s | quant share %.1f%%\n",
+                rows, cols, batch, iters, t_quant, t_quant / it, t_kernel, t_kernel / it,
+                macs / (t_kernel * 1e6), 100.0 * t_quant / (t_quant + t_kernel));
+    } else {
+        fprintf(stderr, "[bench] q8_0 %dx%d batch=%d iters=%d: quant %.1fms (%.2fms/iter) | kernel %.1fms (%.2fms/iter) = %.1f GMAC/s | quant share %.1f%%\n",
+                rows, cols, batch, iters, t_quant, t_quant / it, t_kernel, t_kernel / it,
+                macs / (t_kernel * 1e6), 100.0 * t_quant / (t_quant + t_kernel));
+    }
+#else
+    (void) type; (void) rows; (void) cols; (void) batch; (void) iters;
 #endif
 }
 
-// ── Parity test: NEON q8_K 4x4 quantizer must be bit-identical to the
-// scalar generic (qs bytes, d floats, bsums). Deterministic mixed-magnitude
-// activations including negative amax signs and zero rows.
 extern "C" int sofuu_test_quant_q8_K_parity(int cols, int iters) {
 #if defined(__aarch64__)
     if (cols % 256 != 0 || iters < 1) return -1;
@@ -3966,6 +4096,71 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
 // ── Parity test: the nibble-plane q4_K GEMM must be bit-identical to the
 // packed kernel on deterministic synthetic weights + activations (a few
 // activation rounds incl. zeros and mixed magnitudes).
+// ── Parity: the T1 pre-decoded-scale GEMM (stock tile + ss region) must be
+// bit-identical to the stock packed-tile kernel — the reorganization only
+// replaces the 6-bit group unpack and moves the scale multiply to the f32
+// pipe where every product is exact (see tile_ss_q4_Kx8s comment). ──
+extern "C" int sofuu_test_q4_k_s_bit_exact(int rows, int cols, int batch) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+    if (rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;
+    const size_t nb = cols / 256;
+    const size_t r8 = rows / 8;
+    std::vector<uint8_t> wsrc((size_t)rows * nb * 144);
+    std::vector<uint8_t> wpack(r8 * nb * sizeof(tile_block_q4_Kx8));
+    std::vector<uint8_t> ws(r8 * nb * sizeof(tile_ss_q4_Kx8s));
+    uint32_t rng = 90210;
+    for (auto &b : wsrc) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    sofuu_repack_q4k_8bl(wpack.data(), wsrc.data(), rows, nb, 4);
+    {
+        const tile_block_q4_Kx8 * ins = (const tile_block_q4_Kx8 *)wpack.data();
+        tile_ss_q4_Kx8s *         outs = (tile_ss_q4_Kx8s *)ws.data();
+        for (size_t i = 0; i < (size_t)r8 * nb; ++i) {
+            fill_q4k_s_block(&outs[i], &ins[i]);
+        }
+    }
+    std::vector<float> x((size_t)batch * cols);
+    for (int it = 0; it < 3; ++it) {
+        for (auto &v : x) {
+            rng = rng * 1664525u + 1013904223u;
+            v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f;
+            if ((rng & 7) == 0) v = 0.0f;
+        }
+        std::vector<tile_block_q8_Kx4> qa((batch / 4) * nb);
+        for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+            ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa.data() + g4 * nb, cols);
+        }
+        for (int mode = 0; mode < 2; ++mode) {
+            std::vector<float> oa((size_t)batch * rows, -1e30f), os((size_t)batch * rows, -1e30f);
+            for (size_t g = 0; g < r8; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K(cols, oa.data() + g * 8, rows,
+                    wpack.data() + g * nb * sizeof(tile_block_q4_Kx8), qa.data(), batch, 8,
+                    mode ? oa.data() : nullptr);
+            }
+            for (size_t g = 0; g < r8; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K_s(cols, os.data() + g * 8, rows,
+                    wpack.data() + g * nb * sizeof(tile_block_q4_Kx8),
+                    ws.data() + g * nb * sizeof(tile_ss_q4_Kx8s), qa.data(), batch, 8,
+                    mode ? os.data() : nullptr);
+            }
+            if (memcmp(oa.data(), os.data(), oa.size() * sizeof(float)) != 0) {
+                for (size_t i = 0; i < oa.size(); ++i) {
+                    if (memcmp(&oa[i], &os[i], sizeof(float)) != 0) {
+                        fprintf(stderr, "[parity-s gemm m%d] iter %d: out[%zu] %.9g vs %.9g\n",
+                                mode, it, i, oa[i], os[i]);
+                        return 1;
+                    }
+                }
+                return 2;
+            }
+        }
+    }
+    return 0;
+#else
+    (void) rows; (void) cols; (void) batch;
+    return 0;
+#endif
+}
+
 extern "C" int sofuu_test_gemm_q4_k_plane_parity(int rows, int cols, int batch) {
 #if defined(__aarch64__)
     if (rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;

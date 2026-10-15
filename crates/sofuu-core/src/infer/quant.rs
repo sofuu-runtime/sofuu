@@ -285,6 +285,12 @@ pub fn gemm_plane_parity(rows: usize, cols: usize, batch: usize) -> i32 {
     unsafe { sofuu_test_gemm_q4_k_plane_parity(rows as i32, cols as i32, batch as i32) }
 }
 
+/// Bit-parity gate for the T1 pre-decoded-scale tiles (gemm_s) vs the
+/// stock packed-tile kernel. Returns 0 when outputs are bit-identical.
+pub fn gemm_q4_s_parity(rows: usize, cols: usize, batch: usize) -> i32 {
+    unsafe { sofuu_test_q4_k_s_bit_exact(rows as i32, cols as i32, batch as i32) }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -419,6 +425,7 @@ extern "C" {
     fn sofuu_bench_gemm_plane(rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_test_quant_q8_K_parity(cols: i32, iters: i32) -> i32;
     fn sofuu_test_gemm_q4_k_plane_parity(rows: i32, cols: i32, batch: i32) -> i32;
+    fn sofuu_test_q4_k_s_bit_exact(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
@@ -1830,6 +1837,19 @@ mod tests {
         for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
             let r = gemm_plane_parity(rows, cols, 8);
             assert_eq!(r, 0, "nibble-plane q4_K GEMM diverged at {rows}x{cols}");
+        }
+    }
+
+    /// The T1 pre-decoded-scale GEMM (gemm_s over the stock tile + ss
+    /// section) must be bit-identical to the stock packed-tile kernel: the
+    /// reorganization replaces the 6-bit group unpack with repack-time
+    /// loads and moves the sub-block scale multiply to the f32 pipe, where
+    /// every product is exact.
+    #[test]
+    fn test_gemm_q4_k_s_tiles_bit_exact() {
+        for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
+            let r = gemm_q4_s_parity(rows, cols, 8);
+            assert_eq!(r, 0, "pre-decoded-scale q4_K tiles diverged at {rows}x{cols}");
         }
     }
 

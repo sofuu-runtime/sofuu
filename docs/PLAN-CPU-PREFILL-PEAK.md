@@ -40,7 +40,19 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
 - Risk: low. All inside `lfm2.rs`. No flag needed (bit-parity not claimed —
       RMS gates stay).
 
-#> **DEFAULTS UPDATE 2026-10-15:** the ladders are the standing behavior, not experiments —
+#> **ALL-ARCH LEDGER 2026-10-15:** the ladder is crate plumbing, not an lfm2 detail —
+> `lfm2::accelerate` (cblas/AMX) and `lfm2::blas_enabled()` are `pub(crate)` for every
+> backend. Ports owed, in order:
+> (1) block_graph + gptx3 (same owner): their `forward_prefill_batch` still loops
+>     forward_impl per token — port = lfm2-Phase-0/1 recipe (batch activation buffers,
+>     dequant-once row panels, `WeightMatrix::gemm_batched` on the AMX dispatch, chunked
+>     attention/state glue), then the same RMS/bit gates.
+> (2) GGUF + Spark (peer prefill-tile lane): route their tiles through the same ladder
+>     (AMX default-on + L2-fit working set) instead of a parallel kernel stack.
+> (3) Cross-arch conformance battery in CI: one accuracy + one speed gate per backend,
+>     so future kernels cannot silently regress an untested arch.
+
+> **DEFAULTS UPDATE 2026-10-15:** the ladders are the standing behavior, not experiments —
 > AMX-on-macOS default-on (exact-f32, `SOFUU_PREFILL_BLAS=0` to opt out), 27B direct tile
 > default-on (bit-identical, `SOFUU_T143_DIRECT=0` to opt out), int8 two-sided stays
 > opt-in (`SOFUU_PRE8=1`) for non-AMX aarch64. Same contract for every backend: batched

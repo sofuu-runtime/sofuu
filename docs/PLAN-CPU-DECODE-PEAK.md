@@ -106,6 +106,18 @@ acceptance of truncated-model drafts vs the full model on real prompts
 does not clear break-even with margin, this phase closes with the receipt
 recorded.
 
+**GATE RESULT (2026-10-15, 0c5e7e696): the plain truncated-layer variant is
+CLOSED.** Mechanism shipped (`draft_layers` in lfm2.rs, per-token + batched,
+shared mmap; ignore-tagged `spec_self_draft_acceptance_study`). Receipt on
+liquid-1.3B (30 layers, k=4, 48 cycles): depth 22/30 α
+0.60/0.29/0.02/0.00 (accepted 0.9/cycle); shallower depths worse to zero.
+Sweep math: even natural-text acceptance nets ~1.7× slower than plain
+decode — every draft token sweeps p of every byte. **Live branch within
+D1b: zero-sweep proposals** — n-gram/Lookahead drafting (sketched in
+`infer/lookahead.rs`) proposes at 0 sweeps, so verify = 1 sweep per up-to-k
+candidates and tokens/sweep = accepted+1, quality unchanged; needs only
+tree-attention verify wiring. Medusa/EAGLE heads need training, out of scope.
+
 ## Phase D2 — megakernel fused decode layer (walls 1+3)
 
 - **Expected: the 20–30%-of-ceiling models (liquid, gemma, 0.6B) to 50–70% of

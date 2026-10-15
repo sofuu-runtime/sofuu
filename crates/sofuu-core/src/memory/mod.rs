@@ -9,3 +9,7 @@ pub mod recall_eval;
 /// floor every brain change is gated on).
 #[cfg(test)]
 pub mod invariant_test;
+/// Brain Core II M2: the decay survival harness (weekly-use twins,
+/// reinforcement growth caps, the DeathLedger).
+#[cfg(test)]
+pub mod decay_eval;

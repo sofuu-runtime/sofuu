@@ -105,6 +105,11 @@ pub struct Record {
     /// Where the memory came from ("chat", "agent:researcher", "pin", …).
     /// Empty = unknown.
     pub source: String,
+    /// M2 (Brain Core II): why this row died, once it is a tombstone
+    /// ("forget" — the user asked; "consolidated" — folded into a semantic
+    /// summary). Physically pruned rows live in the DeathLedger instead.
+    /// None = alive (and None never enters a brain card).
+    pub death_reason: Option<String>,
 }
 
 /// B1.2: unix seconds, saturating at u32 (the same width the page index
@@ -159,7 +164,48 @@ impl Record {
             created_at: now_secs(),
             last_recalled_at: 0,
             source: String::new(),
+            death_reason: None,
         }
+    }
+}
+
+/// M2 (Brain Core II): the DeathLedger — a persisted ring of every record
+/// physically pruned from this store, with WHY it died. A decayed fact the
+/// user later hunts for ("where did that note about X go?") deserves an
+/// answer, not silence: "decayed below the recall floor on 2026-10-16" is
+/// the difference between a brain and a black hole. Tombstones keep theirs
+/// inline (`Record.death_reason`); rows retain() physically drops — where
+/// no record survives to carry the field — land here.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeathEntry {
+    pub text: String,
+    pub reason: String,
+    pub at: u64,
+}
+
+/// The ledger keeps the most recent 256 deaths (a brain's distant past is
+/// exactly the part nobody asks about; the list is diagnostics, not an
+/// archive).
+pub const DEATH_LEDGER_CAP: usize = 256;
+
+/// M2: positive reinforcement buys decay tolerance. Each use at least
+/// DOUBLES an episodic row's half-life (never less than +2 days — the SM-2
+/// insight that interval growth, not a fixed multiplier, is what keeps a
+/// cadence alive): the first use buys 3 days (a weekly cadence dips only
+/// to exp(-7/3) ≈ 0.096, safely above the 0.05 floor, where the untouched
+/// 1-day curve dies at exp(-7) ≈ 0.0009), and repeated use converges at
+/// the tier cap — never sturdier than the semantic curve.
+pub const EPISODIC_HALF_LIFE_CAP: u32 = 86400 * 30;
+
+/// Semantic-tier growth cap (M2): semantic rows growth toward quarterly
+/// decay, not immortality — entities (1-year) stay the durable tier.
+pub const SEMANTIC_HALF_LIFE_CAP: u32 = 86400 * 90;
+
+fn half_life_cap_for(tier: u8) -> u32 {
+    if tier == TIER_EPISODIC {
+        EPISODIC_HALF_LIFE_CAP
+    } else {
+        SEMANTIC_HALF_LIFE_CAP
     }
 }
 
@@ -230,6 +276,10 @@ pub struct Cma {
     /// B6: monotonically increasing working-id sequence (eviction must not
     /// renumber ids a caller still holds).
     working_next_seq: u32,
+    /// M2: the DeathLedger — why records physically pruned from this store
+    /// died. Persisted as a top-level "deaths" array in the metadata (old
+    /// files without it hydrate empty), newest last, capped.
+    pub deaths: Vec<DeathEntry>,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -272,6 +322,10 @@ struct RecordJson {
     last_recalled_at: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     source: String,
+    // M2 (Brain Core II) — why a tombstone died. Optional everywhere: old
+    // files lack it, alive records never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    death_reason: Option<String>,
 }
 
 fn default_half_life() -> u32 {
@@ -290,6 +344,7 @@ impl Cma {
             diversity_floor: Some(DIVERSITY_FLOOR_DEFAULT),
             working: Vec::new(),
             working_next_seq: 0,
+            deaths: Vec::new(),
         }
     }
 
@@ -468,14 +523,16 @@ impl Cma {
             return false;
         }
         // The brain-file metadata is {"records":[...]} — the same shape the
-        // C cma_flush wrote.
-        let records: Vec<RecordJson> = match serde_json::from_str::<serde_json::Value>(meta_json) {
-            Ok(v) => match v.get("records").and_then(|r| serde_json::from_value(r.clone()).ok()) {
-                Some(r) => r,
-                None => return false,
-            },
+        // C cma_flush wrote (M2: plus an optional top-level "deaths").
+        let meta: serde_json::Value = match serde_json::from_str(meta_json) {
+            Ok(v) => v,
             Err(_) => return false,
         };
+        let records: Vec<RecordJson> =
+            match meta.get("records").and_then(|r| serde_json::from_value(r.clone()).ok()) {
+                Some(r) => r,
+                None => return false,
+            };
         for i in 0..n {
             self.index.add_vector(&vecs[i * dim..(i + 1) * dim]);
             let mut rec = Record::new(i as u32, "", "", 0);
@@ -502,10 +559,20 @@ impl Cma {
                 rec.created_at = rj.created_at;
                 rec.last_recalled_at = rj.last_recalled_at;
                 rec.source = rj.source.clone();
+                rec.death_reason = rj.death_reason.clone();
             } else {
                 rec.text = "(corrupt record)".to_string();
             }
             self.records.push(rec);
+        }
+        /* M2: the DeathLedger rides beside the records (old files without
+         * it hydrate an empty ledger). Ring-capped on READ too, so a
+         * hand-edited or hostile file cannot balloon it. */
+        if let Some(d) = meta.get("deaths").and_then(|x| serde_json::from_value::<Vec<DeathEntry>>(x.clone()).ok()) {
+            self.deaths = d;
+            if self.deaths.len() > DEATH_LEDGER_CAP {
+                self.deaths = self.deaths.split_off(self.deaths.len() - DEATH_LEDGER_CAP);
+            }
         }
         true
     }
@@ -540,9 +607,14 @@ impl Cma {
                 created_at: r.created_at,
                 last_recalled_at: r.last_recalled_at,
                 source: r.source.clone(),
+                death_reason: r.death_reason.clone(),
             })
             .collect();
-        serde_json::json!({ "records": arr })
+        let mut doc = serde_json::json!({ "records": arr });
+        if !self.deaths.is_empty() {
+            doc["deaths"] = serde_json::to_value(&self.deaths).unwrap_or(serde_json::Value::Null);
+        }
+        doc
     }
 
     /// KV hints: the distinct kv_page_ids of the top-n nearest memories.
@@ -570,7 +642,16 @@ impl Cma {
                 {
                     let rec = &mut self.records[id as usize];
                     rec.strength = 1.0;
-                    rec.half_life = (rec.half_life as f32 * 1.2) as u32;
+                    /* M2: growth under the tier cap, like mark_positive —
+                     * the old ×1.2 here was unbounded (a hot KV row could
+                     * reach a thousand-day half-life). */
+                    if rec.half_life > 0 {
+                        let cap = half_life_cap_for(rec.tier);
+                        if rec.half_life < cap {
+                            let grown = ((rec.half_life as f32) * 1.2) as u32;
+                            rec.half_life = rec.half_life.max(grown.min(cap));
+                        }
+                    }
                 }
                 self.mark_dirty(id);
                 out.push(kv);
@@ -633,6 +714,9 @@ impl Cma {
                     "total_recalls": r.total_recalls,
                     "positive_recalls": r.positive_recalls,
                     "kv_page_id": r.kv_page_id,
+                    /* M2: present on tombstones (why they died); absent on
+                     * living rows. */
+                    "death_reason": r.death_reason,
                 })
             })
             .collect();
@@ -1060,7 +1144,12 @@ impl Cma {
         }
     }
 
-    /// Mark memories as positively reinforced (user continued).
+    /// Mark memories as positively reinforced (user continued). M2: the
+    /// counters move (strength untouched — I7), and the row's half-life
+    /// doubles (≥ +2 days) — recognition buys decay tolerance: a memory
+    /// the user keeps re-engaging survives its own absences instead of
+    /// dying between uses. Growth caps at the tier's curve (episodic
+    /// 30 d, semantic 90 d — entities need no help).
     pub fn mark_positive(&mut self, ids: &[u32]) -> u32 {
         let mut marked = 0;
         for &id in ids {
@@ -1068,6 +1157,16 @@ impl Cma {
                 if rec.positive_recalls < 65535 {
                     rec.positive_recalls += 1;
                     marked += 1;
+                }
+                if rec.half_life > 0 {
+                    let cap = half_life_cap_for(rec.tier);
+                    if rec.half_life < cap {
+                        let doubled = rec.half_life.saturating_mul(2);
+                        let stepped = rec.half_life.saturating_add(86400 * 2);
+                        let grown = doubled.max(stepped).min(cap);
+                        rec.half_life = rec.half_life.max(grown);
+                        self.mark_dirty(id);
+                    }
                 }
             }
             if (id as usize) < self.records.len() {
@@ -1080,11 +1179,27 @@ impl Cma {
     pub fn forget(&mut self, id: u32) -> bool {
         if let Some(rec) = self.records.get_mut(id as usize) {
             rec.tier = TIER_FORGOTTEN;
+            rec.death_reason = Some("forget".to_string());
             self.mark_dirty(id);
             true
         } else {
             false
         }
+    }
+
+    /// M2: record a physical death in the ledger (retain paths; the record
+    /// itself is about to vanish, so the ring is the only witness). Newest
+    /// last, ring-capped.
+    fn ledger_death(&mut self, text: &str, reason: &str) {
+        if self.deaths.len() >= DEATH_LEDGER_CAP {
+            self.deaths.remove(0);
+        }
+        self.deaths.push(DeathEntry {
+            text: text.chars().take(200).collect(),
+            reason: reason.to_string(),
+            at: now_secs() as u64,
+        });
+        self.layout_dirty = true;
     }
 
     /// M3 (PLAN-MEMORY-TOKENS): physically drop dead records so RAM and
@@ -1113,13 +1228,27 @@ impl Cma {
         let mut kept_records: Vec<Record> = Vec::with_capacity(before);
         let mut kept_vectors: Vec<Vec<f32>> = Vec::with_capacity(before);
         let mut remap: HashMap<u32, u32> = HashMap::new();
+        /* Deaths are collected during the drain and ledged after — the
+         * ledger borrows self mutably, and the drain already does. */
+        let mut dead_notes: Vec<(String, String)> = Vec::new();
         for rec in self.records.drain(..) {
             if is_dead(&rec) {
+                /* M2: a tombstone's own reason survives it ("forget" /
+                 * "consolidated"); a weak non-pin pruned by strength is a
+                 * decay death. */
+                let reason = rec
+                    .death_reason
+                    .clone()
+                    .unwrap_or_else(|| "decay".to_string());
+                dead_notes.push((rec.text.clone(), reason));
                 continue;
             }
             remap.insert(rec.id, kept_records.len() as u32);
             kept_vectors.push(self.index.vector(rec.id).to_vec());
             kept_records.push(rec);
+        }
+        for (text, reason) in &dead_notes {
+            self.ledger_death(text, reason);
         }
         // Renumber + remap co-recall partners onto the new id space.
         for (new_id, rec) in kept_records.iter_mut().enumerate() {
@@ -1165,13 +1294,20 @@ impl Cma {
         let mut kept_records: Vec<Record> = Vec::with_capacity(before);
         let mut kept_vectors: Vec<Vec<f32>> = Vec::with_capacity(before);
         let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut dead_notes: Vec<(String, String)> = Vec::new();
         for rec in self.records.drain(..) {
             if is_dead(&rec) {
+                /* M2: the SEM2 channel follows the canonical store — a row
+                 * removed here died of a sibling prune, not its own decay. */
+                dead_notes.push((rec.text.clone(), "sem-sync prune".to_string()));
                 continue;
             }
             remap.insert(rec.id, kept_records.len() as u32);
             kept_vectors.push(self.index.vector(rec.id).to_vec());
             kept_records.push(rec);
+        }
+        for (text, reason) in &dead_notes {
+            self.ledger_death(text, reason);
         }
         for (new_id, rec) in kept_records.iter_mut().enumerate() {
             rec.id = new_id as u32;
@@ -1354,7 +1490,11 @@ impl Cma {
             summaries.push((ci, summary));
         }
         for &wid in &weak {
-            self.records[wid as usize].tier = TIER_FORGOTTEN;
+            let rec = &mut self.records[wid as usize];
+            rec.tier = TIER_FORGOTTEN;
+            /* M2: a consolidated fact is not lost — it lives inside the
+             * semantic summary — so the reason says exactly that. */
+            rec.death_reason = Some("consolidated".to_string());
             self.mark_dirty(wid);
         }
         let mut consolidated = 0usize;

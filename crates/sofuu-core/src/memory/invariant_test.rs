@@ -216,15 +216,26 @@ fn run_fuzz(seed: u32) {
                         let r = &cma.records[id];
                         (r.text.clone(), r.strength, r.tier)
                     };
-                    if rtier != TIER_FORGOTTEN && rstrength >= FORGET_FLOOR {
-                        let v = cma.index.vector(id as u32).to_vec();
-                        let hits = cma.recall(&v, 8);
-                        assert!(
-                            hits.iter().any(|h| h.id as usize == id && h.text == rtext),
-                            "op {op} I3 SELF-RECALL: live record {id} ('{rtext}', s{rstrength}) missing from its own top-8: {:?}",
-                            hits.iter().map(|h| (h.id, &h.text)).collect::<Vec<_>>()
-                        );
-                    }
+                if rtier != TIER_FORGOTTEN && rstrength >= FORGET_FLOOR {
+                    let v = cma.index.vector(id as u32).to_vec();
+                    let hits = cma.recall(&v, 8);
+                    /* The contract is about the FACT, not the row id: an
+                     * exact clone (op-1 re-remember after a dup-gate miss)
+                     * is suppressed by the diversity floor in favor of the
+                     * canonical sibling — the same text must come back. */
+                    assert!(
+                        hits.iter().any(|h| h.text == rtext),
+                        "op {op} I3 SELF-RECALL: live record {id} ('{rtext}', s{rstrength}) missing from its own top-8: {:?} — same-text rows: {:?}",
+                        hits.iter().map(|h| (h.id, &h.text)).collect::<Vec<_>>(),
+                        cma
+                            .records
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.text == rtext)
+                            .map(|(i, r)| (i, r.tier, r.entity_name.clone(), r.death_reason.clone()))
+                            .collect::<Vec<_>>(),
+                    );
+                }
                 }
             }
             // ── mark_positive (I7: counters only, never strength) ───

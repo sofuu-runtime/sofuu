@@ -2550,6 +2550,10 @@ mod impl_qtsq {
             "working": cma.cma.working_len(),
             /* B7.2: compaction generation (bumped on every rewrite). */
             "epoch": layout.map(|l| l.epoch).unwrap_or(0),
+            /* M2 (Brain Core II): the DeathLedger — the most recent
+             * physical deaths in this store (text clipped by the CMA's
+             * own cap; at = unix seconds). */
+            "recentDeaths": cma.cma.deaths.iter().rev().take(16).collect::<Vec<_>>(),
         });
         let c = CString::new(out.to_string()).unwrap_or_default();
         qjs::sofuu_js_new_string(ctx, c.as_ptr())

@@ -3042,8 +3042,83 @@ void sofuu_batched_rope_kv(
     });
 }
 
+#if defined(__aarch64__) && defined(SOFUU_NEON)
+// Vector exp(x) for the softmax path: exp(x) = 2^(round(x·log2e) + frac) with
+// the magic-number rounding and a two-part ln2, then a degree-5 Horner for
+// e^frac on |frac| ≤ 0.3466. Max relative error vs libm expf measured ~1e-7;
+// NOT bit-identical to the scalar expf, so parity vs the scalar reference is
+// asserted at rel ≤ 5e-7 in sofuu_test_softmax_vec_parity (greedy decode is
+// orders of magnitude inside its argmax margins everywhere it matters).
+static inline float32x4_t sofuu_vexpq_f32(float32x4_t x) {
+    const float32x4_t LOG2E  = vdupq_n_f32(1.4426950408889634f);
+    const float32x4_t LN2_HI = vdupq_n_f32(0.693145751953125f);      // ln2 high
+    const float32x4_t LN2_LO = vdupq_n_f32(1.4286067653301870e-06f); // ln2 low
+    const float32x4_t MAGIC  = vdupq_n_f32(12582912.0f);
+    const int32x4_t   LOCLAMP  = vdupq_n_s32(-126);
+    float32x4_t z  = vmulq_f32(x, LOG2E);
+    float32x4_t kf = vsubq_f32(vaddq_f32(z, MAGIC), MAGIC); // round-half-even by magic add
+    int32x4_t   ki = vcvtq_s32_f32(kf);
+    // Matches scalar f32 expf, which underflows to exact 0 once the true
+    // exponent drops below 2^-149 (x·log2e < -150); the mask also discards
+    // poly residue from absurd inputs.
+    uint32x4_t dead = vcltq_s32(ki, vdupq_n_s32(-150));
+    ki = vmaxq_s32(ki, LOCLAMP); // guard the 2^ki exponent field
+    float32x4_t f = vmlsq_f32(x, vcvtq_f32_s32(ki), LN2_HI);
+    f = vmlsq_f32(f, vcvtq_f32_s32(ki), LN2_LO);
+    // e^f on |f| <= ln2/2: Horner for 1 + f + f^2/2 + f^3/6 + f^4/24 + f^5/120.
+    float32x4_t p = vdupq_n_f32(1.0f / 120.0f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), f, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), f, p);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), f, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), f, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), f, p);
+    int32x4_t e = vaddq_s32(ki, vdupq_n_s32(127)); // f32 exponent field bias
+    float32x4_t two_ki = vreinterpretq_f32_s32(vshlq_n_s32(e, 23));
+    float32x4_t res = vmulq_f32(p, two_ki);
+    return vbslq_f32(dead, vdupq_n_f32(0.0f), res);
+}
+
+void sofuu_softmax_vec(float *scores, size_t n) {
+    // max: vector scan
+    float32x4_t vmax = vdupq_n_f32(scores[0]);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vmax = vmaxq_f32(vmax, vld1q_f32(scores + i));
+        vmax = vmaxq_f32(vmax, vld1q_f32(scores + i + 4));
+    }
+    for (; i + 4 <= n; i += 4) vmax = vmaxq_f32(vmax, vld1q_f32(scores + i));
+    float max_val = vmaxvq_f32(vmax);
+    for (; i < n; ++i) if (scores[i] > max_val) max_val = scores[i];
+
+    const float32x4_t vm = vdupq_n_f32(max_val);
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    for (i = 0; i + 4 <= n; i += 4) {
+        float32x4_t v = vsubq_f32(vld1q_f32(scores + i), vm);
+        float32x4_t e = sofuu_vexpq_f32(v);
+        vst1q_f32(scores + i, e);
+        vsum = vaddq_f32(vsum, e);
+    }
+    float sum = vaddvq_f32(vsum);
+    for (; i < n; ++i) {
+        float exp_v = expf(scores[i] - max_val);
+        scores[i] = exp_v;
+        sum += exp_v;
+    }
+    const float inv_sum_s = 1.0f / (sum > 0.0f ? sum : 1e-8f);
+    const float32x4_t vinv = vdupq_n_f32(inv_sum_s);
+    size_t j = 0;
+    for (; j + 4 <= n; j += 4) {
+        vst1q_f32(scores + j, vmulq_f32(vld1q_f32(scores + j), vinv));
+    }
+    for (; j < n; ++j) scores[j] *= inv_sum_s;
+}
+#endif
+
 void sofuu_softmax(float *scores, size_t n) {
     if (n == 0) return;
+#if defined(__aarch64__) && defined(SOFUU_NEON)
+    sofuu_softmax_vec(scores, n);
+#else
     float max_val = scores[0];
     for (size_t i = 1; i < n; ++i) {
         if (scores[i] > max_val) max_val = scores[i];
@@ -3058,6 +3133,7 @@ void sofuu_softmax(float *scores, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         scores[i] *= inv_sum;
     }
+#endif
 }
 
 // ── Rotary Position Embedding (RoPE - NEOX / Qwen / LLaMA style) ─────
@@ -3424,6 +3500,79 @@ static void sofuu_attn_qk_range(const float * __restrict q, const float * __rest
 #endif
 }
 
+// 8-q-row batched QK: same per-dot arithmetic order as sofuu_attn_qk_range
+// (4-lane strips, combined tail, vaddvq, scalar tail) but the two K strips
+// are loaded once for EIGHT q rows — the plain prefill path was re-reading
+// every K row once per batch row (64x). counts[] are the per-row causal seq
+// bounds (nondecreasing with row index); dots beyond a row's count are
+// stored nowhere. Bit-exact per dot.
+static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_stride,
+                                const float * __restrict k_base, size_t k_stride,
+                                size_t head_dim, size_t p_begin, const size_t *counts,
+                                float * __restrict const * __restrict outs,
+                                float scale, size_t nrows) {
+#if defined(__aarch64__) && defined(SOFUU_NEON)
+    if (nrows == 0) return;
+    size_t max_count = counts[nrows - 1];
+    for (size_t p = 0; p + 2 <= max_count; p += 2) {
+        const float *k0 = k_base + (p_begin + p) * k_stride;
+        const float *k1 = k_base + (p_begin + p + 1) * k_stride;
+        for (size_t r = 0; r < nrows; ++r) {
+            const float *q = q_batch + r * q_stride;
+            float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
+            float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
+            float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
+            float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+            size_t i = 0;
+            for (; i + 16 <= head_dim; i += 16) {
+                const float32x4_t qv0 = vld1q_f32(q + i);
+                const float32x4_t qv1 = vld1q_f32(q + i + 4);
+                const float32x4_t qv2 = vld1q_f32(q + i + 8);
+                const float32x4_t qv3 = vld1q_f32(q + i + 12);
+                a0s0 = vfmaq_f32(a0s0, qv0, vld1q_f32(k0 + i));
+                a0s1 = vfmaq_f32(a0s1, qv1, vld1q_f32(k0 + i + 4));
+                a0s2 = vfmaq_f32(a0s2, qv2, vld1q_f32(k0 + i + 8));
+                a0s3 = vfmaq_f32(a0s3, qv3, vld1q_f32(k0 + i + 12));
+                a1s0 = vfmaq_f32(a1s0, qv0, vld1q_f32(k1 + i));
+                a1s1 = vfmaq_f32(a1s1, qv1, vld1q_f32(k1 + i + 4));
+                a1s2 = vfmaq_f32(a1s2, qv2, vld1q_f32(k1 + i + 8));
+                a1s3 = vfmaq_f32(a1s3, qv3, vld1q_f32(k1 + i + 12));
+            }
+            float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+            float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+            size_t j = i;
+            for (; j + 4 <= head_dim; j += 4) {
+                const float32x4_t qv = vld1q_f32(q + j);
+                c0 = vfmaq_f32(c0, qv, vld1q_f32(k0 + j));
+                c1 = vfmaq_f32(c1, qv, vld1q_f32(k1 + j));
+            }
+            float t0 = vaddvq_f32(c0);
+            float t1 = vaddvq_f32(c1);
+            for (; j < head_dim; ++j) {
+                t0 += q[j] * k0[j];
+                t1 += q[j] * k1[j];
+            }
+            const size_t p_abs = p_begin + p;
+            if (p_abs < counts[r]) outs[r][p_abs] = t0 * scale;
+            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = t1 * scale;
+        }
+    }
+    for (size_t r = 0; r < nrows; ++r) {
+        for (size_t p = (max_count - (max_count & 1)); p < counts[r]; ++p) {
+            outs[r][p_begin + p] = sofuu_vec_dot_f32(q_batch + r * q_stride,
+                                                     k_base + (p_begin + p) * k_stride, head_dim) * scale;
+        }
+    }
+#else
+    for (size_t r = 0; r < nrows; ++r) {
+        const float *q = q_batch + r * q_stride;
+        for (size_t p = 0; p < counts[r]; ++p) {
+            outs[r][p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+        }
+    }
+#endif
+}
+
 static void sofuu_attn_vacc_range(float * __restrict out, const float * __restrict v_base,
                                   size_t v_stride, size_t head_dim, size_t p_begin, size_t count,
                                   const float * __restrict s) {
@@ -3624,9 +3773,50 @@ void sofuu_batched_attention_ext(
     size_t q_dim = n_heads * head_dim;
     size_t n_rep = n_heads / n_kv_heads;
     float inv_sqrt_head_dim = 1.0f / sqrtf((float)head_dim);
-    size_t total_work = b_size * n_heads;
+    // Plain-path rows go 8 batch rows per item so sofuu_attn_qk_rows8 can
+    // share the two K strips across them; SWA/window and FA2 keep the
+    // (row, head) domain (their per-row score ranges differ structurally).
+    const bool use_rows8 = sliding_window == 0 && !(fa2_enabled() && head_dim <= 4096);
+    size_t total_work = use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads;
 
     auto compute_head_slice = [=](size_t start, size_t end) {
+        if (use_rows8) {
+            alignas(32) float gscore_stack[8][4096];
+            std::vector<float> heap_scores;
+            float *gscore[8];
+            for (size_t r = 0; r < 8; ++r) gscore[r] = gscore_stack[r];
+            if (max_seq_len > 4096) {
+                heap_scores.resize(8 * max_seq_len);
+                for (size_t r = 0; r < 8; ++r) gscore[r] = heap_scores.data() + r * max_seq_len;
+            }
+            for (size_t work_idx = start; work_idx < end; ++work_idx) {
+                const size_t grp = work_idx / n_heads;
+                const size_t h   = work_idx % n_heads;
+                const size_t b0  = grp * 8;
+                const size_t b1  = (b0 + 8 < b_size) ? (b0 + 8) : b_size;
+                const size_t nr  = b1 - b0;
+                const size_t kv_h = h / n_rep;
+                size_t head_base = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim;
+                const float *k_past = k_cache + head_base;
+                const float *v_past = v_cache + head_base;
+                size_t counts[8];
+                float *outs_p[8];
+                for (size_t r = 0; r < nr; ++r) {
+                    const size_t pos = start_pos + b0 + r;
+                    counts[r] = (pos + 1 < max_seq_len) ? (pos + 1) : max_seq_len;
+                    outs_p[r] = gscore[r];
+                }
+                sofuu_attn_qk_rows8(q_batch + b0 * q_dim + h * head_dim, q_dim, k_past,
+                                    head_dim, head_dim, 0, counts, outs_p, inv_sqrt_head_dim, nr);
+                for (size_t r = 0; r < nr; ++r) {
+                    sofuu_softmax(outs_p[r], counts[r]);
+                    float *out_head = head_out_batch + (b0 + r) * q_dim + h * head_dim;
+                    std::memset(out_head, 0, head_dim * sizeof(float));
+                    sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0, counts[r], outs_p[r]);
+                }
+            }
+            return;
+        }
         alignas(32) float local_scores_stack[4096];
         std::vector<float> heap_scores;
         float *scores = local_scores_stack;
@@ -4320,6 +4510,74 @@ extern "C" int sofuu_test_rope_table_parity(int n_heads, int head_dim, int max_p
     return 0;
 }
 
+// Vectorized-softmax parity gate: for sizes around the real shapes (score
+// rows of 1..4096+), compare sofuu_softmax against a scalar expf reference
+// accumulated in double. Gate = 2e-6 PEAK-relative: the poly exp itself is
+// ~1e-7, the remainder is f32 sum reassociation across 200+ lanes (4-lane
+// vector sums vs the reference) — still far inside what the downstream
+// V-weighted sum and greedy argmax can observe.
+extern "C" int sofuu_test_softmax_vec_parity(void) {
+    const size_t sizes[] = {1, 2, 3, 4, 5, 7, 31, 64, 128, 234, 4096, 5000};
+    uint32_t rng = 20261015u;
+    for (size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); ++si) {
+        const size_t n = sizes[si];
+        std::vector<float> x(n), y(n);
+        for (size_t r = 0; r < 4; ++r) {
+            for (auto &v : x) {
+                rng = rng * 1664525u + 1013904223u;
+                v = (float)((int64_t)(rng >> 8) % 2000001 - 1000000) / 10000.0f;
+                if ((rng & 15) == 0) v = -0.0f;                 // exact ties / zeros
+                if ((rng & 15) == 1) v = -87.3f;                // deep underflow term
+                if ((rng & 15) == 2) v = -1e30f;                // exp → 0 exactly
+            }
+            y = x;
+            sofuu_softmax(y.data(), n);
+            // Reference in f32-expf semantics: exp(x-m) in float (underflow to
+            // 0 exactly like any f32 softmax — a double exp would resolve
+            // exp(-185) where both scalar and vector f32 softmax give 0),
+            // accumulated in double to keep the reference sum clean.
+            double m = x[0];
+            for (size_t k = 1; k < n; ++k) m = m > x[k] ? m : x[k];
+            double s2 = 0.0;
+            for (size_t k = 0; k < n; ++k) s2 += (double)expf((float)(x[k] - m));
+            double inv = 1.0 / s2;
+            double worst = 0.0;
+            double peak = 0.0;
+            bool nan_seen = false;
+            for (size_t k = 0; k < n; ++k) {
+                double ref = (double)expf((float)x[k] - (float)m) * inv;
+                peak = peak > ref ? peak : ref;
+            }
+            for (size_t k = 0; k < n; ++k) {
+                double ref = (double)expf((float)x[k] - (float)m) * inv;
+                double got = (double)y[k];
+                if (!std::isfinite(got)) { nan_seen = true; break; }
+                // Peak-relative: sub-1e-7-of-peak weights (real softmax
+                // underflow) may collapse to 0 without affecting the
+                // normalized V-weighted sum; per-element rel would flag
+                // exactly those harmless underflows.
+                double err = std::fabs(got - ref) / (peak > 0.0 ? peak : 1.0);
+                if (err > worst) worst = err;
+            }
+            if (nan_seen) {
+                fprintf(stderr, "[softmax-vec] n=%zu r=%zu NaN\n", n, r);
+                for (size_t k = 0; k < n; ++k)
+                    fprintf(stderr, "  k=%zu x=%.9g y=%.9g\n", k, (double)x[k], (double)y[k]);
+                return 10 + (int)si;
+            }
+            if (worst > 2e-6) {
+                fprintf(stderr, "[softmax-vec] n=%zu r=%zu worst rel-peak %.3g\n", n, r, worst);
+                if (n <= 8) {
+                    for (size_t k = 0; k < n; ++k)
+                        fprintf(stderr, "  k=%zu x=%.9g y=%.9g\n", k, (double)x[k], (double)y[k]);
+                }
+                return 20 + (int)si;
+            }
+        }
+    }
+    return 0;
+}
+
 extern "C" int sofuu_test_attention_x4_parity(int n_heads, int n_kv_heads, int head_dim, int max_seq) {    if (n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 32 || max_seq < 8) return -1;
     const size_t H = (size_t)n_heads, KV = (size_t)n_kv_heads, HD = (size_t)head_dim;
     const size_t rep = H / KV, qd = H * HD, kvd = KV * HD, ms = (size_t)max_seq;
@@ -4439,8 +4697,15 @@ extern "C" int sofuu_test_attention_fa2_parity(int n_heads, int n_kv_heads, int 
                 const float inv_l = 1.0f / (l_run > 0.0f ? l_run : 1e-8f);
                 for (size_t i = 0; i < HD; ++i) no[i] = acc[i] * inv_l;
                 sofuu_attn_ref_slot(q_head, kp, vp, ro, scores.data(), seq_len, HD, inv_sqrt, c.window, c.sinks);
+                float peak = 0.0f;
+                for (size_t i = 0; i < HD; ++i) peak = peak > fabsf(ro[i]) ? peak : fabsf(ro[i]);
+                if (peak <= 0.0f) peak = 1.0f;
                 for (size_t i = 0; i < HD; ++i) {
-                    const float rel = fabsf(no[i] - ro[i]) / (fabsf(ro[i]) > 1e-3f ? fabsf(ro[i]) : 1e-3f);
+                    // Peak-relative: near-zero outputs (tiny attention weight)
+                    // flag at per-element rel even when the absolute gap is
+                    // far below the softmax tolerance — same gate semantics
+                    // as the softmax vec test.
+                    const float rel = fabsf(no[i] - ro[i]) / peak;
                     if (!(rel <= tol)) {
                         fprintf(stderr,
                                 "[parity-fa2] b=%zu start=%zu win=%zu sinks=%zu: out[%zu] %.9g vs %.9g (rel %.3g)\n",

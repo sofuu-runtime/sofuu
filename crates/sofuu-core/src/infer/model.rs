@@ -22,7 +22,10 @@ use super::quant::{
     GGML_TYPE_Q8_0,
 };
 
-pub const DEFAULT_PREFILL_BATCH: usize = 64;
+/// 128 leaves a half-long tail chunk, which measures better on the Pi 5 than
+/// two full 64 chunks (+4% Qwen prefill: one chunk less, better tile amortization;
+/// Spark/Llama-1B neutral). Mostly GEMM-bucket time — attention is untouched.
+pub const DEFAULT_PREFILL_BATCH: usize = 128;
 
 /// Cap on tokens per prefill batch chunk. Overridable at process start with
 /// `SOFUU_PREFILL_BATCH` (snapped to a multiple of 4 so the tiled GEMM path

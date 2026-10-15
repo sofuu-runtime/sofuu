@@ -548,3 +548,48 @@ comparisons degenerate to NaN-payload matching (kernel-vs-kernel passes
 vacuously, kernel-vs-scalar-add fails on payload drift, and pass/fail flaps
 with codegen). All fixtures are now sanitized
 (`sanitize_block_scale_headers`) so bitwise parity gates test real numbers.
+
+## Session 7 (2026-10-15): the parity wave — Qwen prefill 158 → 183 t/s, ~4% AHEAD of llama.cpp (~176), outputs bit-stable
+
+Three moves, all bit-stable end-to-end (`SS-on ≡ SS-off ≡ pre-wave` output
+tokens verified live):
+
+1. **SOFUU_PREFILL_BATCH default 64 → 128** (+4% alone): the 234-token
+   standard prompt becomes one 128 chunk + a 104 tail — one chunk less and
+   better tile amortization. Spark and Llama-1B neutral; the env var still
+   overrides.
+
+2. **P1 — vectorized softmax** (`sofuu_softmax` NEON exp): the per-score
+   scalar `expf` was ~5M calls per Qwen prompt (γ also 100K+/decode token).
+   Magic-number rounding to 2^(x·log2e) lanes, degree-5 Horner for the
+   fraction, dead-mask aligned to f32 expf's underflow point (x < −104 →
+   exact 0 — same as scalar). NOT bit-identical to libm; gate =
+   `test_softmax_vec_rel_gate` at 2e-6 peak-relative vs a scalar expf
+   reference (the poly is ~1e-7; the rest is f32 sum reassociation across
+   200+ lanes). Receipts: 167.7–169.8 t/s combined with the batch bump.
+
+3. **P2 — batched-QK attention** (`sofuu_attn_qk_rows8`): the plain prefill
+   path re-read every K row once per batch row (64×); now two K strips serve
+   eight q rows per step. Per-dot arithmetic order is IDENTICAL to
+   `sofuu_attn_qk_range` (4-lane strips, combined tail, vaddvq, scalar tail)
+   → bit-exact per dot; the plain-path work domain becomes (group-of-8, head)
+   with per-row causal bounds. SWA/window and the parked FA2 path keep the
+   (row, head) domain. Gate: `test_batched_attention_ext_plain_rows8`
+   (b=10 crosses a group boundary; peak-relative 1e-4 vs an in-test scalar
+   reference). Attention bucket 292 → 176 ms/prompt (−40%).
+
+Device ladder (Pi 5, 2.8 GHz, 234-tok prompt, .t1 → .t1p1 → .t1p2):
+158.6 (batch-64 baseline) → 165.0 (batch 128) → 167.7–169.8 (+vec softmax)
+→ **182.9–184.4 (+rows8 QK) vs llama.cpp ~176–177**. Decode unchanged
+(2.9 t/s single-token latency artifact; wall). Spark 22.6 with
+`SOFUU_SPARK_CPP_GEMM=1` (peer coherence flag; unchanged). Llama-1B band
+intact. Suite 589/0.
+
+Parity-wave findings worth keeping: (1) the first vec-exp build had TWO
+classic NEON-exp bugs — Horner built the reversed polynomial
+(FMA argument order), and the 2^ki rebuild used the DOUBLE exponent bias
+(1023) — a float rebuild is (ki + 127) << 23; both caught by the parity
+gate, not by inspection. (2) Two test-gates used per-element rel on
+near-zero values (softmax underflows / FA2's tiny outputs) and flagged
+1e-7-scale absolute noise as 1e-4 "divergence" — peak-relative is the
+metric that matches softmax/attention numerics.

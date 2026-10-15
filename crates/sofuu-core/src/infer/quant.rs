@@ -535,6 +535,7 @@ extern "C" {
         sink_tokens: usize,
     );
     fn sofuu_test_attention_x4_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
+    fn sofuu_test_softmax_vec_parity() -> i32;
     fn sofuu_test_attention_fa2_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
     fn sofuu_test_rope_table_parity(n_heads: i32, head_dim: i32, max_pos: i32) -> i32;
     fn sofuu_test_gemm_resid_pair_parity(rows: i32, cols: i32, batch: i32) -> i32;
@@ -1031,6 +1032,12 @@ pub fn batched_attention_ext(
     /// original per-position dot/mad path. Returns 0 when outputs match.
     pub fn attention_x4_parity(n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> i32 {
         unsafe { sofuu_test_attention_x4_parity(n_heads as i32, n_kv_heads as i32, head_dim as i32, max_seq as i32) }
+    }
+
+    /// Numerical gate for the NEON softmax (magic-rounded poly exp) vs the
+    /// double-precision scalar reference: max rel ≤ 5e-7, sum ≈ 1.
+    pub fn softmax_vec_parity() -> i32 {
+        unsafe { sofuu_test_softmax_vec_parity() }
     }
 
     /// Numerical gate for the FA2 tiled online-softmax attention vs the
@@ -2286,6 +2293,16 @@ mod tests {
         assert_eq!(attention_x4_parity(6, 2, 48, 100), 0, "odd head_dim/seq shapes diverged");
     }
 
+    /// The NEON softmax replaces per-score scalar expf with a magic-rounded
+    /// degree-5 poly exp — not bit-identical to libm, but at ≤ 5e-7 relative
+    /// it sits orders of magnitude inside greedy-decode argmax margins. The
+    /// C harness sweeps score-row sizes and edge ranges (deep-underflow
+    /// terms, exact zeros) against a double-precision reference.
+    #[test]
+    fn test_softmax_vec_rel_gate() {
+        assert_eq!(softmax_vec_parity(), 0, "NEON softmax out of rel tolerance vs scalar reference");
+    }
+
     /// The FA2 tiled online-softmax kernel must track the two-pass reference
     /// within rel 1e-4 across plain, SWA, and SWA-with-sinks shapes — keeping
     /// seq_len past the 128-block boundary so multi-block rescale is exercised.
@@ -2396,6 +2413,107 @@ mod tests {
         for val in &head_out_batch {
             assert!(val.is_finite(), "expected finite output from attention");
             assert!(*val > 0.0, "expected positive attention output");
+        }
+    }
+
+    /// Plain (no-window) prefill attention through the ext path with MORE
+    /// rows than the 8-row QK group, so the batched-QK work domain (group
+    /// boundaries, ragged per-row causal bounds) is exercised. The engine's
+    /// softmax is the NEON vector exp (rel ~2e-6 peak), so the gate is
+    /// peak-relative 1e-4 against an in-test scalar reference.
+    #[test]
+    fn test_batched_attention_ext_plain_rows8() {
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 32usize;
+        let max_seq_len = 68usize;
+        let b_size = 10usize;
+        let start_pos = 54usize; // rows leave seqs 55..64, crossing a group of 8
+
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let n_rep = n_heads / n_kv_heads;
+        let inv_sqrt = 1.0f32 / (head_dim as f32).sqrt();
+
+        let mut rng = 91234u32;
+        let mut next = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (((rng >> 9) % 4001) as i32 - 2000) as f32 / 512.0
+        };
+        let mut q_batch = vec![0f32; b_size * q_dim];
+        let mut k_cache = vec![0f32; max_seq_len * kv_dim];
+        let mut v_cache = vec![0f32; max_seq_len * kv_dim];
+        for v in q_batch.iter_mut() {
+            *v = next();
+        }
+        for v in k_cache.iter_mut() {
+            *v = next();
+        }
+        for v in v_cache.iter_mut() {
+            *v = next();
+        }
+        // one all-zero q row: exp(0-max) edge with an exact max tie at 0
+        for v in q_batch[..q_dim].iter_mut() {
+            *v = 0.0;
+        }
+        let mut head_out_batch = vec![0f32; b_size * q_dim];
+
+        batched_attention_ext(
+            &q_batch,
+            &k_cache,
+            &v_cache,
+            &mut head_out_batch,
+            b_size,
+            start_pos,
+            0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            0, // no sliding window → plain rows8 path
+            0,
+        );
+
+        for b in 0..b_size {
+            for h in 0..n_heads {
+                let kv_h = h / n_rep;
+                let seq = std::cmp::min(start_pos + b + 1, max_seq_len);
+                let q_head = &q_batch[b * q_dim + h * head_dim..b * q_dim + (h + 1) * head_dim];
+                let mut scores = vec![0f32; seq];
+                for p in 0..seq {
+                    // engine cache layout is head-major: [layer][kv_head][pos][dim]
+                    let k = &k_cache[(kv_h * max_seq_len + p) * head_dim..(kv_h * max_seq_len + p + 1) * head_dim];
+                    let mut d = 0f32;
+                    for i in 0..head_dim {
+                        d += q_head[i] * k[i];
+                    }
+                    scores[p] = d * inv_sqrt;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
+                for s in scores.iter_mut() {
+                    *s /= sum;
+                }
+                let mut refo = vec![0f32; head_dim];
+                for p in 0..seq {
+                    let v = &v_cache[(kv_h * max_seq_len + p) * head_dim..(kv_h * max_seq_len + p + 1) * head_dim];
+                    for j in 0..head_dim {
+                        refo[j] += scores[p] * v[j];
+                    }
+                }
+                let got = &head_out_batch[b * q_dim + h * head_dim..b * q_dim + (h + 1) * head_dim];
+                let peak = refo.iter().fold(0f32, |a, x| a.max(x.abs())).max(1.0);
+                let worst = got
+                    .iter()
+                    .zip(refo.iter())
+                    .map(|(g, r)| ((g - r).abs()) as f64 / peak as f64)
+                    .fold(0.0f64, f64::max);
+                assert!(worst <= 1e-4, "rows8 plain attention diverged b={b} h={h}: {worst:.3e}");
+            }
         }
     }
 

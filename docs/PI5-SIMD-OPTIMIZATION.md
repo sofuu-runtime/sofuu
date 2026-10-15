@@ -445,3 +445,49 @@ the denominator is what actually reaches DRAM at small-seq × small-head —
 score materialization doesn't, so eliminating it buys nothing, while the
 QK/V dot shapes that are already register-tuned can't be beaten by
 re-fusing.
+
+## Session 5 (2026-10-15): T0 platform pass — A76-tuned rustc codegen + thin LTO shipped (opt-in); PGO blocked at link; huge pages closed by kernel; the box runs sustained 2.8 GHz
+
+First slice of docs/PLAN-PI5-DEEP-EDGE.md (the "go deeper" programme written
+after the prefill plan closed). Three platform items, executed in one pass:
+
+1. **Tuned codegen (`SOFUU_PI5_TUNED=1` + `SOFUU_PI5_LTO=1`, opt-in env in
+   `scripts/cross/build_linux_arm64.sh`).** Auditing the toolchain showed the
+   C++ kernels were already A76-tuned (zig-cc.sh → `-mcpu=cortex_a76`;
+   sofuu-ffi build.rs → `-march=armv8.2-a+dotprod`) — the gap was rustc's own
+   NEON codegen and cross-crate layout. Added `-C target-cpu=cortex-a76` +
+   thin LTO + CGU=1 (LTO via the cargo profile env — `-C lto` in RUSTFLAGS
+   errors on intermediate rlibs: "lto can only be run for executables,
+   cdylibs and static library outputs"). Device A/B, interleaved runs on the
+   same box, Qwen3-0.6B: **total 5.22-5.23 s vs 5.32-5.33 s baseline
+   (+1.8%)**, decode **21.3-21.4 vs 20.7 t/s (+2.9%, non-overlapping)**,
+   prefill −1.2% (158.2-158.8 vs 159.9-160.7 — layout re-cost on the
+   prefill path, paid back by decode); Llama-1B neutral both ways (decode on
+   the wall). The tuned artifact is deployed as
+   `sofuu-linux-arm64.tuned`; the standing binary stays generic so peers'
+   battery baselines don't shift underneath them.
+2. **PGO: compiles, blocked at link.** rustup's aarch64-unknown-linux-musl
+   std ships libprofiler_builtins, so the instrumented build compiles —
+   then the static-pie link dies with `ld.lld: error: cannot open
+   __llvm_profile_runtime` (zig toolchain carries no compiler-rt profile
+   runtime for musl). The instrument/use branches are wired into the script
+   (`SOFUU_PI5_PGO_INSTR` / `SOFUU_PI5_PGO_USE`); unblock = clang-musl with
+   `libclang_rt.profile`, or nightly `-Z build-std` with the profiler
+   feature — the rerun is mechanical after that.
+3. **Huge pages: closed by hardware/kernel facts.** Device kernel: 16K
+   pages, **no THP and no hugetlbfs at all** (no
+   `/sys/kernel/mm/transparent_hugepage/`, no Huge* meminfo lines). With 16K
+   pages + A76 contiguous-TLB entries, TLB pressure on streaming GEMV is
+   marginal anyway; a custom kernel is a bad trade for a bench box. The mmap
+   advice set (SEQUENTIAL at load, header WILLNEED) is already the right
+   shape.
+4. **Clock receipts: `arm_freq=2800` was already in config.txt** — every
+   receipt this session (ours and llama.cpp's) was measured at sustained
+   2.8 GHz, +17% over the SoC's rated stock, always equal-footing on the
+   same box. Governor performance, throttle bits clean. No further
+   overclock without an explicit go (reboot risk on the remote box).
+
+Lesson of the pass: the last compile-flag-level percent is splitting the
+difference between paths (decode gains, prefill gives a little back) — the
+remaining real gains are the T1 GEMM math and the T2 format work, per the
+deep-edge programme.

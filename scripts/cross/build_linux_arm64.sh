@@ -108,6 +108,41 @@ export RUSTFLAGS="-C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-targ
 # duplicate the ones zig's driver links itself → duplicate-symbol errors.
 # With it off, zig supplies the CRT for the -static -pie link.
 
+# ── Pi 5 tuned codegen (SOFUU_PI5_TUNED=1) ────────────────────────
+# The C++ SIMD kernels already get -mcpu=cortex_a76 (zig-cc.sh) and
+# +dotprod (build.rs); this tunes rustc's own NEON/intrinsic codegen and
+# scheduling to the same core, plus thin LTO + one codegen unit for
+# cross-crate inlining. The artifact then requires dotprod/fp16-class
+# silicon (A76 / Neoverse N1+); generic ARM builds stay opt-out.
+if [ "${SOFUU_PI5_TUNED:-0}" = "1" ]; then
+    # LTO/codegen-units go through the Cargo profile (env form), not
+    # RUSTFLAGS: -C lto on intermediate rlib units errors out with
+    # "lto can only be run for executables, cdylibs and static library
+    # outputs" — the profile applies LTO only to the final artifact.
+    export RUSTFLAGS="$RUSTFLAGS -C target-cpu=cortex-a76"
+    if [ "${SOFUU_PI5_LTO:-0}" = "1" ]; then
+        export CARGO_PROFILE_RELEASE_LTO=thin
+        export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+        echo "→ + thin LTO + CGU=1"
+    fi
+    echo "→ SOFUU_PI5_TUNED=1: rustc -C target-cpu=cortex-a76"
+fi
+# ── PGO (SOFUU_PI5_PGO_INSTR=1 / SOFUU_PI5_PGO_USE=<profdata>) ────
+# The aarch64-unknown-linux-musl std ships libprofiler_builtins, so LLVM
+# PGO works on stable for our static deploy. One-off flow:
+#   SOFUU_PI5_PGO_INSTR=1 build → run the battery on the Pi with
+#   LLVM_PROFILE_FILE=<dir>/%m.profraw → scp the profraws back →
+#   rustup llvm-profdata merge -output=pgo.profdata →
+#   SOFUU_PI5_PGO_USE=pgo.profdata SOFUU_PI5_TUNED=1 SOFUU_PI5_LTO=1 build.
+if [ "${SOFUU_PI5_PGO_INSTR:-0}" = "1" ]; then
+    export RUSTFLAGS="$RUSTFLAGS -Cprofile-generate=${SOFUU_PGO_DIR:-/tmp/sofuu-pgo}"
+    echo "→ PGO instrument: -Cprofile-generate=${SOFUU_PGO_DIR:-/tmp/sofuu-pgo}"
+fi
+if [ -n "${SOFUU_PI5_PGO_USE:-}" ]; then
+    export RUSTFLAGS="$RUSTFLAGS -Cprofile-use=$SOFUU_PI5_PGO_USE"
+    echo "→ PGO use: -Cprofile-use=$SOFUU_PI5_PGO_USE"
+fi
+
 # -p sofuu-core: build only the CLI package. A whole-workspace build drags
 # in the desktop app (sofuu-desktop/src-tauri), whose notification stack
 # (tauri-plugin-notification → notify-rust → libdbus-sys) requires a

@@ -461,6 +461,11 @@ extern "C" {
     fn sofuu_gemm_q8_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q4_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q6_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
+    fn sofuu_gemm_q8_0_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
+    fn sofuu_gemm_q4_k_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
+    fn sofuu_gemm_q6_k_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
+    fn sofuu_gemm_q4_k_pair(w1: *const u8, w2: *const u8, x: *const f32, out1: *mut f32, out2: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
+    fn sofuu_gemm_q8_0_pair(w1: *const u8, w2: *const u8, x: *const f32, out1: *mut f32, out2: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_f16(weight_bytes: *const u16, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_rmsnorm(out: *mut f32, x: *const f32, weight: *const f32, n: usize, eps: f32);
@@ -524,6 +529,7 @@ extern "C" {
     );
     fn sofuu_test_attention_x4_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
     fn sofuu_test_rope_table_parity(n_heads: i32, head_dim: i32, max_pos: i32) -> i32;
+    fn sofuu_test_gemm_resid_pair_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_tree_rope(
         q_batch: *mut f32,
         k_batch: *mut f32,
@@ -1268,6 +1274,93 @@ pub fn matmat(
         _ => {
             y_batch.fill(0.0);
         }
+    }
+}
+
+/// Residual-fused matmat: computes `w·x` and adds it in place onto `acc`,
+/// which must be preloaded with the residual (`acc` is both source and
+/// destination, so `x += w·x_norm` is one kernel pass instead of GEMM +
+/// separate row-add). Returns false when the fused tile path was not taken —
+/// `acc` is untouched and the caller falls back to `matmat` + `batched_mad`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn matmat_residual(
+    w_bytes: &[u8],
+    type_id: u32,
+    rows: usize,
+    cols: usize,
+    x_batch: &[f32],
+    batch_size: usize,
+    acc: &mut [f32],
+) -> bool {
+    if batch_size < 2 || batch_size > 512 {
+        return false;
+    }
+    assert_eq!(x_batch.len(), batch_size * cols, "x_batch.len() must match batch_size * cols");
+    assert_eq!(acc.len(), batch_size * rows, "acc.len() must match batch_size * rows");
+    if !cfg!(target_arch = "aarch64") {
+        return false;
+    }
+    let dbg = std::env::var_os("SOFUU_FUSE_DEBUG").is_some();
+    let _prof = prof::Scope::new(&prof::GEMM_NS, &prof::GEMM_CALLS);
+    let fused = match type_id {
+        GGML_TYPE_Q4_K => unsafe {
+            sofuu_gemm_q4_k_acc(w_bytes.as_ptr(), x_batch.as_ptr(), acc.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        GGML_TYPE_Q8_0 => unsafe {
+            sofuu_gemm_q8_0_acc(w_bytes.as_ptr(), x_batch.as_ptr(), acc.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        GGML_TYPE_Q6_K => unsafe {
+            sofuu_gemm_q6_k_acc(w_bytes.as_ptr(), x_batch.as_ptr(), acc.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        _ => false,
+    };
+    if dbg {
+        static CALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 || n % 512 == 0 {
+            eprintln!("[fuse-debug] residual type={} {}x{} batch={} -> fused={}", type_id, rows, cols, batch_size, fused);
+        }
+    }
+    fused
+}
+
+/// Dual matmat for the gate/up pair (same input, two weights): computes both
+/// `w1·x` and `w2·x` in one dispatch with a single activation-quantize pass.
+/// Returns false (buffers untouched) when the fused tile path is unavailable;
+/// the caller then falls back to two `matmat` calls.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn matmat_pair(
+    w1_bytes: &[u8],
+    w2_bytes: &[u8],
+    type_id: u32,
+    rows: usize,
+    cols: usize,
+    x_batch: &[f32],
+    batch_size: usize,
+    y1_batch: &mut [f32],
+    y2_batch: &mut [f32],
+) -> bool {
+    if batch_size < 4 || batch_size % 4 != 0 || batch_size > 512 {
+        return false;
+    }
+    assert_eq!(x_batch.len(), batch_size * cols, "x_batch.len() must match batch_size * cols");
+    assert_eq!(y1_batch.len(), batch_size * rows);
+    assert_eq!(y2_batch.len(), batch_size * rows);
+    if !cfg!(target_arch = "aarch64") {
+        return false;
+    }
+    match type_id {
+        GGML_TYPE_Q4_K => unsafe {
+            let _prof = prof::Scope::new(&prof::GEMM_NS, &prof::GEMM_CALLS);
+            sofuu_gemm_q4_k_pair(w1_bytes.as_ptr(), w2_bytes.as_ptr(), x_batch.as_ptr(), y1_batch.as_mut_ptr(), y2_batch.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        GGML_TYPE_Q8_0 => unsafe {
+            let _prof = prof::Scope::new(&prof::GEMM_NS, &prof::GEMM_CALLS);
+            sofuu_gemm_q8_0_pair(w1_bytes.as_ptr(), w2_bytes.as_ptr(), x_batch.as_ptr(), y1_batch.as_mut_ptr(), y2_batch.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        _ => false,
     }
 }
 
@@ -2170,6 +2263,59 @@ mod tests {
     fn test_rope_table_bit_exact() {
         assert_eq!(rope_table_parity(4, 32, 64), 0, "small rope shapes diverged");
         assert_eq!(rope_table_parity(16, 128, 264), 0, "Qwen3-0.6B rope shapes diverged");
+    }
+
+    /// The residual-fused and dual-pair GEMM epilogues (Phase-1 glue fusion)
+    /// must be bit-identical to `matmat` + separate add / two matmats.
+    #[test]
+    fn test_gemm_resid_pair_bit_exact() {
+        unsafe {
+            assert_eq!(sofuu_test_gemm_resid_pair_parity(64, 2048, 8), 0, "fused residual/pair paths diverged");
+            assert_eq!(sofuu_test_gemm_resid_pair_parity(128, 1024, 16), 0, "second shape diverged");
+        }
+    }
+
+    /// The Rust wrappers `matmat_residual` / `matmat_pair` must actually take
+    /// the fused tile path (return true) for standard decoder shapes once the
+    /// tiles are warmed — a regression here silently reverts to the unfused
+    /// GEMM + separate residual-add, which is correct but slower.
+    #[test]
+    fn test_matmat_fused_wrappers_engage() {
+        let rows = 1024usize;
+        let cols = 2048usize;
+        let batch = 64usize;
+        let mut w = vec![0u8; rows * (cols / 256) * 144];
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        tile_warm(w.as_ptr(), rows, cols, GGML_TYPE_Q4_K);
+        let x = vec![0.35f32; batch * cols];
+        let mut acc = vec![0.5f32; batch * rows];
+        let fused = matmat_residual(
+            &w,
+            GGML_TYPE_Q4_K,
+            rows,
+            cols,
+            &x,
+            batch,
+            &mut acc,
+        );
+        assert!(fused, "matmat_residual did not take the fused tile path");
+        let mut g = vec![0f32; batch * rows];
+        let mut u = vec![0f32; batch * rows];
+        let xn = vec![0.1f32; batch * cols];
+        let paired = matmat_pair(
+            &w,
+            &w,
+            GGML_TYPE_Q4_K,
+            cols / 2, // hidden-like rows must still be % 8 and % tile-friendly
+            cols,
+            &xn,
+            batch,
+            &mut g,
+            &mut u,
+        );
+        assert!(paired, "matmat_pair did not take the fused tile path");
     }
 
     #[test]

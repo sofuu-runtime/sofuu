@@ -1361,7 +1361,8 @@ void ggml_gemm_q8_0_4x4_q8_0(int                        n,
                              const void * __restrict vx,
                              const void * __restrict vy,
                              int                        nr,
-                             int                        nc) {
+                             int                        nc,
+                             const float * in_acc) {
     const int qk                = QK8_0;
     const int nb                = n / qk;
     const int ncols_interleaved = 4;
@@ -1414,7 +1415,12 @@ void ggml_gemm_q8_0_4x4_q8_0(int                        n,
             }
 
             for (int m = 0; m < 4; m++) {
-                vst1q_f32(s + (y * 4 + m) * bs + x * 4, sumf[m]);
+                const int offset = (y * 4 + m) * bs + x * 4;
+                if (in_acc) {
+                    vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), sumf[m]));
+                } else {
+                    vst1q_f32(s + offset, sumf[m]);
+                }
             }
         }
     }
@@ -1545,11 +1551,11 @@ static inline void decode_q_Kx8_6bit_scales(const uint8_t * scales_in, int16x8_t
 }
 #endif
 void ggml_gemv_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
-void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
+void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc);
 void ggml_gemv_q6_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
-void ggml_gemm_q6_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
+void ggml_gemm_q6_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc);
 void ggml_gemv_q8_0_4x4_q8_0(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
-void ggml_gemm_q8_0_4x4_q8_0(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc);
+void ggml_gemm_q8_0_4x4_q8_0(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc);
 
 void ggml_gemv_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc) {
     constexpr int qk = QK_K;
@@ -1684,7 +1690,7 @@ void ggml_gemv_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void 
     ggml_gemv_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc) {
+void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -1874,7 +1880,11 @@ void ggml_gemm_q4_K_8x4_q8_K(int n, float * __restrict s, size_t bs, const void 
                 for (int j = 0; j < 2; j++) {
                     int col    = x * ncols_interleaved + j * 4;
                     int offset = row * bs + col;
-                    vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
                 }
             }
         }  // for x
@@ -2013,7 +2023,7 @@ void ggml_gemv_q4_K_8x4_q8_K_sc(int n, float * __restrict s, size_t bs, const vo
     ggml_gemv_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-void ggml_gemm_q4_K_8x4_q8_K_sc(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const void * __restrict vsc) {
+void ggml_gemm_q4_K_8x4_q8_K_sc(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const void * __restrict vsc, const float * in_acc) {
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -2169,7 +2179,11 @@ void ggml_gemm_q4_K_8x4_q8_K_sc(int n, float * __restrict s, size_t bs, const vo
                 for (int j = 0; j < 2; j++) {
                     int col    = x * 8 + j * 4;
                     int offset = row * bs + col;
-                    vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
                 }
             }
         }  // for x
@@ -2374,7 +2388,8 @@ void ggml_gemm_q6_K_8x4_q8_K(int                        n,
                              const void * __restrict vx,
                              const void * __restrict vy,
                              int                        nr,
-                             int                        nc) {
+                             int                        nc,
+                             const float * in_acc) {
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -2560,7 +2575,11 @@ void ggml_gemm_q6_K_8x4_q8_K(int                        n,
                 for (int j = 0; j < 2; j++) {
                     int col    = x * ncols_interleaved + j * 4;
                     int offset = row * bs + col;
-                    vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
                 }
             }
         }  // for x
@@ -2623,7 +2642,7 @@ static inline int sofuu_repack_q4k_8bl_planes(uint8_t * dst, const uint8_t * src
     return sofuu_repack_q4k_8bl_planes_range(dst, src, nblocks, 0, nrow / 8, interleave);
 }
 
-void ggml_gemm_q4_K_8x4_q8_K_p(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc) {
+void ggml_gemm_q4_K_8x4_q8_K_p(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -2795,7 +2814,11 @@ void ggml_gemm_q4_K_8x4_q8_K_p(int n, float * __restrict s, size_t bs, const voi
                 for (int j = 0; j < 2; j++) {
                     int col    = x * 8 + j * 4;
                     int offset = row * bs + col;
-                    vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
                 }
             }
         }  // for x

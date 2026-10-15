@@ -2119,11 +2119,37 @@ static inline size_t gemm_tile_pad_batch(size_t batch_size) {
     return (batch_size >= 2 && batch_size < rpad && rpad <= 8) ? rpad : batch_size;
 }
 
-void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
-    if (rows == 0 || cols == 0 || batch_size == 0) return;
+// In-place elementwise add: dst[i] += src[i]. Fallback kernel for the fused
+// residual add on pad paths (same single IEEE add per element, bit-exact).
+static inline void sofuu_f32_add_inplace(float * __restrict dst, const float * __restrict src, size_t n) {
+#if defined(SOFUU_NEON)
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        vst1q_f32(dst + i,      vaddq_f32(vld1q_f32(dst + i),      vld1q_f32(src + i)));
+        vst1q_f32(dst + i + 4,  vaddq_f32(vld1q_f32(dst + i + 4),  vld1q_f32(src + i + 4)));
+        vst1q_f32(dst + i + 8,  vaddq_f32(vld1q_f32(dst + i + 8),  vld1q_f32(src + i + 8)));
+        vst1q_f32(dst + i + 12, vaddq_f32(vld1q_f32(dst + i + 12), vld1q_f32(src + i + 12)));
+    }
+    for (; i < n; ++i) {
+        dst[i] += src[i];
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] += src[i];
+    }
+#endif
+}
+
+// Residual-fused GEMM core. Contract: in_acc must alias out and out must be
+// preloaded with the residual; on return 0 out holds w*x + residual. Returns
+// 1 when the fused tile path was not taken — out is then UNTOUCHED and the
+// caller falls back to an unfused matmat (+ separate residual add).
+static int sofuu_gemm_q8_0_impl(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size, const float * in_acc) {
+    if (rows == 0 || cols == 0 || batch_size == 0) return in_acc ? 1 : 0;
+    if (in_acc && in_acc != out) return 1;  // fused contract: add in place over the residual
     if (batch_size == 1) {
         sofuu_gemv_q8_0(weight_bytes, x, out, rows, cols);
-        return;
+        return 1;  // batch-1 callers fall back to the unfused matvec path
     }
     size_t n_blocks = cols / 32;
     size_t row_size = n_blocks * sizeof(block_q8_0);
@@ -2149,14 +2175,21 @@ void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
             g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
                     ggml_gemm_q8_0_4x4_q8_0(cols, out_dst + g * 4, rows,
-                        tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, tile_batch, 4);
+                        tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, tile_batch, 4, acc_k);
                 }
             });
-            if (tile_batch != batch_size) std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
-            return;
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
         }
     }
 #endif
@@ -2165,6 +2198,7 @@ void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_
     // Prefill via int8 SDOT (optionally tiled 8x8 by gemm_q8_0_tile below).
     // Small-col matrices stay on the f32 x8 path: with cols < 2048 the
     // dequant-once + register-reuse pattern beats weight re-reads.
+    if (in_acc) return 1;
     if (sofuu_cpu_has_dotprod() && (cols % 32 == 0) && cols >= 2048) {
         const size_t q8_blocks = cols / 32;
         sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
@@ -2179,7 +2213,7 @@ void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_
                 }
             }
         });
-        return;
+        return 0;
     }
 #endif
 
@@ -2231,13 +2265,23 @@ void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_
             }
         }
     });
+    return 0;
 }
 
-void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
-    if (rows == 0 || cols == 0 || batch_size == 0) return;
+void sofuu_gemm_q8_0(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
+    sofuu_gemm_q8_0_impl(weight_bytes, x, out, rows, cols, batch_size, nullptr);
+}
+
+extern "C" int sofuu_gemm_q8_0_acc(const void *weight_bytes, const float *x, float *out_acc, size_t rows, size_t cols, size_t batch_size) {
+    return sofuu_gemm_q8_0_impl(weight_bytes, x, out_acc, rows, cols, batch_size, out_acc);
+}
+
+static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size, const float * in_acc) {
+    if (rows == 0 || cols == 0 || batch_size == 0) return in_acc ? 1 : 0;
+    if (in_acc && in_acc != out) return 1;  // fused contract: add in place over the residual
     if (batch_size == 1) {
         sofuu_gemv_q4_k(weight_bytes, x, out, rows, cols);
-        return;
+        return 1;  // batch-1 callers fall back to the unfused matvec path
     }
     size_t n_blocks = cols / 256;
     size_t row_size = n_blocks * sizeof(block_q4_K);
@@ -2272,14 +2316,21 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
             g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
                     const uint8_t *t = ptile + g * nb * sizeof(tile_block_q4_Kx8p);
-                    ggml_gemm_q4_K_8x4_q8_K_p(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8);
+                    ggml_gemm_q4_K_8x4_q8_K_p(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8, acc_k);
                 }
             });
-            if (tile_batch != batch_size) std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
-            return;
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
         }
         const uint8_t *sc = nullptr;
         if (const uint8_t *tile = sofuu_tile_lookup_sc(weight_bytes, 12, rows, cols, &sc)) {
@@ -2307,26 +2358,34 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
             g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
                     const uint8_t *t = tile + g * nb * sizeof(tile_block_q4_Kx8);
                     if (sc) {
                         ggml_gemm_q4_K_8x4_q8_K_sc(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8,
-                            sc + g * nb * sizeof(tile_sc_q4_Kx8));
+                            sc + g * nb * sizeof(tile_sc_q4_Kx8), acc_k);
                     } else {
-                        ggml_gemm_q4_K_8x4_q8_K(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8);
+                        ggml_gemm_q4_K_8x4_q8_K(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8, acc_k);
                     }
                 }
             });
-            if (tile_batch != batch_size) std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
-            return;
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
         }
     }
 #endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     // Prefill via int8 SDOT (see gemm_q8_0 note): cols >= 2048 only.
+    if (in_acc) return 1;
     if (sofuu_cpu_has_dotprod() && (cols % 256 == 0) && cols >= 2048) {
-        const size_t q8_blocks = cols / 32;
+        const size_t q8_blocks = cols / 256;
         sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
         for (size_t b = 0; b < batch_size; ++b) {
             sofuu_quantize_row_q8_a76(x + b * cols, xq8_base + b * q8_blocks, q8_blocks);
@@ -2339,7 +2398,7 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
                 }
             }
         });
-        return;
+        return 0;
     }
 #endif
 
@@ -2391,13 +2450,23 @@ void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_
             }
         }
     });
+    return 0;
 }
 
-void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
-    if (rows == 0 || cols == 0 || batch_size == 0) return;
+void sofuu_gemm_q4_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
+    sofuu_gemm_q4_k_impl(weight_bytes, x, out, rows, cols, batch_size, nullptr);
+}
+
+extern "C" int sofuu_gemm_q4_k_acc(const void *weight_bytes, const float *x, float *out_acc, size_t rows, size_t cols, size_t batch_size) {
+    return sofuu_gemm_q4_k_impl(weight_bytes, x, out_acc, rows, cols, batch_size, out_acc);
+}
+
+static int sofuu_gemm_q6_k_impl(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size, const float * in_acc) {
+    if (rows == 0 || cols == 0 || batch_size == 0) return in_acc ? 1 : 0;
+    if (in_acc && in_acc != out) return 1;  // fused contract: add in place over the residual
     if (batch_size == 1) {
         sofuu_gemv_q6_k(weight_bytes, x, out, rows, cols);
-        return;
+        return 1;  // batch-1 callers fall back to the unfused matvec path
     }
     size_t n_blocks = cols / 256;
     size_t row_size = n_blocks * sizeof(block_q6_K);
@@ -2433,20 +2502,28 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
             }
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
             g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
                     ggml_gemm_q6_K_8x4_q8_K(cols, out_dst + g * 8, rows,
-                        tile + g * nb * sizeof(tile_block_q6_Kx8), qa_ptr, tile_batch, 8);
+                        tile + g * nb * sizeof(tile_block_q6_Kx8), qa_ptr, tile_batch, 8, acc_k);
                 }
             });
-            if (tile_batch != batch_size) std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
-            return;
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
         }
     }
 #endif
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     // Prefill via int8 SDOT (see gemm_q8_0 note): cols >= 2048 only.
+    if (in_acc) return 1;
     if (sofuu_cpu_has_dotprod() && (cols % 256 == 0) && cols >= 2048) {
         const size_t q8_blocks = cols / 32;
         sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
@@ -2461,7 +2538,7 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
                 }
             }
         });
-        return;
+        return 0;
     }
 #endif
 
@@ -2513,6 +2590,92 @@ void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_
             }
         }
     });
+    return 0;
+}
+
+void sofuu_gemm_q6_k(const void *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
+    sofuu_gemm_q6_k_impl(weight_bytes, x, out, rows, cols, batch_size, nullptr);
+}
+
+extern "C" int sofuu_gemm_q6_k_acc(const void *weight_bytes, const float *x, float *out_acc, size_t rows, size_t cols, size_t batch_size) {
+    return sofuu_gemm_q6_k_impl(weight_bytes, x, out_acc, rows, cols, batch_size, out_acc);
+}
+
+// ── Dual-output GEMM (gate & up share the activation-quant prologue) ──
+// Quantize x once, then run both weight tiles back-to-back per row group:
+// one act-quant pass and one pool dispatch instead of two full GEMM calls
+// (the q8 activations for the second weight come from L2/hot registers).
+// Integer math per output is identical to the separate calls, so out1/out2
+// are bit-equal to two sofuu_gemm_* runs on the same inputs. Returns 1 when
+// the fused tile path was not taken (out1/out2 UNTOUCHED).
+extern "C" int sofuu_gemm_q4_k_pair(const void *w1, const void *w2, const float *x, float *out1, float *out2, size_t rows, size_t cols, size_t batch_size) {
+#if defined(__aarch64__)
+    if (rows == 0 || cols == 0 || batch_size < 4 || batch_size % 4 != 0 || rows % 8 != 0 || cols % 256 != 0 || !SOFUU_TILE_TYPES_OK(12)) return 1;
+    const uint8_t *t1 = sofuu_tile_lookup(w1, 12, rows, cols);
+    const uint8_t *t2 = sofuu_tile_lookup(w2, 12, rows, cols);
+    if (!t1 || !t2) return 1;
+    const size_t nb = cols / 256;
+    tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((batch_size / 4) * nb);
+    if (batch_size >= 8) {
+        const size_t g4n = batch_size / 4;
+        g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+            for (size_t g4 = a; g4 < b; ++g4) {
+                ggml_quantize_mat_q8_K_4x4_neon(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            }
+        });
+    } else {
+        for (size_t g4 = 0; g4 < (size_t)batch_size / 4; ++g4) {
+            ggml_quantize_mat_q8_K_4x4_neon(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+        }
+    }
+    g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+        for (size_t g = g0; g < g1; ++g) {
+            ggml_gemm_q4_K_8x4_q8_K(cols, out1 + g * 8, rows,
+                t1 + g * nb * sizeof(tile_block_q4_Kx8), qa_ptr, batch_size, 8, nullptr);
+            ggml_gemm_q4_K_8x4_q8_K(cols, out2 + g * 8, rows,
+                t2 + g * nb * sizeof(tile_block_q4_Kx8), qa_ptr, batch_size, 8, nullptr);
+        }
+    });
+    return 0;
+#else
+    (void) w1; (void) w2; (void) x; (void) out1; (void) out2; (void) rows; (void) cols; (void) batch_size;
+    return 1;
+#endif
+}
+
+extern "C" int sofuu_gemm_q8_0_pair(const void *w1, const void *w2, const float *x, float *out1, float *out2, size_t rows, size_t cols, size_t batch_size) {
+#if defined(__aarch64__)
+    if (rows == 0 || cols == 0 || batch_size < 4 || batch_size % 4 != 0 || rows % 4 != 0 || cols % 32 != 0 || !SOFUU_TILE_TYPES_OK(8)) return 1;
+    const uint8_t *t1 = sofuu_tile_lookup(w1, 8, rows, cols);
+    const uint8_t *t2 = sofuu_tile_lookup(w2, 8, rows, cols);
+    if (!t1 || !t2) return 1;
+    const size_t nb = cols / 32;
+    tile_block_q8_0x4 *qa_ptr = tile_scratch<tile_block_q8_0x4>((batch_size / 4) * nb);
+    if (batch_size >= 8) {
+        const size_t g4n = batch_size / 4;
+        g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+            for (size_t g4 = a; g4 < b; ++g4) {
+                ggml_quantize_mat_q8_0_4x4(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+            }
+        });
+    } else {
+        for (size_t g4 = 0; g4 < (size_t)batch_size / 4; ++g4) {
+            ggml_quantize_mat_q8_0_4x4(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+        }
+    }
+    g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+        for (size_t g = g0; g < g1; ++g) {
+            ggml_gemm_q8_0_4x4_q8_0(cols, out1 + g * 4, rows,
+                t1 + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, batch_size, 4, nullptr);
+            ggml_gemm_q8_0_4x4_q8_0(cols, out2 + g * 4, rows,
+                t2 + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, batch_size, 4, nullptr);
+        }
+    });
+    return 0;
+#else
+    (void) w1; (void) w2; (void) x; (void) out1; (void) out2; (void) rows; (void) cols; (void) batch_size;
+    return 1;
+#endif
 }
 
 void sofuu_gemm_f32(const float *weight_bytes, const float *x, float *out, size_t rows, size_t cols, size_t batch_size) {
@@ -3483,9 +3646,9 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
                     const uint8_t *t = tile + g * nb * sizeof(tile_block_q4_Kx8);
                     if (sc) {
                         ggml_gemm_q4_K_8x4_q8_K_sc(cols, out.data() + g * 8, rows, t, qa, batch, 8,
-                            sc + g * nb * sizeof(tile_sc_q4_Kx8));
+                            sc + g * nb * sizeof(tile_sc_q4_Kx8), nullptr);
                     } else {
-                        ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows, t, qa, batch, 8);
+                        ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows, t, qa, batch, 8, nullptr);
                     }
                 }
             });
@@ -3500,7 +3663,7 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
             g_pool.parallel_for(0, rows / 4, [&](size_t g0, size_t g1) {
                 for (size_t g = g0; g < g1; ++g) {
                     ggml_gemm_q8_0_4x4_q8_0(cols, out.data() + g * 4, rows,
-                        tile + g * nb * sizeof(tile_block_q8_0x4), qa, batch, 4);
+                        tile + g * nb * sizeof(tile_block_q8_0x4), qa, batch, 4, nullptr);
                 }
             });
         }
@@ -3585,7 +3748,7 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
         g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
             for (size_t g = g0; g < g1; ++g) {
                 ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows,
-                    ktile + g * nb * sizeof(tile_block_q4_Kx8), qa, batch, 8);
+                    ktile + g * nb * sizeof(tile_block_q4_Kx8), qa, batch, 8, nullptr);
             }
         });
         auto t1 = std::chrono::steady_clock::now();
@@ -3596,7 +3759,7 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
         g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
             for (size_t g = g0; g < g1; ++g) {
                 ggml_gemm_q4_K_8x4_q8_K_p(cols, out.data() + g * 8, rows,
-                    ptile + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8);
+                    ptile + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8, nullptr);
             }
         });
         auto t1 = std::chrono::steady_clock::now();
@@ -3639,11 +3802,11 @@ extern "C" int sofuu_test_gemm_q4_k_plane_parity(int rows, int cols, int batch) 
         std::vector<float> oa((size_t)batch * rows, -1e30f), ob((size_t)batch * rows, -1e30f);
         for (size_t g = 0; g < r8; ++g) {
             ggml_gemm_q4_K_8x4_q8_K(cols, oa.data() + g * 8, rows,
-                wpack.data() + g * nb * sizeof(tile_block_q4_Kx8), qa.data(), batch, 8);
+                wpack.data() + g * nb * sizeof(tile_block_q4_Kx8), qa.data(), batch, 8, nullptr);
         }
         for (size_t g = 0; g < r8; ++g) {
             ggml_gemm_q4_K_8x4_q8_K_p(cols, ob.data() + g * 8, rows,
-                wplane.data() + g * nb * sizeof(tile_block_q4_Kx8p), qa.data(), batch, 8);
+                wplane.data() + g * nb * sizeof(tile_block_q4_Kx8p), qa.data(), batch, 8, nullptr);
         }
         if (memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) != 0) {
             for (size_t i = 0; i < oa.size(); ++i) {
@@ -3810,6 +3973,72 @@ extern "C" int sofuu_test_attention_x4_parity(int n_heads, int n_kv_heads, int h
             return 2;
         }
     }
+    return 0;
+}
+
+// ── Parity: residual-fused and dual-pair GEMM paths must be bit-identical to
+// the unfused equivalents on the same inputs (q4_K + q8_0). ──
+extern "C" int sofuu_test_gemm_resid_pair_parity(int rows, int cols, int batch) {
+    if (rows < 8 || rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;
+    const size_t nb4 = cols / 256, nb8 = cols / 32;
+    const size_t wrow4 = nb4 * 144, wrow8 = nb8 * sizeof(block_q8_0);
+    std::vector<uint8_t> w4((size_t)rows * wrow4), w4b((size_t)rows * wrow4);
+    std::vector<uint8_t> w8((size_t)rows * wrow8), w8b((size_t)rows * wrow8);
+    std::vector<float> x((size_t)batch * cols), resid((size_t)batch * rows);
+    uint32_t rng = 991;
+    for (auto &b : w4)  { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    for (auto &v : x)      { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f; }
+    for (auto &v : resid)  { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f; }
+    for (size_t i = 0; i < w4b.size(); ++i)  w4b[i]  = (uint8_t)(w4[i] ^ (uint8_t)(i * 31 + 7));
+    if (sofuu_tile_warm(w4.data(), rows, cols, 12) != 0) return -2;
+    if (sofuu_tile_warm(w4b.data(), rows, cols, 12) != 0) return -2;
+    if (sofuu_tile_warm(w8.data(), rows, cols, 8) != 0) return -2;
+    if (sofuu_tile_warm(w8b.data(), rows, cols, 8) != 0) return -2;
+    std::vector<float> ref(batch * rows), aug(batch * rows), p1(batch * rows), p2(batch * rows);
+
+    // q4_K residual: fused vs gemm + scalar in-place add
+    sofuu_gemm_q4_k(w4.data(), x.data(), ref.data(), rows, cols, batch);
+    for (size_t i = 0; i < ref.size(); ++i) ref[i] = resid[i] + ref[i];
+    aug = resid;
+    if (sofuu_gemm_q4_k_acc(w4.data(), x.data(), aug.data(), rows, cols, batch) != 0) return 1;
+    if (memcmp(ref.data(), aug.data(), ref.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-resid] q4_K mismatch\n"); return 10; }
+
+    // q4_K pair: dual vs two separate gemm calls
+    if (sofuu_gemm_q4_k_pair(w4.data(), w4b.data(), x.data(), p1.data(), p2.data(), rows, cols, batch) != 0) return 2;
+    std::vector<float> s1(batch * rows), s2(batch * rows);
+    sofuu_gemm_q4_k(w4.data(), x.data(), s1.data(), rows, cols, batch);
+    sofuu_gemm_q4_k(w4b.data(), x.data(), s2.data(), rows, cols, batch);
+    if (memcmp(s1.data(), p1.data(), s1.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-pair] q4_K out1 mismatch\n"); return 11; }
+    if (memcmp(s2.data(), p2.data(), s2.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-pair] q4_K out2 mismatch\n"); return 12; }
+
+    // q8_0 residual + pair (rows % 8 also satisfies q8_0's % 4)
+    ref.assign(batch * rows, 0.0f);
+    sofuu_gemm_q8_0(w8.data(), x.data(), ref.data(), rows, cols, batch);
+    for (size_t i = 0; i < ref.size(); ++i) ref[i] = resid[i] + ref[i];
+    aug = resid;
+    if (sofuu_gemm_q8_0_acc(w8.data(), x.data(), aug.data(), rows, cols, batch) != 0) return 3;
+    if (memcmp(ref.data(), aug.data(), ref.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-resid] q8_0 mismatch\n"); return 13; }
+    if (sofuu_gemm_q8_0_pair(w8.data(), w8b.data(), x.data(), p1.data(), p2.data(), rows, cols, batch) != 0) return 4;
+    std::fill(s1.begin(), s1.end(), 0.0f);
+    std::fill(s2.begin(), s2.end(), 0.0f);
+    sofuu_gemm_q8_0(w8.data(), x.data(), s1.data(), rows, cols, batch);
+    sofuu_gemm_q8_0(w8b.data(), x.data(), s2.data(), rows, cols, batch);
+    if (memcmp(s1.data(), p1.data(), s1.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-pair] q8_0 out1 mismatch\n"); return 14; }
+    if (memcmp(s2.data(), p2.data(), s2.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-pair] q8_0 out2 mismatch\n"); return 15; }
+
+    // Pad path: batch 6 → tile_batch 8; the fused kernel runs on scratch and
+    // the residual is added back with sofuu_f32_add_inplace — must equal the
+    // unfused pad path + separate add.
+    const int batch6 = 6;
+    std::vector<float> x6((size_t)batch6 * cols), resid6((size_t)batch6 * rows);
+    for (auto &v : x6)     { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f; }
+    for (auto &v : resid6) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 10) % 4001 - 2000) / 512.0f; }
+    std::vector<float> ref6((size_t)batch6 * rows), aug6((size_t)batch6 * rows);
+    sofuu_gemm_q4_k(w4.data(), x6.data(), ref6.data(), rows, cols, batch6);
+    for (size_t i = 0; i < ref6.size(); ++i) ref6[i] = resid6[i] + ref6[i];
+    aug6 = resid6;
+    if (sofuu_gemm_q4_k_acc(w4.data(), x6.data(), aug6.data(), rows, cols, batch6) != 0) return 5;
+    if (memcmp(ref6.data(), aug6.data(), ref6.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-resid] q4_K pad batch mismatch\n"); return 16; }
     return 0;
 }
 

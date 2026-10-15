@@ -13,7 +13,7 @@ use std::ops::{Deref, DerefMut};
 use super::gguf::GgufFile;
 use super::quant::{
     batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
-    batched_swiglu,
+    batched_swiglu, matmat_residual, matmat_pair,
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
     prefetch_streaming_slice, prefetch_temporal_slice, prof,
@@ -899,26 +899,35 @@ impl TransformerModel {
                 self.sink_tokens,
             );
 
-            // ── Attention Output Projection via matmat ───────────
+            // ── Attention Output Projection + Residual 1 (fused when the
+            // tile path takes it; bit-identical either way) ──────────────
             let attn_out_bytes = Self::tensor_slice(gguf, &layer.attn_output);
-            matmat(
+            if !matmat_residual(
                 attn_out_bytes,
                 layer.attn_output.tensor_type,
                 dim,
                 q_dim,
                 &self.head_out_batch[0..b_size * q_dim],
                 b_size,
-                &mut self.attn_out_batch[0..b_size * dim],
-            );
-
-            // ── Residual Connection 1 ───────────────────────────
-            batched_mad(
                 &mut self.x_batch[0..b_size * dim],
-                &self.attn_out_batch[0..b_size * dim],
-                1.0,
-                b_size,
-                dim,
-            );
+            ) {
+                matmat(
+                    attn_out_bytes,
+                    layer.attn_output.tensor_type,
+                    dim,
+                    q_dim,
+                    &self.head_out_batch[0..b_size * q_dim],
+                    b_size,
+                    &mut self.attn_out_batch[0..b_size * dim],
+                );
+                batched_mad(
+                    &mut self.x_batch[0..b_size * dim],
+                    &self.attn_out_batch[0..b_size * dim],
+                    1.0,
+                    b_size,
+                    dim,
+                );
+            }
 
             // ── FFN Norm for batch ──────────────────────────────
             let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
@@ -934,28 +943,40 @@ impl TransformerModel {
                 norm_eps,
             );
 
-            // ── Batched SwiGLU FFN via matmat ───────────────────
+            // ── Batched SwiGLU FFN: gate+up share one act-quant dispatch ──
             let gate_bytes = Self::tensor_slice(gguf, &layer.ffn_gate);
-            matmat(
+            let up_bytes = Self::tensor_slice(gguf, &layer.ffn_up);
+            if !matmat_pair(
                 gate_bytes,
+                up_bytes,
                 layer.ffn_gate.tensor_type,
                 hidden_dim,
                 dim,
                 &self.x_norm_batch[0..b_size * dim],
                 b_size,
                 &mut self.ffn_gate_batch[0..b_size * hidden_dim],
-            );
-
-            let up_bytes = Self::tensor_slice(gguf, &layer.ffn_up);
-            matmat(
-                up_bytes,
-                layer.ffn_up.tensor_type,
-                hidden_dim,
-                dim,
-                &self.x_norm_batch[0..b_size * dim],
-                b_size,
                 &mut self.ffn_up_batch[0..b_size * hidden_dim],
-            );
+            ) {
+                matmat(
+                    gate_bytes,
+                    layer.ffn_gate.tensor_type,
+                    hidden_dim,
+                    dim,
+                    &self.x_norm_batch[0..b_size * dim],
+                    b_size,
+                    &mut self.ffn_gate_batch[0..b_size * hidden_dim],
+                );
+
+                matmat(
+                    up_bytes,
+                    layer.ffn_up.tensor_type,
+                    hidden_dim,
+                    dim,
+                    &self.x_norm_batch[0..b_size * dim],
+                    b_size,
+                    &mut self.ffn_up_batch[0..b_size * hidden_dim],
+                );
+            }
 
             batched_swiglu(
                 &mut self.ffn_gate_batch[0..b_size * hidden_dim],
@@ -976,7 +997,15 @@ impl TransformerModel {
                         &mut self.ffn_out_batch[item * dim..(item + 1) * dim],
                     );
                 }
-            } else {
+            } else if !matmat_residual(
+                down_bytes,
+                layer.ffn_down.tensor_type,
+                dim,
+                hidden_dim,
+                &self.ffn_gate_batch[0..b_size * hidden_dim],
+                b_size,
+                &mut self.x_batch[0..b_size * dim],
+            ) {
                 matmat(
                     down_bytes,
                     layer.ffn_down.tensor_type,
@@ -986,16 +1015,14 @@ impl TransformerModel {
                     b_size,
                     &mut self.ffn_out_batch[0..b_size * dim],
                 );
+                batched_mad(
+                    &mut self.x_batch[0..b_size * dim],
+                    &self.ffn_out_batch[0..b_size * dim],
+                    1.0,
+                    b_size,
+                    dim,
+                );
             }
-
-            // ── Residual Connection 2 ───────────────────────────
-            batched_mad(
-                &mut self.x_batch[0..b_size * dim],
-                &self.ffn_out_batch[0..b_size * dim],
-                1.0,
-                b_size,
-                dim,
-            );
         }
     }
 

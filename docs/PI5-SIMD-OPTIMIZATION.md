@@ -322,3 +322,76 @@ norm 4, rope 14-16, glue 34, other 0.
 Remaining Qwen prefill gap is ~8% and now truly kernel-side (attention
 prefill at long seq + gemm scale-apply chain); `docs/PLAN-CPU-PREFILL-PEAK.md`
 (plan, awaiting approval) covers the follow-on programme.
+
+## Session 4 (2026-10-15): Phase-1 glue fusion — engaged, bit-exact, measured E2E-neutral
+
+Ported the M2 Pro plan's Phase 1 (glue fusion) to the Pi 5 lanes, adapted to
+our tile dispatch instead of `lfm2.rs`:
+
+1. **Residual-in-epilogue GEMM.** All five tile kernels (q8_0, q4_K, q4_K
+   sidecar, q6_K, q4_K planes) take an in-place-accumulate store
+   (`s + offset` gets `s + acc_f32`), so `x += attn_out` and `x += ffn_out`
+   fold into the out-projection / FFN-down GEMM epilogue. New externs
+   `sofuu_gemm_{q4_k,q8_0,q6_k}_acc` return 0 (fused) / 1 (path not taken, out
+   untouched — callers fall back to unfused `matmat` + `batched_mad`). The pad
+   path adds the residual via `sofuu_f32_add_inplace` after the scratch run.
+   Bit-exact: the same single IEEE add per element as the separate pass
+   (`a+b == b+a`), proven by `test_gemm_resid_pair_bit_exact`, incl. the
+   batch-6 pad case.
+2. **Dual gate/up dispatch.** `sofuu_gemm_{q4_k,q8_0}_pair` quantizes the
+   shared normalized activations once and runs both weight tiles
+   back-to-back per row group — one act-quant pass and dispatch instead of
+   two GEMMs. Bit-equal to two separate calls (same qa bytes).
+
+Wired in `forward_batch_layers_chunk` (the speculative/spec-batch and
+`forward_prefill_batch_chunk_internal` path both go through it; the spec-tree
+path in model.rs was left alone — peer-owned). `SOFUU_FUSE_DEBUG=1` prints
+engagement; the profiler counters confirm it: per 64-token chunk gemm calls
+196 → **168** (pair), glue calls 84 → **28** (mads folded).
+
+**Measured verdict: E2E-neutral on the Pi 5.** Full battery vs same-session
+llama.cpp: Qwen 157.3/20.6 vs 177.8/24.1; Llama-1B 132.2/8.6 vs 58.9/8.6;
+Spark 21.8-22.3/4.1 vs 22.8/4.3; decode parity everywhere — all within the
+±0.5% run band of the pre-Phase-1 numbers. The 34 ms/chunk glue bucket fell
+to 31 ms and dispatch counts fell as designed, but the removed work
+(one T×dim read+write per residual, one act-quant pass per gate/up pair) is
+a few ms against a 1.5 s prompt — and the epilogue add still pays the
+residual load/store inside the gemm, unlike the M2 Pro case where glue was
+55% of prefill. Phase 1 transfers *correctly* but not *profitably* at these
+shapes; keep as bit-exact infrastructure (the counters' pool-dispatch saving
+scales with smaller speculative batches, where dispatch overhead is
+proportionally larger). The remaining Qwen prefill gap is gemm-scale-apply
+chain + attention-at-long-seq; FA2-style tiled attention (the plan's Phase
+5) is the next measured-lever candidate.
+
+### Session 4 addendum: Phase-2 int8-activation SDOT — v1 measured SLOWER; hardware ceiling ~1.4× → parked
+
+Ported the plan's Phase 2 to the Pi float fleet (`lfm2.rs`, opt-in
+`SOFUU_PRE8=1`): activations quantized per 128-band once per layer call,
+panels converted to per-row per-band int8 weights in the same pass that
+dequantizes bf16/MLX4, tile kernel accumulates int8×int8 SDOT into per-band
+i32 and folds two-sided `w_scale·a_scale·iacc` into f32. Numerics proven:
+`pre8_sdot_tile_rel_rms_greedy` — kernel is **exactly** the scalar int8
+reference (maxdiff 0), rel-RMS ≪ 1e-2 vs f32, per-token argmax identical.
+Two engineering lessons baked in: multi-accumulator inline-asm SDOT blocks
+produce wrong results on stable rustc (input/_out register binding across
+statements — use the proven one-acc-per-statement `sdot_band` shape, same as
+the PTQ1_0 path), and the first device A/B must include an engagement +
+scalar-reference bisect (caught both).
+
+**Measured verdict: v1 is 7-17% SLOWER end-to-end** (liquid-350 prefill
+39.2 t/s vs 42.2-46.9 with the f32 tile), because (a) the SDOT tile calls an
+outlined target_feature helper 1024×/panel (8 row-quads × token-pairs ×
+16 bands) — call overhead dominates, and (b) the per-panel int8 weight
+conversion is a scalar pass. Both are fixable, but before investing the fix
+the hardware ceiling says the payoff is thin: on A76, SDOT issues 16
+int8-MACs/cycle against FMA's 8 f32-MACs/cycle on a single pipe — the
+device's int8 ceiling is the already-measured 185 GMAC/s (q8_0 tile) vs an
+f32 tile projection of ~120-135 GMAC/s, i.e. **~1.4× kernel headroom**, not
+the ≥2× the M2 plan assumed (AMX-class). After the two mandatory overhead
+fixes the best-case net is ≲15% on a fleet where GEMM is ~70% of prefill —
+below the plan's own ≥1.8× acceptance bar. Phase 2 parked as bit-gated
+infrastructure (`SOFUU_PRE8=1`, default off, suite 577/0); revisit only if
+the liquid float fleet becomes a product surface, or fold the same
+two-sided-scale eight into the q4_K scale-apply-chain work, which shares the
+math.

@@ -1392,7 +1392,160 @@ fn dequant_linear_row(
     }
 }
 
-    /// y[t, :] = W · x[t, :] for all tokens, weight row read once per call.
+// ════════ Phase 2: int8-activation SDOT GEMM for the float-weight fleet ════════
+// Opt-in via SOFUU_PRE8=1 (plan §Phase 2). Activations are quantized per
+// 128-band once per layer call; each panel dequantizes bf16/MLX4 rows into
+// int8 lanes with a per-row per-band scale (one extra pass over the same
+// bytes the f32 path already dequantized); the tile kernel accumulates
+// int8×int8 SDOT into int32 per band and folds scaled partial sums into f32
+// — the two-sided w_scale·a_scale·iacc pattern the ternary path already
+// proved stable as `trit_row_dot_q`. Requires armv8.2 sdot (Pi 5 / Apple
+// Silicon); other hosts and non-opt-in runs keep the f32 tile4x4 path.
+fn pre8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(target_arch = "aarch64")]
+    {
+        *ON.get_or_init(|| {
+            std::env::var("SOFUU_PRE8").as_deref() == Ok("1")
+                && std::arch::is_aarch64_feature_detected!("dotprod")
+        })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        *ON.get_or_init(|| std::env::var("SOFUU_PRE8").as_deref() == Ok("1"))
+    }
+}
+
+const PRE8_GROUP: usize = 128;
+
+struct ActQ8 {
+    q: Vec<i8>,       // [tokens × n], n group-multiple padded, zero-filled
+    scales: Vec<f32>, // [tokens × groups]
+    tokens: usize,
+    n: usize,
+    groups: usize,
+}
+
+fn quantize_acts_i8(x: &[f32], tokens: usize, cols: usize) -> ActQ8 {
+    let groups = cols.div_ceil(PRE8_GROUP);
+    let n = groups * PRE8_GROUP;
+    let mut q = vec![0i8; tokens * n];
+    let mut scales = vec![1f32; tokens * groups];
+    for t in 0..tokens {
+        for g in 0..groups {
+            let g0 = g * PRE8_GROUP;
+            let g1 = (g0 + PRE8_GROUP).min(cols);
+            let mut amax = 0f32;
+            for i in g0..g1 {
+                amax = amax.max(x[t * cols + i].abs());
+            }
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            scales[t * groups + g] = scale;
+            for i in g0..g1 {
+                q[t * n + i] = (x[t * cols + i] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+    ActQ8 { q, scales, tokens, n, groups }
+}
+
+thread_local! {
+    static WQ_BUF: std::cell::RefCell<Vec<i8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WS_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Per-row per-band int8 conversion of the freshly dequantized f32 panel
+/// (extra absmax+round pass over the same row bytes the f32 path produced).
+/// `stride` = panel row length (the dequantized `cols`, possibly < the padded
+/// `n`); the padded tail stays zero and contributes exactly 0 to every dot.
+fn quantize_w_panel_i8(row_buf: &[f32], rows: usize, stride: usize, n: usize, groups: usize, wq: &mut [i8], ws: &mut [f32]) {
+    for r in 0..rows {
+        for g in 0..groups {
+            let g0 = g * PRE8_GROUP;
+            let mut amax = 0f32;
+            for i in g0..g0 + PRE8_GROUP {
+                let v = if i < stride { row_buf[r * stride + i] } else { 0.0 };
+                amax = amax.max(v.abs());
+            }
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            ws[r * groups + g] = scale;
+            for i in g0..g0 + PRE8_GROUP {
+                let v = if i < stride { row_buf[r * stride + i] } else { 0.0 };
+                wq[r * n + i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+}
+
+/// 4 weight rows × 2 tokens per tile: per 128-band, 8 live int32 SDOT
+/// accumulators (never more, so A76 does not spill), then a two-sided fold
+/// `f32 += hsum(acc) · w_scale[r][g] · a_scale[t][g]`. `n` must be a
+/// group multiple (callers pad), so the inner chunk loop is exact.
+/// One 128-band signed int8 dot — structurally identical to the ternary
+/// path's proven `sdot_128_neon` (fresh 16B loads per chunk, one asm
+/// statement per chunk, single live accumulator).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::missing_safety_doc)]
+unsafe fn sdot_band(w: *const i8, a: *const i8) -> i32 {
+    use std::arch::aarch64::*;
+    let mut acc = vdupq_n_s32(0);
+    for k in 0..(PRE8_GROUP / 16) {
+        let wv = vld1q_s8(w.add(k * 16));
+        let av = vld1q_s8(a.add(k * 16));
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {wv:v}.16b, {av:v}.16b",
+            acc = inout(vreg) acc,
+            wv = in(vreg) wv,
+            av = in(vreg) av,
+            options(pure, nomem, nostack)
+        );
+    }
+    vaddvq_s32(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn gemm_tile4x2_sdot(
+    wq: *const i8,   // panel rows r0..r0+4, row-major [4 × n]
+    wsc: *const f32, // [4 × groups]
+    aq: *const i8,   // tokens t0 and t0+1, [2 × n]
+    asc: *const f32, // [2 × groups]
+    n: usize,
+    groups: usize,
+    out: &mut [f32; 8], // out[r*2 + t]
+) {
+    // SDOT band dots via the proven helper + two-sided f32 fold.
+    let mut tot = [0f32; 8];
+    for g in 0..groups {
+        let g0 = g * PRE8_GROUP;
+        let as0 = *asc.add(g);
+        let as1 = *asc.add(groups + g);
+        let d00 = sdot_band(wq.add(g0), aq.add(g0)) as f32;
+        let d01 = sdot_band(wq.add(g0), aq.add(n + g0)) as f32;
+        let d10 = sdot_band(wq.add(n + g0), aq.add(g0)) as f32;
+        let d11 = sdot_band(wq.add(n + g0), aq.add(n + g0)) as f32;
+        let d20 = sdot_band(wq.add(2 * n + g0), aq.add(g0)) as f32;
+        let d21 = sdot_band(wq.add(2 * n + g0), aq.add(n + g0)) as f32;
+        let d30 = sdot_band(wq.add(3 * n + g0), aq.add(g0)) as f32;
+        let d31 = sdot_band(wq.add(3 * n + g0), aq.add(n + g0)) as f32;
+        tot[0] += d00 * *wsc.add(g) * as0;
+        tot[1] += d01 * *wsc.add(g) * as1;
+        tot[2] += d10 * *wsc.add(groups + g) * as0;
+        tot[3] += d11 * *wsc.add(groups + g) * as1;
+        tot[4] += d20 * *wsc.add(2 * groups + g) * as0;
+        tot[5] += d21 * *wsc.add(2 * groups + g) * as1;
+        tot[6] += d30 * *wsc.add(3 * groups + g) * as0;
+        tot[7] += d31 * *wsc.add(3 * groups + g) * as1;
+    }
+    for (slot, v) in tot.iter().enumerate() {
+        out[slot] = *v as f32;
+    }
+}
+
+/// y[t, :] = W · x[t, :] for all tokens, weight row read once per call.
 /// x must be token-major [t_count, cols]; y token-major [t_count, rows].
 static GEMM_PROF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GEMM_PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1438,6 +1591,15 @@ fn gemm_batched(
     let mmap_ptr = SendPtr(mmap as *const super::mmap::MmapFile);
     let x_ptr = SendPtr(x.as_ptr());
     let y_ptr = SendMutPtr(y.as_mut_ptr());
+    // Phase-2 int8 path: quantize the shared activations once for the whole
+    // layer call; panels convert their dequantized rows to int8 and run the
+    // SDOT tile. Falls back per-call — no caller-visible behavior change.
+    let aq = if pre8_enabled() && t_count >= 4 && rows % 4 == 0 && cols >= 512 {
+        Some(quantize_acts_i8(x, t_count, cols))
+    } else {
+        None
+    };
+    let aq_ptr = aq.as_ref().map(|a| SendPtr(a as *const ActQ8));
     let t_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
     #[cfg(target_os = "macos")]
     if blas_enabled() {
@@ -1480,7 +1642,7 @@ fn gemm_batched(
     const ROW_PANEL: usize = 32;
     let panels = rows.div_ceil(ROW_PANEL);
     super::dynamic_ffn::parallel_for(0, panels, threads, move |p0, p1| unsafe {
-        run_gemm_panels(lt_ptr, mmap_ptr, x_ptr, y_ptr, t_count, rows, cols, p0, p1);
+        run_gemm_panels(lt_ptr, mmap_ptr, x_ptr, y_ptr, aq_ptr, t_count, rows, cols, p0, p1);
     });
     if let Some(t0) = t_start {
         GEMM_PROF_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1497,6 +1659,7 @@ unsafe fn run_gemm_panels(
     mmap_ptr: SendPtr<super::mmap::MmapFile>,
     x_ptr: SendPtr<f32>,
     y_ptr: SendMutPtr<f32>,
+    aq_ptr: Option<SendPtr<ActQ8>>,
     t_count: usize,
     rows: usize,
     cols: usize,
@@ -1511,6 +1674,7 @@ unsafe fn run_gemm_panels(
     let mmap: &super::mmap::MmapFile = unsafe { &*mmap_ptr.0 };
     let x: &[f32] = unsafe { std::slice::from_raw_parts(x_ptr.0, t_count * cols) };
     let y: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(y_ptr.0, t_count * rows) };
+    let aq: Option<&ActQ8> = aq_ptr.map(|p| unsafe { &*p.0 });
     ROW_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.resize(ROW_PANEL * cols, 0.0f32);
@@ -1520,6 +1684,11 @@ unsafe fn run_gemm_panels(
             for ri in 0..panel_rows {
                 dequant_linear_row(lt, mmap, row0 + ri, cols, &mut buf[ri * cols..(ri + 1) * cols]);
             }
+            if let Some(aq) = aq {
+                // ── Phase-2 int8 window: SDOT tiles for 4-row × 2-token
+                // blocks; f32 dots cover the panel/tail remainders. ──
+                run_i8_panel(aq, &buf, panel_rows, cols, x, y, row0, rows, t_count);
+            } else {
             // Register-blocked sweep: 4 rows × 4 tokens per tile; the k
             // stream is shared by all 16 FMAs of a tile.
             let mut t = 0usize;
@@ -1570,7 +1739,81 @@ unsafe fn run_gemm_panels(
                 }
                 t += 1;
             }
+            }  // else (f32 path)
         }
+    });
+}
+
+/// Phase-2 helper: one panel's int8 GEMM — convert the dequantized f32 rows
+/// to per-band int8 weights, then SDOT tiles (4 rows × 2 tokens), with
+/// f32-dot remainders for row/tail remainders.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_i8_panel(
+    aq: &ActQ8,
+    buf: &[f32],
+    panel_rows: usize,
+    cols: usize,
+    x: &[f32],
+    y: &mut [f32],
+    row0: usize,
+    rows: usize,
+    t_count: usize,
+) {
+    WQ_BUF.with(|wqc| {
+        let mut wq = wqc.borrow_mut();
+        wq.resize(panel_rows * aq.n, 0);
+        WS_BUF.with(|wsc| {
+            let mut ws = wsc.borrow_mut();
+            ws.resize(panel_rows * aq.groups, 0.0);
+            quantize_w_panel_i8(buf, panel_rows, cols, aq.n, aq.groups, &mut wq, &mut ws);
+            let mut out = [0.0f32; 8];
+            let mut t = 0usize;
+            while t + 2 <= t_count {
+                let mut ri = 0usize;
+                while ri + 4 <= panel_rows {
+                    unsafe {
+                        gemm_tile4x2_sdot(
+                            wq.as_ptr().add(ri * aq.n),
+                            ws.as_ptr().add(ri * aq.groups),
+                            aq.q.as_ptr().add(t * aq.n),
+                            aq.scales.as_ptr().add(t * aq.groups),
+                            aq.n,
+                            aq.groups,
+                            &mut out,
+                        );
+                    }
+                    for tk in 0..2 {
+                        for ti in 0..4 {
+                            y[(t + tk) * rows + row0 + ri + ti] = out[ti * 2 + tk];
+                        }
+                    }
+                    ri += 4;
+                }
+                for r1 in ri..panel_rows {
+                    for tk in 0..2 {
+                        #[cfg(target_arch = "aarch64")]
+                        let acc = unsafe {
+                            dot_f32_neon(buf.as_ptr().add(r1 * cols), x.as_ptr().add((t + tk) * cols), cols)
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let acc = 0.0f32;
+                        y[(t + tk) * rows + row0 + r1] = acc;
+                    }
+                }
+                t += 2;
+            }
+            while t < t_count {
+                let xr = &x[t * cols..(t + 1) * cols];
+                for ri in 0..panel_rows {
+                    #[cfg(target_arch = "aarch64")]
+                    let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let acc = 0.0f32;
+                    y[t * rows + row0 + ri] = acc;
+                }
+                t += 1;
+            }
+        });
     });
 }
 
@@ -3292,7 +3535,134 @@ mod lfm2_tile_tests {
 mod lfm2_ceiling_probe {
     use super::*;
 
+        /// Phase-2 int8 path: the SDOT tile with two-sided per-band scaling must
+    /// stay within rel-RMS < 1e-2 of the f32 path AND must be greedy-safe:
+    /// per-token argmax over rows is identical (what the sampler actually
+    /// consumes), the same gate the ternary path ships with.
     #[test]
+    fn pre8_sdot_tile_rel_rms_greedy() {
+        if !cfg!(target_arch = "aarch64") {
+            return;
+        }
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let cols = 2048usize;
+        let (rows, tokens) = (4usize, 8usize); // single panel: bisect validity
+        // Weights with realistic FFN-like spread across three magnitude bands.
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let band = i / cols % 3;
+                let base = [0.35f32, 0.012, 0.004][band];
+                (((i % 29) as f32 - 14.5) / 14.5) * base
+            })
+            .collect();
+        let x: Vec<f32> = (0..tokens * cols)
+            .map(|i| (((i * 7 + i / cols) % 23) as f32 - 11.5) / 11.5 * 0.9)
+            .collect();
+
+        // reference: plain f32 dots
+        let mut ref_out = vec![0f32; rows * tokens];
+        for r in 0..rows {
+            for t in 0..tokens {
+                ref_out[t * rows + r] = w[r * cols..(r + 1) * cols]
+                    .iter()
+                    .zip(x[t * cols..(t + 1) * cols].iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
+            }
+        }
+
+        // int8 path: shared act quantization + panel weight quantization
+        let aq = quantize_acts_i8(&x, tokens, cols);
+        let mut got_all = vec![0f32; rows * tokens];
+        let groups = aq.groups;
+        let n = aq.n;
+        // one 4-row panel (pad remaining rows with zeros)
+        let panel_buf = vec![0f32; 4 * n]; // zero pad (row 4..4 unused; rows 0..4 real)
+        let mut wq = vec![0i8; 4 * n];
+        let mut ws = vec![0f32; 4 * groups];
+        let mut all_ok = true;
+        let mut worst_rms = 0f32;
+        for r0 in (0..rows).step_by(4) {
+            let mut pbuf = vec![0f32; 4 * n];
+            for ri in 0..4.min(rows - r0) {
+                pbuf[ri * n..ri * n + cols].copy_from_slice(&w[(r0 + ri) * cols..(r0 + ri) * cols + cols]);
+            }
+            quantize_w_panel_i8(&pbuf, 4, cols, n, groups, &mut wq, &mut ws);
+            let mut t = 0usize;
+            while t + 2 <= tokens {
+                let mut out = [0f32; 8];
+                unsafe {
+                    gemm_tile4x2_sdot(wq.as_ptr(), ws.as_ptr(), aq.q.as_ptr().add(t * n), aq.scales.as_ptr().add(t * groups), n, groups, &mut out);
+                }
+                for ti in 0..2 {
+                    for ri in 0..4 {
+                        if r0 + ri >= rows {
+                            continue;
+                        }
+                        got_all[(t + ti) * rows + r0 + ri] = out[ri * 2 + ti];
+                    }
+                }
+                t += 2;
+            }
+            if t < tokens {
+                let mut out = [0f32; 8];
+                unsafe {
+                    gemm_tile4x2_sdot(wq.as_ptr(), ws.as_ptr(), aq.q.as_ptr().add(t * n), aq.scales.as_ptr().add(t * groups), n, groups, &mut out);
+                }
+            }
+        }
+        // ── bisect: kernel vs scalar int8 reference (same quantized inputs)
+        let mut scalar_i8 = vec![0f32; rows * tokens];
+        for t in 0..tokens {
+            for r in 0..rows {
+                let pr = r % 4; // rows were quantized in panels of 4 (r0=0 here)
+                let mut acc = 0f32;
+                for g in 0..groups {
+                    let g0 = g * PRE8_GROUP;
+                    let mut dot = 0i32;
+                    for i in g0..g0 + PRE8_GROUP {
+                        dot += wq[pr * n + i] as i32 * aq.q[t * n + i] as i32;
+                    }
+                    acc += dot as f32 * ws[pr * groups + g] * aq.scales[t * groups + g];
+                }
+                scalar_i8[t * rows + r] = acc;
+            }
+        }
+        let mut kdiff = 0f32;
+        for t in 0..tokens {
+            for r in 0..4.min(rows) {
+                kdiff = kdiff.max((got_all[t * rows + r] - scalar_i8[t * rows + r]).abs());
+            }
+        }
+        eprintln!("[pre8-dbg] kernel-vs-scalar-i8 maxdiff={kdiff}; sample got={} scalar={}", got_all[0], scalar_i8[0]);
+
+        // vector-level gates (the plan's acceptance): rel-RMS < 1e-2 over the
+        // whole output, and per-token argmax over rows identical to f32.
+        let mut sq_diff = 0f32;
+        let mut sq_ref = 0f32;
+        for i in 0..ref_out.len() {
+            let d = got_all[i] - ref_out[i];
+            sq_diff += d * d;
+            sq_ref += ref_out[i] * ref_out[i];
+        }
+        let rel = (sq_diff / sq_ref.max(1e-12)).sqrt();
+        worst_rms = rel;
+        if rel >= 1e-2 {
+            for i in 0..8 {
+                eprintln!("[pre8-dbg] i={i} got={} want={}", got_all[i], ref_out[i]);
+            }
+        }
+        assert!(rel < 1e-2, "rel-RMS {rel} exceeded 1e-2");
+        for t in 0..tokens {
+            let a = (0..rows).max_by(|&r1, &r2| ref_out[t * rows + r1].total_cmp(&ref_out[t * rows + r2])).unwrap();
+            let b = (0..rows).max_by(|&r1, &r2| got_all[t * rows + r1].total_cmp(&got_all[t * rows + r2])).unwrap();
+            assert_eq!(a, b, "token {t}: argmax {} vs {} (f32 vs pre8)", a, b);
+        }
+    }
+
+#[test]
     #[ignore = "timing probe; run explicitly"]
     fn tile4x4_gflops_single_thread() {
         if !cfg!(target_arch = "aarch64") {

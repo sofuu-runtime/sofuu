@@ -100,6 +100,17 @@
 > breach detail + single-shot salvage. RLM nested-episode recursion stays PLAN-RLM v2
 > scope (documented feature, not a defect); `.env` stays readable per the documented
 > policy.
+> **Attribution + a bonus fix the committed test made possible (still same day):** the
+> close-out pieces above (mapContext cap, contract test, TASKS block) were swept into the
+> bench peer's broad commit `855d25568` — content verified at HEAD; and the contract test
+> immediately earned its keep by exposing a latent funnel bug: `sofuu_rt_call("agent.run", …)`
+> in its documented OBJECT form passed the whole options object as run's single "target"
+> argument and died in normalizeDef ("agent.define: name is required") — the stream
+> builder always spread `(a.target, a.task, a)`; the blocking call now does too (fixed in
+> the same landing; capi suite 46/46 incl. the new test). Env note: repo-root `./sofuu`
+> later froze every exec in `_dyld_start` (macOS provenance path stall, 0% CPU) while
+> identical bytes ran from `target/release/sofuu` — run the target path directly when the
+> root copy hangs on `version`.
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`

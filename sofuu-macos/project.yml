@@ -1,0 +1,93 @@
+# project.yml — XcodeGen spec for the Sofuu macOS app.
+#
+# The Mac sibling of sofuu-ios: same engine, same Swift store/engine layers
+# (donor-ported), SwiftUI shell rebuilt for the desktop — pulldown menus,
+# keyboard shortcuts, vibrancy sidebar, zoom.
+#
+#   brew install xcodegen
+#   make macos-engine      # builds sofuu-macos/engine/libsofuu.dylib (QTSQ-linked)
+#   xcodegen generate      # writes SofuuMac.xcodeproj from this file
+#   xcodebuild -scheme SofuuMac build
+#
+# The engine is a prerequisite: the app links engine/libsofuu.dylib, which
+# scripts/dist/macos-engine.sh produces. Generate the project AFTER the
+# dylib exists, or XcodeGen will warn about the missing file.
+
+name: SofuuMac
+options:
+  bundleIdPrefix: com.sofuu
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  SofuuMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: SofuuMac
+        excludes:
+          - "Info.plist"
+          - "SofuuMac.entitlements"
+          - "Resources/icon.icns"
+      # The cloud shader, compiled into the app's default.metallib —
+      # device.makeDefaultLibrary() reads the MAIN bundle, and the engine
+      # framework's own copy only serves the engine (iOS does the same).
+      - path: ../src/metal/kernels.metal
+    settings:
+      base:
+        PRODUCT_NAME: SofuuMac
+        # NOT "Sofuu" — the Clang module engine/libsofuu.dylib exports via
+        # module.modulemap is named Sofuu, and Swift silently ignores
+        # `import Sofuu` from a Swift module of the same name (the iOS
+        # project.yml documents this trap at length).
+        PRODUCT_MODULE_NAME: SofuuMac
+        PRODUCT_BUNDLE_IDENTIFIER: com.sofuu.desktop
+        MARKETING_VERSION: "0.2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: SofuuMac/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SofuuMac/SofuuMac.entitlements
+        # `import Sofuu` resolves here (module.modulemap + sofuu_embed.h,
+        # both produced by scripts/dist/macos-engine.sh next to the dylib).
+        SWIFT_INCLUDE_PATHS: "$(PROJECT_DIR)/engine"
+        GENERATE_INFOPLIST_FILE: NO
+        COMBINE_HIDPI_IMAGES: YES
+        # Explicit arm64: the engine dylib is arm64-only for now.
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: YES
+        # libc++ is REQUIRED — the engine archive carries a C++ translation
+        # unit (crates/sofuu-ffi/src/simd/infer_kernels.cpp) and a Swift app
+        # does not link libc++ on its own (see the iOS project.yml note).
+        OTHER_LDFLAGS: "$(inherited) -lc++"
+        MTL_LANGUAGE_VERSION: "3.0"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    dependencies:
+      # Built by `make macos-engine` → scripts/dist/macos-engine.sh.
+      # Embed: a dynamic framework, so the .app must carry it — Resources/
+      # (default.metallib) rides along inside it.
+      - framework: engine/Sofuu.framework
+        embed: true
+        codeSign: false
+
+schemes:
+  SofuuMac:
+    build:
+      targets:
+        SofuuMac: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    archive:
+      config: Release

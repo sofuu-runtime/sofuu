@@ -1,0 +1,7 @@
+# Build outputs — never tracked.
+engine/
+build/
+SofuuMac.xcodeproj/
+DerivedData/
+.devstub/sofuu_embed.h
+.DS_Store

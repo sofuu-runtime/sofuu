@@ -804,7 +804,7 @@ impl Spark25Model {
 
             // ── Per-head sigmoid gate (batch) ───────────────
             let gate_bytes = Self::tensor_slice(gguf, &self.layers[layer_idx].attn_gate);
-            matmat(
+            prefill_matmat(
                 gate_bytes,
                 self.layers[layer_idx].attn_gate.tensor_type,
                 n_heads,
@@ -824,7 +824,7 @@ impl Spark25Model {
 
             // ── Output projection + residual ────────────────
             let wo_bytes = Self::tensor_slice(gguf, &self.layers[layer_idx].attn_output);
-            matmat(
+            prefill_matmat(
                 wo_bytes,
                 self.layers[layer_idx].attn_output.tensor_type,
                 dim,
@@ -854,7 +854,7 @@ impl Spark25Model {
 
             // ── GeGLU FFN + residual ────────────────────────
             let gate_bytes = Self::tensor_slice(gguf, &self.layers[layer_idx].ffn_gate);
-            matmat(
+            prefill_matmat(
                 gate_bytes,
                 self.layers[layer_idx].ffn_gate.tensor_type,
                 hidden_dim,
@@ -864,7 +864,7 @@ impl Spark25Model {
                 &mut self.ffn_gate_batch[..b_size * hidden_dim],
             );
             let up_bytes = Self::tensor_slice(gguf, &self.layers[layer_idx].ffn_up);
-            matmat(
+            prefill_matmat(
                 up_bytes,
                 self.layers[layer_idx].ffn_up.tensor_type,
                 hidden_dim,
@@ -880,7 +880,7 @@ impl Spark25Model {
                 );
             }
             let down_bytes = Self::tensor_slice(gguf, &self.layers[layer_idx].ffn_down);
-            matmat(
+            prefill_matmat(
                 down_bytes,
                 self.layers[layer_idx].ffn_down.tensor_type,
                 dim,
@@ -951,8 +951,8 @@ impl Spark25Model {
         }
         let qkv_bytes = Self::tensor_slice(gguf, &layer.attn_qkv);
         let row_stride = type_row_size(layer.attn_qkv.tensor_type, dim);
-        matmat(&qkv_bytes[..], layer.attn_qkv.tensor_type, q_dim, dim, x_norm_batch, b_size, q_batch);
-        matmat(
+        prefill_matmat(&qkv_bytes[..], layer.attn_qkv.tensor_type, q_dim, dim, x_norm_batch, b_size, q_batch);
+        prefill_matmat(
             &qkv_bytes[q_dim * row_stride..],
             layer.attn_qkv.tensor_type,
             kv_dim,
@@ -961,7 +961,7 @@ impl Spark25Model {
             b_size,
             k_batch,
         );
-        matmat(
+        prefill_matmat(
             &qkv_bytes[(q_dim + kv_dim) * row_stride..],
             layer.attn_qkv.tensor_type,
             kv_dim,
@@ -983,7 +983,121 @@ impl Spark25Model {
     }
 }
 
-#[cfg(test)]
+#[derive(Clone, Copy)]
+struct SndPtr<T>(*const T);
+unsafe impl<T> Send for SndPtr<T> {}
+unsafe impl<T> Sync for SndPtr<T> {}
+#[derive(Clone, Copy)]
+struct SndMutPtr<T>(*mut T);
+unsafe impl<T> Send for SndMutPtr<T> {}
+unsafe impl<T> Sync for SndMutPtr<T> {}
+
+/// Spark prefill batched matmul, SOFUU-safe path (default): the C++
+/// batched-gemm tile pipeline corrupts Spark activations (9848995df; TASKS
+/// 2026-10-15 evidence pack), so weights dequantize row by row with the
+/// dispatch decode uses and dot against the chunk directly.
+/// SOFUU_SPARK_CPP_GEMM=1 restores the C++ path once that bug ships.
+fn prefill_matmat(
+    w_bytes: &[u8],
+    ty: u32,
+    rows: usize,
+    cols: usize,
+    xs: &[f32],
+    b_size: usize,
+    ys: &mut [f32],
+) {
+    debug_assert_eq!(xs.len(), b_size * cols);
+    debug_assert_eq!(ys.len(), b_size * rows);
+    if std::env::var_os("SOFUU_SPARK_CPP_GEMM").is_some() {
+        return matmat(w_bytes, ty, rows, cols, xs, b_size, ys);
+    }
+    dequant_gemm_rows(w_bytes, ty, rows, cols, xs, b_size, ys);
+}
+
+fn dequant_gemm_rows(
+    w_bytes: &[u8],
+    ty: u32,
+    rows: usize,
+    cols: usize,
+    xs: &[f32],
+    b_size: usize,
+    ys: &mut [f32],
+) {
+    let rs = type_row_size(ty, cols);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 8)
+        .min(rows.max(1));
+    let wp = SndPtr(w_bytes.as_ptr());
+    let xp = SndPtr(xs.as_ptr());
+    let yp = SndMutPtr(ys.as_mut_ptr());
+    if threads <= 1 {
+        dequant_gemm_rows_range(wp, xp, yp, ty, rs, rows, cols, b_size, 0, rows);
+        return;
+    }
+    std::thread::scope(|s| {
+        for th in 0..threads {
+            let (r0, r1) = (rows * th / threads, rows * (th + 1) / threads);
+            s.spawn(move || dequant_gemm_rows_range(wp, xp, yp, ty, rs, rows, cols, b_size, r0, r1));
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dequant_gemm_rows_range(
+    wp: SndPtr<u8>,
+    xp: SndPtr<f32>,
+    yp: SndMutPtr<f32>,
+    ty: u32,
+    rs: usize,
+    rows: usize,
+    cols: usize,
+    b_size: usize,
+    r0: usize,
+    r1: usize,
+) {
+    let (SndPtr(wp), SndPtr(xp), SndMutPtr(yp)) = (wp, xp, yp);
+    let xs: &[f32] = unsafe { std::slice::from_raw_parts(xp, b_size * cols) };
+    let mut dw = vec![0.0f32; cols];
+    for r in r0..r1 {
+        let src: &[u8] = unsafe { std::slice::from_raw_parts(wp.add(r * rs), rs) };
+        match ty {
+            GGML_TYPE_Q4_0 => dequantize_q4_0_row(src, &mut dw),
+            GGML_TYPE_Q8_0 => dequantize_q8_0_row(src, &mut dw),
+            GGML_TYPE_Q4_K => dequantize_q4_k_row(src, &mut dw),
+            GGML_TYPE_Q6_K => dequantize_q6_k_row(src, &mut dw),
+            GGML_TYPE_F32 => unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr() as *const f32, dw.as_mut_ptr(), cols);
+            },
+            GGML_TYPE_F16 => unsafe {
+                let s = std::slice::from_raw_parts(src.as_ptr() as *const u16, cols);
+                for i in 0..cols {
+                    dw[i] = f16_to_f32(s[i]);
+                }
+            },
+            _ => {
+                for t in 0..b_size {
+                    unsafe {
+                        *yp.add(t * rows + r) = 0.0;
+                    }
+                }
+            }
+        }
+        for t in 0..b_size {
+            let x = &xs[t * cols..(t + 1) * cols];
+            let mut s = 0.0f32;
+            for (d, xv) in dw.iter().zip(x.iter()) {
+                s += *d * xv;
+            }
+            unsafe {
+                *yp.add(t * rows + r) = s;
+            }
+        }
+    }
+}
+
+#[cfg(test)]#[cfg(test)]
 mod tests {
     use super::*;
 

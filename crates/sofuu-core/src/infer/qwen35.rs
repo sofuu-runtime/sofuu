@@ -903,8 +903,11 @@ fn gemm_rows_t143(
 }
 
 fn direct_tile_enabled() -> bool {
+    // DEFAULT ON: bit-identical to the sdot slab path (pinned by
+    // direct_tile_bitmatches_sdot_path) and 2x+ faster. `=0` restores the
+    // old per-(row, token) runner.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOFUU_T143_DIRECT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("SOFUU_T143_DIRECT").as_deref() != Ok("0"))
 }
 
 /// Phase 4a: token-tiled sdot GEMM over the trit slab. Two changes vs

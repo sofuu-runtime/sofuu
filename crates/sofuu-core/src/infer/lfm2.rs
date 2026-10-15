@@ -2065,12 +2065,11 @@ fn blas_dequant_full(
 }
 
 fn blas_enabled() -> bool {
-    // The Accelerate framework is linked at build time on macOS, so the
-    // cblas symbol is always present there; elsewhere the flag is a no-op.
-    if std::env::var("SOFUU_PREFILL_BLAS").as_deref() != Ok("1") {
-        return false;
-    }
-    cfg!(target_os = "macos")
+    // DEFAULT ON for macOS (exact-f32 math, gates-pinned): AMX is the fastest
+    // prefill ladder on Apple Silicon and needs no quality trade. `=0` opts
+    // out (NEON tile fallback); on other platforms this stays off — the
+    // opt-in int8 ladder (SOFUU_PRE8) covers non-AMX aarch64 instead.
+    cfg!(target_os = "macos") && std::env::var("SOFUU_PREFILL_BLAS").as_deref() != Ok("0")
 }
 
 /// Symmetric int8 quantization of one PRE8_GROUP slice: SIMD absmax, one

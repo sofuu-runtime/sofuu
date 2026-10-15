@@ -40,7 +40,13 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
 - Risk: low. All inside `lfm2.rs`. No flag needed (bit-parity not claimed —
       RMS gates stay).
 
-## Phase 2 — int8 activations in the float-weight GEMM  → target 200–300 tk/s
+#> **DEFAULTS UPDATE 2026-10-15:** the ladders are the standing behavior, not experiments —
+> AMX-on-macOS default-on (exact-f32, `SOFUU_PREFILL_BLAS=0` to opt out), 27B direct tile
+> default-on (bit-identical, `SOFUU_T143_DIRECT=0` to opt out), int8 two-sided stays
+> opt-in (`SOFUU_PRE8=1`) for non-AMX aarch64. Same contract for every backend: batched
+> prefill + dequant-once + L2-fit slab + pinned gates.
+
+# Phase 2 — int8 activations in the float-weight GEMM  → target 200–300 tk/s
 
 > **DONE 2026-10-15 (ca696851d):** shipped as two-sided 32-group quant
 > (`SOFUU_PRE8=1`) + per-load `Pre8Slab` weight cache. Warm liquid-1.3B:

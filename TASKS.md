@@ -4,6 +4,16 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — Generalization pass: prefill ladders promoted to DEFAULTS (no env flags needed) — AMX on macOS (`SOFUU_PREFILL_BLAS=0` opts out; section in plan doc for on-by-default) and the 27B direct tile (`SOFUU_T143_DIRECT=0` opts out). liquid-1.3B default prefill 104.3 tk/s warm with ZERO env config; suite 576/0; correctness gates pass on the default path.**
+> The one ladder that trades accuracy (int8 two-sided, `SOFUU_PRE8=1`) stays opt-in by
+> design — on AMX machines the exact-f32 default is both faster and lossless; on
+> non-Apple aarch64, per-platform defaults flip after that port's own gate runs. Every
+> ladder shares the same contract (batched prefill + dequant-once + L2-fit working set
+> + pinned bit-exactness/quality gates), so backends adopt them by routing their GEMMs
+> through the same dispatches instead of re-deriving kernels; gptx3/block_graph adoption
+> (same owner) and the GGUF prefill-tile wave (peer lane) are the remaining funnels, plus
+> a cross-arch conformance battery to keep "all models" honest by CI.
+>
 > **2026-10-15 — Mac CPU / 27B: prefill Phase 4a, token-tiled direct sdot GEMM (`SOFUU_T143_DIRECT=1`) — Ternary-27B serve prefill 2.85 → 3.50 tk/s (+23%), output bit-identical.**
 > `gemm_rows_t143_direct` replaces the per-(row, token) `trit_row_dot_q` walks with a
 > 4-token tile: one weighted `sdot_group_4_neon` band pass (weight chunk loaded once,

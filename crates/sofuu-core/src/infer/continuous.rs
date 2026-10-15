@@ -225,6 +225,7 @@ impl ContinuousBatchServer {
             }
 
             // 3. Execute iteration-level step across all active streams
+            let mut progressed = false;
             let mut streams_to_retain = Vec::new();
             {
                 let mut state = state_arc.lock().unwrap();
@@ -260,6 +261,7 @@ impl ContinuousBatchServer {
                                 stream.cur_pos = p_len;
                             }
                             stream.status = StreamStatus::Decoding;
+                            progressed = true;
                             streams_to_retain.push(stream);
                         }
                         StreamStatus::Decoding => {
@@ -294,6 +296,7 @@ impl ContinuousBatchServer {
                                 for (tbl, pool) in stream.block_tables.iter_mut().zip(pools.iter_mut()) {
                                     tbl.clear(pool);
                                 }
+                                progressed = true;
                                 continue;
                             }
 
@@ -301,6 +304,7 @@ impl ContinuousBatchServer {
                             stream.full_generated.push_str(&piece);
                             stream.generated_tokens.push(next_token);
                             let _ = stream.tx.send(StreamOutput::Token(piece));
+                            progressed = true;
 
                             // Advance decode forward
                             {
@@ -317,8 +321,14 @@ impl ContinuousBatchServer {
                 state.active = streams_to_retain;
             }
 
-            // Yield briefly to prevent CPU starvation on single-threaded event loop
-            std::thread::sleep(Duration::from_millis(1));
+            // Yield only when the iteration did no work. While streams are
+            // decoding, every pass consumes real compute (sample + forward),
+            // so sleeping here would just add a 1 kHz wakeup on one core for
+            // the entire generation — measurable heat on a phone for nothing.
+            // An empty-to-idle transition parks on the condvar at the top.
+            if !progressed {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }

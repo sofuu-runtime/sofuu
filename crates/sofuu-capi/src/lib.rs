@@ -650,12 +650,16 @@ pub unsafe extern "C" fn sofuu_rt_call(
     };
 
     // Parse args: NULL/"" → no args, JSON object → single arg, JSON array → spread.
+    let mut args_is_array = false;
     let args_part = match cstr_or_null(args_json) {
         None | Some("") => "undefined".to_string(),
         Some(s) => {
             // Validate it's valid JSON.
             match serde_json::from_str::<JsonValue>(s) {
-                Ok(_) => format!("JSON.parse({})", serde_json::to_string(s).unwrap_or_default()),
+                Ok(v) => {
+                    args_is_array = v.is_array();
+                    format!("JSON.parse({})", serde_json::to_string(s).unwrap_or_default())
+                }
                 Err(_) => {
                     if !out_json.is_null() {
                         *out_json = error_envelope("bad_args", "args_json is not valid JSON");
@@ -677,6 +681,18 @@ pub unsafe extern "C" fn sofuu_rt_call(
     // tell "you asked for a method this build does not have" from "the
     // method threw". The marker is set on the thrown object and re-read in
     // the catch.
+    // agent.run's shipped signature is POSITIONAL — (target, task, opts).
+    // (2026-10-15, found by the committed contract test) the documented
+    // object form used to land on run() as a single "target" argument and
+    // died in normalizeDef with "agent.define: name is required" — the
+    // stream builder always spread it correctly; the blocking call did not.
+    let call_expr = if args_is_array {
+        "var r=await o.apply(null,a);".to_string()
+    } else if method_str == "agent.run" {
+        "var r=await o(a.target, a.task, a);".to_string()
+    } else {
+        "var r=a===undefined?await o():await o(a);".to_string()
+    };
     let js = format!(
         r#"var __capi_r=null;(async function(){{
   function markUnknown(m){{var e=new TypeError(m);e.__sofuuUnknown=true;return e}}
@@ -685,7 +701,7 @@ pub unsafe extern "C" fn sofuu_rt_call(
     for(var i=0;i<p.length;i++){{if(o==null)throw markUnknown("sofuu."+p.slice(0,i+1).join(".")+" is not available");o=o[p[i]]}}
     if(typeof o!=="function")throw markUnknown("sofuu."+{method_json}+" is not a function");
     var a={args_part};
-    var r=a===undefined?await o():(Array.isArray(a)?await o.apply(null,a):await o(a));
+    {call_expr}
     __capi_r={{ok:true,result:r}}
   }}catch(e){{
     __capi_r={{ok:false,error:{{code:(e&&e.__sofuuUnknown)?"unknown_method":"js_exception",message:e.message||String(e)}}}}
@@ -693,6 +709,7 @@ pub unsafe extern "C" fn sofuu_rt_call(
 }})()"#,
         method_json = serde_json::to_string(method_str).unwrap_or_default(),
         args_part = args_part,
+        call_expr = call_expr,
     );
 
     rt_call_and_capture(rt, &js, out_json)
@@ -4350,6 +4367,208 @@ mod tests {
 
         unsafe { sofuu_rt_free(rt_b) };
         unsafe { sofuu_rt_free(rt_a) };
+    }
+
+    /// Committed agent-loop contract test (audit P2 close-out, 2026-10-15).
+    ///
+    /// The full e2e battery lives in `tests/agent_test.js`, which is
+    /// gitignored local-only — a fresh clone could regress the agent
+    /// loop's core contract invisibly. This drives the REAL shipped JS
+    /// (`src/js/agent.js`, embedded by `shipped.rs`) through the funnel
+    /// with a scripted provider seam — no network, no model needed:
+    ///   1. an inline tool executes and its result reaches the final
+    ///      answer, with real usage landed in the run accounting;
+    ///   2. a delegation cycle (da → db → da) is refused by the guard and
+    ///      the turn still completes (no hang, no re-entry storm) with
+    ///      exactly the expected call count;
+    ///   3. a token budget fires mid-run: stopped :'budget_tokens' with
+    ///      the full breach detail, after one single-shot salvage round.
+    ///
+    /// Deliberately out of scope here: provider delta merging (ai.rs folds
+    /// fragments into `stream.toolCalls`; the local-model protocol parser
+    /// has its own Rust tests) and the RLM path (rlm modules have 50+
+    /// committed inline tests). This is the loop contract a fresh clone
+    /// must never lose.
+    #[test]
+    fn agent_loop_core_contract_runs_through_shipped_js() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        // Scripted provider: sofuu.ai.stream is replaced with a fake that
+        // shifts one step off a FIFO per call — the exact post-fold shape
+        // agent.js consumes (chunk.text from the stream, st.toolCalls,
+        // st.usage). Definitions + a result-capture wrapper ride eval.
+        let setup = CString::new(
+            r#"
+(function () {
+  sofuu._agT = { script: [], last: null };
+  sofuu.ai.stream = function () {
+    var step = sofuu._agT.script.shift() || { text: '(script exhausted)' };
+    var it = (function* () { if (step.text) yield { text: step.text }; })();
+    return {
+      abort: function () {},
+      toolCalls: step.toolCalls || [],
+      usage: step.usage || {},
+      [Symbol.asyncIterator]: function () { return it; }
+    };
+  };
+  sofuu.agent.define({
+    name: 'greeter', system: 'contract test', memory: 'off', rlm: 'off',
+    tools: [{ name: 'greet', description: 'greet the scene',
+              parameters: { type: 'object', properties: {} },
+              execute: function () { return 'GREET-TOOLRES'; } }]
+  });
+  sofuu.agent.define({ name: 'da', system: 'contract test', memory: 'off', rlm: 'off', agents: ['db'] });
+  sofuu.agent.define({ name: 'db', system: 'contract test', memory: 'off', rlm: 'off', agents: ['da'] });
+  /* tiny carries a tool: budgets bind at the loop top, so the run must be
+   * in the tool loop for the token ceiling to fire mid-turn. */
+  sofuu.agent.define({ name: 'tiny', system: 'contract test', memory: 'off', rlm: 'off',
+                       budget: { maxTokens: 1 },
+                       tools: [{ name: 'noop', description: 'no-op',
+                                 parameters: { type: 'object', properties: {} },
+                                 execute: function () { return 'NOPRES'; } }] });
+  var realRun = sofuu.agent.run;
+  sofuu.agent.run = function (t, task, o) {
+    var p;
+    try { p = realRun(t, task, o); }
+    catch (eSync) {
+      sofuu._agT.last = { answer: 'SYNC-REJ: ' + String((eSync && eSync.stack) || eSync).slice(0, 600),
+                          stopped: 'rejected' };
+      return new Promise(function () {}); /* never settles; funnel times nothing */
+    }
+    return p.then(function (r) {
+      sofuu._agT.last = { answer: String(r && r.answer || ''),
+                          stopped: r && r.stopped || null,
+                          breachKind: (r && r.breach) ? r.breach.kind : null,
+                          llmCalls: (r && r.usage) ? (r.usage.llmCalls | 0) : -1,
+                          promptTokens: (r && r.usage) ? (r.usage.promptTokens | 0) : -1,
+                          toolCalls: (r && r.usage) ? (r.usage.toolCalls | 0) : -1 };
+      return r;
+    }, function (e) {
+      sofuu._agT.last = { answer: 'REJECTED: ' + String((e && e.stack) || e).slice(0, 600),
+                          stopped: 'rejected' };
+      throw e;
+    });
+  };
+})()"#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "setup must succeed");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        // Drive one agent.run to completion via the BLOCKING funnel —
+        // sofuu_rt_call pumps the event loop until the promise resolves
+        // (the stream variant is fire-and-tick, for hosts that pump) —
+        // then read the captured result back through eval.
+        fn run_and_capture(rt: *mut CapiRuntime, target: &str, task: &str) -> serde_json::Value {
+            let method = CString::new("agent.run").unwrap();
+            let args = CString::new(format!(
+                "{{\"target\":\"{target}\",\"task\":\"{task}\"}}"
+            ))
+            .unwrap();
+            let mut out: *mut c_char = ptr::null_mut();
+            let rc = unsafe { sofuu_rt_call(rt, method.as_ptr(), args.as_ptr(), &mut out) };
+            assert_eq!(rc, 0, "agent.run must settle: {}", unsafe {
+                if out.is_null() { "".into() } else {
+                    CStr::from_ptr(out).to_string_lossy().into_owned()
+                }
+            });
+            unsafe { sofuu_free(out as *mut c_void) };
+            let q = CString::new("sofuu._agT.last").unwrap();
+            let mut res: *mut c_char = ptr::null_mut();
+            let rc = unsafe { sofuu_rt_eval(rt, q.as_ptr(), &mut res) };
+            assert_eq!(rc, 0, "result readback must succeed");
+            let raw = unsafe { CStr::from_ptr(res) }.to_string_lossy().into_owned();
+            unsafe { sofuu_free(res as *mut c_void) };
+            let envelope: serde_json::Value =
+                serde_json::from_str(&raw).expect("captured result must be JSON envelope");
+            let v = envelope["result"].clone();
+            assert!(
+                v.is_object(),
+                "captured result must be an object — the run must settle: {raw}"
+            );
+            v
+        }
+
+        let script = CString::new(
+            "sofuu._agT.script = [\
+             {toolCalls:[{id:'c1',name:'greet',arguments:{}}],usage:{promptTokens:10,completionTokens:5}},\
+             {text:'final-sees-GREET-TOOLRES',usage:{promptTokens:20,completionTokens:5}}];",
+        )
+        .unwrap();
+        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
+        unsafe { sofuu_free(out as *mut c_void) };
+        let toolRound = run_and_capture(rt, "greeter", "do the thing");
+        assert_eq!(
+            toolRound["answer"].as_str().unwrap_or(""),
+            "final-sees-GREET-TOOLRES",
+            "tool round must produce the final answer: {toolRound}"
+        );
+        assert!(
+            toolRound["promptTokens"].as_i64().unwrap_or(0) >= 30,
+            "usage must reach the run accounting: {toolRound}"
+        );
+        assert!(
+            toolRound["toolCalls"].as_i64().unwrap_or(0) == 1,
+            "exactly one real tool call executes: {toolRound}"
+        );
+
+        // Delegation cycle: da delegates db, db tries to delegate da — the
+        // guard refuses, db finishes anyway, and the tree completes with
+        // exactly 3 llm calls (guard failure would re-enter and burn more).
+        let script = CString::new(
+            "sofuu._agT.script = [\
+             {toolCalls:[{id:'d1',name:'delegate',arguments:{agent:'db',task:'sub'}}],usage:{promptTokens:20,completionTokens:5}},\
+             {toolCalls:[{id:'d2',name:'delegate',arguments:{agent:'da',task:'back'}}],usage:{promptTokens:20,completionTokens:5}},\
+             {text:'cycle-seen-OK',usage:{promptTokens:10,completionTokens:3}},\
+             {text:'parent-done',usage:{promptTokens:10,completionTokens:3}}];",
+        )
+        .unwrap();
+        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
+        unsafe { sofuu_free(out as *mut c_void) };
+        let cycle = run_and_capture(rt, "da", "delegate something");
+        assert_eq!(
+            cycle["answer"].as_str().unwrap_or(""),
+            "parent-done",
+            "guarded cycle completes the tree: {cycle}"
+        );
+        assert!(
+            cycle["llmCalls"].as_i64().unwrap_or(0) <= 5,
+            "no re-entry storm — expected tree-shaped call count: {cycle}"
+        );
+
+        // Token budget: maxTokens 1 blows on the first ask's tool round; the
+        // loop-top breach stops the run, one single-shot salvage round runs,
+        // and the result carries the breach detail with honest usage.
+        let script = CString::new(
+            "sofuu._agT.script = [\
+             {toolCalls:[{id:'b1',name:'noop',arguments:{}}],usage:{promptTokens:50,completionTokens:10}},\
+             {text:'SALVAGE-OK',usage:{promptTokens:5,completionTokens:2}}];",
+        )
+        .unwrap();
+        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
+        unsafe { sofuu_free(out as *mut c_void) };
+        let budget = run_and_capture(rt, "tiny", "long task");
+        assert_eq!(
+            budget["stopped"].as_str().unwrap_or(""),
+            "budget_tokens",
+            "token budget stops the run: {budget}"
+        );
+        assert_eq!(
+            budget["breachKind"].as_str().unwrap_or(""),
+            "budget_tokens",
+            "breach detail rides the result: {budget}"
+        );
+        assert_eq!(
+            budget["answer"].as_str().unwrap_or(""),
+            "SALVAGE-OK",
+            "the salvage round surfaces a usable answer: {budget}"
+        );
+
+        unsafe { sofuu_rt_free(rt) };
     }
 }
 

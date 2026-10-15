@@ -382,3 +382,14 @@ abi-check: libsofuu
 	 elif [ -f dist/libsofuu.so ]; then LIB=dist/libsofuu.so; \
 	 else echo "\033[31m✗ No shared lib in dist/\033[0m"; exit 1; fi; \
 	bash scripts/check_abi.sh $$LIB
+
+# ── Sofuu macOS (SwiftUI app over the C ABI) ───────────────────────
+# Engine artifact + typecheck for the native Mac app. Additive targets —
+# the Tauri desktop targets above stay until the Swift app reaches parity.
+# Output lives in sofuu-macos/engine/ (gitignored), NOT dist/ (release flows
+# own that directory).
+macos-engine:
+	@bash scripts/dist/macos-engine.sh arm64
+
+macos-typecheck:
+	@bash sofuu-macos/scripts/typecheck.sh

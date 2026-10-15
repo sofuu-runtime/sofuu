@@ -59,7 +59,10 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
         LaunchedEffect(state.cloudBg) {
             android.util.Log.i("sofuu-cloud", "cloudBg enabled=${state.cloudBg}")
         }
-        if (state.cloudBg) CloudBackground()
+        // The cloud only animates while a turn streams; idle keeps a
+        // static frame (the full-screen fBm shader at 30fps is a
+        // constant GPU load — the single largest idle heat source).
+        if (state.cloudBg) CloudBackground(animate = state.streaming)
         // safeDrawingPadding = the union of system bars + IME + cutout,
         // so the keyboard pushes the composer up with it and, when the
         // keyboard is closed, the gesture bar never sits on top of it.

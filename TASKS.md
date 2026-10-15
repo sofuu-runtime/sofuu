@@ -4,6 +4,8 @@
 >
 > Legend: ✅ done & verified · 🟡 in progress · ⬜ not started
 >
+> **2026-10-15 — Cross-model benchmark battery (`scripts/bench_all_models.sh`): every model on disk measured through `sofuu serve --infer` on CPU at a fixed ~1,262-token prompt; JSONL history in `docs/bench/all-models.jsonl`.** Prefill (est tok/s): liquid-350 184 · Llama-3.2-1B 210 · Qwen-0.6B 244 · liquid-1.3B 109 · gpt-x3-150m 44 · Spark-4B 29 · Qwen3-8B 27 · gemma-2b 9 · Ternary-27B 2.1 (vs 5.2 at a 276-token prompt — length-sensitive GDN/attention tail). Exposure, not excuse: liquid models ride the AMX ladder, the peer's GGUF tile wave is strong on 0.6-1B, and the un-ported archs (gemma-2b via block_graph, gptx3, Spark/Qwen GGUF) run 5-15× behind — the port ledger in PLAN-CPU-PREFILL-PEAK.md orders them (block_graph first: 9 vs ~100 expected). **Spark-4B flag: decode output incoherent ("echaechastak…") at temp 0 — quality regression in the GGUF/lane, needs the owner's eyes before any perf work.** Harness = committed prompt (`scripts/bench_prompt.txt`, deterministic) + client (`bench_serve.py`) + driver (serve per model, warmup excluded, JSONL history for cross-run regression watch). Battery noise: shared desktop, est-token ×1.31 labels, 27B decode budget capped.
+>
 > **2026-10-15 — Generalization pass: prefill ladders promoted to DEFAULTS (no env flags needed) — AMX on macOS (`SOFUU_PREFILL_BLAS=0` opts out; section in plan doc for on-by-default) and the 27B direct tile (`SOFUU_T143_DIRECT=0` opts out). liquid-1.3B default prefill 104.3 tk/s warm with ZERO env config; suite 576/0; correctness gates pass on the default path.**
 > The one ladder that trades accuracy (int8 two-sided, `SOFUU_PRE8=1`) stays opt-in by
 > design — on AMX machines the exact-f32 default is both faster and lossless; on
@@ -88,6 +90,16 @@
 > C tree was mid-edit; lib target verified). Deliberately NOT changed: host-side
 > `mapContext` chunk cap (trusted-host path, documented) and the RLM recursion stub
 > (documented v1 boundary).
+> **Close-out (same day, commit 3 of this stream): both leftovers closed, on the healed
+> tree.** Host `agent.mapContext` gained the 256-chunk fan-out cap (`opts.maxChunks`
+> lifts it; the battery's 8-25-chunk path unaffected). The agent loop's core contract
+> is now COMMITTED coverage — capi funnel test
+> `agent_loop_core_contract_runs_through_shipped_js` drives real shipped JS with a
+> scripted provider seam (no network, no model) and pins: inline tool round with usage
+> accounting, delegate-cycle guard with a bounded call count, token-budget stop with
+> breach detail + single-shot salvage. RLM nested-episode recursion stays PLAN-RLM v2
+> scope (documented feature, not a defect); `.env` stays readable per the documented
+> policy.
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
@@ -108,7 +120,11 @@
 > sweep in f35638971; follow-on prefill programme drafted in docs/PLAN-CPU-PREFILL-PEAK.md.
 
 > **2026-10-15 — Pi 5: PLAN-CPU-PREFILL-PEAK portability wave — Phase 1 fused-neutral, Phase 2 + Phase 5a measured slower and parked; prefill ceiling already reached.**
+<<<<<<< Updated upstream
 > Portability assessment split the M2 plan for A76: Phase 3 (AMX) impossible, Phase 4 not a Pi lever, Phase 5 (FA2) the only real candidate. Phase-1 glue fusion (residual-in-epilogue on all five tile kernels + dual gate/up pair dispatch, bit-exact `test_gemm_resid_pair_bit_exact`, `SOFUU_FUSE_DEBUG` engagement counters 196→168 gemm / 84→28 glue calls) is **E2E-neutral** on the Pi — glue is 12% of prefill here vs 55% on the M2 — kept as bit-exact infrastructure. Phase-2 int8-activation SDOT (`SOFUU_PRE8=1`, 128-band act quant + tile4x2, kernel == scalar int8 ref maxdiff 0) measured **7-17% slower** (liquid-350 39.2 vs 42.2-46.9 t/s) against a measured A76 SDOT ceiling of only ~1.4× over f32 (single 16-MAC/cyc pipe, no i8mm) → parked default-off. Phase-5a FA2 online-softmax tiled attention (`SOFUU_FA2=1`; 128-position blocks, shared running state across SWA sink+window, parity rel ≤ 1e-4 vs the two-pass reference over the plain/SWA/sink matrix) measured **slower everywhere** (attn bucket 33/61 → 47/80 ms per 64-tok chunk, decode 20.6 → 17.3 t/s): scores never leave L1 at Pi seq lengths so FA2's no-materialization advantage is void and block bookkeeping is pure overhead → parked default-off. Both parked paths live in the suite (580/0) as flag-gated infra. Battery after all waves: Qwen 155.5-157.1/20.6-20.7, Spark 22.2/4.4, Llama-1B ~133/8.6 — session band intact. Repo-health: audit commit 9848995df swept a peer's draft int8 block into `lfm2.rs` (duplicate symbols broke `cargo test` for every lane); fixed by renaming the colliding SDOT items `*_sdot` — both ladders retained, arbitration left to the ladder owner.
+=======
+> Portability assessment split the M2 plan for A76: Phase 3 (AMX) impossible, Phase 4 not a Pi lever, Phase 5 (FA2) the only real candidate. Phase-1 glue fusion (residual-in-epilogue on all five tile kernels + dual gate/up pair dispatch, bit-exact `test_gemm_resid_pair_bit_exact`, `SOFUU_FUSE_DEBUG` engagement counters 196→168 gemm / 84→28 glue calls) is **E2E-neutral** on the Pi — glue is 12% of prefill here vs 55% on the M2 — kept as bit-exact infrastructure. Phase-2 int8-activation SDOT (`SOFUU_PRE8=1`, 128-band act quant + tile4x2, kernel == scalar int8 ref maxdiff 0) measured **7-17% slower** (liquid-350 39.2 vs 42.2-46.9 t/s) against a measured A76 SDOT ceiling of only ~1.4× over f32 (single 16-MAC/cyc pipe, no i8mm) → parked default-off. Phase-5a FA2 online-softmax tiled attention (`SOFUU_FA2=1`; 128-position blocks, shared running state across SWA sink+window, parity rel ≤ 1e-4 vs the two-pass reference over the plain/SWA/sink matrix) measured **slower everywhere** (attn bucket 33/61 → 47/80 ms per 64-tok chunk, decode 20.6 → 17.3 t/s): scores never leave L1 at Pi seq lengths so FA2's no-materialization advantage is void and block bookkeeping is pure overhead → parked default-off. Both parked paths live in the suite (580/0) as flag-gated infra. Battery after all waves: Qwen 155.5-157.1/20.6-20.7, Spark 22.2/4.4, Llama-1B ~133/8.6 — session band intact. Repo-health: audit commit 9848995df swept a peer's draft int8 block into `lfm2.rs` (duplicate symbols broke `cargo test` for every lane); resolved by the ladder owner's `6605a2ed3`, which removed the draft block and kept a single `pre8` ladder — the parked SDOT variant survives in `9848995df` for re-landing.
+>>>>>>> Stashed changes
 
 > **2026-10-14 — agents/RLM: episodes are now metered — fixes the open AUDIT-2026-08-22
 > P2 "RLM turns are invisible to token budgets and /cost".** `rlm.js` banks every ask's

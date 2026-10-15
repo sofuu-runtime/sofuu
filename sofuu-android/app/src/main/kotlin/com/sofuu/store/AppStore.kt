@@ -192,6 +192,7 @@ val runtimeEnv = RuntimeEnv(app)
             is EngineEvent.BootError -> state = state.copy(engineReady = false, bootError = ev.message)
             is EngineEvent.TurnStarted -> Unit // the assistant bubble is created on submit
             is EngineEvent.TurnFinished -> {
+                flushDelta()
                 state = state.copy(streaming = false, phase = null)
                 if (!foreground && ev.error == null) notifier?.invoke("Sofuu finished", "The turn completed.")
                 if (ev.error != null) {
@@ -222,6 +223,21 @@ val runtimeEnv = RuntimeEnv(app)
 
     private fun EngineUsage.toUi(): Usage = Usage(promptTokens, completionTokens, costUsd, steps, servedBy)
 
+    /** Buffered answer text for the streaming assistant bubble (see the
+     *  answer_delta case in applyStep). Must only run on the Main
+     *  dispatcher — the event collector guarantees that. */
+    private val pendingDelta = StringBuilder()
+    private var deltaFlush: kotlinx.coroutines.Job? = null
+
+    private fun flushDelta() {
+        deltaFlush?.cancel()
+        deltaFlush = null
+        if (pendingDelta.isEmpty()) return
+        val text = pendingDelta.toString()
+        pendingDelta.setLength(0)
+        patchAssistant { m -> m.copy(content = m.content + text) }
+    }
+
     private fun patchAssistant(fn: (ChatMessage) -> ChatMessage) {
         val messages = state.messages.toMutableList()
         for (i in messages.indices.reversed()) {
@@ -251,7 +267,18 @@ val runtimeEnv = RuntimeEnv(app)
                     state = state.copy(phase = phase ?: state.phase)
                     return
                 }
-                patchAssistant { m -> m.copy(content = m.content + text) }
+                // Batch on a ~100 ms cadence instead of per token. At
+                // 20-30 tok/s a per-token path copies the whole message
+                // list and re-runs the markdown compositor for every
+                // token — main-thread burn (heat) with zero visible
+                // difference at that granularity.
+                pendingDelta.append(text)
+                if (deltaFlush == null) {
+                    deltaFlush = viewModelScope.launch {
+                        kotlinx.coroutines.delay(100)
+                        flushDelta()
+                    }
+                }
             }
             "think" -> {
                 val text = p.optString("text")

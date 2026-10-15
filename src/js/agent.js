@@ -3603,6 +3603,16 @@
     var chunkChars = (opts.chunkChars | 0) || 16000;
     var chunks = chunkText(String(context == null ? '' : context), chunkChars);
     if (!chunks.length) throw new Error('agent.mapContext: empty context');
+    /* Blast-radius guard (2026-10-15): the model-callable tool path hard-
+     * caps the fan-out (MAP_CONTEXT_MAX_CHUNKS); the host API was
+     * unbounded — a multi-MB string queued thousands of full agent runs.
+     * 256 covers any real document at default chunking (~4 MB); an
+     * explicit opts.maxChunks lifts it for genuinely huge jobs. */
+    var mCap = (opts.maxChunks | 0) > 0 ? (opts.maxChunks | 0) : 256;
+    if (chunks.length > mCap) {
+      throw new Error('agent.mapContext: ' + chunks.length + ' chunks exceeds the ' + mCap +
+        '-chunk fan-out cap — raise chunkChars (currently ' + chunkChars + ') or pass opts.maxChunks');
+    }
     /* Orchestration threading (PLAN-DELEGATE-AWARENESS Move 3): when the
      * caller supplies _orch (the model-callable map_context tool path),
      * every chunk run and the reduce run execute as CHILDREN of that run

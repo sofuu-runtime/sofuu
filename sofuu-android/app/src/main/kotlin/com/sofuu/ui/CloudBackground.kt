@@ -48,7 +48,7 @@ import kotlin.math.floor
  * the warm-dark identity survives.
  */
 @Composable
-fun CloudBackground(modifier: Modifier = Modifier) {
+fun CloudBackground(modifier: Modifier = Modifier, animate: Boolean = true) {
     val colors = LocalSofuuColors.current
     val dark = colors.dark
     LaunchedEffect(dark) {
@@ -59,16 +59,16 @@ fun CloudBackground(modifier: Modifier = Modifier) {
     }
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        ShaderCloud(dark, modifier)
+        ShaderCloud(dark, animate, modifier)
     } else {
-        TileCloud(dark, modifier)
+        TileCloud(dark, animate, modifier)
     }
 }
 
 // ── Path 1: the shader (API 33+) ────────────────────────────────
 
 @Composable
-private fun ShaderCloud(dark: Boolean, modifier: Modifier) {
+private fun ShaderCloud(dark: Boolean, animate: Boolean, modifier: Modifier) {
     val shader = remember(dark) {
         try {
             RuntimeShader(CLOUD_AGSL).apply {
@@ -83,7 +83,7 @@ private fun ShaderCloud(dark: Boolean, modifier: Modifier) {
         }
     }
     if (shader == null) {
-        TileCloud(dark, modifier)
+        TileCloud(dark, animate, modifier)
         return
     }
 
@@ -99,9 +99,15 @@ private fun ShaderCloud(dark: Boolean, modifier: Modifier) {
     // 30fps is plenty for a slow cloud and halves the fragment cost of a
     // full-screen fBm on a phone; the field itself is re-sampled each
     // draw, so the slower cadence is invisible.
+    //
+    // animate gates it entirely: the shader samples 4 domain-warped fBm
+    // chains of 3D simplex noise over every pixel — a constant heavy GPU
+    // load. Driving it only while a turn is in flight makes the cloud
+    // double as the activity indicator and drops idle GPU+CPU cost to a
+    // single frame.
     var frame by remember { mutableStateOf(0L) }
-    if (!reduced) {
-        LaunchedEffect(dark) {
+    if (animate && !reduced) {
+        LaunchedEffect(dark, animate) {
             var last = 0L
             while (true) {
                 withFrameNanos { now ->
@@ -113,7 +119,7 @@ private fun ShaderCloud(dark: Boolean, modifier: Modifier) {
             }
         }
     }
-    val elapsed = if (reduced) 12_000f else ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
+    val elapsed = if (reduced || !animate) 12_000f else ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
 
     var logged by remember { mutableStateOf(false) }
     Canvas(modifier.fillMaxSize()) {
@@ -291,7 +297,7 @@ half4 main(float2 fragCoord) {
 // ── Path 2: the baked tile (below API 33) ───────────────────────
 
 @Composable
-private fun TileCloud(dark: Boolean, modifier: Modifier) {
+private fun TileCloud(dark: Boolean, animate: Boolean, modifier: Modifier) {
     val size = 192
     var tile by remember(dark, size) { mutableStateOf<ImageBitmap?>(null) }
     LaunchedEffect(dark, size) {
@@ -305,14 +311,14 @@ private fun TileCloud(dark: Boolean, modifier: Modifier) {
     val start = remember { System.nanoTime() }
     val context = LocalContext.current
     var frame by remember { mutableStateOf(0L) }
-    if (!animationsDisabled(context)) {
-        LaunchedEffect(dark) {
+    if (animate && !animationsDisabled(context)) {
+        LaunchedEffect(dark, animate) {
             while (true) {
                 withFrameNanos { now -> frame = now }
             }
         }
     }
-    val t = ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
+    val t = if (!animate) 12_000f else ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
 
     val brushA = remember(bitmap) {
         ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated))

@@ -42,7 +42,16 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
 
 ## Phase 2 — int8 activations in the float-weight GEMM  → target 200–300 tk/s
 
-- [ ] Quantize activations per 128-band once per layer call (reuse the
+> **DONE 2026-10-15 (ca696851d):** shipped as two-sided 32-group quant
+> (`SOFUU_PRE8=1`) + per-load `Pre8Slab` weight cache. Warm liquid-1.3B:
+> 79.0 tk/s (f32 68.1 same window, +16%). Kernel bit-exact vs i64 ref; RMS
+> 0.05 bf16 / 0.049 mlx4, greedy identical. 128-band absmax (RMS 0.108) broke
+> greedy — 32-group granularity is the correctness floor. Scalar quant-pass
+> over 2.6B weight elements cost 15% e2e until vectorized. Perf target not
+> met (200–300 assumed sdot 10×; measured sdot reality is ~24%/core over f32) —
+> AMX (Phase 3) beat it instead.
+
+- [x] Quantize activations per 128-band once per layer call (reuse the
       `quantize_acts`/ActQ machinery from `qwen35.rs`), then sdot int8 tile
       variant of `gemm_tile4x4_neon` (weights still dequantized from bf16/MLX4
       into int8 lanes with per-group scales).
@@ -61,7 +70,15 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
 
 ## Phase 3 — AMX via Accelerate (CPU-die coprocessor, not the GPU)  → target 200–350 tk/s
 
-- [ ] Link `Accelerate.framework` (additive `#[link(name = "Accelerate")]`
+> **DONE 2026-10-15 (8f59dc6e0):** warm liquid-1.3B **104.5 tk/s** (int8 79.0,
+> f32 68.1 same window; 4.23× per-token), gemm stage 2937 → 1607 ms. Binary
+> byte-identical (5,097,392 B) — dylib link. Whole-tensor dequant on the ffn
+> pool, one row-major sgemm per tensor on Accelerate's pool (no nesting).
+> Exact-f32 gates pass untouched. 200–350 target assumed bigger tiles reach
+> peak AMX; real ceiling on this workload is the dequant+sgemm split, not AMX
+> throughput. Headroom left: ~104 ms/call w32-slab alloc churn.
+
+- [x] Link `Accelerate.framework` (additive `#[link(name = "Accelerate")]`
       extern block in `lfm2.rs`; no Cargo dependency changes needed).
 - [ ] Opt-in env `SOFUU_PREFILL_BLAS=1`: per layer call, dequant the bf16/mlx4
       weight once into an f32 buffer (thread-local scratch), run

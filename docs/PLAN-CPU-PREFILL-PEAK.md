@@ -55,10 +55,10 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
       `quantize_acts`/ActQ machinery from `qwen35.rs`), then sdot int8 tile
       variant of `gemm_tile4x4_neon` (weights still dequantized from bf16/MLX4
       into int8 lanes with per-group scales).
-- [ ] Two-sided fold per band (w_scale · a_scale · iacc), mirroring
+- [x] Two-sided fold per band (w_scale · a_scale · iacc), mirroring
       `trit_row_dot_q` — same pattern already proven bit-stable on the ternary
       path.
-- [ ] Threshold test budget: rel-RMS < 1e-2 vs f32 path on real model
+- [x] Threshold test budget: rel-RMS < 1e-2 vs f32 path on real model
       (the ternary path's existing gate), greedy top-1 equality over 200-tok
       prompts; ill-conditioned bands (absmax 0) keep the existing fallback.
 - Acceptance: ≥ 1.8× over Phase 1 on the same machine; greedy continuations
@@ -80,12 +80,12 @@ math. So the plan is ordered by cost-of-change per token-per-second gained.
 
 - [x] Link `Accelerate.framework` (additive `#[link(name = "Accelerate")]`
       extern block in `lfm2.rs`; no Cargo dependency changes needed).
-- [ ] Opt-in env `SOFUU_PREFILL_BLAS=1`: per layer call, dequant the bf16/mlx4
+- [x] Opt-in env `SOFUU_PREFILL_BLAS=1`: per layer call, dequant the bf16/mlx4
       weight once into an f32 buffer (thread-local scratch), run
       `cblas_sgemm` for the [T×cols]·[cols×rows] product, then fuse residuals.
       Break-even at T ≈ 64–128 (dequant amortization); keep the NEON tile path
       below that and as fallback (also covers the 5 MB binary-gate check).
-- [ ] Cross-check Apple BLAS numeric contract (row-major details) with one
+- [x] Cross-check Apple BLAS numeric contract (row-major details) with one
       parity test at T=133 (ragged).
 - Acceptance: ≥ 2× over Phase 2 at T ≥ 128; binary size gate still ≤ 5 MB;
       suite green with flag off by default.

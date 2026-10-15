@@ -3437,3 +3437,28 @@ what code reading suggested:
 - Liquid-350 remains EOS-collapsed ≥ ~50 tokens (untouched, known bug).
 - Not started this pass: 27B GDN head parallelization, gptx3 chunked
   prefill port (both queued).
+
+### 2026-10-15 — D1b experimental (user go): same-model self-draft, the α gate
+
+- Mechanism: `draft_layers` truncation in lfm2.rs — per-token `forward` AND
+  `forward_batched` stop at the index; draft instances share the safetensors
+  mmap (weights file-backed, zero extra weight memory). New ignore-tagged
+  test `spec_self_draft_acceptance_study` = the offline acceptance gate from
+  PLAN-CPU-DECODE-PEAK.md (oracle greedy chain on the full instance; draft
+  proposes k from its own state; replay of the oracle tokens restores exact
+  draft state, equivalent to rewind-replay).
+- Receipt (liquid-1.3B, 30 layers, k=4, 48 cycles, synthetic context — a
+  lower bound for natural text): depth 7/30 α 0.00/0.00/0.29/0.00;
+  depth 15/30 all 0.00; depth 22/30 0.60/0.29/0.02/0.00 (accepted 0.9/cycle).
+- Verdict: **plain layer-skip self-drafting is closed on CPU.** Even with
+  natural-text acceptance (~ā 2), a 4-token cycle at p=0.73 costs
+  ~4·0.73 + 3·0.73 + 1 ≈ 5.2 sweeps for ~3 tokens ≈ 1.7× slower than plain
+  decode — every draft token sweeps p of every byte, the same bandwidth wall
+  it is trying to beat. The gate worked: caught before building a
+  coordinator.
+- Keep-alive (same phase, different proposal source): zero-sweep drafts —
+  n-gram/Lookahead proposals already sketched in `infer/lookahead.rs`
+  (49be50eff) cost 0 model sweeps, so verify = 1 sweep per k candidates and
+  tokens/sweep = accepted+1 with zero quality change. That variant passes
+  the math a-priori; needs only tree-attention verify wiring. Medusa/EAGLE
+  heads need training runs, out of scope.

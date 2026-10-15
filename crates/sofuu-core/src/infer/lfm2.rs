@@ -156,6 +156,11 @@ pub struct Lfm2Model {
     pub sliding_window: usize,
     pub sink_tokens: usize,
     pub gpu_layers: usize,
+    /// D1b EXPERIMENTAL (self-speculative draft): truncate the layer loop at
+    /// this index. Set only on a dedicated draft instance sharing the same
+    /// safetensors file — weights are mmap-backed, so a truncated clone costs
+    /// only its own activation/conv/KV buffers. None = full depth.
+    pub draft_layers: Option<usize>,
 }
 
 #[inline(always)]
@@ -418,6 +423,7 @@ impl Lfm2Model {
             sliding_window: 0,
             sink_tokens: 4,
             gpu_layers: n_layers,
+            draft_layers: None,
         })
     }
 
@@ -576,8 +582,9 @@ impl Lfm2Model {
         let n_kv_heads = self.config.n_kv_heads;
         let mmap = &self.sf.mmap;
         let norm_eps = self.config.norm_eps;
-        // 2. Decoder layers
-        for layer_idx in 0..n_layers {
+        // 2. Decoder layers (D1b: draft instances stop early)
+        let n_active = self.draft_layers.unwrap_or(n_layers).min(n_layers);
+        for layer_idx in 0..n_active {
             let layer = self.layers[layer_idx].clone();
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             let (m_eng, m_buf) = if layer_idx < self.gpu_layers {
@@ -2951,7 +2958,9 @@ impl Lfm2Model {
         let prof = prof_enabled();
         let t_wall = if prof { Some(std::time::Instant::now()) } else { None };
 
-        for layer_idx in 0..n_layers {
+        // D1b: draft instances stop early (same truncation as forward()).
+        let n_active = self.draft_layers.unwrap_or(n_layers).min(n_layers);
+        for layer_idx in 0..n_active {
             let layer = self.layers[layer_idx].clone();
             match layer {
                 Lfm2LayerWeights::Conv { operator_norm, in_proj, conv, out_proj, ffn_norm, w1, w3, w2 } => {
@@ -3465,6 +3474,144 @@ mod lfm2_mt_ceiling_probe {
             gmac / secs,
             2.0 * gmac / secs,
             (gmac / secs) / 42.6
+        );
+    }
+}
+
+/// D1b EXPERIMENTAL — self-speculative acceptance study (the D1b gate from
+/// PLAN-CPU-DECODE-PEAK.md). The full model runs the greedy oracle chain k
+/// steps per cycle; same-weights draft instances truncated to a fraction of
+/// the layers propose k tokens from their own aligned state, then replay the
+/// oracle tokens at the same positions — overwriting their KV slots and
+/// conv rings, which is exactly the rewind-replay a real speculative loop
+/// performs (KV at a position is a deterministic function of the token
+/// history ending there, so replay restores exact state). Greedy acceptance
+/// is literally prop_i == oracle_i, so per-position α and the sweep budget
+/// per accepted token fall out of the trace; the full model's state never
+/// depends on the drafts.
+#[test]
+#[ignore = "1.4 GB model load + minutes; run explicitly on a calm machine"]
+fn spec_self_draft_acceptance_study() {
+    let dir = "/Users/priyanshuboruah/Downloads/liquid";
+    let max_seq_len = 1024usize;
+    let mut full = Lfm2Model::from_safetensors_dir(dir, max_seq_len).expect("full model");
+    let total_layers = full.config.n_layers;
+    let vocab = full.lfm_config.vocab_size;
+
+    let depths: Vec<usize> = [total_layers / 4, total_layers / 2, 3 * total_layers / 4]
+        .iter()
+        .map(|&n| n.max(1))
+        .collect();
+    let mut drafts: Vec<Lfm2Model> = depths
+        .iter()
+        .map(|&n| {
+            let mut m =
+                Lfm2Model::from_safetensors_dir(dir, max_seq_len).expect("draft model");
+            m.draft_layers = Some(n);
+            m
+        })
+        .collect();
+
+    // Deterministic seed context (synthetic distribution: a LOWER bound on
+    // natural-text acceptance — real prose drafts better than noise).
+    let w = 64usize;
+    let k = 4usize;
+    let cycles = 48usize;
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut seed = Vec::with_capacity(w);
+    for _ in 0..w {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed.push((state >> 33) as u32 % vocab as u32);
+    }
+    full.forward_batched(&seed, 0);
+    for d in drafts.iter_mut() {
+        d.forward_batched(&seed, 0);
+    }
+
+    let mut prev = seed[w - 1];
+    let mut pos = w;
+    let mut alpha_num = vec![0usize; depths.len() * k];
+    let mut accepted_num = vec![0usize; depths.len()];
+    for _ in 0..cycles {
+        // Oracle greedy chain on the full model (this is the true decode
+        // trajectory; the full instance's state never depends on drafts).
+        let mut oracle = Vec::with_capacity(k);
+        let (mut fprev, mut fpos) = (prev, pos);
+        for _ in 0..k {
+            let lg = full.forward(fprev, fpos);
+            let nt = lg
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            fpos += 1;
+            oracle.push(nt);
+            fprev = nt;
+        }
+
+        // Per depth: propose k, then realign by replaying the oracle chain
+        // at the same positions (overwrites proposal KV/conv state).
+        for (di, _n_active) in depths.iter().enumerate() {
+            let d = &mut drafts[di];
+            let mut props = Vec::with_capacity(k);
+            let (mut dprev, mut dpos) = (prev, pos);
+            for _ in 0..k {
+                let lg = d.forward(dprev, dpos);
+                let nt = lg
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap();
+                dpos += 1;
+                props.push(nt);
+                dprev = nt;
+            }
+            for i in 0..k {
+                if props[i] == oracle[i] {
+                    alpha_num[di * k + i] += 1;
+                }
+            }
+            let mut a = 0;
+            while a < k && props[a] == oracle[a] {
+                a += 1;
+            }
+            accepted_num[di] += a;
+            let (mut rprev, mut rpos) = (prev, pos);
+            for t in oracle.iter() {
+                d.forward(rprev, rpos);
+                rpos += 1;
+                rprev = *t;
+            }
+        }
+
+        prev = oracle[k - 1];
+        pos += k;
+    }
+
+    eprintln!(
+        "D1b self-draft α-study (liquid, {total_layers} layers, k={k}, {cycles} cycles):"
+    );
+    for (di, n_active) in depths.iter().enumerate() {
+        let p = *n_active as f64 / total_layers as f64;
+        let alphas: Vec<f64> = (0..k)
+            .map(|i| alpha_num[di * k + i] as f64 / cycles as f64)
+            .collect();
+        let mean_acc = accepted_num[di] as f64 / cycles as f64;
+        // Cycle sweep budget: k proposal sweeps at p + (k) realign sweeps at
+        // p + k full-model sweeps, yielding `k` oracle tokens per cycle.
+        // Break-even mean α for beating plain decode: see plan.
+        let sum_a: f64 = alphas.iter().sum();
+        eprintln!(
+            "  depth {n_active}/{total_layers} (p={p:.2}): α={:?} Σα/cycle={sum_a:.2} accepted={mean_acc:.2}/k",
+            alphas
+                .iter()
+                .map(|a| format!("{a:.2}"))
+                .collect::<Vec<_>>()
+                .join(",")
         );
     }
 }

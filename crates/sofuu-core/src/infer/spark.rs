@@ -992,11 +992,16 @@ struct SndMutPtr<T>(*mut T);
 unsafe impl<T> Send for SndMutPtr<T> {}
 unsafe impl<T> Sync for SndMutPtr<T> {}
 
-/// Spark prefill batched matmul, SOFUU-safe path (default): the C++
-/// batched-gemm tile pipeline corrupts Spark activations (9848995df; TASKS
-/// 2026-10-15 evidence pack), so weights dequantize row by row with the
-/// dispatch decode uses and dot against the chunk directly.
-/// SOFUU_SPARK_CPP_GEMM=1 restores the C++ path once that bug ships.
+/// Spark prefill batched matmul. The C++ batched-gemm tile pipeline spent
+/// 2026-10-15 → 10-16 behind SOFUU_SPARK_CPP_GEMM because its q4_K dotprod
+/// fallback quantized activations at cols/256 instead of cols/32 — 1/8 of
+/// every row quantized, the dot reading 8× past the scratch (9848995df-era
+/// Spark incoherence; TASKS evidence pack). That unit bug is fixed and the
+/// path is now the default: Pi 5 receipts on t1p4, 433-token prompt, temp 0
+/// — C++ prefill 20.8 tk/s vs the dequant fallback timing out at 400 s for
+/// the same work, and token-identical output to the dequant reference on
+/// the capital-of-France probe. SOFUU_SPARK_CPP_GEMM=0 drops back to the
+/// dequant fallback.
 fn prefill_matmat(
     w_bytes: &[u8],
     ty: u32,
@@ -1008,7 +1013,10 @@ fn prefill_matmat(
 ) {
     debug_assert_eq!(xs.len(), b_size * cols);
     debug_assert_eq!(ys.len(), b_size * rows);
-    if std::env::var_os("SOFUU_SPARK_CPP_GEMM").is_some() {
+    let default_on = std::env::var_os("SOFUU_SPARK_CPP_GEMM")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if default_on {
         return matmat(w_bytes, ty, rows, cols, xs, b_size, ys);
     }
     dequant_gemm_rows(w_bytes, ty, rows, cols, xs, b_size, ys);

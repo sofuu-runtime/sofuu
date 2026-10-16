@@ -2517,6 +2517,158 @@ mod tests {
         }
     }
 
+    /// Spark's fused-QKV prefill shape, exactly as spark.rs runs it: three
+    /// zero-copy row-range matmats over one q4_K tensor, each warmed at its
+    /// sub-range pointer (spark.rs:333) and dispatched with `matmat` —
+    /// including the batch-78→80 pad-to-4 inside the GEMM. Guards the
+    /// 9848995df Spark-corruption class: any tile/lookup/repack wrongness at
+    /// these dims must show here as a reference mismatch.
+    #[test]
+    fn test_spark_qkv_cpp_gemm_parity() {
+        // variant knobs (env) for bisecting: 1 = warm only the q sub-range,
+        // 2 = batch 8 (no pad), 3 = small dims
+        let variant = std::env::var("SOFUU_SPARKTEST_VARIANT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let dim = if variant == 3 { 512 } else { 2560usize };
+        let q_dim = if variant == 3 { 64 } else { 4096usize };
+        let kv_dim = if variant == 3 { 32 } else { 1024usize };
+        let b_size = if variant == 2 {
+            8
+        } else if variant == 4 {
+            80 // direct: tile_batch == batch_size, no pad branch
+        } else if variant == 5 {
+            6 // pad 6→8 at spark dims, single quantize group
+        } else {
+            78usize
+        };
+        let q_rows = dim / 256; // q4_K super-blocks per WEIGHT row (a row spans cols, not q_dim)
+        let row_stride = q_rows * 144;
+        let fused_rows = q_dim + 2 * kv_dim;
+
+        let mut rng = 4242u32;
+        let mut next_b = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng >> 24) as u8
+        };
+        // fused tensor bytes; headers sanitized (finite f16 d/dmin)
+        let mut w = vec![0u8; fused_rows * row_stride];
+        for b in w.iter_mut() {
+            *b = next_b();
+        }
+        for r in 0..fused_rows {
+            for blk in 0..q_rows {
+                let h = r * row_stride + blk * 144;
+                let bits_d = ggml_fp32_to_fp16_bits(0.5f32 + 0.015625 * (r % 16) as f32);
+                let bits_m = ggml_fp32_to_fp16_bits(0.0625f32 + 0.0078125 * ((r + blk) % 16) as f32);
+                w[h..h + 2].copy_from_slice(&bits_d.to_le_bytes());
+                w[h + 2..h + 4].copy_from_slice(&bits_m.to_le_bytes());
+            }
+        }
+
+        // x activations, moderate magnitudes
+        let mut x = vec![0f32; b_size * dim];
+        for v in x.iter_mut() {
+            *v = next_x(&mut rng);
+        }
+
+        // spark.rs warm: three sub-ranges at the exact pointers
+        let base = w.as_ptr();
+        tile_warm(base, q_dim, dim, GGML_TYPE_Q4_K);
+        if variant != 1 {
+            tile_warm(unsafe { base.add(q_dim * row_stride) }, kv_dim, dim, GGML_TYPE_Q4_K);
+            tile_warm(
+                unsafe { base.add((q_dim + kv_dim) * row_stride) },
+                kv_dim,
+                dim,
+                GGML_TYPE_Q4_K,
+            );
+        }
+
+        // dispatch exactly like project_qkv_batch
+        let mut qy = vec![0f32; b_size * q_dim];
+        let mut ky = vec![0f32; b_size * kv_dim];
+        let mut vy = vec![0f32; b_size * kv_dim];
+        matmat(&w[..], GGML_TYPE_Q4_K, q_dim, dim, &x, b_size, &mut qy);
+        matmat(&w[q_dim * row_stride..], GGML_TYPE_Q4_K, kv_dim, dim, &x, b_size, &mut ky);
+        matmat(
+            &w[(q_dim + kv_dim) * row_stride..],
+            GGML_TYPE_Q4_K,
+            kv_dim,
+            dim,
+            &x,
+            b_size,
+            &mut vy,
+        );
+
+        // scalar reference: dequant each row, dot against x. The tile path
+        // quantizes x to q8_K before the dot, so the reference dot on RAW x
+        // differs by the act-quant rounding: the error is absolute-scale
+        // (√dim × dx/2 × w-rms ≈ tens at this fixture) and only looks large
+        // RELATIVE on near-cancelling dots — 8.6% at the smallest while the
+        // same error is ~0.4% of a typical dot. Gate peak-relative per batch
+        // column with an absolute floor; the 9848995df Spark corruption (27%
+        // structural, 3893 absolute at b=0) stays far above it.
+        let mut rowq = vec![0f32; dim];
+        let mut got = vec![0f32; fused_rows * b_size];
+        let mut refd = vec![0f32; fused_rows * b_size];
+        for r in 0..fused_rows {
+            dequantize_q4_k_row(&w[r * row_stride..], &mut rowq);
+            for b in 0..b_size {
+                let mut d = 0f32;
+                for (i, rv) in rowq.iter().enumerate() {
+                    d += rv * x[b * dim + i];
+                }
+                refd[r * b_size + b] = d;
+                got[r * b_size + b] = if r < q_dim {
+                    qy[b * q_dim + r]
+                } else if r < q_dim + kv_dim {
+                    ky[b * kv_dim + (r - q_dim)]
+                } else {
+                    vy[b * kv_dim + (r - q_dim - kv_dim)]
+                };
+            }
+        }
+        for b in 0..b_size {
+            let colmax = (0..fused_rows)
+                .map(|r| refd[r * b_size + b].abs())
+                .fold(0f32, f32::max);
+            for r in 0..fused_rows {
+                let d = refd[r * b_size + b];
+                let g = got[r * b_size + b];
+                assert!(
+                    (g - d).abs() <= 2e-2 * colmax + 150.0,
+                    "qkv sub-range gemm diverged row={r} b={b}: {g:.6} vs {d:.6} colmax={colmax:.6}"
+                );
+            }
+        }
+    }
+
+    fn next_x(rng: &mut u32) -> f32 {
+        *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        (((*rng >> 9) % 2001) as i32 - 1000) as f32 / 512.0
+    }
+
+    fn ggml_fp32_to_fp16_bits(v: f32) -> u16 {
+        // f16 bits via the std half rounding used by the engine's helpers
+        let v = v as f64;
+        let s = if v < 0.0 { 0x8000u16 } else { 0 };
+        let a = v.abs();
+        if a.is_infinite() || a >= 65504.0 {
+            return s | 0x7C00;
+        }
+        if a == 0.0 {
+            return s;
+        }
+        // exact for our test values (small dyadic rationals)
+        let e = a.log2().floor();
+        let m = (a / (2f64).powf(e - 10.0)).round();
+        let re = (e + 15.0) as u16;
+        let mm = (m as u16) & 0x3FF;
+        s | (re << 10) | mm
+    }
+
     #[test]
     fn test_ptq1_0_dequant_known_block() {
         // Hand-built one-block PTQ1_0 row: block = qs[24] | qh[2] | f16 d.

@@ -665,6 +665,21 @@ static T *tile_scratch(size_t n) {
     return buf.data();
 }
 
+// Separate host for the pad-to-4 activation copy: the pad paths hold p (the
+// zero-padded x) while ALSO handing out_dst from the same thread_local
+// tile_scratch vector — a second resize that grows past the first capacity
+// reallocates and leaves p DANGLING (quantizing activations from freed
+// memory). Bit corruption when rows > cols, e.g. Spark's fused-QKV prefill
+// 78→80 pad with rows 4096 > cols 2560 — Qwen never pads (chunks are ÷4) so
+// only the pad-bearing models were hit. A dedicated vector per role makes
+// both pointers stable regardless of resize order.
+template <typename T>
+static T *tile_scratch_pad(size_t n) {
+    static thread_local std::vector<T> buf;
+    buf.resize(n);
+    return buf.data();
+}
+
 extern "C" {
 
 void sofuu_set_threads(int n) {
@@ -2237,7 +2252,7 @@ static int sofuu_gemm_q8_0_impl(const void *weight_bytes, const float *x, float 
             tile_block_q8_0x4 *qa_ptr = tile_scratch<tile_block_q8_0x4>((tile_batch / 4) * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
-                float *p = tile_scratch<float>(tile_batch * cols);
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
                 std::memset(p, 0, tile_batch * cols * sizeof(float));
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
@@ -2372,7 +2387,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
             tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
-                float *p = tile_scratch<float>(tile_batch * cols);
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
                 std::memset(p, 0, tile_batch * cols * sizeof(float));
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
@@ -2412,7 +2427,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
             tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
-                float *p = tile_scratch<float>(tile_batch * cols);
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
                 std::memset(p, 0, tile_batch * cols * sizeof(float));
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
@@ -2452,7 +2467,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
             tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
-                float *p = tile_scratch<float>(tile_batch * cols);
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
                 std::memset(p, 0, tile_batch * cols * sizeof(float));
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
@@ -2498,7 +2513,13 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
     // Prefill via int8 SDOT (see gemm_q8_0 note): cols >= 2048 only.
     if (in_acc) return 1;
     if (sofuu_cpu_has_dotprod() && (cols % 256 == 0) && cols >= 2048) {
-        const size_t q8_blocks = cols / 256;
+        // sofuu_quantize_row_q8_a76 quantizes 32-element blocks, and the dot
+        // kernel reads 8 ext-blocks per q4_K super-block: the buffer unit is
+        // cols/32. This was cols/256 — the quantizer covered 1/8 of every
+        // row and the dot read past the scratch into stale/foreign bytes
+        // (the 9848995df-wave Spark-4B incoherence reached through this
+        // fallback whenever the tile path was skipped).
+        const size_t q8_blocks = cols / 32;
         sofuu_q8_block_ext *xq8_base = tile_scratch<sofuu_q8_block_ext>(batch_size * q8_blocks);
         for (size_t b = 0; b < batch_size; ++b) {
             sofuu_quantize_row_q8_a76(x + b * cols, xq8_base + b * q8_blocks, q8_blocks);
@@ -2596,7 +2617,7 @@ static int sofuu_gemm_q6_k_impl(const void *weight_bytes, const float *x, float 
             tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
-                float *p = tile_scratch<float>(tile_batch * cols);
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
                 std::memset(p, 0, tile_batch * cols * sizeof(float));
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;

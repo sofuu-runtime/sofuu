@@ -593,3 +593,62 @@ gate, not by inspection. (2) Two test-gates used per-element rel on
 near-zero values (softmax underflows / FA2's tiny outputs) and flagged
 1e-7-scale absolute noise as 1e-4 "divergence" — peak-relative is the
 metric that matches softmax/attention numerics.
+
+## Session 8 (2026-10-16): the Spark-4B fix — q4_K/q6_K dotprod-fallback act-quant unit bug (cols/256 → cols/32); SOFUU_SPARK_CPP_GEMM now the default
+
+The 2026-10-15 evidence pack's "remaining suspect: the C++ q4_K tile
+pipeline" is closed, and the suspect was slightly wrong: the tile paths
+(_p/_sc/_s) were never corrupt. The bug lived in the **batched dotprod
+FALLBACK** they masked. `sofuu_gemm_q4_k_impl`'s SDOT fallback (and the
+same block in `sofuu_gemm_q6_k_impl`) sized its activation scratch as
+`q8_blocks = cols / 256`, but `sofuu_quantize_row_q8_a76` is 32-element
+granular and `sofuu_vec_dot_q4_k_dotprod_a76` consumes 8 ext-blocks per
+q4_K super-block — the buffer unit is `cols / 32`. So the quantizer
+covered **1/8 of every row** (the rest quantized from whatever the
+previous call left in the thread-local scratch) and the dot read **8×
+past** the allocation. Whenever tiles engaged (the normal path), the
+fallback never ran and models were fine; Spark-4B's prefill padded
+batches (78 → 80 etc.) plus its fused-QKV shape skipped the tile path —
+hence "coherence breaks only Spark", hence every tile-pipeline A/B
+(mis)updating in innocent. Fixed by the one-line unit change, same as
+the q6_K copy. This also explains evidence-pack finding (2) (activations
+"reach nearest_int huge/NaN once tiles are disabled": garbage in the
+scratch tail, not prefill state).
+
+Second resident of the same mask: the pad paths held the zero-padded
+activation copy *and* `out_dst` from the same `tile_scratch` thread-local;
+a later resize past capacity reallocated the vector and left the pad
+pointer DANGLING mid-GEMM (`rows > cols` cases only — Spark's fused QKV
+4096×2560 pads, Qwen never pads). Now a separate `tile_scratch_pad`
+vector per role.
+
+New regression: `test_spark_qkv_cpp_gemm_parity` (infer/quant.rs) runs
+Spark's exact dims (dim 2560, fused QKV 4096/1024/1024, batch 78 with the
+spark.rs three-sub-range warm) through the production matmat dispatch vs
+a dequant-row reference. Gate is peak-relative per batch column
+(2e-2·colmax + 150) because the file's act-quant noise is absolute-scale
+(√dim · dx/2 · w_rms ≈ tens) and only looks large RELATIVE on
+near-cancelling dots (8.6% at the smallest dot while ~0.4% of a typical
+one); the structural signature (27%, 3893 absolute at b=0) stays far
+above it. Fixture lesson: a weight row spans **cols** (10 q4_K
+super-blocks = 1440 B), not `q_dim` — the first draft strided rows by
+`q_dim/256·144` and produced an engine-vs-reference phantom where only
+row 0 could ever match (and the stray f16 header sanitize offsets landed
+mid-row, feeding row-1 + random-byte headers). Suite 596 passed / 0
+failed; all five SOFUU_SPARKTEST_VARIANT bisect shapes pass.
+
+Device receipts (t1p4/t1p5, Pi 5, 2.8 GHz, 4 threads, temp 0):
+- Coherence: "The capital of France is" → " Paris, which is a major city
+  in Europe." with the C++ path — token-identical to the dequant
+  reference (both show the model's benign trailing "joining" artifact).
+- Spark prefill battery, 433-token prompt: **20.8 tk/s** (20.86 s) with
+  the C++ path vs the dequant fallback killed by a 400 s timeout before
+  finishing 433 tokens; decode 3.8 t/s unchanged (fix is prefill-only).
+- `SOFUU_SPARK_CPP_GEMM` flipped DEFAULT-ON in `spark.rs`
+  (`=0` restores the dequant fallback; `=1`-era semantics unchanged for
+  anyone relying on the historical knob). Verified on device: default
+  run coherent at fast-path speed, `=0` run coherent at dequant speed.
+- q6_K `in_acc` audit item re-verified at tip: `if (in_acc) return 1;`
+  guards both q6_K and q4_K before the dotprod blocks, so the generic
+  tails are unreachable under the fused-residual contract — honest, no
+  change needed.

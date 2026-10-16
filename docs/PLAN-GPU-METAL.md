@@ -1,6 +1,15 @@
 # PLAN-GPU-METAL — full GPU support for the Sofuu engine
 
-**Status: DRAFT — awaiting approval.** Companion to PLAN-CPU-DECODE-PEAK
+**Status: EXECUTION IN PROGRESS (2026-10-16).** Done so far:
+G0 ✓ GREEN & PUSHED (80c81254f) — `sofuu_metal_batch_open/gemv/batch_gemv_staged/batch_end`
+(real command batching; 32 chained bf16 GEMVs in ONE commit = 10.77×, 431→40 µs/op,
+bit-exact at every step; the earlier "visibility bug" was a test slot-map error, retracted).
+G1 primitive ✓ (eb956c128) — `batch_mlx4` quantized GEMV op with bindings mirrored from the
+per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
+Remaining: lfm2 decode client (activation slab + layer wiring under SOFUU_GPU_DECODE=1,
+bar 33→20 ms/token on liquid), gemma wiring, G2 GGUF MSL kernels (q4_K/q6_K/q8_0/q4_0;
+verify Q6_K_XL layout), G3 optional prefill, G4 per-model flip table + iOS check.
+DRAFT awaiting approval for the remaining phases. Companion to PLAN-CPU-DECODE-PEAK
 (CPU-REMAINING backlog C1–C5 frozen). Builds directly on the 2026-10-15 GPU
 survey: the Metal engine (src/metal/metal_engine.mm + infer/metal.rs) has
 correct per-op kernels (gemv mlx4/bf16/f16/f32 + fused qkv/gate_up/gemv_multi)

@@ -149,9 +149,123 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
         eprintln!("\x1b[1mUsage:\x1b[0m");
         eprintln!("  sofuu agent list");
         eprintln!("  sofuu agent run <name> <task…> [--json]");
+        eprintln!("  sofuu agent init <name>          (scaffold ~/.sofuu/agents/<name>.js)");
+        eprintln!("  sofuu agent validate <file.js>   (define dry-run, precise errors)");
         return 1;
     }
     match args[2].as_str() {
+        "init" => {
+            // P4.3 (agentic-core Phase 4): scaffold a def file into the same
+            // dir `sofuu agent list`/`run` already load from. Writing happens
+            // through the runtime's own fs bridge (HOME resolution + jail
+            // semantics live there); the name is sanitised here so it can
+            // never traverse out of the agents dir.
+            let name = args[3].as_str();
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                || name.starts_with('.')
+            {
+                eprintln!("\x1b[31mError:\x1b[0m agent name must match [A-Za-z0-9_-] (dots only in a trailing .js-less id)");
+                return 1;
+            }
+            let name_js = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
+            // The JS env() bridge does not carry HOME in every launch context
+            // (a smoke test scaffolded ./.sofuu into the CWD) — resolve the
+            // home dir HERE and hand the JS the absolute agents dir.
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            if home.is_empty() {
+                eprintln!("\x1b[31mError:\x1b[0m cannot resolve the home directory (HOME/USERPROFILE unset)");
+                return 1;
+            }
+            let dir_js = serde_json::to_string(&format!("{}/.sofuu/agents", home))
+                .unwrap_or_else(|_| "\"\"".into());
+            let code = format!(
+                r#"(async function () {{
+  const dir = {d};
+  const file = dir + '/{n}.js';
+  if (await sofuu.fs.exists(file)) {{
+    console.error('refusing to overwrite existing ' + file);
+    process.exit(1);
+  }}
+  const tpl = [
+    "// sofuu agent '{n}' — scaffolded by \`sofuu agent init\`; edit freely.",
+    "sofuu.agent.define({{",
+    "  name: '{n}',",
+    "  system: 'You are {n}. Be direct and precise; verify claims against tool results before stating them.',",
+    "  memory: 'agent',            // 'agent' | 'shared' | 'off'",
+    "  rlm: 'auto',",
+    "  // approve: 'none',         // 'sensitive' | 'all' — prompts the host via opts.onApproval",
+    "  // shell: 'readonly',       // or allow-list: ['git *', 'npm test*']",
+    "  // netPolicy: {{ allow: ['example.com'] }},",
+    "  // budget: {{ verify: true, maxSteps: 16 }},",
+    "  // responseSchema: {{ type: 'object', required: ['summary'], properties: {{ summary: {{ type: 'string' }} }} }},",
+    "  // learn: true,             // harvest a one-line playbook after successful runs",
+    "  provider: 'openai',         // match your \`sofuu config\` provider",
+    "  model: '',                  // '' = provider default",
+    "  tools: ['web'],             // 'web', {{ builtin: 'bash' }}, inline tools, or {{ mcp: [...] }}",
+    "}});",
+  ].join('\n');
+  await sofuu.fs.mkdir(dir, {{ recursive: true }});
+  await sofuu.fs.writeFile(file, tpl + '\n');
+  console.log('created ' + file);
+  console.log("next: edit the file, then `sofuu agent validate {n}`, then `sofuu agent run {n} \"task\"`");
+}})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});"#,
+                d = dir_js, n = name_js.trim_matches('"')
+            );
+            rt.eval_string(&code, "<agent-init>")
+        }
+        "validate" => {
+            // P4.3: define the file exactly like loadDir does (indirect eval
+            // in global scope) but report EVERY define error verbatim and a
+            // normalized summary; warnings (unknown delegate targets) do not
+            // fail the run, define errors do.
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu agent validate' requires a <file.js> path");
+                return 1;
+            }
+            let fjs = serde_json::to_string(&args[3]).unwrap_or_else(|_| "\"\"".into());
+            let code = format!(
+                r#"(async function () {{
+  const f = {f};
+  let src;
+  try {{ src = await sofuu.fs.readFile(f); }} catch (e) {{
+    console.error('read failed: ' + String((e && e.message) || e));
+    process.exit(1);
+  }}
+  if (typeof src !== 'string') src = String(src);
+  const before = sofuu.agent.list().map(function (a) {{ return a.name; }});
+  try {{ (0, eval)(src); }} catch (e) {{
+    console.error('DEFINE ERROR in ' + f + ': ' + String((e && e.message) || e));
+    process.exit(1);
+  }}
+  const defs = sofuu.agent.list().filter(function (a) {{ return before.indexOf(a.name) < 0; }});
+  if (!defs.length) {{
+    console.error('no sofuu.agent.define() call executed' + (sofuu.agent.list().length ? ' (agents were already loaded)' : ''));
+    process.exit(1);
+  }}
+  const known = sofuu.agent.list().map(function (a) {{ return a.name; }});
+  let warn = 0;
+  for (const a of defs) {{
+    console.log('✓ ' + a.name +
+      (a.model ? ' · ' + a.model : '') +
+      ' · memory ' + a.memory + ' · ' + a.tools + ' tool' + (a.tools === 1 ? '' : 's') +
+      ((a.agents && a.agents.length) ? ' · delegates: ' + a.agents.join(', ') : ''));
+    for (const dg of (a.agents || [])) {{
+      if (known.indexOf(dg) < 0) {{
+        console.log('  ⚠ delegates to unknown agent "' + dg + '" (define it first — runs fail only when it is actually called)');
+        warn++;
+      }}
+    }}
+  }}
+  console.log(defs.length + ' agent(s) valid' + (warn ? ', ' + warn + ' warning(s)' : ''));
+  if (warn > 0) process.exit(0);
+}})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});"#,
+                f = fjs
+            );
+            rt.eval_string(&code, "<agent-validate>")
+        }
         "list" | "ls" => {
             let code = r#"(async function () {
   const ld = await sofuu.agent.loadDir();

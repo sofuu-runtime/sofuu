@@ -236,6 +236,37 @@
 > verify round left). capi 46/46; no ABI growth; doc-authority note: anchors/verify/ledger
 > are driver-level (shipped JS), so embed SDKs inherit them without any header change.
 >
+> **AGENTIC CORE Phase 4 — orchestration & DX (2026-10-16, closes the approved 4-phase stream).**
+> (1) **Structured outputs** (`def responseSchema` / run `opts.responseSchema`, opts wins):
+> the answer is parsed (direct JSON → fenced block → outermost {…}/[…]) and validated against a
+> DELIBERATELY light checker — required keys + exact types at the root and one nested level,
+> bounded array-item types; JSON-Schema's full surface (pattern/enum/oneOf) is where validators
+> become their own failure source. A failing answer gets at most TWO quiet re-asks over the
+> same context ('reply with the corrected JSON ONLY'); an adoptable correction replaces the
+> answer (memory, evidence and finish all see the final form); an unfixable one is reported
+> honestly (`validated:false`, data undefined, run completes). `result.validated` present only
+> when a schema was in force; `result.data` carries the parsed object exactly when validated.
+> (2) **`run({estimate:true})`** returns the cost projection with ZERO model calls, no tool
+> resolution (MCP would spawn), no RLM, no stores: fixed head (system+task+context+images) +
+> named-tool schema estimate + the same `allocPlan` the live run starts from (window/maxOutput/
+> compactAt/toolCap/recall/attach), plus `estWorstCaseTk` as its stated formula and
+> `fitsMaxTokens` (= overflow means "plan for compaction", not impossible). Smoke-tested
+> numbers: approvy → window 32768, worst 57741, fits true. (3) **`sofuu agent init|validate`**
+> (Rust CLI, no new runtime surface): init scaffolds `~/.sofuu/agents/<name>.js` (all P1-P4
+> knobs as commented lines; refuses overwrite; name sanitized against traversal) and validate
+> = a loadDir-identical define dry-run printing the normalized summary with verbatim define
+> errors + unknown-delegate warnings (warn, not fail). Pre-push smoke caught a real bug: the
+> JS `env('HOME')` bridge resolves empty in some launch contexts, so the first cut scaffolded
+> `./.sofuu/agents` into the CWD — home is now resolved in Rust and the absolute dir handed to
+> the JS. (4) **Learnings harvest** (`def learn:true`): after a successful ≥4-step run, ONE
+> ≤200-char playbook line (goal → tools with counts → steps → outcome head) lands in
+> `agent:<name>:playbook` through the EXISTING CMA store surface (vector = the task's embed,
+> so future similar tasks recall it) + a `learned` event; memory/brain Rust code untouched.
+> Evidence: battery 268 PASS (4 new P4 checks: schema adopt with parsed data, unfixable-honest,
+> estimate zero-calls incl. window+verdict, learn harvest with learned+stored events); capi
+> 46/46; no ABI growth; CLI smoke-tested live (init → validate → overwrite refusal → delegate
+> warning → cleanup).
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

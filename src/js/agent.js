@@ -578,6 +578,19 @@
      * Off by default — it costs one LLM call; the P3.3 ledger below gives
      * the zero-token advisory for everyone else. */
     d.budget.verify = b.verify === true;
+    /* P4.1 structured outputs: an optional LIGHT JSON schema (required +
+     * type checks, ≤2 levels of properties) the answer must satisfy —
+     * failures get two quiet bounded re-asks, then result.validated:false
+     * (never a throw). Array-of forms are accepted at the root when the
+     * schema says array. Run opts.responseSchema overrides the def. */
+    d.responseSchema = (def.responseSchema && typeof def.responseSchema === 'object' &&
+                        !Array.isArray(def.responseSchema))
+      ? def.responseSchema : null;
+    /* P4.4 learnings harvest (opt-in): after successful >=4-step runs,
+     * ONE ≤200-char playbook line lands in this agent's own namespace
+     * via the EXISTING CMA store surface ('agent:<name>:playbook',
+     * vector = the task's, so future similar tasks recall it). */
+    d.learn = def.learn === true;
     /* 0 is meaningful here (renewals disabled → pre-2026-10-01 behaviour),
      * so test with 'in' rather than falling back to the default. */
     d.budget.maxContinuations = ('maxContinuations' in b)
@@ -1886,6 +1899,117 @@
     }
   }
 
+  /* ── P4.1 structured outputs (2026-10-16): DELIBERATELY light — exact
+   * type of the root + declared property types (one nested level), and
+   * required keys at both levels. JSON-Schema's full surface (pattern,
+   * enum, oneOf, recursion) is where validators become their own failure
+   * source; a bounded checker that the model can ACTUALLY satisfy beats
+   * an expressive one that re-asks twice and still fails. Returns
+   * { ok, why }; a parse failure is the caller's concern. */
+  function schemaTypeCheck(v, t) {
+    if (!t || t === 'any') return true;
+    switch (t) {
+      case 'string': return typeof v === 'string';
+      case 'number': return typeof v === 'number' && isFinite(v);
+      case 'boolean': return typeof v === 'boolean';
+      case 'object': return !!v && typeof v === 'object' && !Array.isArray(v);
+      case 'array': return Array.isArray(v);
+      case 'null': return v === null;
+      default: return true; /* unknown type string → don't enforce */
+    }
+  }
+  function validateSchemaLight(obj, schema) {
+    try {
+      if (!schema || typeof schema !== 'object') return { ok: true, why: '' };
+      var t = schema.type;
+      if (t && !schemaTypeCheck(obj, t)) {
+        return { ok: false, why: 'root is not ' + t };
+      }
+      var wantObj = (!t && (schema.properties || schema.required)) || t === 'object';
+      if (wantObj && (!obj || typeof obj !== 'object' || Array.isArray(obj))) {
+        return { ok: false, why: 'root must be a JSON object' };
+      }
+      var req, pr;
+      if (wantObj) {
+        req = Array.isArray(schema.required) ? schema.required : [];
+        pr = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {};
+        for (var ri = 0; ri < req.length; ri++) {
+          if (!(req[ri] in obj)) return { ok: false, why: 'missing required key "' + req[ri] + '"' };
+        }
+        for (var k in pr) {
+          if (!(k in obj)) continue;
+          var spec = pr[k];
+          if (spec && spec.type && !schemaTypeCheck(obj[k], spec.type)) {
+            return { ok: false, why: 'key "' + k + '" is not ' + spec.type };
+          }
+          /* one nested level: required + types of the sub-object's keys */
+          if (spec && spec.type === 'object' && obj[k] && typeof obj[k] === 'object' &&
+              !Array.isArray(obj[k])) {
+            var nreq = Array.isArray(spec.required) ? spec.required : [];
+            for (var nj = 0; nj < nreq.length; nj++) {
+              if (!(nreq[nj] in obj[k])) {
+                return { ok: false, why: 'missing "' + k + '.' + nreq[nj] + '"' };
+              }
+            }
+          }
+        }
+      }
+      if (t === 'array' && Array.isArray(obj) && schema.items && schema.items.type) {
+        for (var ai2 = 0; ai2 < Math.min(obj.length, 50); ai2++) {
+          if (!schemaTypeCheck(obj[ai2], schema.items.type)) {
+            return { ok: false, why: 'items[' + ai2 + '] is not ' + schema.items.type };
+          }
+        }
+      }
+      return { ok: true, why: '' };
+    } catch (e) {
+      return { ok: false, why: 'validator error' };
+    }
+  }
+  /* Answer → first JSON value: direct parse, then a fenced ```json block,
+   * then the outermost {…} / […] span. Returns null when nothing parses
+   * (validateSchemaLight is never asked to judge prose). */
+  function extractJsonAnswer(text) {
+    try {
+      var s = String(text == null ? '' : text).trim();
+      var direct = null;
+      try { direct = JSON.parse(s); } catch (e1) { direct = null; }
+      if (direct !== null && typeof direct !== 'undefined') return direct;
+      var fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence && fence[1]) {
+        try { return JSON.parse(fence[1].trim()); } catch (e2) {}
+      }
+      var opens = s.indexOf('{'), opensA = s.indexOf('[');
+      var ch = (opensA >= 0 && (opens < 0 || opensA < opens)) ? '[' : '{';
+      var close = ch === '[' ? ']' : '}';
+      var from = s.indexOf(ch), to = s.lastIndexOf(close);
+      if (from >= 0 && to > from) {
+        try { return JSON.parse(s.slice(from, to + 1)); } catch (e3) {}
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+  /* P4.4: one ≤200-char playbook line — goal, the tools that worked,
+   * the step count, and the outcome's head. Purely informational for
+   * future recall; failure returns null and the hook skips. */
+  function playbookLine(task, toolHist, steps, answer) {
+    try {
+      var best = [];
+      for (var k in toolHist) {
+        if (best.length < 4) best.push(k + '×' + toolHist[k]);
+      }
+      var out = 'worked: ' + String(task).replace(/\s+/g, ' ').trim().slice(0, 90) +
+        ' → ' + (best.join(',') || 'no tools') +
+        ' in ' + steps + ' steps; outcome: ' +
+        String(answer).replace(/\s+/g, ' ').trim().slice(0, 70);
+      return clip(out, 200);
+    } catch (e) {
+      return null;
+    }
+  }
+
   /* ── ML gates (PLAN-ML-GATES) ──────────────────────────────────────
    * Advisors, never filters (Principle 1): the gates observe the loop and
    * emit guidance; they never block, cap, reorder, or delete. Every call
@@ -2318,6 +2442,11 @@
         evidence: (depth === 0 && !stopped && answer &&
                    typeof loopMsgs !== 'undefined' && loopMsgs)
           ? buildEvidence(answer, loopMsgs) : undefined,
+        /* P4.1: present (true/false) only when a responseSchema was in
+         * force and the run finished naturally; data carries the parsed
+         * object exactly when validated is true. */
+        validated: respSchema ? (depth === 0 && !stopped ? validated : undefined) : undefined,
+        data: (respSchema && validated) ? validatedData : undefined,
       };
       emit(stopped ? 'stop' : 'answer', { answer: clip(answer, 200), stopped: stopped });
       if (res.evidence && (res.evidence.backed > 0 || res.evidence.unbacked > 0)) {
@@ -2852,6 +2981,68 @@
         .concat(Array.isArray(opts.history) ? opts.history : [])
         .concat([taskMsg]);
 
+      /* ── P4.2 estimate mode (2026-10-16): project the run's costs
+       * WITHOUT any model call, tool resolution (MCP would spawn
+       * subprocesses), RLM routing, or store activity — pure arithmetic
+       * over exactly the inputs the real run would send. Fields marked
+       * approx are estimates by construction (per-token, not per-byte);
+       * plan is the same allocPlan the live run starts from. */
+      if (opts.estimate === true) {
+        refreshPlan();
+        var esToolNames = [];
+        var esTools = []
+          .concat(d.webTools).concat(d.codeTools).concat(d.hostTools);
+        var esToolTk = 0;
+        for (var esI = 0; esI < esTools.length; esI++) {
+          var esName = String(esTools[esI]);
+          esToolNames.push(esName);
+          var esSpec = (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[esName]) ||
+                       (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[esName]);
+          try { esToolTk += estTok(esSpec ? JSON.stringify(esSpec) : esName); } catch (eEs) {}
+        }
+        for (var esJ = 0; esJ < d.inlineTools.length; esJ++) {
+          esToolNames.push(d.inlineTools[esJ].name);
+          try { esToolTk += estTok(JSON.stringify(d.inlineTools[esJ].name +
+                 ' ' + (d.inlineTools[esJ].description || '') +
+                 ' ' + JSON.stringify(d.inlineTools[esJ].parameters || {}))); } catch (eEs2) {}
+        }
+        esToolTk += d.mcpSets.length * 40; /* mcp tools are name-only until spawn; flat tax */
+        var esHeadTk = estTok(String(d.system || '')) +
+                       estTok(String(task == null ? '' : task)) +
+                       estTok(String(opts.context || '')) +
+                       ((opts.images && opts.images.length) ? opts.images.length * IMAGE_TOKEN_TAX : 0);
+        var esWindow = (lastPlan && lastPlan.window > 0) ? lastPlan.window
+          : contextWindow(d.model, d.baseUrl);
+        var esOut = (lastPlan && lastPlan.maxOutput > 0) ? lastPlan.maxOutput : 0;
+        /* Worst case, stated as its formula: fixed head + full tool schema
+         * re-sent every round + per round a tool-call/result cycle (~700 tk)
+         * plus an output-reserve-sized answer. Overflow of THIS bound is
+         * what compactAt/fitGuard exist to absorb — fitsMaxTokens:false
+         * means "plan for compaction", not "impossible". */
+        var esWorst = (esHeadTk + esToolTk) +
+                      d.budget.maxSteps * (700 + (esOut || 1024)) + esToolTk;
+        return {
+          estimate: true, agent: d.name, model: d.model || '(default)',
+          approx: true, toolNames: esToolNames,
+          plan: lastPlan ? {
+            window: lastPlan.window, maxOutput: lastPlan.maxOutput,
+            compactAt: lastPlan.compactAt,
+            toolCap: lastPlan.toolCap, recall: lastPlan.recall, attach: lastPlan.attach,
+          } : null,
+          window: esWindow,
+          maxOutput: esOut,
+          fixedOverheadTk: esHeadTk + esToolTk,
+          headTk: esHeadTk, toolTk: esToolTk,
+          maxSteps: d.budget.maxSteps,
+          estWorstCaseTk: esWorst,
+          budget: { maxSteps: d.budget.maxSteps, maxTokens: d.budget.maxTokens,
+                    maxWallMs: d.budget.maxWallMs },
+          fitsMaxTokens: d.budget.maxTokens <= 0 || esWorst <= d.budget.maxTokens,
+          usage: { llmCalls: 0, toolCalls: 0, promptTokens: 0, completionTokens: 0 },
+        };
+      }
+
+
       /* Tool resolution + delegate injection (A2) — resolved BEFORE the
        * RLM gate so an RLM-routed turn can inject the agent's tool
        * whitelist into the sandbox (A4 full form). */
@@ -2974,6 +3165,13 @@
        * answer was adopted (advisory — any failure keeps the draft and
        * stays false; result.verified is the only observable). */
       var verified = false;
+      /* P4.1: run opts.responseSchema overrides the def's; also drives
+       * the bounded schema re-asks below. */
+      var respSchema = (opts.responseSchema && typeof opts.responseSchema === 'object' &&
+                        !Array.isArray(opts.responseSchema))
+        ? opts.responseSchema : d.responseSchema;
+      var validated = false;
+      var validatedData;
       /* First-request section weights for the ring's hover card (captured
        * after fitGuard in whichever path fires the turn's first request —
        * the tool loop below or finalAnswer for the plain path). */
@@ -4050,6 +4248,25 @@
         if (stopped) break;
       }
 
+      /* Post-loop quiescent rounds (P3.2 verify, P4.1 schema re-asks):
+       * usage lands in own/tree exactly like a live round, stream is
+       * already complete. */
+      function absorbQuietRound(st) {
+        var u = (st && st.usage) || {};
+        own.promptTokens += u.promptTokens || 0;
+        own.completionTokens += u.completionTokens || 0;
+        own.cacheReadTokens += u.cacheReadTokens || 0;
+        own.cacheWriteTokens += u.cacheWriteTokens || 0;
+        tree.promptTokens += u.promptTokens || 0;
+        tree.completionTokens += u.completionTokens || 0;
+        tree.cacheReadTokens += u.cacheReadTokens || 0;
+        tree.cacheWriteTokens += u.cacheWriteTokens || 0;
+        own.llmCalls++; tree.llmCalls++;
+        emit('llm', { round: own.llmCalls, usage: {
+          promptTokens: u.promptTokens || 0, completionTokens: u.completionTokens || 0,
+          cacheReadTokens: u.cacheReadTokens || 0, cacheWriteTokens: u.cacheWriteTokens || 0 } });
+      }
+
       /* ── P3.2 verify pass (opt-in def key budget.verify) ──────────────
        * The #1 hallucination surface is the final summary: observations
        * were grounded step-by-step, the ANSWER is free-written. For runs
@@ -4084,19 +4301,7 @@
             else vo.max_tokens = lastPlan.maxOutput;
           }
           var vOut = await streamWithRetry(vo, null, null);
-          var vu = vOut.st.usage || {};
-          own.promptTokens += vu.promptTokens || 0;
-          own.completionTokens += vu.completionTokens || 0;
-          own.cacheReadTokens += vu.cacheReadTokens || 0;
-          own.cacheWriteTokens += vu.cacheWriteTokens || 0;
-          tree.promptTokens += vu.promptTokens || 0;
-          tree.completionTokens += vu.completionTokens || 0;
-          tree.cacheReadTokens += vu.cacheReadTokens || 0;
-          tree.cacheWriteTokens += vu.cacheWriteTokens || 0;
-          own.llmCalls++; tree.llmCalls++;
-          emit('llm', { round: own.llmCalls, usage: {
-            promptTokens: vu.promptTokens || 0, completionTokens: vu.completionTokens || 0,
-            cacheReadTokens: vu.cacheReadTokens || 0, cacheWriteTokens: vu.cacheWriteTokens || 0 } });
+          absorbQuietRound(vOut.st);
           var vText = vOut.parts.join('').trim();
           if (!state.cancelled && vText &&
               vText !== '(no response)' && vText !== '(cancelled)') {
@@ -4108,6 +4313,53 @@
           /* Advisory: a broken verify round never breaks the answer. */
           emit('verify', { step: stepsTotal, error: clip(String((eV && eV.message) || eV), 120) });
         }
+      }
+
+      /* ── P4.1 structured outputs (def responseSchema / opts.responseSchema)
+       * Parse + validate the final answer against the LIGHT schema; on a
+       * failure, at most TWO quiet re-asks over the same context ('reply
+       * with the corrected JSON ONLY'). An adoptable correction replaces
+       * the answer (memory + evidence + finish all see the final form);
+       * an unfixable answer is reported honestly as validated:false —
+       * never thrown away, never a stopped run. */
+      if (respSchema && !stopped && depth === 0 && answer &&
+          answer !== '(cancelled)' && answer !== '(no response)') {
+        var pj = extractJsonAnswer(answer);
+        var pv = validateSchemaLight(pj, respSchema);
+        var schemaTries = 0;
+        while (!pv.ok && !state.cancelled && schemaTries < 2) {
+          schemaTries++;
+          emit('schema', { attempt: schemaTries, why: clip(pv.why || '', 160) });
+          try {
+            var sMsgs = messages.concat(loopMsgs);
+            sMsgs.push({ role: 'user', content:
+              '[schema] Your answer must be ONLY a JSON value matching this schema:\n' +
+              clip(JSON.stringify(respSchema), 1500) +
+              '\nYour last answer failed validation (' + clip(pv.why || 'not parseable as JSON', 140) +
+              '). Reply with the corrected JSON ONLY — no prose, no code fences.' });
+            var so2 = aiOpts(d, opts, sMsgs, null, 0);
+            var fgS = fitGuard(so2, so2.messages);
+            so2.messages = fgS.msgs;
+            so2.cacheAnchorCount = undefined;
+            if (lastPlan && lastPlan.maxOutput > 0) {
+              if (so2.max_tokens > 0) so2.max_tokens = Math.min(so2.max_tokens, lastPlan.maxOutput);
+              else so2.max_tokens = lastPlan.maxOutput;
+            }
+            var sOut = await streamWithRetry(so2, null, null);
+            absorbQuietRound(sOut.st);
+            var sText = sOut.parts.join('').trim();
+            if (state.cancelled || !sText || sText === '(no response)' || sText === '(cancelled)') break;
+            answer = sText;
+            pj = extractJsonAnswer(answer);
+            pv = validateSchemaLight(pj, respSchema);
+          } catch (eSc) {
+            emit('schema', { attempt: schemaTries, error: clip(String((eSc && eSc.message) || eSc), 120) });
+            break;
+          }
+        }
+        validated = !!(pv.ok && pj != null);
+        if (validated) validatedData = pj;
+        emit('schema', { attempt: schemaTries, ok: validated });
       }
 
       await storeAndFinish(answer);
@@ -4274,6 +4526,26 @@
           if ((recalledIds.length || (semCma && recalledSemIds.length)) && ansText.trim()) {
             try { cma.flush(); } catch (eF1) {}
             if (semCma) { try { semCma.flush(); } catch (eF2) {} }
+          }
+          /* P4.4 learnings harvest (def learn:true): ONE ≤200-char playbook
+           * line per successful multi-step run, written into this agent's
+           * own namespace THROUGH the existing CMA surface (vector = the
+           * task's, so a future similar task recalls it). Memory/brain Rust
+           * code is untouched — this is exactly the store write the turn
+           * above already exercises, just keyed to a stable playbook key. */
+          if (d.learn && stepsTotal >= 4) {
+            try {
+              var pb = playbookLine(task, toolHist, stepsTotal, ansText);
+              if (pb && vu) {
+                var pbKey = 'agent:' + d.name + ':playbook';
+                if (typeof cma.rememberEntityTurn === 'function') {
+                  cma.rememberEntityTurn(vu, pb, pbKey, 'agent');
+                } else if (typeof cma.rememberEntity === 'function') {
+                  cma.rememberEntity(vu, pb, pbKey, 'agent');
+                }
+                emit('learned', { key: pbKey, line: clip(pb, 200) });
+              }
+            } catch (eL) {}
           }
           emit('stored', { scope: d.memory });
         } catch (e) {}

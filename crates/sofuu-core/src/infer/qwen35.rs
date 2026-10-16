@@ -17,6 +17,16 @@ use super::quant::{bf16_to_f32, f16_to_f32, ptq1_0_dequant_row};
 
 /// GGML tensor type id for PTQ1_0 (prism ternary, 28 bytes per 128 values).
 const GGML_TYPE_PTQ1_0: u32 = 143;
+/// GGML tensor type id for PQ2_0 (prism 2-bit, 34 bytes per 128 values —
+/// 2 B f16 scale FIRST, then 32 B of little-endian 2-bit codes; code c
+/// decodes to (c − 1) · d, i.e. the {−1, 0, +1, +2}·d lattice). Same
+/// hadamard-fold family as PTQ1_0; the Ternary-Bonsai-2-9B stores its
+/// mainline weights here.
+const GGML_TYPE_PQ2_0: u32 = 142;
+
+/// One packed PQ2_0 row on the wire: 34 B per 128 values.
+const PQ2_0_BLOCK_BYTES: usize = 34;
+const PQ2_0_BLOCK_VALUES: usize = 128;
 /// GGML tensor type id for bfloat16.
 const GGML_TYPE_BF16: u32 = 30;
 
@@ -72,6 +82,7 @@ struct RawMat {
     n_in: usize,  // ne0
     n_out: usize, // ne1
     row_bytes: usize,
+    ty: u32, // GGML type of the packed rows (143 PTQ1_0, 142 PQ2_0, ...)
     xform: Xform,
 }
 
@@ -276,6 +287,14 @@ fn wht_blocks(block_len: usize, x: &mut [f32]) {
 }
 
 /// Prepared folded-matmul activation: dst[i] = S[i]·src[i], then per-block H.
+fn raw_gdn_v() -> bool {
+    std::env::var_os("SOFUU_GDN_V_RAW").is_some_and(|v| v != "0")
+}
+
+/// prism.hadamard.gdn_v_grouped is set on EVERY prism checkpoint (27B and 9B
+/// alike) — it marks that the [hd, nk, rep] → [hd, rep, nk] regroup rides the
+/// ssm_out transform, not that it may be skipped. SOFUU_GDN_V_RAW=1 keeps the
+/// raw order for A/B only.
 fn hadamard_prep(block: usize, dst: &mut [f32], src: &[f32], signs: &[f32]) {
     for (d, (&s, &v)) in dst.iter_mut().zip(signs.iter().zip(src.iter())) {
         *d = s * v;
@@ -297,13 +316,13 @@ fn hadamard_prep_in_place(block: usize, x: &mut [f32], signs: &[f32]) {
 fn gdn_perm(dst: &mut [f32], src: &[f32]) {
     const HD: usize = 128;
     const NK: usize = 16;
-    const REP: usize = 3;
-    debug_assert_eq!(src.len(), HD * NK * REP);
-    for rep in 0..REP {
+    let rep = src.len() / (HD * NK); // 27B rep 3, 9B rep 2 (= ssm_dt_rank/nk)
+    debug_assert_eq!(src.len(), HD * NK * rep);
+    for rep_i in 0..rep {
         for nk in 0..NK {
             for d in 0..HD {
-                let fi = d + HD * (nk + NK * rep);
-                let fo = d + HD * rep + HD * REP * nk;
+                let fi = d + HD * (nk + NK * rep_i);
+                let fo = d + HD * rep_i + HD * rep * nk;
                 dst[fo] = src[fi];
             }
         }
@@ -359,6 +378,58 @@ fn dequant_trits_i8(src: &[u8], trits: &mut [i8], scales: &mut [f32]) {
             }
         }
         debug_assert_eq!(o, (blk + 1) * PTQ1_0_BLOCK_VALUES);
+    }
+}
+
+/// Dequantize one PQ2_0 (GGML type 142, prism 2-bit at group 128) row into
+/// per-value int8 levels in {-1, 0, +1, +2} plus the per-128-value f16 block
+/// scale — the same slab contract as `dequant_trits_i8`, so every sdot/slab
+/// consumer runs either codec unchanged: the band dot folds as
+/// `levels[i] · scales[i / 128]` because the code lattice is (code − 1) · d.
+/// Block layout: f16 d FIRST (bytes 0..2), then 32 B of codes; value j lives
+/// at byte j/4 low bits first: code = (qs[j / 4] >> ((j % 4) · 2)) & 3.
+fn dequant_pq2_i8(src: &[u8], levels: &mut [i8], scales: &mut [f32]) {
+    const QK: usize = PQ2_0_BLOCK_VALUES;
+    const BLOCK: usize = PQ2_0_BLOCK_BYTES;
+    let n_blocks = levels.len() / QK;
+    debug_assert!(src.len() >= n_blocks * BLOCK);
+    debug_assert_eq!(scales.len(), n_blocks);
+    for blk in 0..n_blocks {
+        let b_offset = blk * BLOCK;
+        scales[blk] = f16_to_f32(u16::from_le_bytes([src[b_offset], src[b_offset + 1]]));
+        let codes = &src[b_offset + 2..b_offset + BLOCK];
+        for j in 0..QK {
+            let code = codes[j / 4] >> ((j % 4) * 2);
+            levels[blk * QK + j] = (code & 3) as i8 - 1;
+        }
+    }
+}
+
+/// Codec-dispatched row decode for any packed RawMat (both prism codecs).
+#[inline]
+fn dequant_row_i8(m: &RawMat, src: &[u8], levels: &mut [i8], scales: &mut [f32]) {
+    match m.ty {
+        GGML_TYPE_PQ2_0 => dequant_pq2_i8(src, levels, scales),
+        _ => dequant_trits_i8(src, levels, scales),
+    }
+}
+
+/// Codec-dispatched row decode straight to f32 values (embedding-table path).
+#[inline]
+fn dequant_row_to_f32(ty: u32, n_in: usize, src: &[u8], out: &mut [f32]) {
+    match ty {
+        GGML_TYPE_PQ2_0 => {
+            let qk = PQ2_0_BLOCK_VALUES;
+            for c in 0..n_in / qk {
+                let blk = &src[c * PQ2_0_BLOCK_BYTES..(c + 1) * PQ2_0_BLOCK_BYTES];
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for (j, o) in out[c * qk..(c + 1) * qk].iter_mut().enumerate() {
+                    let code = (blk[2 + j / 4] >> ((j % 4) * 2)) & 3;
+                    *o = (code as i8 - 1) as f32 * d;
+                }
+            }
+        }
+        _ => ptq1_0_dequant_row(src, out),
     }
 }
 
@@ -624,6 +695,40 @@ unsafe fn packed_row_dot_t143(row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -
     acc
 }
 
+/// Whole-row file-direct dot over PQ2_0 (type 142) blocks: each 128-value
+/// band's codes decode into a stack level buffer and run the identical
+/// `sdot_group` fold the slab paths use, so file-direct and slab results are
+/// bit-identical. The scale rides block-first (`d` at bytes 0..2).
+#[cfg(target_arch = "aarch64")]
+unsafe fn packed_row_dot_t142(row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -> f32 {
+    let blocks = n_in / PQ2_0_BLOCK_VALUES;
+    debug_assert_eq!(row.len(), blocks * PQ2_0_BLOCK_BYTES);
+    let mut acc = 0.0f32;
+    let mut levels = [0i8; PQ2_0_BLOCK_VALUES];
+    for c in 0..blocks {
+        let blk = &row[c * PQ2_0_BLOCK_BYTES..(c + 1) * PQ2_0_BLOCK_BYTES];
+        let scale = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let codes = &blk[2..];
+        for (j, lv) in levels.iter_mut().enumerate() {
+            let code = codes[j / 4] >> ((j % 4) * 2);
+            *lv = (code & 3) as i8 - 1;
+        }
+        let band = &aq.q[arow * n_in + c * PQ2_0_BLOCK_VALUES..][..PQ2_0_BLOCK_VALUES];
+        let iacc = sdot_group(&levels, band);
+        acc += scale * aq.scales[arow * blocks + c] * iacc as f32;
+    }
+    acc
+}
+
+/// Codec-dispatched whole-row file-direct dot.
+#[cfg(target_arch = "aarch64")]
+unsafe fn packed_row_dot(m: &RawMat, row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -> f32 {
+    match m.ty {
+        GGML_TYPE_PQ2_0 => unsafe { packed_row_dot_t142(row, aq, arow, n_in) },
+        _ => unsafe { packed_row_dot_t143(row, aq, arow, n_in) },
+    }
+}
+
 /// A token activation set quantized per PTQ1_0 band: `q[row * n_in + i]` is
 /// the signed int8 code, `scales[row * blocks + c] = band_absmax / 127`.
 struct ActQ {
@@ -705,7 +810,7 @@ fn gemm_rows_t143_sdot(
     while base < rows {
         let take = rows_per_pass.min(rows - base);
         for i in 0..take {
-            dequant_trits_i8(
+            dequant_row_i8(m, 
                 m.row_slice(data, r_off + base + i),
                 &mut slab_t[i * n_in..(i + 1) * n_in],
                 &mut slab_d[i * blocks..(i + 1) * blocks],
@@ -790,7 +895,7 @@ fn ensure_t143_slab(data: &[u8], m: &RawMat) -> Option<std::sync::Arc<SlabT143>>
             scope.spawn(move || {
                 for i in 0..take {
                     let r = lo + i;
-                    dequant_trits_i8(
+                    dequant_row_i8(m, 
                         m.row_slice(data, r),
                         &mut chunk_t[i * n_in..(i + 1) * n_in],
                         &mut chunk_d[i * blocks..(i + 1) * blocks],
@@ -861,7 +966,7 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
     if threads <= 1 {
         if use_sdot {
             for (r, o) in out.iter_mut().enumerate() {
-                *o = unsafe { packed_row_dot_t143(m.row_slice(data, r), &aq, 0, n_in) };
+                *o = unsafe { packed_row_dot(m, m.row_slice(data, r), &aq, 0, n_in) };
             }
             return;
         }
@@ -869,7 +974,7 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
         let mut rowd = vec![0.0f32; blocks];
         let act = &act[..n_in];
         for (r, o) in out.iter_mut().enumerate() {
-            dequant_trits_i8(m.row_slice(data, r), &mut trits, &mut rowd);
+            dequant_row_i8(m, m.row_slice(data, r), &mut trits, &mut rowd);
             *o = trit_row_dot(&trits, &rowd, act);
         }
         return;
@@ -888,14 +993,14 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
             scope.spawn(move || {
                 if use_sdot {
                     for (i, o) in chunk.iter_mut().enumerate() {
-                        *o = unsafe { packed_row_dot_t143(m.row_slice(data, rows + i), aq_ref, 0, n_in) };
+                        *o = unsafe { packed_row_dot(m, m.row_slice(data, rows + i), aq_ref, 0, n_in) };
                     }
                     return;
                 }
                 let mut trits = vec![0i8; n_in];
                 let mut rowd = vec![0.0f32; blocks];
                 for (i, o) in chunk.iter_mut().enumerate() {
-                    dequant_trits_i8(m.row_slice(data, rows + i), &mut trits, &mut rowd);
+                    dequant_row_i8(m, m.row_slice(data, rows + i), &mut trits, &mut rowd);
                     *o = trit_row_dot(&trits, &rowd, act);
                 }
             });
@@ -935,7 +1040,7 @@ fn gemm_rows_t143(
     while base < rows {
         let take = rows_per_pass.min(rows - base);
         for i in 0..take {
-            dequant_trits_i8(
+            dequant_row_i8(m, 
                 m.row_slice(data, r_off + base + i),
                 &mut slab_t[i * n_in..(i + 1) * n_in],
                 &mut slab_d[i * blocks..(i + 1) * blocks],
@@ -1057,7 +1162,7 @@ fn gemm_rows_t143_direct(
     while base < rows {
         let take = rows_per_pass.min(rows - base);
         for i in 0..take {
-            dequant_trits_i8(
+            dequant_row_i8(m, 
                 m.row_slice(data, r_off + base + i),
                 &mut slab_t[i * n_in..(i + 1) * n_in],
                 &mut slab_d[i * blocks..(i + 1) * blocks],
@@ -1273,7 +1378,14 @@ fn raw_mat_of(data: &[u8], gguf: &GgufFile, name: &str, xform: Xform, expect_typ
         .tensors
         .get(name)
         .ok_or_else(|| format!("missing Qwen35 tensor: {name}"))?;
-    if info.tensor_type != expect_type {
+    let ty = info.tensor_type;
+    // PTQ1_0-expecting calls accept either prism codec (same geometry class);
+    // everything else validates exactly.
+    let ty_ok = match expect_type {
+        GGML_TYPE_PTQ1_0 => ty == GGML_TYPE_PTQ1_0 || ty == GGML_TYPE_PQ2_0,
+        t => ty == t,
+    };
+    if !ty_ok {
         return Err(format!(
             "tensor {name}: unexpected GGUF type {} (expected {expect_type})",
             info.tensor_type
@@ -1284,8 +1396,9 @@ fn raw_mat_of(data: &[u8], gguf: &GgufFile, name: &str, xform: Xform, expect_typ
     }
     let n_in = info.shape[0];
     let n_out = info.shape[1];
-    let row_bytes = match expect_type {
+    let row_bytes = match ty {
         GGML_TYPE_PTQ1_0 => row_bytes_ptq1_0(n_in),
+        GGML_TYPE_PQ2_0 => n_in.div_ceil(PQ2_0_BLOCK_VALUES) * PQ2_0_BLOCK_BYTES,
         GGML_TYPE_BF16 => n_in * 2,
         _ => n_in * 4,
     };
@@ -1296,7 +1409,7 @@ fn raw_mat_of(data: &[u8], gguf: &GgufFile, name: &str, xform: Xform, expect_typ
     if off + total > data.len() {
         return Err(format!("tensor {name}: data out of mmap range"));
     }
-    Ok(RawMat { off, n_in, n_out, row_bytes, xform })
+    Ok(RawMat { off, n_in, n_out, row_bytes, ty, xform })
 }
 
 fn f32_meta_vec(gguf: &GgufFile, data: &[u8], name: &str) -> Result<Vec<f32>, String> {
@@ -1316,12 +1429,29 @@ fn bf16_meta_mat(gguf: &GgufFile, data: &[u8], name: &str, rows: usize, cols: us
         .tensors
         .get(name)
         .ok_or_else(|| format!("missing Qwen35 tensor: {name}"))?;
-    if info.tensor_type != GGML_TYPE_BF16 {
-        return Err(format!("tensor {name}: expected BF16, got type {}", info.tensor_type));
+    if info.tensor_type != GGML_TYPE_BF16 && info.tensor_type != 0 {
+        return Err(format!(
+            "tensor {name}: expected BF16 or F32, got type {}",
+            info.tensor_type
+        ));
     }
     let n: usize = info.shape.iter().product();
     if n != rows * cols {
         return Err(format!("tensor {name}: shape {:?} ≠ [{cols},{rows}]", info.shape));
+    }
+    if info.tensor_type == 0 {
+        // the 9B ships the same small dense tensors as F32 (27B = BF16).
+        let off = gguf.data_offset + info.offset;
+        let end = off
+            .checked_add(n * 4)
+            .ok_or_else(|| format!("tensor {name}: size overflow"))?;
+        if end > data.len() {
+            return Err(format!("tensor {name}: F32 data out of range"));
+        }
+        return Ok(data[off..end]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect());
     }
     read_bf16_mat(data, name, gguf.data_offset + info.offset, rows, cols)
 }
@@ -1369,6 +1499,11 @@ impl Qwen35Model {
         // ── hyperparameters (read from KVs; spec defaults as fallback) ──
         let dim = gguf.get_u32("qwen35.embedding_length").unwrap_or(5120) as usize;
         let n_layers = gguf.get_u32("qwen35.block_count").unwrap_or(64) as usize;
+        // MTP/nextn checkpoints pack the draft layer(s) as the last blk.N —
+        // they are Q8_0 planned for speculative decode, not part of the
+        // single-token main model. Skip them everywhere.
+        let nextn_layers = gguf.get_u32("qwen35.nextn_predict_layers").unwrap_or(0) as usize;
+        let n_main_layers = n_layers.saturating_sub(nextn_layers);
         let n_heads = gguf.get_u32("qwen35.attention.head_count").unwrap_or(24) as usize;
         let n_kv_heads = gguf.get_u32("qwen35.attention.head_count_kv").unwrap_or(4) as usize;
         let head_dim = gguf.get_u32("qwen35.attention.key_length").unwrap_or(256) as usize;
@@ -1464,7 +1599,7 @@ impl Qwen35Model {
         let mut n_gdn = 0usize;
         let mut n_attn = 0usize;
 
-        for li in 0..n_layers {
+        for li in 0..n_main_layers {
             let base = format!("blk.{li}");
             let is_attn = (li + 1) % attn_interval == 0;
             let attn_norm = f32_meta_vec(&gguf, data, &format!("{base}.attn_norm.weight"))?;
@@ -1550,7 +1685,7 @@ impl Qwen35Model {
 
         let config = ModelConfig {
             dim,
-            n_layers,
+            n_layers: n_main_layers,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -1659,7 +1794,7 @@ impl Qwen35Model {
         let t = (token as usize).min(self.embd.n_out.saturating_sub(1));
         let data = self.gguf.as_bytes();
         let row = self.embd.row_slice(data, t);
-        ptq1_0_dequant_row(row, &mut self.rowbuf[..dim]);
+        dequant_row_to_f32(self.embd.ty, dim, row, &mut self.rowbuf[..dim]);
         match self.embd.xform {
             Xform::Inverse(i) => {
                 wht_blocks(self.had_block, &mut self.rowbuf[..dim]);
@@ -1758,7 +1893,11 @@ impl Qwen35Model {
         }
 
         // ssm_out fold: GDN perm first, then signs+hadamard, then gemv.
-        gdn_perm(&mut self.prep_mid, &self.gdn_out);
+        if raw_gdn_v() {
+            self.prep_mid.copy_from_slice(&self.gdn_out);
+        } else {
+            gdn_perm(&mut self.prep_mid, &self.gdn_out);
+        }
         let data = self.gguf.as_bytes();
         match (out_mat.sign_idx(), &self.signs) {
             (Some(i), table) => hadamard_prep_in_place(self.had_block, &mut self.prep_mid, &table[i].1),
@@ -2064,7 +2203,7 @@ impl Qwen35Model {
         for (t, &tok) in tokens.iter().enumerate() {
             let tid = (tok as usize).min(self.embd.n_out.saturating_sub(1));
             let row = self.embd.row_slice(data, tid);
-            ptq1_0_dequant_row(row, &mut escratch[..dim]);
+            dequant_row_to_f32(self.embd.ty, dim, row, &mut escratch[..dim]);
             match self.embd.xform {
                 Xform::Inverse(i) => {
                     wht_blocks(self.had_block, &mut escratch[..dim]);
@@ -2157,7 +2296,12 @@ impl Qwen35Model {
                             *ov *= silu(zv);
                         }
                     }
-                    gdn_perm(&mut bpm[grow..grow + d_inner], &bgdn[grow..grow + d_inner]);
+                    let bm = &mut bpm[grow..grow + d_inner];
+                    if raw_gdn_v() {
+                        bm.copy_from_slice(&bgdn[grow..grow + d_inner]);
+                    } else {
+                        gdn_perm(bm, &bgdn[grow..grow + d_inner]);
+                    }
                     match (out_mat.sign_idx(), &self.signs) {
                         (Some(i), table) => {
                             hadamard_prep_in_place(self.had_block, &mut bpm[grow..grow + d_inner], &table[i].1)
@@ -2332,7 +2476,81 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// PQ2_0 decode: d rides block-first, codes are little-endian 2-bit and
+    /// map (c − 1) — exactly the PrismML-Eng/llama.cpp prism-branch contract.
+    #[test]
+    fn pq2_0_dequant_hand_block() {
+        let mut src = vec![0u8; PQ2_0_BLOCK_BYTES];
+        // d = 1.0 (0x3C00) block-first; one byte with codes 0,1,2,3 packed
+        // low-bits-first, everything else zero.
+        src[0] = 0x00;
+        src[1] = 0x3C;
+        src[2] = 0b11_10_01_00;
+        let mut levels = vec![0i8; PQ2_0_BLOCK_VALUES];
+        let mut scales = vec![0.0f32; 1];
+        dequant_pq2_i8(&src, &mut levels, &mut scales);
+        assert_eq!(scales[0], 1.0);
+        assert_eq!(&levels[..4], &[-1i8, 0, 1, 2]);
+        assert!(levels[4..].iter().all(|&v| v == -1));
+    }
+
+    /// File-backed decode reference: dequantize the first 128 values of the
+    /// 9B's token_embd through the engine codec dispatch and compare the f32
+    /// bit-pattern sha256 against an independent Python reader of the same
+    /// GGUF bytes. Skips when the checkpoint is absent.
+    #[test]
+    fn pq2_0_ternary9b_token_embd_decode_reference() {
+        if !std::path::Path::new(MODEL_PATH_9B).exists() {
+            return;
+        }
+        let gguf = GgufFile::open(MODEL_PATH_9B).unwrap();
+        let data = gguf.mmap.as_slice();
+        let m = raw_mat_of(data, &gguf, "token_embd.weight", Xform::None, GGML_TYPE_PTQ1_0).unwrap();
+        assert_eq!(m.ty, GGML_TYPE_PQ2_0, "9B mainline tensors must be type 142");
+        // MTP regression: the draft layer (blk.32, nextn_predict_layers = 1)
+        // must not become layer 32 of the main model.
+        let model = Qwen35Model::from_gguf(gguf, 0).unwrap();
+        assert_eq!(model.config.n_layers, 32, "9B main layers must be 32 (MTP draft skipped)");
+        let gguf = GgufFile::open(MODEL_PATH_9B).unwrap();
+        let data = gguf.mmap.as_slice();
+        let m = raw_mat_of(data, &gguf, "token_embd.weight", Xform::None, GGML_TYPE_PTQ1_0)
+            .unwrap();
+        let mut levels = vec![0i8; m.n_in];
+        let mut scales = vec![0.0f32; m.n_in / PQ2_0_BLOCK_VALUES];
+        let row0 = m.row_slice(data, 0);
+        dequant_pq2_i8(row0, &mut levels, &mut scales);
+        // The Python reference pins block 0 of row 0 (34 B: f16 d then 32 B
+        // of little-endian 2-bit codes) — compare the SAME 128 values, and
+        // pin the first 8 bytes so a header-walk disagreement between our
+        // gguf parser and the independent reader fails as bytes, not as a
+        // checksum mystery.
+        let head_hex: String = row0[..8].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            head_hex,
+            "bb2205960aaa6054",
+            "token_embd block-0 bytes disagree with the Python header walk (data_offset mismatch?)"
+        );
+        assert_eq!(
+            scales[0],
+            0.01314544677734375,
+            "block-0 f16 scale disagrees with the Python reader"
+        );
+        let vals: Vec<f32> = levels[..128].iter().map(|&lv| lv as f32 * scales[0]).collect();
+        let bits: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let sha = crate::rt::wal::sha256_hex(&bits);
+        assert_eq!(
+            sha,
+            "79ef9d8b5a06cd43e648b72e64f5fd5335b46b733cd331a668a0ede1ceb437b8",
+            "PQ2_0 decode diverges from the independent Python reference on token_embd row 0"
+        );
+    }
+
+
     const MODEL_PATH: &str = "/Users/priyanshuboruah/Downloads/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+    /// Ternary-Bonsai-2-9B (qwen35 / PQ2_0 + MTP draft) — the live-file decode
+    /// reference below is pinned to this checkpoint's token_embd.
+    const MODEL_PATH_9B: &str =
+        "/Users/priyanshuboruah/Downloads/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf";
 
     /// The Hadamard side of the fold must compute exactly the specified
     /// normalized Sylvester WH: H[i][j] = (±1)^popcount(i&j) / sqrt(1024).
@@ -2524,7 +2742,7 @@ mod tests {
             .iter()
             .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
             .collect();
-        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, ty: GGML_TYPE_PTQ1_0, xform: Xform::None };
 
         let mut file_direct = vec![0.0f32; rows];
         gemv_t143(&data, &m, &acts, &mut file_direct);
@@ -2564,7 +2782,7 @@ mod tests {
             .iter()
             .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
             .collect();
-        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, ty: GGML_TYPE_PTQ1_0, xform: Xform::None };
 
         // Expected: per row, per token — the same band-ordered scalar dot.
         let mut want = vec![0.0f32; rows * n_tok];
@@ -2608,7 +2826,7 @@ mod tests {
             .iter()
             .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
             .collect();
-        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, ty: GGML_TYPE_PTQ1_0, xform: Xform::None };
         let want = gemm_rows_t143_sdot(&data, &m, n_tok, &acts, 0, rows);
         let got = gemm_rows_t143_direct(&data, &m, n_tok, &acts, 0, rows);
         for i in 0..want.len() {
@@ -2645,7 +2863,7 @@ mod tests {
             .iter()
             .map(|&b| (b as f32 / 255.0 - 0.5) * 2.0)
             .collect();
-        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, ty: GGML_TYPE_PTQ1_0, xform: Xform::None };
 
         let t0 = std::time::Instant::now();
         let mut scalar = vec![0.0f32; rows * n_tok];
@@ -2784,7 +3002,7 @@ mod tests {
             .iter()
             .map(|&b| (b as f32 / 255.0 - 0.5) * 4.0)
             .collect();
-        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, xform: Xform::None };
+        let m = RawMat { off: 0, n_in, n_out: rows, row_bytes, ty: GGML_TYPE_PTQ1_0, xform: Xform::None };
 
         let exact = gemm_rows_t143(&data, &m, n_tok, &acts, 0, rows);
         let approx = gemm_rows_t143_sdot(&data, &m, n_tok, &acts, 0, rows);

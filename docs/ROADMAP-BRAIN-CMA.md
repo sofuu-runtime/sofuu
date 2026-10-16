@@ -201,16 +201,16 @@ builds; `tests/verify_memory_test.js` 30/30; `tests/chat_memory_e2e.sh` 9/9 on a
 
 ---
 
-## 9. B7 — Harmony & Surface Coherence (last)
+## 9. B7 — Harmony & Surface Coherence (last; the successor program — recall budgeting, ranking targets, reinforcement law, DeathLedger, compact gists — lives in [ROADMAP-BRAIN-CORE.md](ROADMAP-BRAIN-CORE.md))
 
 **Objective:** the brain behaves the same everywhere and says what it does.
 
 | # | Item | Size |
 |---|---|---|
-| B7.1 | **One semantics across surfaces** — same filters, same error codes, same tier names in CLI, chat, server and C ABI; pinned by a cross-surface test. | M |
-| B7.2 | **`sofuu doctor` brain section** — manifest/space, record + tier histogram, capacity headroom, journal state, last compaction. | S |
-| B7.3 | **Chat brain panel** — `/brain info` shows tiers, capacity, channels, last consolidation. | S |
-| B7.4 | **Docs truth pass** — README, `EMBEDDING.md`, `PLAN-SOFUU-CORE.md` reflect shipped behaviour only. | S |
+| B7.1 | **✅ One semantics across surfaces** — pinned by `tests/cross_surface_e2e.sh` (Brain Core III, 2026-10-15): TUI pin → source 'pin', /compact → 'compact', facade forget+retain → DeathLedger 'forget', /share card carries no tombstones and keeps provenance, fresh-brain import re-creates it without resurrecting the forgotten pin. | M |
+| B7.2 | **✅ `sofuu doctor` brain section** (shipped 2026-10-14 audit) — manifest/space, record + tier histogram, capacity headroom, journal state, last compaction. | S |
+| B7.3 | **✅ Chat brain panel** (`/brain info`, shipped with the info-panel + working-tier docs pass) — `/brain info` shows tiers, capacity, channels, last consolidation. | S |
+| B7.4 | **✅ Docs truth pass** — README/EMBEDDING/PLAN-SOFUU-CORE brain claims verified against shipped behaviour (2026-10-15); the measured receipt for the Brain Core II program lives in `ROADMAP-BRAIN-CORE.md`. | S |
 
 **Gate:** cross-surface test green; doctor output on a real brain shows real numbers; no doc claim
 without a passing test behind it.

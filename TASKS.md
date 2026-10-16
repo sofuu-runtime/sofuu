@@ -162,6 +162,42 @@
 > identical bytes ran from `target/release/sofuu` — run the target path directly when the
 > root copy hangs on `version`.
 >
+> **AGENTIC CORE Phase 2 — safety: interactive approvals + policy knobs (2026-10-16, plan-approved stream).**
+> (1) **Approval seam in the shared loop** (`execOneTool`, after the permission gate; zero
+> new C ABI): def key `approve:'none'`(default)|`'sensitive'`(every non-AUTO_PASS tool
+> prompts)|`'all'`; run opt `opts.onApproval(tool,args,id)` → `'allow'|'deny'|true|{allow,always}`.
+> Emits the SAME `approval_request`/`approval_resolved` events chat.js's chat gate emits, so the
+> macOS/desktop approval cards light up for named-agent runs untouched. FAIL-CLOSED: no
+> callback, callback throw, `toolTimeoutMs` timeout, and cancel all DENY; a denial returns the
+> in-band string `'denied by user'` so the model reacts and the run lives. `delegate`/
+> `map_context` never prompt themselves — their CHILD tools each gate, `onApproval` threaded
+> through both sub-agent paths. (2) **Precision fix found during verification (the battery
+> earned its keep again):** the always-allow cache was module-level — approvy's `{allow:true,
+> always:true}` grant silently pre-approved the same tool for every LATER run/def (deny and
+> fail-closed scenarios ran tool-free with `allowed:true, cached:true` traces) → cache is now
+> PER-RUN: an 'always' grant expires with the run that earned it, sub-agents re-ask, bash
+> grants stay command-scoped. Cross-def consent leakage is worse than one extra prompt — the
+> fail-closed direction was chosen deliberately. (3) **Policy knobs on defs** (P2.2):
+> `shell:'default'|'readonly'|patterns[]` — readonly is a small read-only ALLOW-list
+> (deny-lists miss new mutators) with redirect/pipe refusal, patterns[] are anchored regex
+> matches on the raw command before bash's own layers; `netPolicy:{allow[],deny[]}` — allow
+> wins, deny then drops, matched on URL host only, web_open refuses pre-fetch, and infra-level
+> SSRF guards (web.js/opensocket) stay untouched underneath. (4) **web_search filtering
+> rebuilt after the probe caught a real leak:** the first cut parsed the tool's returned TEXT
+> as JSON — web_search returns rendered lines, so parse threw and every result passed through
+> untouched (`secret=LEAKED` in-battery). Now the wrapper runs the STRUCTURED search itself
+> (the exact `sofuu.web.search` entry execute uses) and renders only kept results in web.js's
+> exact line format + a `(n dropped by netPolicy)` note — a dropped result's title/snippet
+> never enters the transcript, so rendered snippets cannot forge url lines. Evidence: battery
+> 259 PASS incl. 6 new P2 checks (exactly-two-prompts-3-runs with in-run always-cache; deny
+> in-band with `allowed:false` + `blocked:'approval'` trace; fail-closed `reason:'no-callback'`;
+> shell allow-list runs git refuses rm; readonly runs ls refuses redirect; netPolicy refuses
+> blocked host + `secret=FILTERED`). cargo --lib 598/1 (the 1 =
+> `lfm2_batched_prefill_matches_per_token_bf16` flaking under full-suite parallel load,
+> passes in isolation — infer workstream's in-flight tree, untouched here); capi 46/46; no ABI
+> growth. test/ battery is gitignored (never committed) — the committed coverage for this
+> phase is the existing capi agent contract + these in-battery checks.
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

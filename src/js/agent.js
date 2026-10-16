@@ -169,6 +169,12 @@
     var win = contextWindow(d && d.model, d && d.baseUrl, !mlEnabled(d));
     return Math.min(24576, Math.max(TOOL_RESULT_CAP_CHARS, Math.floor(win / 8)));
   }
+  /* P2.1: APPROVAL_SEQ stamps unique approval ids only. The always-allow
+   * cache itself is PER-RUN (declared in run() beside toolHist): an
+   * 'always' grant must never leak across runs or across agent defs —
+   * agent A's approval is not agent B's pre-consent. bash entries are
+   * command-scoped, everything else tool-scoped. */
+  var APPROVAL_SEQ = 0;
   var TOOL_RESULT_CAP_CHARS = 4000; /* floor for tiny windows */
   var TOOL_RESULT_HEAD_RATIO = 0.7;
   var TOOL_RESULT_TAIL_RATIO = 0.2;
@@ -583,6 +589,20 @@
      * (always slim) | 'full' (never). */
     d.toolsMode = (def.toolsMode === 'progressive' || def.toolsMode === 'full' || def.toolsMode === 'auto')
       ? String(def.toolsMode) : 'auto';
+    /* P2.1 interactive approvals: 'none' (default) | 'sensitive' (every
+     * non-read-only tool prompts) | 'all' (every tool prompts). The
+     * decision is the host's (opts.onApproval); fail-closed without one. */
+    d.approve = (def.approve === 'all' || def.approve === 'sensitive')
+      ? String(def.approve) : 'none';
+    /* P2.2 policy knobs: shell 'default' (unchanged) | 'readonly'
+     * (read-only command allow-list) | array of anchored patterns; net
+     * allow/deny consulted by the web tools (infra SSRF guards stay). */
+    d.shell = def.shell === 'readonly' ? 'readonly'
+      : (Array.isArray(def.shell) ? def.shell.map(function (p) { return String(p); }).filter(function (p) { return !!p; }) : 'default');
+    d.netPolicy = (def.netPolicy && typeof def.netPolicy === 'object') ? {
+      allow: Array.isArray(def.netPolicy.allow) ? def.netPolicy.allow.map(String) : null,
+      deny: Array.isArray(def.netPolicy.deny) ? def.netPolicy.deny.map(String) : null,
+    } : null;
 
     var tools = def.tools || [];
     if (!Array.isArray(tools)) throw new Error('agent.define: tools must be an array');
@@ -1097,9 +1117,12 @@
       return n;
     } catch (e) { return 0; }
   }
-  function scopeRecall(d, cma, vec, topK) {
+  function scopeRecall(d, cma, vec, topK, queryText) {
     if (!cma || !vec) return [];
-    var hits = cma.recall(vec, topK || 15) || [];
+    /* M1.3: when the caller has the query text, recall rides the token
+     * re-rank (rarity-weighted, reflex-preserving, inert without
+     * evidence). */
+    var hits = (cma.recall(vec, topK || 15, typeof queryText === 'string' ? queryText : undefined) || []);
     if (d.memory === 'agent') {
       var want = 'agent:' + d.name;
       /* M0: the root name is the identity row; nested 'agent:<name>:<fp>'
@@ -1126,10 +1149,10 @@
   var FUSE_TOP_N = 20;
   var FUSE_TOP_K = 5;
   var FUSE_SEM_ONLY_MAX = 2;
-  function fuseRecall(d, entry, hashVec, semVec, topK) {
+  function fuseRecall(d, entry, hashVec, semVec, topK, queryText) {
     var k = topK || 15;
-    var hashHits = scopeRecall(d, entry.cma, hashVec, FUSE_TOP_N);
-    var semHits = scopeRecall(d, entry.sem, semVec, FUSE_TOP_N);
+    var hashHits = scopeRecall(d, entry.cma, hashVec, FUSE_TOP_N, queryText);
+    var semHits = scopeRecall(d, entry.sem, semVec, FUSE_TOP_N, queryText);
     var byText = {};
     var cands = [];
     for (var i = 0; i < hashHits.length; i++) {
@@ -1415,6 +1438,118 @@
           };
         })(conn.client, mname);
       }
+    }
+    /* ── P2.2 policy wrappers (2026-10-15, precision-first) ───────────
+     * hostAllowed(): allow-list wins, deny then drops; '*' prefix =
+     * suffix match ( '*.example.com' ), plain = exact or subdomain. 
+     * shell: 'readonly' = a SMALL read-only command allow-list (allow-list
+     * direction is deliberate: deny-lists miss new mutators); patterns[]
+     * = anchored match, first token semantics carry ('git *'). The match
+     * is on the RAW command before bash's own deny-list/timeout layers.
+     * netPolicy: allow-list wins, deny then drops — matched on the URL
+     * HOST only; infra-level SSRF guards (web.js/P1-15, opensocket_cb)
+     * stay untouched underneath. */
+    function hostAllowed(host) {
+      host = String(host || '').toLowerCase();
+      if (d.netPolicy && d.netPolicy.allow && d.netPolicy.allow.length) {
+        var ok = false;
+        for (var ai = 0; ai < d.netPolicy.allow.length; ai++) {
+          var pat = String(d.netPolicy.allow[ai]).toLowerCase();
+          if (pat.charAt(0) === '*') { if (host.indexOf(pat.slice(1)) >= 0) { ok = true; break; } }
+          else if (host === pat || host.indexOf(pat + '.') === 0) { ok = true; break; }
+        }
+        if (!ok) return false;
+      }
+      if (d.netPolicy && d.netPolicy.deny) {
+        for (var di = 0; di < d.netPolicy.deny.length; di++) {
+          var dpat = String(d.netPolicy.deny[di]).toLowerCase();
+          if (dpat.charAt(0) === '*') { if (host.indexOf(dpat.slice(1)) >= 0) return false; }
+          else if (host === dpat || host.indexOf(dpat + '.') === 0) return false;
+        }
+      }
+      return true;
+    }
+    if (d.shell !== 'default' && exec['bash']) {
+      var realBash = exec['bash'];
+      var shellOk;
+      if (d.shell === 'readonly') {
+        shellOk = function (cmd) {
+          if (/[><]|(^|\s)(tee|rm|mv|cp|truncate|chmod|chown|kill)\b/.test(cmd)) return false;
+          var tok = (cmd.trim().split(/\s+/)[0] || '').toLowerCase();
+          var ok = ({ cat: 1, ls: 1, grep: 1, find: 1, head: 1, tail: 1, wc: 1,
+                      pwd: 1, which: 1, stat: 1, du: 1, df: 1, uname: 1 })[tok] === 1;
+          if (tok === 'echo' || tok === 'printf') ok = !/[>\|]/.test(cmd);
+          if (tok === 'git') ok = /^(git)\s+(status|log|diff|show|branch|remote|tag|rev-parse)\b/.test(cmd);
+          if (tok === 'sed') ok = /^sed\s+-n/.test(cmd);
+          if (tok === 'awk') ok = /^awk\s+'?[^']*(print|printf)/.test(cmd);
+          return ok;
+        };
+      } else {
+        var shellPats = d.shell.map(function (p) {
+          var rx = String(p).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+          return new RegExp('^' + rx);
+        });
+        shellOk = function (cmd) {
+          for (var pi = 0; pi < shellPats.length; pi++) {
+            if (shellPats[pi].test(cmd)) return true;
+          }
+          return false;
+        };
+      }
+      exec['bash'] = function (args) {
+        var cmd = String((args && args.command) || '');
+        if (!shellOk(cmd)) {
+          return Promise.resolve('[shell policy: command refused — this agent runs ' +
+            (d.shell === 'readonly' ? 'read-only shell' : 'a shell allow-list (' + d.shell.join(', ') + ')') +
+            '): ' + clip(cmd, 80) + ']');
+        }
+        return realBash(args);
+      };
+    }
+    if (d.netPolicy && (d.netPolicy.allow || d.netPolicy.deny) && exec['web_open']) {
+      var realOpen = exec['web_open'];
+      exec['web_open'] = function (args) {
+        var m = String((args && args.url) || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i);
+        var host = m ? m[1].toLowerCase() : '';
+        if (!hostAllowed(host)) {
+          return Promise.resolve('[net policy: host refused by this agent\'s netPolicy: ' + clip(host, 80) + ']');
+        }
+        return realOpen(args);
+      };
+    }
+    if (d.netPolicy && (d.netPolicy.allow || d.netPolicy.deny) && exec['web_search']) {
+      var realSearch = exec['web_search'];
+      /* Filter BEFORE rendering: run the structured search ourselves
+       * (sofuu.web.search — the exact entry web.js's execute uses), drop
+       * off-policy results, then render the same 'N. title / url /
+       * snippet' lines web.js emits. Filtering the rendered TEXT instead
+       * would mean trusting snippet bytes not to forge url lines — the
+       * structured path never shows a dropped result's title/snippet at
+       * all. Unparseable rendering is impossible by construction; a
+       * missing sofuu.web or an engine error falls back to the real tool. */
+      exec['web_search'] = async function (args) {
+        if (!sofuu.web || typeof sofuu.web.search !== 'function') return realSearch(args);
+        var r = await sofuu.web.search(String((args && args.query) || ''),
+                                      { count: (args && args.count) || 8 });
+        var all = (r && r.results) || [];
+        var kept = [];
+        var dropped = 0;
+        for (var ri = 0; ri < all.length; ri++) {
+          var it = all[ri];
+          var m2 = String((it && it.url) || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i);
+          if (hostAllowed(m2 ? m2[1].toLowerCase() : '')) kept.push(it);
+          else dropped++;
+        }
+        var lines = [];
+        for (var ki = 0; ki < kept.length; ki++) {
+          lines.push((ki + 1) + '. ' + (kept[ki].title || '') +
+                     '\n   ' + kept[ki].url + '\n   ' + (kept[ki].snippet || ''));
+        }
+        var out = lines.join('\n') || '(no results)';
+        if (dropped > 0) out += '\n(' + dropped + ' result' + (dropped === 1 ? '' : 's') +
+                               ' dropped by this agent\'s netPolicy)';
+        return out;
+      };
     }
     return { specs: specs, exec: exec, mcpNames: mcpNames };
   }
@@ -1817,6 +1952,11 @@
      * every counter as '?'. Counted here at emit time, immune to trace
      * trimming. */
     var toolHist = {};
+    /* P2.1 always-allow cache, per RUN (approve: grants with `always`
+     * expire with the run that earned them; sub-agents re-ask — the
+     * fail-closed direction). Keys: tool name, or 'bash\u0001' +
+     * normalized command for command-scoped bash grants. */
+    var alwaysApproved = {};
     /* ── Token-economy pack (2026-10-15) ───────────────────────────────
      * reuseLedger — per-run, keyed tool + canonical target, valued by
      * strict content equality (fnv1a + length) of the capped result.
@@ -2492,8 +2632,8 @@
           var semQvec = semCma ? embedSemV2(String(task)) : null;
           var maxRecallHits = (d && d.provider === 'local') ? 3 : 15;
           var hits = (semCma && semQvec)
-            ? fuseRecall(d, brainEntry, qvec, semQvec, maxRecallHits)
-            : scopeRecall(d, cma, qvec, maxRecallHits);
+            ? fuseRecall(d, brainEntry, qvec, semQvec, maxRecallHits, String(task))
+            : scopeRecall(d, cma, qvec, maxRecallHits, String(task));
           /* alloc gate (§14): the recall block budget comes from the plan
            * when ML is on (tight sessions recall less); an explicit
            * def.recallBudget still wins. */
@@ -2866,6 +3006,62 @@
           emit('tool_result', { name: name, blocked: gateWhy, result: clip(gateMsg, 200) });
           return gateMsg;
         }
+        /* ── P2.1 interactive approval (2026-10-15) ──────────────────────
+         * Port of chat.js's requestApproval gate into the shared loop:
+         * def.approve 'none' (default — zero behavior change) | 'sensitive'
+         * (everything not on the AUTO_PASS read-only list) | 'all'. The
+         * decision is the HOST's via opts.onApproval(tool, args) →
+         * 'allow' | {allow,always} | 'deny'; the emitted event is the SAME
+         * approval_request shape macOS/desktop already render for chat.js
+         * prompts, so named-agent runs get the y/n card for free. Session
+         * always-allow cache (bash command-scoped) expires with the run;
+         * sub-agents re-ask. FAIL-CLOSED: approve!=none with no callback, a
+         * callback rejection, cancel, and timeout all DENY — an
+         * interactive gate must never default to executing. delegate/
+         * map_context are orchestration (their CHILD tools each gate) and
+         * never prompt themselves. */
+        if (d.approve && d.approve !== 'none' &&
+            name !== 'delegate' && name !== 'map_context') {
+          var risky = !AUTO_PASS_TOOLS[name];
+          var needAsk = d.approve === 'all' || risky;
+          var askKey = name === 'bash'
+            ? 'bash\u0001' + ledgerNorm(String((args && args.command) || ''))
+            : name;
+          if (needAsk && alwaysApproved[askKey] === 1) {
+            emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: true, cached: true });
+          } else if (needAsk) {
+            var appMsg = null;
+            if (typeof opts.onApproval !== 'function') {
+              appMsg = 'denied by policy (approve:' + d.approve + ' but the host provides no onApproval callback)';
+              emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: false, reason: 'no-callback' });
+            } else {
+              APPROVAL_SEQ = (APPROVAL_SEQ || 0) + 1;
+              var apId = 'ap-' + runId + '-' + APPROVAL_SEQ;
+              emit('approval_request', { id: apId, tool: name, args: clip(JSON.stringify(args || {}), 200),
+                                         risky: risky, approve: d.approve });
+              var dec = null;
+              try {
+                dec = await withTimeout(withCancelGuard(state, Promise.resolve(
+                  opts.onApproval(name, args, apId))),
+                  opts.toolTimeoutMs || d.toolTimeoutMs, 'approval for ' + name + ' timed out (raise toolTimeoutMs)');
+              } catch (eApp) {
+                dec = 'deny'; /* timeout, cancel and rejection all deny */
+              }
+              if (state.cancelled) dec = 'deny';
+              var allow = dec === 'allow' || dec === true;
+              if (dec && typeof dec === 'object' && dec.allow === true) {
+                allow = true;
+                if (dec.always) alwaysApproved[askKey] = 1;
+              }
+              emit('approval_resolved', { id: apId, tool: name, allowed: allow });
+              if (!allow) appMsg = 'denied by user';
+            }
+            if (appMsg) {
+              emit('tool_result', { name: name, blocked: 'approval', result: clip(appMsg, 200) });
+              return appMsg;
+            }
+          }
+        }
         /* Supervisor checkpoint 1 — BEFORE the tool runs (PLAN-ML-GATES
          * §11): the trained net layered over the rule subset (exact repeat
          * calls, re-reads of unchanged files) checks the trajectory and
@@ -3128,6 +3324,7 @@
             _treeUsage: tree,
             _cancelState: state,
             onStep: opts.onStep,
+            onApproval: opts.onApproval,
             toolTimeoutMs: opts.toolTimeoutMs,
             /* LONG-HORIZON: the child inherits the parent's remaining
              * wall-clock and a fair share of the step/token budgets —
@@ -3240,7 +3437,8 @@
             concurrency: MAP_CONTEXT_CONCURRENCY,
             _orch: { depth: depth + 1, chain: chain.concat([agentName]), tree: tree,
                      cancelState: state,
-                     onStep: opts.onStep, toolTimeoutMs: opts.toolTimeoutMs, budget: mBudget },
+                     onStep: opts.onStep, onApproval: opts.onApproval,
+                     toolTimeoutMs: opts.toolTimeoutMs, budget: mBudget },
           });
         } catch (e) {
           /* Reduce-run rejection (or mapContext throwing before its own
@@ -4039,7 +4237,8 @@
                               * every chunk + reduce run (same state object
                               * as execDelegate's children). */
                              _cancelState: orch.cancelState,
-                             onStep: orch.onStep, toolTimeoutMs: orch.toolTimeoutMs,
+                             onStep: orch.onStep, onApproval: orch.onApproval,
+                             toolTimeoutMs: orch.toolTimeoutMs,
                              budget: orch.budget }, extra);
     }
     var items = chunks.map(function (c, i) {

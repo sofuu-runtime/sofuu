@@ -35,7 +35,9 @@ no encryption — so a card can be read, diffed and inspected anywhere.
       "entity_type": null,
       "created_at": 1791879023,       // 0 = unknown (legacy)
       "last_recalled_at": 0,          // 0 = never
-      "source": "pin",                // where it came from
+      "source": "pin",                // where it came from: "pin" (/remember),
+                                      // "compact" (/compact gist), "chat",
+                                      // "agent:<name>" turn facts, "import"
       "age_seconds": 0,
       "total_recalls": 0,
       "positive_recalls": 0,

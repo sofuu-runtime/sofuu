@@ -3480,3 +3480,28 @@ what code reading suggested:
   heads need training runs, out of scope.
 > **2026-10-15 — Pi 5: parity wave SHIPPED — Qwen prefill 158 → 182.9-184.4 t/s, now ~4% AHEAD of llama.cpp (~176-177); outputs byte-identical across the whole wave.**
 > (1) `SOFUU_PREFILL_BATCH` default 64→128 (one chunk less + GEMM amortization; Spark/Llama neutral; env still overrides). (2) NEON vector softmax (magic-round 2^(x·log2e) + degree-5 Horner; dead-mask = f32 expf underflow; gate `test_softmax_vec_rel_gate` 2e-6 peak-relative — also cuts decode-attention exps). (3) batched-QK attention `sofuu_attn_qk_rows8`: two K strips shared across 8 q rows, per-dot arithmetic order identical to `sofuu_attn_qk_range` → bit-exact dots; plain-path work domain = (group-of-8, head); window/FA2 keep (row,head); gate `test_batched_attention_ext_plain_rows8` (group-boundary crossing, ragged causal bounds). Attention bucket 292→176 ms/prompt (−40%). Ladder: 158.6 → 165.0 (batch) → 167.7-169.8 (+softmax) → 182.9-184.4 (+rows8) vs llama.cpp ~176-177. Spark 22.6 (peer coherence flag path) and Llama-1B band intact; suite 589/0. Gate-design lesson recorded: per-element rel on near-zero values flags 1e-7 noise as 1e-4 divergence — peak-relative is the softmax/attention gate.
+
+### 2026-10-15 — D1b-L: n-gram speculative decode A/B (user-go experimental)
+
+- Built: `spec_capture` mode in lfm2 forward_batched (per-row final norm+head
+  → per-position logits from ONE sweep; k vocab GEMVs), conv-state
+  snapshot/replay on partial accepts (rejected chain taps persist in conv
+  rings — the one state KV-overwrite cannot heal), test
+  `spec_ngram_lookahead_greedy_ab`: n-gram chain proposals from
+  `infer/lookahead.rs` maps (zero model sweeps), one batched verify, greedy
+  accept + bonus.
+- Correctness: acceptance 96% (104/108); captured rows match the plain
+  stream on non-tie positions. On the synthetic stream the model sits in a
+  2-token tie loop, so ~49% of positions are batched-AMX vs per-token-GEMV
+  coin flips (documented; the two decoders differ in last-bit order — same
+  split the batched-prefill parity test tolerates). Real text has margins.
+- Performance receipt (liquid-1.3B, k=4, n=160): plain=30.4 tps,
+  spec=4.1 tps → 0.13×. The verify batch's fixed cost (pool spawn for a
+  5-token tile, k×65k head passes, snapshot/replay) is ~7× a plain token.
+- Verdict: proposals are free and acceptance is proven, but on this engine
+  the verifier is the cost. forward_batched is tuned for 256-token prefill
+  tiles — tiny-batch latency is the missing piece. This is exactly where
+  D2 (fused low-latency decode batches) decides whether speculative decode
+  pays; and it is why the 27B-slab (where PLAIN decode costs ~1 s/token and
+  batched marginal cost is small) is the first fleet member the math
+  inverts for, not liquid.

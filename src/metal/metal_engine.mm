@@ -1134,13 +1134,47 @@ void sofuu_metal_gemv_async(
     }
 }
 
+// G0: first-op x staging — CPU writes to a no-copy slab between GPU
+// submissions are not guaranteed visible, so the BATCH'S FIRST op takes x
+// from CPU through the private internal buffer (memcpy at call time, reads
+// are correct at the op's execution); chained ops use GPU-written buffers.
+void sofuu_metal_batch_gemv_staged(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    const float* x,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, int dtype
+) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x || !y_buf_ptr || rows == 0 || cols == 0) return;
+    size_t x_bytes = cols * sizeof(float);
+    ensure_buffers(ctx, x_bytes, rows * sizeof(float));
+    std::memcpy(ctx->x_buf.contents, x, x_bytes);
+
+    id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
+    if (dtype == 1) pso = ctx->pso_gemv_f16;
+    else if (dtype == 2) pso = ctx->pso_gemv_f32;
+    size_t aligned_offset = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned_offset atIndex:0];
+    [ctx->batch_enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 // ── G0: real multi-op batching ─────────────────────────────────────────────
 // batch_open retains ONE uncommitted command buffer with a LIVE encoder;
 // every batch_gemv appends an op reading caller-owned MTLBuffers (so ops can
 // chain y→x with zero CPU staging); batch_end ends the encoder, commits once,
 // waits. One GPU submission per batch, independent of op count.
 int sofuu_metal_batch_open(void* ctx_ptr) {
-    fprintf(stderr, "[G0BATCH-LIB-V3] open\n");
     if (!ctx_ptr) return -1;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     sofuu_metal_sync(ctx_ptr);
@@ -1211,6 +1245,7 @@ bool sofuu_metal_available(void) { return false; }
 int sofuu_metal_batch_open(void* ctx) { (void)ctx; return -1; }
 void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 void sofuu_metal_batch_end(void* ctx) { (void)ctx; }
+void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

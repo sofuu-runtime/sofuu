@@ -474,6 +474,13 @@ extern "C" {
         rows: usize, cols: usize, dtype: i32,
     );
     fn sofuu_metal_batch_end(ctx: *mut c_void);
+    fn sofuu_metal_batch_gemv_staged(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x: *const f32,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, dtype: i32,
+    );
 }
 
 impl MetalEngine {
@@ -506,6 +513,27 @@ impl MetalEngine {
     /// End the batch: end encoding, commit once, wait.
     pub fn batch_end(&self) {
         unsafe { sofuu_metal_batch_end(self.ctx) }
+    }
+
+    /// First-op GEMV with CPU-staged x (memcpy into the private internal
+    /// buffer) — GPU-written buffers chain the rest of the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_gemv_staged(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x: &[f32],
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, dtype: i32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_gemv_staged(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x.as_ptr(),
+                y_buf.handle, y_offset,
+                rows, cols, dtype,
+            );
+        }
     }
 }
 
@@ -586,20 +614,22 @@ mod batch_g0_tests {
             for v in f32_view.iter_mut() {
                 *v = 0.0;
             }
-            f32_view[..cols].copy_from_slice(&x0);
             assert!(engine.batch_open(), "batch open");
-            for i in 0..n {
-                let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
-                assert!(engine.batch_open());
+            // op0: CPU-staged x; ops 1..n chain on GPU buffers — ALL in ONE
+            // commit (dedicated slot per op: op i reads slot i, writes i+1).
+            engine.batch_gemv_staged(
+                &w_buf, 0, &x0, &slab_buf, slot_f32 * 4, rows, cols, 0,
+            );
+            for i in 1..n {
                 engine.batch_gemv(
                     &w_buf,
                     0,
-                    &slab_buf, xin * slot_f32 * 4,
-                    &slab_buf, yin * slot_f32 * 4,
+                    &slab_buf, i * slot_f32 * 4,
+                    &slab_buf, (i + 1) * slot_f32 * 4,
                     rows, cols, 0,
                 );
-                engine.batch_end();
             }
+            engine.batch_end();
             (0..=n).map(|k| f32_view[k * slot_f32..(k + 1) * slot_f32].to_vec()).collect()
         };
 
@@ -633,11 +663,13 @@ mod batch_g0_tests {
         let mut max_rel: f64 = 0.0;
         // ping-pong: after k ops the result lives in slot (k odd ? 1 : 0)
         for k in 1..5 {
-            let bslot = if k % 2 == 1 { 1usize } else { 0usize };
-            for (a, b) in batch4[bslot][..rows].iter().zip(plain4[k][..rows].iter()) {
+            let mut rk: f64 = 0.0;
+            for (a, b) in batch4[k][..rows].iter().zip(plain4[k][..rows].iter()) {
                 let d = (*a - *b).abs() / b.abs().max(1e-2);
-                max_rel = max_rel.max(d as f64);
+                rk = rk.max(d as f64);
             }
+            eprintln!("[g0-k] k={k} rel={rk:.2e} plain0={:?} batch0={:?}", plain4[k][0], batch4[k][0]);
+            max_rel = max_rel.max(rk);
         }
         eprintln!(
             "[g0] parity@4 max_rel={:.2e} plain1={:?} batch1={:?}",

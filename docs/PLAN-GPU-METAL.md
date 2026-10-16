@@ -48,7 +48,24 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   fallback = CPU decode on this Mac) FIRES for lfm2**. SOFUU_GPU_DECODE stays an
   opt-in, correct (parity-verified) path; the G4 flip table below carries the
   per-model verdicts.
-- Remaining (not landed): GGUF/Spark/Qwen35/block_graph whole-step clients — same
+- **GPU2 wave (2026-10-16, same day) — GGUF llama decode client (`model.rs`)**: the
+  seven per-layer GEMVs (q/k/v, attn_output, gate/up/down) run as THREE Metal
+  commits per layer (`[q,k,v]`, `[attn_output]`, `[gate, up, GPU-swiglu, down]`)
+  plus a fourth for the lm_head, over a page-aligned zero-copy slab. Norms,
+  QK-norms, RoPE (both interleave modes), CPU KV cache and attention are shared
+  verbatim with the CPU path (`batched_attention_ext`, biases, qk_norm all keep
+  working); KIVI/dynamic-FFN/streaming fall back to CPU per token. Eligible
+  dtypes q4_0/q8_0/q4_K/q6_K — arm fails LOUD otherwise; `--cpu` honored via
+  `from_gguf_with_gpu`. Fleet receipts over the storm tail (load 13-39):
+  GPU>CPU on ALL FOUR GGUF models in equal windows: 0.6B 14.1 vs 9.1,
+  Llama-1B 20.7 vs 10.3, MiniCPM-2B q6_K 6.4 vs 3.6, Qwen3-8B 3.4 vs 1.2 t/s —
+  calibration against the older calm-window CPU rows still pending a clean
+  battery; the streaming-wall receipt for the WHOLE-STEP design does not apply
+  here (this is the fewer-commits hybrid, CPU attention intact).
+Not landed, deferred with receipts: Spark/Qwen35/block_graph/gptx3 whole-step
+clients (bespoke ports of the same pattern; block_graph already has a per-op
+hybrid), ternary PTQ1_0/142 GPU kernels (CPU slab optimal per plan), and G3
+prefill-on-GPU (GEMM-class, the one remaining plausible win). — same
   wall receipt applies to each (their CPU decodes already run 40-56 GB/s per the
   battery best-of table); G3 prefill-on-GPU (untouched): GEMM-class arithmetic
   intensity is the one place an iGPU can still beat AMX+dequant CPU prefill; needs

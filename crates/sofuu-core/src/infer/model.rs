@@ -248,6 +248,13 @@ pub struct TransformerModel {
     pub ffn_out: Vec<f32>,
     pub logits: Vec<f32>,
 
+    /// GPU2 (PLAN-GPU-METAL): GGUF decode client. When armed, execute_layers
+    /// runs the seven per-layer GEMVs through Metal batches (three commits
+    /// per layer + the lm_head); norms, RoPE, the KV cache and attention stay
+    /// on the CPU, shared verbatim with the CPU path. SOFUU_GPU_DECODE=1.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub gpu: Option<GgufGpu>,
+
     // Batched working state buffers for prompt prefill
     pub x_batch: Vec<f32>,
     pub x_norm_batch: Vec<f32>,
@@ -279,6 +286,17 @@ pub struct TransformerModel {
 
 impl TransformerModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
+        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true)
+    }
+
+    /// `gpu_allowed = false` (engine --cpu / CPU-load contract) keeps the
+    /// SOFUU_GPU_DECODE client off even when the env flag is set.
+    pub fn from_gguf_with_gpu(
+        gguf: GgufFile,
+        max_seq_len: usize,
+        vocab_size: usize,
+        gpu_allowed: bool,
+    ) -> Result<Self, String> {
         // 1. Detect architecture prefix
         let arch = gguf.get_str("general.architecture").unwrap_or("llama");
         let prefix = format!("{arch}.");
@@ -452,6 +470,19 @@ impl TransformerModel {
             }
         }
 
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let gpu = {
+            let wanted = gpu_allowed
+                && cfg!(target_os = "macos")
+                && std::env::var_os("SOFUU_GPU_DECODE").is_some()
+                && gguf.resident.is_none();
+            if wanted {
+                GgufGpu::arm(&gguf, &config, &layers, vocab_size)
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             config,
             gguf,
@@ -459,6 +490,8 @@ impl TransformerModel {
             output_norm,
             output,
             layers,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            gpu,
 
             x: vec![0.0f32; dim],
             x_norm: vec![0.0f32; dim],
@@ -1497,6 +1530,17 @@ impl TransformerModel {
     }
 
     pub fn execute_layers(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+        // GPU2: whole-layer Metal batches when armed and the CPU-side
+        // special paths are all off (streaming/dynamic-FFN/KIVI fall back).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.gpu.is_some()
+            && !self.streaming_weights
+            && !self.dynamic_ffn.enabled
+            && self.kivi.is_none()
+        {
+            self.execute_layers_gpu(pos, start_layer, end_layer);
+            return;
+        }
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
@@ -1780,6 +1824,216 @@ impl TransformerModel {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn ggpu_head_active(&self) -> bool {
+        self.gpu.is_some()
+            && matches!(
+                self.output.tensor_type,
+                GGML_TYPE_Q4_0 | GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K
+            )
+    }
+
+    /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn ggpu_head(&mut self) {
+        if let Some(g) = self.gpu.as_mut() {
+            let dim = self.config.dim;
+            let vocab = self.config.vocab_size;
+            let self_x: &mut [f32] = &mut self.x;
+            let dst = g.slot_f32_mut(g.slots.xn, dim);
+            dst[..dim].copy_from_slice(&self_x[..dim]);
+            let off = g.w_offset(&self.gguf, &self.output);
+            assert!(g.engine.batch_open());
+            g.engine.batch_gguf(
+                self.output.tensor_type,
+                &g.w_buf, off,
+                &g.act_buf, g.slots.xn,
+                &g.act_buf, g.slots.logits,
+                vocab, dim,
+            );
+            g.engine.batch_end();
+            let src = g.slot_f32(g.slots.logits, vocab);
+            self.logits.copy_from_slice(src);
+        }
+    }
+
+    /// GPU2 decode path: same CPU glue (norms, QK-norms, RoPE, KV, attention,
+    /// residuals) with the seven per-layer GEMVs batched into three commits.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn execute_layers_gpu(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+        let end = end_layer.min(self.config.n_layers);
+        let windows: Vec<usize> = (0..self.config.n_layers)
+            .map(|i| self.layer_sliding_window(i))
+            .collect();
+        for layer_idx in start_layer..end {
+            self.gpu_layer_step(layer_idx, pos, windows[layer_idx]);
+        }
+    }
+
+    /// One decoder layer: CPU glue + three Metal commits. All GPU ops read
+    /// and write slab slots; the CPU copies f32 values in and out around the
+    /// commits (the same between-submissions coherence the G0 rig proves).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_layer_step(&mut self, layer_idx: usize, pos: usize, sliding_window: usize) {
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let norm_eps = self.config.norm_eps;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let gguf = &self.gguf;
+        let g = match self.gpu.as_mut() {
+            Some(g) => g,
+            None => return,
+        };
+
+        let layer = &self.layers[layer_idx];
+        let q_rows = n_heads * head_dim;
+        let kv_rows = n_kv_heads * head_dim;
+
+        // ── Attention norm (CPU, f32 weights) → stage x_norm ──
+        let attn_norm_bytes = Self::tensor_slice(gguf, &layer.attn_norm);
+        let attn_norm_w = unsafe {
+            std::slice::from_raw_parts(attn_norm_bytes.as_ptr() as *const f32, dim)
+        };
+        rmsnorm(&mut self.x_norm, &self.x, attn_norm_w, norm_eps);
+        g.slot_f32_mut(g.slots.xn, dim).copy_from_slice(&self.x_norm);
+
+        // ── Commit A: q, k, v projections ──────────────────
+        assert!(g.engine.batch_open());
+        let tensors = [
+            (&layer.attn_q, g.slots.qa, q_rows),
+            (&layer.attn_k, g.slots.ka, kv_rows),
+            (&layer.attn_v, g.slots.va, kv_rows),
+        ];
+        for (tv, y_slot, rows) in tensors {
+            g.engine.batch_gguf(
+                tv.tensor_type,
+                &g.w_buf, g.w_offset(gguf, tv),
+                &g.act_buf, g.slots.xn,
+                &g.act_buf, y_slot,
+                rows, dim,
+            );
+        }
+        g.engine.batch_end();
+
+        self.q.copy_from_slice(g.slot_f32(g.slots.qa, q_rows));
+        self.k.copy_from_slice(g.slot_f32(g.slots.ka, kv_rows));
+        self.v.copy_from_slice(g.slot_f32(g.slots.va, kv_rows));
+
+        // ── CPU glue: biases, QK-norms, RoPE, KV write, GQA attention ──
+        if let Some(ref bias) = layer.attn_q_bias {
+            let b = unsafe {
+                std::slice::from_raw_parts(Self::tensor_slice(gguf, bias).as_ptr() as *const f32, q_rows)
+            };
+            for i in 0..q_rows { self.q[i] += b[i]; }
+        }
+        if let Some(ref bias) = layer.attn_k_bias {
+            let b = unsafe {
+                std::slice::from_raw_parts(Self::tensor_slice(gguf, bias).as_ptr() as *const f32, kv_rows)
+            };
+            for i in 0..kv_rows { self.k[i] += b[i]; }
+        }
+        if let Some(ref bias) = layer.attn_v_bias {
+            let b = unsafe {
+                std::slice::from_raw_parts(Self::tensor_slice(gguf, bias).as_ptr() as *const f32, kv_rows)
+            };
+            for i in 0..kv_rows { self.v[i] += b[i]; }
+        }
+        if let Some(ref q_norm) = layer.attn_q_norm {
+            let w = unsafe {
+                std::slice::from_raw_parts(Self::tensor_slice(gguf, q_norm).as_ptr() as *const f32, head_dim)
+            };
+            super::quant::batched_rmsnorm_in_place(&mut self.q, w, n_heads, head_dim, norm_eps);
+        }
+        if let Some(ref k_norm) = layer.attn_k_norm {
+            let w = unsafe {
+                std::slice::from_raw_parts(Self::tensor_slice(gguf, k_norm).as_ptr() as *const f32, head_dim)
+            };
+            super::quant::batched_rmsnorm_in_place(&mut self.k, w, n_kv_heads, head_dim, norm_eps);
+        }
+        let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
+        super::quant::rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
+        super::quant::rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
+
+        let cache_pos = pos % max_seq_len;
+        for kv_h in 0..n_kv_heads {
+            let k_in = &self.k[kv_h * head_dim..(kv_h + 1) * head_dim];
+            let v_in = &self.v[kv_h * head_dim..(kv_h + 1) * head_dim];
+            let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+            self.k_cache[slot..slot + head_dim].copy_from_slice(k_in);
+            self.v_cache[slot..slot + head_dim].copy_from_slice(v_in);
+        }
+        super::quant::batched_attention_ext(
+            &self.q,
+            &self.k_cache,
+            &self.v_cache,
+            &mut self.head_out,
+            1,
+            pos,
+            layer_idx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            sliding_window,
+            self.sink_tokens,
+        );
+
+        // ── Commit B: attention output projection ──────────
+        g.slot_f32_mut(g.slots.ao, q_rows).copy_from_slice(&self.head_out);
+        assert!(g.engine.batch_open());
+        g.engine.batch_gguf(
+            layer.attn_output.tensor_type,
+            &g.w_buf, g.w_offset(gguf, &layer.attn_output),
+            &g.act_buf, g.slots.ao,
+            &g.act_buf, g.slots.xo,
+            dim, q_rows,
+        );
+        g.engine.batch_end();
+        self.attn_out.copy_from_slice(g.slot_f32(g.slots.xo, dim));
+        inline_mad(&mut self.x, &self.attn_out, 1.0);
+
+        // ── FFN norm (CPU) → stage ─────────────────────────
+        let ffn_norm_bytes = Self::tensor_slice(gguf, &layer.ffn_norm);
+        let ffn_norm_w = unsafe {
+            std::slice::from_raw_parts(ffn_norm_bytes.as_ptr() as *const f32, dim)
+        };
+        rmsnorm(&mut self.x_norm, &self.x, ffn_norm_w, norm_eps);
+        g.slot_f32_mut(g.slots.xn, dim).copy_from_slice(&self.x_norm);
+
+        // ── Commit C: gate, up, swiglu (GPU), down ─────────
+        assert!(g.engine.batch_open());
+        g.engine.batch_gguf(
+            layer.ffn_gate.tensor_type,
+            &g.w_buf, g.w_offset(gguf, &layer.ffn_gate),
+            &g.act_buf, g.slots.xn,
+            &g.act_buf, g.slots.gate,
+            hidden_dim, dim,
+        );
+        g.engine.batch_gguf(
+            layer.ffn_up.tensor_type,
+            &g.w_buf, g.w_offset(gguf, &layer.ffn_up),
+            &g.act_buf, g.slots.xn,
+            &g.act_buf, g.slots.up,
+            hidden_dim, dim,
+        );
+        g.engine
+            .batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim);
+        g.engine.batch_gguf(
+            layer.ffn_down.tensor_type,
+            &g.w_buf, g.w_offset(gguf, &layer.ffn_down),
+            &g.act_buf, g.slots.gate,
+            &g.act_buf, g.slots.xo,
+            dim, hidden_dim,
+        );
+        g.engine.batch_end();
+        self.ffn_out.copy_from_slice(g.slot_f32(g.slots.xo, dim));
+        inline_mad(&mut self.x, &self.ffn_out, 1.0);
+    }
+
     fn forward_impl(&mut self, token_id: u32, pos: usize, compute_logits: bool) {
         let dim = self.config.dim;
 
@@ -1797,6 +2051,13 @@ impl TransformerModel {
                 std::slice::from_raw_parts(out_norm_bytes.as_ptr() as *const f32, dim)
             };
             rmsnorm_in_place(&mut self.x, out_norm_weights, norm_eps);
+
+            // GPU2: lm_head GEMV as one Metal batch when eligible.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if self.ggpu_head_active() {
+                self.ggpu_head();
+                return;
+            }
 
             // 4. Output Logits Projection
             let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
@@ -1836,3 +2097,138 @@ mod tests {
     }
 }
 
+
+// ── GPU2: GGUF decode client (PLAN-GPU-METAL all-arch coverage) ────────────
+// Activations live in a page-aligned zero-copy slab; the CPU runs norms,
+// QK-norms, RoPE, the KV cache and attention (f32, shared with the CPU
+// path) and stages inputs into slab slots; the GPU batch runs the seven
+// per-layer GEMVs as three commits: [q,k,v], [attn_output], and
+// [gate, up, swiglu GPU, down]. Eligible dtypes: q4_0/q8_0/q4_K/q6_K.
+// Dispatch-overhead repair, not a decode flip: the M2 Pro streaming wall
+// (~48-50 GB/s for BOTH engines) still governs — see PLAN-GPU-METAL.md.
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn gguf_gpu_slot(cursor: &mut usize, n_f32: usize) -> usize {
+    let off = (*cursor + 255) & !255;
+    *cursor = off + ((n_f32 * 4 + 255) & !255);
+    off
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn gguf_gpu_page(bytes: usize) -> usize {
+    ((bytes + 16383) / 16384) * 16384
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+struct GgufGpuSlots {
+    xn: usize,
+    qa: usize,
+    ka: usize,
+    va: usize,
+    ao: usize,
+    xo: usize,
+    gate: usize,
+    up: usize,
+    logits: usize,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub struct GgufGpu {
+    engine: crate::infer::metal::MetalEngine,
+    /// Zero-copy wrap of the whole GGUF file mmap: every weight bind is
+    /// gguf.data_offset + tv.offset inside it.
+    w_buf: crate::infer::metal::MetalBuffer,
+    /// Buffers BEFORE pages (fields drop in declaration order): the
+    /// MTLBuffers are released before the mmaps they wrap.
+    act_buf: crate::infer::metal::MetalBuffer,
+    act: crate::infer::model::AnonBuffer,
+    slots: GgufGpuSlots,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl GgufGpu {
+    fn arm(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        layers: &[LayerWeights],
+        _vocab: usize,
+    ) -> Option<Self> {
+        if config.max_seq_len > 4096 {
+            eprintln!("[gguf-gpu] disabled: seq > 4096 above the kernel range");
+            return None;
+        }
+        if gguf.resident.is_some() {
+            eprintln!("[gguf-gpu] disabled: resident-weights path is the 27B CPU optimum");
+            return None;
+        }
+        // Every GEMV tensor of every layer must be an eligible dequant dtype.
+        let eligible = |ty: u32| matches!(ty, GGML_TYPE_Q4_0 | GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K);
+        for (i, l) in layers.iter().enumerate() {
+            let ok = [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
+                .iter()
+                .all(|tv| eligible(tv.tensor_type));
+            if !ok {
+                eprintln!("[gguf-gpu] disabled: layer {i} has an ineligible GEMV dtype");
+                return None;
+            }
+        }
+        let engine = crate::infer::metal::MetalEngine::new()?;
+        let w_buf = engine.register_zerocopy_only(gguf.mmap.as_slice())?;
+
+        let dim = config.dim;
+        let q_rows = config.n_heads * config.head_dim;
+        let kv_rows = config.n_kv_heads * config.head_dim;
+        let inter = config.hidden_dim;
+        let vocab = config.vocab_size;
+        let mut cursor = 0usize;
+        let slots = GgufGpuSlots {
+            xn: gguf_gpu_slot(&mut cursor, dim),
+            qa: gguf_gpu_slot(&mut cursor, q_rows),
+            ka: gguf_gpu_slot(&mut cursor, kv_rows),
+            va: gguf_gpu_slot(&mut cursor, kv_rows),
+            ao: gguf_gpu_slot(&mut cursor, dim),
+            xo: gguf_gpu_slot(&mut cursor, dim),
+            gate: gguf_gpu_slot(&mut cursor, inter.max(dim)),
+            up: gguf_gpu_slot(&mut cursor, inter.max(dim)),
+            logits: gguf_gpu_slot(&mut cursor, vocab),
+        };
+        let act_bytes = gguf_gpu_page(cursor);
+        let act = crate::infer::model::AnonBuffer::new(act_bytes / 4);
+        let act_slice: &[u8] =
+            unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
+        let act_buf = engine.register_zerocopy_only(act_slice)?;
+        eprintln!(
+            "[gguf-gpu] decode client armed: dim={dim} heads={}/{} hd={} inter={inter} vocab={vocab} layers={} act={}MB",
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            layers.len(),
+            act_bytes / (1024 * 1024),
+        );
+        Some(Self { engine, w_buf, act_buf, act, slots })
+    }
+
+    #[inline]
+    fn slot_f32_mut(&mut self, off: usize, n: usize) -> &mut [f32] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                (self.act.as_ptr() as *mut u8).add(off) as *mut f32,
+                n,
+            )
+        }
+    }
+
+    #[inline]
+    fn slot_f32(&self, off: usize, n: usize) -> &[f32] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self.act.as_ptr() as *const u8).add(off) as *const f32,
+                n,
+            )
+        }
+    }
+
+    fn w_offset(&self, gguf: &GgufFile, tv: &TensorView) -> usize {
+        gguf.data_offset + tv.offset
+    }
+}

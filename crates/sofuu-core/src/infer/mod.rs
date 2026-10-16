@@ -104,6 +104,15 @@ pub struct InferModel {
 
 impl InferModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
+        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true)
+    }
+
+    pub fn from_gguf_with_gpu(
+        gguf: GgufFile,
+        max_seq_len: usize,
+        vocab_size: usize,
+        gpu_allowed: bool,
+    ) -> Result<Self, String> {
         let arch = gguf.get_str("general.architecture").unwrap_or("llama").to_string();
         if arch == "spark2_5" {
             let m = Spark25Model::from_gguf(gguf, max_seq_len, vocab_size)?;
@@ -583,7 +592,7 @@ impl InferEngine {
             tokenizer.bos_token_id = None;
         }
         let vocab_size = tokenizer.vocab.len();
-        let model = InferModel::from_gguf(gguf, max_seq_len, vocab_size)?;
+        let model = InferModel::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, enable_gpu)?;
         let t_model = t2.elapsed();
 
         if std::env::var("SOFUU_PROFILE_LOAD").is_ok() {

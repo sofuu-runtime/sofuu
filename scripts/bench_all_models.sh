@@ -19,13 +19,22 @@ MODELS=(
   "$HOME/Downloads/Spark-X2.5-4B-Q4_K_M.gguf"
   "$HOME/Downloads/Qwen3-8B-Q4_K_M.gguf"
   "$HOME/Downloads/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+  "$HOME/Downloads/Sharp-MiniCPM5-2B-Q6_K_XL.gguf"
+  "$HOME/Downloads/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf"
 )
 pkill -f "sofuu serve --infer" 2>/dev/null; sleep 2
 for M in "${MODELS[@]}"; do
   [ -e "$M" ] || { echo "SKIP (missing): $M"; continue; }
   NAME=$(basename "$M")
   PORT=$((8940 + RANDOM % 40))
-  "$BIN" serve --infer -m "$M" --cpu --port "$PORT" >"/tmp/sofuu-bench-$NAME.log" 2>&1 &
+  # Best-known per-model config: the 27B decodes ~5x with packed-weight
+  # residency (0.6 vs 0.12 tok/s battery-context); everything else on
+  # defaults (all landed optimizations are default-on).
+  EXTRA_ENV=""
+  case "$NAME" in
+    Ternary-Bonsai-2-27B*) EXTRA_ENV="SOFUU_RESIDENT_WEIGHTS=1";;
+  esac
+  env $EXTRA_ENV "$BIN" serve --infer -m "$M" --cpu --port "$PORT" >"/tmp/sofuu-bench-$NAME.log" 2>&1 &
   SPID=$!
   sleep 6
   R=$(python3 "$REPO/scripts/bench_serve.py" "$PORT" 16 2>/dev/null)

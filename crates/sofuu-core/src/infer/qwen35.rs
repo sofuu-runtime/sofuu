@@ -133,6 +133,8 @@ pub struct Qwen35Model {
     layers: Vec<Layer>,
     /// f32 sign vectors (±1) keyed by input width, from prism.hadamard.
     signs: Vec<(usize, Vec<f32>)>,
+    /// prism.hadamard.block_size for this model (power of two; 27B = 1024).
+    had_block: usize,
     rope_sections: [usize; 4],
     /// GDN slot (0..n_gdn) per layer; usize::MAX for attention layers.
     gdn_index: Vec<usize>,
@@ -266,26 +268,27 @@ fn wht_block(block: &mut [f32]) {
     }
 }
 
-fn wht_blocks(x: &mut [f32]) {
-    for block in x.chunks_exact_mut(HAD_BLOCK) {
+fn wht_blocks(block_len: usize, x: &mut [f32]) {
+    debug_assert!(block_len.is_power_of_two());
+    for block in x.chunks_exact_mut(block_len) {
         wht_block(block);
     }
 }
 
 /// Prepared folded-matmul activation: dst[i] = S[i]·src[i], then per-block H.
-fn hadamard_prep(dst: &mut [f32], src: &[f32], signs: &[f32]) {
+fn hadamard_prep(block: usize, dst: &mut [f32], src: &[f32], signs: &[f32]) {
     for (d, (&s, &v)) in dst.iter_mut().zip(signs.iter().zip(src.iter())) {
         *d = s * v;
     }
-    wht_blocks(dst);
+    wht_blocks(block, dst);
 }
 
 /// Signs + Hadamard applied in place (activation already staged in x).
-fn hadamard_prep_in_place(x: &mut [f32], signs: &[f32]) {
+fn hadamard_prep_in_place(block: usize, x: &mut [f32], signs: &[f32]) {
     for (v, &s) in x.iter_mut().zip(signs) {
         *v *= s;
     }
-    wht_blocks(x);
+    wht_blocks(block, x);
 }
 
 /// GDN regrouping for the folded ssm_out activation. The folded weight expects
@@ -1401,11 +1404,20 @@ impl Qwen35Model {
         }
 
         // ── Prism Hadamard fold metadata ──
+        // The Sylvester butterfly in wht_block works for any power of two;
+        // block_size is a per-model parameter now (27B = 1024, 9B = 4096).
         let had_version = gguf.get_u32("prism.hadamard.version").unwrap_or(0);
-        let had_block = gguf.get_u32("prism.hadamard.block_size").unwrap_or(0) as usize;
-        if had_version != 0 && had_block != HAD_BLOCK {
-            return Err(format!("qwen35: unsupported prism.hadamard.block_size {had_block}"));
-        }
+        let had_block = if had_version != 0 {
+            let hb = gguf.get_u32("prism.hadamard.block_size").unwrap_or(0) as usize;
+            if hb == 0 || !hb.is_power_of_two() {
+                return Err(format!(
+                    "qwen35: unsupported prism.hadamard.block_size {hb} (need a power of two)"
+                ));
+            }
+            hb
+        } else {
+            HAD_BLOCK
+        };
         let signs = Self::load_signs(&mut gguf)?;
         let folded_names = meta_string_list(&gguf, "prism.hadamard.weight_names");
         let inverse_names = meta_string_list(&gguf, "prism.hadamard.inverse_weight_names");
@@ -1562,6 +1574,7 @@ impl Qwen35Model {
             output_norm,
             layers,
             signs,
+            had_block,
             rope_sections: sections,
             gdn_index,
             attn_index,
@@ -1649,7 +1662,7 @@ impl Qwen35Model {
         ptq1_0_dequant_row(row, &mut self.rowbuf[..dim]);
         match self.embd.xform {
             Xform::Inverse(i) => {
-                wht_blocks(&mut self.rowbuf[..dim]);
+                wht_blocks(self.had_block, &mut self.rowbuf[..dim]);
                 let signs = &self.signs[i].1;
                 for (d, (&r, &s)) in self.x.iter_mut().zip(self.rowbuf[..dim].iter().zip(signs)) {
                     *d = r * s;
@@ -1683,7 +1696,7 @@ impl Qwen35Model {
         // alpha/beta (unfolded) read the raw normalized hidden.
         let mut prep = std::mem::take(&mut self.prep512);
         match (s_dim, &self.signs) {
-            (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
+            (Some(i), table) => hadamard_prep(self.had_block, &mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
         let data = self.gguf.as_bytes();
@@ -1748,7 +1761,7 @@ impl Qwen35Model {
         gdn_perm(&mut self.prep_mid, &self.gdn_out);
         let data = self.gguf.as_bytes();
         match (out_mat.sign_idx(), &self.signs) {
-            (Some(i), table) => hadamard_prep_in_place(&mut self.prep_mid, &table[i].1),
+            (Some(i), table) => hadamard_prep_in_place(self.had_block, &mut self.prep_mid, &table[i].1),
             _ => {}
         }
         gemv_t143(data, out_mat, &self.prep_mid, &mut self.mix_out);
@@ -1770,7 +1783,7 @@ impl Qwen35Model {
         // Prepared hidden shared by q/k/v projections (fork memoization).
         let mut prep = std::mem::take(&mut self.prep512);
         match (q_mat.sign_idx(), &self.signs) {
-            (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
+            (Some(i), table) => hadamard_prep(self.had_block, &mut prep, &self.hbuf, &table[i].1),
             _ => prep.copy_from_slice(&self.hbuf),
         }
         let data = self.gguf.as_bytes();
@@ -1842,7 +1855,7 @@ impl Qwen35Model {
 
         // Output projection: signs+hadamard on the 6144 activation, then gemv.
         match (o_mat.sign_idx(), &self.signs) {
-            (Some(i), table) => hadamard_prep_in_place(&mut self.attn3, &table[i].1),
+            (Some(i), table) => hadamard_prep_in_place(self.had_block, &mut self.attn3, &table[i].1),
             _ => {}
         }
         let data = self.gguf.as_bytes();
@@ -1892,7 +1905,7 @@ impl Qwen35Model {
             {
                 let mut prep = std::mem::take(&mut self.prep512);
                 match (self.layers[li].ffn_gate.sign_idx(), &self.signs) {
-                    (Some(i), table) => hadamard_prep(&mut prep, &self.hbuf, &table[i].1),
+                    (Some(i), table) => hadamard_prep(self.had_block, &mut prep, &self.hbuf, &table[i].1),
                     _ => prep.copy_from_slice(&self.hbuf),
                 }
                 let data = self.gguf.as_bytes();
@@ -1907,7 +1920,7 @@ impl Qwen35Model {
             {
                 let mut prep = std::mem::take(&mut self.prep_ff);
                 match (self.layers[li].ffn_down.sign_idx(), &self.signs) {
-                    (Some(i), table) => hadamard_prep(&mut prep, &self.ffn_g, &table[i].1),
+                    (Some(i), table) => hadamard_prep(self.had_block, &mut prep, &self.ffn_g, &table[i].1),
                     _ => prep.copy_from_slice(&self.ffn_g),
                 }
                 let data = self.gguf.as_bytes();
@@ -1922,7 +1935,7 @@ impl Qwen35Model {
         if compute_logits {
             rmsnorm(&mut self.x, &self.output_norm, eps);
             match (self.output.sign_idx(), &self.signs) {
-                (Some(i), table) => hadamard_prep_in_place(&mut self.x, &table[i].1),
+                (Some(i), table) => hadamard_prep_in_place(self.had_block, &mut self.x, &table[i].1),
                 _ => {}
             }
             let data = self.gguf.as_bytes();
@@ -2054,7 +2067,7 @@ impl Qwen35Model {
             ptq1_0_dequant_row(row, &mut escratch[..dim]);
             match self.embd.xform {
                 Xform::Inverse(i) => {
-                    wht_blocks(&mut escratch[..dim]);
+                    wht_blocks(self.had_block, &mut escratch[..dim]);
                     let signs = &self.signs[i].1;
                     for (d, (&r, &s)) in bx[t * dim..(t + 1) * dim]
                         .iter_mut()
@@ -2088,7 +2101,7 @@ impl Qwen35Model {
                     let trow = t * dim;
                     match (qkv_mat.sign_idx(), &self.signs) {
                         (Some(i), table) => {
-                            hadamard_prep(&mut bp[trow..trow + dim], &bh[trow..trow + dim], &table[i].1)
+                            hadamard_prep(self.had_block, &mut bp[trow..trow + dim], &bh[trow..trow + dim], &table[i].1)
                         }
                         _ => bp[trow..trow + dim].copy_from_slice(&bh[trow..trow + dim]),
                     }
@@ -2147,7 +2160,7 @@ impl Qwen35Model {
                     gdn_perm(&mut bpm[grow..grow + d_inner], &bgdn[grow..grow + d_inner]);
                     match (out_mat.sign_idx(), &self.signs) {
                         (Some(i), table) => {
-                            hadamard_prep_in_place(&mut bpm[grow..grow + d_inner], &table[i].1)
+                            hadamard_prep_in_place(self.had_block, &mut bpm[grow..grow + d_inner], &table[i].1)
                         }
                         _ => {}
                     }
@@ -2163,7 +2176,7 @@ impl Qwen35Model {
                     let trow = t * dim;
                     match (q_mat.sign_idx(), &self.signs) {
                         (Some(i), table) => {
-                            hadamard_prep(&mut bp[trow..trow + dim], &bh[trow..trow + dim], &table[i].1)
+                            hadamard_prep(self.had_block, &mut bp[trow..trow + dim], &bh[trow..trow + dim], &table[i].1)
                         }
                         _ => bp[trow..trow + dim].copy_from_slice(&bh[trow..trow + dim]),
                     }
@@ -2236,7 +2249,7 @@ impl Qwen35Model {
                     }
                     match (o_mat.sign_idx(), &self.signs) {
                         (Some(i), table) => {
-                            hadamard_prep_in_place(&mut battn[t * attn_w..(t + 1) * attn_w], &table[i].1)
+                            hadamard_prep_in_place(self.had_block, &mut battn[t * attn_w..(t + 1) * attn_w], &table[i].1)
                         }
                         _ => {}
                     }
@@ -2255,7 +2268,7 @@ impl Qwen35Model {
                 rmsnorm(hrow, &self.layers[li].post_attention_norm, eps);
                 match (self.layers[li].ffn_gate.sign_idx(), &self.signs) {
                     (Some(i), table) => {
-                        hadamard_prep(&mut bp[t * dim..(t + 1) * dim], &bh[t * dim..(t + 1) * dim], &table[i].1)
+                        hadamard_prep(self.had_block, &mut bp[t * dim..(t + 1) * dim], &bh[t * dim..(t + 1) * dim], &table[i].1)
                     }
                     _ => bp[t * dim..(t + 1) * dim].copy_from_slice(&bh[t * dim..(t + 1) * dim]),
                 }
@@ -2272,7 +2285,7 @@ impl Qwen35Model {
                 }
                 match (self.layers[li].ffn_down.sign_idx(), &self.signs) {
                     (Some(i), table) => {
-                        hadamard_prep_in_place(&mut bfg[frow..frow + hidden], &table[i].1)
+                        hadamard_prep_in_place(self.had_block, &mut bfg[frow..frow + hidden], &table[i].1)
                     }
                     _ => {}
                 }
@@ -2290,7 +2303,7 @@ impl Qwen35Model {
             self.x.copy_from_slice(&bx[(n - 1) * dim..n * dim]);
             rmsnorm(&mut self.x, &self.output_norm, eps);
             match (self.output.sign_idx(), &self.signs) {
-                (Some(i), table) => hadamard_prep_in_place(&mut self.x, &table[i].1),
+                (Some(i), table) => hadamard_prep_in_place(self.had_block, &mut self.x, &table[i].1),
                 _ => {}
             }
             gemv_t143(data, &self.output, &self.x, &mut self.logits);

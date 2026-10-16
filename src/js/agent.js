@@ -1942,13 +1942,24 @@
           if (spec && spec.type && !schemaTypeCheck(obj[k], spec.type)) {
             return { ok: false, why: 'key "' + k + '" is not ' + spec.type };
           }
-          /* one nested level: required + types of the sub-object's keys */
+          /* one nested level: required AND declared types of the
+           * sub-object's keys (the first cut checked required only —
+           * review 2026-10-16) */
           if (spec && spec.type === 'object' && obj[k] && typeof obj[k] === 'object' &&
               !Array.isArray(obj[k])) {
             var nreq = Array.isArray(spec.required) ? spec.required : [];
             for (var nj = 0; nj < nreq.length; nj++) {
               if (!(nreq[nj] in obj[k])) {
                 return { ok: false, why: 'missing "' + k + '.' + nreq[nj] + '"' };
+              }
+            }
+            var npr = (spec.properties && typeof spec.properties === 'object') ? spec.properties : null;
+            if (npr) {
+              for (var nk in npr) {
+                if (!(nk in obj[k])) continue;
+                if (npr[nk] && npr[nk].type && !schemaTypeCheck(obj[k][nk], npr[nk].type)) {
+                  return { ok: false, why: '"' + k + '.' + nk + '" is not ' + npr[nk].type };
+                }
               }
             }
           }
@@ -1967,14 +1978,19 @@
     }
   }
   /* Answer → first JSON value: direct parse, then a fenced ```json block,
-   * then the outermost {…} / […] span. Returns null when nothing parses
-   * (validateSchemaLight is never asked to judge prose). */
+   * then the outermost {…} / […] span. Returns undefined when nothing
+   * parses — null is a legitimate VALUE (a rooted "null" answer), so the
+   * sentinel must be undefined; validateSchemaLight is never asked to
+   * judge prose (the P4.1 call site pre-gates undefined). */
   function extractJsonAnswer(text) {
     try {
       var s = String(text == null ? '' : text).trim();
-      var direct = null;
-      try { direct = JSON.parse(s); } catch (e1) { direct = null; }
-      if (direct !== null && typeof direct !== 'undefined') return direct;
+      /* undefined sentinel — JSON.parse("null") legitimately returns null
+       * and must NOT read as a parse failure (review 2026-10-16); parse
+       * never succeeds with undefined, so the sentinel is unambiguous. */
+      var direct;
+      try { direct = JSON.parse(s); } catch (e1) { direct = undefined; }
+      if (direct !== undefined) return direct;
       var fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
       if (fence && fence[1]) {
         try { return JSON.parse(fence[1].trim()); } catch (e2) {}
@@ -1986,9 +2002,9 @@
       if (from >= 0 && to > from) {
         try { return JSON.parse(s.slice(from, to + 1)); } catch (e3) {}
       }
-      return null;
+      return undefined;
     } catch (e) {
-      return null;
+      return undefined;
     }
   }
   /* P4.4: one ≤200-char playbook line — goal, the tools that worked,
@@ -4325,7 +4341,9 @@
       if (respSchema && !stopped && depth === 0 && answer &&
           answer !== '(cancelled)' && answer !== '(no response)') {
         var pj = extractJsonAnswer(answer);
-        var pv = validateSchemaLight(pj, respSchema);
+        var pv = (pj === undefined)
+          ? { ok: false, why: 'not parseable as JSON' }
+          : validateSchemaLight(pj, respSchema);
         var schemaTries = 0;
         while (!pv.ok && !state.cancelled && schemaTries < 2) {
           schemaTries++;
@@ -4351,13 +4369,15 @@
             if (state.cancelled || !sText || sText === '(no response)' || sText === '(cancelled)') break;
             answer = sText;
             pj = extractJsonAnswer(answer);
-            pv = validateSchemaLight(pj, respSchema);
+            pv = (pj === undefined)
+              ? { ok: false, why: 'not parseable as JSON' }
+              : validateSchemaLight(pj, respSchema);
           } catch (eSc) {
             emit('schema', { attempt: schemaTries, error: clip(String((eSc && eSc.message) || eSc), 120) });
             break;
           }
         }
-        validated = !!(pv.ok && pj != null);
+        validated = !!(pv.ok && pj !== undefined);
         if (validated) validatedData = pj;
         emit('schema', { attempt: schemaTries, ok: validated });
       }

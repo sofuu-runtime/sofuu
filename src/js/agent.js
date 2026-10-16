@@ -619,6 +619,14 @@
           description: String(t.description || ''),
           parameters: t.parameters || { type: 'object', properties: {} },
           execute: (typeof t.execute === 'function') ? t.execute : null,
+          /* P1 precision: an inline tool that WRITES data must declare it —
+           * writes:true invalidates reuse-ledger entries for its target
+           * (args.path/args.pattern), writesAll:true clears the whole
+           * ledger (hidden mutations the ledger can't see). Undeclared
+           * mutators are the user's contract: a stale "unchanged" is only
+           * possible when a writer doesn't declare itself. */
+          writes: !!t.writes,
+          writesAll: !!t.writesAll,
         });
         continue;
       }
@@ -1823,25 +1831,70 @@
      * truncate, staged compaction) — a stale anchor would be a cache
      * lie. progressiveEscalated — slim tools promoted to full schemas. */
     var reuseLedger = d.budget.reuseLedger ? {} : null;
+    /* P1 precision hardening (2026-10-15): two INDEPENDENT 32-bit hashes +
+     * the exact length — a collision in both with identical length is the
+     * only way different content can pass as "unchanged", which would
+     * serve stale data to the model. One hash was a silent-liability. */
     function ledgerhash(s) {
-      var h = 0x811c9dc5, i;
+      var h1 = 0x811c9dc5, h2 = 0x01000193, i;
       for (i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = (h * 0x01000193) & 0xffffffff;
+        var c = s.charCodeAt(i);
+        h1 ^= c;
+        h1 = (h1 * 0x01000193) & 0xffffffff;
+        h2 = (h2 ^ (c + i)) & 0xffffffff;
+        h2 = (h2 * 0x85ebca6b) & 0xffffffff;
       }
-      return h;
+      return h1 + ':' + h2;
+    }
+    /* Ledger invalidation must be semantic: `edit_file './src/./x'` and
+     * `read_file 'src/x'` are the same file, so targets are lexically
+     * normalized BEFORE keying. Without this, a write with a dot-walked
+     * path fails to invalidate the entry a read made — the marker then
+     * claims "unchanged" over changed data (the exact hallucination class
+     * this ledger must not create). Over-invalidation (two paths that
+     * normalize alike but differ) only costs a full resend — safe. */
+    function ledgerNorm(p) {
+      var parts = String(p == null ? '' : p).split('/');
+      var out = [];
+      for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i];
+        if (!seg || seg === '.') continue;
+        if (seg === '..') { if (out.length > 0) out.pop(); }
+        else out.push(seg);
+      }
+      return out.join('/');
+    }
+    function ledgerKey(name, args) {
+      return name + '\u0001' + ledgerNorm(mlTarget(args));
     }
     function ledgerInvalidateTarget(target) {
       if (!reuseLedger) return;
-      var suffix = '\u0001' + String(target || '');
+      var suffix = '\u0001' + ledgerNorm(target);
       for (var k in reuseLedger) {
         if (reuseLedger.hasOwnProperty(k) && k.indexOf(suffix, k.length - suffix.length) >= 0) {
           delete reuseLedger[k];
         }
       }
     }
+    /* Any structural compaction clears the ledger: entries say "shown
+     * above", and compaction may have dropped the "above". After a cut,
+     * re-reads return full bytes (correctness over tokens). */
+    function ledgerClearAll() {
+      if (!reuseLedger) return;
+      for (var k in reuseLedger) {
+        if (reuseLedger.hasOwnProperty(k)) delete reuseLedger[k];
+      }
+    }
     var sentLen = 0, prefixRewritten = false;
     var progressiveEscalated = {};
+    /* Declared inline mutators (P1 precision): the reuse ledger trusts
+     * only declared writers. mutators[name] → invalidate that target;
+     * mutatorsAll[name] → clear the ledger (mutation scope unknown). */
+    var mutators = {}, mutatorsAll = {};
+    for (var mutI = 0; mutI < d.inlineTools.length; mutI++) {
+      if (d.inlineTools[mutI].writesAll) mutatorsAll[d.inlineTools[mutI].name] = 1;
+      else if (d.inlineTools[mutI].writes) mutators[d.inlineTools[mutI].name] = 1;
+    }
     var steps = 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
      * renewal, so this is what "how long did this actually run" means. */
@@ -2937,7 +2990,7 @@
          * the normal path below still wraps + emits the real result for
          * the host UI and the gates. */
         if (reuseLedger && !errored && typeof cappedR.text === 'string' && cappedR.text.length >= 512) {
-          var lkey = name + '\u0001' + mlTarget(args);
+          var lkey = ledgerKey(name, args);
           var lhv = ledgerhash(cappedR.text);
           var lprev = reuseLedger[lkey];
           if (lprev && lprev.len === cappedR.text.length && lprev.hash === lhv) {
@@ -2946,7 +2999,7 @@
               cappedR.text = '[unchanged since step ' + lprev.step + ' — identical ' +
                 cappedR.text.length + '-char result, already shown above. Call once more ' +
                 'only if you truly need the full bytes re-sent.]';
-              emit('tool_result', { name: name, reuseLedger: true, target: mlTarget(args) });
+            emit('tool_result', { name: name, reuseLedger: true, target: mlTarget(args) });
             } else {
               lprev.hits = 0; /* third identical: full resend, cycle restarts */
             }
@@ -2957,14 +3010,16 @@
         /* Write tools / bash invalidate ledger entries: an edit_file or
          * write_file drops the entries for that exact target; bash can
          * touch anything, so it clears the whole ledger (correctness
-         * first — a stale "unchanged" is a hallucination factory). */
+         * first — a stale "unchanged" is a hallucination factory).
+         * P1 precision: declared inline mutators participate too —
+         * writes:true invalidates the target, writesAll:true clears all. */
         if (reuseLedger && !errored) {
-          if (name === 'write_file' || name === 'edit_file') {
+          if (name === 'bash') {
+            ledgerClearAll();
+          } else if (name === 'write_file' || name === 'edit_file' || mutators[name]) {
             ledgerInvalidateTarget(mlTarget(args));
-          } else if (name === 'bash') {
-            for (var lk in reuseLedger) {
-              if (reuseLedger.hasOwnProperty(lk)) delete reuseLedger[lk];
-            }
+          } else if (mutatorsAll[name]) {
+            ledgerClearAll();
           }
         }
         /* P2-2: tool results (web pages, file contents, MCP servers, sub-
@@ -3262,7 +3317,7 @@
            * hard stop this is meant to remove. Renew either way, compact
            * when there is something worth compacting. */
           var compacted = compactLoop();
-          if (compacted) loopMsgs = compacted.msgs;
+          if (compacted) { loopMsgs = compacted.msgs; ledgerClearAll(); }
           /* Only the per-window counter resets. stepsTotal already counted
            * every round as it happened; adding `steps` again here counted
            * each round twice and reported a run 1.7x longer than it was. */
@@ -3327,6 +3382,7 @@
             var stagedCompact = compactLoop();
             if (stagedCompact) {
               loopMsgs = stagedCompact.msgs;
+              ledgerClearAll(); /* markers say "shown above" — the "above" may be compacted away */
               prefixRewritten = true; /* the cache anchor would be a lie from here on */
               emit('plan', { compacted: true, staged: true,
                              droppedMsgs: stagedCompact.droppedMsgs,

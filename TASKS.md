@@ -125,6 +125,20 @@
 > escalation, post-escalation execution); cargo --lib 583/1 (the 1 =
 > `memory::invariant_test::fuzz_cma_product_invariants` — brain workstream's in-flight
 > cma.rs, not this stream); capi 46/46; rlm mock+latch green.
+> **P1.5 — precision hardening (2026-10-15, developer directive: precision/reliability
+> over feature count; every phase is re-audited for silent failures before the next
+> lands).** Three silent-failure modes found in the Phase-1 ledger and fixed: (1)
+> 32-bit single-hash equality could rarely false-match different content as
+> "unchanged" → now two independent hashes + exact length; (2) lexical under-invalidation:
+> `edit_file './src/./x'` failed to invalidate the entry `read_file 'src/x'` made →
+> targets are now lexically normalized for keying AND invalidation (over-invalidation is
+> safe — costs a resend; under-invalidation served stale data); (3) markers say "shown
+> above", but compaction may drop the "above" → both staged and continuation compaction
+> now clear the ledger (post-compact re-reads return full bytes). Plus inline write
+> tools can now declare themselves: `writes:true` invalidates the target's entries,
+> `writesAll:true` clears the ledger (undeclared mutators were an invisible staleness
+> hole). Battery: new `pathy` check pins read→marker→dot-walked write→FULL re-read
+> (fulls=2; the bug shape was fulls=1) — agent battery ALL PASSED 252 checks.
 > **Close-out recap (same day, commit 3):** both leftovers closed on the healed tree —
 > host `agent.mapContext` 256-chunk fan-out cap (`opts.maxChunks` lifts it), and the
 > agent loop's core contract is now COMMITTED coverage — capi funnel test

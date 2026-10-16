@@ -194,3 +194,28 @@ tree-attention verify wiring. Medusa/EAGLE heads need training, out of scope.
 - GPU offload (fused whole-graph Metal submission) is deliberately out of
   scope: it reopens the CPU-only constraint. Available if that constraint is
   ever relaxed as a product decision.
+
+## Phase DG — GPU (Metal) decode, ordered by measured blockers (2026-10-15 survey)
+
+Status: survey done, first increment scoped. The Metal engine has per-op
+kernels (gemv mlx4/bf16/f16/f32, fused qkv/gate_up variants) but the async seam
+is fake: `sofuu_metal_gemv_async` syncs on entry, makes a fresh command buffer
+per matvec, and shares internal x/y staging buffers — a data hazard that
+*requires* the per-call sync (and exactly the 30-submissions-per-token overhead
+the CPU-default flip measured). Ordered work:
+
+1. **DG1 — real command-buffer batching (the unlock).** C side
+   (`src/metal/metal_engine.mm`): `batch_begin/open encoder`, per-op enqueue
+   with CALLER-provided y staging (Rust: a small pool of MetalBuffers, one per
+   layer op), `batch_end = commit + wait`. one submission per decode step (+
+   k for spec verify). Rust (`infer/metal.rs`): `DecodeBatch` handle wrapping
+   the open encoder; lfm2/block_graph/model backends enqueue their per-layer
+   GEMVs into it. Flip under `SOFUU_GPU_DECODE=1`, A/B against the
+   CPU-decode default; flips only where it wins (measured bar: >1.3× vs CPU
+   short- and battery-context).
+2. **DG2 — whole-graph encoding per token** (norm/attention glue on CPU,
+   all GEMVs on GPU in one buffer), the shape that finally beats CPU on
+   the 2B–8B band if DG1's numbers support it.
+3. Acceptance: pinned outputs equivalence (GPU vs CPU within bench tolerance
+   for f32/bf16; bit-identical for mlx4 dot kernels vs CPU gemv), calm A/B
+   rows in the battery, explicit per-model GPU on/off table in TASKS.md.

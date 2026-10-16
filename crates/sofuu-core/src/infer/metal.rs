@@ -474,6 +474,15 @@ extern "C" {
         rows: usize, cols: usize, dtype: i32,
     );
     fn sofuu_metal_batch_end(ctx: *mut c_void);
+    fn sofuu_metal_batch_mlx4(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        s_buf: *mut c_void, s_offset: usize,
+        b_buf: *mut c_void, b_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, group_size: usize, is_bf16: i32,
+    );
     fn sofuu_metal_batch_gemv_staged(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -513,6 +522,30 @@ impl MetalEngine {
     /// End the batch: end encoding, commit once, wait.
     pub fn batch_end(&self) {
         unsafe { sofuu_metal_batch_end(self.ctx) }
+    }
+
+    /// Batched mlx4 GEMV op (binds mirror the per-op kernel exactly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_mlx4(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        s_buf: &MetalBuffer, s_offset: usize,
+        b_buf: &MetalBuffer, b_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, group_size: usize, is_bf16: bool,
+    ) {
+        unsafe {
+            sofuu_metal_batch_mlx4(
+                self.ctx,
+                w_buf.handle, w_offset,
+                s_buf.handle, s_offset,
+                b_buf.handle, b_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, group_size, is_bf16 as i32,
+            );
+        }
     }
 
     /// First-op GEMV with CPU-staged x (memcpy into the private internal

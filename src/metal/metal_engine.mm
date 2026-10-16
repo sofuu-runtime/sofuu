@@ -1169,6 +1169,48 @@ void sofuu_metal_batch_gemv_staged(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
+// G1: batched mlx4 GEMV — bindings mirror sofuu_metal_gemv_mlx4 exactly
+// (0=w 1=s 2=b 3=x 4=y, 5=cols 6=group 7=rems[4]) but with caller MTLBuffers
+// for x/y so batch ops chain activations GPU-side.
+void sofuu_metal_batch_mlx4(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* s_buf_ptr, size_t s_offset,
+    void* b_buf_ptr, size_t b_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t group_size, int is_bf16
+) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !s_buf_ptr || !b_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return;
+    id<MTLComputePipelineState> pso = (is_bf16 != 0) ? ctx->pso_gemv_mlx4_bf16 : ctx->pso_gemv_mlx4_f16;
+
+    size_t w_aligned = w_offset & ~255ULL;
+    size_t scales_aligned = s_offset & ~255ULL;
+    size_t biases_aligned = b_offset & ~255ULL;
+    uint32_t rems[4] = {
+        (uint32_t)(w_offset & 255ULL),
+        (uint32_t)(s_offset & 255ULL),
+        (uint32_t)(b_offset & 255ULL),
+        0
+    };
+    uint c = (uint)cols;
+    uint g = (uint)group_size;
+
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:w_aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)s_buf_ptr offset:scales_aligned atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)b_buf_ptr offset:biases_aligned atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:4];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&g length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc setBytes:rems length:sizeof(rems) atIndex:7];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 // ── G0: real multi-op batching ─────────────────────────────────────────────
 // batch_open retains ONE uncommitted command buffer with a LIVE encoder;
 // every batch_gemv appends an op reading caller-owned MTLBuffers (so ops can
@@ -1245,6 +1287,7 @@ bool sofuu_metal_available(void) { return false; }
 int sofuu_metal_batch_open(void* ctx) { (void)ctx; return -1; }
 void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 void sofuu_metal_batch_end(void* ctx) { (void)ctx; }
+void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}

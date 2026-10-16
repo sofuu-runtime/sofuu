@@ -513,114 +513,127 @@ impl MetalEngine {
 mod batch_g0_tests {
     use super::*;
 
-    /// G0 acceptance: N chained GEMV ops in ONE command buffer must (a)
-    /// match the per-op path and a CPU reference within bf16 tolerance, and
-    /// (b) cost one submission — the timing row is the receipt (per-op path
-    /// pays N staging+commit round trips; batched N pay ~1).
+    fn bytes_of(v: &mut [f32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+    }
+
+    /// G0 acceptance: N chained GEMV ops in ONE command buffer.
+    /// Parity is checked on a 4-op run (pure chains at n=32 overflow into
+    /// 1e35 - that is the math of chaining a spectral-radius>1 matrix, not a
+    /// bug); the 32-op run is the submission-cost receipt.
     #[test]
     #[ignore = "Metal + timed; run explicitly on a calm Mac"]
     fn batch_gemv_chain_matches_per_op_and_cpu() {
         let engine = MetalEngine::new().expect("metal engine");
         let rows = 2048usize;
         let cols = 512usize;
-        let n_ops = 32usize;
 
-        // bf16 weights + activation seed
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut rand = move || {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (state >> 33) as u16
+            ((state >> 33) % 1000) as u16
         };
         let f32_to_bf16 = |v: f32| -> u16 { ((v.to_bits() + 0x8000) >> 16) as u16 };
-        let bf16_bits = |r: u16| -> f32 { f32::from_bits((r as u32) << 16) };
+        // Small weights keep chained grows in f32 range for 4 ops.
         let wbytes: Vec<u8> = (0..rows * cols)
-            .flat_map(|_| f32_to_bf16(((rand() % 1000) as f32 - 500.0) / 500.0).to_le_bytes())
+            .flat_map(|_| f32_to_bf16(((rand() % 1000) as f32 - 500.0) * 0.001).to_le_bytes())
             .collect();
-        let x0: Vec<f32> = (0..cols)
-            .map(|_| ((rand() % 1000) as f32 - 500.0) / 500.0)
-            .collect();
+        let x0: Vec<f32> = (0..cols).map(|_| ((rand() % 1000) as f32 - 500.0) * 0.001).collect();
         let w_buf = engine.register_zerocopy_buffer(&wbytes).expect("w buf");
+        let n_max = 32usize;
 
-        // per-op reference path (N commits): chain must reuse distinct Rust
-        // slots since the per-op C copies x from CPU.
-        // Per-op reference: plain CPU vectors (y lands via the C staging copy).
-        let mut chain: Vec<Vec<f32>> =
-            (0..n_ops + 1).map(|_| vec![0f32; rows]).collect();
-        chain[0][..cols].copy_from_slice(&x0);
-        let t0 = std::time::Instant::now();
-        for i in 0..n_ops {
-            let cur = chain[i][..cols].to_vec();
-            engine.gemv_bf16(&w_buf, 0, &cur, &mut chain[i + 1][..rows], rows, cols);
-        }
-        engine.sync();
-        let per_op_us = t0.elapsed().as_micros() as f64 / n_ops as f64;
-        let per_op_final: Vec<f32> = chain[n_ops][..rows].to_vec();
+        // --- per-op reference (one staging + wait + y-copy per op) ---
+        let run_plain = |n: usize| -> Vec<Vec<f32>> {
+            let mut chain: Vec<Vec<f32>> = (0..n + 1).map(|_| vec![0f32; rows]).collect();
+            chain[0][..cols].copy_from_slice(&x0);
+            for i in 0..n {
+                let cur = chain[i][..cols].to_vec();
+                engine.gemv_bf16(&w_buf, 0, &cur, &mut chain[i + 1][..rows], rows, cols);
+            }
+            engine.sync();
+            chain
+        };
 
-        // batched path: rebuild slots with zero-copy staging for x0
-        let mut bp: Vec<MetalBuffer> = (0..n_ops + 1)
-            .map(|_| {
-                engine
-                    .register_zerocopy_buffer(&vec![0u8; rows.max(cols) * 4])
-                    .expect("b slot")
-            })
-            .collect();
-        // stage x0 into slot0 via the GPU-visible alias (copy buffer: write
-        // through CPU code path provided by slot1 Vec trick is not available;
-        // emulate by using the per-op write once)
-        let seed: Vec<f32> = x0.clone();
-
-        // SAFETY: zero-copy buffers alias this Vec's bytes; keep the Vec
-        // alive for the batch duration.
-        let mut bmem: Vec<Vec<f32>> = (0..n_ops + 1).map(|_| vec![0f32; rows.max(cols)]).collect();
-        let bmetals: Vec<MetalBuffer> = (0..n_ops + 1)
-            .map(|i| engine.register_zerocopy_buffer(bytes_of(&mut bmem[i])).expect("b mem"))
-            .collect();
-        bmem[0][..cols].copy_from_slice(&seed);
-
-        assert!(engine.batch_open(), "batch open");
-        for i in 0..n_ops {
-            let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
-            engine.batch_gemv(
-                &w_buf, 0,
-                &bmetals[xin], 0,
-                &bmetals[yin], 0,
-                rows, cols, 0, // dtype 0 = bf16
+        // --- batched (one submission per group) ---
+        // zcopy requires PAGE-ALIGNED host memory: allocate one anonymous
+        // mmap slab, register it once, address each slot by byte offset.
+        let slot_f32 = rows; // read/write both fit in `rows` f32
+        let slab_len = ((n_max + 1) * slot_f32 * 4 + 65535) & !65535;
+        let slab = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                slab_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
             );
-        }
-        engine.batch_end();
-        let batch_us = (11 + 0) as f64; // replaced below
-        let _ = batch_us;
-        // timing (re-issue cleanly)
-        let t1 = std::time::Instant::now();
-        assert!(engine.batch_open());
-        for i in 0..n_ops {
-            let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
-            engine.batch_gemv(&w_buf, 0, &bmetals[xin], 0, &bmetals[yin], 0, rows, cols, 0);
-        }
-        engine.batch_end();
-        let batch_us2 = t1.elapsed().as_micros() as f64 / n_ops as f64;
+            if p == libc::MAP_FAILED {
+                panic!("slab mmap failed");
+            }
+            std::slice::from_raw_parts_mut(p as *mut u8, slab_len)
+        };
+        let slab_buf = engine
+            .register_zerocopy_buffer(unsafe { std::slice::from_raw_parts(slab.as_ptr(), slab_len) })
+            .expect("slab buf");
+        let run_batch = |n: usize| -> Vec<Vec<f32>> {
+            // SAFETY: slab is MAP_PRIVATE writable memory owned by this test.
+            let f32_view: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(slab.as_ptr() as *mut f32, slab_len / 4)
+            };
+            for v in f32_view.iter_mut() {
+                *v = 0.0;
+            }
+            f32_view[..cols].copy_from_slice(&x0);
+            assert!(engine.batch_open(), "batch open");
+            for i in 0..n {
+                let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
+                engine.batch_gemv(
+                    &w_buf,
+                    0,
+                    &slab_buf, xin * slot_f32 * 4,
+                    &slab_buf, yin * slot_f32 * 4,
+                    rows, cols, 0,
+                );
+            }
+            engine.batch_end();
+            (0..=n).map(|k| f32_view[k * slot_f32..(k + 1) * slot_f32].to_vec()).collect()
+        };
 
-        // CPU reference for ONE op-dot (spot check final y)
-        let last_in = if (n_ops - 1) % 2 == 0 { n_ops - 1 + 1 } else { n_ops - 1 };
-        let got = &bmem[if n_ops % 2 == 1 { 1 } else { 0 }][..rows];
-        // parity: compare batched final y against per-op final y
+        // parity at 4 ops
+        let b1early = run_batch(1);
+        eprintln!("[g0-order] first-ever batch op0={:?}", &b1early[1][..3]);
+        let plain4 = run_plain(4);
+        let batch4 = run_batch(4);
+        let p1 = run_plain(1); let b1 = run_batch(1);
+        eprintln!("[g0-op0] plain={:?} batch={:?} x0={:?}", &p1[1][..3], &b1[1][..3], &x0[..3]);
         let mut max_rel: f64 = 0.0;
-        for (a, b) in got.iter().zip(per_op_final.iter()) {
-            let d = (*a - *b).abs() / b.abs().max(1e-3);
-            max_rel = max_rel.max(d as f64);
+        for k in 1..5 {
+            for (a, b) in batch4[k][..rows].iter().zip(plain4[k][..rows].iter()) {
+                let d = (*a - *b).abs() / b.abs().max(1e-2);
+                max_rel = max_rel.max(d as f64);
+            }
         }
-        eprintln!("[g0-dbg] got0={:?} ref0={:?} b0={:?} b1={:?}", &got[..4.min(got.len())], &per_op_final[..4.min(per_op_final.len())], &bmem[0][..4], &bmem[1][..4]);
-        assert!(max_rel < 1e-2, "batched vs per-op divergence {max_rel}");
-        let _ = (last_in, bf16_bits);
         eprintln!(
-            "G0 receipt: per-op {per_op_us:.0}us/op vs batched {batch_us2:.0}us/op ({:.2}x fewer submissions' worth), N={n_ops}, max_rel={max_rel:.2e}",
-            per_op_us / batch_us2,
+            "[g0] parity@4 max_rel={:.2e} plain1={:?} batch1={:?}",
+            max_rel, &plain4[1][..3], &batch4[1][..3]
         );
-    }
+        assert!(max_rel < 1e-2, "batched vs per-op divergence {max_rel}");
 
-    fn bytes_of(v: &mut [f32]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+        // submission-cost receipt at 32 ops
+        let n = 32usize;
+        let t0 = std::time::Instant::now();
+        run_plain(n);
+        let per_op = t0.elapsed().as_micros() as f64 / n as f64;
+        let t1 = std::time::Instant::now();
+        run_batch(n);
+        let batched = t1.elapsed().as_micros() as f64 / n as f64;
+        eprintln!(
+            "G0 receipt: per-op {:.0}us/op vs batched {:.0}us/op  ({:.2}x) at N={}",
+            per_op, batched, per_op / batched, n
+        );
+        let _ = (f32_to_bf16, rows, cols);
     }
 }

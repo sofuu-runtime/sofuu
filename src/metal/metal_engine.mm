@@ -1164,6 +1164,9 @@ void sofuu_metal_batch_gemv(
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return;
+    // Cross-dispatch buffer visibility needs an explicit barrier; ops chain
+    // y->x inside ONE encoder (one commit per batch).
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
     if (dtype == 1) pso = ctx->pso_gemv_f16;
     else if (dtype == 2) pso = ctx->pso_gemv_f32;

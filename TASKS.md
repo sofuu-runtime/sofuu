@@ -266,6 +266,16 @@
 > estimate zero-calls incl. window+verdict, learn harvest with learned+stored events); capi
 > 46/46; no ABI growth; CLI smoke-tested live (init → validate → overwrite refusal → delegate
 > warning → cleanup).
+> **Phase-4 review rounds (OpenQodex, pre-push):** round 1 returned 2 minors, both real and
+> fixed (rooted JSON `null` was read as a parse failure — the sentinel is now undefined and a
+> null VALUE validates; nested property TYPES were documented but only nested required keys
+> were enforced — one-level nested properties now type-check). Round 2 returned 1 major, also
+> real: responseSchema was enforced only on the tool-loop exit — an RLM-routed (or plain
+> no-tools) turn silently skipped validation while the def still promised a schema.
+> enforceSchema() is now ONE shared helper at all three exits, each feeding its own context
+> composition (messages.concat(loopMsgs) vs base messages); result.validated is honest per
+> route. Round 3: **no findings**. Battery 271 PASS incl. pins for every fix (rooted-null,
+> nested-types, plain-exit re-ask).
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`

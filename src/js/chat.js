@@ -1521,6 +1521,13 @@
     var runOpts = {
       history: S.history, signal: 'chat', onStep: onStep,
       shared: '', watched: '',
+      /* M2 (audit 2026-10-16): a def with approve != 'none' driven as a
+       * @mention borrows THIS loop's proven approval gate — same
+       * approval_request event, same sofuu.chat.resolveApproval channel
+       * the desktop cards already answer — instead of failing closed
+       * because a chat-driven run has no onApproval callback. */
+      onApproval: requestApproval,
+      toolTimeoutMs: S.toolTimeoutMs,
     };
     if (Array.isArray(images) && images.length) {
       runOpts.images = images;

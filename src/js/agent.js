@@ -175,6 +175,28 @@
    * agent A's approval is not agent B's pre-consent. bash entries are
    * command-scoped, everything else tool-scoped. */
   var APPROVAL_SEQ = 0;
+  /* M2 (audit 2026-10-16): interactive host approvals for STANDALONE
+   * agent runs. Chat-driven runs borrow chat's requestApproval (a
+   * chat-side onApproval callback); plain rt_call/CLI/SDK runs pass
+   * approveInteractive:true instead — the decision parks here until
+   * sofuu.agent.resolveApproval(id, allow, always) settles it, bounded
+   * by the gate's own timeout/cancel (a vanished host can't pin the
+   * run). Ids mix time + randomness so a guessable id can't
+   * self-approve (the same hardening chat.js's js-3 review got). */
+  var AGENT_PENDING_APPROVALS = {};
+  function approvalRand() {
+    try {
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        var b = new Uint8Array(8);
+        crypto.getRandomValues(b);
+        var r = '';
+        for (var i = 0; i < 8; i++) r += b[i].toString(16);
+        return r;
+      }
+    } catch (e) {}
+    return Math.floor(Math.random() * 0xffffffff).toString(36) +
+           Math.floor(Math.random() * 0xffffffff).toString(36);
+  }
   var TOOL_RESULT_CAP_CHARS = 4000; /* floor for tiny windows */
   var TOOL_RESULT_HEAD_RATIO = 0.7;
   var TOOL_RESULT_TAIL_RATIO = 0.2;
@@ -1476,6 +1498,27 @@
      * netPolicy: allow-list wins, deny then drops — matched on the URL
      * HOST only; infra-level SSRF guards (web.js/P1-15, opensocket_cb)
      * stay untouched underneath. */
+    /* hostOf(): the URL authority → comparison host. The naive capture
+     * ([^\/?#]+) kept userinfo, :port and IPv6 brackets in "host", so a
+     * deny-listed domain came back as an allowed stranger
+     * ('evil.io:8080' / 'x@evil.io' / '[2001:db8::1]') — audit H1.
+     * Strips in order: userinfo (up to the LAST '@'), IPv6 brackets,
+     * :port, then lowercases and drops one trailing dot. */
+    function hostOf(raw) {
+      var h = String(raw || '');
+      var at = h.lastIndexOf('@');
+      if (at >= 0) h = h.slice(at + 1);
+      if (h.charAt(0) === '[') {
+        var close = h.indexOf(']');
+        h = close >= 0 ? h.slice(1, close) : h.slice(1);
+      } else {
+        var colon = h.indexOf(':');
+        if (colon >= 0) h = h.slice(0, colon); /* :port */
+      }
+      h = h.toLowerCase();
+      if (h.charAt(h.length - 1) === '.') h = h.slice(0, -1);
+      return h;
+    }
     function hostAllowed(host) {
       host = String(host || '').toLowerCase();
       var checkOne = function (pat, verdict) {
@@ -1567,7 +1610,7 @@
       var realOpen = exec['web_open'];
       exec['web_open'] = function (args) {
         var m = String((args && args.url) || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i);
-        var host = m ? m[1].toLowerCase() : '';
+        var host = hostOf(m ? m[1] : '');
         if (!hostAllowed(host)) {
           return Promise.resolve('[net policy: host refused by this agent\'s netPolicy: ' + clip(host, 80) + ']');
         }
@@ -1594,7 +1637,7 @@
         for (var ri = 0; ri < all.length; ri++) {
           var it = all[ri];
           var m2 = String((it && it.url) || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i);
-          if (hostAllowed(m2 ? m2[1].toLowerCase() : '')) kept.push(it);
+          if (hostAllowed(hostOf(m2 ? m2[1] : ''))) kept.push(it);
           else dropped++;
         }
         var lines = [];
@@ -1638,6 +1681,9 @@
           agent: { type: 'string', enum: allowed.slice(), description: 'Which sub-agent to run' },
           task: { type: 'string', description: 'The complete, self-contained subtask' },
           why: { type: 'string', description: 'One line on why you are delegating' },
+          /* P4.1 audit-M1: structured sub-agents */
+          schema: { type: 'object', description: 'Optional light JSON schema the sub-agent\'s ANSWER must satisfy (required + type checks). The result then carries a schema-valid marker, or an explicit warning if unvalidated.' },
+          structured: { type: 'boolean', description: 'true = shorthand for a minimal schema: the sub-agent\'s answer must be a JSON object' },
         },
         required: ['agent', 'task'],
       },
@@ -1870,7 +1916,10 @@
    * nothing (arithmetic, common knowledge) — so the ledger is strictly
    * advisory: result.evidence {backed, unbacked, samples}, never a
    * blocker, never fed back into the loop. Bounded: ≤40 distinct claims,
-   * ≤300k-char corpus, one pass. */
+   * ≤300k-char corpus, one pass. Corpus = the tool-loop's transcript only
+   * (loopMsgs): RLM-routed turns read 0/0 — their chunk store isn't a
+   * message row; the ledger stays 0/0 rather than pretending (advisory
+   * by design, audit 2026-10-16 L2). */
   function buildEvidence(answer, msgs) {
     try {
       var corpus = [];
@@ -2007,16 +2056,19 @@
       return undefined;
     }
   }
-  /* P4.4: one ≤200-char playbook line — goal, the tools that worked,
-   * the step count, and the outcome's head. Purely informational for
-   * future recall; failure returns null and the hook skips. */
+  /* P4.4: one ≤200-char playbook line — goal, the tools that ran, the
+   * step count, and the outcome's head. Deliberately says 'ran:', not
+   * 'worked:': a non-stopped run is an OBSERVATION (the model finished),
+   * not a verified success — recall should treat it as what a similar
+   * task's trajectory looked like. Loop exits only (RLM-routed turns
+   * carry no step history and are skipped). */
   function playbookLine(task, toolHist, steps, answer) {
     try {
       var best = [];
       for (var k in toolHist) {
         if (best.length < 4) best.push(k + '×' + toolHist[k]);
       }
-      var out = 'worked: ' + String(task).replace(/\s+/g, ' ').trim().slice(0, 90) +
+      var out = 'ran: ' + String(task).replace(/\s+/g, ' ').trim().slice(0, 90) +
         ' → ' + (best.join(',') || 'no tools') +
         ' in ' + steps + ' steps; outcome: ' +
         String(answer).replace(/\s+/g, ' ').trim().slice(0, 70);
@@ -2458,10 +2510,13 @@
         evidence: (depth === 0 && !stopped && answer &&
                    typeof loopMsgs !== 'undefined' && loopMsgs)
           ? buildEvidence(answer, loopMsgs) : undefined,
-        /* P4.1: present (true/false) only when a responseSchema was in
-         * force and the run finished naturally; data carries the parsed
-         * object exactly when validated is true. */
-        validated: respSchema ? (depth === 0 && !stopped ? validated : undefined) : undefined,
+        /* P4.1: present (true/false) whenever a responseSchema was in
+         * force and the run finished naturally — including SUB-RUNS:
+         * the parent's structured-delegation path reads the child's
+         * validated flag to mark its result (audit M1; the first cut
+         * published it at depth 0 only, so a parent had no way to see
+         * whether a schema'd child actually validated). */
+        validated: respSchema ? (stopped ? undefined : validated) : undefined,
         data: (respSchema && validated) ? validatedData : undefined,
       };
       emit(stopped ? 'stop' : 'answer', { answer: clip(answer, 200), stopped: stopped });
@@ -3002,8 +3057,24 @@
        * subprocesses), RLM routing, or store activity — pure arithmetic
        * over exactly the inputs the real run would send. Fields marked
        * approx are estimates by construction (per-token, not per-byte);
-       * plan is the same allocPlan the live run starts from. */
+       * plan is the same allocPlan the live run starts from.
+       * NOT A RUN: by this point the run registered itself (ACTIVE/
+       * SIGNALS/ACTIVE_COUNT, ml working-set `run_start` — the estimate
+       * block sits below emit('start')). An estimate is an invocation,
+       * not a run (RUN_COUNTS keeps counting it), so the return unwinds
+       * everything finish() would have unwound — without this, every
+       * estimate call leaked an ACTIVE slot and ACTIVE_COUNT never
+       * returned to 0, so the session's idle-disconnect tick never fired
+       * again (audit 2026-10-16 H2). */
       if (opts.estimate === true) {
+        delete ACTIVE[runId];
+        delete SIGNALS[cancelId];
+        ACTIVE_COUNT--;
+        if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
+        if (mlEnabled(d)) {
+          try { sofuu.ml.track(JSON.stringify({ kind: 'run_end', run: String(runId) })); }
+          catch (eEsM) {}
+        }
         refreshPlan();
         var esToolNames = [];
         var esTools = []
@@ -3350,22 +3421,46 @@
             emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: true, cached: true });
           } else if (needAsk) {
             var appMsg = null;
-            if (typeof opts.onApproval !== 'function') {
-              appMsg = 'denied by policy (approve:' + d.approve + ' but the host provides no onApproval callback)';
-              emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: false, reason: 'no-callback' });
+            APPROVAL_SEQ = (APPROVAL_SEQ || 0) + 1;
+            var apId = 'ap-' + runId + '-' + APPROVAL_SEQ + '-' + approvalRand();
+            /* Three ways to ask, one fail-closed default (M2):
+             * 1. opts.onApproval(tool,args,id) — pure-JS hosts.
+             * 2. opts.approveInteractive:true — the decision parks in
+             *    AGENT_PENDING_APPROVALS until sofuu.agent.resolveApproval
+             *    (id,allow,always) settles it; the SAME bounded wait and
+             *    cancel-deny applies (interactive must not outlive the
+             *    tool budget either).
+             * 3. neither — deny by policy (an interactive gate must never
+             *    default to executing). */
+            var apFn = null;
+            var pendingPromise = null;
+            if (typeof opts.onApproval === 'function') {
+              apFn = function () { return opts.onApproval(name, args, apId); };
+            } else if (opts.approveInteractive === true) {
+              /* Register the pending entry BEFORE the emit: the host may
+               * resolve synchronously out of the approval_request event
+               * (the first pre-registration-cut raced that — the resolve
+               * bounced as unknown-id and every ask timed out to deny).
+               * The await still wraps it with the tool ceiling. */
+              pendingPromise = new Promise(function (resA) {
+                AGENT_PENDING_APPROVALS[apId] = { resolve: resA, tool: name };
+              });
+              apFn = function () { return pendingPromise; };
+            }
+            if (!apFn) {
+              appMsg = 'denied by policy (approve:' + d.approve + ' but the host provides neither an onApproval callback nor approveInteractive)';
+              emit('approval_resolved', { id: apId, tool: name, allowed: false, reason: 'no-callback' });
             } else {
-              APPROVAL_SEQ = (APPROVAL_SEQ || 0) + 1;
-              var apId = 'ap-' + runId + '-' + APPROVAL_SEQ;
               emit('approval_request', { id: apId, tool: name, args: clip(JSON.stringify(args || {}), 200),
                                          risky: risky, approve: d.approve });
               var dec = null;
               try {
-                dec = await withTimeout(withCancelGuard(state, Promise.resolve(
-                  opts.onApproval(name, args, apId))),
+                dec = await withTimeout(withCancelGuard(state, Promise.resolve(apFn())),
                   opts.toolTimeoutMs || d.toolTimeoutMs, 'approval for ' + name + ' timed out (raise toolTimeoutMs)');
               } catch (eApp) {
                 dec = 'deny'; /* timeout, cancel and rejection all deny */
               }
+              delete AGENT_PENDING_APPROVALS[apId]; /* deny paths must not leak the slot */
               if (state.cancelled) dec = 'deny';
               var allow = dec === 'allow' || dec === true;
               if (dec && typeof dec === 'object' && dec.allow === true) {
@@ -3636,6 +3731,15 @@
         emit('delegate', { agent: childName, task: clip(String((args && args.task) || ''), 200),
                            why: clip(String((args && args.why) || ''), 120) });
         var childRes;
+        /* P4.1 audit-M1: structured sub-agents — the CALLING model passes
+         * `schema` (a light responseSchema object) or `structured:true`
+         * (≈ {type:'object'}); the child validates its answer and its
+         * result carries validated/data like any other run. Without this
+         * the plan's structured-sub-agents never existed: schemas only
+         * worked when the child def declared its own. */
+        var childSchema = (args && args.schema && typeof args.schema === 'object' &&
+                           !Array.isArray(args.schema)) ? args.schema
+          : ((args && args.structured === true) ? { type: 'object' } : null);
         try {
           childRes = await run(childDef, String((args && args.task) || ''), {
             depth: depth + 1,
@@ -3645,6 +3749,7 @@
             onStep: opts.onStep,
             onApproval: opts.onApproval,
             toolTimeoutMs: opts.toolTimeoutMs,
+            responseSchema: childSchema || undefined,
             /* LONG-HORIZON: the child inherits the parent's remaining
              * wall-clock and a fair share of the step/token budgets —
              * sub-tasks of a long task are long tasks. Without this the
@@ -3682,6 +3787,15 @@
         subRuns.push(childRes);
         own.llmCalls += childRes.usage.llmCalls;
         own.toolCalls += childRes.usage.toolCalls;
+        /* P4.1 audit-M1: a child asked for a schema but finished WITHOUT
+         * validating must not read as a normal structured answer — a
+         * one-line warning rides the result so the parent can react
+         * (re-ask with more context, parse defensively) instead of
+         * trusting prose that was supposed to be JSON. */
+        var schemaWarn = (childSchema && childRes.validated === false)
+          ? '\n[! sub-agent ' + childName + ' did NOT produce a schema-valid answer' +
+            ' — treat the text above as prose, not structured data]'
+          : '';
         /* P1-6: a stopped/errored child must read as a FAILURE to the
          * parent loop — the plain suffix used to look like a normal
          * answer, the parent kept reasoning off a truncated salvage, and
@@ -3694,9 +3808,10 @@
             '\n[sub-agent ' + childName + ' · ' + childRes.usage.llmCalls + ' llm calls · ' +
             childRes.usage.toolCalls + ' tool calls · stopped: ' + childRes.stopped + ']';
         }
-        return childRes.answer +
+        return childRes.answer + schemaWarn +
           '\n[sub-agent ' + childName + ' · ' + childRes.usage.llmCalls + ' llm calls · ' +
-          childRes.usage.toolCalls + ' tool calls]';
+          childRes.usage.toolCalls + ' tool calls' +
+          (childSchema ? (childRes.validated === true ? ' · schema-valid' : ' · schema: unvalidated') : '') + ']';
       }
 
       /* map_context executor (PLAN-DELEGATE-AWARENESS Move 3). The
@@ -4972,5 +5087,18 @@
     } catch (e) {
       return { ok: false, error: String((e && e.message) || e) };
     }
+  };
+  /* M2: resolve an interactive agent approval — the counterpart of the
+   * approval_request events agent runs emit under approveInteractive.
+   * allow=false keeps the gate's fail-closed 'denied by user' path;
+   * allow=true with always=true pre-approves the tool for the REST of
+   * that run only (the always-cache is per-run). */
+  A.resolveApproval = function (id, allow, always) {
+    var key = String(id == null ? '' : id);
+    var p = AGENT_PENDING_APPROVALS[key];
+    if (!p) return { ok: false, error: 'no pending agent approval with that id' };
+    delete AGENT_PENDING_APPROVALS[key];
+    p.resolve(allow ? (always ? { allow: true, always: true } : true) : false);
+    return { ok: true };
   };
 })();

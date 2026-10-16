@@ -277,6 +277,44 @@
 > route. Round 3: **no findings**. Battery 271 PASS incl. pins for every fix (rooted-null,
 > nested-types, plain-exit re-ask).
 >
+> **Stream self-audit (2026-10-16, adversarial re-read of the committed phases) and fixes — one commit.**
+> The audit re-read every landed phase and found 4 real issues + 2 advisory asymmetries; all fixed here:
+> **H1 netPolicy deny-list bypass** — the web_open/web_search wrappers captured the URL authority
+> with `[^\/?#]+` and compared it raw, so `:port`, `user@` and `[IPv6]` forms never matched a
+> deny entry ('evil.io:8080' ≠ 'evil.io'): deny-only policies were evadable, allow-lists merely
+> over-refused. Fixed with one shared `hostOf()` (strip userinfo → bracket-aware IPv6 → :port →
+> lowercase → trailing dot) used by both wrappers; battery `netdeny` pins :port/user@/[v6].
+> **H2 estimate registration leak** — `run({estimate:true})` returns AFTER the run registered
+> (ACTIVE/SIGNALS/ACTIVE_COUNT, emit('start'), ml `run_start`) but never reached finish()'s
+> unwind: every estimate call leaked a slot and left ACTIVE_COUNT > 0 forever, so the session's
+> idle-disconnect tick (ACTIVE_COUNT===0) never fired again. The estimate return now unwinds
+> exactly what finish() would (plus ml run_end; RUN_COUNTS keeps counting it as an invocation);
+> battery pins a repeat call. **M1 structured delegation (a plan item that silently never
+> shipped)** — `delegate` now accepts `schema` (light responseSchema) or `structured:true`
+> (≈{type:'object'}), threads it as the child's responseSchema, marks validated children
+> 'schema-valid', and a child that finished UNVALIDATED carries a loud
+> `[! … did NOT produce a schema-valid answer — treat as prose]` warning instead of reading as
+> a normal structured answer; that required publishing `result.validated` at ALL depths (the
+> first cut gated it to depth 0, so a parent physically could not see a schema'd child's state).
+> **M2 interactive approvals could not be RESOLVED by any host** — for pure-JS hosts there was
+> opts.onApproval; for rt_call/CLI/SDK hosts nothing: approve-defs failed closed into
+> deny-everything (safe, inert). Now: `opts.approveInteractive:true` parks the decision in a
+> pending map resolved by the new `sofuu.agent.resolveApproval(id, allow, always)` (always-true
+> stays per-run); ids mix time+randomness so a guessable id cannot self-approve (chat.js's js-3
+> hardening, mirrored); the entry registers BEFORE the approval_request emit (the first cut
+> raced: a host resolving synchronously out of the event bounced unknown-id and every ask
+> timed out to deny — battery caught it) and deny/timeout paths delete the slot (no map leak);
+> AND chat-driven @mentions now borrow chat's proven requestApproval (same events, same
+> sofuu.chat.resolveApproval channel the desktop cards already answer) instead of having no
+> callback at all. **L1/L2 advisory asymmetries made explicit (code-literal, documented in
+> place)**: verify/learn act on tool-loop exits only and evidence reads only the loop
+> transcript (RLM turns report 0/0 rather than pretend); playbookLine says 'ran:' not
+> 'worked:' — a non-stopped run is an observation, not a verified success.
+> Evidence: battery 278 PASS — 7 new audit checks (H1 ×3 bypass forms, H2 repeat-clean, M1
+> validated-flow + loud-warning, M2 allow+always single-prompt / unknown-id refusal / deny
+> in-band); capi 46/46; zero C-ABI growth (resolveApproval is a JS surface; hosts already see
+> the events).
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

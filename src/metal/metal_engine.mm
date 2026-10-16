@@ -1140,6 +1140,7 @@ void sofuu_metal_gemv_async(
 // chain y→x with zero CPU staging); batch_end ends the encoder, commits once,
 // waits. One GPU submission per batch, independent of op count.
 int sofuu_metal_batch_open(void* ctx_ptr) {
+    fprintf(stderr, "[G0BATCH-LIB-V3] open\n");
     if (!ctx_ptr) return -1;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     sofuu_metal_sync(ctx_ptr);

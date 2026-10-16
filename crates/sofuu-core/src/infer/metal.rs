@@ -590,6 +590,7 @@ mod batch_g0_tests {
             assert!(engine.batch_open(), "batch open");
             for i in 0..n {
                 let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
+                assert!(engine.batch_open());
                 engine.batch_gemv(
                     &w_buf,
                     0,
@@ -597,10 +598,30 @@ mod batch_g0_tests {
                     &slab_buf, yin * slot_f32 * 4,
                     rows, cols, 0,
                 );
+                engine.batch_end();
             }
-            engine.batch_end();
             (0..=n).map(|k| f32_view[k * slot_f32..(k + 1) * slot_f32].to_vec()).collect()
         };
+
+        // triangulate: SAME op sequence but one commit per op (guaranteed
+        // cross-op visibility). If this matches per-op, the bug is in-buffer
+        // visibility only; if not, bindings.
+        {
+            // NOTE: Vec f32 not page-aligned -> copying buffers -> CPU-side
+            // edits invisible. Use the slab instead with 3 slots.
+            let f32_view: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(slab.as_ptr() as *mut f32, slab_len / 4)
+            };
+            for v in f32_view.iter_mut() { *v = 0.0; }
+            f32_view[..cols].copy_from_slice(&x0);
+            for i in 0..2 {
+                let (xin, yin) = if i % 2 == 0 { (0usize, 1usize) } else { (1usize, 0usize) };
+                assert!(engine.batch_open());
+                engine.batch_gemv(&w_buf, 0, &slab_buf, xin * slot_f32 * 4, &slab_buf, yin * slot_f32 * 4, rows, cols, 0);
+                engine.batch_end();
+                eprintln!("[g0-tri] op{} slots01={:?} {:?}", i, &f32_view[..3], &f32_view[slot_f32..slot_f32 + 3]);
+            }
+        }
 
         // parity at 4 ops
         let b1early = run_batch(1);
@@ -610,8 +631,10 @@ mod batch_g0_tests {
         let p1 = run_plain(1); let b1 = run_batch(1);
         eprintln!("[g0-op0] plain={:?} batch={:?} x0={:?}", &p1[1][..3], &b1[1][..3], &x0[..3]);
         let mut max_rel: f64 = 0.0;
+        // ping-pong: after k ops the result lives in slot (k odd ? 1 : 0)
         for k in 1..5 {
-            for (a, b) in batch4[k][..rows].iter().zip(plain4[k][..rows].iter()) {
+            let bslot = if k % 2 == 1 { 1usize } else { 0usize };
+            for (a, b) in batch4[bslot][..rows].iter().zip(plain4[k][..rows].iter()) {
                 let d = (*a - *b).abs() / b.abs().max(1e-2);
                 max_rel = max_rel.max(d as f64);
             }

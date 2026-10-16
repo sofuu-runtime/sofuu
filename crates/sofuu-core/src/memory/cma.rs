@@ -19,6 +19,12 @@ pub const GRAVITY_G: f32 = 0.05;
 pub const CORECALL_MAX: usize = 8;
 pub const DUP_DISTANCE: f32 = 0.05;
 
+/// M1.3 (Brain Core II): the query-token re-rank ceiling. A single hit
+/// carrying every rare query token moves up at most this much of its own
+/// score — enough to flip top-1 over a near neighbor, never enough to
+/// vault a clearly-wrong record into relevance.
+pub const TOKEN_RERANK_BOOST: f32 = 0.35;
+
 /// B5.1 (ROADMAP-BRAIN-CMA): diversity floor. While filling top-k, a
 /// candidate whose cosine to an already-picked hit is >= this is skipped
 /// as a near-duplicate. The default is measured, not guessed -- see
@@ -1062,6 +1068,77 @@ impl Cma {
         /* Gravity only ever sees persistent ids (working ids are filtered
          * above, so update_gravity cannot index out of bounds). */
         self.update_gravity(&recalled_ids);
+        out
+    }
+
+    /// M1.3 (Brain Core II): query-token re-rank — the recall for callers
+    /// that also HAVE the query text. Vector similarity is the retrieval
+    /// engine, but a chatty generic record can outrank the one record
+    /// carrying the query's distinctive token ("quokka"): the embedder
+    /// smooths over exactly the tokens that make a hit THE answer. The law
+    /// is small and provably near-inert:
+    ///
+    ///   mult = 1 + TOKEN_RERANK_BOOST × Σ rarity(t)  for query tokens t
+    ///   rarity(t) = 1 − (hits containing t) / (all hits)
+    ///
+    /// rarity is computed over the CANDIDATE POOL, so boilerplate ("the",
+    /// "about") weighs nothing wherever it appears and a token unique to
+    /// one hit weighs full. The re-rank never jumps the reflex partition
+    /// (an exact-distance match stays above every inexact one) and is
+    /// exactly inert for a query with no rare tokens — same order in,
+    /// same order out.
+    pub fn recall_tokens(
+        &mut self,
+        query: &[f32],
+        top_k: usize,
+        query_text: &str,
+    ) -> Vec<RecallHit> {
+        /* ≥3 chars: two-letter words ride idf≈0 anyway, but dropping them
+         * here keeps the ×(1−df/n) work off the noise floor. */
+        let q_tokens: Vec<String> = tokenize(query_text)
+            .into_iter()
+            .filter(|t| t.chars().count() >= 3)
+            .collect();
+        let mut hits = self.recall(query, top_k);
+        if q_tokens.is_empty() || hits.len() < 2 {
+            return hits;
+        }
+        let n = hits.len();
+        let mut rarity: Vec<f32> = Vec::with_capacity(q_tokens.len());
+        for t in &q_tokens {
+            let df = hits
+                .iter()
+                .filter(|h| tokenize(&h.text).iter().any(|ht| ht == t))
+                .count();
+            rarity.push(1.0 - (df as f32 / n as f32));
+        }
+        const REFLEX_EPS_TOKEN: f32 = 0.02;
+        let mut exact: Vec<(RecallHit, f32)> = Vec::new();
+        let mut inexact: Vec<(RecallHit, f32)> = Vec::new();
+        for h in hits.drain(..) {
+            let ht = tokenize(&h.text);
+            let m = 1.0
+                + TOKEN_RERANK_BOOST
+                    * q_tokens
+                        .iter()
+                        .zip(rarity.iter())
+                        .filter(|(t, _)| ht.iter().any(|x| x == *t))
+                        .map(|(_, r)| *r)
+                        .sum::<f32>();
+            let boosted = h.score * m.min(1.0 + TOKEN_RERANK_BOOST);
+            if h.distance <= REFLEX_EPS_TOKEN {
+                exact.push((h, boosted));
+            } else {
+                inexact.push((h, boosted));
+            }
+        }
+        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        inexact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out = Vec::with_capacity(n);
+        for (mut h, s) in exact.into_iter().chain(inexact.into_iter()) {
+            h.score = s;
+            out.push(h);
+        }
         out
     }
 

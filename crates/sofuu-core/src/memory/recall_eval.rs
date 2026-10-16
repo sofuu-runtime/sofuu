@@ -371,3 +371,136 @@ fn recall_eval_ef_search_setting_is_used() {
     assert!(b.ef_search.is_none());
 }
 
+
+/// ── M1.3 (Brain Core II): the query-token re-rank ────────────────────
+/// The failure the law exists for: the embedder smooths over the tokens
+/// that make a hit THE answer, so a chatty generic record outranks the
+/// one record carrying the query's rare token. Vectors are synthetic
+/// (the CMA is text-blind; the caller embeds) with the text/vector
+/// coupling stated: generic records cluster ON the query direction, the
+/// rare-token record sits strictly farther.
+mod token_rerank {
+    use super::*;
+
+    const D: usize = 64;
+
+    fn unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; D];
+        v[i] = 1.0;
+        v
+    }
+
+    fn rec(cma: &mut Cma, center: &[f32], jitter_seed: u32, text: &str) -> u32 {
+        let mut rng = Rng(jitter_seed);
+        let mut v = center.to_vec();
+        for x in v.iter_mut() {
+            *x += rng.unit() * 0.05;
+        }
+        normalize(&mut v);
+        cma.remember(&v, text, "user", 0) as u32
+    }
+
+    fn build_fixture() -> (Cma, Vec<f32>) {
+        let mut cma = Cma::new(D);
+        /* The chatty facet: five generic records right ON the query
+         * direction, none mentioning the rare token. */
+        let mut center = vec![0.0f32; D];
+        for (i, x) in center.iter_mut().enumerate() {
+            *x = 0.5 * ((i % 7) as f32) / 7.0 + 0.5;
+        }
+        normalize(&mut center);
+        for j in 0..5 {
+            rec(&mut cma, &center, 0x53EED + j as u32, "the team sync notes about the weekly project flow");
+        }
+        /* The rare-token record: strictly FARTHER from the query than any
+         * chatty record, but it carries the answer. */
+        let mut far = center.clone();
+        far[3 % D] -= 0.6;
+        far[7 % D] += 0.2;
+        normalize(&mut far);
+        rec(&mut cma, &far, 0x51A2, "the quokka migration ships on Tuesday with the ledger cutoff");
+        let mut q = center.clone();
+        q[3 % D] -= 0.25;
+        normalize(&mut q);
+        (cma, q)
+    }
+
+    const QUERY: &str = "what did we decide about the quokka migration";
+
+    #[test]
+    fn token_rerank_flips_top1_to_the_rare_token_record() {
+        let (mut cma, q) = build_fixture();
+        let plain = cma.recall(&q, 6);
+        assert_eq!(
+            plain[0].text, "the team sync notes about the weekly project flow",
+            "fixture premise: on vectors alone a chatty record is top-1"
+        );
+        let reranked = cma.recall_tokens(&q, 6, QUERY);
+        assert_eq!(
+            reranked[0].text,
+            "the quokka migration ships on Tuesday with the ledger cutoff",
+            "the rare-token record must take top-1: {:?}",
+            reranked.iter().map(|h| h.text.as_str()).collect::<Vec<_>>()
+        );
+        /* The chatty record does not vanish — re-rank, not eviction. */
+        assert!(
+            reranked.iter().any(|h| h.text.contains("team sync notes")),
+            "the suppressed generic records stay recallable"
+        );
+    }
+
+    #[test]
+    fn token_rerank_is_inert_without_rare_tokens() {
+        /* Inert evidence = every query token EITHER in every hit text
+         * (df = n, rarity 0) OR in no hit at all (matches nothing). Both
+         * must leave the vector order byte-identical. */
+        let mut cma = Cma::new(16);
+        let mut a = vec![0.0; 16];
+        a[0] = 1.0;
+        a[7] = 0.3;
+        let ida = cma.remember(&a, "shared plan about the nightly rebuild", "user", 0) as u32;
+        let mut b = vec![0.0; 16];
+        b[1] = 1.0;
+        b[9] = 0.3;
+        let idb = cma.remember(&b, "shared plan about the deploy window", "user", 0) as u32;
+        let plain: Vec<u32> = cma.recall(&a, 5).iter().map(|h| h.id).collect();
+        let reranked: Vec<u32> = cma
+            .recall_tokens(&a, 5, "shared plan about the xylophone quantum")
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(plain, reranked, "df==n and df==0 weigh nothing");
+        assert_eq!(plain[0], ida, "fixture premise: a leads");
+        let _ = idb;
+    }
+
+    #[test]
+    fn token_rerank_never_jumps_an_exact_match() {
+        let (mut cma, q) = build_fixture();
+        /* One of the chatty records sits at a REFLEX_EXACT distance (the
+         * query basically IS its vector). The rare-token record, however
+         * token-rich, must not displace the exact match from top-1. */
+        let exact_text = "the team sync notes about the weekly project flow";
+        let v = unit(9 % D);
+        let id = cma.remember(&v, exact_text, "user", 0) as u32;
+        let reranked = cma.recall_tokens(&v, 8, QUERY);
+        assert_eq!(
+            reranked[0].id, id,
+            "the exact-distance record keeps its reflex seat: {:?}",
+            reranked.iter().map(|h| (&h.text, h.score)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn token_rerank_scores_ride_the_same_scale() {
+        /* The boosted score must never EXCEED the +boost ceiling relative
+         * to the un-boosted best — a token-rich tail hit cannot vault to
+         * absurd numbers consumers threshold on. */
+        let (mut cma, q) = build_fixture();
+        let reranked = cma.recall_tokens(&q, 6, QUERY);
+        for h in &reranked {
+            assert!(h.score <= 1.0 * (1.0 + super::super::cma::TOKEN_RERANK_BOOST) + 1e-4,
+                    "boosted score out of range: {}", h.score);
+        }
+    }
+}

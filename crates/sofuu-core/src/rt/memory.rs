@@ -1747,6 +1747,22 @@ mod impl_qtsq {
     /// scopes), null for ordinary memories).
     unsafe fn cma_recall_json(shell: &mut CmaShell, query: &[f32], top_k: usize) -> String {
         let hits = shell.cma.recall(query, top_k);
+        cma_hits_json(&hits)
+    }
+
+    /// M1.3: recall with the query-token re-rank — same JSON shape, the
+    /// order (and scores) carry the rarity boost.
+    unsafe fn cma_recall_text_json(
+        shell: &mut CmaShell,
+        query: &[f32],
+        top_k: usize,
+        text: &str,
+    ) -> String {
+        let hits = shell.cma.recall_tokens(query, top_k, text);
+        cma_hits_json(&hits)
+    }
+
+    unsafe fn cma_hits_json(hits: &[crate::memory::cma::RecallHit]) -> String {
         let arr: Vec<serde_json::Value> = hits
             .iter()
             .map(|h| {
@@ -2087,7 +2103,16 @@ mod impl_qtsq {
             top_k = 1024;
         }
 
-        let json = cma_recall_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize);
+        let json = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
+            /* M1.3: optional query text — recall WITH the token re-rank. */
+            let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+            let text = std::ffi::CStr::from_ptr(text)
+                .to_string_lossy()
+                .into_owned();
+            cma_recall_text_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize, &text)
+        } else {
+            cma_recall_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize)
+        };
         let cj = CString::new(json).unwrap_or_default();
         let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
         if qjs::is_exception(arr) {

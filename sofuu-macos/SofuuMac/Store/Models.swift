@@ -43,6 +43,14 @@ struct AppState {
     var zoom: Double = 1.0
     /// ⌘B — the workspaces sidebar collapses to a rail-less hidden state.
     var sidebarCollapsed = false
+    // ── IDE mode: file tree | tabbed code viewport | agent panel ────
+    var ideMode = false
+    var openTabs: [String] = []          // absolute file paths, in tab order
+    var activeTab: String?
+    var tabDirty: [String: Bool] = [:]   // edited vs on-disk per open path
+    // IDE panel widths (the splitters); AppStore seeds these from UiPrefs.
+    var ideTreeWidth: CGFloat = 230
+    var ideAgentWidth: CGFloat = 380
 }
 
 /// One provider's cached model listing (the desktop's model cache).

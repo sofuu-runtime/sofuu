@@ -156,12 +156,21 @@ struct SofuuMenus: Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Chat") { store.newChat() }
                 .keyboardShortcut("n")
+            Divider()
+            Button("Save File") { store.saveActiveTab() }
+                .keyboardShortcut("s")
         }
         CommandMenu("Session") {
             Button("Stop") { store.cancel() }
                 .keyboardShortcut(".", modifiers: .command)
             Button("Compact Session") { store.compactSession() }
                 .keyboardShortcut("k", modifiers: .command)
+            Divider()
+            // Lives here, not in CommandMenu("View"): SwiftUI drops a
+            // custom View menu on the system View menu's altar on this
+            // macOS (its items never render). Session renders reliably.
+            Button(store.state.ideMode ? "Exit IDE Mode" : "IDE Mode") { store.toggleIdeMode() }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
         }
         CommandMenu("View") {
             Button("Toggle Sidebar") { store.toggleSidebar() }

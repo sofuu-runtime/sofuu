@@ -82,6 +82,9 @@ final class AppStore: ObservableObject {
             cloudBg: uiPrefs.cloudBg)
         state.zoom = uiPrefs.zoom
         state.sidebarCollapsed = uiPrefs.sidebarCollapsed
+        state.ideMode = uiPrefs.ideMode
+        state.ideTreeWidth = CGFloat(uiPrefs.ideTreeWidth)
+        state.ideAgentWidth = CGFloat(uiPrefs.ideAgentWidth)
 
         // Engine events → state.
         engine.observe { [weak self] ev in
@@ -290,6 +293,7 @@ final class AppStore: ObservableObject {
         state.streaming = false
         state.phase = nil
         state.liveThink = ""
+        refreshTabsAfterTurn()
     }
 
     /// The step reducer — the desktop's `applyStep`, in Swift.
@@ -979,6 +983,7 @@ final class AppStore: ObservableObject {
         state.approvals = []
         state.preview = nil
         state.ctx = nil
+        closeAllTabs()
         Task { _ = await engine.setProject(path) }
         refreshSessions()
         // Make sure the switched-to folder is in the sidebar list too.
@@ -1205,6 +1210,146 @@ final class AppStore: ObservableObject {
     func toggleSidebar() {
         uiPrefs.sidebarCollapsed.toggle()
         state.sidebarCollapsed = uiPrefs.sidebarCollapsed
+    }
+
+    // ── IDE mode ────────────────────────────────────────────────────────
+
+    /// path → current editor text (live binding for the code viewport).
+    var fileBuffers: [String: String] = [:]
+    /// path → on-disk text at open/reload time (dirty detection + revert).
+    private var diskContents: [String: String] = [:]
+
+    func toggleIdeMode() {
+        uiPrefs.ideMode.toggle()
+        state.ideMode = uiPrefs.ideMode
+    }
+
+    static let maxCodeFileBytes = 1 << 20  // 1 MB — larger files open read-only-empty with a notice
+
+    /// Open a file into a tab: read from disk, mark clean. Binary content
+    /// or oversize files refuse with a system row instead of garbling the
+    /// editor.
+    func openFile(_ path: String) {
+        if openTabsContains(path) { state.activeTab = path; return }
+        let url = URL(fileURLWithPath: path)
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+              size <= Self.maxCodeFileBytes,
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else {
+            systemRow("Cannot open that file in the editor (binary or over 1 MB): \(URL(fileURLWithPath: path).lastPathComponent)")
+            return
+        }
+        diskContents[path] = text
+        fileBuffers[path] = text
+        state.openTabs.append(path)
+        state.tabDirty[path] = false
+        state.activeTab = path
+    }
+
+    private func openTabsContains(_ path: String) -> Bool { state.openTabs.contains(path) }
+
+    func closeTab(_ path: String, force: Bool = false) {
+        if state.tabDirty[path] == true && !force {
+            // Two-step close for unsaved work (the sidebar's armed ✕ rule).
+            state.tabDirty[path] = nil // sentinel: the ✕ now shows "again?"
+            systemRow("Unsaved changes in \(URL(fileURLWithPath: path).lastPathComponent) — click × again to discard.")
+            return
+        }
+        state.openTabs.removeAll { $0 == path }
+        state.tabDirty.removeValue(forKey: path)
+        fileBuffers.removeValue(forKey: path)
+        diskContents.removeValue(forKey: path)
+        if state.activeTab == path {
+            state.activeTab = state.openTabs.last
+        }
+    }
+
+    /// The close button's first tap arms; second tap discards.
+    func isCloseArmed(_ path: String) -> Bool { state.tabDirty[path] == nil && state.tabDirty.index(forKey: path) != nil }
+
+    func setActiveTab(_ path: String) {
+        state.activeTab = path
+        // Re-read from disk if it changed since it was opened (the agent
+        // may have edited it in another turn).
+        reloadIfChanged(path)
+    }
+
+    func updateBuffer(_ path: String, _ text: String) {
+        fileBuffers[path] = text
+        state.tabDirty[path] = text != diskContents[path]
+    }
+
+    func buffer(_ path: String) -> String { fileBuffers[path] ?? "" }
+
+    func isDirty(_ path: String) -> Bool { state.tabDirty[path] == true }
+
+    /// Write the buffer back to disk. Returns nil on success, an error
+    /// line on failure.
+    @discardableResult
+    func saveFile(_ path: String) -> String? {
+        guard let text = fileBuffers[path] else { return "nothing to save" }
+        do {
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+            diskContents[path] = text
+            state.tabDirty[path] = false
+            return nil
+        } catch {
+            return "save failed: \(error.localizedDescription)"
+        }
+    }
+
+    func closeAllTabs() {
+        state.openTabs = []
+        state.activeTab = nil
+        state.tabDirty = [:]
+        fileBuffers = [:]
+        diskContents = [:]
+    }
+
+    /// ⌘S — save the active tab; failures surface as a system row.
+    func saveActiveTab() {
+        guard let path = state.activeTab else { return }
+        if let err = saveFile(path) { systemRow(err) }
+    }
+
+    /// IDE panel widths (the splitters) — read by IdeLayout from state so
+    /// the AppKit drag handles can call the store DIRECTLY (a class ref
+    /// that never goes stale, unlike view closures), with the layout
+    /// change flowing back through the normal published pipeline. dx is a
+    /// PER-EVENT delta, so it accumulates onto the live width — applying
+    /// it to a fixed base made every event compute the same value (the
+    /// "drag only moves one step" bug).
+    enum IdeSplitter { case tree, agent }
+
+    func ideSplitterDrag(_ which: IdeSplitter, dx: CGFloat) {
+        switch which {
+        case .tree:
+            state.ideTreeWidth = min(460, max(170, state.ideTreeWidth + dx))
+        case .agent:
+            state.ideAgentWidth = min(640, max(280, state.ideAgentWidth - dx))
+        }
+    }
+
+    func ideSplitterEnd(_ which: IdeSplitter) {
+        uiPrefs.ideTreeWidth = Double(state.ideTreeWidth)
+        uiPrefs.ideAgentWidth = Double(state.ideAgentWidth)
+        _ = which
+    }
+
+    private func reloadIfChanged(_ path: String) {
+        guard !isDirty(path),
+              let text = try? String(contentsOfFile: path, encoding: .utf8),
+              text != diskContents[path] else { return }
+        diskContents[path] = text
+        fileBuffers[path] = text
+    }
+
+    /// After an agent turn, quietly refresh clean open tabs whose files
+    /// changed on disk (the agent edits files the editor may show).
+    func refreshTabsAfterTurn() {
+        for path in state.openTabs where !isDirty(path) {
+            reloadIfChanged(path)
+        }
     }
 
     /// Images picked from the system panel / paste / drag, riding the next

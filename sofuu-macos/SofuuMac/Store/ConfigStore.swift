@@ -358,4 +358,28 @@ final class UiPrefs {
         get { d.bool(forKey: "sidebarCollapsed") }
         set { d.set(newValue, forKey: "sidebarCollapsed") }
     }
+
+    var ideMode: Bool {
+        get { d.bool(forKey: "ideMode") }
+        set { d.set(newValue, forKey: "ideMode") }
+    }
+
+    /// IDE panel widths in points (the two draggable splitters). 0 means
+    /// never dragged — the layout keeps its default. Clamped on both read
+    /// and write so a stray write can't squeeze the editor out.
+    var ideTreeWidth: Double {
+        get {
+            let v = d.double(forKey: "ideTreeWidth")
+            return v == 0 ? 230 : min(460, max(170, v))
+        }
+        set { d.set(min(460, max(170, newValue)), forKey: "ideTreeWidth") }
+    }
+
+    var ideAgentWidth: Double {
+        get {
+            let v = d.double(forKey: "ideAgentWidth")
+            return v == 0 ? 380 : min(640, max(280, v))
+        }
+        set { d.set(min(640, max(280, newValue)), forKey: "ideAgentWidth") }
+    }
 }

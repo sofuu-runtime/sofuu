@@ -28,6 +28,13 @@ struct Shell: View {
                     .transition(.opacity)
             } else {
                 mainLayout
+                    .overlay(alignment: .top) {
+                        // Sheets ride over whichever layout is up (chat or
+                        // IDE) — settings is a page, not an overlay.
+                        if let which = store.state.sheet {
+                            ComposerSheets(store: store, which: which) { store.closeSheet() }
+                        }
+                    }
             }
         }
         .background(c.bgApp.ignoresSafeArea())
@@ -42,16 +49,22 @@ struct Shell: View {
 
     private var mainLayout: some View {
         HStack(spacing: 0) {
-            if !store.state.sidebarCollapsed {
+            if store.state.ideMode {
+                IdeLayout(store: store)
+            } else if !store.state.sidebarCollapsed {
                 sidebar
                     .transition(.move(edge: .leading).combined(with: .opacity))
             } else {
                 collapsedRail
             }
 
-            Rectangle().fill(c.separator).frame(width: 1)
+            if !store.state.ideMode {
+                Rectangle().fill(c.separator).frame(width: 1)
+            }
 
-            mainColumn
+            if !store.state.ideMode {
+                mainColumn
+            }
         }
     }
 
@@ -251,13 +264,6 @@ struct Shell: View {
                     onRemoveImage: { store.removePickedImage($0) },
                     onAddImages: { store.addPickedImages($0) },
                     onSheet: { store.openSheet($0.rawValue) })
-            }
-        }
-        .overlay(alignment: .top) {
-            // Sheets ride over the main UI (settings is a page, not an
-            // overlay, anymore).
-            if let which = store.state.sheet {
-                ComposerSheets(store: store, which: which) { store.closeSheet() }
             }
         }
     }

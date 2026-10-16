@@ -3292,6 +3292,16 @@
                 cacheReadTokens: rlmUsage.cacheReadTokens | 0, cacheWriteTokens: rlmUsage.cacheWriteTokens | 0 } });
             }
             var rlmAnswer = String((res && res.answer) || '(no response)');
+            /* P4.1: the RLM exit shares the schema contract — without this
+             * a def with responseSchema silently skipped validation on
+             * every RLM-routed turn (review 2026-10-16). Re-asks run over
+             * the base messages (schema conformance is answer-level). */
+            var sOutR = await enforceSchema(rlmAnswer, messages);
+            if (sOutR && !sOutR.skipped) {
+              rlmAnswer = sOutR.answer;
+              validated = sOutR.ok;
+              if (validated) validatedData = sOutR.data;
+            }
             await storeAndFinish(rlmAnswer);
             return finish(rlmAnswer);
             }
@@ -3797,6 +3807,11 @@
       /* Plain path: no tools — one streamed (or completed) answer. */
       if (!tools) {
         answer = await finalAnswer(messages);
+        /* P4.1: the plain exit shares the same schema contract. */
+        var sOutP = await enforceSchema(answer, messages);
+        answer = sOutP.answer;
+        validated = sOutP.ok && !sOutP.skipped;
+        if (validated) validatedData = sOutP.data;
         await storeAndFinish(answer);
         return finish(answer);
       }
@@ -4283,6 +4298,64 @@
           cacheReadTokens: u.cacheReadTokens || 0, cacheWriteTokens: u.cacheWriteTokens || 0 } });
       }
 
+      /* ── P4.1 structured outputs — SHARED at every exit that can produce
+       * the final answer (tool loop AND the RLM path — the first cut only
+       * covered the loop, so a def with responseSchema silently skipped
+       * validation whenever RLM routed the turn; review 2026-10-16).
+       * Parse + validate against the light schema; at most TWO quiet
+       * re-asks ('reply with the corrected JSON ONLY'; ctxMsgs = the
+       * message composition each exit has in hand — the loop's
+       * messages.concat(loopMsgs), or the base messages for RLM, since
+       * conformance is an answer-level property). An adoptable correction
+       * replaces the answer; an unfixable one is reported honestly
+       * (ok:false) — never thrown away, never a stopped run. */
+      async function enforceSchema(initialAnswer, ctxMsgs) {
+        var a = initialAnswer;
+        if (!respSchema || !a || a === '(cancelled)' || a === '(no response)') {
+          return { ok: false, data: undefined, answer: a, skipped: true };
+        }
+        var pj = extractJsonAnswer(a);
+        var pv = (pj === undefined)
+          ? { ok: false, why: 'not parseable as JSON' }
+          : validateSchemaLight(pj, respSchema);
+        var tries = 0;
+        while (!pv.ok && !state.cancelled && tries < 2) {
+          tries++;
+          emit('schema', { attempt: tries, why: clip(pv.why || '', 160) });
+          try {
+            var sMsgs = ctxMsgs.slice();
+            sMsgs.push({ role: 'user', content:
+              '[schema] Your answer must be ONLY a JSON value matching this schema:\n' +
+              clip(JSON.stringify(respSchema), 1500) +
+              '\nYour last answer failed validation (' + clip(pv.why || 'not parseable as JSON', 140) +
+              '). Reply with the corrected JSON ONLY — no prose, no code fences.' });
+            var so2 = aiOpts(d, opts, sMsgs, null, 0);
+            var fgS = fitGuard(so2, so2.messages);
+            so2.messages = fgS.msgs;
+            so2.cacheAnchorCount = undefined;
+            if (lastPlan && lastPlan.maxOutput > 0) {
+              if (so2.max_tokens > 0) so2.max_tokens = Math.min(so2.max_tokens, lastPlan.maxOutput);
+              else so2.max_tokens = lastPlan.maxOutput;
+            }
+            var sOut = await streamWithRetry(so2, null, null);
+            absorbQuietRound(sOut.st);
+            var sText = sOut.parts.join('').trim();
+            if (state.cancelled || !sText || sText === '(no response)' || sText === '(cancelled)') break;
+            a = sText;
+            pj = extractJsonAnswer(a);
+            pv = (pj === undefined)
+              ? { ok: false, why: 'not parseable as JSON' }
+              : validateSchemaLight(pj, respSchema);
+          } catch (eSc) {
+            emit('schema', { attempt: tries, error: clip(String((eSc && eSc.message) || eSc), 120) });
+            break;
+          }
+        }
+        var ok = !!(pv.ok && pj !== undefined);
+        emit('schema', { attempt: tries, ok: ok });
+        return { ok: ok, data: ok ? pj : undefined, answer: a };
+      }
+
       /* ── P3.2 verify pass (opt-in def key budget.verify) ──────────────
        * The #1 hallucination surface is the final summary: observations
        * were grounded step-by-step, the ANSWER is free-written. For runs
@@ -4331,56 +4404,13 @@
         }
       }
 
-      /* ── P4.1 structured outputs (def responseSchema / opts.responseSchema)
-       * Parse + validate the final answer against the LIGHT schema; on a
-       * failure, at most TWO quiet re-asks over the same context ('reply
-       * with the corrected JSON ONLY'). An adoptable correction replaces
-       * the answer (memory + evidence + finish all see the final form);
-       * an unfixable answer is reported honestly as validated:false —
-       * never thrown away, never a stopped run. */
-      if (respSchema && !stopped && depth === 0 && answer &&
-          answer !== '(cancelled)' && answer !== '(no response)') {
-        var pj = extractJsonAnswer(answer);
-        var pv = (pj === undefined)
-          ? { ok: false, why: 'not parseable as JSON' }
-          : validateSchemaLight(pj, respSchema);
-        var schemaTries = 0;
-        while (!pv.ok && !state.cancelled && schemaTries < 2) {
-          schemaTries++;
-          emit('schema', { attempt: schemaTries, why: clip(pv.why || '', 160) });
-          try {
-            var sMsgs = messages.concat(loopMsgs);
-            sMsgs.push({ role: 'user', content:
-              '[schema] Your answer must be ONLY a JSON value matching this schema:\n' +
-              clip(JSON.stringify(respSchema), 1500) +
-              '\nYour last answer failed validation (' + clip(pv.why || 'not parseable as JSON', 140) +
-              '). Reply with the corrected JSON ONLY — no prose, no code fences.' });
-            var so2 = aiOpts(d, opts, sMsgs, null, 0);
-            var fgS = fitGuard(so2, so2.messages);
-            so2.messages = fgS.msgs;
-            so2.cacheAnchorCount = undefined;
-            if (lastPlan && lastPlan.maxOutput > 0) {
-              if (so2.max_tokens > 0) so2.max_tokens = Math.min(so2.max_tokens, lastPlan.maxOutput);
-              else so2.max_tokens = lastPlan.maxOutput;
-            }
-            var sOut = await streamWithRetry(so2, null, null);
-            absorbQuietRound(sOut.st);
-            var sText = sOut.parts.join('').trim();
-            if (state.cancelled || !sText || sText === '(no response)' || sText === '(cancelled)') break;
-            answer = sText;
-            pj = extractJsonAnswer(answer);
-            pv = (pj === undefined)
-              ? { ok: false, why: 'not parseable as JSON' }
-              : validateSchemaLight(pj, respSchema);
-          } catch (eSc) {
-            emit('schema', { attempt: schemaTries, error: clip(String((eSc && eSc.message) || eSc), 120) });
-            break;
-          }
-        }
-        validated = !!(pv.ok && pj !== undefined);
-        if (validated) validatedData = pj;
-        emit('schema', { attempt: schemaTries, ok: validated });
-      }
+      /* ── P4.1 at the tool-loop exit — the shared enforceSchema above
+       * (loopMsgs rides the re-ask context, RLM's exit uses base messages).
+       * result.validated true/false only when a schema was in force. */
+      var sRes = await enforceSchema(answer, messages.concat(loopMsgs));
+      answer = sRes.answer;
+      validated = sRes.ok && !sRes.skipped;
+      if (validated) validatedData = sRes.data;
 
       await storeAndFinish(answer);
       return finish(answer);

@@ -136,7 +136,15 @@ impl InferModel {
     }
 
     pub fn from_lfm2_dir<P: AsRef<Path>>(dir: P, max_seq_len: usize) -> Result<Self, String> {
-        let m = Lfm2Model::from_safetensors_dir(dir, max_seq_len)?;
+        Self::from_lfm2_dir_with_gpu(dir, max_seq_len, true)
+    }
+
+    pub fn from_lfm2_dir_with_gpu<P: AsRef<Path>>(
+        dir: P,
+        max_seq_len: usize,
+        gpu_allowed: bool,
+    ) -> Result<Self, String> {
+        let m = Lfm2Model::from_safetensors_dir_with_gpu(dir, max_seq_len, gpu_allowed)?;
         let config = m.config.clone();
         Ok(Self {
             config,
@@ -458,7 +466,7 @@ impl InferEngine {
                 };
 
                 if is_lfm2 && clean_path.join("model.safetensors").exists() {
-                    let model = InferModel::from_lfm2_dir(&clean_path, max_seq_len)?;
+                    let model = InferModel::from_lfm2_dir_with_gpu(&clean_path, max_seq_len, enable_gpu)?;
                     return Self::finalize_device(Self {
                         model,
                         tokenizer,
@@ -529,7 +537,7 @@ impl InferEngine {
                     };
 
                     if is_lfm2 && ext == "safetensors" {
-                        let model = InferModel::from_lfm2_dir(parent, max_seq_len)?;
+                        let model = InferModel::from_lfm2_dir_with_gpu(parent, max_seq_len, enable_gpu)?;
                         return Self::finalize_device(Self {
                             model,
                             tokenizer,

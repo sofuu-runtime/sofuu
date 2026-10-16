@@ -578,6 +578,11 @@ extern "C" {
         ptr: *const std::ffi::c_void,
         size_bytes: usize,
     ) -> *mut std::ffi::c_void;
+    pub fn sofuu_metal_buffer_create_copy(
+        ctx: *mut std::ffi::c_void,
+        ptr: *const std::ffi::c_void,
+        size_bytes: usize,
+    ) -> *mut std::ffi::c_void;
     pub fn sofuu_metal_buffer_free(buf: *mut std::ffi::c_void);
     pub fn sofuu_metal_gemv_bf16(
         ctx: *mut std::ffi::c_void,

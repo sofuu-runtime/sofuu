@@ -168,6 +168,8 @@ void sofuu_metal_gemv_gate_up_mlx4(
 
 // Create a Metal buffer from pointer (zero-copy if page-aligned, copy fallback if not).
 void* sofuu_metal_buffer_create(void* ctx, const void* ptr, size_t size_bytes);
+// Always a driver-managed COPY of the bytes (never wraps caller memory).
+void* sofuu_metal_buffer_create_copy(void* ctx, const void* ptr, size_t size_bytes);
 
 // Execute Batched Q, K, V Matrix-Vector multiplications on Apple Silicon GPU
 // supporting separate buffers and multiple data types (0 = BF16, 1 = F16, 2 = F32).
@@ -214,6 +216,18 @@ void sofuu_metal_batch_gemv(void* ctx, void* w_buf, size_t w_offset, void* x_buf
 void sofuu_metal_batch_end(void* ctx);
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w_buf, size_t w_offset, const float* x, void* y_buf, size_t y_offset, size_t rows, size_t cols, int dtype);
 void sofuu_metal_batch_mlx4(void* ctx, void* w_buf, size_t w_offset, void* s_buf, size_t s_offset, void* b_buf, size_t b_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t group_size, int is_bf16);
+
+// GPU1: in-batch glue ops — whole-decode-step batches (lfm2 client first).
+// All offsets are byte offsets into caller-owned MTLBuffers; ops chain
+// slot-to-slot inside one encoder, one commit per batch (see infer/metal.rs).
+void sofuu_metal_batch_add(void* ctx, void* acc_buf, size_t acc_offset, void* add_buf, size_t add_offset, size_t n);
+void sofuu_metal_batch_swiglu(void* ctx, void* g_buf, size_t g_offset, void* u_buf, size_t u_offset, size_t n);
+void sofuu_metal_batch_rmsnorm(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, void* y_buf, size_t y_offset, size_t dim, float eps);
+void sofuu_metal_batch_conv_gate(void* ctx, void* bcx_buf, size_t bcx_offset, void* conv_w_buf, size_t conv_w_offset, void* state_buf, size_t state_offset, void* out_buf, size_t out_offset, size_t dim);
+void sofuu_metal_batch_kv_write(void* ctx, void* k_buf, size_t k_offset, void* v_buf, size_t v_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* kln_buf, size_t kln_offset, uint32_t pos, uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base);
+void sofuu_metal_batch_attn(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* qln_buf, size_t qln_offset, void* out_buf, size_t out_offset, uint32_t pos, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base);
+// G2: GGUF dequant-dot GEMV in the live batch. ty: 2=q4_0 8=q8_0 12=q4_K 14=q6_K.
+void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 
 #ifdef __cplusplus
 }

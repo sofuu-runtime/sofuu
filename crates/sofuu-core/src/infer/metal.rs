@@ -56,6 +56,44 @@ impl MetalEngine {
         }
     }
 
+    /// Zero-copy ONLY: None when the memory cannot be wrapped in place.
+    /// The GPU decode clients require this — they write the same host pages
+    /// the GPU reads (activation slab, KV handoff), so a copied buffer would
+    /// desynchronize the two silently.
+    pub fn register_zerocopy_only(&self, slice: &[u8]) -> Option<MetalBuffer> {
+        unsafe {
+            let buf = sofuu_metal_buffer_create_zerocopy(
+                self.ctx,
+                slice.as_ptr() as *const c_void,
+                slice.len(),
+            );
+            if buf.is_null() {
+                None
+            } else {
+                Some(MetalBuffer { handle: buf })
+            }
+        }
+    }
+
+    /// Always a driver-managed copy (never wraps the caller's pages). The
+    /// whole-step decode client uses this for the weight region: whether
+    /// device-owned placement streams faster than the wrapped mmap is a
+    /// measured question, and byte offsets stay identical either way.
+    pub fn create_buffer_copy(&self, slice: &[u8]) -> Option<MetalBuffer> {
+        unsafe {
+            let buf = sofuu_metal_buffer_create_copy(
+                self.ctx,
+                slice.as_ptr() as *const c_void,
+                slice.len(),
+            );
+            if buf.is_null() {
+                None
+            } else {
+                Some(MetalBuffer { handle: buf })
+            }
+        }
+    }
+
     pub fn create_buffer(&self, slice: &[u8]) -> Option<MetalBuffer> {
         unsafe {
             let buf = sofuu_metal_buffer_create(
@@ -490,6 +528,62 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, dtype: i32,
     );
+    // GPU1: in-batch glue ops (whole-decode-step batches).
+    fn sofuu_metal_batch_add(
+        ctx: *mut c_void,
+        acc_buf: *mut c_void, acc_offset: usize,
+        add_buf: *mut c_void, add_offset: usize,
+        n: usize,
+    );
+    fn sofuu_metal_batch_swiglu(
+        ctx: *mut c_void,
+        g_buf: *mut c_void, g_offset: usize,
+        u_buf: *mut c_void, u_offset: usize,
+        n: usize,
+    );
+    fn sofuu_metal_batch_rmsnorm(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        w_buf: *mut c_void, w_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        dim: usize, eps: f32,
+    );
+    fn sofuu_metal_batch_conv_gate(
+        ctx: *mut c_void,
+        bcx_buf: *mut c_void, bcx_offset: usize,
+        conv_w_buf: *mut c_void, conv_w_offset: usize,
+        state_buf: *mut c_void, state_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        dim: usize,
+    );
+    fn sofuu_metal_batch_kv_write(
+        ctx: *mut c_void,
+        k_buf: *mut c_void, k_offset: usize,
+        v_buf: *mut c_void, v_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        kln_buf: *mut c_void, kln_offset: usize,
+        pos: u32, head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32,
+    );
+    fn sofuu_metal_batch_gguf(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    );
+    fn sofuu_metal_batch_attn(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        qln_buf: *mut c_void, qln_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32,
+    );
 }
 
 impl MetalEngine {
@@ -565,6 +659,581 @@ impl MetalEngine {
                 x.as_ptr(),
                 y_buf.handle, y_offset,
                 rows, cols, dtype,
+            );
+        }
+    }
+
+    // ── GPU1: in-batch glue ops (whole-decode-step batches) ────────────────
+    // All offsets are BYTE offsets into caller MTLBuffers. Each op inserts a
+    // memory barrier before dispatch, so chained reads see prior writes.
+    // The CPU touches the slab only between batch_end and the next open.
+
+    pub fn batch_add(
+        &self,
+        acc_buf: &MetalBuffer, acc_offset: usize,
+        add_buf: &MetalBuffer, add_offset: usize,
+        n: usize,
+    ) {
+        unsafe {
+            sofuu_metal_batch_add(
+                self.ctx,
+                acc_buf.handle, acc_offset,
+                add_buf.handle, add_offset,
+                n,
+            );
+        }
+    }
+
+    pub fn batch_swiglu(
+        &self,
+        g_buf: &MetalBuffer, g_offset: usize,
+        u_buf: &MetalBuffer, u_offset: usize,
+        n: usize,
+    ) {
+        unsafe {
+            sofuu_metal_batch_swiglu(
+                self.ctx,
+                g_buf.handle, g_offset,
+                u_buf.handle, u_offset,
+                n,
+            );
+        }
+    }
+
+    /// GGUF dequant-dot GEMV op in the live batch (ty: 2=q4_0 8=q8_0
+    /// 12=q4_K 14=q6_K).
+    pub fn batch_gguf(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize,
+    ) {
+        unsafe {
+            sofuu_metal_batch_gguf(
+                self.ctx,
+                ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols,
+            );
+        }
+    }
+
+    pub fn batch_rmsnorm(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        w_buf: &MetalBuffer, w_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        dim: usize, eps: f32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_rmsnorm(
+                self.ctx,
+                x_buf.handle, x_offset,
+                w_buf.handle, w_offset,
+                y_buf.handle, y_offset,
+                dim, eps,
+            );
+        }
+    }
+
+    pub fn batch_conv_gate(
+        &self,
+        bcx_buf: &MetalBuffer, bcx_offset: usize,
+        conv_w_buf: &MetalBuffer, conv_w_offset: usize,
+        state_buf: &MetalBuffer, state_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        dim: usize,
+    ) {
+        unsafe {
+            sofuu_metal_batch_conv_gate(
+                self.ctx,
+                bcx_buf.handle, bcx_offset,
+                conv_w_buf.handle, conv_w_offset,
+                state_buf.handle, state_offset,
+                out_buf.handle, out_offset,
+                dim,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_kv_write(
+        &self,
+        k_buf: &MetalBuffer, k_offset: usize,
+        v_buf: &MetalBuffer, v_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        kln_buf: &MetalBuffer, kln_offset: usize,
+        pos: u32, head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_kv_write(
+                self.ctx,
+                k_buf.handle, k_offset,
+                v_buf.handle, v_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                kln_buf.handle, kln_offset,
+                pos, head_dim, n_kv_heads, max_seq,
+                eps, rope_base,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_attn(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        qln_buf: &MetalBuffer, qln_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_attn(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                qln_buf.handle, qln_offset,
+                out_buf.handle, out_offset,
+                pos, head_dim, n_heads, n_kv_heads, max_seq,
+                eps, rope_base,
+            );
+        }
+    }
+}
+
+
+#[cfg(all(test, target_os = "macos"))]
+mod batch_gguf_parity_tests {
+    use super::*;
+
+    struct Arena {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl Arena {
+        fn new(bytes: usize) -> Self {
+            let page = 16384usize;
+            let len = ((bytes + page - 1) / page) * page;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED, "arena mmap");
+            Self { ptr: p as *mut u8, len }
+        }
+        fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+        fn f32_view(&self) -> &[f32] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
+        }
+    }
+
+    /// G2 acceptance: the GGUF dequant-dot kernels' VALUES are integer-exact
+    /// vs the CPU dequant; only the lane-parallel summation order differs
+    /// (same tolerance class as the landed mlx4 kernels).
+    #[test]
+    fn batch_gguf_gemv_matches_cpu_vecdot() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let rows = 4usize;
+        let cols = 1024usize;
+
+        let mut state = 0x5DEECE66Du64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            // f32 -> f16 with round-to-nearest on the common range; exact
+            // values used here (small powers/multiples) mostly round-trip.
+            let v = v.clamp(-65504.0, 65504.0);
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let mut exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mut man = (b >> 13) & 0x3FF;
+            if exp <= 0 {
+                exp = 1;
+            }
+            if exp > 30 {
+                exp = 30;
+                man = 0x3FF;
+            }
+            let raw = sign | ((exp as u16) << 10) | man as u16;
+            raw.to_le_bytes()
+        };
+
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 17) as f32) * 0.25f32 - 2.0f32).collect();
+
+        type BuildW = Box<dyn Fn(&mut [u8], usize)>;
+        let mut y_cpu = vec![0f32; rows];
+
+        let cases: Vec<(u32, &str, usize)> = vec![
+            (8, "q8_0", 4),
+            (2, "q4_0", 4),
+            (12, "q4_K", 4),
+            (14, "q6_K", 4),
+        ];
+        for (ty, name, row_bytes_div) in cases {
+            let (row_bytes, nb) = match ty {
+                8 => (cols / 32 * 34, cols / 32),
+                2 => (cols / 32 * 18, cols / 32),
+                12 => (cols / 256 * 144, cols / 256),
+                _ => (cols / 256 * 210, cols / 256),
+            };
+            let _ = row_bytes_div;
+            let mut wbytes = vec![0u8; rows * row_bytes];
+            let w16 = f16_bytes(0.03125f32 * ((rand() % 64) as f32 + 1.0).max(1.0));
+            for r in 0..rows {
+                let base = r * row_bytes;
+                match ty {
+                    8 => {
+                        for b in 0..nb {
+                            let off = base + b * 34;
+                            wbytes[off..off + 2].copy_from_slice(&f16_bytes(0.03125f32 * ((rand() % 32) as f32 + 1.0)));
+                            for j in 0..32 {
+                                wbytes[off + 2 + j] = (rand() % 255) as u8;
+                            }
+                        }
+                    }
+                    2 => {
+                        for b in 0..nb {
+                            let off = base + b * 18;
+                            wbytes[off..off + 2].copy_from_slice(&f16_bytes(0.03125f32 * ((rand() % 32) as f32 + 1.0)));
+                            for j in 0..16 {
+                                wbytes[off + 2 + j] = (rand() % 255) as u8;
+                            }
+                        }
+                    }
+                    12 => {
+                        for b in 0..nb {
+                            let off = base + b * 144;
+                            wbytes[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+                            wbytes[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+                            for j in 0..12 {
+                                wbytes[off + 4 + j] = (rand() & 0x3F) as u8 | ((rand() & 3) << 6) as u8;
+                            }
+                            for j in 0..128 {
+                                wbytes[off + 16 + j] = (rand() % 255) as u8;
+                            }
+                        }
+                    }
+                    _ => {
+                        for b in 0..nb {
+                            let off = base + b * 210;
+                            for j in 0..128 {
+                                wbytes[off + j] = (rand() % 255) as u8;
+                            }
+                            for j in 0..64 {
+                                wbytes[off + 128 + j] = (rand() % 255) as u8;
+                            }
+                            for j in 0..16 {
+                                wbytes[off + 192 + j] = (rand() % 255) as u8;
+                            }
+                            wbytes[off + 208..off + 210]
+                                .copy_from_slice(&f16_bytes(0.0625f32));
+                        }
+                    }
+                }
+            }
+            let _ = w16;
+
+            // CPU reference: per-row dot over the same bytes.
+            for r in 0..rows {
+                let wb = &wbytes[r * row_bytes..(r + 1) * row_bytes];
+                y_cpu[r] = match ty {
+                    8 => crate::infer::quant::vec_dot_q8_0(wb, &x),
+                    2 => crate::infer::quant::vec_dot_q4_0(wb, &x),
+                    12 => unsafe {
+                        crate::infer::quant::vec_dot_raw_q4_k(wb.as_ptr(), x.as_ptr(), nb)
+                    },
+                    _ => unsafe {
+                        crate::infer::quant::vec_dot_raw_q6_k(wb.as_ptr(), x.as_ptr(), nb)
+                    },
+                };
+            }
+
+            // GPU: one batch op over all rows; x and y in one page-aligned
+            // slab (x at 0, y after a 16-byte-aligned gap).
+            let arena = Arena::new(cols * 4 + rows * 4 + 256);
+            unsafe {
+                std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, arena.ptr, cols * 4);
+            }
+            let w_buf = engine
+                .register_zerocopy_buffer(wbytes.as_slice())
+                .expect("w buf");
+            let slab_buf = engine
+                .register_zerocopy_buffer(arena.as_slice())
+                .expect("slab buf");
+            let y_off = (cols * 4 + 63) & !63;
+            assert!(engine.batch_open(), "batch open");
+            engine.batch_gguf(ty, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+            engine.batch_end();
+
+            let y_gpu = &arena.f32_view()[y_off / 4..y_off / 4 + rows];
+            let mut max_rel = 0f64;
+            for r in 0..rows {
+                let denom = y_cpu[r].abs().max(1e-3);
+                let rel = ((y_gpu[r] - y_cpu[r]) as f64 / denom as f64).abs();
+                max_rel = max_rel.max(rel);
+            }
+            eprintln!(
+                "[batch_gguf_parity] {name}: max_rel={max_rel:.3e} cpu[0]={:.4} gpu[0]={:.4}",
+                y_cpu[0], y_gpu[0]
+            );
+            assert!(
+                max_rel < 1e-2,
+                "{name}: GPU vs CPU divergence {max_rel} (cpu[0]={} gpu[0]={})",
+                y_cpu[0],
+                y_gpu[0]
+            );
+        }
+    }
+}
+
+
+#[cfg(all(test, target_os = "macos"))]
+mod q4k_crafted_probe {
+    use super::*;
+
+    fn run_gpu_ty(ty: u32, wbytes: &[u8], x: &[f32], engine: &MetalEngine) -> Vec<f32> {
+        let rows = wbytes.len() / ((x.len() / 256) * 144);
+        let slab_len = x.len() * 4 + rows * 4 + 256;
+        let page = 16384usize;
+        let alloc = ((slab_len + page - 1) / page) * page;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(p != libc::MAP_FAILED);
+        let slab: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(p as *mut u8, alloc) };
+        unsafe { std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, slab.as_mut_ptr(), x.len() * 4) };
+        let y_off = (x.len() * 4 + 63) & !63;
+        let w_buf = engine.register_zerocopy_buffer(wbytes).expect("w");
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+        assert!(engine.batch_open());
+        engine.batch_gguf(ty, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, x.len());
+        engine.batch_end();
+        let f32_view: &[f32] = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, alloc / 4) };
+        f32_view[y_off / 4..y_off / 4 + rows].to_vec()
+    }
+
+    #[test]
+    fn q4k_crafted() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let cols = 256usize; // one block
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32) * 0.5f32 - 3.0f32).collect();
+
+        // d = 1.0 (f16 0x3C00), everything else zero unless a case sets it.
+        let w = |scales: [u8; 12], qs: u8, d: f32, dmin: f32| -> Vec<u8> {
+            let mut wbytes = vec![0u8; 144];
+            let d16: u16 = if d == 1.0 { 0x3C00 } else { 0x3800 }; // 1.0 / 0.5
+            wbytes[0..2].copy_from_slice(&d16.to_le_bytes());
+            let m16: u16 = if dmin == 0.0 { 0x0000 } else { 0x3800 };
+            wbytes[2..4].copy_from_slice(&m16.to_le_bytes());
+            wbytes[4..16].copy_from_slice(&scales);
+            for b in 0..128 {
+                wbytes[16 + b] = qs;
+            }
+            wbytes
+        };
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "A lo-nibble: sc0=1 all-else-0 qs=0x01 -> values [0..32)=1",
+                w([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0x01, 1.0, 0.0),
+            ),
+            (
+                "B hi-nibble: sc1=1 qs=0x10 -> values [32..64)=1",
+                w([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0x10, 1.0, 0.0),
+            ),
+            (
+                "C min: sc0=4 m0=2 dmin=0.5 qs=0x01 -> values [0..32)=3",
+                w([4, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0], 0x01, 1.0, 0.5),
+            ),
+        ];
+
+        // D: four blocks on lanes 0..3 — cross-block/lane contamination check.
+        {
+            let cols4 = 1024usize;
+            let x4: Vec<f32> = (0..cols4).map(|i| ((i % 13) as f32) * 0.5f32 - 3.0f32).collect();
+            let mut wbytes = vec![0u8; 4 * 144];
+            for b in 0..4 {
+                let off = b * 144;
+                wbytes[off..off + 2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d=1
+                wbytes[off] = 0x00;
+                wbytes[off] = 0x00;
+                wbytes[off + 0] = 0x00;
+                wbytes[off + 1] = 0x3C;
+                wbytes[off + 4] = 1; // sc(j=0) = 1, everything else 0
+                for q in 0..128 {
+                    wbytes[off + 16 + q] = 0x01;
+                }
+            }
+            let gpu = run_gpu_ty(12, &wbytes, &x4, &engine);
+            let mut deq = vec![0f32; cols4];
+            crate::infer::quant::dequantize_q4_k_row(&wbytes, &mut deq);
+            let cpu_dot: f32 = deq.iter().zip(x4.iter()).map(|(a, b)| a * b).sum();
+            eprintln!("[q4k-crafted] D 4-blocks gpu[0]={:.4} cpu_dot={:.4}", gpu[0], cpu_dot);
+            assert!(
+                (cpu_dot - gpu[0]).abs() < 1e-2,
+                "D: cpu {cpu_dot} vs gpu {}",
+                gpu[0]
+            );
+        }
+
+        // E: the main test's scale-byte generator (random 6-bit + random top
+        // 2 bits), one block — exercises the j>=4 composed-scale decode.
+        {
+            let mut state = 0xABCDEFu64;
+            let mut rand = move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 33) as u32)
+            };
+            for _ in 0..8 {
+                let x1: Vec<f32> = (0..256).map(|_| ((rand() % 100) as f32) * 0.25f32 - 12.0f32).collect();
+                let mut wbytes = vec![0u8; 144];
+                let d16 = 0x3C00u16; // 1.0
+                wbytes[0..2].copy_from_slice(&d16.to_le_bytes());
+                for j in 0..12 {
+                    wbytes[4 + j] = (rand() & 0x3F) as u8 | ((rand() & 3) << 6) as u8;
+                }
+                for q in 0..128 {
+                    wbytes[16 + q] = (rand() % 255) as u8;
+                }
+                let gpu = run_gpu_ty(12, &wbytes, &x1, &engine);
+                let mut deq = vec![0f32; 256];
+                crate::infer::quant::dequantize_q4_k_row(&wbytes, &mut deq);
+                let cpu_dot: f32 = deq.iter().zip(x1.iter()).map(|(a, b)| a * b).sum();
+                eprintln!("[q4k-crafted] E random gpu[0]={:.4} cpu_dot={:.4}", gpu[0], cpu_dot);
+                assert!(
+                    (cpu_dot - gpu[0]).abs() / cpu_dot.abs().max(1.0) < 1e-3,
+                    "E: cpu {cpu_dot} vs gpu {}",
+                    gpu[0]
+                );
+            }
+        }
+        {
+        } // end of scoped E
+        let _ = (cols, cases);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod q6k_crafted_probe {
+    use super::*;
+
+    #[test]
+    fn q6k_crafted() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let cols = 256usize;
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32) * 0.5f32 - 3.0f32).collect();
+
+        // 210-byte q6_K block: ql[128], qh[64], sc[16], d f16.
+        let mut wbytes = vec![0u8; 210];
+        // Case A: ql=0x11 (low=1 -> 6-bit 1), qh=0, sc[i]=1, d=1.0
+        // CPU value = (1-32)*d*sc = -31 everywhere.
+        for q in 0..128 {
+            wbytes[q] = 0x11;
+        }
+        for s in 0..16 {
+            wbytes[192 + s] = 1;
+        }
+        wbytes[208..210].copy_from_slice(&0x3C00u16.to_le_bytes()); // d=1.0
+        run_one(&engine, &wbytes, &x, "A ql=0x11 sc=1 d=1 -> all -31");
+
+        // Case B: hi-2-bits: ql=0x00, qh=0x55 (val1 bits 1) -> 6-bit = 4 -> 4-32=-28.
+        let mut wbytes_b = vec![0u8; 210];
+        for q in 0..64 {
+            wbytes_b[128 + q] = 0x55;
+        }
+        for s in 0..16 {
+            wbytes_b[192 + s] = 1;
+        }
+        wbytes_b[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+        run_one(&engine, &wbytes_b, &x, "B qh=0x55 -> all -28");
+
+        // Case C: signed scale: sc[0]=-1 (0xFF) for the first quarter only.
+        let mut wbytes_c = vec![0u8; 210];
+        for q in 0..128 {
+            wbytes_c[q] = 0x11;
+        }
+        for s in 0..16 {
+            wbytes_c[192 + s] = 1;
+        }
+        wbytes_c[192] = 0xFF;
+        wbytes_c[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+        run_one(&engine, &wbytes_c, &x, "C sc[0]=-1 d=1");
+
+        fn run_one(engine: &MetalEngine, wbytes: &[u8], x: &[f32], name: &str) {
+            let page = 16384usize;
+            let alloc = ((x.len() * 4 + 256 + page - 1) / page) * page;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    alloc,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED);
+            let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, alloc) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, slab.as_mut_ptr(), x.len() * 4)
+            };
+            let y_off = (x.len() * 4 + 63) & !63;
+            let w_buf = engine.register_zerocopy_buffer(wbytes).expect("w");
+            let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+            assert!(engine.batch_open());
+            engine.batch_gguf(14, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, 1, x.len());
+            engine.batch_end();
+            let f32_view: &[f32] =
+                unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, alloc / 4) };
+            let gpu = f32_view[y_off / 4];
+            // CPU: mirror of the intended mapping (trivial since uniform bytes)
+            // A: all -31; B: all -28; C: first 16 values scale -1, rest +1.
+            let expected = if name.starts_with('A') {
+                -31.0f32 * x.iter().sum::<f32>()
+            } else if name.starts_with('B') {
+                // qh=0x55 -> every 2-bit field = 1 -> 6-bit = 1<<4 = 16 -> q = -16
+                -16.0f32 * x.iter().sum::<f32>()
+            } else {
+                x.iter().enumerate()
+                    .map(|(i, xi)| {
+                        let s = if i < 16 { -1.0f32 } else { 1.0f32 };
+                        (1.0 - 32.0) * s * xi
+                    })
+                    .sum::<f32>()
+            };
+            eprintln!("[q6k-crafted] {name} gpu={gpu:.4} expected={expected:.4}");
+            assert!(
+                (gpu - expected).abs() / 31.0f32.max(1.0) < 0.05,
+                "{name}: gpu {gpu} vs expected {expected}"
             );
         }
     }

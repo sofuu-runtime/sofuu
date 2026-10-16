@@ -378,6 +378,33 @@
     return out.join('\n');
   }
 
+  /* P3.1 edit anchors (2026-10-16): write_file/edit_file RESULTS carry a
+   * few numbered lines of the post-change file — mirroring read_file's
+   * cat -n format (5-wide number, tab), ≤120 chars/line, ≤5 lines — so
+   * the model sees the ACTUAL on-disk result around the change instead
+   * of trusting its own splice arithmetic (the catch: a "successful"
+   * edit result string proves nothing about line numbers or neighbors,
+   * which is exactly what the next edit needs). Freshly re-read from
+   * disk, best-effort: any failure keeps the plain result string. */
+  function anchorRider(text, midIdx, sideLines) {
+    try {
+      var lines = String(text).split('\n');
+      if (midIdx > text.length) midIdx = text.length;
+      var mid = text.slice(0, midIdx).split('\n').length - 1; /* 0-based */
+      var lo = Math.max(0, mid - sideLines);
+      var hi = Math.min(lines.length, mid + sideLines + 1);
+      var out = [];
+      for (var i = lo; i < hi; i++) {
+        var row = lines[i];
+        if (row.length > 120) row = row.slice(0, 119) + '…';
+        out.push(('     ' + (i + 1)).slice(-5) + '\t' + row);
+      }
+      return out.length ? '\npost-edit context:\n' + out.join('\n') : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   TOOLS.write_file = {
     name: 'write_file',
     description: 'Create or overwrite a file with the full given content (jailed to the project directory; parent dirs are created). For targeted changes prefer edit_file.',
@@ -396,7 +423,11 @@
       var existed = await sofuu.fs.exists(p);
       await sofuu.fs.writeFile(p, a.content);
       setLastDiff('write_file', buildWritePreview(rel(p), a.content));
-      return (existed ? 'overwrote ' : 'created ') + rel(p) + ' (' + a.content.length + ' chars)';
+      var res = (existed ? 'overwrote ' : 'created ') + rel(p) + ' (' + a.content.length + ' chars)';
+      try {
+        res += anchorRider(await sofuu.fs.readFile(p, 'utf8'), 0, 2);
+      } catch (eW) {}
+      return res;
     },
   };
 
@@ -437,8 +468,15 @@
                                          : text.slice(0, first) + newS + text.slice(first + oldS.length);
       await sofuu.fs.writeFile(p, updated);
       setLastDiff('edit_file', buildEditDiff(rel(p), text, first, oldS, newS, count));
-      return 'edited ' + rel(p) + ': ' + ((a && a.replace_all) ? count + ' replacements' : '1 replacement') +
+      var res = 'edited ' + rel(p) + ': ' + ((a && a.replace_all) ? count + ' replacements' : '1 replacement') +
         ' (' + (updated.length - text.length >= 0 ? '+' : '') + (updated.length - text.length) + ' chars)';
+      try {
+        /* Anchor against the FRESH on-disk bytes, not the in-memory splice
+         * — the rider's whole point is independent proof of what happened. */
+        res += anchorRider(await sofuu.fs.readFile(p, 'utf8'),
+                           Math.min(first, updated.length), 2);
+      } catch (eE) {}
+      return res;
     },
   };
 

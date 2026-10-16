@@ -209,6 +209,33 @@
 > Battery now pins all three bypasses as checks (shella tc2 'git log; rm —', roshell tc2
 > 'ls; rm —', netw2 '*.example.com' vs 'a.example.com.attacker.io').
 >
+> **AGENTIC CORE Phase 3 — grounding: edit anchors, verify pass, claim ledger (2026-10-16).**
+> (1) **Edit anchors (default-on, tools.js):** write_file/edit_file RESULTS now carry numbered
+> ±2-line context of the post-change file (read_file's exact cat -n format, ≤120 chars/line,
+> ~40-80 tokens per edit) — re-read from DISK after the write, so the rider is independent
+> proof of what actually landed (catches phantom-OK splices and hands the model the line
+> numbers its next edit needs). Best-effort: a failed rider never fails the edit. (2) **Verify
+> pass (opt-in `budget.verify:true`):** for tool runs with ≥4 steps, ONE extra quiet no-tool
+> round hands the draft answer back over the same context ('correct anything the evidence
+> contradicts; reply with the final corrected answer only'); failure/cancel/empty → the
+> original answer stands, and `result.verified:true` appears only when the round ran AND its
+> answer was adopted. Quiet = no live deltas (the draft was already on screen); usage accounted
+> like every other round; the corrected answer is what memory persistence and finish() see.
+> Implementation trap the battery caught: `loopMsgs` contains the TOOL transcript only — the
+> loop concats the base `messages` (system + task) at the aiOpts call site — so a verify
+> request built from loopMsgs alone arrives WITHOUT the system prompt and answers as a
+> stranger (the battery's mock returned its canned catch-all, adopted verbatim, verified:true
+> — observed, diagnosed via request-shape, fixed to `messages.concat(loopMsgs)`). (3) **Claim
+> ledger (always-on, ZERO model tokens):** a post-answer heuristic scan (numbers with
+> units/pct ≥2 digits, ISO dates, slash paths, ≤40 distinct, ≤300k corpus) checks string
+> presence of each claim in the run's tool-result corpus → `result.evidence {backed, unbacked,
+> samples}` + one `evidence` event — strictly advisory (absence proves nothing: arithmetic/
+> common knowledge), never blocks, never feeds the loop. Evidence: battery 264 PASS — 4 new
+> P3 checks (write/edit riders with cat -n numbering incl. the changed line; verify adoption
+> with verified:true + verify trace event; ledger flags exactly the one unbacked '100%' the
+> verify round left). capi 46/46; no ABI growth; doc-authority note: anchors/verify/ledger
+> are driver-level (shipped JS), so embed SDKs inherit them without any header change.
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

@@ -573,6 +573,11 @@
     d.budget.maxWallMs = (b.maxWallMs | 0) || BUDGET_DEFAULTS.maxWallMs;
     /* Per-def tool-result context cap — 0 = scale with the model window. */
     d.budget.maxToolResultChars = (b.maxToolResultChars | 0) || 0;
+    /* P3.2 verify pass (opt-in): after a >=4-step run, ONE extra no-tool
+     * round re-checks the draft answer against the gathered evidence.
+     * Off by default — it costs one LLM call; the P3.3 ledger below gives
+     * the zero-token advisory for everyone else. */
+    d.budget.verify = b.verify === true;
     /* 0 is meaningful here (renewals disabled → pre-2026-10-01 behaviour),
      * so test with 'in' rather than falling back to the default. */
     d.budget.maxContinuations = ('maxContinuations' in b)
@@ -1845,6 +1850,42 @@
     return { text: text, chars: s.length };
   }
 
+  /* ── P3.3 claim ledger (2026-10-16, always-on, ZERO model tokens) ──
+   * Heuristic post-answer scan: claims (numbers with units/pct, ISO
+   * dates, slash paths) are checked for STRING PRESENCE inside this
+   * run's tool-result corpus. Presence proves grounding; absence proves
+   * nothing (arithmetic, common knowledge) — so the ledger is strictly
+   * advisory: result.evidence {backed, unbacked, samples}, never a
+   * blocker, never fed back into the loop. Bounded: ≤40 distinct claims,
+   * ≤300k-char corpus, one pass. */
+  function buildEvidence(answer, msgs) {
+    try {
+      var corpus = [];
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (m && m.role === 'tool' && typeof m.content === 'string') corpus.push(m.content);
+      }
+      var hay = corpus.join('\n');
+      if (hay.length > 300000) hay = hay.slice(0, 150000) + hay.slice(hay.length - 150000);
+      var claims = {};
+      var count = 0;
+      var rx = /\b\d{2,}(?:,\d{3})*(?:\.\d+)?\s?(?:%|ms|us|µs|t\/s|tok|tk|KB|MB|GB|TB)\b|\b\d{1,3}(?:\.\d+)?%|\b\d{4}-\d{2}-\d{2}\b|(?:[\s"'(`])(?:\/|~\/)[\w.@+-]+(?:\/[\w.@+-]+)+/g;
+      var m2;
+      while ((m2 = rx.exec(String(answer))) !== null && count < 40) {
+        var c = m2[0].replace(/^[\s"'(`]+/, '');
+        if (c.length >= 2 && !claims[c]) { claims[c] = 1; count++; }
+      }
+      var backed = 0, unbacked = 0, samples = [];
+      for (var k in claims) {
+        if (hay.indexOf(k) >= 0) backed++;
+        else { unbacked++; if (samples.length < 3) samples.push(k); }
+      }
+      return { backed: backed, unbacked: unbacked, samples: samples };
+    } catch (e) {
+      return null;
+    }
+  }
+
   /* ── ML gates (PLAN-ML-GATES) ──────────────────────────────────────
    * Advisors, never filters (Principle 1): the gates observe the loop and
    * emit guidance; they never block, cap, reorder, or delete. Every call
@@ -2270,8 +2311,19 @@
          * to persist into history. Empty array on plain turns (falsy length
          * checks keep old callers working). */
         transcript: (depth === 0) ? turnTranscript() : undefined,
+        /* P3.2: true only when the opt-in verify round ran and adopted its
+         * corrected answer (undefined on sub-runs/stops — no false signal). */
+        verified: (depth === 0 && !stopped) ? verified : undefined,
+        /* P3.3 advisory claim ledger (zero tokens; see buildEvidence). */
+        evidence: (depth === 0 && !stopped && answer &&
+                   typeof loopMsgs !== 'undefined' && loopMsgs)
+          ? buildEvidence(answer, loopMsgs) : undefined,
       };
       emit(stopped ? 'stop' : 'answer', { answer: clip(answer, 200), stopped: stopped });
+      if (res.evidence && (res.evidence.backed > 0 || res.evidence.unbacked > 0)) {
+        emit('evidence', { backed: res.evidence.backed, unbacked: res.evidence.unbacked,
+                           samples: res.evidence.samples });
+      }
       if (mlEnabled(d)) {
         try { sofuu.ml.track(JSON.stringify({ kind: 'run_end', run: String(runId) })); }
         catch (eMl) {}
@@ -2918,6 +2970,10 @@
       }
 
       var answer = '';
+      /* P3.2: true when the opt-in verify pass ran AND its corrected
+       * answer was adopted (advisory — any failure keeps the draft and
+       * stays false; result.verified is the only observable). */
+      var verified = false;
       /* First-request section weights for the ring's hover card (captured
        * after fitGuard in whichever path fires the turn's first request —
        * the tool loop below or finalAnswer for the plain path). */
@@ -3992,6 +4048,66 @@
           } catch (eMlL) {}
         }
         if (stopped) break;
+      }
+
+      /* ── P3.2 verify pass (opt-in def key budget.verify) ──────────────
+       * The #1 hallucination surface is the final summary: observations
+       * were grounded step-by-step, the ANSWER is free-written. For runs
+       * with real work behind them (>=4 tool steps), hand the draft back
+       * over the same context in ONE extra no-tool round and let the
+       * model confront its own numbers with the gathered evidence. Quiet
+       * (no live deltas — the draft was already on screen); advisory by
+       * construction (failure/cancel/empty → original answer stands);
+       * usage is accounted like every other round; the corrected answer
+       * is what memory persistence and finish() see below. */
+      if (d.budget.verify && !stopped && depth === 0 && stepsTotal >= 4 &&
+          answer && answer !== '(cancelled)' && answer !== '(no response)') {
+        emit('verify', { step: stepsTotal });
+        try {
+          /* Same composition as the loop's own request (ai.rs sees the
+           * verbatim prefix this run already sent): base messages —
+           * system + task — then the live transcript. loopMsgs alone has
+           * NO system row (the loop concats at the call site); a verify
+           * request without it would answer as a stranger. */
+          var vMsgs = messages.concat(loopMsgs);
+          vMsgs.push({ role: 'user', content:
+            '[verify] Draft final answer:\n"""\n' + clip(String(answer), 4000) + '\n"""\n' +
+            'Re-check its key claims (numbers, dates, paths, names) against the actual tool results gathered above. ' +
+            'Correct anything the evidence contradicts; drop anything the evidence does not support. ' +
+            'Reply with the FINAL corrected answer only — no commentary about the check itself.' });
+          var vo = aiOpts(d, opts, vMsgs, null, 0);
+          var fgV = fitGuard(vo, vo.messages);
+          vo.messages = fgV.msgs;
+          vo.cacheAnchorCount = undefined; /* anchor rides the live prefix, not copies */
+          if (lastPlan && lastPlan.maxOutput > 0) {
+            if (vo.max_tokens > 0) vo.max_tokens = Math.min(vo.max_tokens, lastPlan.maxOutput);
+            else vo.max_tokens = lastPlan.maxOutput;
+          }
+          var vOut = await streamWithRetry(vo, null, null);
+          var vu = vOut.st.usage || {};
+          own.promptTokens += vu.promptTokens || 0;
+          own.completionTokens += vu.completionTokens || 0;
+          own.cacheReadTokens += vu.cacheReadTokens || 0;
+          own.cacheWriteTokens += vu.cacheWriteTokens || 0;
+          tree.promptTokens += vu.promptTokens || 0;
+          tree.completionTokens += vu.completionTokens || 0;
+          tree.cacheReadTokens += vu.cacheReadTokens || 0;
+          tree.cacheWriteTokens += vu.cacheWriteTokens || 0;
+          own.llmCalls++; tree.llmCalls++;
+          emit('llm', { round: own.llmCalls, usage: {
+            promptTokens: vu.promptTokens || 0, completionTokens: vu.completionTokens || 0,
+            cacheReadTokens: vu.cacheReadTokens || 0, cacheWriteTokens: vu.cacheWriteTokens || 0 } });
+          var vText = vOut.parts.join('').trim();
+          if (!state.cancelled && vText &&
+              vText !== '(no response)' && vText !== '(cancelled)') {
+            answer = vText;
+            verified = true;
+            emit('verify', { step: stepsTotal, corrected: true });
+          }
+        } catch (eV) {
+          /* Advisory: a broken verify round never breaks the answer. */
+          emit('verify', { step: stepsTotal, error: clip(String((eV && eV.message) || eV), 120) });
+        }
       }
 
       await storeAndFinish(answer);

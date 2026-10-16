@@ -1,6 +1,19 @@
 # PLAN-CPU-DECODE-PEAK
 
 **Status: DRAFT — awaiting approval. Do not start any phase until the user says go.**
+**UPDATE 2026-10-16 — what has run so far, in one place:**
+- Decode pass shipped: CPU-decode default over per-matvec Metal (liquid 10.9→30.6 short-T /
+  7.7→12.7 T≈1300), calm re-measures (Spark 28.6, 8B 13.6 — old battery rows were
+  load-poisoned), t143 slab opt-in bit-exact (perf receipt pending calm box).
+- D1/D1b/D1b-L experimental receipts: plain layer-skip self-draft CLOSED on CPU (α-study);
+  n-gram spec decode PROVEN correct (96% acceptance) but verifier-bound (0.13× on liquid
+  with today's tiny-batch verifier) — unblocked by C1.
+- Battery history (#1–#6) with load-tainting labels; best calm rows: 0.6B 56 dec, 1B 49.8,
+  gptx3 37.8, MiniCPM5-2B 24.9, Spark 20, liquid 13.5, 8B 12.4, gemma 6.5, 27B 0.87.
+- PRISM hadamard block_size parameterized (any power of two) — Ternary-9B loads to the
+  type-142 gate (GGML type 142 packed-embedding kernel still owed — open model task).
+- GPU track moved to PLAN-GPU-METAL (G0 green 10.77×, batch_mlx4 landed; client wiring
+  next). C1–C5 below remain the frozen post-GPU CPU backlog.
 (2026-10-15. Companion to `PLAN-CPU-PREFILL-PEAK.md`, which is complete: prefill
 ladder shipped and default-on. This plan targets the decode side of the same
 budget using the already-proven recipes and new structural levers.)

@@ -209,6 +209,9 @@ void sofuu_metal_gemv_async(
 
 // Wait for any pending asynchronous Metal GPU dispatch to complete.
 void sofuu_metal_sync(void* ctx);
+int sofuu_metal_batch_open(void* ctx);
+void sofuu_metal_batch_gemv(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, int dtype);
+void sofuu_metal_batch_end(void* ctx);
 
 #ifdef __cplusplus
 }

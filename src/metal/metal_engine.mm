@@ -25,6 +25,7 @@ struct MetalContext {
     size_t y_buf_cap;
 
     id<MTLCommandBuffer> pending_cmd;
+    id<MTLComputeCommandEncoder> batch_enc;
     size_t pending_y_bytes;
     float* pending_y_dst;
 };
@@ -136,6 +137,7 @@ void* sofuu_metal_init(void) {
         ctx->x_buf = [dev newBufferWithLength:ctx->x_buf_cap options:MTLResourceStorageModeShared];
         ctx->y_buf = [dev newBufferWithLength:ctx->y_buf_cap options:MTLResourceStorageModeShared];
         ctx->pending_cmd = nil;
+        ctx->batch_enc = nil;
         ctx->pending_y_bytes = 0;
         ctx->pending_y_dst = nullptr;
 
@@ -1059,6 +1061,12 @@ void sofuu_metal_gemv_gate_up_multi(
 void sofuu_metal_sync(void* ctx_ptr) {
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc != nil) {
+        [ctx->batch_enc endEncoding];
+        CFRelease((__bridge CFTypeRef)ctx->batch_enc);
+        ctx->batch_enc = nil;
+        if (ctx->pending_cmd != nil) [ctx->pending_cmd commit];
+    }
     if (ctx->pending_cmd != nil) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = ctx->pending_cmd;
@@ -1126,10 +1134,79 @@ void sofuu_metal_gemv_async(
     }
 }
 
+// ── G0: real multi-op batching ─────────────────────────────────────────────
+// batch_open retains ONE uncommitted command buffer with a LIVE encoder;
+// every batch_gemv appends an op reading caller-owned MTLBuffers (so ops can
+// chain y→x with zero CPU staging); batch_end ends the encoder, commits once,
+// waits. One GPU submission per batch, independent of op count.
+int sofuu_metal_batch_open(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    sofuu_metal_sync(ctx_ptr);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        ctx->batch_enc = (__bridge id<MTLComputeCommandEncoder>)(void*)CFBridgingRetain([cmd computeCommandEncoder]);
+        ctx->pending_cmd = (__bridge id<MTLCommandBuffer>)(void*)CFBridgingRetain(cmd);
+        ctx->pending_y_dst = nullptr;
+        ctx->pending_y_bytes = 0;
+        if (ctx->batch_enc == nil) return -1;
+    }
+    return 0;
+}
+
+void sofuu_metal_batch_gemv(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, int dtype
+) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return;
+    id<MTLComputePipelineState> pso = ctx->pso_gemv_bf16;
+    if (dtype == 1) pso = ctx->pso_gemv_f16;
+    else if (dtype == 2) pso = ctx->pso_gemv_f32;
+
+    size_t aligned_offset = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+void sofuu_metal_batch_end(void* ctx_ptr) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil) { sofuu_metal_sync(ctx_ptr); return; }
+    @autoreleasepool {
+        [ctx->batch_enc endEncoding];
+        CFRelease((__bridge CFTypeRef)ctx->batch_enc);
+        ctx->batch_enc = nil;
+        id<MTLCommandBuffer> cmd = ctx->pending_cmd;
+        if (cmd != nil) {
+            [cmd commit];
+            wait_and_report(cmd, "batch gemv");
+            ctx->pending_cmd = nil;
+            CFRelease((__bridge CFTypeRef)cmd);
+        }
+    }
+}
+
 #else
 
 // Stubs for non-macOS platforms (Linux, Android, Windows)
 bool sofuu_metal_available(void) { return false; }
+int sofuu_metal_batch_open(void* ctx) { (void)ctx; return -1; }
+void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)d; }
+void sofuu_metal_batch_end(void* ctx) { (void)ctx; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

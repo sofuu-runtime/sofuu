@@ -219,3 +219,63 @@ the CPU-default flip measured). Ordered work:
 3. Acceptance: pinned outputs equivalence (GPU vs CPU within bench tolerance
    for f32/bf16; bit-identical for mlx4 dot kernels vs CPU gemv), calm A/B
    rows in the battery, explicit per-model GPU on/off table in TASKS.md.
+
+---
+
+# CPU-REMAINING — the complete "milk CPU to 100%" backlog (2026-10-15, frozen while GPU builds)
+
+State: prefill ladder fully milked (default-on AMX/int8/tile, at/above llama.cpp
+everywhere). Mid/large GGUF decode milked to the bandwidth wall (Spark 87%,
+8B 85%). The decode items below are every measured, known-cause gap left, in
+priority order. Each is env-gated + bit- or tolerance-gated per the plan rules.
+
+## C1 — tiny-batch fused decode (was D2; the highest-value CPU item)
+- Why: small models sit at 20–31% of their bandwidth ceiling (liquid 31%,
+  gemma 21%). A token = ~4ms weight sweep + ~23ms glue/dispatch. Spinning the
+  6-thread pool per-GEMV (~130+/token) with serialize-between stages.
+- Fix: one fused per-layer decode call with resident threads + internal
+  barriers (norm → qkv → rope → attention → out → FFN), no dispatcher return.
+  Double-purpose: this SAME primitive is the fast small-batch verifier that
+  unlocks speculative decoding fleet-wide (measured verifier-bound 0.13× →
+  2–5× once a 5-token batch costs ~1 token).
+- Evidence: spec A/B receipt (88cc8942f); gflop/streaming math in this file.
+- Acceptance: liquid-1.3B ≥50 tok/s short-ctx (from 30), bit-exact vs
+  per-token decode; then gemma/0.6B ports.
+- Files: lfm2.rs/block_graph.rs/model.rs lanes per owner; C++ candidates.
+
+## C2 — attention-head parallelism + KV quant (was D3)
+- Why: battery-context decode is 2–3× worse than short everywhere (liquid
+  30→13.5, gemma 16→6.5): single-threaded O(T) attention, unquantized KV.
+- Fix: (a) split attention over independent heads across the pool (bit-exact,
+  row-split precedent exists in every kernel); (b) KV q4/q8 quant hooks
+  (tier-gated, drift recorded); (c) q4_K repack-time pre-scaled decode GEMV
+  (port the Pi-5 T1 trick to the Mac decode lane).
+- Acceptance: battery-context decode ≥1.6× on liquid + 8B; bit-exact (a),
+  recorded-drift (b)/(c).
+
+## C3 — 27B multipliers (three independent items)
+- a) GDN recurrence parallelization: 48 heads are independent, processed
+  serially — head-parallel split (my lane, qwen35.rs).
+- b) LM head is ~a third of every token's sweep (65k vocab read per token):
+  LUT/bit-packed head decode or head-slab residency — measure first.
+- c) Slab sustained-rate receipt (D0): mechanism shipped (SOFUU_T143_SLAB),
+  perf receipt pending a calm window (prepass thrashed under peer pressure;
+  ~6-min prefill precedes any sustained probe).
+- Expected: with slab + (a), 0.87 → 3–6 tok/s battery-context plausible
+  before any speculative layer.
+
+## C4 — speculative decode with the fast verifier (unlocked by C1)
+- Proven: 96% acceptance, zero-sweep proposals (88cc8942f). Add per-model k
+  caps from sweep profiles (k=6–8 fat-sweep, 2–3 tight), miss→plain fallback.
+- First target: 27B-slab (plain decode pathological, batched marginal small).
+
+## C5 — hygiene items
+- liquid-350 EOS-collapse ≥~50 tokens (correctness; gating its battery row).
+- Prefill AMX w32-slab alloc churn (~104 ms/call): buffer reuse — a few % on
+  prefill, more relevant if reused for C1 chains.
+- Battery rows only from calm windows (load poisoning bit #3 and #4).
+
+Ceiling check after C1–C4: liquid ~55–70 short-ctx / 25–35 battery; 27B
+3–6 battery; spec-decode multiplies tokens-per-sweep on top. That is ~100%
+of what a 6P+4E CPU without batching tricks can express for single-request
+decode; C1's small-batch primitive is the linchpin — it also feeds GPU DG1.

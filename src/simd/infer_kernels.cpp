@@ -2263,12 +2263,24 @@ static int sofuu_gemm_q8_0_impl(const void *weight_bytes, const float *x, float 
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
-            g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
-                for (size_t g = g0; g < g1; ++g) {
-                    ggml_gemm_q8_0_4x4_q8_0(cols, out_dst + g * 4, rows,
-                        tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, tile_batch, 4, acc_k);
-                }
-            });
+            if (tile_batch % 8 == 0) {
+                // 8-act panel: each weight-tile row + weight-scale convert
+                // shared across two 4-act groups; fold order unchanged ->
+                // bit-identical outputs, fewer loads per MAC.
+                g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+                    for (size_t g = g0; g < g1; ++g) {
+                        ggml_gemm_q8_0_8ax4_q8_0(cols, out_dst + g * 4, rows,
+                            tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, tile_batch, 4, acc_k);
+                    }
+                });
+            } else {
+                g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+                    for (size_t g = g0; g < g1; ++g) {
+                        ggml_gemm_q8_0_4x4_q8_0(cols, out_dst + g * 4, rows,
+                            tile + g * nb * sizeof(tile_block_q8_0x4), qa_ptr, tile_batch, 4, acc_k);
+                    }
+                });
+            }
             if (tile_batch != batch_size) {
                 if (in_acc) {
                     sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
@@ -2796,6 +2808,18 @@ extern "C" int sofuu_gemm_q8_0_pair(const void *w1, const void *w2, const float 
         for (size_t g4 = 0; g4 < (size_t)batch_size / 4; ++g4) {
             ggml_quantize_mat_q8_0_4x4(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
         }
+    }
+    if (batch_size % 8 == 0) {
+        // 8-act pair panel: both weight groups and both act groups in one
+        // pass; fold order per output unchanged -> bit-identical.
+        g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
+            for (size_t g = g0; g < g1; ++g) {
+                ggml_gemm_q8_0_8ax4_pair_q8_0(cols, out1 + g * 4, out2 + g * 4, rows,
+                    t1 + g * nb * sizeof(tile_block_q8_0x4), t2 + g * nb * sizeof(tile_block_q8_0x4),
+                    qa_ptr, batch_size, 4);
+            }
+        });
+        return 0;
     }
     g_pool.parallel_for(0, rows / 4, [=](size_t g0, size_t g1) {
         for (size_t g = g0; g < g1; ++g) {

@@ -680,3 +680,32 @@ re-check on this model: 64/128/256 = 133.1/140.0/140.0 — 128 stays.
 Next for this model: q8_0 GEMM kernel toward the SDOT ceiling — repack-time
 scale pre-storage (the T1 pattern) and panel shapes informed by the kernel's
 per-block scale apply chain; measured target 213 -> 250-280 GMAC/s.
+
+### Ceiling push, measured (same session): 8-act panels — +1.5%, and what the miss teaches
+
+Next kernel iteration tried to buy the rest of the gap with load-sharing:
+`ggml_gemm_q8_0_8ax4_q8_0` (each weight-tile row + weight-scale convert shared
+across two consecutive 4-act groups) and the same treatment for the gate/up
+PAIR kernel (`ggml_gemm_q8_0_8ax4_pair_q8_0`), dispatched at batch % 8 == 0,
+fold order per output unchanged → bit-identical (verified: identical temp-0
+continuations, and the scale factor kept the original per-act-lane broadcast
+`u_d[j]·d0[m]` form — the tempting vector-vec factoring breaks it).
+
+Result: prefill 139.5 → 141.5 tk/s (+1.5%), twice, both prompts. The honest
+read: at batch-128 shapes with cols = 2048, each 4-row weight tile is
+~8.7 KB — the eliminated loads were L1/L2 hits, not DRAM traffic, so the
+q8_0 GEMM at ~213 GMAC/s effective is bound by the SDOT dependency chains
+(the 4-accumulator laneq form has ~8 dependent SDOTs per accumulator per
+block) and the per-block f32 scale-apply, not by loads. Closing the remaining
+distance to the ~307 paper ceiling needs a different kernel class: multi-block
+unrolling with f32-fold reassociation (greedy-equality gated, not
+bit-exact — the Phase-1 fusion precedent) or an i8mm-style wide-panel design
+this SoC cannot execute. Prefill plateau for this model on this chip:
+**~140-150 tk/s with today's fold discipline** — 2.5× llama.cpp's 55.6.
+
+Decode plateau confirmed flat too: SOFUU_SPEC_ROWS/DEPTH sweeps (3..8 × 2..4,
+env knobs now shipped) all land 17.6-20.4 tk/s — bigger trees are free but not
+more productive; the accept-rate is n-gram-quality-bound. **20.1-20.4 tk/s is
+the measured decode ceiling for this model on this box** (serial floor 8.7).
+
+Both panel kernels ship (bit-identical, positive, free). t1p9.

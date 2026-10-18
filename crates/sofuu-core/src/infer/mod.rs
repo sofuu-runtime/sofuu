@@ -867,7 +867,11 @@ impl InferEngine {
             // Propose multi-path speculative candidate tree from n-gram cache
             let speculative_tree = if let Some(ref cache) = ngram_cache {
                 if cur_pos + 6 < max_seq_len && step < options.max_tokens {
-                    let tree = lookahead::CandidateTree::build(cache, &history, 5, 3);
+                    // Candidate tree knobs: (max_tree_size, max_depth); the spec tile batch pads
+// to 8, so size 1..8 x depth 1..4 are the legal ranges (default 5 rows deep 3).
+let rows = std::env::var("SOFUU_SPEC_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(5).clamp(1, 8);
+                    let depth = std::env::var("SOFUU_SPEC_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 4);
+                    let tree = lookahead::CandidateTree::build(cache, &history, rows, depth);
                     if !tree.is_empty() {
                         Some(tree)
                     } else {

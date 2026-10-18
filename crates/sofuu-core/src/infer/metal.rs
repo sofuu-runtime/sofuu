@@ -584,6 +584,35 @@ extern "C" {
         pos: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32,
     );
+    fn sofuu_metal_batch_rmsnorm_f32w(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        w_buf: *mut c_void, w_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        dim: usize, eps: f32,
+    );
+    fn sofuu_metal_batch_llama_kv_write(
+        ctx: *mut c_void,
+        k_buf: *mut c_void, k_offset: usize,
+        v_buf: *mut c_void, v_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        kln_buf: *mut c_void, kln_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    );
+    fn sofuu_metal_batch_llama_attn(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        qln_buf: *mut c_void, qln_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    );
 }
 
 impl MetalEngine {
@@ -809,6 +838,94 @@ impl MetalEngine {
             );
         }
     }
+
+    /// RMSNorm with F32 weights (GGUF norm tensors). The weight buffer is
+    /// bound at a 256-byte-aligned offset with the element remainder passed
+    /// through the kernel; the C side does that alignment.
+    pub fn batch_rmsnorm_f32w(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        w_buf: &MetalBuffer, w_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        dim: usize, eps: f32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_rmsnorm_f32w(
+                self.ctx,
+                x_buf.handle, x_offset,
+                w_buf.handle, w_offset,
+                y_buf.handle, y_offset,
+                dim, eps,
+            );
+        }
+    }
+
+    /// Llama-shape KV append: optional f32 head-norm + RoPE (either mode),
+    /// then k(roped)/v(raw) at `pos` of this layer's cache slice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_kv_write(
+        &self,
+        k_buf: &MetalBuffer, k_offset: usize,
+        v_buf: &MetalBuffer, v_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        kln_buf: Option<&MetalBuffer>, kln_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (kln_handle, kln_off) = match kln_buf {
+            Some(b) => (b.handle, kln_offset),
+            None => (k_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_llama_kv_write(
+                self.ctx,
+                k_buf.handle, k_offset,
+                v_buf.handle, v_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                kln_handle, kln_off,
+                has_norm, pos,
+                head_dim, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// Llama-shape GQA decode attention: optional f32 q-norm + RoPE, softmax
+    /// over the full cache prefix, weighted V. kln/qln buffers are only read
+    /// when has_norm is set (a None binding is a placeholder there).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        qln_buf: Option<&MetalBuffer>, qln_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (qln_handle, qln_off) = match qln_buf {
+            Some(b) => (b.handle, qln_offset),
+            None => (q_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_llama_attn(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                qln_handle, qln_off,
+                out_buf.handle, out_offset,
+                has_norm, pos,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+            );
+        }
+    }
 }
 
 
@@ -1011,6 +1128,216 @@ mod batch_gguf_parity_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod q4k_crafted_probe {
     use super::*;
+
+    /// GPU2.1 acceptance: the one-commit glue kernels (f32-weight RMSNorm,
+    /// QK-norm + RoPE + KV append, GQA attention) match a CPU reference built
+    /// from the SAME free functions the CPU path uses (quant::batched_
+    /// rmsnorm_in_place + quant::rope_style + plain softmax), for BOTH rope
+    /// interleave modes. Same tolerance class as the GEMV gates above:
+    /// different summation order, no different values.
+    #[test]
+    fn llama_one_commit_kernels_match_cpu_reference() {
+        use crate::infer::quant::{batched_rmsnorm_in_place, rope_style};
+
+        let engine = MetalEngine::new().expect("metal engine");
+        let dim = 128usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let hd = 32usize;
+        let max_seq = 64usize;
+        let pos = 7usize;
+        let eps = 1e-5f32;
+        let rope_base = 10000.0f32;
+
+        for rope_mode in [0u32, 1u32] {
+            // ── deterministic inputs ──
+            let x: Vec<f32> = (0..dim)
+                .map(|i| ((i % 13) as f32) * 0.5f32 - 3.0f32)
+                .collect();
+            let q0: Vec<f32> = (0..n_heads * hd)
+                .map(|i| ((i % 9) as f32) * 0.25f32 - 1.0f32)
+                .collect();
+            let k0: Vec<f32> = (0..n_kv * hd)
+                .map(|i| ((i % 7) as f32) * 0.5f32 - 1.5f32)
+                .collect();
+            let v0: Vec<f32> = (0..n_kv * hd)
+                .map(|i| ((i % 11) as f32) * 0.125f32 - 0.5f32)
+                .collect();
+            let q_ln: Vec<f32> = (0..hd).map(|i| 1.0f32 + (i % 5) as f32 * 0.05).collect();
+            let k_ln: Vec<f32> = (0..hd).map(|i| 1.0f32 + (i % 3) as f32 * 0.07).collect();
+            let norm_w: Vec<f32> = (0..dim)
+                .map(|i| 0.9f32 + (i % 6) as f32 * 0.03)
+                .collect();
+
+            // ── CPU reference ──
+            let mut xn = vec![0f32; dim];
+            crate::infer::quant::rmsnorm(&mut xn, &x, &norm_w, eps);
+            let mut q = q0.clone();
+            let mut k = k0.clone();
+            batched_rmsnorm_in_place(&mut q, &q_ln, n_heads, hd, eps);
+            batched_rmsnorm_in_place(&mut k, &k_ln, n_kv, hd, eps);
+            rope_style(&mut q, n_heads, hd, pos, rope_base, rope_mode as i32);
+            rope_style(&mut k, n_kv, hd, pos, rope_base, rope_mode as i32);
+            let mut k_cache = vec![0f32; n_kv * max_seq * hd];
+            let mut v_cache = vec![0f32; n_kv * max_seq * hd];
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + pos) * hd;
+                k_cache[off..off + hd].copy_from_slice(&k[kv * hd..(kv + 1) * hd]);
+                v_cache[off..off + hd].copy_from_slice(&v0[kv * hd..(kv + 1) * hd]);
+            }
+            let mut head_out = vec![0f32; n_heads * hd];
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            for h in 0..n_heads {
+                let kv = h / (n_heads / n_kv);
+                let qh = &q[h * hd..(h + 1) * hd];
+                let seq = pos + 1;
+                let mut scores = vec![0f32; seq];
+                let mut mx = f32::NEG_INFINITY;
+                for t in 0..seq {
+                    let base = (kv * max_seq + t) * hd;
+                    let mut dot = 0f32;
+                    for i in 0..hd {
+                        dot += qh[i] * k_cache[base + i];
+                    }
+                    scores[t] = dot * scale;
+                    mx = mx.max(scores[t]);
+                }
+                let mut sum = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in scores.iter_mut() {
+                    *s /= sum;
+                }
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for t in 0..seq {
+                        acc += scores[t] * v_cache[(kv * max_seq + t) * hd + d];
+                    }
+                    head_out[h * hd + d] = acc;
+                }
+            }
+
+            // ── GPU one-commit chain ──
+            let page = 16384usize;
+            // weights buffer: q_ln @0, k_ln@128, attn_norm@4096 bytes
+            let mut wb = vec![0u8; 8192];
+            wb[0..hd * 4].copy_from_slice(unsafe { std::slice::from_raw_parts(q_ln.as_ptr() as *const u8, hd * 4) });
+            wb[128..128 + hd * 4].copy_from_slice(unsafe { std::slice::from_raw_parts(k_ln.as_ptr() as *const u8, hd * 4) });
+            wb[4096..4096 + dim * 4].copy_from_slice(unsafe { std::slice::from_raw_parts(norm_w.as_ptr() as *const u8, dim * 4) });
+            let wb = engine.register_zerocopy_buffer(&wb).expect("wbuf");
+
+            // act slab (f32 offsets, byte offsets = *4): x@0 xn@dim qa@2dim ka@3dim ... —
+            // simple fixed map:
+            let f_x = 0usize;
+            let f_xn = dim;
+            let f_qa = 2 * dim;
+            let f_ka = 3 * dim;
+            let f_va = f_ka + n_kv * hd;
+            let f_ao = f_va + n_kv * hd;
+            let slab_f32 = f_ao + n_heads * hd + 256;
+            let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+            let slab_ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    slab_alloc,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(slab_ptr != libc::MAP_FAILED);
+            let slab: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, slab_alloc) };
+            let kv_alloc = page; // n_kv*max_seq*hd*4 = 16KB = one page
+            let k_ptr = unsafe {
+                libc::mmap(std::ptr::null_mut(), kv_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            };
+            let v_ptr = unsafe {
+                libc::mmap(std::ptr::null_mut(), kv_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            };
+            assert!(k_ptr != libc::MAP_FAILED && v_ptr != libc::MAP_FAILED);
+            let k_cache_b: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(k_ptr as *mut u8, kv_alloc) };
+            let v_cache_b: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(v_ptr as *mut u8, kv_alloc) };
+
+            let put = |slab: &mut [u8], f_off: usize, vals: &[f32]| {
+                unsafe {
+                    std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut f32, slab.len() / 4)
+                        [f_off..f_off + vals.len()]
+                        .copy_from_slice(vals)
+                }
+            };
+            put(slab, f_x, &x);
+            put(slab, f_qa, &q0);
+            put(slab, f_ka, &k0);
+            put(slab, f_va, &v0);
+
+            let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+            let k_buf = engine.register_zerocopy_buffer(k_cache_b).expect("kc");
+            let v_buf = engine.register_zerocopy_buffer(v_cache_b).expect("vc");
+
+            assert!(engine.batch_open());
+            engine.batch_rmsnorm_f32w(&slab_buf, f_x * 4, &wb, 4096, &slab_buf, f_xn * 4, dim, eps);
+            engine.batch_llama_kv_write(
+                &slab_buf, f_ka * 4,
+                &slab_buf, f_va * 4,
+                &k_buf, 0,
+                &v_buf, 0,
+                Some(&wb), 128,
+                1, pos as u32,
+                hd as u32, n_kv as u32, max_seq as u32,
+                eps, rope_base, rope_mode,
+            );
+            engine.batch_llama_attn(
+                &slab_buf, f_qa * 4,
+                &k_buf, 0,
+                &v_buf, 0,
+                Some(&wb), 0,
+                &slab_buf, f_ao * 4,
+                1, pos as u32,
+                hd as u32, n_heads as u32, n_kv as u32, max_seq as u32,
+                eps, rope_base, rope_mode,
+            );
+            engine.batch_end();
+
+            let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, slab_alloc / 4) };
+            // xn parity: only summation order differs
+            for i in 0..dim {
+                let a = view[f_xn + i];
+                let b = xn[i];
+                assert!(
+                    (a - b).abs() <= 2e-4 * (1.0 + b.abs()),
+                    "rope_mode {rope_mode}: xn[{i}] {a} vs {b}"
+                );
+            }
+            // head_out parity
+            for i in 0..n_heads * hd {
+                let a = view[f_ao + i];
+                let b = head_out[i];
+                assert!(
+                    (a - b).abs() <= 2e-3 * (1.0 + b.abs()),
+                    "rope_mode {rope_mode}: head_out[{i}] {a} vs {b}"
+                );
+            }
+            // KV append parity: roped k lands in the cache at pos
+            let k_view = unsafe { std::slice::from_raw_parts(k_ptr as *const f32, kv_alloc / 4) };
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + pos) * hd;
+                for i in 0..hd {
+                    let a = k_view[off + i];
+                    let b = k_cache[off + i];
+                    assert!(
+                        (a - b).abs() <= 1e-5 * (1.0 + b.abs()),
+                        "rope_mode {rope_mode}: k_cache[{off}+{i}] {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
 
     fn run_gpu_ty(ty: u32, wbytes: &[u8], x: &[f32], engine: &MetalEngine) -> Vec<f32> {
         let rows = wbytes.len() / ((x.len() / 256) * 144);

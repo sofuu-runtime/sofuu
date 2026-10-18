@@ -62,6 +62,37 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   calibration against the older calm-window CPU rows still pending a clean
   battery; the streaming-wall receipt for the WHOLE-STEP design does not apply
   here (this is the fewer-commits hybrid, CPU attention intact).
+- **GPU2.1 wave (2026-10-18) — ONE commit per layer for the llama/GGUF shape**:
+  three new kernels (`rmsnorm_f32w` f32-weight RMSNorm, `llama_kv_write`
+  per-kv-head QK-norm + RoPE (split-half AND interleaved) + KV append,
+  `llama_attn` per-q-head GQA decode attention over the full cache prefix)
+  close the CPU glue inside the batch: Norms read f32 weights straight from
+  the weight mmap (256-byte-aligned bind + element-remainder constant), the
+  resume-flags (`has_norm`, `rope_mode`) are bind-time constants, and q/k/norm
+  biases gate at arm (any bias / sliding window / head_dim>128 / f16 norms /
+  misaligned offset → the 3-commit client, loudly labeled in the arm line).
+  The KV cache is no longer duplicated: `k_cache`/`v_cache` are allocated
+  BEFORE `arm()` and registered zero-copy, so GPU kernels and the CPU
+  fallback read and write the SAME memory (576MB saved + fallback coherence
+  by construction; 8B = 36 layers x 8 kv heads x 4096 x 128 f32 x 2).
+  `layers_one_commit` runs 14 batch ops per layer behind ONE
+  batch_open/batch_end (was 3 commits + host round trips); x and the KV
+  caches stay command-buffer-resident across layers, x syncs back once per
+  token.
+  Receipts (2026-10-18, window load 6.3 — opencode peer on 74% CPU, TAINTED):
+  Qwen3-8B-q4_K_M armed "ONE commit/layer" (36 layers, act 0MB, kv-shared
+  576MB); temperature-0 decode output is IDENTICAL to the `--cpu` run on the
+  same prompt ("The loader measures panels on all cores...") — first
+  end-to-end GPU-vs-CPU text parity receipt for the llama shape including the
+  new QK-norm/RoPE-fused attention kernels. Llama-3.2-1B-q8_0 through the same
+  one-commit path: 27.7 t/s decode, 243 t/s prefill. 8B decode stayed ~2.1 t/s
+  in the tainted window — same as the 3-commit client — which LOCALIZES the
+  remaining 8B cost to the GEMV kernels' streaming bandwidth itself
+  (one-row-per-simdgroup 4B scalar loads => ~10 GB/s effective on the ~5GB
+  weight stream), NOT to commit waits or the new attention path: commit-wait
+  elimination was necessary but not sufficient, and the panel-GEMV rewrite
+  (2-8 rows per threadgroup, 16B loads, llama.cpp-class) is now the measured
+  #1 lever for 8B.
 Not landed, deferred with receipts: Spark/Qwen35/block_graph/gptx3 whole-step
 clients (bespoke ports of the same pattern; block_graph already has a per-op
 hybrid), ternary PTQ1_0/142 GPU kernels (CPU slab optimal per plan), and G3

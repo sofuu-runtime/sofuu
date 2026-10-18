@@ -470,6 +470,11 @@ impl TransformerModel {
             }
         }
 
+        // KV caches hoisted so the GPU client can register them zero-copy:
+        // one physical cache, written by whichever path runs (GPU kernels or
+        // the CPU fallback), read by both.
+        let k_cache = AnonBuffer::new(kv_cache_size);
+        let v_cache = AnonBuffer::new(kv_cache_size);
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let gpu = {
             let wanted = gpu_allowed
@@ -477,7 +482,7 @@ impl TransformerModel {
                 && std::env::var_os("SOFUU_GPU_DECODE").is_some()
                 && gguf.resident.is_none();
             if wanted {
-                GgufGpu::arm(&gguf, &config, &layers, vocab_size)
+                GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2)
             } else {
                 None
             }
@@ -517,8 +522,8 @@ impl TransformerModel {
             ffn_up_batch: vec![0.0f32; max_prefill_batch() * hidden_dim],
             ffn_out_batch: vec![0.0f32; max_prefill_batch() * dim],
 
-            k_cache: AnonBuffer::new(kv_cache_size),
-            v_cache: AnonBuffer::new(kv_cache_size),
+            k_cache,
+            v_cache,
             kv_dim,
             sliding_window: detected_sliding_window,
             sink_tokens: 4,
@@ -1862,6 +1867,12 @@ impl TransformerModel {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn execute_layers_gpu(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
         let end = end_layer.min(self.config.n_layers);
+        // Wrap-around (context past max_seq_len) stays on the 3-commit path,
+        // whose KV writes match the CPU modulo arithmetic.
+        if self.gpu.as_ref().map(|g| g.one_commit).unwrap_or(false) && pos < self.config.max_seq_len {
+            self.layers_one_commit(pos, start_layer, end);
+            return;
+        }
         let windows: Vec<usize> = (0..self.config.n_layers)
             .map(|i| self.layer_sliding_window(i))
             .collect();
@@ -1870,9 +1881,121 @@ impl TransformerModel {
         }
     }
 
+    /// GPU2.1 decode step: ALL layers across ONE commit each. Norms run as
+    /// in-batch kernels reading f32 weights straight from the weight mmap;
+    /// q/k RoPE + QK-norm fuse into the KV-write/attention kernels; x, the
+    /// activation slots and the KV caches (registered zero-copy, shared with
+    /// the CPU) are all command-buffer-resident between layers; x syncs back
+    /// to Vec once per token.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let norm_eps = self.config.norm_eps;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let rope_mode: u32 = if self.config.rope_interleaved { 1 } else { 0 };
+        let gguf = &self.gguf;
+
+        let g = self.gpu.as_mut().expect("one_commit without gpu");
+        g.slot_f32_mut(g.slots.x, dim).copy_from_slice(&self.x[..dim]);
+
+        for layer_idx in start_layer..end_layer {
+            let (attn_norm_off, ffn_norm_off, q_norm_off, k_norm_off) = {
+                let l = &self.layers[layer_idx];
+                (
+                    gguf.data_offset + l.attn_norm.offset,
+                    gguf.data_offset + l.ffn_norm.offset,
+                    l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset),
+                    l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset),
+                )
+            };
+            let has_q = u32::from(q_norm_off.is_some());
+            let has_k = u32::from(k_norm_off.is_some());
+            let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
+            let kc_layer = layer_idx * kv_head_bytes;
+            let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
+            let (qln_buf, qln_off) = (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
+            let l = &self.layers[layer_idx];
+
+            assert!(g.engine.batch_open());
+            g.engine.batch_rmsnorm_f32w(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, attn_norm_off,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps,
+            );
+            g.engine.batch_gguf(l.attn_q.tensor_type, &g.w_buf,
+                gguf.data_offset + l.attn_q.offset,
+                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.qa,
+                n_heads * head_dim, dim);
+            g.engine.batch_gguf(l.attn_k.tensor_type, &g.w_buf,
+                gguf.data_offset + l.attn_k.offset,
+                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.ka,
+                n_kv_heads * head_dim, dim);
+            g.engine.batch_gguf(l.attn_v.tensor_type, &g.w_buf,
+                gguf.data_offset + l.attn_v.offset,
+                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.va,
+                n_kv_heads * head_dim, dim);
+            g.engine.batch_llama_kv_write(
+                &g.act_buf, g.slots.ka,
+                &g.act_buf, g.slots.va,
+                &g.k_buf, kc_layer,
+                &g.v_buf, kc_layer,
+                kln_buf, kln_off,
+                has_k, pos as u32,
+                head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
+                norm_eps, rope_freq_base, rope_mode,
+            );
+            g.engine.batch_llama_attn(
+                &g.act_buf, g.slots.qa,
+                &g.k_buf, kc_layer,
+                &g.v_buf, kc_layer,
+                qln_buf, qln_off,
+                &g.act_buf, g.slots.ao,
+                has_q, pos as u32,
+                head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                norm_eps, rope_freq_base, rope_mode,
+            );
+            g.engine.batch_gguf(l.attn_output.tensor_type, &g.w_buf,
+                gguf.data_offset + l.attn_output.offset,
+                &g.act_buf, g.slots.ao, &g.act_buf, g.slots.xo,
+                dim, n_heads * head_dim);
+            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
+            g.engine.batch_rmsnorm_f32w(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, ffn_norm_off,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps,
+            );
+            g.engine.batch_gguf(l.ffn_gate.tensor_type, &g.w_buf,
+                gguf.data_offset + l.ffn_gate.offset,
+                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.gate,
+                hidden_dim, dim);
+            g.engine.batch_gguf(l.ffn_up.tensor_type, &g.w_buf,
+                gguf.data_offset + l.ffn_up.offset,
+                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.up,
+                hidden_dim, dim);
+            g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim);
+            g.engine.batch_gguf(l.ffn_down.tensor_type, &g.w_buf,
+                gguf.data_offset + l.ffn_down.offset,
+                &g.act_buf, g.slots.gate, &g.act_buf, g.slots.xo,
+                dim, hidden_dim);
+            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
+            g.engine.batch_end();
+        }
+        let g = self.gpu.as_mut().expect("one_commit without gpu");
+        self.x[..dim].copy_from_slice(g.slot_f32(g.slots.x, dim));
+    }
+
     /// One decoder layer: CPU glue + three Metal commits. All GPU ops read
     /// and write slab slots; the CPU copies f32 values in and out around the
     /// commits (the same between-submissions coherence the G0 rig proves).
+    /// Kept as the fallback for shapes the one-commit kernels don't cover
+    /// (sliding windows, biases, past-4096 wraparound).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn gpu_layer_step(&mut self, layer_idx: usize, pos: usize, sliding_window: usize) {
         let dim = self.config.dim;
@@ -2033,7 +2156,6 @@ impl TransformerModel {
         self.ffn_out.copy_from_slice(g.slot_f32(g.slots.xo, dim));
         inline_mad(&mut self.x, &self.ffn_out, 1.0);
     }
-
     fn forward_impl(&mut self, token_id: u32, pos: usize, compute_logits: bool) {
         let dim = self.config.dim;
 
@@ -2121,6 +2243,7 @@ fn gguf_gpu_page(bytes: usize) -> usize {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 struct GgufGpuSlots {
+    x: usize,
     xn: usize,
     qa: usize,
     ka: usize,
@@ -2142,6 +2265,15 @@ pub struct GgufGpu {
     /// MTLBuffers are released before the mmaps they wrap.
     act_buf: crate::infer::metal::MetalBuffer,
     act: crate::infer::model::AnonBuffer,
+    /// The MODEL's own KV caches registered zero-copy: the GPU kernels and
+    /// the CPU fallback read and write the same memory, so no per-layer sync
+    /// copy exists and a fallback forward is coherent by construction.
+    /// Layout per layer slice [kv][seq][head_dim], matching the CPU caches.
+    k_buf: crate::infer::metal::MetalBuffer,
+    v_buf: crate::infer::metal::MetalBuffer,
+    /// GPU2.1: whole layer in ONE command buffer (norms/QK-norm/RoPE/KV/
+    /// attention all as batch ops). False = the 3-commit G2 client.
+    one_commit: bool,
     slots: GgufGpuSlots,
 }
 
@@ -2152,6 +2284,9 @@ impl GgufGpu {
         config: &ModelConfig,
         layers: &[LayerWeights],
         _vocab: usize,
+        k_cache: &AnonBuffer,
+        v_cache: &AnonBuffer,
+        is_gemma2: bool,
     ) -> Option<Self> {
         if config.max_seq_len > 4096 {
             eprintln!("[gguf-gpu] disabled: seq > 4096 above the kernel range");
@@ -2175,13 +2310,23 @@ impl GgufGpu {
         let engine = crate::infer::metal::MetalEngine::new()?;
         let w_buf = engine.register_zerocopy_only(gguf.mmap.as_slice())?;
 
+        // ── One-commit gates (GPU2.1): any miss keeps the 3-commit client ──
+        let one_commit_reason = Self::one_commit_blocker(gguf, config, layers, is_gemma2);
+        let one_commit = one_commit_reason.is_none();
+        if let Some(ref why) = one_commit_reason {
+            eprintln!("[gguf-gpu] one-commit disabled ({why}); using the 3-commit client");
+        }
+
         let dim = config.dim;
         let q_rows = config.n_heads * config.head_dim;
         let kv_rows = config.n_kv_heads * config.head_dim;
         let inter = config.hidden_dim;
         let vocab = config.vocab_size;
+        let kv_region_bytes =
+            layers.len() * config.n_kv_heads * config.max_seq_len * config.head_dim * 4;
         let mut cursor = 0usize;
         let slots = GgufGpuSlots {
+            x: gguf_gpu_slot(&mut cursor, dim),
             xn: gguf_gpu_slot(&mut cursor, dim),
             qa: gguf_gpu_slot(&mut cursor, q_rows),
             ka: gguf_gpu_slot(&mut cursor, kv_rows),
@@ -2197,15 +2342,80 @@ impl GgufGpu {
         let act_slice: &[u8] =
             unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
         let act_buf = engine.register_zerocopy_only(act_slice)?;
+        let k_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, kv_region_bytes)
+        };
+        let v_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(v_cache.as_ptr() as *const u8, kv_region_bytes)
+        };
+        let k_buf = engine.register_zerocopy_only(k_bytes)?;
+        let v_buf = engine.register_zerocopy_only(v_bytes)?;
         eprintln!(
-            "[gguf-gpu] decode client armed: dim={dim} heads={}/{} hd={} inter={inter} vocab={vocab} layers={} act={}MB",
+            "[gguf-gpu] decode client armed ({}): dim={dim} heads={}/{} hd={} inter={inter} vocab={vocab} layers={} act={}MB kv-shared={}MB",
+            if one_commit { "ONE commit/layer" } else { "3-commit" },
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
             layers.len(),
             act_bytes / (1024 * 1024),
+            kv_region_bytes / (1024 * 1024),
         );
-        Some(Self { engine, w_buf, act_buf, act, slots })
+        Some(Self { engine, w_buf, act_buf, act, k_buf, v_buf, one_commit, slots })
+    }
+
+    /// One-commit eligibility: every layer full-attention, no biases, f32
+    /// norms 4-byte aligned, head geometry the kernels support. Any miss
+    /// names itself so the arm log is self-explanatory.
+    fn one_commit_blocker(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        layers: &[LayerWeights],
+        is_gemma2: bool,
+    ) -> Option<&'static str> {
+        if config.head_dim > 128 {
+            return Some("head_dim > 128 above kernel accumulators");
+        }
+        if config.n_kv_heads == 0 || config.n_heads % config.n_kv_heads != 0 {
+            return Some("n_heads not divisible by n_kv_heads");
+        }
+        for i in 0..layers.len() {
+            if TransformerModel::calc_layer_sliding_window(is_gemma2, config.sliding_window, i) != 0 {
+                return Some("sliding-window layers present");
+            }
+            let l = &layers[i];
+            if l.attn_q_bias.is_some() || l.attn_k_bias.is_some() || l.attn_v_bias.is_some() {
+                return Some("attention biases present");
+            }
+            let f32_4b = |tv: &Option<TensorView>, what: &'static str| -> Option<&'static str> {
+                if let Some(tv) = tv {
+                    if tv.tensor_type != GGML_TYPE_F32 {
+                        return Some(what);
+                    }
+                    if (gguf.data_offset + tv.offset) % 4 != 0 {
+                        return Some("norm weights not 4-byte aligned");
+                    }
+                }
+                None
+            };
+            if l.attn_norm.tensor_type != GGML_TYPE_F32 || l.ffn_norm.tensor_type != GGML_TYPE_F32 {
+                return Some("block norms not f32");
+            }
+            if (gguf.data_offset + l.attn_norm.offset) % 4 != 0
+                || (gguf.data_offset + l.ffn_norm.offset) % 4 != 0
+            {
+                return Some("norm weights not 4-byte aligned");
+            }
+            if let Some(why) = f32_4b(&l.attn_q_norm, "q_norm not f32") {
+                return Some(why);
+            }
+            if let Some(why) = f32_4b(&l.attn_k_norm, "k_norm not f32") {
+                return Some(why);
+            }
+        }
+        if layers.len() * config.n_kv_heads * config.max_seq_len * config.head_dim * 4 % 16384 != 0 {
+            return Some("k-v region not page-multiple");
+        }
+        None
     }
 
     #[inline]

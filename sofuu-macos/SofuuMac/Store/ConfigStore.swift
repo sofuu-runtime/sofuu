@@ -364,6 +364,13 @@ final class UiPrefs {
         set { d.set(newValue, forKey: "ideMode") }
     }
 
+    /// IDE auto save — buffers are written back 0.8 s after the last edit
+    /// (on by default; the tab-strip toggle flips it).
+    var ideAutoSave: Bool {
+        get { d.object(forKey: "ideAutoSave") as? Bool ?? true }
+        set { d.set(newValue, forKey: "ideAutoSave") }
+    }
+
     /// IDE panel widths in points (the two draggable splitters). 0 means
     /// never dragged — the layout keeps its default. Clamped on both read
     /// and write so a stray write can't squeeze the editor out.

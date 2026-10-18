@@ -68,14 +68,26 @@ struct IdeLayout: View {
 
     private var editorBody: some View {
         ZStack(alignment: .center) {
+            c.bgRaised.ignoresSafeArea()
             if let path = store.state.activeTab, store.state.openTabs.contains(path) {
-                CodeEditor(
-                    text: Binding(
-                        get: { store.buffer(path) },
-                        set: { store.updateBuffer(path, $0) }),
-                    path: path,
-                    dark: scheme == .dark,
-                    onEdited: { store.updateBuffer(path, $0) })
+                HStack(spacing: 0) {
+                    // The gutter renders even before the coordinator exists
+                    // (first-pass ordering) and fills in on its first pulse.
+                    LineGutter(pulse: store.ideGutter, coordinator: store.ideCoordinator)
+                        .frame(width: CodeEditor.gutterWidth)
+                    CodeEditor(
+                        text: Binding(
+                            get: { store.buffer(path) },
+                            set: { store.updateBuffer(path, $0) }),
+                        path: path,
+                        dark: scheme == .dark,
+                        store: store,
+                        onEdited: { text in
+                            store.updateBuffer(path, text)
+                            store.scheduleAutoSave(path)
+                        })
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             } else {
                 Text(store.state.openTabs.isEmpty
                         ? "Open a file from the tree"
@@ -96,13 +108,31 @@ struct IdeLayout: View {
                     }
                 }
                 // Start the tabs ALIGNED WITH THE CODE TEXT (past the
-                // line-number ruler) — clear of the separator and never
-                // floating over the ruler column.
+                // line-number gutter) — clear of the separator.
                 .padding(.leading, 52)
                 .padding(.trailing, 4)
             }
+            .frame(maxWidth: .infinity)
+
+            if !store.state.openTabs.isEmpty {
+                openFilesMenu
+            }
 
             Spacer(minLength: 4)
+
+            // Auto save: writes the buffer 0.8 s after the last edit.
+            Button {
+                store.setIdeAutoSave(!store.ideAutoSaveOn)
+            } label: {
+                Image(systemName: "arrow.down.doc")
+                    .font(.system(size: 12))
+                    .foregroundStyle(store.ideAutoSaveOn ? c.accent : c.textFaint)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(store.ideAutoSaveOn ? "Auto save is ON" : "Auto save is OFF")
+            .padding(.trailing, 2)
 
             if let path = store.state.activeTab, store.isDirty(path) {
                 Button {
@@ -120,6 +150,37 @@ struct IdeLayout: View {
             }
         }
         .frame(minHeight: 34)
+    }
+
+    /// The ▾ menu: every open file (dirty dot included) for quick
+    /// switching, plus Close-all — "see and manage all the files".
+    private var openFilesMenu: some View {
+        Menu {
+            ForEach(store.state.openTabs, id: \.self) { path in
+                Button {
+                    store.setActiveTab(path)
+                } label: {
+                    if path == store.state.activeTab {
+                        Label((path as NSString).lastPathComponent, systemImage: "checkmark")
+                    } else if store.isDirty(path) {
+                        Label((path as NSString).lastPathComponent, systemImage: "circle.fill")
+                    } else {
+                        Text((path as NSString).lastPathComponent)
+                    }
+                }
+            }
+            Divider()
+            Button("Close all tabs") { store.closeAllTabs() }
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(c.textMuted)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("All open files")
     }
 
     // ── Right: agent panel ───────────────────────────────────────────

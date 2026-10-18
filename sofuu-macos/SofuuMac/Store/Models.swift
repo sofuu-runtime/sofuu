@@ -32,7 +32,6 @@ struct AppState {
     var liveThink = ""         // joined think deltas (the "▸ thinking …" line)
     var ctx: CtxMeter?
     var ctxCache: [String: CtxMeter] = [:]
-    var drawerOpen = false
     var sheet: String? // "model" | "effort" | "layers" | "mode" | "permissions"
     var modelsCache: [String: ModelCacheEntry] = [:]
     /// Absolute paths of the GGUF models imported into ~/.sofuu/models.

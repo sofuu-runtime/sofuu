@@ -124,7 +124,7 @@ final class GlobalKeyMonitor {
             guard event.keyCode == 53 else { return event } // esc
             let hasOverlay = MainActor.assumeIsolated {
                 store.state.settingsOpen || store.state.preview != nil
-                    || store.state.sheet != nil || store.state.drawerOpen
+                    || store.state.sheet != nil
             }
             if hasOverlay {
                 Task { @MainActor in _ = store.closeTopOverlay() }

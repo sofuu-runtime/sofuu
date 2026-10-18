@@ -1214,6 +1214,14 @@ final class AppStore: ObservableObject {
 
     // ── IDE mode ────────────────────────────────────────────────────────
 
+    /// The code gutter's observable state — owned here (stable class) so
+    /// it survives tab switches; only the gutter Canvas observes it, so a
+    /// 60 Hz scroll never re-renders the shell.
+    let ideGutter = GutterModel()
+    /// The live editor coordinator — the gutter Canvas reads the text
+    /// view's fresh geometry from it at draw time.
+    weak var ideCoordinator: CodeEditor.Coordinator?
+
     /// path → current editor text (live binding for the code viewport).
     var fileBuffers: [String: String] = [:]
     /// path → on-disk text at open/reload time (dirty detection + revert).
@@ -1265,8 +1273,6 @@ final class AppStore: ObservableObject {
     }
 
     /// The close button's first tap arms; second tap discards.
-    func isCloseArmed(_ path: String) -> Bool { state.tabDirty[path] == nil && state.tabDirty.index(forKey: path) != nil }
-
     func setActiveTab(_ path: String) {
         state.activeTab = path
         // Re-read from disk if it changed since it was opened (the agent
@@ -1276,7 +1282,12 @@ final class AppStore: ObservableObject {
 
     func updateBuffer(_ path: String, _ text: String) {
         fileBuffers[path] = text
-        state.tabDirty[path] = text != diskContents[path]
+        // Only publish when the dirty FLAG flips — a per-keystroke write
+        // would re-render the whole shell on every character.
+        let dirty = text != diskContents[path]
+        if state.tabDirty[path] != dirty {
+            state.tabDirty[path] = dirty
+        }
     }
 
     func buffer(_ path: String) -> String { fileBuffers[path] ?? "" }
@@ -1310,6 +1321,155 @@ final class AppStore: ObservableObject {
     func saveActiveTab() {
         guard let path = state.activeTab else { return }
         if let err = saveFile(path) { systemRow(err) }
+    }
+
+    // ── IDE file operations (create / rename / delete / auto-save) ──────
+
+    var ideAutoSaveOn: Bool { uiPrefs.ideAutoSave }
+
+    func setIdeAutoSave(_ on: Bool) {
+        uiPrefs.ideAutoSave = on
+        if !on {
+            for (_, work) in autoSaveWork { work.cancel() }
+            autoSaveWork = [:]
+        }
+    }
+
+    private var autoSaveWork: [String: DispatchWorkItem] = [:]
+    private var autoSaveErrorNotified = false
+
+    /// Debounced auto-write of the buffer (real-IDE auto save). Silent —
+    /// only a failure surfaces, and only once until a save succeeds.
+    /// Per-path work items: typing in file B must not cancel file A's
+    /// pending save — each path's debounce runs to completion on its own.
+    func scheduleAutoSave(_ path: String) {
+        guard uiPrefs.ideAutoSave, fileBuffers[path] != nil else { return }
+        autoSaveWork[path]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let text = self.fileBuffers[path] else { return }
+            _ = text // buffer is the source of truth; saveFile reads it
+            if let err = self.saveFile(path) {
+                if !self.autoSaveErrorNotified {
+                    self.autoSaveErrorNotified = true
+                    self.systemRow("Auto save failed for \(URL(fileURLWithPath: path).lastPathComponent): \(err)")
+                }
+            } else {
+                self.autoSaveErrorNotified = false
+            }
+        }
+        autoSaveWork[path] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+    }
+
+    /// Sanitize an entry name from the tree composer.
+    private func validateEntryName(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { return nil }
+        return name
+    }
+
+    /// Create + open a new empty file in `dir`. Returns an error line.
+    @discardableResult
+    func createFile(at dir: String, name: String) -> String? {
+        guard let clean = validateEntryName(name) else { return "That file name is not usable." }
+        let path = dir + "/" + clean
+        if FileManager.default.fileExists(atPath: path) {
+            return "\(clean) already exists."
+        }
+        do {
+            try Data().write(to: URL(fileURLWithPath: path))
+        } catch {
+            return "Could not create \(clean): \(error.localizedDescription)"
+        }
+        openFile(path)
+        return nil
+    }
+
+    /// Create a new folder in `dir`. Returns an error line.
+    @discardableResult
+    func createFolder(at dir: String, name: String) -> String? {
+        guard let clean = validateEntryName(name) else { return "That folder name is not usable." }
+        let path = dir + "/" + clean
+        if FileManager.default.fileExists(atPath: path) {
+            return "\(clean) already exists."
+        }
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+        } catch {
+            return "Could not create \(clean): \(error.localizedDescription)"
+        }
+        return nil
+    }
+
+    /// Rename / move a file or folder; open tabs follow if the path (or a
+    /// folder prefix) matches. Returns an error line.
+    @discardableResult
+    func renameFile(_ path: String, newName: String) -> String? {
+        guard let clean = validateEntryName(newName) else { return "That name is not usable." }
+        let dir = (path as NSString).deletingLastPathComponent
+        let target = dir + "/" + clean
+        guard target != path else { return nil }
+        guard !FileManager.default.fileExists(atPath: target) else {
+            return "\(clean) already exists."
+        }
+        do {
+            try FileManager.default.moveItem(atPath: path, toPath: target)
+        } catch {
+            return "Rename failed: \(error.localizedDescription)"
+        }
+        remapTabPaths(path, to: target)
+        return nil
+    }
+
+    /// Trash a file or folder and close matching tabs. Returns an error line.
+    @discardableResult
+    func deleteFile(_ path: String) -> String? {
+        guard path != state.projectDir else { return "That is the workspace folder." }
+        let url = URL(fileURLWithPath: path)
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            // Fallback for volumes without a Trash.
+            do { try FileManager.default.removeItem(at: url) }
+            catch { return "Delete failed: \(error.localizedDescription)" }
+        }
+        let prefix = path.hasSuffix("/") ? path : path + "/"
+        for open in state.openTabs where open == path || open.hasPrefix(prefix) {
+            closeTab(open, force: true)
+        }
+        return nil
+    }
+
+    /// Move open-tab bookkeeping when a file/folder path changes on disk.
+    private func remapTabPaths(_ old: String, to new: String) {
+        var isDir: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: old, isDirectory: &isDir)
+        let folder = isDir.boolValue
+        let prefix = old.hasSuffix("/") ? old : old + "/"
+        let remap: (String) -> String = { p in
+            if p == old { return new }
+            if folder && p.hasPrefix(prefix) { return new + p.dropFirst(prefix.count - 1) }
+            return p
+        }
+        state.openTabs = state.openTabs.map(remap)
+        if let active = state.activeTab {
+            state.activeTab = remap(active)
+        }
+        for (p, v) in fileBuffers where remap(p) != p {
+            fileBuffers[remap(p)] = v
+            fileBuffers.removeValue(forKey: p)
+        }
+        for (p, v) in diskContents where remap(p) != p {
+            diskContents[remap(p)] = v
+            diskContents.removeValue(forKey: p)
+        }
+        let dirtyKeys = state.tabDirty.keys
+        var newDirty: [String: Bool] = state.tabDirty
+        for p in dirtyKeys where remap(p) != p {
+            newDirty[remap(p)] = newDirty[p]
+            newDirty.removeValue(forKey: p)
+        }
+        state.tabDirty = newDirty
     }
 
     /// IDE panel widths (the splitters) — read by IdeLayout from state so
@@ -1382,15 +1542,12 @@ final class AppStore: ObservableObject {
         state.settingsTab = tab
     }
 
-    func setDrawer(_ open: Bool) { state.drawerOpen = open }
-
     func openSheet(_ which: String) { state.sheet = which }
 
     func closeSheet() { state.sheet = nil }
 
     /// Dismiss the top-most overlay, true if it consumed the action (Esc).
     func closeTopOverlay() -> Bool {
-        if state.drawerOpen { state.drawerOpen = false; return true }
         if state.sheet != nil { state.sheet = nil; return true }
         if state.preview != nil { state.preview = nil; return true }
         if state.settingsOpen { state.settingsOpen = false; return true }

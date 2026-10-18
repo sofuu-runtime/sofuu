@@ -652,3 +652,31 @@ Device receipts (t1p4/t1p5, Pi 5, 2.8 GHz, 4 threads, temp 0):
   guards both q6_K and q4_K before the dotprod blocks, so the generic
   tails are unreachable under the fused-residual contract — honest, no
   change needed.
+
+## Session 9 (2026-10-16): Llama-1B Q8_0 focus pass — lookahead speculative decode default-on (decode 2.2x), prefill attribution pinned
+
+Scope: the developer directed a max-effort pass on Llama-3.2-1B-Instruct-Q8_0
+input (prefill) and output (decode) processing. Baseline t1p6, 170-tk prompt,
+2.8 GHz, 4 threads: prefill 139.7 tk/s, decode 9.0 tk/s.
+
+Attribute first (SOFUU_PROFILE): prefill = 92.6% q8_0 GEMM (522 of 564 ms;
+~213 GMAC/s effective against the ~307 GMAC/s SDOT ceiling — kernel headroom
+~1.4x lives here); decode = 97% GEMV (3.33 of 3.42 s) streaming 1.24 GB of
+weights per token at ~12 GB/s effective — the DRAM wall again, so the only
+physical decode lever is reading weights fewer times per emitted token.
+
+The lever already existed: `--lookahead` (Jacobi/n-gram speculative decode on
+the GGUF batched tile path; the same pad-to-4 infra that made spec batches
+weight-stream-shared). A/B: 19.7 tk/s decode with **bit-identical temp-0
+output** (48-tk wild-prompt diff = empty), prefill unchanged. The path is
+sampler-aware (`sample_child` per accepted node) with a greedy-equivalence
+test pinned, and the engine only engages it on the GGUF batched backend.
+
+Flip shipped: the CLI defaults lookahead ON (`SOFUU_LOOKAHEAD=0` or
+`--no-lookahead` = serial), default verified on device: 20.1 tk/s decode
+(run default) vs 8.7 (kill switch), prefill 140.0 both ways. Prefill batch
+re-check on this model: 64/128/256 = 133.1/140.0/140.0 — 128 stays.
+
+Next for this model: q8_0 GEMM kernel toward the SDOT ceiling — repack-time
+scale pre-storage (the T1 pattern) and panel shapes informed by the kernel's
+per-block scale apply chain; measured target 213 -> 250-280 GMAC/s.

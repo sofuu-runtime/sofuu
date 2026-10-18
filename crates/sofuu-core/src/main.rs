@@ -1680,7 +1680,13 @@ fn main() -> ExitCode {
             let mut sliding_window = 0usize;
             let mut custom_ctx = 0usize;
             let mut gpu_layers = 999usize;
-            let mut lookahead = false;
+            // Lookahead speculative decoding is the OUTPUT default on the GGUF
+            // batched path (Pi 5 Llama-1B Q8_0: 9.0 -> 19.7 tk/s, temp-0 outputs
+            // token-identical; the engine only engages it on the GGUF backend).
+            // SOFUU_LOOKAHEAD=0 or --no-lookahead restores serial decoding.
+            let mut lookahead = std::env::var_os("SOFUU_LOOKAHEAD")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             let mut snapkv = false;
             let mut dynamic_ffn = false;
             let mut kivi = false;
@@ -1727,6 +1733,9 @@ fn main() -> ExitCode {
                     i += 1;
                 } else if args[i] == "--lookahead" {
                     lookahead = true;
+                    i += 1;
+                } else if args[i] == "--no-lookahead" {
+                    lookahead = false;
                     i += 1;
                 } else if args[i] == "--snapkv" {
                     snapkv = true;

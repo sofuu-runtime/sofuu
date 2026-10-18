@@ -126,6 +126,37 @@ prefill-on-GPU (GEMM-class, the one remaining plausible win). — same
   intensity is the one place an iGPU can still beat AMX+dequant CPU prefill; needs
   its own tiled-kernel phase.
 
+## FOCUSED PROGRAM (2026-10-18): flip Qwen3-8B first, then the fleet one by one
+
+Focus model: Qwen3-8B Q4_K_M (charter model, worst gap: GPU 2.1 vs CPU 13.7 t/s calm).
+Rule above the plan: every phase ends with same-window measurement + parity receipts;
+no phase starts without the previous phase's numbers; failed attempts recorded.
+
+- Phase 0 — baseline (DONE, receipts above): CPU 13.7 t/s; GPU 2.1; ~4.3GB/token; pure-GEMV
+  floor ~215ms (20 GB/s kernels); measured ~470ms -> ~220ms unattributed.
+- Phase 1 — stopwatch on a token (1 session): per-op timing inside the real one-commit
+  batch (norms, qkv, kv_write, attn, o-proj, adds, swiglu, head, every batch_end wait).
+  EXIT: every ms of the 470 attributed to ±10%; the 220ms split into commit-drains vs
+  barriers vs small-ops vs staging.
+- Phase 2 — ONE commit per TOKEN (1-2 sessions): port the proven lfm2 whole-step pattern
+  to the llama shape (embed + 36 layers + lm_head in a single command buffer; CPU waits
+  once). If Phase 1 shows barriers as the larger sink, rework slot rotation to drop
+  redundant barriers in the same pass. EXIT: >= 4 t/s end-to-end AND temp-0 text still
+  identical to CPU.
+- Phase 3 — hand-tuned readers (bench-gated increments): llama.cpp-class MSL: static
+  unrolls only (measured pitfall: runtime-indexed thread arrays spill to local memory),
+  simd-shuffle scale sharing, multi-block per thread. Gate each step on
+  bench_gguf_gemv_bandwidth: 20 -> 60 -> 100+ GB/s. EXIT: pure-GEMV floor < 90ms/token.
+- Phase 4 — the flip (1 session): calm two-pass battery; GPU must beat 13.7 t/s.
+  Projection after 2+3: ~8-12 t/s = parity-class, not the deep win; the deep win is the
+  bandwidth arsenal layered on top of a GPU-primary path: KIVI 2-bit KV, speculative/MTP
+  verify on GPU, dynamic-FFN sparsity — each its own battery receipt.
+- Phase 5 — fleet roll-out, one model at a time, same recipe mostly config by then:
+  Llama-3.2-1B Q8_0 (small loop, races CPU spec decode) -> Qwen-0.6B -> MiniCPM5-2B
+  Q6_K_XL -> Spark-4B. 27B ternary last (resident-weights CPU path is a special optimum).
+- Constraint that stands: CPU-only mode is never removed (fallback + battery baseline +
+  the honest judge every GPU win must beat same-window).
+
 Remaining: lfm2 decode client ✓ (see GPU1), gemma wiring, G2 GGUF MSL kernels ✓ (see GPU1),
 G3 optional prefill, G4 per-model flip table + iOS check.
 Companion to PLAN-CPU-DECODE-PEAK

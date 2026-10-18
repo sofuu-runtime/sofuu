@@ -133,6 +133,22 @@ impl CandidateTree {
         max_tree_size: usize,
         max_depth: usize,
     ) -> Self {
+        Self::build_cfg(ngram, context, max_tree_size, max_depth, [2, 2, 1, 0])
+    }
+
+    /// Build with explicit per-level candidate widths (levels 1..=4).
+    ///
+    /// The batched verify pass streams the weight set once for the whole
+    /// tree, so breadth costs only tile-batch rows (the tile path pads to 8,
+    /// which caps `max_tree_size`), while every matched candidate extends
+    /// the accepted chain. Wider level 1 therefore trades nothing.
+    pub fn build_cfg(
+        ngram: &NgramCache,
+        context: &[u32],
+        max_tree_size: usize,
+        max_depth: usize,
+        widths: [usize; 4],
+    ) -> Self {
         let mut tree = Self::new();
         tree.max_depth = max_depth;
 
@@ -141,7 +157,7 @@ impl CandidateTree {
         }
 
         // Propose level 1 candidates from context tail
-        let l1 = ngram.propose(context, 2);
+        let l1 = ngram.propose(context, widths[0]);
         for &t1 in &l1 {
             if tree.nodes.len() >= max_tree_size {
                 break;
@@ -157,7 +173,7 @@ impl CandidateTree {
             if max_depth >= 2 && tree.nodes.len() < max_tree_size {
                 let mut branch_ctx = context.to_vec();
                 branch_ctx.push(t1);
-                let l2 = ngram.propose(&branch_ctx, 2);
+                let l2 = ngram.propose(&branch_ctx, widths[1]);
                 for &t2 in &l2 {
                     if tree.nodes.len() >= max_tree_size {
                         break;
@@ -172,16 +188,34 @@ impl CandidateTree {
                     // Propose level 3 candidates continuing from branch 2
                     if max_depth >= 3 && tree.nodes.len() < max_tree_size {
                         branch_ctx.push(t2);
-                        let l3 = ngram.propose(&branch_ctx, 1);
+                        let l3 = ngram.propose(&branch_ctx, widths[2]);
                         for &t3 in &l3 {
                             if tree.nodes.len() >= max_tree_size {
                                 break;
                             }
+                            let idx3 = tree.nodes.len();
                             tree.nodes.push(TreeNode {
                                 token: t3,
                                 parent_idx: Some(idx2),
                                 depth: 3,
                             });
+
+                            // Propose level 4 continuing from branch 3
+                            if max_depth >= 4 && tree.nodes.len() < max_tree_size {
+                                branch_ctx.push(t3);
+                                let l4 = ngram.propose(&branch_ctx, widths[3]);
+                                for &t4 in &l4 {
+                                    if tree.nodes.len() >= max_tree_size {
+                                        break;
+                                    }
+                                    tree.nodes.push(TreeNode {
+                                        token: t4,
+                                        parent_idx: Some(idx3),
+                                        depth: 4,
+                                    });
+                                }
+                                branch_ctx.pop();
+                            }
                         }
                         branch_ctx.pop();
                     }
@@ -440,6 +474,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_build_cfg_widths_and_depth4() {
+        // Handcrafted maps with strictly distinct counts so top_continuations
+        // ranking is deterministic regardless of HashMap iteration order.
+        let mut cache = NgramCache::new(64);
+        cache.bigrams.insert(
+            1,
+            NgramNode {
+                counts: [(9, 3), (8, 2), (7, 1)].into_iter().collect(),
+            },
+        );
+        cache.trigrams.insert(
+            (1, 9),
+            NgramNode {
+                counts: [(5, 3), (4, 2), (3, 1)].into_iter().collect(),
+            },
+        );
+        cache.trigrams.insert(
+            (1, 8),
+            NgramNode {
+                counts: [(4, 1)].into_iter().collect(),
+            },
+        );
+        cache.trigrams.insert(
+            (9, 5),
+            NgramNode {
+                counts: [(6, 1)].into_iter().collect(),
+            },
+        );
+        cache.trigrams.insert(
+            (5, 6),
+            NgramNode {
+                counts: [(2, 1)].into_iter().collect(),
+            },
+        );
+
+        // 9 -> 5 -> 6 -> 2 is the synthesized depth-4 chain; (1,9) ranks 5 > 4.
+        let tree = CandidateTree::build_cfg(&cache, &[1], 8, 4, [3, 2, 2, 1]);
+        assert_eq!(tree.max_depth, 4);
+        let level1: Vec<u32> = tree
+            .nodes
+            .iter()
+            .filter(|n| n.parent_idx.is_none())
+            .map(|n| n.token)
+            .collect();
+        assert_eq!(level1, vec![9, 8, 7]);
+        assert_eq!(tree.size(), 8);
+        // Node order: [9, 5, 6, 2, 4, 8, 4, 7]
+        assert_eq!(tree.nodes[3].token, 2);
+        assert_eq!(tree.nodes[3].depth, 4);
+        assert_eq!(tree.nodes[2].parent_idx, Some(1));
+
+        // Legacy build keeps the old (2,2,1) shape: [9, 5, 6, 4, 8].
+        let legacy = CandidateTree::build(&cache, &[1], 5, 3);
+        assert_eq!(legacy.size(), 5);
+        let legacy_level1: Vec<u32> = legacy
+            .nodes
+            .iter()
+            .filter(|n| n.parent_idx.is_none())
+            .map(|n| n.token)
+            .collect();
+        assert_eq!(legacy_level1, vec![9, 8]);
+
+        // width 0 at level 4 with depth 4: no level-4 nodes.
+        let tree_no4 = CandidateTree::build_cfg(&cache, &[1], 8, 4, [3, 2, 2, 0]);
+        assert!(tree_no4.nodes.iter().all(|n| n.depth <= 3));
+        assert!(!tree_no4.is_empty());
+
+        // Narrow widths prune every level to one candidate.
+        let narrow = CandidateTree::build_cfg(&cache, &[1], 8, 3, [1, 1, 1, 0]);
+        let narrow_l1: Vec<u32> = narrow
+            .nodes
+            .iter()
+            .filter(|n| n.parent_idx.is_none())
+            .map(|n| n.token)
+            .collect();
+        assert_eq!(narrow_l1, vec![9]);
     }
 
     #[test]

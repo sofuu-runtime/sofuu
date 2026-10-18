@@ -674,6 +674,13 @@ impl InferEngine {
 
         // 1. Tokenize prompt
         let input_tokens = self.tokenizer.encode(prompt);
+        if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
+            eprintln!(
+                "[determ] input_tokens.len {} = {:?}",
+                input_tokens.len(),
+                &input_tokens[..input_tokens.len().min(16)]
+            );
+        }
         if input_tokens.is_empty() {
             return Err("prompt produced zero tokens".to_string());
         }
@@ -705,6 +712,9 @@ impl InferEngine {
         if common_prefix == 0 && input_tokens.len() < max_seq_len {
             // Fast-path: unified prefill with last-token logits projection
             let initial_logits = self.model.forward_prefill_all_with_logits(&input_tokens, 0);
+            if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
+                eprintln!("[determ] prefill_logits[..8] = {:?}", &initial_logits[..8]);
+            }
             logits_buf.copy_from_slice(initial_logits);
             cur_pos = input_tokens.len();
             self.last_prefill_tokens = input_tokens.len();
@@ -867,11 +877,44 @@ impl InferEngine {
             // Propose multi-path speculative candidate tree from n-gram cache
             let speculative_tree = if let Some(ref cache) = ngram_cache {
                 if cur_pos + 6 < max_seq_len && step < options.max_tokens {
-                    // Candidate tree knobs: (max_tree_size, max_depth); the spec tile batch pads
-// to 8, so size 1..8 x depth 1..4 are the legal ranges (default 5 rows deep 3).
-let rows = std::env::var("SOFUU_SPEC_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(5).clamp(1, 8);
-                    let depth = std::env::var("SOFUU_SPEC_DEPTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 4);
-                    let tree = lookahead::CandidateTree::build(cache, &history, rows, depth);
+                    // Candidate tree knobs: SOFUU_SPEC_ROWS = max_tree_size (the
+                    // spec tile batch pads to 8, so 1..=8 is the legal range),
+                    // SOFUU_SPEC_DEPTH 1..=4 (level 4 only earns its keep with
+                    // width[3] > 0), and SOFUU_SPEC_WIDTHS="l1,l2,l3,l4" for
+                    // explicit sweeps. Device sweeps (Pi 5, greedy, Llama-1B
+                    // Q8_0): level-1 width 2 dominates — every rank>=3
+                    // candidate row costs attention/act-quant work that beats
+                    // its acceptance rate, so the default stays the legacy
+                    // (2,2,1) shape; rows=8 + "2,2,1,1" measured +1% on
+                    // templated text but -20% on natural text.
+                    let rows = std::env::var("SOFUU_SPEC_ROWS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(5)
+                        .clamp(1, 8);
+                    let depth = std::env::var("SOFUU_SPEC_DEPTH")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(3)
+                        .clamp(1, 4);
+                    let widths = std::env::var("SOFUU_SPEC_WIDTHS")
+                        .ok()
+                        .and_then(|s| {
+                            let p: Vec<usize> = s
+                                .split(',')
+                                .filter_map(|x| x.trim().parse().ok())
+                                .collect();
+                            (p.len() == 4).then_some([p[0], p[1], p[2], p[3]])
+                        })
+                        .unwrap_or(match rows {
+                            8 => [3, 2, 2, if depth >= 4 { 1 } else { 0 }],
+                            7 => [3, 2, 2, 0],
+                            6 => [2, 2, 2, 0],
+                            5 => [2, 2, 1, 0],
+                            _ => [2, 1, 1, 0],
+                        });
+                    let tree =
+                        lookahead::CandidateTree::build_cfg(cache, &history, rows, depth, widths);
                     if !tree.is_empty() {
                         Some(tree)
                     } else {
@@ -986,6 +1029,15 @@ let rows = std::env::var("SOFUU_SPEC_ROWS").ok().and_then(|v| v.parse::<usize>()
             } else {
                 // Standard baseline forward pass (1 token)
                 let next_logits = self.model.forward(next_token, cur_pos);
+                if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() && step <= 2 {
+                    eprintln!(
+                        "[determ] step {} tok {} pos {} logits[0..8] = {:?}",
+                        step,
+                        next_token,
+                        cur_pos,
+                        &next_logits[..8.min(next_logits.len())]
+                    );
+                }
                 logits_buf.copy_from_slice(next_logits);
                 cur_pos += 1;
                 cur_token = sampler.sample(&mut logits_buf, &history);

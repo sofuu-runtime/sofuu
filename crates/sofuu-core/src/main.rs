@@ -1695,12 +1695,12 @@ fn main() -> ExitCode {
 
             let mut i = 4;
             while i < args.len() {
-                if args[i] == "--max-tokens" && i + 1 < args.len() {
+                if (args[i] == "--max-tokens" || args[i] == "-n") && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
                         max_tokens = v;
                     }
                     i += 2;
-                } else if args[i] == "--temp" && i + 1 < args.len() {
+                } else if (args[i] == "--temp" || args[i] == "--temperature") && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<f32>() {
                         temperature = v;
                     }
@@ -1754,6 +1754,12 @@ fn main() -> ExitCode {
                     i += 2;
                 } else if args[i] == "--streaming-weights" || args[i] == "--cache-bypass" {
                     streaming_weights = true;
+                    i += 1;
+                } else if args[i].starts_with('-') && args[i] != "-" {
+                    // A silently-dropped flag is a correctness hazard: e.g.
+                    // "--temperature 0" would leave the sampler at the 0.7
+                    // default with a wall-clock RNG seed.
+                    eprintln!("[sofuu infer] warning: unrecognized flag `{}` ignored", args[i]);
                     i += 1;
                 } else {
                     i += 1;
@@ -2187,7 +2193,7 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
                     "--max-tokens" => {
                         if i + 1 < args.len() { max_tokens = args[i + 1].parse().unwrap_or(256); i += 2; } else { i += 1; }
                     }
-                    "--temp" => {
+                    "--temp" | "--temperature" => {
                         if i + 1 < args.len() { temperature = args[i + 1].parse().unwrap_or(0.7); i += 2; } else { i += 1; }
                     }
                     "--threads" | "-t" => {
@@ -2204,6 +2210,11 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
                     other => {
                         if !other.starts_with('-') && prompt.is_empty() {
                             prompt = other.to_string();
+                        } else if other.starts_with('-') && other != "-" {
+                            // A silently-dropped flag is a correctness hazard:
+                            // e.g. "--temperature 0" would leave the sampler at
+                            // the 0.7 default with a wall-clock RNG seed.
+                            eprintln!("[sofuu infer] warning: unrecognized flag `{}` ignored", other);
                         }
                         i += 1;
                     }

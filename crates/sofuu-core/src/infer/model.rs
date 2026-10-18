@@ -10,7 +10,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use super::gguf::GgufFile;
+use super::gguf::{GgufFile, GgufValue};
 use super::quant::{
     batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
     batched_swiglu, matmat_residual, matmat_pair,
@@ -2203,6 +2203,48 @@ impl TransformerModel {
 mod tests {
     use super::*;
 
+    // Live-model checks: 1.3 GB mmaps thrash the parallel test suite (the
+    // qwen35 live tests share the constraint); run explicitly:
+    //   cargo test -p sofuu-core --lib live_llama1b -- --ignored
+    #[test]
+    #[ignore]
+    fn live_llama1b_prefill_logits_repeat_in_process() {
+        // Env-gated live-model check: repeated prefills INSIDE one process must
+        // produce bit-identical last-position logits. Divergence here means
+        // per-call state (not process layout/ASLR) breaks determinism.
+        let path = std::env::var_os("SOFUU_DET_GGUF")
+            .unwrap_or_else(|| "/Users/priyanshuboruah/Downloads/Llama-3.2-1B-Instruct-Q8_0.gguf".into());
+        if !std::path::Path::new(&path).exists() {
+            println!("model not present; skipping");
+            return;
+        }
+        let gguf = GgufFile::open(&path).expect("open gguf");
+        let vocab = gguf
+            .metadata
+            .get("llama.vocab_size")
+            .and_then(|v| match v {
+                GgufValue::Uint32(n) => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(128256);
+        let mut m = TransformerModel::from_gguf(gguf, 4096, vocab).expect("model load");
+        // Fixed prompt token ids ("Count: one two three four five six seven." + BOS).
+        let toks: Vec<u32> = vec![128000, 2568, 25, 832, 1403, 2380, 3116, 4330, 4848, 8254, 13];
+        let mut runs: Vec<Vec<f32>> = Vec::new();
+        for r in 0..3 {
+            m.reset_cache();
+            let logits = m.forward_prefill_all_with_logits(&toks, 0);
+            runs.push(logits[..8].to_vec());
+        }
+        println!("[det] run0[0..8] = {:?}", runs[0]);
+        for r in 1..runs.len() {
+            assert_eq!(
+                runs[0], runs[r],
+                "in-process repeat {} diverged: {:?} vs {:?}",
+                r, runs[0], runs[r]
+            );
+        }
+    }
     #[test]
     fn test_layer_sliding_window_gemma2_vs_uniform() {
         // Gemma 2 model: alternates between 4096 (even) and 0 (odd)

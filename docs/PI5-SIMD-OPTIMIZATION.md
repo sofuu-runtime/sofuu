@@ -709,3 +709,54 @@ more productive; the accept-rate is n-gram-quality-bound. **20.1-20.4 tk/s is
 the measured decode ceiling for this model on this box** (serial floor 8.7).
 
 Both panel kernels ship (bit-identical, positive, free). t1p9.
+
+## Session 10 — receipts rewrite: the greedy scoreboard (t1p11)
+
+Prior decode numbers in this file and in commit af1003491's message were
+measured with a silently-dropped sampling flag: the `infer` CLI only parsed
+`--temp`, so `--temperature 0` fell into the unknown-arg branch and every
+"greedy" run actually sampled at the 0.7 default with a wall-clock-seeded
+RNG (Sampler::new uses SystemTime). Symptom: different text every run,
+same prefill logits — which read as a compute nondeterminism until the
+sampler was instrumented. Frozen-forever receipts that casually used
+`--temperature`: treat their TEXT-equality claims as unverified; their
+speed numbers remain valid (compute cost is sampling-independent).
+
+Fixed in t1p11: `--temperature` aliased to `--temp`, `-n` aliased to
+`--max-tokens` (it was being dropped too — every earlier "-n 96" run
+actually decoded 256), and the infer arm now WARNS on unrecognized
+dash-flags instead of eating them.
+
+Re-baselined scoreboards, all at true greedy (`--temp 0`), Pi 5, 4×A76
+@2.8 GHz, Llama-3.2-1B Q8_0:
+
+- Serial decode: 9.0-9.2 tk/s (1.05 GB weight stream per token ⇒ ~9.9 GB/s
+  effective; llama.cpp on the same file measures ~8.3 ⇒ ~11 GB/s effective —
+  both engines sit on the same ~10-11 GB/s LPDDR4X soft wall; the isolated
+  4-row tile GEMV loop benches 17.9 GB/s warm, 16.1 GB/s is the
+  single-core pure-read ceiling: the kernel is not the limiter, the cold
+  1 GB stream is. No THP on this kernel to relax TLB pressure.)
+- Lookahead (legacy tree, rows 5 = widths 2/2/1, default-on): 15.6 tk/s
+  on the counting prompt (+69% over serial), token-identical to serial.
+  On natural prose: 9.0 vs 9.1 serial — acceptance is text-bound; the
+  n-gram draft only pays on templated/repetitive output.
+- Width sweep (device, greedy): level-1 width 2 dominates. (2,2,1,1) 15.8,
+  (2,2,2,0) 15.6, (3,2,2,0) 13.6, (4,2,1,1) 14.1 — rank≥3 candidates cost
+  more row work than their acceptance returns. Default stays (2,2,1).
+  CandidateTree::build_cfg now exposes per-level widths + a real level 4
+  (SOFUU_SPEC_ROWS 1..8, SOFUU_SPEC_DEPTH 1..4, SOFUU_SPEC_WIDTHS).
+
+**Numeric-divergence finding (open)**: at true greedy the lookahead path is
+token-identical to serial on templated text but NOT on natural prose —
+near-tie logits flip under the batched tile-GEMM fold vs the serial
+tile-GEMV fold (with SOFUU_NO_TILES=1 both paths run the generic row
+kernels and the outputs match exactly, isolating the difference to the
+tile GEMM family). Both are the model's argmax under their own logits —
+quality-neutral — but cross-path token-equality cannot be claimed until
+the batched and row kernels share per-output fold orders. Next session:
+a GEMV↔GEMM bit-equality unit test per shape to find the first splitting
+op, then either unify the fold or gate acceptance by a tie-margin.
+
+Determinism guard added: `live_llama1b_prefill_logits_repeat_in_process`
+(#[ignore], run with `cargo test -p sofuu-core --lib live_llama1b -- --ignored`)
+— repeated prefills in-process must be bit-identical. t1p11.

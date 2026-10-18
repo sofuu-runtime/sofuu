@@ -3665,3 +3665,19 @@ what code reading suggested:
   pays; and it is why the 27B-slab (where PLAIN decode costs ~1 s/token and
   batched marginal cost is small) is the first fleet member the math
   inverts for, not liquid.
+
+## 2026-10-18 — greedy scoreboard rewrite + CLI flag fixes (t1p11)
+- FIXED: `sofuu infer` silently dropped `--temperature` (only `--temp` parsed) and `-n`;
+  all-day "greedy" runs were sampling at temp 0.7 with a wall-clock RNG seed = the
+  "nondeterminism" investigated for hours. `--temperature` and `-n` now aliased;
+  unrecognized dash-flags warn loudly instead of being eaten.
+- FIXED-CLASS: lookahead tree widths exposed — `CandidateTree::build_cfg` (per-level
+  widths + real depth-4), env knobs SOFUU_SPEC_ROWS/DEPTH/WIDTHS. Device width sweep:
+  l1=2 dominates, default stays (2,2,1); wider trees regress natural text.
+- RECEIPTS (true greedy, Pi 5, Llama-1B Q8_0): serial 9.0-9.2 tk/s; lookahead rows5
+  15.6 tk/s on templated text (+69%, token-identical), 9.0 on natural prose (parity);
+  both engines at the ~10-11 GB/s LPDDR4X soft wall; isolated tile GEMV loop 17.9 GB/s.
+- OPEN: lookahead vs serial token divergence on natural prose (batched tile-GEMM fold
+  vs tile-GEMV fold flips near-tie argmax; SOFUU_NO_TILES=1 unifies). Doc:
+  docs/PI5-SIMD-OPTIMIZATION.md §Session 10.
+- Tests: live_llama1b_prefill_logits_repeat_in_process (#[ignore], in-process bit-stability).

@@ -1339,6 +1339,66 @@ mod q4k_crafted_probe {
         }
     }
 
+    /// Timing-only micro-bench: one GEMV at the Qwen3-8B FFN shape
+    /// (12288x4096 = 28.3MB q4_K weights) — measures the kernel's effective
+    /// weight-stream bandwidth, largely insensitive to CPU load storms.
+    /// Run: cargo test -p sofuu-core --lib bench_gguf -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_gguf_gemv_bandwidth() {
+        use std::time::Instant;
+        let engine = MetalEngine::new().expect("metal engine");
+        let rows = 12288usize;
+        let cols = 4096usize;
+        let blocks = cols / 256;
+        let wlen = rows * blocks * 144; // q4_K bytes
+        let wbuf = vec![0x80u8; wlen];
+        let mut x = vec![0f32; cols];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = ((i % 7) as f32) * 0.25 - 0.75;
+        }
+        let page = 16384usize;
+        let ylen = page;
+        let xylen = x.len() * 4 + ylen;
+        let alloc = ((xylen + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, alloc) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, slab.as_mut_ptr(), x.len() * 4)
+        };
+        let y_off = (x.len() * 4 + 63) & !63;
+        let w_buf = engine.register_zerocopy_buffer(&wbuf).expect("w");
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+
+        for iter in 0..5 {
+            let iters = if iter == 0 { 2 } else { 6 };
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine.batch_open());
+                engine.batch_gguf(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                engine.batch_end();
+            }
+            let dt = t0.elapsed();
+            let per = dt.as_secs_f64() / iters as f64;
+            println!(
+                "[bench gguf q4_K] {:55} per_op={:.3}ms effective_bw={:.1} GB/s",
+                if iter == 0 { "warmup" } else { "measured" },
+                per * 1e3,
+                wlen as f64 / per / 1e9
+            );
+        }
+    }
+
     fn run_gpu_ty(ty: u32, wbytes: &[u8], x: &[f32], engine: &MetalEngine) -> Vec<f32> {
         let rows = wbytes.len() / ((x.len() / 256) * 144);
         let slab_len = x.len() * 4 + rows * 4 + 256;

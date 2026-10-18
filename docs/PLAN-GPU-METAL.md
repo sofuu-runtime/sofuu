@@ -93,6 +93,30 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   elimination was necessary but not sufficient, and the panel-GEMV rewrite
   (2-8 rows per threadgroup, 16B loads, llama.cpp-class) is now the measured
   #1 lever for 8B.
+- **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
+  four kernel variants were built, parity-verified and A/B'd against the shipped
+  one-row-per-simdgroup scalar GEMVs with a new in-GPU bandwidth bench
+  (`bench_gguf_gemv_bandwidth`, #[ignore], q4_K 12288x4096 = 28.3MB — the
+  Qwen3-8B FFN shape): (1) 16B-area windows via uint4 + byte-skew extraction,
+  4 rows/128-thread groups; (2) scalar weights + panel dispatch only; (3)
+  scalar weights + float4-x via thread-array dynamic indexing; (4) float4-x
+  with FULLY STATIC unrolled component access (no dynamic index at all).
+  Same-window results: HEAD scalar 18.5-20.9 GB/s vs best variant 18.8, worst
+  pairs 4.7-7.7 — every variant LOSES to HEAD; the shipped kernel is the
+  measured local optimum on this GPU. Two transferable lessons: thread
+  arrays/vec-components indexed by RUNTIME values spill to local memory and
+  level-2-cache thrash (variants 1-3); only STATIC component access (variant
+  4) avoids it, but plain scalar byte loads into L1 are already the better
+  shape here. The storm window also shifted absolute numbers ~2x (4.7-28.3
+  GB/s across the session at load 3-24), so same-window A/B is mandatory.
+  Consequence for 8B: measured in-batch q4_K ~19-21 GB/s -> pure-GEMV floor
+  ~215ms/token for the ~4.3GB weight stream -> ~4.6 t/s ceiling with THESE
+  kernels; observed 2.1 t/s still holds ~2x of unexplained per-token cost —
+  the next lever is measuring per-op time inside the real 14-op one-commit
+  batch (norm/kv/attn/add ops, barriers, x staging), not wider loads. A
+  llama.cpp-class hand-tuned multi-row kernel family (simd-shuffle scale
+  sharing, static unrolls) remains an OPEN larger program with this bench as
+  its gate.
 Not landed, deferred with receipts: Spark/Qwen35/block_graph/gptx3 whole-step
 clients (bespoke ports of the same pattern; block_graph already has a per-op
 hybrid), ternary PTQ1_0/142 GPU kernels (CPU slab optimal per plan), and G3

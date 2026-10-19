@@ -615,6 +615,24 @@ extern "C" {
         n_heads: u32, head_dim: u32,
         n_chunks_max: u32, meta_stride: u32,
     );
+    fn sofuu_metal_batch_llama_attn_1c_b4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_b4r(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        acc_buf: *mut c_void, acc_offset: usize,
+        rows: usize, cols: usize, acc_dim: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf(
         ctx: *mut c_void,
         ty: u32,
@@ -1202,6 +1220,58 @@ impl MetalEngine {
                 n_heads, head_dim,
                 n_chunks_max, meta_stride,
             );
+        }
+    }
+
+    /// FUSED 1-chunk attention (pos < 128): part+fin in ONE dispatch, no
+    /// meta buffer, no barrier between the two phases. Returns false when
+    /// the PSO is unavailable (caller falls back to part+fin).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_1c_b4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+    ) -> bool {
+        unsafe {
+            sofuu_metal_batch_llama_attn_1c_b4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq,
+            ) == 1
+        }
+    }
+
+    /// B4 q4_K GEMV with the resid-add epilogue (o/down: out width ==
+    /// residual width). Returns false when unavailable; the caller falls
+    /// back to batch_gguf_b4 + batch_add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_gguf_b4r(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        acc_buf: &MetalBuffer, acc_offset: usize,
+        rows: usize, cols: usize, acc_dim: usize,
+    ) -> bool {
+        unsafe {
+            sofuu_metal_batch_gguf_b4r(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                acc_buf.handle, acc_offset,
+                rows, cols, acc_dim,
+            ) == 1
         }
     }
 

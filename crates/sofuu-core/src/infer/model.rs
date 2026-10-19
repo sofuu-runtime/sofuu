@@ -2297,6 +2297,10 @@ impl TransformerModel {
         let vocab_size = self.config.vocab_size;
         let pass_t = std::time::Instant::now();
         let mut ffn_ops = 0usize;
+        let pos_of_last = start_pos + b - 1;
+        let fuse_on = std::env::var("SOFUU_GPU_FUSE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         // Embedding lookup stays on CPU by design (GPU-first directive:
         // embedding/sampler are CPU work; q-row staging is a host copy).
@@ -2398,28 +2402,57 @@ impl TransformerModel {
                     head_dim as u32, n_heads as u32,
                     has_q, norm_eps, rope_freq_base, rope_mode,
                 );
-                g.engine.batch_llama_attn_part_b4(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    &g.meta_buf, meta_layer_off,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    meta_chunks as u32, meta_per_layer as u32,
-                );
-                g.engine.batch_llama_attn_fin_b4(
-                    &g.meta_buf, meta_layer_off,
-                    &g.act_buf, g.slots.ao,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    n_heads as u32, head_dim as u32,
-                    meta_chunks as u32, meta_per_layer as u32,
-                );
+                // pos < 128 (one softmax chunk): part+fin fuse into one
+                // dispatch — one barrier drain instead of two
+                let fused = (pos_of_last + 1) <= 128
+                    && fuse_on
+                    && g.engine.batch_llama_attn_1c_b4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &g.act_buf, g.slots.ao,
+                        &g.act_buf, g.slots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        max_seq_len as u32,
+                    );
+                if !fused {
+                    g.engine.batch_llama_attn_part_b4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &g.meta_buf, meta_layer_off,
+                        &g.act_buf, g.slots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        max_seq_len as u32,
+                        meta_chunks as u32, meta_per_layer as u32,
+                    );
+                    g.engine.batch_llama_attn_fin_b4(
+                        &g.meta_buf, meta_layer_off,
+                        &g.act_buf, g.slots.ao,
+                        &g.act_buf, g.slots.posb,
+                        b,
+                        n_heads as u32, head_dim as u32,
+                        meta_chunks as u32, meta_per_layer as u32,
+                    );
+                }
             }
 
-            gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
-            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+            // o projection + resid-add fused (rows == dim == acc width)
+            if !(fuse_on
+                && l.attn_output.tensor_type == GGML_TYPE_Q4_K
+                && g.engine.batch_gguf_b4r(
+                    &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.xo,
+                    &g.act_buf, g.slots.x,
+                    dim, q_rows, dim,
+                ))
+            {
+                gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
+                g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+            }
             for t in 0..b {
                 g.engine.batch_rmsnorm_f32w(
                     &g.act_buf, g.slots.x + t * dim * 4,
@@ -2436,8 +2469,20 @@ impl TransformerModel {
                 ffn_ops += 3;
             }
             g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim);
-            gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
-            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+            // down projection + resid-add fused
+            if !(fuse_on
+                && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+                && g.engine.batch_gguf_b4r(
+                    &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                    &g.act_buf, g.slots.gate,
+                    &g.act_buf, g.slots.xo,
+                    &g.act_buf, g.slots.x,
+                    dim, hidden_dim, dim,
+                ))
+            {
+                gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
+                g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+            }
             }
         }
 

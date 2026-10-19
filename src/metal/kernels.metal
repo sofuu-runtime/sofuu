@@ -1276,6 +1276,164 @@ kernel void gemv_q4_k_b4c2(
     y[2 * rows + row] = v2;
     y[3 * rows + row] = v3;
 }
+// RESID-ADD EPILOGUE variant: after the GEMV, x_acc[t*acc_dim + row] +=
+// y[t*rows + row] for t in 0..4 — one writer per element (threadgroup row),
+// removing the separate batch_add dispatch (and its barrier) per layer.
+// Only valid when rows == acc_dim (the o/down projections: out width ==
+// residual width, both dim).
+kernel void gemv_q4_k_b4c2r(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],   // [4][cols]
+    device float        *y              [[buffer(2)]],   // [4][rows]
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    device float        *x_acc          [[buffer(6)]],
+    constant uint       &acc_dim        [[buffer(7)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * (cols / 256) * 144;
+    uint sub = lane / 8;
+    uint l8 = lane % 8;
+    uint g = l8 / 2;
+    uint k0 = (l8 % 2) * 16;
+    for (uint b0 = 0; b0 < nb; b0 += 4) {
+        uint b = b0 + sub;
+        if (b >= nb) { break; }
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        uint8_t sc1, m1, sc2, m2;
+        q4k_scale_min(scales, g * 2, &sc1, &m1);
+        q4k_scale_min(scales, g * 2 + 1, &sc2, &m2);
+        float s1 = d * (float)sc1;
+        float s2 = d * (float)sc2;
+        float m1f = dmin * (float)m1;
+        float m2f = dmin * (float)m2;
+        uint4 q4 = *(device const uint4 *)&qs[l8 * 16];
+        uint xbase = b * 256 + g * 64 + k0;
+        // component c covers byte pairs k0+4c..+3; unrolled so the vector
+        // component access stays compile-time (dynamic indexing spills)
+#pragma clang loop unroll(full)
+        for (uint c = 0; c < 4; ++c) {
+            uint comp;
+            if (c == 0) { comp = q4.x; }
+            else if (c == 1) { comp = q4.y; }
+            else if (c == 2) { comp = q4.z; }
+            else { comp = q4.w; }
+            float lo0 = float(comp & 15);
+            float lo1 = float((comp >> 8) & 15);
+            float lo2 = float((comp >> 16) & 15);
+            float lo3 = float((comp >> 24) & 15);
+            float hi0 = float((comp >> 4) & 15);
+            float hi1 = float((comp >> 12) & 15);
+            float hi2 = float((comp >> 20) & 15);
+            float hi3 = float((comp >> 28) & 15);
+            float4 wlo = float4(s1) * float4(lo0, lo1, lo2, lo3) - float4(m1f);
+            float4 whi = float4(s2) * float4(hi0, hi1, hi2, hi3) - float4(m2f);
+            float4 x0lo = *(device const float4 *)&x[xbase + 4 * c];
+            float4 x0hi = *(device const float4 *)&x[xbase + 32 + 4 * c];
+            float4 x1lo = *(device const float4 *)&x[cols + xbase + 4 * c];
+            float4 x1hi = *(device const float4 *)&x[cols + xbase + 32 + 4 * c];
+            float4 x2lo = *(device const float4 *)&x[2 * cols + xbase + 4 * c];
+            float4 x2hi = *(device const float4 *)&x[2 * cols + xbase + 32 + 4 * c];
+            float4 x3lo = *(device const float4 *)&x[3 * cols + xbase + 4 * c];
+            float4 x3hi = *(device const float4 *)&x[3 * cols + xbase + 32 + 4 * c];
+            acc0 += wlo * x0lo + whi * x0hi;
+            acc1 += wlo * x1lo + whi * x1hi;
+            acc2 += wlo * x2lo + whi * x2hi;
+            acc3 += wlo * x3lo + whi * x3hi;
+        }
+    }
+    float v0 = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+    float v1 = (acc1.x + acc1.y) + (acc1.z + acc1.w);
+    float v2 = (acc2.x + acc2.y) + (acc2.z + acc2.w);
+    float v3 = (acc3.x + acc3.y) + (acc3.z + acc3.w);
+    v0 = simd_sum(v0); v1 = simd_sum(v1);
+    v2 = simd_sum(v2); v3 = simd_sum(v3);
+    y[row] = v0;
+    y[rows + row] = v1;
+    y[2 * rows + row] = v2;
+    y[3 * rows + row] = v3;
+    x_acc[row] += v0;
+    x_acc[acc_dim + row] += v1;
+    x_acc[2 * acc_dim + row] += v2;
+    x_acc[3 * acc_dim + row] += v3;
+}
+
+// ── FUSED 1-chunk attention (pos<128): part+fin in ONE dispatch ─────────────
+// Grid = rows × heads; the full softmax fits in one chunk, so the two-phase
+// meta protocol (part writes partials, fin rescales — two dispatches + the
+// drain between them) collapses into direct weighted-V output. Per-row
+// positions from the buffer; softmax bounded by each row's own position
+// (chain causality, same contract as attn_part_b4). vec_dot oracle-class.
+kernel void llama_attn_1c_b4(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device float       *head_out        [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    uint g                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = g / n_heads;
+    uint h   = g % n_heads;
+    uint pos = positions[row];
+    device float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint t_end = pos + 1;
+
+    float mx = -INFINITY;
+    for (uint t = lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        if (dot * scale > mx) { mx = dot * scale; }
+    }
+    float gmax = simd_max(mx);
+    float lsum = 0.0f;
+    for (uint t = lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        lsum += exp(dot * scale - gmax);
+    }
+    float gsum = simd_sum(lsum);
+    float inv = 1.0f / gsum;
+
+    threadgroup float tw[128];
+    for (uint t = lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        tw[t] = exp(dot * scale - gmax);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *out = head_out + ((size_t)row * n_heads + h) * head_dim;
+    float inv_scale_w = inv;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float accw = 0.0f;
+        for (uint t = 0; t < t_end; ++t) {
+            accw += tw[t] * vbase[(size_t)t * head_dim + d];
+        }
+        out[d] = accw * inv_scale_w;
+    }
+}
 
 // COALESCED q6_K GEMV (single row) — the lm_head class fix: the shipped
 // scalar q6_K runs the ~514MB vocab GEMV at ~6GB/s (~80ms of every 8B

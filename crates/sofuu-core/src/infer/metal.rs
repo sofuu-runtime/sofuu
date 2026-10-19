@@ -2748,6 +2748,324 @@ mod q4k_crafted_probe {
         }
     }
 
+    /// Standalone-vs-interleaved b4c2 A/B: the spec pass's FFN GEMVs run
+    /// 16-24 GB/s while the same kernel standalone runs 93-104. Escalating
+    /// contexts, same engine/buffers:
+    ///   alone -> x36 back-to-back -> +glue interleave -> +b4 attention
+    ///   interleave. Each step names the culprit (or absolves it).
+    ///
+    /// Run: cargo test -p sofuu-core --lib bench_interleaved_gemv -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_interleaved_gemv() {
+        use std::time::Instant;
+        std::env::set_var("SOFUU_Q4K_COALESCED", "2");
+        let engine = MetalEngine::new().expect("metal engine");
+        std::env::remove_var("SOFUU_Q4K_COALESCED");
+
+        let rows = 12288usize; // FFN out, cols = dim
+        let dim = 4096usize;
+        let q_rows = 4096usize;
+        let kv_rows = 1024usize;
+        let hd = 128usize;
+        let n_heads = 32usize;
+        let n_kv = 8usize;
+        let b = 4usize;
+        let layers = 36usize;
+        let blocks = dim / 256;
+        let wlen = rows * blocks * 144;
+
+        let mut state = 0x1234ABCDu64;
+        let w: Vec<u8> = {
+            let mut v = vec![0u8; wlen];
+            for x in v.iter_mut() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *x = (state >> 33) as u8;
+            }
+            v
+        };
+
+        // one slab: x | xn | gate+up | qa | ka | va | ao (all [B][..]) + pos
+        let f32s = b * (dim * 2 + 12288 * 2 + q_rows + kv_rows * 2 + q_rows) + 256;
+        let page = 16384usize;
+        let alloc = ((f32s * 4 + page - 1) / page) * page;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, alloc) };
+        let w_buf = engine.register_zerocopy_buffer(&w).expect("w");
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+
+        let kc_bytes = layers * n_kv * 4096 * hd * 4;
+        let kc_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                kc_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert!(kc_ptr != libc::MAP_FAILED);
+        let vc_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                kc_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert!(vc_ptr != libc::MAP_FAILED);
+        let kc: &[u8] = unsafe { std::slice::from_raw_parts(kc_ptr as *const u8, kc_bytes) };
+        let vc: &[u8] = unsafe { std::slice::from_raw_parts(vc_ptr as *const u8, kc_bytes) };
+        let kc_buf = engine.register_zerocopy_buffer(kc).expect("kc");
+        let vc_buf = engine.register_zerocopy_buffer(vc).expect("vc");
+
+        let mut nw = vec![0u8; 16384];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [1.0f32; 4096].as_ptr() as *const u8,
+                nw.as_mut_ptr(),
+                4096 * 4,
+            );
+        }
+        let nw_buf = engine.register_zerocopy_buffer(&nw).expect("nw");
+        let pos: Vec<u32> = (0..16).map(|t| 10 + t as u32).collect();
+        let pos_bytes: Vec<u8> = pos.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pos_buf = engine.register_zerocopy_buffer(&pos_bytes).expect("pos");
+
+        let n_chunks_max = 1usize; // positions ~10 -> 1 chunk of 128
+        let meta_stride = n_heads * n_chunks_max * 2 + n_heads * n_chunks_max * hd;
+        let meta_alloc = ((meta_stride * b * 4) + page - 1) / page * page;
+        let m_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                meta_alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(m_ptr != libc::MAP_FAILED);
+        let mslice: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(m_ptr as *mut u8, meta_alloc) };
+        let meta_buf = engine.register_zerocopy_buffer(mslice).expect("meta");
+
+        // slot offsets (floats)
+        let ox = 0usize;
+        let oxn = ox + b * dim;
+        let og = oxn + b * dim;
+        let ou = og + b * 12288;
+        let oqa = ou + b * 12288;
+        let oka = oqa + b * q_rows;
+        let ova = oka + b * kv_rows;
+        let oao = ova + b * kv_rows;
+
+        let yoff = oxn * 4; // GEMV y target = xn region (any writable region)
+        let gemv_alone = |iters: usize| -> f64 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine.batch_open());
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, 0, &slab_buf, yoff, rows, dim);
+                engine.batch_end();
+            }
+            t0.elapsed().as_secs_f64() / iters as f64
+        };
+        let warm = gemv_alone(2);
+        let alone = gemv_alone(8);
+        println!(
+            "[interleave] alone    per_op={:.3}ms bw={:.1} GB/s (warm {:.3}ms)",
+            alone * 1e3,
+            wlen as f64 / alone / 1e9,
+            warm * 1e3
+        );
+
+        {
+            let t0 = Instant::now();
+            assert!(engine.batch_open());
+            for _ in 0..36 {
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, 0, &slab_buf, yoff, rows, dim);
+            }
+            engine.batch_end();
+            let per = t0.elapsed().as_secs_f64() / 36.0;
+            println!("[interleave] x36      per_op={:.3}ms bw={:.1} GB/s", per * 1e3, wlen as f64 / per / 1e9);
+        }
+
+        {
+            let t0 = Instant::now();
+            assert!(engine.batch_open());
+            for _ in 0..36 {
+                engine.batch_rmsnorm_f32w_b4(
+                    &slab_buf, ox * 4, &nw_buf, 0, &slab_buf, oxn * 4, dim, 1e-5, b,
+                );
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, oxn * 4, &slab_buf, yoff, rows, dim);
+                engine.batch_add(&slab_buf, ox * 4, &slab_buf, yoff, b * dim);
+            }
+            engine.batch_end();
+            let per = t0.elapsed().as_secs_f64() / 36.0;
+            println!("[interleave] +glue    per_layer={:.3}ms (gemv alone {:.3}ms)", per * 1e3, alone * 1e3);
+        }
+
+        {
+            let t0 = Instant::now();
+            assert!(engine.batch_open());
+            for li in 0..8 {
+                let layer_off = li * n_kv * 4096 * hd * 4;
+                engine.batch_llama_kv_write_b4(
+                    &slab_buf, oka * 4, &slab_buf, ova * 4,
+                    &kc_buf, layer_off, &vc_buf, layer_off,
+                    Some(&nw_buf), 0, 1,
+                    &pos_buf, 0, b,
+                    hd as u32, n_kv as u32, 4096,
+                    1e-5, 10000.0, 0,
+                );
+                engine.batch_head_rmsnorm_b4(
+                    &slab_buf, oqa * 4, Some(&nw_buf), 0,
+                    &pos_buf, 0, b,
+                    hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                );
+                engine.batch_llama_attn_part_b4(
+                    &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
+                    &meta_buf, 0, &pos_buf, 0, b,
+                    hd as u32, n_heads as u32, n_kv as u32, 4096,
+                    n_chunks_max as u32, meta_stride as u32,
+                );
+                engine.batch_llama_attn_fin_b4(
+                    &meta_buf, 0, &slab_buf, oao * 4, &pos_buf, 0, b,
+                    n_heads as u32, hd as u32, n_chunks_max as u32, meta_stride as u32,
+                );
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, oxn * 4, &slab_buf, yoff, rows, dim);
+                engine.batch_add(&slab_buf, ox * 4, &slab_buf, yoff, b * dim);
+            }
+            engine.batch_end();
+            let per = t0.elapsed().as_secs_f64() / 8.0;
+            println!("[interleave] +b4attn  per_layer={:.3}ms (gemv alone {:.3}ms)", per * 1e3, alone * 1e3);
+        }
+        // which attention op carries the cost? one op added per sub-case
+        for which in ["kv4", "part4", "kvp"] {
+            let t0 = Instant::now();
+            let layer_off = 0usize;
+            assert!(engine.batch_open());
+            for _ in 0..8 {
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, oxn * 4, &slab_buf, yoff, rows, dim);
+                match which {
+                    "kv4" => {
+                        for _ in 0..4 {
+                            engine.batch_llama_kv_write_b4(
+                                &slab_buf, oka * 4, &slab_buf, ova * 4,
+                                &kc_buf, layer_off, &vc_buf, layer_off,
+                                Some(&nw_buf), 0, 1,
+                                &pos_buf, 0, b,
+                                hd as u32, n_kv as u32, 4096,
+                                1e-5, 10000.0, 0,
+                            );
+                        }
+                    }
+                    "part4" => {
+                        for _ in 0..4 {
+                            engine.batch_llama_attn_part_b4(
+                                &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
+                                &meta_buf, 0, &pos_buf, 0, b,
+                                hd as u32, n_heads as u32, n_kv as u32, 4096,
+                                n_chunks_max as u32, meta_stride as u32,
+                            );
+                        }
+                    }
+                    "kvp" => {
+                        engine.batch_llama_kv_write_b4(
+                            &slab_buf, oka * 4, &slab_buf, ova * 4,
+                            &kc_buf, layer_off, &vc_buf, layer_off,
+                            Some(&nw_buf), 0, 1,
+                            &pos_buf, 0, b,
+                            hd as u32, n_kv as u32, 4096,
+                            1e-5, 10000.0, 0,
+                        );
+                        engine.batch_llama_attn_part_b4(
+                            &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
+                            &meta_buf, 0, &pos_buf, 0, b,
+                            hd as u32, n_heads as u32, n_kv as u32, 4096,
+                            n_chunks_max as u32, meta_stride as u32,
+                        );
+                    }
+                    "pf" => {
+                        engine.batch_llama_attn_part_b4(
+                            &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
+                            &meta_buf, 0, &pos_buf, 0, b,
+                            hd as u32, n_heads as u32, n_kv as u32, 4096,
+                            n_chunks_max as u32, meta_stride as u32,
+                        );
+                        engine.batch_llama_attn_fin_b4(
+                            &meta_buf, 0, &slab_buf, oao * 4, &pos_buf, 0, b,
+                            n_heads as u32, hd as u32, n_chunks_max as u32, meta_stride as u32,
+                        );
+                    }
+                    "kvqn" => {
+                        engine.batch_llama_kv_write_b4(
+                            &slab_buf, oka * 4, &slab_buf, ova * 4,
+                            &kc_buf, layer_off, &vc_buf, layer_off,
+                            Some(&nw_buf), 0, 1,
+                            &pos_buf, 0, b,
+                            hd as u32, n_kv as u32, 4096,
+                            1e-5, 10000.0, 0,
+                        );
+                        engine.batch_head_rmsnorm_b4(
+                            &slab_buf, oqa * 4, Some(&nw_buf), 0,
+                            &pos_buf, 0, b,
+                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                        );
+                    }
+                    "kv" => {
+                        engine.batch_llama_kv_write_b4(
+                            &slab_buf, oka * 4, &slab_buf, ova * 4,
+                            &kc_buf, layer_off, &vc_buf, layer_off,
+                            Some(&nw_buf), 0, 1,
+                            &pos_buf, 0, b,
+                            hd as u32, n_kv as u32, 4096,
+                            1e-5, 10000.0, 0,
+                        );
+                    }
+                    "qn" => {
+                        engine.batch_head_rmsnorm_b4(
+                            &slab_buf, oqa * 4, Some(&nw_buf), 0,
+                            &pos_buf, 0, b,
+                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                        );
+                    }
+                    "part" => {
+                        engine.batch_llama_attn_part_b4(
+                            &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
+                            &meta_buf, 0, &pos_buf, 0, b,
+                            hd as u32, n_heads as u32, n_kv as u32, 4096,
+                            n_chunks_max as u32, meta_stride as u32,
+                        );
+                    }
+                    _ => {
+                        engine.batch_llama_attn_fin_b4(
+                            &meta_buf, 0, &slab_buf, oao * 4, &pos_buf, 0, b,
+                            n_heads as u32, hd as u32, n_chunks_max as u32, meta_stride as u32,
+                        );
+                    }
+                }
+                engine.batch_add(&slab_buf, ox * 4, &slab_buf, yoff, b * dim);
+            }
+            engine.batch_end();
+            let per = t0.elapsed().as_secs_f64() / 8.0;
+            println!("[interleave] op+{}    per_layer={:.3}ms (gemv alone {:.3}ms)", which, per * 1e3, alone * 1e3);
+        }
+        println!("[interleave] done");
+    }
+
     /// MULTI-ROW acceptance: the b4 attention family (kv_write_b4 ->
     /// head_rmsnorm_b4 -> attn_part_b4 -> attn_fin_b4, per-row positions from
     /// the buffer) must equal a per-row CPU reference — each row's softmax

@@ -760,3 +760,23 @@ op, then either unify the fold or gate acceptance by a tie-margin.
 Determinism guard added: `live_llama1b_prefill_logits_repeat_in_process`
 (#[ignore], run with `cargo test -p sofuu-core --lib live_llama1b -- --ignored`)
 — repeated prefills in-process must be bit-identical. t1p11.
+
+### Battery row — Qwen3-0.6B Q4_K_M (2026-10-19, t1p12, post-flag-fix)
+
+Model file had vanished from the device; re-downloaded (unsloth mirror,
+397 MB). Greedy `--temperature 0`, `-n 256`, 4 threads, ~138-token prompt,
+3 reps each; llama.cpp build 11041 same box/prompt `--single-turn -t 4`:
+
+| engine (Qwen3-0.6B Q4_K_M) | prefill t/s | decode t/s |
+|---|---|---|
+| Sofuu serial (`--no-lookahead`) | 179.0-181.5 | 23.0 (3× identical) |
+| Sofuu lookahead (rows 5, default) | 180.4-180.8 | 26.3-27.5 |
+| llama.cpp | 177.9-178.1 | 24.6-25.0 |
+
+Prefill parity/ahead (1.02×); decode ahead with lookahead (1.08× vs llama.cpp;
+serial 0.92×). Wall math: 397 MB weights ⇒ 9.1 GB/s serial / 10.7 GB/s
+lookahead effective. Context: first Qwen receipt 2026-10-14 was prefill 110.4 /
+decode 22.0 — prefill +64% since (act-quant, attention rows8, softmax, batch
+128, tuned rustc), decode +20-25% with lookahead. Token equality serial-vs-
+lookahead at temp 0: NOT equal on this natural prompt (tile-fold divergence,
+see Session 10 finding — same class as Llama-1B).

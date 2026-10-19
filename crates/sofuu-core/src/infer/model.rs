@@ -138,30 +138,6 @@ impl Drop for AnonBuffer {
     }
 }
 
-#[allow(dead_code)]
-#[inline(always)]
-fn inline_dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum0 = 0.0f32;
-    let mut sum1 = 0.0f32;
-    let mut sum2 = 0.0f32;
-    let mut sum3 = 0.0f32;
-    let chunks_a = a.chunks_exact(4);
-    let chunks_b = b.chunks_exact(4);
-    let rem_a = chunks_a.remainder();
-    let rem_b = chunks_b.remainder();
-    for (ca, cb) in chunks_a.zip(chunks_b) {
-        sum0 += ca[0] * cb[0];
-        sum1 += ca[1] * cb[1];
-        sum2 += ca[2] * cb[2];
-        sum3 += ca[3] * cb[3];
-    }
-    let mut total = (sum0 + sum1) + (sum2 + sum3);
-    for (va, vb) in rem_a.iter().zip(rem_b.iter()) {
-        total += va * vb;
-    }
-    total
-}
-
 #[inline(always)]
 fn inline_mad(dst: &mut [f32], src: &[f32], scalar: f32) {
     let len = dst.len().min(src.len());
@@ -2350,7 +2326,14 @@ impl TransformerModel {
             );
         }
 
-        if compute_logits && std::env::var_os("SOFUU_GPU_TRACE").is_some() && self.gpu.is_none() {
+        // The `gpu` field only exists on Apple targets (cfg above); on other
+        // targets the CPU path always owns the head, so the trace helper
+        // prints unconditionally there and consults the field on Apple.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let gpu_took_head = self.gpu.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let gpu_took_head = false;
+        if compute_logits && std::env::var_os("SOFUU_GPU_TRACE").is_some() && !gpu_took_head {
             let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
             for (j, v) in self.logits.iter().enumerate() {
                 if *v > best {

@@ -780,3 +780,52 @@ decode 22.0 — prefill +64% since (act-quant, attention rows8, softmax, batch
 128, tuned rustc), decode +20-25% with lookahead. Token equality serial-vs-
 lookahead at temp 0: NOT equal on this natural prompt (tile-fold divergence,
 see Session 10 finding — same class as Llama-1B).
+
+## Pi 5 code map + knob matrix (2026-10-19 cleanup pass)
+
+### Files (this lane's territory)
+| file | role |
+|---|---|
+| `src/simd/arch/a76_repack.h` | llama.cpp-derived DOTPROD tile kernels: q4_K/q6_K/q8_0 GEMM+GEMV, 8-act panel + gate/up pair, T1 scale sidecar, nibble planes, `_generic` fallbacks (compiled only for aarch64; Apple too) |
+| `src/simd/arch/arm_cortex_a76.h` | per-row vec_dot fallback kernels (q4_0/q8_0/q4_K/q6_K/mlx4), NEON act quantizer, f16/bf16 converts |
+| `src/simd/infer_kernels.cpp` | dispatch (tile lookup/warm/pad), C-ABI exports, gate parity harnesses (`sofuu_test_*`), `SOFUU_BENCH_GEMM` bench |
+| `src/simd/platform/*.h` | core topology, pinning, seq-barrier thread pool |
+| `crates/sofuu-core/src/infer/quant.rs` | Rust FFI wrappers, type_row_size, prof buckets, dequantizers |
+| `crates/sofuu-core/src/infer/model.rs` | llama GGUF runner — SHARED with GPU/KIVI lanes; this lane's parts: prefill batching, type gate, loader fixes |
+| `scripts/cross/build_linux_arm64.sh` | musl cross build (SOFUU_PI5_TUNED/LTO codegen knobs) |
+| `docs/PI5-SIMD-OPTIMIZATION.md` | this file — receipts |
+
+### Knob matrix
+| knob | effect | default | status |
+|---|---|---|---|
+| `SOFUU_LOOKAHEAD=0` / `--no-lookahead` | spec decode kill switch | ON (GGUF) | shipped, default-on |
+| `SOFUU_SPEC_ROWS` | tree size 1..8 (tile batch caps at 8) | 5 | measured: 5 best; wider regresses |
+| `SOFUU_SPEC_DEPTH` | tree depth 1..4 | 3 | level 4 needs width[3]>0 |
+| `SOFUU_SPEC_WIDTHS` | per-level widths "l1,l2,l3,l4" | (2,2,1) shape | l1=2 dominates (device sweep) |
+| `SOFUU_Q4_SS` | T1 pre-decoded q4_K scales kernel | ON (=0 fallback) | shipped, bit-exact |
+| `SOFUU_NIBBLE_PLANES` | nibble-plane q4_K kernels | OFF | opt-in, +1% E2E, parked |
+| `SOFUU_SCALE_SIDECAR` | old scale sidecar variant | OFF | DEAD END (slowed decode); keep off |
+| `SOFUU_FA2` | FA2 tiled attention | OFF | parked (slower on Pi; L1-resident scores) |
+| `SOFUU_NO_TILES` | bypass packed tiles → generic row kernels | OFF | kill switch + numeric A/B tool |
+| `SOFUU_TILE_TYPES_OK` | tile-eligibility type mask | q8_0/q4_K/q6_K | escape hatch |
+| `SOFUU_PREFILL_BATCH` | prefill chunk (snapped to mult of 4) | 128 | 64→128 was +4% |
+| `SOFUU_NUM_THREADS` / set_thread_count | pool size | 4 (Pi `_SC_NPROCESSORS_ONLN`) | S-tuned |
+| `SOFUU_BENCH_GEMM` | rows,cols,batch,iters[,dir] bench | unset | dev bench |
+| `SOFUU_PROFILE`, `SOFUU_PROFILE_LOAD` | token/op attribution | off | diagnostics |
+| `SOFUU_DEBUG_LAYERS`, `SOFUU_DEBUG_DETERMINISM`, `SOFUU_DEBUG_TILES*` | per-layer RMS / step-logits / tile traces | off | diagnostics |
+| `SOFUU_SPARK_CPP_GEMM` | Spark C++ GEMM path | ON (=0 dequant) | shipped, healed |
+| `SOFUU_PI5_TUNED`, `SOFUU_PI5_LTO` | cross codegen — cortex-a76, thin LTO | OFF | opt-in (+2.9% decode) |
+| `SOFUU_NO_ROPE_TABLE`, `SOFUU_ROPE_DEBUG` | rope table bypass / debug | table path | diagnostics |
+
+### Cleanup pass receipts (this pass)
+- Removed: `inline_dot` (dead since Oct 12, never referenced); 2 Rust extern
+  decls whose C++ callers are C++-only (`sofuu_dequantize_row_q4_0/_q8_0`);
+  moved the two cfg(test)-only parity FNs under a `#[cfg(test)]` extern block
+  (kills release-build never-used warnings).
+- Fixed cross build (blocked ALL lanes on the GPU peer's GPU3 wave):
+  `self.gpu` field access at model.rs:2329 is now cfg-split (field is
+  Apple-only); cross target builds again.
+- Verified live: bench harnesses (each `sofuu_test_*`/`sofuu_bench_*` has a
+  live Rust gate/CLI caller — NOT dead, they are the receipt
+  infrastructure); every `_generic` fallback is reachable via its dotprod
+  twin; quant.rs externs all referenced.

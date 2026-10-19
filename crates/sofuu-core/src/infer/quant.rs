@@ -423,11 +423,10 @@ extern "C" {
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_bench_gemm_plane(rows: i32, cols: i32, batch: i32, iters: i32);
-    fn sofuu_test_quant_q8_K_parity(cols: i32, iters: i32) -> i32;
     fn sofuu_test_gemm_q4_k_plane_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_test_q4_k_s_bit_exact(rows: i32, cols: i32, batch: i32) -> i32;
-    fn sofuu_dequantize_row_q4_0(src: *const u8, dst: *mut f32, k: usize);
-    fn sofuu_dequantize_row_q8_0(src: *const u8, dst: *mut f32, k: usize);
+    // (sofuu_dequantize_row_q4_0 / _q8_0 are called from C++ only —
+    // infer_kernels.cpp:2159/2329 — no Rust extern decl needed.)
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q6_k(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_vec_dot_q4_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32;
@@ -538,7 +537,6 @@ extern "C" {
     fn sofuu_test_softmax_vec_parity() -> i32;
     fn sofuu_test_attention_fa2_parity(n_heads: i32, n_kv_heads: i32, head_dim: i32, max_seq: i32) -> i32;
     fn sofuu_test_rope_table_parity(n_heads: i32, head_dim: i32, max_pos: i32) -> i32;
-    fn sofuu_test_gemm_resid_pair_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_tree_rope(
         q_batch: *mut f32,
         k_batch: *mut f32,
@@ -778,6 +776,14 @@ extern "C" {
     pub fn sofuu_metal_sync(ctx: *mut std::ffi::c_void);
 }
 
+// Test-gate harnesses live under cfg(test) so release builds don't carry
+// unused-FFI declarations (the C++ symbols are always compiled; the gate
+// tests link them from here alone).
+#[cfg(test)]
+extern "C" {
+    fn sofuu_test_quant_q8_K_parity(cols: i32, iters: i32) -> i32;
+    fn sofuu_test_gemm_resid_pair_parity(rows: i32, cols: i32, batch: i32) -> i32;
+}
 /// Shift RoPE position of key vectors by `delta_pos` (negative shifts left).
 pub fn rope_shift(vec: &mut [f32], n_heads: usize, head_dim: usize, delta_pos: i64, freq_base: f32) {
     rope_shift_style(vec, n_heads, head_dim, delta_pos, freq_base, 0);

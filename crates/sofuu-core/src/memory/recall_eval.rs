@@ -447,6 +447,10 @@ mod token_rerank {
             reranked.iter().any(|h| h.text.contains("team sync notes")),
             "the suppressed generic records stay recallable"
         );
+        /* With top_k=1, oversampling guarantees the rare-token record still wins top-1 */
+        let top1 = cma.recall_tokens(&q, 1, QUERY);
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].text, "the quokka migration ships on Tuesday with the ledger cutoff");
     }
 
     #[test]

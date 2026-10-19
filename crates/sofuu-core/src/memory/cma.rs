@@ -1099,8 +1099,13 @@ impl Cma {
             .into_iter()
             .filter(|t| t.chars().count() >= 3)
             .collect();
-        let mut hits = self.recall(query, top_k);
-        if q_tokens.is_empty() || hits.len() < 2 {
+        if q_tokens.is_empty() {
+            return self.recall(query, top_k);
+        }
+        let candidate_k = if top_k < 5 { (top_k * 3).max(6) } else { top_k };
+        let mut hits = self.recall(query, candidate_k);
+        if hits.len() < 2 {
+            hits.truncate(top_k);
             return hits;
         }
         let n = hits.len();
@@ -1134,8 +1139,8 @@ impl Cma {
         }
         exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         inexact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out = Vec::with_capacity(n);
-        for (mut h, s) in exact.into_iter().chain(inexact.into_iter()) {
+        let mut out = Vec::with_capacity(top_k.min(n));
+        for (mut h, s) in exact.into_iter().chain(inexact.into_iter()).take(top_k) {
             h.score = s;
             out.push(h);
         }

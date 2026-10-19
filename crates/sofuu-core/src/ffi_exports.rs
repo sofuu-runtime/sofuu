@@ -389,6 +389,44 @@ pub unsafe extern "C" fn sofuu_cma_remember(
     cma.remember(v, text, role, kv_page_id)
 }
 
+/// `sofuu_cma_remember_ex(p, vec, text, role, kv_page_id, source)` → record id (≥0).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_remember_ex(
+    p: *mut std::os::raw::c_void,
+    vec: *const f32,
+    text: *const c_char,
+    role: *const c_char,
+    kv_page_id: u32,
+    source: *const c_char,
+) -> std::os::raw::c_int {
+    if p.is_null() || vec.is_null() || text.is_null() {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let text = match std::ffi::CStr::from_ptr(text).to_str() {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+    let role = if role.is_null() {
+        "unknown"
+    } else {
+        match std::ffi::CStr::from_ptr(role).to_str() {
+            Ok(r) => r,
+            Err(_) => return -1,
+        }
+    };
+    let source = if source.is_null() {
+        ""
+    } else {
+        match std::ffi::CStr::from_ptr(source).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let v = std::slice::from_raw_parts(vec, cma.vec_dim);
+    cma.remember_with_source(v, text, role, kv_page_id, source)
+}
+
 /// B6.1: `sofuu_cma_remember_working(p, vec, text, role, kv_page_id, source)`
 /// → working id (high bit set), or -1 on error. Session-scoped: never
 /// serialized, merged into recall, gone on reload unless promoted.
@@ -512,6 +550,51 @@ pub unsafe extern "C" fn sofuu_cma_recall(
     b.len() as std::os::raw::c_int
 }
 
+/// `sofuu_cma_recall_text(p, query, top_k, query_text, out_buf, out_cap)` — writes recall
+/// JSON array into out_buf, with BM25 rare-token re-ranking when query_text is non-NULL.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_recall_text(
+    p: *mut std::os::raw::c_void,
+    query: *const f32,
+    top_k: usize,
+    query_text: *const c_char,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> std::os::raw::c_int {
+    if p.is_null() || query.is_null() || out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let q = std::slice::from_raw_parts(query, cma.vec_dim);
+    let hits = match cstr_or_null(query_text) {
+        Some(t) if !t.is_empty() => cma.recall_tokens(q, top_k, t),
+        _ => cma.recall(q, top_k),
+    };
+    let arr: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "id": h.id,
+                "distance": h.distance,
+                "score": h.score,
+                "role": h.role,
+                "text": h.text,
+                "tier": h.tier,
+                "strength": h.strength,
+                "entity": h.entity,
+            })
+        })
+        .collect();
+    let json = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
+    let b = json.as_bytes();
+    if b.len() + 1 > out_cap {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(b.as_ptr(), out_buf as *mut u8, b.len());
+    *out_buf.add(b.len()) = 0;
+    b.len() as std::os::raw::c_int
+}
+
 /// `sofuu_cma_kv_hints(p, query, n, out_buf, out_cap)` — JSON array of the
 /// distinct kv_page_ids of the top-n nearest memories. Returns length or -1.
 #[no_mangle]
@@ -608,6 +691,40 @@ pub unsafe extern "C" fn sofuu_cma_remember_entity(
     };
     let v = std::slice::from_raw_parts(vec, cma.vec_dim);
     cma.remember_entity(v, text, name, etype)
+}
+
+/// `sofuu_cma_remember_entity_turn(p, vec, text, name, etype)` → record id (≥0).
+/// Appends an episodic entity turn record rather than overwriting in place.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_remember_entity_turn(
+    p: *mut std::os::raw::c_void,
+    vec: *const f32,
+    text: *const c_char,
+    name: *const c_char,
+    etype: *const c_char,
+) -> std::os::raw::c_int {
+    if p.is_null() || vec.is_null() || text.is_null() || name.is_null() {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let text = match std::ffi::CStr::from_ptr(text).to_str() {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+    let name = match std::ffi::CStr::from_ptr(name).to_str() {
+        Ok(n) => n,
+        Err(_) => return -1,
+    };
+    let etype = if etype.is_null() {
+        "unknown"
+    } else {
+        match std::ffi::CStr::from_ptr(etype).to_str() {
+            Ok(e) => e,
+            Err(_) => return -1,
+        }
+    };
+    let v = std::slice::from_raw_parts(vec, cma.vec_dim);
+    cma.remember_entity_scoped(v, text, name, etype)
 }
 
 /// `sofuu_cma_mark_positive(p, ids, n)` → count marked.
@@ -719,4 +836,85 @@ pub unsafe extern "C" fn sofuu_cma_vectors(
     *out_n = n;
     *out_dim = dim;
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    #[test]
+    fn cma_ffi_exports_remember_ex_and_recall_text() {
+        unsafe {
+            let dim = 16;
+            let p = sofuu_cma_new(dim);
+            assert!(!p.is_null());
+
+            let mut vec_a = vec![0.0f32; dim];
+            vec_a[0] = 1.0;
+            let mut vec_b = vec![0.0f32; dim];
+            vec_b[1] = 1.0;
+            let mut vec_c = vec![0.0f32; dim];
+            vec_c[2] = 1.0;
+
+            let c_text_a = CString::new("database server crash on port 5432").unwrap();
+            let c_text_b = CString::new("network timeout on api gateway").unwrap();
+            let c_role = CString::new("system").unwrap();
+            let c_source = CString::new("agent:tester").unwrap();
+
+            let id_a = sofuu_cma_remember_ex(
+                p,
+                vec_a.as_ptr(),
+                c_text_a.as_ptr(),
+                c_role.as_ptr(),
+                0,
+                c_source.as_ptr(),
+            );
+            assert!(id_a >= 0);
+
+            let id_b = sofuu_cma_remember(
+                p,
+                vec_b.as_ptr(),
+                c_text_b.as_ptr(),
+                c_role.as_ptr(),
+                0,
+            );
+            assert!(id_b >= 0);
+
+            // Test remember_entity_turn
+            let c_text_c = CString::new("Postgres query planner tuning").unwrap();
+            let c_ent_name = CString::new("Postgres").unwrap();
+            let c_ent_type = CString::new("service").unwrap();
+            let id_c = sofuu_cma_remember_entity_turn(
+                p,
+                vec_c.as_ptr(),
+                c_text_c.as_ptr(),
+                c_ent_name.as_ptr(),
+                c_ent_type.as_ptr(),
+            );
+            assert!(id_c >= 0);
+
+            assert_eq!(sofuu_cma_count(p), 3);
+
+            // Test sofuu_cma_recall_text with rare-token match
+            let mut out_buf = vec![0 as c_char; 4096];
+            let c_query_text = CString::new("port 5432 crash").unwrap();
+            let len = sofuu_cma_recall_text(
+                p,
+                vec_a.as_ptr(),
+                2,
+                c_query_text.as_ptr(),
+                out_buf.as_mut_ptr(),
+                out_buf.len(),
+            );
+            assert!(len > 0);
+            let json_str = CStr::from_ptr(out_buf.as_ptr()).to_str().unwrap();
+            let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
+            let hits = val.as_array().unwrap();
+            assert!(!hits.is_empty());
+            assert!(hits[0]["text"].as_str().unwrap().contains("5432"));
+
+            sofuu_cma_free(p);
+        }
+    }
 }

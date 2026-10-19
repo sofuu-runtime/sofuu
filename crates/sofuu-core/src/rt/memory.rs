@@ -1796,6 +1796,63 @@ mod impl_qtsq {
             .remember_entity(vec, text, name, entity_type.unwrap_or("unknown"))
     }
 
+    enum F32View {
+        Borrowed(*const f32, usize),
+        Owned(Vec<f32>),
+    }
+
+    impl F32View {
+        fn as_slice(&self) -> &[f32] {
+            match self {
+                F32View::Borrowed(p, n) => {
+                    if p.is_null() || *n == 0 {
+                        &[]
+                    } else {
+                        unsafe { std::slice::from_raw_parts(*p, *n) }
+                    }
+                }
+                F32View::Owned(v) => v.as_slice(),
+            }
+        }
+    }
+
+    unsafe fn cma_vec_view(ctx: *mut JSContext, v: JSValueConst) -> Option<F32View> {
+        let mut byte_length: usize = 0;
+        let mut byte_offset: usize = 0;
+        let ab = qjs::JS_GetTypedArrayBuffer(ctx, v, &mut byte_offset, &mut byte_length, ptr::null_mut());
+        if !qjs::is_exception(ab) {
+            let mut ab_size: usize = 0;
+            let buf = qjs::JS_GetArrayBuffer(ctx, &mut ab_size, ab);
+            qjs::sofuu_js_free_value(ctx, ab);
+            if !buf.is_null() {
+                let p = (buf as *const u8).add(byte_offset) as *const f32;
+                return Some(F32View::Borrowed(p, byte_length / std::mem::size_of::<f32>()));
+            }
+        } else {
+            let exc = qjs::JS_GetException(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+        }
+
+        // Plain JavaScript Array fallback: [0.1, 0.2, ...]
+        if qjs::JS_IsArray(ctx, v) != 0 {
+            let len_v = qjs::sofuu_js_get_property_str(ctx, v, c"length".as_ptr());
+            let mut len32: u32 = 0;
+            qjs::sofuu_js_to_uint32(ctx, &mut len32, len_v);
+            qjs::sofuu_js_free_value(ctx, len_v);
+            let mut out = vec![0.0f32; len32 as usize];
+            for i in 0..len32 {
+                let el = qjs::JS_GetPropertyUint32(ctx, v, i);
+                let mut d: f64 = 0.0;
+                qjs::JS_ToFloat64(ctx, &mut d, el);
+                qjs::sofuu_js_free_value(ctx, el);
+                out[i as usize] = d as f32;
+            }
+            return Some(F32View::Owned(out));
+        }
+
+        None
+    }
+
     /* Extract a Float32Array arg → borrowed float pointer + element count.
      * Null pointer on error (exception already thrown). */
     unsafe fn cma_vec_arg(ctx: *mut JSContext, v: JSValueConst) -> (*const f32, usize) {
@@ -1971,28 +2028,34 @@ mod impl_qtsq {
         argc: c_int,
         argv: *const JSValueConst,
     ) -> JSValue {
-        if argc < 4 {
+        if argc < 2 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected vec(Float32Array), text, role, kv_page_id".as_ptr(),
+                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen != cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() != cma.vec_dim {
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
 
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
-        let role = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let role = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
+            qjs::sofuu_js_to_cstring(ctx, *argv.add(2))
+        } else {
+            std::ptr::null_mut()
+        };
         let mut page_id: u32 = 0;
-        qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        if argc >= 4 && qjs::sofuu_js_is_number(*argv.add(3)) != 0 {
+            qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        }
         /* B1.2 provenance: optional 5th arg = where this memory came from
          * ("chat", "agent:researcher", "pin", …). Absent → unknown. */
         let source = if argc >= 5 && qjs::sofuu_js_is_string(*argv.add(4)) != 0 {
@@ -2003,7 +2066,7 @@ mod impl_qtsq {
 
         let idx = cma_remember(
             cma,
-            std::slice::from_raw_parts(vec, vlen),
+            vec_slice,
             cstr_opt(text).as_deref(),
             cstr_opt(role).as_deref(),
             page_id,
@@ -2038,11 +2101,11 @@ mod impl_qtsq {
             return qjs::sofuu_js_exception();
         };
 
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen != cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() != cma.vec_dim {
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
 
@@ -2052,7 +2115,7 @@ mod impl_qtsq {
 
         let idx = cma_remember_entity(
             cma,
-            std::slice::from_raw_parts(vec, vlen),
+            vec_slice,
             cstr_opt(text).as_deref(),
             cstr_opt(entity_name).as_deref(),
             cstr_opt(entity_type).as_deref(),
@@ -2079,18 +2142,18 @@ mod impl_qtsq {
         if argc < 2 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected queryVec(Float32Array) and topK".as_ptr(),
+                c"Expected queryVec and topK".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen < cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() < cma.vec_dim {
             /* Short vectors would out-of-bounds read in the C — refuse. */
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
@@ -2109,9 +2172,9 @@ mod impl_qtsq {
             let text = std::ffi::CStr::from_ptr(text)
                 .to_string_lossy()
                 .into_owned();
-            cma_recall_text_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize, &text)
+            cma_recall_text_json(cma, &vec_slice[..cma.vec_dim], top_k as usize, &text)
         } else {
-            cma_recall_json(cma, std::slice::from_raw_parts(vec, cma.vec_dim), top_k as usize)
+            cma_recall_json(cma, &vec_slice[..cma.vec_dim], top_k as usize)
         };
         let cj = CString::new(json).unwrap_or_default();
         let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
@@ -2131,18 +2194,18 @@ mod impl_qtsq {
         if argc < 2 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected queryVec(Float32Array) and n_hints".as_ptr(),
+                c"Expected queryVec and n_hints".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen < cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() < cma.vec_dim {
             /* Short vectors would out-of-bounds read in the C — refuse. */
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
@@ -2153,7 +2216,7 @@ mod impl_qtsq {
             n_hints = 1024;
         }
 
-        let ids = cma.cma.kv_hints(std::slice::from_raw_parts(vec, cma.vec_dim), n_hints as usize);
+        let ids = cma.cma.kv_hints(&vec_slice[..cma.vec_dim], n_hints as usize);
         let arr = qjs::JS_NewArray(ctx);
         for (i, id) in ids.iter().enumerate() {
             qjs::JS_SetPropertyUint32(ctx, arr, i as u32, qjs::sofuu_js_new_uint32(ctx, *id));
@@ -2168,26 +2231,32 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected Array of ids".as_ptr());
+            return qjs::JS_ThrowTypeError(ctx, c"Expected id or Array of ids".as_ptr());
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        if qjs::JS_IsArray(ctx, *argv) == 0 {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument must be Array".as_ptr());
-        }
-        let len_val = qjs::sofuu_js_get_property_str(ctx, *argv, c"length".as_ptr());
-        let mut len: u32 = 0;
-        qjs::sofuu_js_to_uint32(ctx, &mut len, len_val);
-        qjs::sofuu_js_free_value(ctx, len_val);
+        let mut ids: Vec<u32> = Vec::new();
+        if qjs::JS_IsArray(ctx, *argv) != 0 {
+            let len_val = qjs::sofuu_js_get_property_str(ctx, *argv, c"length".as_ptr());
+            let mut len: u32 = 0;
+            qjs::sofuu_js_to_uint32(ctx, &mut len, len_val);
+            qjs::sofuu_js_free_value(ctx, len_val);
 
-        let mut ids: Vec<u32> = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let id_val = qjs::JS_GetPropertyUint32(ctx, *argv, i);
+            ids.reserve(len as usize);
+            for i in 0..len {
+                let id_val = qjs::JS_GetPropertyUint32(ctx, *argv, i);
+                let mut id: u32 = 0;
+                qjs::sofuu_js_to_uint32(ctx, &mut id, id_val);
+                qjs::sofuu_js_free_value(ctx, id_val);
+                ids.push(id);
+            }
+        } else if qjs::sofuu_js_is_number(*argv) != 0 {
             let mut id: u32 = 0;
-            qjs::sofuu_js_to_uint32(ctx, &mut id, id_val);
-            qjs::sofuu_js_free_value(ctx, id_val);
+            qjs::sofuu_js_to_uint32(ctx, &mut id, *argv);
             ids.push(id);
+        } else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument must be an id (number) or Array of ids".as_ptr());
         }
         let marked = cma.cma.mark_positive(&ids);
         qjs::sofuu_js_new_uint32(ctx, marked)
@@ -2342,10 +2411,10 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        let (vecs, vlen) = cma_vec_arg(ctx, *argv);
-        if vecs.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
         let json = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
         let json_s = cstr_opt(json);
         if !json.is_null() {
@@ -2355,9 +2424,9 @@ mod impl_qtsq {
             return qjs::JS_ThrowTypeError(ctx, c"Argument 2 must be a JSON string".as_ptr());
         };
         let dim = cma.vec_dim;
-        let n = vlen / dim.max(1);
+        let n = vec_slice.len() / dim.max(1);
         let stats = cma.cma.import_records(
-            std::slice::from_raw_parts(vecs, vlen),
+            vec_slice,
             n,
             dim,
             &json_s,
@@ -2430,35 +2499,41 @@ mod impl_qtsq {
         argc: c_int,
         argv: *const JSValueConst,
     ) -> JSValue {
-        if argc < 4 {
+        if argc < 2 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected vec(Float32Array), text, role, kv_page_id[, source]".as_ptr(),
+                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen != cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() != cma.vec_dim {
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
-        let role = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+        let role = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
+            qjs::sofuu_js_to_cstring(ctx, *argv.add(2))
+        } else {
+            std::ptr::null_mut()
+        };
         let mut page_id: u32 = 0;
-        qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        if argc >= 4 && qjs::sofuu_js_is_number(*argv.add(3)) != 0 {
+            qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(3));
+        }
         let source = if argc >= 5 && qjs::sofuu_js_is_string(*argv.add(4)) != 0 {
             qjs::sofuu_js_to_cstring(ctx, *argv.add(4))
         } else {
             std::ptr::null_mut()
         };
         let id = cma.cma.remember_working(
-            std::slice::from_raw_parts(vec, vlen),
+            vec_slice,
             cstr_opt(text).as_deref().unwrap_or(""),
-            cstr_opt(role).as_deref().unwrap_or("unknown"),
+            cstr_opt(role).as_deref().unwrap_or("user"),
             page_id,
             cstr_opt(source).as_deref().unwrap_or(""),
         );
@@ -2475,9 +2550,9 @@ mod impl_qtsq {
     }
 
     /// B6.2: `cma.promoteWorking(idsJson)` — promote the session working
-    /// records with these ids (a JSON array of recall-hit ids) into the
-    /// persistent store as episodic. Persistent ids are ignored. Returns
-    /// `{promoted, merged}`.
+    /// records with these ids (a JSON array of recall-hit ids, a JS array,
+    /// or a single id) into the persistent store as episodic. Persistent
+    /// ids are ignored. Returns `{promoted, merged}`.
     unsafe extern "C" fn js_cma_promote_working(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -2485,28 +2560,50 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected ids (JSON array of numbers)".as_ptr());
+            return qjs::JS_ThrowTypeError(ctx, c"Expected ids (Array of numbers, number, or JSON string)".as_ptr());
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        let json_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
-        let Some(json) = cstr_opt(json_ptr) else {
-            if !json_ptr.is_null() {
-                qjs::sofuu_js_free_cstring(ctx, json_ptr);
-            }
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be a JSON array string".as_ptr());
-        };
-        qjs::sofuu_js_free_cstring(ctx, json_ptr);
         let mut ids: Vec<u32> = Vec::new();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(arr) = v.as_array() {
-                for item in arr {
-                    if let Some(n) = item.as_u64() {
+        if qjs::JS_IsArray(ctx, *argv) != 0 {
+            let len_val = qjs::sofuu_js_get_property_str(ctx, *argv, c"length".as_ptr());
+            let mut len: u32 = 0;
+            qjs::sofuu_js_to_uint32(ctx, &mut len, len_val);
+            qjs::sofuu_js_free_value(ctx, len_val);
+
+            ids.reserve(len as usize);
+            for i in 0..len {
+                let id_val = qjs::JS_GetPropertyUint32(ctx, *argv, i);
+                let mut id: u32 = 0;
+                qjs::sofuu_js_to_uint32(ctx, &mut id, id_val);
+                qjs::sofuu_js_free_value(ctx, id_val);
+                ids.push(id);
+            }
+        } else if qjs::sofuu_js_is_number(*argv) != 0 {
+            let mut id: u32 = 0;
+            qjs::sofuu_js_to_uint32(ctx, &mut id, *argv);
+            ids.push(id);
+        } else if qjs::sofuu_js_is_string(*argv) != 0 {
+            let json_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+            if let Some(json) = cstr_opt(json_ptr) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    if let Some(arr) = v.as_array() {
+                        for item in arr {
+                            if let Some(n) = item.as_u64() {
+                                ids.push(n as u32);
+                            }
+                        }
+                    } else if let Some(n) = v.as_u64() {
                         ids.push(n as u32);
                     }
                 }
             }
+            if !json_ptr.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, json_ptr);
+            }
+        } else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be an Array of ids, number, or JSON string".as_ptr());
         }
         let (promoted, merged) = cma.cma.promote_working_by_ids(&ids);
         let out = serde_json::json!({ "promoted": promoted, "merged": merged });
@@ -2830,24 +2927,24 @@ mod impl_qtsq {
         if argc < 4 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected vec(Float32Array), text, entityName, entityType".as_ptr(),
+                c"Expected vec, text, entityName, entityType".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        let (vec, vlen) = cma_vec_arg(ctx, *argv);
-        if vec.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array".as_ptr());
-        }
-        if vlen != cma.vec_dim {
+        let Some(vec_view) = cma_vec_view(ctx, *argv) else {
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+        };
+        let vec_slice = vec_view.as_slice();
+        if vec_slice.len() != cma.vec_dim {
             return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
         }
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
         let entity_name = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
         let entity_type = qjs::sofuu_js_to_cstring(ctx, *argv.add(3));
         let idx = cma.cma.remember_entity_scoped(
-            std::slice::from_raw_parts(vec, vlen),
+            vec_slice,
             cstr_opt(text).as_deref().unwrap_or(""),
             cstr_opt(entity_name).as_deref().unwrap_or(""),
             cstr_opt(entity_type).as_deref().unwrap_or("unknown"),

@@ -201,7 +201,16 @@ const MEMORY_FACADE_JS: &str = r#"
     }
     var inst = sid === undefined || sid === null ? realOpen(path, d) : realOpen(path, d, sid);
     var id = live.indexOf(inst);
-    if (id < 0) { id = live.length; live.push(inst); }
+    if (id < 0) {
+      var emptyIdx = live.indexOf(null);
+      if (emptyIdx >= 0) {
+        id = emptyIdx;
+        live[id] = inst;
+      } else {
+        id = live.length;
+        live.push(inst);
+      }
+    }
     try {
       Object.defineProperty(inst, '__handle', { value: id, enumerable: false });
       inst.toJSON = function () {
@@ -217,9 +226,10 @@ const MEMORY_FACADE_JS: &str = r#"
       if (!got) throw new TypeError('memory: no open brain with handle ' + a.handle);
       return got;
     }
-    var last = live.length ? live[live.length - 1] : null;
-    if (!last) throw new TypeError('memory: no open brain — call memory.open first');
-    return last;
+    for (var i = live.length - 1; i >= 0; i--) {
+      if (live[i]) return live[i];
+    }
+    throw new TypeError('memory: no open brain — call memory.open first');
   }
   function f32(v) {
     if (v instanceof Float32Array) return v;
@@ -251,7 +261,10 @@ const MEMORY_FACADE_JS: &str = r#"
   M.export = function (a) { return one(a || {}, 'export', []); };
   M.recall = function (a) {
     a = a || {};
-    return one(a, 'recall', [f32(a.vec), a.k === undefined ? 5 : (a.k | 0)]);
+    var q = a.text !== undefined ? a.text : a.query;
+    var args = [f32(a.vec), a.k === undefined ? 5 : (a.k | 0)];
+    if (q !== undefined && q !== null) args.push(String(q));
+    return one(a, 'recall', args);
   };
   M.count = function (a) { return one(a || {}, 'count', []); };
   M.flush = function (a) { return one(a || {}, 'flush', []); };
@@ -270,19 +283,74 @@ const MEMORY_FACADE_JS: &str = r#"
   };
   M.promoteWorking = function (a) {
     a = a || {};
-    return one(a, 'promoteWorking', [JSON.stringify(Array.isArray(a.ids) ? a.ids : [])]);
+    return one(a, 'promoteWorking', [JSON.stringify(Array.isArray(a.ids) ? a.ids : (a.id !== undefined ? [a.id] : []))]);
   };
   M.clearWorking = function (a) { return one(a || {}, 'clearWorking', []); };
   /* B7.1: stats is part of the read-out parity (doctor and /brain info
    * read the same numbers a headless host does). */
   M.stats = function (a) { return one(a || {}, 'stats', []); };
+
+  /* CMA parity additions */
+  M.rememberEntity = function (a) {
+    a = a || {};
+    return one(a, 'rememberEntity', [
+      f32(a.vec),
+      a.text || '',
+      a.entity_name || a.entityName || '',
+      a.entity_type || a.entityType || 'unknown'
+    ]);
+  };
+  M.rememberEntityTurn = function (a) {
+    a = a || {};
+    return one(a, 'rememberEntityTurn', [
+      f32(a.vec),
+      a.text || '',
+      a.entity_name || a.entityName || '',
+      a.entity_type || a.entityType || 'unknown'
+    ]);
+  };
+  M.markPositive = function (a) {
+    a = a || {};
+    var ids = a.ids !== undefined ? a.ids : a.id;
+    return one(a, 'markPositive', [ids]);
+  };
+  M.decayTick = function (a) {
+    a = a || {};
+    var dt = a.dt !== undefined ? +a.dt : (a.seconds !== undefined ? +a.seconds : (a.hours !== undefined ? (+a.hours * 3600) : 1));
+    one(a, 'decayTick', [dt]);
+    return true;
+  };
+  M.retain = function (a) { return one(a || {}, 'retain', []); };
+  M.retainAgainst = function (a) {
+    a = a || {};
+    var otherHandle = a.other !== undefined ? a.other : (a.canonical !== undefined ? a.canonical : a.target);
+    var otherInst = pick({ handle: otherHandle });
+    return one(a, 'retainAgainst', [otherInst]);
+  };
+  M.consolidate = function (a) { return one(a || {}, 'consolidate', []); };
+  M.compact = function (a) { return one(a || {}, 'compact', []); };
+  M.importRecords = function (a) {
+    a = a || {};
+    var json = typeof a.records === 'string' ? a.records : JSON.stringify(a.records || []);
+    return one(a, 'importRecords', [f32(a.vecs || a.vec), json]);
+  };
+  M.kvHints = function (a) {
+    a = a || {};
+    var n = a.n_hints !== undefined ? (a.n_hints | 0) : (a.n === undefined ? 5 : (a.n | 0));
+    return one(a, 'kvHints', [f32(a.vec), n]);
+  };
+
   M.close = function (a) {
     var inst = pick(a || {});
     var id = live.indexOf(inst);
-    if (id >= 0) live.splice(id, 1);
+    if (id >= 0) live[id] = null;
     return true;
   };
-  M.handles = function () { return live.length; };
+  M.handles = function () {
+    var count = 0;
+    for (var i = 0; i < live.length; i++) if (live[i]) count++;
+    return count;
+  };
   M.__sofuu_facade = true;
   } /* end memory block */
 
@@ -297,7 +365,16 @@ const MEMORY_FACADE_JS: &str = r#"
     X.connect = function () {
       var c = realConnect.apply(null, arguments);
       var id = clients.indexOf(c);
-      if (id < 0) { id = clients.length; clients.push(c); }
+      if (id < 0) {
+        var emptyIdx = clients.indexOf(null);
+        if (emptyIdx >= 0) {
+          id = emptyIdx;
+          clients[id] = c;
+        } else {
+          id = clients.length;
+          clients.push(c);
+        }
+      }
       try {
         Object.defineProperty(c, '__handle', { value: id, enumerable: false });
         c.toJSON = function () { return { handle: id }; };
@@ -306,10 +383,15 @@ const MEMORY_FACADE_JS: &str = r#"
     };
     function pickClient(a) {
       a = a || {};
-      var got = (a.handle === undefined || a.handle === null)
-        ? clients[clients.length - 1] : clients[a.handle | 0];
-      if (!got) throw new TypeError('mcp: connect a server first');
-      return got;
+      if (a.handle !== undefined && a.handle !== null) {
+        var got = clients[a.handle | 0];
+        if (!got) throw new TypeError('mcp: no client with handle ' + a.handle);
+        return got;
+      }
+      for (var i = clients.length - 1; i >= 0; i--) {
+        if (clients[i]) return clients[i];
+      }
+      throw new TypeError('mcp: connect a server first');
     }
     X.call = function (a) {
       a = a || {};
@@ -319,7 +401,7 @@ const MEMORY_FACADE_JS: &str = r#"
     X.listResources = function (a) { return pickClient(a).listResources(); };
     X.disconnect = function (a) {
       var c = pickClient(a), id = clients.indexOf(c);
-      try { c.disconnect(); } finally { if (id >= 0) clients.splice(id, 1); }
+      try { c.disconnect(); } finally { if (id >= 0) clients[id] = null; }
       return true;
     };
     X.__sofuu_facade = true;
@@ -341,12 +423,37 @@ const MEMORY_FACADE_JS: &str = r#"
       }
       var srv = H.createServer(fn);
       var id = servers.indexOf(srv);
-      if (id < 0) { id = servers.length; servers.push(srv); }
+      if (id < 0) {
+        var emptyIdx = servers.indexOf(null);
+        if (emptyIdx >= 0) {
+          id = emptyIdx;
+          servers[id] = srv;
+        } else {
+          id = servers.length;
+          servers.push(srv);
+        }
+      }
       try { Object.defineProperty(srv, '__handle', { value: id, enumerable: false }); } catch (e) {}
       var port = a.port === undefined ? 8080 : (a.port | 0);
       var host = a.host === undefined ? '127.0.0.1' : a.host;
       if (host) srv.listen(port, host); else srv.listen(port);
       return { handle: id, port: port, host: host };
+    };
+    H.close = function (a) {
+      a = a || {};
+      var srv;
+      if (a.handle !== undefined && a.handle !== null) {
+        srv = servers[a.handle | 0];
+      } else {
+        for (var i = servers.length - 1; i >= 0; i--) {
+          if (servers[i]) { srv = servers[i]; break; }
+        }
+      }
+      if (!srv) throw new TypeError('http: no server running');
+      var id = servers.indexOf(srv);
+      try { if (typeof srv.close === 'function') srv.close(); }
+      finally { if (id >= 0) servers[id] = null; }
+      return true;
     };
     H.__sofuu_serve_facade = true;
   }
@@ -3694,6 +3801,110 @@ mod tests {
             0,
             "brain B must stay empty, got {cb}"
         );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    #[test]
+    fn memory_funnel_handle_tombstoning_and_cma_extended_methods() {
+        require_qtsq!();
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let a = open_brain(rt, "tomb-a");
+        let b = open_brain(rt, "tomb-b");
+        let ha = a.get("handle").and_then(|h| h.as_i64()).unwrap();
+        let hb = b.get("handle").and_then(|h| h.as_i64()).unwrap();
+        assert_eq!(ha, 0);
+        assert_eq!(hb, 1);
+
+        // Remember to B
+        call(
+            rt,
+            "memory.remember",
+            &format!(
+                r#"{{"handle":{hb},"vec":{},"text":"persists in B","role":"user","kv_page_id":0}}"#,
+                hash_axis(1)
+            ),
+        );
+
+        // Close A (handle 0)
+        let close_res = call(rt, "memory.close", &format!(r#"{{"handle":{ha}}}"#));
+        assert_eq!(close_res.as_bool(), Some(true));
+
+        // B must still be accessible via handle 1 without index shift
+        let cb = call(rt, "memory.count", &format!(r#"{{"handle":{hb}}}"#));
+        assert_eq!(cb.as_u64(), Some(1));
+
+        // Test extended CMA methods via sofuu_rt_call on brain B:
+        // 1. rememberEntity
+        let ent_res = call(
+            rt,
+            "memory.rememberEntity",
+            &format!(
+                r#"{{"handle":{hb},"vec":{},"text":"Alice is an engineer","entityName":"Alice","entityType":"person"}}"#,
+                hash_axis(2)
+            ),
+        );
+        assert!(ent_res.as_i64().is_some_and(|idx| idx >= 0));
+
+        // 2. rememberEntityTurn
+        let turn_res = call(
+            rt,
+            "memory.rememberEntityTurn",
+            &format!(
+                r#"{{"handle":{hb},"vec":{},"text":"Alice likes Rust","entityName":"Alice","entityType":"person"}}"#,
+                hash_axis(3)
+            ),
+        );
+        assert!(turn_res.as_i64().is_some_and(|idx| idx >= 0));
+
+        // 3. markPositive
+        let mark_res = call(
+            rt,
+            "memory.markPositive",
+            &format!(r#"{{"handle":{hb},"ids":[0, 1]}}"#),
+        );
+        assert!(mark_res.as_u64().is_some_and(|n| n >= 1));
+
+        // 4. decayTick
+        let decay_res = call(
+            rt,
+            "memory.decayTick",
+            &format!(r#"{{"handle":{hb},"hours":2.0}}"#),
+        );
+        assert_eq!(decay_res.as_bool(), Some(true));
+
+        // 5. kvHints
+        let hints_res = call(
+            rt,
+            "memory.kvHints",
+            &format!(
+                r#"{{"handle":{hb},"vec":{},"n_hints":3}}"#,
+                hash_axis(3)
+            ),
+        );
+        assert!(hints_res.is_array());
+
+        // 6. recall with text forwarding (BM25 rare token re-ranking)
+        let recall_res = call(
+            rt,
+            "memory.recall",
+            &format!(
+                r#"{{"handle":{hb},"vec":{},"k":2,"text":"Alice likes Rust"}}"#,
+                hash_axis(3)
+            ),
+        );
+        let hits = recall_res.as_array().expect("recall returns array");
+        assert!(!hits.is_empty());
+
+        // 7. compact and consolidate
+        let compact_res = call(rt, "memory.compact", &format!(r#"{{"handle":{hb}}}"#));
+        assert!(compact_res.as_i64().is_some());
+
+        let cons_res = call(rt, "memory.consolidate", &format!(r#"{{"handle":{hb}}}"#));
+        assert!(cons_res.as_i64().is_some());
 
         unsafe { sofuu_rt_free(rt) };
     }

@@ -234,6 +234,9 @@ pub struct TransformerModel {
     // Batched working state buffers for prompt prefill
     pub x_batch: Vec<f32>,
     pub x_norm_batch: Vec<f32>,
+    /// True while the gpu slab's xn region holds output-normed chain rows
+    /// (last GPU spec pass) — enables the lazy per-row head commit.
+    pub spec_rows_valid: bool,
     pub q_batch: Vec<f32>,
     pub k_batch: Vec<f32>,
     pub v_batch: Vec<f32>,
@@ -519,6 +522,7 @@ impl TransformerModel {
 
             x_batch: vec![0.0f32; max_prefill_batch() * dim],
             x_norm_batch: vec![0.0f32; max_prefill_batch() * dim],
+            spec_rows_valid: false,
             q_batch: vec![0.0f32; max_prefill_batch() * q_dim],
             k_batch: vec![0.0f32; max_prefill_batch() * kv_dim],
             v_batch: vec![0.0f32; max_prefill_batch() * kv_dim],
@@ -669,6 +673,8 @@ impl TransformerModel {
     /// Run single token step forward through the transformer.
     /// Returns reference to computed logits [vocab_size].
     pub fn forward(&mut self, token_id: u32, pos: usize) -> &[f32] {
+        // A serial step between chain passes invalidates the saved rows.
+        self.spec_rows_valid = false;
         self.forward_impl(token_id, pos, true);
         &self.logits
     }
@@ -1089,6 +1095,14 @@ impl TransformerModel {
 
         let chunk_t0 = prof::enabled().then(std::time::Instant::now);
 
+        // GPU route: B≤4 chunk through the chain pass in ONE commit (the
+        // b4 GEMVs; head GEMV only when the caller needs last-row logits).
+        // Anything unsupported (b>4, boundaries) falls to the CPU tiles.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.gpu_forward_prefill_chain(tokens, start_pos, compute_last_logits) {
+            return &self.logits;
+        }
+
         self.forward_batch_layers_chunk(tokens, start_pos);
 
         if compute_last_logits {
@@ -1172,6 +1186,38 @@ impl TransformerModel {
         self.logits.copy_from_slice(&out_logits[0..vocab_size]);
     }
 
+    /// Lazy per-row LM head for verify_path's accepted rows: ONE GPU head
+    /// GEMV commit over the output-normed xn row the chain pass left in the
+    /// slab. The lm_head is ~514MB of q6_K for the 8B vocab, so it must run
+    /// only for rows verify actually samples (the CPU matvec fallback
+    /// measured ~290ms per row under load; the GPU commit ~13ms).
+    /// Returns false — caller falls back to forward_speculative_head_item —
+    /// when no chain pass covers this step.
+    pub fn spec_chain_head_logits(&mut self, item_idx: usize, out_logits: &mut [f32]) -> bool {
+        if !self.spec_rows_valid || item_idx >= 4 {
+            return false;
+        }
+        let g = match self.gpu.as_mut() {
+            Some(g) if g.token_commit => g,
+            _ => return false,
+        };
+        let dim = self.config.dim;
+        let vocab_size = self.config.vocab_size;
+        let gguf = &self.gguf;
+        g.engine.batch_open();
+        g.engine.batch_gguf(
+            self.output.tensor_type,
+            &g.w_buf, g.w_offset(gguf, &self.output),
+            &g.act_buf, g.slots.xn + item_idx * dim * 4,
+            &g.act_buf, g.slots.logits,
+            vocab_size, dim,
+        );
+        g.engine.batch_end();
+        out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
+        self.logits[0..vocab_size].copy_from_slice(&out_logits[0..vocab_size]);
+        true
+    }
+
     /// Compute LM head logits for an already normalized speculative batch item (e.g. candidate upon hit).
     #[inline(never)]
     pub fn forward_speculative_head_item(&mut self, item_idx: usize, out_logits: &mut [f32]) {
@@ -1221,6 +1267,20 @@ impl TransformerModel {
             let l = self.forward(tokens[0], start_pos);
             out_logits[0..vocab_size].copy_from_slice(l);
             return;
+        }
+
+        // Any non-GPU-chain route invalidates the saved per-row logits.
+        self.spec_rows_valid = false;
+
+        // GPU route: chain-shaped verify pass (root + candidates at strictly
+        // consecutive positions) through the one-commit client. Anything else
+        // (true multi-branch trees, unsupported shapes) falls through to the
+        // CPU tree path below, untouched.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            if self.gpu_forward_spec_chain(tokens, positions, start_pos, out_logits) {
+                return;
+            }
         }
 
         let n_heads = self.config.n_heads;
@@ -2089,6 +2149,363 @@ impl TransformerModel {
         self.x[..dim].copy_from_slice(g.slot_f32(g.slots.x, dim));
     }
 
+    /// GPU spec pass eligibility, for the generate loop's draft shaping.
+    /// True only when the whole-token one-commit client is armed and the
+    /// spec chain is not disabled (SOFUU_GPU_SPEC=0 or a SOFUU_GPU_SKIP
+    /// ablation).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn gpu_spec_chain_armed(&self) -> bool {
+        match self.gpu.as_ref() {
+            Some(g) => g.spec_chain_ready(),
+            None => false,
+        }
+    }
+
+    /// GPU3/G4: speculative-verify CHAIN pass (root + up to 3 candidates at
+    /// strictly consecutive positions start_pos..start_pos+B-1) through the
+    /// whole-token one-commit client. GEMVs run as B=4 batched q4_K GEMVs
+    /// (batch_gguf_b4: the DRAM weight stream — the dominant cost — is
+    /// amortized over all B rows); norms/adds/swiglu and attention run per
+    /// row inside the SAME command buffer. In-order execution + per-op
+    /// buffer barriers give row t's attention visibility of row t-1's KV
+    /// written earlier in the same commit — exactly the chain-causal
+    /// semantics (for chains, is_ancestor == prefix, so the CPU tree path's
+    /// ancestry mask is satisfied by construction).
+    ///
+    /// Candidate K/V land in the persistent cache at their positions; a
+    /// rejected candidate's stale rows are always rewritten before any
+    /// later pass can attend them (each row's KV write precedes its own
+    /// attention within the commit). Returns false (caller falls back to
+    /// the CPU tree path) for anything that is not a supported chain.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_forward_spec_chain(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        start_pos: usize,
+        out_logits: &mut [f32],
+    ) -> bool {
+        if std::env::var("SOFUU_GPU_SPEC")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let head_row = if self.gpu.as_ref().map(|g| g.skip_head).unwrap_or(true) {
+            None
+        } else {
+            Some(0usize)
+        };
+        if !self.gpu_forward_chain_core(
+            tokens,
+            positions,
+            start_pos,
+            head_row,
+            true,
+            out_logits,
+        ) {
+            return false;
+        }
+        if head_row.is_none() {
+            // ablation: no head anywhere — fill zeros so the caller contract
+            // (root logits present) is still met shape-wise.
+            out_logits[..self.config.vocab_size].fill(0.0);
+        }
+        true
+    }
+
+    /// Prefill route: B≤4 chunk through the GPU chain pass (no head unless
+    /// the caller needs the last row's logits). Returns true when taken.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_forward_prefill_chain(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        last_logits: bool,
+    ) -> bool {
+        // OPT-IN (SOFUU_GPU_PREFILL=1): the b4 chunk pass is ~4x the SERIAL
+        // GPU prefill, but at current q4_K kernel rates (~50GB/s class) it
+        // still loses to the CPU tile path on most models — it becomes the
+        // default together with the higher-bandwidth kernel generation.
+        if std::env::var("SOFUU_GPU_PREFILL")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let b = tokens.len();
+        if b < 2 || b > 4 || start_pos + b > self.config.max_seq_len {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
+        let positions: Vec<usize> = (0..b).map(|t| start_pos + t).collect();
+        if !self.gpu_forward_chain_core(
+            tokens,
+            &positions,
+            start_pos,
+            if last_logits { Some(b - 1) } else { None },
+            false,
+            &mut [],
+        ) {
+            return false;
+        }
+        if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
+            eprintln!(
+                "[gpu-profile] prefill-chunk: n={b} start_pos={start_pos} wall={}{}",
+                t0.elapsed().as_micros() as u64,
+                if last_logits { " (last-logits)" } else { "" }
+            );
+        }
+        true
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_forward_chain_core(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        start_pos: usize,
+        head_row: Option<usize>,
+        tree_refill: bool,
+        out_logits: &mut [f32],
+    ) -> bool {
+        let g = match self.gpu.as_mut() {
+            Some(g) if g.token_commit => g,
+            _ => return false,
+        };
+        let b = tokens.len();
+        if b < 2 || b > 4 || positions.len() != b || start_pos + b > self.config.max_seq_len {
+            return false;
+        }
+        for (t, &p) in positions.iter().enumerate() {
+            if p != start_pos + t {
+                return false;
+            }
+        }
+
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let norm_eps = self.config.norm_eps;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let rope_mode: u32 = if self.config.rope_interleaved { 1 } else { 0 };
+        let q_rows = n_heads * head_dim;
+        let kv_rows = n_kv_heads * head_dim;
+        let vocab_size = self.config.vocab_size;
+        let pass_t = std::time::Instant::now();
+
+        // Embedding lookup stays on CPU by design (GPU-first directive:
+        // embedding/sampler are CPU work; q-row staging is a host copy).
+        for (t, &tok) in tokens.iter().enumerate() {
+            let dst = g.slot_f32_mut(g.slots.x + t * dim * 4, dim);
+            Self::lookup_embedding(&self.gguf, &self.token_embd, tok, dim, dst);
+        }
+        // Bound above the macro so macro hygiene can see it (the macro body
+        // expands it at def-site scope); a field borrow is disjoint from
+        // self.gpu, so holding both across the pass is fine.
+        let gguf = &self.gguf;
+
+        // GEMV of one tensor over the whole chain: batch_gguf_b4 when the
+        // tensor is q4_K (the b4 kernel's token-major [4][cols]/[4][rows]
+        // layout matches the x/xn/qa/gate... slot regions exactly), one
+        // batch_gguf per row otherwise. Both paths use identical offsets.
+        macro_rules! gemv_b {
+            ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
+                if $tv.tensor_type == GGML_TYPE_Q4_K {
+                    g.engine.batch_gguf_b4(
+                        &g.w_buf, gguf.data_offset + $tv.offset,
+                        &g.act_buf, $x_off,
+                        &g.act_buf, $y_off,
+                        $rows, $cols,
+                    );
+                } else {
+                    for t in 0..b {
+                        g.engine.batch_gguf(
+                            $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
+                            // offsets are BYTES; slot sizes are element counts
+                            &g.act_buf, $x_off + t * $cols * 4,
+                            &g.act_buf, $y_off + t * $rows * 4,
+                            $rows, $cols,
+                        );
+                    }
+                }
+            };
+        }
+
+        assert!(g.engine.batch_open());
+        for layer_idx in 0..self.config.n_layers {
+            let l = &self.layers[layer_idx];
+            let attn_norm_off = gguf.data_offset + l.attn_norm.offset;
+            let ffn_norm_off = gguf.data_offset + l.ffn_norm.offset;
+            let q_norm_off = l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+            let k_norm_off = l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+            let has_q = u32::from(q_norm_off.is_some());
+            let has_k = u32::from(k_norm_off.is_some());
+            let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
+            let kc_layer = layer_idx * kv_head_bytes;
+            let meta_chunks = (max_seq_len + 127) / 128;
+            let meta_per_layer = n_heads * meta_chunks * 2 + n_heads * meta_chunks * head_dim;
+            let meta_layer_off = layer_idx * meta_per_layer * 4;
+            let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
+
+            for t in 0..b {
+                g.engine.batch_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.w_buf, attn_norm_off,
+                    &g.act_buf, g.slots.xn + t * dim * 4,
+                    dim, norm_eps,
+                );
+            }
+            gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
+            gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
+            gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
+
+            // Attention, row by row, inside the commit: row t's kv_write
+            // lands before row t's attention reads the cache.
+            // (SOFUU_GPU_SKIP=attn timing ablation skips the section.)
+            if !g.skip_attn {
+            for t in 0..b {
+                let pos_t = (start_pos + t) as u32;
+                g.engine.batch_llama_kv_write(
+                    &g.act_buf, g.slots.ka + t * kv_rows * 4,
+                    &g.act_buf, g.slots.va + t * kv_rows * 4,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    kln_buf, kln_off,
+                    has_k, pos_t,
+                    head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_head_rmsnorm(
+                    &g.act_buf, g.slots.qa + t * q_rows * 4,
+                    q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
+                    head_dim as u32, n_heads as u32,
+                    has_q, pos_t, norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_llama_attn_part(
+                    &g.act_buf, g.slots.qa + t * q_rows * 4,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    None, 0,
+                    &g.meta_buf, meta_layer_off,
+                    0, pos_t,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_llama_attn_fin(
+                    &g.meta_buf, meta_layer_off,
+                    &g.act_buf, g.slots.ao + t * q_rows * 4,
+                    pos_t, n_heads as u32, head_dim as u32,
+                );
+            }
+            }
+
+            gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
+            for t in 0..b {
+                g.engine.batch_add(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.act_buf, g.slots.xo + t * dim * 4,
+                    dim,
+                );
+            }
+            for t in 0..b {
+                g.engine.batch_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.w_buf, ffn_norm_off,
+                    &g.act_buf, g.slots.xn + t * dim * 4,
+                    dim, norm_eps,
+                );
+            }
+            if !g.skip_ffn {
+            gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
+            gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
+            for t in 0..b {
+                g.engine.batch_swiglu(
+                    &g.act_buf, g.slots.gate + t * hidden_dim * 4,
+                    &g.act_buf, g.slots.up + t * hidden_dim * 4,
+                    hidden_dim,
+                );
+            }
+            gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
+            for t in 0..b {
+                g.engine.batch_add(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.act_buf, g.slots.xo + t * dim * 4,
+                    dim,
+                );
+            }
+            }
+        }
+
+        // Head: output-norm every row (cheap; feeds lazy per-row logits),
+        // then ONE lm_head GEMV — row 0 (the root logits the tree contract
+        // needs eagerly). The lm_head is ~514MB of q6_K for the 8B vocab:
+        // committing it for all B rows streams 2GB per pass for rows verify
+        // usually never samples; accepted rows get a lazy GPU head commit
+        // (gpu_spec_head_row, ~13ms each) and CPU matvec as the fallback.
+        if let Some(hr) = head_row {
+            for t in 0..b {
+                g.engine.batch_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.w_buf, gguf.data_offset + self.output_norm.offset,
+                    &g.act_buf, g.slots.xn + t * dim * 4,
+                    dim, norm_eps,
+                );
+            }
+            g.engine.batch_gguf(
+                self.output.tensor_type,
+                &g.w_buf, g.w_offset(gguf, &self.output),
+                &g.act_buf, g.slots.xn + hr * dim * 4,
+                &g.act_buf, g.slots.logits,
+                vocab_size, dim,
+            );
+        }
+        g.engine.batch_end();
+
+        if head_row.is_some() {
+            out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
+            self.logits[0..vocab_size].copy_from_slice(&out_logits[0..vocab_size]);
+            let xn_host = g.slot_f32(g.slots.xn, b * dim);
+            self.x_norm_batch[0..b * dim].copy_from_slice(xn_host);
+        }
+        // The lazy per-row head commits (spec verify) read the xn region;
+        // valid only when the output norms above ran.
+        self.spec_rows_valid = head_row.is_some();
+        if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
+            eprintln!(
+                "[gpu-profile] spec-pass: batch={b} wall={}us ~{:.1}us/serial-token-equiv",
+                pass_t.elapsed().as_micros() as u64,
+                pass_t.elapsed().as_micros() as f64 / b as f64
+            );
+        }
+
+        // Refill the CPU tree-K/V staging from the shared cache so the
+        // caller's commit_speculative_candidates stays byte-identical in
+        // behavior: the GPU wrote these rows into the cache (idempotent
+        // copy); rejected rows get rewritten before their positions are
+        // ever attended again. (Not needed on the prefill route.)
+        if tree_refill {
+            for layer_idx in 0..self.config.n_layers {
+                for t in 0..b {
+                    let cache_pos = (start_pos + t) % max_seq_len;
+                    let base = (layer_idx * self.tree_max_nodes + t) * kv_rows;
+                    for kv_h in 0..n_kv_heads {
+                        let src = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim
+                            + cache_pos * head_dim;
+                        self.tree_k_layers[base + kv_h * head_dim..base + (kv_h + 1) * head_dim]
+                            .copy_from_slice(&self.k_cache[src..src + head_dim]);
+                        self.tree_v_layers[base + kv_h * head_dim..base + (kv_h + 1) * head_dim]
+                            .copy_from_slice(&self.v_cache[src..src + head_dim]);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// One decoder layer: CPU glue + three Metal commits. All GPU ops read
     /// and write slab slots; the CPU copies f32 values in and out around the
     /// commits (the same between-submissions coherence the G0 rig proves).
@@ -2588,6 +3005,16 @@ pub struct GgufGpu {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl GgufGpu {
+    /// The spec-verify chain pass needs the whole-token one-commit client.
+    /// SOFUU_GPU_SKIP ablations still run the route (sections are skipped
+    /// for timing work); SOFUU_GPU_SPEC=0 routes the verify pass to CPU.
+    fn spec_chain_ready(&self) -> bool {
+        self.token_commit
+            && std::env::var("SOFUU_GPU_SPEC")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+    }
+
     fn arm(
         gguf: &GgufFile,
         config: &ModelConfig,
@@ -2648,17 +3075,22 @@ impl GgufGpu {
         let kv_region_bytes =
             layers.len() * config.n_kv_heads * config.max_seq_len * config.head_dim * 4;
         let mut cursor = 0usize;
+        // B=4 regions: the spec-verify chain pass (forward_speculative_tree
+        // GPU route) feeds q/k/v/o/ffn GEMVs through batch_gguf_b4 with
+        // token-major [4][cols] x and [4][rows] y. The single-token client
+        // uses row 0 of each region. ~3MB extra slab on 8B-sized models.
+        const SPEC_B: usize = 4;
         let slots = GgufGpuSlots {
-            x: gguf_gpu_slot(&mut cursor, dim),
-            xn: gguf_gpu_slot(&mut cursor, dim),
-            qa: gguf_gpu_slot(&mut cursor, q_rows),
-            ka: gguf_gpu_slot(&mut cursor, kv_rows),
-            va: gguf_gpu_slot(&mut cursor, kv_rows),
-            ao: gguf_gpu_slot(&mut cursor, dim),
-            xo: gguf_gpu_slot(&mut cursor, dim),
-            gate: gguf_gpu_slot(&mut cursor, inter.max(dim)),
-            up: gguf_gpu_slot(&mut cursor, inter.max(dim)),
-            logits: gguf_gpu_slot(&mut cursor, vocab),
+            x: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            xn: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            qa: gguf_gpu_slot(&mut cursor, SPEC_B * q_rows),
+            ka: gguf_gpu_slot(&mut cursor, SPEC_B * kv_rows),
+            va: gguf_gpu_slot(&mut cursor, SPEC_B * kv_rows),
+            ao: gguf_gpu_slot(&mut cursor, SPEC_B * q_rows),
+            xo: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            gate: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
+            up: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
+            logits: gguf_gpu_slot(&mut cursor, SPEC_B * vocab),
         };
         let act_bytes = gguf_gpu_page(cursor);
         let act = crate::infer::model::AnonBuffer::new(act_bytes / 4);

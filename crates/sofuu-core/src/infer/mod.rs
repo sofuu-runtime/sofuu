@@ -298,6 +298,16 @@ impl InferModel {
         }
     }
 
+    /// Serve lazy per-row verify sampling from the last GPU chain pass's
+    /// in-commit logits. Returns false when no chain pass covers this step
+    /// (caller falls back to forward_speculative_head_item).
+    pub fn spec_chain_head_logits(&mut self, item_idx: usize, out_logits: &mut [f32]) -> bool {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.spec_chain_head_logits(item_idx, out_logits),
+            _ => false,
+        }
+    }
+
     pub fn forward_speculative_tree(
         &mut self,
         tokens: &[u32],
@@ -316,6 +326,21 @@ impl InferModel {
                 out_logits[..vocab_size].copy_from_slice(l);
             }
         }
+    }
+
+    /// Whether the GPU spec-verify chain route will take the verify pass
+    /// (drives the generate loop's chain-shaped draft tree).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn gpu_spec_chain_armed(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.gpu_spec_chain_armed(),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn gpu_spec_chain_armed(&self) -> bool {
+        false
     }
 
     pub fn commit_speculative_candidates(&mut self, accepted_batch_indices: &[usize], start_pos: usize) {
@@ -887,32 +912,42 @@ impl InferEngine {
                     // its acceptance rate, so the default stays the legacy
                     // (2,2,1) shape; rows=8 + "2,2,1,1" measured +1% on
                     // templated text but -20% on natural text.
-                    let rows = std::env::var("SOFUU_SPEC_ROWS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(5)
-                        .clamp(1, 8);
                     let depth = std::env::var("SOFUU_SPEC_DEPTH")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(3)
                         .clamp(1, 4);
-                    let widths = std::env::var("SOFUU_SPEC_WIDTHS")
-                        .ok()
-                        .and_then(|s| {
-                            let p: Vec<usize> = s
-                                .split(',')
-                                .filter_map(|x| x.trim().parse().ok())
-                                .collect();
-                            (p.len() == 4).then_some([p[0], p[1], p[2], p[3]])
-                        })
-                        .unwrap_or(match rows {
-                            8 => [3, 2, 2, if depth >= 4 { 1 } else { 0 }],
-                            7 => [3, 2, 2, 0],
-                            6 => [2, 2, 2, 0],
-                            5 => [2, 2, 1, 0],
-                            _ => [2, 1, 1, 0],
-                        });
+                    // GPU spec route: the verify pass runs the chain
+                    // (root + depth candidates at consecutive positions) in
+                    // ONE commit with the B=4 batched GEMVs — so shape the
+                    // draft as the width-1 chain that pass accepts.
+                    let (rows, widths) = if self.model.gpu_spec_chain_armed() {
+                        let d = depth.min(3);
+                        (d.max(1), [1, 1, 1, 0])
+                    } else {
+                        let rows = std::env::var("SOFUU_SPEC_ROWS")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(5)
+                            .clamp(1, 8);
+                        let widths = std::env::var("SOFUU_SPEC_WIDTHS")
+                            .ok()
+                            .and_then(|s| {
+                                let p: Vec<usize> = s
+                                    .split(',')
+                                    .filter_map(|x| x.trim().parse().ok())
+                                    .collect();
+                                (p.len() == 4).then_some([p[0], p[1], p[2], p[3]])
+                            })
+                            .unwrap_or(match rows {
+                                8 => [3, 2, 2, if depth >= 4 { 1 } else { 0 }],
+                                7 => [3, 2, 2, 0],
+                                6 => [2, 2, 2, 0],
+                                5 => [2, 2, 1, 0],
+                                _ => [2, 1, 1, 0],
+                            });
+                        (rows, widths)
+                    };
                     let tree =
                         lookahead::CandidateTree::build_cfg(cache, &history, rows, depth, widths);
                     if !tree.is_empty() {
@@ -937,6 +972,8 @@ impl InferEngine {
 
                 let positions = tree.build_positions(cur_pos);
                 let ancestry_mask = tree.build_full_batch_ancestry_mask();
+                let prof_spec = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
+                let t_verify = std::time::Instant::now();
 
                 self.model.forward_speculative_tree(
                     &batch_tokens,
@@ -954,7 +991,16 @@ impl InferEngine {
                 let (accepted_tokens, accepted_batch_indices, next_sampled) = tree.verify_path(
                     root_predicted,
                     |batch_idx| {
-                        self.model.forward_speculative_head_item(batch_idx, &mut spec_logits_buf);
+                        // The GPU chain pass computed every row's logits
+                        // in-commit; only the CPU-routed paths need the
+                        // per-row matvec (~290ms each under load).
+                        if !self
+                            .model
+                            .spec_chain_head_logits(batch_idx, &mut spec_logits_buf)
+                        {
+                            self.model
+                                .forward_speculative_head_item(batch_idx, &mut spec_logits_buf);
+                        }
                         sampler.sample(&mut spec_logits_buf[0..vocab_size], &history)
                     },
                 );
@@ -962,6 +1008,14 @@ impl InferEngine {
                 // Commit accepted candidate KV vectors to persistent KV cache
                 if !accepted_batch_indices.is_empty() {
                     self.model.commit_speculative_candidates(&accepted_batch_indices, cur_pos);
+                }
+                if prof_spec {
+                    eprintln!(
+                        "[spec] fwd+verify+commit={}us accepted={} (of batch {})",
+                        t_verify.elapsed().as_micros() as u64,
+                        accepted_batch_indices.len(),
+                        batch_tokens.len()
+                    );
                 }
 
                 // Advance cur_pos by 1 (root) + accepted candidate count

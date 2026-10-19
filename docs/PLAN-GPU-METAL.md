@@ -151,6 +151,41 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   one-commit client, then the prefill chunk path (b4 serves it too), then the
   calm two-pass battery. Old kernel remains the default. Everything is
   behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
+  G4 wave (2026-10-19 evening) — spec verify + prefill chunk fully WIRED,
+  receipts honest about the economics:
+  - B4 KERNEL unrolled: a shared-l-loop rewrite (nibble decoded once, 4
+    accumulators, per-token f32 order IDENTICAL to v1) measured 7.5ms
+    until #pragma clang loop unroll(full) — the compiler silently refused
+    to unroll the fat body; with the pragma b4 = 2.30ms vs v1 x4 = 2.99ms
+    same-window (~49 vs ~38 GB/s effective) — real amortization, still
+    bit-exact vs the vec_dot_raw_q4_k oracle. Float-floor nibble decode
+    measured catastrophic (7.5ms) — integer &15/>>4 only. The unroll
+    lesson extends the MSL array: runtime-indexed local arrays, uchar16,
+    AND fat loops without an explicit unroll pragma all silently cost 2x+.
+  - GPU chain-spec verify (forward_speculative_tree route): root + width-1
+    chain (SOFUU_SPEC_DEPTH<=3) in ONE commit per pass; b4 GEMVs; per-row
+    attention (row t's kv_write lands before row t's attn — in-order
+    barrier visibility = chain causality); row-0 head IN-commit; accepted
+    rows get a LAZY GPU head commit (spec_chain_head_logits). The lm_head
+    is ~514MB q6_K: 4 rows in-commit = 2GB/pass (measured worse), CPU
+    matvec = ~290ms/row under load, lazy GPU row = ~13ms. mod.rs shapes
+    the draft as the width-1 chain when gpu_spec_chain_armed(). Text
+    token-identical vs GPU serial on 96-token receipts (two revisions).
+  - Measured economics: spec 2.2 t/s vs serial 5.2 t/s at load 3-5.5 —
+    the pass pays GEMV-for-GEMV (issue-bound plateau) + 4x op bubbles;
+    battery #9 rows appended load-labeled (serial 1.22/1.44 vs spec
+    1.38/1.41 decode, 16-tok serve window). The calm-window two-pass
+    receipt is still the deciding artifact.
+  - GPU prefill chunk route wired (forward_prefill_batch_chunk_internal,
+    b<=4, head on the LAST row, SOFUU_GPU_PREFILL=1 opt-in): generate()'s
+    prefill already prefers CPU tiles (chunks > 4 bail to them), so
+    default fleet behavior is unchanged; engages with
+    SOFUU_PREFILL_BATCH=4 + the env flag.
+  - NEXT (goal 40-50 t/s decode): the ~150GB/s GEMV class is THE blocker
+    (serial AND spec both scale with it): coalesced-lane subtile split
+    (lane l reads qs byte l = full 32B-sector coalescing; f32
+    reassociation = different parity class), 16B weight windows + vec4 x,
+    and the calm-window battery before any per-model flip.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped
   one-row-per-simdgroup scalar GEMVs with a new in-GPU bandwidth bench

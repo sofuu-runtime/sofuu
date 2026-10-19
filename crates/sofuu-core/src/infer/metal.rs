@@ -2701,6 +2701,60 @@ mod q4k_crafted_probe {
                 }
             }
         }
+        // ── 2x2 matrix: kernel level (1 byte-lane, 2 vec4) x buffer
+        // (compact vs deep-in-5GB) — the pass uses level 2 on a 5GB GGUF
+        // mmap; the original receipts were level 1 on compact buffers.
+        for (lvl, bufcase) in [(1usize, "compact"), (1, "5G"), (2, "compact"), (2, "5G")] {
+            std::env::set_var("SOFUU_Q4K_COALESCED", lvl.to_string());
+            let e = MetalEngine::new().expect("matrix engine");
+            std::env::remove_var("SOFUU_Q4K_COALESCED");
+            let wbb = e.register_zerocopy_buffer(&w).expect("w");
+            let sbb = e.register_zerocopy_buffer(slab).expect("slab");
+            let mut woff = 0usize;
+            let mut big_cleanup: Option<(usize, usize)> = None;
+            if bufcase == "5G" {
+                let gb5 = 5usize << 30;
+                let deep = gb5 - w.len() - 64 * 1024 * 1024;
+                let big_ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        gb5,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                assert!(big_ptr != libc::MAP_FAILED);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(w.as_ptr(), (big_ptr as *mut u8).add(deep), w.len());
+                }
+                let big_slice: &[u8] =
+                    unsafe { std::slice::from_raw_parts(big_ptr as *const u8, gb5) };
+                woff = deep;
+                let _ = e.register_zerocopy_buffer(big_slice);
+                big_cleanup = Some((deep, gb5));
+            }
+            for iters in [2usize, 6] {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    assert!(e.batch_open());
+                    e.batch_gguf_b4(&wbb, woff, &sbb, 0, &sbb, y_off, rows, cols);
+                    e.batch_end();
+                }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                if iters == 6 {
+                    println!(
+                        "[q4k matrix] level={} {:8} per_group={:.3}ms eff_bw={:.1} GB/s",
+                        lvl,
+                        bufcase,
+                        per * 1e3,
+                        4.0 * wlen as f64 / per / 1e9
+                    );
+                }
+            }
+            drop(big_cleanup);
+        }
         // 5GB-mmap variant: the CLIENT's weights live in one huge GGUF mmap —
         // does the 16B-span vec4 kernel keep its rate at deep offsets?
         {

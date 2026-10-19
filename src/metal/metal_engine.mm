@@ -196,8 +196,12 @@ void* sofuu_metal_init(void) {
         // (spec chain) q4_K PSOs flip together so every GEMV in a run
         // shares one summation order.
         if (coalesced_level == 2) {
+            // level 2 = BEST PER SHAPE (2x2 matrix receipt: byte-lane b4c
+            // 107/50 GB/s compact/5G vs vec4 46/37 — but the vec4 WINS the
+            // single-row shape as the 12.4 t/s serial receipt showed):
+            // batched pass GEMVs = byte-lane b4c, single-row = vec4 c2.
             ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k_c2");
-            ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c2");
+            ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c");
         } else if (coalesced_level == 1) {
             ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k_c");
             ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c");

@@ -2163,6 +2163,173 @@ mod q4k_crafted_probe {
         println!("[gguf b4 parity] ok: 4 tokens x {rows} rows, cols={cols}");
     }
 
+    /// The ~150GB/s kernel-class attack: coalesced-lane q4_K GEMVs
+    /// (gemv_q4_k_c single + gemv_q4_k_b4c batched, SOFUU_Q4K_COALESCED=1
+    /// flips both PSOs at engine init). Different f32 summation class (per-
+    /// lane partials + one simd_sum), so parity is the vec_dot_raw_q4_k
+    /// 1e-2-rel class — NOT the bit-exact b4 gate. One serialized test so
+    /// the process env can't race the other engines' PSO classes: coalesced
+    /// engine parity first, env cleared, then a v1 engine for the same-
+    /// window bench.
+    ///
+    /// Run: cargo test -p sofuu-core --lib q4k_coalesced -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q4k_coalesced_matches_cpu_and_bench() {
+        use std::time::Instant;
+
+        let rows = 12288usize; // FFN shape: same bench_b4_vs_v1 tensor
+        let blocks = 16usize; // cols = 4096 (the 8B attn/FFN input width)
+        let cols = blocks * 256;
+        let row_bytes = blocks * 144;
+
+        // deterministic q4_K blob: random packed scales + random qs (both
+        // d/m and d may be zero — the oracle handles the real encoding)
+        let mut state = 0x5DEECE66Du64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        let mut w = vec![0u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..blocks {
+                let off = r * row_bytes + b * 144;
+                w[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+                w[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+                for j in 0..12 {
+                    w[off + 4 + j] = (rand() & 0x3F) as u8 | ((rand() & 3) << 6) as u8;
+                }
+                for j in 0..128 {
+                    w[off + 16 + j] = (rand() % 255) as u8;
+                }
+            }
+        }
+        let toks: Vec<Vec<f32>> = (0..4)
+            .map(|t| (0..cols).map(|i| ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5).collect())
+            .collect();
+        // CPU oracle per token per row
+        let mut y_cpu = vec![0f32; 4 * rows];
+        for t in 0..4 {
+            for r in 0..rows {
+                let off = r * row_bytes;
+                y_cpu[t * rows + r] = unsafe {
+                    crate::infer::quant::vec_dot_raw_q4_k(w[off..].as_ptr(), toks[t].as_ptr(), blocks)
+                };
+            }
+        }
+
+        let page = 16384usize;
+        // one page-aligned slab: x[4][cols] then y[4][rows]
+        let slab_len = 4 * cols * 4 + 4 * rows * 4 + page;
+        let alloc = ((slab_len + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, alloc) };
+        for t in 0..4 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    toks[t].as_ptr() as *const u8,
+                    slab.as_mut_ptr().add(t * cols * 4),
+                    cols * 4,
+                );
+            }
+        }
+        let y_off = 4 * cols * 4;
+        let y_off_f = y_off / 4;
+
+        std::env::set_var("SOFUU_Q4K_COALESCED", "1");
+        let engine_c = MetalEngine::new().expect("metal engine (coalesced)");
+        std::env::remove_var("SOFUU_Q4K_COALESCED");
+
+        let wb = engine_c.register_zerocopy_buffer(&w).expect("w");
+        let slab_buf = engine_c.register_zerocopy_buffer(slab).expect("slab");
+
+        // coalesced single-row parity
+        assert!(engine_c.batch_open());
+        engine_c.batch_gguf(12, &wb, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+        engine_c.batch_end();
+        let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, alloc / 4) };
+        let mut rel = 0f64;
+        for r in 0..rows {
+            rel = rel.max(
+                (view[y_off_f + r] as f64 - y_cpu[r] as f64).abs() / y_cpu[r].abs().max(1e-3) as f64,
+            );
+        }
+        println!("[q4k coalesced] single max_rel={rel:.3e}");
+        assert!(rel < 1e-2, "coalesced single vs oracle {rel}");
+
+        // coalesced b4 parity (all 4 x all rows)
+        assert!(engine_c.batch_open());
+        engine_c.batch_gguf_b4(&wb, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+        engine_c.batch_end();
+        let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, alloc / 4) };
+        let mut rel = 0f64;
+        for i in 0..4 * rows {
+            rel = rel.max(
+                (view[y_off_f + i] as f64 - y_cpu[i] as f64).abs() / y_cpu[i].abs().max(1e-3) as f64,
+            );
+        }
+        println!("[q4k coalesced] b4 max_rel={rel:.3e}");
+        assert!(rel < 1e-2, "coalesced b4 vs oracle {rel}");
+
+        // same-window bench: coalesced engine then a fresh v1 engine
+        let wlen = rows * row_bytes as usize;
+        for iters in [2usize, 8] {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine_c.batch_open());
+                engine_c.batch_gguf_b4(&wb, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                engine_c.batch_end();
+            }
+            let per = t0.elapsed().as_secs_f64() / iters as f64;
+            if iters == 8 {
+                println!(
+                    "[q4k coalesced] b4c per_group={:.3}ms eff_bw={:.1} GB/s",
+                    per * 1e3,
+                    4.0 * wlen as f64 / per / 1e9
+                );
+            }
+        }
+        std::env::remove_var("SOFUU_Q4K_COALESCED");
+        let engine_v1 = MetalEngine::new().expect("metal engine (v1)");
+        let wb1 = engine_v1.register_zerocopy_buffer(&w).expect("w");
+        let sb1 = engine_v1.register_zerocopy_buffer(slab).expect("slab");
+        for iters in [2usize, 8] {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine_v1.batch_open());
+                for _t in 0..4 {
+                    engine_v1.batch_gguf(12, &wb1, 0, &sb1, 0, &sb1, y_off, rows, cols);
+                }
+                engine_v1.batch_end();
+            }
+            let per = t0.elapsed().as_secs_f64() / iters as f64;
+            if iters == 8 {
+                println!(
+                    "[q4k coalesced] v1x4 per_group={:.3}ms eff_bw={:.1} GB/s",
+                    per * 1e3,
+                    4.0 * wlen as f64 / per / 1e9
+                );
+            }
+        }
+    }
+
     /// GPU3 acceptance: chunked attention (head_rmsnorm+rope -> part -> fin)
     /// matches the CPU reference (quant:: fns + plain full-prefix softmax).
     #[test]
@@ -2380,6 +2547,87 @@ mod q4k_crafted_probe {
                 if iter == 0 { "warmup" } else { "measured" },
                 per * 1e3,
                 wlen as f64 / per / 1e9
+            );
+        }
+    }
+
+    /// G3 economics A/B (#[ignore], run on a calm Mac): does ONE batch_gguf_b4
+    /// pass over the FFN shape cost one weight stream or more? Compares the
+    /// shipped scalar GEMV (the serial client's cost) against the B=4 kernel
+    /// on the identical tensor, same process, same window.
+    ///
+    /// Run: cargo test -p sofuu-core --lib bench_b4_vs_v1 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_b4_vs_v1() {
+        use std::time::Instant;
+        let engine = MetalEngine::new().expect("metal engine");
+        let rows = 12288usize;
+        let cols = 4096usize;
+        let blocks = cols / 256;
+        let wlen = rows * blocks * 144; // 28.3MB q4_K
+        let wbuf = vec![0x80u8; wlen];
+        // x: [4][cols] token-major
+        let x: Vec<f32> = (0..4 * cols)
+            .map(|i| ((i % 11) as f32) * 0.25 - 1.25)
+            .collect();
+        let page = 16384usize;
+        let ylen = page;
+        let xylen = x.len() * 4 + ylen;
+        let alloc = ((xylen + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, alloc) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, slab.as_mut_ptr(), x.len() * 4)
+        };
+        let y_off = (x.len() * 4 + 63) & !63;
+        let w_buf = engine.register_zerocopy_buffer(&wbuf).expect("w");
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+
+        // v1: four separate tokens = four batch_gguf calls (serial client cost/
+        // 4-token group; the x of tokens 1..3 all points at row 0's x — the
+        // timing here is about the weight stream, not values).
+        for iter in 0..3 {
+            let iters = if iter == 0 { 2 } else { 6 };
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine.batch_open());
+                for _t in 0..4 {
+                    engine.batch_gguf(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                }
+                engine.batch_end();
+            }
+            let per = t0.elapsed().as_secs_f64() / iters as f64;
+            println!(
+                "[bench b4-vs-v1] v1 x4   per_group={:.3}ms stream_bw={:.1} GB/s",
+                per * 1e3,
+                4.0 * wlen as f64 / per / 1e9
+            );
+        }
+        // b4: one call, one [4][cols] batch.
+        for iter in 0..3 {
+            let iters = if iter == 0 { 2 } else { 6 };
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                assert!(engine.batch_open());
+                engine.batch_gguf_b4(&w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                engine.batch_end();
+            }
+            let per = t0.elapsed().as_secs_f64() / iters as f64;
+            println!(
+                "[bench b4-vs-v1] b4      per_group={:.3}ms eff_bw={:.1} GB/s vs-v1-x4",
+                per * 1e3,
+                4.0 * wlen as f64 / per / 1e9
             );
         }
     }

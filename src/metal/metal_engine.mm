@@ -136,9 +136,10 @@ void* sofuu_metal_init(void) {
                   @"(precompiled kernels)");
         }
 
+        // env-gated q4_K kernel class: coalesced-lane vs shipped scalar
+        BOOL q4k_coalesced = NO;
         auto load_pso = [&](NSString* name) -> id<MTLComputePipelineState> {
-            id<MTLFunction> fn = [lib newFunctionWithName:name];
-            if (fn == nil) return nil;
+            id<MTLFunction> fn = [lib newFunctionWithName:name];            if (fn == nil) return nil;
             NSError* pso_err = nil;
             return [dev newComputePipelineStateWithFunction:fn error:&pso_err];
         };
@@ -161,7 +162,13 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_q8_0 = load_pso(@"gemv_q8_0");
         ctx->pso_gemv_q4_0 = load_pso(@"gemv_q4_0");
         ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
-
+        // SOFUU_Q4K_COALESCED=1 flips BOTH q4_K PSOs to the coalesced-lane
+        // kernels — one kernel class per engine instance so serial, spec and
+        // b4 GEMVs all share the same f32 summation order (text parity holds
+        // internally; the coalesced class has its own CPU-oracle parity gate).
+        const char* q4k_class = getenv("SOFUU_Q4K_COALESCED");
+        int coalesced_level = (q4k_class && strcmp(q4k_class, "0") != 0) ? atoi(q4k_class) : 0;
+        q4k_coalesced = coalesced_level > 0;
         ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         ctx->pso_rmsnorm_f32w  = load_pso(@"rmsnorm_f32w");
         ctx->pso_llama_kv_write = load_pso(@"llama_kv_write");
@@ -169,7 +176,20 @@ void* sofuu_metal_init(void) {
         ctx->pso_head_rmsnorm    = load_pso(@"head_rmsnorm");
         ctx->pso_llama_attn_part = load_pso(@"llama_attn_part");
         ctx->pso_llama_attn_fin  = load_pso(@"llama_attn_fin");
-        ctx->pso_gemv_q4_k_b4   = load_pso(@"gemv_q4_k_b4");
+        if (coalesced_level == 2) {
+            ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c2");
+        } else if (coalesced_level == 1) {
+            ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c");
+        }
+        if (ctx->pso_gemv_q4_k_b4 == nil) {
+            // coalesced class unavailable (e.g. a complete bundled metallib
+            // predating it): degrade to the shipped class, never a silent
+            // no-op GEMV
+            if (coalesced_level > 0 && ctx->pso_gemv_q4_k == nil) {
+                ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
+            }
+            ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4");
+        }
 
         // Initial 64KB activation buffers
         ctx->x_buf_cap = 65536 * sizeof(float);

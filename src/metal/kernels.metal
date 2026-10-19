@@ -749,9 +749,200 @@ kernel void gemv_q4_k_b4(
     y[3 * rows + row] = acc3;
 }
 
+// ── COALESCED-LANE q4_K GEMVs (the ~150GB/s kernel-class attack) ────────────
+// Lane l reads qs byte l of each 32-byte group span, so 32 lanes cover a
+// 64-value group's weight bytes in ONE coalesced wavefront (the shipped
+// per-superblock-per-lane layout strides lanes 144B apart and issues ~800
+// scalar ops per lane per superblock; here ~105, dominated by fully
+// coalesced 32B weight waves and 128B x waves), and x loads coalesce
+// across the wavefront too. Scale bytes and d/dmin are lane-uniform; every
+// lane decodes them redundantly (same addresses, no divergence). The f32
+// summation ORDER changes (per-lane partials accumulated across the row,
+// one simd_sum per token at the end) — a DIFFERENT parity class from
+// gemv_q4_k/b4: gated separately at vec_dot_raw_q4_k 1e-2-rel, and the
+// client must run ONE q4_K kernel class per model run (serial and spec
+// both flipped by the same env-gated PSO choice) so text parity holds
+// internally.
+kernel void gemv_q4_k_c(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float acc = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * (cols / 256) * 144;
+    // ALL lanes of the threadgroup walk the same superblock: byte lane + a
+    // 32-lane stride covers each 64-value group's qs span per wavefront.
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        // j = value offset 0/64/128/192; scale pair = (2j, 2j+1)
+        for (uint j = 0; j < 4; ++j) {
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, j * 2, &sc1, &m1);
+            q4k_scale_min(scales, j * 2 + 1, &sc2, &m2);
+            float p1 = d * (float)sc1;
+            float q1 = dmin * (float)m1;
+            float p2 = d * (float)sc2;
+            float q2 = dmin * (float)m2;
+            uint q = (uint)qs[j * 32 + lane];
+            uint xoff = b * 256 + j * 64 + lane;
+            float xw0 = x[xoff];
+            float xw1 = x[xoff + 32];
+            acc += (p1 * (float)(q & 0x0F) - q1) * xw0
+                 + (p2 * (float)(q >> 4) - q2) * xw1;
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = acc;
+    }
+}
+
+// B=4 batched variant: same coalesced weight wavefronts, 4 token
+// accumulators; x token-major [4][cols], y token-major [4][rows].
+kernel void gemv_q4_k_b4c(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],   // [4][cols]
+    device float        *y              [[buffer(2)]],   // [4][rows]
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * (cols / 256) * 144;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        for (uint j = 0; j < 4; ++j) {
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, j * 2, &sc1, &m1);
+            q4k_scale_min(scales, j * 2 + 1, &sc2, &m2);
+            float p1 = d * (float)sc1;
+            float q1 = dmin * (float)m1;
+            float p2 = d * (float)sc2;
+            float q2 = dmin * (float)m2;
+            uint q = (uint)qs[j * 32 + lane];
+            uint xoff = b * 256 + j * 64 + lane;
+            uint xoff1 = xoff + 32;
+            float w1 = p1 * (float)(q & 0x0F) - q1;
+            float w2 = p2 * (float)(q >> 4) - q2;
+            acc0 += w1 * x[xoff] + w2 * x[xoff1];
+            acc1 += w1 * x[cols + xoff] + w2 * x[cols + xoff1];
+            acc2 += w1 * x[2 * cols + xoff] + w2 * x[2 * cols + xoff1];
+            acc3 += w1 * x[3 * cols + xoff] + w2 * x[3 * cols + xoff1];
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    y[row] = acc0;
+    y[rows + row] = acc1;
+    y[2 * rows + row] = acc2;
+    y[3 * rows + row] = acc3;
+}
+
+// VEC variant of the coalesced class. Geometry: sub = lane/8 picks the
+// superblock b = b_base+sub (4 superblocks per wavefront); l8 = lane%8
+// picks the lane's 16B span of the superblock's 128 qs bytes — one 16B-
+// aligned uint4 load (stride 144 = 9x16, span base l8*16). Byte
+// w = l8*16 + 4c + j (component c, byte j) holds the value pair
+// (g*64+k, g*64+32+k) with g = l8/2, k = (l8%2)*16 + 4c + j — component c
+// covers the 4 consecutive pairs k0+4c..k0+4c+3, so its lo nibbles map to
+// ONE float4 x run at xbase+4c (16B-aligned: k0%4==0) and its hi nibbles
+// to the run at +32. Per-value weight = d*sc*nib - dmin*m (m is NOT
+// nibble-scaled). float4 accumulators, one horizontal sum per token at
+// the end + one simd_sum: per-lane-partials class, gated at
+// vec_dot_raw_q4_k 1e-2-rel.
+kernel void gemv_q4_k_b4c2(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],   // [4][cols]
+    device float        *y              [[buffer(2)]],   // [4][rows]
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * (cols / 256) * 144;
+    uint sub = lane / 8;
+    uint l8 = lane % 8;
+    uint g = l8 / 2;
+    uint k0 = (l8 % 2) * 16;
+    for (uint b0 = 0; b0 < nb; b0 += 4) {
+        uint b = b0 + sub;
+        if (b >= nb) { break; }
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        uint8_t sc1, m1, sc2, m2;
+        q4k_scale_min(scales, g * 2, &sc1, &m1);
+        q4k_scale_min(scales, g * 2 + 1, &sc2, &m2);
+        float s1 = d * (float)sc1;
+        float s2 = d * (float)sc2;
+        float m1f = dmin * (float)m1;
+        float m2f = dmin * (float)m2;
+        uint4 q4 = *(device const uint4 *)&qs[l8 * 16];
+        uint xbase = b * 256 + g * 64 + k0;
+        // component c covers byte pairs k0+4c..+3; unrolled so the vector
+        // component access stays compile-time (dynamic indexing spills)
+#pragma clang loop unroll(full)
+        for (uint c = 0; c < 4; ++c) {
+            uint comp;
+            if (c == 0) { comp = q4.x; }
+            else if (c == 1) { comp = q4.y; }
+            else if (c == 2) { comp = q4.z; }
+            else { comp = q4.w; }
+            float lo0 = float(comp & 15);
+            float lo1 = float((comp >> 8) & 15);
+            float lo2 = float((comp >> 16) & 15);
+            float lo3 = float((comp >> 24) & 15);
+            float hi0 = float((comp >> 4) & 15);
+            float hi1 = float((comp >> 12) & 15);
+            float hi2 = float((comp >> 20) & 15);
+            float hi3 = float((comp >> 28) & 15);
+            float4 wlo = float4(s1) * float4(lo0, lo1, lo2, lo3) - float4(m1f);
+            float4 whi = float4(s2) * float4(hi0, hi1, hi2, hi3) - float4(m2f);
+            float4 x0lo = *(device const float4 *)&x[xbase + 4 * c];
+            float4 x0hi = *(device const float4 *)&x[xbase + 32 + 4 * c];
+            float4 x1lo = *(device const float4 *)&x[cols + xbase + 4 * c];
+            float4 x1hi = *(device const float4 *)&x[cols + xbase + 32 + 4 * c];
+            float4 x2lo = *(device const float4 *)&x[2 * cols + xbase + 4 * c];
+            float4 x2hi = *(device const float4 *)&x[2 * cols + xbase + 32 + 4 * c];
+            float4 x3lo = *(device const float4 *)&x[3 * cols + xbase + 4 * c];
+            float4 x3hi = *(device const float4 *)&x[3 * cols + xbase + 32 + 4 * c];
+            acc0 += wlo * x0lo + whi * x0hi;
+            acc1 += wlo * x1lo + whi * x1hi;
+            acc2 += wlo * x2lo + whi * x2hi;
+            acc3 += wlo * x3lo + whi * x3hi;
+        }
+    }
+    float v0 = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+    float v1 = (acc1.x + acc1.y) + (acc1.z + acc1.w);
+    float v2 = (acc2.x + acc2.y) + (acc2.z + acc2.w);
+    float v3 = (acc3.x + acc3.y) + (acc3.z + acc3.w);
+    v0 = simd_sum(v0); v1 = simd_sum(v1);
+    v2 = simd_sum(v2); v3 = simd_sum(v3);
+    y[row] = v0;
+    y[rows + row] = v1;
+    y[2 * rows + row] = v2;
+    y[3 * rows + row] = v3;
+}
+
 // ── GPU3 helper: per-head f32 RMSNorm on a [heads x head_dim] slot ─────────
-// (q-norm for the GGUF shape; done as its own dispatch so the chunked
-// attention kernel reads a fully normalized q with no intra-dispatch race).
 kernel void head_rmsnorm(
     device float       *heads           [[buffer(0)]],
     device const float *w               [[buffer(1)]],

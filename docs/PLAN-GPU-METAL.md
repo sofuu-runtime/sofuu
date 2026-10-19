@@ -181,11 +181,24 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
     prefill already prefers CPU tiles (chunks > 4 bail to them), so
     default fleet behavior is unchanged; engages with
     SOFUU_PREFILL_BATCH=4 + the env flag.
-  - NEXT (goal 40-50 t/s decode): the ~150GB/s GEMV class is THE blocker
-    (serial AND spec both scale with it): coalesced-lane subtile split
-    (lane l reads qs byte l = full 32B-sector coalescing; f32
-    reassociation = different parity class), 16B weight windows + vec4 x,
-    and the calm-window battery before any per-model flip.
+  - KERNEL-CLASS BREAKTHROUGH (2026-10-19 night, same-window receipts): the
+    COALESCED-LANE q4_K class landed — gemv_q4_k_c (single) + gemv_q4_k_b4c
+    (batched, lane l reads byte l of each 32B qs span = full-sector waves,
+    per-lane partials + one simd_sum) and gemv_q4_k_b4c2 (SOFUU_Q4K_COALESCED=2:
+    8 lanes x 16B uint4 spans cover a superblock, 4 superblocks per wavefront,
+    component-parallel float4 x loads + float4 accumulators, one horizontal
+    sum). FFN-tensor 4-token groups, same window: v1 x4 = 3.07ms/36.9 GB/s,
+    b4c = 1.64ms/69.2, b4c2 = 1.13ms/100.0 GB/s — 2.7x the shipped class,
+    parity 2.6e-7 vs vec_dot_raw_q4_k (q4k_coalesced_matches_cpu_and_bench,
+    #[ignore], env-classed). The env flips BOTH single+batch PSOs at engine
+    init so serial/spec/b4 share one class per run (text parity internal;
+    bundled-metallib fallback degrades to v1 rather than silent no-ops).
+    Live 8B at load ~4.9: serial 5.1 t/s, spec 3.3 t/s (text token-identical);
+    the spec pass is now BUBBLE-bound (its GEMV mass is ~40ms at 100GB/s;
+    the ~1600-op commit chain + per-row glue dominate) — next spec levers:
+    batch the per-row elementwise ops across the 4 rows and a multi-row
+    attention kernel.
+
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped
   one-row-per-simdgroup scalar GEMVs with a new in-GPU bandwidth bench

@@ -93,6 +93,34 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   elimination was necessary but not sufficient, and the panel-GEMV rewrite
   (2-8 rows per threadgroup, 16B loads, llama.cpp-class) is now the measured
   #1 lever for 8B.
+- **GPU3 wave A (2026-10-18, whole-token + attribution, ~uncommitted→commit)**:
+  the WHOLE TOKEN now runs in ONE command buffer (embed + 36 layers + final
+  norm + lm_head; CPU waits once; SOFUU_GPU_LAYER_COMMIT=1 restores per-layer
+  waits) — measured effect on 8B decode: ZERO (2.03 vs 2.09 t/s), text parity
+  kept. Combined with a raw-operations ablation matrix (SOFUU_GPU_SKIP="attn,
+  ffn,head" — timing-only) and three in-GPU micro-benches (op-overhead chain,
+  real-layer mimic with ablations, weights geometry incl. file-backed vs
+  anon), the 8B per-token budget is now ATTRIBUTED at stable-window
+  (profile: host_encode 0.2-0.3ms, GPU busy ~264ms/token):
+    FFN gate/up/swiglu/down  ~123 ms  (q4_K GEMVs at ~25-27 GB/s = expected)
+    attention (kv_write + per-head attn) ~85 ms  (KV reads ~375MB -> kernel
+        runs at ~4 GB/s effective: one 32-lane threadgroup per head walking
+        1,270 positions serially = LATENCY-BOUND, the standout defect)
+    head (lm_head q6_K 510MB) ~25-30 ms;  q/k/v + o-proj ~23-25 ms;
+    norms/adds/swiglu glue ~0-5 ms;  commit waits ~0 (proved by 36->1 = no-op)
+  Micro-bench cross-checks: chained q4_K at the FFN shape runs 38 GB/s
+  in-batch; a compact-buffer clone of a whole layer (same seven GEMVs) sums
+  to ~102-115 ms/token vs the client's 264 — closed per-op/geometry/file-
+  backing hypotheses (all equivalent warm); _so the 264-vs-115 gap remains
+  UNEXPLAINED_ and is the next diagnostic after the attention fix.
+  Chunked attention (head_rmsnorm+rope dispatch, then per (head, 128-position
+  chunk) partial softmax+V to a per-layer meta region, then a rescale finish
+  kernel) PASSES an isolated real-shape parity test (hd128, 32/8 heads,
+  pos 1300: max_err 3.75e-2 vs the CPU two-pass softmax) but produces GARBAGE
+  in the full client (old serial kernel in the same client = correct text) —
+  shipped DEFAULT-OFF behind SOFUU_GPU_ATTN=1 until the client-context
+  difference is understood. Old kernel remains the default. Everything is
+  behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped
   one-row-per-simdgroup scalar GEMVs with a new in-GPU bandwidth bench

@@ -602,6 +602,30 @@ extern "C" {
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
     );
+    fn sofuu_metal_batch_head_rmsnorm(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        w_buf: *mut c_void, w_offset: usize,
+        head_dim: u32, n_heads: u32,
+        has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
+    );
+    fn sofuu_metal_batch_llama_attn_part(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        qln_buf: *mut c_void, qln_offset: usize,
+        meta_buf: *mut c_void, meta_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    );
+    fn sofuu_metal_batch_llama_attn_fin(
+        ctx: *mut c_void,
+        meta_buf: *mut c_void, meta_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_alt: u32, n_heads: u32, head_dim: u32,
+    );
     fn sofuu_metal_batch_llama_attn(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -889,6 +913,78 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// Per-head f32 RMSNorm (q-norm) on a [heads x head_dim] slab slot.
+    pub fn batch_head_rmsnorm(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        w_buf: Option<&MetalBuffer>, w_offset: usize,
+        head_dim: u32, n_heads: u32,
+        has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (w_handle, w_off) = match w_buf {
+            Some(b) => (b.handle, w_offset),
+            None => (x_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_head_rmsnorm(
+                self.ctx,
+                x_buf.handle, x_offset,
+                w_handle, w_off,
+                head_dim, n_heads,
+                has_norm, pos, eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// GPU3 attention stage 1: chunked softmax+V partials into meta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_part(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        qln_buf: Option<&MetalBuffer>, qln_offset: usize,
+        meta_buf: &MetalBuffer, meta_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (qln_handle, qln_off) = match qln_buf {
+            Some(b) => (b.handle, qln_offset),
+            None => (q_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_llama_attn_part(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                qln_handle, qln_off,
+                meta_buf.handle, meta_offset,
+                has_norm, pos,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// GPU3 attention stage 2: rescale chunk partials into head_out.
+    pub fn batch_llama_attn_fin(
+        &self,
+        meta_buf: &MetalBuffer, meta_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_alt: u32, n_heads: u32, head_dim: u32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_llama_attn_fin(
+                self.ctx,
+                meta_buf.handle, meta_offset,
+                out_buf.handle, out_offset,
+                pos_alt, n_heads, head_dim,
             );
         }
     }
@@ -1337,6 +1433,738 @@ mod q4k_crafted_probe {
                 }
             }
         }
+    }
+
+    /// Working-set experiment: q4_K GEMV (12288x4096) whose weights sit
+    /// (a) at offset 0 of a compact 28MB buffer vs (b) 3GB deep inside a
+    /// 5GB registered buffer (real-client geometry). Same window, same op.
+    #[test]
+    #[ignore]
+    fn bench_weights_geometry() {
+        use std::os::fd::AsRawFd;
+        use std::time::Instant;
+        let engine = MetalEngine::new().expect("metal engine");
+        let rows = 12288usize;
+        let cols = 4096usize;
+        let blocks = cols / 256;
+        let wlen = rows * blocks * 144;
+        // slab with x + y slots
+        let page = 16384usize;
+        let slab_alloc = page;
+        let slab_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), slab_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        unsafe {
+            let xf = slab_ptr as *mut f32;
+            for i in 0..cols { *xf.add(i) = ((i % 7) as f32) * 0.25 - 0.75; }
+        }
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        let y_off = 8192; // after 4096 f32 x
+
+        let gb5 = 5usize * (1 << 30);
+        let big_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), gb5, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(big_ptr != libc::MAP_FAILED);
+        let deep = 3usize * (1 << 30);
+        unsafe {
+            // fill the deep window with a pattern (touches the pages)
+            let p = (big_ptr as *mut u8).add(deep);
+            for i in (0..wlen).step_by(4096) {
+                *p.add(i) = 0x5A;
+            }
+        }
+        let big: &[u8] = unsafe { std::slice::from_raw_parts(big_ptr as *const u8, gb5) };
+        let big_buf = engine.register_zerocopy_only(big).expect("big");
+
+        let compact = vec![0x5Au8; wlen];
+        let compact_buf = engine.register_zerocopy_only(&compact).expect("compact");
+
+        let run = |buf: &MetalBuffer, off: usize, tag: &str| {
+            for rep in 0..2 {
+                let iters = if rep == 0 { 2 } else { 5 };
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    assert!(engine.batch_open());
+                    engine.batch_gguf(12, buf, off, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                    engine.batch_end();
+                }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                println!(
+                    "[weights geometry] {:<12} per_op={:.2}ms bw={:.1} GB/s",
+                    tag,
+                    per * 1e3,
+                    wlen as f64 / per / 1e9
+                );
+            }
+        };
+        run(&compact_buf, 0, "compact-28M");
+        run(&big_buf, deep, "3G-in-5G");
+        run(&big_buf, 1 << 30, "1G-in-5G");
+        run(&big_buf, gb5 - wlen - 16 * 1024, "4.8G-in-5G");
+        run(&compact_buf, 0, "compact-28M-again");
+        run(&big_buf, deep, "3G-in-5G-again");
+
+        // File-backed vs anon: same 28MB GEMV, weights in a real FILE mmap.
+        let fpath = std::env::temp_dir().join("sofuu_gpugeo_5g.bin");
+        {
+            let f = std::fs::File::create(&fpath).expect("create file");
+            f.set_len(gb5 as u64).expect("set_len");
+            use std::io::{Write, Seek, SeekFrom};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&fpath).expect("open");
+            f.seek(SeekFrom::Start(deep as u64)).expect("seek");
+            let chunk = vec![0x5Au8; 1 << 20];
+            for _ in 0..(wlen >> 20) {
+                f.write_all(&chunk).expect("write");
+            }
+            f.write_all(&vec![0x5Au8; wlen % (1 << 20)]).expect("write tail");
+            f.sync_all().expect("sync");
+        }
+        let f = std::fs::File::open(&fpath).expect("open");
+        let fmap = unsafe {
+            libc::mmap(std::ptr::null_mut(), gb5, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
+        };
+        assert!(fmap != libc::MAP_FAILED);
+        let fbuf: &[u8] = unsafe { std::slice::from_raw_parts(fmap as *const u8, gb5) };
+        let file_buf = engine.register_zerocopy_only(fbuf).expect("filebuf");
+        run(&file_buf, deep, "file-deep-5G");
+        run(&file_buf, deep, "file-deep-5G-warm");
+
+        // Full-token sweep: 40 chained GEMVs, each 28MB but at offsets spread
+        // across the whole 5GB buffer (like the 36-layer sequence touching
+        // every part of the file once per token). ~1.1GB touched per sweep.
+        for rep in 0..3 {
+            let spread: Vec<usize> = (0..40)
+                .map(|i| (i + 1) * (gb5 / 41) & !16383)
+                .collect();
+            let t0 = Instant::now();
+            let iters = 3;
+            for _ in 0..iters {
+                assert!(engine.batch_open());
+                for (j, &off) in spread.iter().enumerate() {
+                    let yoff = 8192 + (j % 2) * 4096 * 4;
+                    let xoff = if j % 2 == 0 { 0 } else { 8192 };
+                    engine.batch_gguf(12, &big_buf, off, &slab_buf, xoff, &slab_buf, yoff, rows, cols);
+                }
+                engine.batch_end();
+            }
+            let dt = t0.elapsed().as_secs_f64() / iters as f64;
+            let bytes = (spread.len() * wlen) as f64;
+            println!(
+                "[token-sweep] 40x28MB spread over 5GB: per_sweep={:.1}ms aggregate_bw={:.1} GB/s",
+                dt * 1e3,
+                bytes / dt / 1e9
+            );
+        }
+    }
+
+    /// Op-overhead attribution: how much does each in-batch op/barrier cost
+    /// at REAL client shapes, chained (dependent) like the one-commit client?
+    /// Bench cases per iteration of K ops in one batch:
+    ///   glue : K x [rmsnorm(4096) -> add(4096)] chained in/out same slots
+    ///   gguf : K x batch_gguf q4_K 12288x4096 chained y->x slot ping-pong
+    /// Run: cargo test -p sofuu-core --lib bench_op_overhead -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_op_overhead() {
+        use std::time::Instant;
+        let engine = MetalEngine::new().expect("metal engine");
+        let dim = 4096usize;
+        let page = 16384usize;
+        // slab: x@0 xn@dim xo@2dim (f32 slots), plus ping-pong y slots
+        let slots_f32 = 8 * dim;
+        let alloc = ((slots_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, alloc) };
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+        let norm_f32 = vec![1.0f32; dim];
+        let mut wb = vec![0u8; 16384];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                norm_f32.as_ptr() as *const u8,
+                wb.as_mut_ptr(),
+                dim * 4,
+            )
+        };
+        let w_buf = engine.register_zerocopy_buffer(&wb).expect("wbuf");
+
+        // gguf chain W: reuse the q4_K FFN weight blob (zeros fine for timing)
+        let rows = 12288usize;
+        let cols = 4096usize;
+        let blocks = cols / 256;
+        let wbuf2 = vec![0x80u8; rows * blocks * 144];
+        let w_buf2 = engine.register_zerocopy_buffer(&wbuf2).expect("w2");
+
+        for case in ["glue", "gguf"] {
+            let iters = if case == "glue" { 4 } else { 2 };
+            for rep in 0..iters {
+                let k = if case == "glue" { 256 } else { 36 };
+                let t0 = Instant::now();
+                assert!(engine.batch_open());
+                for j in 0..k {
+                    if case == "glue" {
+                        // alternating rmsnorm/add chain, x->xn->x slots
+                        if j % 2 == 0 {
+                            engine.batch_rmsnorm_f32w(
+                                &slab_buf, 0, &w_buf, 0, &slab_buf, (1 * dim) * 4, dim, 1e-5,
+                            );
+                        } else {
+                            engine.batch_add(&slab_buf, 0, &slab_buf, (1 * dim) * 4, dim);
+                        }
+                    } else {
+                        // ping-pong y into slots 2..3 dim-offset region (timing only)
+                        let yoff = ((2 + (j % 2)) * dim) * 4;
+                        let xoff = if j % 2 == 0 { 0 } else { (2 + ((j + 1) % 2)) * dim * 4 };
+                        engine.batch_gguf(12, &w_buf2, 0, &slab_buf, xoff, &slab_buf, yoff, rows, cols);
+                    }
+                }
+                engine.batch_end();
+                let per = t0.elapsed().as_secs_f64() / k as f64;
+                println!(
+                    "[bench op-overhead] case={} k={:<4} per_op={:.0} us  ops/s/slot-sweep={:.1}",
+                    case,
+                    k,
+                    per * 1e6,
+                    1.0 / per
+                );
+            }
+        }
+    }
+
+    /// Reproduce ONE REAL Qwen3-8B layer, operator-for-operator, in one batch
+    /// and ablate pieces to attribute the per-layer time. Shapes: dim 4096,
+    /// 32/8 heads x 128, inter 12288, pos 8, all GEMVs q4_K.
+    /// Ablate via: cargo ... bench_layer_mimic -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_layer_mimic() {
+        use std::time::Instant;
+        let engine = MetalEngine::new().expect("metal engine");
+        let dim = 4096usize;
+        let q_rows = 4096usize;   // 32 x 128
+        let kv_rows = 1024usize;  // 8 x 128
+        let hd = 128usize;
+        let inter = 12288usize;
+        let vocab_rows = 151936usize;
+        let page = 16384usize;
+
+        // ── weight blobs (q4_K), nominal offsets ──
+        let qk4 = |rows: usize, cols: usize| vec![0x80u8; rows * (cols / 256) * 144];
+        let wq = qk4(q_rows, dim);
+        let wk = qk4(kv_rows, dim);
+        let wv = qk4(kv_rows, dim);
+        let wo = qk4(dim, q_rows);
+        let wg = qk4(inter, dim);
+        let wu = qk4(inter, dim);
+        let wd = qk4(dim, inter);
+        let q6_row_b = (dim / 256) * 210;
+        let wh = vec![0x80u8; vocab_rows * q6_row_b];
+        let wj = wq.len() + wk.len() + wv.len();
+
+        let w_alloc = wq.len() + wk.len() + wv.len() + wo.len() + wg.len() + wu.len() + wd.len();
+        let w_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                ((w_alloc + page - 1) / page) * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(w_ptr != libc::MAP_FAILED);
+        let wbase = w_ptr as *mut u8;
+        let mut put = |off: usize, src: &[u8]| unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), wbase.add(off), src.len())
+        };
+        put(0, &wq);
+        put(wq.len(), &wk);
+        put(wq.len() + wk.len(), &wv);
+        put(wj, &wo);
+        put(wj + wo.len(), &wg);
+        put(wj + wo.len() + wg.len(), &wu);
+        put(wj + wo.len() + wg.len() + wu.len(), &wd);
+        let w_slice: &[u8] =
+            unsafe { std::slice::from_raw_parts(wbase, ((w_alloc + page - 1) / page) * page) };
+        let w_buf = engine.register_zerocopy_only(w_slice).expect("weights");
+        let head_alloc = ((wh.len() + page - 1) / page) * page;
+        let wh_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                head_alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(wh_ptr != libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(wh.as_ptr(), wh_ptr as *mut u8, wh.len())
+        };
+        let wh_slice: &[u8] = unsafe { std::slice::from_raw_parts(wh_ptr as *const u8, head_alloc) };
+        let wh_buf = engine.register_zerocopy_only(wh_slice).expect("head weights");
+
+        // ── activation slab: x, xn, qa, ka, va, ao, xo, gate, up, logits (f32) ──
+        let logits_f32 = vocab_rows;
+        let slab_f32 = 6 * dim + q_rows + 2 * kv_rows + 2 * inter + logits_f32;
+        let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                slab_alloc,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        let fx = 0usize;
+        let fxn = dim;
+        let fqa = 2 * dim;
+        let fka = fqa + q_rows;
+        let fva = fka + kv_rows;
+        let fao = fva + kv_rows;
+        let fxo = fao + q_rows;
+        let fgate = fxo + dim;
+        let fup = fgate + inter;
+        let flog = fup + inter;
+        let _ = flog;
+
+        // norms (f32 dim) @0/8164, q/k norms (hd) @ head-dim offsets
+        let mk = |bytes: usize| unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        let nw3_ptr = mk(8192);
+        assert!(nw3_ptr != libc::MAP_FAILED);
+        let wb3: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(nw3_ptr as *mut u8, 8192) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [1.0f32; 4096].as_ptr() as *const u8,
+                wb3.as_mut_ptr(),
+                4096 * 4,
+            )
+        };
+        let wnorm = engine.register_zerocopy_only(wb3).expect("norm");
+
+        // KV caches
+        let kv_f32 = kv_rows * 64 * hd; // max_seq 64
+        let kv_alloc = (((kv_f32 * 4) + page - 1) / page) * page;
+        let k_ptr = mk(kv_alloc);
+        let v_ptr = mk(kv_alloc);
+        assert!(k_ptr != libc::MAP_FAILED && v_ptr != libc::MAP_FAILED);
+        let kb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(k_ptr as *mut u8, kv_alloc) };
+        let vb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(v_ptr as *mut u8, kv_alloc) };
+        let k_buf = engine.register_zerocopy_only(kb).expect("k");
+        let v_buf = engine.register_zerocopy_only(vb).expect("v");
+
+        // ablations: full | no-attn (skip kv_write+attn) | no-glue (skip norms+adds) | gemv-only | with-head
+        for mode in ["gemv-only", "no-glue", "no-attn", "full", "full+head"] {
+            for rep in 0..2 {
+                let k_layers = if mode == "full+head" { 4 } else { 8 };
+                let t0 = Instant::now();
+                assert!(engine.batch_open());
+                for li in 0..k_layers {
+                    if mode != "no-glue" && mode != "gemv-only" {
+                        engine.batch_rmsnorm_f32w(&slab_buf, fx * 4, &wnorm, 0, &slab_buf, fxn * 4, dim, 1e-5);
+                    }
+                    engine.batch_gguf(12, &w_buf, 0, &slab_buf, fxn * 4, &slab_buf, fqa * 4, q_rows, dim);
+                    engine.batch_gguf(12, &w_buf, wq.len(), &slab_buf, fxn * 4, &slab_buf, fka * 4, kv_rows, dim);
+                    engine.batch_gguf(12, &w_buf, wq.len() + wk.len(), &slab_buf, fxn * 4, &slab_buf, fva * 4, kv_rows, dim);
+                    if mode == "full" || mode == "full+head" {
+                        engine.batch_llama_kv_write(
+                            &slab_buf, fka * 4,
+                            &slab_buf, fva * 4,
+                            &k_buf, 0,
+                            &v_buf, 0,
+                            Some(&wnorm), 4096,
+                            1, 8,
+                            hd as u32, 8, 64,
+                            1e-5, 10000.0, 0,
+                        );
+                        engine.batch_llama_attn(
+                            &slab_buf, fqa * 4,
+                            &k_buf, 0,
+                            &v_buf, 0,
+                            Some(&wnorm), 4096,
+                            &slab_buf, fao * 4,
+                            1, 8,
+                            hd as u32, 32, 8, 64,
+                            1e-5, 10000.0, 0,
+                        );
+                    }
+                    engine.batch_gguf(12, &w_buf, wj, &slab_buf, fao * 4, &slab_buf, fxo * 4, dim, q_rows);
+                    if mode != "no-glue" && mode != "gemv-only" {
+                        engine.batch_add(&slab_buf, fx * 4, &slab_buf, fxo * 4, dim);
+                        engine.batch_rmsnorm_f32w(&slab_buf, fx * 4, &wnorm, 0, &slab_buf, fxn * 4, dim, 1e-5);
+                    }
+                    engine.batch_gguf(12, &w_buf, wj + wo.len(), &slab_buf, fxn * 4, &slab_buf, fgate * 4, inter, dim);
+                    engine.batch_gguf(12, &w_buf, wj + wo.len() + wg.len(), &slab_buf, fxn * 4, &slab_buf, fup * 4, inter, dim);
+                    if mode != "gemv-only" {
+                        engine.batch_swiglu(&slab_buf, fgate * 4, &slab_buf, fup * 4, inter);
+                    }
+                    engine.batch_gguf(12, &w_buf, wj + wo.len() + wg.len() + wu.len(), &slab_buf, fgate * 4, &slab_buf, fxo * 4, dim, inter);
+                    if mode != "no-glue" && mode != "gemv-only" {
+                        engine.batch_add(&slab_buf, fx * 4, &slab_buf, fxo * 4, dim);
+                    }
+                }
+                if mode == "full+head" {
+                    engine.batch_gguf(14, &wh_buf, 0, &slab_buf, fxn * 4, &slab_buf, flog * 4, vocab_rows, dim);
+                }
+                engine.batch_end();
+                let per = t0.elapsed().as_secs_f64() / k_layers as f64;
+                println!(
+                    "[layer mimic] mode={:<10} per_layer={:.3} ms (x36={:.1} ms/token)",
+                    mode,
+                    per * 1e3,
+                    per * 1e3 * 36.0
+                );
+            }
+        }
+    }
+
+    /// GPU3 acceptance at the REAL Qwen3-8B shape: hd 128, 32/8 heads,
+    /// pos 1300, max_seq 4096 (bytes copied to a compact buffer — geometry
+    /// equivalence already receipted).
+    #[test]
+    fn llama_attn_chunked_matches_cpu_real_shape() {
+        use crate::infer::quant::{batched_rmsnorm_in_place, rope_style};
+        let engine = MetalEngine::new().expect("metal engine");
+        let n_heads = 32usize;
+        let n_kv = 8usize;
+        let hd = 128usize;
+        let max_seq = 4096usize;
+        let pos = 1300usize;
+        let eps = 1e-5f32;
+        let rope_base = 500000.0f32;
+        let rope_mode = 0u32;
+
+        let q0: Vec<f32> = (0..n_heads * hd).map(|i| ((i % 9) as f32) * 0.25 - 1.0).collect();
+        let k0: Vec<f32> = (0..n_kv * hd).map(|i| ((i % 7) as f32) * 0.5 - 1.5).collect();
+        let v0: Vec<f32> = (0..n_kv * hd).map(|i| ((i % 11) as f32) * 0.125 - 0.5).collect();
+        let q_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 5) as f32 * 0.05).collect();
+        let k_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 3) as f32 * 0.07).collect();
+
+        let mut q = q0.clone();
+        batched_rmsnorm_in_place(&mut q, &q_ln, n_heads, hd, eps);
+        rope_style(&mut q, n_heads, hd, pos, rope_base, rope_mode as i32);
+        let mut k = k0.clone();
+        batched_rmsnorm_in_place(&mut k, &k_ln, n_kv, hd, eps);
+        rope_style(&mut k, n_kv, hd, pos, rope_base, rope_mode as i32);
+        let mut k_cache = vec![0f32; n_kv * max_seq * hd];
+        let mut v_cache = vec![0f32; n_kv * max_seq * hd];
+        for t in 0..=pos {
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + t) * hd;
+                for i in 0..hd {
+                    let s = (t * 31 + i * 7 + kv * 13) % 211;
+                    if t == pos {
+                        // current token rows from the ROPED k / raw v
+                        if i < 1 {
+                            k_cache[off + i] = k[kv * hd + i];
+                        }
+                        v_cache[off + i] = v0[kv * hd + i];
+                    } else {
+                        k_cache[off + i] = (s as f32) * 0.01 - 1.0;
+                        v_cache[off + i] = ((s * 3 % 97) as f32) * 0.02 - 0.5;
+                    }
+                }
+            }
+        }
+        // write full roped-k current row
+        for kv in 0..n_kv {
+            let off = (kv * max_seq + pos) * hd;
+            k_cache[off..off + hd].copy_from_slice(&k[kv * hd..(kv + 1) * hd]);
+}
+        let mut head_out = vec![0f32; n_heads * hd];
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        for h in 0..n_heads {
+            let kv = h / (n_heads / n_kv);
+            let qh = &q[h * hd..(h + 1) * hd];
+            let seq = pos + 1;
+            let mut scores = vec![0f32; seq];
+            let mut mx = f32::NEG_INFINITY;
+            for t in 0..seq {
+                let base = (kv * max_seq + t) * hd;
+                let mut dot = 0f32;
+                for i in 0..hd {
+                    dot += qh[i] * k_cache[base + i];
+                }
+                scores[t] = dot * scale;
+                mx = mx.max(scores[t]);
+            }
+            let mut sum = 0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - mx).exp();
+                sum += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+            for d in 0..hd {
+                let mut acc = 0f32;
+                for t in 0..seq {
+                    acc += scores[t] * v_cache[(kv * max_seq + t) * hd + d];
+                }
+                head_out[h * hd + d] = acc;
+            }
+        }
+
+        let page = 16384usize;
+        let mut wb = vec![0u8; 8192];
+        unsafe {
+            std::ptr::copy_nonoverlapping(q_ln.as_ptr() as *const u8, wb.as_mut_ptr(), hd * 4);
+            std::ptr::copy_nonoverlapping(k_ln.as_ptr() as *const u8, wb.as_mut_ptr().add(4096), hd * 4);
+        }
+        let wb = engine.register_zerocopy_buffer(&wb).expect("wbuf");
+        let kc = engine.register_zerocopy_buffer(unsafe {
+            std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, k_cache.len() * 4)
+        }).expect("kc");
+        let vc = engine.register_zerocopy_buffer(unsafe {
+            std::slice::from_raw_parts(v_cache.as_ptr() as *const u8, v_cache.len() * 4)
+        }).expect("vc");
+        let slab_f32 = 12 * 4096;
+        let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), slab_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, slab_alloc) };
+        unsafe {
+            std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut f32, slab.len() / 4)
+                [..q0.len()].copy_from_slice(&q0);
+        }
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+        let n_chunks = (max_seq + 127) / 128;
+        let meta_f32 = n_heads * n_chunks * 2 + n_heads * n_chunks * hd;
+        let meta_alloc = ((meta_f32 * 4 + page - 1) / page) * page;
+        let meta_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), meta_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(meta_ptr != libc::MAP_FAILED);
+        let meta: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(meta_ptr as *mut u8, meta_alloc) };
+        let meta_buf = engine.register_zerocopy_buffer(meta).expect("meta");
+
+        let f_ao = 8 * 4096usize;
+        assert!(engine.batch_open());
+        engine.batch_head_rmsnorm(
+            &slab_buf, 0,
+            Some(&wb), 0,
+            hd as u32, n_heads as u32,
+            1, pos as u32, eps, rope_base, rope_mode,
+        );
+        engine.batch_llama_attn_part(
+            &slab_buf, 0,
+            &kc, 0,
+            &vc, 0,
+            None, 0,
+            &meta_buf, 0,
+            0, pos as u32,
+            hd as u32, n_heads as u32, n_kv as u32, max_seq as u32,
+            eps, rope_base, rope_mode,
+        );
+        engine.batch_llama_attn_fin(
+            &meta_buf, 0,
+            &slab_buf, f_ao * 4,
+            pos as u32, n_heads as u32, hd as u32,
+        );
+        engine.batch_end();
+        let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, slab_alloc / 4) };
+        let mut max_err = 0f32;
+        for i in 0..n_heads * hd {
+            let a = view[f_ao + i];
+            let b = head_out[i];
+            max_err = max_err.max((a - b).abs());
+            assert!((a - b).abs() <= 3e-2 * (1.0 + b.abs()), "real-shape attn: head_out[{i}] {a} vs {b}");
+        }
+        println!("[chunked attn parity real-shape] ok: max_err={max_err}");
+    }
+
+    /// GPU3 acceptance: chunked attention (head_rmsnorm+rope -> part -> fin)
+    /// matches the CPU reference (quant:: fns + plain full-prefix softmax).
+    #[test]
+    fn llama_attn_chunked_matches_cpu_reference() {
+        use crate::infer::quant::{batched_rmsnorm_in_place, rope_style};
+
+        let engine = MetalEngine::new().expect("metal engine");
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let hd = 32usize;
+        let max_seq = 64usize;
+        let pos = 48usize;
+        let eps = 1e-5f32;
+        let rope_base = 10000.0f32;
+        let rope_mode = 0u32;
+
+        let q0: Vec<f32> = (0..n_heads * hd).map(|i| ((i % 9) as f32) * 0.25 - 1.0).collect();
+        let k0: Vec<f32> = (0..n_kv * hd).map(|i| ((i % 7) as f32) * 0.5 - 1.5).collect();
+        let v0: Vec<f32> = (0..n_kv * hd).map(|i| ((i % 11) as f32) * 0.125 - 0.5).collect();
+        let q_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 5) as f32 * 0.05).collect();
+        let k_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 3) as f32 * 0.07).collect();
+
+        // CPU reference
+        let mut q = q0.clone();
+        batched_rmsnorm_in_place(&mut q, &q_ln, n_heads, hd, eps);
+        rope_style(&mut q, n_heads, hd, pos, rope_base, rope_mode as i32);
+        let mut k = k0.clone();
+        batched_rmsnorm_in_place(&mut k, &k_ln, n_kv, hd, eps);
+        rope_style(&mut k, n_kv, hd, pos, rope_base, rope_mode as i32);
+        let mut k_cache = vec![0f32; n_kv * max_seq * hd];
+        let mut v_cache = vec![0f32; n_kv * max_seq * hd];
+        for kv in 0..n_kv {
+            let off = (kv * max_seq + pos) * hd;
+            k_cache[off..off + hd].copy_from_slice(&k[kv * hd..(kv + 1) * hd]);
+            v_cache[off..off + hd].copy_from_slice(&v0[kv * hd..(kv + 1) * hd]);
+        }
+        // history rows: pseudo values at all earlier positions
+        for t in 0..pos {
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + t) * hd;
+                for i in 0..hd {
+                    let s = (t * 31 + i * 7 + kv) % 100;
+                    k_cache[off + i] = (s as f32) * 0.02 - 1.0;
+                    v_cache[off + i] = ((s * 3 % 50) as f32) * 0.02 - 0.5;
+                }
+            }
+        }
+        let mut head_out = vec![0f32; n_heads * hd];
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        for h in 0..n_heads {
+            let kv = h / (n_heads / n_kv);
+            let qh = &q[h * hd..(h + 1) * hd];
+            let seq = pos + 1;
+            let mut scores = vec![0f32; seq];
+            let mut mx = f32::NEG_INFINITY;
+            for t in 0..seq {
+                let base = (kv * max_seq + t) * hd;
+                let mut dot = 0f32;
+                for i in 0..hd {
+                    dot += qh[i] * k_cache[base + i];
+                }
+                scores[t] = dot * scale;
+                mx = mx.max(scores[t]);
+            }
+            let mut sum = 0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - mx).exp();
+                sum += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+            for d in 0..hd {
+                let mut acc = 0f32;
+                for t in 0..seq {
+                    acc += scores[t] * v_cache[(kv * max_seq + t) * hd + d];
+                }
+                head_out[h * hd + d] = acc;
+            }
+        }
+
+        // GPU: head_rmsnorm+rope on qa, part, fin
+        let page = 16384usize;
+        // wbuf: q_ln@0, k_ln@4096
+        let mut wb = vec![0u8; 8192];
+        unsafe {
+            std::ptr::copy_nonoverlapping(q_ln.as_ptr() as *const u8, wb.as_mut_ptr(), hd * 4);
+            std::ptr::copy_nonoverlapping(k_ln.as_ptr() as *const u8, wb.as_mut_ptr().add(4096), hd * 4);
+        }
+        let wb = engine.register_zerocopy_buffer(&wb).expect("wbuf");
+
+        let mut kc_b = vec![0u8; n_kv * max_seq * hd * 4];
+        let mut vc_b = vec![0u8; n_kv * max_seq * hd * 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(k_cache.as_ptr() as *const u8, kc_b.as_mut_ptr(), kc_b.len());
+            std::ptr::copy_nonoverlapping(v_cache.as_ptr() as *const u8, vc_b.as_mut_ptr(), vc_b.len());
+        }
+        let kc = engine.register_zerocopy_buffer(&kc_b).expect("kc");
+        let vc = engine.register_zerocopy_buffer(&vc_b).expect("vc");
+
+        // act slab: qa@0 ao@q_rows ... slots aligned
+        let slab_f32 = 12 * 4096;
+        let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), slab_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(slab_ptr != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr as *mut u8, slab_alloc) };
+        unsafe {
+            std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut f32, slab.len() / 4)
+                [..q0.len()].copy_from_slice(&q0);
+        }
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+        let meta_f32 = n_heads * ((max_seq + 127) / 128) * 2 + n_heads * ((max_seq + 127) / 128) * hd;
+        let meta_alloc = ((meta_f32 * 4 + page - 1) / page) * page;
+        let meta_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), meta_alloc, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(meta_ptr != libc::MAP_FAILED);
+        let meta: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(meta_ptr as *mut u8, meta_alloc) };
+        let meta_buf = engine.register_zerocopy_buffer(meta).expect("meta");
+
+        let f_ao = 8 * 4096usize; // fresh region
+        assert!(engine.batch_open());
+        engine.batch_head_rmsnorm(
+            &slab_buf, 0,
+            Some(&wb), 0,
+            hd as u32, n_heads as u32,
+            1, pos as u32, eps, rope_base, rope_mode,
+        );
+        engine.batch_llama_attn_part(
+            &slab_buf, 0,
+            &kc, 0,
+            &vc, 0,
+            None, 0,
+            &meta_buf, 0,
+            0, pos as u32,
+            hd as u32, n_heads as u32, n_kv as u32, max_seq as u32,
+            eps, rope_base, rope_mode,
+        );
+        engine.batch_llama_attn_fin(
+            &meta_buf, 0,
+            &slab_buf, f_ao * 4,
+            pos as u32, n_heads as u32, hd as u32,
+        );
+        engine.batch_end();
+
+        let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, slab_alloc / 4) };
+        for i in 0..n_heads * hd {
+            let a = view[f_ao + i];
+            let b = head_out[i];
+            assert!(
+                (a - b).abs() <= 2e-3 * (1.0 + b.abs()),
+                "chunked attn: head_out[{i}] {a} vs {b}"
+            );
+        }
+        println!("[chunked attn parity] ok: pos={pos} heads={n_heads} kv={n_kv} hd={hd}");
     }
 
     /// Timing-only micro-bench: one GEMV at the Qwen3-8B FFN shape

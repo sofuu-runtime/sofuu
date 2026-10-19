@@ -512,7 +512,7 @@ impl TransformerModel {
                 && std::env::var_os("SOFUU_GPU_DECODE").is_some()
                 && gguf.resident.is_none();
             if wanted {
-                GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2)
+                GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm)
             } else {
                 None
             }
@@ -1931,7 +1931,13 @@ impl TransformerModel {
         let gguf = &self.gguf;
 
         let g = self.gpu.as_mut().expect("one_commit without gpu");
+        let token_commit = g.token_commit && start_layer == 0 && end_layer == self.config.n_layers;
         g.slot_f32_mut(g.slots.x, dim).copy_from_slice(&self.x[..dim]);
+        let prof = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
+        let t_start = std::time::Instant::now();
+        if token_commit {
+            assert!(g.engine.batch_open());
+        }
 
         for layer_idx in start_layer..end_layer {
             let (attn_norm_off, ffn_norm_off, q_norm_off, k_norm_off) = {
@@ -1947,11 +1953,13 @@ impl TransformerModel {
             let has_k = u32::from(k_norm_off.is_some());
             let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
             let kc_layer = layer_idx * kv_head_bytes;
+            let meta_chunks = (max_seq_len + 127) / 128;
+            let meta_per_layer = n_heads * meta_chunks * 2 + n_heads * meta_chunks * head_dim;
             let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
-            let (qln_buf, qln_off) = (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
             let l = &self.layers[layer_idx];
-
-            assert!(g.engine.batch_open());
+            if !token_commit {
+                assert!(g.engine.batch_open());
+            }
             g.engine.batch_rmsnorm_f32w(
                 &g.act_buf, g.slots.x,
                 &g.w_buf, attn_norm_off,
@@ -1970,6 +1978,8 @@ impl TransformerModel {
                 gguf.data_offset + l.attn_v.offset,
                 &g.act_buf, g.slots.xn, &g.act_buf, g.slots.va,
                 n_kv_heads * head_dim, dim);
+            let run_attn = !g.skip_attn;
+            if run_attn {
             g.engine.batch_llama_kv_write(
                 &g.act_buf, g.slots.ka,
                 &g.act_buf, g.slots.va,
@@ -1980,16 +1990,58 @@ impl TransformerModel {
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                 norm_eps, rope_freq_base, rope_mode,
             );
-            g.engine.batch_llama_attn(
-                &g.act_buf, g.slots.qa,
-                &g.k_buf, kc_layer,
-                &g.v_buf, kc_layer,
-                qln_buf, qln_off,
-                &g.act_buf, g.slots.ao,
-                has_q, pos as u32,
-                head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                norm_eps, rope_freq_base, rope_mode,
-            );
+            // Chunked attention (GPU3): correct in isolation at the real shape
+            // but garbage in the full client — default OFF until the client
+            // context is understood; SOFUU_GPU_ATTN=1 re-enables.
+            let attn_new = std::env::var("SOFUU_GPU_ATTN")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if attn_new {
+                // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
+                // race), then chunked attention partials + finish rescale.
+                g.engine.batch_head_rmsnorm(
+                    &g.act_buf, g.slots.qa,
+                    q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
+                    head_dim as u32, n_heads as u32,
+                    has_q, pos as u32, norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_llama_attn_part(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    None, 0,
+                    &g.meta_buf, layer_idx * meta_per_layer * 4,
+                    0, pos as u32,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_llama_attn_fin(
+                    &g.meta_buf, layer_idx * meta_per_layer * 4,
+                    &g.act_buf, g.slots.ao,
+                    pos as u32, n_heads as u32, head_dim as u32,
+                );
+            } else {
+                let (qln_buf, qln_off) =
+                    (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
+                g.engine.batch_llama_attn(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    qln_buf, qln_off,
+                    &g.act_buf, g.slots.ao,
+                    has_q, pos as u32,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                );
+            }
+            let trace = std::env::var_os("SOFUU_GPU_TRACE").is_some();
+            if trace && (layer_idx == 0 || layer_idx == 17 || layer_idx == 35) {
+                let ao = g.slot_f32(g.slots.ao, n_heads * head_dim);
+                let r: f32 = (ao.iter().map(|v| v * v).sum::<f32>() / (n_heads * head_dim) as f32)
+                    .sqrt();
+                eprintln!("[trace] L{layer_idx} pos{pos} attn_out_rms={r:.6}");
+            }
+            }
             g.engine.batch_gguf(l.attn_output.tensor_type, &g.w_buf,
                 gguf.data_offset + l.attn_output.offset,
                 &g.act_buf, g.slots.ao, &g.act_buf, g.slots.xo,
@@ -2001,6 +2053,8 @@ impl TransformerModel {
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps,
             );
+            let run_ffn = !g.skip_ffn;
+            if run_ffn {
             g.engine.batch_gguf(l.ffn_gate.tensor_type, &g.w_buf,
                 gguf.data_offset + l.ffn_gate.offset,
                 &g.act_buf, g.slots.xn, &g.act_buf, g.slots.gate,
@@ -2015,9 +2069,47 @@ impl TransformerModel {
                 &g.act_buf, g.slots.gate, &g.act_buf, g.slots.xo,
                 dim, hidden_dim);
             g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
-            g.engine.batch_end();
+            }
+            if !token_commit {
+                g.engine.batch_end();
+            }
         }
+        let host_us = t_start.elapsed().as_micros() as u64;
+        let gguf2 = &self.gguf;
         let g = self.gpu.as_mut().expect("one_commit without gpu");
+        let head_on = token_commit && !g.skip_head;
+        if head_on {
+            // Final norm + lm_head in the SAME command buffer, then one drain.
+            g.engine.batch_rmsnorm_f32w(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, gguf2.data_offset + self.output_norm.offset,
+                &g.act_buf, g.slots.xn,
+                dim, self.config.norm_eps,
+            );
+            g.engine.batch_gguf(
+                self.output.tensor_type,
+                &g.w_buf, g.w_offset(gguf2, &self.output),
+                &g.act_buf, g.slots.xn,
+                &g.act_buf, g.slots.logits,
+                self.config.vocab_size, dim,
+            );
+            g.engine.batch_end();
+            self.logits[..self.config.vocab_size]
+                .copy_from_slice(g.slot_f32(g.slots.logits, self.config.vocab_size));
+        }
+        if prof {
+            let total_us = t_start.elapsed().as_micros() as u64;
+            PROFILE_HOST_US.fetch_add(host_us, std::sync::atomic::Ordering::Relaxed);
+            PROFILE_TOTAL_US.fetch_add(total_us, std::sync::atomic::Ordering::Relaxed);
+            let h = PROFILE_HOST_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tt = PROFILE_TOTAL_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[gpu-profile] token: host_encode={}us total_after_wait={}us gpu_busy~={}us",
+                h,
+                tt,
+                tt.saturating_sub(h)
+            );
+        }
         self.x[..dim].copy_from_slice(g.slot_f32(g.slots.x, dim));
     }
 
@@ -2195,6 +2287,37 @@ impl TransformerModel {
         // 2. Transformer layers
         self.execute_layers(pos, 0, self.config.n_layers);
 
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let token_head = self
+            .gpu
+            .as_ref()
+            .map(|g| g.token_commit)
+            .unwrap_or(false);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let token_head = false;
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if token_head && compute_logits {
+            // Head ran in-batch inside layers_one_commit; logits already home.
+            let trace = std::env::var_os("SOFUU_GPU_TRACE").is_some();
+            if trace {
+                let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
+                let mut ss = 0f32;
+                for (i, v) in self.logits.iter().enumerate() {
+                    ss += v * v;
+                    if *v > best {
+                        best = *v;
+                        bi = i;
+                    }
+                }
+                eprintln!(
+                    "[trace] tok pos{pos} logits_rms={:.4} argmax={bi}({best:.3})",
+                    (ss / self.logits.len() as f32).sqrt()
+                );
+            }
+            return;
+        }
+
         if compute_logits {
             let norm_eps = self.config.norm_eps;
             // 3. Final Output Norm
@@ -2225,6 +2348,17 @@ impl TransformerModel {
                 &self.x,
                 &mut self.logits,
             );
+        }
+
+        if compute_logits && std::env::var_os("SOFUU_GPU_TRACE").is_some() && self.gpu.is_none() {
+            let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
+            for (j, v) in self.logits.iter().enumerate() {
+                if *v > best {
+                    best = *v;
+                    bi = j;
+                }
+            }
+            eprintln!("[trace] tok pos{pos} argmax={bi}({best:.3})");
         }
     }
 }
@@ -2416,6 +2550,12 @@ fn gguf_gpu_page(bytes: usize) -> usize {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+static PROFILE_HOST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static PROFILE_TOTAL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+use std::sync::atomic::Ordering;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 struct GgufGpuSlots {
     x: usize,
     xn: usize,
@@ -2448,6 +2588,18 @@ pub struct GgufGpu {
     /// GPU2.1: whole layer in ONE command buffer (norms/QK-norm/RoPE/KV/
     /// attention all as batch ops). False = the 3-commit G2 client.
     one_commit: bool,
+    /// GPU3: the WHOLE TOKEN (36 layers + final norm + lm_head) in one
+    /// command buffer; the CPU waits once per token. SOFUU_GPU_LAYER_COMMIT=1
+    /// restores per-layer waits for A/B receipts.
+    token_commit: bool,
+    /// Timing-only ablations (results are garbage text; never shipped on).
+    /// GPU3 attention meta buffer (shared across layers, barrier-ordered):
+    /// per head-chunk {max,sum} pair + per head-chunk partial V sums.
+    meta_buf: crate::infer::metal::MetalBuffer,
+    meta: crate::infer::model::AnonBuffer,
+    skip_attn: bool,
+    skip_ffn: bool,
+    skip_head: bool,
     slots: GgufGpuSlots,
 }
 
@@ -2461,6 +2613,8 @@ impl GgufGpu {
         k_cache: &AnonBuffer,
         v_cache: &AnonBuffer,
         is_gemma2: bool,
+        output: &TensorView,
+        output_norm: &TensorView,
     ) -> Option<Self> {
         if config.max_seq_len > 4096 {
             eprintln!("[gguf-gpu] disabled: seq > 4096 above the kernel range");
@@ -2490,6 +2644,18 @@ impl GgufGpu {
         if let Some(ref why) = one_commit_reason {
             eprintln!("[gguf-gpu] one-commit disabled ({why}); using the 3-commit client");
         }
+
+        // Whole-token gate: on top of one_commit, the final norm must be f32
+        // 4-byte aligned and lm_head an eligible GEMV dtype (it runs in-batch).
+        let head_ok = output_norm.tensor_type == GGML_TYPE_F32
+            && (gguf.data_offset + output_norm.offset) % 4 == 0
+            && matches!(
+                output.tensor_type,
+                GGML_TYPE_Q4_0 | GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K
+            );
+        let token_commit = one_commit
+            && head_ok
+            && std::env::var_os("SOFUU_GPU_LAYER_COMMIT").is_none();
 
         let dim = config.dim;
         let q_rows = config.n_heads * config.head_dim;
@@ -2524,9 +2690,21 @@ impl GgufGpu {
         };
         let k_buf = engine.register_zerocopy_only(k_bytes)?;
         let v_buf = engine.register_zerocopy_only(v_bytes)?;
+        let meta_chunks = (config.max_seq_len + 127) / 128;
+        let meta_head_f32 =
+            config.n_heads * meta_chunks * 2 + config.n_heads * meta_chunks * config.head_dim;
+        // per-layer region (layers overwrite each other's chunks otherwise)
+        let meta_per_layer = meta_head_f32;
+        let meta_f32 =
+            ((meta_per_layer * config.n_layers * 4 + 16383) / 16384) * 16384 / 4;
+        let meta = crate::infer::model::AnonBuffer::new(meta_f32);
+        let meta_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(meta.as_ptr() as *const u8, meta_f32 * 4)
+        };
+        let meta_buf = engine.register_zerocopy_only(meta_bytes)?;
         eprintln!(
             "[gguf-gpu] decode client armed ({}): dim={dim} heads={}/{} hd={} inter={inter} vocab={vocab} layers={} act={}MB kv-shared={}MB",
-            if one_commit { "ONE commit/layer" } else { "3-commit" },
+            if token_commit { "ONE commit/TOKEN" } else if one_commit { "ONE commit/layer" } else { "3-commit" },
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
@@ -2534,7 +2712,23 @@ impl GgufGpu {
             act_bytes / (1024 * 1024),
             kv_region_bytes / (1024 * 1024),
         );
-        Some(Self { engine, w_buf, act_buf, act, k_buf, v_buf, one_commit, slots })
+        let skips = std::env::var("SOFUU_GPU_SKIP").unwrap_or_default();
+        Some(Self {
+            engine,
+            w_buf,
+            act_buf,
+            act,
+            k_buf,
+            v_buf,
+            meta_buf,
+            meta,
+            one_commit,
+            token_commit,
+            skip_attn: skips.contains("attn"),
+            skip_ffn: skips.contains("ffn"),
+            skip_head: skips.contains("head"),
+            slots,
+        })
     }
 
     /// One-commit eligibility: every layer full-attention, no biases, f32

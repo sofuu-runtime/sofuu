@@ -668,6 +668,200 @@ kernel void gemv_q6_k(
     }
 }
 
+// ── GPU3 helper: per-head f32 RMSNorm on a [heads x head_dim] slot ─────────
+// (q-norm for the GGUF shape; done as its own dispatch so the chunked
+// attention kernel reads a fully normalized q with no intra-dispatch race).
+kernel void head_rmsnorm(
+    device float       *heads           [[buffer(0)]],
+    device const float *w               [[buffer(1)]],
+    constant uint      &w_rem           [[buffer(2)]],
+    constant uint      &head_dim        [[buffer(3)]],
+    constant uint      &n_heads         [[buffer(4)]],
+    constant float     &eps             [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant float     &rope_base       [[buffer(8)]],
+    constant uint      &rope_mode       [[buffer(9)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    // Per-head f32 RMSNorm (q-norm, when present) + RoPE — one dispatch so
+    // the chunked attention reads fully processed q with no internal race.
+    if (h >= n_heads) { return; }
+    device float *row = heads + (size_t)h * head_dim;
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            ss += row[i] * row[i];
+        }
+        ss = simd_sum(ss);
+        float rms = rsqrt(ss / float(head_dim) + eps);
+        for (uint i = lane; i < head_dim; i += 32) {
+            row[i] = row[i] * rms * w[w_rem + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = lane; j < head_dim / 2; j += 32) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float r0 = row[j];
+            float r1 = row[j + head_dim / 2];
+            row[j]                = r0 * c - r1 * s;
+            row[j + head_dim / 2] = r1 * c + r0 * s;
+        } else {
+            float r0 = row[2 * j];
+            float r1 = row[2 * j + 1];
+            row[2 * j]     = r0 * c - r1 * s;
+            row[2 * j + 1] = r1 * c + r0 * s;
+        }
+    }
+}
+
+// ── GPU3: chunked decode attention (replaces serial per-head llama_attn) ───
+// One threadgroup per (q head, 128-position chunk): lanes stride the chunk's
+// positions with 128-wide unrolled dots (short dependency chains, real
+// memory parallelism), softmax-normalized PARTIAL weighted-V sums and
+// (chunk max, chunk sum) go to meta; a finish kernel rescales and sums the
+// chunk partials per head — deterministic, same two-pass softmax semantics
+// as the CPU (global max over chunks), tolerance-gated like every kernel.
+// meta layout (f32): [h][c][CHUNK] partial V-accum (128 dims per chunk),
+//                    [head_off] = heads*chunks*CHUNK → per-head {max, sum}.
+#define ATTN_CHUNK 128
+
+kernel void llama_attn_part(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *meta            [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    uint g                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    // NOTE: this kernel requires n_heads % 32 == 0 handled by grid math and
+    // head_dim <= 128; threadgroup = 32 lanes; chunk = 128 positions.
+    uint n_chunks = (pos + 1 + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    uint h = g / n_chunks;
+    uint c = g % n_chunks;
+    if (h >= n_heads) { return; }
+    device float *q_head = q + h * head_dim;
+    float scale = rsqrt(float(head_dim));
+    if (c == 0 && has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            ss += q_head[i] * q_head[i];
+        }
+        ss = simd_sum(ss);
+        float rms = rsqrt(ss / float(head_dim) + eps);
+        for (uint i = lane; i < head_dim; i += 32) {
+            q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint t0 = c * ATTN_CHUNK;
+    uint t_end = min(t0 + ATTN_CHUNK, pos + 1);
+
+    // Pass 1: one lane per position (lane owns positions lane, lane+32, ...)
+    // dot over head_dim, softmax numerator relative to the CHUNK max.
+    float mx = -INFINITY;
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        if (dot * scale > mx) { mx = dot * scale; }
+    }
+    float cmax = simd_max(mx);
+
+    float lsum = 0.0f;
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        lsum += exp(dot * scale - cmax);
+    }
+    float csum = simd_sum(lsum);
+
+    if (lane == 0) {
+        meta[(size_t)h * n_chunks * 2 + c * 2 + 0] = cmax;
+        meta[(size_t)h * n_chunks * 2 + c * 2 + 1] = csum;
+    }
+
+    // Pass 2: stage per-position weights in threadgroup memory (one write).
+    threadgroup float tw[ATTN_CHUNK];
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        tw[t - t0] = exp(dot * scale - cmax);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 3: lane owns dims lane, lane+32, ... — coalesced V reads, one
+    // load+FMA per position; normalized partial for the finish rescale.
+    size_t parts = (size_t)h * n_chunks * head_dim;
+    float inv = 1.0f / csum;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0f;
+        for (uint t = t0; t < t_end; ++t) {
+            acc += tw[t - t0] * vbase[(size_t)t * head_dim + d];
+        }
+        meta[parts + (size_t)c * head_dim + d] = acc * inv;
+    }
+}
+
+kernel void llama_attn_fin(
+    device float       *meta            [[buffer(0)]],
+    device float       *head_out        [[buffer(1)]],
+    constant uint      &n_heads         [[buffer(2)]],
+    constant uint      &head_dim        [[buffer(3)]],
+    constant uint      &pos             [[buffer(4)]],
+    uint g                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    // out[d] = (1/gsum) * sum_c csum_c * exp(cmax_c - gmax) * partial[c][d]
+    uint n_chunks = (pos + 1 + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    uint h = g;
+    if (h >= n_heads) { return; }
+    size_t mbase = (size_t)h * n_chunks * 2;
+    float gmax = -INFINITY;
+    for (uint c = 0; c < n_chunks; ++c) {
+        gmax = max(gmax, meta[mbase + c * 2 + 0]);
+    }
+    float gsum = 0.0f;
+    for (uint c = 0; c < n_chunks; ++c) {
+        gsum += meta[mbase + c * 2 + 1] * exp(meta[mbase + c * 2 + 0] - gmax);
+    }
+    float inv = 1.0f / gsum;
+    size_t parts = (size_t)h * n_chunks * head_dim;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0f;
+        for (uint c = 0; c < n_chunks; ++c) {
+            float coef = exp(meta[mbase + c * 2 + 0] - gmax) * meta[mbase + c * 2 + 1];
+            acc += meta[parts + (size_t)c * head_dim + d] * coef;
+        }
+        head_out[h * head_dim + d] = acc * inv;
+    }
+}
+
 // ── GPU2.1: one-commit-per-layer glue for the llama/GGUF shape ─────────────
 // RMSNorm with F32 weights (GGUF norm tensors are f32), slot addresses via
 // 16-byte-aligned buffer offsets; weight element remainder passed as a

@@ -10,7 +10,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use super::gguf::{GgufFile, GgufValue};
+use super::gguf::{GgufFile, GgufValue, TensorInfo};
 use super::quant::{
     batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
     batched_swiglu, matmat_residual, matmat_pair,
@@ -395,18 +395,17 @@ impl TransformerModel {
             // error instead of a mid-forward panic (type_row_size's fallback
             // sizes Q3_K/IQ* as f32 and corrupts the slice math). The llama
             // matvec path handles exactly these types.
-            const SUPPORTED: [u32; 7] = [
+            const SUPPORTED: [u32; 6] = [
                 crate::infer::quant::GGML_TYPE_F32,
                 crate::infer::quant::GGML_TYPE_F16,
                 crate::infer::quant::GGML_TYPE_Q4_0,
-                crate::infer::quant::GGML_TYPE_Q4_1,
                 crate::infer::quant::GGML_TYPE_Q8_0,
                 crate::infer::quant::GGML_TYPE_Q4_K,
                 crate::infer::quant::GGML_TYPE_Q6_K,
             ];
             if !SUPPORTED.contains(&info.tensor_type) {
                 return Err(format!(
-                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q4_1, q8_0, q4_k, q6_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
+                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
                     info.tensor_type
                 ));
             }
@@ -2233,6 +2232,108 @@ impl TransformerModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a synthetic 1-layer llama GGUF over a temp mmap so the loader's
+    /// type gate and tied-output handling can be tested without a real model.
+    fn synth_gguf(output_type: Option<u32>) -> GgufFile {
+        use std::collections::HashMap;
+        let path = std::env::temp_dir().join(format!(
+            "sofuu_synth_gguf_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        let mut metadata = HashMap::new();
+        metadata.insert("general.architecture".into(), GgufValue::String("llama".into()));
+        metadata.insert("llama.embedding_length".into(), GgufValue::Uint32(64));
+        metadata.insert("llama.block_count".into(), GgufValue::Uint32(1));
+        metadata.insert("llama.attention.head_count".into(), GgufValue::Uint32(2));
+        metadata.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(2));
+        metadata.insert("llama.feed_forward_length".into(), GgufValue::Uint32(96));
+        metadata.insert("llama.vocab_size".into(), GgufValue::Uint32(256));
+        let mut tensors = HashMap::new();
+        let mut add = |name: &str, shape: [usize; 2], ty: u32, off: &mut usize| {
+            let vals: usize = shape[0] * shape[1];
+            let bytes = crate::infer::quant::type_row_size(ty, vals);
+            tensors.insert(
+                name.to_string(),
+                TensorInfo {
+                    name: name.to_string(),
+                    shape: shape.to_vec(),
+                    tensor_type: ty,
+                    offset: *off,
+                    size_bytes: bytes,
+                },
+            );
+            *off += bytes;
+        };
+        let mut off = 0usize;
+        add("token_embd.weight", [64, 256], GGML_TYPE_Q8_0, &mut off);
+        add("blk.0.attn_norm.weight", [64, 1], GGML_TYPE_F32, &mut off);
+        add("blk.0.attn_q.weight", [64, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.attn_k.weight", [64, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.attn_v.weight", [64, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.attn_output.weight", [64, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.ffn_norm.weight", [64, 1], GGML_TYPE_F32, &mut off);
+        add("blk.0.ffn_gate.weight", [96, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.ffn_up.weight", [96, 64], GGML_TYPE_Q4_K, &mut off);
+        add("blk.0.ffn_down.weight", [64, 96], GGML_TYPE_Q4_K, &mut off);
+        if let Some(ty) = output_type {
+            add("output.weight", [64, 256], ty, &mut off);
+        }
+        add("output_norm.weight", [64, 1], GGML_TYPE_F32, &mut off);
+        GgufFile {
+            mmap: std::sync::Arc::new(crate::infer::mmap::MmapFile::open(&path).unwrap()),
+            resident: None,
+            version: 3,
+            metadata,
+            tensors,
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn unsupported_tensor_type_fails_load_loudly() {
+        // token_embd in an unsupported quant (Q3_K family, type 11): the load
+        // must reject the file with an actionable error, never reach the
+        // mid-forward tensor_slice panic.
+        let mut gguf = synth_gguf(Some(GGML_TYPE_Q8_0));
+        let bad = gguf.tensors.get("token_embd.weight").unwrap().clone();
+        gguf.tensors.insert(
+            "token_embd.weight".into(),
+            TensorInfo { tensor_type: 11, ..bad },
+        );
+        let err = match TransformerModel::from_gguf(gguf, 512, 256) {
+            Err(e) => e,
+            Ok(_) => panic!("unsupported type must fail the load"),
+        };
+        assert!(err.contains("not supported"), "unexpected error: {err}");
+        assert!(err.contains("token_embd.weight"), "error must name the tensor: {err}");
+    }
+
+    #[test]
+    fn present_but_unsupported_output_weight_is_not_treated_as_tied() {
+        // output.weight EXISTS in an unsupported type: the load must fail —
+        // silently tying embeddings would produce wrong logits.
+        let gguf = synth_gguf(Some(11));
+        let err = match TransformerModel::from_gguf(gguf, 512, 256) {
+            Err(e) => e,
+            Ok(_) => panic!("unsupported output.weight must fail the load"),
+        };
+        assert!(err.contains("output.weight"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn absent_output_weight_ties_embeddings() {
+        // No output.weight at all: tied embeddings, load must succeed.
+        let gguf = synth_gguf(None);
+        let m = TransformerModel::from_gguf(gguf, 512, 256).expect("tied load must succeed");
+        assert_eq!(m.output.tensor_type, GGML_TYPE_Q8_0);
+        assert_eq!(m.output.size_bytes, m.token_embd.size_bytes);
+    }
 
     // Live-model checks: 1.3 GB mmaps thrash the parallel test suite (the
     // qwen35 live tests share the constraint); run explicitly:

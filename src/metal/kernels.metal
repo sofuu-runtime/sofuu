@@ -682,11 +682,11 @@ kernel void gemv_q4_k_b4(
     constant uint       &cols           [[buffer(3)]],
     constant uint       &w_rem          [[buffer(4)]],
     constant uint       &rows           [[buffer(5)]],
-    uint row                            [[thread_position_in_grid]],
+    uint row                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
     // v1-clone: the PROVEN per-value scalar q4_K arithmetic, four token
-    // accumulators added on top; x is token-major [4][cols] (x_batch shape).
+    // accumulators added on top; x token-major [4][cols] (x_batch shape).
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     uint row_byte = w_rem + row * (cols / 256) * 144;
     uint nb = cols / 256;
@@ -696,90 +696,90 @@ kernel void gemv_q4_k_b4(
         device const uchar *qs = w_base + row_byte + b * 144 + 16;
         device const uchar *scales = w_base + row_byte + b * 144 + 4;
         uint is = 0;
-            {
-                device const float *xt = x + (size_t)0 * cols;
-                float a0 = 0.0f;
-                for (uint j = 0; j < 256; j += 64) {
-                    uint8_t sc1, m1, sc2, m2;
-                    q4k_scale_min(scales, is + j / 32, &sc1, &m1);
-                    q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
-                    float d1 = d * (float)sc1;
-                    float mm1 = dmin * (float)m1;
-                    float d2 = d * (float)sc2;
-                    float mm2 = dmin * (float)m2;
-                    uint qb = j / 2;
-                    for (uint l = 0; l < 32; ++l) {
-                        float x0 = xt[b * 256 + j + l];
-                        float x1 = xt[b * 256 + j + 32 + l];
-                        a0 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
-                        a0 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
-                    }
+        {
+            device const float *xt = x + (size_t)0 * cols;
+            float a0 = 0.0f;
+            for (uint j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + j / 32, &sc1, &m1);
+                q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
+                float d1 = d * (float)sc1;
+                float mm1 = dmin * (float)m1;
+                float d2 = d * (float)sc2;
+                float mm2 = dmin * (float)m2;
+                uint qb = j / 2;
+                for (uint l = 0; l < 32; ++l) {
+                    float x0 = xt[b * 256 + j + l];
+                    float x1 = xt[b * 256 + j + 32 + l];
+                    a0 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
+                    a0 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
                 }
-                acc0 += a0;
             }
-            {
-                device const float *xt = x + (size_t)1 * cols;
-                float a1 = 0.0f;
-                for (uint j = 0; j < 256; j += 64) {
-                    uint8_t sc1, m1, sc2, m2;
-                    q4k_scale_min(scales, is + j / 32, &sc1, &m1);
-                    q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
-                    float d1 = d * (float)sc1;
-                    float mm1 = dmin * (float)m1;
-                    float d2 = d * (float)sc2;
-                    float mm2 = dmin * (float)m2;
-                    uint qb = j / 2;
-                    for (uint l = 0; l < 32; ++l) {
-                        float x0 = xt[b * 256 + j + l];
-                        float x1 = xt[b * 256 + j + 32 + l];
-                        a1 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
-                        a1 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
-                    }
+            acc0 += a0;
+        }
+        {
+            device const float *xt = x + (size_t)1 * cols;
+            float a1 = 0.0f;
+            for (uint j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + j / 32, &sc1, &m1);
+                q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
+                float d1 = d * (float)sc1;
+                float mm1 = dmin * (float)m1;
+                float d2 = d * (float)sc2;
+                float mm2 = dmin * (float)m2;
+                uint qb = j / 2;
+                for (uint l = 0; l < 32; ++l) {
+                    float x0 = xt[b * 256 + j + l];
+                    float x1 = xt[b * 256 + j + 32 + l];
+                    a1 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
+                    a1 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
                 }
-                acc1 += a1;
             }
-            {
-                device const float *xt = x + (size_t)2 * cols;
-                float a2 = 0.0f;
-                for (uint j = 0; j < 256; j += 64) {
-                    uint8_t sc1, m1, sc2, m2;
-                    q4k_scale_min(scales, is + j / 32, &sc1, &m1);
-                    q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
-                    float d1 = d * (float)sc1;
-                    float mm1 = dmin * (float)m1;
-                    float d2 = d * (float)sc2;
-                    float mm2 = dmin * (float)m2;
-                    uint qb = j / 2;
-                    for (uint l = 0; l < 32; ++l) {
-                        float x0 = xt[b * 256 + j + l];
-                        float x1 = xt[b * 256 + j + 32 + l];
-                        a2 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
-                        a2 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
-                    }
+            acc1 += a1;
+        }
+        {
+            device const float *xt = x + (size_t)2 * cols;
+            float a2 = 0.0f;
+            for (uint j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + j / 32, &sc1, &m1);
+                q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
+                float d1 = d * (float)sc1;
+                float mm1 = dmin * (float)m1;
+                float d2 = d * (float)sc2;
+                float mm2 = dmin * (float)m2;
+                uint qb = j / 2;
+                for (uint l = 0; l < 32; ++l) {
+                    float x0 = xt[b * 256 + j + l];
+                    float x1 = xt[b * 256 + j + 32 + l];
+                    a2 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
+                    a2 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
                 }
-                acc2 += a2;
             }
-            {
-                device const float *xt = x + (size_t)3 * cols;
-                float a3 = 0.0f;
-                for (uint j = 0; j < 256; j += 64) {
-                    uint8_t sc1, m1, sc2, m2;
-                    q4k_scale_min(scales, is + j / 32, &sc1, &m1);
-                    q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
-                    float d1 = d * (float)sc1;
-                    float mm1 = dmin * (float)m1;
-                    float d2 = d * (float)sc2;
-                    float mm2 = dmin * (float)m2;
-                    uint qb = j / 2;
-                    for (uint l = 0; l < 32; ++l) {
-                        float x0 = xt[b * 256 + j + l];
-                        float x1 = xt[b * 256 + j + 32 + l];
-                        a3 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
-                        a3 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
-                    }
+            acc2 += a2;
+        }
+        {
+            device const float *xt = x + (size_t)3 * cols;
+            float a3 = 0.0f;
+            for (uint j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + j / 32, &sc1, &m1);
+                q4k_scale_min(scales, is + j / 32 + 1, &sc2, &m2);
+                float d1 = d * (float)sc1;
+                float mm1 = dmin * (float)m1;
+                float d2 = d * (float)sc2;
+                float mm2 = dmin * (float)m2;
+                uint qb = j / 2;
+                for (uint l = 0; l < 32; ++l) {
+                    float x0 = xt[b * 256 + j + l];
+                    float x1 = xt[b * 256 + j + 32 + l];
+                    a3 += d1 * (float)(qs[qb + l] & 0x0F) * x0 - mm1 * x0;
+                    a3 += d2 * (float)(qs[qb + l] >> 4) * x1 - mm2 * x1;
                 }
-                acc3 += a3;
             }
+            acc3 += a3;
+        }
         is += 8;
     }
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);

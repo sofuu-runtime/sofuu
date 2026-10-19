@@ -2033,14 +2033,11 @@ mod q4k_crafted_probe {
         println!("[chunked attn parity real-shape] ok: max_err={max_err}");
     }
 
-    /// GPU3 acceptance: the B=4 batched q4_K GEMV matches the CPU dequant-dot
-    /// for FOUR tokens at once. Weights: crafted superblocks (d=1, mins 0,
-    /// sc0=1 qs pattern) so the CPU reference is plain nibble arithmetic.
-    // G3 B=4 prototype: live kernel verified (2x-multiplier probe) but output
-    // is row-independent (-367.75 for all rows) while isolated row bytes read
-    // correctly — under investigation; ignored so the suite stays green.
+    /// GPU3 acceptance: the B=4 batched q4_K GEMV matches the RECEIPTED CPU
+    /// oracle (quant::vec_dot_raw_q4_k) for FOUR tokens at once, on crafted
+    /// superblocks whose packed scale bytes zero out half the subgroups —
+    /// so both scale decode and nibble→value mapping are exercised.
     #[test]
-    #[ignore]
     fn gguf_b4_matches_cpu() {
         let engine = MetalEngine::new().expect("metal engine");
         let rows = 8usize;
@@ -2053,15 +2050,16 @@ mod q4k_crafted_probe {
                 let off = (r * blocks + b) * 144;
                 w[off..off + 2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d=1
                 // scales: each group pair (sc_lo=1, sc_hi=1), mins 0
-                for i in 0..4 {
-                    w[off + 4 + i] = 1;                     // d(0..3) = 1 (low 6 bits)
-                    w[off + 8 + i] = 1;                     // d(4..7) low nibble = 1
-                }
-                // m scales: [4..8) hold m(0..3) via >>4; [8..12) hold m(4..7)
-                // via >>4 — both stay 0 here.
-                for i in 0..4 {
-                    w[off + 4 + i] = 1; // keep low bits 1 (d(0..3)); top2 = 0
-                }
+                // q4_K packed scale encoding (mirror q4k_scale_min):
+                //   d(j<4)  = scales[j]&63        -> scales[0],[1] = 1 give
+                //      d-scale 1 for the lo/hi subgroups of superblock pairs
+                //   d(j>=4) = scales[j+4]&15 | (scales[j-4]>>6)<<4
+                //                                       -> scales[8],[9] = 1
+                //   m(*) via scales[4..8]>>4 and scales[j]>>6 — stay 0.
+                w[off + 4 + 0] = 1;
+                w[off + 4 + 1] = 1;
+                w[off + 4 + 8] = 1;
+                w[off + 4 + 9] = 1;
                 for i in 0..128 {
                     // deterministic nibble bytes
                     w[off + 16 + i] = ((i * 37 + r * 5 + b) % 256) as u8;
@@ -2072,30 +2070,21 @@ mod q4k_crafted_probe {
             .map(|t| (0..cols).map(|i| ((i * 5 + t * 3) % 17) as f32 * 0.25 - 2.0).collect())
             .collect();
 
-        // CPU reference: dequant y = d*(nib·sc) - dmin·m; d=1, min=0, sc(lo/hi)=1
-        // → value = nibble; fold: out[t][r] = Σ_groups [Σ_lo(byte·x) + Σ_hi(byte·x)]
-        // with byte l: lo -> x[j+l], hi -> x[j+32+l], group j byte base j/2.
+        // CPU reference: the RECEIPTED q4_K dot (same fn the vecdot parity
+        // gate uses) per token per row — no hand-rolled decode here: the
+        // crafted scale bytes make subgroups {2,3,6,7} decode to d=0, and a
+        // naive all-groups-with-sc=1 formula silently disagrees with that.
         let mut y_cpu = vec![0f32; 4 * rows];
-        for r in 0..rows {
-            for t in 0..4 {
-                let mut s = 0f32;
-                for b in 0..blocks {
-                    let off = (r * blocks + b) * 144;
-                    let mut is = 0usize;
-                    for j in (0..256).step_by(64) {
-                        // sc = scales[is]&63 (d), scales[is+4] handled by CPU
-                        // enc — with our pattern sc_lo=1 for the value groups:
-                        let qb = j / 2;
-                        for l in 0..32 {
-                            let x0 = toks[t][b * 256 + j + l];
-                            let x1 = toks[t][b * 256 + j + 32 + l];
-                            s += (w[off + 16 + qb + l] & 15) as f32 * x0;
-                            s += (w[off + 16 + qb + l] >> 4) as f32 * x1;
-                        }
-                        is += 2;
-                    }
-                }
-                y_cpu[t * rows + r] = s;
+        for t in 0..4 {
+            for r in 0..rows {
+                let off = r * blocks * 144;
+                y_cpu[t * rows + r] = unsafe {
+                    crate::infer::quant::vec_dot_raw_q4_k(
+                        w[off..].as_ptr(),
+                        toks[t].as_ptr(),
+                        blocks,
+                    )
+                };
             }
         }
 
@@ -2132,22 +2121,45 @@ mod q4k_crafted_probe {
         assert!(engine.batch_open());
         engine.batch_gguf_b4(&wb, 0, &yb, 0, &yb, y_off, rows, cols);
         engine.batch_end();
+        // capture b4's answer BEFORE anything else writes these slots
         let view = unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, xb.len() / 4) };
-        for i in 0..40 {
-            eprintln!(
-                "[b4 debug] slot {i}: gpu={} cpu={}",
-                view[y_off / 4 + i],
-                if i < 4 * rows { y_cpu[i] } else { 0.0 }
-            );
+        let y_b4: Vec<f32> = view[y_off / 4..y_off / 4 + 4 * rows].to_vec();
+
+        // cross-check against the SHIPPED v1 kernel on token 0 (overwrites
+        // slots y0..yrows, hence the capture above)
+        assert!(engine.batch_open());
+        engine.batch_gguf(12, &wb, 0, &yb, 0, &yb, y_off, rows, cols);
+        engine.batch_end();
+        let view = unsafe { std::slice::from_raw_parts(xb.as_ptr() as *const f32, xb.len() / 4) };
+        println!(
+            "[b4-vs-v1] row0: b4={} v1={} cpu={}",
+            y_b4[0], view[y_off / 4], y_cpu[0]
+        );
+
+        // v1 oracle sanity: receipted kernel must match vec_dot_raw_q4_k
+        let mut v1_rel = 0f64;
+        for r in 0..rows {
+            let a = view[y_off / 4 + r] as f64;
+            let b = y_cpu[r] as f64;
+            v1_rel = v1_rel.max((a - b).abs() / b.abs().max(1e-3));
         }
+        println!("[b4 parity] v1-vs-cpu max_rel={v1_rel:.3e}");
+
+        // the b4 gate: all 4 tokens x all rows against the receipted dot
+        let mut max_rel = 0f64;
         for i in 0..4 * rows {
-            let a = view[y_off / 4 + i];
-            let b = y_cpu[i];
-            assert!(
-                (a - b).abs() <= 5e-3 * (1.0 + b.abs()),
-                "b4[{i}] gpu={a} cpu={b}"
-            );
+            let a = y_b4[i] as f64;
+            let b = y_cpu[i] as f64;
+            max_rel = max_rel.max((a - b).abs() / b.abs().max(1e-3));
         }
+        println!("[b4 parity] b4-vs-cpu max_rel={max_rel:.3e}");
+        assert!(v1_rel < 1e-2, "v1 oracle drifted vs vec_dot_raw_q4_k");
+        assert!(
+            max_rel < 1e-2,
+            "b4 GPU vs CPU divergence {max_rel} (b4[0]={} cpu[0]={})",
+            y_b4[0],
+            y_cpu[0]
+        );
         println!("[gguf b4 parity] ok: 4 tokens x {rows} rows, cols={cols}");
     }
 

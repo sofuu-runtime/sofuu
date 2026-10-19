@@ -134,16 +134,22 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   — 7 designs now bracket the same ~20 GB/s per-threadgroup streaming
   plateau; the kernel-class breakthrough (llama.cpp references ~100+ GB/s)
   remains an open craft problem and gate = bench_gguf_gemv_bandwidth.
-  G3 wave B (2026-10-19, in tree): the B=4 batched q4_K GEMV — the kernel that
-  serves BOTH prefill (weight stream amortized over prompt tokens) and spec
-  verification — is implemented (kernel + C op batch_gguf_b4 + binding +
-  parity harness, token-major [4][cols] -> [4][rows] matching x_batch). The
-  kernel is LIVE (2x-multiplier probe changes its output) and reads row-
-  dependent weight bytes (byte-probe receipt) yet computes a ROW-INDEPENDENT
-  accumulator (-367.75 for all rows) even as a direct v1 per-value clone;
-  test ignored (gguf_b4_matches_cpu) while the context difference is hunted —
-  NEXT SESSION: q4k-crafted-scale case-A style minimal repro, then wire spec
-  verify (4 tokens/pass) through the one-commit client once correct. Old kernel remains the default. Everything is
+  G3 wave B (2026-10-19, SHIPPED & PARITY-BIT-EXACT): the B=4 batched q4_K GEMV —
+  the kernel that serves BOTH prefill (weight stream amortized over prompt tokens)
+  and spec verification — now passes gguf_b4_matches_cpu at max_rel=0.000e0 (4
+  tokens x 8 rows, cols=1024, receipted oracle = quant::vec_dot_raw_q4_k) and the
+  test is un-ignored (permanent suite gate). Root cause of the FALSE row-
+  invariance alarm was twofold, NOT kernel math: (1) the kernel used
+  [[thread_position_in_grid]] = FLAT global id (tg*32+lane), so guarded writes
+  scattered at 32x stride — a guarded double-probe (slot0=1000, slot32=1032
+  stamped, slots 1-7 quiet) pinned the semantics and the fix is the plain
+  [[threadgroup_position_in_grid]] every shipped GEMV uses; (2) the test's hand
+  CPU reference folded ALL groups with sc=1 while the crafted scale bytes decode
+  subgroups {2,3,6,7} to d=0 — replaced with the receipted vec_dot_raw_q4_k
+  oracle (v1 sanity row: max_rel 0.0 too). A v1 cross-check prints b4/v1/cpu row
+  tri-agreement (74.5). NEXT: wire spec verify (4 tokens/pass) through the
+  one-commit client, then the prefill chunk path (b4 serves it too), then the
+  calm two-pass battery. Old kernel remains the default. Everything is
   behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped

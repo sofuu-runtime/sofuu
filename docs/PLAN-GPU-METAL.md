@@ -126,7 +126,14 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   client). Fix = partial region begins after the heads×chunks×2 pairs; text
   parity restored; chunked attention is now DEFAULT and measures 85 -> ~49
   ms/token at ctx ~1.3k (7.7 GB/s KV-effective — pass-3 still latency-bound;
-  further t-chunk x d-split is the next attention step). Old kernel remains the default. Everything is
+  further t-chunk x d-split is the next attention step).
+  q4_K GEMV variant #7 (aligned uint4 loads + fully static unrolls +
+  algebraic scale fold, still 1-row/32-lane) REMOVED after A/B: bandwidth
+  tied the scalar kernel (18.7-20.0 vs 19.8-20.8 GB/s same-window) AND it
+  cannot pass the bit-exact q4_K gate (the fold regroups f32 addition order)
+  — 7 designs now bracket the same ~20 GB/s per-threadgroup streaming
+  plateau; the kernel-class breakthrough (llama.cpp references ~100+ GB/s)
+  remains an open craft problem and gate = bench_gguf_gemv_bandwidth. Old kernel remains the default. Everything is
   behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped

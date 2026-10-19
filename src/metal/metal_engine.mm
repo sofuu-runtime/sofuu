@@ -28,6 +28,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemv_q4_0;
     id<MTLComputePipelineState> pso_gemv_q4_k;
     id<MTLComputePipelineState> pso_gemv_q6_k;
+
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
     id<MTLComputePipelineState> pso_llama_kv_write;
@@ -99,7 +100,7 @@ void* sofuu_metal_init(void) {
             @"add_inplace", @"lfm2_conv_gate", @"lfm2_kv_write", @"lfm2_attn",
             @"gemv_q8_0", @"gemv_q4_0", @"gemv_q4_k", @"gemv_q6_k",
             @"rmsnorm_f32w", @"llama_kv_write", @"llama_attn",
-            @"head_rmsnorm", @"llama_attn_part", @"llama_attn_fin"
+            @"head_rmsnorm", @"llama_attn_part", @"llama_attn_fin",
         ];
 
         id<MTLLibrary> lib = nil;
@@ -158,6 +159,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_q8_0 = load_pso(@"gemv_q8_0");
         ctx->pso_gemv_q4_0 = load_pso(@"gemv_q4_0");
         ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
+
         ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         ctx->pso_rmsnorm_f32w  = load_pso(@"rmsnorm_f32w");
         ctx->pso_llama_kv_write = load_pso(@"llama_kv_write");

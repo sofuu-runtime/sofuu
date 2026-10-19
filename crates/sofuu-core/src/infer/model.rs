@@ -391,6 +391,25 @@ impl TransformerModel {
                 .tensors
                 .get(name)
                 .ok_or_else(|| format!("tensor not found: {name}"))?;
+            // Gate unsupported quant types at load with a loud, actionable
+            // error instead of a mid-forward panic (type_row_size's fallback
+            // sizes Q3_K/IQ* as f32 and corrupts the slice math). The llama
+            // matvec path handles exactly these types.
+            const SUPPORTED: [u32; 7] = [
+                crate::infer::quant::GGML_TYPE_F32,
+                crate::infer::quant::GGML_TYPE_F16,
+                crate::infer::quant::GGML_TYPE_Q4_0,
+                crate::infer::quant::GGML_TYPE_Q4_1,
+                crate::infer::quant::GGML_TYPE_Q8_0,
+                crate::infer::quant::GGML_TYPE_Q4_K,
+                crate::infer::quant::GGML_TYPE_Q6_K,
+            ];
+            if !SUPPORTED.contains(&info.tensor_type) {
+                return Err(format!(
+                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q4_1, q8_0, q4_k, q6_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
+                    info.tensor_type
+                ));
+            }
             Ok(TensorView {
                 offset: info.offset,
                 size_bytes: info.size_bytes,
@@ -411,7 +430,19 @@ impl TransformerModel {
 
         let token_embd = find_tensor("token_embd.weight")?;
         let output_norm = find_tensor("output_norm.weight")?;
-        let output = find_tensor("output.weight").unwrap_or_else(|_| token_embd.clone());
+        // Tied embeddings: fall back to token_embd ONLY when output.weight is
+        // genuinely absent. A present-but-invalid output.weight (e.g. an
+        // unsupported quant type) must fail the load — the type gate's error
+        // is not a tie signal.
+        let output = match find_tensor("output.weight") {
+            Ok(tv) => tv,
+            Err(e) => {
+                if gguf.tensors.contains_key("output.weight") {
+                    return Err(e);
+                }
+                token_embd.clone()
+            }
+        };
 
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {

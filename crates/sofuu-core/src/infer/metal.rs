@@ -573,6 +573,48 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     );
+    fn sofuu_metal_batch_llama_kv_write_b4(
+        ctx: *mut c_void,
+        k_buf: *mut c_void, k_offset: usize,
+        v_buf: *mut c_void, v_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        kln_buf: *mut c_void, kln_offset: usize,
+        has_norm: u32,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    );
+    fn sofuu_metal_batch_head_rmsnorm_b4(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        w_buf: *mut c_void, w_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32,
+        has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
+    );
+    fn sofuu_metal_batch_llama_attn_part_b4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        meta_buf: *mut c_void, meta_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        n_chunks_max: u32, meta_stride: u32,
+    );
+    fn sofuu_metal_batch_llama_attn_fin_b4(
+        ctx: *mut c_void,
+        meta_buf: *mut c_void, meta_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        n_heads: u32, head_dim: u32,
+        n_chunks_max: u32, meta_stride: u32,
+    );
     fn sofuu_metal_batch_gguf(
         ctx: *mut c_void,
         ty: u32,
@@ -1040,6 +1082,125 @@ impl MetalEngine {
                 meta_buf.handle, meta_offset,
                 out_buf.handle, out_offset,
                 pos_alt, n_heads, head_dim,
+            );
+        }
+    }
+
+    /// Multi-row (B≤4 chain) KV write: positions from a u32 buffer, grid =
+    /// rows × kv_heads; rows are contiguous [B][kv_heads*hd].
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_kv_write_b4(
+        &self,
+        k_buf: &MetalBuffer, k_offset: usize,
+        v_buf: &MetalBuffer, v_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        kln_buf: Option<&MetalBuffer>, kln_offset: usize,
+        has_norm: u32,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (kln_handle, kln_off) = match kln_buf {
+            Some(b) => (b.handle, kln_offset),
+            None => (k_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_llama_kv_write_b4(
+                self.ctx,
+                k_buf.handle, k_offset,
+                v_buf.handle, v_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                kln_handle, kln_off,
+                has_norm,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// Multi-row per-head q-norm + RoPE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_head_rmsnorm_b4(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        w_buf: Option<&MetalBuffer>, w_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32,
+        has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
+    ) {
+        let (w_handle, w_off) = match w_buf {
+            Some(b) => (b.handle, w_offset),
+            None => (x_buf.handle, 0),
+        };
+        unsafe {
+            sofuu_metal_batch_head_rmsnorm_b4(
+                self.ctx,
+                x_buf.handle, x_offset,
+                w_handle, w_off,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads,
+                has_norm, eps, rope_base, rope_mode,
+            );
+        }
+    }
+
+    /// Multi-row chunked attention partials: row r's softmax bound is
+    /// positions[r] (chain causality within the batch); meta regions are
+    /// meta_stride floats apart per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_part_b4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        meta_buf: &MetalBuffer, meta_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        n_chunks_max: u32, meta_stride: u32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_llama_attn_part_b4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                meta_buf.handle, meta_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                n_chunks_max, meta_stride,
+            );
+        }
+    }
+
+    /// Multi-row finish rescale (pairs with batch_llama_attn_part_b4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_fin_b4(
+        &self,
+        meta_buf: &MetalBuffer, meta_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        n_heads: u32, head_dim: u32,
+        n_chunks_max: u32, meta_stride: u32,
+    ) {
+        unsafe {
+            sofuu_metal_batch_llama_attn_fin_b4(
+                self.ctx,
+                meta_buf.handle, meta_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                n_heads, head_dim,
+                n_chunks_max, meta_stride,
             );
         }
     }
@@ -2470,6 +2631,45 @@ mod q4k_crafted_probe {
                 }
             }
         }
+        // 5GB-mmap variant: the CLIENT's weights live in one huge GGUF mmap —
+        // does the 16B-span vec4 kernel keep its rate at deep offsets?
+        {
+            let gb5 = 5usize << 30;
+            let deep = gb5 - w.len() - 64 * 1024 * 1024;
+            let big_ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    gb5,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert!(big_ptr != libc::MAP_FAILED);
+            unsafe {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), (big_ptr as *mut u8).add(deep), w.len());
+            }
+            let big_slice: &[u8] = unsafe { std::slice::from_raw_parts(big_ptr as *const u8, gb5) };
+            let big_buf = engine_c.register_zerocopy_buffer(big_slice).expect("big");
+            for iters in [2usize, 8] {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    assert!(engine_c.batch_open());
+                    engine_c
+                        .batch_gguf_b4(&big_buf, deep, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                    engine_c.batch_end();
+                }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                if iters == 8 {
+                    println!(
+                        "[q4k coalesced] b4c2-in-5G per_group={:.3}ms eff_bw={:.1} GB/s",
+                        per * 1e3,
+                        4.0 * wlen as f64 / per / 1e9
+                    );
+                }
+            }
+        }
         let engine_v1 = MetalEngine::new().expect("metal engine (v1)");
         let wb1 = engine_v1.register_zerocopy_buffer(&w).expect("w");
         let sb1 = engine_v1.register_zerocopy_buffer(slab).expect("slab");
@@ -2546,6 +2746,210 @@ mod q4k_crafted_probe {
                 }
             }
         }
+    }
+
+    /// MULTI-ROW acceptance: the b4 attention family (kv_write_b4 ->
+    /// head_rmsnorm_b4 -> attn_part_b4 -> attn_fin_b4, per-row positions from
+    /// the buffer) must equal a per-row CPU reference — each row's softmax
+    /// bounded by ITS position (chain causality) even though all rows' KV
+    /// landed in the cache before any attention ran. The rows' cache slots
+    /// are pre-filled with garbage so a missing/late kv_write fails loudly.
+    #[test]
+    fn llama_attn_b4_matches_cpu_reference() {
+        use crate::infer::quant::{batched_rmsnorm_in_place, rope_style};
+
+        let engine = MetalEngine::new().expect("metal engine");
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let hd = 32usize;
+        let max_seq = 64usize;
+        let b = 4usize;
+        let p0 = 5usize; // rows at positions 5..8
+        let eps = 1e-5f32;
+        let rope_base = 10000.0f32;
+        let rope_mode = 0u32;
+
+        // raw per-row q/k/v inputs (pre-norm, pre-rope)
+        let q_raw: Vec<f32> = (0..b * n_heads * hd).map(|i| ((i % 9) as f32) * 0.25 - 1.0).collect();
+        let k_raw: Vec<f32> = (0..b * n_kv * hd).map(|i| ((i % 7) as f32) * 0.5 - 1.5).collect();
+        let v_raw: Vec<f32> = (0..b * n_kv * hd).map(|i| ((i % 11) as f32) * 0.125 - 0.5).collect();
+        let q_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 5) as f32 * 0.05).collect();
+        let k_ln: Vec<f32> = (0..hd).map(|i| 1.0 + (i % 3) as f32 * 0.07).collect();
+
+        // prefix history (positions 0..p0) + garbage in the rows' own slots
+        let mut k_cache = vec![0f32; n_kv * max_seq * hd];
+        let mut v_cache = vec![0f32; n_kv * max_seq * hd];
+        for t in 0..p0 {
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + t) * hd;
+                for i in 0..hd {
+                    let s = (t * 31 + i * 7 + kv) % 100;
+                    k_cache[off + i] = (s as f32) * 0.02 - 1.0;
+                    v_cache[off + i] = ((s * 3 % 50) as f32) * 0.02 - 0.5;
+                }
+            }
+        }
+        for t in p0..p0 + b {
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + t) * hd;
+                for i in 0..hd {
+                    k_cache[off + i] = 7777.0f32; // garbage: must be overwritten
+                    v_cache[off + i] = -8888.0f32;
+                }
+            }
+        }
+
+        // CPU reference: per row — norm+rope k/v, write cache, norm+rope q,
+        // softmax over 0..=pos, weighted V
+        let mut q_ref = q_raw.clone();
+        for t in 0..b {
+            let q_row = &mut q_ref[t * n_heads * hd..(t + 1) * n_heads * hd];
+            batched_rmsnorm_in_place(q_row, &q_ln, n_heads, hd, eps);
+            rope_style(q_row, n_heads, hd, p0 + t, rope_base, rope_mode as i32);
+            let k_row = &mut k_raw[t * n_kv * hd..(t + 1) * n_kv * hd].to_vec();
+            batched_rmsnorm_in_place(k_row, &k_ln, n_kv, hd, eps);
+            rope_style(k_row, n_kv, hd, p0 + t, rope_base, rope_mode as i32);
+            for kv in 0..n_kv {
+                let off = (kv * max_seq + p0 + t) * hd;
+                k_cache[off..off + hd].copy_from_slice(&k_row[kv * hd..(kv + 1) * hd]);
+                v_cache[off..off + hd].copy_from_slice(&v_raw[t * n_kv * hd + kv * hd..t * n_kv * hd + (kv + 1) * hd]);
+            }
+        }
+        let mut head_ref = vec![0f32; b * n_heads * hd];
+        for t in 0..b {
+            let pos = p0 + t;
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            for h in 0..n_heads {
+                let kv = h / (n_heads / n_kv);
+                let qh = &q_ref[t * n_heads * hd + h * hd..t * n_heads * hd + (h + 1) * hd];
+                let seq = pos + 1;
+                let mut scores = vec![0f32; seq];
+                let mut mx = f32::NEG_INFINITY;
+                for tt in 0..seq {
+                    let base = (kv * max_seq + tt) * hd;
+                    let mut dot = 0f32;
+                    for i in 0..hd {
+                        dot += qh[i] * k_cache[base + i];
+                    }
+                    scores[tt] = dot * scale;
+                    mx = mx.max(scores[tt]);
+                }
+                let mut sum = 0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - mx).exp();
+                    sum += *sc;
+                }
+                for sc in scores.iter_mut() {
+                    *sc /= sum;
+                }
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for tt in 0..seq {
+                        acc += scores[tt] * v_cache[(kv * max_seq + tt) * hd + d];
+                    }
+                    head_ref[t * n_heads * hd + h * hd + d] = acc;
+                }
+            }
+        }
+
+        // GPU: b4 attention family
+        let page = 16384usize;
+        let q_off = 0usize;
+        let k_off = q_off + (((b * n_heads * hd * 4) + page - 1) / page) * page;
+        let v_off = k_off + (((b * n_kv * hd * 4) + page - 1) / page) * page;
+        let ao_off = v_off + (((b * n_kv * hd * 4) + page - 1) / page) * page;
+        let pos_off = ao_off + (((b * n_heads * hd * 4) + page - 1) / page) * page;
+        let slab_len = pos_off + page;
+        let alloc = ((slab_len + page - 1) / page) * page;
+        let p_slab = unsafe {
+            libc::mmap(std::ptr::null_mut(), alloc, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p_slab != libc::MAP_FAILED);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(p_slab as *mut u8, alloc) };
+        unsafe { std::ptr::copy_nonoverlapping(q_raw.as_ptr() as *const u8, slab.as_mut_ptr().add(q_off), q_raw.len() * 4); }
+        unsafe { std::ptr::copy_nonoverlapping(k_raw.as_ptr() as *const u8, slab.as_mut_ptr().add(k_off), k_raw.len() * 4); }
+        unsafe { std::ptr::copy_nonoverlapping(v_raw.as_ptr() as *const u8, slab.as_mut_ptr().add(v_off), v_raw.len() * 4); }
+        let pos_u32: Vec<u32> = (0..16).map(|t| (p0 + t) as u32).collect();
+        unsafe { std::ptr::copy_nonoverlapping(pos_u32.as_ptr() as *const u8, slab.as_mut_ptr().add(pos_off), 16 * 4); }
+
+        let mut cache_bytes = vec![0u8; k_cache.len() * 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(k_cache.as_ptr() as *const u8, cache_bytes.as_mut_ptr(), cache_bytes.len());
+        }
+        let mut vcache_bytes = vec![0u8; v_cache.len() * 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(v_cache.as_ptr() as *const u8, vcache_bytes.as_mut_ptr(), vcache_bytes.len());
+        }
+        // k/v caches must be page-aligned anon (engine registers them)
+        let kc_ptr = unsafe { libc::mmap(std::ptr::null_mut(), ((k_cache.len() * 4 + page - 1) / page) * page, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert!(kc_ptr != libc::MAP_FAILED);
+        unsafe { std::ptr::copy_nonoverlapping(k_cache.as_ptr() as *const u8, kc_ptr as *mut u8, k_cache.len() * 4); }
+        let kc_slice: &[u8] = unsafe { std::slice::from_raw_parts(kc_ptr as *const u8, ((k_cache.len() * 4 + page - 1) / page) * page) };
+        let vc_ptr = unsafe { libc::mmap(std::ptr::null_mut(), ((v_cache.len() * 4 + page - 1) / page) * page, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert!(vc_ptr != libc::MAP_FAILED);
+        unsafe { std::ptr::copy_nonoverlapping(v_cache.as_ptr() as *const u8, vc_ptr as *mut u8, v_cache.len() * 4); }
+        let vc_slice: &[u8] = unsafe { std::slice::from_raw_parts(vc_ptr as *const u8, ((v_cache.len() * 4 + page - 1) / page) * page) };
+
+        // norm w buffer: q_ln@0, k_ln@4096
+        let mut wb = vec![0u8; 8192];
+        unsafe {
+            std::ptr::copy_nonoverlapping(q_ln.as_ptr() as *const u8, wb.as_mut_ptr(), hd * 4);
+            std::ptr::copy_nonoverlapping(k_ln.as_ptr() as *const u8, wb.as_mut_ptr().add(4096), hd * 4);
+        }
+
+        let slab_buf = engine.register_zerocopy_buffer(slab).expect("slab");
+        let wb_buf = engine.register_zerocopy_buffer(&wb).expect("wb");
+        let kc_buf = engine.register_zerocopy_buffer(kc_slice).expect("kc");
+        let vc_buf = engine.register_zerocopy_buffer(vc_slice).expect("vc");
+
+        let n_chunks_max = (p0 + b + 127) / 128; // 1 at these positions
+        let meta_stride = n_heads * n_chunks_max * 2 + n_heads * n_chunks_max * hd;
+        let meta_alloc = (((meta_stride * b * 4) + page - 1) / page) * page;
+        let m_ptr = unsafe { libc::mmap(std::ptr::null_mut(), meta_alloc, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert!(m_ptr != libc::MAP_FAILED);
+        let m_slice: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(m_ptr as *mut u8, meta_alloc) };
+        let meta_buf = engine.register_zerocopy_buffer(m_slice).expect("meta");
+
+        assert!(engine.batch_open());
+        engine.batch_llama_kv_write_b4(
+            &slab_buf, k_off, &slab_buf, v_off,
+            &kc_buf, 0, &vc_buf, 0,
+            Some(&wb_buf), 4096, 1,
+            &slab_buf, pos_off, b,
+            hd as u32, n_kv as u32, max_seq as u32,
+            eps, rope_base, rope_mode,
+        );
+        engine.batch_head_rmsnorm_b4(
+            &slab_buf, q_off,
+            Some(&wb_buf), 0,
+            &slab_buf, pos_off,
+            b,
+            hd as u32, n_heads as u32, 1, eps, rope_base, rope_mode,
+        );
+        engine.batch_llama_attn_part_b4(
+            &slab_buf, q_off, &kc_buf, 0, &vc_buf, 0,
+            &meta_buf, 0, &slab_buf, pos_off, b,
+            hd as u32, n_heads as u32, n_kv as u32, max_seq as u32,
+            n_chunks_max as u32, meta_stride as u32,
+        );
+        engine.batch_llama_attn_fin_b4(
+            &meta_buf, 0, &slab_buf, ao_off, &slab_buf, pos_off, b,
+            n_heads as u32, hd as u32, n_chunks_max as u32, meta_stride as u32,
+        );
+        engine.batch_end();
+
+        let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, alloc / 4) };
+        let ao_f = ao_off / 4;
+        let mut max_err = 0f64;
+        for i in 0..b * n_heads * hd {
+            max_err = max_err.max((view[ao_f + i] as f64 - head_ref[i] as f64).abs());
+        }
+        println!("[attn b4] max_err={max_err:.3e}");
+        assert!(max_err < 5e-2, "b4 attention vs per-row CPU ref {max_err}");
+        // the GPU pass also OVERWROTE the row cache slots through the
+        // registered cache buffers — the CPU consumed them identically.
+        let _ = (cache_bytes, vcache_bytes);
     }
 
     /// GPU3 acceptance: chunked attention (head_rmsnorm+rope -> part -> fin)
@@ -2784,7 +3188,17 @@ mod q4k_crafted_probe {
         let cols = 4096usize;
         let blocks = cols / 256;
         let wlen = rows * blocks * 144; // 28.3MB q4_K
-        let wbuf = vec![0x80u8; wlen];
+        // random bytes: a constant blob is page-compressible on the GPU —
+        // constant-byte receipts were inflated ~4-5x (b4c2 "100 GB/s")
+        let mut state = 0xBADC0DEu64;
+        let wbuf = {
+            let mut v = vec![0u8; wlen];
+            for b in v.iter_mut() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            v
+        };
         // x: [4][cols] token-major
         let x: Vec<f32> = (0..4 * cols)
             .map(|i| ((i % 11) as f32) * 0.25 - 1.25)

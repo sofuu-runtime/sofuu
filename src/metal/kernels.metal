@@ -1,6 +1,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Hoisted above the chunked-attention kernels that use it (defined again
+// further down; the identical redefinition is benign).
+#define ATTN_CHUNK 128
+
 static inline uint read_u32(device const uchar* base, uint byte_offset) {
     device const uchar* p = base + byte_offset;
     if ((uintptr_t(p) & 3) == 0) {
@@ -838,6 +842,245 @@ kernel void rmsnorm_f32w_b4(
     float rms = rsqrt(sum_sq / float(dim) + eps);
     for (uint i = lane; i < dim; i += 32) {
         yr[i] = xr[i] * rms * w[w_rem + i];
+    }
+}
+
+#define ATTN_CHUNK 128
+
+// ── MULTI-ROW (B≤4 chain) attention family ──────────────────────────────────
+// The spec chain pass dispatches kv_write/head_rmsnorm/attn_part/attn_fin
+// once PER ROW today (~576 extra dispatches per token); these variants take
+// the row count and a positions[B] u32 buffer (per-row RoPE position and
+// attention bound) and process all rows in grid = rows × <heads> thread
+// groups. Chain causality: kv_write_b4 lands every row's KV BEFORE any
+// attention reads, and attn_part_b4 bounds row r's softmax strictly to
+// positions[r] — later rows' cache content is excluded by construction, so
+// the per-row semantics equal the per-row dispatch sequence exactly.
+// Row slots are contiguous [B][...] (the b4 GEMV outputs), meta regions are
+// meta_stride apart per row (the client passes meta_per_layer).
+kernel void llama_kv_write_b4(
+    device float       *k              [[buffer(0)]],
+    device const float *v              [[buffer(1)]],
+    device float       *k_cache_layer  [[buffer(2)]],
+    device float       *v_cache_layer  [[buffer(3)]],
+    device const float *k_ln           [[buffer(4)]],
+    constant uint      &k_ln_rem       [[buffer(5)]],
+    constant uint      &has_norm       [[buffer(6)]],
+    device const uint  *positions      [[buffer(7)]],
+    constant uint      &head_dim       [[buffer(8)]],
+    constant uint      &n_kv_heads     [[buffer(9)]],
+    constant uint      &max_seq        [[buffer(10)]],
+    constant float     &eps            [[buffer(11)]],
+    constant float     &rope_base      [[buffer(12)]],
+    constant uint      &rope_mode      [[buffer(13)]],
+    uint kv                           [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    uint row = kv / n_kv_heads;
+    uint kh  = kv % n_kv_heads;
+    uint pos = positions[row];
+    device float *k_head = k + ((size_t)row * n_kv_heads + kh) * head_dim;
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            ss += k_head[i] * k_head[i];
+        }
+        ss = simd_sum(ss);
+        float rms = rsqrt(ss / float(head_dim) + eps);
+        for (uint i = lane; i < head_dim; i += 32) {
+            k_head[i] = k_head[i] * rms * k_ln[k_ln_rem + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+    for (uint j = lane; j < head_dim / 2; j += 32) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float k0 = k_head[j];
+            float k1 = k_head[j + head_dim / 2];
+            k_head[j]                = k0 * c - k1 * s;
+            k_head[j + head_dim / 2] = k1 * c + k0 * s;
+        } else {
+            float k0 = k_head[2 * j];
+            float k1 = k_head[2 * j + 1];
+            k_head[2 * j]     = k0 * c - k1 * s;
+            k_head[2 * j + 1] = k1 * c + k0 * s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    device float *k_dst = k_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
+    device float *v_dst = v_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
+    for (uint i = lane; i < head_dim; i += 32) {
+        k_dst[i] = k_head[i];
+        v_dst[i] = v[(size_t)row * n_kv_heads * head_dim + kh * head_dim + i];
+    }
+}
+
+kernel void head_rmsnorm_b4(
+    device float       *heads           [[buffer(0)]],
+    device const float *w               [[buffer(1)]],
+    constant uint      &w_rem           [[buffer(2)]],
+    constant uint      &head_dim        [[buffer(3)]],
+    constant uint      &n_heads         [[buffer(4)]],
+    constant float     &eps             [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    device const uint  *positions       [[buffer(7)]],
+    constant float     &rope_base       [[buffer(8)]],
+    constant uint      &rope_mode       [[buffer(9)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = h / n_heads;
+    uint hh  = h % n_heads;
+    uint pos = positions[row];
+    device float *rp = heads + ((size_t)row * n_heads + hh) * head_dim;
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            ss += rp[i] * rp[i];
+        }
+        ss = simd_sum(ss);
+        float rms = rsqrt(ss / float(head_dim) + eps);
+        for (uint i = lane; i < head_dim; i += 32) {
+            rp[i] = rp[i] * rms * w[w_rem + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = lane; j < head_dim / 2; j += 32) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float r0 = rp[j];
+            float r1 = rp[j + head_dim / 2];
+            rp[j]                = r0 * c - r1 * s;
+            rp[j + head_dim / 2] = r1 * c + r0 * s;
+        } else {
+            float r0 = rp[2 * j];
+            float r1 = rp[2 * j + 1];
+            rp[2 * j]     = r0 * c - r1 * s;
+            rp[2 * j + 1] = r1 * c + r0 * s;
+        }
+    }
+}
+
+kernel void llama_attn_part_b4(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *meta            [[buffer(4)]],
+    device const uint  *positions       [[buffer(5)]],
+    constant uint      &head_dim        [[buffer(6)]],
+    constant uint      &n_heads         [[buffer(7)]],
+    constant uint      &n_kv_heads      [[buffer(8)]],
+    constant uint      &max_seq         [[buffer(9)]],
+    constant uint      &n_chunks_max    [[buffer(10)]],
+    constant uint      &meta_stride     [[buffer(11)]],
+    uint g                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    // grid = rows*heads*n_chunks_max; the q-norm already ran (head_rmsnorm_b4)
+    uint row = g / (n_heads * n_chunks_max);
+    uint rem = g % (n_heads * n_chunks_max);
+    uint h = rem / n_chunks_max;
+    uint c = rem % n_chunks_max;
+    uint pos = positions[row];
+    uint n_chunks = (pos + 1 + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    if (c >= n_chunks) { return; }
+    device float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    device float *m = meta + (size_t)row * meta_stride;
+    uint t0 = c * ATTN_CHUNK;
+    uint t_end = min(t0 + ATTN_CHUNK, pos + 1);
+
+    float mx = -INFINITY;
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        if (dot * scale > mx) { mx = dot * scale; }
+    }
+    float cmax = simd_max(mx);
+
+    float lsum = 0.0f;
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        lsum += exp(dot * scale - cmax);
+    }
+    float csum = simd_sum(lsum);
+
+    if (lane == 0) {
+        m[(size_t)h * n_chunks_max * 2 + c * 2 + 0] = cmax;
+        m[(size_t)h * n_chunks_max * 2 + c * 2 + 1] = csum;
+    }
+
+    threadgroup float tw[ATTN_CHUNK];
+    for (uint t = t0 + lane; t < t_end; t += 32) {
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) {
+            dot += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        tw[t - t0] = exp(dot * scale - cmax);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    size_t parts = (size_t)n_heads * n_chunks_max * 2 + (size_t)h * n_chunks_max * head_dim;
+    float inv = 1.0f / csum;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0f;
+        for (uint t = t0; t < t_end; ++t) {
+            acc += tw[t - t0] * vbase[(size_t)t * head_dim + d];
+        }
+        m[parts + (size_t)c * head_dim + d] = acc * inv;
+    }
+}
+
+kernel void llama_attn_fin_b4(
+    device float       *meta            [[buffer(0)]],
+    device float       *head_out        [[buffer(1)]],
+    device const uint  *positions       [[buffer(2)]],
+    constant uint      &n_heads         [[buffer(3)]],
+    constant uint      &head_dim        [[buffer(4)]],
+    constant uint      &n_chunks_max    [[buffer(5)]],
+    constant uint      &meta_stride     [[buffer(6)]],
+    uint g                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = g / n_heads;
+    uint h   = g % n_heads;
+    uint pos = positions[row];
+    uint n_chunks = (pos + 1 + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    device float *m = meta + (size_t)row * meta_stride;
+    size_t mbase = (size_t)h * n_chunks_max * 2;
+    float gmax = -INFINITY;
+    for (uint c = 0; c < n_chunks; ++c) {
+        gmax = max(gmax, m[mbase + c * 2 + 0]);
+    }
+    float gsum = 0.0f;
+    for (uint c = 0; c < n_chunks; ++c) {
+        gsum += m[mbase + c * 2 + 1] * exp(m[mbase + c * 2 + 0] - gmax);
+    }
+    float inv = 1.0f / gsum;
+    size_t parts = (size_t)n_heads * n_chunks_max * 2 + (size_t)h * n_chunks_max * head_dim;
+    device float *out = head_out + ((size_t)row * n_heads + h) * head_dim;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0f;
+        for (uint c = 0; c < n_chunks; ++c) {
+            acc += m[mbase + c * 2 + 1] * exp(m[mbase + c * 2 + 0] - gmax)
+                 * m[parts + (size_t)c * head_dim + d];
+        }
+        out[d] = acc * inv;
     }
 }
 

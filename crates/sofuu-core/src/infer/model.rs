@@ -2296,12 +2296,23 @@ impl TransformerModel {
         let kv_rows = n_kv_heads * head_dim;
         let vocab_size = self.config.vocab_size;
         let pass_t = std::time::Instant::now();
+        let mut ffn_ops = 0usize;
 
         // Embedding lookup stays on CPU by design (GPU-first directive:
         // embedding/sampler are CPU work; q-row staging is a host copy).
         for (t, &tok) in tokens.iter().enumerate() {
             let dst = g.slot_f32_mut(g.slots.x + t * dim * 4, dim);
             Self::lookup_embedding(&self.gguf, &self.token_embd, tok, dim, dst);
+        }
+        // Per-row positions for the b4 attention family (u32s bit-written
+        // into the posb slot).
+        {
+            let pb = g.slot_f32_mut(g.slots.posb, 16);
+            let pbb =
+                unsafe { std::slice::from_raw_parts_mut(pb.as_ptr() as *mut u32, 16) };
+            for (t, item) in pbb.iter_mut().enumerate().take(b) {
+                *item = (start_pos + t) as u32;
+            }
         }
         // Bound above the macro so macro hygiene can see it (the macro body
         // expands it at def-site scope); a field borrow is disjoint from
@@ -2361,44 +2372,50 @@ impl TransformerModel {
             gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
             gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
 
-            // Attention, row by row, inside the commit: row t's kv_write
-            // lands before row t's attention reads the cache.
-            // (SOFUU_GPU_SKIP=attn timing ablation skips the section.)
+            // Attention in four b4 dispatches (rows × heads × chunks grid):
+            // kv_write_b4 lands every row's KV first; attn_part_b4 bounds
+            // row r's softmax to positions[r], so later rows' fresh cache
+            // content is excluded — chain causality without per-row
+            // dispatches. (SOFUU_GPU_SKIP=attn timing ablation skips it.)
             if !g.skip_attn {
-            for t in 0..b {
-                let pos_t = (start_pos + t) as u32;
-                g.engine.batch_llama_kv_write(
-                    &g.act_buf, g.slots.ka + t * kv_rows * 4,
-                    &g.act_buf, g.slots.va + t * kv_rows * 4,
+                g.engine.batch_llama_kv_write_b4(
+                    &g.act_buf, g.slots.ka,
+                    &g.act_buf, g.slots.va,
                     &g.k_buf, kc_layer,
                     &g.v_buf, kc_layer,
                     kln_buf, kln_off,
-                    has_k, pos_t,
+                    has_k,
+                    &g.act_buf, g.slots.posb,
+                    b,
                     head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                     norm_eps, rope_freq_base, rope_mode,
                 );
-                g.engine.batch_head_rmsnorm(
-                    &g.act_buf, g.slots.qa + t * q_rows * 4,
+                g.engine.batch_head_rmsnorm_b4(
+                    &g.act_buf, g.slots.qa,
                     q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
+                    &g.act_buf, g.slots.posb,
+                    b,
                     head_dim as u32, n_heads as u32,
-                    has_q, pos_t, norm_eps, rope_freq_base, rope_mode,
+                    has_q, norm_eps, rope_freq_base, rope_mode,
                 );
-                g.engine.batch_llama_attn_part(
-                    &g.act_buf, g.slots.qa + t * q_rows * 4,
+                g.engine.batch_llama_attn_part_b4(
+                    &g.act_buf, g.slots.qa,
                     &g.k_buf, kc_layer,
                     &g.v_buf, kc_layer,
-                    None, 0,
                     &g.meta_buf, meta_layer_off,
-                    0, pos_t,
+                    &g.act_buf, g.slots.posb,
+                    b,
                     head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode,
+                    meta_chunks as u32, meta_per_layer as u32,
                 );
-                g.engine.batch_llama_attn_fin(
+                g.engine.batch_llama_attn_fin_b4(
                     &g.meta_buf, meta_layer_off,
-                    &g.act_buf, g.slots.ao + t * q_rows * 4,
-                    pos_t, n_heads as u32, head_dim as u32,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    n_heads as u32, head_dim as u32,
+                    meta_chunks as u32, meta_per_layer as u32,
                 );
-            }
             }
 
             gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
@@ -2412,8 +2429,12 @@ impl TransformerModel {
                 );
             }
             if !g.skip_ffn {
+            ffn_ops += 1;
             gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
             gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
+            if !g.skip_ffn {
+                ffn_ops += 3;
+            }
             g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim);
             gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
             g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
@@ -2444,6 +2465,7 @@ impl TransformerModel {
             );
         }
         g.engine.batch_end();
+        let commit_us = pass_t.elapsed().as_micros() as u64;
 
         if head_row.is_some() {
             out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
@@ -2451,14 +2473,17 @@ impl TransformerModel {
             let xn_host = g.slot_f32(g.slots.xn, b * dim);
             self.x_norm_batch[0..b * dim].copy_from_slice(xn_host);
         }
+        let post_us = pass_t.elapsed().as_micros() as u64;
         // The lazy per-row head commits (spec verify) read the xn region;
         // valid only when the output norms above ran.
         self.spec_rows_valid = head_row.is_some();
         if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
             eprintln!(
-                "[gpu-profile] spec-pass: batch={b} wall={}us ~{:.1}us/serial-token-equiv",
+                "[gpu-profile] spec-pass: batch={b} wall={}us commit={}us post-head={}us refill={}us",
                 pass_t.elapsed().as_micros() as u64,
-                pass_t.elapsed().as_micros() as f64 / b as f64
+                commit_us,
+                post_us.saturating_sub(commit_us),
+                pass_t.elapsed().as_micros() as u64 - post_us
             );
         }
 
@@ -2938,6 +2963,7 @@ use std::sync::atomic::Ordering;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 struct GgufGpuSlots {
     x: usize,
+    posb: usize,
     xn: usize,
     qa: usize,
     ka: usize,
@@ -3062,6 +3088,7 @@ impl GgufGpu {
         const SPEC_B: usize = 4;
         let slots = GgufGpuSlots {
             x: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            posb: gguf_gpu_slot(&mut cursor, SPEC_B * 16),
             xn: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
             qa: gguf_gpu_slot(&mut cursor, SPEC_B * q_rows),
             ka: gguf_gpu_slot(&mut cursor, SPEC_B * kv_rows),
@@ -3088,10 +3115,11 @@ impl GgufGpu {
         let meta_chunks = (config.max_seq_len + 127) / 128;
         let meta_head_f32 =
             config.n_heads * meta_chunks * 2 + config.n_heads * meta_chunks * config.head_dim;
-        // per-layer region (layers overwrite each other's chunks otherwise)
+        // per-layer region (layers overwrite each other's chunks otherwise);
+        // the spec chain's b4 attention needs SPEC_B per-row meta regions
         let meta_per_layer = meta_head_f32;
         let meta_f32 =
-            ((meta_per_layer * config.n_layers * 4 + 16383) / 16384) * 16384 / 4;
+            ((meta_per_layer * config.n_layers * SPEC_B * 4 + 16383) / 16384) * 16384 / 4;
         let meta = crate::infer::model::AnonBuffer::new(meta_f32);
         let meta_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(meta.as_ptr() as *const u8, meta_f32 * 4)

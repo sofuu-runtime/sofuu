@@ -198,6 +198,61 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
     the ~1600-op commit chain + per-row glue dominate) — next spec levers:
     batch the per-row elementwise ops across the 4 rows and a multi-row
     attention kernel.
+  - G4 CHAIN-SPEC CLIENT (2026-10-19 late night): the spec pass runs root +
+    <=3 candidates at consecutive positions in ONE commit — B=4 slot regions
+    (x/xn/qa/ka/va/ao/xo/gate/up x4, logits xB, posb) with per-row position
+    bounds in the attention kernels (chain causality), B-row glue
+    (rmsnorm_f32w_b4; flat swiglu/add reused over n=B*rows), and LAZY per-row
+    head commits (lm_head = ~514MB q6_K: a 4-row in-commit head = 2GB/pass —
+    CPU matvec 290ms/row under load vs ~13ms lazy GPU row). Multi-row
+    attention family (kv_write/head_rmsnorm/attn_part/attn_fin with a
+    positions buffer parameter) parity 1.04e-7 against a garbage-prefilled
+    cache (causality receipt).
+  - PASS-WALL TRAJECTORY + FIRST SPEC>SERIAL CROSSOVER (all load ~3.7-4.9):
+    pass wall 635 -> 332 -> 232ms (class matrix fix below); 96-token Count
+    serial 5.3 vs spec 6.0 t/s — first net spec win; Paris natural text
+    serial 11.1 / spec 4.6 (acceptance-limited on natural text, as on Pi 5).
+    Battery #9: 12-14 rows, all load-labeled (calm pair 12.0 serial / 6.0
+    spec at load ~3.7).
+  - FUSION WAVE — MEASURED NEUTRAL UNDER LOAD, shipped behind a kill switch:
+    llama_attn_1c_b4 (part+fin fused, pos<128, no meta) + gemv_q4_k_b4c2r
+    (resid-add epilogue for o/down where rows==acc_dim, one writer per
+    element), SOFUU_GPU_FUSE=0 disables. Same-window client pass: no delta
+    beyond run noise — the "each dependent op pays the prior op's ~2.5ms
+    barrier drain" model (true per-op in isolation) does NOT express in the
+    client pass under load; window load governs. Fusion stays available but
+    is not a lever on its own.
+  - CLASS MATRIX CORRECTION + FIX (2026-10-19 night 5, commit 6c084e4c2):
+    the "b4c2 = 100 GB/s" receipts above were MISLABELED — the bench engine
+    ran at SOFUU_COALESCED=1, so those numbers belong to byte-lane b4c.
+    TRUE same-window 2x2 (level x buffer): level-1 b4c compact 106.7 /
+    in-5GB-mmap 50.1 GB/s; level-2 b4c2 compact 45.7 / in-5GB 37.3 — the
+    vec4 batch variant is inferior everywhere. FIX: SOFUU_Q4K_COALESCED=2
+    now means BEST-PER-SHAPE — serial single-row GEMVs use the vec4 class
+    (gemv_q4_k_c2: 12.0-12.4 t/s serial stands on it), spec-pass batched
+    GEMVs use byte-lane b4c (pass wall 332 -> 232ms). Also REVERTED with
+    receipt: a 5GB anonymous weight copy to dodge mmap collapses (load
+    +20-30s, no live delta — serial c2-single does not suffer the collapse;
+    batched kernels still measure ~24 GB/s in the real 5GB space vs 93-104
+    compact — the OPEN SPEC-PASS ANOMALY, needs a Metal GPU-frame capture
+    to attribute the client pass's remaining ~300ms-class overhead at calm).
+  - MEASUREMENT HAZARDS (pinned): (1) every fresh process pays ~7-8s of GPU
+    page-onboard for the 4.9GB weight space — runs shorter than ~60 tokens
+    are contaminated; deciding receipts are 96-token. (2) zsh `env $E` does
+    not word-split multi-var env strings -> stale invariance data RETRACTED;
+    all later receipts use direct `env VAR=.. VAR2=.. cmd` forms. (3) window
+    load swings standalone kernel rates 3-10x — only same-window A/Bs are
+    legal evidence.
+  - DECIDING CALM ARTIFACTS (armed 2026-10-19 ~21:00): watcher 1 waits for
+    load < 2.5 then runs serial x2 + spec x2 96-token receipts on
+    SOFUU_Q4K_COALESCED=2 into battery #9 (auto); watcher 2 fires behind it
+    in the same window: ~2.6k-token long-prompt prefill receipts (CPU tile
+    route + SOFUU_GPU_PREFILL=1 route — the input-side 80-150 t/s baseline)
+    plus a SOFUU_SPEC_DEPTH=1/2/3 acceptance sweep on the chain route.
+    Calm projections to beat if the gap to 40-50 persists: spec pass
+    ~90-150ms -> spec ~10-14 t/s, serial ~15-20 t/s; the remaining gap is
+    byte/stream class (read-all-weights is not a floor: sparsity/spec/MTP/
+    KIVI per the order of battle).
 
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped

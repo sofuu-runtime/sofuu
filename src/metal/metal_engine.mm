@@ -28,6 +28,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemv_q4_0;
     id<MTLComputePipelineState> pso_gemv_q4_k;
     id<MTLComputePipelineState> pso_gemv_q6_k;
+    id<MTLComputePipelineState> pso_gemv_q4_k_b4;
 
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
@@ -101,6 +102,7 @@ void* sofuu_metal_init(void) {
             @"gemv_q8_0", @"gemv_q4_0", @"gemv_q4_k", @"gemv_q6_k",
             @"rmsnorm_f32w", @"llama_kv_write", @"llama_attn",
             @"head_rmsnorm", @"llama_attn_part", @"llama_attn_fin",
+            @"gemv_q4_k_b4"
         ];
 
         id<MTLLibrary> lib = nil;
@@ -167,6 +169,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_head_rmsnorm    = load_pso(@"head_rmsnorm");
         ctx->pso_llama_attn_part = load_pso(@"llama_attn_part");
         ctx->pso_llama_attn_fin  = load_pso(@"llama_attn_fin");
+        ctx->pso_gemv_q4_k_b4   = load_pso(@"gemv_q4_k_b4");
 
         // Initial 64KB activation buffers
         ctx->x_buf_cap = 65536 * sizeof(float);
@@ -1641,6 +1644,34 @@ void sofuu_metal_batch_llama_attn(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
+// GPU3: batched (B=4) q4_K GEMV — token-major x[4][cols] -> y[4][rows].
+void sofuu_metal_batch_gguf_b4(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return;
+    if (ctx->pso_gemv_q4_k_b4 == nil) return;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint r = (uint)rows;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_b4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&r length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 // G2: GGUF dequant-dot GEMV, one op in the live batch. ty is the GGML type
 // id (2 = q4_0, 8 = q8_0, 12 = q4_K, 14 = q6_K). Bindings: 0=w 1=x 2=y
 // 3=cols 4=w_rem.
@@ -1768,6 +1799,7 @@ void sofuu_metal_batch_head_rmsnorm(void* ctx, void* x, size_t xo, void* w, size
 void sofuu_metal_batch_llama_attn_part(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* meta, size_t mo, uint32_t hn, uint32_t p, uint32_t hd2, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)meta;(void)mo;(void)hn;(void)p;(void)hd2;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
 void sofuu_metal_batch_llama_attn_fin(void* ctx, void* meta, size_t mo, void* out, size_t oo, uint32_t p, uint32_t nh, uint32_t hd) { (void)ctx;(void)meta;(void)mo;(void)out;(void)oo;(void)p;(void)nh;(void)hd; }
 void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
+void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

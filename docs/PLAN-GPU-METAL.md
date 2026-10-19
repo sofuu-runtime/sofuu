@@ -133,7 +133,17 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   cannot pass the bit-exact q4_K gate (the fold regroups f32 addition order)
   — 7 designs now bracket the same ~20 GB/s per-threadgroup streaming
   plateau; the kernel-class breakthrough (llama.cpp references ~100+ GB/s)
-  remains an open craft problem and gate = bench_gguf_gemv_bandwidth. Old kernel remains the default. Everything is
+  remains an open craft problem and gate = bench_gguf_gemv_bandwidth.
+  G3 wave B (2026-10-19, in tree): the B=4 batched q4_K GEMV — the kernel that
+  serves BOTH prefill (weight stream amortized over prompt tokens) and spec
+  verification — is implemented (kernel + C op batch_gguf_b4 + binding +
+  parity harness, token-major [4][cols] -> [4][rows] matching x_batch). The
+  kernel is LIVE (2x-multiplier probe changes its output) and reads row-
+  dependent weight bytes (byte-probe receipt) yet computes a ROW-INDEPENDENT
+  accumulator (-367.75 for all rows) even as a direct v1 per-value clone;
+  test ignored (gguf_b4_matches_cpu) while the context difference is hunted —
+  NEXT SESSION: q4k-crafted-scale case-A style minimal repro, then wire spec
+  verify (4 tokens/pass) through the one-commit client once correct. Old kernel remains the default. Everything is
   behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped

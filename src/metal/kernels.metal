@@ -749,6 +749,98 @@ kernel void gemv_q4_k_b4(
     y[3 * rows + row] = acc3;
 }
 
+// SINGLE-row variant of the b4c2 geometry (the serial client's actual op
+// shape): 8 lanes x 16B uint4 spans cover one superblock, 4 superblocks per
+// wavefront, float4 x loads + one float4 accumulator, horizontal sum once.
+// gemv_q4_k_c (the byte-lane version) measured only 24 GB/s single-row —
+// the 16B-span geometry is what carries the class.
+kernel void gemv_q4_k_c2(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float4 acc = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    uint sub = lane / 8;
+    uint l8 = lane % 8;
+    uint g = l8 / 2;
+    uint k0 = (l8 % 2) * 16;
+    for (uint b0 = 0; b0 < nb; b0 += 4) {
+        uint b = b0 + sub;
+        if (b >= nb) { break; }
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        uint8_t sc1, m1, sc2, m2;
+        q4k_scale_min(scales, g * 2, &sc1, &m1);
+        q4k_scale_min(scales, g * 2 + 1, &sc2, &m2);
+        float s1 = d * (float)sc1;
+        float s2 = d * (float)sc2;
+        float m1f = dmin * (float)m1;
+        float m2f = dmin * (float)m2;
+        uint4 q4 = *(device const uint4 *)&qs[l8 * 16];
+        uint xbase = b * 256 + g * 64 + k0;
+#pragma clang loop unroll(full)
+        for (uint c = 0; c < 4; ++c) {
+            uint comp;
+            if (c == 0) { comp = q4.x; }
+            else if (c == 1) { comp = q4.y; }
+            else if (c == 2) { comp = q4.z; }
+            else { comp = q4.w; }
+            float4 lo4 = float4(float(comp & 15), float((comp >> 8) & 15),
+                                float((comp >> 16) & 15), float((comp >> 24) & 15));
+            float4 hi4 = float4(float((comp >> 4) & 15), float((comp >> 12) & 15),
+                                float((comp >> 20) & 15), float((comp >> 28) & 15));
+            float4 wlo = float4(s1) * lo4 - float4(m1f);
+            float4 whi = float4(s2) * hi4 - float4(m2f);
+            float4 xlo = *(device const float4 *)&x[xbase + 4 * c];
+            float4 xhi = *(device const float4 *)&x[xbase + 32 + 4 * c];
+            acc += wlo * xlo + whi * xhi;
+        }
+    }
+    float v = (acc.x + acc.y) + (acc.z + acc.w);
+    v = simd_sum(v);
+    if (lane == 0) {
+        y[row] = v;
+    }
+}
+
+// B-row RMSNorm (f32 weights): one threadgroup per row, rows are
+// contiguous [B][dim] — collapses the spec chain's 4 per-row norm
+// dispatches into one (the elementwise swiglu/add need no variant: their
+// flat kernels already accept n = B*n over the contiguous [B][n] slabs).
+kernel void rmsnorm_f32w_b4(
+    device const float *x              [[buffer(0)]],
+    device const float *w              [[buffer(1)]],
+    device float       *y              [[buffer(2)]],
+    constant uint      &dim            [[buffer(3)]],
+    constant float     &eps            [[buffer(4)]],
+    constant uint      &w_rem          [[buffer(5)]],
+    constant uint      &rows           [[buffer(6)]],
+    uint row                           [[threadgroup_position_in_grid]],
+    uint lane                          [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) { return; }
+    device const float *xr = x + row * dim;
+    device float *yr = y + row * dim;
+    float sum_sq = 0.0f;
+    for (uint i = lane; i < dim; i += 32) {
+        float v = xr[i];
+        sum_sq += v * v;
+    }
+    sum_sq = simd_sum(sum_sq);
+    float rms = rsqrt(sum_sq / float(dim) + eps);
+    for (uint i = lane; i < dim; i += 32) {
+        yr[i] = xr[i] * rms * w[w_rem + i];
+    }
+}
+
 // ── COALESCED-LANE q4_K GEMVs (the ~150GB/s kernel-class attack) ────────────
 // Lane l reads qs byte l of each 32-byte group span, so 32 lanes cover a
 // 64-value group's weight bytes in ONE coalesced wavefront (the shipped
@@ -940,6 +1032,67 @@ kernel void gemv_q4_k_b4c2(
     y[rows + row] = v1;
     y[2 * rows + row] = v2;
     y[3 * rows + row] = v3;
+}
+
+// COALESCED q6_K GEMV (single row) — the lm_head class fix: the shipped
+// scalar q6_K runs the ~514MB vocab GEMV at ~6GB/s (~80ms of every 8B
+// token; the layer-mimic ablation prices the head at ~+456ms/pass). Same
+// wavefront idea as gemv_q4_k_c: 32 lanes cover one 210B superblock per
+// wavefront — each lane serves (n,p) = (lane/16 gives p; n looped 0..1)
+// and l = lane%16, reading ONE ql byte + ONE qh byte (both coalesced
+// across lanes) and emitting 4 value products into x runs at +0/+32/+64/
+// +96 (runs coalesce across consecutive lanes). q6_K semantics exactly
+// as sofuu_vec_dot_q6_k: value v = d*sc[8n+p+{0,2,1,3}]*
+// ((lo4 | hi2<<4) - 32) with hi2 from qh bit-pairs (0,1)/(2,3)/(4,5)/(6,7)
+// for the four +0/+32/+64/+96 runs. int8 scales (char cast). Per-lane
+// partials + one simd_sum: per-lane-partials class, gated at
+// vec_dot_raw_q6_k 1e-2-rel.
+kernel void gemv_q6_k_c(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float acc = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    uint p = lane / 16;
+    uint l = lane % 16;
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 210;
+        float d = float(read_f16(blk, 208));
+        for (uint n = 0; n < 2; ++n) {
+            uint qh = (uint)blk[128 + 32 * n + 16 * p + l];
+            uint qlb = 64 * n + 16 * p + l;
+            uint lo = (uint)blk[qlb];
+            uint hi = (uint)blk[qlb + 32];
+            uint isb = 192 + 8 * n + p;
+            // sofuu_vec_dot_q6_k scale order: runs +0/+32/+64/+96 use
+            // sc[8n+part + 0/+2/+4/+6] (sc strides 8 per half here)
+            float s0 = d * (float)(char)blk[isb + 0];
+            float s2 = d * (float)(char)blk[isb + 2];
+            float s1 = d * (float)(char)blk[isb + 4];
+            float s3 = d * (float)(char)blk[isb + 6];
+            // runs: +0 (sc0, qh bits 0-1), +32 (sc2, bits 2-3),
+            // +64 (sc1, bits 4-5), +96 (sc3, bits 6-7); -32 signed bias
+            int q1 = (int)((lo & 15u) | ((qh & 3u) << 4)) - 32;
+            int q2 = (int)(((hi & 15u) | (((qh >> 2) & 3u) << 4)) & 63u) - 32;
+            int q3 = (int)(((lo >> 4) | (((qh >> 4) & 3u) << 4)) & 63u) - 32;
+            int q4 = (int)(((hi >> 4) | (((qh >> 6) & 3u) << 4)) & 63u) - 32;
+            uint xoff = b * 256 + 128 * n + 16 * p + l;
+            acc += s0 * (float)q1 * x[xoff]
+                 + s2 * (float)q2 * x[xoff + 32]
+                 + s1 * (float)q3 * x[xoff + 64]
+                 + s3 * (float)q4 * x[xoff + 96];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = acc;
+    }
 }
 
 // ── GPU3 helper: per-head f32 RMSNorm on a [heads x head_dim] slot ─────────

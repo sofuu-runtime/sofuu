@@ -2351,14 +2351,12 @@ impl TransformerModel {
             let meta_layer_off = layer_idx * meta_per_layer * 4;
             let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
 
-            for t in 0..b {
-                g.engine.batch_rmsnorm_f32w(
-                    &g.act_buf, g.slots.x + t * dim * 4,
-                    &g.w_buf, attn_norm_off,
-                    &g.act_buf, g.slots.xn + t * dim * 4,
-                    dim, norm_eps,
-                );
-            }
+            g.engine.batch_rmsnorm_f32w_b4(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, attn_norm_off,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps, b,
+            );
             gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
             gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
             gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
@@ -2404,13 +2402,7 @@ impl TransformerModel {
             }
 
             gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
-            for t in 0..b {
-                g.engine.batch_add(
-                    &g.act_buf, g.slots.x + t * dim * 4,
-                    &g.act_buf, g.slots.xo + t * dim * 4,
-                    dim,
-                );
-            }
+            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
             for t in 0..b {
                 g.engine.batch_rmsnorm_f32w(
                     &g.act_buf, g.slots.x + t * dim * 4,
@@ -2422,21 +2414,9 @@ impl TransformerModel {
             if !g.skip_ffn {
             gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
             gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
-            for t in 0..b {
-                g.engine.batch_swiglu(
-                    &g.act_buf, g.slots.gate + t * hidden_dim * 4,
-                    &g.act_buf, g.slots.up + t * hidden_dim * 4,
-                    hidden_dim,
-                );
-            }
+            g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim);
             gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
-            for t in 0..b {
-                g.engine.batch_add(
-                    &g.act_buf, g.slots.x + t * dim * 4,
-                    &g.act_buf, g.slots.xo + t * dim * 4,
-                    dim,
-                );
-            }
+            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
             }
         }
 

@@ -32,6 +32,7 @@ struct MetalContext {
 
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
+    id<MTLComputePipelineState> pso_rmsnorm_f32w_b4;
     id<MTLComputePipelineState> pso_llama_kv_write;
     id<MTLComputePipelineState> pso_llama_attn;
     id<MTLComputePipelineState> pso_head_rmsnorm;
@@ -171,24 +172,47 @@ void* sofuu_metal_init(void) {
         q4k_coalesced = coalesced_level > 0;
         ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         ctx->pso_rmsnorm_f32w  = load_pso(@"rmsnorm_f32w");
+        ctx->pso_rmsnorm_f32w_b4 = load_pso(@"rmsnorm_f32w_b4");
         ctx->pso_llama_kv_write = load_pso(@"llama_kv_write");
         ctx->pso_llama_attn     = load_pso(@"llama_attn");
         ctx->pso_head_rmsnorm    = load_pso(@"head_rmsnorm");
         ctx->pso_llama_attn_part = load_pso(@"llama_attn_part");
         ctx->pso_llama_attn_fin  = load_pso(@"llama_attn_fin");
+        // class 1 = byte-lane coalesced; class 2 = 16B-span vec4 coalesced
+        // (the faster class: b4c2 100 GB/s vs 69, head q6_K 90.5 vs the
+        // v1 q6_K 15.5). BOTH the single-row (serial client) and batched
+        // (spec chain) q4_K PSOs flip together so every GEMV in a run
+        // shares one summation order.
         if (coalesced_level == 2) {
+            ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k_c2");
             ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c2");
         } else if (coalesced_level == 1) {
+            ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k_c");
             ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c");
         }
-        if (ctx->pso_gemv_q4_k_b4 == nil) {
+        if (coalesced_level > 0) {
+            // the q6_K class rides the same env: the ~514MB lm_head runs on
+            // the scalar q6_K at 15.6 GB/s (32.9ms) vs 92 GB/s (5.5ms)
+            // coalesced
+            ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k_c");
+            if (ctx->pso_gemv_q6_k == nil) {
+                // bundled metallib predates it: degrade to the shipped
+                // q6_K class rather than a silent no-op GEMV
+                ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
+            }
+        }
+        if (ctx->pso_gemv_q4_k == nil || ctx->pso_gemv_q4_k_b4 == nil) {
             // coalesced class unavailable (e.g. a complete bundled metallib
             // predating it): degrade to the shipped class, never a silent
             // no-op GEMV
-            if (coalesced_level > 0 && ctx->pso_gemv_q4_k == nil) {
-                ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
-            }
+            ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
             ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4");
+            if (coalesced_level > 0 && ctx->pso_gemv_q6_k == nil) {
+                ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
+            }
+        }
+        if (ctx->pso_gemv_q6_k == nil) {
+            ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         }
 
         // Initial 64KB activation buffers
@@ -1583,6 +1607,35 @@ void sofuu_metal_batch_rmsnorm_f32w(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
+// B-row RMSNorm (spec chain): rows contiguous [B][dim], grid = B threadgroups
+void sofuu_metal_batch_rmsnorm_f32w_b4(
+    void* ctx_ptr,
+    void* x_buf_ptr, size_t x_offset,
+    void* w_buf_ptr, size_t w_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t dim, float eps, size_t rows
+) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !x_buf_ptr || !w_buf_ptr || !y_buf_ptr || dim == 0 || rows == 0) return;
+    if (ctx->pso_rmsnorm_f32w_b4 == nil) return;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned_offset = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL) / 4;
+    uint d = (uint)dim;
+    uint r = (uint)rows;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_rmsnorm_f32w_b4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&d length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&eps length:sizeof(float) atIndex:4];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&r length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(r, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
 // Per-kv-head: optional f32 head-RMSNorm, split-half (mode 0) or interleaved
 // (mode 1) RoPE on k, append k(roped)/v(raw) at `pos` of this layer's slice.
 void sofuu_metal_batch_llama_kv_write(
@@ -1813,6 +1866,7 @@ void sofuu_metal_batch_conv_gate(void* ctx, void* bcx, size_t bco, void* cw, siz
 void sofuu_metal_batch_kv_write(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t p, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)p;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb; }
 void sofuu_metal_batch_attn(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* out, size_t oo, uint32_t p, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)out;(void)oo;(void)p;(void)hd;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb; }
 void sofuu_metal_batch_rmsnorm_f32w(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps; }
+void sofuu_metal_batch_rmsnorm_f32w_b4(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps, size_t rows) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps;(void)rows; }
 void sofuu_metal_batch_llama_kv_write(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t hn, uint32_t p, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)hn;(void)p;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
 void sofuu_metal_batch_llama_attn(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* out, size_t oo, uint32_t hn, uint32_t p, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)out;(void)oo;(void)hn;(void)p;(void)hd;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
 void sofuu_metal_batch_head_rmsnorm(void* ctx, void* x, size_t xo, void* w, size_t wo, uint32_t hd, uint32_t nh, uint32_t hn, uint32_t p, float e, float rb, uint32_t rm) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)hd;(void)nh;(void)hn;(void)p;(void)e;(void)rb;(void)rm; }

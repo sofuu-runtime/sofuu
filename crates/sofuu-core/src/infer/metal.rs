@@ -598,6 +598,13 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         dim: usize, eps: f32,
     );
+    fn sofuu_metal_batch_rmsnorm_f32w_b4(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        w_buf: *mut c_void, w_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        dim: usize, eps: f32, rows: usize,
+    );
     fn sofuu_metal_batch_llama_kv_write(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -907,6 +914,27 @@ impl MetalEngine {
                 w_buf.handle, w_offset,
                 y_buf.handle, y_offset,
                 dim, eps,
+            );
+        }
+    }
+
+    /// B-row f32-weight RMSNorm for the spec chain: rows are contiguous
+    /// [B][dim]; one dispatch instead of B.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_rmsnorm_f32w_b4(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        w_buf: &MetalBuffer, w_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        dim: usize, eps: f32, rows: usize,
+    ) {
+        unsafe {
+            sofuu_metal_batch_rmsnorm_f32w_b4(
+                self.ctx,
+                x_buf.handle, x_offset,
+                w_buf.handle, w_offset,
+                y_buf.handle, y_offset,
+                dim, eps, rows,
             );
         }
     }
@@ -2307,6 +2335,141 @@ mod q4k_crafted_probe {
             }
         }
         std::env::remove_var("SOFUU_Q4K_COALESCED");
+        // single-row coalesced GEMV vs the v1 server (the serial client's
+        // actual op shape — the b4 kernels above can't serve it)
+        {
+            let x1s: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32) * 0.25 - 1.5).collect();
+            unsafe {
+                std::ptr::copy_nonoverlapping(x1s.as_ptr() as *const u8, slab.as_mut_ptr(), cols * 4);
+            }
+            for iters in [2usize, 8] {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    assert!(engine_c.batch_open());
+                    engine_c.batch_gguf(12, &wb, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols);
+                    engine_c.batch_end();
+                }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                if iters == 8 {
+                    println!(
+                        "[q4k coalesced] c-single per_op={:.3}ms bw={:.1} GB/s",
+                        per * 1e3,
+                        wlen as f64 / per / 1e9
+                    );
+                }
+            }
+        }
+        // ── q6_K coalesced (the lm_head class): parity on random blobs then
+        // the REAL head shape as the bench (151936 x 4096 = ~514MB) ──
+        for (q6rows, label) in [(8usize, "parity-8"), (151936usize, "head-bench")] {
+            let q6cols = 4096usize;
+            let q6blocks = q6cols / 256;
+            let q6row = q6blocks * 210;
+            let mut w6 = vec![0u8; q6rows * q6row];
+            for r in 0..q6rows {
+                for b in 0..q6blocks {
+                    let off = r * q6row + b * 210;
+                    for j in 0..128 {
+                        w6[off + j] = (rand() % 255) as u8; // ql
+                    }
+                    for j in 0..64 {
+                        w6[off + 128 + j] = (rand() % 255) as u8; // qh
+                    }
+                    for j in 0..16 {
+                        w6[off + 192 + j] = (rand() % 255) as i8 as u8; // int8 scales
+                    }
+                    w6[off + 208..off + 210].copy_from_slice(&f16_bytes(0.0625f32));
+                }
+            }
+            let tok6: Vec<f32> = (0..q6cols).map(|i| ((i * 5 + 7) % 19) as f32 * 0.25 - 2.25).collect();
+            if label == "parity-8" {
+                let mut y6 = vec![0f32; q6rows];
+                for r in 0..q6rows {
+                    y6[r] = unsafe {
+                        crate::infer::quant::vec_dot_raw_q6_k(w6[r * q6row..].as_ptr(), tok6.as_ptr(), q6blocks)
+                    };
+                }
+                let wb6 = engine_c.register_zerocopy_buffer(&w6).expect("w6");
+                let page6 = 16384usize;
+                let sl6n = q6cols * 4 + q6rows * 4 + page6;
+                let al6 = ((sl6n + page6 - 1) / page6) * page6;
+                let p6 = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        al6,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert!(p6 != libc::MAP_FAILED);
+                let sl6: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(p6 as *mut u8, al6) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(tok6.as_ptr() as *const u8, sl6.as_mut_ptr(), q6cols * 4)
+                };
+                let yoff6 = (q6cols * 4 + 63) & !63;
+                let sb6 = engine_c.register_zerocopy_buffer(sl6).expect("slab6");
+                assert!(engine_c.batch_open());
+                engine_c.batch_gguf(14, &wb6, 0, &sb6, 0, &sb6, yoff6, q6rows, q6cols);
+                engine_c.batch_end();
+                let v6 = unsafe { std::slice::from_raw_parts(sl6.as_ptr() as *const f32, al6 / 4) };
+                let yf6 = yoff6 / 4;
+                let mut rel = 0f64;
+                for r in 0..q6rows {
+                    rel = rel.max((v6[yf6 + r] as f64 - y6[r] as f64).abs() / y6[r].abs().max(1e-3) as f64);
+                }
+                println!("[q6k coalesced] single max_rel={rel:.3e}");
+                assert!(rel < 1e-2, "q6_K coalesced vs oracle {rel}");
+                let _ = (wb6, sb6);
+            } else {
+                // head-shape bench: coalesced engine vs fresh v1 engine
+                std::env::set_var("SOFUU_Q4K_COALESCED", "1");
+                let e6b = MetalEngine::new().expect("engine q6b");
+                std::env::remove_var("SOFUU_Q4K_COALESCED");
+                let page6 = 16384usize;
+                let sl6n = q6cols * 4 + q6rows * 4 + page6;
+                let al6 = ((sl6n + page6 - 1) / page6) * page6;
+                let p6 = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        al6,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert!(p6 != libc::MAP_FAILED);
+                let sl6: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(p6 as *mut u8, al6) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(tok6.as_ptr() as *const u8, sl6.as_mut_ptr(), q6cols * 4)
+                };
+                let yoff6 = (q6cols * 4 + 63) & !63;
+                let _ = engine_c.register_zerocopy_buffer(&w6);
+                let wb6 = e6b.register_zerocopy_buffer(&w6).expect("w6b");
+                let sb6 = e6b.register_zerocopy_buffer(sl6).expect("sl6b");
+                for iters in [2usize, 4] {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        assert!(e6b.batch_open());
+                        e6b.batch_gguf(14, &wb6, 0, &sb6, 0, &sb6, yoff6, q6rows, q6cols);
+                        e6b.batch_end();
+                    }
+                    let per = t0.elapsed().as_secs_f64() / iters as f64;
+                    if iters == 4 {
+                        println!(
+                            "[q6k coalesced] head {} rows per_op={:.3}ms bw={:.1} GB/s",
+                            q6rows,
+                            per * 1e3,
+                            (q6rows * q6row) as f64 / per / 1e9
+                        );
+                    }
+                }
+            }
+        }
         let engine_v1 = MetalEngine::new().expect("metal engine (v1)");
         let wb1 = engine_v1.register_zerocopy_buffer(&w).expect("w");
         let sb1 = engine_v1.register_zerocopy_buffer(slab).expect("slab");
@@ -2326,6 +2489,61 @@ mod q4k_crafted_probe {
                     per * 1e3,
                     4.0 * wlen as f64 / per / 1e9
                 );
+            }
+        }
+        // v1-class q6_K head bench (same shape as the coalesced head above)
+        {
+            let q6cols = 4096usize;
+            let q6blocks = q6cols / 256;
+            let q6row = q6blocks * 210;
+            let mut state = 0xC0FFEEu64;
+            let mut rand = move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let mut w6 = vec![0u8; 151936 * q6row];
+            for chunk in w6.chunks_mut(4096) {
+                for b in chunk.iter_mut() {
+                    *b = (rand() % 255) as u8;
+                }
+            }
+            let tok6: Vec<f32> = (0..q6cols).map(|i| ((i * 5 + 7) % 19) as f32 * 0.25 - 2.25).collect();
+            let page6 = 16384usize;
+            let sl6n = q6cols * 4 + 151936 * 4 + page6;
+            let al6 = ((sl6n + page6 - 1) / page6) * page6;
+            let p6 = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    al6,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p6 != libc::MAP_FAILED);
+            let sl6: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(p6 as *mut u8, al6) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(tok6.as_ptr() as *const u8, sl6.as_mut_ptr(), q6cols * 4)
+            };
+            let yoff6 = (q6cols * 4 + 63) & !63;
+            let wb6 = engine_v1.register_zerocopy_buffer(&w6).expect("w6v1");
+            let sb6 = engine_v1.register_zerocopy_buffer(sl6).expect("sl6v1");
+            for iters in [1usize, 3] {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    assert!(engine_v1.batch_open());
+                    engine_v1.batch_gguf(14, &wb6, 0, &sb6, 0, &sb6, yoff6, 151936, q6cols);
+                    engine_v1.batch_end();
+                }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                if iters == 3 {
+                    println!(
+                        "[q6k coalesced] v1 head per_op={:.3}ms bw={:.1} GB/s",
+                        per * 1e3,
+                        (151936 * q6row) as f64 / per / 1e9
+                    );
+                }
             }
         }
     }

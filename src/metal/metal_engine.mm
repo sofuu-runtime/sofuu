@@ -364,6 +364,15 @@ static inline void wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel)
     if (cmd.status == MTLCommandBufferStatusError) {
         NSLog(@"Sofuu Metal: %s command buffer failed: %@", kernel, cmd.error);
     }
+    // SOFUU_GPU_TIMING=1: device-side execution time of every command
+    // buffer (GPUStartTime/GPUEndTime) — the GPU-busy vs CPU-wall split
+    // that attributes the spec-pass overhead without an Instruments trace
+    static int timing = -1;
+    if (timing < 0) { const char* t = getenv("SOFUU_GPU_TIMING"); timing = (t && atoi(t) != 0) ? 1 : 0; }
+    if (timing) {
+        fprintf(stderr, "SOFUU_CMD_TIMING kernel=%s gpu_us=%.0f\n",
+                kernel, (cmd.GPUEndTime - cmd.GPUStartTime) * 1e6);
+    }
 }
 
 static inline void ensure_buffers(MetalContext* ctx, size_t x_bytes, size_t y_bytes) {
@@ -2012,11 +2021,55 @@ void sofuu_metal_batch_gguf(
 // every batch_gemv appends an op reading caller-owned MTLBuffers (so ops can
 // chain y→x with zero CPU staging); batch_end ends the encoder, commits once,
 // waits. One GPU submission per batch, independent of op count.
+// GPU-frame capture state (env-gated, shared between batch_open/batch_end;
+// single-threaded engine — no sync needed)
+static NSString *g_cap_path = nil;
+static int g_cap_skip = -1, g_cap_n = 1, g_cap_cycles = 0;
+static bool g_cap_active = false;
+
 int sofuu_metal_batch_open(void* ctx_ptr) {
     if (!ctx_ptr) return -1;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     sofuu_metal_sync(ctx_ptr);
     @autoreleasepool {
+        // Env-gated GPU-frame capture for the interleaved-vs-standalone GEMV
+        // attribute pass: SOFUU_METAL_CAPTURE=<out.gputrace>,
+        // SOFUU_METAL_CAPTURE_SKIP=<cycles> and SOFUU_METAL_CAPTURE_N=<n>
+        // (default 1) — skip the process's warmup cycles, then record n
+        // batch_open..batch_end command buffers of the steady-state pass.
+        if (g_cap_skip < 0) {
+            const char* p = getenv("SOFUU_METAL_CAPTURE");
+            const char* s = getenv("SOFUU_METAL_CAPTURE_SKIP");
+            const char* n = getenv("SOFUU_METAL_CAPTURE_N");
+            g_cap_n = n ? atoi(n) : 1;
+            if (g_cap_n < 1) g_cap_n = 1;
+            g_cap_skip = s ? atoi(s) : 0;
+            g_cap_path = p ? [NSString stringWithUTF8String:p] : nil;
+        }
+        if (g_cap_path != nil && !g_cap_active && g_cap_cycles >= g_cap_skip) {
+            MTLCaptureManager *mgr = [MTLCaptureManager sharedCaptureManager];
+            if ([mgr supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+                MTLCaptureDescriptor *d = [MTLCaptureDescriptor new];
+                d.captureObject = ctx->device;
+                d.destination = MTLCaptureDestinationGPUTraceDocument;
+                d.outputURL = [NSURL fileURLWithPath:g_cap_path];
+                NSError *err = nil;
+                if ([mgr startCaptureWithDescriptor:d error:&err]) {
+                    g_cap_active = true;
+                    fprintf(stderr, "[metal] gpu capture STARTED (cycle %d, %s)\n",
+                            g_cap_cycles, g_cap_path.UTF8String);
+                } else {
+                    fprintf(stderr, "[metal] gpu capture FAILED: %s\n",
+                            err.localizedDescription.UTF8String ?: "(nil)");
+                    g_cap_path = nil;
+                }
+            } else {
+                fprintf(stderr, "[metal] gpu capture unsupported (no GPUTraceDocument) — needs Xcode runtime support\n");
+                g_cap_path = nil;
+            }
+        }
+        g_cap_cycles++;
+
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         ctx->batch_enc = (__bridge id<MTLComputeCommandEncoder>)(void*)CFBridgingRetain([cmd computeCommandEncoder]);
         ctx->pending_cmd = (__bridge id<MTLCommandBuffer>)(void*)CFBridgingRetain(cmd);
@@ -2072,6 +2125,14 @@ void sofuu_metal_batch_end(void* ctx_ptr) {
             wait_and_report(cmd, "batch gemv");
             ctx->pending_cmd = nil;
             CFRelease((__bridge CFTypeRef)cmd);
+        }
+        // paired with the startCapture in batch_open: a captured cycle ends
+        // exactly at its batch_end so the trace holds whole passes
+        if (g_cap_active) {
+            [[MTLCaptureManager sharedCaptureManager] stopCapture];
+            g_cap_active = false;
+            fprintf(stderr, "[metal] gpu capture STOPPED (cycle %d)\n",
+                    g_cap_cycles - 1);
         }
     }
 }

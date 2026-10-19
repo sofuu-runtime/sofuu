@@ -1990,12 +1990,12 @@ impl TransformerModel {
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                 norm_eps, rope_freq_base, rope_mode,
             );
-            // Chunked attention (GPU3): correct in isolation at the real shape
-            // but garbage in the full client — default OFF until the client
-            // context is understood; SOFUU_GPU_ATTN=1 re-enables.
+            // GPU3 chunked attention (default; the meta-overlap bug is fixed —
+            // head-0 partials were overwriting the {max,sum} block).
+            // SOFUU_GPU_ATTN=0 restores the pre-GPU3 serial kernel.
             let attn_new = std::env::var("SOFUU_GPU_ATTN")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+                .map(|v| v != "0")
+                .unwrap_or(true);
             if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.

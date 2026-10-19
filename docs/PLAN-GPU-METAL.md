@@ -118,8 +118,15 @@ per-op kernel (w/s/b aligned offsets + rems[4]); Rust `MetalEngine::batch_mlx4`.
   kernel) PASSES an isolated real-shape parity test (hd128, 32/8 heads,
   pos 1300: max_err 3.75e-2 vs the CPU two-pass softmax) but produces GARBAGE
   in the full client (old serial kernel in the same client = correct text) —
-  shipped DEFAULT-OFF behind SOFUU_GPU_ATTN=1 until the client-context
-  difference is understood. Old kernel remains the default. Everything is
+  shipped default-OFF at first; the push-review MAJOR finding 'chunked
+  attention metadata overlaps' (kernels.metal) then exposed the actual bug:
+  head 0's partial-V region started at meta[0], the same bytes as the
+  {max,sum} block — head 0's own writes corrupted its softmax metadata
+  (tolerance-invisible in the isolated test, amplified to garbage in the
+  client). Fix = partial region begins after the heads×chunks×2 pairs; text
+  parity restored; chunked attention is now DEFAULT and measures 85 -> ~49
+  ms/token at ctx ~1.3k (7.7 GB/s KV-effective — pass-3 still latency-bound;
+  further t-chunk x d-split is the next attention step). Old kernel remains the default. Everything is
   behind SOFUU_GPU_DECODE=1 as before; CPU-only mode untouched.
 - **Panel GEMV rewrite (2026-10-18) — ATTEMPTED, MEASURED DEAD END, not shipped**:
   four kernel variants were built, parity-verified and A/B'd against the shipped

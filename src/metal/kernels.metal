@@ -817,7 +817,8 @@ kernel void llama_attn_part(
 
     // Pass 3: lane owns dims lane, lane+32, ... — coalesced V reads, one
     // load+FMA per position; normalized partial for the finish rescale.
-    size_t parts = (size_t)h * n_chunks * head_dim;
+    // partials live AFTER all {max,sum} pairs (heads * chunks * 2 floats)
+    size_t parts = (size_t)n_heads * n_chunks * 2 + (size_t)h * n_chunks * head_dim;
     float inv = 1.0f / csum;
     for (uint d = lane; d < head_dim; d += 32) {
         float acc = 0.0f;
@@ -851,7 +852,7 @@ kernel void llama_attn_fin(
         gsum += meta[mbase + c * 2 + 1] * exp(meta[mbase + c * 2 + 0] - gmax);
     }
     float inv = 1.0f / gsum;
-    size_t parts = (size_t)h * n_chunks * head_dim;
+    size_t parts = (size_t)n_heads * n_chunks * 2 + (size_t)h * n_chunks * head_dim;
     for (uint d = lane; d < head_dim; d += 32) {
         float acc = 0.0f;
         for (uint c = 0; c < n_chunks; ++c) {

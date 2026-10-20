@@ -44,6 +44,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_llama_attn_fin_b4;
     id<MTLComputePipelineState> pso_llama_attn_1c_b4;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4c2r;
+    id<MTLComputePipelineState> pso_gemm_q4_k;
+    bool pso_gemm_q4_k_live;
 
     id<MTLBuffer> x_buf;
     id<MTLBuffer> y_buf;
@@ -230,6 +232,12 @@ void* sofuu_metal_init(void) {
         if (ctx->pso_gemv_q6_k == nil) {
             ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         }
+        // prefill GEMM class (P1 of llama.cpp parity): if the bundled
+        // metallib predates the kernel the live flag stays false and the
+        // GEMM prefill route never engages — visible unavailable, never a
+        // silent no-op GEMM
+        ctx->pso_gemm_q4_k = load_pso(@"gemm_q4_k");
+        ctx->pso_gemm_q4_k_live = ctx->pso_gemm_q4_k != nil;
 
         // Initial 64KB activation buffers
         ctx->x_buf_cap = 65536 * sizeof(float);
@@ -1294,6 +1302,44 @@ void sofuu_metal_batch_gemv_staged(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
+// P1: prefill GEMM op (q4_K first). x is [B x cols], y is [B x rows]
+// (row-major), one commit rides the live batch like every other op.
+// Returns 1 dispatched, 0 unavailable (PSO missing / bad args) — the Rust
+// side gates the GPU prefill route on a probe, never on silent zeros.
+int sofuu_metal_batch_gguf_gemm(
+    void* ctx_ptr,
+    uint32_t ty,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t B
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0 || B == 0) return 0;
+    if (!ctx->pso_gemm_q4_k_live) return 0;
+    if (ty != 12) return 0; // q4_K only for now; q8_0/q6_K follow the receipt
+    id<MTLComputePipelineState> pso = ctx->pso_gemm_q4_k;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint rn = (uint)rows;
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
+    uint subtiles = (Bn + 7) / 8;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, subtiles, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
+}
+
 // G1: batched mlx4 GEMV — bindings mirror sofuu_metal_gemv_mlx4 exactly
 // (0=w 1=s 2=b 3=x 4=y, 5=cols 6=group 7=rems[4]) but with caller MTLBuffers
 // for x/y so batch ops chain activations GPU-side.
@@ -2167,6 +2213,7 @@ int sofuu_metal_batch_llama_attn_1c_b4(void* ctx, void* q, size_t qo, void* kc, 
 int sofuu_metal_batch_gguf_b4r(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, void* acc, size_t ao, size_t r, size_t c, size_t ad) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)acc;(void)ao;(void)r;(void)c;(void)ad; return 0; }
 void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
+int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

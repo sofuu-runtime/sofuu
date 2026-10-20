@@ -1872,3 +1872,101 @@ kernel void llama_attn(
         head_out[h * head_dim + d] = acc_v[n_acc++];
     }
 }
+
+// ── PREFILL GEMM class (P1 of PLAN-LLAMA-CPP-PARITY) ───────────────────────
+// y[t][row] = dot(W[row], X[t]) for a B-token tile. One threadgroup per
+// (row, 8-token subtile); lanes stride the 256-value quant blocks exactly
+// like gemv_q4_k, and EVERY weight byte is reused across the 8 tokens of the
+// subtile (one dequant, 8 FMAs). The token loop is STATICALLY unrolled with
+// compile-time indices (t0 computed from threadgroup coords, t runtime only
+// in the MASK) — no runtime-indexed accumulator arrays, the measured spill
+// trap. Grid: (rows, ceil(B/GEMM_TS)); y is [B x rows] row-major, x is
+// [B x cols] row-major.
+#define GEMM_TS 8
+
+kernel void gemm_q4_k(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint ts = tg.y;
+    uint t0 = ts * GEMM_TS;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    for (uint b = lane; b < nb; b += 32) {
+        float d  = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        uint is = 0;
+        for (uint j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            float d1 = d * (float)sc1;
+            float mm1 = dmin * (float)m1;
+            q4k_scale_min(scales, is + 1, &sc2, &m2);
+            float d2 = d * (float)sc2;
+            float mm2 = dmin * (float)m2;
+            uint qb = j / 2;
+            uint xb = b * 256;
+            for (uint l = 0; l < 32; ++l) {
+                float wlo = d1 * (float)(qs[qb + l] & 0x0F) - mm1;
+                float whi = d2 * (float)(qs[qb + l] >> 4) - mm2;
+                uint k0 = xb + j + l;
+                if (v0) { a0 += wlo * x0[k0]; }
+                if (v1) { a1 += wlo * x1[k0]; }
+                if (v2) { a2 += wlo * x2[k0]; }
+                if (v3) { a3 += wlo * x3[k0]; }
+                if (v4) { a4 += wlo * x4[k0]; }
+                if (v5) { a5 += wlo * x5[k0]; }
+                if (v6) { a6 += wlo * x6[k0]; }
+                if (v7) { a7 += wlo * x7[k0]; }
+                uint k32 = k0 + 32;
+                if (v0) { a0 += whi * x0[k32]; }
+                if (v1) { a1 += whi * x1[k32]; }
+                if (v2) { a2 += whi * x2[k32]; }
+                if (v3) { a3 += whi * x3[k32]; }
+                if (v4) { a4 += whi * x4[k32]; }
+                if (v5) { a5 += whi * x5[k32]; }
+                if (v6) { a6 += whi * x6[k32]; }
+                if (v7) { a7 += whi * x7[k32]; }
+            }
+            is += 2;
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    if (lane == 0) {
+        if (v0) y[(size_t)(t0 + 0) * rows + row] = acc0;
+        if (v1) y[(size_t)(t0 + 1) * rows + row] = acc1;
+        if (v2) y[(size_t)(t0 + 2) * rows + row] = acc2;
+        if (v3) y[(size_t)(t0 + 3) * rows + row] = acc3;
+        if (v4) y[(size_t)(t0 + 4) * rows + row] = acc4;
+        if (v5) y[(size_t)(t0 + 5) * rows + row] = acc5;
+        if (v6) y[(size_t)(t0 + 6) * rows + row] = acc6;
+        if (v7) y[(size_t)(t0 + 7) * rows + row] = acc7;
+    }
+}

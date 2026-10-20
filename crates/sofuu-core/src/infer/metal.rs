@@ -573,6 +573,14 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     );
+    fn sofuu_metal_batch_gguf_gemm(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -954,6 +962,31 @@ impl MetalEngine {
                 y_buf.handle, y_offset,
                 rows, cols,
             );
+        }
+    }
+
+    /// Prefill GEMM (P1): y[t][row] = dot(W[row], X[t]) for B tokens —
+    /// x is [B x cols], y is [B x rows], row-major, one op in the live
+    /// batch. ty is the GGML type id (q4_K = 12). Returns false when the
+    /// kernel class is unavailable (metallib predates it) or args are bad —
+    /// callers must fall back, never assume the output was written.
+    pub fn batch_gguf_gemm(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        unsafe {
+            sofuu_metal_batch_gguf_gemm(
+                self.ctx,
+                ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
         }
     }
 
@@ -2131,6 +2164,147 @@ mod q4k_crafted_probe {
                 );
             }
         }
+    }
+
+    /// P1 prefill GEMM parity (llama.cpp-parity program): y[t][r] for 5
+    /// tokens (odd B exercises the subtile mask) must equal the CPU oracle
+    /// vec_dot_raw_q4_k at every (t, r). Tolerance-gated like the GEMV class;
+    /// also a compact-blob rate measurement for the kernel class.
+    #[test]
+    #[ignore] // GPU bench class: run with `cargo test -- --ignored` at the engine
+    fn gemm_q4_k_matches_cpu() {
+        use std::time::Instant;
+
+        let rows = 1024usize;
+        let blocks = 16usize; // cols 4096
+        let cols = blocks * 256;
+        let row_bytes = blocks * 144;
+        let B = 5usize;
+
+        let mut state = 0x5DEECE66Du64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        // sanitized fixture (random bytes in f16 headers would decode NaN —
+        // the bitwise-fixture trap): fixed d/dmin, random packed scales+qs
+        let mut w = vec![0u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..blocks {
+                let off = r * row_bytes + b * 144;
+                w[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+                w[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+                for j in 0..12 {
+                    w[off + 4 + j] = (rand() & 0x3F) as u8 | ((rand() & 3) << 6) as u8;
+                }
+                for j in 0..128 {
+                    w[off + 16 + j] = (rand() % 255) as u8;
+                }
+            }
+        }
+        let toks: Vec<Vec<f32>> = (0..B)
+            .map(|t| (0..cols).map(|i| ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5).collect())
+            .collect();
+        let mut y_cpu = vec![0f32; B * rows];
+        for t in 0..B {
+            for r in 0..rows {
+                let off = r * row_bytes;
+                y_cpu[t * rows + r] = unsafe {
+                    crate::infer::quant::vec_dot_raw_q4_k(w[off..].as_ptr(), toks[t].as_ptr(), blocks)
+                };
+            }
+        }
+
+        let page = 16384usize;
+        let w_alloc = ((w.len() + page - 1) / page) * page;
+        let mk = |bytes: usize| -> *mut u8 {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED);
+            p as *mut u8
+        };
+        let w_ptr = mk(w_alloc);
+        let wb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(w_ptr, w.len()) };
+        wb.copy_from_slice(&w);
+        let engine = MetalEngine::new().expect("engine");
+        let w_buf = engine.register_zerocopy_only(wb).expect("w");
+
+        // x[B][cols] + y[B][rows] in one slab
+        let slab_f32 = B * cols + B * rows;
+        let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = mk(slab_alloc);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        for t in 0..B {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    toks[t].as_ptr() as *const u8,
+                    slab_ptr.add(t * cols * 4),
+                    cols * 4,
+                )
+            };
+        }
+        let y_off = B * cols * 4;
+
+        // probe + dispatch + wait
+        let dispatched = {
+            assert!(engine.batch_open());
+            let ok = engine.batch_gguf_gemm(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B);
+            engine.batch_end();
+            ok
+        };
+        assert!(dispatched, "gemm_q4_k PSO unavailable — build the metallib");
+
+        let y_union: &[u8] = unsafe { std::slice::from_raw_parts(slab_ptr.add(y_off), B * rows * 4) };
+        let y_gpu: &[f32] = unsafe { std::slice::from_raw_parts(y_union.as_ptr() as *const f32, B * rows) };
+        // dots here reach ~1.7e4, so the gate is RELATIVE (abs 3.9e-3 was
+        // 2.3e-7 relative = plain f32 summation reassociation, same class
+        // as the GEMV gates); 1e-6 rel + 1e-4 abs floor for near-zero rows
+        let mut worst = 0f32;
+        let (mut wt, mut wr, mut wa, mut wb) = (0usize, 0usize, 0f32, 0f32);
+        for t in 0..B {
+            for r in 0..rows {
+                let a = y_gpu[t * rows + r];
+                let b = y_cpu[t * rows + r];
+                let tol = 1e-6 * b.abs().max(1.0);
+                let e = (a - b).abs();
+                if e > worst { worst = e; wt = t; wr = r; wa = a; wb = b; }
+                assert!(
+                    e <= tol.max(1e-4),
+                    "gemm_q4_k parity broken at t={t} r={r}: gpu={a:.6e} cpu={b:.6e} (rel {:.2e})",
+                    e / b.abs().max(1.0)
+                );
+            }
+        }
+        println!("[gemm_q4_k] rows={rows} cols={cols} B={B} worst_abs={worst:e} worst t={wt} r={wr} gpu={wa:.6e} cpu={wb:.6e} — PARITY PASS");
+
+        // rate: repeat the dispatch with fresh x, time the commit
+        let t0 = Instant::now();
+        let reps = 8usize;
+        for _ in 0..reps {
+            assert!(engine.batch_open());
+            let ok = engine.batch_gguf_gemm(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B);
+            engine.batch_end();
+            assert!(ok);
+        }
+        let per = t0.elapsed() / reps as u32;
+        let bytes = rows as f64 * row_bytes as f64;
+        println!("[gemm_q4_k] per-dispatch {:.3?} ms -> {:.1} GB/s weight stream", per.as_secs_f64() * 1e3, bytes / per.as_secs_f64() / 1e9);
     }
 
     /// GPU3 acceptance at the REAL Qwen3-8B shape: hd 128, 32/8 heads,

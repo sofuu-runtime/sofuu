@@ -664,6 +664,15 @@ extern "C" {
         rows_total: usize, cols: usize, B: usize,
         secs: *const u32, n_sec: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_gemm_acc(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        res_buf: *mut c_void, res_offset: usize, res_stride: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1104,6 +1113,34 @@ impl MetalEngine {
                 y_buf.handle, y_offset,
                 rows_total, cols, b,
                 secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// P1 wave 2: resid-add epilogue GEMM (o/down). y[t*rows + row] =
+    /// dot(W[row], X[t]) + res[t*res_stride + row] — one writer per element.
+    /// Returns false when unavailable (kernel PSO missing or non-q4_K).
+    pub fn batch_gguf_gemm_acc(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        res_buf: &MetalBuffer, res_offset: usize, res_stride: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_acc(
+                self.ctx,
+                ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                res_buf.handle, res_offset, res_stride,
+                y_buf.handle, y_offset,
+                rows, cols, b,
             ) == 1
         };
         self.op_tock(K_GGUF_GEMM, __t);

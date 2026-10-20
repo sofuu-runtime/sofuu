@@ -2669,6 +2669,9 @@ impl TransformerModel {
             }};
         }
 
+        let acc_fuse = std::env::var("SOFUU_GEMM_ACC")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let multi_dbg = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
         let multi_dbg_done = std::cell::Cell::new(false);
         // P1 op-diet: fused multi-section GEMM (qkv / gate_up). Section
@@ -2680,6 +2683,16 @@ impl TransformerModel {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
                 let all_q4k = $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
                 let mut fast = false;
+                if multi_dbg && !multi_dbg_done.replace(true) {
+                    eprintln!(
+                        "[multi-debug] all_q4k={} types={:?} rows_total={} cols={} b={} x_off={} y_offs={:?}",
+                        all_q4k,
+                        $secs.iter().map(|s| s.0.tensor_type).collect::<Vec<_>>(),
+                        $rows_total, $cols, b,
+                        $x_off,
+                        $secs.iter().map(|s| s.3).collect::<Vec<_>>()
+                    );
+                }
                 if all_q4k {
                     let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
                     let mut end = 0u32;
@@ -2798,8 +2811,19 @@ impl TransformerModel {
                     );
                 }
             }
-            gemm!(l.attn_output, pslots.ao, pslots.xo, dim, q_rows);
-            g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+            let o_ok = acc_fuse
+                && l.attn_output.tensor_type == GGML_TYPE_Q4_K
+                && g.engine.batch_gguf_gemm_acc(
+                    12, &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    pbuf, pslots.ao,
+                    pbuf, pslots.x, dim,
+                    pbuf, pslots.x,
+                    dim, q_rows, b,
+                );
+            if !o_ok {
+                gemm!(l.attn_output, pslots.ao, pslots.xo, dim, q_rows);
+                g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+            }
 
             g.engine.batch_rmsnorm_f32w_b4(
                 pbuf, pslots.x,
@@ -2820,8 +2844,19 @@ impl TransformerModel {
                     gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
                 }
                 g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
-                gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
-                g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+                let d_ok = acc_fuse
+                    && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+                    && g.engine.batch_gguf_gemm_acc(
+                        12, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                        pbuf, pslots.gate,
+                        pbuf, pslots.x, dim,
+                        pbuf, pslots.x,
+                        dim, hidden_dim, b,
+                    );
+                if !d_ok {
+                    gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
+                    g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+                }
             }
         }
 

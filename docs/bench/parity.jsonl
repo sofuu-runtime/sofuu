@@ -1,0 +1,5 @@
+{"model": "Qwen-3-0.6B-i1-Q4_K_M", "ll_pp": 3416, "ll_tg": 223, "sofuu_pp": 605, "sofuu_tg": 23.4, "pass_pp": false, "pass_tg": false, "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 11.2-13.1", "ts": "2026-10-20T09:18:19Z"}
+{"model": "Llama-3.2-1B-Q8_0", "ll_pp": 2069, "ll_tg": 123, "sofuu_pp": 362, "sofuu_tg": 50.3, "pass_pp": false, "pass_tg": false, "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 10.6-10.6", "ts": "2026-10-20T09:18:19Z"}
+{"model": "Spark-X2.5-4B-Q4_K_M", "ll_pp": 461, "ll_tg": 51, "sofuu_pp": 71, "sofuu_tg": 28.6, "pass_pp": false, "pass_tg": false, "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 6.9-6.9", "ts": "2026-10-20T09:18:19Z"}
+{"model": "Sharp-MiniCPM5-2B-Q6_K_XL", "ll_pp": 863, "ll_tg": 72, "sofuu_pp": 131, "sofuu_tg": 6.9, "pass_pp": false, "pass_tg": false, "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 5.1-5.9", "ts": "2026-10-20T09:18:19Z"}
+{"model": "Qwen3-8B-Q4_K_M", "ll_pp": 264, "ll_tg": 31, "sofuu_pp": 46, "sofuu_tg": 3.2, "pass_pp": false, "pass_tg": false, "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 3.5-4.3", "ts": "2026-10-20T09:18:19Z"}

@@ -2254,3 +2254,91 @@ kernel void gemv_q4_k_b4multi(
     yr[2 * sec_ystr] = acc2;
     yr[3 * sec_ystr] = acc3;
 }
+
+// ── P1/2: multi-section q6_K b4 GEMV (attn_v is Q6_K in Q4_K_M/i1 files;
+// MiniCPM5-2B's whole FFN is Q6_K_XL) ──────────────────────────────────────
+// Same section table as the q4_K b4multi. Lane = the l index (0..31) so the
+// four x reads per (b, n, lane) are warp-consecutive — coalesced where the
+// v1 kernel was lane-strided-over-blocks (uncoalesced x). 210-byte blocks:
+// ql[128] @0, qh[64] @128, int8 scales[16] @192, d f16 @208; value =
+// (6-bit - 32) * (d * sc[8n + l/16 + {0,2,4,6}]). All 4 token rows ride one
+// threadgroup (4 accumulators), stores go to the section's y region.
+kernel void gemv_q6_k_b4multi(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &rows_tot [[buffer(4)]],
+    constant GemmSection    *secs     [[buffer(5)]],
+    uint row                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows_tot) { return; }
+    uint prev_end = 0u;
+    uint sec_off = 0u;
+    uint sec_rem = 0u;
+    uint sec_yoff = 0u;
+    uint sec_ystr = 0u;
+    for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+        uint end_i = secs[i].rows_end;
+        if (row >= prev_end && row < end_i) {
+            sec_off = secs[i].off;
+            sec_rem = secs[i].rem;
+            sec_yoff = secs[i].y_off;
+            sec_ystr = secs[i].y_stride;
+            break;
+        }
+        prev_end = end_i;
+    }
+    uint local_row = row - prev_end;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = sec_off + sec_rem + local_row * nb * 210;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = w_base + row_byte + b * 210 + 128;
+        device const uchar *sc = w_base + row_byte + b * 210 + 192;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint n = 0; n < 2; ++n) {
+            uint l = lane;
+            uchar qh8 = qh[n * 32 + l];
+            uint isn = 8 * n + l / 16;
+            float s0 = d * (float)(signed char)sc[isn + 0];
+            float s2 = d * (float)(signed char)sc[isn + 2];
+            float s4 = d * (float)(signed char)sc[isn + 4];
+            float s6 = d * (float)(signed char)sc[isn + 6];
+            float q1 = (float)((ql[n * 64 + l] & 0x0F) | (((qh8 >> 0) & 3) << 4)) - 32.0f;
+            float q2 = (float)((ql[n * 64 + l + 32] & 0x0F) | (((qh8 >> 2) & 3) << 4)) - 32.0f;
+            float q3 = (float)((ql[n * 64 + l] >> 4) | (((qh8 >> 4) & 3) << 4)) - 32.0f;
+            float q4 = (float)((ql[n * 64 + l + 32] >> 4) | (((qh8 >> 6) & 3) << 4)) - 32.0f;
+            uint xb6 = b * 256 + n * 128 + l;
+            a0 += q1 * s0 * x[xb6]
+                + q2 * s2 * x[xb6 + 32]
+                + q3 * s4 * x[xb6 + 64]
+                + q4 * s6 * x[xb6 + 96];
+            a1 += q1 * s0 * x[cols + xb6]
+                + q2 * s2 * x[cols + xb6 + 32]
+                + q3 * s4 * x[cols + xb6 + 64]
+                + q4 * s6 * x[cols + xb6 + 96];
+            a2 += q1 * s0 * x[2 * cols + xb6]
+                + q2 * s2 * x[2 * cols + xb6 + 32]
+                + q3 * s4 * x[2 * cols + xb6 + 64]
+                + q4 * s6 * x[2 * cols + xb6 + 96];
+            a3 += q1 * s0 * x[3 * cols + xb6]
+                + q2 * s2 * x[3 * cols + xb6 + 32]
+                + q3 * s4 * x[3 * cols + xb6 + 64]
+                + q4 * s6 * x[3 * cols + xb6 + 96];
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    device float *yr = y + sec_yoff / 4 + local_row;
+    if (lane == 0) {
+        yr[0] = acc0;
+        yr[sec_ystr] = acc1;
+        yr[2 * sec_ystr] = acc2;
+        yr[3 * sec_ystr] = acc3;
+    }
+}

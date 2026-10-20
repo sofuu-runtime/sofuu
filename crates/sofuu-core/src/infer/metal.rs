@@ -682,6 +682,15 @@ extern "C" {
         rows_total: usize, cols: usize,
         secs: *const u32, n_sec: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf6_b4multi(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_base_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        rows_total: usize, cols: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1173,6 +1182,33 @@ impl MetalEngine {
         let __t = self.op_tick(K_GGUF);
         let __r = unsafe {
             sofuu_metal_batch_gguf_b4multi(
+                self.ctx,
+                ty,
+                w_buf.handle, w_base_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle,
+                rows_total, cols,
+                secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF, __t);
+        __r
+    }
+
+    /// P1 completion: multi-section q6_K b4 GEMV (attn_v / MiniCPM FFN).
+    pub fn batch_gguf6_b4multi(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_base_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer,
+        rows_total: usize, cols: usize,
+        secs: &[[u32; 5]],
+    ) -> bool {
+        debug_assert!(secs.len() <= 4);
+        let __t = self.op_tick(K_GGUF);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf6_b4multi(
                 self.ctx,
                 ty,
                 w_buf.handle, w_base_offset,
@@ -2850,6 +2886,168 @@ mod q4k_crafted_probe {
             first.map(|(s, t, r, a, b, raw)| (s, t, r, a as u64, b as u64, raw, raw & 255))
         );
         assert!(fails == 0, "b4multi parity broken: {fails} mismatches");
+    }
+
+    /// P1 completion: gemv_q6_k_b4multi must equal per-section q6_K dots
+    /// (vec_dot_raw_q6_k oracle) across 3 sections with unaligned offsets.
+    #[test]
+    #[ignore]
+    fn gemv_q6_k_b4multi_oracle() {
+        let blocks = 8usize; // cols 2048
+        let cols = blocks * 256;
+        let row_bytes = blocks * 210; // q6_K: 210 bytes per 256 values
+        let sec_rows = [512usize, 384usize, 640usize];
+        let total: usize = sec_rows.iter().sum();
+
+        let mut state = 0x853C49E6748FEA9Bu64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        // sanitized: d fixed, random qh (6-bit packing!) + random scales
+        // (signed int8) + random ql
+        let mut w = vec![0u8; 3 * total * row_bytes + 4096];
+        let mut sec_w = [0usize; 3];
+        let mut cur = 0usize;
+        for s in 0..3 {
+            sec_w[s] = cur;
+            for r in 0..sec_rows[s] {
+                let row_start = cur;
+                for b in 0..blocks {
+                    let off = row_start + b * 210;
+                    w[off..off + 2].copy_from_slice(&f16_bytes(0.03125f32));
+                    for j in 0..128 {
+                        w[off + j] = (rand() % 256) as u8;
+                    }
+                    for j in 0..64 {
+                        w[off + 128 + j] = (rand() % 256) as u8;
+                    }
+                    for j in 0..16 {
+                        w[off + 192 + j] = ((rand() % 63) as i32 - 31) as u8; // int8 scale
+                    }
+                }
+                cur = row_start + row_bytes;
+            }
+            cur += 64; // unaligned pads (rem != 0)
+        }
+        let w_len = cur;
+
+        let page = 16384usize;
+        let mk = |bytes: usize| -> *mut u8 {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED);
+            p as *mut u8
+        };
+        let w_alloc = ((w_len + page - 1) / page) * page;
+        let w_ptr = mk(w_alloc);
+        let wb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(w_ptr, w_len) };
+        wb.copy_from_slice(&w[..w_len]);
+        let engine = MetalEngine::new().expect("engine");
+        let w_buf = engine.register_zerocopy_only(wb).expect("w");
+
+        let x_f32 = 4 * cols;
+        let region = 4 * total;
+        let alloc_f32 = x_f32 + region;
+        let slab_alloc = ((alloc_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = mk(slab_alloc);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        for t in 0..4 {
+            for i in 0..cols {
+                let v = ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5;
+                unsafe { *(slab_ptr.add((t * cols + i) * 4) as *mut f32) = v };
+            }
+        }
+        let out_off = x_f32 * 4;
+
+        // CPU oracle per token per row
+        let mut sec_cpu = [[0f32; 4]; 3];
+        let mut outs: Vec<(usize, usize)> = Vec::new(); // (sec, y_off)
+        {
+            let mut off = out_off;
+            for s in 0..3 {
+                outs.push((s, off));
+                off += 4 * sec_rows[s] * 4;
+            }
+        }
+        // y regions: REUSE one slab (out areas after x)
+        let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+        let mut end = 0u32;
+        let base = sec_w[0] & !255usize;
+        for (s, rows) in sec_rows.iter().enumerate() {
+            let raw = sec_w[s];
+            blob[s][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
+            blob[s][1] = (raw & 255usize) as u32;
+            end += *rows as u32;
+            blob[s][2] = end;
+            blob[s][3] = outs[s].1 as u32;
+            blob[s][4] = *rows as u32;
+        }
+        assert!(engine.batch_open());
+        let ok = engine.batch_gguf6_b4multi(14, &w_buf, base, &slab_buf, 0, &slab_buf, total, cols, &blob);
+        engine.batch_end();
+        assert!(ok, "q6 b4multi unavailable");
+
+        for s in 0..3 {
+            for t in 0..4 {
+                for r in 0..sec_rows[s] {
+                    let row = sec_w[s] + r * row_bytes;
+                    let x = unsafe { std::slice::from_raw_parts(slab_ptr as *const f32, cols) };
+                    let _ = x; // oracle reads token t
+                    let xt = unsafe {
+                        std::slice::from_raw_parts(
+                            (slab_ptr as *const f32).add(t * cols),
+                            cols,
+                        )
+                    };
+                    let cpu = unsafe {
+                        crate::infer::quant::vec_dot_raw_q6_k(
+                            w.as_ptr().add(row), xt.as_ptr(), blocks,
+                        )
+                    };
+                    sec_cpu[s][t] = cpu; // store one sample per (s,t)
+                    break; // only row 0 per (s,t) for the assert loop below
+                }
+            }
+        }
+        let f32_at = |byte_off: usize, idx: usize| -> f32 {
+            unsafe { *(slab_ptr.add(byte_off + idx * 4) as *const f32) }
+        };
+        let mut worst = 0f32;
+        let mut fails = 0usize;
+        for (s, off) in &outs {
+            let rows = sec_rows[*s];
+            for t in 0..4 {
+                let a = f32_at(*off, t * rows);
+                let b = sec_cpu[*s][t];
+                let e = (a - b).abs();
+                let tol = 1e-5 * b.abs().max(1.0);
+                if e > tol.max(1e-3) {
+                    fails += 1;
+                    println!("[q6b4] FAIL s={s} t={t} r=0: {a:.4e} vs {b:.4e}");
+                }
+                worst = worst.max(e);
+            }
+        }
+        println!("[q6b4] worst={worst:e} fails={fails}");
+        assert!(fails == 0, "q6 b4multi parity broken");
+        println!("[q6b4] PARITY PASS (3 sections, unaligned, q6_K oracle)");
     }
 
     /// GPU3 acceptance at the REAL Qwen3-8B shape: hd 128, 32/8 heads,

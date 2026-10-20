@@ -1206,6 +1206,7 @@ impl TransformerModel {
     /// measured ~290ms per row under load; the GPU commit ~13ms).
     /// Returns false — caller falls back to forward_speculative_head_item —
     /// when no chain pass covers this step.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn spec_chain_head_logits(&mut self, item_idx: usize, out_logits: &mut [f32]) -> bool {
         if !self.spec_rows_valid || item_idx >= 4 {
             return false;
@@ -1229,6 +1230,12 @@ impl TransformerModel {
         out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
         self.logits[0..vocab_size].copy_from_slice(&out_logits[0..vocab_size]);
         true
+    }
+
+    /// No GPU slab on other targets: the caller's CPU fallback is the path.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn spec_chain_head_logits(&mut self, _item_idx: usize, _out_logits: &mut [f32]) -> bool {
+        false
     }
 
     /// Compute LM head logits for an already normalized speculative batch item (e.g. candidate upon hit).
@@ -2378,44 +2385,90 @@ impl TransformerModel {
         let multi_dbg_dec_dumped = std::cell::Cell::new(false);
         macro_rules! gemm_fused_dec {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
-                let types_dbg: Vec<u32> = $secs.iter().map(|s| s.0.tensor_type).collect();
-                let all_q4k = fuse_multi
-                    && $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
+                // P1 completion: type-grouped section runs — consecutive
+                // sections of one type ride ONE dispatch (qkv = [q4,q4,q6K]
+                // -> 2 dispatches: q+k via the q4 b4multi, v via the q6 one).
+                let mut all_ok = fuse_multi && !$secs.is_empty();
                 let mut fast = false;
-                if multi_dbg_dec && !multi_dbg_dec_done.replace(true) {
-                    eprintln!(
-                        "[b4multi-debug] all_q4k={} types={:?} rows_total={} cols={} b={}",
-                        all_q4k, types_dbg, $rows_total, $cols, b
-                    );
-                }
-                if all_q4k {
-                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
-                    let mut end = 0u32;
-                    let base = (gguf.data_offset + $secs[0].0.offset) & !255usize;
+                let mut run: Vec<(usize, u32, u32, u32, u32)> = Vec::new(); // (idx, rows, y_off, y_stride, type)
+                let mut flushed_fast = true;
+                {
+                    let mut run_type: u32 = 0;
                     for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
-                        let raw = gguf.data_offset + tv.offset;
-                        blob[i][0] = ((raw & !255usize) - base) as u32;
-                        blob[i][1] = (raw & 255usize) as u32;
-                        end += *rows as u32;
-                        blob[i][2] = end;
-                        blob[i][3] = *y_off as u32;
-                        blob[i][4] = *y_stride as u32;
+                        let ty = tv.tensor_type;
+                        if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K {
+                            // unsupported type inside the fused set -> fall
+                            // back per-tensor (the caller handles !gu_ok!)
+                            all_ok = false;
+                            break;
+                        }
+                        if run.is_empty() {
+                            run_type = ty;
+                        } else if ty != run_type {
+                            // flush the run
+                            let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                            let mut end = 0u32;
+                            let base = (gguf.data_offset + $secs[run[0].0].0.offset) & !255usize;
+                            let mut rt = 0u32;
+                            for (j, (idx, rr, yo, ys, _t)) in run.iter().enumerate() {
+                                let raw = gguf.data_offset + $secs[*idx].0.offset;
+                                blob[j][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
+                                blob[j][1] = (raw & 255usize) as u32;
+                                end += *rr;
+                                blob[j][2] = end;
+                                blob[j][3] = *yo;
+                                blob[j][4] = *ys;
+                                rt = end;
+                            }
+                            let ok = if run_type == GGML_TYPE_Q4_K {
+                                g.engine.batch_gguf_b4multi(
+                                    12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                    rt as usize, $cols, &blob,
+                                )
+                            } else {
+                                g.engine.batch_gguf6_b4multi(
+                                    14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                    rt as usize, $cols, &blob,
+                                )
+                            };
+                            flushed_fast &= ok;
+                            run.clear();
+                            run_type = ty;
+                        }
+                        run.push((i, *rows, *y_off as u32, *y_stride, ty));
                     }
-                    fast = g.engine.batch_gguf_b4multi(
-                        12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                        $rows_total, $cols, &blob,
-                    );
-                    if multi_dbg_dec && fast && !multi_dbg_dec_dumped.replace(true) {
-                        // dump the gate..up slice of the act slab for A/B
-                        let lo = ($secs[0].2) / 4;
-                        let hi = lo + 8 * ($secs[1].1 as usize);
-                        let dump: Vec<f32> = g.slot_f32(0, hi.max(1)).to_vec();
-                        let _ = std::fs::write(
-                            format!("/tmp/chaindump_{}_{}.bin", std::process::id(), ($secs[1].1)),
-                            dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
-                        );
+                    if all_ok && !run.is_empty() {
+                        let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                        let mut end = 0u32;
+                        let base = (gguf.data_offset + $secs[run[0].0].0.offset) & !255usize;
+                        let mut rt = 0u32;
+                        for (j, (idx, rr, yo, ys, _t)) in run.iter().enumerate() {
+                            let raw = gguf.data_offset + $secs[*idx].0.offset;
+                            blob[j][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
+                            blob[j][1] = (raw & 255usize) as u32;
+                            end += *rr;
+                            blob[j][2] = end;
+                            blob[j][3] = *yo;
+                            blob[j][4] = *ys;
+                            rt = end;
+                        }
+                        let ok = if run_type == GGML_TYPE_Q4_K {
+                            g.engine.batch_gguf_b4multi(
+                                12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                rt as usize, $cols, &blob,
+                            )
+                        } else {
+                            g.engine.batch_gguf6_b4multi(
+                                14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                rt as usize, $cols, &blob,
+                            )
+                        };
+                        flushed_fast &= ok;
+                    } else {
+                        flushed_fast = false;
                     }
                 }
+                fast = all_ok && flushed_fast;
                 fast
             }};
         }

@@ -829,3 +829,41 @@ see Session 10 finding — same class as Llama-1B).
   live Rust gate/CLI caller — NOT dead, they are the receipt
   infrastructure); every `_generic` fallback is reachable via its dotprod
   twin; quant.rs externs all referenced.
+
+## Session 11 — MiniCPM parity correction; merged-GEMV measured DEAD; Qwen profile
+
+**MiniCPM5-Sharp 2B Q6_K_XL was never 1.9× behind.** Same-session, same-prompt
+(t1p14, greedy, 4 threads): Sofuu prefill **37.8 tk/s** vs llama.cpp **36.4**
+(decode 5.7 vs 5.6). The old "17.6 vs 33.3" receipt predates the CLI flag
+fixes/knob corrections; treat it as void. At supported formats every Pi model
+is now at parity or ahead: Llama-1B (2.5× prefill / 1.9× decode lookahead),
+Qwen-0.6B (+2% prefill / +10% decode lookahead), Spark (parity), MiniCPM
+(parity).
+
+**Qwen-0.6B decode attribution (SOFUU_PROFILE, serial):** per 32-token window
+~1.05s gemv (82%, 9.45 GB/s effective of a 13.0 GB/s pure-stream bench
+ceiling), **attn 182-213 ms (15% — the 39 MB/token f32 KV read is the cost)**,
+norm 6 ms, glue ~0. The decode gap to the wall is cold-stream physics, not
+dispatch.
+
+**Spec shape for Qwen-0.6B:** rows 5/7 ≈ 23.5-23.7, rows 8 = **14.1 tk/s
+cliff** (tree batch 9 → pad-12 → loses the 8-act panel path). Keep default
+rows 5; never run rows 8 on this batch geometry.
+
+**Merged-GEMV experiment — built, gated, measured ZERO, REVERTED.**
+`sofuu_gemv_q4k_q6k_multi` merged q/k/v (3→1) and gate/up (2→1) per layer
+(84 fewer pool round-trips/token, one act quantization), bit-exact vs the
+individual calls (harness `sofuu_test_gemv_multi_parity`). Device A/B:
+Qwen 22.7 vs 22.7 serial, MiniCPM 5.7 vs 5.6, Llama-1B untouched (q8_0) —
+**no measurable gain**. The pool's sequence-barrier round trip is ~3 µs, so
+dispatch overhead was never the missing 3.5 GB/s. Not shipped (per the
+panel-GEMV precedent: zero-value paths don't land).
+
+**Kept from the pass:** a tile-test mutex — the tile cache is keyed by
+(weight pointer, rows, cols, type) and parallel tests can recycle a freed
+fixture address, aliasing another test's entry (observed as intermittent
+`spark_qkv`/`multi` gate failures). Tile-warming tests now serialize.
+
+Implication for the next lever list: decode bytes are the only remaining
+knob (KV f32 39 MB/token = KIVI's lane; lm-head bound-skip; Q3_K kernels),
+and the ~13 GB/s stream ceiling bounds all of it.

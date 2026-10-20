@@ -1607,8 +1607,18 @@ pub fn rope_style(
 mod tests {
     use super::*;
 
+    /// Tile-cache entries are keyed by (weight pointer, rows, cols, type);
+    /// tests running in parallel can hand the allocator the same address for
+    /// a different fixture, so every tile-warming test takes this lock.
+    static TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tile_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TILE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_tile_gemv_q8_0_matches_reference() {
+        let _guard = tile_test_guard();
         // 16 rows x 32 cols (single q8_0 block per row, one 4-row tile pair).
         let rows = 16usize;
         let cols = 32usize;
@@ -1657,6 +1667,7 @@ mod tests {
 
     #[test]
     fn test_tile_gemm_q8_0_matches_reference() {
+        let _guard = tile_test_guard();
         let rows = 16usize;
         let cols = 32usize;
         let batch = 8usize;
@@ -1770,6 +1781,7 @@ mod tests {
 
     #[test]
     fn test_tile_q4_k_scale_sidecar_bit_exact() {
+        let _guard = tile_test_guard();
         // (16, 256) takes the serial warm path (2 row groups); (128, 256)
         // crosses the parallel thresholds (16 row groups, 16 tile blocks)
         // so the ranged repack + sidecar fill are covered too.
@@ -1852,6 +1864,7 @@ mod tests {
     /// warm time and must not change the int math.
     #[test]
     fn test_gemm_q4_k_nibble_plane_bit_exact() {
+        let _guard = tile_test_guard();
         for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
             let r = gemm_plane_parity(rows, cols, 8);
             assert_eq!(r, 0, "nibble-plane q4_K GEMM diverged at {rows}x{cols}");
@@ -1865,6 +1878,7 @@ mod tests {
     /// every product is exact.
     #[test]
     fn test_gemm_q4_k_s_tiles_bit_exact() {
+        let _guard = tile_test_guard();
         for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
             let r = gemm_q4_s_parity(rows, cols, 8);
             assert_eq!(r, 0, "pre-decoded-scale q4_K tiles diverged at {rows}x{cols}");
@@ -1880,6 +1894,7 @@ mod tests {
     /// so an identical sibling fixture could alias mid-test.
     #[test]
     fn test_tile_gemm_small_batch_pad_bit_exact() {
+        let _guard = tile_test_guard();
         let rows = 24usize;
         let cols = 256usize;
         let w_bytes = build_q4_k_fixture(rows, cols);
@@ -2336,6 +2351,7 @@ mod tests {
     /// must be bit-identical to `matmat` + separate add / two matmats.
     #[test]
     fn test_gemm_resid_pair_bit_exact() {
+        let _guard = tile_test_guard();
         unsafe {
             assert_eq!(sofuu_test_gemm_resid_pair_parity(64, 2048, 8), 0, "fused residual/pair paths diverged");
             assert_eq!(sofuu_test_gemm_resid_pair_parity(128, 1024, 16), 0, "second shape diverged");
@@ -2348,6 +2364,7 @@ mod tests {
     /// GEMM + separate residual-add, which is correct but slower.
     #[test]
     fn test_matmat_fused_wrappers_engage() {
+        let _guard = tile_test_guard();
         let rows = 1024usize;
         let cols = 2048usize;
         let batch = 64usize;
@@ -2536,6 +2553,7 @@ mod tests {
     /// these dims must show here as a reference mismatch.
     #[test]
     fn test_spark_qkv_cpp_gemm_parity() {
+        let _guard = tile_test_guard();
         // variant knobs (env) for bisecting: 1 = warm only the q sub-range,
         // 2 = batch 8 (no pad), 3 = small dims
         let variant = std::env::var("SOFUU_SPARKTEST_VARIANT")

@@ -119,3 +119,53 @@ CPU-only mode untouched; peer lanes (src/simd, macOS editor, continuous.rs) not 
 ## Phase 5 — post-parity (only after the table is green)
 Speculative/MTP verify chains, KIVI-style KV, sparsity — the byte-cut levers for
 "improve later" per the goal statement.
+
+# PROGRESS LEDGER (2026-10-20 night — update after every wave)
+
+Status vs the phase plan: **~40% of the program**. Phase 0 done; Phase 1 largely
+landed (one fusion inapplicable on today's quants, one kernel shipped-OFF pending
+a mystery); Phase 2 barely started (kernels exist, no per-model wins yet); Phase
+3 not started; Phase 4 blocked on a genuinely calm window; Phase 5 by design not
+entered.
+
+## What is DONE (pushed, text-gated)
+- **Phase 0 (complete):** parity.jsonl standing harness (scripts/parity_sweep.sh);
+  per-op attribution (SOFUU_GPU_TIMING=2, 14 op kinds); verdict: host enqueue is
+  3% of the token — the fight is op count and window load, not CPU dispatch.
+- **P1.2 gate_up fusion, prefill:** gemm_q4_k_multi shipped ON (0.6B prefill
+  19→32.6-33.9 t/s loaded, +72%, text-identical 3x-repeated).
+- **P1.3 resid-add epilogue (prefill):** gemm_q4_k_acc shipped ON (o/down absorb
+  their add; ops/layer 31→29); review fix guards it behind !skip_attn.
+- **P1.4 barrier diet:** dropped-with-receipt (enqueue trivial per P0.2).
+- **Kernels + pinned parity tests:** gemm_q4_k (2.3e-7 rel), gemm_q4_k_multi
+  (bit-exact, incl unaligned sections), gemv_q4_k_b4multi (bit-exact after the
+  test's own ref-offset fix), gemm_q4_k_acc (text-gated in-model).
+- **Battery 10.5:** first parity.jsonl rows; bars re-measured HIGHER than battery
+  #10 (0.6B tg 223 vs 173): 0.6B 3416/223, 1B 2069/123, Spark 461/51, MiniCPM
+  863/72, 8B 264/31.
+- **Close calls with receipts:** qkv fusion is INAPPLICABLE on unsloth i1 quants
+  (attn_v=Q6_K type 14) → per-tensor fallback is correct behavior; the GEMM
+  shape loses at B≤4 (3-9 t/s of decode) → decode fusion OFF.
+
+## What is OPEN (evidence in memory: mac-metal-gpu1-session)
+- **b4multi decode fusion OFF-by-mystery:** bit-exact standalone, but the
+  verify-chain text diverges deterministically in-model, and separately the
+  serial GPU single-token path diverges from CPU (pre-existing, fusion-free),
+  while SPEC=verify text == CPU. A final twist (24-token vs 96-token runs under
+  the same env differing) points at a load/state-dependent route flip. Every
+  text gate from here must PIN SOFUU_GPU_SPEC and the load window.
+- **Serial-path CPU divergence:** token-1 differs with fusion-free code — real
+  correctness item, next diagnostic target.
+- Mixed-type fusions (q4_K + Q6_K sections in one dispatch) — needed before qkv
+  fusion can earn on the fleet (attn_v is Q6_K in Q4_K_M/i1 files).
+
+## Phase-by-phase remaining
+- **Phase 2 (tg):** q6_K batched GEMV class (MiniCPM 6.9 vs 72 — the worst gap),
+  q8_0 coalesced class (1B 50.3 vs 123), 8B Seriacal-path fix + GPU receipts at
+  pinned env (3.2@load-5 vs 31), Spark (28.6 vs 51), Phi-4-mini loader (fused
+  attn_qkv split-at-load; bar 563/46). Nothing landed yet.
+- **Phase 3 (pp):** chunk 32→128; GEMM compute-rate phase (float4-x loads,
+  2-4 rows/threadgroup; targets ~4 TFLOP/s on 0.6B, ~2 on 8B). Not started.
+- **Phase 4:** calm (<2.5) deciding sweep → parity.jsonl PASS/fail → per-model
+  default flips. Blocked on window/peers so far.
+- **Phase 5:** untouched by design (spec/MTP/KIVI/sparsity after parity).

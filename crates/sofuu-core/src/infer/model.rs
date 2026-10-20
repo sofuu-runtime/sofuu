@@ -2366,9 +2366,13 @@ impl TransformerModel {
         // P2 decode diet: the SAME fused multi-section GEMM kernel as the
         // prefill route — B-generic (mask subtiles), sections land in the
         // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
+        // measured OFF: the GEMM's 8-token subtile machinery wastes lanes at
+        // the chain's B<=4 (0.6B decode 21-23 fused vs 29-30 unfused, same
+        // window) — the decode diet needs a b4c-class multi-section GEMV, not
+        // this kernel. SOFUU_FUSE_MULTI=1 re-enabless for experiments.
         let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         macro_rules! gemm_fused_dec {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
                 let all_q4k = fuse_multi

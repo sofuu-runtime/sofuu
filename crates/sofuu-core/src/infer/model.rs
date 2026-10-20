@@ -2363,6 +2363,39 @@ impl TransformerModel {
             };
         }
 
+        // P2 decode diet: the SAME fused multi-section GEMM kernel as the
+        // prefill route — B-generic (mask subtiles), sections land in the
+        // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
+        let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        macro_rules! gemm_fused_dec {
+            ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
+                let all_q4k = fuse_multi
+                    && $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
+                let mut fast = false;
+                if all_q4k {
+                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                    let mut end = 0u32;
+                    let base = (gguf.data_offset + $secs[0].0.offset) & !255usize;
+                    for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
+                        let raw = gguf.data_offset + tv.offset;
+                        blob[i][0] = ((raw & !255usize) - base) as u32;
+                        blob[i][1] = (raw & 255usize) as u32;
+                        end += *rows as u32;
+                        blob[i][2] = end;
+                        blob[i][3] = *y_off as u32;
+                        blob[i][4] = *y_stride as u32;
+                    }
+                    fast = g.engine.batch_gguf_gemm_multi(
+                        12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf, 0,
+                        $rows_total, $cols, b, &blob,
+                    );
+                }
+                fast
+            }};
+        }
+
         assert!(g.engine.batch_open());
         for layer_idx in 0..self.config.n_layers {
             let l = &self.layers[layer_idx];
@@ -2385,9 +2418,19 @@ impl TransformerModel {
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps, b,
             );
-            gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
-            gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
-            gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
+            let qkv_ok = gemm_fused_dec!(
+                [
+                    (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
+                    (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
+                    (&l.attn_v, kv_rows as u32, g.slots.va, kv_rows as u32),
+                ],
+                q_rows + 2 * kv_rows, dim, g.slots.xn
+            );
+            if !qkv_ok {
+                gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
+                gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
+                gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
+            }
 
             // Attention in four b4 dispatches (rows × heads × chunks grid):
             // kv_write_b4 lands every row's KV first; attn_part_b4 bounds
@@ -2476,8 +2519,17 @@ impl TransformerModel {
             }
             if !g.skip_ffn {
             ffn_ops += 1;
-            gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
-            gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
+            let gu_ok = gemm_fused_dec!(
+                [
+                    (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
+                    (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
+                ],
+                2 * hidden_dim, dim, g.slots.xn
+            );
+            if !gu_ok {
+                gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
+                gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
+            }
             if !g.skip_ffn {
                 ffn_ops += 3;
             }

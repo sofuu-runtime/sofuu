@@ -2366,18 +2366,28 @@ impl TransformerModel {
         // P2 decode diet: the SAME fused multi-section GEMM kernel as the
         // prefill route — B-generic (mask subtiles), sections land in the
         // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
-        // measured OFF: the GEMM's 8-token subtile machinery wastes lanes at
-        // the chain's B<=4 (0.6B decode 21-23 fused vs 29-30 unfused, same
-        // window) — the decode diet needs a b4c-class multi-section GEMV, not
-        // this kernel. SOFUU_FUSE_MULTI=1 re-enabless for experiments.
+        // DEFAULT OFF pending a fixture that reproduces it: the b4multi
+        // kernel is bit-exact standalone (incl. unaligned sections) yet the
+        // verify-chain text diverges deterministically in-model (see memory
+        // evidence trail). SOFUU_FUSE_MULTI=1 enables for debugging.
         let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let multi_dbg_dec = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
+        let multi_dbg_dec_done = std::cell::Cell::new(false);
+        let multi_dbg_dec_dumped = std::cell::Cell::new(false);
         macro_rules! gemm_fused_dec {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
+                let types_dbg: Vec<u32> = $secs.iter().map(|s| s.0.tensor_type).collect();
                 let all_q4k = fuse_multi
                     && $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
                 let mut fast = false;
+                if multi_dbg_dec && !multi_dbg_dec_done.replace(true) {
+                    eprintln!(
+                        "[b4multi-debug] all_q4k={} types={:?} rows_total={} cols={} b={}",
+                        all_q4k, types_dbg, $rows_total, $cols, b
+                    );
+                }
                 if all_q4k {
                     let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
                     let mut end = 0u32;
@@ -2391,10 +2401,20 @@ impl TransformerModel {
                         blob[i][3] = *y_off as u32;
                         blob[i][4] = *y_stride as u32;
                     }
-                    fast = g.engine.batch_gguf_gemm_multi(
-                        12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf, 0,
-                        $rows_total, $cols, b, &blob,
+                    fast = g.engine.batch_gguf_b4multi(
+                        12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                        $rows_total, $cols, &blob,
                     );
+                    if multi_dbg_dec && fast && !multi_dbg_dec_dumped.replace(true) {
+                        // dump the gate..up slice of the act slab for A/B
+                        let lo = ($secs[0].2) / 4;
+                        let hi = lo + 8 * ($secs[1].1 as usize);
+                        let dump: Vec<f32> = g.slot_f32(0, hi.max(1)).to_vec();
+                        let _ = std::fs::write(
+                            format!("/tmp/chaindump_{}_{}.bin", std::process::id(), ($secs[1].1)),
+                            dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
+                        );
+                    }
                 }
                 fast
             }};

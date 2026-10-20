@@ -673,6 +673,15 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, B: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_b4multi(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_base_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        rows_total: usize, cols: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1144,6 +1153,36 @@ impl MetalEngine {
             ) == 1
         };
         self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// P2 decode diet: multi-section q4_K b4 GEMV — the byte-lane b4c shape
+    /// with a section table (no GEMM subtiles; all 4 token rows per
+    /// threadgroup). y region offsets are ABSOLUTE slab bytes, strides are
+    /// region rows. Returns false when unavailable.
+    pub fn batch_gguf_b4multi(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_base_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer,
+        rows_total: usize, cols: usize,
+        secs: &[[u32; 5]],
+    ) -> bool {
+        debug_assert!(secs.len() <= 4);
+        let __t = self.op_tick(K_GGUF);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_b4multi(
+                self.ctx,
+                ty,
+                w_buf.handle, w_base_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle,
+                rows_total, cols,
+                secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF, __t);
         __r
     }
 
@@ -2649,6 +2688,168 @@ mod q4k_crafted_probe {
             &per_t[..B]
         );
         assert!(fails == 0, "gemm_q4_k_multi parity broken: {fails} mismatches");
+    }
+
+    /// P2 decode-diet parity: gemv_q4_k_b4multi must equal per-section
+    /// batch_gguf_b4 for every section (all 4 token rows per threadgroup).
+    #[test]
+    #[ignore]
+    fn gemv_q4_k_b4multi_matches_split() {
+        let blocks = 8usize; // cols 2048
+        let cols = blocks * 256;
+        let row_bytes = blocks * 144;
+        let sec_rows = [512usize, 384usize, 640usize];
+        let total: usize = sec_rows.iter().sum();
+
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        let mut w = vec![0u8; 3 * total * row_bytes + 4096];
+        let mut sec_w = [0usize; 3];
+        let mut cur = 0usize;
+        for s in 0..3 {
+            sec_w[s] = cur;
+            for r in 0..sec_rows[s] {
+                let row_start = cur;
+                for b in 0..blocks {
+                    let off = row_start + b * 144;
+                    w[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+                    w[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+                    for j in 0..12 {
+                        w[off + 4 + j] = (rand() & 0x3F) as u8 | ((rand() & 3) << 6) as u8;
+                    }
+                    for j in 0..128 {
+                        w[off + 16 + j] = (rand() % 255) as u8;
+                    }
+                }
+                cur = row_start + row_bytes;
+            }
+            // NON-ALIGNED inter-section pads (+64): the model's real tensors
+            // sit at raw offsets with rem up to 255 (e.g. ffn_gate rem=64)
+            cur += 64;
+        }
+        let w_len = cur;
+
+        let page = 16384usize;
+        let mk = |bytes: usize| -> *mut u8 {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED);
+            p as *mut u8
+        };
+        let w_alloc = ((w_len + page - 1) / page) * page;
+        let w_ptr = mk(w_alloc);
+        let wb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(w_ptr, w_len) };
+        wb.copy_from_slice(&w[..w_len]);
+        let engine = MetalEngine::new().expect("engine");
+        let w_buf = engine.register_zerocopy_only(wb).expect("w");
+
+        // slab: x[4][cols] + ref[4][total] + out[4][total]
+        let x_f32 = 4 * cols;
+        let region = 4 * total;
+        let alloc_f32 = x_f32 + 2 * region;
+        let slab_alloc = ((alloc_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = mk(slab_alloc);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        for t in 0..4 {
+            for i in 0..cols {
+                let v = ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5;
+                unsafe { *(slab_ptr.add((t * cols + i) * 4) as *mut f32) = v };
+            }
+        }
+        let ref_off = x_f32 * 4;
+        let out_off = (x_f32 + region) * 4;
+
+        // per-tensor singles: batch_gguf_b4 into [4][rows] regions (packed)
+        let mut sec_ref: [usize; 3] = [0; 3];
+        let mut sec_out: [usize; 3] = [0; 3];
+        {
+            let mut accr = ref_off;
+            let mut acco = out_off;
+            for s in 0..3 {
+                sec_ref[s] = accr;
+                sec_out[s] = acco;
+                accr += 4 * sec_rows[s] * 4;
+                acco += 4 * sec_rows[s] * 4;
+            }
+        }
+        for s in 0..3 {
+            assert!(engine.batch_open());
+            engine.batch_gguf_b4(
+                &w_buf, sec_w[s], &slab_buf, 0, &slab_buf, sec_ref[s], sec_rows[s], cols,
+            );
+            engine.batch_end();
+        }
+
+        // fused multi
+        let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+        let mut end = 0u32;
+        let base = sec_w[0] & !255usize;
+        for (s, rows) in sec_rows.iter().enumerate() {
+            let raw = sec_w[s];
+            blob[s][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
+            blob[s][1] = (raw & 255usize) as u32;
+            end += *rows as u32;
+            blob[s][2] = end;
+            blob[s][3] = sec_out[s] as u32;
+            blob[s][4] = *rows as u32;
+        }
+        assert!(engine.batch_open());
+        let ok = engine.batch_gguf_b4multi(
+            12, &w_buf, base, &slab_buf, 0, &slab_buf, total, cols, &blob,
+        );
+        engine.batch_end();
+        assert!(ok, "b4multi unavailable");
+
+        let f32_at = |byte_off: usize, idx: usize| -> f32 {
+            unsafe { *(slab_ptr.add(byte_off + idx * 4) as *const f32) }
+        };
+        let mut fails = 0usize;
+        let mut worst = 0f32;
+        let mut per_sec = [0usize; 3];
+        let mut per_tok = [0usize; 4];
+        let mut first = None;
+        for s in 0..3 {
+            let rows = sec_rows[s];
+            for t in 0..4 {
+                for r in 0..rows {
+                    let a = f32_at(sec_out[s], t * rows + r);
+                    let b = f32_at(sec_ref[s], t * rows + r);
+                    let e = (a - b).abs();
+                    let tol = 1e-6 * b.abs().max(1.0);
+                    if e > tol.max(1e-4) {
+                        fails += 1;
+                        per_sec[s] += 1;
+                        per_tok[t] += 1;
+                        if first.is_none() { first = Some((s, t, r, a, b, sec_w[s])); }
+                    }
+                    worst = worst.max(e);
+                }
+            }
+        }
+        println!(
+            "[b4multi] fails={fails} worst={worst:e} per_sec={per_sec:?} per_tok={per_tok:?} first={:?}",
+            first.map(|(s, t, r, a, b, raw)| (s, t, r, a as u64, b as u64, raw, raw & 255))
+        );
+        assert!(fails == 0, "b4multi parity broken: {fails} mismatches");
     }
 
     /// GPU3 acceptance at the REAL Qwen3-8B shape: hd 128, 32/8 heads,

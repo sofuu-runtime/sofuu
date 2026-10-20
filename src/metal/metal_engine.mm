@@ -47,9 +47,11 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q4_k;
     id<MTLComputePipelineState> pso_gemm_q4_k_multi;
     id<MTLComputePipelineState> pso_gemm_q4_k_acc;
+    id<MTLComputePipelineState> pso_gpu_q4_k_b4multi;
     bool pso_gemm_q4_k_live;
     bool pso_gemm_q4_k_multi_live;
     bool pso_gemm_q4_k_acc_live;
+    bool pso_gpu_q4_k_b4multi_live;
 
     id<MTLBuffer> x_buf;
     id<MTLBuffer> y_buf;
@@ -246,6 +248,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q4_k_multi_live = ctx->pso_gemm_q4_k_multi != nil;
         ctx->pso_gemm_q4_k_acc = load_pso(@"gemm_q4_k_acc");
         ctx->pso_gemm_q4_k_acc_live = ctx->pso_gemm_q4_k_acc != nil;
+        ctx->pso_gpu_q4_k_b4multi = load_pso(@"gemv_q4_k_b4multi");
+        ctx->pso_gpu_q4_k_b4multi_live = ctx->pso_gpu_q4_k_b4multi != nil;
 
         // Initial 64KB activation buffers
         ctx->x_buf_cap = 65536 * sizeof(float);
@@ -1433,6 +1437,40 @@ int sofuu_metal_batch_gguf_gemm_acc(
     return 1;
 }
 
+// P2 decode diet: multi-section q4_K b4 GEMV (see kernels.metal). All four
+// token rows computed per threadgroup; sections write their own y regions.
+// (external "C": this op sits past the file's extern-c region)
+extern "C" int sofuu_metal_batch_gguf_b4multi(
+    void* ctx_ptr,
+    uint32_t ty,
+    void* w_buf_ptr, size_t w_base_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr,
+    size_t rows_total, size_t cols,
+    const uint32_t* secs /* [4][5] padded */, size_t n_sec
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
+    if (!ctx->pso_gpu_q4_k_b4multi_live) return 0;
+    if (ty != 12) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    uint c = (uint)cols;
+    uint rn = (uint)rows_total;
+    uint sblob[20];
+    for (int i = 0; i < 20; ++i) sblob[i] = secs[i];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gpu_q4_k_b4multi];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:w_base_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:sblob length:sizeof(sblob) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows_total, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
+}
+
 // G1: batched mlx4 GEMV — bindings mirror sofuu_metal_gemv_mlx4 exactly
 // (0=w 1=s 2=b 3=x 4=y, 5=cols 6=group 7=rems[4]) but with caller MTLBuffers
 // for x/y so batch ops chain activations GPU-side.
@@ -2309,6 +2347,7 @@ void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
 int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t yo, size_t rt, size_t c, size_t B, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)yo;(void)rt;(void)c;(void)B;(void)secs;(void)ns; return 0; }
 int sofuu_metal_batch_gguf_gemm_acc(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* res, size_t ro, size_t rs, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)res;(void)ro;(void)rs;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
+int sofuu_metal_batch_gguf_b4multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t rt, size_t c, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)rt;(void)c;(void)secs;(void)ns; return 0; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

@@ -2811,7 +2811,8 @@ impl TransformerModel {
                     );
                 }
             }
-            let o_ok = acc_fuse
+            let o_ok = !g.skip_attn
+                && acc_fuse
                 && l.attn_output.tensor_type == GGML_TYPE_Q4_K
                 && g.engine.batch_gguf_gemm_acc(
                     12, &g.w_buf, gguf.data_offset + l.attn_output.offset,

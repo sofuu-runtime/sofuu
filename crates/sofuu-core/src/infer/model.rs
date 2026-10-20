@@ -2396,7 +2396,7 @@ impl TransformerModel {
                     let mut run_type: u32 = 0;
                     for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
                         let ty = tv.tensor_type;
-                        if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K {
+                        if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K && ty != GGML_TYPE_Q8_0 {
                             // unsupported type inside the fused set -> fall
                             // back per-tensor (the caller handles !gu_ok!)
                             all_ok = false;
@@ -2420,16 +2420,19 @@ impl TransformerModel {
                                 blob[j][4] = *ys;
                                 rt = end;
                             }
-                            let ok = if run_type == GGML_TYPE_Q4_K {
-                                g.engine.batch_gguf_b4multi(
-                                    12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                    rt as usize, $cols, &blob,
-                                )
-                            } else {
-                                g.engine.batch_gguf6_b4multi(
+                            let ok = match run_type {
+                                GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
                                     14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
                                     rt as usize, $cols, &blob,
-                                )
+                                ),
+                                GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
+                                    8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                    rt as usize, $cols, &blob,
+                                ),
+                                _ => g.engine.batch_gguf_b4multi(
+                                    12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                    rt as usize, $cols, &blob,
+                                ),
                             };
                             flushed_fast &= ok;
                             run.clear();
@@ -2452,21 +2455,44 @@ impl TransformerModel {
                             blob[j][4] = *ys;
                             rt = end;
                         }
-                        let ok = if run_type == GGML_TYPE_Q4_K {
-                            g.engine.batch_gguf_b4multi(
-                                12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                rt as usize, $cols, &blob,
-                            )
-                        } else {
-                            g.engine.batch_gguf6_b4multi(
+                        let ok = match run_type {
+                            GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
                                 14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
                                 rt as usize, $cols, &blob,
-                            )
+                            ),
+                            GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
+                                8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                rt as usize, $cols, &blob,
+                            ),
+                            _ => g.engine.batch_gguf_b4multi(
+                                12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                                rt as usize, $cols, &blob,
+                            ),
                         };
                         flushed_fast &= ok;
+                        if multi_dbg_dec && !multi_dbg_dec_dumped.replace(true) {
+                            let lo = ($secs[0].2 as u32).min(
+                                $secs.iter().take(4).map(|s| s.2 as u32).min().unwrap_or(0),
+                            ) as usize / 4;
+                            let hi = lo + 4 * $rows_total;
+                            let dump: Vec<f32> = g.slot_f32(lo, hi.max(1) - lo).to_vec();
+                            let _ = std::fs::write(
+                                format!("/tmp/chaindump_{}.bin", std::process::id()),
+                                dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
+                            );
+                        }
                     } else {
                         flushed_fast = false;
                     }
+                }
+                if multi_dbg_dec && !multi_dbg_dec_dumped.replace(true) {
+                    let lo = $secs.iter().take(4).map(|s| s.2 as u32).min().unwrap_or(0) as usize / 4;
+                    let hi = lo + 4 * $rows_total;
+                    let dump: Vec<f32> = g.slot_f32(lo, hi.max(1) - lo).to_vec();
+                    let _ = std::fs::write(
+                        format!("/tmp/chaindump_unf.bin"),
+                        dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
+                    );
                 }
                 fast = all_ok && flushed_fast;
                 fast

@@ -2342,3 +2342,59 @@ kernel void gemv_q6_k_b4multi(
         yr[3 * sec_ystr] = acc3;
     }
 }
+
+// ── P2: multi-section q8_0 b4 GEMV (1B fleet + MiniCPM's q8_0 tensors) ─────
+// q8_0 block = f16 d + 32 int8 (34 bytes / 32 values; d FIRST). Lane = value index
+// (warp-consecutive x reads); every lane accumulates its position's
+// contributions across ALL blocks, so ONE simd_sum per token closes it.
+kernel void gemv_q8_0_b4multi(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &rows_tot [[buffer(4)]],
+    constant GemmSection    *secs     [[buffer(5)]],
+    uint row                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows_tot) { return; }
+    uint prev_end = 0u;
+    uint sec_off = 0u;
+    uint sec_rem = 0u;
+    uint sec_yoff = 0u;
+    uint sec_ystr = 0u;
+    for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+        uint end_i = secs[i].rows_end;
+        if (row >= prev_end && row < end_i) {
+            sec_off = secs[i].off;
+            sec_rem = secs[i].rem;
+            sec_yoff = secs[i].y_off;
+            sec_ystr = secs[i].y_stride;
+            break;
+        }
+        prev_end = end_i;
+    }
+    uint local_row = row - prev_end;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = cols / 32;
+    uint row_byte = sec_off + sec_rem + local_row * nb * 34;
+    for (uint b = 0; b < nb; ++b) {
+        // q8_0 = [f16 d][32 int8] — d FIRST (GGML layout)
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + lane]));
+        uint xb = b * 32 + lane;
+        acc0 += d * q * x[xb];
+        acc1 += d * q * x[cols + xb];
+        acc2 += d * q * x[2 * cols + xb];
+        acc3 += d * q * x[3 * cols + xb];
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    device float *yr = y + sec_yoff / 4 + local_row;
+    if (lane == 0) {
+        yr[0] = acc0;
+        yr[sec_ystr] = acc1;
+        yr[2 * sec_ystr] = acc2;
+        yr[3 * sec_ystr] = acc3;
+    }
+}

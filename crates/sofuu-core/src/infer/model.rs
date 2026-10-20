@@ -1095,6 +1095,19 @@ impl TransformerModel {
 
         let chunk_t0 = prof::enabled().then(std::time::Instant::now);
 
+        // P1 (llama.cpp parity): B<=32 chunks through the prefill GEMM class
+        // (SOFUU_GPU_PREFILL_GEMM=1). Any unsupported chunk falls back to the
+        // b4 route / CPU tiles below.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if std::env::var("SOFUU_GPU_PREFILL_GEMM")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            && b_size >= 2
+            && self.gpu_forward_prefill_gemm_chunks(tokens, start_pos, compute_last_logits)
+        {
+            return &self.logits;
+        }
+
         // GPU route: B≤4 chunk through the chain pass in ONE commit (the
         // b4 GEMVs; head GEMV only when the caller needs last-row logits).
         // Anything unsupported (b>4, boundaries) falls to the CPU tiles.
@@ -2556,6 +2569,266 @@ impl TransformerModel {
         true
     }
 
+    /// P1 (llama.cpp parity): prefill a B<=32-token chunk through the GEMM
+    /// class in ONE commit — gemm_q4_k reuses every weight byte across the
+    /// chunk's tokens; the glue is the b4 family at rows=B (all its kernels
+    /// are rows-generic). Q4_K weights ride batch_gguf_gemm; any other type
+    /// (or a missing GEMM PSO) falls back to per-row GEMVs in the same
+    /// commit — correct, just not the parity rate. Causality: the b4
+    /// attention bounds each row's softmax to positions[r], so a chunk's
+    /// later rows never see earlier rows' fresh KV beyond their position.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_forward_prefill_gemm_core(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want_logits: bool,
+    ) -> bool {
+        let b = tokens.len();
+        if !(1..=32).contains(&b)
+            || start_pos + b > self.config.max_seq_len
+        {
+            return false;
+        }
+        let g = match self.gpu.as_mut() {
+            Some(gg) if gg.token_commit && gg.pref_buf.is_some() => gg,
+            _ => return false,
+        };
+        let pslots = match g.pref_slots {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let pref_bytes = g.pref_bytes;
+        let pbuf = match g.pref_buf.as_ref() {
+            Some(pb) => pb,
+            None => return false,
+        };
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let norm_eps = self.config.norm_eps;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let rope_mode: u32 = if self.config.rope_interleaved { 1 } else { 0 };
+        let q_rows = n_heads * head_dim;
+        let kv_rows = n_kv_heads * head_dim;
+        let vocab_size = self.config.vocab_size;
+        let gguf = &self.gguf;
+        let pos_of_last = start_pos + b - 1;
+
+        // Embedding lookup + per-row positions on the host slab.
+        {
+            let ph = g.pref_act.as_mut().unwrap();
+            let ph_buf: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(ph.as_ptr() as *mut f32, pref_bytes / 4)
+            };
+            for (t, &tok) in tokens.iter().enumerate() {
+                let dst = &mut ph_buf[pslots.x / 4 + t * dim..pslots.x / 4 + (t + 1) * dim];
+                Self::lookup_embedding(&self.gguf, &self.token_embd, tok, dim, dst);
+            }
+            let pbb = unsafe {
+                std::slice::from_raw_parts_mut(
+                    ph_buf[pslots.posb / 4..].as_ptr() as *mut u32,
+                    b,
+                )
+            };
+            for (t, item) in pbb.iter_mut().enumerate() {
+                *item = (start_pos + t) as u32;
+            }
+        }
+
+        let pass_t = std::time::Instant::now();
+        macro_rules! gemm {
+            ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {{
+                let fast = $tv.tensor_type == GGML_TYPE_Q4_K
+                    && g.engine.batch_gguf_gemm(
+                        12, &g.w_buf, gguf.data_offset + $tv.offset,
+                        pbuf, $x_off, pbuf, $y_off,
+                        $rows, $cols, b,
+                    );
+                if !fast {
+                    for t in 0..b {
+                        g.engine.batch_gguf(
+                            $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
+                            pbuf, $x_off + t * $cols * 4,
+                            pbuf, $y_off + t * $rows * 4,
+                            $rows, $cols,
+                        );
+                    }
+                }
+            }};
+        }
+
+        assert!(g.engine.batch_open());
+        for layer_idx in 0..self.config.n_layers {
+            let l = &self.layers[layer_idx];
+            let attn_norm_off = gguf.data_offset + l.attn_norm.offset;
+            let ffn_norm_off = gguf.data_offset + l.ffn_norm.offset;
+            let q_norm_off = l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+            let k_norm_off = l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+            let has_q = u32::from(q_norm_off.is_some());
+            let has_k = u32::from(k_norm_off.is_some());
+            let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
+            let kc_layer = layer_idx * kv_head_bytes;
+            let meta_chunks = (max_seq_len + 127) / 128;
+            let meta_per_layer = n_heads * meta_chunks * 2 + n_heads * meta_chunks * head_dim;
+            let meta_layer_off = layer_idx * meta_per_layer * 4;
+            let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
+
+            g.engine.batch_rmsnorm_f32w_b4(
+                pbuf, pslots.x,
+                &g.w_buf, attn_norm_off,
+                pbuf, pslots.xn,
+                dim, norm_eps, b,
+            );
+            gemm!(l.attn_q, pslots.xn, pslots.qa, q_rows, dim);
+            gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
+            gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
+
+            if !g.skip_attn {
+                g.engine.batch_llama_kv_write_b4(
+                    pbuf, pslots.ka,
+                    pbuf, pslots.va,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    kln_buf, kln_off,
+                    has_k,
+                    pbuf, pslots.posb,
+                    b,
+                    head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                );
+                g.engine.batch_head_rmsnorm_b4(
+                    pbuf, pslots.qa,
+                    q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
+                    pbuf, pslots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32,
+                    has_q, norm_eps, rope_freq_base, rope_mode,
+                );
+                let fused = (pos_of_last + 1) <= 128
+                    && g.engine.batch_llama_attn_1c_b4(
+                        pbuf, pslots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        pbuf, pslots.ao,
+                        pbuf, pslots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        max_seq_len as u32,
+                    );
+                if !fused {
+                    g.engine.batch_llama_attn_part_b4(
+                        pbuf, pslots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &g.meta_buf, meta_layer_off,
+                        pbuf, pslots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        max_seq_len as u32,
+                        meta_chunks as u32, meta_per_layer as u32,
+                    );
+                    g.engine.batch_llama_attn_fin_b4(
+                        &g.meta_buf, meta_layer_off,
+                        pbuf, pslots.ao,
+                        pbuf, pslots.posb,
+                        b,
+                        n_heads as u32, head_dim as u32,
+                        meta_chunks as u32, meta_per_layer as u32,
+                    );
+                }
+            }
+            gemm!(l.attn_output, pslots.ao, pslots.xo, dim, q_rows);
+            g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+
+            g.engine.batch_rmsnorm_f32w_b4(
+                pbuf, pslots.x,
+                &g.w_buf, ffn_norm_off,
+                pbuf, pslots.xn,
+                dim, norm_eps, b,
+            );
+            if !g.skip_ffn {
+                gemm!(l.ffn_gate, pslots.xn, pslots.gate, hidden_dim, dim);
+                gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
+                g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
+                gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
+                g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+            }
+        }
+
+        // Last-row logits inside the same commit (output-norm + head GEMV).
+        if want_logits {
+            // the last loop op released xo — it is the head's norm scratch
+            g.engine.batch_rmsnorm_f32w(
+                pbuf, pslots.x + (b - 1) * dim * 4,
+                &g.w_buf, gguf.data_offset + self.output_norm.offset,
+                pbuf, pslots.xo,
+                dim, norm_eps,
+            );
+            g.engine.batch_gguf(
+                self.output.tensor_type,
+                &g.w_buf, g.w_offset(gguf, &self.output),
+                pbuf, pslots.xo,
+                pbuf, pslots.logits,
+                vocab_size, dim,
+            );
+        }
+        g.engine.batch_end();
+
+        if want_logits {
+            let lg: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    (g.pref_act.as_ref().unwrap().as_ptr() as *const u8)
+                        .add(pslots.logits) as *const f32,
+                    vocab_size,
+                )
+            };
+            self.logits[0..vocab_size].copy_from_slice(lg);
+        }
+        if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
+            eprintln!(
+                "[gpu-profile] prefill-gemm: n={b} start_pos={start_pos} wall={}us logits={}",
+                pass_t.elapsed().as_micros() as u64,
+                want_logits
+            );
+        }
+        true
+    }
+
+    /// P1: full prefill through the GEMM route in ~32-token chunks. The KV
+    /// lands in the shared caches positions-contiguous; the CPU's next decode
+    /// step continues exactly where the chunks stopped. Returns false when
+    /// anything unsupported appeared (caller falls back to b4/CPU tiles).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_forward_prefill_gemm_chunks(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> bool {
+        if self.gpu.as_ref().map(|g| g.pref_slots.is_none()).unwrap_or(true) {
+            return false;
+        }
+        let vocab = self.config.vocab_size;
+        let mut pos = start_pos;
+        let mut off = 0usize;
+        while off < tokens.len() {
+            let take = (tokens.len() - off).min(32);
+            let last = compute_last_logits && off + take == tokens.len();
+            if !self.gpu_forward_prefill_gemm_core(&tokens[off..off + take], pos, last) {
+                return false;
+            }
+            pos += take;
+            off += take;
+        }
+        let _ = vocab;
+        true
+    }
+
     /// One decoder layer: CPU glue + three Metal commits. All GPU ops read
     /// and write slab slots; the CPU copies f32 values in and out around the
     /// commits (the same between-submissions coherence the G0 rig proves).
@@ -3020,6 +3293,24 @@ struct GgufGpuSlots {
     logits: usize,
 }
 
+/// P1 (llama.cpp parity): 32-row GEMM prefill slab layout (byte offsets
+/// into pref_buf, same gguf_gpu_slot cursor rule as GgufGpuSlots).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(Clone, Copy)]
+struct PrefillSlots {
+    x: usize,
+    posb: usize,
+    xn: usize,
+    qa: usize,
+    ka: usize,
+    va: usize,
+    ao: usize,
+    xo: usize,
+    gate: usize,
+    up: usize,
+    logits: usize,
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct GgufGpu {
     engine: crate::infer::metal::MetalEngine,
@@ -3052,6 +3343,13 @@ pub struct GgufGpu {
     skip_ffn: bool,
     skip_head: bool,
     slots: GgufGpuSlots,
+    /// P1 (llama.cpp parity): 32-row GEMM prefill slab. All None unless
+    /// SOFUU_GPU_PREFILL_GEMM=1 at engine construction (memory is not paid
+    /// by the default fleet path).
+    pref_buf: Option<crate::infer::metal::MetalBuffer>,
+    pref_act: Option<crate::infer::model::AnonBuffer>,
+    pref_slots: Option<PrefillSlots>,
+    pref_bytes: usize,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -3149,6 +3447,37 @@ impl GgufGpu {
         let act_slice: &[u8] =
             unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
         let act_buf = engine.register_zerocopy_only(act_slice)?;
+        // P1 (llama.cpp parity): the GEMM prefill slab, built only when the
+        // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B=32
+        // rows; every stage's [B x rows] region sized accordingly.
+        let pre_enabled = std::env::var("SOFUU_GPU_PREFILL_GEMM")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let (pref_buf, pref_act, pref_slots, pref_bytes) = if pre_enabled {
+            const PRE_B: usize = 32;
+            let mut pc = 0usize;
+            let ps = PrefillSlots {
+                x: gguf_gpu_slot(&mut pc, PRE_B * dim),
+                posb: gguf_gpu_slot(&mut pc, PRE_B * 16),
+                xn: gguf_gpu_slot(&mut pc, PRE_B * dim),
+                qa: gguf_gpu_slot(&mut pc, PRE_B * q_rows),
+                ka: gguf_gpu_slot(&mut pc, PRE_B * kv_rows),
+                va: gguf_gpu_slot(&mut pc, PRE_B * kv_rows),
+                ao: gguf_gpu_slot(&mut pc, PRE_B * q_rows),
+                xo: gguf_gpu_slot(&mut pc, PRE_B * dim),
+                gate: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
+                up: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
+                logits: gguf_gpu_slot(&mut pc, vocab),
+            };
+            let pb = gguf_gpu_page(pc);
+            let pa = crate::infer::model::AnonBuffer::new(pb / 4);
+            let pslice: &[u8] =
+                unsafe { std::slice::from_raw_parts(pa.as_ptr() as *const u8, pb) };
+            let pbuf = engine.register_zerocopy_only(pslice)?;
+            (Some(pbuf), Some(pa), Some(ps), pb)
+        } else {
+            (None, None, None, 0usize)
+        };
         let k_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, kv_region_bytes)
         };
@@ -3195,6 +3524,10 @@ impl GgufGpu {
             skip_attn: skips.contains("attn"),
             skip_ffn: skips.contains("ffn"),
             skip_head: skips.contains("head"),
+            pref_buf,
+            pref_act,
+            pref_slots,
+            pref_bytes,
             slots,
         })
     }

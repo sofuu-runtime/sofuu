@@ -54,3 +54,68 @@ Rules carried over: CPU-only mode is never removed; every kernel parity-gated be
 can serve a receipt; battery rows labeled with load, never skipped; commits straight to
 main with the OpenQodex gate; src/simd/* is a peer lane — CPU kernel work is coordinated,
 GPUs kernels are ours.
+
+# ROADMAP — exact llama.cpp parity, step by step (no dates)
+
+Contract for every step: bit/tolerance parity gate lands BEFORE any rate receipt;
+int-returning ops (visible unavailable, never silent no-ops); every row load-labeled;
+CPU-only mode untouched; peer lanes (src/simd, macOS editor, continuous.rs) not edited.
+
+## Phase 0 — measurement contract (do first, keeps every later step honest)
+- P0.1 The only accepted receipt: ll.cpp bar = `llama-bench -m M -t 10 -p 210 -n 82 -r 3`
+  DEFAULT config (Metal offload) vs Sofuu same-window, both pp+tg, in
+  `docs/bench/all-models.jsonl`; calm window (<2.5 load) supersedes. Acceptance per
+  model: Sofuu pp >= llama.cpp pp AND tg >= llama.cpp tg.
+- P0.2 Per-op attribution: extend SOFUU_GPU_TIMING from per-commit to per-op (CPU
+  enqueue µs / GPU busy µs / gap µs) — this decides whether Phase 1 attacks barrier
+  count or CPU dispatch cost first. Deliverable: one table for the 0.6B pass.
+
+## Phase 1 — op diet: ~34 ops/layer -> ~10 (shared unlock for decode AND prefill)
+- P1.1 gemm3 "qkv": one dispatch computes Q,K,V (three weight offsets in the one
+  registered w_buf, row-span split). Parity gate: equals 3 separate GEMMs + layout
+  [B x (q_rows+2*kv_rows)].
+- P1.2 gemm2 "gate_up": one dispatch, y = [B x 2*inter] contiguous halves (swiglu
+  kernel unchanged).
+- P1.3 resid-add epilogue GEMM (mirror gemv_q4_k_b4c2r): o-projection and down
+  projection absorb their residual add — kills 2 flat adds per layer.
+- P1.4 Barrier diet from the P0.2 table: independent ops (kv vs q-norm) enqueue
+  without barriers; dependent chains keep them. Bar: per-op net cost <= 10 µs calm.
+- P1.5 Re-measure prefill route + decode chain after the diet (same-window A/B,
+  not projections).
+
+## Phase 2 — decode (output tps) parity, per model, in gap order
+- P2.1 8B q4_K: bar tg 22.1 = 109 GB/s effective = our measured 106.7 GB/s kernel
+  rate with <=10% overhead. This is the most reachable parity — do first.
+- P2.2 q8_0 coalesced class (byte-lane, 16B loads) GEMV+GEMM for 1B (bar 103 =
+  124 GB/s effective — highest bandwidth ask in the fleet) + K2 gains if desired.
+- P2.3 q6_K batched GEMV + GEMM (single-row class already 92 GB/s bit-exact) for
+  MiniCPM5-2B (bar 68) — MiniCPM may route heads through q6_K GEMV 92-class too.
+- P2.4 Spark-4B (bar 40): diet receipts + kv_write single-write path check.
+- P2.5 P3 loader: Phi-4-mini fused attn_qkv — split into q/k/v VIEWS at load
+  (offset arithmetic in the existing zero-copy mmap, no copy), then it rides the
+  same classes (bar 35).
+- P2.6 bf16/f32 fleet (gemma, liquid, lfm2, gpt-x3): fused qkv/gate_up kernels
+  already exist — wire the same diet, battery rows. No llama.cpp reference where
+  its loader fails (K2, Ternary 27B) — our bests stand, marked out-of-parity-scope.
+
+## Phase 3 — prefill (input tps) parity, per model
+- P3.1 Chunk size 32 -> 128 (kernel B-mask is already arbitrary; slot slab PRE_B
+  and positions buffer resize; KV layer math unchanged).
+- P3.2 GEMM compute-rate phase: at B=128 the class is compute-bound (455 FLOP/byte)
+  — float4-x loads + 2-4 rows per threadgroup sharing x bytes; target ~2 TFLOP/s
+  (8B bar 211 t/s) and ~4 TFLOP/s (0.6B bar 3336 t/s = llama.cpp is near iGPU peak).
+- P3.3 Causal batched attention for rows=B (the b4 family is rows-generic — feed
+  rows=128) with per-row position bounds; kept off the hot barrier chain by
+  ordering kv_write before attention in one commit.
+- P3.4 Per-model pp receipts >= the bar; long-context/slide-window models (gemma)
+  via the part/fin meta path at 4096+.
+
+## Phase 4 — deciding batteries + flips
+- P4.1 Calm two-engine sweep (/tmp/parity_sweep.sh) — the deciding table.
+- P4.2 Flip per-model defaults (per-MODEL, not global) only where BOTH pp and tg
+  pass; CPU fallback retained everywhere.
+- P4.3 Re-run after every landed perf change (standing battery rule).
+
+## Phase 5 — post-parity (only after the table is green)
+Speculative/MTP verify chains, KIVI-style KV, sparsity — the byte-cut levers for
+"improve later" per the goal statement.

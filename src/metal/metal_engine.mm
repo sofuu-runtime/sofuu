@@ -45,7 +45,9 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_llama_attn_1c_b4;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4c2r;
     id<MTLComputePipelineState> pso_gemm_q4_k;
+    id<MTLComputePipelineState> pso_gemm_q4_k_multi;
     bool pso_gemm_q4_k_live;
+    bool pso_gemm_q4_k_multi_live;
 
     id<MTLBuffer> x_buf;
     id<MTLBuffer> y_buf;
@@ -238,6 +240,8 @@ void* sofuu_metal_init(void) {
         // silent no-op GEMM
         ctx->pso_gemm_q4_k = load_pso(@"gemm_q4_k");
         ctx->pso_gemm_q4_k_live = ctx->pso_gemm_q4_k != nil;
+        ctx->pso_gemm_q4_k_multi = load_pso(@"gemm_q4_k_multi");
+        ctx->pso_gemm_q4_k_multi_live = ctx->pso_gemm_q4_k_multi != nil;
 
         // Initial 64KB activation buffers
         ctx->x_buf_cap = 65536 * sizeof(float);
@@ -1340,6 +1344,50 @@ int sofuu_metal_batch_gguf_gemm(
     return 1;
 }
 
+// P1 op-diet: fused multi-section GEMM (qkv -> n_sec=3, gate_up -> n_sec=2).
+// secs is n_sec (<=4, host-padded to 4) {off, rem, rows_end} entries where
+// off is the 256-aligned w_buf byte offset and rows_end the prefix row sum.
+// x is [B x cols], y is [B x rows_total]. Returns 1 dispatched.
+int sofuu_metal_batch_gguf_gemm_multi(
+    void* ctx_ptr,
+    uint32_t ty,
+    void* w_buf_ptr, size_t w_base_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows_total, size_t cols, size_t B,
+    const uint32_t* secs /* [4][3] padded */, size_t n_sec
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || B == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
+    if (!ctx->pso_gemm_q4_k_multi_live) return 0;
+    if (ty != 12) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint rn = (uint)rows_total;
+    uint ns = (uint)n_sec;
+    uint sblob[20]; // 4 sections x {off, rem, rows_end, y_off, y_stride}
+    for (int i = 0; i < 20; ++i) sblob[i] = secs[i];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_multi];
+    // sections carry u32 DELTAS from w_base_offset (the first section's
+    // 256-aligned start) — absolute offsets overflow u32 on 5GB files
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:w_base_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:2]; // sections carry absolute slab offsets
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:sblob length:sizeof(sblob) atIndex:6];
+    // NOTE n_sec is redundant with the padded blob but kept for clarity of
+    // the trace; the kernel scans all 4 padded entries (empty spans never
+    // match). Dispatch grid: (rows_total, subtiles).
+    uint subtiles = (Bn + 7) / 8;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows_total, subtiles, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
+}
+
 // G1: batched mlx4 GEMV — bindings mirror sofuu_metal_gemv_mlx4 exactly
 // (0=w 1=s 2=b 3=x 4=y, 5=cols 6=group 7=rems[4]) but with caller MTLBuffers
 // for x/y so batch ops chain activations GPU-side.
@@ -2214,6 +2262,7 @@ int sofuu_metal_batch_gguf_b4r(void* ctx, void* w, size_t wo, void* x, size_t xo
 void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
+int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t yo, size_t rt, size_t c, size_t B, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)yo;(void)rt;(void)c;(void)B;(void)secs;(void)ns; return 0; }
 void* sofuu_metal_init(void) { return NULL; }
 void sofuu_metal_free(void* ctx) {}
 void* sofuu_metal_buffer_create_zerocopy(void* ctx, const void* ptr, size_t size_bytes) { return NULL; }

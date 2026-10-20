@@ -2572,6 +2572,10 @@ impl TransformerModel {
         true
     }
 
+    fn bytemuck_or_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
     /// P1 (llama.cpp parity): prefill a B<=32-token chunk through the GEMM
     /// class in ONE commit — gemm_q4_k reuses every weight byte across the
     /// chunk's tokens; the glue is the b4 family at rows=B (all its kernels
@@ -2665,6 +2669,45 @@ impl TransformerModel {
             }};
         }
 
+        let multi_dbg = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
+        let multi_dbg_done = std::cell::Cell::new(false);
+        // P1 op-diet: fused multi-section GEMM (qkv / gate_up). Section
+        // weight offsets are u32 DELTAS from the first section's 256-aligned
+        // base (the C side binds w at that base; absolute offsets overflow
+        // u32 on the 8B's 5.0GB file). Falls back to per-tensor gemm! on any
+        // non-q4_K tensor or a missing fused PSO.
+        macro_rules! gemm_fused {
+            ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
+                let all_q4k = $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
+                let mut fast = false;
+                if all_q4k {
+                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                    let mut end = 0u32;
+                    let base = (gguf.data_offset + $secs[0].0.offset) & !255usize;
+                    for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
+                        let raw = gguf.data_offset + tv.offset;
+                        blob[i][0] = ((raw & !255usize) - base) as u32;
+                        blob[i][1] = (raw & 255usize) as u32;
+                        end += *rows as u32;
+                        blob[i][2] = end;
+                        blob[i][3] = *y_off as u32;
+                        blob[i][4] = *y_stride as u32;
+                    }
+                    if multi_dbg && !multi_dbg_done.replace(true) {
+                        eprintln!(
+                            "[multi-debug] base={base} secs={:?} rows_total={} cols={} b={}",
+                            &blob[..], $rows_total, $cols, b
+                        );
+                    }
+                    fast = g.engine.batch_gguf_gemm_multi(
+                        12, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
+                        $rows_total, $cols, b, &blob,
+                    );
+                }
+                fast
+            }};
+        }
+
         assert!(g.engine.batch_open());
         for layer_idx in 0..self.config.n_layers {
             let l = &self.layers[layer_idx];
@@ -2687,9 +2730,19 @@ impl TransformerModel {
                 pbuf, pslots.xn,
                 dim, norm_eps, b,
             );
-            gemm!(l.attn_q, pslots.xn, pslots.qa, q_rows, dim);
-            gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
-            gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
+            let qkv_fused = gemm_fused!(
+                [
+                    (&l.attn_q, q_rows as u32, pslots.qa, q_rows as u32),
+                    (&l.attn_k, kv_rows as u32, pslots.ka, kv_rows as u32),
+                    (&l.attn_v, kv_rows as u32, pslots.va, kv_rows as u32),
+                ],
+                q_rows + 2 * kv_rows, dim, pslots.xn
+            ) && std::env::var("SOFUU_FUSE_QKV").map(|v| v == "1").unwrap_or(false);
+            if !qkv_fused {
+                gemm!(l.attn_q, pslots.xn, pslots.qa, q_rows, dim);
+                gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
+                gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
+            }
 
             if !g.skip_attn {
                 g.engine.batch_llama_kv_write_b4(
@@ -2755,8 +2808,17 @@ impl TransformerModel {
                 dim, norm_eps, b,
             );
             if !g.skip_ffn {
-                gemm!(l.ffn_gate, pslots.xn, pslots.gate, hidden_dim, dim);
-                gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
+                let ffn_fused = gemm_fused!(
+                    [
+                        (&l.ffn_gate, hidden_dim as u32, pslots.gate, hidden_dim as u32),
+                        (&l.ffn_up, hidden_dim as u32, pslots.up, hidden_dim as u32),
+                    ],
+                    2 * hidden_dim, dim, pslots.xn
+                ) && std::env::var("SOFUU_FUSE_GUP").map(|v| v != "0").unwrap_or(true);
+                if !ffn_fused {
+                    gemm!(l.ffn_gate, pslots.xn, pslots.gate, hidden_dim, dim);
+                    gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
+                }
                 g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
                 gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
                 g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
@@ -2783,6 +2845,22 @@ impl TransformerModel {
         g.engine.batch_end();
         if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
             g.engine.print_op_timing("prefill-gemm");
+        }
+        if std::env::var_os("SOFUU_PREFILL_DEBUG_DUMP").is_some() {
+            let ph = g.pref_act.as_ref().unwrap();
+            let idx: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(ph.as_ptr() as *const f32, pref_bytes / 4)
+            }
+            .to_vec();
+            let _ = std::fs::write(
+                format!(
+                    "/tmp/prefdump_{}_{}x{}.bin",
+                    std::process::id(),
+                    start_pos,
+                    b
+                ),
+                Self::bytemuck_or_bytes(&idx),
+            );
         }
 
         if want_logits {

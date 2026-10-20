@@ -243,6 +243,7 @@ int sofuu_metal_batch_gguf_b4r(void* ctx, void* w_buf, size_t w_offset, void* x_
 void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
+int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w_buf, size_t w_base_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows_total, size_t cols, size_t B, const uint32_t* secs, size_t n_sec);
 
 #ifdef __cplusplus
 }

@@ -1970,3 +1970,127 @@ kernel void gemm_q4_k(
         if (v7) y[(size_t)(t0 + 7) * rows + row] = acc7;
     }
 }
+
+// ── P1 op-diet: multi-tensor GEMM (fused qkv / fused gate_up) ──────────────
+// One dispatch computes y = concat(W_0 x, ..., W_{n-1} x) over B tokens —
+// grid (total_rows, ceil(B/8)); each threadgroup resolves its section from
+// the row span table (<=4 sections: {weight byte-offset, row count} pairs),
+// then dots exactly like gemm_q4_k. Sections live in ONE registered weight
+// buffer, so the offsets are bytes. Cuts 3 qkv GEMVs + 2 FFN GEMVs per layer
+// into 2 dispatches.
+#define GEMM_MAX_SECTIONS 4
+
+struct GemmSection {
+    uint off;       // 256-aligned byte offset into the weight buffer
+    uint rem;       // byte remainder (=<255) folded into the dequant cursor
+    uint rows_end;  // cumulative row end (prefix sum); host pads to 4 with
+                    // duplicate ends so empty spans never match
+    uint y_off;     // ABSOLUTE byte offset of this section's y region in the
+                    // shared slab (q/k/v land in their own slots from ONE
+                    // dispatch; the glue kernels keep reading per-region)
+    uint y_stride;  // row stride of that region in floats (region rows)
+};
+
+kernel void gemm_q4_k_multi(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &B        [[buffer(4)]],
+    constant uint           &rows_tot [[buffer(5)]],
+    constant GemmSection    *secs     [[buffer(6)]],
+    uint2 tg                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint ts = tg.y;
+    if (row >= rows_tot) { return; }
+    uint t0 = ts * GEMM_TS;
+
+    // resolve the section by row span (constant-space runtime indexing is a
+    // plain load — not the thread-array spill trap); the weight cursor is
+    // per-section: off + rem + local_row * nb * 144
+    uint prev_end = 0u;
+    uint sec_off = 0u;
+    uint sec_rem = 0u;
+    uint sec_yoff = 0u;
+    uint sec_ystr = 0u;
+    for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+        uint end_i = secs[i].rows_end;
+        if (row >= prev_end && row < end_i) {
+            sec_off = secs[i].off;
+            sec_rem = secs[i].rem;
+            sec_yoff = secs[i].y_off;
+            sec_ystr = secs[i].y_stride;
+            break;
+        }
+        prev_end = end_i;
+    }
+    uint local_row = row - prev_end;
+
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+
+    uint nb = cols / 256;
+    uint row_byte = sec_off + sec_rem + local_row * nb * 144;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = lane; b < nb; b += 32) {
+        float d  = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        uint is = 0;
+        for (uint j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            float d1 = d * (float)sc1;
+            float mm1 = dmin * (float)m1;
+            q4k_scale_min(scales, is + 1, &sc2, &m2);
+            float d2 = d * (float)sc2;
+            float mm2 = dmin * (float)m2;
+            uint qb = j / 2;
+            uint xb = b * 256;
+            for (uint l = 0; l < 32; ++l) {
+                float wlo = d1 * (float)(qs[qb + l] & 0x0F) - mm1;
+                float whi = d2 * (float)(qs[qb + l] >> 4) - mm2;
+                uint k0 = xb + j + l;
+                uint k32 = k0 + 32;
+                if (v0) { a0 += wlo * x0[k0]; a0 += whi * x0[k32]; }
+                if (v1) { a1 += wlo * x1[k0]; a1 += whi * x1[k32]; }
+                if (v2) { a2 += wlo * x2[k0]; a2 += whi * x2[k32]; }
+                if (v3) { a3 += wlo * x3[k0]; a3 += whi * x3[k32]; }
+                if (v4) { a4 += wlo * x4[k0]; a4 += whi * x4[k32]; }
+                if (v5) { a5 += wlo * x5[k0]; a5 += whi * x5[k32]; }
+                if (v6) { a6 += wlo * x6[k0]; a6 += whi * x6[k32]; }
+                if (v7) { a7 += wlo * x7[k0]; a7 += whi * x7[k32]; }
+            }
+            is += 2;
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    device float *yr = y + sec_yoff / 4 + local_row;
+    if (lane == 0) {
+        if (v0) yr[(size_t)(t0 + 0) * sec_ystr] = acc0;
+        if (v1) yr[(size_t)(t0 + 1) * sec_ystr] = acc1;
+        if (v2) yr[(size_t)(t0 + 2) * sec_ystr] = acc2;
+        if (v3) yr[(size_t)(t0 + 3) * sec_ystr] = acc3;
+        if (v4) yr[(size_t)(t0 + 4) * sec_ystr] = acc4;
+        if (v5) yr[(size_t)(t0 + 5) * sec_ystr] = acc5;
+        if (v6) yr[(size_t)(t0 + 6) * sec_ystr] = acc6;
+        if (v7) yr[(size_t)(t0 + 7) * sec_ystr] = acc7;
+    }
+}

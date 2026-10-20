@@ -2524,6 +2524,9 @@ impl TransformerModel {
         }
         g.engine.batch_end();
         let commit_us = pass_t.elapsed().as_micros() as u64;
+        if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
+            g.engine.print_op_timing("spec-pass");
+        }
 
         if head_row.is_some() {
             out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
@@ -2778,6 +2781,9 @@ impl TransformerModel {
             );
         }
         g.engine.batch_end();
+        if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
+            g.engine.print_op_timing("prefill-gemm");
+        }
 
         if want_logits {
             let lg: &[f32] = unsafe {

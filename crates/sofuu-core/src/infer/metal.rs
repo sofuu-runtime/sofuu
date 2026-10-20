@@ -14,7 +14,35 @@
 use std::ffi::c_void;
 use super::quant::*;
 
+pub const OP_KINDS: usize = 16;
+pub const K_GGUF: usize = 0;
+pub const K_GGUF_B4: usize = 1;
+pub const K_GGUF_GEMM: usize = 2;
+pub const K_RMSNORM: usize = 3;
+pub const K_RMSNORM_B4: usize = 4;
+pub const K_KVWRITE: usize = 5;
+pub const K_KVWRITE_B4: usize = 6;
+pub const K_HEAD_RMSNORM: usize = 7;
+pub const K_ATTN: usize = 8;
+pub const K_ATTN_PART: usize = 9;
+pub const K_ATTN_FIN: usize = 10;
+pub const K_ATTN_1C: usize = 11;
+pub const K_ADD: usize = 12;
+pub const K_SWIGLU: usize = 13;
+pub const K_HEAD: usize = 14;
+pub const OP_NAMES: [&str; OP_KINDS] = [
+    "gguf", "gguf_b4", "gemm", "rmsnorm", "rmsnorm_b4", "kv_write", "kv_write_b4",
+    "head_rmsnorm", "attn", "attn_part", "attn_fin", "attn_1c", "add", "swiglu",
+    "head", "unused",
+];
+
 pub struct MetalEngine {
+    /// P0.2 per-op HOST enqueue timing (SOFUU_GPU_TIMING=2): nanos + count
+    /// per op kind, reported by take_op_timing/print_op_timing.
+    op_ns: [std::sync::atomic::AtomicU64; OP_KINDS],
+    op_ct: [std::sync::atomic::AtomicU64; OP_KINDS],
+    tgate: std::sync::atomic::AtomicU8,
+
     ctx: *mut c_void,
 }
 
@@ -31,8 +59,54 @@ impl MetalEngine {
             if ctx.is_null() {
                 return None;
             }
-            Some(Self { ctx })
+            Some(Self {
+                ctx,
+                op_ns: Default::default(),
+                op_ct: Default::default(),
+                tgate: std::sync::atomic::AtomicU8::new(0),
+            })
         }
+    }
+
+    /// P0.2: host-side enqueue tick — a scoped Instant, ns+count into the
+    /// kind bucket, only when SOFUU_GPU_TIMING=2 (gate cached in an atomic).
+    fn op_tick(&self, kind: usize) -> Option<std::time::Instant> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = self.tgate.load(Relaxed);
+        if g == 0 {
+            let v = std::env::var("SOFUU_GPU_TIMING")
+                .map(|x| x.trim() == "2")
+                .unwrap_or(false) as u8;
+            self.tgate.store(if v != 0 { 2 } else { 1 }, Relaxed);
+            if v != 0 { return Some(std::time::Instant::now()); }
+            return None;
+        }
+        if g == 2 { Some(std::time::Instant::now()) } else { None }
+    }
+    fn op_tock(&self, kind: usize, t0: Option<std::time::Instant>) {
+        if let Some(t0) = t0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.op_ns[kind].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            self.op_ct[kind].fetch_add(1, Relaxed);
+        }
+    }
+    /// P0.2 report: per op-kind host-enqueue totals; returns the text (the
+    /// caller prints it so logs stay in one stream). Gate stays enabled.
+    pub fn print_op_timing(&self, label: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut any = false;
+        let mut out = format!("[op-timing {label}] kind count total_us avg_us");
+        for k in 0..OP_KINDS {
+            let ct = self.op_ct[k].swap(0, Relaxed);
+            if ct == 0 { continue; }
+            let ns = self.op_ns[k].swap(0, Relaxed);
+            any = true;
+            out.push_str(&format!(
+                "\n[op-timing {label}] {} {} {:.0} {:.2}",
+                OP_NAMES[k], ct, ns as f64 / 1e3, ns as f64 / 1e3 / ct as f64
+            ));
+        }
+        if any { eprintln!("{out}"); }
     }
 
     pub fn register_zerocopy_buffer(&self, slice: &[u8]) -> Option<MetalBuffer> {
@@ -808,7 +882,7 @@ impl MetalEngine {
         acc_buf: &MetalBuffer, acc_offset: usize,
         add_buf: &MetalBuffer, add_offset: usize,
         n: usize,
-    ) {
+    ) {        let __t = self.op_tick(K_ADD);
         unsafe {
             sofuu_metal_batch_add(
                 self.ctx,
@@ -817,6 +891,7 @@ impl MetalEngine {
                 n,
             );
         }
+        self.op_tock(K_ADD, __t);
     }
 
     pub fn batch_swiglu(
@@ -824,7 +899,7 @@ impl MetalEngine {
         g_buf: &MetalBuffer, g_offset: usize,
         u_buf: &MetalBuffer, u_offset: usize,
         n: usize,
-    ) {
+    ) {        let __t = self.op_tick(K_SWIGLU);
         unsafe {
             sofuu_metal_batch_swiglu(
                 self.ctx,
@@ -833,6 +908,7 @@ impl MetalEngine {
                 n,
             );
         }
+        self.op_tock(K_SWIGLU, __t);
     }
 
     /// GGUF dequant-dot GEMV op in the live batch (ty: 2=q4_0 8=q8_0
@@ -844,7 +920,7 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize,
-    ) {
+    ) {        let __t = self.op_tick(K_GGUF);
         unsafe {
             sofuu_metal_batch_gguf(
                 self.ctx,
@@ -855,6 +931,7 @@ impl MetalEngine {
                 rows, cols,
             );
         }
+        self.op_tock(K_GGUF, __t);
     }
 
     pub fn batch_rmsnorm(
@@ -953,7 +1030,7 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize,
-    ) {
+    ) {        let __t = self.op_tick(K_GGUF_B4);
         unsafe {
             sofuu_metal_batch_gguf_b4(
                 self.ctx,
@@ -963,6 +1040,7 @@ impl MetalEngine {
                 rows, cols,
             );
         }
+        self.op_tock(K_GGUF_B4, __t);
     }
 
     /// Prefill GEMM (P1): y[t][row] = dot(W[row], X[t]) for B tokens —
@@ -977,8 +1055,8 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
-    ) -> bool {
-        unsafe {
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
             sofuu_metal_batch_gguf_gemm(
                 self.ctx,
                 ty,
@@ -987,7 +1065,9 @@ impl MetalEngine {
                 y_buf.handle, y_offset,
                 rows, cols, b,
             ) == 1
-        }
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
     }
 
     /// RMSNorm with F32 weights (GGUF norm tensors). The weight buffer is
@@ -999,7 +1079,7 @@ impl MetalEngine {
         w_buf: &MetalBuffer, w_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         dim: usize, eps: f32,
-    ) {
+    ) {        let __t = self.op_tick(K_RMSNORM);
         unsafe {
             sofuu_metal_batch_rmsnorm_f32w(
                 self.ctx,
@@ -1009,6 +1089,7 @@ impl MetalEngine {
                 dim, eps,
             );
         }
+        self.op_tock(K_RMSNORM, __t);
     }
 
     /// B-row f32-weight RMSNorm for the spec chain: rows are contiguous
@@ -1020,7 +1101,7 @@ impl MetalEngine {
         w_buf: &MetalBuffer, w_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         dim: usize, eps: f32, rows: usize,
-    ) {
+    ) {        let __t = self.op_tick(K_RMSNORM_B4);
         unsafe {
             sofuu_metal_batch_rmsnorm_f32w_b4(
                 self.ctx,
@@ -1030,6 +1111,7 @@ impl MetalEngine {
                 dim, eps, rows,
             );
         }
+        self.op_tock(K_RMSNORM_B4, __t);
     }
 
     /// Llama-shape KV append: optional f32 head-norm + RoPE (either mode),
@@ -1049,7 +1131,7 @@ impl MetalEngine {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
-        };
+        };        let __t = self.op_tick(K_KVWRITE);
         unsafe {
             sofuu_metal_batch_llama_kv_write(
                 self.ctx,
@@ -1063,6 +1145,7 @@ impl MetalEngine {
                 eps, rope_base, rope_mode,
             );
         }
+        self.op_tock(K_KVWRITE, __t);
     }
 
     /// Per-head f32 RMSNorm (q-norm) on a [heads x head_dim] slab slot.
@@ -1156,7 +1239,7 @@ impl MetalEngine {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
-        };
+        };        let __t = self.op_tick(K_KVWRITE_B4);
         unsafe {
             sofuu_metal_batch_llama_kv_write_b4(
                 self.ctx,
@@ -1172,6 +1255,7 @@ impl MetalEngine {
                 eps, rope_base, rope_mode,
             );
         }
+        self.op_tock(K_KVWRITE_B4, __t);
     }
 
     /// Multi-row per-head q-norm + RoPE.
@@ -1188,7 +1272,7 @@ impl MetalEngine {
         let (w_handle, w_off) = match w_buf {
             Some(b) => (b.handle, w_offset),
             None => (x_buf.handle, 0),
-        };
+        };        let __t = self.op_tick(K_HEAD_RMSNORM);
         unsafe {
             sofuu_metal_batch_head_rmsnorm_b4(
                 self.ctx,
@@ -1200,6 +1284,7 @@ impl MetalEngine {
                 has_norm, eps, rope_base, rope_mode,
             );
         }
+        self.op_tock(K_HEAD_RMSNORM, __t);
     }
 
     /// Multi-row chunked attention partials: row r's softmax bound is
@@ -1216,7 +1301,7 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         n_chunks_max: u32, meta_stride: u32,
-    ) {
+    ) {        let __t = self.op_tick(K_ATTN_PART);
         unsafe {
             sofuu_metal_batch_llama_attn_part_b4(
                 self.ctx,
@@ -1230,6 +1315,7 @@ impl MetalEngine {
                 n_chunks_max, meta_stride,
             );
         }
+        self.op_tock(K_ATTN_PART, __t);
     }
 
     /// Multi-row finish rescale (pairs with batch_llama_attn_part_b4).
@@ -1242,7 +1328,7 @@ impl MetalEngine {
         rows: usize,
         n_heads: u32, head_dim: u32,
         n_chunks_max: u32, meta_stride: u32,
-    ) {
+    ) {        let __t = self.op_tick(K_ATTN_FIN);
         unsafe {
             sofuu_metal_batch_llama_attn_fin_b4(
                 self.ctx,
@@ -1254,6 +1340,7 @@ impl MetalEngine {
                 n_chunks_max, meta_stride,
             );
         }
+        self.op_tock(K_ATTN_FIN, __t);
     }
 
     /// FUSED 1-chunk attention (pos < 128): part+fin in ONE dispatch, no
@@ -1270,7 +1357,8 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
     ) -> bool {
-        unsafe {
+        let __t = self.op_tick(K_ATTN_1C);
+        let __r = unsafe {
             sofuu_metal_batch_llama_attn_1c_b4(
                 self.ctx,
                 q_buf.handle, q_offset,
@@ -1281,7 +1369,9 @@ impl MetalEngine {
                 rows as u32,
                 head_dim, n_heads, n_kv_heads, max_seq,
             ) == 1
-        }
+        };
+        self.op_tock(K_ATTN_1C, __t);
+        __r
     }
 
     /// B4 q4_K GEMV with the resid-add epilogue (o/down: out width ==
@@ -1326,7 +1416,7 @@ impl MetalEngine {
         let (qln_handle, qln_off) = match qln_buf {
             Some(b) => (b.handle, qln_offset),
             None => (q_buf.handle, 0),
-        };
+        };        let __t = self.op_tick(K_ATTN);
         unsafe {
             sofuu_metal_batch_llama_attn(
                 self.ctx,
@@ -1340,6 +1430,7 @@ impl MetalEngine {
                 eps, rope_base, rope_mode,
             );
         }
+        self.op_tock(K_ATTN, __t);
     }
 }
 

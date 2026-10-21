@@ -323,9 +323,9 @@ impl InferModel {
     }
 
     /// How many speculative batch rows the CPU head pass can take at once.
-    pub fn spec_head_batch_capacity(&self) -> usize {
+    pub fn prefill_batch_rows(&self) -> usize {
         match &self.backend {
-            ModelBackend::Gguf(m) => m.spec_head_batch_capacity(),
+            ModelBackend::Gguf(m) => m.prefill_batch_rows(),
             _ => 0,
         }
     }
@@ -918,6 +918,7 @@ impl InferEngine {
         let mut serial_tokens: u32 = 0;
         let mut spec_ns: u64 = 0;
         let mut spec_tokens: u32 = 0;
+        let mut spec_decided = false;
 
         let mut step = 0;
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
@@ -1052,7 +1053,7 @@ impl InferEngine {
                     // them (SOFUU_PREFILL_BATCH=4 with a 5-row tree used to
                     // panic in the batched embedding lookup). Clamp the draft
                     // to what the buffers hold; row 0 is the root.
-                    let rows = rows.min(self.model.spec_head_batch_capacity().saturating_sub(1));
+                    let rows = rows.min(self.model.prefill_batch_rows().saturating_sub(1));
                     if rows == 0 {
                         None
                     } else {
@@ -1118,7 +1119,7 @@ impl InferEngine {
                 // overrun them.
                 let batched_heads = tree_rows > 0
                     && !self.model.gpu_chain_heads()
-                    && 1 + tree_rows <= self.model.spec_head_batch_capacity();
+                    && 1 + tree_rows <= self.model.prefill_batch_rows();
                 if batched_heads {
                     if spec_logits_batch.len() < tree_rows * vocab_size {
                         spec_logits_batch.resize(tree_rows * vocab_size, 0.0);
@@ -1161,12 +1162,20 @@ impl InferEngine {
                 spec_accepted += accepted_batch_indices.len() as u32;
                 spec_ns += t_verify.elapsed().as_nanos() as u64;
                 spec_tokens += 1 + accepted_batch_indices.len() as u32;
-                if spec_adapt && !spec_disabled && spec_should_disable(spec_steps, spec_accepted, spec_min_accept) {
-                    spec_disabled = true;
-                }
-                if spec_adapt && !spec_disabled && spec_is_losing(spec_ns, spec_tokens, serial_ns, serial_tokens) {
-                    spec_disabled = true;
-                    if quant::prof::enabled() {
+                if spec_adapt && !spec_disabled && !spec_decided {
+                    let lose = spec_should_disable(spec_steps, spec_accepted, spec_min_accept)
+                        || spec_is_losing(spec_ns, spec_tokens, serial_ns, serial_tokens);
+                    // Decide ONCE, as soon as both samples exist: the serial
+                    // rate only comes from the warmup window (no serial steps
+                    // run afterwards), so re-deciding later would judge fresh
+                    // tree costs against a stale baseline — that is how a
+                    // transient warmup rate could switch a winning tree off
+                    // mid-generation.
+                    if lose || (spec_steps >= 8 && serial_tokens >= 4) {
+                        spec_disabled = lose;
+                        spec_decided = true;
+                    }
+                    if spec_disabled && quant::prof::enabled() {
                         let spec_rate = spec_tokens as f64 * 1e9 / spec_ns as f64;
                         let serial_rate = serial_tokens as f64 * 1e9 / serial_ns as f64;
                         eprintln!(

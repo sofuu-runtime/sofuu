@@ -1442,8 +1442,10 @@ impl TransformerModel {
     /// Qwen3-0.6B, i.e. ~10.5 ms on the Pi, and the walk visits 3-5 nodes per
     /// step — which is why speculative steps measured 65-102 ms and the default
     /// (speculation on) lost to serial decode.
-    /// How many batch rows `spec_head_logits_batch` can take in one call.
-    pub fn spec_head_batch_capacity(&self) -> usize {
+    /// Rows available in the shared batch buffers (`x_batch`, `x_norm_batch`)
+    /// that BOTH the speculative tree forward and the batched head pass write
+    /// into, so one number bounds both.
+    pub fn prefill_batch_rows(&self) -> usize {
         max_prefill_batch()
     }
 
@@ -3832,6 +3834,70 @@ mod tests {
             );
         }
     }
+    /// The CPU speculative path precomputes every tree node's head logits in
+    /// one GEMM and the walk samples each node from that buffer (row i-1 =
+    /// batch row i). It must agree with the per-row matvec it replaced, or the
+    /// walk verifies against another node's prediction and silently accepts a
+    /// different branch.
+    ///
+    /// Needs a real checkpoint (the synthetic fixtures are all-zero weights, so
+    /// every logit would be zero and the comparison vacuous). Skips when the
+    /// file is absent; point SOFUU_SPEC_HEAD_GGUF at any small GGUF to run it.
+    #[test]
+    fn spec_head_logits_batch_matches_per_row_matvec() {
+        let path = std::env::var_os("SOFUU_SPEC_HEAD_GGUF").unwrap_or_else(|| {
+            "/Users/priyanshuboruah/Downloads/Llama-3.2-1B-Instruct-Q8_0.gguf".into()
+        });
+        if !std::path::Path::new(&path).exists() {
+            println!("model not present; skipping");
+            return;
+        }
+        let gguf = GgufFile::open(&path).expect("open gguf");
+        let vocab = gguf
+            .metadata
+            .get("llama.vocab_size")
+            .and_then(|v| match v {
+                GgufValue::Uint32(n) => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(128256);
+        let mut m = TransformerModel::from_gguf(gguf, 64, vocab).expect("model load");
+        m.reset_cache();
+        // Root plus two depth-1 children (the ancestry mask is row-major, 1
+        // where the column is an ancestor of the row).
+        let tokens = vec![128000u32, 2568, 25];
+        let positions = vec![0usize, 1, 1];
+        let mask = vec![
+            1u8, 0, 0,
+            1, 1, 0,
+            1, 0, 1,
+        ];
+        let mut root_logits = vec![0.0f32; vocab];
+        m.forward_speculative_tree(&tokens, &positions, &mask, 0, &mut root_logits);
+        assert!(
+            root_logits.iter().any(|v| v.abs() > 1e-6),
+            "root logits are all zero — the comparison below would be vacuous"
+        );
+
+        let rows = 2usize;
+        let mut batched = vec![0.0f32; rows * vocab];
+        m.spec_head_logits_batch(1, rows, &mut batched);
+
+        for r in 0..rows {
+            let mut per_row = vec![0.0f32; vocab];
+            m.forward_speculative_head_item(1 + r, &mut per_row);
+            let batched_row = &batched[r * vocab..(r + 1) * vocab];
+            for i in 0..vocab {
+                let tol = 1e-4 * (1.0 + per_row[i].abs());
+                assert!(
+                    (batched_row[i] - per_row[i]).abs() <= tol,
+                    "row {r} logit {i}: batched {} vs per-row {}",
+                    batched_row[i], per_row[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_layer_sliding_window_gemma2_vs_uniform() {
         // Gemma 2 model: alternates between 4096 (even) and 0 (odd)

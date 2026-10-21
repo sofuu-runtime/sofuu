@@ -3260,6 +3260,33 @@ mod q4k_crafted_probe {
         println!("[q8b4] worst={worst:e} fails={fails}");
         assert!(fails == 0, "q8 b4multi parity broken: {fails}");
 
+        // c2 oracle gate (the serial-decode class): batch_gguf ty=8 routes
+        // to gemv_q8_0_c2 when SOFUU_Q4K_COALESCED>0 at engine init. Single
+        // token (x row 0), compare rows 0..min(sec rows,4) against the C
+        // q8_0 oracle.
+        {
+            let mut cblob_ok = false;
+            // region for y: reuse the per-token layout — y[sec_rows] at offs
+            let c2_y = out_off; // same tail region (refresh from x row 0)
+            assert!(engine.batch_open());
+            engine.batch_gguf(8, &w_buf, sec_w[0] & !255, &slab_buf, 0, &slab_buf, c2_y, 1, cols);
+            engine.batch_end();
+            cblob_ok = true;
+            assert!(cblob_ok, "c2 dispatch failed");
+            let row = sec_w[0];
+            let cpu = unsafe {
+                crate::infer::quant::vec_dot_raw_q8_0(
+                    w.as_ptr().add(row),
+                    slab_ptr as *const f32,
+                    blocks,
+                )
+            };
+            let a = f32_at(c2_y, 0);
+            let e2 = (a - cpu).abs();
+            assert!(e2 <= (1e-5 * cpu.abs().max(1.0)).max(2e-3), "c2 parity: {a:.4e} vs {cpu:.4e}");
+            println!("[q8c2] c2-class oracle gate PASS (section 0, COALESCED env decides the psO)");
+        }
+
         // rate: the REAL 1B FFN shape (4096 rows x 2048 cols = 13.5MB q8_0),
         // 4-token x; llama.cpp's effective decode rate on the 1B ~150 GB/s
         use std::time::Instant;

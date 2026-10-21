@@ -2940,3 +2940,96 @@ kernel void gemm_q6_k_acc(
         if (v7) yr[(size_t)(t0 + 7) * rows] = acc7 + res[(size_t)(t0 + 7) * res_stride + row];
     }
 }
+
+// ── Phase 3b: tile-32 GEMM class (lane = token) ────────────────────────────
+// The GEMM_TS=8 shape re-reads every weight byte once per 8-token tile —
+// at B=128 that is 16x weight traffic and the measured stream rate DROPS
+// with B (q8_0 2048x2048: 3.1 / 1.4 / 0.7 GB/s at B=5/32/128). This shape
+// assigns the 32 lanes to the 32 TOKENS of one tile: weight bytes are read
+// ONCE per threadgroup (broadcast to all lanes), x stays per-lane, and
+// each lane carries one complete dot — B=128 costs ceil(B/32) = 4 weight
+// passes. Summation order per output = value-serial inside each
+// quant-block, blocks in order — a plain scalar loop, matching
+// vec_dot_raw_* association exactly.
+
+kernel void gemm_q8_0_t32(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint t = tg.y * 32u + lane;
+    bool v = t < B;
+    uint nb = cols / 32;
+    uint row_byte = w_rem + row * nb * 34;
+    float acc = 0.0f;
+    device const float *xt = x + (v ? t * cols : 0);
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        uint xb = b * 32;
+        float s = 0.0f;
+        for (uint j = 0; j < 32; ++j) {
+            float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + j]));
+            s += q * xt[xb + j];
+        }
+        acc += d * s;
+    }
+    if (v) { y[(size_t)t * rows + row] = acc; }
+}
+
+kernel void gemm_q6_k_t32(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint t = tg.y * 32u + lane;
+    bool v = t < B;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    float acc = 0.0f;
+    device const float *xt = x + (v ? t * cols : 0);
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = w_base + row_byte + b * 210 + 128;
+        device const uchar *sc = w_base + row_byte + b * 210 + 192;
+        float s = 0.0f;
+        // value order == the decode b4multi kernel: half-blocks n=0,1; the
+        // scale pair base = 8n + (l/16); d folded into the scales exactly
+        // as decode; four 32-stride nibble groups added in the same sequence
+        for (uint n = 0; n < 2; ++n) {
+            for (uint l = 0; l < 32; ++l) {
+                uint ix = 8 * n + (l >> 4);
+                uchar qh8 = qh[n * 32 + l];
+                float s0 = d * (float)(signed char)sc[ix + 0];
+                float s2 = d * (float)(signed char)sc[ix + 2];
+                float s4 = d * (float)(signed char)sc[ix + 4];
+                float s6 = d * (float)(signed char)sc[ix + 6];
+                float q1 = (float)((ql[n * 64 + l] & 0x0F) | (((qh8 >> 0) & 3) << 4)) - 32.0f;
+                float q2 = (float)((ql[n * 64 + l + 32] & 0x0F) | (((qh8 >> 2) & 3) << 4)) - 32.0f;
+                float q3 = (float)((ql[n * 64 + l] >> 4) | (((qh8 >> 4) & 3) << 4)) - 32.0f;
+                float q4v = (float)((ql[n * 64 + l + 32] >> 4) | (((qh8 >> 6) & 3) << 4)) - 32.0f;
+                uint xb6 = b * 256 + n * 128 + l;
+                s += q1 * s0 * xt[xb6]
+                   + q2 * s2 * xt[xb6 + 32]
+                   + q3 * s4 * xt[xb6 + 64]
+                   + q4v * s6 * xt[xb6 + 96];
+            }
+        }
+        acc += s;
+    }
+    if (v) { y[(size_t)t * rows + row] = acc; }
+}

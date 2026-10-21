@@ -53,6 +53,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q6_k;
     id<MTLComputePipelineState> pso_gemm_q6_k_multi;
     id<MTLComputePipelineState> pso_gemm_q6_k_acc;
+    id<MTLComputePipelineState> pso_gemm_q8_0_t32;
+    id<MTLComputePipelineState> pso_gemm_q6_k_t32;
     id<MTLComputePipelineState> pso_gpu_q4_k_b4multi;
     id<MTLComputePipelineState> pso_gpu_q6_k_b4multi;
     id<MTLComputePipelineState> pso_gpu_q8_0_b4multi;
@@ -66,6 +68,12 @@ struct MetalContext {
     bool pso_gemm_q6_k_live;
     bool pso_gemm_q6_k_multi_live;
     bool pso_gemm_q6_k_acc_live;
+    bool pso_gemm_q8_0_t32_live;
+    bool pso_gemm_q6_k_t32_live;
+    // SOFUU_GEMM_TILE=32 selects the lane-token tile class (weights read
+    // once per threadgroup; the tile-8 class re-reads weights per 8 tokens,
+    // 16x at B=128). Read once at context init.
+    bool gemm_tile32;
     bool pso_gpu_q4_k_b4multi_live;
     bool pso_gpu_q6_k_b4multi_live;
     bool pso_gpu_q8_0_b4multi_live;
@@ -278,6 +286,12 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q6_k_multi_live = ctx->pso_gemm_q6_k_multi != nil;
         ctx->pso_gemm_q6_k_acc = load_pso(@"gemm_q6_k_acc");
         ctx->pso_gemm_q6_k_acc_live = ctx->pso_gemm_q6_k_acc != nil;
+        ctx->pso_gemm_q8_0_t32 = load_pso(@"gemm_q8_0_t32");
+        ctx->pso_gemm_q8_0_t32_live = ctx->pso_gemm_q8_0_t32 != nil;
+        ctx->pso_gemm_q6_k_t32 = load_pso(@"gemm_q6_k_t32");
+        ctx->pso_gemm_q6_k_t32_live = ctx->pso_gemm_q6_k_t32 != nil;
+        const char* gemm_tile_env = std::getenv("SOFUU_GEMM_TILE");
+        ctx->gemm_tile32 = gemm_tile_env && strcmp(gemm_tile_env, "32") == 0;
         ctx->pso_gpu_q4_k_b4multi = load_pso(@"gemv_q4_k_b4multi");
         ctx->pso_gpu_q4_k_b4multi_live = ctx->pso_gpu_q4_k_b4multi != nil;
         ctx->pso_gpu_q6_k_b4multi = load_pso(@"gemv_q6_k_b4multi");
@@ -1376,9 +1390,15 @@ int sofuu_metal_batch_gguf_gemm(
     // types (8 = q8_0, 12 = q4_K, 14 = q6_K); unsupported ty falls back to
     // the caller's per-row loop, visible-unavailable, never a silent no-op.
     switch (ty) {
-        case 8:  if (!ctx->pso_gemm_q8_0_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0]; break;
+        case 8:
+            if (ctx->gemm_tile32 && ctx->pso_gemm_q8_0_t32_live) { [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0_t32]; }
+            else { if (!ctx->pso_gemm_q8_0_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0]; }
+            break;
         case 12: [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k]; break;
-        case 14: if (!ctx->pso_gemm_q6_k_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k]; break;
+        case 14:
+            if (ctx->gemm_tile32 && ctx->pso_gemm_q6_k_t32_live) { [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_t32]; }
+            else { if (!ctx->pso_gemm_q6_k_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k]; }
+            break;
         default: return 0;
     }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

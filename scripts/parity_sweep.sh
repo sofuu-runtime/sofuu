@@ -18,7 +18,9 @@ for M in "${MODELS[@]}"; do
   LLTG=$(python3 -c "import sys; xs=sys.stdin.read().split(); print(xs[1] if len(xs)>1 else 0)" <<< "$L")
   BS=$(env SOFUU_GPU_DECODE=1 ./target/release/sofuu infer "$M" "Write three sentences about Paris." --max-tokens 82 --temp 0 2>&1 | grep "prefill:" | sed 's/\x1b\[[0-9;]*m//g' | tail -1)
   BP=$(env SOFUU_GPU_DECODE=1 SOFUU_GPU_PREFILL_GEMM=1 ./target/release/sofuu infer "$M" "$BIGP" --max-tokens 8 --temp 0 2>&1 | grep "prefill:" | sed 's/\x1b\[[0-9;]*m//g' | tail -1)
-  echo "$N|$LLPP|$LLTG|$BS|$BP|load=$(uptime | sed 's/.*averages: //' | cut -d, -f1)" >> $OUT
+  BP12=$(env SOFUU_GPU_DECODE=1 SOFUU_GPU_PREFILL_GEMM=1 SOFUU_PREFILL_CHUNK=128 ./target/release/sofuu infer "$M" "$BIGP" --max-tokens 8 --temp 0 2>&1 | grep "prefill:" | sed 's/\x1b\[[0-9;]*m//g' | tail -1)
+  echo "$N|$LLPP|$LLTG|$BS|$BP|chunk=c32,load=$(uptime | sed 's/.*averages: //' | cut -d, -f1)" >> $OUT
+  echo "$N|$LLPP|$LLTG|$BS|$BP12|chunk=c128,load=$(uptime | sed 's/.*averages: //' | cut -d, -f1)" >> $OUT
 done
 python3 - "$OUT" <<'PYEOF'
 import sys, json, datetime, re

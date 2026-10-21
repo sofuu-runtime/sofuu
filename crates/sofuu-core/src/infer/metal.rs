@@ -5598,3 +5598,116 @@ fn gemm_q6_k_matches_cpu() {
         unsafe { libc::munmap(slab_ptr as *mut libc::c_void, slab_alloc) };
     }
 }
+
+/// Phase 3b: the tile-32 (lane = token) q8_0 GEMM — weights read once per
+/// threadgroup instead of once per 8-token tile (the tile-8 class re-reads
+/// weights 16x at B=128 and its stream RATE DROPS with B). Same fixture,
+/// reference and tolerances as gemm_q8_0_matches_cpu; run ignored tests
+/// with --test-threads=1 (the SOFUU_GEMM_TILE env selection is process-
+/// global and read at engine init).
+#[test]
+#[ignore] // GPU bench class: `cargo test -- --ignored --test-threads=1`
+fn gemm_q8_0_t32_matches_cpu() {
+    use std::time::Instant;
+
+    std::env::set_var("SOFUU_GEMM_TILE", "32");
+    let rows = 2048usize;
+    let blocks = 64usize;
+    let cols = blocks * 32;
+    let row_bytes = blocks * 34;
+
+    let mut state = 0x2545F4914F6CDD1Du64;
+    let mut rand = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let f16_bytes = |v: f32| -> [u8; 2] {
+        let b = v.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+        let man = (b >> 13) & 0x3FF;
+        (sign | (exp << 10) | (man as u16)).to_le_bytes()
+    };
+    let mut w = vec![0u8; rows * row_bytes];
+    for r in 0..rows {
+        for b in 0..blocks {
+            let off = r * row_bytes + b * 34;
+            w[off..off + 2].copy_from_slice(&f16_bytes(0.03125f32));
+            for j in 0..32 {
+                w[off + 2 + j] = (rand() % 255) as u8;
+            }
+        }
+    }
+    for b_case in [5usize, 32usize, 128usize] {
+        let B = b_case;
+        let toks: Vec<Vec<f32>> = (0..B)
+            .map(|t| (0..cols).map(|i| ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5).collect())
+            .collect();
+        let mut y_cpu = vec![0f32; B * rows];
+        for t in 0..B {
+            for r in 0..rows {
+                y_cpu[t * rows + r] =
+                    crate::infer::quant::vec_dot_raw_q8_0(w[r * row_bytes..].as_ptr(), toks[t].as_ptr(), blocks);
+            }
+        }
+        let page = 16384usize;
+        let mk = |bytes: usize| -> *mut u8 {
+            let p = unsafe {
+                libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            };
+            assert!(p != libc::MAP_FAILED);
+            p as *mut u8
+        };
+        let w_alloc = ((w.len() + page - 1) / page) * page;
+        let w_ptr = mk(w_alloc);
+        let wb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(w_ptr, w.len()) };
+        wb.copy_from_slice(&w);
+        let engine = MetalEngine::new().expect("engine");
+        let w_buf = engine.register_zerocopy_only(wb).expect("w");
+        let slab_f32 = B * cols + B * rows;
+        let slab_alloc = ((slab_f32 * 4 + page - 1) / page) * page;
+        let slab_ptr = mk(slab_alloc);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr, slab_alloc) };
+        let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+        for t in 0..B {
+            unsafe {
+                std::ptr::copy_nonoverlapping(toks[t].as_ptr() as *const u8, slab_ptr.add(t * cols * 4), cols * 4)
+            };
+        }
+        let y_off = B * cols * 4;
+        let dispatched = {
+            assert!(engine.batch_open());
+            let ok = engine.batch_gguf_gemm(8, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B);
+            engine.batch_end();
+            ok
+        };
+        assert!(dispatched, "gemm_q8_0_t32 PSO unavailable at B={B}");
+        let y_gpu: &[f32] =
+            unsafe { std::slice::from_raw_parts(slab_ptr.add(y_off) as *const f32, B * rows) };
+        let mut worst = 0f64;
+        let (mut wt, mut wr, mut wa, mut wcr) = (0usize, 0usize, 0f32, 0f32);
+        for t in 0..B {
+            for r in 0..rows {
+                let a = y_gpu[t * rows + r];
+                let b = y_cpu[t * rows + r];
+                let e = (a as f64 - b as f64).abs() / b.abs().max(1.0) as f64;
+                if e > worst { worst = e; wt = t; wr = r; wa = a; wcr = b; }
+            }
+        }
+        assert!(worst <= 1e-6, "gemm_q8_0_t32 parity broken at B={B} t={wt} r={wr}: gpu={wa:.6e} cpu={wcr:.6e} (rel {worst:.2e})");
+        println!("[gemm_q8_0_t32] B={B} rows={rows} cols={cols} worst_rel={worst:.2e} — PARITY PASS");
+        let t0 = Instant::now();
+        let reps = 4usize;
+        for _ in 0..reps {
+            assert!(engine.batch_open());
+            let ok = engine.batch_gguf_gemm(8, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B);
+            engine.batch_end();
+            assert!(ok);
+        }
+        let per = t0.elapsed() / reps as u32;
+        let bytes = rows as f64 * row_bytes as f64;
+        println!("[gemm_q8_0_t32] B={B} per-dispatch {:.3?} ms -> {:.1} GB/s weight stream", per.as_secs_f64() * 1e3, bytes / per.as_secs_f64() / 1e9);
+        unsafe { libc::munmap(w_ptr as *mut libc::c_void, w_alloc) };
+        unsafe { libc::munmap(slab_ptr as *mut libc::c_void, slab_alloc) };
+    }
+}

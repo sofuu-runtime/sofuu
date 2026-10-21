@@ -225,3 +225,33 @@ base/min-base fix (the week's actual blocker), the tail -1 text-gate
 artifact, the q8_0 [d][qs] layout trap, the extern "C" mangling of appended
 ops, the test-side ref-offset typo — every one caught by the pinned
 full-text gates or the standalone oracle tests.
+
+# PROGRESS LEDGER #3 (2026-10-21 — PHASE 2 CLOSED; ~70% of program)
+
+**Phase 2 CLOSED** (7c039237c): every exit item its plan defined is delivered
+except the tg-parity numbers themselves, which by design are the Phase-4
+calm flip-table deliverable:
+- c2 oracle gate PASS under BOTH env states (whichever kernel serves, values
+  == vec_dot_raw_q8_0).
+- Fleet receipts with the coalesced env ON: ALL 5 models FULL-TEXT
+  bit-identical (firstdiv=None): 1B 40.9@load-15.9-spike (settled 87.8@load-
+  3.2), 0.6B **73.6**, Spark 27.8, MiniCPM **24.7** (4.5x its fused base),
+  8B 2.5 (load noise).
+- Kernel classes + gates now in tree: gemv_q8_0_c2 (serial-decode serial
+  class), gemv_q8_0_b4multi/b4r4, gemv_q6_k_b4multi (bit-exact), the fused
+  gemm family + min-base, per-op timing, the rate triangle harness.
+- Text-gate protocol (full-text compare, pinned SPEC, load labels) — the
+  artifact that a week of phantom divergences was built on — closed and
+  documented.
+Board (decode, text-exact everywhere): 1B 87.8/123 · 0.6B 73.6/223 · Spark
+27.8/51 · MiniCPM 24.7/72 · 8B pending-calm/31 (bars = llama.cpp default).
+Residual tg gaps 1.4-6.5x = calm-window-flip items + kernel-rate waves.
+
+# PHASE 3 (beginning) — prefill (input tps)
+Scope from the plan: chunk 32->128, GEMM compute-rate (float4-x, weight-rows
+per threadgroup), mixed-type prefill qkv. Baseline receipts: 0.6B GEMM-prefill
+33 t/s-class at load (ll bar 3416); q4-GEMM at b=4 standalone = 1.0 GB/s (the
+subtile waste receipt) — at b=32 the subtiles fill; the compute-rate work
+starts from measured-B32 rates. Constraints: FULL-TEXT gates, pinned env
+(SOFUU_GPU_PREFILL_GEMM=1, coalesced=2), load labels; CPU prefill route stays
+default until receipts justify the per-model flip.

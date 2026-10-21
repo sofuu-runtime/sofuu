@@ -3081,10 +3081,16 @@ impl TransformerModel {
             return false;
         }
         let vocab = self.config.vocab_size;
+        // SPILL SAFETY established by receipts: b=32 rows span meta slots
+        // [L, L+31) inside the layers*4-slot buffer at ANY prompt length
+        // (max 58 of 112 slots on the 0.6B) — the original all-pos 5-chunk
+        // receipts were bit-exact through this spill. b=128 would overflow
+        // (L+127 > 112) → that needs the meta resize; chunks stay <=32 until
+        // then (SOFUU_PREFILL_CHUNK caps at 32 for now).
         let pre_chunk = std::env::var("SOFUU_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (1..=128).contains(v))
+            .filter(|v| (1..=32).contains(v))
             .unwrap_or(32);
         let mut pos = start_pos;
         let mut off = 0usize;

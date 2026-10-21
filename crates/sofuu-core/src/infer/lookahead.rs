@@ -477,6 +477,42 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn verify_path_indices_are_batch_rows_for_the_batched_head_pass() {
+        // The CPU path precomputes head logits for every tree node in one
+        // GEMM and fills buffer row i-1 with batch row i (verify_path's
+        // node_idx + 1). Pin that contract here: the walk must hand back
+        // exactly nodes.len() distinct batch rows, in descent order, so each
+        // sample reads the node's own logits.
+        let mut cache = NgramCache::new(64);
+        cache.bigrams.insert(
+            1,
+            NgramNode {
+                counts: [(9, 3), (8, 2)].into_iter().collect(),
+            },
+        );
+        cache.trigrams.insert(
+            (1, 9),
+            NgramNode {
+                counts: [(5, 3)].into_iter().collect(),
+            },
+        );
+        let tree = CandidateTree::build_cfg(&cache, &[1], 4, 3, [2, 1, 0, 0]);
+        let mut asked: Vec<usize> = Vec::new();
+        let (accepted, indices, _final) = tree.verify_path(9, |batch_idx| {
+            asked.push(batch_idx);
+            // Predict each node's child token so the walk descends one level.
+            match batch_idx {
+                1 => 5,
+                _ => u32::MAX,
+            }
+        });
+        assert_eq!(asked, indices, "each visited node must be sampled exactly once");
+        assert_eq!(indices, vec![1, 2], "batch rows are node_idx + 1, in descent order");
+        assert_eq!(accepted, vec![9, 5]);
+        assert!(indices.iter().all(|&i| i >= 1 && i <= tree.size()), "batch row out of range");
+    }
+
     fn test_build_cfg_widths_and_depth4() {
         // Handcrafted maps with strictly distinct counts so top_continuations
         // ranking is deterministic regardless of HashMap iteration order.

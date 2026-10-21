@@ -3081,10 +3081,15 @@ impl TransformerModel {
             return false;
         }
         let vocab = self.config.vocab_size;
+        let pre_chunk = std::env::var("SOFUU_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=128).contains(v))
+            .unwrap_or(32);
         let mut pos = start_pos;
         let mut off = 0usize;
         while off < tokens.len() {
-            let take = (tokens.len() - off).min(32);
+            let take = (tokens.len() - off).min(pre_chunk);
             let last = compute_last_logits && off + take == tokens.len();
             if !self.gpu_forward_prefill_gemm_core(&tokens[off..off + take], pos, last) {
                 return false;

@@ -150,8 +150,24 @@ fn main() {
         .file(src.join("simd/infer_kernels.cpp"));
 
     if target_arch == "aarch64" {
-        cpp.flag_if_supported("-march=armv8-a");
-        cpp.flag_if_supported("-march=armv8.2-a+dotprod");
+        // +fp16 is what defines __ARM_FEATURE_FP16_VECTOR_ARITHMETIC, and that
+        // macro gates the f16 KV attention kernels (vcvt_f32_f16 loads,
+        // sofuu_batched_attention_ext_k16 et al). armv8.2-a+dotprod alone
+        // leaves it undefined, so those kernels silently compiled to their
+        // scalar conversions — caught on Pi 5 by the quant.rs f16-vs-f32
+        // parity test. Every core that has dotprod (A55/A75/A76/A77/A78,
+        // Apple M-series) also has fullfp16, so this adds no hardware
+        // requirement beyond the one the kernels already imply.
+        //
+        // Exactly ONE -march: a later -march replaces the target feature set
+        // instead of merging with the earlier one, so appending a baseline
+        // flag here would quietly drop fp16/dotprod again. Probe with a
+        // throwaway Build so the probed flag cannot leak into the real one.
+        const FP16_MARCH: &str = "-march=armv8.2-a+fp16+dotprod";
+        let mut probe = cc::Build::new();
+        probe.cpp(true).warnings(false);
+        let fp16_ok = probe.is_flag_supported(FP16_MARCH).unwrap_or(false);
+        cpp.flag(if fp16_ok { FP16_MARCH } else { "-march=armv8.2-a+dotprod" });
     } else if target_arch == "x86_64" {
         cpp.flag_if_supported("-mavx2");
         cpp.flag_if_supported("-mfma");

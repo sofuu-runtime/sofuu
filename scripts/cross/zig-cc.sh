@@ -38,6 +38,12 @@ for a in "$@"; do
         --target=x86_64-apple-darwin)         ARGS+=("-target" "x86_64-macos") ;;
         --target=aarch64-apple-darwin)        ARGS+=("-target" "aarch64-macos") ;;
         -march=armv8-a)                       ;;
+        # build.rs appends one -march before this wrapper runs; a later
+        # -march would replace -mcpu=cortex_a76's feature set (dropping
+        # fullfp16, which gates the f16 KV attention kernels). cortex_a76
+        # already implies armv8.2-a+dotprod+fullfp16 with A76 scheduling.
+        -march=armv8.2-a+fp16+dotprod)        ;;
+        -march=armv8.2-a+dotprod)             ;;
         *)                                    ARGS+=("$a") ;;
     esac
 done

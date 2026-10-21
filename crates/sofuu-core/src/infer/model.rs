@@ -582,9 +582,18 @@ impl TransformerModel {
         let k16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
         let v16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
         if kv_f16 && std::env::var_os("SOFUU_PROFILE").is_some() {
+            let feat = super::quant::simd_features();
             eprintln!(
-                "[infer] f16 KV shadows on ({} MB x2, CPU attention path)",
-                kv_cache_size / (2 << 20)
+                "[infer] f16 KV shadows on ({} MB x2, CPU attention path, vector f16 kernels: {})",
+                kv_cache_size / (2 << 20),
+                if super::quant::kv16_fast_path() { "yes" } else { "NO (scalar fallback)" }
+            );
+            eprintln!(
+                "[infer] simd features: neon={} dotprod={} fp16v={} i8mm={}",
+                feat & 1 != 0,
+                feat & 2 != 0,
+                feat & 4 != 0,
+                feat & 8 != 0
             );
         }
 

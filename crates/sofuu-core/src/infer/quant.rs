@@ -299,6 +299,19 @@ pub fn gemm_q4_s_parity(rows: usize, cols: usize, batch: usize) -> i32 {
     unsafe { sofuu_test_q4_k_s_bit_exact(rows as i32, cols as i32, batch as i32) }
 }
 
+/// Whether the vector FP16 attention kernels are compiled in. Builds whose
+/// `-march` lacks `+fp16` silently fall back to scalar conversions, which is
+/// slow enough to erase the f16 KV traffic win — surface it instead.
+pub fn kv16_fast_path() -> bool {
+    unsafe { sofuu_kv16_fast_path() != 0 }
+}
+
+/// Compile-time SIMD feature bits (1=NEON, 2=dotprod, 4=fp16 vectors,
+/// 8=i8mm) for the engine's kernel-selection macros.
+pub fn simd_features() -> i32 {
+    unsafe { sofuu_simd_features() }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -551,6 +564,10 @@ extern "C" {
         sliding_window: usize,
         sink_tokens: usize,
     );
+    fn sofuu_kv16_fast_path() -> i32;
+    fn sofuu_simd_features() -> i32;
+    fn sofuu_test_qk_rows8_f32(q: *const f32, k: *const f32, head_dim: usize, count: usize, out: *mut f32, scale: f32);
+    fn sofuu_test_qk_rows8_k16(q: *const f32, k: *const u16, head_dim: usize, count: usize, out: *mut f32, scale: f32);
     fn sofuu_batched_attention_ext_k16(
         q_batch: *const f32,
         k_cache: *const u16,
@@ -2934,6 +2951,117 @@ mod tests {
         // Typed f32 slice
         let f32_buf = vec![1.234f32; 4096];
         prefetch_temporal_slice(&f32_buf);
+    }
+
+    /// The f16 KV shadow is lossless only if the f16 attention kernels keep the
+    /// f32 kernels' accumulation order. With the vector FP16 path compiled in
+    /// (build.rs passes -march=armv8.2-a+fp16+dotprod) KV values that are
+    /// exactly f16-representable must give bit-identical attention output; the
+    /// scalar fallback converts one element at a time and can differ by an ulp,
+    /// so it is held to a tight tolerance instead. Without this gate the f16
+    /// kernels silently degrade to the fallback and still "pass" a loose test.
+    #[test]
+    fn test_attention_k16_matches_f32_for_f16_exact_kv() {
+        let fast_path = unsafe { sofuu_kv16_fast_path() } != 0;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 32usize;
+        let max_seq = 40usize;
+        let seq_len = 33usize;
+        let q_dim = n_heads * head_dim;
+
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 33) as f32 / (u32::MAX >> 1) as f32) - 0.5
+        };
+
+        let mut q = vec![0.0f32; q_dim];
+        for v in q.iter_mut() {
+            *v = next();
+        }
+        // KV values are f16-rounded first, so the f32 cache and the f16 shadow
+        // hold the same numbers and the two kernels are directly comparable.
+        let mut k32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
+        let mut v32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
+        let mut k16 = vec![0u16; k32.len()];
+        let mut v16 = vec![0u16; v32.len()];
+        for h in 0..n_kv_heads {
+            for p in 0..seq_len {
+                let base = h * max_seq * head_dim + p * head_dim;
+                for d in 0..head_dim {
+                    let kh = f32_to_f16(next());
+                    let vh = f32_to_f16(next());
+                    k16[base + d] = kh;
+                    v16[base + d] = vh;
+                    k32[base + d] = f16_to_f32(kh);
+                    v32[base + d] = f16_to_f32(vh);
+                }
+            }
+        }
+
+        let check = |a: &[f32], b: &[f32], what: &str| {
+            if fast_path {
+                assert_eq!(a, b, "{what} diverged under the vector f16 path");
+            } else {
+                let md = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                assert!(md <= 1e-6, "{what} diverged by {md:e} under the scalar f16 fallback");
+            }
+        };
+
+        // Score vectors: covers the 2-position pair loop and the leftover dot.
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        for count in 1..=seq_len {
+            let mut s32 = vec![0.0f32; count];
+            let mut s16 = vec![0.0f32; count];
+            unsafe {
+                sofuu_test_qk_rows8_f32(q.as_ptr(), k32.as_ptr(), head_dim, count, s32.as_mut_ptr(), scale);
+                sofuu_test_qk_rows8_k16(q.as_ptr(), k16.as_ptr(), head_dim, count, s16.as_mut_ptr(), scale);
+            }
+            check(&s32, &s16, &format!("score vectors at count {count}"));
+        }
+
+        // Decode shape: one row through the rows8 score path, every position.
+        for pos in 0..seq_len {
+            let mut out32 = vec![0.0f32; q_dim];
+            let mut out16 = vec![0.0f32; q_dim];
+            batched_attention_ext(
+                &q, &k32, &v32, &mut out32, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+            );
+            batched_attention_ext_k16(
+                &q, &k16, &v16, &mut out16, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+            );
+            check(&out32, &out16, &format!("decode attention at pos {pos}"));
+        }
+
+        // Sliding-window shape (MiniCPM/Spark use SWA): window + sinks.
+        let mut out32 = vec![0.0f32; q_dim];
+        let mut out16 = vec![0.0f32; q_dim];
+        batched_attention_ext(
+            &q, &k32, &v32, &mut out32, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
+        );
+        batched_attention_ext_k16(
+            &q, &k16, &v16, &mut out16, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
+        );
+        check(&out32, &out16, "sliding-window attention");
+
+        // Batch shape: 8 rows in one call (rows8 group sharing K strips).
+        let rows = 8usize;
+        let mut qb = vec![0.0f32; rows * q_dim];
+        for v in qb.iter_mut() {
+            *v = next();
+        }
+        let mut ob32 = vec![0.0f32; rows * q_dim];
+        let mut ob16 = vec![0.0f32; rows * q_dim];
+        batched_attention_ext(
+            &qb, &k32, &v32, &mut ob32, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        batched_attention_ext_k16(
+            &qb, &k16, &v16, &mut ob16, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        check(&ob32, &ob16, "batched attention");
     }
 }
 

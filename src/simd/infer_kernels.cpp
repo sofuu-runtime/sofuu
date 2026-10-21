@@ -3741,6 +3741,74 @@ static inline float32x4_t sofuu_ldf16(const uint16_t *p) {
 
 static inline float sofuu_ldf16_1(const uint16_t *p) { return f16_to_f32_val(*p); }
 
+// Mirrors sofuu_vec_mad_f32's loop shape (16-wide strips of four registers, then
+// 4-wide, then scalar) including its fused vmlaq, so the f16 path stays
+// bit-identical to the f32 path when the KV values are f16-representable.
+static inline void sofuu_mad_f16_f32(float * __restrict dst, const uint16_t * __restrict src,
+                                     float scalar, size_t n) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float32x4_t s = vdupq_n_f32(scalar);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t d0 = vld1q_f32(dst + i);
+        float32x4_t d1 = vld1q_f32(dst + i + 4);
+        float32x4_t d2 = vld1q_f32(dst + i + 8);
+        float32x4_t d3 = vld1q_f32(dst + i + 12);
+        d0 = vmlaq_f32(d0, sofuu_ldf16(src + i), s);
+        d1 = vmlaq_f32(d1, sofuu_ldf16(src + i + 4), s);
+        d2 = vmlaq_f32(d2, sofuu_ldf16(src + i + 8), s);
+        d3 = vmlaq_f32(d3, sofuu_ldf16(src + i + 12), s);
+        vst1q_f32(dst + i, d0);
+        vst1q_f32(dst + i + 4, d1);
+        vst1q_f32(dst + i + 8, d2);
+        vst1q_f32(dst + i + 12, d3);
+    }
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vld1q_f32(dst + i);
+        d = vmlaq_f32(d, sofuu_ldf16(src + i), s);
+        vst1q_f32(dst + i, d);
+    }
+    for (; i < n; ++i) {
+        dst[i] += sofuu_ldf16_1(src + i) * scalar;
+    }
+#else
+    for (size_t i = 0; i < n; ++i) dst[i] += sofuu_ldf16_1(src + i) * scalar;
+#endif
+}
+
+// Tail dot over an f16 KV row that mirrors sofuu_vec_dot_f32's accumulation
+// order exactly (4 accumulators over 16-wide strips, pairwise combine, 4-wide
+// continue, vaddvq, scalar remainder), so the f16 path is bit-identical to the
+// f32 path whenever the KV values are exactly f16-representable.
+static inline float sofuu_dot_f16_f32(const float * __restrict q, const uint16_t * __restrict k, size_t n) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        sum0 = vfmaq_f32(sum0, vld1q_f32(q + i),      sofuu_ldf16(k + i));
+        sum1 = vfmaq_f32(sum1, vld1q_f32(q + i + 4),  sofuu_ldf16(k + i + 4));
+        sum2 = vfmaq_f32(sum2, vld1q_f32(q + i + 8),  sofuu_ldf16(k + i + 8));
+        sum3 = vfmaq_f32(sum3, vld1q_f32(q + i + 12), sofuu_ldf16(k + i + 12));
+    }
+    sum0 = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+    for (; i + 4 <= n; i += 4) {
+        sum0 = vfmaq_f32(sum0, vld1q_f32(q + i), sofuu_ldf16(k + i));
+    }
+    float total = vaddvq_f32(sum0);
+    for (; i < n; ++i) {
+        total += q[i] * sofuu_ldf16_1(k + i);
+    }
+    return total;
+#else
+    float total = 0.0f;
+    for (size_t i = 0; i < n; ++i) total += q[i] * sofuu_ldf16_1(k + i);
+    return total;
+#endif
+}
+
 static void sofuu_attn_qk_range_k16(const float * __restrict q, const uint16_t * __restrict k_base,
                                     size_t k_stride, size_t head_dim, size_t p_begin, size_t count,
                                     float scale, float * __restrict scores_out) {
@@ -3787,9 +3855,7 @@ static void sofuu_attn_qk_range_k16(const float * __restrict q, const uint16_t *
     }
     for (; p < count; ++p) {
         const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
-        float t = 0.0f;
-        for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
-        scores_out[p] = t * scale;
+        scores_out[p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
     }
 #else
     for (size_t p = 0; p < count; ++p) {
@@ -3856,9 +3922,7 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
         for (size_t p = (max_count - (max_count & 1)); p < counts[r]; ++p) {
             const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
             const float *q = q_batch + r * q_stride;
-            float t = 0.0f;
-            for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
-            outs[r][p_begin + p] = t * scale;
+            outs[r][p_begin + p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
         }
     }
 #else
@@ -3866,9 +3930,7 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
         const float *q = q_batch + r * q_stride;
         for (size_t p = 0; p < counts[r]; ++p) {
             const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
-            float t = 0.0f;
-            for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
-            outs[r][p] = t * scale;
+            outs[r][p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
         }
     }
 #endif
@@ -3914,8 +3976,7 @@ static void sofuu_attn_vacc_range_k16(float * __restrict out, const uint16_t * _
         }
     }
     for (; p < count; ++p) {
-        const uint16_t *vrow = v_base + (p_begin + p) * v_stride;
-        for (size_t i = 0; i < head_dim; ++i) out[i] += sofuu_ldf16_1(vrow + i) * s[p];
+        sofuu_mad_f16_f32(out, v_base + (p_begin + p) * v_stride, s[p], head_dim);
     }
 #else
     for (size_t p = 0; p < count; ++p) {
@@ -4243,6 +4304,52 @@ void sofuu_batched_attention_ext(
 // (rows8 score sharing, pool threshold), FA2 not wired here — its tile pass
 // is f32-only and measured net-negative at our seq lengths. SWA and sinks
 // are supported because MiniCPM/Spark use sliding windows.
+// Score-only entry points + a capability probe for the Rust f16-vs-f32 parity
+// test (quant.rs). The probe lets the test demand bit-exactness on the vector
+// FP16 path and a tolerance on the scalar fallback, so a build that loses
+// -march=...+fp16 fails loudly instead of quietly running the slow fallback.
+extern "C" int sofuu_kv16_fast_path(void) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+// Compile-time SIMD feature bits, printable from the CLI under SOFUU_PROFILE.
+// Kernel selection hinges on these macros, and a build that silently loses one
+// (a -march/-mcpu override, a toolchain without +dotprod) just runs slower.
+extern "C" int sofuu_simd_features(void) {
+    int f = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    f |= 1;  // NEON
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    f |= 2;  // SDOT/UDOT
+#endif
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    f |= 4;  // fullfp16 vector arithmetic
+#endif
+#if defined(__ARM_FEATURE_I8MM)
+    f |= 8;  // int8 matrix multiply
+#endif
+    return f;
+}
+
+extern "C" void sofuu_test_qk_rows8_f32(const float *q, const float *k, size_t head_dim,
+                                        size_t count, float *out, float scale) {
+    size_t counts[1] = { count };
+    float *outs[1] = { out };
+    sofuu_attn_qk_rows8(q, head_dim, k, head_dim, head_dim, 0, counts, outs, scale, 1);
+}
+
+extern "C" void sofuu_test_qk_rows8_k16(const float *q, const uint16_t *k, size_t head_dim,
+                                        size_t count, float *out, float scale) {
+    size_t counts[1] = { count };
+    float *outs[1] = { out };
+    sofuu_attn_qk_rows8_k16(q, head_dim, k, head_dim, head_dim, 0, counts, outs, scale, 1);
+}
+
 void sofuu_batched_attention_ext_k16(
     const float *q_batch,
     const uint16_t *k_cache,

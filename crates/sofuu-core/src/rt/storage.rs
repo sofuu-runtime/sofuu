@@ -410,6 +410,67 @@ impl StorageManager {
             results.push(serde_json::Value::Object(map));
         }
 
+        // If results are fewer than query.limit (or no limit) and historical segments exist on disk:
+        if query.limit == 0 || results.len() < query.limit as usize {
+            let active_seg_file = weekly_table_segment_name(self.active_year, self.active_week, table_name);
+            if let Ok(entries) = fs::read_dir(&self.base_dir) {
+                let suffix = format!("_{table_name}.qtsq");
+                let mut historical_files = Vec::new();
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.starts_with("storage_") && fname.ends_with(&suffix) && fname != active_seg_file {
+                        historical_files.push(entry.path());
+                    }
+                }
+                historical_files.sort();
+                if query.order_desc {
+                    historical_files.reverse();
+                }
+
+                for hfile in historical_files {
+                    if query.limit > 0 && results.len() >= query.limit as usize {
+                        break;
+                    }
+                    let mut rem_query = query.clone();
+                    if query.limit > 0 {
+                        rem_query.limit = (query.limit as usize - results.len()) as u32;
+                    }
+                    if let Ok(h_tbl) = SofuTable::query_qtsq(&hfile, table_name, self.password.as_deref(), &rem_query) {
+                        let h_count = h_tbl.row_count();
+                        for r in 0..h_count {
+                            if let Ok(row) = h_tbl.get_row(r) {
+                                let mut map = serde_json::Map::new();
+                                for (ci, val) in row.into_iter().enumerate() {
+                                    if ci < col_names.len() {
+                                        let key = &col_names[ci];
+                                        let jv = match val {
+                                            SofuValue::Null => serde_json::Value::Null,
+                                            SofuValue::Int64(i) => serde_json::json!(i),
+                                            SofuValue::Int32(i) => serde_json::json!(i),
+                                            SofuValue::Float64(f) => serde_json::json!(f),
+                                            SofuValue::Float32(f) => serde_json::json!(f),
+                                            SofuValue::Bool(b) => serde_json::json!(b),
+                                            SofuValue::Timestamp(t) => serde_json::json!(t),
+                                            SofuValue::String(s) => serde_json::json!(s),
+                                            SofuValue::Bytes(b) => serde_json::json!(b),
+                                            SofuValue::Json(j) => {
+                                                serde_json::from_str(&j).unwrap_or(serde_json::Value::String(j))
+                                            }
+                                        };
+                                        map.insert(key.clone(), jv);
+                                    }
+                                }
+                                results.push(serde_json::Value::Object(map));
+                                if query.limit > 0 && results.len() >= query.limit as usize {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -574,16 +635,24 @@ unsafe extern "C" fn js_storage_query(
     let q_obj: serde_json::Value = serde_json::from_str(&query_json).unwrap_or(serde_json::Value::Null);
 
     let mut q = SofuQuery::new();
-    if let Some(min_id) = q_obj.get("minId").and_then(|v| v.as_i64()) {
+    if let Some(min_id) = q_obj.get("minId").or_else(|| q_obj.get("min_id")).and_then(|v| v.as_i64()) {
         q = q.min_id(min_id);
     }
-    if let Some(max_id) = q_obj.get("maxId").and_then(|v| v.as_i64()) {
+    if let Some(max_id) = q_obj.get("maxId").or_else(|| q_obj.get("max_id")).and_then(|v| v.as_i64()) {
         q = q.max_id(max_id);
     }
-    if let Some(min_t) = q_obj.get("minTimestamp").and_then(|v| v.as_i64()) {
+    if let Some(min_t) = q_obj.get("minTimestamp")
+        .or_else(|| q_obj.get("min_timestamp"))
+        .or_else(|| q_obj.get("time_start"))
+        .or_else(|| q_obj.get("minTime"))
+        .and_then(|v| v.as_i64()) {
         q = q.min_timestamp(min_t);
     }
-    if let Some(max_t) = q_obj.get("maxTimestamp").and_then(|v| v.as_i64()) {
+    if let Some(max_t) = q_obj.get("maxTimestamp")
+        .or_else(|| q_obj.get("max_timestamp"))
+        .or_else(|| q_obj.get("time_end"))
+        .or_else(|| q_obj.get("maxTime"))
+        .and_then(|v| v.as_i64()) {
         q = q.max_timestamp(max_t);
     }
     if let Some(lim) = q_obj.get("limit").and_then(|v| v.as_u64()) {
@@ -592,12 +661,15 @@ unsafe extern "C" fn js_storage_query(
     if let Some(off) = q_obj.get("offset").and_then(|v| v.as_u64()) {
         q = q.offset(off as u32);
     }
-    if let Some(desc) = q_obj.get("orderDesc").and_then(|v| v.as_bool()) {
+    if let Some(desc) = q_obj.get("orderDesc")
+        .or_else(|| q_obj.get("order_desc"))
+        .and_then(|v| v.as_bool())
+        .or_else(|| q_obj.get("order").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("desc"))) {
         q = q.order_desc(desc);
     }
     if let (Some(col), Some(val)) = (
-        q_obj.get("filterCol").and_then(|v| v.as_str()),
-        q_obj.get("filterVal").and_then(|v| v.as_str()),
+        q_obj.get("filterCol").or_else(|| q_obj.get("filter_col")).and_then(|v| v.as_str()),
+        q_obj.get("filterVal").or_else(|| q_obj.get("filter_val")).and_then(|v| v.as_str()),
     ) {
         q = q.filter_str(col, val);
     }

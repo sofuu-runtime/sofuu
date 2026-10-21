@@ -610,7 +610,12 @@ sofuu_table_t *sofuu_table_query(const sofuu_table_t *tbl, const sofuu_query_t *
         filter_col_idx = sofuu_schema_find_col(&tbl->schema, q->filter_col_name);
     }
 
-    for (uint32_t bi = 0; bi < tbl->num_blocks; bi++) {
+    bool desc = q ? q->order_desc : false;
+    int bi_start = desc ? ((int)tbl->num_blocks - 1) : 0;
+    int bi_end = desc ? -1 : (int)tbl->num_blocks;
+    int bi_step = desc ? -1 : 1;
+
+    for (int bi = bi_start; bi != bi_end; bi += bi_step) {
         const sofuu_block_t *b = tbl->blocks[bi];
         if (!b || b->row_count == 0) continue;
 
@@ -623,7 +628,11 @@ sofuu_table_t *sofuu_table_query(const sofuu_table_t *tbl, const sofuu_query_t *
         }
 
         /* Scan rows within this block */
-        for (uint32_t r = 0; r < b->row_count; r++) {
+        int r_start = desc ? ((int)b->row_count - 1) : 0;
+        int r_end = desc ? -1 : (int)b->row_count;
+        int r_step = desc ? -1 : 1;
+
+        for (int r = r_start; r != r_end; r += r_step) {
             if (q && q->min_id != 0 && tbl->schema.pk_col_idx >= 0) {
                 int64_t val = ((int64_t *)b->col_data[tbl->schema.pk_col_idx])[r];
                 if (val < q->min_id) continue;
@@ -739,7 +748,34 @@ int sofuu_table_write_qtsq(const sofuu_table_t *tbl, const char *filepath, const
         free(sub_meta);
     }
 
-    /* Streams 2..N: Serialized Columnar Blocks */
+    /* Stream 2: Checkpoint Seek Index */
+    if (tbl->num_blocks > 0) {
+        size_t chk_size = sizeof(sofuu_block_checkpoint_t) * tbl->num_blocks;
+        sofuu_block_checkpoint_t *chk_arr = (sofuu_block_checkpoint_t *)malloc(chk_size);
+        if (chk_arr) {
+            for (uint32_t i = 0; i < tbl->num_blocks; i++) {
+                const sofuu_block_t *b = tbl->blocks[i];
+                chk_arr[i].block_index = i;
+                chk_arr[i].row_count = b ? b->row_count : 0;
+                chk_arr[i].min_id = b ? b->min_id : 0;
+                chk_arr[i].max_id = b ? b->max_id : 0;
+                chk_arr[i].min_timestamp = b ? b->min_timestamp : 0;
+                chk_arr[i].max_timestamp = b ? b->max_timestamp : 0;
+                chk_arr[i].payload_bytes = 0;
+            }
+            qtsq_context_t *sub_chk = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+            if (sub_chk) {
+                if (sofuu_pack_substream(sub_chk, (const uint8_t *)chk_arr, chk_size) == QTSQ_OK) {
+                    qtsq_container_add_stream(container, sub_chk, "index/checkpoints");
+                }
+                qtsq_free(sub_chk);
+                free(sub_chk);
+            }
+            free(chk_arr);
+        }
+    }
+
+    /* Streams 3..N: Serialized Columnar Blocks */
     for (uint32_t i = 0; i < tbl->num_blocks; i++) {
         const sofuu_block_t *b = tbl->blocks[i];
         if (!b) continue;
@@ -868,7 +904,295 @@ sofuu_table_t *sofuu_table_read_qtsq(const char *filepath, const char *table_nam
         }
     }
 
+    /* Third pass: read checkpoint index stream if present */
+    for (uint32_t i = 0; i < stream_count; i++) {
+        char name[256];
+        if (qtsq_container_get_stream_name(container, i, name, sizeof(name)) == QTSQ_OK) {
+            if (strcmp(name, "index/checkpoints") == 0) {
+                qtsq_context_t *sub = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+                if (sub && qtsq_container_get_stream(container, i, sub, name, sizeof(name)) == QTSQ_OK) {
+                    uint8_t *raw = NULL;
+                    size_t raw_size = 0;
+                    if (sofuu_unpack_substream(sub, &raw, &raw_size) == QTSQ_OK && raw) {
+                        uint32_t count = raw_size / sizeof(sofuu_block_checkpoint_t);
+                        if (count > 0) {
+                            if (tbl->blocks_cap < count) {
+                                tbl->checkpoints = (sofuu_block_checkpoint_t *)realloc(tbl->checkpoints, count * sizeof(sofuu_block_checkpoint_t));
+                            }
+                            memcpy(tbl->checkpoints, raw, count * sizeof(sofuu_block_checkpoint_t));
+                            tbl->checkpoints_count = count;
+                        }
+                        free(raw);
+                    }
+                    qtsq_free(sub);
+                    free(sub);
+                }
+                break;
+            }
+        }
+    }
+
     qtsq_free(container);
     free(container);
     return tbl;
+}
+
+/* Direct fast checkpoint-indexed query on a QTSQ container file without loading full table */
+sofuu_table_t *sofuu_table_query_qtsq(const char *filepath, const char *table_name, const char *password, const sofuu_query_t *q) {
+    if (!filepath) return NULL;
+
+    qtsq_context_t *container = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+    if (!container) return NULL;
+
+    int r = qtsq_init(container);
+    if (r == QTSQ_OK) {
+        r = qtsq_read(container, filepath);
+    }
+    if (r == QTSQ_OK && container->is_encrypted) {
+        if (password) {
+            r = qtsq_vault_decrypt_password(container, password);
+        } else {
+            r = -1;
+        }
+    }
+    if (r != QTSQ_OK) {
+        qtsq_free(container);
+        free(container);
+        return NULL;
+    }
+
+    uint32_t stream_count = 0;
+    qtsq_container_get_count(container, &stream_count);
+
+    sofuu_schema_t schema;
+    sofuu_schema_init(&schema, table_name ? table_name : "default");
+
+    /* Step 1: Read metadata schema */
+    for (uint32_t i = 0; i < stream_count; i++) {
+        char name[256];
+        if (qtsq_container_get_stream_name(container, i, name, sizeof(name)) == QTSQ_OK) {
+            if (strcmp(name, "meta/schema") == 0) {
+                qtsq_context_t *sub = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+                if (sub && qtsq_container_get_stream(container, i, sub, name, sizeof(name)) == QTSQ_OK) {
+                    uint8_t *raw = NULL;
+                    size_t raw_size = 0;
+                    if (sofuu_unpack_substream(sub, &raw, &raw_size) == QTSQ_OK && raw) {
+                        if (raw_size >= sizeof(sofuu_schema_t)) {
+                            memcpy(&schema, raw, sizeof(sofuu_schema_t));
+                        }
+                        free(raw);
+                    }
+                    qtsq_free(sub);
+                    free(sub);
+                }
+                break;
+            }
+        }
+    }
+
+    sofuu_table_t *res = sofuu_table_create(&schema);
+    if (!res) {
+        qtsq_free(container);
+        free(container);
+        return NULL;
+    }
+
+    /* Step 2: Read Checkpoints */
+    sofuu_block_checkpoint_t *checkpoints = NULL;
+    uint32_t num_checkpoints = 0;
+
+    for (uint32_t i = 0; i < stream_count; i++) {
+        char name[256];
+        if (qtsq_container_get_stream_name(container, i, name, sizeof(name)) == QTSQ_OK) {
+            if (strcmp(name, "index/checkpoints") == 0) {
+                qtsq_context_t *sub = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+                if (sub && qtsq_container_get_stream(container, i, sub, name, sizeof(name)) == QTSQ_OK) {
+                    uint8_t *raw = NULL;
+                    size_t raw_size = 0;
+                    if (sofuu_unpack_substream(sub, &raw, &raw_size) == QTSQ_OK && raw) {
+                        uint32_t count = raw_size / sizeof(sofuu_block_checkpoint_t);
+                        if (count > 0) {
+                            checkpoints = (sofuu_block_checkpoint_t *)malloc(raw_size);
+                            if (checkpoints) {
+                                memcpy(checkpoints, raw, raw_size);
+                                num_checkpoints = count;
+                            }
+                        }
+                        free(raw);
+                    }
+                    qtsq_free(sub);
+                    free(sub);
+                }
+                break;
+            }
+        }
+    }
+
+    int filter_col_idx = -1;
+    if (q && q->filter_col_name) {
+        filter_col_idx = sofuu_schema_find_col(&schema, q->filter_col_name);
+    }
+
+    uint32_t rows_skipped_offset = 0;
+    uint32_t target_offset = q ? q->offset : 0;
+    uint32_t target_limit = q ? q->limit : 0;
+    bool desc = q ? q->order_desc : false;
+
+    if (num_checkpoints > 0) {
+        int start_idx = desc ? ((int)num_checkpoints - 1) : 0;
+        int end_idx = desc ? -1 : (int)num_checkpoints;
+        int step = desc ? -1 : 1;
+
+        for (int ci = start_idx; ci != end_idx; ci += step) {
+            const sofuu_block_checkpoint_t *chk = &checkpoints[ci];
+
+            /* Checkpoint Skip Evaluation: Skip block WITHOUT decompressing if out of range */
+            if (q) {
+                if (q->min_id != 0 && chk->max_id < q->min_id) continue;
+                if (q->max_id != 0 && chk->min_id > q->max_id) continue;
+                if (q->min_timestamp != 0 && chk->max_timestamp < q->min_timestamp) continue;
+                if (q->max_timestamp != 0 && chk->min_timestamp > q->max_timestamp) continue;
+            }
+
+            /* Block qualifies! Locate stream in container */
+            char target_blk_name[64];
+            snprintf(target_blk_name, sizeof(target_blk_name), "blk_%06u", chk->block_index);
+
+            for (uint32_t si = 0; si < stream_count; si++) {
+                char sname[256];
+                if (qtsq_container_get_stream_name(container, si, sname, sizeof(sname)) == QTSQ_OK) {
+                    if (strstr(sname, target_blk_name) != NULL) {
+                        /* Decompress ONLY this matching block */
+                        qtsq_context_t *sub = (qtsq_context_t *)calloc(1, sizeof(qtsq_context_t));
+                        if (sub && qtsq_container_get_stream(container, si, sub, sname, sizeof(sname)) == QTSQ_OK) {
+                            uint8_t *raw = NULL;
+                            size_t raw_size = 0;
+                            if (sofuu_unpack_substream(sub, &raw, &raw_size) == QTSQ_OK && raw) {
+                                sofuu_block_t *b = sofuu_block_deserialize(raw, raw_size, &schema);
+                                if (b) {
+                                    int r_start = desc ? ((int)b->row_count - 1) : 0;
+                                    int r_end = desc ? -1 : (int)b->row_count;
+                                    int r_step = desc ? -1 : 1;
+
+                                    for (int r = r_start; r != r_end; r += r_step) {
+                                        if (q && q->min_id != 0 && schema.pk_col_idx >= 0) {
+                                            int64_t val = ((int64_t *)b->col_data[schema.pk_col_idx])[r];
+                                            if (val < q->min_id) continue;
+                                        }
+                                        if (q && q->max_id != 0 && schema.pk_col_idx >= 0) {
+                                            int64_t val = ((int64_t *)b->col_data[schema.pk_col_idx])[r];
+                                            if (val > q->max_id) continue;
+                                        }
+                                        if (q && q->min_timestamp != 0 && schema.timestamp_col_idx >= 0) {
+                                            int64_t val = ((int64_t *)b->col_data[schema.timestamp_col_idx])[r];
+                                            if (val < q->min_timestamp) continue;
+                                        }
+                                        if (q && q->max_timestamp != 0 && schema.timestamp_col_idx >= 0) {
+                                            int64_t val = ((int64_t *)b->col_data[schema.timestamp_col_idx])[r];
+                                            if (val > q->max_timestamp) continue;
+                                        }
+                                        if (filter_col_idx >= 0 && q && q->filter_val.type == SOFUU_TYPE_STRING) {
+                                            uint32_t o0 = b->str_offsets[filter_col_idx][r];
+                                            uint32_t o1 = b->str_offsets[filter_col_idx][r + 1];
+                                            uint32_t len = o1 - o0;
+                                            const char *str = (const char *)(b->str_heap[filter_col_idx] + o0);
+                                            if (len != q->filter_val.as.str.len ||
+                                                (len > 0 && memcmp(str, q->filter_val.as.str.ptr, len) != 0)) {
+                                                continue;
+                                            }
+                                        }
+
+                                        // Apply offset
+                                        if (rows_skipped_offset < target_offset) {
+                                            rows_skipped_offset++;
+                                            continue;
+                                        }
+
+                                        // Extract row values and append to result table
+                                        sofuu_val_t row_vals[SOFUU_MAX_COLS];
+                                        for (uint32_t c = 0; c < schema.num_cols; c++) {
+                                            row_vals[c].type = schema.cols[c].type;
+                                            if (b->null_map[c] && b->null_map[c][r]) {
+                                                row_vals[c].type = SOFUU_TYPE_NULL;
+                                                continue;
+                                            }
+                                            switch (schema.cols[c].type) {
+                                                case SOFUU_TYPE_INT64:
+                                                case SOFUU_TYPE_TIMESTAMP:
+                                                    row_vals[c].as.i64 = ((int64_t *)b->col_data[c])[r];
+                                                    break;
+                                                case SOFUU_TYPE_INT32:
+                                                    row_vals[c].as.i32 = ((int32_t *)b->col_data[c])[r];
+                                                    break;
+                                                case SOFUU_TYPE_FLOAT64:
+                                                    row_vals[c].as.f64 = ((double *)b->col_data[c])[r];
+                                                    break;
+                                                case SOFUU_TYPE_FLOAT32:
+                                                    row_vals[c].as.f32 = ((float *)b->col_data[c])[r];
+                                                    break;
+                                                case SOFUU_TYPE_BOOL:
+                                                    row_vals[c].as.b = ((bool *)b->col_data[c])[r];
+                                                    break;
+                                                case SOFUU_TYPE_STRING:
+                                                case SOFUU_TYPE_JSON: {
+                                                    uint32_t o0 = b->str_offsets[c][r];
+                                                    uint32_t o1 = b->str_offsets[c][r + 1];
+                                                    row_vals[c].as.str.ptr = (const char *)(b->str_heap[c] + o0);
+                                                    row_vals[c].as.str.len = o1 - o0;
+                                                    break;
+                                                }
+                                                case SOFUU_TYPE_BYTES: {
+                                                    uint32_t o0 = b->str_offsets[c][r];
+                                                    uint32_t o1 = b->str_offsets[c][r + 1];
+                                                    row_vals[c].as.bytes.ptr = (const uint8_t *)(b->str_heap[c] + o0);
+                                                    row_vals[c].as.bytes.len = o1 - o0;
+                                                    break;
+                                                }
+                                                default:
+                                                    row_vals[c].type = SOFUU_TYPE_NULL;
+                                                    break;
+                                            }
+                                        }
+
+                                        sofuu_table_insert(res, row_vals, schema.num_cols);
+
+                                        // Check limit
+                                        if (target_limit > 0 && res->total_rows >= target_limit) {
+                                            sofuu_block_free(b, &schema);
+                                            free(raw);
+                                            qtsq_free(sub);
+                                            free(sub);
+                                            goto query_done;
+                                        }
+                                    }
+
+                                    sofuu_block_free(b, &schema);
+                                }
+                                free(raw);
+                            }
+                            qtsq_free(sub);
+                            free(sub);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: no checkpoints stream found, read entire table and run in-memory query
+        sofuu_table_free(res);
+        qtsq_free(container);
+        free(container);
+        sofuu_table_t *full = sofuu_table_read_qtsq(filepath, table_name, password);
+        if (!full) return NULL;
+        res = sofuu_table_query(full, q);
+        sofuu_table_free(full);
+        return res;
+    }
+
+query_done:
+    if (checkpoints) free(checkpoints);
+    qtsq_free(container);
+    free(container);
+    return res;
 }

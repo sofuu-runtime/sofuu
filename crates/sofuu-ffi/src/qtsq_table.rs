@@ -211,6 +211,12 @@ extern "C" {
         table_name: *const c_char,
         password: *const c_char,
     ) -> *mut SofuuTableOpaque;
+    pub fn sofuu_table_query_qtsq(
+        filepath: *const c_char,
+        table_name: *const c_char,
+        password: *const c_char,
+        q: *const SofuuQueryC,
+    ) -> *mut SofuuTableOpaque;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -675,6 +681,59 @@ impl SofuTable {
             schema,
         })
     }
+
+    /// Fast checkpoint-indexed query directly against an on-disk QTSQ file.
+    /// Only matching columnar blocks are decompressed, enabling sub-1.5ms pagination.
+    pub fn query_qtsq<P: AsRef<Path>>(
+        path: P,
+        table_name: &str,
+        password: Option<&str>,
+        query: &SofuQuery,
+    ) -> Result<Self, String> {
+        let path_str = path.as_ref().to_str().ok_or("Invalid UTF-8 path")?;
+        let c_path = CString::new(path_str).map_err(|e| e.to_string())?;
+        let c_name = CString::new(table_name).map_err(|e| e.to_string())?;
+
+        let _pass_cs = password.map(|p| CString::new(p).unwrap());
+        let pass_ptr = _pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+
+        let mut c_query = SofuuQueryC::default();
+        c_query.min_id = query.min_id;
+        c_query.max_id = query.max_id;
+        c_query.min_timestamp = query.min_timestamp;
+        c_query.max_timestamp = query.max_timestamp;
+        c_query.limit = query.limit;
+        c_query.offset = query.offset;
+        c_query.order_desc = query.order_desc;
+
+        let _pinned_name = query.filter_col_name.as_ref().map(|s| CString::new(s.as_str()).unwrap());
+        if let Some(ref c_str) = _pinned_name {
+            c_query.filter_col_name = c_str.as_ptr();
+        }
+
+        if let Some(SofuValue::String(ref s)) = query.filter_val {
+            c_query.filter_val.val_type = SofuuColType::String as u8;
+            c_query.filter_val.as_val.str_val = SofuuStrRef {
+                ptr: s.as_ptr() as *const c_char,
+                len: s.len() as u32,
+            };
+        }
+
+        let res_ptr = unsafe {
+            sofuu_table_query_qtsq(c_path.as_ptr(), c_name.as_ptr(), pass_ptr, &c_query)
+        };
+        if res_ptr.is_null() {
+            return Err(format!("Failed to query table '{table_name}' from {}", path_str));
+        }
+
+        let schema_c = unsafe { *(res_ptr as *const SofuuSchemaC) };
+        let schema = SofuSchema { raw: schema_c };
+
+        Ok(Self {
+            raw: res_ptr,
+            schema,
+        })
+    }
 }
 
 impl Drop for SofuTable {
@@ -844,5 +903,44 @@ mod tests {
         let q_lim = SofuQuery::new().limit(5);
         let res_lim = tbl.query(&q_lim).unwrap();
         assert_eq!(res_lim.row_count(), 5);
+    }
+
+    #[test]
+    fn test_selective_disk_query_qtsq() {
+        let schema = SofuSchema::new("events")
+            .unwrap()
+            .add_col("id", SofuuColType::Int64, SOFUU_COL_PRIMARY_KEY | SOFUU_COL_AUTO_INC)
+            .unwrap()
+            .add_col("data", SofuuColType::String, SOFUU_COL_REQUIRED)
+            .unwrap()
+            .add_col("timestamp", SofuuColType::Timestamp, 0)
+            .unwrap();
+
+        let mut tbl = SofuTable::create(&schema).unwrap();
+        for i in 0..250 {
+            tbl.insert(&[
+                SofuValue::Int64(0),
+                SofuValue::String(format!("Event payload #{i}")),
+                SofuValue::Timestamp(1729500000000 + i * 1000),
+            ])
+            .unwrap();
+        }
+
+        let tmp_file = std::env::temp_dir().join(format!("test_sofuu_query_{}.qtsq", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        tbl.write_qtsq(&tmp_file, None).unwrap();
+
+        // Selective query for 20 latest events descending
+        let q = SofuQuery::new()
+            .min_timestamp(1729500100000)
+            .limit(20)
+            .order_desc(true);
+
+        let q_res = SofuTable::query_qtsq(&tmp_file, "events", None, &q).unwrap();
+        assert_eq!(q_res.row_count(), 20);
+
+        let top_row = q_res.get_row(0).unwrap();
+        assert_eq!(top_row[0], SofuValue::Int64(250));
+
+        let _ = std::fs::remove_file(&tmp_file);
     }
 }

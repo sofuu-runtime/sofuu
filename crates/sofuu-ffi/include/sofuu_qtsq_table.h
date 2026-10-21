@@ -170,6 +170,9 @@ int sofuu_table_write_qtsq(const sofuu_table_t *tbl, const char *filepath, const
 /* Reads a table from an existing QTSQ container */
 sofuu_table_t *sofuu_table_read_qtsq(const char *filepath, const char *table_name, const char *password);
 
+/* Direct fast checkpoint-indexed query on a QTSQ container file without loading full table */
+sofuu_table_t *sofuu_table_query_qtsq(const char *filepath, const char *table_name, const char *password, const sofuu_query_t *q);
+
 #ifdef __cplusplus
 }
 #endif

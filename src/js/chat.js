@@ -1094,8 +1094,27 @@
       }
     } catch (e) {}
   }
-  /* Real-time conversation: the event's text lands in its own tiny qtsq
-   * file THIS moment — a crash mid-turn loses nothing already said. */
+  /* QTSQ Structured Storage Driver handle (CMA v2 Phase 3/4) */
+  var _projectDb = null;
+  var _projectDbPath = null;
+  function getProjectDb(project) {
+    if (!project) return null;
+    var dbPath = project + '/.sofuu/storage';
+    if (_projectDb && _projectDbPath === dbPath) {
+      return _projectDb;
+    }
+    try {
+      if (globalThis.sofuu && globalThis.sofuu.storage && typeof globalThis.sofuu.storage.open === 'function') {
+        _projectDb = globalThis.sofuu.storage.open(dbPath);
+        _projectDbPath = dbPath;
+        return _projectDb;
+      }
+    } catch (eDb) {}
+    return null;
+  }
+
+  /* Real-time conversation: writes to native QTSQ structured storage
+   * (CMA v2) with fallback to per-event files for crash safety. */
   function sessionLog(kind, text) {
     if (!S.session) return;
     var t = now();
@@ -1103,6 +1122,45 @@
     var ev = { seq: S.eventSeq, t: t, kind: kind };
     S.session.events.push(ev);
     if (S.info) S.info.last_seen = t;
+
+    /* 1. High-throughput structured columnar logging (Phase 4) */
+    try {
+      var sdb = getProjectDb(S.project);
+      if (sdb) {
+        var strText = String(text == null ? '' : text);
+        if (kind === 'prompt') {
+          sdb.messages.insert({
+            session_id: S.info.id,
+            role: 'user',
+            content: strText,
+            tokens: 0,
+            timestamp: t,
+            meta: JSON.stringify({ seq: ev.seq })
+          });
+        } else if (kind === 'answer') {
+          sdb.messages.insert({
+            session_id: S.info.id,
+            role: 'assistant',
+            content: strText,
+            tokens: 0,
+            timestamp: t,
+            meta: JSON.stringify({ seq: ev.seq })
+          });
+        } else if (kind === 'tools' || kind === 'usage') {
+          sdb.traces.insert({
+            session_id: S.info.id,
+            step_index: ev.seq,
+            tool_name: kind,
+            input: strText,
+            output: '',
+            duration_ms: 0,
+            timestamp: t
+          });
+        }
+      }
+    } catch (eStorage) {}
+
+    /* 2. Legacy per-event file backup for crash-proof compatibility */
     try {
       if (typeof __qtsq_session_save === 'function') {
         ensureDir(convDir(S.project, S.info.id));
@@ -1250,9 +1308,38 @@
             }
             if (seenPrompts < tailTurns) fetchFrom = 0;
           }
+          /* Fast-path: consult structured storage first */
+          var sdb = getProjectDb(project);
+          var sdbMap = null;
+          if (sdb) {
+            try {
+              var sdbRows = sdb.messages.query({
+                filterCol: 'session_id',
+                filterVal: String(id),
+                orderDesc: false
+              });
+              if (sdbRows && sdbRows.length > 0) {
+                sdbMap = new Map();
+                for (var si = 0; si < sdbRows.length; si++) {
+                  var r = sdbRows[si];
+                  if (r.meta) {
+                    try {
+                      var m = JSON.parse(r.meta);
+                      if (m && m.seq) sdbMap.set(m.seq, r.content);
+                    } catch (eM) {}
+                  }
+                }
+              }
+            } catch (eSdb) {}
+          }
+
           for (var i = fetchFrom; i < evs.length; i++) {
             var ev = evs[i];
             ev.text = '';
+            if (sdbMap && sdbMap.has(ev.seq)) {
+              ev.text = String(sdbMap.get(ev.seq));
+              continue;
+            }
             if (i >= fetchFrom && (ev.file || (ev.seq && ev.kind))) {
               try {
                 var f = ev.file || (convDir(project, id) + '/' +

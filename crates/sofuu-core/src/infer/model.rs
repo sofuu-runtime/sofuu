@@ -2373,126 +2373,111 @@ impl TransformerModel {
         // P2 decode diet: the SAME fused multi-section GEMM kernel as the
         // prefill route — B-generic (mask subtiles), sections land in the
         // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
-        // DEFAULT OFF pending a fixture that reproduces it: the b4multi
-        // kernel is bit-exact standalone (incl. unaligned sections) yet the
-        // verify-chain text diverges deterministically in-model (see memory
-        // evidence trail). SOFUU_FUSE_MULTI=1 enables for debugging.
+        // SHIPPED ON (SOFUU_FUSE_MULTI=0 disables): the in-model divergence
+        // was the section blob's base — base was taken from the FIRST
+        // section's aligned offset, but sections are not monotonic in file
+        // order (1B attn_k < attn_q) so the k delta underflowed u32 → the
+        // kernel read base+u32::MAX+rem = garbage ~1e-1-off activations.
+        // base = MIN aligned offset across the run fixes it: 1B + MiniCPM +
+        // 0.6B FULL-TEXT == CPU with the type-grouped mixed dispatch.
         let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        #[inline]
+        fn f16_bits_to_f32(h: u16) -> f32 {
+            let sign = ((h >> 15) as u32) << 31;
+            let exp = ((h >> 10) & 0x1F) as u32;
+            let man = (h & 0x3FF) as u32;
+            if exp == 0 {
+                f32::from_bits(sign | (man << 13))
+            } else if exp == 31 {
+                f32::from_bits(sign | 0x7F80_0000 | (man << 13))
+            } else {
+                f32::from_bits(sign | ((exp + 112) << 23) | (man << 13))
+            }
+        }
         let multi_dbg_dec = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
         let multi_dbg_dec_done = std::cell::Cell::new(false);
         let multi_dbg_dec_dumped = std::cell::Cell::new(false);
         macro_rules! gemm_fused_dec {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
-                // P1 completion: type-grouped section runs — consecutive
-                // sections of one type ride ONE dispatch (qkv = [q4,q4,q6K]
-                // -> 2 dispatches: q+k via the q4 b4multi, v via the q6 one).
+                // P1/P2: type-grouped section runs — consecutive sections of
+                // one type ride ONE dispatch. base = MIN aligned weight offset
+                // across the run (sections may not be monotonic in file order —
+                // the 1B's attn_k sits BELOW attn_q; a first-section base made
+                // the k delta underflow u32 = the b4blob OOB receipt).
                 let mut all_ok = fuse_multi && !$secs.is_empty();
                 let mut fast = false;
-                let mut run: Vec<(usize, u32, u32, u32, u32)> = Vec::new(); // (idx, rows, y_off, y_stride, type)
-                let mut flushed_fast = true;
-                {
-                    let mut run_type: u32 = 0;
-                    for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
-                        let ty = tv.tensor_type;
-                        if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K && ty != GGML_TYPE_Q8_0 {
-                            // unsupported type inside the fused set -> fall
-                            // back per-tensor (the caller handles !gu_ok!)
-                            all_ok = false;
-                            break;
-                        }
-                        if run.is_empty() {
-                            run_type = ty;
-                        } else if ty != run_type {
-                            // flush the run
-                            let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
-                            let mut end = 0u32;
-                            let base = (gguf.data_offset + $secs[run[0].0].0.offset) & !255usize;
-                            let mut rt = 0u32;
-                            for (j, (idx, rr, yo, ys, _t)) in run.iter().enumerate() {
-                                let raw = gguf.data_offset + $secs[*idx].0.offset;
-                                blob[j][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
-                                blob[j][1] = (raw & 255usize) as u32;
-                                end += *rr;
-                                blob[j][2] = end;
-                                blob[j][3] = *yo;
-                                blob[j][4] = *ys;
-                                rt = end;
-                            }
-                            let ok = match run_type {
-                                GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
-                                    14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                    rt as usize, $cols, &blob,
-                                ),
-                                GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
-                                    8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                    rt as usize, $cols, &blob,
-                                ),
-                                _ => g.engine.batch_gguf_b4multi(
-                                    12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                    rt as usize, $cols, &blob,
-                                ),
-                            };
-                            flushed_fast &= ok;
-                            run.clear();
-                            run_type = ty;
-                        }
-                        run.push((i, *rows, *y_off as u32, *y_stride, ty));
+                let mut groups: Vec<(u32, Vec<(usize, u32, u32, u32)>)> = Vec::new(); // (type, [(secs idx, rows, y_off, y_stride)])
+                for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
+                    let ty = tv.tensor_type;
+                    if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K && ty != GGML_TYPE_Q8_0 {
+                        all_ok = false;
+                        break;
                     }
-                    if all_ok && !run.is_empty() {
-                        let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
-                        let mut end = 0u32;
-                        let base = (gguf.data_offset + $secs[run[0].0].0.offset) & !255usize;
-                        let mut rt = 0u32;
-                        for (j, (idx, rr, yo, ys, _t)) in run.iter().enumerate() {
-                            let raw = gguf.data_offset + $secs[*idx].0.offset;
-                            blob[j][0] = (((raw & !255usize) - base).min(u32::MAX as usize)) as u32;
-                            blob[j][1] = (raw & 255usize) as u32;
-                            end += *rr;
-                            blob[j][2] = end;
-                            blob[j][3] = *yo;
-                            blob[j][4] = *ys;
-                            rt = end;
-                        }
-                        let ok = match run_type {
-                            GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
-                                14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                rt as usize, $cols, &blob,
-                            ),
-                            GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
-                                8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                rt as usize, $cols, &blob,
-                            ),
-                            _ => g.engine.batch_gguf_b4multi(
-                                12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                                rt as usize, $cols, &blob,
-                            ),
-                        };
-                        flushed_fast &= ok;
-                        if multi_dbg_dec && !multi_dbg_dec_dumped.replace(true) {
-                            let lo = ($secs[0].2 as u32).min(
-                                $secs.iter().take(4).map(|s| s.2 as u32).min().unwrap_or(0),
-                            ) as usize / 4;
-                            let hi = lo + 4 * $rows_total;
-                            let dump: Vec<f32> = g.slot_f32(lo, hi.max(1) - lo).to_vec();
-                            let _ = std::fs::write(
-                                format!("/tmp/chaindump_{}.bin", std::process::id()),
-                                dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
-                            );
-                        }
-                    } else {
-                        flushed_fast = false;
+                    match groups.last_mut() {
+                        Some(g) if g.0 == ty => g.1.push((i, *rows, *y_off as u32, *y_stride)),
+                        _ => groups.push((ty, vec![(i, *rows, *y_off as u32, *y_stride)])),
                     }
                 }
-                if multi_dbg_dec && !multi_dbg_dec_dumped.replace(true) {
-                    let lo = $secs.iter().take(4).map(|s| s.2 as u32).min().unwrap_or(0) as usize / 4;
-                    let hi = lo + 4 * $rows_total;
-                    let dump: Vec<f32> = g.slot_f32(lo, hi.max(1) - lo).to_vec();
-                    let _ = std::fs::write(
-                        format!("/tmp/chaindump_unf.bin"),
-                        dump.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
-                    );
+                let mut flushed_fast = true;
+                let mut first_dumped = !multi_dbg_dec;
+                for (run_type, run) in groups.iter() {
+                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                    let mut base = usize::MAX;
+                    for (idx, _rr, _yo, _ys) in run {
+                        let raw = gguf.data_offset + $secs[*idx].0.offset;
+                        base = base.min(raw & !255usize);
+                    }
+                    let mut end = 0u32;
+                    let mut rt = 0u32;
+                    for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
+                        let raw = gguf.data_offset + $secs[*idx].0.offset;
+                        blob[j][0] = ((raw & !255usize) - base) as u32;
+                        blob[j][1] = (raw & 255usize) as u32;
+                        end += *rr;
+                        blob[j][2] = end;
+                        blob[j][3] = *yo;
+                        blob[j][4] = *ys;
+                        rt = end;
+                    }
+                    if multi_dbg_dec && !first_dumped {
+                        first_dumped = true;
+                        let fb8 = gguf.as_bytes();
+                        for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
+                            let raw = gguf.data_offset + $secs[*idx].0.offset;
+                            let slot = base + blob[j][0] as usize + blob[j][1] as usize;
+                            if slot + 2 > fb8.len() || raw + 2 > fb8.len() {
+                                eprintln!("[b4blob] sec{j} OOB base={base} off={} rem={} raw={raw} file_len={}",
+                                    blob[j][0], blob[j][1], fb8.len());
+                                continue;
+                            }
+                            let bits = u16::from_le_bytes([fb8[raw], fb8[raw + 1]]);
+                            let d_file = f16_bits_to_f32(bits);
+                            let bits2 = u16::from_le_bytes([fb8[slot], fb8[slot + 1]]);
+                            let d_slot = f16_bits_to_f32(bits2);
+                            eprintln!(
+                                "[b4blob] sec{j} ty={} raw={raw} base={base} off={} rem={} rows_end={} y_off={} stride={} d_file={d_file:.6e} d_slot={d_slot:.6e} match={}",
+                                *run_type, blob[j][0], blob[j][1], blob[j][2], blob[j][3], blob[j][4],
+                                (bits == bits2) as u8
+                            );
+                        }
+                    }
+                    let ok = match *run_type {
+                        GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
+                            14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                            rt as usize, $cols, &blob,
+                        ),
+                        GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
+                            8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                            rt as usize, $cols, &blob,
+                        ),
+                        _ => g.engine.batch_gguf_b4multi(
+                            12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                            rt as usize, $cols, &blob,
+                        ),
+                    };
+                    flushed_fast &= ok;
                 }
                 fast = all_ok && flushed_fast;
                 fast

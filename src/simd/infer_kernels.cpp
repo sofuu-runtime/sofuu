@@ -16,7 +16,6 @@
 #include <functional>
 #include <algorithm>
 #include <chrono>
-#include <atomic>
 #include <cstdio>
 #include <memory>
 
@@ -3022,11 +3021,51 @@ void sofuu_rmsnorm(float *out, const float *x, const float *weight, size_t n, fl
 
 // ── SwiGLU Activation ────────────────────────────────────────────────
 void sofuu_swiglu(float *out, const float *gate, const float *up, size_t n) {
+#if defined(SOFUU_NEON)
+    // silu(g) * up, where silu(g) = g / (1 + exp(-g)). The scalar expf loop
+    // below cost ~8.6us per 3072-element call — 0.7ms of every Qwen decode
+    // token and a slice of every prefill chunk. This is the usual 2^k * poly(r)
+    // NEON exp (|r| <= ln2/2, degree 6 => ~1e-8 relative), and out may alias
+    // gate (the decode path calls it in place), so each lane block loads both
+    // inputs before storing.
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t ln2 = vdupq_n_f32(0.6931471805599453f);
+    const float32x4_t inv_ln2 = vdupq_n_f32(1.4426950408889634f);
+    const float32x4_t lo = vdupq_n_f32(-87.0f);
+    const float32x4_t hi = vdupq_n_f32(88.0f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        for (int lane = 0; lane < 16; lane += 4) {
+            const float32x4_t g = vld1q_f32(gate + i + lane);
+            const float32x4_t u = vld1q_f32(up + i + lane);
+            const float32x4_t x = vminq_f32(vmaxq_f32(vnegq_f32(g), lo), hi);
+            const float32x4_t kf = vrndnq_f32(vmulq_f32(x, inv_ln2));
+            const float32x4_t r = vfmsq_f32(x, kf, ln2);
+            float32x4_t p = vdupq_n_f32(1.0f / 720.0f);
+            p = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), r, p);
+            p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), r, p);
+            p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), r, p);
+            p = vfmaq_f32(vdupq_n_f32(0.5f), r, p);
+            p = vfmaq_f32(one, r, p);
+            p = vfmaq_f32(one, r, p);
+            const int32x4_t ki = vcvtq_s32_f32(kf);
+            const float32x4_t scale =
+                vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ki, vdupq_n_s32(127)), 23));
+            const float32x4_t e = vmulq_f32(p, scale);
+            vst1q_f32(out + i + lane, vmulq_f32(vdivq_f32(g, vaddq_f32(one, e)), u));
+        }
+    }
+    for (; i < n; ++i) {
+        const float g = gate[i];
+        out[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+#else
     for (size_t i = 0; i < n; ++i) {
         float g = gate[i];
         float silu = g / (1.0f + expf(-g));
         out[i] = silu * up[i];
     }
+#endif
 }
 
 // ── Numerically Stable Softmax ───────────────────────────────────────
@@ -3986,6 +4025,178 @@ static void sofuu_attn_vacc_range_k16(float * __restrict out, const uint16_t * _
 #endif
 }
 
+// ── GQA-fused decode attention (n_rep == 2) ──────────────────────────
+// One KV head serves two query heads. Scoring and accumulating both queries
+// in one pass over the K/V rows halves the DRAM traffic of decode attention,
+// which is what that pass is bound by once the context is long (f16 KV:
+// 2 bytes x 2 tensors x ctx x kv_heads per layer). Per-head calls re-read the
+// same rows and only reuse them if both reps land back-to-back on one worker,
+// which the work split does not guarantee.
+//
+// Arithmetic per (position, rep) is the same instruction sequence as
+// sofuu_attn_qk_rows8_k16 / sofuu_attn_vacc_range_k16, so the outputs are
+// bit-identical to the per-head path (pinned by a unit test).
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+static void sofuu_attn_qk_gqa2_k16(const float * __restrict q_a, const float * __restrict q_b,
+                                   const uint16_t * __restrict k_base, size_t k_stride,
+                                   size_t head_dim, size_t count, float scale,
+                                   float * __restrict s_a, float * __restrict s_b) {
+    size_t p = 0;
+    for (; p + 2 <= count; p += 2) {
+        const uint16_t *k0 = k_base + p * k_stride;
+        const uint16_t *k1 = k_base + (p + 1) * k_stride;
+        float32x4_t aa0 = vdupq_n_f32(0.0f), aa1 = vdupq_n_f32(0.0f);
+        float32x4_t aa2 = vdupq_n_f32(0.0f), aa3 = vdupq_n_f32(0.0f);
+        float32x4_t ab0 = vdupq_n_f32(0.0f), ab1 = vdupq_n_f32(0.0f);
+        float32x4_t ab2 = vdupq_n_f32(0.0f), ab3 = vdupq_n_f32(0.0f);
+        float32x4_t ba0 = vdupq_n_f32(0.0f), ba1 = vdupq_n_f32(0.0f);
+        float32x4_t ba2 = vdupq_n_f32(0.0f), ba3 = vdupq_n_f32(0.0f);
+        float32x4_t bb0 = vdupq_n_f32(0.0f), bb1 = vdupq_n_f32(0.0f);
+        float32x4_t bb2 = vdupq_n_f32(0.0f), bb3 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t qa0 = vld1q_f32(q_a + i);
+            const float32x4_t qa1 = vld1q_f32(q_a + i + 4);
+            const float32x4_t qa2 = vld1q_f32(q_a + i + 8);
+            const float32x4_t qa3 = vld1q_f32(q_a + i + 12);
+            const float32x4_t qb0 = vld1q_f32(q_b + i);
+            const float32x4_t qb1 = vld1q_f32(q_b + i + 4);
+            const float32x4_t qb2 = vld1q_f32(q_b + i + 8);
+            const float32x4_t qb3 = vld1q_f32(q_b + i + 12);
+            const float32x4_t k00 = sofuu_ldf16(k0 + i);
+            const float32x4_t k01 = sofuu_ldf16(k0 + i + 4);
+            const float32x4_t k02 = sofuu_ldf16(k0 + i + 8);
+            const float32x4_t k03 = sofuu_ldf16(k0 + i + 12);
+            const float32x4_t k10 = sofuu_ldf16(k1 + i);
+            const float32x4_t k11 = sofuu_ldf16(k1 + i + 4);
+            const float32x4_t k12 = sofuu_ldf16(k1 + i + 8);
+            const float32x4_t k13 = sofuu_ldf16(k1 + i + 12);
+            aa0 = vfmaq_f32(aa0, qa0, k00);
+            aa1 = vfmaq_f32(aa1, qa1, k01);
+            aa2 = vfmaq_f32(aa2, qa2, k02);
+            aa3 = vfmaq_f32(aa3, qa3, k03);
+            ab0 = vfmaq_f32(ab0, qa0, k10);
+            ab1 = vfmaq_f32(ab1, qa1, k11);
+            ab2 = vfmaq_f32(ab2, qa2, k12);
+            ab3 = vfmaq_f32(ab3, qa3, k13);
+            ba0 = vfmaq_f32(ba0, qb0, k00);
+            ba1 = vfmaq_f32(ba1, qb1, k01);
+            ba2 = vfmaq_f32(ba2, qb2, k02);
+            ba3 = vfmaq_f32(ba3, qb3, k03);
+            bb0 = vfmaq_f32(bb0, qb0, k10);
+            bb1 = vfmaq_f32(bb1, qb1, k11);
+            bb2 = vfmaq_f32(bb2, qb2, k12);
+            bb3 = vfmaq_f32(bb3, qb3, k13);
+        }
+        float32x4_t ca0 = vaddq_f32(vaddq_f32(aa0, aa1), vaddq_f32(aa2, aa3));
+        float32x4_t cb0 = vaddq_f32(vaddq_f32(ab0, ab1), vaddq_f32(ab2, ab3));
+        float32x4_t ca1 = vaddq_f32(vaddq_f32(ba0, ba1), vaddq_f32(ba2, ba3));
+        float32x4_t cb1 = vaddq_f32(vaddq_f32(bb0, bb1), vaddq_f32(bb2, bb3));
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t qa = vld1q_f32(q_a + j);
+            const float32x4_t qb = vld1q_f32(q_b + j);
+            const float32x4_t k0v = sofuu_ldf16(k0 + j);
+            const float32x4_t k1v = sofuu_ldf16(k1 + j);
+            ca0 = vfmaq_f32(ca0, qa, k0v);
+            cb0 = vfmaq_f32(cb0, qa, k1v);
+            ca1 = vfmaq_f32(ca1, qb, k0v);
+            cb1 = vfmaq_f32(cb1, qb, k1v);
+        }
+        float ta0 = vaddvq_f32(ca0), tb0 = vaddvq_f32(cb0);
+        float ta1 = vaddvq_f32(ca1), tb1 = vaddvq_f32(cb1);
+        for (; j < head_dim; ++j) {
+            ta0 += q_a[j] * sofuu_ldf16_1(k0 + j);
+            tb0 += q_a[j] * sofuu_ldf16_1(k1 + j);
+            ta1 += q_b[j] * sofuu_ldf16_1(k0 + j);
+            tb1 += q_b[j] * sofuu_ldf16_1(k1 + j);
+        }
+        s_a[p] = ta0 * scale;
+        s_a[p + 1] = tb0 * scale;
+        s_b[p] = ta1 * scale;
+        s_b[p + 1] = tb1 * scale;
+    }
+    for (; p < count; ++p) {
+        const uint16_t *k0 = k_base + p * k_stride;
+        s_a[p] = sofuu_dot_f16_f32(q_a, k0, head_dim) * scale;
+        s_b[p] = sofuu_dot_f16_f32(q_b, k0, head_dim) * scale;
+    }
+}
+
+static void sofuu_attn_vacc_gqa2_k16(float * __restrict out_a, float * __restrict out_b,
+                                     const uint16_t * __restrict v_base, size_t v_stride,
+                                     size_t head_dim, size_t count,
+                                     const float * __restrict s_a, const float * __restrict s_b) {
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t da0 = vld1q_f32(out_a + i), da1 = vld1q_f32(out_a + i + 4);
+            float32x4_t da2 = vld1q_f32(out_a + i + 8), da3 = vld1q_f32(out_a + i + 12);
+            float32x4_t db0 = vld1q_f32(out_b + i), db1 = vld1q_f32(out_b + i + 4);
+            float32x4_t db2 = vld1q_f32(out_b + i + 8), db3 = vld1q_f32(out_b + i + 12);
+            for (int a = 0; a < 4; ++a) {
+                const uint16_t *  vrow = v_base + (p + a) * v_stride;
+                const float32x4_t sa   = vdupq_n_f32(s_a[p + a]);
+                const float32x4_t sb   = vdupq_n_f32(s_b[p + a]);
+                const float32x4_t v0 = sofuu_ldf16(vrow + i);
+                const float32x4_t v1 = sofuu_ldf16(vrow + i + 4);
+                const float32x4_t v2 = sofuu_ldf16(vrow + i + 8);
+                const float32x4_t v3 = sofuu_ldf16(vrow + i + 12);
+                da0 = vmlaq_f32(da0, v0, sa);
+                da1 = vmlaq_f32(da1, v1, sa);
+                da2 = vmlaq_f32(da2, v2, sa);
+                da3 = vmlaq_f32(da3, v3, sa);
+                db0 = vmlaq_f32(db0, v0, sb);
+                db1 = vmlaq_f32(db1, v1, sb);
+                db2 = vmlaq_f32(db2, v2, sb);
+                db3 = vmlaq_f32(db3, v3, sb);
+            }
+            vst1q_f32(out_a + i, da0); vst1q_f32(out_a + i + 4, da1);
+            vst1q_f32(out_a + i + 8, da2); vst1q_f32(out_a + i + 12, da3);
+            vst1q_f32(out_b + i, db0); vst1q_f32(out_b + i + 4, db1);
+            vst1q_f32(out_b + i + 8, db2); vst1q_f32(out_b + i + 12, db3);
+        }
+        for (int a = 0; a < 4; ++a) {
+            const uint16_t *  vrow = v_base + (p + a) * v_stride;
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                const float32x4_t v = sofuu_ldf16(vrow + it);
+                vst1q_f32(out_a + it, vmlaq_f32(vld1q_f32(out_a + it), v, vdupq_n_f32(s_a[p + a])));
+                vst1q_f32(out_b + it, vmlaq_f32(vld1q_f32(out_b + it), v, vdupq_n_f32(s_b[p + a])));
+            }
+            for (; it < head_dim; ++it) {
+                const float v = sofuu_ldf16_1(vrow + it);
+                out_a[it] += v * s_a[p + a];
+                out_b[it] += v * s_b[p + a];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        const uint16_t *vrow = v_base + p * v_stride;
+        sofuu_mad_f16_f32(out_a, vrow, s_a[p], head_dim);
+        sofuu_mad_f16_f32(out_b, vrow, s_b[p], head_dim);
+    }
+}
+
+// SOFUU_GQA_ATTN=0 restores the per-head path (A/B switch). The overridable
+// atomic lets the equivalence test drive both paths in one process.
+static std::atomic<int> g_gqa_force{-1};
+static std::atomic<uint64_t> g_gqa_calls{0};
+extern "C" void sofuu_set_gqa_attn(int mode) { g_gqa_force.store(mode, std::memory_order_relaxed); }
+// Non-vacuity probe for the equivalence test: proves the fused branch ran.
+extern "C" uint64_t sofuu_gqa_attn_calls(void) { return g_gqa_calls.load(std::memory_order_relaxed); }
+static bool gqa_attn_enabled() {
+    const int forced = g_gqa_force.load(std::memory_order_relaxed);
+    if (forced >= 0) return forced != 0;
+    // Measured on Pi 5 (Qwen3-0.6B Q4_K_M, 16 heads / 8 KV heads / d=128,
+    // seq 200): 0.173 -> 0.115 ms per layer (-33%), which is 22.3 -> 23.5 t/s
+    // decode at a 234-token prompt with speculation off.
+    static int v = getenv("SOFUU_GQA_ATTN") ? (atoi(getenv("SOFUU_GQA_ATTN")) != 0) : 1;
+    return v != 0;
+}
+#endif
+
 // ── FA2-style block-tiled attention (online softmax) ─────────────────
 // The previous per-slot path materialized all seq_len scores and made three
 // scalar passes over them (dot / max+exp+sum / normalize) before a separate
@@ -4370,9 +4581,48 @@ void sofuu_batched_attention_ext_k16(
     size_t n_rep = n_heads / n_kv_heads;
     float inv_sqrt_head_dim = 1.0f / sqrtf((float)head_dim);
     const bool use_rows8 = sliding_window == 0;
-    size_t total_work = use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads;
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    // Decode (b == 1) with exactly two query heads per KV head: score and
+    // accumulate both in one pass over the K/V rows.
+    const bool use_gqa = use_rows8 && b_size == 1 && n_rep == 2 && n_kv_heads > 1 && gqa_attn_enabled();
+#else
+    const bool use_gqa = false;
+#endif
+    size_t total_work = use_gqa ? n_kv_heads
+                                : (use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads);
 
     auto compute_head_slice = [=](size_t start, size_t end) {
+        if (use_gqa) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            alignas(32) float gscore_stack[2][4096];
+            std::vector<float> heap_scores;
+            float *gscore[2];
+            for (size_t r = 0; r < 2; ++r) gscore[r] = gscore_stack[r];
+            if (max_seq_len > 4096) {
+                heap_scores.resize(2 * max_seq_len);
+                for (size_t r = 0; r < 2; ++r) gscore[r] = heap_scores.data() + r * max_seq_len;
+            }
+            g_gqa_calls.fetch_add((uint64_t)(end - start), std::memory_order_relaxed);
+            for (size_t work_idx = start; work_idx < end; ++work_idx) {
+                const size_t kv_h = work_idx;
+                const size_t pos = start_pos;
+                const size_t count = (pos + 1 < max_seq_len) ? (pos + 1) : max_seq_len;
+                const size_t head_base = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim;
+                const uint16_t *k_past = k_cache + head_base;
+                const uint16_t *v_past = v_cache + head_base;
+                const float *q_a = q_batch + (kv_h * n_rep) * head_dim;
+                float *out_a = head_out_batch + (kv_h * n_rep) * head_dim;
+                sofuu_attn_qk_gqa2_k16(q_a, q_a + head_dim, k_past, head_dim, head_dim, count,
+                                       inv_sqrt_head_dim, gscore[0], gscore[1]);
+                sofuu_softmax(gscore[0], count);
+                sofuu_softmax(gscore[1], count);
+                std::memset(out_a, 0, 2 * head_dim * sizeof(float));
+                sofuu_attn_vacc_gqa2_k16(out_a, out_a + head_dim, v_past, head_dim, head_dim, count,
+                                         gscore[0], gscore[1]);
+            }
+            return;
+#endif
+        }
         if (use_rows8) {
             alignas(32) float gscore_stack[8][4096];
             std::vector<float> heap_scores;
@@ -4461,6 +4711,10 @@ void sofuu_batched_attention_ext_k16(
 
     size_t effective_len = (sliding_window > 0 && start_pos > sliding_window) ? sliding_window : (start_pos + b_size / 2 + 1);
     bool run_parallel = (total_work >= 32) || (total_work >= 16 && effective_len >= 128);
+    // The GQA path has one work item per KV head (8 on Qwen/Llama-3.2), below
+    // the per-head thresholds but still worth spreading once each item is real
+    // work at long context.
+    if (use_gqa) run_parallel = (n_kv_heads >= 4 && effective_len >= 128);
 
     if (run_parallel) {
         g_pool.parallel_for(0, total_work, compute_head_slice);
@@ -4752,24 +5006,37 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
 extern "C" void sofuu_bench_gemv(unsigned type, int rows, int cols, int iters) {
 #if defined(__aarch64__)
     if (rows < 4 || iters < 1) return;
-    if (type != 8 && type != 12) return;
+    if (type != 8 && type != 12 && type != 14) return;
+    const bool q6 = (type == 14);
     const bool q4 = (type == 12);
-    const size_t row_size = q4 ? (size_t)(cols / 256) * 144 : (size_t)(cols / 32) * 34;
+    const size_t row_size = q6 ? (size_t)(cols / 256) * 210
+                              : (q4 ? (size_t)(cols / 256) * 144 : (size_t)(cols / 32) * 34);
     std::vector<uint8_t> w((size_t)rows * row_size);
     std::vector<float> x((size_t)cols);
     std::vector<float> out((size_t)rows);
     uint32_t rng = 424242;
     for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
     for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
-    sanitize_block_scale_headers(w.data(), (size_t)rows * (q4 ? (size_t)(cols / 256) : (size_t)(cols / 32)),
-                                 q4 ? 144 : 34, q4 ? 4 : 2);
-    if (sofuu_tile_warm(w.data(), rows, cols, q4 ? 12 : 8) != 0) {
+    if (q6) {
+        // q6_K carries its fp16 d at the END of the 210-byte block; the shared
+        // helper stamps a header at offset 0, which would hit ql[] instead.
+        size_t n_blk = (size_t)rows * (size_t)(cols / 256);
+        for (size_t i = 0; i < n_blk; ++i) {
+            uint16_t db = ggml_cpu_fp32_to_fp16(0.5f + 0.015625f * (float)(i % 16));
+            memcpy(w.data() + i * 210 + 208, &db, 2);
+        }
+    } else {
+        sanitize_block_scale_headers(w.data(), (size_t)rows * (q4 ? (size_t)(cols / 256) : (size_t)(cols / 32)),
+                                     q4 ? 144 : 34, q4 ? 4 : 2);
+    }
+    if (sofuu_tile_warm(w.data(), rows, cols, q6 ? 14 : (q4 ? 12 : 8)) != 0) {
         fprintf(stderr, "[bench] gemv tile warm failed\n");
         return;
     }
     auto run = [&]() {
-        if (q4) sofuu_gemv_q4_k(w.data(), x.data(), out.data(), rows, cols);
-        else    sofuu_gemv_q8_0(w.data(), x.data(), out.data(), rows, cols);
+        if (q6)      sofuu_gemv_q6_k(w.data(), x.data(), out.data(), rows, cols);
+        else if (q4) sofuu_gemv_q4_k(w.data(), x.data(), out.data(), rows, cols);
+        else         sofuu_gemv_q8_0(w.data(), x.data(), out.data(), rows, cols);
     };
     run();
     auto t0 = std::chrono::steady_clock::now();
@@ -4777,10 +5044,42 @@ extern "C" void sofuu_bench_gemv(unsigned type, int rows, int cols, int iters) {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const double bytes = (double)rows * row_size * (double)iters;
     fprintf(stderr, "[bench] gemv %s %dx%d iters=%d: %.2fms/iter, %.2f GB/s\n",
-            q4 ? "q4_K" : "q8_0", rows, cols, iters, ms / iters, bytes / (ms * 1e6));
+            q6 ? "q6_K" : (q4 ? "q4_K" : "q8_0"), rows, cols, iters, ms / iters, bytes / (ms * 1e6));
 #else
     (void) type; (void) rows; (void) cols; (void) iters;
 #endif
+}
+
+// Decode-attention bench: one layer's worth of work, b rows over `iters`
+// iterations, so the k16 kernels can be timed without a model loaded.
+// SOFUU_BENCH_ATTN=b,heads,kv_heads,head_dim,seq_len,iters
+extern "C" void sofuu_bench_attn(int b_size, int n_heads, int n_kv_heads, int head_dim,
+                                 int seq_len, int iters) {
+    if (b_size < 1 || n_heads < 1 || n_kv_heads < 1 || head_dim < 1 || seq_len < 1 || iters < 1) return;
+    const size_t q_dim = (size_t)n_heads * head_dim;
+    const size_t kv_dim = (size_t)n_kv_heads * head_dim;
+    std::vector<float> q((size_t)b_size * q_dim, 0.05f);
+    std::vector<uint16_t> k16((size_t)n_kv_heads * seq_len * head_dim);
+    std::vector<uint16_t> v16(k16.size());
+    std::vector<float> out((size_t)b_size * q_dim);
+    uint32_t rng = 12345;
+    for (auto &h : k16) { rng = rng * 1664525u + 1013904223u; h = f32_to_f16_val(((int)(rng >> 16) % 200 - 100) / 300.0f); }
+    for (auto &h : v16) { rng = rng * 1664525u + 1013904223u; h = f32_to_f16_val(((int)(rng >> 16) % 200 - 100) / 300.0f); }
+    auto run = [&]() {
+        sofuu_batched_attention_ext_k16(q.data(), k16.data(), v16.data(), out.data(),
+                                        (size_t)b_size, (size_t)(seq_len - b_size), 0,
+                                        (size_t)n_heads, (size_t)n_kv_heads, (size_t)head_dim,
+                                        (size_t)seq_len, 0, 0);
+    };
+    run();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; it++) run();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // KV bytes this pass must touch once per kv head (+ trace of scores).
+    const double bytes = (double)n_kv_heads * seq_len * head_dim * 2 * 2 * iters;
+    fprintf(stderr, "[bench] attn_k16 b=%d h=%zu/%zu d=%d seq=%d iters=%d: %.3fms/iter, %.2f GB/s (kv floor)\n",
+            b_size, (size_t)n_heads, (size_t)n_kv_heads, head_dim, seq_len, iters,
+            ms / iters, bytes / (ms * 1e6));
 }
 
 extern "C" int sofuu_test_quant_q8_K_parity(int cols, int iters) {

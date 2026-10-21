@@ -174,6 +174,7 @@ impl AnonBuffer {
 
 #[inline(always)]
 fn inline_mad(dst: &mut [f32], src: &[f32], scalar: f32) {
+    let _p = super::quant::prof::Scope::new(&super::quant::prof::GLUE_NS, &super::quant::prof::GLUE_CALLS);
     let len = dst.len().min(src.len());
     let chunks_dst = dst[..len].chunks_exact_mut(4);
     let chunks_src = src[..len].chunks_exact(4);
@@ -843,6 +844,7 @@ impl TransformerModel {
         dim: usize,
         dst: &mut [f32],
     ) {
+        let _p = super::quant::prof::Scope::new(&super::quant::prof::EMBED_NS, &super::quant::prof::EMBED_CALLS);
         let emb_bytes = Self::tensor_slice(gguf, token_embd);
         let row_size = type_row_size(token_embd.tensor_type, dim);
         let row_offset = (token_id as usize) * row_size;

@@ -312,6 +312,17 @@ pub fn simd_features() -> i32 {
     unsafe { sofuu_simd_features() }
 }
 
+/// Decode-attention microbenchmark (b, heads, kv heads, head_dim, seq, iters).
+pub unsafe fn bench_attn(b: i32, heads: i32, kv_heads: i32, head_dim: i32, seq: i32, iters: i32) {
+    sofuu_bench_attn(b, heads, kv_heads, head_dim, seq, iters);
+}
+
+/// Force the GQA-fused decode attention path on (1) or off (0); -1 restores
+/// the SOFUU_GQA_ATTN default. Only the equivalence test uses it.
+pub fn set_gqa_attn(mode: i32) {
+    unsafe { sofuu_set_gqa_attn(mode) };
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -564,6 +575,9 @@ extern "C" {
         sliding_window: usize,
         sink_tokens: usize,
     );
+    fn sofuu_bench_attn(b: i32, heads: i32, kv_heads: i32, head_dim: i32, seq: i32, iters: i32);
+    fn sofuu_set_gqa_attn(mode: i32);
+    fn sofuu_gqa_attn_calls() -> u64;
     fn sofuu_kv16_fast_path() -> i32;
     fn sofuu_simd_features() -> i32;
     fn sofuu_test_qk_rows8_f32(q: *const f32, k: *const f32, head_dim: usize, count: usize, out: *mut f32, scale: f32);
@@ -1714,6 +1728,7 @@ pub fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32]) {
 #[inline]
 pub fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
     assert_eq!(gate.len(), up.len());
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     unsafe {
         sofuu_swiglu(gate.as_mut_ptr(), gate.as_ptr(), up.as_ptr(), gate.len());
     }
@@ -2960,109 +2975,183 @@ mod tests {
     /// scalar fallback converts one element at a time and can differ by an ulp,
     /// so it is held to a tight tolerance instead. Without this gate the f16
     /// kernels silently degrade to the fallback and still "pass" a loose test.
-    #[test]
-    fn test_attention_k16_matches_f32_for_f16_exact_kv() {
-        let fast_path = unsafe { sofuu_kv16_fast_path() } != 0;
-        let n_heads = 4usize;
-        let n_kv_heads = 2usize;
-        let head_dim = 32usize;
-        let max_seq = 40usize;
-        let seq_len = 33usize;
-        let q_dim = n_heads * head_dim;
+/// Shared body of the f16-vs-f32 attention parity check, parameterised by
+/// head_dim so the 16-wide strip, the 4-wide continuation and the scalar tail
+/// are all exercised (32 = strips only, 34/36 = strips + tail).
+fn check_attention_k16_parity(head_dim: usize) {
 
-        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let fast_path = unsafe { sofuu_kv16_fast_path() } != 0;
+    let n_heads = 4usize;
+    let n_kv_heads = 2usize;
+    let max_seq = 40usize;
+    let seq_len = 33usize;
+    let q_dim = n_heads * head_dim;
+
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        ((rng >> 33) as f32 / (u32::MAX >> 1) as f32) - 0.5
+    };
+
+    let mut q = vec![0.0f32; q_dim];
+    for v in q.iter_mut() {
+        *v = next();
+    }
+    // KV values are f16-rounded first, so the f32 cache and the f16 shadow
+    // hold the same numbers and the two kernels are directly comparable.
+    let mut k32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
+    let mut v32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
+    let mut k16 = vec![0u16; k32.len()];
+    let mut v16 = vec![0u16; v32.len()];
+    for h in 0..n_kv_heads {
+        for p in 0..seq_len {
+            let base = h * max_seq * head_dim + p * head_dim;
+            for d in 0..head_dim {
+                let kh = f32_to_f16(next());
+                let vh = f32_to_f16(next());
+                k16[base + d] = kh;
+                v16[base + d] = vh;
+                k32[base + d] = f16_to_f32(kh);
+                v32[base + d] = f16_to_f32(vh);
+            }
+        }
+    }
+
+    let check = |a: &[f32], b: &[f32], what: &str| {
+        if fast_path {
+            assert_eq!(a, b, "{what} diverged under the vector f16 path");
+        } else {
+            let md = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert!(md <= 1e-6, "{what} diverged by {md:e} under the scalar f16 fallback");
+        }
+    };
+
+    // Score vectors: covers the 2-position pair loop and the leftover dot.
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    for count in 1..=seq_len {
+        let mut s32 = vec![0.0f32; count];
+        let mut s16 = vec![0.0f32; count];
+        unsafe {
+            sofuu_test_qk_rows8_f32(q.as_ptr(), k32.as_ptr(), head_dim, count, s32.as_mut_ptr(), scale);
+            sofuu_test_qk_rows8_k16(q.as_ptr(), k16.as_ptr(), head_dim, count, s16.as_mut_ptr(), scale);
+        }
+        check(&s32, &s16, &format!("score vectors at count {count}"));
+    }
+
+    // Decode shape: one row through the rows8 score path, every position.
+    for pos in 0..seq_len {
+        let mut out32 = vec![0.0f32; q_dim];
+        let mut out16 = vec![0.0f32; q_dim];
+        batched_attention_ext(
+            &q, &k32, &v32, &mut out32, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        batched_attention_ext_k16(
+            &q, &k16, &v16, &mut out16, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        check(&out32, &out16, &format!("decode attention at pos {pos}"));
+    }
+
+    // GQA-fused decode (n_rep == 2) must be bit-identical to the per-head
+    // path: same arithmetic, K/V rows read once instead of twice.
+    let calls_before = unsafe { sofuu_gqa_attn_calls() };
+    for pos in [0usize, 1, 2, 7, seq_len - 1] {
+        let mut per_head = vec![0.0f32; q_dim];
+        let mut fused = vec![0.0f32; q_dim];
+        set_gqa_attn(0);
+        batched_attention_ext_k16(
+            &q, &k16, &v16, &mut per_head, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        set_gqa_attn(1);
+        batched_attention_ext_k16(
+            &q, &k16, &v16, &mut fused, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+        );
+        assert_eq!(per_head, fused, "GQA-fused decode attention differs at pos {pos}");
+    }
+    set_gqa_attn(-1);
+    let calls_after = unsafe { sofuu_gqa_attn_calls() };
+    assert!(
+        calls_after > calls_before,
+        "the fused GQA branch never ran — the equivalence check above is vacuous"
+    );
+
+    // Sliding-window shape (MiniCPM/Spark use SWA): window + sinks.
+    let mut out32 = vec![0.0f32; q_dim];
+    let mut out16 = vec![0.0f32; q_dim];
+    batched_attention_ext(
+        &q, &k32, &v32, &mut out32, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
+    );
+    batched_attention_ext_k16(
+        &q, &k16, &v16, &mut out16, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
+    );
+    check(&out32, &out16, "sliding-window attention");
+
+    // Batch shape: 8 rows in one call (rows8 group sharing K strips).
+    let rows = 8usize;
+    let mut qb = vec![0.0f32; rows * q_dim];
+    for v in qb.iter_mut() {
+        *v = next();
+    }
+    let mut ob32 = vec![0.0f32; rows * q_dim];
+    let mut ob16 = vec![0.0f32; rows * q_dim];
+    batched_attention_ext(
+        &qb, &k32, &v32, &mut ob32, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+    );
+    batched_attention_ext_k16(
+        &qb, &k16, &v16, &mut ob16, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+    );
+    check(&ob32, &ob16, "batched attention");
+
+}
+
+    /// The vectorized sigmoid in sofuu_swiglu must stay within f32 noise of the
+    /// scalar reference it replaced: the NEON path uses a degree-6 polynomial
+    /// exp, so anything beyond ~1e-6 relative means a broken lane or clamp.
+    #[test]
+    fn test_swiglu_matches_scalar_reference() {
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
         let mut next = || {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             ((rng >> 33) as f32 / (u32::MAX >> 1) as f32) - 0.5
         };
-
-        let mut q = vec![0.0f32; q_dim];
-        for v in q.iter_mut() {
-            *v = next();
-        }
-        // KV values are f16-rounded first, so the f32 cache and the f16 shadow
-        // hold the same numbers and the two kernels are directly comparable.
-        let mut k32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
-        let mut v32 = vec![0.0f32; n_kv_heads * max_seq * head_dim];
-        let mut k16 = vec![0u16; k32.len()];
-        let mut v16 = vec![0u16; v32.len()];
-        for h in 0..n_kv_heads {
-            for p in 0..seq_len {
-                let base = h * max_seq * head_dim + p * head_dim;
-                for d in 0..head_dim {
-                    let kh = f32_to_f16(next());
-                    let vh = f32_to_f16(next());
-                    k16[base + d] = kh;
-                    v16[base + d] = vh;
-                    k32[base + d] = f16_to_f32(kh);
-                    v32[base + d] = f16_to_f32(vh);
-                }
+        // Cover the clamp tails and ordinary activations; 19 is not a multiple
+        // of the 16-wide strip so the scalar remainder is exercised too.
+        for n in [1usize, 4, 16, 19, 4096] {
+            let mut gate = vec![0.0f32; n];
+            let mut up = vec![0.0f32; n];
+            for i in 0..n {
+                gate[i] = if i % 97 == 0 { next() * 240.0 } else { next() * 24.0 };
+                up[i] = next() * 4.0;
+            }
+            let want: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(&g, &u)| (g / (1.0f32 + (-g).exp())) * u)
+                .collect();
+            let mut got = gate.clone();
+            swiglu_in_place(&mut got, &up);
+            for i in 0..n {
+                let tol = 1e-6 * want[i].abs().max(1.0);
+                assert!(
+                    (got[i] - want[i]).abs() <= tol,
+                    "swiglu[{i}] of {n}: {} vs reference {}",
+                    got[i], want[i]
+                );
             }
         }
-
-        let check = |a: &[f32], b: &[f32], what: &str| {
-            if fast_path {
-                assert_eq!(a, b, "{what} diverged under the vector f16 path");
-            } else {
-                let md = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-                assert!(md <= 1e-6, "{what} diverged by {md:e} under the scalar f16 fallback");
-            }
-        };
-
-        // Score vectors: covers the 2-position pair loop and the leftover dot.
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        for count in 1..=seq_len {
-            let mut s32 = vec![0.0f32; count];
-            let mut s16 = vec![0.0f32; count];
-            unsafe {
-                sofuu_test_qk_rows8_f32(q.as_ptr(), k32.as_ptr(), head_dim, count, s32.as_mut_ptr(), scale);
-                sofuu_test_qk_rows8_k16(q.as_ptr(), k16.as_ptr(), head_dim, count, s16.as_mut_ptr(), scale);
-            }
-            check(&s32, &s16, &format!("score vectors at count {count}"));
-        }
-
-        // Decode shape: one row through the rows8 score path, every position.
-        for pos in 0..seq_len {
-            let mut out32 = vec![0.0f32; q_dim];
-            let mut out16 = vec![0.0f32; q_dim];
-            batched_attention_ext(
-                &q, &k32, &v32, &mut out32, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
-            );
-            batched_attention_ext_k16(
-                &q, &k16, &v16, &mut out16, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
-            );
-            check(&out32, &out16, &format!("decode attention at pos {pos}"));
-        }
-
-        // Sliding-window shape (MiniCPM/Spark use SWA): window + sinks.
-        let mut out32 = vec![0.0f32; q_dim];
-        let mut out16 = vec![0.0f32; q_dim];
-        batched_attention_ext(
-            &q, &k32, &v32, &mut out32, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
-        );
-        batched_attention_ext_k16(
-            &q, &k16, &v16, &mut out16, 1, seq_len - 1, 0, n_heads, n_kv_heads, head_dim, max_seq, 8, 2,
-        );
-        check(&out32, &out16, "sliding-window attention");
-
-        // Batch shape: 8 rows in one call (rows8 group sharing K strips).
-        let rows = 8usize;
-        let mut qb = vec![0.0f32; rows * q_dim];
-        for v in qb.iter_mut() {
-            *v = next();
-        }
-        let mut ob32 = vec![0.0f32; rows * q_dim];
-        let mut ob16 = vec![0.0f32; rows * q_dim];
-        batched_attention_ext(
-            &qb, &k32, &v32, &mut ob32, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
-        );
-        batched_attention_ext_k16(
-            &qb, &k16, &v16, &mut ob16, rows, 0, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
-        );
-        check(&ob32, &ob16, "batched attention");
     }
+
+    #[test]
+    fn test_attention_k16_matches_f32_for_f16_exact_kv() {
+        for head_dim in [32usize, 34, 36] {
+            check_attention_k16_parity(head_dim);
+        }
+    }
+
+
 }
 
 /// Batched prefill GEMM entries for the shared C++ kernels — the same ones

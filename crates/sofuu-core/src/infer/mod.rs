@@ -1167,6 +1167,18 @@ impl InferEngine {
             }
         }
 
+        // Speculation receipt: steps vs accepted candidates is the number the
+        // adaptive gate acts on, so a run that felt slower can be diagnosed
+        // without a rebuild (tokens/step below the break-even means the tree
+        // paid for drafts that missed).
+        if quant::prof::enabled() && spec_steps > 0 {
+            let tps = (spec_steps + spec_accepted) as f32 / spec_steps as f32;
+            eprintln!(
+                "[spec] steps={spec_steps} accepted={spec_accepted} tokens/step={tps:.3} gate_off={} min_accept={spec_min_accept:.2}",
+                if spec_disabled { "yes" } else { "no" }
+            );
+        }
+
         // Cache the history for multi-turn continuations
         self.cached_tokens = history;
 

@@ -1660,6 +1660,23 @@ fn main() -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
             }
+            if let Ok(spec) = std::env::var("SOFUU_BENCH_ATTN") {
+                // b,heads,kv_heads,head_dim,seq_len,iters — decode attention cost.
+                let parts: Vec<usize> = spec
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>().unwrap_or(0))
+                    .collect();
+                if parts.len() == 6 && parts.iter().all(|&v| v > 0) {
+                    eprintln!("[bench] SOFUU_BENCH_ATTN {}", spec);
+                    unsafe {
+                        sofuu_core::infer::quant::bench_attn(
+                            parts[0] as i32, parts[1] as i32, parts[2] as i32,
+                            parts[3] as i32, parts[4] as i32, parts[5] as i32,
+                        );
+                    }
+                    return ExitCode::SUCCESS;
+                }
+            }
             if let Ok(spec) = std::env::var("SOFUU_BENCH_GEMM") {
                 let parts: Vec<usize> = spec
                     .split(',')

@@ -169,3 +169,59 @@ entered.
 - **Phase 4:** calm (<2.5) deciding sweep → parity.jsonl PASS/fail → per-model
   default flips. Blocked on window/peers so far.
 - **Phase 5:** untouched by design (spec/MTP/KIVI/sparsity after parity).
+
+# PROGRESS LEDGER #2 (2026-10-21 — phases 0-1 complete, phase 2 ~70%)
+
+**Overall: ~55-60% of the program.** The decode-side correctness contract is
+now UNIFORM: all five llama.cpp-loadable fleet models decode FULL-TEXT
+bit-identical to the CPU route with the fused type-grouped dispatch ON
+(battery #11.1/#11.2, docs/bench/parity.jsonl).
+
+## Phase status
+- **Phase 0 (100%)** — unchanged; PLUS the text-gate protocol fix: full-text
+  compare (tail -1 was comparing different lines of multiline completions —
+  it manufactured a week of phantom text divergences) with SOFUU_GPU_SPEC
+  pinned.
+- **Phase 1 (100%)** — op diet landed end-to-end: gate_up fusion (prefill
+  +72%), o/down resid-epilogue GEMM, the q6_K sectioned b4 GEMV (bit-exact,
+  lane=l coalesced), and TYPE-GROUPED mixed dispatch (q4_K/q6_K/q8_0 runs —
+  the qkv [q4,q4,q6] case = 2 dispatches). The qkv fusion is no longer
+  blocked by mixed types.
+- **Phase 2 (~70%)** — the decode per-model program is CORRECTNESS-COMPLETE:
+  1B 61.9-72 t/s (was 44-53), MiniCPM 10.8 (was 5.4-6.9), 0.6B 39.9, Spark
+  24.0, 8B correct (calm receipts pending). The enabling fix = THE blob base
+  bug: sections are not monotonic in file order (1B attn_k sits below
+  attn_q); base-from-first-section underflowed the u32 delta to 2^32 → the
+  kernel read base+2^32+rem. base = MIN aligned offset per run (group-then-
+  dispatch rewrite; the prefill macro's latent copy audited+fixed the same
+  day). Rate wave begun: q8_0 b4r4 (x-traffic/4) = RATE-NEUTRAL with receipt
+  → decode is latency-chain bound (64 serialized load→cvt→FMA iterations per
+  lane; f16 d interleaved every 34B blocks u32 loads) — unroll/dual-chain +
+  lane-split + int8x4 de-interleave are the named levers.
+- **Phase 3 (5%)** — GEMM class exists at B≤32 (text-exact, 33 t/s class on
+  0.6B at load); chunk-128 + compute-rate not started.
+- **Phase 4 (0%)** — calm sweep blocked on window; bars from battery #10.5/11.
+- **Phase 5** — not entered (by design).
+
+## Board (decode bars = llama.cpp default, full-text-gated Sofuu)
+| model | bar | Sofuu | gap | note |
+|---|---|---|---|---|
+| 1B | 123 | 62 | 2.0x | q8_0 fused ✓; latency chain next |
+| 0.6B | 223 | 40 | 5.6x | q4/q6 ✓ |
+| Spark | 51 | 24 | 2.1x | rides q4 |
+| MiniCPM | 72 | 11 | 6.5x deepest | q6/q8 ✓; rate wave |
+| 8B | 31 | pending calm | — | correct at any load; ~3 calm-class |
+
+Prompt side (Phase 3) is where the 3-6x gaps remain on every model.
+
+## Next in order
+1. q8_0 latency-chain experiments (2-block unroll with 8 chains → lane-split
+   → int8x4 de-interleave); same pattern for q6_K (MiniCPM).
+2. 8B calm receipts; then Phase 3 chunk-128 + compute-rate.
+3. Calm deciding sweep (Phase 4) → per-model flip table → Phase 5.
+
+Bugs closed this leg (receipts in memory: mac-metal-gpu1-session): the blob
+base/min-base fix (the week's actual blocker), the tail -1 text-gate
+artifact, the q8_0 [d][qs] layout trap, the extern "C" mangling of appended
+ops, the test-side ref-offset typo — every one caught by the pinned
+full-text gates or the standalone oracle tests.

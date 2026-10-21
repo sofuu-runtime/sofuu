@@ -271,6 +271,14 @@ pub fn gemm_bench(ty: u32, rows: usize, cols: usize, batch: usize, iters: usize)
     }
 }
 
+/// Device micro-bench for the serial decode GEMV path (kernel + prologue):
+/// prints GB/s of weight bytes streamed per call, the decode bandwidth metric.
+pub fn gemv_bench(ty: u32, rows: usize, cols: usize, iters: usize) {
+    unsafe {
+        sofuu_bench_gemv(ty, rows as i32, cols as i32, iters as i32);
+    }
+}
+
 /// Device micro-bench for the q4_K nibble-plane prefill kernel vs the packed
 /// one (kernel-only, identical synthetic tensors); prints both GMAC/s rates.
 pub fn gemm_bench_plane(rows: usize, cols: usize, batch: usize, iters: usize) {
@@ -422,6 +430,7 @@ extern "C" {
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
+    fn sofuu_bench_gemv(ty: u32, rows: i32, cols: i32, iters: i32);
     fn sofuu_bench_gemm_plane(rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_test_gemm_q4_k_plane_parity(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_test_q4_k_s_bit_exact(rows: i32, cols: i32, batch: i32) -> i32;
@@ -486,6 +495,15 @@ extern "C" {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize, freq_base: f32, rope_mode: i32,
     );
+    fn sofuu_kv16_convert(src: *const f32, dst: *mut u16, n: usize);
+    fn sofuu_batched_rope_kv_f16(
+        q_batch: *mut f32, k_batch: *mut f32, v_batch: *const f32,
+        k_cache: *mut f32, v_cache: *mut f32,
+        k16_cache: *mut u16, v16_cache: *mut u16,
+        b_size: usize, start_pos: usize, layer_idx: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, freq_base: f32, rope_mode: i32,
+    );
     fn sofuu_swiglu(out: *mut f32, gate: *const f32, up: *const f32, n: usize);
     fn sofuu_softmax(scores: *mut f32, n: usize);
     fn sofuu_rope(vec: *mut f32, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32, rope_style: i32);
@@ -522,6 +540,21 @@ extern "C" {
         q_batch: *const f32,
         k_cache: *const f32,
         v_cache: *const f32,
+        head_out_batch: *mut f32,
+        b_size: usize,
+        start_pos: usize,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        sliding_window: usize,
+        sink_tokens: usize,
+    );
+    fn sofuu_batched_attention_ext_k16(
+        q_batch: *const f32,
+        k_cache: *const u16,
+        v_cache: *const u16,
         head_out_batch: *mut f32,
         b_size: usize,
         start_pos: usize,
@@ -1039,6 +1072,45 @@ pub fn batched_attention_ext(
         }
     }
 
+    /// f16-KV twin of `batched_attention_ext`: identical work split, halves
+    /// the KV bytes the score/AV passes stream. Numerically equals the f32
+    /// path up to f16 storage rounding (llama.cpp's default KV precision).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_attention_ext_k16(
+        q_batch: &[f32],
+        k16_cache: &[u16],
+        v16_cache: &[u16],
+        head_out_batch: &mut [f32],
+        b_size: usize,
+        start_pos: usize,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        sliding_window: usize,
+        sink_tokens: usize,
+    ) {
+        let _prof = prof::Scope::new(&prof::ATTN_NS, &prof::ATTN_CALLS);
+        unsafe {
+            sofuu_batched_attention_ext_k16(
+                q_batch.as_ptr(),
+                k16_cache.as_ptr(),
+                v16_cache.as_ptr(),
+                head_out_batch.as_mut_ptr(),
+                b_size,
+                start_pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                sliding_window,
+                sink_tokens,
+            );
+        }
+    }
+
     /// Bit-parity gate for the x4-position attention inner loops vs the
     /// original per-position dot/mad path. Returns 0 when outputs match.
     pub fn attention_x4_parity(n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> i32 {
@@ -1511,6 +1583,61 @@ pub fn batched_rope_kv(
             v_batch.as_ptr(),
             k_cache.as_mut_ptr(),
             v_cache.as_mut_ptr(),
+            b_size,
+            start_pos,
+            layer_idx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            freq_base,
+            rope_mode,
+        );
+    }
+}
+
+/// Vectorized f32 -> f16 row convert; the single rounding path every f16 KV
+/// shadow writer uses (matches the prefill writer bit for bit).
+#[inline]
+pub fn kv16_convert(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    unsafe {
+        sofuu_kv16_convert(src.as_ptr(), dst.as_mut_ptr(), src.len());
+    }
+}
+
+/// Batched RoPE + KV scatter that also writes the f16 shadow the CPU
+/// attention reads (one pass, so the shadow cannot drift).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn batched_rope_kv_f16(
+    q_batch: &mut [f32],
+    k_batch: &mut [f32],
+    v_batch: &[f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    k16_cache: &mut [u16],
+    v16_cache: &mut [u16],
+    b_size: usize,
+    start_pos: usize,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    freq_base: f32,
+    rope_mode: i32,
+) {
+    let _p = prof::Scope::new(&prof::ROPE_NS, &prof::ROPE_CALLS);
+    unsafe {
+        sofuu_batched_rope_kv_f16(
+            q_batch.as_mut_ptr(),
+            k_batch.as_mut_ptr(),
+            v_batch.as_ptr(),
+            k_cache.as_mut_ptr(),
+            v_cache.as_mut_ptr(),
+            k16_cache.as_mut_ptr(),
+            v16_cache.as_mut_ptr(),
             b_size,
             start_pos,
             layer_idx,

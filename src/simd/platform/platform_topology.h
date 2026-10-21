@@ -42,13 +42,19 @@ static inline int detect_optimal_threads() {
 #include <unistd.h>
 
 static inline int detect_optimal_threads() {
-    // Raspberry Pi 5 has 4 physical Cortex-A76 cores with no SMT
-    long n_online = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_online > 0) {
-        return (int)n_online;
-    }
-    int logical = (int)std::thread::hardware_concurrency();
-    return (logical > 0) ? logical : 4;
+    // Raspberry Pi 5 has 4 physical Cortex-A76 cores with no SMT.
+    // Cache the first answer: musl resolves _SC_NPROCESSORS_ONLN through the
+    // calling thread's affinity mask, so a later query from a thread the pool
+    // pinned to one core reports 1 and would silently collapse the pool.
+    static const int cached = [] {
+        long n_online = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n_online > 0) {
+            return (int)n_online;
+        }
+        int logical = (int)std::thread::hardware_concurrency();
+        return (logical > 0) ? logical : 4;
+    }();
+    return cached;
 }
 
 #else

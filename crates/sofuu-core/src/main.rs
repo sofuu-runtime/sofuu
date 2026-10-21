@@ -1645,6 +1645,21 @@ fn main() -> ExitCode {
             }
         }
         "infer" => {
+            if let Ok(spec) = std::env::var("SOFUU_BENCH_GEMV") {
+                // type,rows,cols,iters — serial-decode weight-stream rate.
+                let parts: Vec<usize> = spec
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>().unwrap_or(0))
+                    .collect();
+                if parts.len() == 4 && parts.iter().all(|&v| v > 0) {
+                    eprintln!(
+                        "[bench] SOFUU_BENCH_GEMV type={} rows={} cols={} iters={}",
+                        parts[0], parts[1], parts[2], parts[3]
+                    );
+                    sofuu_core::infer::quant::gemv_bench(parts[0] as u32, parts[1], parts[2], parts[3]);
+                    return ExitCode::SUCCESS;
+                }
+            }
             if let Ok(spec) = std::env::var("SOFUU_BENCH_GEMM") {
                 let parts: Vec<usize> = spec
                     .split(',')

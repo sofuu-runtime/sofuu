@@ -226,6 +226,22 @@ impl InferModel {
         }
     }
 
+    /// Per-model speculative tree size (see TransformerModel::spec_rows_default).
+    pub fn spec_rows_default(&self) -> usize {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.spec_rows_default(),
+            _ => 5,
+        }
+    }
+
+    /// Per-model decode thread count (see TransformerModel::decode_threads_auto).
+    pub fn decode_threads_auto(&self, max_threads: usize) -> usize {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.decode_threads_auto(max_threads),
+            _ => max_threads,
+        }
+    }
+
     pub fn set_streaming_weights(&mut self, enabled: bool) {
         if let ModelBackend::Gguf(m) = &mut self.backend {
             m.set_streaming_weights(enabled);
@@ -683,6 +699,21 @@ impl InferEngine {
     where
         F: FnMut(&str) -> bool,
     {
+        // Auto mode adjusts the pool per phase; restore the caller's count on
+        // every exit path so a stream() call never leaks its decode
+        // configuration to other users of the global pool.
+        struct PoolRestore(usize);
+        impl Drop for PoolRestore {
+            fn drop(&mut self) {
+                self::quant::set_thread_count(self.0);
+            }
+        }
+        let pool_base = if options.threads == 0 {
+            Some(self::quant::get_thread_count())
+        } else {
+            None
+        };
+        let _pool_guard = pool_base.map(PoolRestore);
         if options.threads > 0 {
             self::quant::set_thread_count(options.threads);
         }
@@ -853,6 +884,18 @@ impl InferEngine {
         let mut step = 0;
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
 
+        // Phase-tuned pool when the caller left threads on auto: prefill
+        // keeps every core (GEMM panels scale), decode narrows for q8_0.
+        if let Some(base) = pool_base {
+            let decode_threads = self.model.decode_threads_auto(base);
+            if quant::prof::enabled() {
+                eprintln!("[pool] auto: base={base} decode={decode_threads}");
+            }
+            if decode_threads != base {
+                self::quant::set_thread_count(decode_threads);
+            }
+        }
+
         while step < options.max_tokens {
             // Per-token profile scope (SOFUU_PROFILE): dropped at every
             // break path; report() prints every 32 steps with fresh buckets.
@@ -946,7 +989,7 @@ impl InferEngine {
                         let rows = std::env::var("SOFUU_SPEC_ROWS")
                             .ok()
                             .and_then(|v| v.parse::<usize>().ok())
-                            .unwrap_or(5)
+                            .unwrap_or_else(|| self.model.spec_rows_default())
                             .clamp(1, 8);
                         let widths = std::env::var("SOFUU_SPEC_WIDTHS")
                             .ok()

@@ -3098,6 +3098,55 @@ void sofuu_batched_rope_kv(
     });
 }
 
+// Vectorized f32 -> f16 row convert shared by every f16 KV shadow writer
+// (prefill batch, per-token decode, spec commits, compaction re-mirror), so
+// every writer rounds identically to the C __fp16 cast.
+void sofuu_kv16_convert(const float *src, uint16_t *dst, size_t n) {
+    size_t i = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(src + i)),
+                                     vcvt_f16_f32(vld1q_f32(src + i + 4)));
+        vst1q_f16((__fp16 *)(dst + i), h);
+    }
+#endif
+    for (; i < n; ++i) dst[i] = f32_to_f16_val(src[i]);
+}
+
+// f16 KV shadow writer: same RoPE + f32 KV store as sofuu_batched_rope_kv,
+// plus the f16 copy the CPU attention reads. Keep both stores in this one
+// pass so the shadow can never drift from the authoritative f32 cache.
+void sofuu_batched_rope_kv_f16(
+    float *q_batch, float *k_batch, const float *v_batch,
+    float *k_cache, float *v_cache,
+    uint16_t *k16_cache, uint16_t *v16_cache,
+    size_t b_size, size_t start_pos, size_t layer_idx,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t max_seq_len, float freq_base, int rope_mode
+) {
+    if (b_size == 0) return;
+    size_t q_dim = n_heads * head_dim;
+    size_t kv_dim = n_kv_heads * head_dim;
+    g_pool.parallel_for(0, b_size, [=](size_t b0, size_t b1) {
+        for (size_t b = b0; b < b1; ++b) {
+            size_t pos = start_pos + b;
+            sofuu_rope(q_batch + b * q_dim, n_heads, head_dim, pos, freq_base, rope_mode);
+            sofuu_rope(k_batch + b * kv_dim, n_kv_heads, head_dim, pos, freq_base, rope_mode);
+            size_t cache_pos = pos % max_seq_len;
+            const float *v_row = v_batch + b * kv_dim;
+            for (size_t kv_h = 0; kv_h < n_kv_heads; ++kv_h) {
+                size_t slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+                const float *k_row = k_batch + b * kv_dim + kv_h * head_dim;
+                const float *vv_row = v_row + kv_h * head_dim;
+                memcpy(k_cache + slot, k_row, head_dim * sizeof(float));
+                memcpy(v_cache + slot, vv_row, head_dim * sizeof(float));
+                sofuu_kv16_convert(k_row, k16_cache + slot, head_dim);
+                sofuu_kv16_convert(vv_row, v16_cache + slot, head_dim);
+            }
+        }
+    });
+}
+
 #if defined(__aarch64__) && defined(SOFUU_NEON)
 // Vector exp(x) for the softmax path: exp(x) = 2^(round(x·log2e) + frac) with
 // the magic-number rounding and a two-part ln2, then a degree-5 Horner for
@@ -3679,6 +3728,203 @@ static void sofuu_attn_vacc_range(float * __restrict out, const float * __restri
 #endif
 }
 
+// ── f16 KV attention inner kernels ────────────────────────────────────
+// Same loop shapes as the f32 kernels above; every KV load is converted
+// from the halved f16 shadow, so DRAM traffic on the score/AV passes drops
+// 50% (the llama.cpp default KV precision). Arithmetic order per dot is the
+// same after conversion; values match the f32 path up to f16 rounding.
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+static inline float32x4_t sofuu_ldf16(const uint16_t *p) {
+    return vcvt_f32_f16(vld1_f16((const __fp16 *)p));
+}
+#endif
+
+static inline float sofuu_ldf16_1(const uint16_t *p) { return f16_to_f32_val(*p); }
+
+static void sofuu_attn_qk_range_k16(const float * __restrict q, const uint16_t * __restrict k_base,
+                                    size_t k_stride, size_t head_dim, size_t p_begin, size_t count,
+                                    float scale, float * __restrict scores_out) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t p = 0;
+    for (; p + 2 <= count; p += 2) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        const uint16_t *k1 = k_base + (p_begin + p + 1) * k_stride;
+        float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
+        float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
+        float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
+        float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t qv0 = vld1q_f32(q + i);
+            const float32x4_t qv1 = vld1q_f32(q + i + 4);
+            const float32x4_t qv2 = vld1q_f32(q + i + 8);
+            const float32x4_t qv3 = vld1q_f32(q + i + 12);
+            a0s0 = vfmaq_f32(a0s0, qv0, sofuu_ldf16(k0 + i));
+            a0s1 = vfmaq_f32(a0s1, qv1, sofuu_ldf16(k0 + i + 4));
+            a0s2 = vfmaq_f32(a0s2, qv2, sofuu_ldf16(k0 + i + 8));
+            a0s3 = vfmaq_f32(a0s3, qv3, sofuu_ldf16(k0 + i + 12));
+            a1s0 = vfmaq_f32(a1s0, qv0, sofuu_ldf16(k1 + i));
+            a1s1 = vfmaq_f32(a1s1, qv1, sofuu_ldf16(k1 + i + 4));
+            a1s2 = vfmaq_f32(a1s2, qv2, sofuu_ldf16(k1 + i + 8));
+            a1s3 = vfmaq_f32(a1s3, qv3, sofuu_ldf16(k1 + i + 12));
+        }
+        float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+        float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t qv = vld1q_f32(q + j);
+            c0 = vfmaq_f32(c0, qv, sofuu_ldf16(k0 + j));
+            c1 = vfmaq_f32(c1, qv, sofuu_ldf16(k1 + j));
+        }
+        float t0 = vaddvq_f32(c0);
+        float t1 = vaddvq_f32(c1);
+        for (; j < head_dim; ++j) {
+            t0 += q[j] * sofuu_ldf16_1(k0 + j);
+            t1 += q[j] * sofuu_ldf16_1(k1 + j);
+        }
+        scores_out[p]     = t0 * scale;
+        scores_out[p + 1] = t1 * scale;
+    }
+    for (; p < count; ++p) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        float t = 0.0f;
+        for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
+        scores_out[p] = t * scale;
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        float t = 0.0f;
+        for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
+        scores_out[p] = t * scale;
+    }
+#endif
+}
+
+static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_stride,
+                                    const uint16_t * __restrict k_base, size_t k_stride,
+                                    size_t head_dim, size_t p_begin, const size_t *counts,
+                                    float * __restrict const * __restrict outs,
+                                    float scale, size_t nrows) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    if (nrows == 0) return;
+    size_t max_count = counts[nrows - 1];
+    for (size_t p = 0; p + 2 <= max_count; p += 2) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        const uint16_t *k1 = k_base + (p_begin + p + 1) * k_stride;
+        for (size_t r = 0; r < nrows; ++r) {
+            const float *q = q_batch + r * q_stride;
+            float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
+            float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
+            float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
+            float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+            size_t i = 0;
+            for (; i + 16 <= head_dim; i += 16) {
+                const float32x4_t qv0 = vld1q_f32(q + i);
+                const float32x4_t qv1 = vld1q_f32(q + i + 4);
+                const float32x4_t qv2 = vld1q_f32(q + i + 8);
+                const float32x4_t qv3 = vld1q_f32(q + i + 12);
+                a0s0 = vfmaq_f32(a0s0, qv0, sofuu_ldf16(k0 + i));
+                a0s1 = vfmaq_f32(a0s1, qv1, sofuu_ldf16(k0 + i + 4));
+                a0s2 = vfmaq_f32(a0s2, qv2, sofuu_ldf16(k0 + i + 8));
+                a0s3 = vfmaq_f32(a0s3, qv3, sofuu_ldf16(k0 + i + 12));
+                a1s0 = vfmaq_f32(a1s0, qv0, sofuu_ldf16(k1 + i));
+                a1s1 = vfmaq_f32(a1s1, qv1, sofuu_ldf16(k1 + i + 4));
+                a1s2 = vfmaq_f32(a1s2, qv2, sofuu_ldf16(k1 + i + 8));
+                a1s3 = vfmaq_f32(a1s3, qv3, sofuu_ldf16(k1 + i + 12));
+            }
+            float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+            float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+            size_t j = i;
+            for (; j + 4 <= head_dim; j += 4) {
+                const float32x4_t qv = vld1q_f32(q + j);
+                c0 = vfmaq_f32(c0, qv, sofuu_ldf16(k0 + j));
+                c1 = vfmaq_f32(c1, qv, sofuu_ldf16(k1 + j));
+            }
+            float t0 = vaddvq_f32(c0);
+            float t1 = vaddvq_f32(c1);
+            for (; j < head_dim; ++j) {
+                t0 += q[j] * sofuu_ldf16_1(k0 + j);
+                t1 += q[j] * sofuu_ldf16_1(k1 + j);
+            }
+            const size_t p_abs = p_begin + p;
+            if (p_abs < counts[r]) outs[r][p_abs] = t0 * scale;
+            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = t1 * scale;
+        }
+    }
+    for (size_t r = 0; r < nrows; ++r) {
+        for (size_t p = (max_count - (max_count & 1)); p < counts[r]; ++p) {
+            const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+            const float *q = q_batch + r * q_stride;
+            float t = 0.0f;
+            for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
+            outs[r][p_begin + p] = t * scale;
+        }
+    }
+#else
+    for (size_t r = 0; r < nrows; ++r) {
+        const float *q = q_batch + r * q_stride;
+        for (size_t p = 0; p < counts[r]; ++p) {
+            const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+            float t = 0.0f;
+            for (size_t j = 0; j < head_dim; ++j) t += q[j] * sofuu_ldf16_1(k0 + j);
+            outs[r][p] = t * scale;
+        }
+    }
+#endif
+}
+
+static void sofuu_attn_vacc_range_k16(float * __restrict out, const uint16_t * __restrict v_base,
+                                      size_t v_stride, size_t head_dim, size_t p_begin, size_t count,
+                                      const float * __restrict s) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t d0 = vld1q_f32(out + i);
+            float32x4_t d1 = vld1q_f32(out + i + 4);
+            float32x4_t d2 = vld1q_f32(out + i + 8);
+            float32x4_t d3 = vld1q_f32(out + i + 12);
+            for (int a = 0; a < 4; ++a) {
+                const float32x4_t sv   = vdupq_n_f32(s[p + a]);
+                const uint16_t *  vrow = v_base + (p_begin + p + a) * v_stride;
+                d0 = vmlaq_f32(d0, sofuu_ldf16(vrow + i), sv);
+                d1 = vmlaq_f32(d1, sofuu_ldf16(vrow + i + 4), sv);
+                d2 = vmlaq_f32(d2, sofuu_ldf16(vrow + i + 8), sv);
+                d3 = vmlaq_f32(d3, sofuu_ldf16(vrow + i + 12), sv);
+            }
+            vst1q_f32(out + i, d0);
+            vst1q_f32(out + i + 4, d1);
+            vst1q_f32(out + i + 8, d2);
+            vst1q_f32(out + i + 12, d3);
+        }
+        for (int a = 0; a < 4; ++a) {
+            const uint16_t *  vrow = v_base + (p_begin + p + a) * v_stride;
+            const float32x4_t sv   = vdupq_n_f32(s[p + a]);
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                float32x4_t d = vld1q_f32(out + it);
+                d = vmlaq_f32(d, sofuu_ldf16(vrow + it), sv);
+                vst1q_f32(out + it, d);
+            }
+            for (; it < head_dim; ++it) {
+                out[it] += sofuu_ldf16_1(vrow + it) * s[p + a];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        const uint16_t *vrow = v_base + (p_begin + p) * v_stride;
+        for (size_t i = 0; i < head_dim; ++i) out[i] += sofuu_ldf16_1(vrow + i) * s[p];
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        const uint16_t *vrow = v_base + (p_begin + p) * v_stride;
+        for (size_t i = 0; i < head_dim; ++i) out[i] += sofuu_ldf16_1(vrow + i) * s[p];
+    }
+#endif
+}
+
 // ── FA2-style block-tiled attention (online softmax) ─────────────────
 // The previous per-slot path materialized all seq_len scores and made three
 // scalar passes over them (dot / max+exp+sum / normalize) before a separate
@@ -3993,6 +4239,129 @@ void sofuu_batched_attention_ext(
     }
 }
 
+// f16-KV twin of sofuu_batched_attention_ext. Same work decomposition
+// (rows8 score sharing, pool threshold), FA2 not wired here — its tile pass
+// is f32-only and measured net-negative at our seq lengths. SWA and sinks
+// are supported because MiniCPM/Spark use sliding windows.
+void sofuu_batched_attention_ext_k16(
+    const float *q_batch,
+    const uint16_t *k_cache,
+    const uint16_t *v_cache,
+    float *head_out_batch,
+    size_t b_size,
+    size_t start_pos,
+    size_t layer_idx,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    size_t max_seq_len,
+    size_t sliding_window,
+    size_t sink_tokens
+) {
+    if (b_size == 0 || n_heads == 0 || head_dim == 0) return;
+    size_t q_dim = n_heads * head_dim;
+    size_t n_rep = n_heads / n_kv_heads;
+    float inv_sqrt_head_dim = 1.0f / sqrtf((float)head_dim);
+    const bool use_rows8 = sliding_window == 0;
+    size_t total_work = use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads;
+
+    auto compute_head_slice = [=](size_t start, size_t end) {
+        if (use_rows8) {
+            alignas(32) float gscore_stack[8][4096];
+            std::vector<float> heap_scores;
+            float *gscore[8];
+            for (size_t r = 0; r < 8; ++r) gscore[r] = gscore_stack[r];
+            if (max_seq_len > 4096) {
+                heap_scores.resize(8 * max_seq_len);
+                for (size_t r = 0; r < 8; ++r) gscore[r] = heap_scores.data() + r * max_seq_len;
+            }
+            for (size_t work_idx = start; work_idx < end; ++work_idx) {
+                const size_t grp = work_idx / n_heads;
+                const size_t h   = work_idx % n_heads;
+                const size_t b0  = grp * 8;
+                const size_t b1  = (b0 + 8 < b_size) ? (b0 + 8) : b_size;
+                const size_t nr  = b1 - b0;
+                const size_t kv_h = h / n_rep;
+                size_t head_base = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim;
+                const uint16_t *k_past = k_cache + head_base;
+                const uint16_t *v_past = v_cache + head_base;
+                size_t counts[8];
+                float *outs_p[8];
+                for (size_t r = 0; r < nr; ++r) {
+                    const size_t pos = start_pos + b0 + r;
+                    counts[r] = (pos + 1 < max_seq_len) ? (pos + 1) : max_seq_len;
+                    outs_p[r] = gscore[r];
+                }
+                sofuu_attn_qk_rows8_k16(q_batch + b0 * q_dim + h * head_dim, q_dim, k_past,
+                                        head_dim, head_dim, 0, counts, outs_p, inv_sqrt_head_dim, nr);
+                for (size_t r = 0; r < nr; ++r) {
+                    sofuu_softmax(outs_p[r], counts[r]);
+                    float *out_head = head_out_batch + (b0 + r) * q_dim + h * head_dim;
+                    std::memset(out_head, 0, head_dim * sizeof(float));
+                    sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, 0, counts[r], outs_p[r]);
+                }
+            }
+            return;
+        }
+        alignas(32) float local_scores_stack[4096];
+        std::vector<float> heap_scores;
+        float *scores = local_scores_stack;
+        if (max_seq_len > 4096) {
+            heap_scores.resize(max_seq_len);
+            scores = heap_scores.data();
+        }
+        for (size_t work_idx = start; work_idx < end; ++work_idx) {
+            size_t b = work_idx / n_heads;
+            size_t h = work_idx % n_heads;
+            size_t kv_h = h / n_rep;
+            size_t pos = start_pos + b;
+            size_t seq_len = (pos + 1 < max_seq_len) ? (pos + 1) : max_seq_len;
+
+            const float *q_head = q_batch + b * q_dim + h * head_dim;
+            size_t head_base = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim;
+            const uint16_t *k_past = k_cache + head_base;
+            const uint16_t *v_past = v_cache + head_base;
+
+            if (sliding_window > 0 && seq_len > sliding_window) {
+                size_t window_start = seq_len - sliding_window;
+                size_t sink_end = (sink_tokens < window_start) ? sink_tokens : window_start;
+                size_t active_count = sink_end + (seq_len - window_start);
+
+                sofuu_attn_qk_range_k16(q_head, k_past, head_dim, head_dim, 0, sink_end, inv_sqrt_head_dim, scores);
+                sofuu_attn_qk_range_k16(q_head, k_past, head_dim, head_dim, window_start, seq_len - window_start,
+                                        inv_sqrt_head_dim, scores + sink_end);
+
+                sofuu_softmax(scores, active_count);
+
+                float *out_head = head_out_batch + b * q_dim + h * head_dim;
+                std::memset(out_head, 0, head_dim * sizeof(float));
+
+                sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, 0, sink_end, scores);
+                sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, window_start, seq_len - window_start,
+                                          scores + sink_end);
+            } else {
+                sofuu_attn_qk_range_k16(q_head, k_past, head_dim, head_dim, 0, seq_len, inv_sqrt_head_dim, scores);
+
+                sofuu_softmax(scores, seq_len);
+
+                float *out_head = head_out_batch + b * q_dim + h * head_dim;
+                std::memset(out_head, 0, head_dim * sizeof(float));
+
+                sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, 0, seq_len, scores);
+            }
+        }
+    };
+
+    size_t effective_len = (sliding_window > 0 && start_pos > sliding_window) ? sliding_window : (start_pos + b_size / 2 + 1);
+    bool run_parallel = (total_work >= 32) || (total_work >= 16 && effective_len >= 128);
+
+    if (run_parallel) {
+        g_pool.parallel_for(0, total_work, compute_head_slice);
+    } else {
+        compute_head_slice(0, total_work);
+    }
+}
+
 void sofuu_batched_attention(
     const float *q_batch,
     const float *k_cache,
@@ -4267,6 +4636,43 @@ extern "C" void sofuu_bench_gemm(unsigned type, int rows, int cols, int batch, i
     }
 #else
     (void) type; (void) rows; (void) cols; (void) batch; (void) iters;
+#endif
+}
+
+// Serial-decode GEMV micro-bench (Pi diagnostics; SOFUU_BENCH_GEMV env hook).
+// Prints the weight-stream rate of the batch-1 path — the decode bandwidth
+// metric — with the synthetic tile warmed outside the timed region.
+extern "C" void sofuu_bench_gemv(unsigned type, int rows, int cols, int iters) {
+#if defined(__aarch64__)
+    if (rows < 4 || iters < 1) return;
+    if (type != 8 && type != 12) return;
+    const bool q4 = (type == 12);
+    const size_t row_size = q4 ? (size_t)(cols / 256) * 144 : (size_t)(cols / 32) * 34;
+    std::vector<uint8_t> w((size_t)rows * row_size);
+    std::vector<float> x((size_t)cols);
+    std::vector<float> out((size_t)rows);
+    uint32_t rng = 424242;
+    for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
+    sanitize_block_scale_headers(w.data(), (size_t)rows * (q4 ? (size_t)(cols / 256) : (size_t)(cols / 32)),
+                                 q4 ? 144 : 34, q4 ? 4 : 2);
+    if (sofuu_tile_warm(w.data(), rows, cols, q4 ? 12 : 8) != 0) {
+        fprintf(stderr, "[bench] gemv tile warm failed\n");
+        return;
+    }
+    auto run = [&]() {
+        if (q4) sofuu_gemv_q4_k(w.data(), x.data(), out.data(), rows, cols);
+        else    sofuu_gemv_q8_0(w.data(), x.data(), out.data(), rows, cols);
+    };
+    run();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; it++) run();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double bytes = (double)rows * row_size * (double)iters;
+    fprintf(stderr, "[bench] gemv %s %dx%d iters=%d: %.2fms/iter, %.2f GB/s\n",
+            q4 ? "q4_K" : "q8_0", rows, cols, iters, ms / iters, bytes / (ms * 1e6));
+#else
+    (void) type; (void) rows; (void) cols; (void) iters;
 #endif
 }
 

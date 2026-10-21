@@ -13,14 +13,25 @@ use std::ops::{Deref, DerefMut};
 use super::gguf::{GgufFile, GgufValue, TensorInfo};
 use super::quant::{
     batched_add_bias, batched_mad, batched_rmsnorm, batched_rmsnorm_in_place, batched_rope_kv,
+    batched_rope_kv_f16,
     batched_swiglu, matmat_residual, matmat_pair,
-    batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row,
+    batched_attention_ext, batched_attention_ext_k16, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
     prefetch_streaming_slice, prefetch_temporal_slice, prof,
     rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, tree_attention, tree_rope, type_row_size,
     GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
 };
+
+/// Mirror a freshly written f32 KV row into the f16 shadow. Both stores stay
+/// on every write path, so the shadow can never describe a stale cache.
+#[inline]
+fn kv16_store(shadow: Option<&mut AnonBuffer>, slot: usize, src: &[f32]) {
+    if let Some(buf) = shadow {
+        let dst = buf.as_u16_mut();
+        super::quant::kv16_convert(src, &mut dst[slot..slot + src.len()]);
+    }
+}
 
 /// 128 leaves a half-long tail chunk, which measures better on the Pi 5 than
 /// two full 64 chunks (+4% Qwen prefill: one chunk less, better tile amortization;
@@ -138,6 +149,29 @@ impl Drop for AnonBuffer {
     }
 }
 
+impl AnonBuffer {
+    /// f16 view of the same allocation: one f32 slot holds two u16 halves.
+    /// Used by the KV shadow, which is allocated at half the f32 element
+    /// count so its byte footprint equals the f16 payload exactly.
+    #[inline]
+    pub fn as_u16(&self) -> &[u16] {
+        if self.len == 0 || self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u16, self.len * 2) }
+        }
+    }
+
+    #[inline]
+    pub fn as_u16_mut(&mut self) -> &mut [u16] {
+        if self.len == 0 || self.ptr.is_null() {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u16, self.len * 2) }
+        }
+    }
+}
+
 #[inline(always)]
 fn inline_mad(dst: &mut [f32], src: &[f32], scalar: f32) {
     let len = dst.len().min(src.len());
@@ -249,6 +283,14 @@ pub struct TransformerModel {
     // KV Cache: [layer, kv_head, max_seq_len, head_dim]
     pub k_cache: AnonBuffer,
     pub v_cache: AnonBuffer,
+    /// f16 shadows of the KV caches, read by the CPU attention path to halve
+    /// KV DRAM traffic (llama.cpp's default KV precision). `None` when the
+    /// f16 path is inactive; the f32 caches remain authoritative either way.
+    pub k16_cache: Option<AnonBuffer>,
+    pub v16_cache: Option<AnonBuffer>,
+    pub kv_f16: bool,
+    /// Element-weighted dominant quant type of the projection matrices.
+    pub dominant_proj_type: u32,
     pub kv_dim: usize,
 
     // Sliding Window Attention & Attention Sinks
@@ -422,6 +464,24 @@ impl TransformerModel {
             }
         };
 
+        // Dominant projection quant type: drives the speculative tree default.
+        // q6_K's batched GEMM has no 8-act panel kernel, so a batch-8 draft
+        // step is compute-bound; measured on the Pi, a rows=3 tree (batch 4)
+        // beats rows=5 there, while q4_K/q8_0 models prefer rows=5.
+        let mut type_elems: Vec<(u32, u64)> = Vec::new();
+        let mut note_type = |ty: u32, shape: &Vec<usize>| {
+            if shape.len() != 2 {
+                return;
+            }
+            let elems = (shape[0] as u64) * (shape[1] as u64);
+            match type_elems.iter_mut().find(|(t, _)| *t == ty) {
+                Some((_, e)) => *e += elems,
+                None => type_elems.push((ty, elems)),
+            }
+        };
+        note_type(token_embd.tensor_type, &token_embd.shape);
+        note_type(output.tensor_type, &output.shape);
+
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let attn_norm = find_tensor(&format!("blk.{i}.attn_norm.weight"))?;
@@ -463,6 +523,17 @@ impl TransformerModel {
         let kv_dim = n_kv_heads * head_dim;
         let kv_cache_size = n_layers * final_seq_len * kv_dim;
 
+        for l in &layers {
+            for tv in [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down] {
+                note_type(tv.tensor_type, &tv.shape);
+            }
+        }
+        let dominant_proj_type = type_elems
+            .iter()
+            .max_by_key(|(_, e)| *e)
+            .map(|(t, _)| *t)
+            .unwrap_or(GGML_TYPE_F32);
+
         // Warm packed-tile GEMM/GEMV cache for all quantized 2-D matrices
         // (q8_0 / q4_K / q6_K). Non-quantized or odd-geometry tensors are
         // ignored by the tile layer and fall back to the generic kernels.
@@ -496,6 +567,26 @@ impl TransformerModel {
                 None
             }
         };
+        // f16 KV shadows: CPU-only Linux (the Pi lane). The GPU client binds
+        // the f32 caches zero-copy, KIVI owns its own packed store, and the
+        // Android app keeps its tuned f32 path — all of those stay f32.
+        // SOFUU_KV_F16=0 is the kill switch.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let gpu_armed = gpu.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let gpu_armed = false;
+        let kv_f16 = cfg!(all(target_os = "linux", not(target_os = "android")))
+            && !gpu_armed
+            && kv_cache_size % 2 == 0
+            && std::env::var("SOFUU_KV_F16").map(|v| v != "0").unwrap_or(true);
+        let k16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
+        let v16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
+        if kv_f16 && std::env::var_os("SOFUU_PROFILE").is_some() {
+            eprintln!(
+                "[infer] f16 KV shadows on ({} MB x2, CPU attention path)",
+                kv_cache_size / (2 << 20)
+            );
+        }
 
         Ok(Self {
             config,
@@ -534,6 +625,10 @@ impl TransformerModel {
 
             k_cache,
             v_cache,
+            k16_cache,
+            v16_cache,
+            kv_f16,
+            dominant_proj_type,
             kv_dim,
             sliding_window: detected_sliding_window,
             sink_tokens: 4,
@@ -552,6 +647,28 @@ impl TransformerModel {
     /// while odd layers (1, 3, 5...) use full global attention (sliding_window = 0).
     /// Mistral and other models apply uniform sliding window across all layers.
     #[inline]
+    /// Default speculative tree size for this model. q6_K projections have no
+    /// 8-act panel GEMM, so a rows=5 draft (batch 8) is compute-bound; device
+    /// sweeps on the Pi put rows=3 (batch 4) ~7% ahead there, while q4_K and
+    /// q8_0 models prefer the rows=5 tree.
+    #[inline]
+    pub fn spec_rows_default(&self) -> usize {
+        if self.dominant_proj_type == GGML_TYPE_Q6_K { 3 } else { 5 }
+    }
+
+    /// Decode-phase thread count (auto mode, Pi lane). q8_0's GEMV is a pure
+    /// DRAM stream: two streams already saturate the Pi 5 memory controller
+    /// and four streams thrash it (SmolLM2 26.5→31.5 t/s, 1B 16.2→18.3).
+    /// k-quant GEMVs carry per-block scale math and keep every core.
+    #[inline]
+    pub fn decode_threads_auto(&self, max_threads: usize) -> usize {
+        #[cfg(all(target_os = "linux", not(target_os = "android")))]
+        if self.dominant_proj_type == GGML_TYPE_Q8_0 {
+            return max_threads.min(2);
+        }
+        max_threads
+    }
+
     pub fn layer_sliding_window(&self, layer_idx: usize) -> usize {
         Self::calc_layer_sliding_window(self.is_gemma2, self.sliding_window, layer_idx)
     }
@@ -581,6 +698,12 @@ impl TransformerModel {
     pub fn reset_cache(&mut self) {
         self.k_cache.fill(0.0);
         self.v_cache.fill(0.0);
+        if let Some(k16) = self.k16_cache.as_mut() {
+            k16.as_u16_mut().fill(0);
+        }
+        if let Some(v16) = self.v16_cache.as_mut() {
+            v16.as_u16_mut().fill(0);
+        }
         self.kivi = None;
     }
 
@@ -667,6 +790,30 @@ impl TransformerModel {
             self.config.rope_freq_base,
             if self.config.rope_interleaved { 1 } else { 0 },
         );
+        // Re-mirror the compacted window into the f16 shadow (rare path; a
+        // stale shadow here would feed attention wrong history).
+        if self.kv_f16 {
+            let new_len = current_seq_len - drop_tokens;
+            let hd = self.config.head_dim;
+            let seq = self.config.max_seq_len;
+            let heads = self.config.n_layers * self.config.n_kv_heads;
+            let k16 = self.k16_cache.as_mut().unwrap().as_u16_mut();
+            let v16 = self.v16_cache.as_mut().unwrap().as_u16_mut();
+            for h in 0..heads {
+                let base = h * seq * hd;
+                for p in 0..new_len {
+                    let row = base + p * hd;
+                    super::quant::kv16_convert(
+                        &self.k_cache[row..row + hd],
+                        &mut k16[row..row + hd],
+                    );
+                    super::quant::kv16_convert(
+                        &self.v_cache[row..row + hd],
+                        &mut v16[row..row + hd],
+                    );
+                }
+            }
+        }
         current_seq_len - drop_tokens
     }
 
@@ -917,24 +1064,49 @@ impl TransformerModel {
 
             // ── RoPE & KV-Cache Storage for batch ────────────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            batched_rope_kv(
-                &mut self.q_batch[0..b_size * q_dim],
-                &mut self.k_batch[0..b_size * kv_dim],
-                &self.v_batch[0..b_size * kv_dim],
-                &mut self.k_cache,
-                &mut self.v_cache,
-                b_size,
-                start_pos,
-                layer_idx,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq_len,
-                rope_freq_base,
-                rope_mode,
-            );
+            if self.kv_f16 {
+                batched_rope_kv_f16(
+                    &mut self.q_batch[0..b_size * q_dim],
+                    &mut self.k_batch[0..b_size * kv_dim],
+                    &self.v_batch[0..b_size * kv_dim],
+                    &mut self.k_cache,
+                    &mut self.v_cache,
+                    self.k16_cache.as_mut().unwrap().as_u16_mut(),
+                    self.v16_cache.as_mut().unwrap().as_u16_mut(),
+                    b_size,
+                    start_pos,
+                    layer_idx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    rope_freq_base,
+                    rope_mode,
+                );
+            } else {
+                batched_rope_kv(
+                    &mut self.q_batch[0..b_size * q_dim],
+                    &mut self.k_batch[0..b_size * kv_dim],
+                    &self.v_batch[0..b_size * kv_dim],
+                    &mut self.k_cache,
+                    &mut self.v_cache,
+                    b_size,
+                    start_pos,
+                    layer_idx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    rope_freq_base,
+                    rope_mode,
+                );
+            }
 
             // ── Multi-Head / Grouped-Query Attention for batch ───
+            // Batched prefill keeps the f32 score kernel: at 8+ rows the
+            // shares-K-strip pass is compute-bound, and the f16 converts cost
+            // more than the halved bytes save there. The f16 shadows are still
+            // written above, so decode reads them.
             let sliding_window = self.layer_sliding_window(layer_idx);
             batched_attention_ext(
                 &self.q_batch[0..b_size * q_dim],
@@ -1450,6 +1622,8 @@ impl TransformerModel {
                 let v_src = &self.v_batch[kv_h * head_dim..(kv_h + 1) * head_dim];
                 self.k_cache[slot..slot + head_dim].copy_from_slice(k_src);
                 self.v_cache[slot..slot + head_dim].copy_from_slice(v_src);
+                kv16_store(self.k16_cache.as_mut(), slot, k_src);
+                kv16_store(self.v16_cache.as_mut(), slot, v_src);
             }
 
             // ── 2D Block-Causal Tree Self-Attention ─────────────────
@@ -1601,10 +1775,12 @@ impl TransformerModel {
 
                 for kv_h in 0..n_kv_heads {
                     let slot = (l * n_kv_heads + kv_h) * max_seq_len * head_dim + dest_pos * head_dim;
-                    self.k_cache[slot..slot + head_dim]
-                        .copy_from_slice(&k_cand[kv_h * head_dim..(kv_h + 1) * head_dim]);
-                    self.v_cache[slot..slot + head_dim]
-                        .copy_from_slice(&v_cand[kv_h * head_dim..(kv_h + 1) * head_dim]);
+                    let k_row = &k_cand[kv_h * head_dim..(kv_h + 1) * head_dim];
+                    let v_row = &v_cand[kv_h * head_dim..(kv_h + 1) * head_dim];
+                    self.k_cache[slot..slot + head_dim].copy_from_slice(k_row);
+                    self.v_cache[slot..slot + head_dim].copy_from_slice(v_row);
+                    kv16_store(self.k16_cache.as_mut(), slot, k_row);
+                    kv16_store(self.v16_cache.as_mut(), slot, v_row);
                 }
             }
         }
@@ -1764,6 +1940,8 @@ impl TransformerModel {
                 let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
                 self.k_cache[slot..slot + head_dim].copy_from_slice(k_in);
                 self.v_cache[slot..slot + head_dim].copy_from_slice(v_in);
+                kv16_store(self.k16_cache.as_mut(), slot, k_in);
+                kv16_store(self.v16_cache.as_mut(), slot, v_in);
             }
 
             // ── Multi-Head / Grouped-Query Attention ────────
@@ -1780,6 +1958,23 @@ impl TransformerModel {
             if let Some(ref mut kivi) = self.kivi {
                 kivi.append_token(layer_idx, &self.k, &self.v);
                 kivi.compute_layer_attention(layer_idx, n_heads, &self.q, &mut self.head_out);
+            } else if self.kv_f16 {
+                let sliding_window = self.layer_sliding_window(layer_idx);
+                batched_attention_ext_k16(
+                    &self.q,
+                    self.k16_cache.as_ref().unwrap().as_u16(),
+                    self.v16_cache.as_ref().unwrap().as_u16(),
+                    &mut self.head_out,
+                    1,
+                    pos,
+                    layer_idx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    sliding_window,
+                    self.sink_tokens,
+                );
             } else {
                 let sliding_window = self.layer_sliding_window(layer_idx);
                 batched_attention_ext(
@@ -3204,22 +3399,42 @@ impl TransformerModel {
             let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
             self.k_cache[slot..slot + head_dim].copy_from_slice(k_in);
             self.v_cache[slot..slot + head_dim].copy_from_slice(v_in);
+            kv16_store(self.k16_cache.as_mut(), slot, k_in);
+            kv16_store(self.v16_cache.as_mut(), slot, v_in);
         }
-        super::quant::batched_attention_ext(
-            &self.q,
-            &self.k_cache,
-            &self.v_cache,
-            &mut self.head_out,
-            1,
-            pos,
-            layer_idx,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            sliding_window,
-            self.sink_tokens,
-        );
+        if self.kv_f16 {
+            super::quant::batched_attention_ext_k16(
+                &self.q,
+                self.k16_cache.as_ref().unwrap().as_u16(),
+                self.v16_cache.as_ref().unwrap().as_u16(),
+                &mut self.head_out,
+                1,
+                pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                sliding_window,
+                self.sink_tokens,
+            );
+        } else {
+            super::quant::batched_attention_ext(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.head_out,
+                1,
+                pos,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                sliding_window,
+                self.sink_tokens,
+            );
+        }
 
         // ── Commit B: attention output projection ──────────
         g.slot_f32_mut(g.slots.ao, q_rows).copy_from_slice(&self.head_out);

@@ -362,6 +362,25 @@ impl SofuSchema {
         }
     }
 
+    pub fn col_type(&self, idx: usize) -> Option<SofuuColType> {
+        if idx < self.raw.num_cols as usize {
+            match self.raw.cols[idx].col_type {
+                1 => Some(SofuuColType::Int64),
+                2 => Some(SofuuColType::Int32),
+                3 => Some(SofuuColType::Float64),
+                4 => Some(SofuuColType::Float32),
+                5 => Some(SofuuColType::Bool),
+                6 => Some(SofuuColType::Timestamp),
+                7 => Some(SofuuColType::String),
+                8 => Some(SofuuColType::Bytes),
+                9 => Some(SofuuColType::Json),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn raw(&self) -> &SofuuSchemaC {
         &self.raw
     }

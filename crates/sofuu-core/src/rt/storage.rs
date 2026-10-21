@@ -314,7 +314,8 @@ impl StorageManager {
 
         let mut row_vals = Vec::with_capacity(col_names.len());
 
-        for col_name in &col_names {
+        for (col_idx, col_name) in col_names.iter().enumerate() {
+            let col_type = schema.col_type(col_idx);
             let json_val = obj.get(col_name);
             let val = match json_val {
                 None | Some(serde_json::Value::Null) => {
@@ -324,6 +325,9 @@ impl StorageManager {
                     } else {
                         SofuValue::Null
                     }
+                }
+                Some(v) if col_type == Some(SofuuColType::Json) => {
+                    SofuValue::Json(v.to_string())
                 }
                 Some(serde_json::Value::Bool(b)) => SofuValue::Bool(*b),
                 Some(serde_json::Value::Number(n)) => {
@@ -358,12 +362,6 @@ impl StorageManager {
         self.dirty = true;
 
         let row_id = tbl.row_count() as i64;
-
-        // Auto-flush when bounded block reaches capacity
-        if row_id > 0 && row_id % 128 == 0 {
-            let _ = self.flush();
-        }
-
         Ok(row_id)
     }
 

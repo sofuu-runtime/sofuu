@@ -301,10 +301,34 @@ int sofuu_block_append_row(sofuu_block_t *b, const sofuu_schema_t *schema, const
             case SOFUU_TYPE_STRING:
             case SOFUU_TYPE_BYTES:
             case SOFUU_TYPE_JSON: {
-                const uint8_t *src_bytes = (v->type == SOFUU_TYPE_STRING || v->type == SOFUU_TYPE_JSON) ?
-                                           (const uint8_t *)v->as.str.ptr : v->as.bytes.ptr;
-                uint32_t len = (v->type == SOFUU_TYPE_STRING || v->type == SOFUU_TYPE_JSON) ?
-                               v->as.str.len : v->as.bytes.len;
+                char conv_buf[64];
+                const uint8_t *src_bytes = NULL;
+                uint32_t len = 0;
+
+                if (v->type == SOFUU_TYPE_STRING || v->type == SOFUU_TYPE_JSON) {
+                    src_bytes = (const uint8_t *)v->as.str.ptr;
+                    len = v->as.str.len;
+                } else if (v->type == SOFUU_TYPE_BYTES) {
+                    src_bytes = v->as.bytes.ptr;
+                    len = v->as.bytes.len;
+                } else if (schema->cols[i].type == SOFUU_TYPE_JSON) {
+                    // Auto-coercion of scalar primitives into JSON text
+                    if (v->type == SOFUU_TYPE_INT64 || v->type == SOFUU_TYPE_TIMESTAMP) {
+                        snprintf(conv_buf, sizeof(conv_buf), "%lld", (long long)v->as.i64);
+                    } else if (v->type == SOFUU_TYPE_INT32) {
+                        snprintf(conv_buf, sizeof(conv_buf), "%d", v->as.i32);
+                    } else if (v->type == SOFUU_TYPE_FLOAT64) {
+                        snprintf(conv_buf, sizeof(conv_buf), "%f", v->as.f64);
+                    } else if (v->type == SOFUU_TYPE_FLOAT32) {
+                        snprintf(conv_buf, sizeof(conv_buf), "%f", (double)v->as.f32);
+                    } else if (v->type == SOFUU_TYPE_BOOL) {
+                        snprintf(conv_buf, sizeof(conv_buf), "%s", v->as.b ? "true" : "false");
+                    } else {
+                        snprintf(conv_buf, sizeof(conv_buf), "null");
+                    }
+                    src_bytes = (const uint8_t *)conv_buf;
+                    len = (uint32_t)strlen(conv_buf);
+                }
 
                 if (!src_bytes && len > 0) return -3;
 

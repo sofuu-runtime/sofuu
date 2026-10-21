@@ -2836,7 +2836,14 @@ impl TransformerModel {
                 if all_q4k {
                     let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
                     let mut end = 0u32;
-                    let base = (gguf.data_offset + $secs[0].0.offset) & !255usize;
+                    // base = MIN aligned offset across the sections — the
+                    // decode fusion's b4blob receipt proved sections are not
+                    // monotonic in file order (1B attn_k < attn_q); a first-
+                    // section base underflowed the u32 delta to 2^32.
+                    let base = (0..$secs.len().min(4))
+                        .map(|i| (gguf.data_offset + $secs[i].0.offset) & !255usize)
+                        .min()
+                        .unwrap_or(0);
                     for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
                         let raw = gguf.data_offset + tv.offset;
                         blob[i][0] = ((raw & !255usize) - base) as u32;

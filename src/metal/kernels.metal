@@ -2474,3 +2474,31 @@ kernel void gemv_q8_0_b4r4(
         }
     }
 }
+
+// ── P2: q8_0 coalesced single-row class (the serial-decode GEMV) ───────────
+// v1 walked blocks LANE-STRIDED (warp x reads scattered across 32 blocks per
+// instruction). v2: ALL lanes iterate the SAME block — qs[b*34+2+lane] = one
+// 32B sector across the warp, x[b*32+lane] = one 128B wavefront; each lane
+// accumulates its value-position across blocks; ONE simd_sum per row.
+kernel void gemv_q8_0_c2(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    uint row                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    float acc = 0.0f;
+    uint nb = cols / 32;
+    uint row_byte = w_rem + row * nb * 34;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + lane]));
+        acc += d * q * x[b * 32 + lane];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = acc;
+    }
+}

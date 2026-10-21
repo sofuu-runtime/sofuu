@@ -259,6 +259,12 @@ void* sofuu_metal_init(void) {
         ctx->pso_gpu_q6_k_b4multi = load_pso(@"gemv_q6_k_b4multi");
         ctx->pso_gpu_q6_k_b4multi_live = ctx->pso_gpu_q6_k_b4multi != nil;
         ctx->pso_gpu_q8_0_b4multi = load_pso(@"gemv_q8_0_b4multi");
+        // P2: q8_0 coalesced single-row class — flips the SERIAL decode PSO
+        // the same way q4_K/q6_K ride SOFUU_Q4K_COALESCED (nil-degrade to v1)
+        id<MTLComputePipelineState> q8c2 = load_pso(@"gemv_q8_0_c2");
+        if (q8c2 != nil && coalesced_level > 0) {
+            ctx->pso_gemv_q8_0 = q8c2;
+        }
         ctx->pso_gpu_q8_0_b4multi_live = ctx->pso_gpu_q8_0_b4multi != nil;
         ctx->pso_gpu_q8_0_b4r4 = load_pso(@"gemv_q8_0_b4r4");
         ctx->pso_gpu_q8_0_b4r4_live = ctx->pso_gpu_q8_0_b4r4 != nil;

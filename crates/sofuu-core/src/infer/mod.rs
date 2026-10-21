@@ -314,6 +314,22 @@ impl InferModel {
         }
     }
 
+    /// Whether the GPU chain pass supplies per-node head logits for the walk.
+    pub fn gpu_chain_heads(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.gpu_chain_heads(),
+            _ => false,
+        }
+    }
+
+    /// LM-head logits for several speculative batch rows in one pass.
+    pub fn spec_head_logits_batch(&mut self, first_row: usize, n_rows: usize, out: &mut [f32]) {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.spec_head_logits_batch(first_row, n_rows, out),
+            _ => {}
+        }
+    }
+
     /// Serve lazy per-row verify sampling from the last GPU chain pass's
     /// in-commit logits. Returns false when no chain pass covers this step
     /// (caller falls back to forward_speculative_head_item).
@@ -862,6 +878,8 @@ impl InferEngine {
         };
 
         let mut spec_logits_buf = vec![0.0f32; vocab_size];
+        // Per-node head logits for one speculative step (grown on first use).
+        let mut spec_logits_batch: Vec<f32> = Vec::new();
 
         // Adaptive speculation: a spec step costs ~one serial step plus a
         // little extra row work, so it only pays when the draft chain lands
@@ -873,6 +891,10 @@ impl InferEngine {
         // SOFUU_SPEC_ADAPT=0 restores always-on; SOFUU_SPEC_MIN_ACCEPT
         // overrides the 1.15 tokens/step threshold.
         let spec_adapt = std::env::var("SOFUU_SPEC_ADAPT").map(|v| v != "0").unwrap_or(true);
+        let spec_warmup: usize = std::env::var("SOFUU_SPEC_WARMUP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
         let spec_min_accept = std::env::var("SOFUU_SPEC_MIN_ACCEPT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
@@ -880,6 +902,14 @@ impl InferEngine {
         let mut spec_steps: u32 = 0;
         let mut spec_accepted: u32 = 0;
         let mut spec_disabled = false;
+        // Self-calibrating gate state. The fixed tokens/step threshold cannot
+        // be right for every model: a 5-row tree costs ~2.7 serial tokens of
+        // time on the Pi (65-102 ms vs 42 ms), so acceptance has to clear
+        // 2.7x, not 1.15x. Measure both rates instead of guessing.
+        let mut serial_ns: u64 = 0;
+        let mut serial_tokens: u32 = 0;
+        let mut spec_ns: u64 = 0;
+        let mut spec_tokens: u32 = 0;
 
         let mut step = 0;
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
@@ -1023,6 +1053,10 @@ impl InferEngine {
                 None
             };
 
+            // Warmup: run plain serial decode for a few steps so the gate has
+            // a measured serial rate to compare speculation against.
+            let speculative_tree = if step < spec_warmup { None } else { speculative_tree };
+
             if let Some(tree) = speculative_tree {
                 // MULTI-PATH LOOKAHEAD TREE SPECULATION:
                 // Evaluates [next_token, tree.tokens()...] in parallel in a single forward pass!
@@ -1048,14 +1082,33 @@ impl InferEngine {
                 logits_buf.copy_from_slice(&spec_logits_buf[0..vocab_size]);
                 let root_predicted = sampler.sample(&mut logits_buf, &history);
 
-                // Greedily traverse the tree along matching branches with lazy LM head projection
+                // Greedily traverse the tree along matching branches. The walk
+                // asks for the head's prediction at every node it visits, so on
+                // the CPU path compute all nodes' logits in one pass over the
+                // lm head up front (lazily that is one full 127 MB read per
+                // node, which made spec steps 65-102 ms and lost to serial
+                // decode despite 2.06 tokens/step). Row 0 is the root, whose
+                // logits the tree forward already produced.
+                let tree_rows = tree.size();
+                let batched_heads = tree_rows > 0 && !self.model.gpu_chain_heads();
+                if batched_heads {
+                    if spec_logits_batch.len() < tree_rows * vocab_size {
+                        spec_logits_batch.resize(tree_rows * vocab_size, 0.0);
+                    }
+                    self.model.spec_head_logits_batch(
+                        1,
+                        tree_rows,
+                        &mut spec_logits_batch[..tree_rows * vocab_size],
+                    );
+                }
                 let (accepted_tokens, accepted_batch_indices, next_sampled) = tree.verify_path(
                     root_predicted,
                     |batch_idx| {
-                        // The GPU chain pass computed every row's logits
-                        // in-commit; only the CPU-routed paths need the
-                        // per-row matvec (~290ms each under load).
-                        if !self
+                        if batched_heads && batch_idx >= 1 {
+                            let off = (batch_idx - 1) * vocab_size;
+                            spec_logits_buf
+                                .copy_from_slice(&spec_logits_batch[off..off + vocab_size]);
+                        } else if !self
                             .model
                             .spec_chain_head_logits(batch_idx, &mut spec_logits_buf)
                         {
@@ -1070,8 +1123,20 @@ impl InferEngine {
                 // paying for drafts that do not land.
                 spec_steps += 1;
                 spec_accepted += accepted_batch_indices.len() as u32;
+                spec_ns += t_verify.elapsed().as_nanos() as u64;
+                spec_tokens += 1 + accepted_batch_indices.len() as u32;
                 if spec_adapt && !spec_disabled && spec_should_disable(spec_steps, spec_accepted, spec_min_accept) {
                     spec_disabled = true;
+                }
+                if spec_adapt && !spec_disabled && spec_is_losing(spec_ns, spec_tokens, serial_ns, serial_tokens) {
+                    spec_disabled = true;
+                    if quant::prof::enabled() {
+                        let spec_rate = spec_tokens as f64 * 1e9 / spec_ns as f64;
+                        let serial_rate = serial_tokens as f64 * 1e9 / serial_ns as f64;
+                        eprintln!(
+                            "[spec] gate: off — {spec_rate:.1} tok/s with tree ({spec_tokens}/{spec_steps} steps) vs {serial_rate:.1} serial"
+                        );
+                    }
                 }
 
                 // Commit accepted candidate KV vectors to persistent KV cache
@@ -1151,6 +1216,7 @@ impl InferEngine {
                 cur_token = next_sampled;
             } else {
                 // Standard baseline forward pass (1 token)
+                let t_serial = std::time::Instant::now();
                 let next_logits = self.model.forward(next_token, cur_pos);
                 if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() && step <= 2 {
                     eprintln!(
@@ -1164,6 +1230,8 @@ impl InferEngine {
                 logits_buf.copy_from_slice(next_logits);
                 cur_pos += 1;
                 cur_token = sampler.sample(&mut logits_buf, &history);
+                serial_ns += t_serial.elapsed().as_nanos() as u64;
+                serial_tokens += 1;
             }
         }
 
@@ -1192,6 +1260,20 @@ impl InferEngine {
 /// loss. Only evaluated after a 16-step warmup so early misses (cold n-gram
 /// cache) cannot latch the tree off prematurely, while short generations
 /// still stop paying for a losing draft within ~25% of their length.
+/// Self-calibrating gate: speculation pays only when it delivers tokens faster
+/// than plain serial decode. Both rates are measured in the same run (serial
+/// during the warmup window), so the break-even acceptance follows the model,
+/// the prompt and the kernel cost instead of a constant. The 2% margin keeps
+/// measurement noise from flipping the tree off.
+fn spec_is_losing(spec_ns: u64, spec_tokens: u32, serial_ns: u64, serial_tokens: u32) -> bool {
+    if spec_ns == 0 || serial_ns == 0 || spec_tokens < 8 || serial_tokens < 4 {
+        return false;
+    }
+    let spec_rate = spec_tokens as f64 / spec_ns as f64;
+    let serial_rate = serial_tokens as f64 / serial_ns as f64;
+    spec_rate <= serial_rate * 1.02
+}
+
 fn spec_should_disable(steps: u32, accepted: u32, min_tokens_per_step: f32) -> bool {
     // Two-tier: by 8 steps a chain near 1.0 tokens/step is a sure loss (cold
     // cache warmup is over by then); the full break-even threshold needs the
@@ -1205,7 +1287,25 @@ fn spec_should_disable(steps: u32, accepted: u32, min_tokens_per_step: f32) -> b
 
 #[cfg(test)]
 mod adaptive_spec_tests {
-    use super::spec_should_disable;
+    use super::{spec_is_losing, spec_should_disable};
+
+    #[test]
+    fn calibrated_gate_keeps_a_fast_tree() {
+        // 2 tokens per step at 87ms = 43ms/token vs 42ms serial: too close to
+        // pay for, so the gate must turn it off.
+        assert!(spec_is_losing(10 * 87_000_000, 20, 10 * 42_000_000, 10));
+        // Same cost but 3.5 tokens/step: a clear win, keep it.
+        assert!(!spec_is_losing(10 * 87_000_000, 35, 10 * 42_000_000, 10));
+        // Cheap steps (e.g. q6_K-shaped trees at 60ms) pay at 2 tokens/step.
+        assert!(!spec_is_losing(10 * 60_000_000, 20, 10 * 42_000_000, 10));
+    }
+
+    #[test]
+    fn calibrated_gate_needs_enough_samples() {
+        assert!(!spec_is_losing(1_000_000_000, 7, 10_000_000, 10));
+        assert!(!spec_is_losing(1_000_000_000, 20, 10_000_000, 3));
+        assert!(!spec_is_losing(0, 20, 10, 10));
+    }
 
     #[test]
     fn warmup_never_disables() {

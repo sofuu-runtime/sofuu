@@ -1422,6 +1422,48 @@ impl TransformerModel {
         false
     }
 
+    /// Whether the GPU chain pass supplies per-node head logits (then the CPU
+    /// batched pass below is unnecessary).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn gpu_chain_heads(&self) -> bool {
+        self.spec_rows_valid && self.gpu.as_ref().map(|g| g.token_commit).unwrap_or(false)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn gpu_chain_heads(&self) -> bool {
+        false
+    }
+
+    /// LM-head logits for `n_rows` speculative batch items starting at
+    /// `first_row`, in ONE pass over the output tensor.
+    ///
+    /// The tree walk needs the head's prediction at every node it visits. Doing
+    /// that lazily costs a full read of the lm head per node — 127 MB on
+    /// Qwen3-0.6B, i.e. ~10.5 ms on the Pi, and the walk visits 3-5 nodes per
+    /// step — which is why speculative steps measured 65-102 ms and the default
+    /// (speculation on) lost to serial decode.
+    pub fn spec_head_logits_batch(&mut self, first_row: usize, n_rows: usize, out: &mut [f32]) {
+        let dim = self.config.dim;
+        let vocab_size = self.config.vocab_size;
+        let n_rows = n_rows.min(max_prefill_batch().saturating_sub(first_row));
+        assert!(n_rows > 0, "spec_head_logits_batch needs at least one row");
+        assert!(
+            first_row + n_rows <= self.x_norm_batch.len() / dim,
+            "spec batch row {first_row}+{n_rows} exceeds x_norm_batch"
+        );
+        assert_eq!(out.len(), n_rows * vocab_size, "out must hold n_rows x vocab");
+        let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+        matmat(
+            out_bytes,
+            self.output.tensor_type,
+            vocab_size,
+            dim,
+            &self.x_norm_batch[first_row * dim..(first_row + n_rows) * dim],
+            n_rows,
+            &mut out[0..n_rows * vocab_size],
+        );
+    }
+
     /// Compute LM head logits for an already normalized speculative batch item (e.g. candidate upon hit).
     #[inline(never)]
     pub fn forward_speculative_head_item(&mut self, item_idx: usize, out_logits: &mut [f32]) {

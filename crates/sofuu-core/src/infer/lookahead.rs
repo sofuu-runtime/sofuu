@@ -477,7 +477,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn verify_path_indices_are_batch_rows_for_the_batched_head_pass() {
         // The CPU path precomputes head logits for every tree node in one
         // GEMM and fills buffer row i-1 with batch row i (verify_path's

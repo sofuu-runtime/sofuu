@@ -1278,9 +1278,10 @@ impl TransformerModel {
 
         let chunk_t0 = prof::enabled().then(std::time::Instant::now);
 
-        // P1 (llama.cpp parity): B<=32 chunks through the prefill GEMM class
-        // (SOFUU_GPU_PREFILL_GEMM=1). Any unsupported chunk falls back to the
-        // b4 route / CPU tiles below.
+        // P1 (llama.cpp parity): B<=pre_chunk chunks through the prefill
+        // GEMM class (SOFUU_GPU_PREFILL_GEMM=1; cap = SOFUU_PREFILL_CHUNK,
+        // clamped 1..=128, default 32). Any unsupported chunk falls back to
+        // the b4 route / CPU tiles below.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if std::env::var("SOFUU_GPU_PREFILL_GEMM")
             .map(|v| v == "1")
@@ -2938,9 +2939,9 @@ impl TransformerModel {
         want_logits: bool,
     ) -> bool {
         let b = tokens.len();
-        if !(1..=32).contains(&b)
-            || start_pos + b > self.config.max_seq_len
-        {
+        // The chunk cap the slab was sized for (parsed once at arm()).
+        let cap = self.gpu.as_ref().map(|g| g.pre_chunk).unwrap_or(0);
+        if !(1..=cap).contains(&b) || start_pos + b > self.config.max_seq_len {
             return false;
         }
         let g = match self.gpu.as_mut() {
@@ -3272,7 +3273,8 @@ impl TransformerModel {
         true
     }
 
-    /// P1: full prefill through the GEMM route in ~32-token chunks. The KV
+    /// P1: full prefill through the GEMM route in pre_chunk-token chunks
+    /// (SOFUU_PREFILL_CHUNK, default 32, up to 128). The KV
     /// lands in the shared caches positions-contiguous; the CPU's next decode
     /// step continues exactly where the chunks stopped. Returns false when
     /// anything unsupported appeared (caller falls back to b4/CPU tiles).
@@ -3287,17 +3289,19 @@ impl TransformerModel {
             return false;
         }
         let vocab = self.config.vocab_size;
-        // SPILL SAFETY established by receipts: b=32 rows span meta slots
-        // [L, L+31) inside the layers*4-slot buffer at ANY prompt length
-        // (max 58 of 112 slots on the 0.6B) — the original all-pos 5-chunk
-        // receipts were bit-exact through this spill. b=128 would overflow
-        // (L+127 > 112) → that needs the meta resize; chunks stay <=32 until
-        // then (SOFUU_PREFILL_CHUNK caps at 32 for now).
-        let pre_chunk = std::env::var("SOFUU_PREFILL_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (1..=32).contains(v))
-            .unwrap_or(32);
+        // SPILL SAFETY: attention part/fin rows write meta slots [L, L+b)
+        // (bind base = layer_idx) inside the n_layers*16-slot buffer, and
+        // every layer rewrites its own range before its own fin reads it,
+        // so the only bound is (n_layers-1)+pre_chunk < n_layers*16 —
+        // 155 vs 448 on the 0.6B even at the 128-row cap (arm() clamps
+        // pre_chunk to that bound). Receipts: 5-chunk all-pos and the
+        // 757-token prompt were bit-exact through the same spill at b=32.
+        // (SOFUU_PREFILL_CHUNK is parsed once in arm(); pre_chunk here is
+        // the slab-sized value.)
+        let pre_chunk = self.gpu.as_ref().map(|g| g.pre_chunk).unwrap_or(32);
+        if std::env::var_os("SOFUU_PREFILL_DEBUG").is_some() {
+            eprintln!("[prefill-dbg] chunks: n_tokens={} pre_chunk={} start_pos={}", tokens.len(), pre_chunk, start_pos);
+        }
         let mut pos = start_pos;
         let mut off = 0usize;
         while off < tokens.len() {
@@ -3797,8 +3801,9 @@ struct GgufGpuSlots {
     logits: usize,
 }
 
-/// P1 (llama.cpp parity): 32-row GEMM prefill slab layout (byte offsets
-/// into pref_buf, same gguf_gpu_slot cursor rule as GgufGpuSlots).
+/// P1 (llama.cpp parity): B-row GEMM prefill slab layout (byte offsets
+/// into pref_buf, same gguf_gpu_slot cursor rule as GgufGpuSlots). B =
+/// pre_chunk (SOFUU_PREFILL_CHUNK, clamped 1..=128, default 32).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Clone, Copy)]
 struct PrefillSlots {
@@ -3847,13 +3852,17 @@ pub struct GgufGpu {
     skip_ffn: bool,
     skip_head: bool,
     slots: GgufGpuSlots,
-    /// P1 (llama.cpp parity): 32-row GEMM prefill slab. All None unless
+    /// P1 (llama.cpp parity): B-row GEMM prefill slab. All None unless
     /// SOFUU_GPU_PREFILL_GEMM=1 at engine construction (memory is not paid
     /// by the default fleet path).
     pref_buf: Option<crate::infer::metal::MetalBuffer>,
     pref_act: Option<crate::infer::model::AnonBuffer>,
     pref_slots: Option<PrefillSlots>,
     pref_bytes: usize,
+    /// The chunk cap the slab was sized for (parsed ONCE at arm(); the
+    /// forward paths read this field, never the env again, so slab and
+    /// chunk cannot diverge). 0 when the prefill slab was not built.
+    pre_chunk: usize,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -3952,13 +3961,31 @@ impl GgufGpu {
             unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
         let act_buf = engine.register_zerocopy_only(act_slice)?;
         // P1 (llama.cpp parity): the GEMM prefill slab, built only when the
-        // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B=32
-        // rows; every stage's [B x rows] region sized accordingly.
+        // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B =
+        // pre_chunk rows (SOFUU_PREFILL_CHUNK, clamped 1..=128, default 32);
+        // every stage's [B x rows] region sized accordingly.
         let pre_enabled = std::env::var("SOFUU_GPU_PREFILL_GEMM")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let pre_chunk = if pre_enabled {
+            let requested = std::env::var("SOFUU_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| (1..=128).contains(v))
+                .unwrap_or(32);
+            // Attention part/fin rows land at meta slots [L, L+b) where the
+            // bind base is layer_idx slots inside an n_layers*SPEC_B*4-slot
+            // buffer: worst index (n_layers-1)+b must stay below
+            // n_layers*16. 128-row chunks on a 28-layer model peak at slot
+            // 155 of 448 — the 32-row receipts' spill was the same hazard
+            // at b=32 (peak 58 of 112 by an off-by-4 in the old note; the
+            // capacity here is 16 slots per layer, not 4).
+            requested.min(15 * layers.len() + 1)
+        } else {
+            0
+        };
         let (pref_buf, pref_act, pref_slots, pref_bytes) = if pre_enabled {
-            const PRE_B: usize = 32;
+            let PRE_B = pre_chunk;
             let mut pc = 0usize;
             let ps = PrefillSlots {
                 x: gguf_gpu_slot(&mut pc, PRE_B * dim),
@@ -4032,6 +4059,7 @@ impl GgufGpu {
             pref_act,
             pref_slots,
             pref_bytes,
+            pre_chunk,
             slots,
         })
     }

@@ -1633,6 +1633,17 @@ void sofuu_metal_batch_mlx4(
 // orders the previous dispatch's writes. The CPU touches the slab only
 // before batch_open / after batch_end.
 
+// Metal dispatchThreadgroups caps each grid dimension at 1024. Prefill
+// chunks of 128 rows × n_heads(×n_chunks) exceed that in one dimension —
+// the launch silently truncates (rows past the cap never ran: the
+// chunk-b=128 text bisect). The split keeps flat threadgroup semantics;
+// kernels linearize tg.y*1024+tg.x, bit-identical when the grid fits a
+// single x row (every decode/spec route).
+static MTLSize sf_grid2d(uint total_groups) {
+    return MTLSizeMake(total_groups > 1024u ? 1024u : total_groups,
+                       (total_groups + 1023u) / 1024u, 1);
+}
+
 void sofuu_metal_batch_add(
     void* ctx_ptr,
     void* acc_buf_ptr, size_t acc_offset,
@@ -1648,7 +1659,7 @@ void sofuu_metal_batch_add(
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)acc_buf_ptr offset:acc_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)add_buf_ptr offset:add_offset atIndex:1];
     [ctx->batch_enc setBytes:&un length:sizeof(uint) atIndex:2];
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((n + 255) / 256))
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
@@ -1667,7 +1678,7 @@ void sofuu_metal_batch_swiglu(
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)g_buf_ptr offset:g_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)u_buf_ptr offset:u_offset atIndex:1];
     [ctx->batch_enc setBytes:&un length:sizeof(uint) atIndex:2];
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((n + 255) / 256))
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
@@ -1929,7 +1940,7 @@ int sofuu_metal_batch_llama_attn_1c_b4(
     [ctx->batch_enc setBytes:&n_kv_heads length:sizeof(uint) atIndex:7];
     [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:8];
     uint grid = rows * n_heads;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     return 1;
 }
@@ -2006,7 +2017,7 @@ void sofuu_metal_batch_llama_kv_write_b4(
     [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:12];
     [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:13];
     uint grid = rows * n_kv_heads;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
@@ -2040,7 +2051,7 @@ void sofuu_metal_batch_head_rmsnorm_b4(
     [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:8];
     [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:9];
     uint grid = rows * n_heads;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
@@ -2075,7 +2086,7 @@ void sofuu_metal_batch_llama_attn_part_b4(
     [ctx->batch_enc setBytes:&n_chunks_max length:sizeof(uint) atIndex:10];
     [ctx->batch_enc setBytes:&meta_stride length:sizeof(uint) atIndex:11];
     uint grid = rows * n_heads * n_chunks_max;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
@@ -2102,7 +2113,7 @@ void sofuu_metal_batch_llama_attn_fin_b4(
     [ctx->batch_enc setBytes:&n_chunks_max length:sizeof(uint) atIndex:5];
     [ctx->batch_enc setBytes:&meta_stride length:sizeof(uint) atIndex:6];
     uint grid = rows * n_heads;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 

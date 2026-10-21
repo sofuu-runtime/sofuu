@@ -180,8 +180,13 @@ kernel void swiglu(
     device float       *g               [[buffer(0)]],
     device const float *u               [[buffer(1)]],
     constant uint      &n               [[buffer(2)]],
-    uint id                             [[thread_position_in_grid]]
+    // 2D-split dispatch: linearization that is bit-identical when the grid fits
+    // one x row of 1024 threadgroups and still legal above it (prefill
+    // b=128 × 12288-hidden swiglu = 6144 threadgroups > the 1024 one-dim cap).
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint ti                             [[thread_index_in_threadgroup]]
 ) {
+    uint id = (tg.y * 1024u + tg.x) * 256u + ti;
     if (id >= n) { return; }
     float val = g[id];
     float silu = val / (1.0f + exp(-val));
@@ -192,8 +197,10 @@ kernel void add_inplace(
     device float       *acc             [[buffer(0)]],
     device const float *add             [[buffer(1)]],
     constant uint      &n               [[buffer(2)]],
-    uint id                             [[thread_position_in_grid]]
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint ti                             [[thread_index_in_threadgroup]]
 ) {
+    uint id = (tg.y * 1024u + tg.x) * 256u + ti;
     if (id >= n) { return; }
     acc[id] += add[id];
 }
@@ -873,9 +880,10 @@ kernel void llama_kv_write_b4(
     constant float     &eps            [[buffer(11)]],
     constant float     &rope_base      [[buffer(12)]],
     constant uint      &rope_mode      [[buffer(13)]],
-    uint kv                           [[threadgroup_position_in_grid]],
+    uint3 kvtg                         [[threadgroup_position_in_grid]],
     uint lane                         [[thread_index_in_simdgroup]]
 ) {
+    uint kv = kvtg.y * 1024u + kvtg.x;
     uint row = kv / n_kv_heads;
     uint kh  = kv % n_kv_heads;
     uint pos = positions[row];
@@ -928,9 +936,10 @@ kernel void head_rmsnorm_b4(
     device const uint  *positions       [[buffer(7)]],
     constant float     &rope_base       [[buffer(8)]],
     constant uint      &rope_mode       [[buffer(9)]],
-    uint h                              [[threadgroup_position_in_grid]],
+    uint3 htg                          [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    uint h = htg.y * 1024u + htg.x;
     uint row = h / n_heads;
     uint hh  = h % n_heads;
     uint pos = positions[row];
@@ -978,9 +987,10 @@ kernel void llama_attn_part_b4(
     constant uint      &max_seq         [[buffer(9)]],
     constant uint      &n_chunks_max    [[buffer(10)]],
     constant uint      &meta_stride     [[buffer(11)]],
-    uint g                              [[threadgroup_position_in_grid]],
+    uint3 gtg                           [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    uint g = gtg.y * 1024u + gtg.x;
     // grid = rows*heads*n_chunks_max; the q-norm already ran (head_rmsnorm_b4)
     uint row = g / (n_heads * n_chunks_max);
     uint rem = g % (n_heads * n_chunks_max);
@@ -1054,9 +1064,10 @@ kernel void llama_attn_fin_b4(
     constant uint      &head_dim        [[buffer(4)]],
     constant uint      &n_chunks_max    [[buffer(5)]],
     constant uint      &meta_stride     [[buffer(6)]],
-    uint g                              [[threadgroup_position_in_grid]],
+    uint3 gtg                           [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    uint g = gtg.y * 1024u + gtg.x;
     uint row = g / n_heads;
     uint h   = g % n_heads;
     uint pos = positions[row];
@@ -1381,9 +1392,10 @@ kernel void llama_attn_1c_b4(
     constant uint      &n_heads         [[buffer(6)]],
     constant uint      &n_kv_heads      [[buffer(7)]],
     constant uint      &max_seq         [[buffer(8)]],
-    uint g                              [[threadgroup_position_in_grid]],
+    uint3 gtg                           [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    uint g = gtg.y * 1024u + gtg.x;
     uint row = g / n_heads;
     uint h   = g % n_heads;
     uint pos = positions[row];

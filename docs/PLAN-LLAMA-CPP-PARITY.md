@@ -255,3 +255,44 @@ subtile waste receipt) — at b=32 the subtiles fill; the compute-rate work
 starts from measured-B32 rates. Constraints: FULL-TEXT gates, pinned env
 (SOFUU_GPU_PREFILL_GEMM=1, coalesced=2), load labels; CPU prefill route stays
 default until receipts justify the per-model flip.
+
+## PHASE 3 first receipts (2026-10-21 late — chunk-128 leg)
+- **THE 1024-THREADGROUP DISPATCH BUG (the day's real find).** Seven batch
+  ops dispatched rows-scaled grids in ONE Metal dimension capped at 1024
+  threadgroups: attn_1c_b4/kv_write_b4/head_rmsnorm_b4/attn_part_b4/
+  attn_fin_b4 (rows×heads(×n_chunks)), add/swiglu ((b·n+255)/256). Past the
+  cap the launch SILENTLY TRUNCATES — bisect pins it: b=60 (960 groups) was
+  bit-exact at any prompt, b=128 (2048) garbled only rows ≥64 (first tokens
+  fine, then forked). Also present in add (8B b=128: 2048 groups) and swiglu
+  (8B b=128: 6144). Fix = `sf_grid2d` 2D split (x=min(g,1024), y=ceil/1024)
+  + kernels linearize `tg.y*1024+tg.x` — bit-identical when the grid fits
+  one x row, so every decode/spec route is dispatch-tuple-identical.
+- **Chunk-128 shipped** (SOFUU_PREFILL_CHUNK 1..=128, default 32): slab
+  (PRE_B) sized by the env parsed ONCE in arm() into a `pre_chunk` struct
+  field — the forward paths read the field, never the env, so slab and
+  chunk cannot diverge. Meta needs NO resize: capacity is n_layers×
+  SPEC_B×4 slots (448 on 28 layers; rows land at [L, L+b) via the
+  layer_idx slot base and each layer rewrites its own range) — the old
+  note's "112 slots / b=128 overflows" dropped a factor of 4; arm() still
+  clamps to 15·layers+1 to keep tiny-layer models legal.
+- **Rates:** 0.6B 326-tk prompt: chunk-128 = **51.1 t/s** vs chunk-32
+  32.3 t/s same window (+58%). Pre-fix route showed 49.8 — because the
+  truncated launches did LESS work; the honest number is 51.1 with correct
+  text.
+- **Text gates = tolerance-class, with controls.** Deterministic synonym
+  forks (5×-stable md5s) on tie-heavy prompts (e.g. `sentence ×2` exact
+  repeats: "the ferry" → "the harbor's first ferry"); distinctive-tail
+  prompt identical (P25), chunk-60 identical, decode (SPEC=0/1, CPU
+  prefill) identical. Signature matches the accepted f32-reassociation
+  argmax-flip class; the numeric top-2-gap probe ( certify with logits,
+  not prose) is booked as Phase-3 residual parity work.
+- **Peer-lane interplay (flagged):** the concurrent GQA-fused CPU decode
+  + vector-swiglu commit moved the CPU baseline text on GQA models —
+  Paris 0.6B/1B now fork CPU-vs-GPU where battery #11 was exact. Decode
+  dispatch is provably untouched by this leg (grid tuples identical at
+  y=1); treat ALL cross-route text receipts as transient until the
+  Phase-4 calm sweep re-pins both sides per model.
+- The forward pipeline itself splits prefill calls (108+2-style tails,
+  dynamic per run) above the GEMM chunker — featured here so nobody
+  misreads chunk profiles; SOFUU_PREFILL_DEBUG prints per-call
+  n_tokens/pre_chunk.

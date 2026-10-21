@@ -3259,6 +3259,136 @@ mod q4k_crafted_probe {
         }
         println!("[q8b4] worst={worst:e} fails={fails}");
         assert!(fails == 0, "q8 b4multi parity broken: {fails}");
+
+        // rate: the REAL 1B FFN shape (4096 rows x 2048 cols = 13.5MB q8_0),
+        // 4-token x; llama.cpp's effective decode rate on the 1B ~150 GB/s
+        use std::time::Instant;
+        {
+            let fb_rows = 4096usize;
+            let fb_cols = 2048usize;
+            let fb_blocks = fb_cols / 32; // 64
+            let fb_rb = fb_blocks * 34;
+            let fb_bytes = fb_rows * fb_rb;
+            let fb_alloc = ((fb_bytes + page - 1) / page) * page;
+            let fb_ptr = mk(fb_alloc);
+            let mut state2 = 0x1234567890ABCDEFu64;
+            let mut rand2 = move || {
+                state2 = state2
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state2 >> 33) as u32
+            };
+            let fbb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(fb_ptr, fb_bytes) };
+            // sanitized: d first (f16 0.03125), random int8 qs
+            for r in 0..fb_rows {
+                for b in 0..fb_blocks {
+                    let off = r * fb_rb + b * 34;
+                    fbb[off..off + 2].copy_from_slice(&f16_bytes(0.03125f32));
+                    for j in 0..32 {
+                        fbb[off + 2 + j] = (rand2() % 256) as u8;
+                    }
+                }
+            }
+            let fb_buf = engine.register_zerocopy_only(fbb).expect("fb");
+            // x slab already [4][cols-test] — cols differ (2048 vs test cols
+            // 256): reuse slab_base x region? test x = [4][256] — too narrow.
+            // allocate a dedicated x for the big dispatch (4 x 2048 floats).
+            let bx_bytes = 4 * fb_cols * 4;
+            let bx_ptr = mk(bx_bytes.max(page));
+            for t in 0..4 {
+                for i in 0..fb_cols {
+                    let v = ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5;
+                    unsafe { *(bx_ptr.add((t * fb_cols + i) * 4) as *mut f32) = v };
+                }
+            }
+            let bx_buf = engine
+                .register_zerocopy_only(unsafe {
+                    std::slice::from_raw_parts_mut(bx_ptr, bx_bytes.max(page))
+                })
+                .expect("bx");
+            // y region: reuse the tail of the big x slab? place y after x in a
+            // padded slab (4 x 4096 floats)
+            let y_needed = 4 * fb_rows * 4;
+            let byy = bx_bytes.max(page);
+            // y lives inside the SAME registered buffer boundaries — bx is
+            // exactly bx_bytes; register one more buffer for y
+            let by_ptr = mk(y_needed.max(page));
+            let by_buf = engine
+                .register_zerocopy_only(unsafe {
+                    std::slice::from_raw_parts_mut(by_ptr, y_needed.max(page))
+                })
+                .expect("by");
+            // one q8_0 section covering the whole tensor: blob base = aligned 0
+            let mut bblob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+            bblob[0][0] = 0;
+            bblob[0][1] = 0;
+            bblob[0][2] = fb_rows as u32;
+            bblob[0][3] = 0; // y bound at 0 (absolute)
+            // y buffer bound at offset 0 -> y_off absolute 0
+            bblob[0][4] = fb_rows as u32;
+            let reps = 8usize;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                assert!(engine.batch_open());
+                let ok = engine.batch_gguf8_b4r4(8, &fb_buf, 0, &bx_buf, 0, &by_buf, fb_rows, fb_cols, &bblob);
+                engine.batch_end();
+                assert!(ok, "r4 fb dispatch unavailable");
+            }
+            let per = t0.elapsed().as_secs_f64();
+            println!(
+                "[q8b4] R4 rate: {} dispatches {:.2?} -> {:.1} GB/s weight stream ({} rows x {} cols)",
+                reps, t0.elapsed(), fb_bytes as f64 * reps as f64 / per / 1e9, fb_rows, fb_cols
+            );
+            // V1 per-ROW class (batch_gguf ty=8 = the serial-decode kernel):
+            // rows_total single-token x width cols — run 4 times for the 4 tokens? the serial decode uses ONE token: x = [cols] single row. Use x rows = 1 token: bind bx row 0 (bx holds 4 rows) and 4 sequential single dispatches? batch_gguf handles one (x,y) pair per op: rows=4096, x=bx row0 (2048 floats at the bx buffer), y=by row 0.
+            {
+                let mut vblob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                let _ = &vblob;
+                let t1 = Instant::now();
+                for _ in 0..reps {
+                    assert!(engine.batch_open());
+                    engine.batch_gguf(8, &fb_buf, 0, &bx_buf, 0, &by_buf, 0, fb_rows, fb_cols);
+                    engine.batch_end();
+                }
+                let per1 = t1.elapsed().as_secs_f64();
+                println!(
+                    "[q8b4] V1 per-row GEMV rate (single token): -> {:.1} GB/s",
+                    fb_bytes as f64 * reps as f64 / per1 / 1e9
+                );
+            }
+            // q4_K class reference on the SAME shape (4096 x 2048 padded q4 blob)
+            let q4_rb = 144usize * (fb_cols / 256); // 144*8 = 1152
+            let qb_bytes = fb_rows * q4_rb;
+            let qb_ptr = mk(((qb_bytes + page - 1) / page) * page);
+            let qbb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(qb_ptr, qb_bytes) };
+            // fixed d/dmin headers + random bytes (matches the gemm fixture rules)
+            for r in 0..fb_rows {
+                for b in 0..(fb_cols / 256) {
+                    let off = r * q4_rb + b * 144;
+                    qbb[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+                    qbb[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+                    for j in 0..140 {
+                        qbb[off + 4 + j] = (rand2() % 256) as u8;
+                    }
+                }
+            }
+            let qb_buf = engine.register_zerocopy_only(qbb).expect("qb");
+            let qt = 2048usize; // 4-token x width for q4 = cols 2048 (q4 gemm shape)
+            let mut qblob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+            qblob[0][0] = 0; qblob[0][1] = 0; qblob[0][2] = fb_rows as u32; qblob[0][3] = 0; qblob[0][4] = fb_rows as u32;
+            let t2 = Instant::now();
+            for _ in 0..reps {
+                assert!(engine.batch_open());
+                let ok = engine.batch_gguf_gemm(12, &qb_buf, 0, &bx_buf, 0, &by_buf, 0, fb_rows, qt, 4);
+                engine.batch_end();
+                assert!(ok, "q4 gemm fallback");
+            }
+            let per2 = t2.elapsed().as_secs_f64();
+            println!(
+                "[q8b4] Q4K-GEMM reference -> {:.1} GB/s (same shape, 4 tokens)",
+                qb_bytes as f64 * reps as f64 / per2 / 1e9
+            );
+        }
     }
 
     /// GPU3 acceptance at the REAL Qwen3-8B shape: hd 128, 32/8 heads,

@@ -2468,7 +2468,7 @@ impl TransformerModel {
                             14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
                             rt as usize, $cols, &blob,
                         ),
-                        GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4multi(
+                        GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4r4(
                             8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
                             rt as usize, $cols, &blob,
                         ),

@@ -700,6 +700,15 @@ extern "C" {
         rows_total: usize, cols: usize,
         secs: *const u32, n_sec: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf8_b4r4(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_base_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        rows_total: usize, cols: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1245,6 +1254,33 @@ impl MetalEngine {
         let __t = self.op_tick(K_GGUF);
         let __r = unsafe {
             sofuu_metal_batch_gguf8_b4multi(
+                self.ctx,
+                ty,
+                w_buf.handle, w_base_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle,
+                rows_total, cols,
+                secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF, __t);
+        __r
+    }
+
+    /// P2 rate wave: q8_0 with 4 weight-rows per threadgroup (x traffic /4).
+    pub fn batch_gguf8_b4r4(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_base_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer,
+        rows_total: usize, cols: usize,
+        secs: &[[u32; 5]],
+    ) -> bool {
+        debug_assert!(secs.len() <= 4);
+        let __t = self.op_tick(K_GGUF);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf8_b4r4(
                 self.ctx,
                 ty,
                 w_buf.handle, w_base_offset,

@@ -2398,3 +2398,79 @@ kernel void gemv_q8_0_b4multi(
         yr[3 * sec_ystr] = acc3;
     }
 }
+
+// ── P2 rate wave: q8_0 b4 GEMV, FOUR WEIGHT-ROWS per threadgroup ───────────
+// The b4multi shape leaves x:weight traffic ~14:1 (each row's threadgroup
+// re-reads all 4 token rows of x). Grouping 4 weight rows per threadgroup
+// shares each x load across 4 rows (x traffic / 4). Lane = value index;
+// per-row section resolution (a group may span a section boundary).
+#define Q8_R4 4
+
+kernel void gemv_q8_0_b4r4(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &rows_tot [[buffer(4)]],
+    constant GemmSection    *secs     [[buffer(5)]],
+    uint g                            [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    // resolve 4 rows (may straddle a section boundary)
+    uint sec_off[Q8_R4], sec_rem[Q8_R4], sec_yoff[Q8_R4], sec_ystr[Q8_R4], lrow[Q8_R4];
+    bool valid[Q8_R4];
+    for (uint r = 0u; r < Q8_R4; ++r) {
+        uint row = g * Q8_R4 + r;
+        valid[r] = row < rows_tot;
+        uint prev_end = 0u;
+        sec_off[r] = 0u; sec_rem[r] = 0u; sec_yoff[r] = 0u; sec_ystr[r] = 0u; lrow[r] = 0u;
+        for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+            uint end_i = secs[i].rows_end;
+            if (row >= prev_end && row < end_i) {
+                sec_off[r] = secs[i].off;
+                sec_rem[r] = secs[i].rem;
+                sec_yoff[r] = secs[i].y_off;
+                sec_ystr[r] = secs[i].y_stride;
+                lrow[r] = row - prev_end;
+                break;
+            }
+            prev_end = end_i;
+        }
+}
+    float acc[Q8_R4][4];
+    for (uint r = 0u; r < Q8_R4; ++r) {
+        acc[r][0] = 0.0f; acc[r][1] = 0.0f; acc[r][2] = 0.0f; acc[r][3] = 0.0f;
+    }
+    uint nb = cols / 32;
+    uint rb[Q8_R4];
+    for (uint r = 0u; r < Q8_R4; ++r) {
+        rb[r] = sec_off[r] + sec_rem[r] + lrow[r] * nb * 34;
+    }
+    for (uint b = 0u; b < nb; ++b) {
+        float xv0 = x[b * 32 + lane];
+        float xv1 = x[cols + b * 32 + lane];
+        float xv2 = x[2 * cols + b * 32 + lane];
+        float xv3 = x[3 * cols + b * 32 + lane];
+        for (uint r = 0u; r < Q8_R4; ++r) {
+            float d = float(read_f16(w_base, rb[r] + b * 34));
+            float q = (float)(as_type<int8_t>(w_base[rb[r] + b * 34 + 2 + lane]));
+            acc[r][0] += d * q * xv0;
+            acc[r][1] += d * q * xv1;
+            acc[r][2] += d * q * xv2;
+            acc[r][3] += d * q * xv3;
+        }
+    }
+    for (uint r = 0u; r < Q8_R4; ++r) {
+        float s0 = simd_sum(acc[r][0]);
+        float s1 = simd_sum(acc[r][1]);
+        float s2 = simd_sum(acc[r][2]);
+        float s3 = simd_sum(acc[r][3]);
+        if (lane == 0 && valid[r]) {
+            device float *yr = y + sec_yoff[r] / 4 + lrow[r];
+            yr[0] = s0;
+            yr[sec_ystr[r]] = s1;
+            yr[2 * sec_ystr[r]] = s2;
+            yr[3 * sec_ystr[r]] = s3;
+        }
+    }
+}

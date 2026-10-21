@@ -1147,8 +1147,16 @@ impl InferEngine {
                     },
                 );
 
-                // Adaptive gate: measure tokens-per-spec-step and stop
-                // paying for drafts that do not land.
+                // Commit accepted candidate KV vectors to persistent KV cache
+                if !accepted_batch_indices.is_empty() {
+                    self.model.commit_speculative_candidates(&accepted_batch_indices, cur_pos);
+                }
+
+                // Adaptive gate: measure tokens-per-spec-step and stop paying
+                // for drafts that do not land. The step is charged for its
+                // whole cost — forward, head logits, verify AND the KV commit —
+                // so the rate compared against serial decode is like for like
+                // (timing it before the commit silently flattered the tree).
                 spec_steps += 1;
                 spec_accepted += accepted_batch_indices.len() as u32;
                 spec_ns += t_verify.elapsed().as_nanos() as u64;
@@ -1165,11 +1173,6 @@ impl InferEngine {
                             "[spec] gate: off — {spec_rate:.1} tok/s with tree ({spec_tokens}/{spec_steps} steps) vs {serial_rate:.1} serial"
                         );
                     }
-                }
-
-                // Commit accepted candidate KV vectors to persistent KV cache
-                if !accepted_batch_indices.is_empty() {
-                    self.model.commit_speculative_candidates(&accepted_batch_indices, cur_pos);
                 }
                 if prof_spec {
                     eprintln!(
@@ -1288,18 +1291,23 @@ impl InferEngine {
 /// loss. Only evaluated after a 16-step warmup so early misses (cold n-gram
 /// cache) cannot latch the tree off prematurely, while short generations
 /// still stop paying for a losing draft within ~25% of their length.
-/// Self-calibrating gate: speculation pays only when it delivers tokens faster
-/// than plain serial decode. Both rates are measured in the same run (serial
-/// during the warmup window), so the break-even acceptance follows the model,
-/// the prompt and the kernel cost instead of a constant. The 2% margin keeps
-/// measurement noise from flipping the tree off.
+/// Self-calibrating gate: turn speculation off when it is clearly slower than
+/// plain serial decode. Both rates are measured in the same run (serial during
+/// the warmup window), so the break-even follows the model, the prompt and the
+/// kernel cost instead of a constant.
+///
+/// The margin is deliberately lenient (3%): the two losses are asymmetric. A
+/// marginal tree costs a couple of percent, while switching off a winning one
+/// costs ~12% (Qwen3-0.6B measured 27.0 t/s with the tree vs 23.7 serial), and
+/// step-cost estimates carry a few percent of run-to-run noise because they are
+/// sampled from a handful of steps.
 fn spec_is_losing(spec_ns: u64, spec_tokens: u32, serial_ns: u64, serial_tokens: u32) -> bool {
     if spec_ns == 0 || serial_ns == 0 || spec_tokens < 8 || serial_tokens < 4 {
         return false;
     }
     let spec_rate = spec_tokens as f64 / spec_ns as f64;
     let serial_rate = serial_tokens as f64 / serial_ns as f64;
-    spec_rate <= serial_rate * 1.02
+    spec_rate <= serial_rate * 0.97
 }
 
 /// Speculation is skipped for the first `warmup` steps so the self-calibrating
@@ -1336,13 +1344,18 @@ mod adaptive_spec_tests {
 
     #[test]
     fn calibrated_gate_keeps_a_fast_tree() {
-        // 2 tokens per step at 87ms = 43ms/token vs 42ms serial: too close to
-        // pay for, so the gate must turn it off.
+        // 2.1 tokens per step at 87ms = 41.4ms/token vs 42ms serial: 1.4%
+        // faster, inside the noise margin, so the tree stays.
+        assert!(!spec_is_losing(10 * 87_000_000, 21, 10 * 42_000_000, 10));
+        // 2.0 tokens per step at 87ms = 43.5ms/token: 3.6% slower, past the
+        // margin, so it goes off.
         assert!(spec_is_losing(10 * 87_000_000, 20, 10 * 42_000_000, 10));
         // Same cost but 3.5 tokens/step: a clear win, keep it.
         assert!(!spec_is_losing(10 * 87_000_000, 35, 10 * 42_000_000, 10));
         // Cheap steps (e.g. q6_K-shaped trees at 60ms) pay at 2 tokens/step.
         assert!(!spec_is_losing(10 * 60_000_000, 20, 10 * 42_000_000, 10));
+        // Clear loss: 1.14 tokens/step at 87ms is 76ms/token vs 42ms serial.
+        assert!(spec_is_losing(10 * 87_000_000, 11, 10 * 42_000_000, 10));
     }
 
     #[test]

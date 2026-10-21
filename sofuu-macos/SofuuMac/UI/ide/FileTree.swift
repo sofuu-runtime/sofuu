@@ -24,7 +24,8 @@ struct FileTree: View {
         enum Mode { case newFile, newFolder, rename }
         let mode: Mode
         let dir: String        // parent directory of the entry
-        var initial: String    // prefill (rename: the old name)
+        var initial: String    // the field's live text
+        var original: String = ""  // rename: the pre-edit name (the source path)
     }
 
     var body: some View {
@@ -279,7 +280,8 @@ private struct EntryRow: View {
             .contextMenu {
                 Button("Rename…") {
                     composer = FileTree.EntryComposer(
-                        mode: .rename, dir: parentDir, initial: entry.name)
+                        mode: .rename, dir: parentDir, initial: entry.name,
+                        original: entry.name)
                     composerFocused.wrappedValue = true
                 }
                 Button("Move to Trash…", role: .destructive) {
@@ -366,7 +368,9 @@ private struct RowComposer: View {
         case .newFolder:
             err = store.createFolder(at: c.dir, name: name)
         case .rename:
-            err = store.renameFile(c.dir + "/" + c.initial, newName: name)
+            // The source path uses the ORIGINAL name: `initial` is the
+            // live field text, which the user is changing right now.
+            err = store.renameFile(c.dir + "/" + c.original, newName: name)
         }
         if let err { store.systemRow(err) }
         composer = nil

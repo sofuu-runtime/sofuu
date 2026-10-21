@@ -9,6 +9,7 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -65,6 +66,14 @@ public:
           current_task_(nullptr)
     {
         int default_threads = detect_optimal_threads();
+        // SOFUU_NUM_THREADS: explicit override for device tuning (set by
+        // the Android app's engine controls; read once at pool creation).
+        // Kept alongside the file's other getenv knobs.
+        if (const char *th_env = getenv("SOFUU_NUM_THREADS")) {
+            int n = atoi(th_env);
+            int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
+            if (n > 0 && n <= online) default_threads = n;
+        }
         set_thread_count(default_threads);
     }
 
@@ -114,6 +123,8 @@ public:
             task(start, end);
             return;
         }
+
+
 
         size_t n_workers = workers_.size() + 1;
         size_t chunk = (total + n_workers - 1) / n_workers;

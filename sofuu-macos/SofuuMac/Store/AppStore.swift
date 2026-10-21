@@ -908,9 +908,13 @@ final class AppStore: ObservableObject {
             // Engine dropped its registry entry — the bytes go with it, at
             // the MESH root (git toplevel when the project sits inside a
             // repo, else the folder — MacPaths, desktop sessions.rs rule).
-            let base = MacPaths.sessionsDir(engine.projectDir)
-            try? FileManager.default.removeItem(at: base.appendingPathComponent(id))
-            try? FileManager.default.removeItem(at: base.appendingPathComponent("\(id).qtsq"))
+            //Disk work + the git-tooplevel spawn run OFF the main thread.
+            let projectDir = engine.projectDir
+            await Task.detached(priority: .utility) {
+                let base = MacPaths.sessionsDir(projectDir)
+                try? FileManager.default.removeItem(at: base.appendingPathComponent(id))
+                try? FileManager.default.removeItem(at: base.appendingPathComponent("\(id).qtsq"))
+            }.value
             applyDeleteSession(id)
         }
     }
@@ -931,14 +935,18 @@ final class AppStore: ObservableObject {
     func clearSessions() {
         Task {
             guard let r = await engine.clearSessions(), r.optBool("ok") else { return }
-            let base = MacPaths.sessionsDir(engine.projectDir)
-            for sid in (r.optArray("ids") as? [String]) ?? [] {
-                // Ids are engine-generated; never let a registry entry turn
-                // into a traversal.
-                if sid.isEmpty || sid.contains("/") || sid.contains("\\") || sid.hasPrefix(".") { continue }
-                try? FileManager.default.removeItem(at: base.appendingPathComponent(sid))
-                try? FileManager.default.removeItem(at: base.appendingPathComponent("\(sid).qtsq"))
-            }
+            let ids = (r.optArray("ids") as? [String]) ?? []
+            // Ids are engine-generated; never let a registry entry turn
+            // into a traversal. Disk work + git-tooplevel spawn off main.
+            let projectDir = engine.projectDir
+            await Task.detached(priority: .utility) {
+                let base = MacPaths.sessionsDir(projectDir)
+                for sid in ids where !sid.isEmpty && !sid.contains("/")
+                    && !sid.contains("\\") && !sid.hasPrefix(".") {
+                    try? FileManager.default.removeItem(at: base.appendingPathComponent(sid))
+                    try? FileManager.default.removeItem(at: base.appendingPathComponent("\(sid).qtsq"))
+                }
+            }.value
             for s in state.sessions {
                 state.messageCache.removeValue(forKey: s.id)
                 state.ctxCache.removeValue(forKey: s.id)
@@ -1267,6 +1275,9 @@ final class AppStore: ObservableObject {
         state.tabDirty.removeValue(forKey: path)
         fileBuffers.removeValue(forKey: path)
         diskContents.removeValue(forKey: path)
+        // The server needs to drop the document too (no stale diagnostics
+        // for a closed file).
+        NotificationCenter.default.post(name: .init("IDEDocumentClosed"), object: path)
         if state.activeTab == path {
             state.activeTab = state.openTabs.last
         }
@@ -1303,6 +1314,7 @@ final class AppStore: ObservableObject {
             try text.write(toFile: path, atomically: true, encoding: .utf8)
             diskContents[path] = text
             state.tabDirty[path] = false
+            NotificationCenter.default.post(name: .init("IDEFileContentSaved"), object: path)
             return nil
         } catch {
             return "save failed: \(error.localizedDescription)"
@@ -1310,6 +1322,26 @@ final class AppStore: ObservableObject {
     }
 
     func closeAllTabs() {
+        // Never silently discard unsaved work: with auto-save ON every
+        // dirty buffer gets written; with it OFF the dirty tabs stay open
+        // and only the clean ones close.
+        let dirtyTabs = state.openTabs.filter { isDirty($0) }
+        if !dirtyTabs.isEmpty {
+            if ideAutoSaveOn {
+                for p in dirtyTabs {
+                    if let err = saveFile(p) {
+                        systemRow(err)
+                        return
+                    }
+                }
+            } else {
+                systemRow("Unsaved changes — save (⌘S) or turn auto-save on before closing all tabs.")
+                return
+            }
+        }
+        for path in state.openTabs {
+            NotificationCenter.default.post(name: .init("IDEDocumentClosed"), object: path)
+        }
         state.openTabs = []
         state.activeTab = nil
         state.tabDirty = [:]

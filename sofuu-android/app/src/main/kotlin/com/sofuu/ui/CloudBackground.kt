@@ -100,18 +100,17 @@ private fun ShaderCloud(dark: Boolean, animate: Boolean, modifier: Modifier) {
     // full-screen fBm on a phone; the field itself is re-sampled each
     // draw, so the slower cadence is invisible.
     //
-    // animate gates it entirely: the shader samples 4 domain-warped fBm
-    // chains of 3D simplex noise over every pixel — a constant heavy GPU
-    // load. Driving it only while a turn is in flight makes the cloud
-    // double as the activity indicator and drops idle GPU+CPU cost to a
-    // single frame.
+    // Always on. The drift is ~0.03 uv/s, so a 20-sample/s cadence moves
+    // the field only a handful of screen pixels between samples — visually
+    // continuous while keeping the full-screen fBm off the 60/120Hz-vs
+    // treadmill; the visible octave count stays where the palette reads.
     var frame by remember { mutableStateOf(0L) }
-    if (animate && !reduced) {
-        LaunchedEffect(dark, animate) {
+    if (!reduced) {
+        LaunchedEffect(dark) {
             var last = 0L
             while (true) {
                 withFrameNanos { now ->
-                    if (now - last >= 33_000_000L) {
+                    if (now - last >= 50_000_000L) {
                         last = now
                         frame = now
                     }
@@ -222,11 +221,12 @@ float snoise(float3 v) {
 }
 
 /* 3-octave variant for the giant slow lobes — those are low-frequency by
-   nature, so the extra octaves were never visible. */
+   nature, and the finest octave cost more than the eye could read
+   through the palette/alpha curve. */
 float lobes3(float3 p) {
   float f = 0.0;
   float amp = 0.5;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     f += amp * snoise(p);
     p = p * 2.03 + float3(9.7, 3.1, 6.3);
     amp *= 0.5;
@@ -237,7 +237,7 @@ float lobes3(float3 p) {
 float fbm(float3 p) {
   float f = 0.0;
   float amp = 0.5;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 3; i++) {
     f += amp * snoise(p);
     p = p * 2.03 + float3(9.7, 3.1, 6.3);
     amp *= 0.5;
@@ -294,31 +294,38 @@ half4 main(float2 fragCoord) {
 }
 """.trimIndent()
 
+
 // ── Path 2: the baked tile (below API 33) ───────────────────────
 
 @Composable
 private fun TileCloud(dark: Boolean, animate: Boolean, modifier: Modifier) {
-    val size = 192
+    val size = 256
     var tile by remember(dark, size) { mutableStateOf<ImageBitmap?>(null) }
     LaunchedEffect(dark, size) {
         tile = withContext(Dispatchers.Default) { bakeCloudTile(size, dark) }
-    }
-    LaunchedEffect(Unit) {
-        android.util.Log.i("sofuu-cloud", "cloud path = baked tile (no AGSL on this device)")
     }
     val bitmap = tile ?: return
 
     val start = remember { System.nanoTime() }
     val context = LocalContext.current
     var frame by remember { mutableStateOf(0L) }
-    if (animate && !animationsDisabled(context)) {
-        LaunchedEffect(dark, animate) {
+    if (!animationsDisabled(context)) {
+        // 30fps is plenty for a slow drift and quarters the repaint cost
+        // on 120Hz panels; the heap-free per-frame work is a nanotime
+        // compare.
+        LaunchedEffect(dark) {
+            var last = 0L
             while (true) {
-                withFrameNanos { now -> frame = now }
+                withFrameNanos { now ->
+                    if (now - last >= 33_000_000L) {
+                        last = now
+                        frame = now
+                    }
+                }
             }
         }
     }
-    val t = if (!animate) 12_000f else ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
+    val t = ((frame.takeIf { it > 0 } ?: System.nanoTime()) - start) / 1_000_000_000f
 
     val brushA = remember(bitmap) {
         ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated))

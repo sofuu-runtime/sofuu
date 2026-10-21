@@ -68,8 +68,14 @@ android {
             signingConfig = if (hasSigning) {
                 signingConfigs.getByName("release")
             } else {
-                logger.warn("keystore.properties not found — assembling an UNSIGNED release APK")
-                null
+                // No keystore.properties: fall back to the debug key so
+                // `assembleRelease` is locally INSTALLABLE — that matters
+                // now that release (R8/optimized) is the honest way to feel
+                // the app's real smoothness, debug Compose being far
+                // jankier than the shipping artifact. Still warn: this is
+                // test signing, not shipping.
+                logger.warn("keystore.properties not found — signing the release APK with the DEBUG key (test builds only)")
+                signingConfigs.getByName("debug")
             }
         }
     }

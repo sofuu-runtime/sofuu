@@ -81,8 +81,71 @@ class ConfigStore(private val context: Context) {
                 merged.put(k, v)
             }
         }
+        normalizeEndpoints(merged)
+        syncFlatMirror(merged)
         writeConfig(merged)
         return merged
+    }
+
+    /**
+     * OpenAI-wire providers need the FULL chat-completions URL — the
+     * engine (chat.js) uses the entry's endpoint verbatim as the request
+     * URL. A bare base like `https://api.river.ai/v1` answers
+     * HTTP 200 with an empty body and a clean close, which the engine
+     * reports as "stream ended without [DONE] (transfer closed) —
+     * possible truncation" and burns the retry ladder. Same rule as the
+     * desktop's normalizeEndpoints; anthropic/local endpoints carry their
+     * own paths and are left alone. Idempotent.
+     */
+    private fun normalizeEndpoints(cfg: JSONObject) {
+        val providers = cfg.optJSONArray("providers") ?: return
+        for (i in 0 until providers.length()) {
+            val p = providers.optJSONObject(i) ?: continue
+            val profile = p.optString("profile").lowercase()
+            if (profile == "anthropic" || profile == "local") continue
+            val endpoint = p.optString("endpoint").trim()
+            if (endpoint.isEmpty()) continue
+            if (endpoint.lowercase().contains("/chat/completions")) continue
+            p.put(
+                "endpoint",
+                endpoint + if (endpoint.endsWith("/")) "chat/completions" else "/chat/completions",
+            )
+        }
+    }
+
+    /**
+     * Keep the legacy flat mirror on the active provider's entry — the
+     * shape chat.js's loadConfig builds for itself, and what the composer
+     * label and session rows read. An empty entry model clears the mirror
+     * ("no model selected" until picked), matching the desktop.
+     */
+    private fun syncFlatMirror(cfg: JSONObject) {
+        val active = cfg.optString("active")
+        if (active.isEmpty()) return
+        val providers = cfg.optJSONArray("providers") ?: return
+        var entry: JSONObject? = null
+        for (i in 0 until providers.length()) {
+            val p = providers.optJSONObject(i) ?: continue
+            if (p.optString("name") == active) { entry = p; break }
+        }
+        entry ?: return
+        cfg.put("provider", entry.optString("name"))
+        cfg.put("model", entry.optString("model"))
+        cfg.put("base_url", entry.optString("endpoint"))
+    }
+
+    /**
+     * Repair a config written before normalization existed (or by a tool
+     * that stored a base URL). Runs once at boot; writes only when the
+     * file actually changed.
+     */
+    fun repairEndpoints() {
+        val cur = readConfig()
+        if (cur.length() == 0) return
+        val before = cur.toString()
+        normalizeEndpoints(cur)
+        syncFlatMirror(cur)
+        if (cur.toString() != before) writeConfig(cur)
     }
 
     private fun mergeProviders(existing: org.json.JSONArray?, incoming: org.json.JSONArray): org.json.JSONArray {
@@ -206,9 +269,11 @@ class UiPrefs(context: Context) {
         get() = prefs.getString("permissions", "prompt") ?: "prompt"
         set(v) = prefs.edit().putString("permissions", v).apply()
 
+    // Key bumped to "cloudBg2": installs that stored the old default
+    // (true) must land on the NEW default (false) — the API-clean way.
     var cloudBg: Boolean
-        get() = prefs.getBoolean("cloudBg", true)
-        set(v) = prefs.edit().putBoolean("cloudBg", v).apply()
+        get() = prefs.getBoolean("cloudBg2", false)
+        set(v) = prefs.edit().putBoolean("cloudBg2", v).apply()
 
     var chatFontSize: Int
         get() = prefs.getInt("chatFontSize", 15)

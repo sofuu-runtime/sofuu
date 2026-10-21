@@ -140,6 +140,11 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
          *  cwd spawned MCP children inherit). Call before [create]. */
         fun chdir(path: String) = nativeChdir(path)
 
+        /** Route engine console output to a file as well as logcat — on
+         *  OEM phones whose logcat swallows app output this is the only
+         *  engine-visibility channel. Call before [create]. */
+        fun setEngineLogFile(path: String) = nativeSetEngineLogFile(path)
+
         /** Create the runtime on the calling thread. `configJson` is the
          *  sofuu_rt_new config (NULL-safe); the app passes the app files
          *  dir as config_root so ~/.sofuu lands in private storage. */
@@ -182,6 +187,7 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
 
         @JvmStatic private external fun nativeSetHome(path: String)
         @JvmStatic private external fun nativeChdir(path: String)
+        @JvmStatic private external fun nativeSetEngineLogFile(path: String)
 
         /**
          * Set (or, with a null value, unset) a process environment

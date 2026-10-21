@@ -35,6 +35,7 @@ private struct Root: View {
 
     @Environment(\.colorScheme) private var systemScheme
     @State private var keys: GlobalKeyMonitor?
+    @State private var watchersInstalled = false
 
     var body: some View {
         GeometryReader { geo in
@@ -80,8 +81,12 @@ private struct Root: View {
 
     // Focus-driven notifications: a finished turn or a waiting approval
     // only notifies when no Sofuu window is frontmost (the Tauri host.rs
-    // rule). Plus the 5-minute model-cache prefetch refresh.
+    // rule). Plus the 5-minute model-cache prefetch refresh. Registered
+    // ONCE — onAppear can re-fire, and stacked timers multiply engine
+    // cache refreshes forever.
     private func installFocusWatchers() {
+        guard !watchersInstalled else { return }
+        watchersInstalled = true
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { _ in Task { @MainActor in store.foreground = true } }
@@ -159,6 +164,15 @@ struct SofuuMenus: Commands {
             Divider()
             Button("Save File") { store.saveActiveTab() }
                 .keyboardShortcut("s")
+            Divider()
+            Button("Find in File") {
+                NotificationCenter.default.post(name: .init("IDEFindToggle"), object: nil)
+            }
+                .keyboardShortcut("f")
+            Button("Document Outline") {
+                NotificationCenter.default.post(name: .init("IDEOutlineToggle"), object: nil)
+            }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
         }
         CommandMenu("Session") {
             Button("Stop") { store.cancel() }

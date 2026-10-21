@@ -182,7 +182,11 @@ private fun TableBlock(t: MdBlock.Table, fontSize: Int) {
 @Composable
 private fun inlineMd(s: String): AnnotatedString {
     val c = LocalSofuuColors.current
-    return buildInline(s, c)
+    // The inline scanner allocates and walks on every invocation; without
+    // this remember, every visible paragraph re-built its spans on every
+    // recomposition — including every scroll frame and every streaming
+    // flush. Keyed on text + palette, so it builds once per content.
+    return remember(s, c) { buildInline(s, c) }
 }
 
 /**

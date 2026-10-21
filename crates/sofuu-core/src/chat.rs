@@ -7730,6 +7730,8 @@ mod tests {
         check_parse("<chat-driver>", DRIVER, true);
         check_parse("agent.js", include_str!("../../../src/js/agent.js"), true);
         check_parse("tools.js", include_str!("../../../src/js/tools.js"), true);
+        check_parse("extractor.js", include_str!("../../../src/js/extractor.js"), true);
+        check_parse("storage.js", include_str!("../../../src/js/storage.js"), true);
         check_parse("chat.js", include_str!("../../../src/js/chat.js"), true);
     }
 

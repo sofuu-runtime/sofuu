@@ -30,6 +30,10 @@ pub const AGENT_JS: &str = include_str!("../../../src/js/agent.js");
 pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
 /// The coding-tools driver — single source of truth is src/js/tools.js.
 pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
+/// The automated fact extractor — single source of truth is src/js/extractor.js.
+pub const EXTRACTOR_JS: &str = include_str!("../../../src/js/extractor.js");
+/// The native structured storage driver — single source of truth is src/js/storage.js.
+pub const STORAGE_JS: &str = include_str!("../../../src/js/storage.js");
 /// The chat turn engine — single source of truth is src/js/chat.js
 /// (PLAN-DESKTOP C). Eval'd LAST: it builds on sofuu.agent/web/tools and
 /// exposes sofuu.chat.* for embedded hosts (the desktop app). Hosts that

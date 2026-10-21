@@ -146,15 +146,22 @@ private fun TextFieldRow(
     label: String,
     value: String,
     placeholder: String,
-    onSubmit: (String) -> Unit,
+    onChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val c = LocalSofuuColors.current
+    // Local echo keeps the cursor stable while the caller's value makes a
+    // round trip; every edit is still pushed to [onChange]. (This used to
+    // type into local state and never call back at all, so every settings
+    // field — including the provider form — read as empty.)
     var text by remember { mutableStateOf(value) }
     LaunchedEffect(value) { text = value }
     androidx.compose.foundation.text.BasicTextField(
         value = text,
-        onValueChange = { text = it },
+        onValueChange = {
+            text = it
+            onChange(it)
+        },
         textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontFamily = FontFamily.Monospace, fontSize = 13.sp),
         cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
         modifier = modifier
@@ -170,6 +177,41 @@ private fun TextFieldRow(
             }
         },
     )
+}
+
+/**
+ * Text field whose value reaches [onApply] only when the user taps Apply.
+ * For knobs that reboot the engine: applying per keystroke would restart
+ * it while a multi-digit number is still being typed.
+ */
+@Composable
+private fun AppliedFieldRow(
+    label: String,
+    value: String,
+    placeholder: String,
+    onApply: (String) -> Unit,
+) {
+    val c = LocalSofuuColors.current
+    var text by remember { mutableStateOf(value) }
+    LaunchedEffect(value) { text = value }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(Modifier.weight(1f)) {
+            TextFieldRow(label, text, placeholder, { text = it })
+        }
+        Text(
+            "Apply",
+            fontSize = 12.sp,
+            color = c.accentContrast,
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(c.accent)
+                .clickable { onApply(text) }
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+    }
 }
 
 /** One key/value tile of the live engine card. */
@@ -364,18 +406,18 @@ private fun GeneralPane(store: AppStore) {
             }
         })
         Row_("Context window", "Override the model's window (0 = engine-resolved truth).", {
-            TextFieldRow("ctx", state.config?.ctxWindow?.toString().orEmpty(), "auto", {
-                it.toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("ctx_window", n)) }
+            AppliedFieldRow("ctx", state.config?.ctxWindow?.toString().orEmpty(), "auto", { v ->
+                v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("ctx_window", n)) }
             })
         })
         Row_("Max output tokens", "Override the per-request output cap (0 = model default).", {
-            TextFieldRow("maxout", state.config?.maxOutput?.toString().orEmpty(), "model default", {
-                it.toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("max_output", n)) }
+            AppliedFieldRow("maxout", state.config?.maxOutput?.toString().orEmpty(), "model default", { v ->
+                v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("max_output", n)) }
             })
         })
         Row_("Session budget (USD)", "The engine refuses new turns past the cap (0 = uncapped).", {
-            TextFieldRow("budget", state.config?.budgetUsd?.takeIf { it > 0 }?.toString().orEmpty(), "uncapped", {
-                it.toDoubleOrNull()?.let { n -> store.patchConfig(JSONObject().put("budget_usd", n)) }
+            AppliedFieldRow("budget", state.config?.budgetUsd?.takeIf { it > 0 }?.toString().orEmpty(), "uncapped", { v ->
+                v.trim().toDoubleOrNull()?.let { n -> store.patchConfig(JSONObject().put("budget_usd", n)) }
             })
         })
         Section("Memory & recall")
@@ -387,27 +429,27 @@ private fun GeneralPane(store: AppStore) {
             modifier = Modifier.padding(bottom = 4.dp),
         )
         Row_("Recall similarity floor", "Minimum match score for a memory to be recalled (0 = default 0.30).", {
-            TextFieldRow("recall_min", state.config?.recallMin?.takeIf { it > 0 }?.toString().orEmpty(), "default 0.30", {
-                it.toDoubleOrNull()?.let { n ->
+            AppliedFieldRow("recall_min", state.config?.recallMin?.takeIf { it > 0 }?.toString().orEmpty(), "default 0.30", { v ->
+                v.trim().toDoubleOrNull()?.let { n ->
                     store.patchConfig(JSONObject().put("recall_min", n.coerceIn(0.0, 1.0)))
                 }
             })
         })
         Row_("Recall token budget", "Max tokens of memories injected per turn (0 = auto ≈2% of window, 1k–16k).", {
-            TextFieldRow("recall_budget", state.config?.recallBudget?.takeIf { it > 0 }?.toString().orEmpty(), "auto", {
-                it.toLongOrNull()?.let { n ->
+            AppliedFieldRow("recall_budget", state.config?.recallBudget?.takeIf { it > 0 }?.toString().orEmpty(), "auto", { v ->
+                v.trim().toLongOrNull()?.let { n ->
                     store.patchConfig(JSONObject().put("recall_budget", n.coerceIn(0L, 16_000L)))
                 }
             })
         })
         Row_("Embeddings — provider", "Optional OpenAI-compatible provider for memory embeddings. Blank = the bundled offline embedder.", {
-            TextFieldRow("embed_provider", state.config?.embedProvider.orEmpty(), "bundled offline embedder", {
-                store.patchConfig(JSONObject().put("embed_provider", it.trim()))
+            AppliedFieldRow("embed_provider", state.config?.embedProvider.orEmpty(), "bundled offline embedder", { v ->
+                store.patchConfig(JSONObject().put("embed_provider", v.trim()))
             })
         })
         Row_("Embeddings — model", "Embedding model id used for memory vectors.", {
-            TextFieldRow("embed_model", state.config?.embedModel.orEmpty(), "default", {
-                store.patchConfig(JSONObject().put("embed_model", it.trim()))
+            AppliedFieldRow("embed_model", state.config?.embedModel.orEmpty(), "default", { v ->
+                store.patchConfig(JSONObject().put("embed_model", v.trim()))
             })
         })
         VectorEngineCard(store)
@@ -486,6 +528,7 @@ private fun EngineEnvCard(store: AppStore) {
     var allowInternal by remember { mutableStateOf(env.webAllowInternal) }
     var backend by remember { mutableStateOf(env.memoryBackend) }
     var engine by remember { mutableStateOf(env.webEngine) }
+    var phaseMetrics by remember { mutableStateOf(env.phaseMetrics) }
 
     ToggleRow("Coding tools", "All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.", noTools)
     { noTools = it; env.noTools = it; store.applyRuntimeEnv() }
@@ -516,7 +559,7 @@ private fun EngineEnvCard(store: AppStore) {
             "maxsteps",
             if (env.chatMaxSteps > 0) env.chatMaxSteps.toString() else "",
             "200 (engine default)",
-            onSubmit = {
+            onChange = {
                 val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
                 env.chatMaxSteps = n
                 store.applyRuntimeEnv()
@@ -528,15 +571,50 @@ private fun EngineEnvCard(store: AppStore) {
             "stall",
             if (env.stallTimeoutSecs > 0) env.stallTimeoutSecs.toString() else "",
             "300 (engine default)",
-            onSubmit = {
+            onChange = {
                 val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
                 env.stallTimeoutSecs = n
                 store.applyRuntimeEnv()
             },
         )
     }
+    Row_("CPU threads for inference", "Kernel-pool threads decoding locally. 0 = auto (4 on this class of phone). Apply restarts the engine — watch the tok/s line to compare.") {
+        AppliedFieldRow(
+            "threads",
+            if (env.numThreads > 0) env.numThreads.toString() else "",
+            "auto (4)",
+            onApply = {
+                env.numThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
+                store.restartEngineForEnv()
+            },
+        )
+    }
+    Row_("Prefill threads", "Threads for the batched prompt pass — compute-bound, scales with the big cluster. 0 = auto (8). Apply restarts; TTFT is the scoreboard.") {
+        AppliedFieldRow(
+            "prefill",
+            if (env.prefillThreads > 0) env.prefillThreads.toString() else "",
+            "auto (8)",
+            onApply = {
+                env.prefillThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
+                store.restartEngineForEnv()
+            },
+        )
+    }
+    Row_("Decode threads", "Threads for token generation — bandwidth-bound, tune for the tok/s readout. 0 = auto (4). Apply restarts the engine.") {
+        AppliedFieldRow(
+            "decode",
+            if (env.decodeThreads > 0) env.decodeThreads.toString() else "",
+            "auto (4)",
+            onApply = {
+                env.decodeThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
+                store.restartEngineForEnv()
+            },
+        )
+    }
+    ToggleRow("Phase metrics", "Write the per-token engine split (forward / sampler / glue) to files/phase-metrics.log every 256 tokens. Restart to apply. Readable over adb.", phaseMetrics)
+    { phaseMetrics = it; env.phaseMetrics = it; store.restartEngineForEnv() }
     Text(
-        "Only Context gates needs a restart; everything else is read while a turn " +
+        "Context gates and CPU threads need a restart; everything else is read while a turn " +
             "runs, so it applies to the next message.",
         fontSize = 10.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp),
     )
@@ -695,6 +773,8 @@ private fun ProvidersPane(store: AppStore) {
     var newEndpoint by remember { mutableStateOf("") }
     var newModel by remember { mutableStateOf("") }
     var newKey by remember { mutableStateOf("") }
+    var addError by remember { mutableStateOf<String?>(null) }
+    var addNote by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(emptySet<String>()) }
 
     Column(Modifier.verticalScroll(rememberScrollState())) {
@@ -713,16 +793,49 @@ private fun ProvidersPane(store: AppStore) {
                 .clip(RoundedCornerShape(999.dp))
                 .background(c.accent)
                 .clickable {
-                    if (newName.isNotEmpty() && newEndpoint.isNotEmpty()) {
+                    val name = newName.trim()
+                    val endpoint = newEndpoint.trim()
+                    val model = newModel.trim()
+                    addNote = null
+                    if (name.isEmpty() || endpoint.isEmpty()) {
+                        // The button used to fail silently here, which read
+                        // as "Add does nothing".
+                        addError = "Name and endpoint are required."
+                    } else {
                         val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
-                        providers.add(JSONObject().put("name", newName).put("endpoint", newEndpoint).put("model", newModel).put("profile", ""))
-                        store.patchConfig(JSONObject().put("providers", org.json.JSONArray(providers)).put("active", newName).put("provider", newName))
-                        if (newKey.isNotEmpty()) store.setProviderKey(newName, newKey)
+                        providers.add(
+                            JSONObject().put("name", name).put("endpoint", endpoint)
+                                .put("model", model).put("profile", ""),
+                        )
+                        val patch = JSONObject()
+                            .put("providers", org.json.JSONArray(providers))
+                        if (model.isNotEmpty()) {
+                            // chat.js resolves the model from the active
+                            // provider entry, but the flat mirror drives the
+                            // composer pill — keep both in step.
+                            patch.put("active", name).put("provider", name).put("model", model)
+                            addNote = null
+                        } else {
+                            // Switching to an entry with no model would keep
+                            // sending the previous provider's model id to the
+                            // new endpoint. Add it, leave it inactive, and say
+                            // how to finish the switch.
+                            addNote = "Added $name — open the model sheet in the composer, pick one of its models, and it becomes active."
+                        }
+                        store.patchConfig(patch)
+                        if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
                         newName = ""; newEndpoint = ""; newModel = ""; newKey = ""
+                        addError = null
                     }
                 }
                 .padding(horizontal = 18.dp, vertical = 10.dp),
         )
+        addError?.let {
+            Text(it, fontSize = 11.sp, color = c.errStrong, modifier = Modifier.padding(top = 6.dp))
+        }
+        addNote?.let {
+            Text(it, fontSize = 11.sp, color = c.ok, modifier = Modifier.padding(top = 6.dp))
+        }
 
         Section("Configured providers")
         for (p in state.config?.providers ?: emptyList()) {
@@ -775,12 +888,17 @@ private fun ProvidersPane(store: AppStore) {
                                 .clip(RoundedCornerShape(999.dp))
                                 .background(c.accent)
                                 .clickable {
-                                    if (ep.isNotBlank()) store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
-                                    editing = editing - p.name
+                                    if (ep.isNotBlank()) {
+                                        store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
+                                        editing = editing - p.name
+                                    }
                                 }
                                 .padding(horizontal = 16.dp, vertical = 8.dp),
                         )
-                        if (p.name == state.config?.active) {
+                        // Only offered for a non-active provider; the
+                        // condition was inverted, so the one provider the
+                        // button appeared on was the one it could not switch.
+                        if (p.name != state.config?.active) {
                             Text(
                                 "Set as active",
                                 fontSize = 12.sp,
@@ -1063,7 +1181,7 @@ private fun BrainPane(store: AppStore) {
         }
 
         Section("Search")
-        TextFieldRow("recall", recalled, "a fact to recall", onSubmit = { recalled = it })
+        TextFieldRow("recall", recalled, "a fact to recall", onChange = { recalled = it })
         hits?.let { h ->
             Spacer(Modifier.height(8.dp))
             if (h.length() == 0) {
@@ -1183,8 +1301,8 @@ private fun BrainPane(store: AppStore) {
             "Ask what the gates would say about a call before the agent makes it.",
             fontSize = 11.sp, color = c.textFaint,
         )
-        TextFieldRow("tool", probeTool, "read_file", onSubmit = { probeTool = it })
-        TextFieldRow("args", probeArgs, "{\"path\":\"README.md\"}", onSubmit = { probeArgs = it })
+        TextFieldRow("tool", probeTool, "read_file", onChange = { probeTool = it })
+        TextFieldRow("args", probeArgs, "{\"path\":\"README.md\"}", onChange = { probeArgs = it })
         Text(
             "Check",
             fontSize = 12.sp,
@@ -1237,7 +1355,7 @@ private fun BrainPane(store: AppStore) {
             Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
         }
         if (imgPath != null) {
-            TextFieldRow("describe", imgQuery, "what to look for", onSubmit = { imgQuery = it })
+            TextFieldRow("describe", imgQuery, "what to look for", onChange = { imgQuery = it })
             SmallButton(c.accent, c.accentContrast, "Compare to text") {
                 scope.launch {
                     imgSim = withContext(Dispatchers.IO) { surface.imageTextSimilarity(imgPath!!, imgQuery) }
@@ -1257,8 +1375,8 @@ private fun BrainPane(store: AppStore) {
         }
 
         Section("Similarity")
-        TextFieldRow("a", simA, "first string", onSubmit = { simA = it })
-        TextFieldRow("b", simB, "second string", onSubmit = { simB = it })
+        TextFieldRow("a", simA, "first string", onChange = { simA = it })
+        TextFieldRow("b", simB, "second string", onChange = { simB = it })
         sim?.let {
             Spacer(Modifier.height(6.dp))
             Text(
@@ -1367,9 +1485,9 @@ private fun AgentsPane(store: AppStore) {
         }
 
         Section("Define an agent")
-        TextFieldRow("name", name, "reviewer", onSubmit = { name = it })
-        TextFieldRow("system", system, "what this agent is for", onSubmit = { system = it })
-        TextFieldRow("max steps", maxSteps, "24", onSubmit = { maxSteps = it })
+        TextFieldRow("name", name, "reviewer", onChange = { name = it })
+        TextFieldRow("system", system, "what this agent is for", onChange = { system = it })
+        TextFieldRow("max steps", maxSteps, "24", onChange = { maxSteps = it })
         ToggleRow("Web tools", "web_search and web_open", withWeb) { withWeb = it }
         ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 10.dp)) {
@@ -1397,7 +1515,7 @@ private fun AgentsPane(store: AppStore) {
         }
 
         Section("Run headlessly")
-        TextFieldRow("task", task, "a task to hand the agent", onSubmit = { task = it })
+        TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it })
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
             SmallButton(if (running) c.bgCardHover else c.accent, if (running) c.textFaint else c.accentContrast,
                 if (running) "Running…" else "Run") {

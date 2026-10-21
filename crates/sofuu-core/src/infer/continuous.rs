@@ -13,6 +13,134 @@ use super::paged_kv::{BlockPool, SequenceBlockTable};
 use super::sampler::{Sampler, SamplerConfig};
 use super::{GenerateOptions, InferEngine};
 
+// ── Phase-aware kernel-pool sizing ───────────────────────────────
+// Prefill and decode want different teams. Prefill is compute-bound
+// (batched GEMM over the whole prompt) and speeds up nearly linearly
+// with threads on the performance cluster; decode is bandwidth-bound
+// (every weight byte crosses memory each token) and has a tuned
+// count resembling 4-6. The pool is global, so each scheduling
+// iteration snapshots the phase of work it is about to run and resizes
+// at most when the value changed; the rebuild is sub-millisecond and
+// happens twice per turn at most.
+//
+// Both are host-settable:
+//   SOFUU_PREFILL_THREADS / SOFUU_DECODE_THREADS — explicit
+//   SOFUU_NUM_THREADS — decode fallback (the app's CPU-threads setting)
+
+/// Read a thread-count env var if present and sane.
+fn env_threads(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0 && *n <= 8)
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum PoolPhase { Prefill, Decode }
+
+fn pool_threads_for(phase: PoolPhase) -> usize {
+    let online = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    match phase {
+        PoolPhase::Prefill => env_threads("SOFUU_PREFILL_THREADS")
+            // Default = the kernel pool's own mobile default (4 = the big
+            // cluster). More threads only help with UNEVEN chunk splits —
+            // parallel_for splits equally, so every little-core worker in
+            // the barrier caps prefill at that core's pace. 8-16 threads
+            // remain available via env for kernels that support them.
+            .unwrap_or_else(|| 4.min(online)),
+        PoolPhase::Decode => env_threads("SOFUU_DECODE_THREADS")
+            .or_else(|| env_threads("SOFUU_NUM_THREADS"))
+            .unwrap_or_else(|| 4.min(online)),
+    }
+}
+
+/// Resize the pool for the phase if the current count differs. The pool
+/// works on its own lock, disjoint from the scheduler/engine mutexes —
+/// never taken while a forward is running, so no lock-order hazard.
+fn size_pool_for_phase(phase: PoolPhase) {
+    let want = pool_threads_for(phase);
+    if crate::infer::quant::get_thread_count() != want {
+        crate::infer::quant::set_thread_count(want);
+    }
+}
+
+// ── Phase metrics (Parts 0/1 instrument) ────────────────────────
+// On-device split of a decode token: forward (the weight sweep, inside
+// the model), sampler, and the rest (state handling, channel sends,
+// scheduler glue). Aggregate in atomics; a line is appended to
+// $SOFUU_PHASE_METRICS every 256 tokens and at prefill boundaries.
+// Zero-cost unless the env var is set.
+
+static M_FWD_US: AtomicU64 = AtomicU64::new(0);
+static M_SAMPLE_US: AtomicU64 = AtomicU64::new(0);
+static M_ARM_US: AtomicU64 = AtomicU64::new(0);
+static M_PREFILL_US: AtomicU64 = AtomicU64::new(0);
+static M_PREFILLS: AtomicU64 = AtomicU64::new(0);
+static M_TOKENS: AtomicU64 = AtomicU64::new(0);
+static M_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn metrics_file() -> &'static Option<String> {
+    M_PATH.get_or_init(|| {
+        std::env::var("SOFUU_PHASE_METRICS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
+fn metrics_add(fwd_us: u64, sample_us: u64, arm_us: u64, prefill_us: u64, prefills: u64, tokens: u64) {
+    if metrics_file().is_none() {
+        return;
+    }
+    M_FWD_US.fetch_add(fwd_us, Ordering::Relaxed);
+    M_SAMPLE_US.fetch_add(sample_us, Ordering::Relaxed);
+    M_ARM_US.fetch_add(arm_us, Ordering::Relaxed);
+    M_PREFILL_US.fetch_add(prefill_us, Ordering::Relaxed);
+    M_PREFILLS.fetch_add(prefills, Ordering::Relaxed);
+    let total = M_TOKENS.fetch_add(tokens, Ordering::Relaxed) + tokens;
+    // Snapshot on a 256-token cadence, plus every prefill boundary (its
+    // per-call cost would otherwise wash out of a 256-token window).
+    let crossed = (total - tokens) / 256 != total / 256;
+    decode_metrics_emit(crossed || (prefill_us > 0 && prefills > 0));
+}
+
+/// Flush the aggregate line. Called internally on the 256-token cadence;
+/// `force` is for prefill boundaries.
+fn decode_metrics_emit(cond: bool) {
+    if !cond || metrics_file().is_none() {
+        return;
+    }
+    let fwd = M_FWD_US.swap(0, Ordering::Relaxed);
+    let sample = M_SAMPLE_US.swap(0, Ordering::Relaxed);
+    let arm = M_ARM_US.swap(0, Ordering::Relaxed);
+    let pre = M_PREFILL_US.swap(0, Ordering::Relaxed);
+    let prefills = M_PREFILLS.swap(0, Ordering::Relaxed);
+    let tokens = M_TOKENS.load(Ordering::Relaxed);
+    if tokens == 0 && fwd == 0 && pre == 0 {
+        return; // nothing measured in this window
+    }
+    let per_tok = if tokens > 0 { arm / tokens } else { 0 };
+    let line = format!(
+        "window tokens={} fwd_tok_us={} sample_tok_us={} arm_tok_us={} glue_tok_us={} prefill_us={} prefills={}\n",
+        tokens,
+        if tokens > 0 { fwd / tokens } else { 0 },
+        if tokens > 0 { sample / tokens } else { 0 },
+        per_tok,
+        per_tok.saturating_sub(fwd / tokens.max(1)).saturating_sub(sample / tokens.max(1)),
+        pre,
+        prefills,
+    );
+    if let Some(path) = metrics_file() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = write!(f, "{}", line);
+        }
+    }
+}
+
 /// Message emitted by an active generation stream to the caller/HTTP writer.
 #[derive(Debug, Clone)]
 pub enum StreamOutput {
@@ -44,6 +172,11 @@ pub struct ActiveStream {
     pub id: u64,
     pub prompt_tokens: Vec<u32>,
     pub generated_tokens: Vec<u32>,
+    /// prompt + every sampled token, appended ONCE per token. The decode
+    /// step used to rebuild this by cloning prompt_tokens and splicing
+    /// generated_tokens on EVERY iteration — O(turn²) element copies by
+    /// the end of a long reply — just to hand the sampler a history.
+    pub full_history: Vec<u32>,
     pub cur_pos: usize,
     pub options: GenerateOptions,
     pub tx: std::sync::mpsc::Sender<StreamOutput>,
@@ -176,6 +309,14 @@ impl ContinuousBatchServer {
             // 2. Admit pending requests into active streams
             {
                 let mut state = state_arc.lock().unwrap();
+                // Phase snapshot BEFORE the work: admissions mean prefill;
+                // any active Decoding stream means decode. Runs while the
+                // scheduler state is held; the pool lock is disjoint.
+                if state.active.iter().any(|st| st.status == StreamStatus::Decoding) {
+                    size_pool_for_phase(PoolPhase::Decode);
+                } else {
+                    size_pool_for_phase(PoolPhase::Prefill);
+                }
                 while let Some(req) = state.pending.pop_front() {
                     if req.aborted.load(Ordering::Relaxed) {
                         let _ = req.tx.send(StreamOutput::Done(0, 0));
@@ -205,10 +346,12 @@ impl ContinuousBatchServer {
                         block_tables.push(SequenceBlockTable::new());
                     }
 
+                    let full_history = input_tokens.clone();
                     let active_stream = ActiveStream {
                         id: next_seq_id,
                         prompt_tokens: input_tokens,
                         generated_tokens: Vec::new(),
+                        full_history,
                         cur_pos: 0,
                         options: req.options,
                         tx: req.tx,
@@ -246,6 +389,7 @@ impl ContinuousBatchServer {
 
                     match stream.status {
                         StreamStatus::Prefilling => {
+                            let pf_t0 = std::time::Instant::now();
                             let mut eng = engine_arc.lock().unwrap();
                             let p_len = stream.prompt_tokens.len();
 
@@ -260,16 +404,19 @@ impl ContinuousBatchServer {
                                 stream.logits_buf.copy_from_slice(logits);
                                 stream.cur_pos = p_len;
                             }
+                            drop(eng);
+                            metrics_add(0, 0, 0, pf_t0.elapsed().as_micros() as u64, 1, 0);
+                            decode_metrics_emit(false);
                             stream.status = StreamStatus::Decoding;
                             progressed = true;
                             streams_to_retain.push(stream);
                         }
                         StreamStatus::Decoding => {
-                            let next_token = {
-                                let mut history = stream.prompt_tokens.clone();
-                                history.extend_from_slice(&stream.generated_tokens);
-                                stream.sampler.sample(&mut stream.logits_buf, &history)
-                            };
+                            let arm_t0 = std::time::Instant::now();
+                            let s_t0 = std::time::Instant::now();
+                            let next_token =
+                                stream.sampler.sample(&mut stream.logits_buf, &stream.full_history);
+                            let sample_us = s_t0.elapsed().as_micros() as u64;
 
                             let (is_eos, raw_tok_str, piece) = {
                                 let eng = engine_arc.lock().unwrap();
@@ -303,16 +450,21 @@ impl ContinuousBatchServer {
                             // Emit token chunk to HTTP listener
                             stream.full_generated.push_str(&piece);
                             stream.generated_tokens.push(next_token);
+                            stream.full_history.push(next_token);
                             let _ = stream.tx.send(StreamOutput::Token(piece));
                             progressed = true;
 
                             // Advance decode forward
+                            let f_t0 = std::time::Instant::now();
                             {
                                 let mut eng = engine_arc.lock().unwrap();
                                 let logits = eng.model.forward(next_token, stream.cur_pos);
                                 stream.logits_buf.copy_from_slice(logits);
                             }
+                            let fwd_us = f_t0.elapsed().as_micros() as u64;
                             stream.cur_pos += 1;
+                            metrics_add(fwd_us, sample_us, arm_t0.elapsed().as_micros() as u64, 0, 0, 1);
+                            decode_metrics_emit(false);
                             streams_to_retain.push(stream);
                         }
                         _ => {}

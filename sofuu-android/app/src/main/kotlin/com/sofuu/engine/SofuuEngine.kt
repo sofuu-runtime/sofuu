@@ -131,8 +131,15 @@ class SofuuEngine(
     private fun engineMain() {
         try {
             File(projectDir).mkdirs()
-            // Engine console output → logcat (tag `sofuu-js`). Installed
-            // BEFORE rt_new so boot warnings are not lost.
+            // Engine console output → logcat AND the console file (the
+            // logcat tag is dead on some OEM builds — the file survives).
+            // Installed BEFORE rt_new so boot warnings are not lost.
+            // Create the console file immediately so its presence (or
+            // absence after a crash) is never ambiguous mid-test.
+            kotlin.runCatching {
+                java.io.File(homeDir, "engine-console.log").createNewFile()
+            }
+            SofuuBridge.setEngineLogFile(java.io.File(homeDir, "engine-console.log").absolutePath)
             SofuuBridge.setLogEnabled(true)
             log("boot: home=$homeDir project=$projectDir abi=${SofuuBridge.abiVersion()}")
             // Android has no $HOME — pin it before the runtime boots (the

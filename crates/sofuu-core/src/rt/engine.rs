@@ -261,6 +261,7 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         mod_memory_register(ctx);
         mod_kv_register(ctx);
         mod_agent_register(ctx);
+        crate::rt::storage::mod_storage_register(ctx);
     }
 
     // ── Build capital-S 'Sofuu' convenience global ────────────────
@@ -363,7 +364,8 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
 
     let mem = unsafe { qjs::sofuu_js_get_property_str(ctx, sofuu_obj, c"memory".as_ptr()) };
     if !unsafe { qjs::is_undefined(mem) } && !unsafe { qjs::is_null(mem) } {
-        unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"memory".as_ptr(), mem) };
+        unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"memory".as_ptr(), qjs::sofuu_js_dup_value(ctx, mem)) };
+        unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"brain".as_ptr(), mem) };
     } else {
         unsafe { qjs::sofuu_js_free_value(ctx, mem) };
     }

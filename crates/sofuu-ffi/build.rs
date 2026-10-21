@@ -365,6 +365,25 @@ fn main() {
                 println!("cargo:rerun-if-changed={}", qtc_lib.display());
             }
         }
+
+        // ── Sofuu QTSQ Columnar Table Subsystem ──────────────────
+        let table_c = root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.c");
+        if table_c.exists() {
+            let mut table_cc = cc::Build::new();
+            table_cc
+                .opt_level(2)
+                .warnings(false)
+                .include(root.join("crates/sofuu-ffi/include"))
+                .include(qtsq_dir.join("include"))
+                .include(qtsq_dir.join("compressor/include"))
+                .file(&table_c);
+            table_cc.compile("sofuu_qtsq_table");
+            println!("cargo:rerun-if-changed={}", table_c.display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.h").display()
+            );
+        }
         // zlib: POSIX resolves -lz from the system toolchain. Windows has no
         // system zlib — probe the same vcpkg triplet the curl block uses
         // (the CMake port's find_package(ZLIB) satisfies it the same way),
@@ -444,6 +463,13 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
         println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-link-lib=objc");
+        if Path::new("/opt/homebrew/lib/libopus.dylib").exists() {
+            println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+            println!("cargo:rustc-link-lib=opus");
+        } else if Path::new("/usr/local/lib/libopus.dylib").exists() {
+            println!("cargo:rustc-link-search=native=/usr/local/lib");
+            println!("cargo:rustc-link-lib=opus");
+        }
     }
     println!("cargo:rerun-if-env-changed=SOFUU_QTSQ_DIR");
     println!("cargo:rerun-if-env-changed=SOFUU_QTSQ_LIB");

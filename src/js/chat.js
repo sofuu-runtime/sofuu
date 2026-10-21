@@ -1628,6 +1628,18 @@
        * land on another session's meter. */
       sid: S.info ? S.info.id : null,
     } });
+    /* Phase 2 (PLAN-CMA-V2): automated post-turn background fact extractor.
+     * Fires asynchronously without delaying the user's interactive response. */
+    if (globalThis.sofuu && globalThis.sofuu.extractor && typeof globalThis.sofuu.extractor.processTurnAsync === 'function' && c.brain) {
+      var extModel = c.extractor_model || c.extractor || (c.provider === 'local' ? c.model : null);
+      if (extModel) {
+        var bPath = S.project ? S.project + '/.sofuu/brain/brain.qtsq' : '.sofuu/brain.qtsq';
+        try {
+          var bHandle = globalThis.sofuu.brain && typeof globalThis.sofuu.brain.open === 'function' ? globalThis.sofuu.brain.open(bPath, 64) : null;
+          globalThis.sofuu.extractor.processTurnAsync(txt, answer, { model: extModel, brain: bHandle });
+        } catch (eExt) {}
+      }
+    }
     /* Keep the brain manifest's `updated` fresh after a turn that may
      * have written memories (consolidation/remember). */
     brainIndexTouch(S.project);

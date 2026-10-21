@@ -11,6 +11,11 @@ struct IdeLayout: View {
     @Environment(\.sofuuColors) private var c
     @Environment(\.colorScheme) private var scheme
 
+    @State private var findVisible = false
+    @State private var findQuery = ""
+    @State private var findCaseSensitive = false
+    @State private var findCount = 0
+
     var body: some View {
         HStack(spacing: 0) {
             FileTree(store: store)
@@ -35,6 +40,16 @@ struct IdeLayout: View {
             editorColumn
                 .frame(maxWidth: .infinity)
                 .background(c.bgRaised.ignoresSafeArea())
+                .overlay(alignment: .top) {
+                    if findVisible {
+                        FindBar(
+                            query: $findQuery,
+                            caseSensitive: $findCaseSensitive,
+                            count: $findCount,
+                            store: store,
+                            onClose: { findVisible = false; store.ideCoordinator?.endFind() })
+                    }
+                }
 
             VerticalSplitter(
                 store: store,
@@ -54,6 +69,10 @@ struct IdeLayout: View {
                 .background(c.bgSidebar.ignoresSafeArea())
         }
         .background(c.bgApp.ignoresSafeArea())
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("IDEFindToggle"))) { _ in
+            findVisible.toggle()
+            if !findVisible { store.ideCoordinator?.endFind() }
+        }
     }
 
     // ── Middle: tabs + code viewport ─────────────────────────────────
@@ -63,6 +82,8 @@ struct IdeLayout: View {
             tabStrip
             Divider().overlay(c.separator)
             editorBody
+            Divider().overlay(c.separator)
+            EditorStatus(hud: store.ideGutter, store: store)
         }
     }
 
@@ -310,30 +331,30 @@ private struct EditorTab: View {
             if dirty {
                 Circle().fill(c.accent).frame(width: 5, height: 5)
             }
-            if active {
-                if closeArm {
-                    Text("again ✓")
-                        .font(.system(size: 9))
-                        .foregroundStyle(c.errStrong)
-                        .onTapGesture {
-                            closeArm = false
-                            store.closeTab(path, force: true)
-                        }
-                } else {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(c.textFaint)
-                        .onTapGesture {
-                            if !dirty {
-                                store.closeTab(path)
-                            } else {
-                                closeArm = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                                    if closeArm { closeArm = false }
-                                }
+            // Every tab closes (real IDEs don't force activation to close);
+            // the two-step "again ✓" arm guards dirty ones.
+            if closeArm {
+                Text("again ✓")
+                    .font(.system(size: 9))
+                    .foregroundStyle(c.errStrong)
+                    .onTapGesture {
+                        closeArm = false
+                        store.closeTab(path, force: true)
+                    }
+            } else {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(c.textFaint)
+                    .onTapGesture {
+                        if !dirty {
+                            store.closeTab(path)
+                        } else {
+                            closeArm = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                                if closeArm { closeArm = false }
                             }
                         }
-                }
+                    }
             }
         }
         .padding(.horizontal, 10)
@@ -559,3 +580,129 @@ private struct VerticalSplitter: NSViewRepresentable {
 
 enum HorizontalEdge { case leading, trailing }
 
+
+// MARK: - Find bar (⌘F)
+
+/// In-file find: match count, next/prev, case toggle. Selection happens
+/// through the live coordinator.
+struct FindBar: View {
+    @Binding var query: String
+    @Binding var caseSensitive: Bool
+    @Binding var count: Int
+    let store: AppStore
+    let onClose: () -> Void
+
+    @Environment(\.sofuuColors) private var c
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            TextField("Find in file", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .frame(width: 220)
+                .focused($fieldFocused)
+                .onSubmit { store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: true) }
+                .onChange(of: query) { _ in
+                    count = store.ideCoordinator?.findMatches(query: query, caseSensitive: caseSensitive) ?? 0
+                    if !query.isEmpty { store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: true) }
+                }
+            Text(count > 0 ? "\(count) match\(count == 1 ? "" : "es")" : "no matches")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            Button {
+                store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: false)
+            } label: {
+                Image(systemName: "chevron.up").controlIcon()
+            }
+            .buttonStyle(.plain)
+            .help("Previous match (⇧↩)")
+            Button {
+                store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: true)
+            } label: {
+                Image(systemName: "chevron.down").controlIcon()
+            }
+            .buttonStyle(.plain)
+            .help("Next match (↩)")
+            Button {
+                caseSensitive.toggle()
+                count = store.ideCoordinator?.findMatches(query: query, caseSensitive: caseSensitive) ?? 0
+            } label: {
+                Text("Aa")
+                    .font(.system(size: 11, weight: caseSensitive ? .bold : .regular))
+                    .foregroundColor(caseSensitive ? .accentColor : .secondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Match case")
+            Button {
+                onClose()
+            } label: {
+                Image(systemName: "xmark").controlIcon()
+            }
+            .buttonStyle(.plain)
+            .help("Close (Esc)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(CompositedTheme.surface)
+        .overlay(
+            Rectangle().fill(c.separator).frame(height: 1),
+            alignment: .bottom
+        )
+        .onAppear { fieldFocused = true }
+        .onExitCommand { onClose() }
+    }
+}
+
+// MARK: - Status line
+
+/// Bottom strip: cursor, language, LSP state, problem counts.
+struct EditorStatus: View {
+    @ObservedObject var hud: GutterModel
+    let store: AppStore
+
+    @Environment(\.sofuuColors) private var c
+
+    var body: some View {
+        let path = store.state.activeTab
+        let language = path.map { Languages.language(forPath: $0) }
+        let problems = path.flatMap { hud.diagnostics[$0] } ?? []
+        let errors = problems.filter { $0.isError }.count
+        let warnings = problems.filter { $0.isWarning }.count
+
+        HStack(spacing: 10) {
+            Text("Ln \(hud.cursor.line), Col \(hud.cursor.column)")
+            if let language {
+                Text(language.name)
+            }
+            Text(hud.lspStatus)
+            Spacer()
+            if errors > 0 {
+                Label("\(errors)", systemImage: "xmark.octagon.fill")
+                    .foregroundStyle(.red.opacity(0.8))
+            }
+            if warnings > 0 {
+                Label("\(warnings)", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow.opacity(0.9))
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+}
+
+private extension Image {
+    func controlIcon() -> some View {
+        font(.system(size: 10, weight: .semibold))
+            .foregroundColor(.secondary)
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+    }
+}

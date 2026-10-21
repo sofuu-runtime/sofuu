@@ -24,6 +24,8 @@ pub mod qjs;
 pub mod qjs_rt;
 #[cfg(has_qtsq)]
 pub mod qtsq; // M9: QTSQ codec bindings (brain/KV persistence; crates/sofuu-core/src/rt/memory.rs)
+#[cfg(has_qtsq)]
+pub mod qtsq_table; // Phase 3: Sofuu QTSQ columnar table engine (crates/sofuu-core/src/rt/storage.rs)
 pub mod uv;
 
 // ── C API (mirrors src/sofuu.h) ─────────────────────────────────

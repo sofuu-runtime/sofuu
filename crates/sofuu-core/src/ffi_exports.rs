@@ -595,6 +595,74 @@ pub unsafe extern "C" fn sofuu_cma_recall_text(
     b.len() as std::os::raw::c_int
 }
 
+/// B8.1: `sofuu_cma_learn(p, text, role, source)` → record id (≥0), or -1 on error.
+/// Auto-embeds text using TF-IDF subword morphology and inserts into CMA.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_learn(
+    p: *mut std::os::raw::c_void,
+    text: *const c_char,
+    role: *const c_char,
+    source: *const c_char,
+) -> std::os::raw::c_int {
+    if p.is_null() || text.is_null() {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let Some(text_str) = cstr_or_null(text) else {
+        return -1;
+    };
+    let role_str = cstr_or_null(role).unwrap_or("user");
+    let source_str = cstr_or_null(source).unwrap_or("");
+    let mut vec = vec![0.0f32; cma.vec_dim];
+    crate::rt::ai::sofuu_tfidf_embed(text_str.as_bytes(), &mut vec, cma.vec_dim);
+    cma.remember_with_source(&vec, text_str, role_str, 0, source_str)
+}
+
+/// B8.2: `sofuu_cma_search(p, query_text, top_k, out_buf, out_cap)` — writes hybrid
+/// semantic + BM25 recall JSON into out_buf (caller-allocated). Returns JSON length or -1.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_cma_search(
+    p: *mut std::os::raw::c_void,
+    query_text: *const c_char,
+    top_k: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> std::os::raw::c_int {
+    if p.is_null() || query_text.is_null() || out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let cma = &mut *(p as *mut crate::memory::cma::Cma);
+    let Some(q_text) = cstr_or_null(query_text) else {
+        return -1;
+    };
+    let mut vec = vec![0.0f32; cma.vec_dim];
+    crate::rt::ai::sofuu_tfidf_embed(q_text.as_bytes(), &mut vec, cma.vec_dim);
+    let hits = cma.recall_tokens(&vec, top_k, q_text);
+    let arr: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "id": h.id,
+                "distance": h.distance,
+                "score": h.score,
+                "role": h.role,
+                "text": h.text,
+                "tier": h.tier,
+                "strength": h.strength,
+                "entity": h.entity,
+            })
+        })
+        .collect();
+    let json = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
+    let b = json.as_bytes();
+    if b.len() + 1 > out_cap {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(b.as_ptr(), out_buf as *mut u8, b.len());
+    *out_buf.add(b.len()) = 0;
+    b.len() as std::os::raw::c_int
+}
+
 /// `sofuu_cma_kv_hints(p, query, n, out_buf, out_cap)` — JSON array of the
 /// distinct kv_page_ids of the top-n nearest memories. Returns length or -1.
 #[no_mangle]
@@ -913,6 +981,36 @@ mod tests {
             let hits = val.as_array().unwrap();
             assert!(!hits.is_empty());
             assert!(hits[0]["text"].as_str().unwrap().contains("5432"));
+
+            sofuu_cma_free(p);
+        }
+    }
+
+    #[test]
+    fn cma_ffi_exports_learn_and_search() {
+        unsafe {
+            let dim = 32;
+            let p = sofuu_cma_new(dim);
+            assert!(!p.is_null());
+
+            let c_fact = CString::new("User prefers TypeScript over Python for backend services.").unwrap();
+            let c_role = CString::new("user").unwrap();
+            let c_source = CString::new("chat").unwrap();
+
+            let id = sofuu_cma_learn(p, c_fact.as_ptr(), c_role.as_ptr(), c_source.as_ptr());
+            assert!(id >= 0);
+            assert_eq!(sofuu_cma_count(p), 1);
+
+            let mut out_buf = vec![0 as c_char; 4096];
+            let c_query = CString::new("backend programming language").unwrap();
+            let len = sofuu_cma_search(p, c_query.as_ptr(), 5, out_buf.as_mut_ptr(), out_buf.len());
+            assert!(len > 0);
+
+            let json_str = CStr::from_ptr(out_buf.as_ptr()).to_str().unwrap();
+            let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
+            let hits = val.as_array().unwrap();
+            assert!(!hits.is_empty());
+            assert!(hits[0]["text"].as_str().unwrap().contains("TypeScript"));
 
             sofuu_cma_free(p);
         }

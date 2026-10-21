@@ -76,6 +76,14 @@ build_one() {
         -DUSE_NGHTTP2=OFF \
         -DCURL_CA_BUNDLE=none \
         -DCURL_CA_PATH=none >/dev/null 2>&1
+    # ^ "none" is deliberate: curl 8.6 only takes CA locations from these
+    # compile-time macros, and any path baked here would be a path on the
+    # BUILD machine (OpenSSL's OPENSSLDIR already carries one). The Android
+    # app supplies the phone's own anchors at runtime — it writes a PEM
+    # bundle and sets SOFUU_CA_BUNDLE before the runtime boots; sofuu-ffi's
+    # curl_easy_init wrapper applies it to every handle. Do not point these
+    # at /system/etc/security/cacerts either: Android names those files by
+    # MD5 hash and OpenSSL 3 looks hash dirs up by SHA-1.
     cmake --build "$build" >/dev/null 2>&1
     cmake --install "$build" >/dev/null 2>&1
     [ -f "$out/lib/libcurl.a" ] || { echo "✗ curl build incomplete for $MOBILE_ABI_NAME"; exit 1; }

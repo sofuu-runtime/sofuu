@@ -56,6 +56,9 @@ data class ChatMessage(
     val usage: Usage? = null,
     val status: String = "done", // streaming | done | error
     val error: String? = null,
+    /** Final speed line, set when the turn finishes:
+     *  "22.4 tok/s · first 0.38s · 117 tok". */
+    val metrics: String? = null,
 )
 
 data class Approval(

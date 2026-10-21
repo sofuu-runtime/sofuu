@@ -74,6 +74,37 @@ class RuntimeEnv(private val context: Context) {
         get() = prefs.getInt(KEY_MAX_STEPS, 0)
         set(v) = prefs.edit().putInt(KEY_MAX_STEPS, v.coerceIn(0, 2000)).apply()
 
+    /** Inference thread count for the CPU kernel pool. 0 = auto (the pool
+     *  picks 4 on mobile big.LITTLE). Read once, at pool creation — takes
+     *  effect after an engine restart. The pool also refuses counts above
+     *  the online core count. Also the DECODE fallback when no
+     *  decode-specific override is present. */
+    var numThreads: Int
+        get() = prefs.getInt(KEY_NUM_THREADS, 0)
+        set(v) = prefs.edit().putInt(KEY_NUM_THREADS, v.coerceIn(0, 8)).apply()
+
+    /** Prefill-phase thread count (batched GEMM over the prompt —
+     *  compute-bound, wants the whole performance cluster). 0 = auto
+     *  (min(online, 8)). Read per scheduling iteration; takes effect
+     *  after an engine restart. */
+    var prefillThreads: Int
+        get() = prefs.getInt(KEY_PREFILL_THREADS, 0)
+        set(v) = prefs.edit().putInt(KEY_PREFILL_THREADS, v.coerceIn(0, 8)).apply()
+
+    /** Decode-phase thread count override. 0 = the pool default
+     *  (`numThreads`, else 4). Read per scheduling iteration. */
+    var decodeThreads: Int
+        get() = prefs.getInt(KEY_DECODE_THREADS, 0)
+        set(v) = prefs.edit().putInt(KEY_DECODE_THREADS, v.coerceIn(0, 8)).apply()
+
+    /** Per-phase decode instrumentation: appends a window line (forward /
+     *  sample / glue per token + prefill aggregates) to
+     *  files/phase-metrics.log every 256 tokens. Diagnostic; near-zero
+     *  cost when off. */
+    var phaseMetrics: Boolean
+        get() = prefs.getBoolean(KEY_PHASE_METRICS, false)
+        set(v) = prefs.edit().putBoolean(KEY_PHASE_METRICS, v).apply()
+
     /** Set before `sofuu_rt_new`. Returns what it actually applied, so
      *  the UI can show the effective values rather than the requested
      *  ones. */
@@ -98,6 +129,28 @@ class RuntimeEnv(private val context: Context) {
         put(KEY_WEB_ALLOW_INTERNAL, if (webAllowInternal) "1" else null)
         put(KEY_STALL_TIMEOUT, if (stallTimeoutSecs > 0) stallTimeoutSecs.toString() else null)
         put(KEY_MAX_STEPS, if (chatMaxSteps > 0) chatMaxSteps.toString() else null)
+        // Pool-creation-time read for the base count; the phase knobs are
+        // read per scheduling iteration but are only meaningful with the
+        // rebuilt pool — the engine restart keeps all three consistent.
+        put(KEY_NUM_THREADS, if (numThreads > 0) numThreads.toString() else null)
+        put(KEY_PREFILL_THREADS, if (prefillThreads > 0) prefillThreads.toString() else null)
+        put(KEY_DECODE_THREADS, if (decodeThreads > 0) decodeThreads.toString() else null)
+        put(
+            KEY_PHASE_METRICS,
+            if (phaseMetrics) context.getFileStreamPath("phase-metrics.log").absolutePath else null,
+        )
+        // The engine's static curl has no compiled-in trust store on
+        // Android (see CaTrust), so every https:// call — provider model
+        // lists, chat completions, web tools — needs this one.
+        val caBundle = CaTrust.ensureBundle(context)
+        put(KEY_CA_BUNDLE, caBundle)
+        if (caBundle == null) {
+            // Last resort: OpenSSL may still resolve the hash directory on
+            // builds that support the legacy names. Better than no path.
+            put(KEY_CA_PATH, "/system/etc/security/cacerts")
+        } else {
+            put(KEY_CA_PATH, null)
+        }
         return applied
     }
 
@@ -110,5 +163,11 @@ class RuntimeEnv(private val context: Context) {
         private const val KEY_WEB_ALLOW_INTERNAL = "SOFUU_WEB_ALLOW_INTERNAL"
         private const val KEY_STALL_TIMEOUT = "SOFUU_STALL_TIMEOUT_SECS"
         private const val KEY_MAX_STEPS = "SOFUU_CHAT_MAX_STEPS"
+    private const val KEY_NUM_THREADS = "SOFUU_NUM_THREADS"
+    private const val KEY_PREFILL_THREADS = "SOFUU_PREFILL_THREADS"
+    private const val KEY_DECODE_THREADS = "SOFUU_DECODE_THREADS"
+    private const val KEY_PHASE_METRICS = "SOFUU_PHASE_METRICS"
+    const val KEY_CA_BUNDLE = "SOFUU_CA_BUNDLE"
+    private const val KEY_CA_PATH = "SOFUU_CA_PATH"
     }
 }

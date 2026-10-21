@@ -2028,18 +2028,75 @@ mod impl_qtsq {
         argc: c_int,
         argv: *const JSValueConst,
     ) -> JSValue {
-        if argc < 2 {
+        if argc < 1 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
+                c"Expected text or (vec, text[, role, kv_page_id, source])".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
+        // B8.1: If first argument is a string, auto-embed via local TF-IDF
+        if qjs::sofuu_js_is_string(*argv) != 0 {
+            let text = qjs::sofuu_js_to_cstring(ctx, *argv);
+            let role = if argc >= 2 && qjs::sofuu_js_is_string(*argv.add(1)) != 0 {
+                qjs::sofuu_js_to_cstring(ctx, *argv.add(1))
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut page_id: u32 = 0;
+            let mut source_idx: usize = 2;
+            if argc >= 3 && qjs::sofuu_js_is_number(*argv.add(2)) != 0 {
+                qjs::sofuu_js_to_uint32(ctx, &mut page_id, *argv.add(2));
+                source_idx = 3;
+            }
+            let source = if (argc as usize) > source_idx && qjs::sofuu_js_is_string(*argv.add(source_idx)) != 0 {
+                qjs::sofuu_js_to_cstring(ctx, *argv.add(source_idx))
+            } else {
+                std::ptr::null_mut()
+            };
+
+            let text_opt = cstr_opt(text);
+            let role_opt = cstr_opt(role);
+            let source_opt = cstr_opt(source);
+
+            let mut emb = vec![0.0f32; cma.vec_dim];
+            if let Some(ref t) = text_opt {
+                crate::rt::ai::sofuu_tfidf_embed(t.as_bytes(), &mut emb, cma.vec_dim);
+            }
+
+            let idx = cma_remember(
+                cma,
+                &emb,
+                text_opt.as_deref(),
+                role_opt.as_deref(),
+                page_id,
+                source_opt.as_deref(),
+            );
+
+            if !text.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, text);
+            }
+            if !role.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, role);
+            }
+            if !source.is_null() {
+                qjs::sofuu_js_free_cstring(ctx, source);
+            }
+            return qjs::sofuu_js_new_int32(ctx, idx);
+        }
+
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
+            );
+        }
+
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array, Array of numbers, or text string".as_ptr());
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() != cma.vec_dim {
@@ -2081,6 +2138,106 @@ mod impl_qtsq {
         }
         if !source.is_null() {
             qjs::sofuu_js_free_cstring(ctx, source);
+        }
+        qjs::sofuu_js_new_int32(ctx, idx)
+    }
+
+    /// B8.1: `cma.learn(text[, role, source])` or `cma.learn(text, { role, source, pageId })`
+    /// Dedicated 1-line high-level memory ingestion with automatic subword TF-IDF embedding.
+    unsafe extern "C" fn js_cma_learn(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected text (string)".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let text_c = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let text_opt = cstr_opt(text_c);
+
+        let mut role_str = String::from("user");
+        let mut source_str = String::new();
+        let mut page_id: u32 = 0;
+
+        if argc >= 2 {
+            let arg1 = *argv.add(1);
+            if qjs::sofuu_js_is_string(arg1) != 0 {
+                let r = qjs::sofuu_js_to_cstring(ctx, arg1);
+                if let Some(rs) = cstr_opt(r) {
+                    role_str = rs;
+                }
+                if !r.is_null() {
+                    qjs::sofuu_js_free_cstring(ctx, r);
+                }
+                if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
+                    let s = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
+                    if let Some(ss) = cstr_opt(s) {
+                        source_str = ss;
+                    }
+                    if !s.is_null() {
+                        qjs::sofuu_js_free_cstring(ctx, s);
+                    }
+                }
+            } else if qjs::sofuu_js_is_object(arg1) != 0 {
+                let r_val = qjs::sofuu_js_get_property_str(ctx, arg1, c"role".as_ptr());
+                if qjs::sofuu_js_is_string(r_val) != 0 {
+                    let r = qjs::sofuu_js_to_cstring(ctx, r_val);
+                    if let Some(rs) = cstr_opt(r) {
+                        role_str = rs;
+                    }
+                    if !r.is_null() {
+                        qjs::sofuu_js_free_cstring(ctx, r);
+                    }
+                }
+                qjs::sofuu_js_free_value(ctx, r_val);
+
+                let s_val = qjs::sofuu_js_get_property_str(ctx, arg1, c"source".as_ptr());
+                if qjs::sofuu_js_is_string(s_val) != 0 {
+                    let s = qjs::sofuu_js_to_cstring(ctx, s_val);
+                    if let Some(ss) = cstr_opt(s) {
+                        source_str = ss;
+                    }
+                    if !s.is_null() {
+                        qjs::sofuu_js_free_cstring(ctx, s);
+                    }
+                }
+                qjs::sofuu_js_free_value(ctx, s_val);
+
+                let pid_val = qjs::sofuu_js_get_property_str(ctx, arg1, c"pageId".as_ptr());
+                if qjs::sofuu_js_is_number(pid_val) != 0 {
+                    qjs::sofuu_js_to_uint32(ctx, &mut page_id, pid_val);
+                } else {
+                    let kpid_val = qjs::sofuu_js_get_property_str(ctx, arg1, c"kv_page_id".as_ptr());
+                    if qjs::sofuu_js_is_number(kpid_val) != 0 {
+                        qjs::sofuu_js_to_uint32(ctx, &mut page_id, kpid_val);
+                    }
+                    qjs::sofuu_js_free_value(ctx, kpid_val);
+                }
+                qjs::sofuu_js_free_value(ctx, pid_val);
+            }
+        }
+
+        let mut emb = vec![0.0f32; cma.vec_dim];
+        if let Some(ref t) = text_opt {
+            crate::rt::ai::sofuu_tfidf_embed(t.as_bytes(), &mut emb, cma.vec_dim);
+        }
+
+        let idx = cma_remember(
+            cma,
+            &emb,
+            text_opt.as_deref(),
+            Some(&role_str),
+            page_id,
+            Some(&source_str),
+        );
+
+        if !text_c.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, text_c);
         }
         qjs::sofuu_js_new_int32(ctx, idx)
     }
@@ -2139,18 +2296,55 @@ mod impl_qtsq {
         argc: c_int,
         argv: *const JSValueConst,
     ) -> JSValue {
-        if argc < 2 {
+        if argc < 1 {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                c"Expected queryVec and topK".as_ptr(),
+                c"Expected queryText or (queryVec, topK[, text])".as_ptr(),
             );
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
+        // B8.2: If first argument is a string, auto-embed query text + token re-rank
+        if qjs::sofuu_js_is_string(*argv) != 0 {
+            let text_c = qjs::sofuu_js_to_cstring(ctx, *argv);
+            let text = if !text_c.is_null() {
+                let s = std::ffi::CStr::from_ptr(text_c).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, text_c);
+                s
+            } else {
+                String::new()
+            };
+            let mut top_k: u32 = 5;
+            if argc >= 2 && qjs::sofuu_js_is_number(*argv.add(1)) != 0 {
+                qjs::sofuu_js_to_uint32(ctx, &mut top_k, *argv.add(1));
+            }
+            if top_k > 1024 {
+                top_k = 1024;
+            }
+            let mut query_vec = vec![0.0f32; cma.vec_dim];
+            crate::rt::ai::sofuu_tfidf_embed(text.as_bytes(), &mut query_vec, cma.vec_dim);
+
+            let json = cma_recall_text_json(cma, &query_vec, top_k as usize, &text);
+            let cj = CString::new(json).unwrap_or_default();
+            let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
+            if qjs::is_exception(arr) {
+                qjs::sofuu_js_get_exception(ctx);
+                arr = qjs::JS_NewArray(ctx);
+            }
+            return arr;
+        }
+
+        if argc < 2 {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Expected queryVec and topK".as_ptr(),
+            );
+        }
+
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array, Array of numbers, or string".as_ptr());
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() < cma.vec_dim {
@@ -2178,6 +2372,51 @@ mod impl_qtsq {
         };
         let cj = CString::new(json).unwrap_or_default();
         let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
+        if qjs::is_exception(arr) {
+            qjs::sofuu_js_get_exception(ctx);
+            arr = qjs::JS_NewArray(ctx);
+        }
+        arr
+    }
+
+    /// B8.2: `cma.search(queryText[, topK])`
+    /// Dedicated 1-line high-level semantic recall with automatic subword TF-IDF embedding + BM25 re-ranking.
+    unsafe extern "C" fn js_cma_search(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        argc: c_int,
+        argv: *const JSValueConst,
+    ) -> JSValue {
+        if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
+            return qjs::JS_ThrowTypeError(ctx, c"Expected queryText (string)".as_ptr());
+        }
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+
+        let text_c = qjs::sofuu_js_to_cstring(ctx, *argv);
+        let text = if !text_c.is_null() {
+            let s = std::ffi::CStr::from_ptr(text_c).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, text_c);
+            s
+        } else {
+            String::new()
+        };
+
+        let mut top_k: u32 = 5;
+        if argc >= 2 && qjs::sofuu_js_is_number(*argv.add(1)) != 0 {
+            qjs::sofuu_js_to_uint32(ctx, &mut top_k, *argv.add(1));
+        }
+        if top_k > 1024 {
+            top_k = 1024;
+        }
+
+        let mut query_vec = vec![0.0f32; cma.vec_dim];
+        crate::rt::ai::sofuu_tfidf_embed(text.as_bytes(), &mut query_vec, cma.vec_dim);
+
+        let json = cma_recall_text_json(cma, &query_vec, top_k as usize, &text);
+        let cj = CString::new(json).unwrap_or_default();
+        let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-search>".as_ptr());
         if qjs::is_exception(arr) {
             qjs::sofuu_js_get_exception(ctx);
             arr = qjs::JS_NewArray(ctx);
@@ -2962,8 +3201,9 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 21] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 23] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
+            cfunc_entry(c"learn", 3, js_cma_learn),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
             cfunc_entry(c"importRecords", 2, js_cma_import),
@@ -2972,6 +3212,7 @@ mod impl_qtsq {
             cfunc_entry(c"retainAgainst", 1, js_cma_retain_against),
             cfunc_entry(c"rememberEntity", 4, js_cma_remember_entity),
             cfunc_entry(c"recall", 2, js_cma_recall),
+            cfunc_entry(c"search", 2, js_cma_search),
             cfunc_entry(c"kvHints", 2, js_cma_kv_hints),
             cfunc_entry(c"forget", 1, js_cma_forget),
             cfunc_entry(c"flush", 0, js_cma_flush),
@@ -3972,7 +4213,8 @@ mod impl_qtsq {
             CMA_MODULE_FUNCS.with(|t| t.as_ptr()),
             CMA_MODULE_FUNCS.with(|t| t.len() as c_int),
         );
-        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"memory".as_ptr(), mem_obj);
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"memory".as_ptr(), qjs::sofuu_js_dup_value(ctx, mem_obj));
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"brain".as_ptr(), mem_obj);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
     }
 
@@ -5903,6 +6145,107 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
             // Omitted k_summary zero-fills (older-index path), not garbage.
             assert!(kv.pages[42].k_summary.iter().all(|v| *v == 0.0));
 
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B8.3: Verification of high-level `brain.learn()` and `brain.search()` 1-line facade,
+    /// string-first `cma.remember()` and `cma.recall()`, and the `sofuu.brain` alias.
+    #[test]
+    fn cma_learn_search_and_brain_alias() {
+        use sofuu_ffi::qjs::CtxPtr;
+        let dir = fresh_test_dir("b8-facade-test");
+        let path = dir.join("brain.qtsq");
+        let path_s = path.to_str().unwrap().to_string();
+
+        let _loop_guard = crate::rt::test_loop_lock();
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            let _ctx_guard = CtxPtr::new(ctx);
+            memory_register(ctx);
+
+            let script = format!(
+                r#"
+                // Test 1: sofuu.brain alias exists and opens brain
+                var brain = sofuu.brain.open('{path_s}', 64);
+
+                // Test 2: cma.learn(text) with auto-embedding
+                var id1 = brain.learn("User prefers TypeScript over Python for backend services.", "user", "chat");
+
+                // Test 3: cma.learn with options object
+                var id2 = brain.learn("Rust is used for the high performance core runtime.", {{ role: "system", source: "docs" }});
+
+                // Test 4: string-first cma.remember
+                var id3 = brain.remember("SQLite was replaced with QTSQ storage.");
+
+                // Test 5: cma.search(queryText)
+                var hits = brain.search("TypeScript backend", 2);
+
+                // Test 6: string-first cma.recall(queryText)
+                var hitsRecall = brain.recall("QTSQ storage", 2);
+
+                globalThis.res = {{
+                    id1: id1,
+                    id2: id2,
+                    id3: id3,
+                    count: brain.count(),
+                    hitsLen: hits.length,
+                    topText: hits.length > 0 ? hits[0].text : "",
+                    recallLen: hitsRecall.length,
+                    recallText: hitsRecall.length > 0 ? hitsRecall[0].text : ""
+                }};
+                "#
+            );
+            let script_c = CString::new(script).unwrap();
+            let r = qjs::JS_Eval(
+                ctx,
+                script_c.as_ptr(),
+                script_c.as_bytes().len(),
+                c"<b8-learn-test>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            );
+            assert!(!qjs::is_exception(r), "script threw");
+
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let res_val = qjs::sofuu_js_get_property_str(ctx, global, c"res".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+
+            let id1_v = qjs::sofuu_js_get_property_str(ctx, res_val, c"id1".as_ptr());
+            let mut id1: i32 = -1;
+            qjs::JS_ToInt32(ctx, &mut id1, id1_v);
+            qjs::sofuu_js_free_value(ctx, id1_v);
+            assert!(id1 >= 0, "id1 should be non-negative");
+
+            let count_v = qjs::sofuu_js_get_property_str(ctx, res_val, c"count".as_ptr());
+            let mut count: i32 = 0;
+            qjs::JS_ToInt32(ctx, &mut count, count_v);
+            qjs::sofuu_js_free_value(ctx, count_v);
+            assert_eq!(count, 3, "brain count should be 3");
+
+            let hits_len_v = qjs::sofuu_js_get_property_str(ctx, res_val, c"hitsLen".as_ptr());
+            let mut hits_len: i32 = 0;
+            qjs::JS_ToInt32(ctx, &mut hits_len, hits_len_v);
+            qjs::sofuu_js_free_value(ctx, hits_len_v);
+            assert!(hits_len > 0, "search should return hits");
+
+            let top_text_v = qjs::sofuu_js_get_property_str(ctx, res_val, c"topText".as_ptr());
+            let top_text_c = qjs::sofuu_js_to_cstring(ctx, top_text_v);
+            let top_text = CStr::from_ptr(top_text_c).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, top_text_c);
+            qjs::sofuu_js_free_value(ctx, top_text_v);
+            assert!(top_text.contains("TypeScript"), "top hit should match search query");
+
+            let rec_text_v = qjs::sofuu_js_get_property_str(ctx, res_val, c"recallText".as_ptr());
+            let rec_text_c = qjs::sofuu_js_to_cstring(ctx, rec_text_v);
+            let rec_text = CStr::from_ptr(rec_text_c).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, rec_text_c);
+            qjs::sofuu_js_free_value(ctx, rec_text_v);
+            assert!(rec_text.contains("QTSQ"), "recall hit should match recall query");
+
+            qjs::sofuu_js_free_value(ctx, res_val);
             qjs::JS_FreeContext(ctx);
             qjs::JS_FreeRuntime(rt);
         }

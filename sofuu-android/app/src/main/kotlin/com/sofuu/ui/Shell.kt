@@ -59,10 +59,7 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
         LaunchedEffect(state.cloudBg) {
             android.util.Log.i("sofuu-cloud", "cloudBg enabled=${state.cloudBg}")
         }
-        // The cloud only animates while a turn streams; idle keeps a
-        // static frame (the full-screen fBm shader at 30fps is a
-        // constant GPU load — the single largest idle heat source).
-        if (state.cloudBg) CloudBackground(animate = state.streaming)
+        if (state.cloudBg) CloudBackground()
         // safeDrawingPadding = the union of system bars + IME + cutout,
         // so the keyboard pushes the composer up with it and, when the
         // keyboard is closed, the gesture bar never sits on top of it.
@@ -122,7 +119,12 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                 BarIcon(Icons2.MoreVert, "More") { store.openHistory() }
             }
 
-            // ── Chat ──────────────────────────────────────────────
+            // ── Chat (edge-to-edge; the composer overlays it) ──────
+            // The chat fills the whole remaining height and scrolls UNDER
+            // the translucent composer, so no line is ever cropped at the
+            // panel boundary — text stays visible to the screen edge. The
+            // list's bottom inset keeps the newest line readable above the
+            // composer when pinned to the bottom.
             Box(Modifier.weight(1f)) {
                 if (state.bootError != null) {
                     Banner(state.bootError!!, isError = true)
@@ -139,6 +141,8 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                         streaming = state.streaming,
                         chatFontSize = state.chatFontSize,
                         preview = state.preview,
+                        bottomInset = 200.dp,
+                        liveMetrics = state.liveMetrics,
                         voiceCapable = store.voiceCapable(),
                         onSpeak = { store.speak(it) },
                     )
@@ -155,42 +159,46 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                         store.approve(state.approvals.first().id, allow, always)
                     }
                 }
-            }
 
-            // ── Composer ─────────────────────────────────────────
-            if (state.preview == null) {
-                Composer(
-                    streaming = state.streaming,
-                    mode = state.mode,
-                    permissions = state.permissions,
-                    config = state.config,
-                    localModelLabels = state.localModelLabels,
-                    ctx = state.ctx,
-                    images = state.pickedImages,
-                    pendingMentions = state.pendingMentions,
-                    onSubmit = { t, imgs ->
-                        store.submit(t, imgs)
-                        store.clearPickedImages()
-                    },
-                    onCancel = { store.cancel() },
-                    onModeChange = { store.setMode(it) },
-                    onPermissionsChange = { store.setPermissions(it) },
-                    onConfigPatch = { patch ->
-                        store.patchConfig(org.json.JSONObject().apply { patch.forEach { (k, v) -> put(k, v) } })
-                    },
-                    onOpenSettings = { tab -> store.openSettings(true, tab) },
-                    onAttach = { onPickFiles() },
-                    dictating = state.dictating,
-                    voiceCapable = store.voiceCapable(),
-                    onMic = {
-                        // Ask first, then record — the launcher restarts
-                        // toggleDictation() once permission lands.
-                        if (onRequestMic()) store.toggleDictation()
-                    },
-                    onRemoveImage = { i -> store.removePickedImage(i) },
-                    onMentionsConsumed = { store.consumeMentions() },
-                    onSheet = { store.openSheet(it.name.lowercase()) },
-                )
+                // Composer overlay — aligned to the bottom of the same Box
+                // the chat fills, so chat text scrolls behind its
+                // translucent chrome instead of being cut at a panel edge.
+                if (state.preview == null) {
+                    Column(Modifier.align(Alignment.BottomCenter)) {
+                        Composer(
+                            streaming = state.streaming,
+                            mode = state.mode,
+                            permissions = state.permissions,
+                            config = state.config,
+                            localModelLabels = state.localModelLabels,
+                            ctx = state.ctx,
+                            images = state.pickedImages,
+                            pendingMentions = state.pendingMentions,
+                            onSubmit = { t, imgs ->
+                                store.submit(t, imgs)
+                                store.clearPickedImages()
+                            },
+                            onCancel = { store.cancel() },
+                            onModeChange = { store.setMode(it) },
+                            onPermissionsChange = { store.setPermissions(it) },
+                            onConfigPatch = { patch ->
+                                store.patchConfig(org.json.JSONObject().apply { patch.forEach { (k, v) -> put(k, v) } })
+                            },
+                            onOpenSettings = { tab -> store.openSettings(true, tab) },
+                            onAttach = { onPickFiles() },
+                            dictating = state.dictating,
+                            voiceCapable = store.voiceCapable(),
+                            onMic = {
+                                // Ask first, then record — the launcher restarts
+                                // toggleDictation() once permission lands.
+                                if (onRequestMic()) store.toggleDictation()
+                            },
+                            onRemoveImage = { i -> store.removePickedImage(i) },
+                            onMentionsConsumed = { store.consumeMentions() },
+                            onSheet = { store.openSheet(it.name.lowercase()) },
+                        )
+                    }
+                }
             }
         }
 

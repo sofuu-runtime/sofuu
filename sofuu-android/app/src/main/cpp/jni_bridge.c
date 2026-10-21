@@ -272,6 +272,14 @@ Java_com_sofuu_engine_SofuuBridge_nativeRtCancel(JNIEnv *env, jclass cls, jlong 
  * The callback fires on the owning engine thread with C strings valid
  * only for the call, so we print them and are done — no JNI round-trip
  * and no lifetime questions. */
+/* Console lines ALSO append to an app-named file when
+ * nativeSetEngineLogFile was called: on several OEM phones (vivo at
+ * least) logcat never receives app output, and the console is the only
+ * window into the engine's internals. Append-mode per line — the path
+ * is set before the runtime boots, writers are single (engine thread),
+ * and fopen/fclose per line is cheap at chat rates. */
+static char g_engine_log_path[512] = {0};
+
 static void on_engine_log(const char *level, const char *message, void *opaque) {
     (void)opaque;
     int prio = ANDROID_LOG_INFO;
@@ -281,7 +289,15 @@ static void on_engine_log(const char *level, const char *message, void *opaque) 
         else if (strcmp(level, "debug") == 0)  prio = ANDROID_LOG_DEBUG;
         else if (strcmp(level, "trace") == 0)  prio = ANDROID_LOG_VERBOSE;
     }
-    __android_log_print(prio, "sofuu-js", "%s", message ? message : "");
+    const char *msg = message ? message : "";
+    __android_log_print(prio, "sofuu-js", "%s", msg);
+    if (g_engine_log_path[0] != 0) {
+        FILE *f = fopen(g_engine_log_path, "a");
+        if (f) {
+            fprintf(f, "%s: %s\n", level ? level : "info", msg);
+            fclose(f);
+        }
+    }
 }
 
 /* SofuuBridge.nativeSetLogEnabled(boolean) */
@@ -289,6 +305,19 @@ JNIEXPORT void JNICALL
 Java_com_sofuu_engine_SofuuBridge_nativeSetLogEnabled(JNIEnv *env, jclass cls, jboolean enabled) {
     (void)env; (void)cls;
     sofuu_embed_set_log_cb(enabled == JNI_TRUE ? on_engine_log : NULL, NULL);
+}
+
+/* SofuuBridge.nativeSetEngineLogFile(path): route console lines to a
+ * file as well as logcat. Call BEFORE the runtime boots. */
+JNIEXPORT void JNICALL
+Java_com_sofuu_engine_SofuuBridge_nativeSetEngineLogFile(JNIEnv *env, jclass cls, jstring path) {
+    (void)cls;
+    if (path == NULL) { g_engine_log_path[0] = 0; return; }
+    const char *p = (*env)->GetStringUTFChars(env, path, NULL);
+    if (p) {
+        snprintf(g_engine_log_path, sizeof g_engine_log_path, "%s", p);
+        (*env)->ReleaseStringUTFChars(env, path, p);
+    }
 }
 
 /* ── Vector embeddings (H-E1 / M1) ─────────────────────────────────

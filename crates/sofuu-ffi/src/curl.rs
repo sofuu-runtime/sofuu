@@ -8,7 +8,7 @@
 // below are callable with the exact C vararg types (c_long for the LONG
 // options, pointers for STRING/OBJECT/CB ones).
 
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
 use std::os::raw::{c_int, c_long, c_void};
 
 pub const CURLE_OK: c_int = 0;
@@ -49,6 +49,13 @@ pub const CURLOPT_FAILONERROR: c_long = 45;
 pub const CURLOPT_POSTFIELDS: c_int = 10015;
 pub const CURLOPT_POSTFIELDSIZE: c_int = 60;
 pub const CURLOPT_SSL_VERIFYPEER: c_int = 64;
+// Trust-anchor locations (curl.h STRINGPOINT 65/97). The Android static
+// build pins CURL_CA_BUNDLE/CURL_CA_PATH to "none" and its OpenSSL
+// OPENSSLDIR points into the host build tree, so the runtime must supply
+// a store at handle-init time or every https:// request fails
+// CURLE_PEER_FAILED_VERIFICATION.
+pub const CURLOPT_CAINFO: c_int = 10065;
+pub const CURLOPT_CAPATH: c_int = 10097;
 pub const CURLOPT_MAXFILESIZE: c_int = 114;
 pub const CURLOPT_TIMEOUT_MS: c_int = 155;
 // Patience guard (curl.h: CONNECTTIMEOUT=LONG+78) + the timeout result
@@ -156,7 +163,10 @@ pub type CurlTimerCallback = unsafe extern "C" fn(*mut CurlM, c_long, *mut c_voi
 
 extern "C" {
     pub fn curl_global_init(flags: c_long) -> c_int;
-    pub fn curl_easy_init() -> *mut Curl;
+    // Bound through the wrapper below, so every handle inherits the
+    // runtime-supplied trust store (see apply_ca_defaults).
+    #[link_name = "curl_easy_init"]
+    pub fn curl_easy_init_raw() -> *mut Curl;
     pub fn curl_easy_cleanup(curl: *mut Curl);
     pub fn curl_easy_strerror(code: c_int) -> *const c_char;
     pub fn curl_slist_append(list: *mut CurlSlist, s: *const c_char) -> *mut CurlSlist;
@@ -187,4 +197,51 @@ extern "C" {
     pub fn curl_mime_filename(part: *mut CurlMimePart, filename: *const c_char) -> c_int;
     pub fn curl_mime_type(part: *mut CurlMimePart, mimetype: *const c_char) -> c_int;
     pub fn curl_mime_data(part: *mut CurlMimePart, data: *const c_char, datasize: usize) -> c_int;
+}
+
+/// Initialize an easy handle, applying the process trust store.
+///
+/// curl 8.6 consults `CURL_CA_BUNDLE`/`CURL_CA_PATH` only as *compile-time*
+/// macros, and the Android static build sets both to "none" (OpenSSL's
+/// baked-in OPENSSLDIR is a host path that does not exist on device). No
+/// handle-level CA option is set anywhere else, so without this every
+/// https:// request fails CURLE_PEER_FAILED_VERIFICATION.
+///
+/// The host supplies the store before the runtime boots:
+///   SOFUU_CA_BUNDLE=/path/to/cacert.pem   (preferred — a PEM bundle)
+///   SOFUU_CA_PATH=/path/to/hashed/certs   (fallback — OpenSSL hash dir)
+/// Unset on hosts whose curl already has a working default (macOS).
+pub fn curl_easy_init() -> *mut Curl {
+    // SAFETY: plain C call; callers already null-check the result.
+    let easy = unsafe { curl_easy_init_raw() };
+    if !easy.is_null() {
+        apply_ca_defaults(easy);
+    }
+    easy
+}
+
+fn apply_ca_defaults(easy: *mut Curl) {
+    // The option copies the string, so the CString only needs to outlive
+    // the setopt call.
+    if let Some(path) = env_nonempty("SOFUU_CA_BUNDLE") {
+        if let Ok(c) = CString::new(path) {
+            // SAFETY: valid handle; CAINFO is an OBJECTPOINT (char *).
+            unsafe {
+                curl_easy_setopt(easy, CURLOPT_CAINFO, c.as_ptr());
+            }
+            return;
+        }
+    }
+    if let Some(path) = env_nonempty("SOFUU_CA_PATH") {
+        if let Ok(c) = CString::new(path) {
+            // SAFETY: valid handle; CAPATH is an OBJECTPOINT (char *).
+            unsafe {
+                curl_easy_setopt(easy, CURLOPT_CAPATH, c.as_ptr());
+            }
+        }
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }

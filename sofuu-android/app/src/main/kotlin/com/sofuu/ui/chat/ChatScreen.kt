@@ -60,16 +60,26 @@ fun ChatScreen(
     streaming: Boolean,
     chatFontSize: Int,
     preview: SessionPreview?,
+    /** Extra bottom padding for content that scrolls under the translucent
+     *  composer overlay — when pinned to the bottom, the newest line rests
+     *  just above it; scrolled-up text shows through to the screen edge. */
+    bottomInset: androidx.compose.ui.unit.Dp = 0.dp,
+    liveMetrics: String? = null,
     voiceCapable: Boolean = false,
     onSpeak: (String) -> Unit = {},
 ) {
     val c = LocalSofuuColors.current
     val listState = rememberLazyListState()
 
-    // Stick to the bottom while new content streams.
+    // Stick to the bottom while new content streams — but only when the
+    // user is already there, and without animating. During streaming the
+    // content length changes ~10×/s; an animateScrollToItem per change
+    // cancelled the previous scroll mid-flight, which read as constant
+    // stutter. An instant jump when pinned, nothing when the user scrolled
+    // up to read, is the standard chat-scroll contract.
     LaunchedEffect(messages.size, messages.lastOrNull()?.content?.length) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem((messages.size - 1).coerceAtLeast(0))
+        if (messages.isNotEmpty() && listState.canScrollForward == false) {
+            listState.scrollToItem((messages.size - 1).coerceAtLeast(0))
         }
     }
 
@@ -85,15 +95,28 @@ fun ChatScreen(
                 .fillMaxSize()
                 .padding(horizontal = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 12.dp, bottom = 16.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 12.dp, bottom = bottomInset),
         ) {
-            items(messages) { m -> MessageRow(m, chatFontSize, phase, voiceCapable, onSpeak) }
+            // Keys: without them, item identity is positional — every
+            // content flush re-attached per-row remember state (expanded
+            // tool rows, selection context) to whatever bubble now sat at
+            // that index, and all visible rows recomposed wholesale.
+            items(messages, key = { it.id }, contentType = { it.role }) { m ->
+                MessageRow(m, chatFontSize, phase, voiceCapable, onSpeak, liveMetrics)
+            }
         }
     }
 }
 
 @Composable
-private fun MessageRow(m: ChatMessage, fontSize: Int, phase: String?, voiceCapable: Boolean, onSpeak: (String) -> Unit) {
+private fun MessageRow(
+    m: ChatMessage,
+    fontSize: Int,
+    phase: String?,
+    voiceCapable: Boolean,
+    onSpeak: (String) -> Unit,
+    liveMetrics: String? = null,
+) {
     val c = LocalSofuuColors.current
     when (m.role) {
         MsgRole.USER -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
@@ -124,6 +147,15 @@ private fun MessageRow(m: ChatMessage, fontSize: Int, phase: String?, voiceCapab
             // "Thinking…" for every turn regardless of what it was doing.
             if (m.status == "streaming" && phase != null) {
                 PhaseLine(phase, streaming = true)
+            }
+            if (m.status == "streaming" && liveMetrics != null) {
+                Text(
+                    liveMetrics,
+                    color = c.textFaint,
+                    fontSize = (fontSize - 3).sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(bottom = 2.dp),
+                )
             }
             ToolTimelineView(m.timeline)
             if (m.content.isNotEmpty()) {
@@ -156,6 +188,15 @@ private fun MessageRow(m: ChatMessage, fontSize: Int, phase: String?, voiceCapab
                 m.usage.line()?.let {
                     Text(it, color = c.textFaint, fontSize = (fontSize - 4).sp, modifier = Modifier.padding(top = 4.dp))
                 }
+            }
+            if (m.status == "done" && m.metrics != null) {
+                Text(
+                    "⌁ ${m.metrics}",
+                    color = c.textFaint,
+                    fontSize = (fontSize - 4).sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
             }
             // Read aloud. Provider-backed, and only offered when the active
             // provider can actually synthesize — same gate as the mic.

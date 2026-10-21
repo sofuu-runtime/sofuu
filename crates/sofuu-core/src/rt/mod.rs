@@ -28,6 +28,8 @@ pub mod ai; // M8: sofuu.ai.* (mod_ai.c + tfidf_embed.c; SIMD kernels stay C)
 pub mod local_tools; // C1: local-model tool calling (prompt protocol + stream parser)
 pub mod wal; // C2: durable atomic publish + write-ahead journal (brain/KV persistence)
 #[cfg(has_qtsq)]
+pub mod storage; // Phase 3: Native QTSQ Structured Storage Driver (sofuu.storage)
+#[cfg(has_qtsq)]
 pub mod brain_store; // B3: segmented brain storage (manifest + bounded segments)
 pub mod brain_key; // B4: the machine-local brain key (key file + legacy fallback)
 pub mod model_caps; // per-model capability registry (ctx/max-output/thinking)

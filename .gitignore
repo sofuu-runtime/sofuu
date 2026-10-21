@@ -37,6 +37,7 @@ test_loop.c
 Makefile.bak
 context.md
 build.log
+*.log
 compile_commands.json
 findings.md
 progress.md

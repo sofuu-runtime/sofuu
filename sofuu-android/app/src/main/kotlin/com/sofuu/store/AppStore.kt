@@ -29,6 +29,8 @@ data class AppState(
     val messages: List<ChatMessage> = emptyList(),
     val messageCache: Map<String, List<ChatMessage>> = emptyMap(),
     val streaming: Boolean = false,
+    /** Live speed readout on the streaming bubble. */
+    val liveMetrics: String? = null,
     val approvals: List<Approval> = emptyList(),
     val config: SofuuConfig? = null,
     val projectDir: String? = null,
@@ -40,7 +42,7 @@ data class AppState(
     val mode: String = "agent", // agent | chat
     val preview: SessionPreview? = null,
     val theme: String = "system", // light | dark | system
-    val cloudBg: Boolean = true,
+    val cloudBg: Boolean = false,
     val pickedImages: List<String> = emptyList(),
     /** @mentions spliced into the composer by the file picker. */
     val pendingMentions: String = "",
@@ -171,7 +173,11 @@ val runtimeEnv = RuntimeEnv(app)
                 if (ev is EngineEvent.TurnFinished) refreshSessions()
             }
         }
-        // Load config + state immediately (cheap, no engine).
+        // Load config + state immediately (cheap, no engine). Repair runs
+        // first: an entry saved as a bare base URL before normalization
+        // existed would otherwise fail every turn with "stream ended
+        // without [DONE]".
+        configs.repairEndpoints()
         state = state.copy(config = configs.redacted())
         // Engine environment knobs MUST be in place before the runtime is
         // created: SOFUU_NO_ML gates module registration inside the
@@ -179,6 +185,15 @@ val runtimeEnv = RuntimeEnv(app)
         val appliedEnv = runtimeEnv.apply()
         engine.start()
         android.util.Log.i("sofuu-engine", "env applied: $appliedEnv")
+        // The engine's curl has no built-in trust store on Android; without
+        // this bundle every https:// call fails certificate verification.
+        // Say so instead of leaving the user with a raw curl error.
+        if (appliedEnv[RuntimeEnv.KEY_CA_BUNDLE].isNullOrEmpty()) {
+            systemRow(
+                "warning: no system CA certificates were readable — HTTPS " +
+                    "providers will fail certificate verification.",
+            )
+        }
     }
 
     // ── Engine event reducer ──────────────────────────────────────
@@ -193,12 +208,13 @@ val runtimeEnv = RuntimeEnv(app)
             is EngineEvent.TurnStarted -> Unit // the assistant bubble is created on submit
             is EngineEvent.TurnFinished -> {
                 flushDelta()
-                state = state.copy(streaming = false, phase = null)
+                val speed = finalMetricsText()
+                state = state.copy(streaming = false, phase = null, liveMetrics = null)
                 if (!foreground && ev.error == null) notifier?.invoke("Sofuu finished", "The turn completed.")
                 if (ev.error != null) {
                     patchAssistant { m -> m.copy(status = "error", error = ev.error) }
                 } else {
-                    patchAssistant { m -> m.copy(status = "done", usage = ev.usage?.toUi()) }
+                    patchAssistant { m -> m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed) }
                 }
             }
             is EngineEvent.Ctx -> {
@@ -229,6 +245,37 @@ val runtimeEnv = RuntimeEnv(app)
     private val pendingDelta = StringBuilder()
     private var deltaFlush: kotlinx.coroutines.Job? = null
 
+    // ── Turn speed instrumentation (UI readout) ──
+    // Deltas are token pieces, so the rate is piece-rate — within rounding
+    // of the model's true tok/s. All timing via elapsedRealtime.
+    private var turnStartMs = 0L
+    private var firstTokenMs = 0L
+    private var lastTokenMs = 0L
+    private var tokenCount = 0
+
+    private fun resetTurnMetrics() {
+        turnStartMs = android.os.SystemClock.elapsedRealtime()
+        firstTokenMs = 0L
+        lastTokenMs = 0L
+        tokenCount = 0
+    }
+
+    private fun liveMetricsText(untilMs: Long): String? {
+        if (firstTokenMs == 0L) return null
+        val ttft = (firstTokenMs - turnStartMs) / 1000.0
+        val window = (untilMs - firstTokenMs).coerceAtLeast(1L) / 1000.0
+        val tps = tokenCount / window
+        return "%.1f tok/s · first %.1fs".format(java.util.Locale.US, tps, ttft)
+    }
+
+    private fun finalMetricsText(): String? {
+        if (firstTokenMs == 0L || tokenCount == 0) return null
+        val ttft = (firstTokenMs - turnStartMs) / 1000.0
+        val window = (lastTokenMs - firstTokenMs).coerceAtLeast(1L) / 1000.0
+        val tps = tokenCount / window
+        return "%.1f tok/s · first %.1fs · %d tok".format(java.util.Locale.US, tps, ttft, tokenCount)
+    }
+
     private fun flushDelta() {
         deltaFlush?.cancel()
         deltaFlush = null
@@ -236,6 +283,9 @@ val runtimeEnv = RuntimeEnv(app)
         val text = pendingDelta.toString()
         pendingDelta.setLength(0)
         patchAssistant { m -> m.copy(content = m.content + text) }
+        state = state.copy(
+            liveMetrics = if (state.streaming) liveMetricsText(android.os.SystemClock.elapsedRealtime()) else null,
+        )
     }
 
     private fun patchAssistant(fn: (ChatMessage) -> ChatMessage) {
@@ -272,6 +322,10 @@ val runtimeEnv = RuntimeEnv(app)
                 // list and re-runs the markdown compositor for every
                 // token — main-thread burn (heat) with zero visible
                 // difference at that granularity.
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (firstTokenMs == 0L) firstTokenMs = now
+                lastTokenMs = now
+                tokenCount++
                 pendingDelta.append(text)
                 if (deltaFlush == null) {
                     deltaFlush = viewModelScope.launch {
@@ -488,10 +542,12 @@ val runtimeEnv = RuntimeEnv(app)
             messages = state.messages + ChatMessage(nextId("m"), MsgRole.USER, userText) +
                 ChatMessage(nextId("m"), MsgRole.ASSISTANT, status = "streaming"),
             streaming = true,
+            liveMetrics = null,
             // Truthful label: with effort off (all local non-thinking models)
             // nothing "thinks" — the model answers directly.
             phase = if (state.config?.effort.isNullOrEmpty()) "Generating" else "Thinking",
         )
+        resetTurnMetrics()
         // Off-main: a first send mints a session via engine.newSession().get()
         // — bounded, but a bounded wait is still a frozen UI on Main.
         viewModelScope.launch(Dispatchers.Default) {
@@ -742,6 +798,18 @@ val runtimeEnv = RuntimeEnv(app)
         touchEngineUse()
         refreshSessions(resumeNewest = true)
         engine.setPermissions(state.permissions)
+        // A tuned model keeps its measured decode thread count across
+        // restarts. A manual decode override in Settings wins. An untuned
+        // local model gets the Part-0 protocol (probe + receipts) run
+        // automatically, so the measurement does not depend on re-selecting
+        // the model in Settings.
+        state.config?.model?.takeIf { it.endsWith(".gguf", ignoreCase = true) && it.contains("/files/models/") }?.let { model ->
+            if (runtimeEnv.decodeThreads > 0) {
+                applyTunedDecode(model)
+            } else {
+                viewModelScope.launch(Dispatchers.Default) { calibrateDecodeThreads(model) }
+            }
+        }
         // Prefetch every provider's model list in the background.
         refreshModelCache()
         // The on-device model list is just a directory read — no engine
@@ -983,7 +1051,11 @@ val runtimeEnv = RuntimeEnv(app)
             }
         }
         if (providers == current.map { it.toJson() }) return
-        patchConfig(JSONObject().put("providers", JSONArray(providers)))
+        val patch = JSONObject().put("providers", JSONArray(providers))
+        // chat.js reads the model from the active provider entry, but the
+        // flat mirror drives the composer pill — keep it in step.
+        if (name == state.config?.active && model != null) patch.put("model", model.trim())
+        patchConfig(patch)
         refreshModelCache()
     }
 
@@ -1168,6 +1240,142 @@ val runtimeEnv = RuntimeEnv(app)
             state = state.copy(config = configs.redacted(merged))
             refreshLocalModels()
             refreshSessions(resumeNewest = true)
+            // Auto-tune: apply this model's stored decode thread count, or
+            // measure it once on-device. The user's manual decode override
+            // takes precedence over the auto result.
+            if (!state.streaming) {
+                viewModelScope.launch(Dispatchers.Default) {
+                    if (runtimeEnv.decodeThreads > 0) {
+                        applyTunedDecode(path)
+                    } else {
+                        calibrateDecodeThreads(path)
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Per-model decode auto-tuning ─────────────────────────────
+    // Decode is memory-bandwidth-bound and the sweet-spot thread count
+    // differs per model size; it cannot be computed from specs, so once
+    // per model the app MEASURES it: a few short streaming generations at
+    // each candidate count (through the real scheduler, so the phase pool
+    // applies live), the highest tok/s wins and is persisted per model.
+
+    private fun tunePrefs() = getApplication<Application>()
+        .getSharedPreferences("sofuu_tune", android.content.Context.MODE_PRIVATE)
+
+    private fun tunedDecodeFor(path: String): Int =
+        tunePrefs().getInt("decode:" + path, 0)
+
+    private fun applyTunedDecode(path: String) {
+        val t = tunedDecodeFor(path)
+        if (t > 0) com.sofuu.engine.SofuuBridge.setEnv("SOFUU_DECODE_THREADS", t.toString())
+    }
+
+    /** Part 0 receipts: one JSON line per measurement in
+     *  files/bench-receipts.jsonl (pull via adb run-as). */
+    private fun appendBenchReceipt(
+        path: String,
+        threads: Int,
+        n: Int,
+        ms: Long,
+        ttft: Long,
+        tps: Double,
+        phase: String,
+    ) {
+        try {
+            val f = File(getApplication<Application>().filesDir, "bench-receipts.jsonl")
+            val rec = org.json.JSONObject()
+                .put("ts", System.currentTimeMillis())
+                .put("device", android.os.Build.MODEL)
+                .put("phase", phase)
+                .put("model", path.substringAfterLast('/'))
+                .put("threads", threads)
+                .put("n", n)
+                .put("ms", ms)
+                .put("ttft_ms", ttft)
+                .put("tps", "%.2f".format(java.util.Locale.US, tps))
+            f.appendText(rec.toString() + "\n")
+        } catch (_: Throwable) {
+        }
+    }
+
+    private suspend fun calibrateDecodeThreads(path: String) {
+        if (state.streaming || tunedDecodeFor(path) > 0) return
+        val cores = Runtime.getRuntime().availableProcessors()
+        val candidates = listOf(4, 6, 8).filter { it <= cores }.distinct()
+        if (candidates.size <= 1) return
+        withContext(Dispatchers.Main) {
+            systemRow("Auto-tuning decode threads — the tok/s winner is saved for this model.")
+        }
+        var best = -1
+        var bestTps = 0.0
+        var sawFailure = false
+        var first = true
+        for (t in candidates) {
+            if (state.streaming) return  // a real turn takes priority
+            withContext(Dispatchers.Main) {
+                com.sofuu.engine.SofuuBridge.setEnv("SOFUU_DECODE_THREADS", t.toString())
+                state = state.copy(liveMetrics = "tuning: " + t + " threads…")
+            }
+            val js = "(function(){ return new Promise(function(res){" + "\n" +
+                "var t0 = Date.now(), n = 0, done = false, t1 = 0, err = '';" + "\n" +
+                "function fin(){ if (!done) { done = true; res(JSON.stringify({n:n, ms:Date.now()-t0, ttft:(t1? (t1-t0) : (Date.now()-t0)), err:err})); } }" + "\n" +
+                "var it; try { it = sofuu.ai.stream('Count from 1 to 12.', {model:" + com.sofuu.engine.SofuuEngine.quote(path) + ", maxTokens: 24}); } catch (e) { err = 'sync: ' + String(e && e.message || e); fin(); return; }" + "\n" +
+                "(async function(){ try { for await (var c of it) { n++; if (!t1) t1 = Date.now(); } } catch (e) { err = 'stream: ' + String(e && e.message || e); } fin(); })();" + "\n" +
+                "setTimeout(fin, 20000);" + "\n" +
+                "}); })()"
+            // First candidate pays the model load; give it headroom.
+            val budget = if (first) 60_000L else 25_000L
+            val r = try {
+                engine.queryFuture(js, budget).get(budget + 1_000, TimeUnit.MILLISECONDS)
+            } catch (e: Exception) {
+                null
+            }
+            val n = r?.optInt("n", 0) ?: 0
+            val ms = r?.optLong("ms", 0) ?: 0
+            val ttft = r?.optLong("ttft", 0) ?: 0
+            val errText = r?.optString("err", "").orEmpty()
+            if (r == null || r.has("timeout") || n < 8 || ms <= 0) {
+                sawFailure = true
+                withContext(Dispatchers.Main) {
+                    val why = when {
+                        r == null -> "engine did not answer"
+                        r.has("timeout") -> "timed out after ${ms}ms"
+                        else -> "only $n tokens"
+                    }
+                    systemRow("tune $t threads: no data ($why)${if (errText.isNotEmpty()) " err=" + errText.take(140) else ""}")
+                }
+                continue
+            }
+            first = false
+            val tps = n * 1000.0 / ms
+            appendBenchReceipt(path, t, n, ms, ttft, tps, "decode-tune")
+            withContext(Dispatchers.Main) {
+                systemRow("tune $t threads: " + "%.1f".format(java.util.Locale.US, tps) + " tok/s (" + n + " tok / " + ms + "ms, first " + ttft + "ms)")
+            }
+            if (tps > bestTps) {
+                bestTps = tps
+                best = t
+            }
+        }
+        if (best > 0 && !state.streaming && state.config?.model == path) {
+            withContext(Dispatchers.Main) {
+                com.sofuu.engine.SofuuBridge.setEnv("SOFUU_DECODE_THREADS", best.toString())
+                systemRow("Auto-tuned: " + best + " threads best (" + "%.1f".format(java.util.Locale.US, bestTps) + " tok/s) — will be used for this model.")
+            }
+            tunePrefs().edit()
+                .putInt("decode:" + path, best)
+                .putFloat("tps:" + path, bestTps.toFloat())
+                .apply()
+            runtimeEnv.decodeThreads = 0  // the per-model value supersedes the global knob
+            appendBenchReceipt(path, best, -1, -1, -1, bestTps, "decode-winner")
+        } else if (sawFailure && !state.streaming) {
+            withContext(Dispatchers.Main) {
+                com.sofuu.engine.SofuuBridge.setEnv("SOFUU_DECODE_THREADS", null)
+                systemRow("Auto-tune skipped (model busy or too slow to measure) — defaults kept.")
+            }
         }
     }
 

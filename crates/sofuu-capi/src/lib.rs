@@ -242,8 +242,19 @@ const MEMORY_FACADE_JS: &str = r#"
 
   M.remember = function (a) {
     a = a || {};
+    if (!a.vec && a.text) {
+      return one(a, 'remember', [String(a.text), a.role || 'user', a.kv_page_id | 0,
+                                 a.source === undefined ? undefined : String(a.source)]);
+    }
     return one(a, 'remember', [f32(a.vec), a.text, a.role || 'user', a.kv_page_id | 0,
                                a.source === undefined ? undefined : String(a.source)]);
+  };
+  M.learn = function (a) {
+    a = a || {};
+    var text = typeof a === 'string' ? a : (a.text !== undefined ? a.text : '');
+    var role = a.role || 'user';
+    var source = a.source !== undefined ? String(a.source) : undefined;
+    return one(a, 'learn', [String(text), role, source]);
   };
   /* B1.5: the read-out surface, same shape as the in-process API. */
   M.list = function (a) {
@@ -262,9 +273,19 @@ const MEMORY_FACADE_JS: &str = r#"
   M.recall = function (a) {
     a = a || {};
     var q = a.text !== undefined ? a.text : a.query;
-    var args = [f32(a.vec), a.k === undefined ? 5 : (a.k | 0)];
+    var k = a.k === undefined ? (a.top_k !== undefined ? (a.top_k | 0) : 5) : (a.k | 0);
+    if (!a.vec && q !== undefined && q !== null) {
+      return one(a, 'recall', [String(q), k]);
+    }
+    var args = [f32(a.vec), k];
     if (q !== undefined && q !== null) args.push(String(q));
     return one(a, 'recall', args);
+  };
+  M.search = function (a) {
+    a = a || {};
+    var q = typeof a === 'string' ? a : (a.text !== undefined ? a.text : (a.query !== undefined ? a.query : ''));
+    var k = a.k === undefined ? (a.top_k !== undefined ? (a.top_k | 0) : 5) : (a.k | 0);
+    return one(a, 'search', [String(q), k]);
   };
   M.count = function (a) { return one(a || {}, 'count', []); };
   M.flush = function (a) { return one(a || {}, 'flush', []); };
@@ -352,6 +373,9 @@ const MEMORY_FACADE_JS: &str = r#"
     return count;
   };
   M.__sofuu_facade = true;
+  if (S.brain && !S.brain.__sofuu_facade) {
+    S.brain = M;
+  }
   } /* end memory block */
 
   /* ── MCP: the same dead-end, and the highest-value one after memory.
@@ -3758,6 +3782,26 @@ mod tests {
             "the axis-0 query must retrieve the axis-0 record"
         );
 
+        // 4b. Test learn and search via funnel (auto-embedding)
+        let learn_args = format!(
+            r#"{{"handle":{hid},"text":"User prefers TypeScript over Python for backend services.","role":"user"}}"#
+        );
+        let learn_idx = call(rt, "memory.learn", &learn_args);
+        assert!(
+            learn_idx.as_i64().is_some_and(|i| i >= 0),
+            "learn should return an index, got {learn_idx}"
+        );
+
+        let search_args = format!(
+            r#"{{"handle":{hid},"query":"TypeScript backend","k":2}}"#
+        );
+        let search_hits = call(rt, "memory.search", &search_args);
+        let search_arr = search_hits
+            .as_array()
+            .unwrap_or_else(|| panic!("search should return an array, got {search_hits}"));
+        assert!(!search_arr.is_empty(), "search should find the stored record");
+        assert!(search_arr[0]["text"].as_str().unwrap().contains("TypeScript"));
+
         // 5. flush persists.
         let ok = call(rt, "memory.flush", &format!(r#"{{"handle":{hid}}}"#));
         assert!(
@@ -4336,7 +4380,9 @@ mod tests {
             "ai.speak",
             "memory.open",
             "memory.remember",
+            "memory.learn",
             "memory.recall",
+            "memory.search",
             "memory.count",
             "memory.flush",
             "memory.forget",
@@ -4368,7 +4414,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            36,
+            38,
             "the funnel contract list changed length — update it deliberately"
         );
 

@@ -322,6 +322,14 @@ impl InferModel {
         }
     }
 
+    /// How many speculative batch rows the CPU head pass can take at once.
+    pub fn spec_head_batch_capacity(&self) -> usize {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.spec_head_batch_capacity(),
+            _ => 0,
+        }
+    }
+
     /// LM-head logits for several speculative batch rows in one pass.
     pub fn spec_head_logits_batch(&mut self, first_row: usize, n_rows: usize, out: &mut [f32]) {
         match &mut self.backend {
@@ -1039,12 +1047,22 @@ impl InferEngine {
                             });
                         (rows, widths)
                     };
-                    let tree =
-                        lookahead::CandidateTree::build_cfg(cache, &history, rows, depth, widths);
-                    if !tree.is_empty() {
-                        Some(tree)
-                    } else {
+                    // The tree forward runs inside the prefill batch buffers, so
+                    // a tree with more nodes than the configured batch overruns
+                    // them (SOFUU_PREFILL_BATCH=4 with a 5-row tree used to
+                    // panic in the batched embedding lookup). Clamp the draft
+                    // to what the buffers hold; row 0 is the root.
+                    let rows = rows.min(self.model.spec_head_batch_capacity().saturating_sub(1));
+                    if rows == 0 {
                         None
+                    } else {
+                        let tree =
+                            lookahead::CandidateTree::build_cfg(cache, &history, rows, depth, widths);
+                        if !tree.is_empty() {
+                            Some(tree)
+                        } else {
+                            None
+                        }
                     }
                 } else {
                     None
@@ -1055,7 +1073,11 @@ impl InferEngine {
 
             // Warmup: run plain serial decode for a few steps so the gate has
             // a measured serial rate to compare speculation against.
-            let speculative_tree = if step < spec_warmup { None } else { speculative_tree };
+            let speculative_tree = if spec_allowed_at(step, spec_warmup) {
+                speculative_tree
+            } else {
+                None
+            };
 
             if let Some(tree) = speculative_tree {
                 // MULTI-PATH LOOKAHEAD TREE SPECULATION:
@@ -1090,7 +1112,13 @@ impl InferEngine {
                 // decode despite 2.06 tokens/step). Row 0 is the root, whose
                 // logits the tree forward already produced.
                 let tree_rows = tree.size();
-                let batched_heads = tree_rows > 0 && !self.model.gpu_chain_heads();
+                // Capacity check: the CPU head pass works on the prefill batch
+                // buffers, so a tree that does not fit (SOFUU_PREFILL_BATCH
+                // small) must fall back to the per-node path rather than
+                // overrun them.
+                let batched_heads = tree_rows > 0
+                    && !self.model.gpu_chain_heads()
+                    && 1 + tree_rows <= self.model.spec_head_batch_capacity();
                 if batched_heads {
                     if spec_logits_batch.len() < tree_rows * vocab_size {
                         spec_logits_batch.resize(tree_rows * vocab_size, 0.0);
@@ -1274,6 +1302,12 @@ fn spec_is_losing(spec_ns: u64, spec_tokens: u32, serial_ns: u64, serial_tokens:
     spec_rate <= serial_rate * 1.02
 }
 
+/// Speculation is skipped for the first `warmup` steps so the self-calibrating
+/// gate has a measured serial token cost to compare against.
+fn spec_allowed_at(step: usize, warmup: usize) -> bool {
+    step >= warmup
+}
+
 fn spec_should_disable(steps: u32, accepted: u32, min_tokens_per_step: f32) -> bool {
     // Two-tier: by 8 steps a chain near 1.0 tokens/step is a sure loss (cold
     // cache warmup is over by then); the full break-even threshold needs the
@@ -1287,7 +1321,18 @@ fn spec_should_disable(steps: u32, accepted: u32, min_tokens_per_step: f32) -> b
 
 #[cfg(test)]
 mod adaptive_spec_tests {
-    use super::{spec_is_losing, spec_should_disable};
+    use super::{spec_allowed_at, spec_is_losing, spec_should_disable};
+
+    #[test]
+    fn warmup_boundary_is_exact() {
+        // Steps before the warmup run serial (the gate needs that sample);
+        // the step at the boundary and everything after may speculate.
+        assert!(!spec_allowed_at(0, 4));
+        assert!(!spec_allowed_at(3, 4));
+        assert!(spec_allowed_at(4, 4));
+        assert!(spec_allowed_at(5, 4));
+        assert!(spec_allowed_at(0, 0));
+    }
 
     #[test]
     fn calibrated_gate_keeps_a_fast_tree() {

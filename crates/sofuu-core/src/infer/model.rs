@@ -1442,6 +1442,11 @@ impl TransformerModel {
     /// Qwen3-0.6B, i.e. ~10.5 ms on the Pi, and the walk visits 3-5 nodes per
     /// step — which is why speculative steps measured 65-102 ms and the default
     /// (speculation on) lost to serial decode.
+    /// How many batch rows `spec_head_logits_batch` can take in one call.
+    pub fn spec_head_batch_capacity(&self) -> usize {
+        max_prefill_batch()
+    }
+
     pub fn spec_head_logits_batch(&mut self, first_row: usize, n_rows: usize, out: &mut [f32]) {
         let dim = self.config.dim;
         let vocab_size = self.config.vocab_size;

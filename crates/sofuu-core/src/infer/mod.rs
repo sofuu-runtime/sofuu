@@ -832,6 +832,24 @@ impl InferEngine {
 
         let mut spec_logits_buf = vec![0.0f32; vocab_size];
 
+        // Adaptive speculation: a spec step costs ~one serial step plus a
+        // little extra row work, so it only pays when the draft chain lands
+        // more than ~1.15 tokens per step. Models/prompts where drafts miss
+        // (short generations, natural text on some models) measured SLOWER
+        // with the tree on (MiniCPM 5.2 vs 5.7 tk/s, Llama-1B short EOS
+        // window). After a warmup window the stream disables the tree for
+        // the rest of the generation when acceptance is below break-even.
+        // SOFUU_SPEC_ADAPT=0 restores always-on; SOFUU_SPEC_MIN_ACCEPT
+        // overrides the 1.15 tokens/step threshold.
+        let spec_adapt = std::env::var("SOFUU_SPEC_ADAPT").map(|v| v != "0").unwrap_or(true);
+        let spec_min_accept = std::env::var("SOFUU_SPEC_MIN_ACCEPT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.15);
+        let mut spec_steps: u32 = 0;
+        let mut spec_accepted: u32 = 0;
+        let mut spec_disabled = false;
+
         let mut step = 0;
         let mut cur_token = sampler.sample(&mut logits_buf, &history);
 
@@ -901,7 +919,7 @@ impl InferEngine {
 
             // Propose multi-path speculative candidate tree from n-gram cache
             let speculative_tree = if let Some(ref cache) = ngram_cache {
-                if cur_pos + 6 < max_seq_len && step < options.max_tokens {
+                if !spec_disabled && cur_pos + 6 < max_seq_len && step < options.max_tokens {
                     // Candidate tree knobs: SOFUU_SPEC_ROWS = max_tree_size (the
                     // spec tile batch pads to 8, so 1..=8 is the legal range),
                     // SOFUU_SPEC_DEPTH 1..=4 (level 4 only earns its keep with
@@ -1005,6 +1023,14 @@ impl InferEngine {
                     },
                 );
 
+                // Adaptive gate: measure tokens-per-spec-step and stop
+                // paying for drafts that do not land.
+                spec_steps += 1;
+                spec_accepted += accepted_batch_indices.len() as u32;
+                if spec_adapt && !spec_disabled && spec_should_disable(spec_steps, spec_accepted, spec_min_accept) {
+                    spec_disabled = true;
+                }
+
                 // Commit accepted candidate KV vectors to persistent KV cache
                 if !accepted_batch_indices.is_empty() {
                     self.model.commit_speculative_candidates(&accepted_batch_indices, cur_pos);
@@ -1102,5 +1128,52 @@ impl InferEngine {
         self.cached_tokens = history;
 
         Ok(full_generated)
+    }
+}
+
+/// Adaptive speculation gate: a speculative step delivers `1 + accepted/steps`
+/// tokens for roughly one serial step plus a bit of extra row work, so a
+/// draft chain that lands fewer than `min_tokens_per_step` tokens is a net
+/// loss. Only evaluated after a 16-step warmup so early misses (cold n-gram
+/// cache) cannot latch the tree off prematurely, while short generations
+/// still stop paying for a losing draft within ~25% of their length.
+fn spec_should_disable(steps: u32, accepted: u32, min_tokens_per_step: f32) -> bool {
+    // Two-tier: by 8 steps a chain near 1.0 tokens/step is a sure loss (cold
+    // cache warmup is over by then); the full break-even threshold needs the
+    // steadier 16-step estimate.
+    if steps < 8 {
+        return false;
+    }
+    let tokens_per_step = (steps + accepted) as f32 / steps as f32;
+    tokens_per_step < 1.05 || (steps >= 16 && tokens_per_step < min_tokens_per_step)
+}
+
+#[cfg(test)]
+mod adaptive_spec_tests {
+    use super::spec_should_disable;
+
+    #[test]
+    fn warmup_never_disables() {
+        assert!(!spec_should_disable(7, 0, 1.15));
+        assert!(!spec_should_disable(0, 0, 1.15));
+    }
+
+    #[test]
+    fn below_break_even_disables() {
+        // Sure-loss tier: 8 steps with no hits = 1.0 tokens/step.
+        assert!(spec_should_disable(8, 0, 1.15));
+        // 1.125 tokens/step at 8 steps is not sure-loss, and the full tier
+        // needs 16 steps.
+        assert!(!spec_should_disable(8, 1, 1.15));
+        // 1.125 at 16 steps (< 1.15 threshold): full tier fires.
+        assert!(spec_should_disable(16, 2, 1.15));
+    }
+
+    #[test]
+    fn healthy_acceptance_keeps_speculating() {
+        // Llama-1B counting-prompt-like: ~1.9 tokens/step.
+        assert!(!spec_should_disable(16, 14, 1.15));
+        // Qwen natural-text-like: ~1.2 tokens/step.
+        assert!(!spec_should_disable(64, 13, 1.15));
     }
 }

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use sofuu_ffi::qjs::JSContext;
 use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_NOWAIT, UV_RUN_ONCE};
 
-use crate::rt::promise::sofuu_flush_jobs;
+use crate::rt::promise::{sofuu_flush_jobs, sofuu_flush_jobs_bounded};
 
 /// The global libuv loop (`static uv_loop_t g_loop` in the retired loop.c).
 /// Sized via a C shim — uv_loop_t is opaque to Rust.
@@ -239,21 +239,36 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         return;
     }
     loop {
-        /* First: pump any immediately-available JS microtasks */
-        sofuu_flush_jobs(ctx);
+        /* First: pump immediately-available JS microtasks, bounded at 1024
+         * to prevent infinite microtask chains from starving the event loop. */
+        let drained = sofuu_flush_jobs_bounded(ctx, 1024);
+        if !drained {
+            /* Starvation escape: poll libuv without blocking so timers/I/O run */
+            uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
+            process_dispatch_pending_signals();
+            /* Continue draining pending microtasks without blocking in UV_RUN_ONCE */
+            continue;
+        }
 
-        /* Then: run one round of libuv I/O (blocking with timeout) */
+        /* All microtasks drained. Run one round of libuv I/O (blocking with timeout) */
         let has_pending = uv::uv_run(loop_ptr(), UV_RUN_ONCE);
 
         /* Dispatch any SIGINT/SIGTERM that fired (process.on handlers or
          * the exit(130/143) fallback) — previously dead code. */
         process_dispatch_pending_signals();
 
-        /* After libuv fires callbacks, flush JS microtasks again */
-        sofuu_flush_jobs(ctx);
+        /* After libuv fires callbacks, flush JS microtasks again (bounded) */
+        let drained_after = sofuu_flush_jobs_bounded(ctx, 1024);
+        if !drained_after {
+            uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
+            process_dispatch_pending_signals();
+        }
 
         if has_pending == 0 && uv::uv_loop_alive(loop_ptr()) == 0 {
-            break;
+            /* Only exit if the microtask queue is genuinely empty too */
+            if sofuu_flush_jobs_bounded(ctx, 1024) {
+                break;
+            }
         }
 
         /* Test-only escape hatch: a bound means a hang is reported as a
@@ -293,10 +308,10 @@ pub unsafe extern "C" fn sofuu_loop_tick_nb(ctx: *mut JSContext) {
     if loop_ptr().is_null() {
         return;
     }
-    sofuu_flush_jobs(ctx);
+    sofuu_flush_jobs_bounded(ctx, 1024);
     uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
     process_dispatch_pending_signals();
-    sofuu_flush_jobs(ctx);
+    sofuu_flush_jobs_bounded(ctx, 1024);
 }
 
 /// Walk callback: closes any handle that is still active.

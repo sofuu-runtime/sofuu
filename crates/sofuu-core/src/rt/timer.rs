@@ -15,10 +15,10 @@ use std::os::raw::{c_int, c_uint};
 use std::ptr;
 
 use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
-use sofuu_ffi::uv::{self, UvHandle, UvTimer};
+use sofuu_ffi::uv::{self, UvCheck, UvHandle, UvTimer};
 
 use crate::rt::event_loop::sofuu_loop_get;
-use crate::rt::promise::{sofuu_flush_jobs, sofuu_promise_new, sofuu_promise_resolve, PromiseHandle};
+use crate::rt::promise::{sofuu_flush_jobs, sofuu_flush_jobs_bounded, sofuu_promise_new, sofuu_promise_resolve, PromiseHandle};
 
 extern "C" {
     /// mod_process.c — dispatch to process.on('uncaughtException'); stays C
@@ -120,7 +120,7 @@ unsafe extern "C" fn on_timer(handle: *mut UvTimer) {
         qjs::sofuu_js_free_value(ctx, exc);
     }
     qjs::sofuu_js_free_value(ctx, ret);
-    sofuu_flush_jobs(ctx);
+    sofuu_flush_jobs_bounded(ctx, 1024);
 
     /* Check if the callback called clearInterval on THIS timer */
     if (*t).closing != 0 {
@@ -306,6 +306,110 @@ unsafe extern "C" fn js_sleep(
     promise
 }
 
+// ── scheduler.yield() / sofuu.yield() — Cooperative event loop yield ────
+
+struct YieldReq {
+    promise: *mut PromiseHandle,
+    handle: *mut UvCheck,
+    settled: bool,
+}
+
+unsafe extern "C" fn on_yield_close(handle: *mut UvHandle) {
+    crate::rt::event_loop::untrack_handle(handle);
+    let req = *(handle as *mut *mut YieldReq);
+    if !req.is_null() {
+        if !(*req).settled && !(*req).promise.is_null() {
+            let p = (*req).promise;
+            let ctx = (*p).ctx;
+            qjs::sofuu_js_free_value(ctx, (*p).resolve);
+            qjs::sofuu_js_free_value(ctx, (*p).reject);
+            libc::free(p as *mut c_void);
+        }
+        libc::free(handle as *mut c_void);
+        drop(Box::from_raw(req));
+    }
+}
+
+unsafe extern "C" fn on_yield_check(handle: *mut UvCheck) {
+    let req = *(handle as *mut *mut YieldReq);
+    let p = (*req).promise;
+    let ctx = (*p).ctx;
+
+    (*req).settled = true;
+    uv::uv_check_stop(handle);
+    sofuu_promise_resolve(p, qjs::sofuu_js_undefined()); /* frees p */
+    sofuu_flush_jobs(ctx);
+
+    uv::uv_close(handle as *mut UvHandle, Some(on_yield_close));
+}
+
+unsafe extern "C" fn js_scheduler_yield(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let mut out: *mut PromiseHandle = ptr::null_mut();
+    let promise = sofuu_promise_new(ctx, &mut out);
+    if qjs::is_exception(promise) {
+        return promise;
+    }
+
+    let req = Box::into_raw(Box::new(YieldReq {
+        promise: out,
+        handle: ptr::null_mut(),
+        settled: false,
+    }));
+    let handle = libc::malloc(uv::sofuu_uv_check_size()) as *mut UvCheck;
+    *(handle as *mut *mut YieldReq) = req;
+    (*req).handle = handle;
+
+    uv::uv_check_init(sofuu_loop_get(), handle);
+    uv::uv_check_start(handle, Some(on_yield_check));
+
+    /* F-2: armed per-ctx — a multi-engine teardown cleanly closes it */
+    unsafe {
+        crate::rt::event_loop::track_handle(ctx, handle as *mut UvHandle, Some(on_yield_close))
+    };
+
+    promise
+}
+
+unsafe extern "C" fn js_setimmediate(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    js_set_timer(ctx, argc, argv, 0)
+}
+
+unsafe extern "C" fn js_queue_microtask(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || qjs::JS_IsFunction(ctx, *argv) == 0 {
+        let msg = c"queueMicrotask: first argument must be a function";
+        return qjs::JS_ThrowTypeError(ctx, msg.as_ptr());
+    }
+
+    let mut out: *mut PromiseHandle = ptr::null_mut();
+    let promise = sofuu_promise_new(ctx, &mut out);
+    if !qjs::is_exception(promise) {
+        let then_fn = qjs::sofuu_js_get_property_str(ctx, promise, c"then".as_ptr());
+        if !qjs::is_undefined(then_fn) {
+            let res = qjs::JS_Call(ctx, then_fn, promise, 1, argv);
+            qjs::sofuu_js_free_value(ctx, res);
+            qjs::sofuu_js_free_value(ctx, then_fn);
+        }
+        sofuu_promise_resolve(out, qjs::sofuu_js_undefined());
+        qjs::sofuu_js_free_value(ctx, promise);
+    }
+    qjs::sofuu_js_undefined()
+}
+
 // ── Registration (C symbol replacement for mod_timer_register) ────────
 
 /// # Safety
@@ -337,8 +441,36 @@ pub unsafe extern "C" fn mod_timer_register(ctx: *mut JSContext) {
         c"clearInterval".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_clear_timer, c"clearInterval".as_ptr(), 1),
     );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        global,
+        c"setImmediate".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_setimmediate, c"setImmediate".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        global,
+        c"clearImmediate".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_clear_timer, c"clearImmediate".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        global,
+        c"queueMicrotask".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_queue_microtask, c"queueMicrotask".as_ptr(), 1),
+    );
 
-    /* sofuu.sleep(ms) — bonus utility */
+    // globalThis.scheduler = { yield: js_scheduler_yield }
+    let scheduler_obj = qjs::sofuu_js_new_object(ctx);
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        scheduler_obj,
+        c"yield".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_scheduler_yield, c"yield".as_ptr(), 0),
+    );
+    qjs::sofuu_js_set_property_str(ctx, global, c"scheduler".as_ptr(), scheduler_obj);
+
+    /* sofuu.sleep(ms) and sofuu.yield() — bonus utilities */
     let mut sofuu_obj = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
     if qjs::is_undefined(sofuu_obj) {
         sofuu_obj = qjs::sofuu_js_new_object(ctx);
@@ -348,6 +480,12 @@ pub unsafe extern "C" fn mod_timer_register(ctx: *mut JSContext) {
         sofuu_obj,
         c"sleep".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_sleep, c"sleep".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        sofuu_obj,
+        c"yield".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_scheduler_yield, c"yield".as_ptr(), 0),
     );
     qjs::sofuu_js_set_property_str(ctx, global, c"sofuu".as_ptr(), sofuu_obj);
     qjs::sofuu_js_free_value(ctx, global);
@@ -418,6 +556,66 @@ sofuu.sleep(3).then(function () { slept = true; });";
         unsafe { qjs::sofuu_js_free_value(ctx, global) };
 
         // SAFETY: teardown AFTER the loop is closed (M0/M1 discipline).
+        unsafe { crate::rt::event_loop::sofuu_loop_close() };
+        unsafe { qjs::JS_FreeContext(ctx) };
+        unsafe { qjs::JS_FreeRuntime(rt) };
+    }
+
+    #[test]
+    fn test_scheduler_yield_immediate_and_microtasks() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        let ctp = unsafe { CtxPtr::new(ctx) };
+        unsafe { sofuu_rt_install_rejection_tracker(rt) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        unsafe { mod_timer_register(ctx) };
+
+        let script = c"var yieldPassed = false; \
+var sofuuYieldPassed = false; \
+var immediateFired = false; \
+var microtaskFired = false; \
+setImmediate(function() { immediateFired = true; }); \
+queueMicrotask(function() { microtaskFired = true; }); \
+(async function() { \
+  await scheduler.yield(); \
+  yieldPassed = true; \
+  await sofuu.yield(); \
+  sofuuYieldPassed = true; \
+})();";
+        let r = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                script.as_ptr(),
+                script.to_bytes().len(),
+                c"<scheduler-test>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        assert!(!unsafe { qjs::is_exception(r) }, "eval must not throw");
+        unsafe { qjs::sofuu_js_free_value(ctx, r) };
+
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(10))) };
+
+        let global = unsafe { qjs::global_object(ctp) };
+
+        let yp = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"yieldPassed".as_ptr()) };
+        assert_eq!(unsafe { qjs::JS_ToBool(ctx, yp) }, 1, "scheduler.yield() must resolve");
+        unsafe { qjs::sofuu_js_free_value(ctx, yp) };
+
+        let syp = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuuYieldPassed".as_ptr()) };
+        assert_eq!(unsafe { qjs::JS_ToBool(ctx, syp) }, 1, "sofuu.yield() must resolve");
+        unsafe { qjs::sofuu_js_free_value(ctx, syp) };
+
+        let im = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"immediateFired".as_ptr()) };
+        assert_eq!(unsafe { qjs::JS_ToBool(ctx, im) }, 1, "setImmediate must fire");
+        unsafe { qjs::sofuu_js_free_value(ctx, im) };
+
+        let mt = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"microtaskFired".as_ptr()) };
+        assert_eq!(unsafe { qjs::JS_ToBool(ctx, mt) }, 1, "queueMicrotask must fire");
+        unsafe { qjs::sofuu_js_free_value(ctx, mt) };
+
+        unsafe { qjs::sofuu_js_free_value(ctx, global) };
         unsafe { crate::rt::event_loop::sofuu_loop_close() };
         unsafe { qjs::JS_FreeContext(ctx) };
         unsafe { qjs::JS_FreeRuntime(rt) };

@@ -295,6 +295,7 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     unsafe { qjs::sofuu_js_free_value(ctx, fs_obj) };
 
     copy_fn!(ctx, sofuu, sofuu_obj, "sleep");
+    copy_fn!(ctx, sofuu, sofuu_obj, "yield");
     copy_fn!(ctx, sofuu, sofuu_obj, "exec");
 
     // Sofuu.createMCPServer → sofuu.mcp.serve (the real implementation)

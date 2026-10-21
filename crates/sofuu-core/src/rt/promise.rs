@@ -144,24 +144,25 @@ pub unsafe extern "C" fn sofuu_promise_reject_str(p: *mut PromiseHandle, msg: *c
     sofuu_promise_reject(p, err);
 }
 
-/// Pump all pending QuickJS microtasks/jobs — call after each libuv callback.
-///
-/// # Safety
-/// `ctx` must be the live runtime context (loop thread).
+/// Pump all pending QuickJS microtasks/jobs — bounded by max_jobs to prevent event-loop starvation.
+/// Returns true if all jobs in the queue were drained, false if execution was interrupted by the bound.
 #[no_mangle]
-pub unsafe extern "C" fn sofuu_flush_jobs(ctx: *mut JSContext) {
-    // SAFETY: ctx is live; JS_GetRuntime returns its owning runtime.
+pub unsafe extern "C" fn sofuu_flush_jobs_bounded(ctx: *mut JSContext, max_jobs: usize) -> bool {
     let rt = qjs::JS_GetRuntime(ctx);
     let mut ctx2: *mut JSContext = ptr::null_mut();
+    let mut executed = 0usize;
+
     loop {
-        // SAFETY: ctx2 is written by JS_ExecutePendingJob; err semantics
-        // identical to the retired promises.c.
+        if executed >= max_jobs {
+            sofuu_rt_report_pending_rejections(ctx);
+            return false;
+        }
+
         let err = qjs::JS_ExecutePendingJob(rt, &mut ctx2);
         if err < 0 {
             /* Unhandled exception that broke the microtask queue: give
              * process.on('uncaughtException') a chance to handle it; fall
              * back to the standard dump when no handler is registered. */
-            // SAFETY: exception is pending on ctx2; exc is live.
             let exc = qjs::sofuu_js_get_exception(ctx2);
             if process_dispatch_uncaught(ctx2, exc) == 0 {
                 let msg_v = qjs::JS_ToString(ctx2, exc);
@@ -169,7 +170,6 @@ pub unsafe extern "C" fn sofuu_flush_jobs(ctx: *mut JSContext) {
                 let msg = if s.is_null() {
                     "?".to_string()
                 } else {
-                    // SAFETY: s valid until freed below.
                     CStr::from_ptr(s).to_string_lossy().into_owned()
                 };
                 eprintln!("\x1b[31m[sofuu] Unhandled Promise Rejection:\x1b[0m {}", msg);
@@ -194,11 +194,19 @@ pub unsafe extern "C" fn sofuu_flush_jobs(ctx: *mut JSContext) {
         if err == 0 {
             break;
         }
+        executed += 1;
     }
-    /* Deferred rejection reporting: print only rejections that are STILL
-     * unhandled now that the queue is calm (handler-later retractions were
-     * already dropped by the tracker). */
     sofuu_rt_report_pending_rejections(ctx);
+    true
+}
+
+/// Pump all pending QuickJS microtasks/jobs — call after each libuv callback.
+///
+/// # Safety
+/// `ctx` must be the live runtime context (loop thread).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_flush_jobs(ctx: *mut JSContext) {
+    sofuu_flush_jobs_bounded(ctx, usize::MAX);
 }
 
 // ── Deferred unhandled-rejection tracker (moved verbatim from engine.c) ──

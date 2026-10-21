@@ -1389,14 +1389,15 @@ int sofuu_metal_batch_gguf_gemm(
     // Phase 3: the real GEMM class covers all three GEMV-eligible quant
     // types (8 = q8_0, 12 = q4_K, 14 = q6_K); unsupported ty falls back to
     // the caller's per-row loop, visible-unavailable, never a silent no-op.
+    bool tile32 = false;
     switch (ty) {
         case 8:
-            if (ctx->gemm_tile32 && ctx->pso_gemm_q8_0_t32_live) { [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0_t32]; }
+            if (ctx->gemm_tile32 && ctx->pso_gemm_q8_0_t32_live) { tile32 = true; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0_t32]; }
             else { if (!ctx->pso_gemm_q8_0_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0]; }
             break;
         case 12: [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k]; break;
         case 14:
-            if (ctx->gemm_tile32 && ctx->pso_gemm_q6_k_t32_live) { [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_t32]; }
+            if (ctx->gemm_tile32 && ctx->pso_gemm_q6_k_t32_live) { tile32 = true; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_t32]; }
             else { if (!ctx->pso_gemm_q6_k_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k]; }
             break;
         default: return 0;
@@ -1414,7 +1415,10 @@ int sofuu_metal_batch_gguf_gemm(
     [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
     [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
     [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
-    uint subtiles = (Bn + 7) / 8;
+    // tile-8 class: 8 tokens per tile; tile-32 class: 32 — the group count
+    // must match the selected kernel's tile or the t32 dispatch overspawns
+    // 4x guarded-off threadgroups
+    uint subtiles = tile32 ? (Bn + 31) / 32 : (Bn + 7) / 8;
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, subtiles, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     return 1;

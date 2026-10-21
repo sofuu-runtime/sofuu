@@ -47,6 +47,12 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q4_k;
     id<MTLComputePipelineState> pso_gemm_q4_k_multi;
     id<MTLComputePipelineState> pso_gemm_q4_k_acc;
+    id<MTLComputePipelineState> pso_gemm_q8_0;
+    id<MTLComputePipelineState> pso_gemm_q8_0_multi;
+    id<MTLComputePipelineState> pso_gemm_q8_0_acc;
+    id<MTLComputePipelineState> pso_gemm_q6_k;
+    id<MTLComputePipelineState> pso_gemm_q6_k_multi;
+    id<MTLComputePipelineState> pso_gemm_q6_k_acc;
     id<MTLComputePipelineState> pso_gpu_q4_k_b4multi;
     id<MTLComputePipelineState> pso_gpu_q6_k_b4multi;
     id<MTLComputePipelineState> pso_gpu_q8_0_b4multi;
@@ -54,6 +60,12 @@ struct MetalContext {
     bool pso_gemm_q4_k_live;
     bool pso_gemm_q4_k_multi_live;
     bool pso_gemm_q4_k_acc_live;
+    bool pso_gemm_q8_0_live;
+    bool pso_gemm_q8_0_multi_live;
+    bool pso_gemm_q8_0_acc_live;
+    bool pso_gemm_q6_k_live;
+    bool pso_gemm_q6_k_multi_live;
+    bool pso_gemm_q6_k_acc_live;
     bool pso_gpu_q4_k_b4multi_live;
     bool pso_gpu_q6_k_b4multi_live;
     bool pso_gpu_q8_0_b4multi_live;
@@ -254,6 +266,18 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q4_k_multi_live = ctx->pso_gemm_q4_k_multi != nil;
         ctx->pso_gemm_q4_k_acc = load_pso(@"gemm_q4_k_acc");
         ctx->pso_gemm_q4_k_acc_live = ctx->pso_gemm_q4_k_acc != nil;
+        ctx->pso_gemm_q8_0 = load_pso(@"gemm_q8_0");
+        ctx->pso_gemm_q8_0_live = ctx->pso_gemm_q8_0 != nil;
+        ctx->pso_gemm_q8_0_multi = load_pso(@"gemm_q8_0_multi");
+        ctx->pso_gemm_q8_0_multi_live = ctx->pso_gemm_q8_0_multi != nil;
+        ctx->pso_gemm_q8_0_acc = load_pso(@"gemm_q8_0_acc");
+        ctx->pso_gemm_q8_0_acc_live = ctx->pso_gemm_q8_0_acc != nil;
+        ctx->pso_gemm_q6_k = load_pso(@"gemm_q6_k");
+        ctx->pso_gemm_q6_k_live = ctx->pso_gemm_q6_k != nil;
+        ctx->pso_gemm_q6_k_multi = load_pso(@"gemm_q6_k_multi");
+        ctx->pso_gemm_q6_k_multi_live = ctx->pso_gemm_q6_k_multi != nil;
+        ctx->pso_gemm_q6_k_acc = load_pso(@"gemm_q6_k_acc");
+        ctx->pso_gemm_q6_k_acc_live = ctx->pso_gemm_q6_k_acc != nil;
         ctx->pso_gpu_q4_k_b4multi = load_pso(@"gemv_q4_k_b4multi");
         ctx->pso_gpu_q4_k_b4multi_live = ctx->pso_gpu_q4_k_b4multi != nil;
         ctx->pso_gpu_q6_k_b4multi = load_pso(@"gemv_q6_k_b4multi");
@@ -1348,15 +1372,21 @@ int sofuu_metal_batch_gguf_gemm(
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0 || B == 0) return 0;
     if (!ctx->pso_gemm_q4_k_live) return 0;
-    if (ty != 12) return 0; // q4_K only for now; q8_0/q6_K follow the receipt
-    id<MTLComputePipelineState> pso = ctx->pso_gemm_q4_k;
+    // Phase 3: the real GEMM class covers all three GEMV-eligible quant
+    // types (8 = q8_0, 12 = q4_K, 14 = q6_K); unsupported ty falls back to
+    // the caller's per-row loop, visible-unavailable, never a silent no-op.
+    switch (ty) {
+        case 8:  if (!ctx->pso_gemm_q8_0_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0]; break;
+        case 12: [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k]; break;
+        case 14: if (!ctx->pso_gemm_q6_k_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k]; break;
+        default: return 0;
+    }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = w_offset & ~255ULL;
     uint w_rem = (uint)(w_offset & 255ULL);
     uint c = (uint)cols;
     uint Bn = (uint)B;
     uint rn = (uint)rows;
-    [ctx->batch_enc setComputePipelineState:pso];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
@@ -1387,7 +1417,12 @@ int sofuu_metal_batch_gguf_gemm_multi(
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || B == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
     if (!ctx->pso_gemm_q4_k_multi_live) return 0;
-    if (ty != 12) return 0;
+    switch (ty) {
+        case 8:  if (!ctx->pso_gemm_q8_0_multi_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0_multi]; break;
+        case 12: [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_multi]; break;
+        case 14: if (!ctx->pso_gemm_q6_k_multi_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_multi]; break;
+        default: return 0;
+    }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     uint c = (uint)cols;
     uint Bn = (uint)B;
@@ -1395,7 +1430,6 @@ int sofuu_metal_batch_gguf_gemm_multi(
     uint ns = (uint)n_sec;
     uint sblob[20]; // 4 sections x {off, rem, rows_end, y_off, y_stride}
     for (int i = 0; i < 20; ++i) sblob[i] = secs[i];
-    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_multi];
     // sections carry u32 DELTAS from w_base_offset (the first section's
     // 256-aligned start) — absolute offsets overflow u32 on 5GB files
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:w_base_offset atIndex:0];
@@ -1431,7 +1465,12 @@ int sofuu_metal_batch_gguf_gemm_acc(
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !res_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0 || B == 0) return 0;
     if (!ctx->pso_gemm_q4_k_acc_live) return 0;
-    if (ty != 12) return 0;
+    switch (ty) {
+        case 8:  if (!ctx->pso_gemm_q8_0_acc_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q8_0_acc]; break;
+        case 12: [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_acc]; break;
+        case 14: if (!ctx->pso_gemm_q6_k_acc_live) return 0; [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_acc]; break;
+        default: return 0;
+    }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = w_offset & ~255ULL;
     uint w_rem = (uint)(w_offset & 255ULL);
@@ -1439,7 +1478,6 @@ int sofuu_metal_batch_gguf_gemm_acc(
     uint Bn = (uint)B;
     uint rs = (uint)res_stride;
     uint rn = (uint)rows;
-    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_acc];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)res_buf_ptr offset:res_offset atIndex:2];

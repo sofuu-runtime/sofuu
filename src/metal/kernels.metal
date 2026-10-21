@@ -2514,3 +2514,429 @@ kernel void gemv_q8_0_c2(
         y[row] = acc;
     }
 }
+
+// ── Phase 3 compute-rate: real GEMM kernels for q8_0 and q6_K ──────────────
+// Before this, batch_gguf_gemm accepted q4_K only — every q8_0/q6_K tensor
+// in the prefill GEMM route rode the per-token GEMV class (B dispatches per
+// tensor per layer: the 1B's all-q8_0 prefill was 7×B×layers dispatches).
+// These copy gemm_q4_k's shape (grid (rows, ceil(B/GEMM_TS)), 32 lanes,
+// 8-token accumulators) with the DECODE kernels' receipted dequant cores
+// (gemv_q8_0_b4multi / gemv_q6_k_b4multi) — per-accumulator order matches
+// the decode sequence exactly.
+
+kernel void gemm_q8_0(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 32;
+    uint row_byte = w_rem + row * nb * 34;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    // lane = value index (32 consecutive int8 = one coalesced block read)
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + lane]));
+        uint k = b * 32 + lane;
+        if (v0) { acc0 += d * q * x0[k]; }
+        if (v1) { acc1 += d * q * x1[k]; }
+        if (v2) { acc2 += d * q * x2[k]; }
+        if (v3) { acc3 += d * q * x3[k]; }
+        if (v4) { acc4 += d * q * x4[k]; }
+        if (v5) { acc5 += d * q * x5[k]; }
+        if (v6) { acc6 += d * q * x6[k]; }
+        if (v7) { acc7 += d * q * x7[k]; }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    if (lane == 0) {
+        if (v0) y[(size_t)(t0 + 0) * rows + row] = acc0;
+        if (v1) y[(size_t)(t0 + 1) * rows + row] = acc1;
+        if (v2) y[(size_t)(t0 + 2) * rows + row] = acc2;
+        if (v3) y[(size_t)(t0 + 3) * rows + row] = acc3;
+        if (v4) y[(size_t)(t0 + 4) * rows + row] = acc4;
+        if (v5) y[(size_t)(t0 + 5) * rows + row] = acc5;
+        if (v6) y[(size_t)(t0 + 6) * rows + row] = acc6;
+        if (v7) y[(size_t)(t0 + 7) * rows + row] = acc7;
+    }
+}
+
+kernel void gemm_q6_k(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = w_base + row_byte + b * 210 + 128;
+        device const uchar *sc = w_base + row_byte + b * 210 + 192;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        for (uint n = 0; n < 2; ++n) {
+            uchar qh8 = qh[n * 32 + lane];
+            uint isn = 8 * n + lane / 16;
+            float s0 = d * (float)(signed char)sc[isn + 0];
+            float s2 = d * (float)(signed char)sc[isn + 2];
+            float s4 = d * (float)(signed char)sc[isn + 4];
+            float s6 = d * (float)(signed char)sc[isn + 6];
+            float q1 = (float)((ql[n * 64 + lane] & 0x0F) | (((qh8 >> 0) & 3) << 4)) - 32.0f;
+            float q2 = (float)((ql[n * 64 + lane + 32] & 0x0F) | (((qh8 >> 2) & 3) << 4)) - 32.0f;
+            float q3 = (float)((ql[n * 64 + lane] >> 4) | (((qh8 >> 4) & 3) << 4)) - 32.0f;
+            float q4 = (float)((ql[n * 64 + lane + 32] >> 4) | (((qh8 >> 6) & 3) << 4)) - 32.0f;
+            uint xb6 = b * 256 + n * 128 + lane;
+            if (v0) { a0 += q1 * s0 * x0[xb6] + q2 * s2 * x0[xb6 + 32] + q3 * s4 * x0[xb6 + 64] + q4 * s6 * x0[xb6 + 96]; }
+            if (v1) { a1 += q1 * s0 * x1[xb6] + q2 * s2 * x1[xb6 + 32] + q3 * s4 * x1[xb6 + 64] + q4 * s6 * x1[xb6 + 96]; }
+            if (v2) { a2 += q1 * s0 * x2[xb6] + q2 * s2 * x2[xb6 + 32] + q3 * s4 * x2[xb6 + 64] + q4 * s6 * x2[xb6 + 96]; }
+            if (v3) { a3 += q1 * s0 * x3[xb6] + q2 * s2 * x3[xb6 + 32] + q3 * s4 * x3[xb6 + 64] + q4 * s6 * x3[xb6 + 96]; }
+            if (v4) { a4 += q1 * s0 * x4[xb6] + q2 * s2 * x4[xb6 + 32] + q3 * s4 * x4[xb6 + 64] + q4 * s6 * x4[xb6 + 96]; }
+            if (v5) { a5 += q1 * s0 * x5[xb6] + q2 * s2 * x5[xb6 + 32] + q3 * s4 * x5[xb6 + 64] + q4 * s6 * x5[xb6 + 96]; }
+            if (v6) { a6 += q1 * s0 * x6[xb6] + q2 * s2 * x6[xb6 + 32] + q3 * s4 * x6[xb6 + 64] + q4 * s6 * x6[xb6 + 96]; }
+            if (v7) { a7 += q1 * s0 * x7[xb6] + q2 * s2 * x7[xb6 + 32] + q3 * s4 * x7[xb6 + 64] + q4 * s6 * x7[xb6 + 96]; }
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    if (lane == 0) {
+        if (v0) y[(size_t)(t0 + 0) * rows + row] = acc0;
+        if (v1) y[(size_t)(t0 + 1) * rows + row] = acc1;
+        if (v2) y[(size_t)(t0 + 2) * rows + row] = acc2;
+        if (v3) y[(size_t)(t0 + 3) * rows + row] = acc3;
+        if (v4) y[(size_t)(t0 + 4) * rows + row] = acc4;
+        if (v5) y[(size_t)(t0 + 5) * rows + row] = acc5;
+        if (v6) y[(size_t)(t0 + 6) * rows + row] = acc6;
+        if (v7) y[(size_t)(t0 + 7) * rows + row] = acc7;
+    }
+}
+
+// Multi-section variants (the gemm_fused! qkv/gate_up path) with per-section
+// GemmSection resolution exactly like gemm_q4_k_multi.
+kernel void gemm_q8_0_multi(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &B        [[buffer(4)]],
+    constant uint           &rows_tot [[buffer(5)]],
+    constant GemmSection    *secs     [[buffer(6)]],
+    uint2 tg                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    if (row >= rows_tot) { return; }
+    uint prev_end = 0u, sec_off = 0u, sec_rem = 0u, sec_yoff = 0u, sec_ystr = 0u;
+    for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+        uint end_i = secs[i].rows_end;
+        if (row >= prev_end && row < end_i) {
+            sec_off = secs[i].off; sec_rem = secs[i].rem;
+            sec_yoff = secs[i].y_off; sec_ystr = secs[i].y_stride;
+            break;
+        }
+        prev_end = end_i;
+    }
+    uint local_row = row - prev_end;
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 32;
+    uint row_byte = sec_off + sec_rem + local_row * nb * 34;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + lane]));
+        uint k = b * 32 + lane;
+        if (v0) { acc0 += d * q * x0[k]; }
+        if (v1) { acc1 += d * q * x1[k]; }
+        if (v2) { acc2 += d * q * x2[k]; }
+        if (v3) { acc3 += d * q * x3[k]; }
+        if (v4) { acc4 += d * q * x4[k]; }
+        if (v5) { acc5 += d * q * x5[k]; }
+        if (v6) { acc6 += d * q * x6[k]; }
+        if (v7) { acc7 += d * q * x7[k]; }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    device float *yr = y + sec_yoff / 4 + local_row;
+    if (lane == 0) {
+        if (v0) yr[0] = acc0;
+        if (v1) yr[sec_ystr] = acc1;
+        if (v2) yr[2 * sec_ystr] = acc2;
+        if (v3) yr[3 * sec_ystr] = acc3;
+        if (v4) yr[4 * sec_ystr] = acc4;
+        if (v5) yr[5 * sec_ystr] = acc5;
+        if (v6) yr[6 * sec_ystr] = acc6;
+        if (v7) yr[7 * sec_ystr] = acc7;
+    }
+}
+
+kernel void gemm_q6_k_multi(
+    device const uchar      *w_base   [[buffer(0)]],
+    device const float      *x        [[buffer(1)]],
+    device float            *y        [[buffer(2)]],
+    constant uint           &cols     [[buffer(3)]],
+    constant uint           &B        [[buffer(4)]],
+    constant uint           &rows_tot [[buffer(5)]],
+    constant GemmSection    *secs     [[buffer(6)]],
+    uint2 tg                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    if (row >= rows_tot) { return; }
+    uint prev_end = 0u, sec_off = 0u, sec_rem = 0u, sec_yoff = 0u, sec_ystr = 0u;
+    for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+        uint end_i = secs[i].rows_end;
+        if (row >= prev_end && row < end_i) {
+            sec_off = secs[i].off; sec_rem = secs[i].rem;
+            sec_yoff = secs[i].y_off; sec_ystr = secs[i].y_stride;
+            break;
+        }
+        prev_end = end_i;
+    }
+    uint local_row = row - prev_end;
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 256;
+    uint row_byte = sec_off + sec_rem + local_row * nb * 210;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = w_base + row_byte + b * 210 + 128;
+        device const uchar *sc = w_base + row_byte + b * 210 + 192;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        for (uint n = 0; n < 2; ++n) {
+            uchar qh8 = qh[n * 32 + lane];
+            uint isn = 8 * n + lane / 16;
+            float s0 = d * (float)(signed char)sc[isn + 0];
+            float s2 = d * (float)(signed char)sc[isn + 2];
+            float s4 = d * (float)(signed char)sc[isn + 4];
+            float s6 = d * (float)(signed char)sc[isn + 6];
+            float q1 = (float)((ql[n * 64 + lane] & 0x0F) | (((qh8 >> 0) & 3) << 4)) - 32.0f;
+            float q2 = (float)((ql[n * 64 + lane + 32] & 0x0F) | (((qh8 >> 2) & 3) << 4)) - 32.0f;
+            float q3 = (float)((ql[n * 64 + lane] >> 4) | (((qh8 >> 4) & 3) << 4)) - 32.0f;
+            float q4 = (float)((ql[n * 64 + lane + 32] >> 4) | (((qh8 >> 6) & 3) << 4)) - 32.0f;
+            uint xb6 = b * 256 + n * 128 + lane;
+            if (v0) { a0 += q1 * s0 * x0[xb6] + q2 * s2 * x0[xb6 + 32] + q3 * s4 * x0[xb6 + 64] + q4 * s6 * x0[xb6 + 96]; }
+            if (v1) { a1 += q1 * s0 * x1[xb6] + q2 * s2 * x1[xb6 + 32] + q3 * s4 * x1[xb6 + 64] + q4 * s6 * x1[xb6 + 96]; }
+            if (v2) { a2 += q1 * s0 * x2[xb6] + q2 * s2 * x2[xb6 + 32] + q3 * s4 * x2[xb6 + 64] + q4 * s6 * x2[xb6 + 96]; }
+            if (v3) { a3 += q1 * s0 * x3[xb6] + q2 * s2 * x3[xb6 + 32] + q3 * s4 * x3[xb6 + 64] + q4 * s6 * x3[xb6 + 96]; }
+            if (v4) { a4 += q1 * s0 * x4[xb6] + q2 * s2 * x4[xb6 + 32] + q3 * s4 * x4[xb6 + 64] + q4 * s6 * x4[xb6 + 96]; }
+            if (v5) { a5 += q1 * s0 * x5[xb6] + q2 * s2 * x5[xb6 + 32] + q3 * s4 * x5[xb6 + 64] + q4 * s6 * x5[xb6 + 96]; }
+            if (v6) { a6 += q1 * s0 * x6[xb6] + q2 * s2 * x6[xb6 + 32] + q3 * s4 * x6[xb6 + 64] + q4 * s6 * x6[xb6 + 96]; }
+            if (v7) { a7 += q1 * s0 * x7[xb6] + q2 * s2 * x7[xb6 + 32] + q3 * s4 * x7[xb6 + 64] + q4 * s6 * x7[xb6 + 96]; }
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    device float *yr = y + sec_yoff / 4 + local_row;
+    if (lane == 0) {
+        if (v0) yr[0] = acc0;
+        if (v1) yr[sec_ystr] = acc1;
+        if (v2) yr[2 * sec_ystr] = acc2;
+        if (v3) yr[3 * sec_ystr] = acc3;
+        if (v4) yr[4 * sec_ystr] = acc4;
+        if (v5) yr[5 * sec_ystr] = acc5;
+        if (v6) yr[6 * sec_ystr] = acc6;
+        if (v7) yr[7 * sec_ystr] = acc7;
+    }
+}
+
+// Residual-add epilogue variants (o/down projections: batch_gguf_gemm_acc),
+// dequant cores as above, y = acc + res[token*res_stride + row].
+kernel void gemm_q8_0_acc(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device const float  *res            [[buffer(2)]],
+    device float        *y              [[buffer(3)]],
+    constant uint       &cols           [[buffer(4)]],
+    constant uint       &w_rem          [[buffer(5)]],
+    constant uint       &B              [[buffer(6)]],
+    constant uint       &res_stride     [[buffer(7)]],
+    constant uint       &rows           [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    if (row >= rows) { return; }
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 32;
+    uint row_byte = w_rem + row * nb * 34;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 34));
+        float q = (float)(as_type<int8_t>(w_base[row_byte + b * 34 + 2 + lane]));
+        uint k = b * 32 + lane;
+        if (v0) { acc0 += d * q * x0[k]; }
+        if (v1) { acc1 += d * q * x1[k]; }
+        if (v2) { acc2 += d * q * x2[k]; }
+        if (v3) { acc3 += d * q * x3[k]; }
+        if (v4) { acc4 += d * q * x4[k]; }
+        if (v5) { acc5 += d * q * x5[k]; }
+        if (v6) { acc6 += d * q * x6[k]; }
+        if (v7) { acc7 += d * q * x7[k]; }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    device float *yr = y + row;
+    if (lane == 0) {
+        if (v0) yr[(size_t)(t0 + 0) * rows] = acc0 + res[(size_t)(t0 + 0) * res_stride + row];
+        if (v1) yr[(size_t)(t0 + 1) * rows] = acc1 + res[(size_t)(t0 + 1) * res_stride + row];
+        if (v2) yr[(size_t)(t0 + 2) * rows] = acc2 + res[(size_t)(t0 + 2) * res_stride + row];
+        if (v3) yr[(size_t)(t0 + 3) * rows] = acc3 + res[(size_t)(t0 + 3) * res_stride + row];
+        if (v4) yr[(size_t)(t0 + 4) * rows] = acc4 + res[(size_t)(t0 + 4) * res_stride + row];
+        if (v5) yr[(size_t)(t0 + 5) * rows] = acc5 + res[(size_t)(t0 + 5) * res_stride + row];
+        if (v6) yr[(size_t)(t0 + 6) * rows] = acc6 + res[(size_t)(t0 + 6) * res_stride + row];
+        if (v7) yr[(size_t)(t0 + 7) * rows] = acc7 + res[(size_t)(t0 + 7) * res_stride + row];
+    }
+}
+
+kernel void gemm_q6_k_acc(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device const float  *res            [[buffer(2)]],
+    device float        *y              [[buffer(3)]],
+    constant uint       &cols           [[buffer(4)]],
+    constant uint       &w_rem          [[buffer(5)]],
+    constant uint       &B              [[buffer(6)]],
+    constant uint       &res_stride     [[buffer(7)]],
+    constant uint       &rows           [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    uint row = tg.x;
+    if (row >= rows) { return; }
+    uint t0 = tg.y * GEMM_TS;
+    bool v0 = t0 + 0 < B, v1 = t0 + 1 < B, v2 = t0 + 2 < B, v3 = t0 + 3 < B;
+    bool v4 = t0 + 4 < B, v5 = t0 + 5 < B, v6 = t0 + 6 < B, v7 = t0 + 7 < B;
+    device const float *x0 = x + (v0 ? (t0 + 0) * cols : 0);
+    device const float *x1 = x + (v1 ? (t0 + 1) * cols : 0);
+    device const float *x2 = x + (v2 ? (t0 + 2) * cols : 0);
+    device const float *x3 = x + (v3 ? (t0 + 3) * cols : 0);
+    device const float *x4 = x + (v4 ? (t0 + 4) * cols : 0);
+    device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
+    device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
+    device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = w_base + row_byte + b * 210 + 128;
+        device const uchar *sc = w_base + row_byte + b * 210 + 192;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        for (uint n = 0; n < 2; ++n) {
+            uchar qh8 = qh[n * 32 + lane];
+            uint isn = 8 * n + lane / 16;
+            float s0 = d * (float)(signed char)sc[isn + 0];
+            float s2 = d * (float)(signed char)sc[isn + 2];
+            float s4 = d * (float)(signed char)sc[isn + 4];
+            float s6 = d * (float)(signed char)sc[isn + 6];
+            float q1 = (float)((ql[n * 64 + lane] & 0x0F) | (((qh8 >> 0) & 3) << 4)) - 32.0f;
+            float q2 = (float)((ql[n * 64 + lane + 32] & 0x0F) | (((qh8 >> 2) & 3) << 4)) - 32.0f;
+            float q3 = (float)((ql[n * 64 + lane] >> 4) | (((qh8 >> 4) & 3) << 4)) - 32.0f;
+            float q4 = (float)((ql[n * 64 + lane + 32] >> 4) | (((qh8 >> 6) & 3) << 4)) - 32.0f;
+            uint xb6 = b * 256 + n * 128 + lane;
+            if (v0) { a0 += q1 * s0 * x0[xb6] + q2 * s2 * x0[xb6 + 32] + q3 * s4 * x0[xb6 + 64] + q4 * s6 * x0[xb6 + 96]; }
+            if (v1) { a1 += q1 * s0 * x1[xb6] + q2 * s2 * x1[xb6 + 32] + q3 * s4 * x1[xb6 + 64] + q4 * s6 * x1[xb6 + 96]; }
+            if (v2) { a2 += q1 * s0 * x2[xb6] + q2 * s2 * x2[xb6 + 32] + q3 * s4 * x2[xb6 + 64] + q4 * s6 * x2[xb6 + 96]; }
+            if (v3) { a3 += q1 * s0 * x3[xb6] + q2 * s2 * x3[xb6 + 32] + q3 * s4 * x3[xb6 + 64] + q4 * s6 * x3[xb6 + 96]; }
+            if (v4) { a4 += q1 * s0 * x4[xb6] + q2 * s2 * x4[xb6 + 32] + q3 * s4 * x4[xb6 + 64] + q4 * s6 * x4[xb6 + 96]; }
+            if (v5) { a5 += q1 * s0 * x5[xb6] + q2 * s2 * x5[xb6 + 32] + q3 * s4 * x5[xb6 + 64] + q4 * s6 * x5[xb6 + 96]; }
+            if (v6) { a6 += q1 * s0 * x6[xb6] + q2 * s2 * x6[xb6 + 32] + q3 * s4 * x6[xb6 + 64] + q4 * s6 * x6[xb6 + 96]; }
+            if (v7) { a7 += q1 * s0 * x7[xb6] + q2 * s2 * x7[xb6 + 32] + q3 * s4 * x7[xb6 + 64] + q4 * s6 * x7[xb6 + 96]; }
+        }
+        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
+        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    device float *yr = y + row;
+    if (lane == 0) {
+        if (v0) yr[(size_t)(t0 + 0) * rows] = acc0 + res[(size_t)(t0 + 0) * res_stride + row];
+        if (v1) yr[(size_t)(t0 + 1) * rows] = acc1 + res[(size_t)(t0 + 1) * res_stride + row];
+        if (v2) yr[(size_t)(t0 + 2) * rows] = acc2 + res[(size_t)(t0 + 2) * res_stride + row];
+        if (v3) yr[(size_t)(t0 + 3) * rows] = acc3 + res[(size_t)(t0 + 3) * res_stride + row];
+        if (v4) yr[(size_t)(t0 + 4) * rows] = acc4 + res[(size_t)(t0 + 4) * res_stride + row];
+        if (v5) yr[(size_t)(t0 + 5) * rows] = acc5 + res[(size_t)(t0 + 5) * res_stride + row];
+        if (v6) yr[(size_t)(t0 + 6) * rows] = acc6 + res[(size_t)(t0 + 6) * res_stride + row];
+        if (v7) yr[(size_t)(t0 + 7) * rows] = acc7 + res[(size_t)(t0 + 7) * res_stride + row];
+    }
+}

@@ -2995,11 +2995,30 @@ impl TransformerModel {
         }
 
         let pass_t = std::time::Instant::now();
+        // Phase 3 q8_0/q6_K GEMM kernels exist and are BIT-EXACT standalone
+        // (gemm_q8_0/gemm_q6_k oracles, worst_rel=0 at B=5/32/128), but the
+        // all-q8_0 1B produced silently-wrong values in-model at 128-row
+        // passes (garbage logits → the CPU repack's nearest_int assert on
+        // downstream activation magnitudes; deterministic per prompt,
+        // B<=32 passes clean, skip=attn is clean) — the defect is booked,
+        // UNTIL it is pinned the extra dtypes are env opt-in only:
+        // SOFUU_GEMM_TYPES=all. q4_K (the receipted state since Phase 1)
+        // stays the default gate for every model. Declared before the gemm!
+        // macro below (macro_rules hygiene: the body resolves in the
+        // definition context).
+        let gemm_types_all = std::env::var("SOFUU_GEMM_TYPES")
+            .map(|v| v == "all")
+            .unwrap_or(false);
         macro_rules! gemm {
             ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {{
-                let fast = $tv.tensor_type == GGML_TYPE_Q4_K
+                // Phase 3: the real-GEMM class dispatches per TYPE (8/12/14);
+                // q6_K/q8_0 ride it only under SOFUU_GEMM_TYPES=all (the 1B
+                // in-model defect above), other dtypes take the per-row loop.
+                let fast = ($tv.tensor_type == GGML_TYPE_Q4_K
+                    || (gemm_types_all
+                        && matches!($tv.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_0)))
                     && g.engine.batch_gguf_gemm(
-                        12, &g.w_buf, gguf.data_offset + $tv.offset,
+                        $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
                         pbuf, $x_off, pbuf, $y_off,
                         $rows, $cols, b,
                     );
@@ -3028,48 +3047,62 @@ impl TransformerModel {
         // non-q4_K tensor or a missing fused PSO.
         macro_rules! gemm_fused {
             ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
-                let all_q4k = $secs.iter().all(|s| s.0.tensor_type == GGML_TYPE_Q4_K);
-                let mut fast = false;
-                if multi_dbg && !multi_dbg_done.replace(true) {
+                // Phase 3 (mixed-type qkv): type-GROUPED fused GEMM —
+                // consecutive same-type sections ride ONE multi-gemm
+                // dispatch (uniform qkv/gate_up = 1 dispatch; mixed
+                // [q4,q4,q6] = 2). base = MIN aligned offset across the
+                // GROUP (the b4blob receipt: sections are not monotonic in
+                // file order — 1B attn_k < attn_q).
+                let mut fast = !$secs.is_empty();
+                let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+                for (i, s) in $secs.iter().enumerate().take(4) {
+                    let ty = s.0.tensor_type;
+                    let eligible = ty == GGML_TYPE_Q4_K
+                        || (gemm_types_all
+                            && matches!(ty, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_0));
+                    if !eligible {
+                        fast = false;
+                        break;
+                    }
+                    match groups.last_mut() {
+                        Some(g) if g.0 == ty => g.1.push(i),
+                        _ => groups.push((ty, vec![i])),
+                    }
+                }
+                if fast && multi_dbg && !multi_dbg_done.replace(true) {
                     eprintln!(
-                        "[multi-debug] all_q4k={} types={:?} rows_total={} cols={} b={} x_off={} y_offs={:?}",
-                        all_q4k,
-                        $secs.iter().map(|s| s.0.tensor_type).collect::<Vec<_>>(),
-                        $rows_total, $cols, b,
-                        $x_off,
-                        $secs.iter().map(|s| s.3).collect::<Vec<_>>()
+                        "[multi-debug] type-groups={} types={:?} rows_total={} cols={} b={}",
+                        groups.len(),
+                        groups.iter().map(|(ty, _)| ty).collect::<Vec<_>>(),
+                        $rows_total, $cols, b
                     );
                 }
-                if all_q4k {
-                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
-                    let mut end = 0u32;
-                    // base = MIN aligned offset across the sections — the
-                    // decode fusion's b4blob receipt proved sections are not
-                    // monotonic in file order (1B attn_k < attn_q); a first-
-                    // section base underflowed the u32 delta to 2^32.
-                    let base = (0..$secs.len().min(4))
-                        .map(|i| (gguf.data_offset + $secs[i].0.offset) & !255usize)
-                        .min()
-                        .unwrap_or(0);
-                    for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
-                        let raw = gguf.data_offset + tv.offset;
-                        blob[i][0] = ((raw & !255usize) - base) as u32;
-                        blob[i][1] = (raw & 255usize) as u32;
-                        end += *rows as u32;
-                        blob[i][2] = end;
-                        blob[i][3] = *y_off as u32;
-                        blob[i][4] = *y_stride as u32;
-                    }
-                    if multi_dbg && !multi_dbg_done.replace(true) {
-                        eprintln!(
-                            "[multi-debug] base={base} secs={:?} rows_total={} cols={} b={}",
-                            &blob[..], $rows_total, $cols, b
-                        );
-                    }
-                    fast = g.engine.batch_gguf_gemm_multi(
-                        12, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
-                        $rows_total, $cols, b, &blob,
-                    );
+                if fast {
+                    fast = groups.iter().all(|(ty, idxs)| {
+                        let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                        // zero rows_end on the padded slots can never match
+                        // a row span (end < prev_end) — same rule as the
+                        // host-padded decoder tables
+                        let base = idxs.iter()
+                            .map(|&i| (gguf.data_offset + $secs[i].0.offset) & !255usize)
+                            .min()
+                            .unwrap_or(0);
+                        let mut end = 0u32;
+                        for (j, &i) in idxs.iter().enumerate() {
+                            let (tv, rows, y_off, y_stride) = &$secs[i];
+                            let raw = gguf.data_offset + tv.offset;
+                            blob[j][0] = ((raw & !255usize) - base) as u32;
+                            blob[j][1] = (raw & 255usize) as u32;
+                            end += *rows;
+                            blob[j][2] = end;
+                            blob[j][3] = *y_off as u32;
+                            blob[j][4] = *y_stride as u32;
+                        }
+                        g.engine.batch_gguf_gemm_multi(
+                            *ty, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
+                            end as usize, $cols, b, &blob,
+                        )
+                    });
                 }
                 fast
             }};
@@ -3167,9 +3200,14 @@ impl TransformerModel {
             }
             let o_ok = !g.skip_attn
                 && acc_fuse
-                && l.attn_output.tensor_type == GGML_TYPE_Q4_K
+                && (l.attn_output.tensor_type == GGML_TYPE_Q4_K
+                    || (gemm_types_all
+                        && matches!(
+                            l.attn_output.tensor_type,
+                            GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
+                        )))
                 && g.engine.batch_gguf_gemm_acc(
-                    12, &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    l.attn_output.tensor_type, &g.w_buf, gguf.data_offset + l.attn_output.offset,
                     pbuf, pslots.ao,
                     pbuf, pslots.x, dim,
                     pbuf, pslots.x,
@@ -3200,9 +3238,14 @@ impl TransformerModel {
                 }
                 g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
                 let d_ok = acc_fuse
-                    && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+                    && (l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+                        || (gemm_types_all
+                            && matches!(
+                                l.ffn_down.tensor_type,
+                                GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
+                            )))
                     && g.engine.batch_gguf_gemm_acc(
-                        12, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                        l.ffn_down.tensor_type, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
                         pbuf, pslots.gate,
                         pbuf, pslots.x, dim,
                         pbuf, pslots.x,

@@ -296,3 +296,36 @@ default until receipts justify the per-model flip.
   dynamic per run) above the GEMM chunker — featured here so nobody
   misreads chunk profiles; SOFUU_PREFILL_DEBUG prints per-call
   n_tokens/pre_chunk.
+
+## PHASE 3 second receipts (2026-10-21 late — compute-rate leg, PARTIAL by design)
+- **q8_0 + q6_K REAL GEMM kernels landed** (was: the prefill `gemm!` fast path
+  accepted q4_K ONLY; every q8_0/q6_K tensor rode the per-token GEMV loop —
+  the 1B's all-q8_0 prefill was 7×B×layers dispatches/pass). Six kernels:
+  gemm_q8_0 / gemm_q6_k × {plain, multi (qkv/gate_up fused), acc (o/down
+  resid epilogue)}, dequant cores copied from the receipted decode kernels
+  (gemv_q8_0_b4multi / gemv_q6_k_b4multi), same 8-token tile shape as
+  gemm_q4_k. **Oracles: worst_rel = 0.0 (bit-exact vs vec_dot_raw) at
+  B=5/32/128** on fleet shapes (1B attn_q 2048×2048; 0.6B attn_v 1024×1024).
+- **SOFUU_GEMM_TYPES=all env-GATES the new dtypes OFF by default** — q4_K
+  stays the only default-dispatched type until the defect below is pinned.
+- **THE 1B ROUTE DEFECT (booked, Phase-4 blocker):** the prefill-GEMM route
+  on the all-q8_0 1B produces silently-wrong KV/logits at b>=~64-row passes
+  → the CPU repack path then asserts (nearest_int fval>4194303) or text
+  forks garbage-wards; passes working per-prompt-deterministically at
+  b<=32 (clean receipts c32 exit=0) and SINGLE-pass c128-108-token works;
+  the 326-tok c128 sequence (part/fin at b≈108 with priors) breaks. The
+  kernels are bit-exact standalone, and the per-row GEMV fallback ALSO
+  breaks there → this is ROUTE/GLUE-level at 1B shapes (32 heads, hd=64,
+  nkv=8), attention-chain per ablation (skip=attn clean). The 0.6B (16
+  heads, hd=128) runs the same glue bit-exact at b=128.
+- **Standalone GEMV-class rates under load 8-9 (labeled, ceiling work next):**
+  q8_0 2048×2048: 3.1 / 1.4 / 0.7 GB/s at B=5/32/128 (rate DROPS with B —
+  the tile-broadcast design wastes at scale); q6_K 1024×1024: 1.2 / 0.9 /
+  0.4. The vectorized-load compute-rate iteration (u32 weight loads,
+  float4 x, rows/threadgroup) is the actual Phase-3b payload and stays
+  OPEN; these kernels land the DISPATCH count fix + correct needs the
+  rate iteration.
+- In-model receipts (all load 5-9, ±40%): 1B route c32 types=all **98.0
+  tk/s**; MiniCPM route c128 types=all **70.4 tk/s** (first real prefill
+  GEMM on the q6/q8 mix). Battery default (route off) untouched: 1B
+  CPU-tiles prefill 161 t/s at the same load, exit=0, IOGPU=0.

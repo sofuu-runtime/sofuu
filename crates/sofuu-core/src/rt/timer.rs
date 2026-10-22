@@ -105,6 +105,7 @@ unsafe extern "C" fn on_timer(handle: *mut UvTimer) {
     qjs::JS_SetAsyncContext(rt, (*t).async_context);
     let ret = qjs::JS_Call(ctx, (*t).callback, qjs::sofuu_js_undefined(), 0, ptr::null());
     qjs::JS_SetAsyncContext(rt, prev_ctx);
+    qjs::sofuu_js_free_value(ctx, prev_ctx);
     if qjs::is_exception(ret) {
         let exc = qjs::sofuu_js_get_exception(ctx);
         /* process.on('uncaughtException') gets the first shot; fall back to

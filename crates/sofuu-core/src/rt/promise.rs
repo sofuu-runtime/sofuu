@@ -90,6 +90,7 @@ pub unsafe extern "C" fn sofuu_promise_resolve(p: *mut PromiseHandle, value: JSV
     // SAFETY: p->resolve is a live resolver function; JS_UNDEFINED this_obj.
     let ret = qjs::JS_Call(ctx, (*p).resolve, qjs::sofuu_js_undefined(), 1, &value);
     qjs::JS_SetAsyncContext(rt, prev_ctx);
+    qjs::sofuu_js_free_value(ctx, prev_ctx);
     if qjs::is_exception(ret) {
         /* Log but don't crash — the promise was already settled or handler threw */
         // SAFETY: exception is pending on ctx; all values live.
@@ -131,6 +132,7 @@ pub unsafe extern "C" fn sofuu_promise_reject(p: *mut PromiseHandle, error: JSVa
     // SAFETY: p->reject is a live resolver function; JS_UNDEFINED this_obj.
     let ret = qjs::JS_Call(ctx, (*p).reject, qjs::sofuu_js_undefined(), 1, &error);
     qjs::JS_SetAsyncContext(rt, prev_ctx);
+    qjs::sofuu_js_free_value(ctx, prev_ctx);
     qjs::sofuu_js_free_value(ctx, ret);
     qjs::sofuu_js_free_value(ctx, error);
     qjs::sofuu_js_free_value(ctx, (*p).resolve);

@@ -1875,10 +1875,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
-    prev_async_ctx = rt->current_async_context;
-    rt->current_async_context = e->async_context;
+    prev_async_ctx = JS_DupValueRT(rt, rt->current_async_context);
+    JS_SetAsyncContext(rt, e->async_context);
     res = e->job_func(e->ctx, e->argc, (JSValueConst *)e->argv);
-    rt->current_async_context = prev_async_ctx;
+    JS_SetAsyncContext(rt, prev_async_ctx);
+    JS_FreeValueRT(rt, prev_async_ctx);
     JS_FreeValue(ctx, e->async_context);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);

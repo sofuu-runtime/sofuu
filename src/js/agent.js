@@ -82,12 +82,24 @@
    * 'full' keeps existing behavior for every caller until a host sets one. */
   var AUTO_PASS_TOOLS = {
     read_file: 1, grep: 1, glob: 1, list_dir: 1, todo_write: 1,
-    web_search: 1, web_open: 1,
+    web_search: 1, web_open: 1, code_eval: 1,
   };
   /* `remember` writes ONLY the sofuu-marked section of AGENTS.md — strictly
    * less reach than edit_file (any jailed file), so it rides the edit
    * profile; plan mode (no writes of any kind) still blocks it. */
   var EDIT_TOOLS = { write_file: 1, edit_file: 1, remember: 1 };
+  /* Safe read-only / deterministic sandbox / child tools for concurrent execution (Phase 3). */
+  var PARALLEL_TOOLS = {
+    read_file: 1, grep: 1, glob: 1, list_dir: 1,
+    web_search: 1, web_open: 1, code_eval: 1, delegate: 1,
+  };
+  async function yieldCooperative() {
+    if (globalThis.scheduler && typeof globalThis.scheduler.yield === 'function') {
+      try { await globalThis.scheduler.yield(); } catch (_) {}
+    } else if (typeof sofuu !== 'undefined' && typeof sofuu.yield === 'function') {
+      try { await sofuu.yield(); } catch (_) {}
+    }
+  }
   var PERMISSION_PROFILE = 'full';
   function permissionBlocked(name) {
     var p = PERMISSION_PROFILE;
@@ -687,6 +699,8 @@
            * possible when a writer doesn't declare itself. */
           writes: !!t.writes,
           writesAll: !!t.writesAll,
+          parallel: !!(t.parallel || t.readOnly),
+          readOnly: !!(t.readOnly || t.parallel),
         });
         continue;
       }
@@ -2180,11 +2194,15 @@
   /**
    * sofuu.agent.run(handleOrNameOrDef, task, opts) → Promise<AgentResult>
    */
-  async function run(target, task, opts) {
+  function run(target, task, opts) {
     opts = opts || {};
+    var d = resolveDef(target);
     var parentCtx = (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function')
       ? sofuu.context.getStore()
       : null;
+    if (parentCtx && parentCtx.runId && !ACTIVE[parentCtx.runId]) {
+      parentCtx = null;
+    }
 
     if (parentCtx) {
       if (!opts._cancelState && parentCtx.state) opts._cancelState = parentCtx.state;
@@ -2192,10 +2210,8 @@
       if (!opts.traceId && parentCtx.traceId) opts.traceId = parentCtx.traceId;
       if (!opts.sessionId && parentCtx.sessionId) opts.sessionId = parentCtx.sessionId;
       if (typeof opts.depth !== 'number' && typeof parentCtx.depth === 'number') opts.depth = parentCtx.depth + 1;
-      if (!opts.chain && parentCtx.chain) opts.chain = parentCtx.chain.slice();
+      if (!opts.chain && parentCtx.chain) opts.chain = parentCtx.chain.concat([d.name]);
     }
-
-    var d = resolveDef(target);
     /* LONG-HORIZON: a caller may hand the run a budget override (see
      * execDelegate — sub-agents inherit the parent's long-horizon budget
      * instead of resetting to the 12-step/5-minute library defaults).
@@ -2264,9 +2280,14 @@
       }
     }
 
-    if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
-      sofuu.context.enterWith(runStore);
+    if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.run === 'function') {
+      return sofuu.context.run(runStore, function () {
+        return runCore();
+      });
     }
+    return runCore();
+
+    async function runCore() {
     /* Live per-tool histogram for the breach report — (2026-10-15) the
      * report used to re-scan the trace for kind:'tool' entries, but
      * TRACE_CAP demotion deletes old payloads, so a long run's report read
@@ -2355,6 +2376,19 @@
     for (var mutI = 0; mutI < d.inlineTools.length; mutI++) {
       if (d.inlineTools[mutI].writesAll) mutatorsAll[d.inlineTools[mutI].name] = 1;
       else if (d.inlineTools[mutI].writes) mutators[d.inlineTools[mutI].name] = 1;
+    }
+    function isParallelTool(toolName) {
+      if (mutators && (mutators[toolName] || mutatorsAll[toolName])) return false;
+      if (PARALLEL_TOOLS[toolName]) return true;
+      if (d.inlineTools) {
+        for (var ti = 0; ti < d.inlineTools.length; ti++) {
+          if (d.inlineTools[ti].name === toolName) {
+            if (d.inlineTools[ti].parallel || d.inlineTools[ti].readOnly) return true;
+            break;
+          }
+        }
+      }
+      return false;
     }
     var steps = 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
@@ -3831,13 +3865,7 @@
                                 llmCalls: 0, toolCalls: 0 },
                        trace: [], stopped: 'error', error: emsg };
           subRuns.push(childRes);
-          if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
-            sofuu.context.enterWith(runStore);
-          }
           return 'tool error: sub-agent \'' + childName + '\' failed: ' + emsg;
-        }
-        if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
-          sofuu.context.enterWith(runStore);
         }
         subRuns.push(childRes);
         own.llmCalls += childRes.usage.llmCalls;
@@ -3993,6 +4021,7 @@
        * generation and the answer streams live. loopMsgs is declared in the
        * run scope (shared with turnTranscript) since 2026-09-03 e. */
       for (;;) {
+        await yieldCooperative();
         state.emptyRetriesRound = 0; /* LONG-HORIZON: fresh empty-stream allowance per round */
         state.progressiveRetriesRound = 0; /* P1.4: fresh escalation allowance per round */
         var breach0 = budgetBreach();
@@ -4323,64 +4352,79 @@
           break;
         }
         steps++; stepsTotal++;
-        /* Parallel fan-out (PLAN-DELEGATE-AWARENESS Move 4): a round whose
-         * calls are ALL delegates runs them concurrently — that is the
-         * point of a swarm. Any other mix keeps the strict sequential
-         * path (later calls in a round may depend on earlier results).
-         * Transcript pairs are written in ISSUE order after all settle,
-         * so the persisted shape [assistant(tool_calls_i), tool(result_i)]
-         * is byte-identical to the sequential path; tool_result events
-         * fire as each child completes. */
-        var allDelegates = stcs.length > 1;
-        for (var pc = 0; pc < stcs.length; pc++) {
-          if (String(stcs[pc].name || '') !== 'delegate') { allDelegates = false; break; }
-        }
-        if (allDelegates && hasDelegate) {
-          var parPromises = [];
-          for (var pi = 0; pi < stcs.length; pi++) {
-            if (state.cancelled) { stopped = 'cancelled'; break; }
-            var pstc = stcs[pi];
-            var psname = String(pstc.name || '');
-            var psargs = (pstc.arguments && typeof pstc.arguments === 'object') ? pstc.arguments : {};
-            var pscid = 'call_' + runId + '_' + steps + '_' + pi + '_' + psname;
-            parPromises.push((function (pn, pa, pid) {
-              /* execOneTool maps tool errors to 'tool error:' strings and
-               * never rejects in practice; the rejection branch is
-               * belt-and-braces so one unexpected throw can't un-await
-               * the sibling fan-out. */
-              return execOneTool(pn, pa, pid).then(
-                function (r) { return { id: pid, name: pn, args: pa, result: String(r == null ? '' : r) }; },
-                function (e) { return { id: pid, name: pn, args: pa,
-                                        result: 'tool error: ' + String((e && e.message) || e) }; });
-            })(psname, psargs, pscid));
+        /* Concurrent Tool Dispatch & Cooperative Scheduling (Phase 3):
+         * Partition stcs into contiguous batches of parallelizable (read-only /
+         * sandbox / delegate) tools vs sequential (mutating) tools.
+         * Contiguous parallel runs execute concurrently with bounded concurrency (default 4).
+         * Every tool's assistant/tool transcript pair is emitted in exact
+         * issue order so the persisted shape [assistant(tool_calls_i), tool(result_i)]
+         * is byte-identical to the sequential path. */
+        var toolChunks = [];
+        var curToolChunk = null;
+        for (var tci = 0; tci < stcs.length; tci++) {
+          var tstc = stcs[tci];
+          var tsname = String(tstc.name || '');
+          var tIsPar = isParallelTool(tsname);
+          if (!curToolChunk || curToolChunk.isPar !== tIsPar) {
+            curToolChunk = { isPar: tIsPar, items: [] };
+            toolChunks.push(curToolChunk);
           }
-          var parResults = await Promise.all(parPromises);
-          for (var pr = 0; pr < parResults.length; pr++) {
-            loopMsgs.push({ role: 'assistant', content: null,
-                            tool_calls: [{ id: parResults[pr].id, type: 'function',
-                                           function: { name: parResults[pr].name, arguments: JSON.stringify(parResults[pr].args) } }] });
-            loopMsgs.push({ role: 'tool', tool_call_id: parResults[pr].id, content: parResults[pr].result });
-          }
-          /* Every dispatched call RAN, so every dispatched call gets its
-           * transcript pair — even on cancel (an assistant tool_calls
-           * message without its tool result is a provider 400). */
-          if (state.cancelled) stopped = stopped || 'cancelled';
-        } else {
-        for (var si = 0; si < stcs.length; si++) {
-          if (state.cancelled) { stopped = 'cancelled'; break; }
-          var stc = stcs[si];
-          var sname = String(stc.name || '');
-          var sargs = (stc.arguments && typeof stc.arguments === 'object') ? stc.arguments : {};
-          var scid = 'call_' + runId + '_' + steps + '_' + si + '_' + sname;
-          /* P3: renamed stRes — was `var sres`, which function-scoped onto
-           * the main stream's `sres` (declared for the streamWithRetry
-           * result above) and silently reused it. */
-          var stRes = await execOneTool(sname, sargs, scid);
-          loopMsgs.push({ role: 'assistant', content: null,
-                          tool_calls: [{ id: scid, type: 'function',
-                                         function: { name: sname, arguments: JSON.stringify(sargs) } }] });
-          loopMsgs.push({ role: 'tool', tool_call_id: scid, content: stRes });
+          curToolChunk.items.push({
+            stc: tstc,
+            idx: tci,
+            name: tsname,
+            args: (tstc.arguments && typeof tstc.arguments === 'object') ? tstc.arguments : {},
+            cid: 'call_' + runId + '_' + steps + '_' + tci + '_' + tsname
+          });
         }
+
+        for (var chi = 0; chi < toolChunks.length; chi++) {
+          if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
+          var cchunk = toolChunks[chi];
+          if (cchunk.isPar && cchunk.items.length > 1) {
+            var cLimit = Math.min(Math.max(1, (opts.toolConcurrency | 0) || 4), cchunk.items.length);
+            var parResults = new Array(cchunk.items.length);
+            var parNext = 0;
+            var parWorkers = [];
+            for (var pw = 0; pw < cLimit; pw++) {
+              parWorkers.push((async function () {
+                for (;;) {
+                  if (state.cancelled) { stopped = stopped || 'cancelled'; return; }
+                  var pIdx = parNext++;
+                  if (pIdx >= cchunk.items.length) return;
+                  var pItem = cchunk.items[pIdx];
+                  try {
+                    var pRes = await execOneTool(pItem.name, pItem.args, pItem.cid);
+                    parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args, result: String(pRes == null ? '' : pRes) };
+                  } catch (e) {
+                    parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args,
+                                         result: 'tool error: ' + String((e && e.message) || e) };
+                  }
+                }
+              })());
+            }
+            await Promise.all(parWorkers);
+            for (var pri = 0; pri < parResults.length; pri++) {
+              var prItem = parResults[pri];
+              if (!prItem) continue;
+              loopMsgs.push({ role: 'assistant', content: null,
+                              tool_calls: [{ id: prItem.id, type: 'function',
+                                             function: { name: prItem.name, arguments: JSON.stringify(prItem.args) } }] });
+              loopMsgs.push({ role: 'tool', tool_call_id: prItem.id, content: prItem.result });
+            }
+            if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
+          } else {
+            for (var si = 0; si < cchunk.items.length; si++) {
+              if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
+              var sItem = cchunk.items[si];
+              var stRes = await execOneTool(sItem.name, sItem.args, sItem.cid);
+              loopMsgs.push({ role: 'assistant', content: null,
+                              tool_calls: [{ id: sItem.cid, type: 'function',
+                                             function: { name: sItem.name, arguments: JSON.stringify(sItem.args) } }] });
+              loopMsgs.push({ role: 'tool', tool_call_id: sItem.cid, content: stRes });
+            }
+            if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
+          }
         }
         /* Freshness gate boundary flush (§5/§16): stale verdicts queued
          * during this step's tool calls become ONE ephemeral user notice
@@ -4777,6 +4821,7 @@
       if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
       throw e;
     }
+    }
   }
 
   /* Wrap a promise so a cancel() between awaits rejects promptly (the
@@ -4811,6 +4856,7 @@
           var i = next++;
           if (i >= items.length) return;
           var it = items[i] || {};
+          await yieldCooperative();
           try {
             results[i] = await run(it.agent, it.task, it.opts || {});
           } catch (e) {
@@ -4897,6 +4943,7 @@
       parts.push('## chunk ' + (i + 1) + ' of ' + sub.length + '\n' + (sub[i].answer || '(no answer)'));
     }
     var reduceTarget = opts.reduceAgent || opts.agent;
+    await yieldCooperative();
     var merged = await run(reduceTarget,
       String(task) + '\n\nMerge these partial findings into one final answer. Keep the facts, drop duplicates:\n\n' + parts.join('\n\n'),
       orchOpts({ context: '' }));

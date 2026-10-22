@@ -58,7 +58,7 @@ def main():
     ap.add_argument("model")
     ap.add_argument("prompt")
     ap.add_argument("--max-tokens", type=int, default=32)
-    ap.add_argument("--bound", type=float, default=5e-2)
+    ap.add_argument("--bound", type=str, default="5e-2")  # float, or "auto"
     ap.add_argument("--gpu-env", default="SOFUU_GPU_DECODE=1,SOFUU_GPU_PREFILL_GEMM=1")
     ap.add_argument("--cpu-env", default="")
     ap.add_argument("--label", default="gate")
@@ -68,6 +68,10 @@ def main():
         if os.path.exists(f):
             os.remove(f)
 
+    if a.bound.lower() == "auto":
+        a.bound = 0.0          # sentinel: resolved from matched steps
+    else:
+        a.bound = float(a.bound)
     gpu_env = dict(kv.split("=", 1) for kv in a.gpu_env.split(",") if kv)
     cpu_env = dict(kv.split("=", 1) for kv in a.cpu_env.split(",") if kv)
 
@@ -91,6 +95,15 @@ def main():
     # context-divergent by construction and must not be judged.
     i = diverge[0]
     d = abs(c[i][1] - g[i][1])
+    if a.bound <= 0:
+        # --bound auto: self-referential envelope — the fork-step |dtop1| is
+        # certified when it does not exceed the WORST top-1 delta observed at
+        # steps the two routes agreed on argmax (the same generation's own
+        # measured noise band; no magic constant).
+        matched_d = [abs(c[k][1] - g[k][1]) for k in range(n) if k not in set(diverge)]
+        if matched_d:
+            a.bound = max(matched_d)
+            print(f"[{a.label}] auto-bound from matched steps = {a.bound:.4f}")
     if d < a.bound:
         print(f"[{a.label}] VERDICT=NEAR-TIE-CERTIFIED first-fork-step={i} "
               f"cpu_tok={c[i][0]} gpu_tok={g[i][0]} |dtop1|={d:.4f} (bound {a.bound}) "

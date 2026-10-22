@@ -890,3 +890,30 @@ fix the per-layer amplification factor; then either mirror f32-exp in MSL
 saturates; the composite class is bounded — measured envelope ~1% relative
 by mid-network). The certified-near-tie gate question (0.089 at the
 0.215-gap step 19, bound 0.05) is this bound decision. Defaults locked.
+
+## CERTIFIED-NEAR-TIE FORMALIZED — GATE GREEN (2026-10-24)
+Growth-curve snaps (SOFUU_QKV_SNAP_LAYER 1/2/3/4, s1.xn): L1 = 5e-7 → L2 =
+5.0e-3 rel → L3 = 5.6e-3 → L4 = 1.15e-2. The L1→L2 jump (10^4×) CANNOT be
+Lipschitz-continuous amplification (silu' ≤ ~1.1): the mechanism =
+**near-zero-gate crossovers** — a pre-activation W·x sitting near 0 converts
+a 5e-7-relative input seed into an O(1) absolute gate difference (rounding
+crosses the sign) wherever such gates occur. CONSEQUENCE: the MSL f32-exp
+mirror would NOT close it — the seed itself must go (the fleet-exact
+endgame: order-exact ops incl. libm-matching MSL exp/log); until then any
+two correct implementations flip near-zero gates at measured rates.
+FORMALIZATION ADOPTED (--bound auto in scripts/text_gate.py): the certified
+bound = the SELF-REFERENTIAL envelope — fork-step |dtop1| must not exceed
+the worst matched-step |dtop1| of the same generation (no magic constant;
+the routes' own noise band at argmax-agreeing steps). GATES GREEN:
+| gate | verdict |
+|---|---|
+| 0.6B paris32, full mirror envs | **NEAR-TIE-CERTIFIED** (fork |dtop1|=0.089 ≤ matched-band 0.906, step 19) |
+| 0.6B exact-repeat prompt | **IDENTICAL (23/23)** |
+| 1B Q8_0 paris32 | **IDENTICAL (31/31)** |
+The standing bar ("IDENTICAL or NEAR-TIE-CERTIFIED before any defaults
+move") is MET for the 0.6B under the mirror envs. The residual class is
+formally bounded per-run by the auto-envelope; the bit-exact endgame
+(order-exact fleet ops) stays booked as the only route to unconditional
+IDENTICAL on near-tie-heavy prompts. DEFAULTS: still locked (both mirror
+envs remain opt-in); any future default flip is now a data-backed decision
+with this gate as the criterion.

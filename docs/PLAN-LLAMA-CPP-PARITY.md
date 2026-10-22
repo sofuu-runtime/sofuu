@@ -873,3 +873,20 @@ layer index or reorder) and test the swiglu-exp hypothesis by feeding the
 GPU swiglu's inputs/outputs to a host recompute. The gate verdict remains
 downstream of this class; certified-near-tie needs it bounded. Defaults
 locked.
+
+## L1 LOCALIZATION DONE — THE CLASS IS AMPLIFICATION (2026-10-24)
+SOFUU_QKV_SNAP_LAYER n parameter landed (both routes; default 0). L1 A/B
+(tiles-CPU vs mirror-complete-GPU, 6-token prefill): **EVERY L1 stage =
+f32-noise** — s1.xn 5.1e-7, s2.qa/ka/va 6e-8..1.6e-7, s3.kc 6.1e-5 abs on
+|K|~285 (≈2e-7 relative), s4.qa 1.9e-6. No unmirrored op at L1. Combined
+with the boundary receipt (L0 1e-4 → L1 0.01 → L2 1.1 → L5 2.0 abs): the
+L2+ tile-class-magnitude divergence = **geometric amplification of the
+legitimate f32 seed through the depth** (candidate: Metal-SFU exp in swiglu
+vs libm expf, gated multiplication per layer) — RECLASSIFIED from "unmirrored
+op" to "amplified seed". NEXT: (a) snap L2/L3 to trace the growth curve,
+(b) host-recompute the swiglu diff (Metal exp vs libm) on dumped gate/up to
+fix the per-layer amplification factor; then either mirror f32-exp in MSL
+(booked if the user wants bit-exact) or bound+certify (the amplification
+saturates; the composite class is bounded — measured envelope ~1% relative
+by mid-network). The certified-near-tie gate question (0.089 at the
+0.215-gap step 19, bound 0.05) is this bound decision. Defaults locked.

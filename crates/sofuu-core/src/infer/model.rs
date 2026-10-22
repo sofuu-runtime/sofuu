@@ -1029,6 +1029,10 @@ impl TransformerModel {
         }
 
         // 2. Transformer layers
+        let snap_layer: usize = std::env::var("SOFUU_QKV_SNAP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         for layer_idx in 0..self.config.n_layers {
             let layer = &self.layers[layer_idx];
 
@@ -1067,7 +1071,7 @@ impl TransformerModel {
             }
             // SOFUU_QKV_SNAP stage s1 (attn-norm out) — GPU mirror in the
             // prefill gemm core.
-            if layer_idx == 0 {
+            if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                     let prefix = prefix.to_string_lossy().to_string();
                     let nsl: Vec<u8> = self.x_norm_batch[0..b_size * dim]
@@ -1134,7 +1138,7 @@ impl TransformerModel {
             }
 
             // ── Per-token QK-Norm ────────────────────────────────
-            if layer_idx == 0 {
+            if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                     let prefix = prefix.to_string_lossy().to_string();
                     let seg = |src: &[f32], n: usize| -> Vec<u8> {
@@ -1223,7 +1227,7 @@ impl TransformerModel {
 
             // SOFUU_QKV_SNAP s3 (K/V cache rows post k-norm+rope) + s4
             // (q post q-norm+rope) — GPU mirror after kv_write/head_rmsnorm.
-            if layer_idx == 0 {
+            if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                     let prefix = prefix.to_string_lossy().to_string();
                     let msl = self.config.max_seq_len;
@@ -3334,6 +3338,12 @@ impl TransformerModel {
         let gemm_types_all = std::env::var("SOFUU_GEMM_TYPES")
             .map(|v| v == "all")
             .unwrap_or(false);
+        // SOFUU_QKV_SNAP_LAYER: which layer the QKV stage bisect snapshots
+        // (default 0; set 1+ to localize mid-network divergence).
+        let snap_layer: usize = std::env::var("SOFUU_QKV_SNAP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         // 8x4-tile MMQ mirror: route the q4_K batch gemms through the
         // act-quantized kernels that bit-mirror the CPU tiles' integer/f32
         // order (default pair route parity; see PLAN-LLAMA-CPP-PARITY).
@@ -3495,7 +3505,7 @@ impl TransformerModel {
             // s3 K/V cache rows after kv_write (post k-norm+rope), s4 qa after
             // head_rmsnorm (post q-norm+rope). Same checkpoints exist in the
             // CPU tiles path.
-            if layer_idx == 0 {
+            if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                     let prefix = prefix.to_string_lossy().to_string();
                     if !g.engine.batch_end() {
@@ -3528,7 +3538,7 @@ impl TransformerModel {
                 gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
                 gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
             }
-            if layer_idx == 0 {
+            if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                     let prefix = prefix.to_string_lossy().to_string();
                     if !g.engine.batch_end() {
@@ -3574,7 +3584,7 @@ impl TransformerModel {
                     has_q, norm_eps, rope_freq_base, rope_mode,
                     Some((pbuf, pslots.rope)),
                 );
-                if layer_idx == 0 {
+                if layer_idx == snap_layer {
                     if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
                         let prefix = prefix.to_string_lossy().to_string();
                         if !g.engine.batch_end() {

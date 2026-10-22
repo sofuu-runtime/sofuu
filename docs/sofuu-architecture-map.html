@@ -357,7 +357,7 @@
   <div class="hband">
     <div class="hlabel"><div class="no">LAYER 2</div><div class="nm">Rust core<br>sofuu-core</div></div>
     <div class="hgrid" style="grid-template-columns: repeat(6, 1fr);">
-      <div class="hcard"><div class="t">rt/ (20 files)</div><div class="s">engine, loop, fs, http, ai, caps, tui</div></div>
+      <div class="hcard"><div class="t">rt/ (22 files)</div><div class="s">engine, loop, zerocopy, async_context, sandbox, ai</div></div>
       <div class="hcard"><div class="t">infer/ (28 files)</div><div class="s">Metal GPU, lookahead, KIVI, continuous</div></div>
       <div class="hcard"><div class="t">memory/</div><div class="s">CMA 4-tier + HNSW + BM25 re-ranking</div></div>
       <div class="hcard"><div class="t">ml/ (5 models)</div><div class="s">alloc, compaction, freshness, relevance, supervisor</div></div>
@@ -446,21 +446,20 @@
   </p>
 
   <table>
-    <tr><th style="width:40mm;">Sub-part (file)</th><th>Role in the runtime substrate</th></tr>
-    <tr><td class="sub">engine.rs</td><td class="role">QuickJS engine lifecycle and module bootstrap; evaluates user scripts and registers all native Rust modules into JS.</td></tr>
-    <tr><td class="sub">loop.rs</td><td class="role">Global libuv event loop driver with immediate QuickJS microtask drain after every single I/O polling tick.</td></tr>
+    <tr><th style="width:42mm;">Sub-part (file)</th><th>Role in the runtime substrate</th></tr>
+    <tr><td class="sub">engine.rs / shipped.rs</td><td class="role">QuickJS engine lifecycle and AOT precompiled bytecode snapshotting (7 shipped <span class="mono">.bc</span> drivers) yielding sub-16ms cold start.</td></tr>
+    <tr><td class="sub">loop.rs / timer.rs</td><td class="role">Global libuv event loop driver with bounded microtasks (N=1024), W3C <span class="mono">scheduler.yield()</span>, and starvation protection.</td></tr>
+    <tr><td class="sub">zerocopy.rs</td><td class="role">64-byte aligned SIMD memory bridge (<span class="mono">sofuu.memory/buffer</span>): zero-copy <span class="mono">Float32Array</span> views and safe detachment.</td></tr>
+    <tr><td class="sub">async_context.rs</td><td class="role">Native <span class="mono">AsyncLocalStorage</span> &amp; <span class="mono">sofuu.context</span>: propagates traceId, sessionId, and AbortSignal across async chains with 0 crosstalk.</td></tr>
+    <tr><td class="sub">sandbox.rs</td><td class="role">Hermetic agent sandbox with single-instruction fuel metering via QuickJS interrupt counters, &le;6ms deadlines, and memory caps.</td></tr>
     <tr><td class="sub">ai.rs</td><td class="role">The <span class="mono">sofuu.ai</span> streaming router: dispatches across OpenAI, Anthropic, Ollama, and embedded local inference.</td></tr>
     <tr><td class="sub">memory.rs</td><td class="role">CMA JavaScript module: features <span class="mono">cma_vec_view</span> accepting both Float32Array (zero-copy) and standard JS arrays.</td></tr>
-    <tr><td class="sub">promise.rs</td><td class="role">Promise &harr; libuv async bridge; handles deferred unhandled-rejection tracking and Rust future bridging.</td></tr>
-    <tr><td class="sub">timer.rs</td><td class="role">setTimeout, setInterval, clearTimeout, and non-blocking asynchronous <span class="mono">sofuu.sleep</span>.</td></tr>
-    <tr><td class="sub">fs.rs</td><td class="role">Asynchronous filesystem operations on libuv (<span class="mono">sofuu.fs</span> read/write/stat/unlink/mkdir family).</td></tr>
-    <tr><td class="sub">process_spawn.rs</td><td class="role"><span class="mono">sofuu.spawn</span> and <span class="mono">sofuu.exec</span> subprocess management with streaming pipes.</td></tr>
-    <tr><td class="sub">http_client.rs</td><td class="role">The <span class="mono">fetch</span> API implementation backed by libcurl with UAF-hardened streaming memory safety.</td></tr>
-    <tr><td class="sub">http_server.rs</td><td class="role">Embedded <span class="mono">sofuu.http</span> HTTP/1.1 server supporting routing, chunked responses, and streaming.</td></tr>
+    <tr><td class="sub">promise.rs</td><td class="role">Promise &harr; libuv async bridge; async context capture, unhandled-rejection tracking, and Rust future bridging.</td></tr>
+    <tr><td class="sub">fs.rs / process_spawn.rs</td><td class="role">Asynchronous filesystem operations (<span class="mono">sofuu.fs</span>) and streaming child subprocess execution (<span class="mono">sofuu.spawn/exec</span>).</td></tr>
+    <tr><td class="sub">http_client.rs / server.rs</td><td class="role">High-throughput <span class="mono">fetch()</span> backed by UAF-hardened libcurl and embedded async <span class="mono">sofuu.http</span> HTTP/1.1 server.</td></tr>
     <tr><td class="sub">http_sse.rs</td><td class="role">JS-facing <span class="mono">sofuu.SSEParser</span> streaming parser over incoming server-sent event streams.</td></tr>
     <tr><td class="sub">mcp.rs</td><td class="role">Model Context Protocol JS module: client/server lifecycle, tool calling, and resource indexing.</td></tr>
-    <tr><td class="sub">model_caps.rs</td><td class="role">Authoritative model capability registry: context windows, thinking kinds, max tokens; single source of truth.</td></tr>
-    <tr><td class="sub">model_caps_discovered.rs</td><td class="role">Dynamic capability ladder: updates model context limits from HTTP 400 responses and runtime discoveries.</td></tr>
+    <tr><td class="sub">model_caps.rs</td><td class="role">Authoritative model capability registry &amp; dynamic HTTP 400 discovery ladder (context windows, thinking tokens).</td></tr>
     <tr><td class="sub">host_poke.rs</td><td class="role">Thread-safe cross-thread wakeup pipe: lets host UI threads inject events into a running JS loop safely.</td></tr>
     <tr><td class="sub">session_js.rs</td><td class="role">Synchronous session-mesh primitives exposed to shipped JS for workspace context sharing.</td></tr>
     <tr><td class="sub">npm.rs / cjs.rs</td><td class="role">Lightweight npm package resolution and CommonJS compatibility shims for legacy modules.</td></tr>

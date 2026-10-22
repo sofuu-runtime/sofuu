@@ -86,9 +86,12 @@ Layer 1 wraps raw C pointers into memory-safe Rust abstractions and exposes an e
 The beating heart of Sofuu, written in memory-safe Rust. It is divided into five critical modules:
 
 #### A. Runtime Substrate (`src/rt/`)
-Coordinates the language runtime, async tasks, and platform APIs.
-- **`engine.rs`**: QuickJS context lifecycle, module registration, and top-level execution.
-- **`loop.rs`**: Global event loop driver that polls libuv I/O and immediately drains QuickJS microtask job queues after each tick.
+Coordinates the language runtime, async event loop, memory bridges, and security sandboxes.
+- **`engine.rs` & `shipped.rs`**: QuickJS context lifecycle, module registration, and AOT precompiled bytecode snapshotting (`agent.bc`, `web.bc`, `tools.bc`, `extractor.bc`, `storage.bc`, `chat.bc`, `rlm.bc`) yielding sub-16ms engine cold starts.
+- **`loop.rs`, `timer.rs` & `promise.rs`**: Global libuv event loop driver with bounded microtask pumping ($N = 1024$) to prevent I/O starvation. Implements W3C `scheduler.yield()`, `sofuu.yield()`, `setImmediate`, `clearImmediate`, and `queueMicrotask`.
+- **`zerocopy.rs`**: Direct memory bridge allocating 64-byte aligned SIMD buffers (`sofuu.memory` / `sofuu.buffer`). Enables zero-copy coherent views between `Float32Array` / `Uint8Array` and native inference/vector kernels with explicit `detach()` capabilities.
+- **`async_context.rs`**: Native `AsyncLocalStorage` and `sofuu.context` namespace backed by QuickJS async context slots. Propagates `traceId`, `sessionId`, and `AbortSignal` across promise reactions, microtasks, timers, and native async I/O with zero crosstalk.
+- **`sandbox.rs`**: Hermetic agent sandboxing with single-instruction deterministic fuel metering via QuickJS interrupt counters, $\le 6\text{ ms}$ wall-clock deadlines, memory/stack size caps, structured log interception, and dual ephemeral/stateful execution modes.
 - **`ai.rs`**: The unified `sofuu.ai` interface. Dispatches streaming LLM requests across OpenAI, Anthropic, Ollama, and the embedded local inference engine with backpressure handling.
 - **`memory.rs`**: Exposes the Cognitive Memory Architecture to JavaScript. Features `cma_vec_view` for zero-copy views over `Float32Array` or automatic extraction from standard JS arrays.
 - **`fs.rs` & `process_spawn.rs`**: Asynchronous filesystem operations (`sofuu.fs`) and child process execution (`sofuu.spawn`, `sofuu.exec`).

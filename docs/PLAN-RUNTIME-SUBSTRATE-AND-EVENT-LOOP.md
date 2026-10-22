@@ -53,8 +53,8 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - W3C `scheduler.yield()`, `sofuu.yield()`, `setImmediate`, `clearImmediate`, `queueMicrotask`: Breaks current microtask turn, schedules immediate tick, and returns a promise resolving on the next turn.
 - **Verification**: `tests/test_scheduler_starvation.js` executing 21,595 continuous microtasks while servicing timer ticks with 0 event loop lockup (timer jitter $\le 2\text{ ms}$).
 
-### Phase 2: AOT Bytecode Snapshotting for Shipped Drivers [COMPLETE]
-- **Status**: Implemented, verified, and audited.
+### Phase 2: AOT Bytecode Snapshotting for Shipped Drivers [COMPLETE & PUSHED]
+- **Status**: Implemented, verified, and pushed (`7b9ff8c59`).
 - **Deliverables**:
   - QuickJS bytecode C-FFI serialization/deserialization exports (`JS_WriteObject`, `JS_ReadObject`, `JS_EvalFunction`) in `crates/sofuu-ffi/src/qjs.rs`.
   - Bytecode compiler CLI subcommand `sofuu compile-bc <in.js> <out.bc>` in `crates/sofuu-core/src/main.rs`.
@@ -62,8 +62,8 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - Precompiled AOT bytecode for all 7 shipped drivers: `agent.bc`, `web.bc`, `tools.bc`, `extractor.bc`, `storage.bc`, `chat.bc`, `rlm.bc`.
 - **Verification**: `tests/test_bytecode_hydration.js` verifying instantaneous hydration of all 7 subsystems; engine cold start time dropped to $\le 16\text{ ms}$; stripped binary size is $4.7\text{ MB}$ (well within $\le 5.0\text{ MB}$ budget).
 
-### Phase 3: Zero-Copy TypedArray & Native Memory Bridge [COMPLETE]
-- **Status**: Implemented, verified, audited.
+### Phase 3: Zero-Copy TypedArray & Native Memory Bridge [COMPLETE & PUSHED]
+- **Status**: Implemented, verified, and pushed (`62a034c40`).
 - **Deliverables**:
   - Bound `JS_DetachArrayBuffer` in `crates/sofuu-ffi/src/qjs.rs` and patched QuickJS detach double-free in `deps/quickjs/quickjs.c`.
   - Implemented `crates/sofuu-core/src/rt/zerocopy.rs`:
@@ -87,8 +87,8 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - Full JS test suite 59 passed, 0 failed.
   - Stripped release binary size: **4.8 MB** ($\le 5.0\text{ MB}$ budget ceiling).
 
-### Phase 4: Native AsyncLocalStorage & Agent Context Propagation [COMPLETE]
-- **Status**: Implemented, verified, audited.
+### Phase 4: Native AsyncLocalStorage & Agent Context Propagation [COMPLETE & PUSHED]
+- **Status**: Implemented, verified, and pushed (`6aa44e614`).
 - **Problem**: Autonomous agent execution across nested async tools requires manual passing of `sessionId`, `traceId`, and `AbortSignal`.
 - **Deliverables**:
   - Bound native async context slots in QuickJS runtime (`rt->current_async_context`), promise reactions (`rd->async_context`), and microtask job entries (`e->async_context`).
@@ -106,8 +106,8 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - Full JS test suite 59 passed, 0 failed, 1 skipped.
   - Stripped release binary size: **4.8 MB** ($\le 5.0\text{ MB}$ budget ceiling).
 
-### Phase 5: Deterministic Agent Sandboxing & Fuel Meters [COMPLETE]
-- **Status**: Implemented, verified, audited.
+### Phase 5: Deterministic Agent Sandboxing & Fuel Meters [COMPLETE & PUSHED]
+- **Status**: Implemented, verified, audited, and pushed (`45403ac05`).
 - **Problem**: Agent-generated tools can execute infinite loops or exhaust memory.
 - **Deliverables**:
   - Bound `JS_GetInterruptCounter`, `JS_SetInterruptCounter`, `JS_PromiseState`, `JS_PromiseResult`, `JS_GetContextOpaque`, and `JS_SetContextOpaque` in QuickJS and `sofuu-ffi`.
@@ -122,7 +122,8 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
     - Ephemeral one-shot `sofuu.sandbox.run(code, opts)`, `sofuu.sandbox.eval(code, opts)`, and stateful `sofuu.sandbox.create(opts)`.
 - **Verification**: `tests/test_sandbox_fuel.js` (12/12 passing): infinite loops terminate in $\le 6\text{ ms}$, fuel metering accurately tracks 1002 units for 500-iteration loop, memory bombs and recursion traps caught safely, complete host isolation verified.
 
-### Phase 6: Integration Torture Suite & Release Audit [COMPLETE]
+### Phase 6: Integration Torture Suite & Release Audit [COMPLETE & PUSHED]
+- **Status**: Implemented, verified, audited, and pushed (`45403ac05`).
 - **Deliverables**:
   - Authored comprehensive torture test `tests/test_runtime_substrate_torture.js` executing 100 concurrent asynchronous tasks combining all 5 modernization tracks (cooperative scheduler yielding, SIMD zero-copy buffer allocation and detachment, AsyncLocalStorage context propagation with 0 crosstalk, and metered sandboxing).
   - Measured 100-task torture execution time: **65 ms total** (**0.65 ms/task** effective).

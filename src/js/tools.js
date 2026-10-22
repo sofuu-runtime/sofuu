@@ -649,6 +649,86 @@
     },
   };
 
+  /* code_eval — In-process deterministic JavaScript/TypeScript sandboxed execution.
+   * Powered by sofuu.sandbox. Has zero-subprocess overhead (< 1ms startup),
+   * strict instruction fuel limit (500k ops), 2000ms wall-clock deadline,
+   * 16MB memory ceiling, captured console logs, and hermetic host isolation. */
+  TOOLS.code_eval = {
+    name: 'code_eval',
+    description: 'Execute JavaScript or TypeScript code in a secure, deterministic in-process sandbox. Use this for math, data manipulation, algorithm verification, parsing, or testing logic. Code runs in < 1ms with captured console.log output. Host OS/filesystem/network APIs are completely disabled for safety.',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: 'The JavaScript/TypeScript code or expression to evaluate. The result of the last expression or return statement is returned.',
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Optional wall-clock timeout in milliseconds (default 2000, max 10000).',
+        },
+        fuel_limit: {
+          type: 'number',
+          description: 'Optional instruction fuel limit (default 500000, max 5000000). Traps infinite loops deterministically.',
+        },
+      },
+      required: ['code'],
+    },
+    execute: async function (args) {
+      var code = (args && typeof args.code === 'string') ? args.code : '';
+      if (!code.trim()) throw new Error('code_eval: code string required');
+      var timeout = 2000;
+      if (args && typeof args.timeout_ms === 'number' && args.timeout_ms > 0) {
+        timeout = Math.min(10000, Math.floor(args.timeout_ms));
+      }
+      var fuel = 500000;
+      if (args && typeof args.fuel_limit === 'number' && args.fuel_limit > 0) {
+        fuel = Math.min(5000000, Math.floor(args.fuel_limit));
+      }
+
+      if (typeof sofuu === 'undefined' || !sofuu.sandbox || typeof sofuu.sandbox.run !== 'function') {
+        throw new Error('code_eval: sofuu.sandbox runtime substrate not available');
+      }
+
+      var res = sofuu.sandbox.run(code, {
+        fuel: fuel,
+        timeoutMs: timeout,
+        maxMemoryMB: 16,
+        captureConsole: true,
+        throwOnError: false,
+      });
+
+      var out = [];
+      if (res.logs && res.logs.length > 0) {
+        out.push('=== Console Output ===\n' + res.logs.join('\n'));
+      }
+
+      if (res.success) {
+        var rStr = '';
+        if (typeof res.result === 'undefined') {
+          rStr = '(undefined)';
+        } else if (typeof res.result === 'string') {
+          rStr = res.result;
+        } else {
+          try {
+            rStr = JSON.stringify(res.result, null, 2);
+          } catch (eJ) {
+            rStr = String(res.result);
+          }
+        }
+        out.push('=== Result ===\n' + rStr);
+        out.push('(fuel: ' + (res.fuelUsed || 0) + ' ops, ' + (res.elapsedMs ? res.elapsedMs.toFixed(2) : 0) + 'ms)');
+        return out.join('\n\n');
+      } else {
+        var errType = res.errorType || (res.interrupted ? 'interrupted' : 'error');
+        var errDesc = res.error || 'Evaluation failed';
+        out.push('=== Execution Failed [' + errType + '] ===\n' + errDesc);
+        out.push('(fuel consumed: ' + (res.fuelUsed || 0) + ' ops, ' + (res.elapsedMs ? res.elapsedMs.toFixed(2) : 0) + 'ms)');
+        return out.join('\n\n');
+      }
+    },
+  };
+
   sofuu.tools._loaded = true;
   sofuu.tools.VERSION = '1';
   sofuu.tools.TOOLS = TOOLS;
@@ -696,5 +776,5 @@
     },
   };
 
-  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'list_dir', 'bash', 'todo_write'];
+  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'list_dir', 'bash', 'code_eval', 'todo_write'];
 })();

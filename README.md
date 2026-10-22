@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single < 5 MB binary (4.0 MB stripped release). Zero daemons, zero external deps.*
+> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single < 5 MB binary (4.8 MB stripped release). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
@@ -22,7 +22,7 @@ Everything AI workloads need is built into the binary — no npm packages requir
 
 ## Features
 
-- **JS/TS runtime** — QuickJS (ES2023) + libuv event loop, ~3 ms startup, TypeScript runs with no tsconfig or compiler step, `sofuu bundle` ships one file
+- **JS/TS runtime** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3 ms startup, TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
 - **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), mmap load in 17–38 ms, up to 150 tok/s prefill, up to 68.7 tok/s decode, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + sub-agents** — `sofuu.agent.define/run`, built-in `code` + `web` tools, budgets, cancel, trace rendering; the same loop powers chat

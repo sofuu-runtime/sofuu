@@ -345,7 +345,9 @@ struct IdeLayout: View {
                     onOpenSettings: { _ in },
                     onRemoveImage: { store.removePickedImage($0) },
                     onAddImages: { store.addPickedImages($0) },
-                    onSheet: { store.openSheet($0.rawValue) })
+                    onSheet: { store.openSheet($0.rawValue) },
+                    pendingDraft: store.state.composerDraft,
+                    onConsumeDraft: { store.consumeComposerDraft() })
             }
         }
         .background(c.bgApp.ignoresSafeArea())

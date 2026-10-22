@@ -34,6 +34,13 @@ struct Composer: View {
     let onAddImages: ([String]) -> Void
     let onSheet: (ComposerSheet) -> Void
 
+    /// External text hand-off (Services "Send to Sofuu", sofuu:// deep
+    /// links). Seeded once on first render and again whenever the store
+    /// parks new draft text; consumed (cleared) by the store so the same
+    /// text never re-applies after the user edits it.
+    var pendingDraft: String? = nil
+    var onConsumeDraft: () -> Void = {}
+
     @Environment(\.sofuuColors) private var c
     @State private var text = ""
     @State private var slashIndex = 0
@@ -123,8 +130,19 @@ struct Composer: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .onAppear { installKeyMonitor() }
+        .onAppear {
+            installKeyMonitor()
+            if let draft = pendingDraft, !draft.isEmpty {
+                text = draft
+                onConsumeDraft()
+            }
+        }
         .onDisappear { removeKeyMonitor() }
+        .onChange(of: pendingDraft) { draft in
+            guard let draft, !draft.isEmpty else { return }
+            text = draft
+            onConsumeDraft()
+        }
     }
 
     private var imageStrip: some View {

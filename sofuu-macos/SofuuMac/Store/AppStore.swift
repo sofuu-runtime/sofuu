@@ -1259,6 +1259,93 @@ final class AppStore: ObservableObject {
         state.ideMode = uiPrefs.ideMode
     }
 
+    /// Switch into IDE mode holding nothing (open-with a file when no
+    /// project is loaded yet — the tab still opens; the tree fills once a
+    /// workspace is chosen).
+    func enterIdeMode() {
+        if state.ideMode { return }
+        uiPrefs.ideMode = true
+        state.ideMode = true
+    }
+
+    // ── Platform intake (Finder/Open-with • sofuu:// • Services) ──────
+
+    /// Everything macOS hands the app from outside routes through here:
+    /// file:// URLs (Finder "Open With", dock drops) and sofuu:// deep
+    /// links. The app is frontmost by definition for onOpenURL, but
+    /// activation is harmless and makes Services hand-offs deterministic.
+    func openIncoming(_ url: URL) {
+        let activate = { NSApp.activate(ignoringOtherApps: true) }
+        if url.isFileURL {
+            var isDir: ObjCBool = false
+            let path = url.path
+            guard !path.isEmpty,
+                  FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return }
+            activate()
+            if isDir.boolValue {
+                openWorkspace(path)
+            } else {
+                enterIdeMode()
+                openFile(path)
+            }
+            return
+        }
+        guard url.scheme?.lowercased() == "sofuu" else { return }
+        let host = (url.host ?? "").lowercased()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let path = items.first { $0.name == "path" }?.value
+        switch host {
+        case "workspace":
+            guard let path, !path.isEmpty else { return }
+            activate()
+            openWorkspace(path)
+        case "open":
+            guard let path, !path.isEmpty else { return }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return }
+            activate()
+            if isDir.boolValue { openWorkspace(path) }
+            else { enterIdeMode(); openFile(path) }
+        case "new-chat":
+            activate()
+            newChat()
+        default:
+            break
+        }
+    }
+
+    /// macOS Services "Send to Sofuu": park the text in the draft slot;
+    /// whichever Composer is on screen (chat or IDE agent panel) seeds
+    /// itself from it and consumes the slot.
+    func receiveSharedText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        state.composerDraft = trimmed
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func consumeComposerDraft() {
+        state.composerDraft = nil
+    }
+
+    // ── Onboarding + shortcut cheat sheet ────────────────────────────
+
+    static let onboardingShownKey = "sofuu.onboardingShown"
+
+    func maybeShowOnboarding() {
+        guard !UserDefaults.standard.bool(forKey: Self.onboardingShownKey) else { return }
+        state.onboardingVisible = true
+    }
+
+    func dismissOnboarding() {
+        state.onboardingVisible = false
+        UserDefaults.standard.set(true, forKey: Self.onboardingShownKey)
+    }
+
+    func showShortcutHelp() { state.shortcutHelpVisible = true }
+
+    func dismissShortcutHelp() { state.shortcutHelpVisible = false }
+
     static let maxCodeFileBytes = 1 << 20  // 1 MB — larger files open read-only-empty with a notice
 
     /// Open a file into a tab: read from disk, mark clean. Binary content
@@ -1769,6 +1856,10 @@ final class AppStore: ObservableObject {
         if state.sheet != nil { state.sheet = nil; return true }
         if state.preview != nil { state.preview = nil; return true }
         if state.settingsOpen { state.settingsOpen = false; return true }
+        if state.shortcutHelpVisible { state.shortcutHelpVisible = false; return true }
+        // Dismissing the welcome card also retires the first-run gate —
+        // Esc here means "got it".
+        if state.onboardingVisible { dismissOnboarding(); return true }
         return false
     }
 

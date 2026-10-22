@@ -25,6 +25,13 @@ struct AppState {
     var pickedImages: [String] = []
     /// @mentions spliced into the composer by the file picker.
     var pendingMentions = ""
+    /// Text handed over from outside the app (macOS Services "Send to
+    /// Sofuu", sofuu:// routes); the visible Composer consumes and clears it.
+    var composerDraft: String?
+    /// First-run welcome card (UserDefaults-gated, shown once).
+    var onboardingVisible = false
+    /// ⇧⌘/ keyboard-shortcut cheat sheet.
+    var shortcutHelpVisible = false
     var phase: String?
     /// TUI-style live streaming state (chat.rs's answer spinner + think
     /// line + PHASE sweep, ported 1:1).

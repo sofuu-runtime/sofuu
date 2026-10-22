@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// The app entry — the mac twin of the iOS `SofuuApp`:
@@ -36,35 +37,56 @@ private struct Root: View {
     @Environment(\.colorScheme) private var systemScheme
     @State private var keys: GlobalKeyMonitor?
     @State private var watchersInstalled = false
+    @State private var badgeSub: AnyCancellable?
 
     var body: some View {
         GeometryReader { geo in
-            SofuuTheme(dark: store.resolvedDark(systemScheme == .dark)) {
-                // FullBleed paints the app surface across the WHOLE window —
-                // including the invisible title-bar band. Without it the
-                // band shows the window's own (black) background above the
-                // shell: the "dead strip". The GeometryReader's proposal is
-                // the full window bounds because .ignoresSafeArea() below
-                // lifts the safe-area insets.
-                FullBleed {
-                    Shell(store: store)
-                        // The desktop's document zoom: the shell scales while
-                        // the container holds the unzoomed frame.
-                        .scaleEffect(store.state.zoom, anchor: .topLeading)
-                        .frame(
-                            width: geo.size.width / store.state.zoom,
-                            height: geo.size.height / store.state.zoom,
-                            alignment: .topLeading)
-                        .clipped()
+            ZStack {
+                SofuuTheme(dark: store.resolvedDark(systemScheme == .dark)) {
+                    // FullBleed paints the app surface across the WHOLE window —
+                    // including the invisible title-bar band. Without it the
+                    // band shows the window's own (black) background above the
+                    // shell: the "dead strip". The GeometryReader's proposal is
+                    // the full window bounds because .ignoresSafeArea() below
+                    // lifts the safe-area insets.
+                    FullBleed {
+                        Shell(store: store)
+                            // The desktop's document zoom: the shell scales while
+                            // the container holds the unzoomed frame.
+                            .scaleEffect(store.state.zoom, anchor: .topLeading)
+                            .frame(
+                                width: geo.size.width / store.state.zoom,
+                                height: geo.size.height / store.state.zoom,
+                                alignment: .topLeading)
+                            .clipped()
+                    }
+                }
+                // Platform overlays ride above the themed shell, outside the
+                // document zoom (they are chrome, not content). They get
+                // their own SofuuTheme — as siblings of the shell they'd
+                // miss its environment and fall back to light colors.
+                SofuuTheme(dark: store.resolvedDark(systemScheme == .dark)) {
+                    ZStack {
+                        if store.state.onboardingVisible {
+                            WelcomeCard(store: store)
+                        }
+                        if store.state.shortcutHelpVisible {
+                            ShortcutSheet(store: store)
+                        }
+                    }
                 }
             }
         }
         .ignoresSafeArea()
+        // Finder "Open With" / dock drops / sofuu:// deep links all land
+        // here (declared in Info.plist: CFBundleDocumentTypes + URL type).
+        .onOpenURL { store.openIncoming($0) }
         .onAppear {
             CrashLog.install()
             Notifications.requestAuthorization()
             store.notifier = { title, body in Notifications.post(title: title, body: body) }
             if keys == nil { keys = GlobalKeyMonitor(store: store) }
+            store.maybeShowOnboarding()
             // Fill the screen at launch (menu bar + dock stay visible —
             // standard maximize, not full-screen mode).
             DispatchQueue.main.async {
@@ -87,6 +109,24 @@ private struct Root: View {
     private func installFocusWatchers() {
         guard !watchersInstalled else { return }
         watchersInstalled = true
+
+        // macOS Services: "Send to Sofuu" in the app's Services submenu
+        // (NSServices in Info.plist). NSApp retains the provider object.
+        // Set once at launch — the Services menu re-reads it on activation
+        // (the old NSUpdateServicesMenu global no longer exists in this SDK).
+        NSApp.servicesProvider = ServicesBridge(store: store)
+
+        // Dock badge = pending approvals. Cleared again when the queue
+        // drains (allowing or denying the last card). objectWillChange
+        // fires BEFORE the mutation lands, so hop one tick forward via
+        // receive(on:) to see the new count.
+        badgeSub = store.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak store] _ in
+                let n = store?.state.approvals.count ?? 0
+                NSApp.dockTile.badgeLabel = n > 0 ? String(n) : nil
+            }
+
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { _ in Task { @MainActor in store.foreground = true } }
@@ -144,6 +184,21 @@ private struct FullBleed<Content: View>: View {
     }
 }
 
+/// The macOS Services provider behind the "Send to Sofuu" menu item
+/// (NSServices in Info.plist declares `NSMessage sendText`). The system
+/// calls the selector with a pasteboard owned by the lending app, on an
+/// arbitrary thread — marshal onto main before touching the store.
+final class ServicesBridge: NSObject {
+    private let store: AppStore
+
+    init(store: AppStore) { self.store = store }
+
+    @objc func sendText(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        guard let text = pboard.string(forType: .string), !text.isEmpty else { return }
+        DispatchQueue.main.async { self.store.receiveSharedText(text) }
+    }
+}
+
 /// Esc closes the top overlay (the desktop's Esc rule) — consumed only when
 /// an overlay was actually open. Field editors keep their own Esc behaviour
 /// otherwise. Lifetime matches the app process; one instance per Root.
@@ -167,6 +222,7 @@ final class GlobalKeyMonitor {
             let hasOverlay = MainActor.assumeIsolated {
                 store.state.settingsOpen || store.state.preview != nil
                     || store.state.sheet != nil
+                    || store.state.shortcutHelpVisible || store.state.onboardingVisible
             }
             if hasOverlay {
                 Task { @MainActor in _ = store.closeTopOverlay() }
@@ -245,6 +301,9 @@ struct SofuuMenus: Commands {
             // macOS (its items never render). Session renders reliably.
             Button(store.state.ideMode ? "Exit IDE Mode" : "IDE Mode") { store.toggleIdeMode() }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
+            Divider()
+            Button("Keyboard Shortcuts") { store.showShortcutHelp() }
+                .keyboardShortcut("/", modifiers: [.command, .shift])
         }
         CommandMenu("View") {
             Button("Toggle Sidebar") { store.toggleSidebar() }

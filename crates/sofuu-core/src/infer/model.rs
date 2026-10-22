@@ -2451,12 +2451,16 @@ impl TransformerModel {
         let decode_mmq = std::env::var("SOFUU_DECODE_MMQ")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // Bisect filter: SOFUU_DECODE_MMQ_OPS=q4|q6 (both by default)
+        let dmmq_ops = std::env::var("SOFUU_DECODE_MMQ_OPS").unwrap_or_default();
+        let dmmq_q4 = dmmq_ops.is_empty() || dmmq_ops.contains("q4");
+        let dmmq_q6 = dmmq_ops.is_empty() || dmmq_ops.contains("q6");
         macro_rules! dec_gguf {
             ($tv:expr, $w_off:expr, $src:expr, $dst:expr, $rows:expr, $cols:expr) => {{
                 // q6_K only: the q6 tile GEMV is numerically the per-256
                 // batch-mmq pipeline at B=1 (probe-exact); the q4 tile GEMV
                 // uses its own blocklen-8 interleave — booked separately.
-                let (mmqd, is_q4) = if decode_mmq && $tv.tensor_type == GGML_TYPE_Q6_K {
+                let (mmqd, is_q4) = if decode_mmq && dmmq_q6 && $tv.tensor_type == GGML_TYPE_Q6_K {
                     (
                         g.engine.batch_quantize_q8_k(
                             &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
@@ -2466,7 +2470,7 @@ impl TransformerModel {
                         ),
                         false,
                     )
-                } else if decode_mmq && $tv.tensor_type == GGML_TYPE_Q4_K {
+                } else if decode_mmq && dmmq_q4 && $tv.tensor_type == GGML_TYPE_Q4_K {
                     // q4 tile GEMV consumes the ROW quantizer convention
                     // (positive d); the gemm mirror kernel is convention-free.
                     (

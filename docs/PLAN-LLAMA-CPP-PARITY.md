@@ -799,3 +799,25 @@ the gemms consume DIFFERENT inputs: xn, ao, gate — verify each dec_gguf!
 captures ITS $src), and live-value saturation corners (qs clamping).
 The probe + pos-quantizer + wiring are committed; the debug harness is all
 in place (SOFUU_DECODE_PROBE + the DECODE-TARGET check).
+
+## DECODE_MMQ BISECTION (2026-10-23 — SOFUU_DECODE_MMQ_OPS filter shipped)
+Per-branch gates (paris32, TILE_MMQ+DECODE_MMQ, bound 0.05):
+| config | fork step | \|dtop1\| at fork |
+|---|---|---|
+| neither (tile-mmq only) | 19 | 0.156 |
+| **q4-only (pos-quant + gemm mirror, 5 GEMVs)** | 19 | **0.102 — best; the q4 branch is LIVE-CORRECT and IMPROVES parity** |
+| q6-only (2 GEMVs + head) | 19 | 0.196 = baseline (q6 neutral) |
+| both | **2** | 0.35 — COMBO-ONLY interaction bug |
+Findings: the q4 decode mirror is correct on live inputs (fork UNCHANGED at
+the same near-tie step, class shrunk); the q6 decode branch is neutral
+alone; running both breaks (step 2) — a combination bug, not a per-branch
+one. Prime suspects for the combo: the xq8e slot lifetime across interleaved
+per-256 quantize ops of BOTH types inside one commit (the q6 quantize uses
+the signed-max kernel, the q4 the pos kernel — same output region), or a
+dispatch-order subtlety with the mirrored o/down writes. BOOKED: fix the
+combo (or ship q4-only as the decode_mmq semantics), then the q6 decode
+class needs its own explanation (q6 alone = baseline ⇒ the v/down gemvs are
+NOT the carrier of the 0.156 class — the class rides the q4 gemvs alone,
+which q4-mirroring reduces to 0.102; the残余 = likely the head + attention
+glue, bounded by the certified-near-tie question at the 0.215-gap step).
+Defaults locked throughout.

@@ -990,3 +990,31 @@ hmask half, which the random fixture passed), `test_q3_k_gemv_gemm_matches_dequa
 oracle, plus the residual-fused variant). Loader: Q3_K is in the SUPPORTED set
 and the tile warm list; the two loader tests that used type 11 as the
 "unsupported" example now use IQ3_XXS (type 18).
+
+### Full battery, same window (t1p60, 2026-10-22)
+
+Re-run after the Q3_K change, ours 2 reps vs llama.cpp `-t 4`, greedy,
+governor `performance`, 234-token prompt:
+
+| model | prefill ours | llama | decode ours | llama |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_K_M (396 MB) n=80 | 184.7-185.0 | 177.7 | 24.4-24.9 | 24.4 |
+| Qwen3-0.6B Q3_K_S (323 MB) n=80 | 142.6-144.1 | 73.3-73.4 | 27.2 | 27.7-28.1 |
+| Llama-3.2-1B Q8_0 n=40 | 141.1 | 59.1 | 14.9 | 8.8 |
+| SmolLM2-360M Q8_0 n=80 | 362.8-364.2 | 328.0 | (EOS at once)* | 28.1 |
+| Sharp-MiniCPM5-2B Q6_K_XL n=40 | 38.2-38.5 | 38.7 | (EOS at once)* | 5.5 |
+| Spark-X2.5-4B Q4_K_M n=40 | 24.2-24.6 | 22.1 | 3.9-4.2 | 4.0 |
+| Ternary-9B PQ2_0 n=4 (type 142) | 1.4 | n/a | 0.7 | n/a |
+
+\* same template/EOS caveat as Session 4: our chat template makes these two stop
+immediately on this prompt, so the long-prompt decode cell is not comparable.
+
+**Absolute decode numbers are window-local.** In this window both engines read
+Qwen Q4_K_M decode at 24.4-24.9 (llama 24.4) where the Session-4 window read
+28.1 vs 23.5 — including for the *old* binary (t1p47 re-measured today: 24.7,
+identical to t1p60), so it is machine state after the reboot, not a regression.
+Only same-window comparisons are valid.
+
+Still short of "not a bit less": Q3_K decode 27.2 vs 27.7-28.1 (2%, native 8-row
+tile identified above) and MiniCPM prefill 38.2-38.5 vs 38.7 (0.5-1.3%, q6_K
+GEMM rate). Everything else is ahead or at parity in the same window.

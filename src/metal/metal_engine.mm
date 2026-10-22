@@ -237,8 +237,16 @@ void* sofuu_metal_init(void) {
         // kernels — one kernel class per engine instance so serial, spec and
         // b4 GEMVs all share the same f32 summation order (text parity holds
         // internally; the coalesced class has its own CPU-oracle parity gate).
+        // Arm A (plan): class 2 is now the DEFAULT. It is the faster decode
+        // GEMV mapping (b4c2 100 GB/s vs 69 for class 1, head q6_K 90.5 vs
+        // 15.5) and it was gate-clean on the whole fleet, so the knob became
+        // an opt-OUT: SOFUU_Q4K_COALESCED=0 restores the pre-arm-A mapping,
+        // =1 pins class 1, =2 pins class 2. Unset means 2.
         const char* q4k_class = getenv("SOFUU_Q4K_COALESCED");
-        int coalesced_level = (q4k_class && strcmp(q4k_class, "0") != 0) ? atoi(q4k_class) : 0;
+        int coalesced_level = 2;
+        if (q4k_class != NULL) {
+            coalesced_level = (strcmp(q4k_class, "0") != 0) ? atoi(q4k_class) : 0;
+        }
         q4k_coalesced = coalesced_level > 0;
         ctx->pso_gemv_q6_k = load_pso(@"gemv_q6_k");
         ctx->pso_rmsnorm_f32w  = load_pso(@"rmsnorm_f32w");

@@ -2447,12 +2447,21 @@ impl TransformerModel {
         }
     }
 
+/// Arm A (plan): the act-quantized decode GEMVs (a76 dotprod serial
+    /// mirrors of the CPU matvec) are now the DEFAULT, because they were
+    /// gate-clean fleet-wide and are the decode-parity counterpart of the
+    /// prefill tile MMQ. Opt out with SOFUU_DECODE_MMQ=0.
+    fn decode_mmq_enabled() -> bool {
+        !matches!(
+            std::env::var("SOFUU_DECODE_MMQ").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    }
+
     /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn ggpu_head(&mut self) -> bool {
-        let decode_mmq_head = std::env::var("SOFUU_DECODE_MMQ")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let decode_mmq_head = Self::decode_mmq_enabled();
         if let Some(g) = self.gpu.as_mut() {
             let dim = self.config.dim;
             let vocab = self.config.vocab_size;
@@ -2546,9 +2555,7 @@ impl TransformerModel {
         // SOFUU_DECODE_MMQ=1: per-token GEMVs through the act-quantized
         // kernels that bit-mirror the CPU's a76 dotprod serial matvec (the
         // decode-parity counterpart of SOFUU_GPU_TILE_MMQ).
-        let decode_mmq = std::env::var("SOFUU_DECODE_MMQ")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let decode_mmq = Self::decode_mmq_enabled();
         // Bisect filter: SOFUU_DECODE_MMQ_OPS=q4|q6 (both by default)
         let dmmq_ops = std::env::var("SOFUU_DECODE_MMQ_OPS").unwrap_or_default();
         let dmmq_q4 = dmmq_ops.is_empty() || dmmq_ops.contains("q4");

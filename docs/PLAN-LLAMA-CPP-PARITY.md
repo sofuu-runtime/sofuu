@@ -1266,3 +1266,37 @@ tile change wins on one shape and loses on another. The next real lever is a
 schedule that holds x resident across ALL of a layer's GEMMs (one staging pass
 per token block, weights streamed) instead of re-staging per GEMM, or MPSGraph
 for the whole ffn block.
+
+## LEDGER #6 — ARM A: the two measured decode defaults are now the defaults
+
+Both knobs were opt-in experiment flags that had already been measured as wins
+and gated clean. They are now opt-OUT, because a flag nobody sets is a win
+nobody gets:
+
+* `SOFUU_Q4K_COALESCED` unset => **2** (vec4 / 16B-span coalesced q4_K GEMV
+  class: b4c2 100 GB/s vs 69 for class 1, head q6_K 90.5 vs 15.5). `=0`
+  restores the pre-arm-A mapping, `=1`/`=2` still pin a class.
+* `SOFUU_DECODE_MMQ` unset => **on** (per-token GEMVs through the act-quantized
+  kernels that mirror the CPU's a76 dotprod serial matvec — the decode-parity
+  counterpart of the prefill tile MMQ). `=0` opts out.
+
+Both are read in this lane (`metal_engine.mm` engine init and `model.rs`), so
+the flip needs no peer-lane edit.
+
+Decode receipts, same session, max of 2-3 runs, 4 models (bar in brackets):
+
+| model | before | after | delta | bar |
+|---|---|---|---|---|
+| 0.6B Q4_K_M | 38.3 | **52.0** | **+36%** | 224.5 |
+| 8B Q4_K_M | 4.70 | **7.60** | **+62%** | 31.2 |
+| 1B Q8_0 | 69.1 | 68.8 | flat (no q4_K class in play) | 121.9 |
+| Spark-4B Q4_K_M | 25.2 | 24.8 | -2% (inside noise) | 51 |
+
+Gates after the flip: 0.6B NEAR-TIE-CERTIFIED (|dtop1| 0.277 < bound 1.165),
+1B NEAR-TIE-CERTIFIED (0.024 < 0.223), **Spark-4B IDENTICAL 23/23** — which is
+why Spark's -2% is read as path noise rather than an arithmetic cost. 8B is
+ungated for time (a 24-step CPU reference on a 5 GB model does not fit a
+measurement window here) and is the one open item on this ledger.
+
+Remaining tg factors to the bars after this: 0.6B 4.3x, 1B 1.8x, Spark 2.1x,
+8B 4.1x.

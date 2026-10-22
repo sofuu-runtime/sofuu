@@ -662,6 +662,12 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         cols: usize, B: usize,
     ) -> i32;
+    fn sofuu_metal_batch_quantize_q8_k_pos(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gemm_q4_k_mmq(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1250,6 +1256,26 @@ impl MetalEngine {
                 x_buf.handle, x_offset,
                 y_buf.handle, y_offset,
                 nb_total,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// Positive-d row-quantizer variant (sofuu_quantize_row_q8_K semantics):
+    /// d = amax/127, rint(x*127/amax) — the CPU tile GEMV's convention.
+    pub fn batch_quantize_q8_k_pos(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        cols: usize, b: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_quantize_q8_k_pos(
+                self.ctx,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                cols, b,
             ) == 1
         };
         self.op_tock(K_GGUF_GEMM, __t);
@@ -6549,22 +6575,44 @@ fn mmq_tile_value_probe() {
     let qx_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(qpx, qsx) }).expect("qx");
     let (ypx, ysx) = mk(rows * 4);
     let yx_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(ypx, ysx) }).expect("yx");
+    let (yp6x, ys6x) = mk(rows * 4);
+    let y6x_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(yp6x, ys6x) }).expect("y6x");
     let ok256 = {
         assert!(engine.batch_open());
-        let q_ok = engine.batch_quantize_q8_k(&x1_buf, 0, &qx_buf, 0, cols, 1);
-        let g4 = q_ok && engine.batch_gemm_q4_k_mmq(&w_buf, 0, &qx_buf, 0, &yx_buf, 0, rows, cols, 1);
-        g4 && engine.batch_gemm_q6_k_mmq(&w6_buf, 0, &qx_buf, 0, &yx_buf, 0, rows, cols, 1)
-            && { engine.batch_end(); true }
+        let _ = engine.batch_quantize_q8_k(&x1_buf, 0, &qx_buf, 0, cols, 1);
+        let q_okp = engine.batch_quantize_q8_k_pos(&x1_buf, 0, &qx_buf, 0, cols, 1);
+        // NOTE: separate outputs — a shared y would let the q6 pass clobber
+        // the q4 result (the earlier 3839 ghost).
+        let g4 = q_okp && engine.batch_gemm_q4_k_mmq(&w_buf, 0, &qx_buf, 0, &yx_buf, 0, rows, cols, 1);
+        let g6 = engine.batch_gemm_q6_k_mmq(&w6_buf, 0, &qx_buf, 0, &y6x_buf, 0, rows, cols, 1);
+        engine.batch_end();
+        q_okp && g4 && g6
     };
     assert!(ok256, "per-256 B=1 dispatch failed");
     let mut d4_256 = 0f32;
     let mut d6_256 = 0f32;
     for r in 0..rows {
-        let g = unsafe { (ypx as *const f32).add(r).read() };
-        d4_256 = d4_256.max((cq4[r] - g).abs());
-        d6_256 = d6_256.max((cq6[r] - g).abs());
+        let g4 = unsafe { (ypx as *const f32).add(r).read() };
+        let g6 = unsafe { (yp6x as *const f32).add(r).read() };
+        d4_256 = d4_256.max((cq4[r] - g4).abs());
+        d6_256 = d6_256.max((cq6[r] - g6).abs());
     }
     eprintln!("[probe] DECODE-TARGET check: gemv4-tile vs per-256-mmq worst={d4_256:.4e} | gemv6-tile vs per-256-mmq worst={d6_256:.4e}");
+    // quantizer receipt for the pos convention: GPU qs bytes vs host ints
+    let iscalep = 127.0f32 / (x1.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+    let mut qpos_mis = 0usize;
+    for j in 0..cols {
+        let qh: i8 = rint_i32(x1[j] * iscalep) as i8;
+        let qg = unsafe { *((qpx as *const i8).add(4 + j)) }; // TileQ8K.d at 0..4
+        if qh != qg { if qpos_mis < 4 { eprintln!("[probe] qpos j={j} host={qh} gpu={qg} x={:+.4}", x1[j]); } qpos_mis += 1; }
+    }
+    eprintln!("[probe] pos-quant mismatches={qpos_mis}/256 (GPU d={})", unsafe { (qpx as *const f32).read() });
+    for r in 0..rows.min(4) {
+        eprintln!(
+            "[probe] dtarget r{r}: gemv_cpu={:+.4} gpu256={:+.4}",
+            cq4[r], unsafe { (ypx as *const f32).add(r).read() }
+        );
+    }
     unsafe { libc::munmap(qpx as *mut libc::c_void, qsx) };
     unsafe { libc::munmap(ypx as *mut libc::c_void, ysx) };
     unsafe { libc::munmap(qp2 as *mut libc::c_void, qsz2) };

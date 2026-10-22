@@ -3354,3 +3354,35 @@ kernel void gemv_q6_k_mmq32(
     }
     y[row] = total;
 }
+
+// Positive-d row variant for the GEMV class (sofuu_quantize_row_q8_K: d =
+// amax/127, id = 127/amax, round-nearest-even) — the CPU tile GEMV consumes
+// this convention, NOT the mat quantizer's negative signed-max one. Same
+// TileQ8K block layout, same gemm_q4_k_mmq consumer.
+kernel void quantize_q8_k_pos(
+    device const float *x    [[buffer(0)]],
+    device TileQ8K     *y    [[buffer(1)]],
+    constant uint      &cols [[buffer(2)]],
+    uint2 gid            [[thread_position_in_grid]]
+) {
+    uint nb = cols / 256;
+    uint t  = gid.x;
+    uint b  = gid.y;
+    device const float *xb = x + (size_t)t * cols + b * 256;
+    float amax = 0.0f;
+    for (uint j = 0; j < 256; ++j) {
+        float ax = fabs(xb[j]);
+        if (ax > amax) amax = ax;
+    }
+    device TileQ8K *o = y + (size_t)t * nb + b;
+    if (amax == 0.0f) {
+        o->d = 0.0f;
+        for (uint j = 0; j < 256; ++j) o->qs[j] = 0;
+        return;
+    }
+    float id = 127.0f / amax;
+    o->d = amax / 127.0f;
+    for (uint j = 0; j < 256; ++j) {
+        o->qs[j] = (char)rint(xb[j] * id);
+    }
+}

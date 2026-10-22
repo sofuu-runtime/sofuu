@@ -2456,15 +2456,32 @@ impl TransformerModel {
                 // q6_K only: the q6 tile GEMV is numerically the per-256
                 // batch-mmq pipeline at B=1 (probe-exact); the q4 tile GEMV
                 // uses its own blocklen-8 interleave — booked separately.
-                let mmqd = decode_mmq
-                    && $tv.tensor_type == GGML_TYPE_Q6_K
-                    && g.engine.batch_quantize_q8_k(
-                        &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
+                let (mmqd, is_q4) = if decode_mmq && $tv.tensor_type == GGML_TYPE_Q6_K {
+                    (
+                        g.engine.batch_quantize_q8_k(
+                            &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
+                        ) && g.engine.batch_gemm_q6_k_mmq(
+                            &g.w_buf, $w_off, &g.act_buf, g.slots.xq8e,
+                            &g.act_buf, $dst, $rows, $cols, 1,
+                        ),
+                        false,
                     )
-                    && g.engine.batch_gemm_q6_k_mmq(
-                        &g.w_buf, $w_off, &g.act_buf, g.slots.xq8e,
-                        &g.act_buf, $dst, $rows, $cols, 1,
-                    );
+                } else if decode_mmq && $tv.tensor_type == GGML_TYPE_Q4_K {
+                    // q4 tile GEMV consumes the ROW quantizer convention
+                    // (positive d); the gemm mirror kernel is convention-free.
+                    (
+                        g.engine.batch_quantize_q8_k_pos(
+                            &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
+                        ) && g.engine.batch_gemm_q4_k_mmq(
+                            &g.w_buf, $w_off, &g.act_buf, g.slots.xq8e,
+                            &g.act_buf, $dst, $rows, $cols, 1,
+                        ),
+                        true,
+                    )
+                } else {
+                    (false, false)
+                };
+                let _ = is_q4;
                 if !mmqd {
                     g.engine.batch_gguf($tv.tensor_type, &g.w_buf, $w_off,
                         &g.act_buf, $src, &g.act_buf, $dst, $rows, $cols);

@@ -775,3 +775,27 @@ segments, per-sb fma + int bias + fused subtract — read lines 1879-1896 for
 the lane pairing), probe it in mmq_tile_value_probe vs sofuu_gemv_q4_k at
 warm-hit shapes, wire dec_gguf! q4 branch to it, re-gate. Defaults locked
 throughout; q6/q4 prefill + q6 decode all bit-exact at this point.
+
+## DECODE MIRROR REGRESSION NOTE (2026-10-23 final)
+DECODE-TARGET receipt FIXED: the earlier gemv4-vs-per256 3.839e3 was a PROBE
+BUG (one shared y buffer — the q6 pass clobbered the q4 result). With
+separate outputs: **gemv4-tile == per-256-pos-quant == 0.0000e0 AND gemv6 ==
+0.0000e0** — BOTH decode GEMV classes are bit-mirrored (q4 needs the ROW
+quantizer convention d = amax/127 positive — quantize_q8_k_pos added; the
+gemm kernel itself is convention-agnostic). Fixture receipt correction: the
+q4 fixture d bytes = f16 0.0 ([0,0] truncation) so the probe's q4 section
+exercised only the min-term path live — the D-term path is covered by the
+live prefill receipts (s2.qa 9.5e-7 with real weights + the signed-max
+quantizer = the same gemm kernel).
+BUT the LIVE gate with SOFUU_DECODE_MMQ=1 REGRESSED (fork step 2, |dtop1|
+0.35 vs 0.156 without it) — the decode GEMV mirror chain has a live-path
+defect the fixture probe does not catch (env-gated OFF by default, no
+defaults moved; tile-mmq-only gate re-verified = step 19 unchanged).
+BOOKED NEXT SESSION: bisect the decode_mmq live regression — candidates:
+(b=1) quantize input slot grammar (xn re-read timing inside the commit),
+head tensor type on the 0.6B (q4 vs q6 branch pick), qx slot reuse across
+the 7 GEMVs in one commit (the quantize op re-run per gemm is required —
+the gemms consume DIFFERENT inputs: xn, ao, gate — verify each dec_gguf!
+captures ITS $src), and live-value saturation corners (qs clamping).
+The probe + pos-quantizer + wiring are committed; the debug harness is all
+in place (SOFUU_DECODE_PROBE + the DECODE-TARGET check).

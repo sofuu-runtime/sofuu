@@ -102,6 +102,7 @@ final class AppStore: ObservableObject {
         // Tauri app's step 5a.
         state.config = configs.redacted(configs.readConfigWithKeys())
         updateVoiceGate()
+        loadEngineVersion()
         // Engine environment knobs MUST be in place before the runtime is
         // created: SOFUU_NO_ML gates module registration inside the
         // library, so setting it afterwards silently does nothing.
@@ -1865,6 +1866,7 @@ final class AppStore: ObservableObject {
         if state.settingsOpen { state.settingsOpen = false; return true }
         if state.shortcutHelpVisible { state.shortcutHelpVisible = false; return true }
         if state.chatSearchOpen { closeChatSearch(); return true }
+        if state.gitPanelOpen { setGitPanelOpen(false); return true }
         // Dismissing the welcome card also retires the first-run gate —
         // Esc here means "got it".
         if state.onboardingVisible { dismissOnboarding(); return true }
@@ -2138,6 +2140,97 @@ final class AppStore: ObservableObject {
         GitMonitor.status(root: root) { [weak self] map in
             Task { @MainActor in self?.state.gitStatus = map }
         }
+        GitMonitor.detailedStatus(root: root) { [weak self] files, branch in
+            Task { @MainActor in
+                self?.state.gitFiles = files
+                self?.state.gitBranch = branch
+            }
+        }
+    }
+
+    // ── Git staging / commit panel ─────────────────────────────────────
+
+    func setGitPanelOpen(_ open: Bool) {
+        state.gitPanelOpen = open
+        if open { refreshGitStatus(force: true) }
+    }
+
+    private func runGitAction(_ args: [String], failurePrefix: String) {
+        guard let root = state.projectDir else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let (ok, output) = GitMonitor.mutate(root, args)
+            DispatchQueue.main.async {
+                if !ok { self?.systemRow("\(failurePrefix): \(output)") }
+                self?.refreshGitStatus(force: true)
+            }
+        }
+    }
+
+    /// Stage relative paths. Untracked files included — the panel only
+    /// offers whole-file staging, the TUI's `git add` level.
+    func gitStage(_ relatives: [String]) {
+        runGitAction(["add", "--"] + relatives, failurePrefix: "git add failed")
+    }
+
+    func gitUnstage(_ relatives: [String]) {
+        runGitAction(["restore", "--staged", "--"] + relatives, failurePrefix: "git restore failed")
+    }
+
+    /// Commit what the index holds right now. Refuses an empty message
+    /// and an empty index instead of shelling out to fail opaquely.
+    func gitCommit(message: String, onDone: @escaping (Bool, String) -> Void) {
+        let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { onDone(false, "Write a commit message first"); return }
+        let staged = state.gitFiles.values.filter { $0.staged != nil }
+        guard !staged.isEmpty else { onDone(false, "Nothing is staged"); return }
+        guard let root = state.projectDir else { onDone(false, "No workspace open"); return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let (ok, output) = GitMonitor.mutate(root, ["commit", "-m", text])
+            DispatchQueue.main.async {
+                if ok {
+                    self?.systemRow("Committed to \(self?.state.gitBranch ?? "") — \(staged.count) file(s).")
+                }
+                self?.refreshGitStatus(force: true)
+                onDone(ok, ok ? "" : output)
+            }
+        }
+    }
+
+    // ── Engine watch / version ─────────────────────────────────────────
+
+    /// 10 s watchdog: surface a wedged or exited engine pump instead of
+    /// dying silently. Auto-clears when the pump ticks again (or a fresh
+    /// restartEngineForEnv() boots a new one).
+    func checkPumpHealth() {
+        let age = engine.pumpAge
+        if age > 8 {
+            if state.enginePumpStall == nil {
+                let detail = age.isFinite ? "\(Int(age))s idle" : "thread exited"
+                state.enginePumpStall = "Engine pump stalled (\(detail)) — turns may not respond. Session ▸ Restart Engine reboots it."
+                NSLog("[sofuu-engine] pump stalled: \(detail)")
+            }
+        } else if state.enginePumpStall != nil {
+            state.enginePumpStall = nil
+        }
+    }
+
+    /// Settings engine-card line: from the bundled dylib's own attributes
+    /// (works in Debug AND installed builds); ABI version straight from
+    /// the linked bridge.
+    func loadEngineVersion() {
+        var line = "libsofuu ABI v\(engine.abiVersion)"
+        let dylib = Bundle.main.bundleURL.appendingPathComponent("Frameworks/libsofuu.dylib")
+        if let values = try? dylib.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) {
+            let mb = Double(values.fileSize ?? 0) / 1_048_576
+            if let date = values.contentModificationDate {
+                let f = DateFormatter()
+                f.dateFormat = "yyyy-MM-dd HH:mm"
+                line += String(format: " · %.1f MB · built %@", mb, f.string(from: date))
+            } else {
+                line += String(format: " · %.1f MB", mb)
+            }
+        }
+        state.engineVersion = line
     }
 
     /// Working tree vs HEAD in the floating diff panel.

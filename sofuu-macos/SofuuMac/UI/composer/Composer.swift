@@ -98,7 +98,7 @@ struct Composer: View {
             VStack(alignment: .leading, spacing: 0) {
                 // Borderless: macOS TextFields default to a bezeled box;
                 // the desktop composer's input sits straight on the card.
-                TextField("Ask, @mention files, or type / for commands…", text: $text, axis: .vertical)
+                TextField(L10n.t("composer.placeholder"), text: $text, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15, design: .monospaced))
                     .foregroundStyle(c.text)

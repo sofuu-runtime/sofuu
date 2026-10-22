@@ -44,6 +44,18 @@ struct AppState {
     /// The full gate also checks the active provider (Composer param) —
     /// the engine rejects Local/Anthropic audio at call time as well.
     var voiceSurfaceOK = false
+    /// Watchdog banner text when the engine pump stops ticking (nil =
+    /// healthy). checkPumpHealth() sets/clears it on a 10 s cadence.
+    var enginePumpStall: String?
+    /// Human-readable engine artifact line for the Settings engine card
+    /// (dylib size + build time + ABI version).
+    var engineVersion = ""
+    /// IDE git panel (stage/unstage/commit) — branch of the workspace.
+    var gitPanelOpen = false
+    var gitBranch = ""
+    /// Full two-column git state (staged + unstaged separately) for the
+    /// commit panel; the tree dots keep using gitStatus.
+    var gitFiles: [String: GitFileState] = [:]
     var phase: String?
     /// TUI-style live streaming state (chat.rs's answer spinner + think
     /// line + PHASE sweep, ported 1:1).
@@ -181,6 +193,17 @@ struct ChatMessage: Identifiable {
     var usage: Usage?
     var status = "done" // streaming | done | error
     var error: String?
+}
+
+/// One working-tree file in the commit panel: column-split porcelain.
+/// `staged` = index vs HEAD (anything in column X), `unstaged` = worktree
+/// vs index (column Y or an untracked file). Relative to the workspace
+/// root — actions take this path straight to `git add`/`restore`.
+struct GitFileState: Identifiable, Equatable {
+    var relative: String
+    var staged: GitStatusKind?
+    var unstaged: GitStatusKind?
+    var id: String { relative }
 }
 
 struct Approval: Identifiable {

@@ -55,7 +55,7 @@ struct ChatSearchBar: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 12))
                     .foregroundStyle(c.textFaint)
-                TextField("Search chat…", text: $query)
+                TextField(L10n.t("search.placeholder"), text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .foregroundStyle(c.text)
@@ -66,11 +66,11 @@ struct ChatSearchBar: View {
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(c.textFaint)
                 }
-                hudButton("chevron.up", "Previous match") { step(-1) }
+                hudButton("chevron.up", L10n.t("search.prev")) { step(-1) }
                     .disabled(hits.isEmpty)
-                hudButton("chevron.down", "Next match") { step(1) }
+                hudButton("chevron.down", L10n.t("search.next")) { step(1) }
                     .disabled(hits.isEmpty)
-                hudButton("xmark", "Close (Esc)") { store.closeChatSearch() }
+                hudButton("xmark", L10n.t("search.close")) { store.closeChatSearch() }
             }
             .padding(.horizontal, 10)
             .frame(height: 38)
@@ -79,12 +79,12 @@ struct ChatSearchBar: View {
             Divider().overlay(c.separator)
 
             if query.isEmpty {
-                Text("Search your messages and Sofuu's replies")
+                Text(L10n.t("search.hint"))
                     .font(.system(size: 11))
                     .foregroundStyle(c.textFaint)
                     .padding(10)
             } else if hits.isEmpty {
-                Text("No matches")
+                Text(L10n.t("search.noMatches"))
                     .font(.system(size: 12))
                     .foregroundStyle(c.textFaint)
                     .padding(10)

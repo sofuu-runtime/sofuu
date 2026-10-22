@@ -12,7 +12,7 @@ struct WelcomeCard: View {
     var body: some View {
         scrim {
             VStack(alignment: .leading, spacing: 0) {
-                Text("Sofuu")
+                Text(L10n.t("onboarding.title"))
                     .font(.system(size: 30, weight: .bold, design: .serif))
                     .foregroundStyle(c.text)
                 Text("A local-first coding agent for macOS — chat with it, or hand it a folder and let it work in the built-in IDE.")
@@ -50,7 +50,7 @@ struct WelcomeCard: View {
                     Button {
                         store.dismissOnboarding()
                     } label: {
-                        Text("Get Started")
+                        Text(L10n.t("onboarding.getStarted"))
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(c.accentContrast)
                             .padding(.horizontal, 16)

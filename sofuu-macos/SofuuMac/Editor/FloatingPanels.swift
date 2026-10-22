@@ -23,8 +23,7 @@ enum IDEHUD {
     }
 
     static func hideHover() {
-        hoverPanel?.orderOut(nil)
-        hoverPanel = nil
+        discard(&hoverPanel)
     }
 
     // MARK: - Completion
@@ -40,8 +39,7 @@ enum IDEHUD {
     }
 
     static func hideCompletions() {
-        completionPanel?.orderOut(nil)
-        completionPanel = nil
+        discard(&completionPanel)
     }
 
     // MARK: - Outline
@@ -64,8 +62,7 @@ enum IDEHUD {
     }
 
     static func hideOutline() {
-        outlinePanel?.orderOut(nil)
-        outlinePanel = nil
+        discard(&outlinePanel)
     }
 
     // MARK: - Prompt (single field: rename / go-to-line / symbol query)
@@ -83,8 +80,7 @@ enum IDEHUD {
     }
 
     static func hidePrompt() {
-        promptPanel?.orderOut(nil)
-        promptPanel = nil
+        discard(&promptPanel)
     }
 
     // MARK: - Generic pick list (code actions / workspace symbols)
@@ -103,8 +99,7 @@ enum IDEHUD {
     }
 
     static func hideList() {
-        listPanel?.orderOut(nil)
-        listPanel = nil
+        discard(&listPanel)
     }
 
     // MARK: - Diff (read-only working-tree vs HEAD popup)
@@ -121,14 +116,14 @@ enum IDEHUD {
     }
 
     static func hideDiff() {
-        diffPanel?.orderOut(nil)
-        diffPanel = nil
+        discard(&diffPanel)
     }
 
     private static func present(_ panel: inout NSPanel?, content: NSView, frame: NSRect) {
         if let existing = panel {
             existing.setFrame(frame, display: true)
             existing.contentView = content
+            ensureChild(existing)
             existing.orderFrontRegardless()
             return
         }
@@ -144,7 +139,28 @@ enum IDEHUD {
         p.isMovableByWindowBackground = false
         p.contentView = content
         panel = p
+        ensureChild(p)
         p.orderFrontRegardless()
+    }
+
+    /// Parent the panel to the app window so it MOVES with it (#41:
+    /// screen-anchored panels used to lag behind when the window moved).
+    /// Frames are still screen coordinates — correct at placement, then
+    /// the parent drags them along.
+    private static func ensureChild(_ p: NSPanel) {
+        let parent = NSApp.keyWindow ?? NSApp.mainWindow
+            ?? NSApp.windows.first { $0.isVisible && !($0 is NSPanel) }
+        guard let parent, p !== parent, p.parent !== parent else { return }
+        p.parent?.removeChildWindow(p)
+        parent.addChildWindow(p, ordered: .above)
+    }
+
+    private static func discard(_ panel: inout NSPanel?) {
+        if let p = panel {
+            p.parent?.removeChildWindow(p)
+            p.orderOut(nil)
+        }
+        panel = nil
     }
 
     // MARK: - Geometry

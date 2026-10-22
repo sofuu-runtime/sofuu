@@ -337,6 +337,10 @@ struct IdeLayout: View {
                     ChatSearchBar(store: store)
                         .padding(.top, 8)
                 }
+                // Watchdog: a wedged engine pump must be visible.
+                if let stall = store.state.enginePumpStall {
+                    IdeBanner(text: stall, isError: true)
+                }
             }
             .animation(.easeOut(duration: 0.18), value: store.state.approvals.count)
 
@@ -366,6 +370,16 @@ struct IdeLayout: View {
             }
         }
         .background(c.bgApp.ignoresSafeArea())
+        .overlay(alignment: .topTrailing) {
+            // Git panel rides the IDE layout's top edge (tree + editor +
+            // agent are one IDE surface; the panel is IDE-wide).
+            if store.state.gitPanelOpen {
+                GitPanel(store: store)
+                    .padding(.top, 34)
+                    .padding(.trailing, 14)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: store.state.gitPanelOpen)
     }
 
     private var agentHeader: some View {
@@ -798,7 +812,17 @@ struct EditorStatus: View {
             if let language {
                 Text(language.name)
             }
-            Text(hud.lspStatus)
+            // Per-language server view: the coordinator's own status for
+            // THIS file's language, plus a registry-wide count of the
+            // other live servers (multi-language tabs are common).
+            let servers = LSPRegistry.shared.liveServers()
+            let others = servers.filter { server in
+                guard let language else { return true }
+                return server.language != language.name
+            }
+            Text(hud.lspStatus + (others.isEmpty ? "" : " · +\(others.count)"))
+                .help(hud.lspStatus + (servers.isEmpty ? "" : " — live: "
+                    + servers.map { "\($0.language) (idle \($0.idleSeconds / 60)m)" }.joined(separator: ", ")))
             Button {
                 store.openSettings(true, tab: "console")
             } label: {
@@ -809,6 +833,22 @@ struct EditorStatus: View {
             }
             .buttonStyle(.plain)
             .help("Engine console (stderr tail + app errors)")
+            Button {
+                store.setGitPanelOpen(true)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(store.state.gitBranch.isEmpty ? "git" : store.state.gitBranch)
+                    if !store.state.gitFiles.isEmpty {
+                        Text("· \(store.state.gitFiles.count)")
+                    }
+                }
+                .foregroundStyle(c.textMuted)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Stage changes and commit")
             Spacer()
             if errors > 0 {
                 Label("\(errors)", systemImage: "xmark.octagon.fill")

@@ -28,6 +28,20 @@ final class LSPRegistry {
         langID + "#" + rootPath
     }
 
+    /// Main-safe snapshot for the status line: one entry per live client
+    /// (language name, root tail, age of last activity). The status bar
+    /// composes "Swift · running · idle 3m · +2 more" from this instead
+    /// of relying on the coordinator's single-language report alone.
+    func liveServers() -> [(language: String, rootPath: String, idleSeconds: Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        return clients.values
+            .filter { $0.isRunning }
+            .map { (language: $0.languageName, rootPath: $0.rootPath, idleSeconds: Int(now.timeIntervalSince($0.lastActivity))) }
+            .sorted { ($0.language, $0.rootPath) < ($1.language, $1.rootPath) }
+    }
+
     /// The running client for a language at a root, if any. Non-blocking.
     func runningClient(langID raw: String, rootPath: String) -> LSPClient? {
         lock.lock()

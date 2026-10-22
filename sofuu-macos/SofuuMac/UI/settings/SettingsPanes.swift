@@ -331,6 +331,9 @@ private struct GeneralPane: View {
         VStack(spacing: 14) {
             SectionCard(label: "ENGINE") {
                 if let e = engineCard {
+                    if !state.engineVersion.isEmpty {
+                        engineLine("Engine", state.engineVersion)
+                    }
                     engineLine("Model", e.optString("model").nilIfEmpty ?? "(none)")
                     engineLine("Provider", e.optString("provider").nilIfEmpty ?? "(none)")
                     engineLine("Session", String(e.optString("sessionId").prefix(10)).nilIfEmpty ?? "—")
@@ -614,6 +617,21 @@ private struct AppearancePane: View {
                             onMinus: { store.setChatFontSize(state.chatFontSize - 1) },
                             onPlus: { store.setChatFontSize(state.chatFontSize + 1) },
                             reset: nil)
+                }
+            }
+
+            SectionCard(label: "LANGUAGE") {
+                ControlRow(label: "App language",
+                           desc: "The string table is live — English ships today; translations are one dictionary away.") {
+                    Menu {
+                        Button("English") { L10n.language = "en" }
+                    } label: {
+                        Text(L10n.language == "en" ? "English" : L10n.language)
+                            .font(.system(size: 11))
+                            .foregroundStyle(c.text)
+                    }
+                    .menuStyle(.borderedButton)
+                    .frame(width: 150)
                 }
             }
 

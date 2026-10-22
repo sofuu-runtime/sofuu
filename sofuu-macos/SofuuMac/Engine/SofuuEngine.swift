@@ -75,6 +75,23 @@ final class SofuuEngine: @unchecked Sendable {
         return _ready
     }
 
+    // ── Health (app-side pump watchdog) ─────────────────────────────
+
+    /// Touched by `engineMain` on every pump iteration (20 ms cadence).
+    private let healthLock = NSLock()
+    private var lastPumpTick = Date()
+
+    /// Seconds since the pump loop last turned. ~0–0.02 while healthy;
+    /// grows without bound once the engine thread has wedged or exited —
+    /// the app watchdog turns that into a visible banner instead of a
+    /// silently dead app. ∞ when the engine thread is not running at all.
+    var pumpAge: TimeInterval {
+        healthLock.lock()
+        let tick = lastPumpTick
+        healthLock.unlock()
+        return isRunning ? Date().timeIntervalSince(tick) : .infinity
+    }
+
     private var thread: Thread?
     /// The live runtime. Written on the engine thread at boot and cleared
     /// there at shutdown, but READ from any caller thread — so it needs a
@@ -218,6 +235,7 @@ final class SofuuEngine: @unchecked Sendable {
             // smooth typewriter instead of chunky bursts (the ABI tick is
             // cheap); idle cost is negligible.
             while isRunning {
+                healthLock.lock(); lastPumpTick = Date(); healthLock.unlock()
                 if let cmd = dequeue(timeout: 0.02) {
                     if !isRunning { break }
                     cmd()
@@ -226,6 +244,11 @@ final class SofuuEngine: @unchecked Sendable {
                 drainEvents(rt)
             }
             log("pump exit")
+            healthLock.lock(); lastPumpTick = .distantPast; healthLock.unlock()
+            // The runtime is going away (deliberate shutdown or thread
+            // failure) — drop the ready flag so the app's watchdog sees
+            // the truth instead of a stale green light.
+            readyLock.lock(); _ready = false; readyLock.unlock()
 
             // Free the runtime HERE, while this is still the thread that
             // created it — docs/EMBEDDING.md: a runtime belongs to exactly

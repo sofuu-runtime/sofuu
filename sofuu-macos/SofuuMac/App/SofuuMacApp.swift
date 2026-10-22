@@ -138,6 +138,12 @@ private struct Root: View {
             Task { @MainActor in store.refreshModelCache() }
         }
 
+        // Pump watchdog: a wedged or exited engine thread must surface as
+        // a banner, not as a silently dead app.
+        Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+            Task { @MainActor in store.checkPumpHealth() }
+        }
+
         // Language servers hold hundreds of MB each — they must die with
         // the app, not linger as orphans after quit.
         NotificationCenter.default.addObserver(
@@ -223,7 +229,7 @@ final class GlobalKeyMonitor {
                 store.state.settingsOpen || store.state.preview != nil
                     || store.state.sheet != nil
                     || store.state.shortcutHelpVisible || store.state.onboardingVisible
-                    || store.state.chatSearchOpen
+                    || store.state.chatSearchOpen || store.state.gitPanelOpen
             }
             if hasOverlay {
                 Task { @MainActor in _ = store.closeTopOverlay() }
@@ -253,63 +259,64 @@ struct SofuuMenus: Commands {
                 .keyboardShortcut(",")
         }
         CommandGroup(replacing: .newItem) {
-            Button("New Chat") { store.newChat() }
+            Button(L10n.t("menu.newChat")) { store.newChat() }
                 .keyboardShortcut("n")
             Divider()
-            Button("Save File") { store.saveActiveTab() }
+            Button(L10n.t("menu.saveFile")) { store.saveActiveTab() }
                 .keyboardShortcut("s")
             Divider()
-            Button("Find in File") {
+            Button(L10n.t("menu.findInFile")) {
                 NotificationCenter.default.post(name: .init("IDEFindToggle"), object: nil)
             }
                 .keyboardShortcut("f")
-            Button("Search Project") {
+            Button(L10n.t("menu.searchProject")) {
                 NotificationCenter.default.post(name: .init("IDESearchToggle"), object: nil)
             }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
             Divider()
-            Button("Rename Symbol") { store.ideCoordinator?.renameAtCaret() }
+            Button(L10n.t("menu.renameSymbol")) { store.ideCoordinator?.renameAtCaret() }
                 .keyboardShortcut("r")
-            Button("Find References") {
+            Button(L10n.t("menu.findReferences")) {
                 NotificationCenter.default.post(name: .init("IDERefToggle"), object: nil)
             }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-            Button("Find Symbol in Workspace") {
+            Button(L10n.t("menu.findSymbol")) {
                 NotificationCenter.default.post(name: .init("IDESymbolToggle"), object: nil)
             }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
-            Button("Go to Line") {
+            Button(L10n.t("menu.goToLine")) {
                 NotificationCenter.default.post(name: .init("IDEGoLineToggle"), object: nil)
             }
                 .keyboardShortcut("l")
-            Button("Format File") {
+            Button(L10n.t("menu.formatFile")) {
                 if let path = store.state.activeTab { store.formatFile(path) }
             }
                 .keyboardShortcut("f", modifiers: [.command, .option, .shift])
-            Button("Document Outline") {
+            Button(L10n.t("menu.outline")) {
                 NotificationCenter.default.post(name: .init("IDEOutlineToggle"), object: nil)
             }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
             Divider()
-            Button("Search Chat") { store.setChatSearchOpen(true) }
+            Button(L10n.t("menu.searchChat")) { store.setChatSearchOpen(true) }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
-            Button("Export Chat as Markdown…") { store.exportSessionMarkdown() }
+            Button(L10n.t("menu.exportMarkdown")) { store.exportSessionMarkdown() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
         }
         CommandMenu("Session") {
-            Button("Stop") { store.cancel() }
+            Button(L10n.t("menu.stop")) { store.cancel() }
                 .keyboardShortcut(".", modifiers: .command)
-            Button("Compact Session") { store.compactSession() }
+            Button(L10n.t("menu.compact")) { store.compactSession() }
                 .keyboardShortcut("k", modifiers: .command)
             Divider()
             // Lives here, not in CommandMenu("View"): SwiftUI drops a
             // custom View menu on the system View menu's altar on this
             // macOS (its items never render). Session renders reliably.
-            Button(store.state.ideMode ? "Exit IDE Mode" : "IDE Mode") { store.toggleIdeMode() }
+            Button(L10n.t(store.state.ideMode ? "menu.exitIdeMode" : "menu.ideMode")) { store.toggleIdeMode() }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             Divider()
-            Button("Keyboard Shortcuts") { store.showShortcutHelp() }
+            Button(L10n.t("menu.shortcuts")) { store.showShortcutHelp() }
                 .keyboardShortcut("/", modifiers: [.command, .shift])
+            Button(L10n.t("menu.restartEngine")) { store.restartEngineForEnv() }
         }
         CommandMenu("View") {
             Button("Toggle Sidebar") { store.toggleSidebar() }

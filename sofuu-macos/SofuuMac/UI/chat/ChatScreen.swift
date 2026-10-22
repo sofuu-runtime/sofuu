@@ -73,6 +73,8 @@ private struct MessageRow: View {
 
     @Environment(\.sofuuColors) private var c
     @State private var hovered = false
+    /// #40: assistant rows alternate rendered markdown ↔ raw source.
+    @State private var showSource = false
 
     /// "[image]"-only turns have nothing to edit or resend.
     private var actionable: Bool { !m.content.isEmpty && m.content != "[image]" }
@@ -133,7 +135,14 @@ private struct MessageRow: View {
 
                 if !m.content.isEmpty {
                     HStack(alignment: .bottom, spacing: 2) {
-                        MarkdownBody(text: m.content, fontSize: fontSize)
+                        if showSource {
+                            Text(m.content)
+                                .font(.system(size: CGFloat(fontSize - 1), design: .monospaced))
+                                .foregroundStyle(c.textMuted)
+                                .textSelection(.enabled)
+                        } else {
+                            MarkdownBody(text: m.content, fontSize: fontSize)
+                        }
                         if m.status == "streaming" { SpinnerCursor(frame: streamFrame) }
                     }
                 }
@@ -151,8 +160,23 @@ private struct MessageRow: View {
                         .foregroundStyle(c.textFaint)
                         .padding(.top, 4)
                 }
+                if hovered && m.status == "done" && !m.content.isEmpty {
+                    HStack(spacing: 8) {
+                        rowButton(showSource ? "text.redaction" : "curlybraces",
+                                  showSource ? "Show rendered" : "Show raw markdown") {
+                            showSource.toggle()
+                        }
+                        rowButton("doc.on.doc", "Copy as markdown") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(m.content, forType: .string)
+                        }
+                    }
+                    .padding(.top, 3)
+                    .transition(.opacity)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .onHover { hovered = $0 }
             .padding(.top, 8).padding(.bottom, 10)
         }
     }

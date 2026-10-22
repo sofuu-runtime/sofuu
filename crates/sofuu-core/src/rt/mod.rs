@@ -35,6 +35,7 @@ pub mod brain_key; // B4: the machine-local brain key (key file + legacy fallbac
 pub mod model_caps; // per-model capability registry (ctx/max-output/thinking)
 pub mod model_caps_discovered; // caps harvested from endpoint model listings (provider-agnostic)
 pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agent.c + qtsq_adapter.c)
+pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod engine; // M10: engine.c + sofuu.c + repl.c (boot, loader, Sofuu aliases, eval, destroy)
 pub mod host_poke; // PLAN-DESKTOP A: thread-safe host→engine wakeup (uv_async poke)
 pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js

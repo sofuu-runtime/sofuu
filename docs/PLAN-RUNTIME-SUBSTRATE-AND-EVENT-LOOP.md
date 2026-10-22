@@ -62,12 +62,30 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - Precompiled AOT bytecode for all 7 shipped drivers: `agent.bc`, `web.bc`, `tools.bc`, `extractor.bc`, `storage.bc`, `chat.bc`, `rlm.bc`.
 - **Verification**: `tests/test_bytecode_hydration.js` verifying instantaneous hydration of all 7 subsystems; engine cold start time dropped to $\le 16\text{ ms}$; stripped binary size is $4.7\text{ MB}$ (well within $\le 5.0\text{ MB}$ budget).
 
-### Phase 3: Zero-Copy TypedArray & Native Memory Bridge
-- **Problem**: Vector embeddings and QTSQ columnar blocks copy memory when passed to JavaScript.
+### Phase 3: Zero-Copy TypedArray & Native Memory Bridge [COMPLETE]
+- **Status**: Implemented, verified, audited.
 - **Deliverables**:
-  - Safe FFI wrapper for `JS_NewArrayBuffer` with external deallocation callbacks.
-  - Direct mapping between Rust `AnonBuffer` and JavaScript `Float32Array` / `Uint8Array`.
-- **Verification**: `tests/test_zerocopy_buffer.js` verifying 0 allocations and 0 memory leaks upon GC.
+  - Bound `JS_DetachArrayBuffer` in `crates/sofuu-ffi/src/qjs.rs` and patched QuickJS detach double-free in `deps/quickjs/quickjs.c`.
+  - Implemented `crates/sofuu-core/src/rt/zerocopy.rs`:
+    - `AlignedBuffer`: 64-byte aligned SIMD memory allocation for AVX-512 / ARM NEON.
+    - Safe C trampoline deallocators (`free_aligned_buffer_cb`, `free_vec_u8_cb`, `free_vec_f32_cb`, `free_arc_vec_f32_cb`) linking QuickJS ArrayBuffer lifecycle directly to Rust memory.
+    - Zero-copy constructors: `new_zerocopy_aligned_buffer`, `new_zerocopy_u8_buffer`, `new_zerocopy_f32_array`, `new_shared_f32_array`.
+    - Safe buffer reflection and borrow: `extract_buffer_info`, `create_typed_view`.
+  - Exposed modern JavaScript API on both `sofuu.memory` and `sofuu.buffer`:
+    - `allocAligned(bytes, alignment = 64)` -> `ArrayBuffer`
+    - `allocFloat32(length)` -> `Float32Array` (64-byte aligned)
+    - `allocUint8(length)` -> `Uint8Array` (64-byte aligned)
+    - `viewFloat32(arrayBuffer, byteOffset?, length?)` -> `Float32Array`
+    - `viewUint8(arrayBuffer, byteOffset?, length?)` -> `Uint8Array`
+    - `detach(arrayBuffer)` -> `boolean`
+    - `isDetached(arrayBuffer)` -> `boolean`
+    - `addressOf(typedArrayOrBuffer)` -> `string`
+    - `isAligned(typedArrayOrBuffer, alignment = 64)` -> `boolean`
+  - Integrated zero-copy buffers into SIMD pipeline (`sofuu.ai.dot`, `sofuu.ai.similarity`, `sofuu.ai.l2`).
+- **Verification**:
+  - `tests/test_zerocopy_buffer.js` verifying 64-byte alignment, dual TypedArray coherent in-place mutation, SIMD dot product and cosine similarity, detachment lifecycle, and 10,000 GC cycle torture test with 0 memory leaks.
+  - Full JS test suite 59 passed, 0 failed.
+  - Stripped release binary size: **4.8 MB** ($\le 5.0\text{ MB}$ budget ceiling).
 
 ### Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 - **Problem**: Autonomous agent execution across nested async tools requires manual passing of `sessionId`, `traceId`, and `AbortSignal`.

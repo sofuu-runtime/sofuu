@@ -264,6 +264,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::storage::mod_storage_register(ctx);
     }
 
+    // Phase 3: Zero-Copy TypedArray & Native Memory Bridge (sofuu.memory.* / sofuu.buffer.*)
+    unsafe {
+        crate::rt::zerocopy::mod_zerocopy_register(ctx);
+    }
+
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };

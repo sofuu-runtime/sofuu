@@ -466,6 +466,8 @@ extern "C" {
     ) -> JSValue;
     // quickjs.h:821 — single-copy buffer alloc for bulk chunk delivery (net-7).
     pub fn JS_NewArrayBufferCopy(ctx: *mut JSContext, buf: *const u8, len: usize) -> JSValue;
+    // quickjs.h:822 — detach ArrayBuffer immediately and revoke view access
+    pub fn JS_DetachArrayBuffer(ctx: *mut JSContext, obj: JSValueConst);
     // ── M10: the real exports behind the reimplemented shims ──
     pub fn __JS_FreeValue(ctx: *mut JSContext, v: JSValue);
     pub fn __JS_FreeValueRT(rt: *mut JSRuntime, v: JSValue);

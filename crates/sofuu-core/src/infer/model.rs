@@ -1020,6 +1020,13 @@ impl TransformerModel {
             let dst = &mut self.x_batch[b * dim..(b + 1) * dim];
             Self::lookup_embedding(gguf, &self.token_embd, tok, dim, dst);
         }
+        if let Some(prefix) = std::env::var_os("SOFUU_LAYER_SNAP") {
+            let prefix = prefix.to_string_lossy().to_string();
+            let esl: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.x_batch.as_ptr() as *const u8, tokens.len() * dim * 4)
+            };
+            let _ = std::fs::write(format!("{prefix}.emb"), esl);
+        }
 
         // 2. Transformer layers
         for layer_idx in 0..self.config.n_layers {
@@ -1038,6 +1045,38 @@ impl TransformerModel {
                 dim,
                 norm_eps,
             );
+            // SOFUU_LAYER_SNAP=<prefix>: per-layer residual + normed-x dump
+            // (the CPU tiles' mirror of the route's SOFUU_PREFILL_DEBUG_DUMP
+            // slab dumps — the L-granularity divergence pin).
+            if let Some(prefix) = std::env::var_os("SOFUU_LAYER_SNAP") {
+                let prefix = prefix.to_string_lossy().to_string();
+                let xsl: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        self.x_batch.as_ptr() as *const u8,
+                        b_size * dim * 4,
+                    )
+                };
+                let nsl: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        self.x_norm_batch.as_ptr() as *const u8,
+                        b_size * dim * 4,
+                    )
+                };
+                let _ = std::fs::write(format!("{prefix}.L{layer_idx}.xb"), xsl);
+                let _ = std::fs::write(format!("{prefix}.L{layer_idx}.xn"), nsl);
+            }
+            // SOFUU_QKV_SNAP stage s1 (attn-norm out) — GPU mirror in the
+            // prefill gemm core.
+            if layer_idx == 0 {
+                if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    let nsl: Vec<u8> = self.x_norm_batch[0..b_size * dim]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    let _ = std::fs::write(format!("{prefix}.s1.xn"), &nsl);
+                }
+            }
 
             // ── Batched Q, K, V Projections via matmat ──────────
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
@@ -1095,6 +1134,26 @@ impl TransformerModel {
             }
 
             // ── Per-token QK-Norm ────────────────────────────────
+            if layer_idx == 0 {
+                if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    let seg = |src: &[f32], n: usize| -> Vec<u8> {
+                        src[..n].iter().flat_map(|v| v.to_le_bytes()).collect()
+                    };
+                    let _ = std::fs::write(
+                        format!("{prefix}.s2.qa"),
+                        seg(&self.q_batch, b_size * q_dim),
+                    );
+                    let _ = std::fs::write(
+                        format!("{prefix}.s2.ka"),
+                        seg(&self.k_batch, b_size * kv_dim),
+                    );
+                    let _ = std::fs::write(
+                        format!("{prefix}.s2.va"),
+                        seg(&self.v_batch, b_size * kv_dim),
+                    );
+                }
+            }
             if let Some(ref q_norm) = layer.attn_q_norm {
                 let q_norm_bytes = Self::tensor_slice(gguf, q_norm);
                 let q_norm_w = unsafe {
@@ -1160,6 +1219,34 @@ impl TransformerModel {
                     rope_freq_base,
                     rope_mode,
                 );
+            }
+
+            // SOFUU_QKV_SNAP s3 (K/V cache rows post k-norm+rope) + s4
+            // (q post q-norm+rope) — GPU mirror after kv_write/head_rmsnorm.
+            if layer_idx == 0 {
+                if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    let msl = self.config.max_seq_len;
+                    let hd = head_dim;
+                    let mut kseg = Vec::with_capacity(b_size * n_kv_heads * hd * 4);
+                    let mut vseg = kseg.clone();
+                    for kh in 0..n_kv_heads {
+                        let base = (kh * msl + start_pos) * hd;
+                        for i in base..base + b_size * hd {
+                            kseg.extend_from_slice(&self.k_cache[i].to_le_bytes());
+                        }
+                        for i in base..base + b_size * hd {
+                            vseg.extend_from_slice(&self.v_cache[i].to_le_bytes());
+                        }
+                    }
+                    let _ = std::fs::write(format!("{prefix}.s3.kc"), &kseg);
+                    let _ = std::fs::write(format!("{prefix}.s3.vc"), &vseg);
+                    let qsl: Vec<u8> = self.q_batch[0..b_size * q_dim]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    let _ = std::fs::write(format!("{prefix}.s4.qa"), &qsl);
+                }
             }
 
             // ── Multi-Head / Grouped-Query Attention for batch ───
@@ -2838,6 +2925,10 @@ impl TransformerModel {
             }};
         }
 
+        // SOFUU_LAYER_SNAP: split the chunk into one command buffer PER
+        // LAYER and dump xn/x after each — the L-granularity divergence pin
+        // against the CPU tiles' SOFUU_LAYER_SNAP (the slab is unreadable
+        // mid-buffer otherwise).
         assert!(g.engine.batch_open());
         for layer_idx in 0..self.config.n_layers {
             let l = &self.layers[layer_idx];
@@ -3144,6 +3235,14 @@ impl TransformerModel {
             for (t, item) in pbb.iter_mut().enumerate() {
                 *item = (start_pos + t) as u32;
             }
+            if let Some(prefix) = std::env::var_os("SOFUU_LAYER_SNAP") {
+                let prefix = prefix.to_string_lossy().to_string();
+                let esl: Vec<u8> = ph_buf[pslots.x / 4..pslots.x / 4 + b * dim]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let _ = std::fs::write(format!("{prefix}.emb"), &esl);
+            }
             // rope table: EXACT mirror of sofuu_rope_fill_rows —
             // freqs[j] = 1/powf(base, 2j/hd) (f32 powf), theta = pos × freq,
             // layout [row] = cos(hd/2) | sin(hd/2). The kernels take this
@@ -3278,8 +3377,14 @@ impl TransformerModel {
             }};
         }
 
-        assert!(g.engine.batch_open());
+        let layer_snap = std::env::var_os("SOFUU_LAYER_SNAP").is_some();
+        if !layer_snap {
+            assert!(g.engine.batch_open());
+        }
         for layer_idx in 0..self.config.n_layers {
+            if layer_snap {
+                assert!(g.engine.batch_open());
+            }
             let l = &self.layers[layer_idx];
             let attn_norm_off = gguf.data_offset + l.attn_norm.offset;
             let ffn_norm_off = gguf.data_offset + l.ffn_norm.offset;
@@ -3300,6 +3405,31 @@ impl TransformerModel {
                 pbuf, pslots.xn,
                 dim, norm_eps, b,
             );
+            // SOFUU_QKV_SNAP=<prefix> (layer 0): stage bisect of the L0
+            // attention entry — s1 attn-norm out, s2 qkv-gemm out (pre-norm),
+            // s3 K/V cache rows after kv_write (post k-norm+rope), s4 qa after
+            // head_rmsnorm (post q-norm+rope). Same checkpoints exist in the
+            // CPU tiles path.
+            if layer_idx == 0 {
+                if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    if !g.engine.batch_end() {
+                        return false;
+                    }
+                    let lt = g.pref_act.as_ref().unwrap();
+                    let lp: &[f32] = unsafe {
+                        std::slice::from_raw_parts(lt.as_ptr() as *const f32, pref_bytes / 4)
+                    };
+                    let seg = |off: usize, n: usize| -> Vec<u8> {
+                        lp[off / 4..off / 4 + n]
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect()
+                    };
+                    let _ = std::fs::write(format!("{prefix}.s1.xn"), seg(pslots.xn, b * dim));
+                    assert!(g.engine.batch_open());
+                }
+            }
             let qkv_fused = gemm_fused!(
                 [
                     (&l.attn_q, q_rows as u32, pslots.qa, q_rows as u32),
@@ -3312,6 +3442,28 @@ impl TransformerModel {
                 gemm!(l.attn_q, pslots.xn, pslots.qa, q_rows, dim);
                 gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
                 gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
+            }
+            if layer_idx == 0 {
+                if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    if !g.engine.batch_end() {
+                        return false;
+                    }
+                    let lt = g.pref_act.as_ref().unwrap();
+                    let lp: &[f32] = unsafe {
+                        std::slice::from_raw_parts(lt.as_ptr() as *const f32, pref_bytes / 4)
+                    };
+                    let seg = |off: usize, n: usize| -> Vec<u8> {
+                        lp[off / 4..off / 4 + n]
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect()
+                    };
+                    let _ = std::fs::write(format!("{prefix}.s2.qa"), seg(pslots.qa, b * q_rows));
+                    let _ = std::fs::write(format!("{prefix}.s2.ka"), seg(pslots.ka, b * kv_rows));
+                    let _ = std::fs::write(format!("{prefix}.s2.va"), seg(pslots.va, b * kv_rows));
+                    assert!(g.engine.batch_open());
+                }
             }
 
             if !g.skip_attn {
@@ -3337,6 +3489,38 @@ impl TransformerModel {
                     has_q, norm_eps, rope_freq_base, rope_mode,
                     Some((pbuf, pslots.rope)),
                 );
+                if layer_idx == 0 {
+                    if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
+                        let prefix = prefix.to_string_lossy().to_string();
+                        if !g.engine.batch_end() {
+                            return false;
+                        }
+                        let lt = g.pref_act.as_ref().unwrap();
+                        let lp: &[f32] = unsafe {
+                            std::slice::from_raw_parts(lt.as_ptr() as *const f32, pref_bytes / 4)
+                        };
+                        let mut kseg =
+                            Vec::with_capacity(b * n_kv_heads * head_dim * 4);
+                        let mut vseg = kseg.clone();
+                        for kh in 0..n_kv_heads {
+                            let base = (kh * max_seq_len + start_pos) * head_dim;
+                            for i in base..base + b * head_dim {
+                                kseg.extend_from_slice(&self.k_cache[i].to_le_bytes());
+                            }
+                            for i in base..base + b * head_dim {
+                                vseg.extend_from_slice(&self.v_cache[i].to_le_bytes());
+                            }
+                        }
+                        let _ = std::fs::write(format!("{prefix}.s3.kc"), &kseg);
+                        let _ = std::fs::write(format!("{prefix}.s3.vc"), &vseg);
+                        let qsl: Vec<u8> = lp[pslots.qa / 4..pslots.qa / 4 + b * q_rows]
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect();
+                        let _ = std::fs::write(format!("{prefix}.s4.qa"), &qsl);
+                        assert!(g.engine.batch_open());
+                    }
+                }
                 // Per-pass TRUE chunk count for part/fin: the config-level
                 // meta_chunks (32 at msl 4096) spawns 131k mostly-early-return
                 // threadgroups on 32-head models when b=128 lands at pos>=128
@@ -3438,6 +3622,33 @@ impl TransformerModel {
                     g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
                 }
             }
+            if layer_snap {
+                if !g.engine.batch_end() {
+                    return false;
+                }
+                let lt = g.pref_act.as_ref().unwrap();
+                let lp: &[f32] = unsafe {
+                    std::slice::from_raw_parts(lt.as_ptr() as *const f32, pref_bytes / 4)
+                };
+                let xsl: Vec<u8> = lp[pslots.x / 4..pslots.x / 4 + b * dim]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let nsl: Vec<u8> = lp[pslots.xn / 4..pslots.xn / 4 + b * dim]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                if let Some(prefix) = std::env::var_os("SOFUU_LAYER_SNAP") {
+                    let prefix = prefix.to_string_lossy().to_string();
+                    let _ = std::fs::write(format!("{prefix}.L{layer_idx}.xb"), &xsl);
+                    let _ = std::fs::write(format!("{prefix}.L{layer_idx}.xn"), &nsl);
+                }
+                assert!(g.engine.batch_open());
+            }
+        }
+        if layer_snap {
+            // the logits tail (below) needs the encoder it assumes open
+            assert!(g.engine.batch_open());
         }
 
         // Last-row logits inside the same commit (output-norm + head GEMV).

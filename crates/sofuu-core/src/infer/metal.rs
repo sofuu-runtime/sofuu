@@ -4361,11 +4361,13 @@ mod q4k_crafted_probe {
                     &pos_buf, 0, b,
                     hd as u32, n_kv as u32, 4096,
                     1e-5, 10000.0, 0,
+                None,
                 );
                 engine.batch_head_rmsnorm_b4(
                     &slab_buf, oqa * 4, Some(&nw_buf), 0,
                     &pos_buf, 0, b,
                     hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                None,
                 );
                 engine.batch_llama_attn_part_b4(
                     &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
@@ -4401,6 +4403,7 @@ mod q4k_crafted_probe {
                                 &pos_buf, 0, b,
                                 hd as u32, n_kv as u32, 4096,
                                 1e-5, 10000.0, 0,
+                            None,
                             );
                         }
                     }
@@ -4422,6 +4425,7 @@ mod q4k_crafted_probe {
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
                             1e-5, 10000.0, 0,
+                        None,
                         );
                         engine.batch_llama_attn_part_b4(
                             &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
@@ -4450,11 +4454,13 @@ mod q4k_crafted_probe {
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
                             1e-5, 10000.0, 0,
+                        None,
                         );
                         engine.batch_head_rmsnorm_b4(
                             &slab_buf, oqa * 4, Some(&nw_buf), 0,
                             &pos_buf, 0, b,
                             hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                        None,
                         );
                     }
                     "kv" => {
@@ -4465,6 +4471,7 @@ mod q4k_crafted_probe {
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
                             1e-5, 10000.0, 0,
+                        None,
                         );
                     }
                     "qn" => {
@@ -4472,6 +4479,7 @@ mod q4k_crafted_probe {
                             &slab_buf, oqa * 4, Some(&nw_buf), 0,
                             &pos_buf, 0, b,
                             hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
+                        None,
                         );
                     }
                     "part" => {
@@ -4669,6 +4677,7 @@ mod q4k_crafted_probe {
             &slab_buf, pos_off, b,
             hd as u32, n_kv as u32, max_seq as u32,
             eps, rope_base, rope_mode,
+        None,
         );
         engine.batch_head_rmsnorm_b4(
             &slab_buf, q_off,
@@ -4676,6 +4685,7 @@ mod q4k_crafted_probe {
             &slab_buf, pos_off,
             b,
             hd as u32, n_heads as u32, 1, eps, rope_base, rope_mode,
+        None,
         );
         engine.batch_llama_attn_part_b4(
             &slab_buf, q_off, &kc_buf, 0, &vc_buf, 0,
@@ -5960,9 +5970,9 @@ fn attn_glue_b4_fault_isolation_1b() {
         }
         run_isolated!("kv_write_b4", engine.batch_llama_kv_write_b4(
             k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32));
+            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, None));
         run_isolated!("head_rmsnorm_b4", engine.batch_head_rmsnorm_b4(
-            q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32));
+            q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, None));
         run_isolated!("attn_part_b4", engine.batch_llama_attn_part_b4(
             q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
             hd, nh, nkv, max_seq, ncm, meta_per_layer as u32));
@@ -5971,9 +5981,9 @@ fn attn_glue_b4_fault_isolation_1b() {
         run_isolated!("ALL-IN-ONE", {
             engine.batch_llama_kv_write_b4(
                 k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32);
+                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, None);
             engine.batch_head_rmsnorm_b4(
-                q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32);
+                q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, None);
             engine.batch_llama_attn_part_b4(
                 q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
                 hd, nh, nkv, max_seq, ncm, meta_per_layer as u32);
@@ -5987,5 +5997,116 @@ fn attn_glue_b4_fault_isolation_1b() {
     assert!(faults.is_empty(), "attention-glue faults at 1B shapes: {faults:?}");
     for (p, a) in &ptrs {
         unsafe { libc::munmap(*p as *mut libc::c_void, *a) };
+    }
+}
+
+/// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape
+/// (b=2 rows, 2 priors, 32 heads / 8 kv / hd 64). The CPU mirror is the
+/// textbook serial attention: causal softmax(q·k/√hd) × v over priors.
+/// Deviation beyond f32-noise = the divergence the KV diff attributed to
+/// the attention output. Run: cargo test -- --ignored --test-threads=1
+#[test]
+#[ignore]
+fn attn_1c_values_micro_shape() {
+    let nh = 32usize;
+    let nkv = 8usize;
+    let hd = 64usize;
+    let b = 2usize;
+    let priors = 2usize;
+    let mut state = 0xfeedbeefcafeu64;
+    let mut rand = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) % 2003) as f32 / 1000.0f32 - 1.0f32
+    };
+    let q: Vec<f32> = (0..b * nh * hd).map(|_| rand()).collect();
+    let kc: Vec<f32> = (0..nkv * priors * hd).map(|_| rand()).collect();
+    let vc: Vec<f32> = (0..nkv * priors * hd).map(|_| rand()).collect();
+    let posb: Vec<u32> = (0..b).map(|t| (priors - b + t) as u32).collect();
+    let mut expected = vec![0f32; b * nh * hd];
+    for row in 0..b {
+        let pos = posb[row] as usize;
+        for h in 0..nh {
+            let kvh = h * nkv / nh;
+            let qo = (row * nh + h) * hd;
+            let mut mx = f32::NEG_INFINITY;
+            let mut scores = vec![0f32; pos + 1];
+            for t in 0..=pos {
+                let ko = (kvh * priors + t) * hd;
+                let s: f32 = (0..hd).map(|i| q[qo + i] * kc[ko + i]).sum();
+                scores[t] = s / (hd as f32).sqrt();
+                if scores[t] > mx { mx = scores[t]; }
+            }
+            let esum: f32 = scores.iter().map(|s| (s - mx).exp()).sum();
+            for i in 0..hd {
+                let mut acc = 0f32;
+                for t in 0..=pos {
+                    let vo = (kvh * priors + t) * hd;
+                    acc += vc[vo + i] * ((scores[t] - mx).exp() / esum);
+                }
+                expected[(row * nh + h) * hd + i] = acc;
+            }
+        }
+    }
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    let alloc = |bytes: usize| bytes.div_ceil(page) * page;
+    let engine = MetalEngine::new().expect("engine");
+    let mut ptrs: Vec<(*mut u8, usize)> = Vec::new();
+    let mut sub: Vec<(*mut u8, MetalBuffer, usize)> = Vec::new();
+    for f in [&q, &kc, &vc, &expected] {
+        let sz = alloc(f.len() * 4);
+        let p = mk(sz);
+        ptrs.push((p, sz));
+        unsafe { std::ptr::copy_nonoverlapping(f.as_ptr() as *const u8, p, f.len() * 4) };
+        let buf = engine.register_zerocopy_only(unsafe {
+            std::slice::from_raw_parts_mut(p, sz)
+        }).expect("reg");
+        sub.push((p, buf, f.len()));
+    }
+    let pos_sz = alloc(b * 4);
+    let posptr = mk(pos_sz);
+    ptrs.push((posptr, pos_sz));
+    for (t, v) in posb.iter().enumerate() {
+        unsafe { (posptr as *mut u32).add(t).write_unaligned(*v) };
+    }
+    let posbuf = engine.register_zerocopy_only(unsafe {
+        std::slice::from_raw_parts_mut(posptr, pos_sz)
+    }).expect("reg pos");
+    let q_buf = (&sub[0].1, &sub[1].1, &sub[2].1, &sub[3].1);
+    let (kc_buf, vc_buf, out_buf) = (q_buf.1, q_buf.2, q_buf.3);
+    let dispatched = {
+        assert!(engine.batch_open());
+        let ok = engine.batch_llama_attn_1c_b4(
+            q_buf.0, 0,
+            kc_buf, 0,
+            vc_buf, 0,
+            out_buf, 0,
+            &posbuf, 0,
+            b,
+            hd as u32, nh as u32, nkv as u32, priors as u32,
+            None,
+        );
+        engine.batch_end();
+        ok
+    };
+    assert!(dispatched, "attn_1c PSO unavailable");
+    // read back the out region and compare
+    let mut worst = 0f32;
+    let mut wi = 0usize;
+    for (i, e) in expected.iter().enumerate() {
+        let g = unsafe { (sub[3].0 as *const f32).add(i).read() };
+        let d = (g - e).abs();
+        if d > worst { worst = d; wi = i; }
+        assert!(d <= 1e-3, "attn_1c value mismatch at idx {i}: gpu={g:.6} cpu={e:.6}");
+    }
+    println!("[attn_1c] micro-shape worst|d|={worst:.3e} at idx {wi} — VALUES PASS");
+    for (p, sz) in &ptrs {
+        unsafe { libc::munmap(*p as *mut libc::c_void, *sz) };
     }
 }

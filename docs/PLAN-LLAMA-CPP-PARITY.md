@@ -527,3 +527,50 @@ order reaching tie-heavy argmaxes, same family as the KV projection
 noise). Per-model DEFAULT flips need the per-model defaults machinery
 (peer: per-model spec/pool defaults) — until then SOFUU_Q4K_COALESCED=2
 per-run stays the documented fast path for Spark/MiniCPM-class models.
+
+## ROOT CAUSE PINNED (2026-10-22/23 — the P2-class fork is the act-quant arithmetic class, NOT a kernel bug)
+Three receipts, one conclusion. The instruments: attn_1c_values_micro_shape
+(the 1c value oracle, b=2/priors=2/32h/8kv/hd64 — CPU mirror = textbook
+causal softmax attention) → **PASS, worst |Δ| 1.2e-7 = the 1c kernel is
+eliminated**; SOFUU_QKV_SNAP stage bisect at L0 (identical embeddings →
+s1 attn-norm out 2.4e-7 noise → **s2 qa/ka/va ALL ~1e-2, every value** →
+s3.vc inherits va unchanged through kv_write → s4/L0 downstream
+amplification) → **the divergence is born in the W_qkv GEMM values**;
+and the decisive real-weights oracle (Python q4_K dequant of
+blk.0.attn_q.weight straight from the GGUF, canonical get_scale_min_k4 +
+nibble math, f64 dot against the dumped s1.xn):
+- **python vs GPU gemm: worst 1.5e-6 (exact)** — the Metal q4_K GEMM is
+  canonical-correct.
+- **python vs CPU matmat: worst 1.5-1.8e-2, e.g. r1419 py=1.050925
+  gpu=1.050925 EXACT, cpu=1.047717** — the CPU side deviates.
+
+WHY (not a bug): the CPU batch gemm is the llama.cpp-class MMQ pipeline —
+`ggml_quantize_mat_q8_K_4x4_neon` q8_K activations + 8x4 packed-tile
+integer dot (dotprod_a76) — while the Metal gemm dequantizes and dots in
+f32 exactly. Two legitimate arithmetic classes; ~1e-2 relative is
+act-quant noise by design (same class as the Pi-5 receipts). llama.cpp
+GPU-vs-CPU text matches because ITS Metal MMQ also quantizes activations
+with the CPU-identical code; Sofuu's GPU gemm never got that treatment.
+Consequences, all consistent at last:
+- q4_K models (0.6B, 8B) CANNOT route-match text at tie-heavy argmaxes in
+  either direction — explains P2/P60 DIFFER + the c2-gate bug-class rows;
+  q8_0 models (1B) matched because both sides are exact there.
+- "GPU kernel bug" suspicion on q4_K gemm: RETRACTED (all three live
+  dispatch classes — tile-8, tile-32, fused-qkv — agree with each other
+  bit-for-bit and with canonical).
+- CPU route vs llama.cpp: UNCHANGED status (CPU = act-quant class both).
+
+## THE PARITY FIX (booked next session): Metal q8_Kx4 MMQ gemm
+Give the GPU gemm the CPU's exact feeds: host runs the SAME act-quant
+(sofuu ggml_quantize_mat_q8_K_4x4 semantics) on xn/ao/etc once, passes
+(q8_K bytes + per-block scales) to a Metal kernel that mirrors the CPU
+integer dot + per-block scale-deferral and per-block f32 association
+ORDER bit-for-bit, consuming the same packed-tile weight layout
+(sofuu_tile_lookup_p) so W-side reads are 1:1. Gate behind
+SOFUU_GPU_ACTQUANT=1 (default off), validate with the same SOFUU_QKV_SNAP
+stage bisect (s2 must go byte-identical), then re-gate P2/P60/P25
+full-text GPU-vs-CPU — that is the CPU-identical bar. Only after that do
+any route/coalesced default flips move. (Fallback ordering caveat: the
+tile repack cache must be populated before the GPU gemm reads it, or the
+kernel needs the unpacked-row form — decided at implementation when the
+tile lookup's lifetime is wired into the engine.)

@@ -3610,9 +3610,13 @@ impl TransformerModel {
                             blob[j][3] = *y_off as u32;
                             blob[j][4] = *y_stride as u32;
                         }
-                        // 64-row tile for the tall (gate/up) shapes, then the
-                        // 32-row tile, then the shipped 8-token multi
-                        g.engine.batch_gguf_gemm_tiled_wide_multi(
+                        // matrix pipe (LEDGER #7, opt-in), then the 64-row
+                        // tile for the tall (gate/up) shapes, then the 32-row
+                        // tile, then the shipped 8-token multi
+                        g.engine.batch_gguf_gemm_mma64_multi(
+                            *ty, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
+                            end as usize, $cols, b, &blob,
+                        ) || g.engine.batch_gguf_gemm_tiled_wide_multi(
                             *ty, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
                             end as usize, $cols, b, &blob,
                         ) || g.engine.batch_gguf_gemm_tiled_multi(

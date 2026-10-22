@@ -1428,3 +1428,42 @@ matrix pipe**.
 
 Arm C's verdict is hereby superseded: MMA is not a 1.2x curiosity, it is the
 only route, with ~9x of headroom over what we are currently doing.
+
+### The matrix pipe works: 2.1x on the kernel, NEAR-TIE on the text
+
+`gemm_q4_k_mma64` dequantizes a 32-value k-slice into fp16 threadgroup tiles
+(64 rows x 64 tokens, 128 threads, one simdgroup per 16-row band, 16 fp32
+accumulator fragments) and runs `simdgroup_multiply_accumulate`.
+
+| shape (B=128, q4_K) | fp32 32-row tile | mma64 |
+|---|---|---|
+| 6144x1024 | 1.28 | **3.00** |
+| 3072x1024 | 1.22 | **2.73** |
+| 1024x2048 | 1.16 | **2.08** |
+| 1024x4096 | 1.16 | **2.13** |
+
+Accuracy against the exact f32 CPU reference on 3072x1024/B=128:
+`worst_abs 9.7e-1` on a tensor scale of 6836 = **1.4e-4 abs/scale**, worst
+relative 2.8e-4. That is fp16-tile arithmetic (fp16 multiply, fp32 accumulate),
+the same class as llama.cpp's `mul_mm`, so it is gated at 2e-2 abs/scale rather
+than bit-parity, and text-gated separately: NEAR-TIE-CERTIFIED with
+`|dtop1| = 0.2770` against bound 1.165 — **bit-identical |dtop1| to the fp32
+path**, i.e. the drift belongs to the model, not to the fp16 tiles.
+
+End to end on the 0.6B, 123-token prefill: 324 ms -> **288 ms (1.13x)** while
+the kernel itself is 2.1x. The gap is the finding: the pass is no longer
+GEMM-bound. At 288 ms the GEMM share is ~140 ms, attention ~31 ms, and ~120 ms
+is norms / kv_write / per-op dispatch / the b<16 tail path. **The next prefill
+lever is that ~120 ms, not the matmul.**
+
+Two bugs worth recording, both caught by measurement rather than review:
+* fragment conventions are not guessable — a first version using
+  `ulong2(0, kk)` offsets and a transposed direct store produced 35x garbage;
+  matching `gemm_q4_k_mma`'s pointer-arithmetic loads plus a threadgroup
+  scratch store fixed it (1.4e-4);
+* the section-fused host loop under-flowed `rows_end - prev_end` on the padded
+  zero slots into ~4e9 rows -> 67M threadgroups -> a 21-second prefill. The
+  fused shaders already skip `rows_end <= prev_end`; the host loop now does too.
+
+MMA stays opt-in (`SOFUU_GPU_GEMM_MMA=1`) until the non-GEMM overhead is gone
+and the combined effect can be measured in one receipt.

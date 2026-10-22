@@ -4693,3 +4693,137 @@ kernel void peak_mma(device float *out [[buffer(0)]], uint tid [[thread_position
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tmp[0] == (half)12345.0f) { out[tid] = (float)tmp[1]; }
 }
+
+// ── the parity path: q4_K GEMM through the matrix pipe ─────────────────────
+// LEDGER #7: fp32 tops out at 2.1 TFLOP/s on this GPU while simdgroup_matrix
+// measures 18.8, and llama.cpp's 4.0 TFLOP/s is above the fp32 pipe entirely.
+// So prefill parity needs the matrix pipe: dequantize a k-slice into fp16
+// threadgroup tiles, then accumulate 8x8x8 fragments (fp16 multiply, fp32
+// accumulate - the same arithmetic class llama.cpp's mul_mm uses).
+//
+// Tile 64 rows x 64 tokens, 128 threads = 4 simdgroups, one per 16-row band.
+// Each simdgroup holds 2x8 = 16 accumulator fragments (32 registers/lane).
+// Fragment access follows gemm_q4_k_mma exactly (the one MMA kernel with a
+// passing parity test): BOTH tiles are stored [row][k] with k contiguous, A is
+// loaded with pointer arithmetic and transpose=false, B with transpose=true so
+// it reads as (k, token), and output goes through a threadgroup scratch rather
+// than a transposed direct store.
+#define MM_R 64
+#define MM_T 64
+#define MM_BK 32
+#define MM_PADK 40
+#define MM_THREADS 128
+
+kernel void gemm_q4_k_mma64(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]],
+    uint sgid                           [[simdgroup_index_in_threadgroup]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    threadgroup half ws[MM_R][MM_PADK];
+    threadgroup half xs[MM_T][MM_PADK];
+    threadgroup float oc[4][64];
+
+    uint r0 = tg.x * MM_R;
+    uint t0 = tg.y * MM_T;
+    uint nb = cols / 256;
+    uint nbk = cols / MM_BK;
+
+    simdgroup_matrix<float, 8, 8> acc[2][8];
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); }
+    }
+
+    uint srow = tid >> 1;          // 64 rows, 2 threads each
+    uint sk = (tid & 1) * 16;      // 16 of the 32 k values
+
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * MM_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        {
+            uint grow = r0 + srow;
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 144;
+                device const uchar *blk = w_base + row_byte + b * 144;
+                float d = float(read_f16(w_base, row_byte + b * 144));
+                float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+                uint8_t sc, m;
+                q4k_scale_min(blk + 4, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16 + 32 * (sub >> 1);
+                bool hi = (sub & 1) != 0;
+                for (uint u = 0; u < 16; ++u) {
+                    uint byte = (uint)qrow[sk + u];
+                    uint nib = hi ? (byte >> 4) : (byte & 0x0F);
+                    ws[srow][sk + u] = (half)(ds * (float)nib - mm);
+                }
+            } else {
+                for (uint u = 0; u < 16; ++u) { ws[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        {
+            uint gt = t0 + srow;
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + sk;
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint rl = sgid * 16;
+        for (uint kk = 0; kk < MM_BK; kk += 8) {
+            simdgroup_matrix<half, 8, 8> afr[2];
+            simdgroup_matrix<half, 8, 8> bfr[8];
+            simdgroup_load(afr[0], &ws[rl + 0][kk], MM_PADK, ulong2(0, 0), false);
+            simdgroup_load(afr[1], &ws[rl + 8][kk], MM_PADK, ulong2(0, 0), false);
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < 8; ++j) {
+                simdgroup_load(bfr[j], &xs[j * 8][kk], MM_PADK, ulong2(0, 0), true);
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], afr[i], bfr[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // epilogue: acc is (rows x tokens); y is token-major [B][rows]. Go through a
+    // threadgroup scratch (start of the loop, i.e. epilogue only) so the layout
+    // conversion is plain stores instead of a transposed simdgroup_store.
+    uint tbase = t0 + (sgid & 3);   // unused banding, kept simple below
+    (void)tbase;
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) {
+            simdgroup_store(acc[i][j], &oc[sgid][0], 8, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            uint grow = r0 + sgid * 16 + i * 8 + (lane >> 3);
+            uint gt = t0 + j * 8 + (lane & 7);
+            if (grow < rows && gt < B) {
+                y[(size_t)gt * rows + grow] = oc[sgid][lane];
+            }
+            // each lane holds row (lane>>3), token (lane&7); cover the other
+            // half of the 8x8 tile (rows 4..7) with a second pass
+            uint grow2 = r0 + sgid * 16 + i * 8 + ((lane >> 3) + 4);
+            if (grow2 < rows && gt < B) {
+                y[(size_t)gt * rows + grow2] = oc[sgid][lane + 32];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}

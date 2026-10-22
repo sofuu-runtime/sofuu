@@ -259,12 +259,14 @@ int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w_buf, size_t w_of
 int sofuu_metal_peak_fma16(void* ctx, void* out_buf, size_t n_blocks);
 int sofuu_metal_peak_fma(void* ctx, void* out_buf, size_t n_blocks);
 int sofuu_metal_peak_mma(void* ctx, void* out_buf, size_t n_blocks);
+int sofuu_metal_batch_gguf_gemm_mma64(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemm_tiled_r88(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemm_tiled_wide_multi(void* ctx, uint32_t ty, void* w_buf, size_t w_base_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows_total, size_t cols, size_t B, const uint32_t* secs, size_t n_sec);
 int sofuu_metal_batch_gguf_gemm_tiled_wide(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemm_mma(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t has_table);
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
+int sofuu_metal_batch_gguf_gemm_mma64_multi(void* ctx, uint32_t ty, void* w_buf, size_t w_base_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows_total, size_t cols, size_t B, const uint32_t* secs, size_t n_sec);
 int sofuu_metal_batch_gguf_gemm_tiled_multi(void* ctx, uint32_t ty, void* w_buf, size_t w_base_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows_total, size_t cols, size_t B, const uint32_t* secs, size_t n_sec);
 int sofuu_metal_batch_gguf_gemm_tiled_acc(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* res_buf, size_t res_offset, size_t res_stride, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w_buf, size_t w_base_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows_total, size_t cols, size_t B, const uint32_t* secs, size_t n_sec);

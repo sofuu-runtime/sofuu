@@ -50,6 +50,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_peak_fma16;
     id<MTLComputePipelineState> pso_peak_fma;
     id<MTLComputePipelineState> pso_peak_mma;
+    id<MTLComputePipelineState> pso_gemm_q4_k_mma64;
+    bool pso_gemm_q4_k_mma64_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_r88;
     bool pso_gemm_q4_k_tiled_r88_live;
     bool pso_gemm_q4_k_tiled_db_live;
@@ -339,6 +341,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_peak_fma16 = load_pso(@"peak_fma16");
         ctx->pso_peak_fma = load_pso(@"peak_fma");
         ctx->pso_peak_mma = load_pso(@"peak_mma");
+        ctx->pso_gemm_q4_k_mma64 = load_pso(@"gemm_q4_k_mma64");
+        ctx->pso_gemm_q4_k_mma64_live = ctx->pso_gemm_q4_k_mma64 != nil;
         ctx->pso_gemm_q4_k_tiled_r88 = load_pso(@"gemm_q4_k_tiled_r88");
         ctx->pso_gemm_q4_k_tiled_r88_live = ctx->pso_gemm_q4_k_tiled_r88 != nil;
         ctx->pso_gemm_q4_k_tiled_wide_fused = load_pso(@"gemm_q4_k_tiled_wide_fused");
@@ -1780,6 +1784,38 @@ int sofuu_metal_batch_gguf_gemm_tiled_r88(
                                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }
+int sofuu_metal_batch_gguf_gemm_mma64(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t B
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (rows == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (!ctx->pso_gemm_q4_k_mma64_live) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mma64];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint rn = (uint)rows;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
+    uint r_tiles = (uint)((rows + 63) / 64);
+    uint t_tiles = (uint)((B + 63) / 64);
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(r_tiles, t_tiles, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
 
 // arm-E: 64-row tiled variant (x staged once per 64 rows instead of 32).
 int sofuu_metal_batch_gguf_gemm_tiled_wide(
@@ -1855,6 +1891,56 @@ int sofuu_metal_batch_gguf_gemm_mma(
 // each weight row once per 64 tokens instead of once per 8. res_stride = 0
 // keeps the pure multi behaviour; the _acc entry synthesizes a one-section
 // table with res_stride != 0 for the o/down resid epilogue.
+// Section-fused MMA: the kernel is single-tensor, so sections are dispatched
+// back to back inside the caller's commit. Sections are independent (they write
+// disjoint y regions), and the fused benefit is x reuse in L2 plus one commit.
+int sofuu_metal_batch_gguf_gemm_mma64_multi(
+    void* ctx_ptr,
+    uint32_t ty,
+    void* w_buf_ptr, size_t w_base_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows_total, size_t cols, size_t B,
+    const uint32_t* secs, size_t n_sec
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (rows_total == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (!secs || n_sec == 0 || n_sec > 4) return 0;
+    if (ty != 12 || !ctx->pso_gemm_q4_k_mma64_live) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mma64];
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint prev_end = 0;
+    for (size_t s = 0; s < n_sec; ++s) {
+        const uint32_t* sec = secs + s * 5;
+        uint32_t off = sec[0];
+        uint32_t rem = sec[1];
+        uint32_t rows_end = sec[2];
+        uint32_t y_off = sec[3];
+        // padded slots carry rows_end == 0; they must never be interpreted as
+        // a span (rows_end < prev_end), the same rule the fused kernels use
+        if (rows_end <= prev_end) continue;
+        uint32_t rows_sec = rows_end - prev_end;
+        prev_end = rows_end;
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr
+                           offset:(w_base_offset + off) atIndex:0];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:(y_offset + y_off) atIndex:2];
+        [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [ctx->batch_enc setBytes:&rem length:sizeof(uint) atIndex:4];
+        [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
+        [ctx->batch_enc setBytes:&rows_sec length:sizeof(uint) atIndex:6];
+        uint r_tiles = (rows_sec + 63) / 64;
+        uint t_tiles = (B + 63) / 64;
+        [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(r_tiles, t_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    return 1;
+}
+
 int sofuu_metal_batch_gguf_gemm_tiled_multi(
     void* ctx_ptr,
     uint32_t ty,

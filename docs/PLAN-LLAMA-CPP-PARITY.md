@@ -686,3 +686,24 @@ ggml_quantize_mat_q8_K_4x4 on the CPU's xn; if quants match, diff the per-
 block d/scale order inside the shipped kernel by elimination against the
 remaining variants (s/sc/plain 8x4) empirically. The gate bar (default pair
 IDENTICAL/CERTIFIED) stays open until then; NO defaults moved.
+
+## TILE-VARIANT ELIMINATION (2026-10-23, mirror session 2)
+- Plain `ggml_gemm_q4_K_8x4_q8_K` (sc fallback): READ — f32/int structure is
+  IDENTICAL to the p kernel (per-sb fma, int bias, fused vmlsq; only q4 byte
+  fetch differs: interleaved-8-row tile vs expanded planes — a pure
+  permutation, value-identical). So p/plain are one numeric class; s/sc
+  (scale sidecars) likely too.
+- The env forcing test (NIBBLE_PLANES/Q4_SS/SCALE_SIDECAR) produces
+  bit-identical CPU values → the active kind didn't change → the shipped
+  CPU kernel vs my 5.4e-7-validated p-mirror mismatch (9.8e-2 / r0 −23%
+  cancellation-amplified) is NOT tile-kind selection.
+- A quick python sketch of the a76-per-32 dotprod candidate (~0.3% class at
+  r1419) was INCONCLUSIVE (sketch indexing bugs; not debugged this session).
+- Standing next step (unchanged): snap the GPU TileQ8K quants (xq8 region)
+  and host-quantize the CPU's s1.xn through ggml_quantize_mat_q8_K_4x4
+  semantics — that split decides quantizer-input vs kernel-order in one
+  receipt. r1419 evidence: CPU 1.047717 vs canon 1.050925 (−0.3%) = an
+  integer-actquant-class output of SOME pipeline, so the shipped kernel IS
+  an int pipeline; the 9.8e-2/r0 deltas are cancellation amplification of a
+  small systematic difference (prime suspect: q8-tile bsum interleave or
+  lane-mapping in my extraction, or a quant flip cascade).

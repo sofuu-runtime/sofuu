@@ -14,6 +14,12 @@ extern "C" {
 int sofuu_metal_batch_quantize_q8_k(void* ctx, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t cols, size_t B);
 int sofuu_metal_batch_gemm_q4_k_mmq(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gemm_q6_k_mmq(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
+// Per-32 a76 act-quant decode mirrors (SOFUU_DECODE_MMQ=1). The quantize
+// op covers nb_total = B*cols/32 blocks of the f32 rows in ONE dispatch;
+// the gemv mirrors consume the Q8Ext blocks (stride 40B: d, sum_x, qs[32]).
+int sofuu_metal_batch_quantize_q8_ext(void* ctx, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t nb_total);
+int sofuu_metal_batch_gemv_q4_k_mmq32(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
+int sofuu_metal_batch_gemv_q6_k_mmq32(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 
 // Returns true if running on macOS with an active Apple Silicon GPU.
 bool sofuu_metal_available(void);

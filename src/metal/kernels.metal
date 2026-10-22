@@ -3223,3 +3223,134 @@ kernel void gemm_q6_k_mmq(
     }
     y[(size_t)t * rows + row] = acc;
 }
+
+// ── Per-32 a76 act-quant decode mirrors (SOFUU_DECODE_MMQ=1) ────────────────
+// The CPU serial matvec (sofuu_gemv_q4_k/q6_k dotprod branches) quantizes the
+// activation per-32 to sofuu_q8_block_ext {d, sum_x, qs[32]} (POSITIVE d =
+// amax/127, round-nearest-even) and dots with integer sdot + explicit
+// (d_sc*dx)*acc − (m_sc*dx)*sum_x f32 ops in the CPU's sequential order.
+// These kernels mirror that bit-for-bit.
+struct Q8Ext { float d; int sum_x; char qs[32]; };
+
+// grid: (B*cols/32)
+kernel void quantize_q8_ext(
+    device const float *x   [[buffer(0)]],
+    device Q8Ext       *y   [[buffer(1)]],
+    uint gid             [[thread_position_in_grid]]
+) {
+    device const float *xb = x + (size_t)gid * 32;
+    float amax = 0.0f;
+    for (uint i = 0; i < 32; ++i) { float ax = fabs(xb[i]); if (ax > amax) amax = ax; }
+    float dd = amax / 127.0f;
+    float id = (dd > 0.0f) ? (127.0f / amax) : 0.0f;
+    device Q8Ext *o = y + gid;
+    o->d = dd;
+    int sum = 0;
+    for (uint i = 0; i < 32; ++i) {
+        int q = (int)rint(xb[i] * id);
+        o->qs[i] = (char)q;
+        sum += q;
+    }
+    o->sum_x = sum;
+}
+
+// grid: (rows,) — q4_K
+kernel void gemv_q4_k_mmq32(
+    device const uchar  *w_base [[buffer(0)]],
+    device const Q8Ext  *xq     [[buffer(1)]],
+    device float        *y      [[buffer(2)]],
+    constant uint       &cols   [[buffer(3)]],
+    constant uint       &w_rem  [[buffer(4)]],
+    uint gid              [[thread_position_in_grid]]
+) {
+    uint row = gid;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    float total = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmn = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        for (uint j = 0; j < 4; ++j) {
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            q4k_scale_min(scales, j * 2 + 0, &sc_lo, &m_lo);
+            q4k_scale_min(scales, j * 2 + 1, &sc_hi, &m_hi);
+            float d1 = d * (float)sc_lo;
+            float m1 = dmn * (float)m_lo;
+            float d2 = d * (float)sc_hi;
+            float m2 = dmn * (float)m_hi;
+            device const Q8Ext *xl = xq + (size_t)b * 8 + j * 2;
+            device const Q8Ext *xh = xq + (size_t)b * 8 + j * 2 + 1;
+            int acc_lo = 0, acc_hi = 0;
+            for (uint k = 0; k < 32; ++k) {
+                uchar wq = qs[j * 32 + k];
+                acc_lo += (int)(wq & 0x0F) * (int)xl->qs[k];
+                acc_hi += (int)(wq >> 4)   * (int)xh->qs[k];
+            }
+            total += (d1 * xl->d) * (float)acc_lo - (m1 * xl->d) * (float)xl->sum_x;
+            total += (d2 * xh->d) * (float)acc_hi - (m2 * xh->d) * (float)xh->sum_x;
+        }
+    }
+    y[row] = total;
+}
+
+// grid: (rows,) — q6_K
+kernel void gemv_q6_k_mmq32(
+    device const uchar  *w_base [[buffer(0)]],
+    device const Q8Ext  *xq     [[buffer(1)]],
+    device float        *y      [[buffer(2)]],
+    constant uint       &cols   [[buffer(3)]],
+    constant uint       &w_rem  [[buffer(4)]],
+    uint gid              [[thread_position_in_grid]]
+) {
+    uint row = gid;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    float total = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = ql + 128;
+        device const uchar *sc = qh + 64;
+        for (uint hh = 0; hh < 2; ++hh) {
+            for (uint part = 0; part < 2; ++part) {
+                uint l_base = part * 16;
+                float a[4]; int32_t acc4[4];
+                for (uint qn = 0; qn < 4; ++qn) acc4[qn] = 0;
+                for (uint j = 0; j < 16; ++j) {
+                    uint m = l_base + j;
+                    uchar ql0 = ql[hh * 64 + l_base + j];
+                    uchar ql2 = ql[hh * 64 + l_base + j + 32];
+                    uchar qhb = qh[hh * 32 + l_base + j];
+                    int v1 = (int)((ql0 & 0x0F) | (((qhb >> 0) & 3) << 4)) - 32;
+                    int v2 = (int)((ql2 & 0x0F) | (((qhb >> 2) & 3) << 4)) - 32;
+                    int v3 = (int)(((ql0 >> 4) | (((qhb >> 4) & 3) << 4))) - 32;
+                    int v4 = (int)(((ql2 >> 4) | (((qhb >> 6) & 3) << 4))) - 32;
+                    device const Q8Ext *xg0 = xq + (size_t)b * 8 + hh * 4 + 0;
+                    device const Q8Ext *xg1 = xq + (size_t)b * 8 + hh * 4 + 1;
+                    device const Q8Ext *xg2 = xq + (size_t)b * 8 + hh * 4 + 2;
+                    device const Q8Ext *xg3 = xq + (size_t)b * 8 + hh * 4 + 3;
+                    acc4[0] += v1 * (int)xg0->qs[m];
+                    acc4[1] += v2 * (int)xg1->qs[m];
+                    acc4[2] += v3 * (int)xg2->qs[m];
+                    acc4[3] += v4 * (int)xg3->qs[m];
+                }
+                uint hs = hh * 8 + part;
+                float s0 = d * (float)(signed char)sc[hs + 0];
+                float s2 = d * (float)(signed char)sc[hs + 2];
+                float s4 = d * (float)(signed char)sc[hs + 4];
+                float s6 = d * (float)(signed char)sc[hs + 6];
+                device const Q8Ext *xg0 = xq + (size_t)b * 8 + hh * 4 + 0;
+                device const Q8Ext *xg1 = xq + (size_t)b * 8 + hh * 4 + 1;
+                device const Q8Ext *xg2 = xq + (size_t)b * 8 + hh * 4 + 2;
+                device const Q8Ext *xg3 = xq + (size_t)b * 8 + hh * 4 + 3;
+                total += (s0 * xg0->d) * (float)acc4[0];
+                total += (s2 * xg1->d) * (float)acc4[1];
+                total += (s4 * xg2->d) * (float)acc4[2];
+                total += (s6 * xg3->d) * (float)acc4[3];
+            }
+        }
+    }
+    y[row] = total;
+}

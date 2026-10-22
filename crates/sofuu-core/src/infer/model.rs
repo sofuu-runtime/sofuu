@@ -2352,6 +2352,9 @@ impl TransformerModel {
     }
 
     fn ggpu_head(&mut self) -> bool {
+        let decode_mmq_head = std::env::var("SOFUU_DECODE_MMQ")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if let Some(g) = self.gpu.as_mut() {
             let dim = self.config.dim;
             let vocab = self.config.vocab_size;
@@ -2360,13 +2363,28 @@ impl TransformerModel {
             dst[..dim].copy_from_slice(&self_x[..dim]);
             let off = g.w_offset(&self.gguf, &self.output);
             assert!(g.engine.batch_open());
-            g.engine.batch_gguf(
-                self.output.tensor_type,
-                &g.w_buf, off,
-                &g.act_buf, g.slots.xn,
-                &g.act_buf, g.slots.logits,
-                vocab, dim,
-            );
+            {
+                // q6-only decode head mirror (same probe receipt as above).
+                let mmqh = decode_mmq_head
+                    && self.output.tensor_type == GGML_TYPE_Q6_K
+                    && g.engine.batch_quantize_q8_k(
+                        &g.act_buf, g.slots.xn, &g.act_buf, g.slots.xq8e, dim, 1,
+                    )
+                    && g.engine.batch_gemm_q6_k_mmq(
+                        &g.w_buf, off,
+                        &g.act_buf, g.slots.xq8e, &g.act_buf, g.slots.logits,
+                        vocab, dim, 1,
+                    );
+                if !mmqh {
+                    g.engine.batch_gguf(
+                        self.output.tensor_type,
+                        &g.w_buf, off,
+                        &g.act_buf, g.slots.xn,
+                        &g.act_buf, g.slots.logits,
+                        vocab, dim,
+                    );
+                }
+            }
             if !g.engine.batch_end() {
                 return false;
             }
@@ -2426,6 +2444,33 @@ impl TransformerModel {
 
         let g = self.gpu.as_mut().expect("one_commit without gpu");
         let token_commit = g.token_commit && start_layer == 0 && end_layer == self.config.n_layers;
+
+        // SOFUU_DECODE_MMQ=1: per-token GEMVs through the act-quantized
+        // kernels that bit-mirror the CPU's a76 dotprod serial matvec (the
+        // decode-parity counterpart of SOFUU_GPU_TILE_MMQ).
+        let decode_mmq = std::env::var("SOFUU_DECODE_MMQ")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        macro_rules! dec_gguf {
+            ($tv:expr, $w_off:expr, $src:expr, $dst:expr, $rows:expr, $cols:expr) => {{
+                // q6_K only: the q6 tile GEMV is numerically the per-256
+                // batch-mmq pipeline at B=1 (probe-exact); the q4 tile GEMV
+                // uses its own blocklen-8 interleave — booked separately.
+                let mmqd = decode_mmq
+                    && $tv.tensor_type == GGML_TYPE_Q6_K
+                    && g.engine.batch_quantize_q8_k(
+                        &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
+                    )
+                    && g.engine.batch_gemm_q6_k_mmq(
+                        &g.w_buf, $w_off, &g.act_buf, g.slots.xq8e,
+                        &g.act_buf, $dst, $rows, $cols, 1,
+                    );
+                if !mmqd {
+                    g.engine.batch_gguf($tv.tensor_type, &g.w_buf, $w_off,
+                        &g.act_buf, $src, &g.act_buf, $dst, $rows, $cols);
+                }
+            }};
+        }
         g.slot_f32_mut(g.slots.x, dim).copy_from_slice(&self.x[..dim]);
         let prof = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
         let t_start = std::time::Instant::now();
@@ -2460,18 +2505,12 @@ impl TransformerModel {
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps,
             );
-            g.engine.batch_gguf(l.attn_q.tensor_type, &g.w_buf,
-                gguf.data_offset + l.attn_q.offset,
-                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.qa,
-                n_heads * head_dim, dim);
-            g.engine.batch_gguf(l.attn_k.tensor_type, &g.w_buf,
-                gguf.data_offset + l.attn_k.offset,
-                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.ka,
-                n_kv_heads * head_dim, dim);
-            g.engine.batch_gguf(l.attn_v.tensor_type, &g.w_buf,
-                gguf.data_offset + l.attn_v.offset,
-                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.va,
-                n_kv_heads * head_dim, dim);
+            dec_gguf!(l.attn_q, gguf.data_offset + l.attn_q.offset,
+                g.slots.xn, g.slots.qa, n_heads * head_dim, dim);
+            dec_gguf!(l.attn_k, gguf.data_offset + l.attn_k.offset,
+                g.slots.xn, g.slots.ka, n_kv_heads * head_dim, dim);
+            dec_gguf!(l.attn_v, gguf.data_offset + l.attn_v.offset,
+                g.slots.xn, g.slots.va, n_kv_heads * head_dim, dim);
             let run_attn = !g.skip_attn;
             if run_attn {
             g.engine.batch_llama_kv_write(
@@ -2536,10 +2575,8 @@ impl TransformerModel {
                 eprintln!("[trace] L{layer_idx} pos{pos} attn_out_rms={r:.6}");
             }
             }
-            g.engine.batch_gguf(l.attn_output.tensor_type, &g.w_buf,
-                gguf.data_offset + l.attn_output.offset,
-                &g.act_buf, g.slots.ao, &g.act_buf, g.slots.xo,
-                dim, n_heads * head_dim);
+            dec_gguf!(l.attn_output, gguf.data_offset + l.attn_output.offset,
+                g.slots.ao, g.slots.xo, dim, n_heads * head_dim);
             g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
             g.engine.batch_rmsnorm_f32w(
                 &g.act_buf, g.slots.x,
@@ -2549,19 +2586,13 @@ impl TransformerModel {
             );
             let run_ffn = !g.skip_ffn;
             if run_ffn {
-            g.engine.batch_gguf(l.ffn_gate.tensor_type, &g.w_buf,
-                gguf.data_offset + l.ffn_gate.offset,
-                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.gate,
-                hidden_dim, dim);
-            g.engine.batch_gguf(l.ffn_up.tensor_type, &g.w_buf,
-                gguf.data_offset + l.ffn_up.offset,
-                &g.act_buf, g.slots.xn, &g.act_buf, g.slots.up,
-                hidden_dim, dim);
+            dec_gguf!(l.ffn_gate, gguf.data_offset + l.ffn_gate.offset,
+                g.slots.xn, g.slots.gate, hidden_dim, dim);
+            dec_gguf!(l.ffn_up, gguf.data_offset + l.ffn_up.offset,
+                g.slots.xn, g.slots.up, hidden_dim, dim);
             g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim);
-            g.engine.batch_gguf(l.ffn_down.tensor_type, &g.w_buf,
-                gguf.data_offset + l.ffn_down.offset,
-                &g.act_buf, g.slots.gate, &g.act_buf, g.slots.xo,
-                dim, hidden_dim);
+            dec_gguf!(l.ffn_down, gguf.data_offset + l.ffn_down.offset,
+                g.slots.gate, g.slots.xo, dim, hidden_dim);
             g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
             }
             if !token_commit && !g.engine.batch_end() {
@@ -4360,6 +4391,7 @@ struct GgufGpuSlots {
     gate: usize,
     up: usize,
     logits: usize,
+    xq8e: usize,
 }
 
 /// P1 (llama.cpp parity): B-row GEMM prefill slab layout (byte offsets
@@ -4517,6 +4549,10 @@ impl GgufGpu {
             gate: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
             up: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
             logits: gguf_gpu_slot(&mut cursor, SPEC_B * vocab),
+            xq8e: gguf_gpu_slot(
+                &mut cursor,
+                (dim.max(q_rows).max(inter.max(dim)) / 32) * 10,
+            ),
         };
         let act_bytes = gguf_gpu_page(cursor);
         let act = crate::infer::model::AnonBuffer::new(act_bytes / 4);

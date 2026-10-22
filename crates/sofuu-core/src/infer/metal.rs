@@ -676,6 +676,26 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, B: usize,
     ) -> i32;
+    fn sofuu_metal_batch_quantize_q8_ext(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        nb_total: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gemv_q4_k_mmq32(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        xq_buf: *mut c_void, xq_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gemv_q6_k_mmq32(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        xq_buf: *mut c_void, xq_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_multi(
         ctx: *mut c_void,
         ty: u32,
@@ -1211,6 +1231,68 @@ impl MetalEngine {
                 xq_buf.handle, xq_offset,
                 y_buf.handle, y_offset,
                 rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// Per-32 act-quant (a76 class): B*cols/32 Q8Ext blocks (stride 40B).
+    pub fn batch_quantize_q8_ext(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        nb_total: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_quantize_q8_ext(
+                self.ctx,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                nb_total,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// q4_K decode gemv mirror: consumes Q8Ext activations, mirrors the CPU
+    /// dotprod-a76 summation order bit-for-bit (y = [rows]).
+    pub fn batch_gemv_q4_k_mmq32(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        xq_buf: &MetalBuffer, xq_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gemv_q4_k_mmq32(
+                self.ctx,
+                w_buf.handle, w_offset,
+                xq_buf.handle, xq_offset,
+                y_buf.handle, y_offset,
+                rows, cols,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// q6_K decode gemv mirror (same class contract as q4).
+    pub fn batch_gemv_q6_k_mmq32(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        xq_buf: &MetalBuffer, xq_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gemv_q6_k_mmq32(
+                self.ctx,
+                w_buf.handle, w_offset,
+                xq_buf.handle, xq_offset,
+                y_buf.handle, y_offset,
+                rows, cols,
             ) == 1
         };
         self.op_tock(K_GGUF_GEMM, __t);
@@ -6405,6 +6487,90 @@ fn mmq_tile_value_probe() {
     }
     unsafe { libc::munmap(wp6 as *mut libc::c_void, wsz6) };
     unsafe { libc::munmap(op6 as *mut libc::c_void, osz6) };
+
+    // ── per-32 decode gemv section (batch = 1 token) ───────────────
+    extern "C" {
+        fn sofuu_gemv_q4_k(
+            w: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize,
+        );
+        fn sofuu_gemv_q6_k(
+            w: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize,
+        );
+    }
+    let x1: Vec<f32> = x[..cols].to_vec();
+    // CPU references (production parity: warm first so the tile gemv is live;
+    // the mmq32 mirror targets the DOTPROD path — force it via warm miss on
+    // shape? rows=8/cols=256 IS tile-eligible → the shipped gemv takes the
+    // TILE path. The mmq32 target is the dotprod class; compare honestly):
+    let mut cq4 = vec![0f32; rows];
+    let mut cq6 = vec![0f32; rows];
+    unsafe {
+        sofuu_gemv_q4_k(w.as_ptr(), x1.as_ptr(), cq4.as_mut_ptr(), rows, cols);
+        sofuu_gemv_q6_k(w6.as_ptr(), x1.as_ptr(), cq6.as_mut_ptr(), rows, cols);
+    }
+    let nb_total = cols / 32;
+    let (qp2, qsz2) = mk(nb_total * 40);
+    let q2_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(qp2, qsz2) }).expect("q2");
+    let (yp4, ysz4) = mk(rows * 4);
+    let y4_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(yp4, ysz4) }).expect("y4");
+    let (yp6, ysz6) = mk(rows * 4);
+    let y6_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(yp6, ysz6) }).expect("y6");
+    // x1 into a page buffer
+    let (xp1, xsz1) = mk(x1.len() * 4);
+    unsafe { std::ptr::copy_nonoverlapping(x1.as_ptr() as *const u8, xp1, x1.len() * 4) };
+    let x1_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(xp1, xsz1) }).expect("x1");
+    let d32 = {
+        assert!(engine.batch_open());
+        let okq = engine.batch_quantize_q8_ext(&x1_buf, 0, &q2_buf, 0, nb_total);
+        let g4 = okq && engine.batch_gemv_q4_k_mmq32(&w_buf, 0, &q2_buf, 0, &y4_buf, 0, rows, cols);
+        let g6 = okq && engine.batch_gemv_q6_k_mmq32(&w6_buf, 0, &q2_buf, 0, &y6_buf, 0, rows, cols);
+        engine.batch_end();
+        okq && g4 && g6
+    };
+    assert!(d32, "q32 PSO unavailable");
+    let mut w432 = 0f32;
+    let mut w632 = 0f32;
+    for r in 0..rows {
+        let g4 = unsafe { (yp4 as *const f32).add(r).read() };
+        let g6 = unsafe { (yp6 as *const f32).add(r).read() };
+        let d4 = (cq4[r] - g4).abs();
+        let d6 = (cq6[r] - g6).abs();
+        if d4 > w432 { w432 = d4; }
+        if d6 > w632 { w632 = d6; }
+    }
+    eprintln!("[probe] q32 gemv4 CPU-vs-GPU worst={w432:.4e} | gemv6 CPU-vs-GPU worst={w632:.4e}");
+    // decide the decode mirror target: CPU TILE GEMV (b=1) vs the per-256
+    // batch-mmq kernels at B=1 (the q4 probe's host model, token 0 of the
+    // same activations). NB: the per-256 runs also verify at batch=1.
+    let mut g4_256 = vec![0f32; rows];
+    let mut g6_256 = vec![0f32; rows];
+    let xq8_256_bytes = (cols / 256) * 260;
+    let (qpx, qsx) = mk(xq8_256_bytes);
+    let qx_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(qpx, qsx) }).expect("qx");
+    let (ypx, ysx) = mk(rows * 4);
+    let yx_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(ypx, ysx) }).expect("yx");
+    let ok256 = {
+        assert!(engine.batch_open());
+        let q_ok = engine.batch_quantize_q8_k(&x1_buf, 0, &qx_buf, 0, cols, 1);
+        let g4 = q_ok && engine.batch_gemm_q4_k_mmq(&w_buf, 0, &qx_buf, 0, &yx_buf, 0, rows, cols, 1);
+        g4 && engine.batch_gemm_q6_k_mmq(&w6_buf, 0, &qx_buf, 0, &yx_buf, 0, rows, cols, 1)
+            && { engine.batch_end(); true }
+    };
+    assert!(ok256, "per-256 B=1 dispatch failed");
+    let mut d4_256 = 0f32;
+    let mut d6_256 = 0f32;
+    for r in 0..rows {
+        let g = unsafe { (ypx as *const f32).add(r).read() };
+        d4_256 = d4_256.max((cq4[r] - g).abs());
+        d6_256 = d6_256.max((cq6[r] - g).abs());
+    }
+    eprintln!("[probe] DECODE-TARGET check: gemv4-tile vs per-256-mmq worst={d4_256:.4e} | gemv6-tile vs per-256-mmq worst={d6_256:.4e}");
+    unsafe { libc::munmap(qpx as *mut libc::c_void, qsx) };
+    unsafe { libc::munmap(ypx as *mut libc::c_void, ysx) };
+    unsafe { libc::munmap(qp2 as *mut libc::c_void, qsz2) };
+    unsafe { libc::munmap(yp4 as *mut libc::c_void, ysz4) };
+    unsafe { libc::munmap(yp6 as *mut libc::c_void, ysz6) };
+    unsafe { libc::munmap(xp1 as *mut libc::c_void, xsz1) };
 }
 
 fn half_to_f32(h: u16) -> f32 {

@@ -750,3 +750,28 @@ on-device rope (rope=None at the decode sites) + head class) — the decode-
 chain refactor booked earlier owns it. STANDING: no route/coalescing
 defaults moved; prefill route parity = f32-noise across all 8 prefill gemms
 (q4_K ×5 + q6_K ×2 + va path covered by q6) + the act-quant class unified.
+
+## DECODE-CHAIN MIRROR — q6 closed, q4-GEMV is the last artifact (2026-10-23)
+SOFUU_DECODE_MMQ=1 wiring shipped: layers_one_commit's 7 GEMV sites + the
+ggpu_head route through decode mirrors (fallback = batch_gguf, visible),
+with an xq8e slot added to GgufGpuSlots. Receipts:
+- Decode mirror target decided EMPIRICALLY (probe DECODE-TARGET check):
+  the shipped CPU decode gemv at warm-hit shapes = the TILE GEMV class,
+  NOT the a76 dotprod: **gemv6-tile vs per-256 batch-mmq at B=1 = 0.0000e0
+  exactly** (the q6 decode = the existing gemm_q6_k_mmq at B=1, wired);
+  **gemv4-tile vs per-256-mmq = 3.839e3** — the q4 tile GEMV
+  (ggml_gemv_q4_K_8x4_q8_K, blocklen 8, per-lane interleave at
+  a76_repack.h:1802-1933) has its OWN integer/f32 order, distinct from both
+  the p-gemm pipeline and the a76 per-32 dotprod.
+- The per-32 mmq32 kernels (quantize_q8_ext + gemv_*_mmq32) are IN-TREE
+  behind the same env but currently DEAD for q4 (they mirror the dotprod
+  class, which the shipped binary does not take on these shapes).
+- Gate (paris32 + TILE_MMQ + DECODE_MMQ): fork stays at step 19 (|dtop1|
+  0.196) — 5 of the 7 per-step decode GEMVs are q4 (q/k/o/gate/up), so the
+  q4-GEMV interleave carries the class (stable |dtop1| 0.004-0.255/step).
+BOOKED NEXT (the last parity artifact): mirror ggml_gemv_q4_K_8x4_q8_K in
+MSL (gemv_q4_k_tile: per-row acc over the 8-row lane interleave, blocklen-8
+segments, per-sb fma + int bias + fused subtract — read lines 1879-1896 for
+the lane pairing), probe it in mmq_tile_value_probe vs sofuu_gemv_q4_k at
+warm-hit shapes, wire dec_gguf! q4 branch to it, re-gate. Defaults locked
+throughout; q6/q4 prefill + q6 decode all bit-exact at this point.

@@ -51,6 +51,12 @@ struct MetalContext {
     bool pso_gemm_q4_k_mmq_live;
     id<MTLComputePipelineState> pso_gemm_q6_k_mmq;
     bool pso_gemm_q6_k_mmq_live;
+    id<MTLComputePipelineState> pso_quantize_q8_ext;
+    bool pso_quantize_q8_ext_live;
+    id<MTLComputePipelineState> pso_gemv_q4_k_mmq32;
+    bool pso_gemv_q4_k_mmq32_live;
+    id<MTLComputePipelineState> pso_gemv_q6_k_mmq32;
+    bool pso_gemv_q6_k_mmq32_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_multi;
     id<MTLComputePipelineState> pso_gemm_q4_k_acc;
     id<MTLComputePipelineState> pso_gemm_q8_0;
@@ -302,6 +308,12 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q4_k_mmq_live = ctx->pso_gemm_q4_k_mmq != nil;
         ctx->pso_gemm_q6_k_mmq = load_pso(@"gemm_q6_k_mmq");
         ctx->pso_gemm_q6_k_mmq_live = ctx->pso_gemm_q6_k_mmq != nil;
+        ctx->pso_quantize_q8_ext = load_pso(@"quantize_q8_ext");
+        ctx->pso_quantize_q8_ext_live = ctx->pso_quantize_q8_ext != nil;
+        ctx->pso_gemv_q4_k_mmq32 = load_pso(@"gemv_q4_k_mmq32");
+        ctx->pso_gemv_q4_k_mmq32_live = ctx->pso_gemv_q4_k_mmq32 != nil;
+        ctx->pso_gemv_q6_k_mmq32 = load_pso(@"gemv_q6_k_mmq32");
+        ctx->pso_gemv_q6_k_mmq32_live = ctx->pso_gemv_q6_k_mmq32 != nil;
         const char* gemm_tile_env = std::getenv("SOFUU_GEMM_TILE");
         ctx->gemm_tile32 = gemm_tile_env && strcmp(gemm_tile_env, "32") == 0;
         ctx->pso_gpu_q4_k_b4multi = load_pso(@"gemv_q4_k_b4multi");
@@ -1444,6 +1456,64 @@ int sofuu_metal_batch_gemm_q4_k_mmq(
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, (NSUInteger)B, 1)
                   threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     return 1;
+}
+
+// Per-32 act-quant to Q8Ext blocks (stride 40B); nb_total = B*cols/32.
+int sofuu_metal_batch_quantize_q8_ext(
+    void* ctx_ptr, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t nb_total
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !x_buf || !y_buf || nb_total == 0) return 0;
+    if (!ctx->pso_quantize_q8_ext_live) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_quantize_q8_ext];
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf offset:x_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf offset:y_offset atIndex:1];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nb_total, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    return 1;
+}
+
+static int gemv_mmq32_dispatch(
+    MetalContext* ctx, id<MTLComputePipelineState> pso,
+    void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset,
+    void* y_buf, size_t y_offset, size_t rows, size_t cols
+) {
+    if (ctx->batch_enc == nil || !w_buf || !xq_buf || !y_buf || rows == 0 || cols == 0 || cols % 256 != 0) return 0;
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)xq_buf offset:xq_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    return 1;
+}
+
+int sofuu_metal_batch_gemv_q4_k_mmq32(
+    void* ctx_ptr, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset,
+    void* y_buf, size_t y_offset, size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (!ctx->pso_gemv_q4_k_mmq32_live) return 0;
+    return gemv_mmq32_dispatch(ctx, ctx->pso_gemv_q4_k_mmq32, w_buf, w_offset, xq_buf, xq_offset, y_buf, y_offset, rows, cols);
+}
+
+int sofuu_metal_batch_gemv_q6_k_mmq32(
+    void* ctx_ptr, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset,
+    void* y_buf, size_t y_offset, size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (!ctx->pso_gemv_q6_k_mmq32_live) return 0;
+    return gemv_mmq32_dispatch(ctx, ctx->pso_gemv_q6_k_mmq32, w_buf, w_offset, xq_buf, xq_offset, y_buf, y_offset, rows, cols);
 }
 
 // q6_K MMQ mirror over TileQ8K activations (bit-twin of ggml_gemm_q6_K_8x4_q8_K).

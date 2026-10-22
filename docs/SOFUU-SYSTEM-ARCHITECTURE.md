@@ -170,16 +170,17 @@ Five specialized ~8.5k-parameter feedforward neural networks (MLPs) trained offl
 
 ### Layer 3: Shipped Embedded JavaScript Drivers (`src/js/`)
 
-These drivers are compiled directly into the binary via `include_str!` and automatically registered on engine startup:
+These drivers are compiled directly into the binary via `include_str!` (with optional precompiled QuickJS AOT bytecode snapshots `*.bc` for sub-16ms engine cold starts) and automatically registered on engine startup:
 
 ```
 src/js/
-├── agent.js     (2,160 lines) — Autonomous agent loop, tool scheduling, sub-agent spawning, trace logging
-├── chat.js      (1,795 lines) — Chat turn manager, streaming token chunker, fallback ladder, post-turn fact extraction hook
-├── extractor.js (  338 lines) — Local asynchronous fact extractor, heuristic pre-filter, ChatML prompt, contradiction resolution
-├── tools.js     (  428 lines) — Built-in native file & OS tools (read, write, edit, grep, glob, list_dir, bash)
-├── web.js       (  327 lines) — Built-in web search (keyless DuckDuckGo) and URL content extraction
-└── rlm.js       (  305 lines) — Protocol harness running inside isolated RLM sandboxes
+├── agent.js     (5,452 lines) — Autonomous agent loop, cooperative scheduler.yield() pacing, AsyncLocalStorage context, contiguous batch-parallel tool dispatch, real-time QTSQ trace streaming & crash resumption
+├── chat.js      (2,569 lines) — Chat turn manager, streaming token chunker, fallback ladder, post-turn fact extraction hook
+├── extractor.js (  330 lines) — Local asynchronous fact extractor, heuristic pre-filter, ChatML prompt, contradiction resolution
+├── storage.js   (  202 lines) — Native QTSQ relational/tabular driver, Database, TracesCollection, checkpoint range query pagination
+├── tools.js     (  780 lines) — Built-in native file & OS tools, in-process deterministic code_eval sandbox (fuel meters, 16MB cap)
+├── web.js       (  484 lines) — Built-in web search (keyless DuckDuckGo) and URL content extraction
+└── rlm.js       (  383 lines) — Protocol harness running inside isolated RLM sandboxes
 ```
 
 ---
@@ -256,11 +257,47 @@ sequenceDiagram
     Memory-->>Turn: Array of matched memory records
 ```
 
+### C. Autonomous Agent Execution & Crash Recovery Flow
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Host App / User
+    participant Agent as sofuu.agent (agent.js)
+    participant Ctx as sofuu.context (ALS)
+    participant Sched as Cooperative Scheduler
+    participant Dispatcher as Batch Tool Dispatcher
+    participant QTSQ as Storage (sdb.traces)
+
+    Host->>Agent: sofuu.agent.run(prompt, options)
+    Agent->>Ctx: context.run({ runId, depth, signal })
+    loop Turn Execution Steps
+        Agent->>Sched: scheduler.yield() (pacing)
+        Sched-->>Agent: Resume on next loop tick
+        Agent->>QTSQ: Real-time trace append (thought / step)
+        Agent->>Dispatcher: Dispatch turn tool calls
+        par Batch-Parallel Read Tools (Concurrency <= 4)
+            Dispatcher->>Agent: exec(read_file, grep, code_eval)
+        and Serialized Mutating Tools
+            Dispatcher->>Agent: exec(write_file, edit_file, bash)
+        end
+        Agent->>QTSQ: Real-time trace append (tool results)
+    end
+    Agent-->>Host: Final turn resolution
+
+    Note over Host,QTSQ: Mid-Flight Crash & Resumption
+    Host->>Agent: sofuu.agent.resume(runId)
+    Agent->>QTSQ: Sub-ms checkpoint query for runId
+    QTSQ-->>Agent: Historical step transcripts & tool results
+    Agent->>Agent: Rehydrate context & fast-forward completed steps
+    Agent->>Agent: Continue execution from last uncompleted step
+    Agent-->>Host: Completed turn resolution
+```
+
 ---
 
 ## 4. Architectural Invariants & Quality Standards
 
-1. **Release Binary Ceiling**: The stripped release binary must strictly remain $\le 5.0\text{ MB}$ (current: 4.2 MB). Whole-program Link Time Optimization (`lto = "fat"`), `opt-level = "z"`, and symbol stripping are mandatory.
+1. **Release Binary Ceiling**: The stripped release binary must strictly remain $\le 5.0\text{ MB}$ (current: 4.9 MB). Whole-program Link Time Optimization (`lto = "fat"`), `opt-level = "z"`, and symbol stripping are mandatory.
 2. **Zero Memory Leaks & Zero Plaintext Leaks**: All QTSQ containers must pass strict AES-256-GCM verification. No raw user data may touch persistent storage unencrypted.
 3. **No Daemon Dependencies**: Everything runs in-process. Never launch background server daemons or localhost HTTP bridges for local inference.
 4. **Stable C-ABI Contracts**: All additions to `sofuu-capi` must maintain backward compatibility, handle tombstoning, and zero pointer corruption across host boundaries.

@@ -3561,6 +3561,25 @@ fn check_attention_k16_parity(head_dim: usize) {
     );
     check(&ob32, &ob16, "batched attention");
 
+    // Long-prefix batch: 32 rows late in the sequence so the row-paired
+    // score and value kernels run their main loops over a long shared prefix
+    // (the rows=8 case above only reaches the short-count tails).
+    let rows = 32usize;
+    let start = seq_len - rows;
+    let mut qb = vec![0.0f32; rows * q_dim];
+    for v in qb.iter_mut() {
+        *v = next();
+    }
+    let mut ob32 = vec![0.0f32; rows * q_dim];
+    let mut ob16 = vec![0.0f32; rows * q_dim];
+    batched_attention_ext(
+        &qb, &k32, &v32, &mut ob32, rows, start, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+    );
+    batched_attention_ext_k16(
+        &qb, &k16, &v16, &mut ob16, rows, start, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+    );
+    check(&ob32, &ob16, "long-prefix batched attention");
+
 }
 
     /// The worker pool must survive the three failure modes that would

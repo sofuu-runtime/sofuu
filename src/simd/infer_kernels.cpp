@@ -4225,6 +4225,69 @@ static void sofuu_attn_qk_range(const float * __restrict q, const float * __rest
 // every K row once per batch row (64x). counts[] are the per-row causal seq
 // bounds (nondecreasing with row index); dots beyond a row's count are
 // stored nowhere. Bit-exact per dot.
+// Single-row reference for the f32 score pass: four partial accumulators per
+// position over 16-wide strips, pairwise summed, then the 4-wide and scalar
+// tails. The row-pair loop below keeps exactly this order per row.
+static void sofuu_attn_qk_row_f32(const float * __restrict q, const float * __restrict k_base,
+                                  size_t k_stride, size_t head_dim, size_t p_begin, size_t count,
+                                  float scale, float * __restrict out) {
+#if defined(__aarch64__) && defined(SOFUU_NEON)
+    size_t p = 0;
+    for (; p + 2 <= count; p += 2) {
+        const float *k0 = k_base + (p_begin + p) * k_stride;
+        const float *k1 = k_base + (p_begin + p + 1) * k_stride;
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        float32x4_t b0 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+        float32x4_t b2 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t q0 = vld1q_f32(q + i);
+            const float32x4_t q1 = vld1q_f32(q + i + 4);
+            const float32x4_t q2 = vld1q_f32(q + i + 8);
+            const float32x4_t q3 = vld1q_f32(q + i + 12);
+            a0 = vfmaq_f32(a0, q0, vld1q_f32(k0 + i));
+            a1 = vfmaq_f32(a1, q1, vld1q_f32(k0 + i + 4));
+            a2 = vfmaq_f32(a2, q2, vld1q_f32(k0 + i + 8));
+            a3 = vfmaq_f32(a3, q3, vld1q_f32(k0 + i + 12));
+            b0 = vfmaq_f32(b0, q0, vld1q_f32(k1 + i));
+            b1 = vfmaq_f32(b1, q1, vld1q_f32(k1 + i + 4));
+            b2 = vfmaq_f32(b2, q2, vld1q_f32(k1 + i + 8));
+            b3 = vfmaq_f32(b3, q3, vld1q_f32(k1 + i + 12));
+        }
+        float32x4_t c0 = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        float32x4_t c1 = vaddq_f32(vaddq_f32(b0, b1), vaddq_f32(b2, b3));
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t qv = vld1q_f32(q + j);
+            c0 = vfmaq_f32(c0, qv, vld1q_f32(k0 + j));
+            c1 = vfmaq_f32(c1, qv, vld1q_f32(k1 + j));
+        }
+        float t0 = vaddvq_f32(c0);
+        float t1 = vaddvq_f32(c1);
+        for (; j < head_dim; ++j) {
+            t0 += q[j] * k0[j];
+            t1 += q[j] * k1[j];
+        }
+        out[p] = t0 * scale;
+        out[p + 1] = t1 * scale;
+    }
+    for (; p < count; ++p) {
+        out[p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        out[p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+    }
+#endif
+}
+
+// Batched prefill score pass for up to 8 rows over one head's K strip. Rows
+// are processed in PAIRS so each K row is loaded once for both rows: the
+// single-row loop spends 8 loads + 8 FMAs per 2 positions, the pair 8 loads
+// + 16 FMAs. Per-row arithmetic is untouched (four partial accumulators per
+// position over 16-wide strips), so scores are bit-identical to the
+// single-row path.
 static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_stride,
                                 const float * __restrict k_base, size_t k_stride,
                                 size_t head_dim, size_t p_begin, const size_t *counts,
@@ -4232,53 +4295,99 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
                                 float scale, size_t nrows) {
 #if defined(__aarch64__) && defined(SOFUU_NEON)
     if (nrows == 0) return;
-    size_t max_count = counts[nrows - 1];
-    for (size_t p = 0; p + 2 <= max_count; p += 2) {
-        const float *k0 = k_base + (p_begin + p) * k_stride;
-        const float *k1 = k_base + (p_begin + p + 1) * k_stride;
-        for (size_t r = 0; r < nrows; ++r) {
-            const float *q = q_batch + r * q_stride;
-            float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
-            float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
-            float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
-            float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+    const size_t max_count = counts[nrows - 1];
+    const size_t npairs = max_count - (max_count & 1);
+    size_t r = 0;
+    for (; r + 2 <= nrows; r += 2) {
+        const float *qa = q_batch + r * q_stride;
+        const float *qb = q_batch + (r + 1) * q_stride;
+        for (size_t p = 0; p + 2 <= npairs; p += 2) {
+            const float *k0 = k_base + (p_begin + p) * k_stride;
+            const float *k1 = k_base + (p_begin + p + 1) * k_stride;
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+            float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+            float32x4_t c0 = vdupq_n_f32(0.0f), c1 = vdupq_n_f32(0.0f);
+            float32x4_t c2 = vdupq_n_f32(0.0f), c3 = vdupq_n_f32(0.0f);
+            float32x4_t b0 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+            float32x4_t b2 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+            float32x4_t d0 = vdupq_n_f32(0.0f), d1 = vdupq_n_f32(0.0f);
+            float32x4_t d2 = vdupq_n_f32(0.0f), d3 = vdupq_n_f32(0.0f);
             size_t i = 0;
             for (; i + 16 <= head_dim; i += 16) {
-                const float32x4_t qv0 = vld1q_f32(q + i);
-                const float32x4_t qv1 = vld1q_f32(q + i + 4);
-                const float32x4_t qv2 = vld1q_f32(q + i + 8);
-                const float32x4_t qv3 = vld1q_f32(q + i + 12);
-                a0s0 = vfmaq_f32(a0s0, qv0, vld1q_f32(k0 + i));
-                a0s1 = vfmaq_f32(a0s1, qv1, vld1q_f32(k0 + i + 4));
-                a0s2 = vfmaq_f32(a0s2, qv2, vld1q_f32(k0 + i + 8));
-                a0s3 = vfmaq_f32(a0s3, qv3, vld1q_f32(k0 + i + 12));
-                a1s0 = vfmaq_f32(a1s0, qv0, vld1q_f32(k1 + i));
-                a1s1 = vfmaq_f32(a1s1, qv1, vld1q_f32(k1 + i + 4));
-                a1s2 = vfmaq_f32(a1s2, qv2, vld1q_f32(k1 + i + 8));
-                a1s3 = vfmaq_f32(a1s3, qv3, vld1q_f32(k1 + i + 12));
+                const float32x4_t k00 = vld1q_f32(k0 + i);
+                const float32x4_t k01 = vld1q_f32(k0 + i + 4);
+                const float32x4_t k02 = vld1q_f32(k0 + i + 8);
+                const float32x4_t k03 = vld1q_f32(k0 + i + 12);
+                const float32x4_t k10 = vld1q_f32(k1 + i);
+                const float32x4_t k11 = vld1q_f32(k1 + i + 4);
+                const float32x4_t k12 = vld1q_f32(k1 + i + 8);
+                const float32x4_t k13 = vld1q_f32(k1 + i + 12);
+                const float32x4_t qa0 = vld1q_f32(qa + i);
+                const float32x4_t qa1 = vld1q_f32(qa + i + 4);
+                const float32x4_t qa2 = vld1q_f32(qa + i + 8);
+                const float32x4_t qa3 = vld1q_f32(qa + i + 12);
+                a0 = vfmaq_f32(a0, qa0, k00);
+                a1 = vfmaq_f32(a1, qa1, k01);
+                a2 = vfmaq_f32(a2, qa2, k02);
+                a3 = vfmaq_f32(a3, qa3, k03);
+                c0 = vfmaq_f32(c0, qa0, k10);
+                c1 = vfmaq_f32(c1, qa1, k11);
+                c2 = vfmaq_f32(c2, qa2, k12);
+                c3 = vfmaq_f32(c3, qa3, k13);
+                const float32x4_t qb0 = vld1q_f32(qb + i);
+                const float32x4_t qb1 = vld1q_f32(qb + i + 4);
+                const float32x4_t qb2 = vld1q_f32(qb + i + 8);
+                const float32x4_t qb3 = vld1q_f32(qb + i + 12);
+                b0 = vfmaq_f32(b0, qb0, k00);
+                b1 = vfmaq_f32(b1, qb1, k01);
+                b2 = vfmaq_f32(b2, qb2, k02);
+                b3 = vfmaq_f32(b3, qb3, k03);
+                d0 = vfmaq_f32(d0, qb0, k10);
+                d1 = vfmaq_f32(d1, qb1, k11);
+                d2 = vfmaq_f32(d2, qb2, k12);
+                d3 = vfmaq_f32(d3, qb3, k13);
             }
-            float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
-            float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+            float32x4_t sa = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+            float32x4_t sc = vaddq_f32(vaddq_f32(c0, c1), vaddq_f32(c2, c3));
+            float32x4_t sb = vaddq_f32(vaddq_f32(b0, b1), vaddq_f32(b2, b3));
+            float32x4_t sd = vaddq_f32(vaddq_f32(d0, d1), vaddq_f32(d2, d3));
             size_t j = i;
             for (; j + 4 <= head_dim; j += 4) {
-                const float32x4_t qv = vld1q_f32(q + j);
-                c0 = vfmaq_f32(c0, qv, vld1q_f32(k0 + j));
-                c1 = vfmaq_f32(c1, qv, vld1q_f32(k1 + j));
+                const float32x4_t qav = vld1q_f32(qa + j);
+                const float32x4_t qbv = vld1q_f32(qb + j);
+                const float32x4_t k0v = vld1q_f32(k0 + j);
+                const float32x4_t k1v = vld1q_f32(k1 + j);
+                sa = vfmaq_f32(sa, qav, k0v);
+                sc = vfmaq_f32(sc, qav, k1v);
+                sb = vfmaq_f32(sb, qbv, k0v);
+                sd = vfmaq_f32(sd, qbv, k1v);
             }
-            float t0 = vaddvq_f32(c0);
-            float t1 = vaddvq_f32(c1);
+            float ta = vaddvq_f32(sa);
+            float tc = vaddvq_f32(sc);
+            float tb = vaddvq_f32(sb);
+            float td = vaddvq_f32(sd);
             for (; j < head_dim; ++j) {
-                t0 += q[j] * k0[j];
-                t1 += q[j] * k1[j];
+                const float qaj = qa[j];
+                const float qbj = qb[j];
+                ta += qaj * k0[j];
+                tc += qaj * k1[j];
+                tb += qbj * k0[j];
+                td += qbj * k1[j];
             }
             const size_t p_abs = p_begin + p;
-            if (p_abs < counts[r]) outs[r][p_abs] = t0 * scale;
-            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = t1 * scale;
+            if (p_abs < counts[r]) outs[r][p_abs] = ta * scale;
+            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = tc * scale;
+            if (p_abs < counts[r + 1]) outs[r + 1][p_abs] = tb * scale;
+            if (p_abs + 1 < counts[r + 1]) outs[r + 1][p_abs + 1] = td * scale;
         }
     }
-    for (size_t r = 0; r < nrows; ++r) {
-        for (size_t p = (max_count - (max_count & 1)); p < counts[r]; ++p) {
-            outs[r][p_begin + p] = sofuu_vec_dot_f32(q_batch + r * q_stride,
+    if (r < nrows) {
+        sofuu_attn_qk_row_f32(q_batch + r * q_stride, k_base, k_stride, head_dim, p_begin,
+                              counts[r], scale, outs[r]);
+    }
+    for (size_t rr = 0; rr < nrows; ++rr) {
+        for (size_t p = npairs; p < counts[rr]; ++p) {
+            outs[rr][p_begin + p] = sofuu_vec_dot_f32(q_batch + rr * q_stride,
                                                      k_base + (p_begin + p) * k_stride, head_dim) * scale;
         }
     }
@@ -4286,11 +4395,12 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
     for (size_t r = 0; r < nrows; ++r) {
         const float *q = q_batch + r * q_stride;
         for (size_t p = 0; p < counts[r]; ++p) {
-            outs[r][p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
+            outs[r][p_begin + p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
         }
     }
 #endif
 }
+
 
 static void sofuu_attn_vacc_range(float * __restrict out, const float * __restrict v_base,
                                   size_t v_stride, size_t head_dim, size_t p_begin, size_t count,
@@ -4339,6 +4449,86 @@ static void sofuu_attn_vacc_range(float * __restrict out, const float * __restri
     for (size_t p = 0; p < count; ++p) {
         sofuu_vec_mad_f32(out, v_base + (p_begin + p) * v_stride, s[p], head_dim);
     }
+#endif
+}
+
+// Value accumulation for TWO rows over one head's V strip, sharing every V
+// row load. Per-row arithmetic is the exact sequence of
+// sofuu_attn_vacc_range (4 positions per pass, 16-wide strip accumulators).
+static void sofuu_attn_vacc_pair(float * __restrict out_a, float * __restrict out_b,
+                                 const float * __restrict v_base, size_t v_stride,
+                                 size_t head_dim, size_t p_begin, size_t count,
+                                 const float * __restrict s_a, const float * __restrict s_b) {
+#if defined(SOFUU_NEON)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t a0 = vld1q_f32(out_a + i);
+            float32x4_t a1 = vld1q_f32(out_a + i + 4);
+            float32x4_t a2 = vld1q_f32(out_a + i + 8);
+            float32x4_t a3 = vld1q_f32(out_a + i + 12);
+            float32x4_t b0 = vld1q_f32(out_b + i);
+            float32x4_t b1 = vld1q_f32(out_b + i + 4);
+            float32x4_t b2 = vld1q_f32(out_b + i + 8);
+            float32x4_t b3 = vld1q_f32(out_b + i + 12);
+            for (int q = 0; q < 4; ++q) {
+                const float *vrow = v_base + (p_begin + p + q) * v_stride;
+                const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+                const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+                const float32x4_t v0 = vld1q_f32(vrow + i);
+                const float32x4_t v1 = vld1q_f32(vrow + i + 4);
+                const float32x4_t v2 = vld1q_f32(vrow + i + 8);
+                const float32x4_t v3 = vld1q_f32(vrow + i + 12);
+                a0 = vfmaq_f32(a0, v0, sa);
+                a1 = vfmaq_f32(a1, v1, sa);
+                a2 = vfmaq_f32(a2, v2, sa);
+                a3 = vfmaq_f32(a3, v3, sa);
+                b0 = vfmaq_f32(b0, v0, sb);
+                b1 = vfmaq_f32(b1, v1, sb);
+                b2 = vfmaq_f32(b2, v2, sb);
+                b3 = vfmaq_f32(b3, v3, sb);
+            }
+            vst1q_f32(out_a + i, a0);
+            vst1q_f32(out_a + i + 4, a1);
+            vst1q_f32(out_a + i + 8, a2);
+            vst1q_f32(out_a + i + 12, a3);
+            vst1q_f32(out_b + i, b0);
+            vst1q_f32(out_b + i + 4, b1);
+            vst1q_f32(out_b + i + 8, b2);
+            vst1q_f32(out_b + i + 12, b3);
+        }
+        for (int q = 0; q < 4; ++q) {
+            const float *vrow = v_base + (p_begin + p + q) * v_stride;
+            const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+            const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                const float32x4_t v = vld1q_f32(vrow + it);
+                float32x4_t da = vld1q_f32(out_a + it);
+                float32x4_t db = vld1q_f32(out_b + it);
+                da = vfmaq_f32(da, v, sa);
+                db = vfmaq_f32(db, v, sb);
+                vst1q_f32(out_a + it, da);
+                vst1q_f32(out_b + it, db);
+            }
+            for (; it < head_dim; ++it) {
+                const float v = vrow[it];
+                out_a[it] += v * s_a[p + q];
+                out_b[it] += v * s_b[p + q];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        const float *vrow = v_base + (p_begin + p) * v_stride;
+        for (size_t it = 0; it < head_dim; ++it) {
+            out_a[it] += vrow[it] * s_a[p];
+            out_b[it] += vrow[it] * s_b[p];
+        }
+    }
+#else
+    sofuu_attn_vacc_range(out_a, v_base, v_stride, head_dim, p_begin, count, s_a);
+    sofuu_attn_vacc_range(out_b, v_base, v_stride, head_dim, p_begin, count, s_b);
 #endif
 }
 
@@ -4481,6 +4671,74 @@ static void sofuu_attn_qk_range_k16(const float * __restrict q, const uint16_t *
 #endif
 }
 
+// Reference accumulation for ONE row: four partial accumulators per position,
+// pairwise summed over the 16-wide strips, then the 4-wide and scalar tails.
+// Every row of the pair loop below keeps exactly this order, so the pair
+// kernel's scores are bit-identical to this function's.
+static void sofuu_attn_qk_row_k16(const float * __restrict q,
+                                  const uint16_t * __restrict k_base, size_t k_stride,
+                                  size_t head_dim, size_t p_begin, size_t count,
+                                  float scale, float * __restrict out) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t p = 0;
+    for (; p + 2 <= count; p += 2) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        const uint16_t *k1 = k_base + (p_begin + p + 1) * k_stride;
+        float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
+        float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
+        float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
+        float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t qv0 = vld1q_f32(q + i);
+            const float32x4_t qv1 = vld1q_f32(q + i + 4);
+            const float32x4_t qv2 = vld1q_f32(q + i + 8);
+            const float32x4_t qv3 = vld1q_f32(q + i + 12);
+            a0s0 = vfmaq_f32(a0s0, qv0, sofuu_ldf16(k0 + i));
+            a0s1 = vfmaq_f32(a0s1, qv1, sofuu_ldf16(k0 + i + 4));
+            a0s2 = vfmaq_f32(a0s2, qv2, sofuu_ldf16(k0 + i + 8));
+            a0s3 = vfmaq_f32(a0s3, qv3, sofuu_ldf16(k0 + i + 12));
+            a1s0 = vfmaq_f32(a1s0, qv0, sofuu_ldf16(k1 + i));
+            a1s1 = vfmaq_f32(a1s1, qv1, sofuu_ldf16(k1 + i + 4));
+            a1s2 = vfmaq_f32(a1s2, qv2, sofuu_ldf16(k1 + i + 8));
+            a1s3 = vfmaq_f32(a1s3, qv3, sofuu_ldf16(k1 + i + 12));
+        }
+        float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+        float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t qv = vld1q_f32(q + j);
+            c0 = vfmaq_f32(c0, qv, sofuu_ldf16(k0 + j));
+            c1 = vfmaq_f32(c1, qv, sofuu_ldf16(k1 + j));
+        }
+        float t0 = vaddvq_f32(c0);
+        float t1 = vaddvq_f32(c1);
+        for (; j < head_dim; ++j) {
+            t0 += q[j] * sofuu_ldf16_1(k0 + j);
+            t1 += q[j] * sofuu_ldf16_1(k1 + j);
+        }
+        out[p] = t0 * scale;
+        out[p + 1] = t1 * scale;
+    }
+    for (; p < count; ++p) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        out[p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
+    }
+#else
+    for (size_t p = 0; p < count; ++p) {
+        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+        out[p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
+    }
+#endif
+}
+
+// Prefill score pass for up to 8 rows over one head's K strip. Rows are
+// processed in PAIRS that share each K conversion: the single-row loop spends
+// 8 cvt + 4 loads per 8 FMAs, and on the Pi 5 the cvt unit, not the FMA unit,
+// gates the pass (measured ~20 GMAC/s against a ~38 GMAC/s cvt ceiling).
+// Pairing halves the conversions per macro-op without touching any row's
+// accumulation order, so the scores stay bit-identical to
+// sofuu_attn_qk_row_k16.
 static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_stride,
                                     const uint16_t * __restrict k_base, size_t k_stride,
                                     size_t head_dim, size_t p_begin, const size_t *counts,
@@ -4489,66 +4747,106 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     if (nrows == 0) return;
     size_t max_count = counts[nrows - 1];
-    for (size_t p = 0; p + 2 <= max_count; p += 2) {
-        const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
-        const uint16_t *k1 = k_base + (p_begin + p + 1) * k_stride;
-        for (size_t r = 0; r < nrows; ++r) {
-            const float *q = q_batch + r * q_stride;
+    size_t r = 0;
+    for (; r + 2 <= nrows; r += 2) {
+        const float *qa = q_batch + r * q_stride;
+        const float *qb = q_batch + (r + 1) * q_stride;
+        for (size_t p = 0; p + 2 <= max_count; p += 2) {
+            const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+            const uint16_t *k1 = k_base + (p_begin + p + 1) * k_stride;
             float32x4_t a0s0 = vdupq_n_f32(0.0f), a0s1 = vdupq_n_f32(0.0f);
             float32x4_t a0s2 = vdupq_n_f32(0.0f), a0s3 = vdupq_n_f32(0.0f);
             float32x4_t a1s0 = vdupq_n_f32(0.0f), a1s1 = vdupq_n_f32(0.0f);
             float32x4_t a1s2 = vdupq_n_f32(0.0f), a1s3 = vdupq_n_f32(0.0f);
+            float32x4_t b0s0 = vdupq_n_f32(0.0f), b0s1 = vdupq_n_f32(0.0f);
+            float32x4_t b0s2 = vdupq_n_f32(0.0f), b0s3 = vdupq_n_f32(0.0f);
+            float32x4_t b1s0 = vdupq_n_f32(0.0f), b1s1 = vdupq_n_f32(0.0f);
+            float32x4_t b1s2 = vdupq_n_f32(0.0f), b1s3 = vdupq_n_f32(0.0f);
             size_t i = 0;
             for (; i + 16 <= head_dim; i += 16) {
-                const float32x4_t qv0 = vld1q_f32(q + i);
-                const float32x4_t qv1 = vld1q_f32(q + i + 4);
-                const float32x4_t qv2 = vld1q_f32(q + i + 8);
-                const float32x4_t qv3 = vld1q_f32(q + i + 12);
-                a0s0 = vfmaq_f32(a0s0, qv0, sofuu_ldf16(k0 + i));
-                a0s1 = vfmaq_f32(a0s1, qv1, sofuu_ldf16(k0 + i + 4));
-                a0s2 = vfmaq_f32(a0s2, qv2, sofuu_ldf16(k0 + i + 8));
-                a0s3 = vfmaq_f32(a0s3, qv3, sofuu_ldf16(k0 + i + 12));
-                a1s0 = vfmaq_f32(a1s0, qv0, sofuu_ldf16(k1 + i));
-                a1s1 = vfmaq_f32(a1s1, qv1, sofuu_ldf16(k1 + i + 4));
-                a1s2 = vfmaq_f32(a1s2, qv2, sofuu_ldf16(k1 + i + 8));
-                a1s3 = vfmaq_f32(a1s3, qv3, sofuu_ldf16(k1 + i + 12));
+                const float32x4_t k00 = sofuu_ldf16(k0 + i);
+                const float32x4_t k01 = sofuu_ldf16(k0 + i + 4);
+                const float32x4_t k02 = sofuu_ldf16(k0 + i + 8);
+                const float32x4_t k03 = sofuu_ldf16(k0 + i + 12);
+                const float32x4_t k10 = sofuu_ldf16(k1 + i);
+                const float32x4_t k11 = sofuu_ldf16(k1 + i + 4);
+                const float32x4_t k12 = sofuu_ldf16(k1 + i + 8);
+                const float32x4_t k13 = sofuu_ldf16(k1 + i + 12);
+                const float32x4_t qa0 = vld1q_f32(qa + i);
+                const float32x4_t qa1 = vld1q_f32(qa + i + 4);
+                const float32x4_t qa2 = vld1q_f32(qa + i + 8);
+                const float32x4_t qa3 = vld1q_f32(qa + i + 12);
+                a0s0 = vfmaq_f32(a0s0, qa0, k00);
+                a0s1 = vfmaq_f32(a0s1, qa1, k01);
+                a0s2 = vfmaq_f32(a0s2, qa2, k02);
+                a0s3 = vfmaq_f32(a0s3, qa3, k03);
+                a1s0 = vfmaq_f32(a1s0, qa0, k10);
+                a1s1 = vfmaq_f32(a1s1, qa1, k11);
+                a1s2 = vfmaq_f32(a1s2, qa2, k12);
+                a1s3 = vfmaq_f32(a1s3, qa3, k13);
+                const float32x4_t qb0 = vld1q_f32(qb + i);
+                const float32x4_t qb1 = vld1q_f32(qb + i + 4);
+                const float32x4_t qb2 = vld1q_f32(qb + i + 8);
+                const float32x4_t qb3 = vld1q_f32(qb + i + 12);
+                b0s0 = vfmaq_f32(b0s0, qb0, k00);
+                b0s1 = vfmaq_f32(b0s1, qb1, k01);
+                b0s2 = vfmaq_f32(b0s2, qb2, k02);
+                b0s3 = vfmaq_f32(b0s3, qb3, k03);
+                b1s0 = vfmaq_f32(b1s0, qb0, k10);
+                b1s1 = vfmaq_f32(b1s1, qb1, k11);
+                b1s2 = vfmaq_f32(b1s2, qb2, k12);
+                b1s3 = vfmaq_f32(b1s3, qb3, k13);
             }
-            float32x4_t c0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
-            float32x4_t c1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+            float32x4_t ca0 = vaddq_f32(vaddq_f32(a0s0, a0s1), vaddq_f32(a0s2, a0s3));
+            float32x4_t ca1 = vaddq_f32(vaddq_f32(a1s0, a1s1), vaddq_f32(a1s2, a1s3));
+            float32x4_t cb0 = vaddq_f32(vaddq_f32(b0s0, b0s1), vaddq_f32(b0s2, b0s3));
+            float32x4_t cb1 = vaddq_f32(vaddq_f32(b1s0, b1s1), vaddq_f32(b1s2, b1s3));
             size_t j = i;
             for (; j + 4 <= head_dim; j += 4) {
-                const float32x4_t qv = vld1q_f32(q + j);
-                c0 = vfmaq_f32(c0, qv, sofuu_ldf16(k0 + j));
-                c1 = vfmaq_f32(c1, qv, sofuu_ldf16(k1 + j));
+                const float32x4_t k0j = sofuu_ldf16(k0 + j);
+                const float32x4_t k1j = sofuu_ldf16(k1 + j);
+                ca0 = vfmaq_f32(ca0, vld1q_f32(qa + j), k0j);
+                ca1 = vfmaq_f32(ca1, vld1q_f32(qa + j), k1j);
+                cb0 = vfmaq_f32(cb0, vld1q_f32(qb + j), k0j);
+                cb1 = vfmaq_f32(cb1, vld1q_f32(qb + j), k1j);
             }
-            float t0 = vaddvq_f32(c0);
-            float t1 = vaddvq_f32(c1);
+            float ta0 = vaddvq_f32(ca0);
+            float ta1 = vaddvq_f32(ca1);
+            float tb0 = vaddvq_f32(cb0);
+            float tb1 = vaddvq_f32(cb1);
             for (; j < head_dim; ++j) {
-                t0 += q[j] * sofuu_ldf16_1(k0 + j);
-                t1 += q[j] * sofuu_ldf16_1(k1 + j);
+                ta0 += qa[j] * sofuu_ldf16_1(k0 + j);
+                ta1 += qa[j] * sofuu_ldf16_1(k1 + j);
+                tb0 += qb[j] * sofuu_ldf16_1(k0 + j);
+                tb1 += qb[j] * sofuu_ldf16_1(k1 + j);
             }
             const size_t p_abs = p_begin + p;
-            if (p_abs < counts[r]) outs[r][p_abs] = t0 * scale;
-            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = t1 * scale;
+            if (p_abs < counts[r]) outs[r][p_abs] = ta0 * scale;
+            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = ta1 * scale;
+            if (p_abs < counts[r + 1]) outs[r + 1][p_abs] = tb0 * scale;
+            if (p_abs + 1 < counts[r + 1]) outs[r + 1][p_abs + 1] = tb1 * scale;
+        }
+        for (size_t rr = r; rr < r + 2; ++rr) {
+            for (size_t p = (max_count - (max_count & 1)); p < counts[rr]; ++p) {
+                const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
+                const float *q = q_batch + rr * q_stride;
+                outs[rr][p_begin + p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
+            }
         }
     }
-    for (size_t r = 0; r < nrows; ++r) {
-        for (size_t p = (max_count - (max_count & 1)); p < counts[r]; ++p) {
-            const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
-            const float *q = q_batch + r * q_stride;
-            outs[r][p_begin + p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
-        }
+    if (r < nrows) {
+        sofuu_attn_qk_row_k16(q_batch + r * q_stride, k_base, k_stride, head_dim, p_begin,
+                              counts[r], scale, outs[r]);
     }
 #else
     for (size_t r = 0; r < nrows; ++r) {
-        const float *q = q_batch + r * q_stride;
-        for (size_t p = 0; p < counts[r]; ++p) {
-            const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
-            outs[r][p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
-        }
+        sofuu_attn_qk_row_k16(q_batch + r * q_stride, k_base, k_stride, head_dim, p_begin,
+                              counts[r], scale, outs[r]);
     }
 #endif
 }
+
+
 
 static void sofuu_attn_vacc_range_k16(float * __restrict out, const uint16_t * __restrict v_base,
                                       size_t v_stride, size_t head_dim, size_t p_begin, size_t count,
@@ -4599,6 +4897,85 @@ static void sofuu_attn_vacc_range_k16(float * __restrict out, const uint16_t * _
     }
 #endif
 }
+
+// Prefill value-accumulation for TWO rows over one head's V strip, sharing the
+// f16->f32 conversion of every V row. Per-row arithmetic is the exact
+// instruction sequence of sofuu_attn_vacc_range_k16 (4 positions per pass,
+// 16-wide strip accumulators), so the outputs are bit-identical.
+static void sofuu_attn_vacc_pair_k16(float * __restrict out_a, float * __restrict out_b,
+                                     const uint16_t * __restrict v_base, size_t v_stride,
+                                     size_t head_dim, size_t p_begin, size_t count,
+                                     const float * __restrict s_a, const float * __restrict s_b) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t a0 = vld1q_f32(out_a + i);
+            float32x4_t a1 = vld1q_f32(out_a + i + 4);
+            float32x4_t a2 = vld1q_f32(out_a + i + 8);
+            float32x4_t a3 = vld1q_f32(out_a + i + 12);
+            float32x4_t b0 = vld1q_f32(out_b + i);
+            float32x4_t b1 = vld1q_f32(out_b + i + 4);
+            float32x4_t b2 = vld1q_f32(out_b + i + 8);
+            float32x4_t b3 = vld1q_f32(out_b + i + 12);
+            for (int q = 0; q < 4; ++q) {
+                const uint16_t *vrow = v_base + (p_begin + p + q) * v_stride;
+                const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+                const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+                const float32x4_t v0 = sofuu_ldf16(vrow + i);
+                const float32x4_t v1 = sofuu_ldf16(vrow + i + 4);
+                const float32x4_t v2 = sofuu_ldf16(vrow + i + 8);
+                const float32x4_t v3 = sofuu_ldf16(vrow + i + 12);
+                a0 = vmlaq_f32(a0, v0, sa);
+                a1 = vmlaq_f32(a1, v1, sa);
+                a2 = vmlaq_f32(a2, v2, sa);
+                a3 = vmlaq_f32(a3, v3, sa);
+                b0 = vmlaq_f32(b0, v0, sb);
+                b1 = vmlaq_f32(b1, v1, sb);
+                b2 = vmlaq_f32(b2, v2, sb);
+                b3 = vmlaq_f32(b3, v3, sb);
+            }
+            vst1q_f32(out_a + i, a0);
+            vst1q_f32(out_a + i + 4, a1);
+            vst1q_f32(out_a + i + 8, a2);
+            vst1q_f32(out_a + i + 12, a3);
+            vst1q_f32(out_b + i, b0);
+            vst1q_f32(out_b + i + 4, b1);
+            vst1q_f32(out_b + i + 8, b2);
+            vst1q_f32(out_b + i + 12, b3);
+        }
+        for (int q = 0; q < 4; ++q) {
+            const uint16_t *vrow = v_base + (p_begin + p + q) * v_stride;
+            const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+            const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                const float32x4_t v = sofuu_ldf16(vrow + it);
+                float32x4_t da = vld1q_f32(out_a + it);
+                float32x4_t db = vld1q_f32(out_b + it);
+                da = vmlaq_f32(da, v, sa);
+                db = vmlaq_f32(db, v, sb);
+                vst1q_f32(out_a + it, da);
+                vst1q_f32(out_b + it, db);
+            }
+            for (; it < head_dim; ++it) {
+                const float v = sofuu_ldf16_1(vrow + it);
+                out_a[it] += v * s_a[p + q];
+                out_b[it] += v * s_b[p + q];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        sofuu_mad_f16_f32(out_a, v_base + (p_begin + p) * v_stride, s_a[p], head_dim);
+        sofuu_mad_f16_f32(out_b, v_base + (p_begin + p) * v_stride, s_b[p], head_dim);
+    }
+#else
+    sofuu_attn_vacc_range_k16(out_a, v_base, v_stride, head_dim, p_begin, count, s_a);
+    sofuu_attn_vacc_range_k16(out_b, v_base, v_stride, head_dim, p_begin, count, s_b);
+#endif
+}
+
 
 // ── GQA-fused decode attention (n_rep == 2) ──────────────────────────
 // One KV head serves two query heads. Scoring and accumulating both queries
@@ -5113,6 +5490,12 @@ void sofuu_batched_attention_ext(
                 heap_scores.resize(8 * max_seq_len);
                 for (size_t r = 0; r < 8; ++r) gscore[r] = heap_scores.data() + r * max_seq_len;
             }
+            // Group-major order: a thread's slice is four consecutive row
+            // groups for all heads, so the K/V prefix those groups share is
+            // re-read while still resident. Head-major (all groups per head)
+            // was measured 1.5-2x SLOWER on the long-context prefill despite
+            // the flat work split — the extra reuse window costs more in
+            // cache thrash than the imbalance ever did.
             for (size_t work_idx = start; work_idx < end; ++work_idx) {
                 const size_t grp = work_idx / n_heads;
                 const size_t h   = work_idx % n_heads;
@@ -5136,7 +5519,30 @@ void sofuu_batched_attention_ext(
                     sofuu_softmax(outs_p[r], counts[r]);
                     float *out_head = head_out_batch + (b0 + r) * q_dim + h * head_dim;
                     std::memset(out_head, 0, head_dim * sizeof(float));
-                    sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0, counts[r], outs_p[r]);
+                }
+                // Accumulate row pairs in one pass so each V row is loaded
+                // once for two rows; longer rows finish their tail through the
+                // single-row kernel.
+                size_t rp = 0;
+                for (; rp + 2 <= nr; rp += 2) {
+                    float *oa = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
+                    float *ob = head_out_batch + (b0 + rp + 1) * q_dim + h * head_dim;
+                    const size_t cm = counts[rp] < counts[rp + 1] ? counts[rp] : counts[rp + 1];
+                    sofuu_attn_vacc_pair(oa, ob, v_past, head_dim, head_dim, 0, cm,
+                                         outs_p[rp], outs_p[rp + 1]);
+                    if (counts[rp] > cm) {
+                        sofuu_attn_vacc_range(oa, v_past, head_dim, head_dim, cm,
+                                              counts[rp] - cm, outs_p[rp] + cm);
+                    }
+                    if (counts[rp + 1] > cm) {
+                        sofuu_attn_vacc_range(ob, v_past, head_dim, head_dim, cm,
+                                              counts[rp + 1] - cm, outs_p[rp + 1] + cm);
+                    }
+                }
+                if (rp < nr) {
+                    float *out_head = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
+                    sofuu_attn_vacc_range(out_head, v_past, head_dim, head_dim, 0,
+                                          counts[rp], outs_p[rp]);
                 }
             }
             return;
@@ -5449,7 +5855,30 @@ void sofuu_batched_attention_ext_k16(
                     sofuu_softmax(outs_p[r], counts[r]);
                     float *out_head = head_out_batch + (b0 + r) * q_dim + h * head_dim;
                     std::memset(out_head, 0, head_dim * sizeof(float));
-                    sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, 0, counts[r], outs_p[r]);
+                }
+                // Accumulate row pairs in one pass so each V row is converted
+                // once for two rows; the shared prefix is the shorter count and
+                // the longer row finishes through the single-row kernel.
+                size_t rp = 0;
+                for (; rp + 2 <= nr; rp += 2) {
+                    float *oa = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
+                    float *ob = head_out_batch + (b0 + rp + 1) * q_dim + h * head_dim;
+                    const size_t cm = counts[rp] < counts[rp + 1] ? counts[rp] : counts[rp + 1];
+                    sofuu_attn_vacc_pair_k16(oa, ob, v_past, head_dim, head_dim, 0, cm,
+                                            outs_p[rp], outs_p[rp + 1]);
+                    if (counts[rp] > cm) {
+                        sofuu_attn_vacc_range_k16(oa, v_past, head_dim, head_dim, cm,
+                                                  counts[rp] - cm, outs_p[rp] + cm);
+                    }
+                    if (counts[rp + 1] > cm) {
+                        sofuu_attn_vacc_range_k16(ob, v_past, head_dim, head_dim, cm,
+                                                  counts[rp + 1] - cm, outs_p[rp + 1] + cm);
+                    }
+                }
+                if (rp < nr) {
+                    float *out_head = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
+                    sofuu_attn_vacc_range_k16(out_head, v_past, head_dim, head_dim, 0,
+                                              counts[rp], outs_p[rp]);
                 }
             }
             return;

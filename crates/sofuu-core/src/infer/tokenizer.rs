@@ -66,6 +66,19 @@ pub enum SpaceStyle {
     None,
 }
 
+/// Pre-digested merge table for the fast BPE path.
+///
+/// The legacy encoder rebuilds a `"a b"` string for every adjacent pair on
+/// every merge iteration — O(chars²) allocations, which on a Pi 5 costs
+/// ~3.3 ms per prompt token (a 1210-token conversation turn burned 4 s in the
+/// tokenizer alone). Here each merge is resolved once at load into a pair of
+/// token ids, and the merge order is reproduced by a heap keyed on
+/// (rank, left position) — the same "lowest rank, leftmost on ties" rule the
+/// legacy scan implements, so token ids are identical.
+pub struct BpeFastTables {
+    pair_ranks: HashMap<(u32, u32), u32>,
+}
+
 pub struct BpeTokenizer {
     pub vocab: Vec<String>,
     pub token_to_id: IndexedStringTable,
@@ -74,6 +87,10 @@ pub struct BpeTokenizer {
     pub eos_token_id: Option<u32>,
     pub special_tokens: Vec<(String, u32)>,
     pub space_style: SpaceStyle,
+    /// `None` when the merge table cannot be represented exactly (a merge half
+    /// that is not itself a vocab token, or `SpaceStyle::None` where symbols can
+    /// contain the key separator); those tokenizers keep the legacy encoder.
+    pub bpe_fast: Option<BpeFastTables>,
 }
 
 impl BpeTokenizer {
@@ -107,7 +124,7 @@ impl BpeTokenizer {
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        Some(Self {
+        let mut tok = Self {
             vocab,
             token_to_id,
             merges,
@@ -115,7 +132,10 @@ impl BpeTokenizer {
             eos_token_id,
             special_tokens,
             space_style,
-        })
+            bpe_fast: None,
+        };
+        tok.bpe_fast = build_fast_tables(&tok);
+        Some(tok)
     }
 
     pub fn from_hf_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, String> {
@@ -301,7 +321,7 @@ impl BpeTokenizer {
         };
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        Ok(Self {
+        let mut tok = Self {
             vocab,
             token_to_id,
             merges,
@@ -309,7 +329,10 @@ impl BpeTokenizer {
             eos_token_id,
             special_tokens,
             space_style,
-        })
+            bpe_fast: None,
+        };
+        tok.bpe_fast = build_fast_tables(&tok);
+        Ok(tok)
     }
 
     #[inline(always)]
@@ -369,22 +392,146 @@ impl BpeTokenizer {
         tokens
     }
 
+    /// Byte-level (GPT-2) or SentencePiece normalization applied before BPE.
+    fn normalize_text(&self, text: &str) -> String {
+        match self.space_style {
+            // GPT-2/Llama BPE is byte-level. Mapping only spaces corrupts
+            // prompts containing newlines, tabs, quotes, and non-ASCII text.
+            SpaceStyle::Gpt2 => text.bytes().map(gpt2_byte_to_char).collect(),
+            SpaceStyle::SentencePiece => text.replace(' ', "\u{2581}"),
+            SpaceStyle::None => text.to_string(),
+        }
+    }
+
     /// Encode a single regular text segment using BPE merges.
     fn encode_segment(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
             return Vec::new();
         }
+        let normalized = self.normalize_text(text);
+        // SOFUU_BPE_LEGACY=1 restores the O(n²) scanner (also the test oracle
+        // for the fast path). Resolved once per process.
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let legacy = *LEGACY.get_or_init(|| std::env::var_os("SOFUU_BPE_LEGACY").is_some());
+        match (&self.bpe_fast, legacy) {
+            (Some(fast), false) => self.encode_segment_fast(fast, &normalized),
+            _ => self.encode_segment_legacy(&normalized),
+        }
+    }
 
-        let normalized = match self.space_style {
-            SpaceStyle::Gpt2 => {
-                // GPT-2/Llama BPE is byte-level. Mapping only spaces corrupts
-                // prompts containing newlines, tabs, quotes, and non-ASCII text.
-                text.bytes().map(gpt2_byte_to_char).collect()
+    /// Heap-driven BPE over interned token ids: same merge order as the legacy
+    /// scanner (lowest rank first, leftmost on ties), so the ids are identical
+    /// — only the pair keys and the repeated full rescans are gone.
+    fn encode_segment_fast(&self, fast: &BpeFastTables, normalized: &str) -> Vec<u32> {
+        let n = normalized.chars().count();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Local symbol arena: a merged symbol is the concatenation of two
+        // adjacent ones, so bytes are only ever appended.
+        let mut arena: Vec<u8> = Vec::with_capacity(normalized.len() * 2);
+        let mut sym_off: Vec<u32> = Vec::with_capacity(n * 2);
+        let mut sym_len: Vec<u32> = Vec::with_capacity(n * 2);
+        let mut sym_id: Vec<u32> = Vec::with_capacity(n * 2); // vocab id or u32::MAX
+        // Distinct characters repeat heavily; one hash probe per character
+        // would otherwise dominate short texts.
+        let mut char_cache: HashMap<char, u32> = HashMap::new();
+        for c in normalized.chars() {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            let id = *char_cache
+                .entry(c)
+                .or_insert_with(|| self.token_to_id.get(s, &self.vocab).unwrap_or(u32::MAX));
+            sym_off.push(arena.len() as u32);
+            sym_len.push(s.len() as u32);
+            arena.extend_from_slice(s.as_bytes());
+            sym_id.push(id);
+        }
+
+        // Slots: one per initial symbol, in text order. A merge folds the right
+        // slot into the left one, so slot order stays left-to-right and slot
+        // index is the position used for the leftmost tie-break.
+        let mut slot_sym: Vec<u32> = (0..n as u32).collect();
+        let mut prev: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
+        let mut next: Vec<i32> = (0..n as i32).map(|i| i + 1).collect();
+        next[n - 1] = -1;
+        let mut alive = vec![true; n];
+
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> =
+            std::collections::BinaryHeap::new();
+        for i in 0..n.saturating_sub(1) {
+            push_pair(&mut heap, &fast.pair_ranks, &sym_id, &slot_sym, i, i + 1);
+        }
+
+        while let Some(std::cmp::Reverse((rank, l, r))) = heap.pop() {
+            let (li, ri) = (l as usize, r as usize);
+            if !alive[li] || !alive[ri] || next[li] != ri as i32 {
+                continue; // stale: a neighbour merged since this was queued
             }
-            SpaceStyle::SentencePiece => text.replace(' ', "\u{2581}"),
-            SpaceStyle::None => text.to_string(),
-        };
+            // The stored rank can be stale when the left symbol was just
+            // rewritten by another merge; only an unchanged pair may fire.
+            let (la, ra) = (slot_sym[li] as usize, slot_sym[ri] as usize);
+            match fast.pair_ranks.get(&(sym_id[la], sym_id[ra])) {
+                Some(&cur) if cur == rank => {}
+                _ => continue,
+            }
 
+            let (o1, l1) = (sym_off[la], sym_len[la]);
+            let (o2, l2) = (sym_off[ra], sym_len[ra]);
+            let start = arena.len() as u32;
+            arena.extend_from_within(o1 as usize..(o1 + l1) as usize);
+            arena.extend_from_within(o2 as usize..(o2 + l2) as usize);
+            let total = l1 + l2;
+            let merged_id = std::str::from_utf8(&arena[start as usize..(start + total) as usize])
+                .ok()
+                .and_then(|s| self.token_to_id.get(s, &self.vocab))
+                .unwrap_or(u32::MAX);
+            sym_off.push(start);
+            sym_len.push(total);
+            sym_id.push(merged_id);
+            slot_sym[li] = (sym_id.len() - 1) as u32;
+            alive[ri] = false;
+            next[li] = next[ri];
+            if next[li] >= 0 {
+                prev[next[li] as usize] = li as i32;
+            }
+            if prev[li] >= 0 {
+                push_pair(&mut heap, &fast.pair_ranks, &sym_id, &slot_sym, prev[li] as usize, li);
+            }
+            if next[li] >= 0 {
+                push_pair(&mut heap, &fast.pair_ranks, &sym_id, &slot_sym, li, next[li] as usize);
+            }
+        }
+
+        let mut out = Vec::with_capacity(n);
+        let mut slot = 0i32;
+        while slot >= 0 {
+            let si = slot as usize;
+            let sym = slot_sym[si] as usize;
+            let id = sym_id[sym];
+            if id != u32::MAX {
+                out.push(id);
+            } else {
+                // Byte fallback: encode individual bytes as "<0xXX>" tokens.
+                let o = sym_off[sym] as usize;
+                let l = sym_len[sym] as usize;
+                for &b in &arena[o..o + l] {
+                    let byte_repr = format!("<0x{:02X}>", b);
+                    if let Some(id) = self.get_token_id(&byte_repr) {
+                        out.push(id);
+                    }
+                }
+            }
+            slot = next[si];
+        }
+        out
+    }
+
+    /// Reference encoder: rescans the whole segment for the best pair on every
+    /// merge. Kept as the fallback for tokenizers the fast tables cannot
+    /// represent exactly, and as a test oracle for the fast path.
+    fn encode_segment_legacy(&self, normalized: &str) -> Vec<u32> {
         // Initial character tokens
         let mut word_parts: Vec<String> = normalized.chars().map(|c| c.to_string()).collect();
 
@@ -479,6 +626,43 @@ impl BpeTokenizer {
     }
 }
 
+/// Queue the pair starting at `left`, unless either symbol is not a vocab
+/// token (such a pair can never match a merge, see `build_fast_tables`).
+fn push_pair(
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>>,
+    pair_ranks: &HashMap<(u32, u32), u32>,
+    sym_id: &[u32],
+    slot_sym: &[u32],
+    left: usize,
+    right: usize,
+) {
+    let a = sym_id[slot_sym[left] as usize];
+    let b = sym_id[slot_sym[right] as usize];
+    if a != u32::MAX && b != u32::MAX {
+        if let Some(&rank) = pair_ranks.get(&(a, b)) {
+            heap.push(std::cmp::Reverse((rank, left as u32, right as u32)));
+        }
+    }
+}
+
+/// Resolve the merge table into `(left_id, right_id) -> rank` for the fast
+/// encoder. Returns `None` (legacy encoder) when a merge half is not itself a
+/// vocab token — the pair-key mapping would then not be exact — or when the
+/// style's symbols can contain the `' '` key separator (`SpaceStyle::None`).
+fn build_fast_tables(tok: &BpeTokenizer) -> Option<BpeFastTables> {
+    if tok.space_style == SpaceStyle::None || tok.merges.is_empty() {
+        return None;
+    }
+    let mut pair_ranks = HashMap::with_capacity(tok.merges.len());
+    for (key, &rank) in &tok.merges {
+        let (a, b) = key.split_once(' ')?;
+        let ia = tok.token_to_id.get(a, &tok.vocab)?;
+        let ib = tok.token_to_id.get(b, &tok.vocab)?;
+        pair_ranks.insert((ia, ib), rank as u32);
+    }
+    Some(BpeFastTables { pair_ranks })
+}
+
 fn gpt2_bytes_table() -> [Option<u8>; 512] {
     let mut table = [None; 512];
     let mut bs = Vec::with_capacity(256);
@@ -531,6 +715,153 @@ fn gpt2_byte_to_char(b: u8) -> char {
         encoder
     });
     table[b as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toy_tokenizer() -> BpeTokenizer {
+        // GPT-2 byte-level vocab over the characters the tests use, with the
+        // merge table of a handful of words so chained merges are exercised.
+        let mut vocab: Vec<String> = Vec::new();
+        let mut push = |s: &str| {
+            vocab.push(s.to_string());
+        };
+        for b in 0u8..=255 {
+            push(&gpt2_byte_to_char(b).to_string());
+        }
+        for s in [
+            "he", "ll", "hel", "hell", "hello", "Ġw", "Ġwo", "wo", "wor", "worl",
+            "world", "ĠĠ", "!!", ",Ġ",
+        ] {
+            push(s);
+        }
+        for b in 0u8..=255 {
+            push(&format!("<0x{:02X}>", b));
+        }
+        let mut merges = HashMap::new();
+        for (rank, key) in [
+            "h e", "l l", "he l", "hell o", "Ġ w", "Ġw o", "wo r", "wor l",
+            "worl d", "Ġ Ġ", "! !", ", Ġ",
+        ]
+        .iter()
+        .enumerate()
+        {
+            merges.insert(key.to_string(), rank);
+        }
+        let token_to_id = IndexedStringTable::build(&vocab);
+        let space_style = SpaceStyle::Gpt2;
+        let mut tok = BpeTokenizer {
+            vocab,
+            token_to_id,
+            merges,
+            bos_token_id: None,
+            eos_token_id: None,
+            special_tokens: Vec::new(),
+            space_style,
+            bpe_fast: None,
+        };
+        tok.bpe_fast = build_fast_tables(&tok);
+        tok
+    }
+
+    fn assert_same(tok: &BpeTokenizer, text: &str) {
+        let fast = tok.bpe_fast.as_ref().expect("toy tokenizer must use the fast path");
+        let normalized = tok.normalize_text(text);
+        let a = tok.encode_segment_fast(fast, &normalized);
+        let b = tok.encode_segment_legacy(&normalized);
+        assert_eq!(a, b, "fast vs legacy diverged for {text:?}");
+    }
+
+    #[test]
+    fn fast_bpe_matches_legacy_on_edge_cases() {
+        let tok = toy_tokenizer();
+        for text in [
+            "",
+            "h",
+            "hello",
+            "hello world",
+            "hello  world",
+            "helloworld",
+            "hello, world!!",
+            "\n\thello\n",
+            "hello hello hello",
+            "wörld",           // chars outside the toy vocab -> byte fallback
+            "héllo wörld",
+            "....",
+            "  ",
+            "a b c",
+            "hello\nworld",
+        ] {
+            assert_same(&tok, text);
+        }
+    }
+
+    /// Random text over the toy alphabet, including the separator and bytes
+    /// that only exist as <0xXX> tokens: 400 strings, compared id-for-id.
+    #[test]
+    fn fast_bpe_matches_legacy_fuzz() {
+        let tok = toy_tokenizer();
+        let alphabet: Vec<char> = "helowrd,!? \n\tĠ".chars().collect();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..400 {
+            let len = (next() % 24) as usize;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            assert_same(&tok, &s);
+        }
+    }
+
+    /// A merge that duplicates an earlier key must keep the later rank (the
+    /// string map overwrites); the pair map has to reproduce that.
+    #[test]
+    fn fast_bpe_duplicate_merge_rank() {
+        let mut tok = toy_tokenizer();
+        tok.merges.insert("l l".to_string(), 99);
+        tok.merges.insert("h e".to_string(), 100);
+        tok.bpe_fast = build_fast_tables(&tok);
+        assert_same(&tok, "hello");
+    }
+
+    /// End-to-end equivalence on the real production prompt with the real
+    /// Qwen tokenizer, when those files exist on this machine.
+    #[test]
+    fn fast_bpe_matches_legacy_real_qwen_prompt() {
+        let candidates = [
+            "/Users/priyanshuboruah/Downloads/Qwen3-0.6B-Q4_K_M.gguf",
+            "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf",
+            "/Users/priyanshuboruah/Downloads/Llama-3.2-1B-Instruct-Q8_0.gguf",
+        ];
+        let model = match candidates.iter().find(|p| std::path::Path::new(p).exists()) {
+            Some(p) => std::path::Path::new(p),
+            None => return,
+        };
+        let prompt = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/bench_prompt.txt");
+        if !prompt.exists() {
+            return;
+        }
+        let mut gguf = GgufFile::open(model).expect("open model");
+        let tok = BpeTokenizer::from_gguf(&mut gguf).expect("tokenizer");
+        assert!(tok.bpe_fast.is_some(), "Qwen merge table must be representable");
+        let text = std::fs::read_to_string(prompt).expect("read prompt");
+        assert_same(&tok, &text);
+        // A multi-turn-ish concatenation, with special-token-like text.
+        let convo = format!(
+            "<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\nSure — here\tis\n\n a reply.<|im_end|>\n"
+        );
+        assert_same(&tok, &convo);
+        let ids = tok.encode(&convo);
+        assert!(!ids.is_empty());
+    }
 }
 
 pub fn decode_byte_level(s: &str) -> String {

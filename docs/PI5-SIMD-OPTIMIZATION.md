@@ -1144,3 +1144,99 @@ was excluded; the steady-state pairs above were rerun back-to-back.
 Tests: `test_pool_resilience_selftest`, `test_matvec_rejects_short_weights`,
 `test_truncated_gguf_is_a_clean_error`, `test_corrupt_gguf_header_is_rejected`
 (112 infer tests pass on the Mac lane).
+
+## Session 14 (2026-10-23) — Long-context conversations (Pi 5 lane)
+
+Charter: make a long prompt cheap. At the 1210-token bench prompt the old
+pipeline spent **4.47 s of fixed cost per fresh conversation** (tokenizer +
+full KV-cache zero-fill) and its prefill was 118 t/s against llama.cpp's
+132.2. Both are gone; prefill attention was the other 43% of the remaining
+time and is now row-paired.
+
+### What shipped
+
+1. **Heap-driven BPE tokenizer** (`infer/tokenizer.rs`). The old loop picked
+   the globally lowest merge rank by rescanning every merge pair after every
+   merge (O(n²) with a `format!` per comparison): 3.3-3.7 ms/token at a 1210
+   token prompt, i.e. 4.4 s. The new path pre-resolves merge ranks to vocab
+   ids at load (`bpe_fast`) and drives the same "lowest rank, leftmost on
+   ties" rule from a `BinaryHeap` of `(rank, left, right)` with lazy
+   invalidation. `SOFUU_BPE_LEGACY=1` restores the scanner for an A/B.
+   Tokenization is now **5.9 ms** — the whole fixed cost of a fresh prompt.
+2. **No KV zero-fill on reset** (`model.rs reset_cache`). Every reader is
+   bounded by `pos + 1` (attention counts, KIVI ingest, spec tree), all
+   writers go through `kv16_store`, and mmap pages are lazily committed — the
+   1.3 GB memset bought nothing. `SOFUU_KV_ZERO=1` restores the fill.
+3. **Row-paired f32 prefill attention** (`infer_kernels.cpp`). Batched
+   prefill uses the **f32** KV caches (`batched_attention_ext`), not the f16
+   shadows: at 8+ rows the f16 path's conversions cost more than the halved
+   bytes save, and that comment in `model.rs` is what the measurements below
+   confirm. The score pass now processes rows in pairs sharing every K load
+   (8 loads + 16 FMAs per two positions instead of 8 + 8), and the value pass
+   does the same for V (new `sofuu_attn_vacc_pair`). Per-row arithmetic is
+   unchanged — four partial accumulators per position over 16-wide strips —
+   so scores and outputs stay **bit-identical** to the previous kernel.
+
+### Receipts (Pi 5, governor `performance`, `-t 4`, greedy, Qwen3-0.6B Q4_K_M)
+
+| build | fixed cost (n=0) | prefill 1210 tk | attn bucket | decode |
+|---|---|---|---|---|
+| t1p67 (before) | 4.47 s (tokenize 4.4 + reset 0.55) | 118.0-118.6 t/s | 4246 ms | 16.4 tk/s |
+| t1p68 (tokenizer + reset) | **5.9 ms** | 123.1-123.4 t/s | 4246 ms | 16.4 tk/s |
+| t1p70 (+ k16 pair/quad probes) | 5.9 ms | 121.6-121.7 t/s | 4246 ms | 16.4 tk/s |
+| **t1p71 (+ f32 row pairing)** | **5.9 ms** | **132.0-132.6 t/s** | **3667 ms** | **16.4 tk/s** |
+| llama.cpp 11041, same window | — | 132.2 t/s | — | 12.6 tk/s |
+
+Time to first token on the same prompt: **14.7 s → 9.17 s (-38%)**;
+end-to-end prefill throughput **+11.6%**; attention bucket **-13.6%**.
+
+Longer prompt (2419 tokens = the bench text twice):
+
+| engine | prefill | decode | turn time (2419 prefill + 100 gen) |
+|---|---|---|---|
+| sofuu t1p71 | 99.4-99.6 t/s | 9.7 tk/s | 34.6 s |
+| llama.cpp 11041 | 105.6 t/s | 6.5 tk/s | 38.3 s |
+
+Prefill is 5.9% behind at 2.4k positions (attention is O(n²) and llama.cpp's
+f16-dot kernels are still cheaper per MAC), generation is 49% ahead, so a
+turn is ~10% faster overall and the gap widens with output length.
+
+Full-text greedy equality against t1p67 (32 tokens, the 1210-token prompt):
+**identical** for Qwen3-0.6B Q4_K_M, Qwen3-0.6B Q3_K_S, Llama-3.2-1B Q8_0,
+Spark-X2.5-4B Q4_K_M and MiniCPM5-2B Q6_K_XL. The tokenizer and the new
+kernels are bit-exact where it matters.
+
+Per-model prefill/decode at the 1210-token prompt (t1p71): Qwen Q4_K_M
+132.0/16.4, Qwen Q3_K_S 110.1/13.9, Llama-1B Q8_0 124.9/14.8, Spark Q4_K_M
+21.4/3.8 (SWA, window-bounded), MiniCPM5-2B Q6 35.5/6.6 (SWA).
+
+### Measured dead ends (kept out)
+
+- **Head-major attention work order** (-15% prefill): re-indexing the static
+  pool split so every thread sees all row groups looked balanced on paper but
+  cost 1.5-2x in the attention bucket at long context — each thread re-reads
+  the whole K/V prefix per head group and thrashes cache. Group-major (the
+  old order) keeps a thread's four groups on the same resident prefix.
+- **Quad-row V accumulation in the f16 kernels**: neutral end-to-end (the
+  k16 kernels only serve decode and the micro-bench).
+- **f16-dot (VMLAL) prefill scoring**: built, measured 3.6x slower as
+  compiled (scalar fallback — `-march` had no `+fp16fml`), then removed:
+  batched prefill does not use the f16 KV path at all, so the change had no
+  path to the metric. Revisit only if prefill is ever routed to the f16
+  shadows, and then as an explicitly non-bit-exact option.
+
+### Knobs and tests
+
+| env | default | effect |
+|---|---|---|
+| `SOFUU_BPE_LEGACY=1` | off | restores the O(n²) tokenizer scanner |
+| `SOFUU_KV_ZERO=1` | off | zero-fills the KV cache on reset (old behaviour) |
+
+Tests: `fast_bpe_matches_legacy_on_edge_cases`,
+`fast_bpe_matches_legacy_fuzz` (400 random strings),
+`fast_bpe_duplicate_merge_rank`,
+`fast_bpe_matches_legacy_real_qwen_prompt` (real GGUF, bench prompt),
+and `test_attention_k16_matches_f32_for_f16_exact_kv` now includes a
+32-row long-prefix batch that exercises the new paired f32 score/value
+kernels over a long shared prefix (it caught a missing tail row during
+development).

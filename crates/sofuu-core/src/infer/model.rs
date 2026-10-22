@@ -796,14 +796,27 @@ impl TransformerModel {
     }
 
     /// Reset KV cache for a fresh conversation/prompt.
+    ///
+    /// The zero-fill is skipped by default. Every reader bounds its scan to
+    /// the live window (`pos + 1`), every live position is written before it
+    /// is read (`kv16_store` mirrors both stores on every write path), and the
+    /// caches are anonymous mmap — lazily committed to the shared zero page —
+    /// so a fill would only force the full 1.3 GB of a 4096-token context into
+    /// physical memory (≈0.5 s on the Pi 5, once per fresh prompt) and keep it
+    /// resident for a conversation that may never use it.
+    /// `SOFUU_KV_ZERO=1` restores the fill for deterministic cache dumps.
     pub fn reset_cache(&mut self) {
-        self.k_cache.fill(0.0);
-        self.v_cache.fill(0.0);
-        if let Some(k16) = self.k16_cache.as_mut() {
-            k16.as_u16_mut().fill(0);
-        }
-        if let Some(v16) = self.v16_cache.as_mut() {
-            v16.as_u16_mut().fill(0);
+        static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let zero = *ZERO.get_or_init(|| std::env::var_os("SOFUU_KV_ZERO").is_some());
+        if zero {
+            self.k_cache.fill(0.0);
+            self.v_cache.fill(0.0);
+            if let Some(k16) = self.k16_cache.as_mut() {
+                k16.as_u16_mut().fill(0);
+            }
+            if let Some(v16) = self.v16_cache.as_mut() {
+                v16.as_u16_mut().fill(0);
+            }
         }
         self.kivi = None;
     }

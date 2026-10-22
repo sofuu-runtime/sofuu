@@ -1381,6 +1381,7 @@ impl TransformerModel {
             &mut out_logits[0..vocab_size],
         );
         self.logits.copy_from_slice(&out_logits[0..vocab_size]);
+        self.logits_gap_probe_tagged("cpu_tiles_head", start_pos + tokens.len() - 1);
     }
 
     /// Lazy per-row LM head for verify_path's accepted rows: ONE GPU head
@@ -2194,6 +2195,25 @@ impl TransformerModel {
 
     /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
+
+    /// SOFUU_LOGITS_GAP_PROBE=<path>: append the top-8 (value, id) of the
+    /// just-computed logits — one line per token, CPU and GPU routes
+    /// append to their own files; the top-2 gap at the first divergent
+    /// line classifies a text fork as near-tie (reassociation) vs real.
+    fn logits_gap_probe_tagged(&self, tag: &str, pos: usize) {
+        if let Some(p) = std::env::var_os("SOFUU_LOGITS_GAP_PROBE") {
+            let mut idx: Vec<usize> = (0..self.logits.len()).collect();
+            idx.sort_by(|a, b| self.logits[*b].partial_cmp(&self.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+            let line: Vec<String> = idx.iter().take(8)
+                .map(|i| format!("({:.6e},{})", self.logits[*i], i))
+                .collect();
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                let _ = writeln!(f, "{} pos={} {}", tag, pos, line.join(" "));
+            }
+        }
+    }
+
     fn ggpu_head(&mut self) -> bool {
         if let Some(g) = self.gpu.as_mut() {
             let dim = self.config.dim;
@@ -2216,7 +2236,12 @@ impl TransformerModel {
             let src = g.slot_f32(g.slots.logits, vocab);
             self.logits.copy_from_slice(src);
         }
+        self.logits_gap_probe_tagged("ggpu_head", usize::MAX);
         true
+    }
+
+    fn logits_gap_probe(&self) {
+        self.logits_gap_probe_tagged("cpu_head", usize::MAX);
     }
 
     /// GPU2 decode path: same CPU glue (norms, QK-norms, RoPE, KV, attention,
@@ -3393,6 +3418,7 @@ impl TransformerModel {
                 )
             };
             self.logits[0..vocab_size].copy_from_slice(lg);
+            self.logits_gap_probe_tagged("prefill_head", pos_of_last);
         }
         if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
             eprintln!(
@@ -3723,6 +3749,7 @@ impl TransformerModel {
                 &self.x,
                 &mut self.logits,
             );
+            self.logits_gap_probe();
         }
 
         // The `gpu` field only exists on Apple targets (cfg above); on other

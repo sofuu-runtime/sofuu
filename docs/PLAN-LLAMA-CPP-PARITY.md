@@ -434,3 +434,19 @@ stays the pinned-receipts switch).
   the lldb backtrace attempt hung; next session pins it with SOFUU
   instrumentation in the CPU prefill path (model.rs lane), not src/simd
   (peer lane). Defaults are unaffected (route opt-in; battery path clean).
+
+## PROBE CORRECTION (2026-10-22, top-2-gap logits probe landed)
+SOFUU_LOGITS_GAP_PROBE now dumps tagged top-8 (value,id) logits per token
+from prefill_head (GEMM core), cpu_tiles_head (CPU tiles), ggpu_head and
+cpu_head (decode). At the P2 fork (exact-repeat prompt, pos 73, compare
+aligned at the same position): **CPU tiles top-1 = 3364 (gap 0.674),
+GPU route top-1 = 576 (gap 0.353) — top-1 differs by 0.455 logits and the
+GPU's id is not in the CPU's top-8.** The earlier "tolerance-class
+synonym fork" classification for this family is REFUTED — the GEMM-route
+prefill computes materially different logits on exact-repeat prompts
+(P2, P60-differ vs P25-with-distinctive-tail-identical). The suspicion
+sits in the attention-glue values (kv_write/1c — the only fleet ops
+without a value oracle; the gemms are bit-exact by oracles). The
+part/fin/1c/kv_write value-oracle program (CPU attention mirror) is the
+next concrete instrument; until it lands, treat ALL GEMM-route text
+divergences as bug-class, not reassociation-class.

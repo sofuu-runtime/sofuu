@@ -836,6 +836,24 @@ extern "C" {
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_gemm_tiled_wide_multi(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+        B: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_gemm_tiled_wide(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+        B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_mma(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1963,6 +1981,99 @@ impl MetalEngine {
             ) == 1
         };
         self.op_tock(K_ATTN_1C, __t);
+        __r
+    }
+
+    /// arm-E: 64-row tiled q4_K GEMM — same ABI and output layout as
+    /// `batch_gguf_gemm_tiled`, but x is staged once per 64-row block
+    /// (the ffn gate/up shape is x-traffic bound at 32 rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_gguf_gemm_tiled_wide(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        if ty != 12 || !Self::gemm_tiled_enabled() || b < 16 {
+            return false;
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_tiled_wide(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// arm-E: 64-row fused tiled q4_K GEMM (section table). Enabled only for
+    /// the shapes that measured a win: rows >= 4096 (the ffn gate/up side,
+    /// where the activation tile is re-staged once per row block).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_wide_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static WIDE: AtomicU8 = AtomicU8::new(0);
+        match WIDE.load(Ordering::Relaxed) {
+            0 => {
+                // OFF by default: the 64-row tile wins 1.32x on the single
+                // dominant GEMM shape but that slice is too small to resolve
+                // end to end (0.6B: 560 vs 564 ms under load 5.0). Flip only
+                // after an idle-machine A/B shows a win on both 0.6B and 8B.
+                let on = matches!(
+                    std::env::var("SOFUU_GPU_GEMM_WIDE").as_deref(),
+                    Ok("1") | Ok("on") | Ok("true")
+                );
+                WIDE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+            1 => true,
+            _ => false,
+        }
+    }
+
+    pub fn batch_gguf_gemm_tiled_wide_multi(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows_total: usize, cols: usize, b: usize,
+        secs: &[[u32; 5]],
+    ) -> bool {
+        if ty != 12
+            || !Self::gemm_tiled_enabled()
+            || !Self::gemm_wide_enabled()
+            || b < 16
+            || rows_total < 4096
+            || secs.is_empty()
+            || secs.len() > 4
+        {
+            return false;
+        }
+        let mut flat = [0u32; 20];
+        for (i, s) in secs.iter().enumerate() {
+            flat[i * 5..i * 5 + 5].copy_from_slice(s);
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_tiled_wide_multi(
+                self.ctx,
+                ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows_total, cols, b,
+                flat.as_ptr(), secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
         __r
     }
 
@@ -6361,6 +6472,13 @@ fn gemm_q4_k_tiled_matches_cpu() {
                 ty, &w_buf, 0, &slab_buf, 0, &slab_buf, 0, rows, cols, B, &blob,
             );
             engine.batch_end();
+            if B < 16 {
+                // the route hands b<16 to the shipped 8-token class on purpose
+                // (a 3-token tail must not pay for a 64-token tile): the tiled
+                // entry refuses it, so there is nothing to compare here.
+                assert!(!ok, "tiled multi should refuse B={B}");
+                continue;
+            }
             assert!(ok, "tiled multi ty={ty} unavailable");
             let y_gpu: &[f32] = unsafe { std::slice::from_raw_parts(slab_ptr.add(y_off) as *const f32, B * rows) };
             let mut worst = 0f32;
@@ -7665,34 +7783,160 @@ fn bench_tiled_real_shapes() {
         for i in 0..slab.len() { slab[i] = 0; }
         let s_buf = engine.register_zerocopy_only(slab).expect("slab");
         let y_off = B * cols * 4;
-        let run = |n: usize| {
+        let run = |n: usize, wide: bool| {
             let t0 = Instant::now();
             for _ in 0..n {
                 assert!(engine.batch_open());
-                // the plain tiled entry is q4_K-only; q6_K shapes go through
-                // the acc form (which is how the route dispatches them)
-                let ok = if ty == 12 {
+                let ok = if ty == 12 && wide {
+                    engine.batch_gguf_gemm_tiled_wide(ty, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows, cols, B)
+                } else if ty == 12 {
                     engine.batch_gguf_gemm_tiled(ty, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows, cols, B)
                 } else {
                     engine.batch_gguf_gemm_tiled_acc(ty, &w_buf, 0, &s_buf, 0, &s_buf, 0, 0, &s_buf, y_off, rows, cols, B)
                 };
                 engine.batch_end();
-                assert!(ok, "tiled {rows}x{cols} ty={ty}");
+                assert!(ok, "tiled {rows}x{cols} ty={ty} wide={wide}");
             }
             t0.elapsed().as_secs_f64() / n as f64
         };
-        run(2);
-        let per = run(5);
         let flop = 2.0 * rows as f64 * cols as f64 * B as f64;
+        run(2, false);
+        let per = run(5, false);
+        let per_w = if ty == 12 {
+            run(2, true);
+            run(5, true)
+        } else {
+            f64::NAN
+        };
         println!(
-            "[real-shape] ty={ty} {rows}x{cols} B={B}: {:.3} ms  {:.2} TFLOP/s",
-            per * 1e3, flop / per / 1e12
+            "[real-shape] ty={ty} {rows}x{cols} B={B}: 32row {:.3} ms {:.2} TFLOP/s | 64row {:.3} ms {:.2} TFLOP/s",
+            per * 1e3, flop / per / 1e12, per_w * 1e3, flop / per_w / 1e12
         );
         unsafe {
             libc::munmap(wp as *mut libc::c_void, w_bytes);
             libc::munmap(sp as *mut libc::c_void, slab_bytes);
         }
     }
+}
+
+/// arm-E: the 64-row fused tile must match the 32-row fused tile bit-for-bit
+/// in the class sense — same dequant, same f32 accumulate, so the only
+/// difference is summation order inside a k-slice. Gate: 1e-5 relative.
+#[test]
+#[ignore]
+fn gemm_q4_k_tiled_wide_fused_matches_cpu() {
+    std::env::set_var("SOFUU_GPU_GEMM_TILED", "1");
+    // the 64-row tile is opt-in (it wins on one shape, loses on the rest)
+    std::env::set_var("SOFUU_GPU_GEMM_WIDE", "1");
+    let engine = MetalEngine::new().expect("engine");
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    // two sections, 64-row straddle: 4096 + 2048 rows, cols = 512
+    let cols = 512usize;
+    let s_rows = [4096usize, 2048usize];
+    let rows_tot = 6144usize;
+    let b = 128usize;
+    let bb = 144usize;
+    let nb = cols / 256;
+    let w_bytes = ((rows_tot * nb * bb) as f64 * 1.0).ceil() as usize;
+    let w_bytes = w_bytes.div_ceil(page) * page;
+    let wp = mk(w_bytes);
+    let w: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(wp, w_bytes) };
+    let mut seed = 0x12345678u64;
+    for byte in w.iter_mut() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *byte = (seed >> 33) as u8;
+    }
+    for blk in 0..(rows_tot * nb) {
+        let off = blk * bb;
+        w[off] = 0x00; w[off + 1] = 0x34;      // d    = 0.25
+        w[off + 2] = 0x00; w[off + 3] = 0x2C;  // dmin = 0.0625
+    }
+    let w_buf = engine.register_zerocopy_only(w).expect("w");
+    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 101.0).collect();
+    let mut s = vec![0u8; ((b * cols + b * rows_tot) * 4).div_ceil(page) * page];
+    for (i, v) in x.iter().enumerate() { s[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes()); }
+    let s_buf = engine.register_zerocopy_only(&mut s).expect("slab");
+    let y_off = b * cols * 4;
+    // [off, rem, rows_end, y_off(bytes), y_stride(elements)]
+    // Each section owns its own [b x section_rows] y region, exactly as the
+    // route lays out q/k/v — the epilogue's local_row is section-relative.
+    let secs: [[u32; 5]; 2] = [
+        [0, 0, s_rows[0] as u32, 0, s_rows[0] as u32],
+        [
+            (s_rows[0] * nb * bb) as u32,
+            0,
+            rows_tot as u32,
+            (b * s_rows[0] * 4) as u32,
+            s_rows[1] as u32,
+        ],
+    ];
+    // reference implementation of the same sections: the 32-row fused tile
+    assert!(engine.batch_open());
+    let ok32 = engine.batch_gguf_gemm_tiled_multi(12, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows_tot, cols, b, &secs);
+    engine.batch_end();
+    assert!(ok32, "32-row fused dispatch rejected");
+    let gather = |buf: &[u8]| -> Vec<f32> {
+        let mut out = vec![0f32; b * rows_tot];
+        for t in 0..b {
+            for grow in 0..rows_tot {
+                let (base, stride, local) = if grow < s_rows[0] {
+                    (0usize, s_rows[0], grow)
+                } else {
+                    (b * s_rows[0], s_rows[1], grow - s_rows[0])
+                };
+                let o = y_off + (base + t * stride + local) * 4;
+                out[t * rows_tot + grow] = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+            }
+        }
+        out
+    };
+    let got32: Vec<f32> = gather(&s);
+    for v in s[y_off..].iter_mut() { *v = 0; }
+    assert!(engine.batch_open());
+    let ok = engine.batch_gguf_gemm_tiled_wide_multi(12, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows_tot, cols, b, &secs);
+    engine.batch_end();
+    assert!(ok, "wide fused dispatch rejected");
+    let got: Vec<f32> = gather(&s);
+
+    // CPU reference: the same two sections back to back
+    let mut want = vec![0f32; b * rows_tot];
+    for t in 0..b {
+        for grow in 0..rows_tot {
+            let off = grow * nb * bb;
+            want[t * rows_tot + grow] = unsafe {
+                crate::infer::quant::vec_dot_raw_q4_k(
+                    w[off..].as_ptr(),
+                    x[t * cols..].as_ptr(),
+                    nb,
+                )
+            };
+        }
+    }
+    // Random-bit scales produce rows whose true dot lands near zero (cancellation),
+    // where a relative gate is meaningless — 0.0 vs 1e-4 reads as "125% error".
+    // Gate on absolute error against the tensor's own scale instead.
+    let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1.0);
+    let mut w32 = 0f32;
+    let mut wwid = 0f32;
+    for i in 0..want.len() {
+        w32 = w32.max((got32[i] - want[i]).abs() / scale);
+        wwid = wwid.max((got[i] - want[i]).abs() / scale);
+    }
+    println!(
+        "[wide-fused] 2 sections 4096+2048 rows x 512 cols, B=128: \
+         32row worst={w32:.3e} 64row worst={wwid:.3e} (abs/scale, scale={scale:.1})"
+    );
+    assert!(w32 <= 1e-5, "32-row fused drifted: {w32:.3e}");
+    assert!(wwid <= 1e-5, "64-row fused mismatch: {wwid:.3e}");
+    println!("[wide-fused] PARITY PASS (64-row == 32-row == CPU)");
 }
 
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape

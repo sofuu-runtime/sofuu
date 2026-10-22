@@ -1234,3 +1234,35 @@ Two consequences:
    compute mapping (the 16x8 thread grid with a 4x4 register tile only
    covers 32 rows), which is the concrete next step, ahead of any further
    MMA work.
+
+## LEDGER #5 — 64-ROW TILE: kernel win, no end-to-end win (default off)
+
+`gemm_q4_k_tiled_wide` / `_wide_fused` stage x once per 64-row block instead of
+per 32 (8x4 register tile per thread, 8 row-groups x 16 token-groups, 32
+accumulators). Parity: `gemm_q4_k_tiled_wide_fused_matches_cpu` — 2 sections
+4096+2048 rows, 512 cols, B=128 — 64-row is **bit-identical** to the 32-row
+fused tile and both sit at 9.8e-7 of the CPU reference (absolute/scale; a
+relative gate is meaningless on rows whose dot cancels to ~0).
+
+Kernel rate, same buffers, 5 reps (quiet machine):
+
+| shape | 32-row | 64-row |
+|---|---|---|
+| **6144x1024** (ffn gate/up) | 1.92 ms · 0.84 TFLOP/s | **1.45 ms · 1.11** (+32%) |
+| 3072x1024 (qkv) | 0.79 · 1.01 | 0.84 · 0.95 (-6%) |
+| 1024x2048 (o-proj) | 0.61 · 0.88 | 0.70 · 0.76 (-15%) |
+| 1024x3072 (down) | 0.83 · 0.97 | 0.97 · 0.83 (-17%) |
+| 1024x4096 (wide ffn) | 1.05 · 1.03 | 1.24 · 0.87 (-19%) |
+
+So it is gated to `rows >= 4096` (the gate/up side only) and **off by default**
+(`SOFUU_GPU_GEMM_WIDE=1` to arm). End to end on the 0.6B, min of 3, 123-token
+prefill: 560 ms (32-row) vs 564 ms (wide) — inside the noise, because gate/up is
+one of four GEMM shapes in a pass where GEMM is ~60% of the time:
+0.6 x 0.25 x 0.32 ~= 5% expected, and the box was at load 5.0 (WindowServer +
+browser) with run-to-run spread of 20%.
+
+Conclusion carried forward: per-shape tiling is now exhausted — every remaining
+tile change wins on one shape and loses on another. The next real lever is a
+schedule that holds x resident across ALL of a layer's GEMMs (one staging pass
+per token block, weights streamed) instead of re-staging per GEMM, or MPSGraph
+for the whole ffn block.

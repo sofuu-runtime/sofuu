@@ -574,3 +574,39 @@ any route/coalesced default flips move. (Fallback ordering caveat: the
 tile repack cache must be populated before the GPU gemm reads it, or the
 kernel needs the unpacked-row form — decided at implementation when the
 tile lookup's lifetime is wired into the engine.)
+
+## PHASE-4 OPENING RECEIPTS (2026-10-23 09:1xZ — the MMQ mirror is partly SUPERSEDED)
+Constants: 0.6B i1-Q4_K_M, "Write three sentences about Paris.",
+SOFUU_QKV_SNAP stage dumps + tagged logits probes.
+1. **SOFUU_NO_TILES CPU == GPU at the L0 qkv stage: worst 1.2e-6
+   (r1419 nt=1.050925 gpu=1.050925 py=1.050925)** — the shipped plain
+   batch branch reaches the exact class; only the default TILE path
+   (q8_K per-256 activations, 3x-worker 8x4 repack kernel) deviates
+   1.8e-2 vs both. "Act-quant metal mirror" for the qkv stage: NOT
+   NEEDED — the GPU exact gemm already has its CPU twin (NO_TILES).
+2. TILES vs NOTILES both on CPU: 1.835e-2 (s2.qa) — tiles carry the
+   coarse-actquant class; notiles/py/gpu are one canonical class.
+3. Tagged-logits probe, prefill step-1 (pos=5): NOTILES-cpu vs GPU route
+   agree on ALL top-8 token IDs; values differ ~4e-3 absolute on
+   |logit|~14.5 (≈3e-4 relative) — vs the P2/P60 fork gaps (0.3-0.7) that
+   class is 100x smaller: the 1.8e-2 tiles class was THE text-fork
+   driver; the remaining 3e-4 residual = accumulated f32 association
+   noise (CPU 4-lane vec_dot_f32 vs GPU sequential) amplified by 28
+   layers, and it still tie-flips some far-context steps.
+4. Full text A/B (Paris/32): cpu-tiles / cpu-notiles / gpu-route are ALL
+   THREE different — prefill parity alone does not close text; the
+   decode GEMV classes (ggpu_head vs cpu matvec) add their own logits
+   offsets per generated token.
+
+REVISED BOOKING (supersedes "Metal q8_Kx4 MMQ gemm" for the prefill side):
+- (a) remaining text-parity gap = DECODE-side class + the 3e-4 residual;
+  the decode-chain refactor + a logits-tolerance gate (near-tie
+  certification from item 5) own the bar;
+- (b) the ONLY default-route change this justifies: NONE today — but the
+  {SOFUU_GPU_PREfill + SOFUU_NO_TILES} pair is a documented
+  CPU-identical-class prefill configuration (1.2e-6/3e-4);
+- (c) the 1.8e-2 tiles class vs canonical stays a KNOWN property of the
+  default route (llama.cpp-adjacent coarse-actquant), rate receipts
+  unaffected; if the developer wants default-CPU vs default-GPU text
+  equality, the 8x4-tile MSL mirror (q8_K per-256 + mmla order) is the
+  booked kernel program.

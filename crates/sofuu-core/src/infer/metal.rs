@@ -655,6 +655,20 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, B: usize,
     ) -> i32;
+    // 8x4-tile MMQ mirror (SOFUU_GPU_TILE_MMQ=1)
+    fn sofuu_metal_batch_quantize_q8_k(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        cols: usize, B: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gemm_q4_k_mmq(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        xq_buf: *mut c_void, xq_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_multi(
         ctx: *mut c_void,
         ty: u32,
@@ -1123,6 +1137,49 @@ impl MetalEngine {
                 ty,
                 w_buf.handle, w_offset,
                 x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// 8x4-tile MMQ mirror: act-quantize [B x cols] f32 rows into per-256
+    /// TileQ8K blocks (d + qs[256], stride 260B). y region must be
+    /// B*(cols/256)*260 bytes.
+    pub fn batch_quantize_q8_k(
+        &self,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        cols: usize, b: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_quantize_q8_k(
+                self.ctx,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// q4_K gemm over TileQ8K activations mirroring the CPU tiles' integer/
+    /// f32 order bit-for-bit (y = [B x rows]).
+    pub fn batch_gemm_q4_k_mmq(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        xq_buf: &MetalBuffer, xq_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gemm_q4_k_mmq(
+                self.ctx,
+                w_buf.handle, w_offset,
+                xq_buf.handle, xq_offset,
                 y_buf.handle, y_offset,
                 rows, cols, b,
             ) == 1

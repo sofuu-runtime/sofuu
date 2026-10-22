@@ -665,3 +665,24 @@ certification-class until the fleet-exact endgame (order-exact ops +
 libm-matching exp) is funded. PROMPT SET for future re-gates: "Write
 three sentences about Paris." (+32) and the exact-repeat string above
 (+24) — re-run scripts/text_gate.py unchanged.
+
+## 8x4-TILE MSL MIRROR — framework shipped, byte-identity PENDING one receipt (2026-10-23)
+Landed (SOFUU_GPU_TILE_MMQ=1, default off): `quantize_q8_k` + `gemm_q4_k_mmq`
+MSL kernels (a76_repack.h q8_K act-quant + p-pipeline f32/int order, explicit
+fma), C exports + PSOs + wrappers, and the prefill-core wiring (gemm! macro
+branch, o-proj/down via mmq+batch_add = the CPU's single vaddq, fused gate_up
+and acc paths excluded under the gate, xq8 slot region).
+Validation state: a from-scratch Python reducer of the p-pipeline matches the
+MSL kernel to 5.4e-7 (kernel is semantically the p-algorithm), BUT the
+shipped CPU tile kernel's measured values sit 9.8e-2 from BOTH the mirror
+AND the python reducer fed the CPU's own s1 input (r0: py=-0.013968 =
+mirror; CPU=-0.017208). Forcing SOFUU_NIBBLE_PLANES/Q4_SS/SCALE_SIDECAR
+changed nothing (p was already active). So a9-pipeline reading ≠ shipped
+binary's actual kernel — remaining suspect: the act-quant INPUT class (the
+2.4e-7 rmsnorm delta flipping near-.5 quants, amplifying ~1e3 through the
+dot) not yet isolated. BOOKED NEXT: dump the GPU-side TileQ8K quants (one
+temporary snap of the xq8 region) vs a host re-run of
+ggml_quantize_mat_q8_K_4x4 on the CPU's xn; if quants match, diff the per-
+block d/scale order inside the shipped kernel by elimination against the
+remaining variants (s/sc/plain 8x4) empirically. The gate bar (default pair
+IDENTICAL/CERTIFIED) stays open until then; NO defaults moved.

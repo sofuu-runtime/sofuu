@@ -3057,3 +3057,105 @@ kernel void gemm_q6_k_t32(
     }
     if (v) { y[(size_t)t * rows + row] = acc; }
 }
+
+// ── 8x4-tile MMQ mirror (SOFUU_GPU_TILE_MMQ=1) ──────────────────────────────
+// Bit-identical twin of the CPU default-tile q4_K path (a76_repack.h):
+// activations quantized per-256 q8_K exactly like ggml_quantize_mat_q8_K_4x4
+// (signed-max iscale = -127/max, magic-number round-to-nearest-even): then
+// the gemm mirrors ggml_gemm_q4_K_8x4_q8_K_p's per-(row,token) combination:
+// per 64-chunk the exact integer sc_lo*acc_lo + sc_hi*acc_hi is fma'd into a
+// running f32 acc (fused, single rounding), the bsum*min int32 bias
+// accumulates across the 4 chunks and is subtracted fused at block tail
+// (vmlsq = single-rounded). Integers are order-free; the only order-sensitive
+// ops are explicit fma() calls.
+#pragma clang fp contract(off)
+
+struct TileQ8K {
+    float d;
+    char  qs[256];
+};
+
+// grid: (B, cols/256)
+kernel void quantize_q8_k(
+    device const float *x    [[buffer(0)]],   // [B x cols] row-major
+    device TileQ8K     *y    [[buffer(1)]],   // [B * (cols/256)] blocks
+    constant uint      &cols [[buffer(2)]],
+    uint2 gid            [[thread_position_in_grid]]
+) {
+    uint nb = cols / 256;
+    uint t  = gid.x;
+    uint b  = gid.y;
+    device const float *xb = x + (size_t)t * cols + b * 256;
+    float amax = 0.0f, max = 0.0f;
+    for (uint j = 0; j < 256; ++j) {
+        float ax = fabs(xb[j]);
+        if (ax > amax) { amax = ax; max = xb[j]; }
+    }
+    device TileQ8K *o = y + (size_t)t * nb + b;
+    if (amax == 0.0f) {
+        o->d = 0.0f;
+        for (uint j = 0; j < 256; ++j) o->qs[j] = 0;
+        return;
+    }
+    float iscale = -127.0f / max;
+    o->d = 1.0f / iscale;
+    for (uint j = 0; j < 256; ++j) {
+        float q = xb[j] * iscale;
+        q += 12582912.0f;
+        q -= 12582912.0f;
+        o->qs[j] = (char)(int)q;
+    }
+}
+
+// grid: (rows, B)
+kernel void gemm_q4_k_mmq(
+    device const uchar   *w_base [[buffer(0)]],
+    device const TileQ8K *xq     [[buffer(1)]],
+    device float         *y      [[buffer(2)]],
+    constant uint        &cols   [[buffer(3)]],
+    constant uint        &w_rem  [[buffer(4)]],
+    constant uint        &B      [[buffer(5)]],
+    constant uint        &rows   [[buffer(6)]],
+    uint2 gid              [[thread_position_in_grid]]   // (row, token)
+) {
+    uint row = gid.x;
+    uint t   = gid.y;
+    uint nb  = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    device const TileQ8K *x8 = xq + (size_t)t * nb;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d  = float(read_f16(w_base, row_byte + b * 144));
+        float dmn = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        float dx = x8[b].d;
+        float sbd_scale = d * dx;
+        float sbd_min = dmn * dx;
+        device const char *q8 = x8[b].qs;
+        int bias = 0;
+        for (uint sb = 0; sb < 4; ++sb) {
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            q4k_scale_min(scales, sb * 2 + 0, &sc_lo, &m_lo);
+            q4k_scale_min(scales, sb * 2 + 1, &sc_hi, &m_hi);
+            uint q_off = sb * 64;
+            uint b_off = sb * 32;
+            int acc_lo = 0, acc_hi = 0;
+            int bsum_lo = 0, bsum_hi = 0;
+            for (uint k = 0; k < 32; ++k) {
+                uchar wq = qs[b_off + k];
+                int ql = (int)q8[q_off + k];
+                int qh = (int)q8[q_off + 32 + k];
+                acc_lo  += (int)(wq & 0x0F) * ql;
+                acc_hi  += (int)(wq >> 4)   * qh;
+                bsum_lo += ql;
+                bsum_hi += qh;
+            }
+            int sum_int = (int)sc_lo * acc_lo + (int)sc_hi * acc_hi;
+            acc = fma(sbd_scale, (float)sum_int, acc);
+            bias += (int)m_lo * bsum_lo + (int)m_hi * bsum_hi;
+        }
+        acc = fma(-sbd_min, (float)bias, acc);
+    }
+    y[(size_t)t * rows + row] = acc;
+}

@@ -3278,19 +3278,38 @@ impl TransformerModel {
         let gemm_types_all = std::env::var("SOFUU_GEMM_TYPES")
             .map(|v| v == "all")
             .unwrap_or(false);
+        // 8x4-tile MMQ mirror: route the q4_K batch gemms through the
+        // act-quantized kernels that bit-mirror the CPU tiles' integer/f32
+        // order (default pair route parity; see PLAN-LLAMA-CPP-PARITY).
+        let tile_mmq = std::env::var("SOFUU_GPU_TILE_MMQ")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         macro_rules! gemm {
             ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {{
                 // Phase 3: the real-GEMM class dispatches per TYPE (8/12/14);
                 // q6_K/q8_0 ride it only under SOFUU_GEMM_TYPES=all (the 1B
                 // in-model defect above), other dtypes take the per-row loop.
-                let fast = ($tv.tensor_type == GGML_TYPE_Q4_K
-                    || (gemm_types_all
-                        && matches!($tv.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_0)))
-                    && g.engine.batch_gguf_gemm(
-                        $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
-                        pbuf, $x_off, pbuf, $y_off,
+                let mmq_fast = tile_mmq
+                    && $tv.tensor_type == GGML_TYPE_Q4_K
+                    && g.engine.batch_quantize_q8_k(
+                        pbuf, $x_off, pbuf, pslots.xq8, $cols, b,
+                    )
+                    && g.engine.batch_gemm_q4_k_mmq(
+                        &g.w_buf, gguf.data_offset + $tv.offset,
+                        pbuf, pslots.xq8,
+                        pbuf, $y_off,
                         $rows, $cols, b,
                     );
+                let fast = mmq_fast
+                    || (($tv.tensor_type == GGML_TYPE_Q4_K
+                        || (gemm_types_all
+                            && matches!($tv.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_0)))
+                        && g.engine.batch_gguf_gemm(
+                            $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
+                            pbuf, $x_off, pbuf, $y_off,
+                            $rows, $cols, b,
+                        ));
                 if !fast {
                     for t in 0..b {
                         g.engine.batch_gguf(
@@ -3566,6 +3585,9 @@ impl TransformerModel {
             }
             let o_ok = !g.skip_attn
                 && acc_fuse
+                // tile_mmq takes the o-proj through gemm!+add below (the mmq
+                // mirror has no fused-acc form; the add = the CPU's one vaddq).
+                && !(tile_mmq && l.attn_output.tensor_type == GGML_TYPE_Q4_K)
                 && (l.attn_output.tensor_type == GGML_TYPE_Q4_K
                     || (gemm_types_all
                         && matches!(
@@ -3597,13 +3619,15 @@ impl TransformerModel {
                         (&l.ffn_up, hidden_dim as u32, pslots.up, hidden_dim as u32),
                     ],
                     2 * hidden_dim, dim, pslots.xn
-                ) && std::env::var("SOFUU_FUSE_GUP").map(|v| v != "0").unwrap_or(true);
+                ) && std::env::var("SOFUU_FUSE_GUP").map(|v| v != "0").unwrap_or(true)
+                    && !tile_mmq;
                 if !ffn_fused {
                     gemm!(l.ffn_gate, pslots.xn, pslots.gate, hidden_dim, dim);
                     gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
                 }
                 g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
                 let d_ok = acc_fuse
+                    && !(tile_mmq && l.ffn_down.tensor_type == GGML_TYPE_Q4_K)
                     && (l.ffn_down.tensor_type == GGML_TYPE_Q4_K
                         || (gemm_types_all
                             && matches!(
@@ -4345,6 +4369,7 @@ struct PrefillSlots {
     gate: usize,
     up: usize,
     rope: usize,
+    xq8: usize,
     logits: usize,
 }
 
@@ -4525,6 +4550,10 @@ impl GgufGpu {
                 ao: gguf_gpu_slot(&mut pc, PRE_B * q_rows),
                 xo: gguf_gpu_slot(&mut pc, PRE_B * dim),
                 rope: gguf_gpu_slot(&mut pc, PRE_B * config.head_dim),
+                xq8: gguf_gpu_slot(
+                    &mut pc,
+                    PRE_B * (dim.max(q_rows).max(config.hidden_dim) / 256) * 65,
+                ),
                 gate: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
                 up: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
                 logits: gguf_gpu_slot(&mut pc, vocab),

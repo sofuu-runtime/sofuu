@@ -1871,8 +1871,15 @@ impl TransformerModel {
             if self.execute_layers_gpu(pos, start_layer, end_layer) {
                 return;
             }
-            // the GPU rejected the batch command buffer (outputs untouched —
-            // no KV written): fall through and run the layers on the CPU
+            // A rejected command buffer tears (partial writes, later ops
+            // killed). Falling through to the full CPU layer loop from
+            // start_layer is still coherent: every layer's KV write for the
+            // token's positions is overwritten (GPU and CPU KV are
+            // bit-identical per the parity receipts, so the rerun is
+            // idempotent), and self.x here is the token's layer INPUT — the
+            // GPU paths only sync x back to the host at their successful
+            // tails, never on a failure return.
+            // layers 0..(start_layer) were never touched by this call.
         }
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;

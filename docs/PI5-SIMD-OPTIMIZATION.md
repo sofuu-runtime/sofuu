@@ -1018,3 +1018,22 @@ Only same-window comparisons are valid.
 Still short of "not a bit less": Q3_K decode 27.2 vs 27.7-28.1 (2%, native 8-row
 tile identified above) and MiniCPM prefill 38.2-38.5 vs 38.7 (0.5-1.3%, q6_K
 GEMM rate). Everything else is ahead or at parity in the same window.
+
+### UD-IQ3_XXS scope (measured, not started)
+
+The Qwen3-0.6B-UD-IQ3_XXS file is not "one missing type". Its tensor histogram:
+`f32` 113 (norms), `q5_K` 1 (token_embd), `iq2_xs` 10, `iq3_xxs` 112, `iq3_s` 33,
+`iq2_s` 36, `iq4_xs` 5 — six quant formats, five of them codebook quants (each
+needs llama.cpp's grid table + ksigns table + a grid GEMV/GEMM). That is a much
+larger project than Q3_K's single 110-byte block format; q5_K (176 B/256, same
+scale/min permutation family as q4_K) is the only mechanical one and it alone
+does not open the file.
+
+### Ternary-9B prefill is MAC-bound, not bandwidth-bound
+
+233-token prefill takes 165-171 s (1.4 tk/s). The slab GEMM
+(`gemm_rows_t143_direct`) already expands each weight row to int8 once per pass
+and dots 4 tokens per SDOT group, so the remaining rate — 9B params ≈ 18
+GMAC/token at 1.4 tk/s ≈ 25 GMAC/s, versus ~200 GMAC/s for the q4_K tile GEMM —
+is kernel efficiency, not redundant weight reads. There is no llama.cpp baseline
+(type 142 is Prism-private).

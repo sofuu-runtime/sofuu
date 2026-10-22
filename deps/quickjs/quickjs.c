@@ -269,6 +269,7 @@ struct JSRuntime {
     uintptr_t stack_limit; /* lower stack limit */
     
     JSValue current_exception;
+    JSValue current_async_context;
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
 
@@ -831,6 +832,7 @@ typedef struct JSJobEntry {
     struct list_head link;
     JSContext *ctx;
     JSJobFunc *job_func;
+    JSValue async_context;
     int argc;
     JSValue argv[0];
 } JSJobEntry;
@@ -1682,6 +1684,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     JS_UpdateStackTop(rt);
 
     rt->current_exception = JS_NULL;
+    rt->current_async_context = JS_UNDEFINED;
 
     return rt;
  fail:
@@ -1829,6 +1832,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
         return -1;
     e->ctx = ctx;
     e->job_func = job_func;
+    e->async_context = JS_DupValue(ctx, rt->current_async_context);
     e->argc = argc;
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
@@ -1848,7 +1852,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
     JSJobEntry *e;
-    JSValue res;
+    JSValue res, prev_async_ctx;
     int i, ret;
 
     if (list_empty(&rt->job_list)) {
@@ -1860,7 +1864,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
+    prev_async_ctx = rt->current_async_context;
+    rt->current_async_context = e->async_context;
     res = e->job_func(e->ctx, e->argc, (JSValueConst *)e->argv);
+    rt->current_async_context = prev_async_ctx;
+    JS_FreeValue(ctx, e->async_context);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -1945,11 +1953,13 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     JS_FreeValueRT(rt, rt->current_exception);
+    JS_FreeValueRT(rt, rt->current_async_context);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeValueRT(rt, e->async_context);
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
@@ -47700,6 +47710,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    JSValue async_context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
@@ -47727,6 +47738,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
+    JS_FreeValueRT(rt, rd->async_context);
     js_free_rt(rt, rd);
 }
 
@@ -47780,6 +47792,21 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt,
     rt->host_promise_rejection_tracker_opaque = opaque;
 }
 
+JSValue JS_GetAsyncContext(JSRuntime *rt)
+{
+    if (!rt)
+        return JS_UNDEFINED;
+    return JS_DupValueRT(rt, rt->current_async_context);
+}
+
+void JS_SetAsyncContext(JSRuntime *rt, JSValueConst val)
+{
+    if (!rt)
+        return;
+    JS_FreeValueRT(rt, rt->current_async_context);
+    rt->current_async_context = JS_DupValueRT(rt, val);
+}
+
 static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
                                       JSValueConst value, BOOL is_reject)
 {
@@ -47787,6 +47814,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
     JSValueConst args[5];
+    JSValue prev_ctx;
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -47810,7 +47838,10 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, is_reject);
         args[4] = value;
+        prev_ctx = ctx->rt->current_async_context;
+        ctx->rt->current_async_context = rd->async_context;
         JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        ctx->rt->current_async_context = prev_ctx;
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -48011,6 +48042,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
             JS_MarkValue(rt, rd->handler, mark_func);
+            JS_MarkValue(rt, rd->async_context, mark_func);
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
@@ -48501,6 +48533,7 @@ static __exception int perform_promise_then(JSContext *ctx,
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     JSPromiseReactionData *rd_array[2], *rd;
+    JSValue prev_ctx;
     int i, j;
 
     rd_array[0] = NULL;
@@ -48519,6 +48552,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = JS_DupValue(ctx, handler);
+        rd->async_context = JS_DupValue(ctx, ctx->rt->current_async_context);
         rd_array[i] = rd;
     }
 
@@ -48541,7 +48575,10 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, i);
         args[4] = s->promise_result;
+        prev_ctx = ctx->rt->current_async_context;
+        ctx->rt->current_async_context = rd->async_context;
         JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        ctx->rt->current_async_context = prev_ctx;
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }

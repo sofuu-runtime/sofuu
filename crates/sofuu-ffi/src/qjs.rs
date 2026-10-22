@@ -413,6 +413,8 @@ extern "C" {
         cb: Option<JSHostPromiseRejectionTracker>,
         opaque: *mut c_void,
     );
+    pub fn JS_GetAsyncContext(rt: *mut JSRuntime) -> JSValue;
+    pub fn JS_SetAsyncContext(rt: *mut JSRuntime, val: JSValueConst);
     pub fn JS_CallConstructor(
         ctx: *mut JSContext,
         func_obj: JSValueConst,

@@ -269,6 +269,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::zerocopy::mod_zerocopy_register(ctx);
     }
 
+    // Phase 4: Native AsyncLocalStorage & Context Propagation (sofuu.context.*)
+    unsafe {
+        crate::rt::async_context::mod_async_context_register(ctx);
+    }
+
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };
@@ -388,6 +393,13 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"agent".as_ptr(), agent_mod) };
     } else {
         unsafe { qjs::sofuu_js_free_value(ctx, agent_mod) };
+    }
+
+    let context_mod = unsafe { qjs::sofuu_js_get_property_str(ctx, sofuu_obj, c"context".as_ptr()) };
+    if !unsafe { qjs::is_undefined(context_mod) } && !unsafe { qjs::is_null(context_mod) } {
+        unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"context".as_ptr(), context_mod) };
+    } else {
+        unsafe { qjs::sofuu_js_free_value(ctx, context_mod) };
     }
 
     unsafe { qjs::sofuu_js_free_value(ctx, sofuu_obj) };
@@ -525,6 +537,25 @@ pub unsafe extern "C" fn sofuu_module_loader(
     }
     // SAFETY: module_name is a NUL-terminated C string.
     let name = unsafe { CStr::from_ptr(module_name) }.to_string_lossy().into_owned();
+
+    // Built-in node:async_hooks / async_hooks module support
+    if name == "node:async_hooks" || name == "async_hooks" {
+        let code = c"export const AsyncLocalStorage = (globalThis.sofuu && globalThis.sofuu.context && globalThis.sofuu.context.AsyncLocalStorage) || globalThis.AsyncLocalStorage; export default { AsyncLocalStorage };";
+        let func = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                code.as_ptr(),
+                code.to_bytes().len(),
+                module_name,
+                qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+            )
+        };
+        if unsafe { qjs::is_exception(func) } {
+            unsafe { qjs::js_std_dump_error(ctx) };
+            return ptr::null_mut();
+        }
+        return unsafe { qjs::sofuu_js_value_get_ptr(func) };
+    }
     // SAFETY: opaque is our g_loader_base CString or NULL.
     let base: String = if opaque.is_null() {
         "./".to_string()

@@ -42,6 +42,7 @@ pub struct PromiseHandle {
     pub ctx: *mut JSContext,
     pub resolve: JSValue,
     pub reject: JSValue,
+    pub async_context: JSValue,
 }
 
 /// # Safety
@@ -63,9 +64,12 @@ pub unsafe extern "C" fn sofuu_promise_new(ctx: *mut JSContext, out: *mut *mut P
         qjs::sofuu_js_free_value(ctx, resolvers[1]);
         return qjs::sofuu_js_exception();
     }
+    let rt = qjs::JS_GetRuntime(ctx);
+    let async_ctx = qjs::JS_GetAsyncContext(rt);
     (*p).ctx = ctx;
     (*p).resolve = resolvers[0];
     (*p).reject = resolvers[1];
+    (*p).async_context = async_ctx;
 
     *out = p;
     promise
@@ -80,8 +84,12 @@ pub unsafe extern "C" fn sofuu_promise_resolve(p: *mut PromiseHandle, value: JSV
         return; /* already settled & freed — caller must null its handle */
     }
     let ctx = (*p).ctx;
+    let rt = qjs::JS_GetRuntime(ctx);
+    let prev_ctx = qjs::JS_GetAsyncContext(rt);
+    qjs::JS_SetAsyncContext(rt, (*p).async_context);
     // SAFETY: p->resolve is a live resolver function; JS_UNDEFINED this_obj.
     let ret = qjs::JS_Call(ctx, (*p).resolve, qjs::sofuu_js_undefined(), 1, &value);
+    qjs::JS_SetAsyncContext(rt, prev_ctx);
     if qjs::is_exception(ret) {
         /* Log but don't crash — the promise was already settled or handler threw */
         // SAFETY: exception is pending on ctx; all values live.
@@ -104,6 +112,7 @@ pub unsafe extern "C" fn sofuu_promise_resolve(p: *mut PromiseHandle, value: JSV
     qjs::sofuu_js_free_value(ctx, ret);
     qjs::sofuu_js_free_value(ctx, (*p).resolve);
     qjs::sofuu_js_free_value(ctx, (*p).reject);
+    qjs::sofuu_js_free_value(ctx, (*p).async_context);
     libc::free(p as *mut c_void);
 }
 
@@ -116,12 +125,17 @@ pub unsafe extern "C" fn sofuu_promise_reject(p: *mut PromiseHandle, error: JSVa
         return; /* already settled & freed — caller must null its handle */
     }
     let ctx = (*p).ctx;
+    let rt = qjs::JS_GetRuntime(ctx);
+    let prev_ctx = qjs::JS_GetAsyncContext(rt);
+    qjs::JS_SetAsyncContext(rt, (*p).async_context);
     // SAFETY: p->reject is a live resolver function; JS_UNDEFINED this_obj.
     let ret = qjs::JS_Call(ctx, (*p).reject, qjs::sofuu_js_undefined(), 1, &error);
+    qjs::JS_SetAsyncContext(rt, prev_ctx);
     qjs::sofuu_js_free_value(ctx, ret);
     qjs::sofuu_js_free_value(ctx, error);
     qjs::sofuu_js_free_value(ctx, (*p).resolve);
     qjs::sofuu_js_free_value(ctx, (*p).reject);
+    qjs::sofuu_js_free_value(ctx, (*p).async_context);
     libc::free(p as *mut c_void);
 }
 

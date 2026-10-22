@@ -36,6 +36,7 @@ struct Timer {
     closing: c_int, /* 1 = clearInterval called, deferred close pending */
     id: c_uint,
     handle: *mut UvTimer,
+    async_context: JSValue,
 }
 
 const MAX_TIMERS: usize = 1024;
@@ -82,6 +83,7 @@ unsafe extern "C" fn on_timer_close(handle: *mut UvHandle) {
         return;
     }
     qjs::sofuu_js_free_value((*t).ctx, (*t).callback);
+    qjs::sofuu_js_free_value((*t).ctx, (*t).async_context);
     libc::free(handle as *mut c_void);
     drop(Box::from_raw(t));
 }
@@ -98,7 +100,11 @@ unsafe extern "C" fn on_timer(handle: *mut UvTimer) {
     }
 
     /* Call the JS callback with no arguments */
+    let rt = qjs::JS_GetRuntime(ctx);
+    let prev_ctx = qjs::JS_GetAsyncContext(rt);
+    qjs::JS_SetAsyncContext(rt, (*t).async_context);
     let ret = qjs::JS_Call(ctx, (*t).callback, qjs::sofuu_js_undefined(), 0, ptr::null());
+    qjs::JS_SetAsyncContext(rt, prev_ctx);
     if qjs::is_exception(ret) {
         let exc = qjs::sofuu_js_get_exception(ctx);
         /* process.on('uncaughtException') gets the first shot; fall back to
@@ -144,6 +150,8 @@ unsafe fn timer_create(ctx: *mut JSContext, cb: JSValueConst, delay_ms: u64, rep
         *n = n.wrapping_add(1);
         id
     });
+    let rt = qjs::JS_GetRuntime(ctx);
+    let async_ctx = qjs::JS_GetAsyncContext(rt);
     let t = Box::into_raw(Box::new(Timer {
         ctx,
         callback: qjs::sofuu_js_dup_value(ctx, cb),
@@ -151,6 +159,7 @@ unsafe fn timer_create(ctx: *mut JSContext, cb: JSValueConst, delay_ms: u64, rep
         closing: 0,
         id,
         handle: ptr::null_mut(),
+        async_context: async_ctx,
     }));
     let handle = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
     // SAFETY: uv handles start with the `data` field.
@@ -253,8 +262,18 @@ unsafe extern "C" fn on_sleep_close(handle: *mut UvHandle) {
     /* Timer handle fully closed — safe to free the container */
     // SAFETY: data set at init.
     let req = *(handle as *mut *mut SleepReq);
-    libc::free(handle as *mut c_void);
-    drop(Box::from_raw(req));
+    if !req.is_null() {
+        if !(*req).promise.is_null() {
+            let p = (*req).promise;
+            let ctx = (*p).ctx;
+            qjs::sofuu_js_free_value(ctx, (*p).resolve);
+            qjs::sofuu_js_free_value(ctx, (*p).reject);
+            qjs::sofuu_js_free_value(ctx, (*p).async_context);
+            libc::free(p as *mut c_void);
+        }
+        libc::free(handle as *mut c_void);
+        drop(Box::from_raw(req));
+    }
 }
 
 unsafe extern "C" fn on_sleep_timer(handle: *mut UvTimer) {
@@ -263,6 +282,7 @@ unsafe extern "C" fn on_sleep_timer(handle: *mut UvTimer) {
     let p = (*req).promise;
     let ctx = (*p).ctx; /* save before resolve frees p */
 
+    (*req).promise = ptr::null_mut();
     uv::uv_timer_stop(handle);
     sofuu_promise_resolve(p, qjs::sofuu_js_undefined()); /* frees p */
     sofuu_flush_jobs(ctx);
@@ -306,73 +326,17 @@ unsafe extern "C" fn js_sleep(
     promise
 }
 
-// ── scheduler.yield() / sofuu.yield() — Cooperative event loop yield ────
-
-struct YieldReq {
-    promise: *mut PromiseHandle,
-    handle: *mut UvCheck,
-    settled: bool,
-}
-
-unsafe extern "C" fn on_yield_close(handle: *mut UvHandle) {
-    crate::rt::event_loop::untrack_handle(handle);
-    let req = *(handle as *mut *mut YieldReq);
-    if !req.is_null() {
-        if !(*req).settled && !(*req).promise.is_null() {
-            let p = (*req).promise;
-            let ctx = (*p).ctx;
-            qjs::sofuu_js_free_value(ctx, (*p).resolve);
-            qjs::sofuu_js_free_value(ctx, (*p).reject);
-            libc::free(p as *mut c_void);
-        }
-        libc::free(handle as *mut c_void);
-        drop(Box::from_raw(req));
-    }
-}
-
-unsafe extern "C" fn on_yield_check(handle: *mut UvCheck) {
-    let req = *(handle as *mut *mut YieldReq);
-    let p = (*req).promise;
-    let ctx = (*p).ctx;
-
-    (*req).settled = true;
-    uv::uv_check_stop(handle);
-    sofuu_promise_resolve(p, qjs::sofuu_js_undefined()); /* frees p */
-    sofuu_flush_jobs(ctx);
-
-    uv::uv_close(handle as *mut UvHandle, Some(on_yield_close));
-}
 
 unsafe extern "C" fn js_scheduler_yield(
     ctx: *mut JSContext,
-    _this: JSValueConst,
+    this_val: JSValueConst,
     _argc: c_int,
     _argv: *const JSValueConst,
 ) -> JSValue {
-    let mut out: *mut PromiseHandle = ptr::null_mut();
-    let promise = sofuu_promise_new(ctx, &mut out);
-    if qjs::is_exception(promise) {
-        return promise;
-    }
-
-    let req = Box::into_raw(Box::new(YieldReq {
-        promise: out,
-        handle: ptr::null_mut(),
-        settled: false,
-    }));
-    let handle = libc::malloc(uv::sofuu_uv_check_size()) as *mut UvCheck;
-    *(handle as *mut *mut YieldReq) = req;
-    (*req).handle = handle;
-
-    uv::uv_check_init(sofuu_loop_get(), handle);
-    uv::uv_check_start(handle, Some(on_yield_check));
-
-    /* F-2: armed per-ctx — a multi-engine teardown cleanly closes it */
-    unsafe {
-        crate::rt::event_loop::track_handle(ctx, handle as *mut UvHandle, Some(on_yield_close))
-    };
-
-    promise
+    let zero = qjs::sofuu_js_new_uint32(ctx, 0);
+    let ret = js_sleep(ctx, this_val, 1, &zero);
+    qjs::sofuu_js_free_value(ctx, zero);
+    ret
 }
 
 unsafe extern "C" fn js_setimmediate(

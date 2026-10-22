@@ -866,6 +866,7 @@ unsafe extern "C" fn js_fetch_stream_wait(
         ctx,
         resolve: qjs::sofuu_js_dup_value(ctx, resolvers[0]),
         reject: qjs::sofuu_js_dup_value(ctx, resolvers[1]),
+        async_context: qjs::JS_GetAsyncContext(qjs::JS_GetRuntime(ctx)),
     }));
     (*r).pending_next = pnext;
     (*r).pending_resolve = qjs::sofuu_js_dup_value(ctx, resolvers[0]);
@@ -1296,6 +1297,7 @@ unsafe fn response_wait_done(ctx: *mut JSContext, r: *mut ResponseData) -> JSVal
         ctx,
         resolve: qjs::sofuu_js_dup_value(ctx, resolvers[0]),
         reject: qjs::sofuu_js_dup_value(ctx, resolvers[1]),
+        async_context: qjs::JS_GetAsyncContext(qjs::JS_GetRuntime(ctx)),
     }));
     (*r).pending_settle.push(p);
     qjs::sofuu_js_free_value(ctx, resolvers[0]);
@@ -2915,6 +2917,7 @@ function go(f) {
                 ctx,
                 resolve: qjs::sofuu_js_dup_value(ctx, resolvers[0]),
                 reject: qjs::sofuu_js_dup_value(ctx, resolvers[1]),
+                async_context: qjs::JS_GetAsyncContext(qjs::JS_GetRuntime(ctx)),
             })));
             qjs::sofuu_js_free_value(ctx, resolvers[0]);
             qjs::sofuu_js_free_value(ctx, resolvers[1]);
@@ -2927,6 +2930,7 @@ function go(f) {
                 ctx,
                 resolve: qjs::sofuu_js_dup_value(ctx, resolvers[0]),
                 reject: qjs::sofuu_js_dup_value(ctx, resolvers[1]),
+                async_context: qjs::JS_GetAsyncContext(qjs::JS_GetRuntime(ctx)),
             }));
             (*r).pending_resolve = qjs::sofuu_js_dup_value(ctx, resolvers[0]);
             qjs::sofuu_js_free_value(ctx, resolvers[0]);

@@ -87,12 +87,24 @@ While V8 or Node.js runtimes require tens to hundreds of megabytes, Sofuu pairs 
   - Full JS test suite 59 passed, 0 failed.
   - Stripped release binary size: **4.8 MB** ($\le 5.0\text{ MB}$ budget ceiling).
 
-### Phase 4: Native AsyncLocalStorage & Agent Context Propagation
+### Phase 4: Native AsyncLocalStorage & Agent Context Propagation [COMPLETE]
+- **Status**: Implemented, verified, audited.
 - **Problem**: Autonomous agent execution across nested async tools requires manual passing of `sessionId`, `traceId`, and `AbortSignal`.
 - **Deliverables**:
-  - Promise capability hook in `sofuu_promise_new` snapshots active context.
-  - `sofuu.context.AsyncLocalStorage` implementation with `.run()`, `.getStore()`, `.set()`.
-- **Verification**: `tests/test_async_context.js` validating context propagation across deep async trees.
+  - Bound native async context slots in QuickJS runtime (`rt->current_async_context`), promise reactions (`rd->async_context`), and microtask job entries (`e->async_context`).
+  - Implemented `JS_GetAsyncContext` and `JS_SetAsyncContext` C-FFI exports in `deps/quickjs` and `crates/sofuu-ffi/src/qjs.rs`.
+  - Bound `PromiseHandle.async_context` in `crates/sofuu-core/src/rt/promise.rs` so `sofuu_promise_new` snapshots active context and `sofuu_promise_resolve` / `sofuu_promise_reject` restores it.
+  - Linked timer callbacks (`setTimeout`, `setImmediate`, `setInterval`, `sofuu.sleep`) to capture and restore active async context.
+  - Implemented `crates/sofuu-core/src/rt/async_context.rs` providing:
+    - `AsyncLocalStorage` class with `.run(store, callback, ...args)`, `.getStore()`, `.enterWith(store)`, `.set(keyOrStore, value)`, `.exit(callback, ...args)`, `.disable()`, `static snapshot()`, and `static bind(fn)`.
+    - `sofuu.context` namespace with `.run()`, `.getStore()`, `.get()`, `.set()`, `.snapshot()`, `.bind()`, and dynamic getters/setters for `.traceId`, `.sessionId`, and `.signal`.
+    - Built-in `AbortController` and `AbortSignal` for cooperative cancellation across agent execution chains.
+    - Zero-config built-in module resolution for `node:async_hooks` and `async_hooks`.
+- **Verification**:
+  - `tests/test_async_context.js`: All 9 verification steps passed covering sync execution, microtasks, promise reactions, timers, native file I/O & sleep, deep nested hierarchies (L1->L2->L3->L2->L1), concurrent interleaved tasks with zero crosstalk, and agent sugar.
+  - `tests/test_async_hooks_module.mjs`: ESM module import of `node:async_hooks` verified.
+  - Full JS test suite 59 passed, 0 failed, 1 skipped.
+  - Stripped release binary size: **4.8 MB** ($\le 5.0\text{ MB}$ budget ceiling).
 
 ### Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 - **Problem**: Agent-generated tools can execute infinite loops or exhaust memory.

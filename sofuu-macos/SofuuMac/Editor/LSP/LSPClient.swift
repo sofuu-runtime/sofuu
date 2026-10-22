@@ -29,6 +29,11 @@ final class LSPClient {
         transport.onExit = { [weak self] in
             guard let self else { return }
             self.isRunning = false
+            // Ambient the stranded requests — their handlers capture caller
+            // state and would otherwise sit in `pending` forever.
+            let stranded = self.pending
+            self.pending = [:]
+            for (_, handler) in stranded { handler(nil) }
             self.onServerExit?()
         }
         transport.onMessage = { [weak self] message in

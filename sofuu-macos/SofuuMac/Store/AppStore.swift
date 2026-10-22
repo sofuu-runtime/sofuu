@@ -1275,6 +1275,9 @@ final class AppStore: ObservableObject {
         state.tabDirty.removeValue(forKey: path)
         fileBuffers.removeValue(forKey: path)
         diskContents.removeValue(forKey: path)
+        // Drop any pending auto-save for this path (its buffer is gone).
+        autoSaveWork[path]?.cancel()
+        autoSaveWork.removeValue(forKey: path)
         // The server needs to drop the document too (no stale diagnostics
         // for a closed file).
         NotificationCenter.default.post(name: .init("IDEDocumentClosed"), object: path)
@@ -1310,6 +1313,11 @@ final class AppStore: ObservableObject {
     @discardableResult
     func saveFile(_ path: String) -> String? {
         guard let text = fileBuffers[path] else { return "nothing to save" }
+        // A buffer whose file was deleted on disk (by the agent, or a
+        // terminal) must NOT resurrect it through an auto-save write.
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "file is gone from disk — close the tab and reopen it from the tree"
+        }
         do {
             try text.write(toFile: path, atomically: true, encoding: .utf8)
             diskContents[path] = text

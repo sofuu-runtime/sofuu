@@ -152,6 +152,12 @@ struct CodeEditor: NSViewRepresentable {
             observeFileNotifications()
         }
 
+        deinit {
+            if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+            if let saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
+            if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        }
+
         // MARK: - Attach / text pipeline
 
         func attach(_ sv: NSScrollView) {
@@ -405,24 +411,35 @@ struct CodeEditor: NSViewRepresentable {
             }
         }
 
-        func requestCompletion(prefix: String, line: Int, column: Int, screenRect: NSRect) {
-            guard let path else { return }
-            if let lsp {
-                flushLSPChangeNow()
-                lsp.completion(path: path, line: line - 1, character: column - 1, text: textView?.string) { items in
-                    // Empty prefix (after '.') = member completion — the
-                    // server already ordered against the receiver.
-                    let filtered = prefix.isEmpty
-                        ? items
-                        : items.filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
-                    guard !filtered.isEmpty else { return }
-                    self.gutter.completions = Array(filtered.prefix(50))
-                    self.gutter.completionIndex = 0
-                    IDEHUD.showCompletions(self.gutter, anchor: screenRect)
+        private var completionWork: DispatchWorkItem?
+
+        /// Debounced (0.08 s) — one keystroke must not equal one server
+        /// request + one HUD rebuild; the anchor rect is recomputed at
+        /// fire time from the captured caret location.
+        func requestCompletion(prefix: String, line: Int, column: Int, location: Int) {
+            completionWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let tv = self.textView else { return }
+                let rect = (tv as? SofuuCodeView)?.screenRect(at: location) ?? .zero
+                if let lsp = self.lsp, let path = self.path {
+                    self.flushLSPChangeNow()
+                    lsp.completion(path: path, line: line - 1, character: column - 1, text: tv.string) { items in
+                        // Empty prefix (after '.') = member completion — the
+                        // server already ordered against the receiver.
+                        let filtered = prefix.isEmpty
+                            ? items
+                            : items.filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+                        guard !filtered.isEmpty else { return }
+                        self.gutter.completions = Array(filtered.prefix(50))
+                        self.gutter.completionIndex = 0
+                        IDEHUD.showCompletions(self.gutter, anchor: rect)
+                    }
+                } else {
+                    self.offerDocumentWords(prefix: prefix, screenRect: rect)
                 }
-            } else {
-                offerDocumentWords(prefix: prefix, screenRect: screenRect)
             }
+            completionWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
         }
 
         private func offerDocumentWords(prefix: String, screenRect: NSRect) {
@@ -528,17 +545,18 @@ struct CodeEditor: NSViewRepresentable {
         func requestOutline() {
             guard let path else { return }
             if let lsp {
-                lsp.symbols(path: path, text: textView?.string) { nodes in
+                lsp.symbols(path: path, text: textView?.string) { [weak self] nodes in
+                    guard let self else { return }
                     if !nodes.isEmpty {
                         self.gutter.outline = nodes
                     }
-                    IDEHUD.showOutline(self.gutter.outline) { node in
-                        self.scrollTo(characterLine: node.line + 1, column: 1)
+                    IDEHUD.showOutline(self.gutter.outline) { [weak self] node in
+                        self?.scrollTo(characterLine: node.line + 1, column: 1)
                     }
                 }
             } else {
-                IDEHUD.showOutline(gutter.outline) { node in
-                    self.scrollTo(characterLine: node.line + 1, column: 1)
+                IDEHUD.showOutline(gutter.outline) { [weak self] node in
+                    self?.scrollTo(characterLine: node.line + 1, column: 1)
                 }
             }
         }

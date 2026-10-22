@@ -371,19 +371,63 @@ enum Lexer {
             outlineWords = ["function", "class", "interface", "enum"]
         case .python:
             outlineWords = ["def", "class"]
-        case .json:
-            outlineWords = []
+        case .go:
+            outlineWords = ["func", "type", "struct", "interface"]
+        case .java, .csharp:
+            outlineWords = ["class", "interface", "enum", "record", "struct"]
+        case .kotlin:
+            outlineWords = ["fun", "class", "interface", "object"]
+        case .ruby:
+            outlineWords = ["def", "class", "module"]
+        case .php:
+            outlineWords = ["function", "class", "interface", "trait"]
+        case .lua:
+            outlineWords = ["function"]
+        case .zig:
+            outlineWords = ["fn", "struct", "enum", "union"]
+        case .dart:
+            outlineWords = ["class", "mixin", "enum", "extension"]
+        case .scala:
+            outlineWords = ["class", "object", "trait", "def"]
+        case .haskell:
+            outlineWords = ["data", "newtype", "type"]
+        case .elixir:
+            outlineWords = ["defmodule", "def", "defp", "defmacro"]
         default:
             outlineWords = []
         }
         guard outlineWords.contains(word) else { return false }
 
         // The definition keyword must be the first word on its line (after
-        // whitespace / pub / export / async / static modifiers).
+        // whitespace / visibility-and-declaration modifiers).
         var lineBegin = offset
         while lineBegin > 0, units[lineBegin - 1] != 0x0A { lineBegin -= 1 }
         var j = lineBegin
-        let modifiers: Set<String> = language.id == .ts ? ["export", "default", "declare", "abstract", "async"] : (language.id == .rust ? ["pub", "async", "const", "unsafe", "extern"] : (language.id == .python ? ["async"] : ["public", "private", "internal", "fileprivate", "open", "static", "final", "async", "required", "convenience", "mutating", "override"]))
+        let modifiers: Set<String>
+        switch language.id {
+        case .ts:
+            modifiers = ["export", "default", "declare", "abstract", "async"]
+        case .rust:
+            modifiers = ["pub", "async", "const", "unsafe", "extern"]
+        case .python:
+            modifiers = ["async"]
+        case .java:
+            modifiers = ["public", "private", "protected", "static", "final", "abstract", "sealed", "strictfp", "default"]
+        case .kotlin:
+            modifiers = ["public", "private", "internal", "protected", "open", "override", "final", "abstract", "sealed", "suspend", "inline", "expect", "actual", "external", "operator", "infix"]
+        case .csharp:
+            modifiers = ["public", "private", "protected", "internal", "static", "sealed", "abstract", "override", "virtual", "async", "partial", "extern", "unsafe", "new", "const"]
+        case .dart:
+            modifiers = ["abstract", "base", "final", "sealed", "static", "external", "covariant"]
+        case .scala:
+            modifiers = ["case", "final", "implicit", "lazy", "abstract", "sealed", "private", "protected", "override"]
+        case .zig:
+            modifiers = ["pub", "export", "extern", "inline", "threadlocal", "const"]
+        case .swift:
+            modifiers = ["public", "private", "internal", "fileprivate", "open", "static", "final", "async", "required", "convenience", "mutating", "override"]
+        default:
+            modifiers = []
+        }
         let words: [String] = String(decoding: units[lineBegin..<min(offset, units.count)], as: UTF16.self)
             .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
         for w in words {

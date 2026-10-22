@@ -97,6 +97,12 @@ private struct Root: View {
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             Task { @MainActor in store.refreshModelCache() }
         }
+
+        // Language servers hold hundreds of MB each — they must die with
+        // the app, not linger as orphans after quit.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in LSPRegistry.shared.stopAll() }
     }
 }
 

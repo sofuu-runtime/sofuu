@@ -323,8 +323,7 @@ final class SofuuCodeView: NSTextView {
             prefix = ""
         }
         let (line, column) = editor?.lineColumn(ofOffset: location) ?? (0, 0)
-        let rect = screenRect(at: location)
-        editor?.requestCompletion(prefix: prefix, line: line, column: column, screenRect: rect)
+        editor?.requestCompletion(prefix: prefix, line: line, column: column, location: location)
     }
 
     func wordPrefixBeforeCaret() -> String {

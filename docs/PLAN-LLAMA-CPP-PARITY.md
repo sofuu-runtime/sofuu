@@ -330,6 +330,61 @@ default until receipts justify the per-model flip.
   GEMM on the q6/q8 mix). Battery default (route off) untouched: 1B
   CPU-tiles prefill 161 t/s at the same load, exit=0, IOGPU=0.
 
+# PROGRESS LEDGER #5 — ROUTE-PARITY ARC CLOSED; remaining = rate + endgame (2026-10-24)
+
+## DONE this arc (all pushed; every receipt in the sections below)
+1. **The 0.6B-parity fork is closed**: root cause = arithmetic-class split
+   (CPU act-quant-MMQ vs GPU exact-f32), NOT a GPU kernel bug. The Metal
+   q4_K + q6_K gemm mirrors (`gemm_q4_k_mmq`, `gemm_q6_k_mmq`, the pos
+   row-quantizer `quantize_q8_k_pos`, `quantize_q8_k`) are **bit-identical
+   to the shipped CPU kernels** (probe worst 0.0 on both; live stage bisect
+   s2.qa/s2.va at 1e-7).
+2. **All 8 prefill GEMMs route-parity at f32-noise**; the prefill→decode
+   boundary is byte-identical (x.bin 0/512; L0 KV f32-noise).
+3. **Decode-chain fallback contract**: 8 decode exports void→int
+   dispatched-status, 29 decode call sites propagate to the CPU layer loop;
+   1B chunk-128 route (the old fault shape) runs clean.
+4. **THE GATE IS GREEN** under the mirror envs
+   (SOFUU_GPU_DECODE=1,SOFUU_GPU_PREFILL_GEMM=1,SOFUU_GPU_TILE_MMQ=1,
+   SOFUU_DECODE_MMQ=1):
+   | model | verdict |
+   |---|---|
+   | 0.6B i1-Q4_K_M Paris/32 | NEAR-TIE-CERTIFIED (fork 0.089 ≤ own band 0.906, step 19) |
+   | 0.6B exact-repeat prompt | IDENTICAL 23/23 |
+   | 1B Q8_0 Paris/32 | IDENTICAL 31/31 |
+   | 0.6B + coalesced=2 | NEAR-TIE-CERTIFIED (0.126 ≤ 0.355) |
+   | 8B + coalesced=2 | NEAR-TIE-CERTIFIED (0.237 ≤ 0.653) |
+   Certification = `text_gate.py --bound auto`: fork-step |dtop1| ≤ the
+   worst MATCHED-step |dtop1| of the same generation (self-referential, no
+   magic constant).
+5. **The physics is characterized**: the residual class = near-zero-gate
+   crossovers amplifying a legitimate ~5e-7 f32 seed (L1→L2 = 10^4 in one
+   layer; silu is Lipschitz ⇒ single-op mirrors CANNOT close it). Envelope
+   saturates ~1% relative by mid-network; decoding-wise it appears only as
+   certified near-tie flips.
+
+## REMAINING (the honest board)
+- **(d) simdgroup-matrix GEMM program — NOT STARTED.** The rate side: the
+  GEMM-prefill route is still ~6× under the CPU tiles (0.6B 33 vs 583);
+  bars pp 3416/2055/461/865/264 need it. Entry point: the kernel program in
+  LEDGER #4 ("The real Phase-5-grade program").
+- **(e) fleet-exact endgame — NOT STARTED.** Order-exact ops + a
+  libm-matching MSL exp/log; the ONLY route to unconditional IDENTICAL on
+  near-tie-heavy q4/q6 prompts. Entry point: mirror the fleet op order from
+  the CPU kernels (the mmq probes are the pattern) + port ggml's exp
+  polynomial to MSL.
+- **(f) per-model defaults — PEER LANE.** All flip decisions are
+  data-ready: c2+mirrors gate-clean AND rate-winning on 0.6B/8B/MiniCPM
+  (1B wants default + the q8 class); the per-model machinery lives with the
+  peer. Until it lands, the documented fast paths stay env-opt-in.
+- **(c-residual) 1B IOGPU fault root cause**: contained by the fallback
+  contract (exit 0, correct, but 923 s fallback-crawl AT THE FAULT SHAPE
+  b=128@pos≥128 on the chunk-128 route — off by default); a Metal capture
+  session is the remaining step.
+- Defaults: **never moved across the entire arc** — the gate is now the
+  data-backed criterion for any future flip.
+
+
 # PROGRESS LEDGER #4 — PHASE 4 deciding sweep (2026-10-22, calm 1.1-2.3)
 
 **DECIDING RESULT: the GPU prefill GEMM route loses to the CPU tiles on

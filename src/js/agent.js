@@ -2191,6 +2191,35 @@
       skipSnips + '. Advisory only — it is still shown if you need it.';
   }
 
+  /* Phase 4: Storage resolver for real-time trace persistence */
+  function resolveStorage(opts) {
+    if (!opts || opts.storage === false) return null;
+    if (opts.storage && opts.storage.traces && typeof opts.storage.traces.insert === 'function') {
+      return opts.storage.traces;
+    }
+    if (opts.db && opts.db.traces && typeof opts.db.traces.insert === 'function') {
+      return opts.db.traces;
+    }
+    if (opts.storage && typeof opts.storage.insert === 'function') {
+      return opts.storage;
+    }
+    var dbPath = null;
+    if (typeof opts.storage === 'string') {
+      dbPath = opts.storage;
+    } else if (opts.storagePath || opts.storageFile) {
+      dbPath = opts.storagePath || opts.storageFile;
+    } else if (opts.storage === true) {
+      dbPath = (typeof process !== 'undefined' && process.env && process.env.SOFUU_STORAGE) || '.sofuu/storage';
+    }
+    if (dbPath && typeof sofuu !== 'undefined' && sofuu.storage && typeof sofuu.storage.open === 'function') {
+      try {
+        var db = sofuu.storage.open(dbPath);
+        return db ? db.traces : null;
+      } catch (e) {}
+    }
+    return null;
+  }
+
   /**
    * sofuu.agent.run(handleOrNameOrDef, task, opts) → Promise<AgentResult>
    */
@@ -2224,7 +2253,7 @@
     var depth = opts.depth || 0;
     var chain = opts.chain || [d.name];
     var started = Date.now();
-    var runId = 'ar' + (NEXT_RUN++);
+    var runId = opts.resumeRunId || ('ar' + (NEXT_RUN++));
     /* Children (delegate/map fan-out) thread the parent's state object
      * through opts._cancelState — a cancel on the parent must mark and
      * abort the children too (bench S4: cancel left the child's 4s tool
@@ -2288,6 +2317,7 @@
     return runCore();
 
     async function runCore() {
+    var traceStorage = resolveStorage(opts);
     /* Live per-tool histogram for the breach report — (2026-10-15) the
      * report used to re-scan the trace for kind:'tool' entries, but
      * TRACE_CAP demotion deletes old payloads, so a long run's report read
@@ -2390,10 +2420,10 @@
       }
       return false;
     }
-    var steps = 0;
+    var steps = (typeof opts.resumeSteps === 'number') ? opts.resumeSteps : 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
      * renewal, so this is what "how long did this actually run" means. */
-    var stepsTotal = 0;
+    var stepsTotal = steps;
     var stopped = null;
     /* Task-gate state (see TODO_GATE_STEPS): did this run ever call
      * todo_write, and has the one-shot reminder already been injected? */
@@ -2409,7 +2439,9 @@
      * reference what it read/did in earlier turns, and compaction (not a
      * per-turn release) is what sheds old context. Copy-on-persist: drivers
      * get a snapshot, never the live loopMsgs array. */
-    var loopMsgs = [];
+    var loopMsgs = Array.isArray(opts.resumeTranscript)
+      ? opts.resumeTranscript.slice()
+      : (Array.isArray(opts.resumeMessages) ? opts.resumeMessages.slice() : []);
     function turnTranscript() {
       return loopMsgs.filter(function (m) {
         if (m.role === 'assistant' && m.tool_calls) return true;
@@ -2500,6 +2532,58 @@
       var e = { t: Date.now() - started, kind: kind };
       if (payload !== undefined) e.payload = payload;
       trace.push(e);
+      if (traceStorage) {
+        try {
+          var toolName = kind;
+          var inVal = null;
+          var outVal = '';
+          var dur = 0;
+          if (kind === 'tool' && payload) {
+            toolName = payload.name || kind;
+            inVal = { kind: 'tool', name: payload.name, payload: payload };
+            outVal = payload.result != null ? String(payload.result) : '';
+            dur = payload.duration || 0;
+          } else if (kind === 'tool_result' && payload) {
+            toolName = payload.name || kind;
+            inVal = { kind: 'tool_result', name: payload.name, payload: payload };
+            outVal = payload.result != null ? String(payload.result) : (payload.error != null ? String(payload.error) : '');
+          } else if (kind === 'start' && payload) {
+            inVal = { kind: 'start', payload: payload };
+            outVal = payload.task != null ? String(payload.task) : '';
+          } else if (kind === 'plan' && payload) {
+            inVal = { kind: 'plan', payload: payload };
+            outVal = payload.step != null ? String(payload.step) : '';
+          } else if (kind === 'think' || kind === 'thought') {
+            inVal = { kind: 'think', payload: payload };
+            outVal = payload.text != null ? String(payload.text) : '';
+          } else if (kind === 'answer') {
+            inVal = { kind: 'answer', payload: payload };
+            outVal = payload.answer != null ? String(payload.answer) : (payload.text != null ? String(payload.text) : '');
+          } else if (kind === 'error') {
+            inVal = { kind: 'error', payload: payload };
+            outVal = payload.error != null ? String(payload.error) : '';
+          } else if (kind === 'delegate' && payload) {
+            toolName = 'delegate';
+            inVal = { kind: 'delegate', payload: payload };
+            outVal = payload.agent || '';
+          } else if (payload && typeof payload === 'object') {
+            inVal = { kind: kind, payload: payload };
+            outVal = JSON.stringify(payload);
+          } else {
+            inVal = { kind: kind, payload: payload };
+            outVal = String(payload == null ? '' : payload);
+          }
+          traceStorage.insert({
+            session_id: String(runId),
+            step_index: steps,
+            tool_name: toolName,
+            input: inVal,
+            output: outVal,
+            duration_ms: dur,
+            timestamp: Date.now()
+          });
+        } catch (eTr) {}
+      }
       /* M4: bound the HEAVY data, keep the shape — the first-16 skeleton
        * (start/plan) and the freshest (TRACE_CAP-16) events keep their
        * payloads; the event that just fell out of that window is demoted to
@@ -2616,10 +2700,13 @@
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
       if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
+      if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
+        try { traceStorage.db.flush(); } catch (eFl) {}
+      }
       return res;
     }
 
-    emit('start', { task: clip(task, 300), depth: depth, chain: chain.slice() });
+    emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
     /* PLAN-ML-GATES §8: open this run's trajectory in the working set.
      * Sub-agents run under their own runId, so trajectories stay separate. */
     if (mlEnabled(d)) {
@@ -4819,9 +4906,156 @@
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
       if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
+      if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
+        try { traceStorage.db.flush(); } catch (eFl) {}
+      }
       throw e;
     }
     }
+  }
+
+  /* Phase 4: Fast selective historical trace retrieval */
+  async function getTrace(runId, opts) {
+    opts = opts || {};
+    var store = resolveStorage(opts);
+    if (!store) {
+      var p = (opts && (opts.storagePath || opts.storageFile)) ||
+              (typeof process !== 'undefined' && process.env && process.env.SOFUU_STORAGE) ||
+              '.sofuu/storage';
+      try {
+        if (typeof sofuu !== 'undefined' && sofuu.storage && typeof sofuu.storage.open === 'function') {
+          store = sofuu.storage.open(p).traces;
+        }
+      } catch (e) {}
+    }
+    if (!store) return [];
+    var q = {
+      filterCol: 'session_id',
+      filterVal: String(runId)
+    };
+    if (opts.order === 'desc') q.orderDesc = true;
+    if (opts.limit) q.limit = opts.limit;
+    if (opts.offset) q.offset = opts.offset;
+    var rows = await store.query(q);
+    if (!Array.isArray(rows)) return [];
+    var resTrace = [];
+    var startT = rows.length > 0 ? rows[0].timestamp : 0;
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var inObj = row.input;
+      if (typeof inObj === 'string') {
+        try { inObj = JSON.parse(inObj); } catch (e) {}
+      }
+      var kind = (inObj && inObj.kind) || row.tool_name || 'step';
+      var payload = (inObj && inObj.payload !== undefined) ? inObj.payload : (inObj || null);
+      resTrace.push({
+        t: Math.max(0, row.timestamp - startT),
+        kind: kind,
+        payload: payload,
+        step: row.step_index
+      });
+    }
+    return resTrace;
+  }
+
+  /* Phase 4: State reconstruction & execution replay */
+  async function resume(runId, opts) {
+    opts = opts || {};
+    var trace = await getTrace(runId, opts);
+    if (!trace || trace.length === 0) {
+      throw new Error('No trace found for run: ' + runId);
+    }
+    var startEv = trace.find(function (e) { return e.kind === 'start'; });
+    var startPayload = (startEv && startEv.payload) || {};
+    var agentName = opts.agent || startPayload.agentName || startPayload.name;
+    var task = (opts.task !== undefined) ? opts.task : (startPayload.fullTask || startPayload.task);
+    if (!agentName) {
+      throw new Error('Trace missing agentName for run: ' + runId);
+    }
+
+    var isDone = trace.some(function (e) { return e.kind === 'answer' || e.kind === 'done'; });
+    if (isDone && !opts.force) {
+      var ansEv = trace.slice().reverse().find(function (e) { return e.kind === 'answer' || e.kind === 'done'; });
+      var ansText = (ansEv && ansEv.payload && (ansEv.payload.answer || ansEv.payload.text)) || '';
+      return {
+        runId: runId,
+        name: agentName,
+        answer: ansText,
+        trace: trace,
+        resumed: false,
+        completed: true
+      };
+    }
+
+    // Reconstruct loopMsgs from prior completed tool rounds
+    var reconstructedTranscript = [];
+    var maxStep = 0;
+    var toolCallsPending = [];
+    for (var i = 0; i < trace.length; i++) {
+      var ev = trace[i];
+      if (typeof ev.step === 'number' && ev.step > maxStep) maxStep = ev.step;
+      if (ev.kind === 'tool' && ev.payload) {
+        var callId = 'call_' + runId + '_' + (ev.step || 0) + '_' + (ev.payload.name || 'tool');
+        var args = ev.payload.args;
+        if (typeof args === 'string') {
+          try { args = JSON.parse(args); } catch (e) {}
+        }
+        toolCallsPending.push({
+          id: callId,
+          name: ev.payload.name,
+          args: args || {}
+        });
+      } else if (ev.kind === 'tool_result' && ev.payload) {
+        var tName = ev.payload.name;
+        var pending = toolCallsPending.shift() || {
+          id: 'call_' + runId + '_' + (ev.step || 0) + '_' + tName,
+          name: tName,
+          args: {}
+        };
+        reconstructedTranscript.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: pending.id,
+            type: 'function',
+            function: {
+              name: pending.name,
+              arguments: JSON.stringify(pending.args)
+            }
+          }]
+        });
+        reconstructedTranscript.push({
+          role: 'tool',
+          tool_call_id: pending.id,
+          content: String(ev.payload.result == null ? (ev.payload.error || '') : ev.payload.result)
+        });
+      }
+    }
+    while (toolCallsPending.length > 0) {
+      var rem = toolCallsPending.shift();
+      reconstructedTranscript.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: rem.id,
+          type: 'function',
+          function: { name: rem.name, arguments: JSON.stringify(rem.args) }
+        }]
+      });
+      reconstructedTranscript.push({
+        role: 'tool',
+        tool_call_id: rem.id,
+        content: ''
+      });
+    }
+
+    var resumeOpts = Object.assign({}, opts, {
+      resumeRunId: runId,
+      resumeTranscript: reconstructedTranscript,
+      resumeSteps: maxStep + 1
+    });
+
+    return run(agentName, task, resumeOpts);
   }
 
   /* Wrap a promise so a cancel() between awaits rejects promptly (the
@@ -5105,6 +5339,9 @@
   A.cancel = cancel;
   A.list = list;
   A.loadDir = loadDir;
+  /* Phase 4: Real-time QTSQ trace persistence & replay */
+  A.getTrace = getTrace;
+  A.resume = resume;
   /* Phase 2: Active context reader via AsyncLocalStorage */
   A.current = function () {
     if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function') {

@@ -67,7 +67,15 @@
         q.filterCol = 'session_id';
         q.filterVal = String(options.sessionId);
       }
+      if (options.runId) {
+        q.filterCol = 'session_id';
+        q.filterVal = String(options.runId);
+      }
       if (options.limit) q.limit = options.limit;
+      if (options.offset) q.offset = options.offset;
+      if (options.minTime) q.minTimestamp = options.minTime;
+      if (options.maxTime) q.maxTimestamp = options.maxTime;
+      if (options.order === 'desc') q.orderDesc = true;
       return this.query(q);
     }
   }

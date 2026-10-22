@@ -728,3 +728,25 @@ sc[is+0/2/4/6] per part-half per the repo's own sofuu_dequantize_row_q6_k),
 mirror `gemm_q6_k_mmq`, wire the macro for type 14, then re-gate. The
 q6_K dequant reference to mirror = sofuu_dequantize_row_q6_k (infer_kernels
 .cpp:810) — n×part halves, is=part, sc stride 2 per part.
+
+## Q6_K MIRROR BIT-IDENTITY CLOSED (2026-10-23 — attn_v/ffn_down class)
+`gemm_q6_k_mmq` MSL + engine/wrapper/macro type-14 wiring under
+SOFUU_GPU_TILE_MMQ=1. Receipts: mmq_tile_value_probe q6 section
+(cpu==gpu==host, worst 0.0000e0 at |values|~3000, with production-parity
+sofuu_tile_warm ty=14); live stage s2.va/s3.vc 1.085e-2 → 1.788e-7.
+Layout receipts that cost the iterations: (a) the repo's block_q6_K = {ql
+[128], qh[64], scales[16], d f16 LAST} — the mirror and the fixture both
+assumed d first; (b) fixture floats: `1.0f32.to_le_bytes()[..2]` = [0,0] =
+f16 0.0 (two vacuous-zero probe rounds before f16(1.0)=0x3C00); (c) ql byte
+per quartet: qn%2==0 → ql[l], qn%2==1 → ql[l+32]; nibble lo/hi by qn<2; qh
+bits = (qh[l]>>(qn*2))&3; v = bits−32; scales = sc[n*8 + j/16 + sb*2].
+GATE (paris32, GPU env + TILE_MMQ): **FORK moved step 2 → step 19.** The
+per-step receipt (SOUU_DECODE_PROBE aligned): steps 0-18 token-identical
+with a STABLE |dtop1| 0.004-0.255 oscillation (not growing = a decode-step
+class, not prefill compounding), fence-post flip at the 0.215-gap near-tie.
+REMAINING class = the serial-decode chain itself (CPU serial matvec stack vs
+GPU layers_one_commit: decode GEMV summation class + decode kv_write legacy
+on-device rope (rope=None at the decode sites) + head class) — the decode-
+chain refactor booked earlier owns it. STANDING: no route/coalescing
+defaults moved; prefill route parity = f32-noise across all 8 prefill gemms
+(q4_K ×5 + q6_K ×2 + va path covered by q6) + the act-quant class unified.

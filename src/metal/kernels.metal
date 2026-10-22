@@ -3158,3 +3158,68 @@ kernel void gemm_q4_k_mmq(
     }
     y[(size_t)t * rows + row] = acc;
 }
+
+// q6_K MMQ mirror (SOFUU_GPU_TILE_MMQ=1, type 14): bit-twin of the CPU q6_K
+// tile pipeline (ggml_gemm_q6_K_8x4_q8_K): same act-quant, per-block int32
+// accumulation of scale*dot over (half, 32-group), ONE fused fma at block
+// tail. Element e = n*128 + sb*32 + j; value = 6-bit | qh bits − 32; scale =
+// sc[n*8 + j/16 + sb*2] (canonical sofuu_dequantize_row_q6_k indexing read
+// from the ORIGINAL block bytes).
+struct TileQ6K {
+    float d;
+    char  rest[208];   // ql[128] | qh[64] | scales[16]
+};
+
+// grid: (rows, B)
+kernel void gemm_q6_k_mmq(
+    device const uchar   *w_base [[buffer(0)]],
+    device const TileQ8K *xq     [[buffer(1)]],
+    device float         *y      [[buffer(2)]],
+    constant uint        &cols   [[buffer(3)]],
+    constant uint        &w_rem  [[buffer(4)]],
+    constant uint        &B      [[buffer(5)]],
+    constant uint        &rows   [[buffer(6)]],
+    uint2 gid              [[thread_position_in_grid]]
+) {
+    uint row = gid.x;
+    uint t   = gid.y;
+    uint nb  = cols / 256;
+    uint row_byte = w_rem + row * nb * 210;
+    device const TileQ8K *x8 = xq + (size_t)t * nb;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+        float dx = x8[b].d;
+        float sbd = d * dx;
+        device const uchar *ql = w_base + row_byte + b * 210;
+        device const uchar *qh = ql + 128;
+        device const uchar *sc = qh + 64;
+        device const char *q8 = x8[b].qs;
+        int acc_int = 0;
+        for (uint n = 0; n < 2; ++n) {
+            device const uchar *qlh = ql + n * 64;
+            device const uchar *qhh = qh + n * 32;
+            for (uint sb = 0; sb < 4; ++sb) {
+                int acc_l = 0, acc_h = 0;
+                for (uint j = 0; j < 32; ++j) {
+                    uint m = sb * 32 + j;
+                    uint l = j;
+                    uint qn = sb;
+                    uchar qlb = ((qn & 1) == 0) ? qlh[l] : qlh[l + 32];
+                    uchar nib = (qn < 2) ? (qlb & 0x0F) : (qlb >> 4);
+                    int v = (int)((nib | (((qhh[l] >> (qn * 2)) & 3) << 4))) - 32;
+                    int qv = (int)q8[n * 128 + m];
+                    if (j < 16) {
+                        acc_l += v * qv;
+                    } else {
+                        acc_h += v * qv;
+                    }
+                }
+                acc_int += (int)(signed char)sc[n * 8 + 0 + sb * 2] * acc_l
+                         + (int)(signed char)sc[n * 8 + 1 + sb * 2] * acc_h;
+            }
+        }
+        acc = fma(sbd, (float)acc_int, acc);
+    }
+    y[(size_t)t * rows + row] = acc;
+}

@@ -13,6 +13,7 @@ extern "C" {
 // that mirrors ggml_gemm_q4_K_8x4_q8_K_p's integer/f32 order bit-for-bit.
 int sofuu_metal_batch_quantize_q8_k(void* ctx, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t cols, size_t B);
 int sofuu_metal_batch_gemm_q4_k_mmq(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
+int sofuu_metal_batch_gemm_q6_k_mmq(void* ctx, void* w_buf, size_t w_offset, void* xq_buf, size_t xq_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 
 // Returns true if running on macOS with an active Apple Silicon GPU.
 bool sofuu_metal_available(void);

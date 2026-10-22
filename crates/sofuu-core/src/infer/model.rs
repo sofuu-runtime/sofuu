@@ -3290,17 +3290,27 @@ impl TransformerModel {
                 // Phase 3: the real-GEMM class dispatches per TYPE (8/12/14);
                 // q6_K/q8_0 ride it only under SOFUU_GEMM_TYPES=all (the 1B
                 // in-model defect above), other dtypes take the per-row loop.
-                let mmq_fast = tile_mmq
-                    && $tv.tensor_type == GGML_TYPE_Q4_K
+                let mmq_quant = tile_mmq
+                    && matches!($tv.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K)
                     && g.engine.batch_quantize_q8_k(
                         pbuf, $x_off, pbuf, pslots.xq8, $cols, b,
-                    )
-                    && g.engine.batch_gemm_q4_k_mmq(
-                        &g.w_buf, gguf.data_offset + $tv.offset,
-                        pbuf, pslots.xq8,
-                        pbuf, $y_off,
-                        $rows, $cols, b,
                     );
+                let mmq_fast = mmq_quant
+                    && if $tv.tensor_type == GGML_TYPE_Q4_K {
+                        g.engine.batch_gemm_q4_k_mmq(
+                            &g.w_buf, gguf.data_offset + $tv.offset,
+                            pbuf, pslots.xq8,
+                            pbuf, $y_off,
+                            $rows, $cols, b,
+                        )
+                    } else {
+                        g.engine.batch_gemm_q6_k_mmq(
+                            &g.w_buf, gguf.data_offset + $tv.offset,
+                            pbuf, pslots.xq8,
+                            pbuf, $y_off,
+                            $rows, $cols, b,
+                        )
+                    };
                 let fast = mmq_fast
                     || (($tv.tensor_type == GGML_TYPE_Q4_K
                         || (gemm_types_all
@@ -3587,7 +3597,7 @@ impl TransformerModel {
                 && acc_fuse
                 // tile_mmq takes the o-proj through gemm!+add below (the mmq
                 // mirror has no fused-acc form; the add = the CPU's one vaddq).
-                && !(tile_mmq && l.attn_output.tensor_type == GGML_TYPE_Q4_K)
+                && !(tile_mmq && matches!(l.attn_output.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K))
                 && (l.attn_output.tensor_type == GGML_TYPE_Q4_K
                     || (gemm_types_all
                         && matches!(
@@ -3627,7 +3637,7 @@ impl TransformerModel {
                 }
                 g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
                 let d_ok = acc_fuse
-                    && !(tile_mmq && l.ffn_down.tensor_type == GGML_TYPE_Q4_K)
+                    && !(tile_mmq && matches!(l.ffn_down.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K))
                     && (l.ffn_down.tensor_type == GGML_TYPE_Q4_K
                         || (gemm_types_all
                             && matches!(

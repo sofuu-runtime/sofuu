@@ -49,6 +49,8 @@ struct MetalContext {
     bool pso_quantize_q8_k_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_mmq;
     bool pso_gemm_q4_k_mmq_live;
+    id<MTLComputePipelineState> pso_gemm_q6_k_mmq;
+    bool pso_gemm_q6_k_mmq_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_multi;
     id<MTLComputePipelineState> pso_gemm_q4_k_acc;
     id<MTLComputePipelineState> pso_gemm_q8_0;
@@ -298,6 +300,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_quantize_q8_k_live = ctx->pso_quantize_q8_k != nil;
         ctx->pso_gemm_q4_k_mmq = load_pso(@"gemm_q4_k_mmq");
         ctx->pso_gemm_q4_k_mmq_live = ctx->pso_gemm_q4_k_mmq != nil;
+        ctx->pso_gemm_q6_k_mmq = load_pso(@"gemm_q6_k_mmq");
+        ctx->pso_gemm_q6_k_mmq_live = ctx->pso_gemm_q6_k_mmq != nil;
         const char* gemm_tile_env = std::getenv("SOFUU_GEMM_TILE");
         ctx->gemm_tile32 = gemm_tile_env && strcmp(gemm_tile_env, "32") == 0;
         ctx->pso_gpu_q4_k_b4multi = load_pso(@"gemv_q4_k_b4multi");
@@ -1424,6 +1428,37 @@ int sofuu_metal_batch_gemm_q4_k_mmq(
     if (ctx->batch_enc == nil || !w_buf || !xq_buf || !y_buf || rows == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
     if (!ctx->pso_gemm_q4_k_mmq_live) return 0;
     [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mmq];
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint rn = (uint)rows;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)xq_buf offset:xq_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, (NSUInteger)B, 1)
+                  threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    return 1;
+}
+
+// q6_K MMQ mirror over TileQ8K activations (bit-twin of ggml_gemm_q6_K_8x4_q8_K).
+int sofuu_metal_batch_gemm_q6_k_mmq(
+    void* ctx_ptr,
+    void* w_buf, size_t w_offset,
+    void* xq_buf, size_t xq_offset,
+    void* y_buf, size_t y_offset,
+    size_t rows, size_t cols, size_t B
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf || !xq_buf || !y_buf || rows == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (!ctx->pso_gemm_q6_k_mmq_live) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q6_k_mmq];
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = w_offset & ~255ULL;
     uint w_rem = (uint)(w_offset & 255ULL);

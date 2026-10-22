@@ -669,6 +669,13 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, B: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gemm_q6_k_mmq(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        xq_buf: *mut c_void, xq_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_multi(
         ctx: *mut c_void,
         ty: u32,
@@ -1177,6 +1184,28 @@ impl MetalEngine {
     ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gemm_q4_k_mmq(
+                self.ctx,
+                w_buf.handle, w_offset,
+                xq_buf.handle, xq_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// q6_K MMQ mirror over TileQ8K activations (bit-twin of the CPU q6_K tile
+    /// pipeline; y = [B x rows]).
+    pub fn batch_gemm_q6_k_mmq(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        xq_buf: &MetalBuffer, xq_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gemm_q6_k_mmq(
                 self.ctx,
                 w_buf.handle, w_offset,
                 xq_buf.handle, xq_offset,
@@ -6266,6 +6295,116 @@ fn mmq_tile_value_probe() {
     unsafe { libc::munmap(xp as *mut libc::c_void, xsz) };
     unsafe { libc::munmap(qp as *mut libc::c_void, qsz) };
     unsafe { libc::munmap(op as *mut libc::c_void, osz) };
+
+    // ── q6_K section ────────────────────────────────────────────────
+    #[inline]
+    fn rint_i32(v: f32) -> i32 {
+        let r = v + 12582912.0f32;
+        ((r - 12582912.0f32) as i32)
+    }
+    extern "C" {
+        fn sofuu_gemm_q6_k(
+            w: *const u8, x: *const f32, out: *mut f32,
+            rows: usize, cols: usize, batch: usize,
+        );
+    }
+    let mut w6: Vec<u8> = Vec::with_capacity(rows * 210);
+    for r in 0..rows {
+        for i in 0..128u32 {
+            w6.push(((i * 29 + (r as u32) * 13 + 7) & 0xFF) as u8);
+        }
+        for i in 0..64u32 {
+            w6.push(((i * 53 + (r as u32) * 41 + 3) & 0x3F) as u8);
+        }
+        for i in 0..16u8 {
+            w6.push(((i as i8) - 8) as u8);
+        }
+        w6.extend_from_slice(&0x3C00u16.to_le_bytes()); // f16 1.0 — repo block_q6_K: d LAST
+    }
+    let warm6 = unsafe { sofuu_tile_warm(w6.as_ptr(), rows, cols, 14) };
+    eprintln!("[probe] q6 tile_warm = {warm6}");
+    let mut cpu6 = vec![0f32; batch * rows];
+    unsafe {
+        sofuu_gemm_q6_k(w6.as_ptr(), x.as_ptr(), cpu6.as_mut_ptr(), rows, cols, batch);
+    }
+    let host6 = {
+        let mut out = vec![0f32; batch * rows];
+        for t in 0..batch {
+            let seg = &x[t * cols..(t + 1) * cols];
+            let amax = seg.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let mut mx = 0.0f32;
+            for v in seg.iter() {
+                if v.abs() == amax { mx = *v; break; }
+            }
+            let iscale = if amax != 0.0 { -127.0f32 / mx } else { 0.0 };
+            let d8 = if amax != 0.0 { 1.0 / iscale } else { 0.0 };
+            let q8: Vec<i32> = seg.iter().map(|v| rint_i32(v * iscale)).collect();
+            for r in 0..rows {
+                let blk = &w6[r * 210..(r + 1) * 210];
+                let d = half_to_f32((blk[209] as u16) << 8 | blk[208] as u16);
+                let ql = &blk[0..128];
+                let qh = &blk[128..192];
+                let sc = &blk[192..208];
+                let sbd = d * d8;
+                let mut acc_int: i64 = 0;
+                for n in 0..2usize {
+                    for sb in 0..4usize {
+                        let mut acc_l: i64 = 0;
+                        let mut acc_h: i64 = 0;
+                        for j in 0..32usize {
+                            let m = sb * 32 + j;
+                            let qn = sb;
+                            let qlb = if qn % 2 == 0 { ql[n * 64 + j] } else { ql[n * 64 + j + 32] };
+                            let nib = if qn < 2 { qlb & 0x0F } else { qlb >> 4 };
+                            let v = (((nib | (((qh[n * 32 + j] >> (qn * 2)) & 3) << 4)) as i32) - 32) as i64;
+                            let qv = q8[n * 128 + m] as i64;
+                            if j < 16 { acc_l += v * qv; } else { acc_h += v * qv; }
+                        }
+                        let sc_l = sc[n * 8 + sb * 2] as i8 as i64;
+                        let sc_h = sc[n * 8 + 1 + sb * 2] as i8 as i64;
+                        acc_int += sc_l * acc_l + sc_h * acc_h;
+                    }
+                }
+                out[t * rows + r] = sbd * (acc_int as f32);
+            }
+        }
+        out
+    };
+    let (wp6, wsz6) = mk(w6.len());
+    unsafe { std::ptr::copy_nonoverlapping(w6.as_ptr(), wp6, w6.len()) };
+    let w6_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(wp6, wsz6) }).expect("w6");
+    let (op6, osz6) = mk(batch * rows * 4);
+    let o6_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(op6, osz6) }).expect("o6");
+    let dispatched6 = {
+        assert!(engine.batch_open());
+        let q_ok = engine.batch_quantize_q8_k(&x_buf, 0, &q_buf, 0, cols, batch);
+        let g_ok = q_ok && engine.batch_gemm_q6_k_mmq(&w6_buf, 0, &q_buf, 0, &o6_buf, 0, rows, cols, batch);
+        engine.batch_end();
+        q_ok && g_ok
+    };
+    assert!(dispatched6, "q6 PSO unavailable");
+    let mut worst6 = 0f32;
+    let mut hworst6 = 0f32;
+    for i in 0..batch * rows {
+        let g = unsafe { (op6 as *const f32).add(i).read() };
+        let d = (cpu6[i] - g).abs();
+        if d > worst6 { worst6 = d; }
+        let d2 = (cpu6[i] - host6[i]).abs();
+        if d2 > hworst6 { hworst6 = d2; }
+    }
+    eprintln!("[probe] q6 CPU-vs-GPU worst={worst6:.4e} | CPU-vs-HOST worst={hworst6:.4e}");
+    for t in 0..batch.min(2) {
+        for r in 0..rows {
+            eprintln!(
+                "q6 r{r} t{t}: cpu={:+.4} gpu={:+.4} host={:+.4}",
+                cpu6[t * rows + r],
+                unsafe { (op6 as *const f32).add(t * rows + r).read() },
+                host6[t * rows + r]
+            );
+        }
+    }
+    unsafe { libc::munmap(wp6 as *mut libc::c_void, wsz6) };
+    unsafe { libc::munmap(op6 as *mut libc::c_void, osz6) };
 }
 
 fn half_to_f32(h: u16) -> f32 {

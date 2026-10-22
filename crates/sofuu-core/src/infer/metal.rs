@@ -608,13 +608,13 @@ extern "C" {
         acc_buf: *mut c_void, acc_offset: usize,
         add_buf: *mut c_void, add_offset: usize,
         n: usize,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_swiglu(
         ctx: *mut c_void,
         g_buf: *mut c_void, g_offset: usize,
         u_buf: *mut c_void, u_offset: usize,
         n: usize,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_rmsnorm(
         ctx: *mut c_void,
         x_buf: *mut c_void, x_offset: usize,
@@ -826,7 +826,7 @@ extern "C" {
         x_buf: *mut c_void, x_offset: usize,
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_attn(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -843,7 +843,7 @@ extern "C" {
         w_buf: *mut c_void, w_offset: usize,
         y_buf: *mut c_void, y_offset: usize,
         dim: usize, eps: f32,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_rmsnorm_f32w_b4(
         ctx: *mut c_void,
         x_buf: *mut c_void, x_offset: usize,
@@ -861,14 +861,14 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_head_rmsnorm(
         ctx: *mut c_void,
         x_buf: *mut c_void, x_offset: usize,
         w_buf: *mut c_void, w_offset: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn_part(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -879,13 +879,13 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn_fin(
         ctx: *mut c_void,
         meta_buf: *mut c_void, meta_offset: usize,
         out_buf: *mut c_void, out_offset: usize,
         pos_alt: u32, n_heads: u32, head_dim: u32,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -990,16 +990,15 @@ impl MetalEngine {
         acc_buf: &MetalBuffer, acc_offset: usize,
         add_buf: &MetalBuffer, add_offset: usize,
         n: usize,
-    ) {        let __t = self.op_tick(K_ADD);
-        unsafe {
-            sofuu_metal_batch_add(
+    ) -> bool {        let __t = self.op_tick(K_ADD);
+        let __r = unsafe { sofuu_metal_batch_add(
                 self.ctx,
                 acc_buf.handle, acc_offset,
                 add_buf.handle, add_offset,
                 n,
-            );
-        }
+            ) == 1 };
         self.op_tock(K_ADD, __t);
+        __r
     }
 
     pub fn batch_swiglu(
@@ -1007,16 +1006,15 @@ impl MetalEngine {
         g_buf: &MetalBuffer, g_offset: usize,
         u_buf: &MetalBuffer, u_offset: usize,
         n: usize,
-    ) {        let __t = self.op_tick(K_SWIGLU);
-        unsafe {
-            sofuu_metal_batch_swiglu(
+    ) -> bool {        let __t = self.op_tick(K_SWIGLU);
+        let __r = unsafe { sofuu_metal_batch_swiglu(
                 self.ctx,
                 g_buf.handle, g_offset,
                 u_buf.handle, u_offset,
                 n,
-            );
-        }
+            ) == 1 };
         self.op_tock(K_SWIGLU, __t);
+        __r
     }
 
     /// GGUF dequant-dot GEMV op in the live batch (ty: 2=q4_0 8=q8_0
@@ -1028,18 +1026,17 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize,
-    ) {        let __t = self.op_tick(K_GGUF);
-        unsafe {
-            sofuu_metal_batch_gguf(
+    ) -> bool {        let __t = self.op_tick(K_GGUF);
+        let __r = unsafe { sofuu_metal_batch_gguf(
                 self.ctx,
                 ty,
                 w_buf.handle, w_offset,
                 x_buf.handle, x_offset,
                 y_buf.handle, y_offset,
                 rows, cols,
-            );
-        }
+            ) == 1 };
         self.op_tock(K_GGUF, __t);
+        __r
     }
 
     pub fn batch_rmsnorm(
@@ -1504,17 +1501,16 @@ impl MetalEngine {
         w_buf: &MetalBuffer, w_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         dim: usize, eps: f32,
-    ) {        let __t = self.op_tick(K_RMSNORM);
-        unsafe {
-            sofuu_metal_batch_rmsnorm_f32w(
+    ) -> bool {        let __t = self.op_tick(K_RMSNORM);
+        let __r = unsafe { sofuu_metal_batch_rmsnorm_f32w(
                 self.ctx,
                 x_buf.handle, x_offset,
                 w_buf.handle, w_offset,
                 y_buf.handle, y_offset,
                 dim, eps,
-            );
-        }
+            ) == 1 };
         self.op_tock(K_RMSNORM, __t);
+        __r
     }
 
     /// B-row f32-weight RMSNorm for the spec chain: rows are contiguous
@@ -1552,13 +1548,12 @@ impl MetalEngine {
         has_norm: u32, pos: u32,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
-    ) {
+    ) -> bool {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
         };        let __t = self.op_tick(K_KVWRITE);
-        unsafe {
-            sofuu_metal_batch_llama_kv_write(
+        let __r = unsafe { sofuu_metal_batch_llama_kv_write(
                 self.ctx,
                 k_buf.handle, k_offset,
                 v_buf.handle, v_offset,
@@ -1568,9 +1563,9 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
-            );
-        }
+            ) == 1 };
         self.op_tock(K_KVWRITE, __t);
+        __r
     }
 
     /// Per-head f32 RMSNorm (q-norm) on a [heads x head_dim] slab slot.
@@ -1580,20 +1575,19 @@ impl MetalEngine {
         w_buf: Option<&MetalBuffer>, w_offset: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
-    ) {
+    ) -> bool {
         let (w_handle, w_off) = match w_buf {
             Some(b) => (b.handle, w_offset),
             None => (x_buf.handle, 0),
         };
-        unsafe {
-            sofuu_metal_batch_head_rmsnorm(
+        let __r = unsafe { sofuu_metal_batch_head_rmsnorm(
                 self.ctx,
                 x_buf.handle, x_offset,
                 w_handle, w_off,
                 head_dim, n_heads,
                 has_norm, pos, eps, rope_base, rope_mode,
-            );
-        }
+            ) == 1 };
+        __r
     }
 
     /// GPU3 attention stage 1: chunked softmax+V partials into meta.
@@ -1608,13 +1602,12 @@ impl MetalEngine {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
-    ) {
+    ) -> bool {
         let (qln_handle, qln_off) = match qln_buf {
             Some(b) => (b.handle, qln_offset),
             None => (q_buf.handle, 0),
         };
-        unsafe {
-            sofuu_metal_batch_llama_attn_part(
+        let __r = unsafe { sofuu_metal_batch_llama_attn_part(
                 self.ctx,
                 q_buf.handle, q_offset,
                 kc_buf.handle, kc_layer_offset,
@@ -1624,8 +1617,8 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_heads, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
-            );
-        }
+            ) == 1 };
+        __r
     }
 
     /// GPU3 attention stage 2: rescale chunk partials into head_out.
@@ -1634,15 +1627,14 @@ impl MetalEngine {
         meta_buf: &MetalBuffer, meta_offset: usize,
         out_buf: &MetalBuffer, out_offset: usize,
         pos_alt: u32, n_heads: u32, head_dim: u32,
-    ) {
-        unsafe {
-            sofuu_metal_batch_llama_attn_fin(
+    ) -> bool {
+        let __r = unsafe { sofuu_metal_batch_llama_attn_fin(
                 self.ctx,
                 meta_buf.handle, meta_offset,
                 out_buf.handle, out_offset,
                 pos_alt, n_heads, head_dim,
-            );
-        }
+            ) == 1 };
+        __r
     }
 
     /// Multi-row (B≤4 chain) KV write: positions from a u32 buffer, grid =

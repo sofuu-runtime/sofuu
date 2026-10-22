@@ -2495,8 +2495,10 @@ impl TransformerModel {
                 };
                 let _ = is_q4;
                 if !mmqd {
-                    g.engine.batch_gguf($tv.tensor_type, &g.w_buf, $w_off,
-                        &g.act_buf, $src, &g.act_buf, $dst, $rows, $cols);
+                    if !g.engine.batch_gguf($tv.tensor_type, &g.w_buf, $w_off,
+                        &g.act_buf, $src, &g.act_buf, $dst, $rows, $cols) {
+                        return false;
+                    }
                 }
             }};
         }
@@ -2528,12 +2530,14 @@ impl TransformerModel {
             if !token_commit {
                 assert!(g.engine.batch_open());
             }
-            g.engine.batch_rmsnorm_f32w(
+            if !g.engine.batch_rmsnorm_f32w(
                 &g.act_buf, g.slots.x,
                 &g.w_buf, attn_norm_off,
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps,
-            );
+            ) {
+                return false;
+            }
             dec_gguf!(l.attn_q, gguf.data_offset + l.attn_q.offset,
                 g.slots.xn, g.slots.qa, n_heads * head_dim, dim);
             dec_gguf!(l.attn_k, gguf.data_offset + l.attn_k.offset,
@@ -2542,7 +2546,7 @@ impl TransformerModel {
                 g.slots.xn, g.slots.va, n_kv_heads * head_dim, dim);
             let run_attn = !g.skip_attn;
             if run_attn {
-            g.engine.batch_llama_kv_write(
+            if !g.engine.batch_llama_kv_write(
                 &g.act_buf, g.slots.ka,
                 &g.act_buf, g.slots.va,
                 &g.k_buf, kc_layer,
@@ -2551,7 +2555,9 @@ impl TransformerModel {
                 has_k, pos as u32,
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                 norm_eps, rope_freq_base, rope_mode,
-            );
+            ) {
+                return false;
+            }
             // GPU3 chunked attention (default; the meta-overlap bug is fixed —
             // head-0 partials were overwriting the {max,sum} block).
             // SOFUU_GPU_ATTN=0 restores the pre-GPU3 serial kernel.
@@ -2561,13 +2567,15 @@ impl TransformerModel {
             if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.
-                g.engine.batch_head_rmsnorm(
+                if !g.engine.batch_head_rmsnorm(
                     &g.act_buf, g.slots.qa,
                     q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
                     head_dim as u32, n_heads as u32,
                     has_q, pos as u32, norm_eps, rope_freq_base, rope_mode,
-                );
-                g.engine.batch_llama_attn_part(
+                ) {
+                    return false;
+                }
+                if !g.engine.batch_llama_attn_part(
                     &g.act_buf, g.slots.qa,
                     &g.k_buf, kc_layer,
                     &g.v_buf, kc_layer,
@@ -2576,12 +2584,16 @@ impl TransformerModel {
                     0, pos as u32,
                     head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
                     norm_eps, rope_freq_base, rope_mode,
-                );
-                g.engine.batch_llama_attn_fin(
+                ) {
+                    return false;
+                }
+                if !g.engine.batch_llama_attn_fin(
                     &g.meta_buf, layer_idx * meta_per_layer * 4,
                     &g.act_buf, g.slots.ao,
                     pos as u32, n_heads as u32, head_dim as u32,
-                );
+                ) {
+                    return false;
+                }
             } else {
                 let (qln_buf, qln_off) =
                     (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
@@ -2606,23 +2618,31 @@ impl TransformerModel {
             }
             dec_gguf!(l.attn_output, gguf.data_offset + l.attn_output.offset,
                 g.slots.ao, g.slots.xo, dim, n_heads * head_dim);
-            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
-            g.engine.batch_rmsnorm_f32w(
+            if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim) {
+                return false;
+            }
+            if !g.engine.batch_rmsnorm_f32w(
                 &g.act_buf, g.slots.x,
                 &g.w_buf, ffn_norm_off,
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps,
-            );
+            ) {
+                return false;
+            }
             let run_ffn = !g.skip_ffn;
             if run_ffn {
             dec_gguf!(l.ffn_gate, gguf.data_offset + l.ffn_gate.offset,
                 g.slots.xn, g.slots.gate, hidden_dim, dim);
             dec_gguf!(l.ffn_up, gguf.data_offset + l.ffn_up.offset,
                 g.slots.xn, g.slots.up, hidden_dim, dim);
-            g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim);
+            if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim) {
+                return false;
+            }
             dec_gguf!(l.ffn_down, gguf.data_offset + l.ffn_down.offset,
                 g.slots.gate, g.slots.xo, dim, hidden_dim);
-            g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
+            if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim) {
+                return false;
+            }
             }
             if !token_commit && !g.engine.batch_end() {
                 return false;
@@ -2634,19 +2654,23 @@ impl TransformerModel {
         let head_on = token_commit && !g.skip_head;
         if head_on {
             // Final norm + lm_head in the SAME command buffer, then one drain.
-            g.engine.batch_rmsnorm_f32w(
+            if !g.engine.batch_rmsnorm_f32w(
                 &g.act_buf, g.slots.x,
                 &g.w_buf, gguf2.data_offset + self.output_norm.offset,
                 &g.act_buf, g.slots.xn,
                 dim, self.config.norm_eps,
-            );
-            g.engine.batch_gguf(
+            ) {
+                return false;
+            }
+            if !g.engine.batch_gguf(
                 self.output.tensor_type,
                 &g.w_buf, g.w_offset(gguf2, &self.output),
                 &g.act_buf, g.slots.xn,
                 &g.act_buf, g.slots.logits,
                 self.config.vocab_size, dim,
-            );
+            ) {
+                return false;
+            }
             if !g.engine.batch_end() {
                 return false;
             }
@@ -3103,15 +3127,19 @@ impl TransformerModel {
                 ))
             {
                 gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
-                g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+                if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
+                    return false;
+                }
             }
             for t in 0..b {
-                g.engine.batch_rmsnorm_f32w(
+                if !g.engine.batch_rmsnorm_f32w(
                     &g.act_buf, g.slots.x + t * dim * 4,
                     &g.w_buf, ffn_norm_off,
                     &g.act_buf, g.slots.xn + t * dim * 4,
                     dim, norm_eps,
-                );
+                ) {
+                    return false;
+                }
             }
             if !g.skip_ffn {
             ffn_ops += 1;
@@ -3129,7 +3157,9 @@ impl TransformerModel {
             if !g.skip_ffn {
                 ffn_ops += 3;
             }
-            g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim);
+            if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim) {
+                return false;
+            }
             // down projection + resid-add fused
             if !(fuse_on
                 && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
@@ -3142,7 +3172,9 @@ impl TransformerModel {
                 ))
             {
                 gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
-                g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim);
+                if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
+                    return false;
+                }
             }
             }
         }
@@ -3155,20 +3187,24 @@ impl TransformerModel {
         // (gpu_spec_head_row, ~13ms each) and CPU matvec as the fallback.
         if let Some(hr) = head_row {
             for t in 0..b {
-                g.engine.batch_rmsnorm_f32w(
+                if !g.engine.batch_rmsnorm_f32w(
                     &g.act_buf, g.slots.x + t * dim * 4,
                     &g.w_buf, gguf.data_offset + self.output_norm.offset,
                     &g.act_buf, g.slots.xn + t * dim * 4,
                     dim, norm_eps,
-                );
+                ) {
+                    return false;
+                }
             }
-            g.engine.batch_gguf(
+            if !g.engine.batch_gguf(
                 self.output.tensor_type,
                 &g.w_buf, g.w_offset(gguf, &self.output),
                 &g.act_buf, g.slots.xn + hr * dim * 4,
                 &g.act_buf, g.slots.logits,
                 vocab_size, dim,
-            );
+            ) {
+                return false;
+            }
         }
         if !g.engine.batch_end() {
             return false;
@@ -3388,12 +3424,14 @@ impl TransformerModel {
                         ));
                 if !fast {
                     for t in 0..b {
-                        g.engine.batch_gguf(
+                        if !g.engine.batch_gguf(
                             $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
                             pbuf, $x_off + t * $cols * 4,
                             pbuf, $y_off + t * $rows * 4,
                             $rows, $cols,
-                        );
+                        ) {
+                            return false;
+                        }
                     }
                 }
             }};
@@ -3679,7 +3717,9 @@ impl TransformerModel {
                 );
             if !o_ok {
                 gemm!(l.attn_output, pslots.ao, pslots.xo, dim, q_rows);
-                g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+                if !g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim) {
+                    return false;
+                }
             }
 
             g.engine.batch_rmsnorm_f32w_b4(
@@ -3701,7 +3741,9 @@ impl TransformerModel {
                     gemm!(l.ffn_gate, pslots.xn, pslots.gate, hidden_dim, dim);
                     gemm!(l.ffn_up, pslots.xn, pslots.up, hidden_dim, dim);
                 }
-                g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim);
+                if !g.engine.batch_swiglu(pbuf, pslots.gate, pbuf, pslots.up, b * hidden_dim) {
+                    return false;
+                }
                 let d_ok = acc_fuse
                     && !(tile_mmq && matches!(l.ffn_down.tensor_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K))
                     && (l.ffn_down.tensor_type == GGML_TYPE_Q4_K
@@ -3719,7 +3761,9 @@ impl TransformerModel {
                     );
                 if !d_ok {
                     gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
-                    g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim);
+                    if !g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim) {
+                        return false;
+                    }
                 }
             }
             if layer_snap {
@@ -3754,19 +3798,23 @@ impl TransformerModel {
         // Last-row logits inside the same commit (output-norm + head GEMV).
         if want_logits {
             // the last loop op released xo — it is the head's norm scratch
-            g.engine.batch_rmsnorm_f32w(
+            if !g.engine.batch_rmsnorm_f32w(
                 pbuf, pslots.x + (b - 1) * dim * 4,
                 &g.w_buf, gguf.data_offset + self.output_norm.offset,
                 pbuf, pslots.xo,
                 dim, norm_eps,
-            );
-            g.engine.batch_gguf(
+            ) {
+                return false;
+            }
+            if !g.engine.batch_gguf(
                 self.output.tensor_type,
                 &g.w_buf, g.w_offset(gguf, &self.output),
                 pbuf, pslots.xo,
                 pbuf, pslots.logits,
                 vocab_size, dim,
-            );
+            ) {
+                return false;
+            }
         }
         // A rejected command buffer leaves outputs untouched: treat the
         // pass as not-happened so the caller falls back to the CPU route
@@ -3900,13 +3948,15 @@ impl TransformerModel {
             (&layer.attn_v, g.slots.va, kv_rows),
         ];
         for (tv, y_slot, rows) in tensors {
-            g.engine.batch_gguf(
+            if !g.engine.batch_gguf(
                 tv.tensor_type,
                 &g.w_buf, g.w_offset(gguf, tv),
                 &g.act_buf, g.slots.xn,
                 &g.act_buf, y_slot,
                 rows, dim,
-            );
+            ) {
+                return false;
+            }
         }
         if !g.engine.batch_end() {
             return false;
@@ -3998,13 +4048,15 @@ impl TransformerModel {
         // ── Commit B: attention output projection ──────────
         g.slot_f32_mut(g.slots.ao, q_rows).copy_from_slice(&self.head_out);
         assert!(g.engine.batch_open());
-        g.engine.batch_gguf(
+        if !g.engine.batch_gguf(
             layer.attn_output.tensor_type,
             &g.w_buf, g.w_offset(gguf, &layer.attn_output),
             &g.act_buf, g.slots.ao,
             &g.act_buf, g.slots.xo,
             dim, q_rows,
-        );
+        ) {
+            return false;
+        }
         if !g.engine.batch_end() {
             return false;
         }
@@ -4021,29 +4073,35 @@ impl TransformerModel {
 
         // ── Commit C: gate, up, swiglu (GPU), down ─────────
         assert!(g.engine.batch_open());
-        g.engine.batch_gguf(
+        if !g.engine.batch_gguf(
             layer.ffn_gate.tensor_type,
             &g.w_buf, g.w_offset(gguf, &layer.ffn_gate),
             &g.act_buf, g.slots.xn,
             &g.act_buf, g.slots.gate,
             hidden_dim, dim,
-        );
-        g.engine.batch_gguf(
+        ) {
+            return false;
+        }
+        if !g.engine.batch_gguf(
             layer.ffn_up.tensor_type,
             &g.w_buf, g.w_offset(gguf, &layer.ffn_up),
             &g.act_buf, g.slots.xn,
             &g.act_buf, g.slots.up,
             hidden_dim, dim,
-        );
+        ) {
+            return false;
+        }
         g.engine
             .batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, hidden_dim);
-        g.engine.batch_gguf(
+        if !g.engine.batch_gguf(
             layer.ffn_down.tensor_type,
             &g.w_buf, g.w_offset(gguf, &layer.ffn_down),
             &g.act_buf, g.slots.gate,
             &g.act_buf, g.slots.xo,
             dim, hidden_dim,
-        );
+        ) {
+            return false;
+        }
         if !g.engine.batch_end() {
             return false;
         }

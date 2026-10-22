@@ -1902,15 +1902,15 @@ static MTLSize sf_grid2d(uint total_groups) {
                        (total_groups + 1023u) / 1024u, 1);
 }
 
-void sofuu_metal_batch_add(
+int sofuu_metal_batch_add(
     void* ctx_ptr,
     void* acc_buf_ptr, size_t acc_offset,
     void* add_buf_ptr, size_t add_offset,
     size_t n
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !acc_buf_ptr || !add_buf_ptr || n == 0) return;
+    if (ctx->batch_enc == nil || !acc_buf_ptr || !add_buf_ptr || n == 0) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     uint un = (uint)n;
     [ctx->batch_enc setComputePipelineState:ctx->pso_add_inplace];
@@ -1919,17 +1919,18 @@ void sofuu_metal_batch_add(
     [ctx->batch_enc setBytes:&un length:sizeof(uint) atIndex:2];
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((n + 255) / 256))
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
 }
 
-void sofuu_metal_batch_swiglu(
+int sofuu_metal_batch_swiglu(
     void* ctx_ptr,
     void* g_buf_ptr, size_t g_offset,
     void* u_buf_ptr, size_t u_offset,
     size_t n
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !g_buf_ptr || !u_buf_ptr || n == 0) return;
+    if (ctx->batch_enc == nil || !g_buf_ptr || !u_buf_ptr || n == 0) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     uint un = (uint)n;
     [ctx->batch_enc setComputePipelineState:ctx->pso_swiglu];
@@ -1938,6 +1939,7 @@ void sofuu_metal_batch_swiglu(
     [ctx->batch_enc setBytes:&un length:sizeof(uint) atIndex:2];
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((n + 255) / 256))
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
 }
 
 // Slot-based RMSNorm (w is bf16 in the model buffer) reusing the per-op
@@ -2069,16 +2071,16 @@ void sofuu_metal_batch_attn(
 }
 
 // GPU3: per-head f32 RMSNorm (q-norm) on a [heads x head_dim] slot.
-void sofuu_metal_batch_head_rmsnorm(
+int sofuu_metal_batch_head_rmsnorm(
     void* ctx_ptr,
     void* x_buf_ptr, size_t x_offset,
     void* w_buf_ptr, size_t w_offset,
     uint32_t head_dim, uint32_t n_heads,
     uint32_t has_norm, uint32_t pos, float eps, float rope_base, uint32_t rope_mode
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !x_buf_ptr) return;
+    if (ctx->batch_enc == nil || !x_buf_ptr) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = w_buf_ptr ? (w_offset & ~255ULL) : 0;
     uint w_rem = w_buf_ptr ? (uint)(w_offset & 255ULL) / 4 : 0;
@@ -2099,10 +2101,11 @@ void sofuu_metal_batch_head_rmsnorm(
     [ctx->batch_enc setBytes:&rm length:sizeof(uint) atIndex:9];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // GPU3 attention, stage 1: chunked softmax+V partials to the meta buffer.
-void sofuu_metal_batch_llama_attn_part(
+int sofuu_metal_batch_llama_attn_part(
     void* ctx_ptr,
     void* q_buf_ptr, size_t q_offset,
     void* kc_buf_ptr, size_t kc_layer_offset,
@@ -2114,9 +2117,9 @@ void sofuu_metal_batch_llama_attn_part(
     uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq,
     float eps, float rope_base, uint32_t rope_mode
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil) { (void)has_norm_q_unused; return; }
+    if (ctx->batch_enc == nil) { (void)has_norm_q_unused; return 0; }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = qln_buf_ptr ? (qln_offset & ~255ULL) : 0;
     uint w_rem = qln_buf_ptr ? (uint)(qln_offset & 255ULL) / 4 : 0;
@@ -2141,19 +2144,20 @@ void sofuu_metal_batch_llama_attn_part(
     uint n_chunks = (pos + 1 + 127) / 128;
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads * n_chunks, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // GPU3 attention, stage 2: rescale chunk partials into head_out.
-void sofuu_metal_batch_llama_attn_fin(
+int sofuu_metal_batch_llama_attn_fin(
     void* ctx_ptr,
     void* meta_buf_ptr, size_t meta_offset,
     void* out_buf_ptr, size_t out_offset,
     uint32_t pos,
     uint32_t n_heads, uint32_t head_dim
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil) return;
+    if (ctx->batch_enc == nil) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_fin];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)meta_buf_ptr offset:meta_offset atIndex:0];
@@ -2163,6 +2167,7 @@ void sofuu_metal_batch_llama_attn_fin(
     [ctx->batch_enc setBytes:&pos length:sizeof(uint) atIndex:4];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // ── MULTI-ROW (B≤4 chain) attention ops: positions come from a u32 buffer ──
@@ -2393,16 +2398,16 @@ void sofuu_metal_batch_llama_attn_fin_b4(
 
 // GPU2.1: RMSNorm with F32 weights (GGUF norm tensors). Weight bound at a
 // 256-byte-aligned offset with the element remainder passed as a constant.
-void sofuu_metal_batch_rmsnorm_f32w(
+int sofuu_metal_batch_rmsnorm_f32w(
     void* ctx_ptr,
     void* x_buf_ptr, size_t x_offset,
     void* w_buf_ptr, size_t w_offset,
     void* y_buf_ptr, size_t y_offset,
     size_t dim, float eps
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !x_buf_ptr || !w_buf_ptr || !y_buf_ptr || dim == 0) return;
+    if (ctx->batch_enc == nil || !x_buf_ptr || !w_buf_ptr || !y_buf_ptr || dim == 0) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned_offset = w_offset & ~255ULL;
     uint w_rem = (uint)(w_offset & 255ULL) / 4;   // element remainder (f32)
@@ -2416,6 +2421,7 @@ void sofuu_metal_batch_rmsnorm_f32w(
     [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:5];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // B-row RMSNorm (spec chain): rows contiguous [B][dim], grid = B threadgroups
@@ -2449,7 +2455,7 @@ void sofuu_metal_batch_rmsnorm_f32w_b4(
 
 // Per-kv-head: optional f32 head-RMSNorm, split-half (mode 0) or interleaved
 // (mode 1) RoPE on k, append k(roped)/v(raw) at `pos` of this layer's slice.
-void sofuu_metal_batch_llama_kv_write(
+int sofuu_metal_batch_llama_kv_write(
     void* ctx_ptr,
     void* k_buf_ptr, size_t k_offset,
     void* v_buf_ptr, size_t v_offset,
@@ -2461,9 +2467,9 @@ void sofuu_metal_batch_llama_kv_write(
     uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq,
     float eps, float rope_base, uint32_t rope_mode
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !k_buf_ptr || !v_buf_ptr || !kc_buf_ptr || !vc_buf_ptr) return;
+    if (ctx->batch_enc == nil || !k_buf_ptr || !v_buf_ptr || !kc_buf_ptr || !vc_buf_ptr) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned_offset = kln_buf_ptr ? (kln_offset & ~255ULL) : 0;
     uint w_rem = kln_buf_ptr ? (uint)(kln_offset & 255ULL) / 4 : 0;
@@ -2485,6 +2491,7 @@ void sofuu_metal_batch_llama_kv_write(
     [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:13];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_kv_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // Per-q-head GQA decode attention with optional f32 q-norm + RoPE, softmax
@@ -2559,7 +2566,7 @@ void sofuu_metal_batch_gguf_b4(
 // G2: GGUF dequant-dot GEMV, one op in the live batch. ty is the GGML type
 // id (2 = q4_0, 8 = q8_0, 12 = q4_K, 14 = q6_K). Bindings: 0=w 1=x 2=y
 // 3=cols 4=w_rem.
-void sofuu_metal_batch_gguf(
+int sofuu_metal_batch_gguf(
     void* ctx_ptr,
     uint32_t ty,
     void* w_buf_ptr, size_t w_offset,
@@ -2567,16 +2574,16 @@ void sofuu_metal_batch_gguf(
     void* y_buf_ptr, size_t y_offset,
     size_t rows, size_t cols
 ) {
-    if (!ctx_ptr) return;
+    if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return 0;
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
         case 8:  pso = ctx->pso_gemv_q8_0; break;
         case 2:  pso = ctx->pso_gemv_q4_0; break;
         case 12: pso = ctx->pso_gemv_q4_k; break;
         case 14: pso = ctx->pso_gemv_q6_k; break;
-        default: return;
+        default: return 0;
     }
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     size_t aligned = w_offset & ~255ULL;
@@ -2590,6 +2597,7 @@ void sofuu_metal_batch_gguf(
     [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 // ── G0: real multi-op batching ─────────────────────────────────────────────
@@ -2728,26 +2736,26 @@ void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, v
 int sofuu_metal_batch_end(void* ctx) { (void)ctx; return 0; }
 void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
-void sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; }
-void sofuu_metal_batch_swiglu(void* ctx, void* g, size_t go, void* u, size_t uo, size_t n) { (void)ctx;(void)g;(void)go;(void)u;(void)uo;(void)n; }
+int sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; return 0; }
+int sofuu_metal_batch_swiglu(void* ctx, void* g, size_t go, void* u, size_t uo, size_t n) { (void)ctx;(void)g;(void)go;(void)u;(void)uo;(void)n; return 0; }
 void sofuu_metal_batch_rmsnorm(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps; }
 void sofuu_metal_batch_conv_gate(void* ctx, void* bcx, size_t bco, void* cw, size_t cwo, void* st, size_t sto, void* out, size_t oo, size_t dim) { (void)ctx;(void)bcx;(void)bco;(void)cw;(void)cwo;(void)st;(void)sto;(void)out;(void)oo;(void)dim; }
 void sofuu_metal_batch_kv_write(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t p, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)p;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb; }
 void sofuu_metal_batch_attn(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* out, size_t oo, uint32_t p, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)out;(void)oo;(void)p;(void)hd;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb; }
-void sofuu_metal_batch_rmsnorm_f32w(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps; }
+int sofuu_metal_batch_rmsnorm_f32w(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps; return 0; }
 void sofuu_metal_batch_rmsnorm_f32w_b4(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps, size_t rows) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps;(void)rows; }
-void sofuu_metal_batch_llama_kv_write(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t hn, uint32_t p, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)hn;(void)p;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
+int sofuu_metal_batch_llama_kv_write(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t hn, uint32_t p, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)hn;(void)p;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; return 0; }
 void sofuu_metal_batch_llama_attn(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* out, size_t oo, uint32_t hn, uint32_t p, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)out;(void)oo;(void)hn;(void)p;(void)hd;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
-void sofuu_metal_batch_head_rmsnorm(void* ctx, void* x, size_t xo, void* w, size_t wo, uint32_t hd, uint32_t nh, uint32_t hn, uint32_t p, float e, float rb, uint32_t rm) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)hd;(void)nh;(void)hn;(void)p;(void)e;(void)rb;(void)rm; }
-void sofuu_metal_batch_llama_attn_part(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* meta, size_t mo, uint32_t hn, uint32_t p, uint32_t hd2, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)meta;(void)mo;(void)hn;(void)p;(void)hd2;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
-void sofuu_metal_batch_llama_attn_fin(void* ctx, void* meta, size_t mo, void* out, size_t oo, uint32_t p, uint32_t nh, uint32_t hd) { (void)ctx;(void)meta;(void)mo;(void)out;(void)oo;(void)p;(void)nh;(void)hd; }
+int sofuu_metal_batch_head_rmsnorm(void* ctx, void* x, size_t xo, void* w, size_t wo, uint32_t hd, uint32_t nh, uint32_t hn, uint32_t p, float e, float rb, uint32_t rm) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)hd;(void)nh;(void)hn;(void)p;(void)e;(void)rb;(void)rm; return 0; }
+int sofuu_metal_batch_llama_attn_part(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* qln, size_t qlo, void* meta, size_t mo, uint32_t hn, uint32_t p, uint32_t hd2, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)qln;(void)qlo;(void)meta;(void)mo;(void)hn;(void)p;(void)hd2;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; return 0; }
+int sofuu_metal_batch_llama_attn_fin(void* ctx, void* meta, size_t mo, void* out, size_t oo, uint32_t p, uint32_t nh, uint32_t hd) { (void)ctx;(void)meta;(void)mo;(void)out;(void)oo;(void)p;(void)nh;(void)hd; return 0; }
 void sofuu_metal_batch_llama_kv_write_b4(void* ctx, void* k, size_t ko, void* v, size_t vo, void* kc, size_t kco, void* vc, size_t vco, void* kln, size_t klo, uint32_t hn, void* pb, size_t po, uint32_t rows, uint32_t hd, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm) { (void)ctx;(void)k;(void)ko;(void)v;(void)vo;(void)kc;(void)kco;(void)vc;(void)vco;(void)kln;(void)klo;(void)hn;(void)pb;(void)po;(void)rows;(void)hd;(void)nkv;(void)ms;(void)e;(void)rb;(void)rm; }
 void sofuu_metal_batch_head_rmsnorm_b4(void* ctx, void* x, size_t xo, void* w, size_t wo, void* pb, size_t po, uint32_t rows, uint32_t hd, uint32_t nh, uint32_t hn, float e, float rb, uint32_t rm) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)pb;(void)po;(void)rows;(void)hd;(void)nh;(void)hn;(void)e;(void)rb;(void)rm; }
 void sofuu_metal_batch_llama_attn_part_b4(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* meta, size_t mo, void* pb, size_t po, uint32_t rows, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, uint32_t ncm, uint32_t mstr) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)meta;(void)mo;(void)pb;(void)po;(void)rows;(void)hd;(void)nh;(void)nkv;(void)ms;(void)ncm;(void)mstr; }
 void sofuu_metal_batch_llama_attn_fin_b4(void* ctx, void* meta, size_t mo, void* out, size_t oo, void* pb, size_t po, uint32_t rows, uint32_t nh, uint32_t hd, uint32_t ncm, uint32_t mstr) { (void)ctx;(void)meta;(void)mo;(void)out;(void)oo;(void)pb;(void)po;(void)rows;(void)nh;(void)hd;(void)ncm;(void)mstr; }
 int sofuu_metal_batch_llama_attn_1c_b4(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* out, size_t oo, void* pb, size_t po, uint32_t rows, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)out;(void)oo;(void)pb;(void)po;(void)rows;(void)hd;(void)nh;(void)nkv;(void)ms; return 0; }
 int sofuu_metal_batch_gguf_b4r(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, void* acc, size_t ao, size_t r, size_t c, size_t ad) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)acc;(void)ao;(void)r;(void)c;(void)ad; return 0; }
-void sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
+int sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; return 0; }
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
 int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t yo, size_t rt, size_t c, size_t B, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)yo;(void)rt;(void)c;(void)B;(void)secs;(void)ns; return 0; }

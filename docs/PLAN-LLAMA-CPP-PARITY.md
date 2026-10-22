@@ -917,3 +917,17 @@ formally bounded per-run by the auto-envelope; the bit-exact endgame
 IDENTICAL on near-tie-heavy prompts. DEFAULTS: still locked (both mirror
 envs remain opt-in); any future default flip is now a data-backed decision
 with this gate as the criterion.
+
+## DECODE-CHAIN FALLBACK CONTRACT LANDED (2026-10-24 — open item 3 closed)
+The 8 decode-chain exports (add/swiglu/head_rmsnorm/attn_part/attn_fin/
+rmsnorm_f32w/llama_kv_write/gguf) converted void→int (dispatched status;
+guards return 0; success returns 1; non-Apple stubs return 0), Rust
+externs→i32, all 8 wrappers → bool, and **29 decode call sites propagate**
+(`if !op { return false; }` across layers_one_commit + gpu_layer_step, the
+established return-false pattern) — a mid-chain dispatch failure now takes
+the whole token step to the CPU layer loop instead of silently continuing
+with stale slot state. Verified: 0 build errors; the 0.6B mirror-complete
+gate stays NEAR-TIE-CERTIFIED (step 19, 0.089 — unchanged happy path); the
+1B 219-token chunk-128 GEMM-route run (the previously-faulting shape) runs
+clean end-to-end with correct state (counted the 36 repeated words; prefill
+96.8 tk/s / decode 56.0 tk/s).

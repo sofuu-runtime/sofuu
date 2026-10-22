@@ -821,3 +821,14 @@ NOT the carrier of the 0.156 class — the class rides the q4 gemvs alone,
 which q4-mirroring reduces to 0.102; the残余 = likely the head + attention
 glue, bounded by the certified-near-tie question at the 0.215-gap step).
 Defaults locked throughout.
+
+## COMBO BUG FIXED — POS QUANTIZER FOR BOTH DECODE TYPES (2026-10-23 final)
+The combo-only interaction (fork 19→2) = the SIGNED-MAX quantize_q8_k kernel
+in the q6 decode branch. Sign-equivalence argued + measured: the q6pos combo
+(fork step 19, |dtop1| 0.155) matches the singles' class; DECODE_MMQ_OPS
+=q6pos receipt kept in-tree. Permanent wiring = pos quantizer for BOTH q4
+and q6 decode branches (quantize_q8_k dropped from the decode path). Gate
+(paris32, TILE_MMQ+DECODE_MMQ): fork step 19, 0.155 — the per-step decode
+class is now uniform (~0.15 at the fork's 0.215-gap near-tie; the residual =
+head + attention-glue + the decode attn read path — the certified-near-tie
+question). DEFAULTS: never moved; both mirror envs stay opt-in.

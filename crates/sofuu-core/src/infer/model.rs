@@ -2460,9 +2460,13 @@ impl TransformerModel {
                 // q6_K only: the q6 tile GEMV is numerically the per-256
                 // batch-mmq pipeline at B=1 (probe-exact); the q4 tile GEMV
                 // uses its own blocklen-8 interleave — booked separately.
+                // The decode mirror uses the POS row-quantizer for BOTH
+                // types: the signed-max kernel triggered a combo-only live
+                // regression (fork step 19→2) while pos is sign-equivalent
+                // and bisects clean (SOFUU_DECODE_MMQ_OPS=q6pos receipt).
                 let (mmqd, is_q4) = if decode_mmq && dmmq_q6 && $tv.tensor_type == GGML_TYPE_Q6_K {
                     (
-                        g.engine.batch_quantize_q8_k(
+                        g.engine.batch_quantize_q8_k_pos(
                             &g.act_buf, $src, &g.act_buf, g.slots.xq8e, $cols, 1,
                         ) && g.engine.batch_gemm_q6_k_mmq(
                             &g.w_buf, $w_off, &g.act_buf, g.slots.xq8e,

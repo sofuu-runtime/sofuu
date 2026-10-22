@@ -1630,6 +1630,42 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "compile-bc" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu compile-bc <input.js> <output.bc>'");
+                return ExitCode::FAILURE;
+            }
+            let in_path = &args[2];
+            let out_path = &args[3];
+            let src = match std::fs::read_to_string(in_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading {in_path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = unsafe { sofuu_ffi::qjs::JS_NewRuntime() };
+            let ctx = unsafe { sofuu_ffi::qjs::JS_NewContext(rt) };
+            let bc = unsafe { sofuu_core::shipped::compile_to_bytecode(ctx, &src, in_path) };
+            unsafe {
+                sofuu_ffi::qjs::JS_FreeContext(ctx);
+                sofuu_ffi::qjs::JS_FreeRuntime(rt);
+            }
+            match bc {
+                Some(bytes) => {
+                    if let Err(e) = std::fs::write(out_path, &bytes) {
+                        eprintln!("Error writing {out_path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("Compiled {in_path} ({} bytes) -> {out_path} ({} bytes)", src.len(), bytes.len());
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("Compilation failed for {in_path}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "doctor" => {
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,

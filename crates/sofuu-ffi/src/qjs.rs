@@ -499,12 +499,29 @@ pub const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10; // verified (quickjs.h:278)
 pub const JS_PROP_HAS_GET: c_int = 1 << 11;
 pub const JS_PROP_HAS_SET: c_int = 1 << 12;
 
+pub const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
+pub const JS_READ_OBJ_BYTECODE: c_int = 1 << 0;
+pub const JS_READ_OBJ_ROM_DATA: c_int = 1 << 1;
+
 /// `JS_CFUNC_constructor` (quickjs.h JSCFunctionEnum) for JS_NewCFunction2.
 pub const JS_CFUNC_constructor: c_int = 2;
 
 // ── Direct C exports (linkable from Rust) ─────────────────────────
 
 extern "C" {
+    pub fn JS_WriteObject(
+        ctx: *mut JSContext,
+        psize: *mut usize,
+        obj: JSValueConst,
+        flags: c_int,
+    ) -> *mut u8;
+    pub fn JS_ReadObject(
+        ctx: *mut JSContext,
+        buf: *const u8,
+        buf_len: usize,
+        flags: c_int,
+    ) -> JSValue;
+    pub fn JS_EvalFunction(ctx: *mut JSContext, fun_obj: JSValue) -> JSValue;
     pub fn JS_NewRuntime() -> *mut JSRuntime;
     pub fn JS_FreeRuntime(rt: *mut JSRuntime);
     pub fn JS_NewContext(rt: *mut JSRuntime) -> *mut JSContext;

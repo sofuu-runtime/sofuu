@@ -484,45 +484,57 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
         register_global_fn(ctx, "__rlm_route", js_rlm_route as JSCFunction);
         register_global_fn(ctx, "__rlm_log_route", js_rlm_log_route as JSCFunction);
 
-        let src = std::ffi::CString::new(DRIVER_JS).unwrap_or_default();
-        let r = qjs::JS_Eval(
-            ctx,
-            src.as_ptr(),
-            DRIVER_JS.len(),
-            c"<rlm-driver>".as_ptr(),
-            qjs::JS_EVAL_TYPE_GLOBAL,
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            DRIVER_JS,
+            Some(crate::shipped::RLM_BC),
+            "<rlm-driver>",
         );
-        if qjs::is_exception(r) {
-            // A driver failure must never take the engine down — the JS
-            // guards make this unreachable in practice; log and move on.
-            let exc = qjs::JS_GetException(ctx);
-            let p = qjs::sofuu_js_to_cstring(ctx, exc);
-            if !p.is_null() {
-                let msg = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
-                qjs::sofuu_js_free_cstring(ctx, p);
-                eprintln!("[sofuu] rlm driver eval failed: {msg}");
-            }
-            qjs::sofuu_js_free_value(ctx, exc);
-        }
-        qjs::sofuu_js_free_value(ctx, r);
 
         // Shipped drivers beyond RLM (PLAN-AGENTS): the agent runtime
         // (sofuu.agent.define/run/…) and web search (sofuu.web.search/open).
         // Pure JS over the registered primitives — no host functions. The
         // seam runs after memory.rs registered sofuu.agent.create/prefetch,
         // and both drivers merge into the live namespace objects.
-        crate::shipped::eval_shipped(
+        // Bytecode snapshotting (Phase 2) hydrats them in microseconds.
+        crate::shipped::eval_shipped_with_bytecode(
             ctx as *mut c_void,
             crate::shipped::AGENT_JS,
+            Some(crate::shipped::AGENT_BC),
             "<agent-driver>",
         );
-        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::WEB_JS, "<web-driver>");
-        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::TOOLS_JS, "<tools-driver>");
-        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::EXTRACTOR_JS, "<extractor-driver>");
-        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::STORAGE_JS, "<storage-driver>");
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::WEB_JS,
+            Some(crate::shipped::WEB_BC),
+            "<web-driver>",
+        );
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::TOOLS_JS,
+            Some(crate::shipped::TOOLS_BC),
+            "<tools-driver>",
+        );
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::EXTRACTOR_JS,
+            Some(crate::shipped::EXTRACTOR_BC),
+            "<extractor-driver>",
+        );
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::STORAGE_JS,
+            Some(crate::shipped::STORAGE_BC),
+            "<storage-driver>",
+        );
         // PLAN-DESKTOP C: the chat turn engine (sofuu.chat.*) — last, since
         // it builds on the agent/web/tools drivers above.
-        crate::shipped::eval_shipped(ctx as *mut c_void, crate::shipped::CHAT_JS, "<chat-driver>");
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::CHAT_JS,
+            Some(crate::shipped::CHAT_BC),
+            "<chat-driver>",
+        );
     }
 }
 

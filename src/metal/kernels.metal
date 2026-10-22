@@ -4510,3 +4510,186 @@ kernel void gemm_q4_k_tiled_wide_fused(
         }
     }
 }
+
+// ── item 2b: 8x8 register tile — the threadgroup-bandwidth fix ──────────────
+// The probe split the 32-row tile: staging 36%, and the FMA loop alone at 1.41
+// TFLOP/s = 25% of peak. The loop moves 8 floats of threadgroup memory per 16
+// FMAs (2 B/FMA); a core's threadgroup pipe moves 64 B/cycle against 128
+// FLOP/cycle of FMA, so peak needs <= 1 B/FMA and a 4x4 thread tile cannot
+// reach it no matter how it is scheduled — which is why double-buffering,
+// 256 threads and the 8x4 variant all measured the same.
+//
+// Bytes/FMA = (R + T) / (R*T) for an RxT thread tile: 2.0 at 4x4, 1.5 at 8x4,
+// 1.0 at 8x8. This kernel is the 8x8 case, and the tiles are stored TRANSPOSED
+// (ws[k][r], xs[k][t]) so each thread's 8 rows and 8 tokens are contiguous and
+// come back as two float4 loads instead of eight scalar ones.
+// Tile: 128 rows x 64 tokens, 128 threads, thread tile 8x8.
+#define R88_R 128
+#define R88_T 64
+#define R88_BK 32
+#define R88_PAD_R 132
+#define R88_PAD_T 68
+#define R88_THREADS 128
+
+kernel void gemm_q4_k_tiled_r88(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    // declared as float4 so the buffers are 16-byte aligned and the compute
+    // loop's vector loads are well defined (both strides are multiples of 4)
+    threadgroup float4 ws4[(R88_BK * R88_PAD_R) / 4];
+    threadgroup float4 xs4[(R88_BK * R88_PAD_T) / 4];
+    threadgroup float *ws = (threadgroup float *)ws4;
+    threadgroup float *xs = (threadgroup float *)xs4;
+
+    uint r0 = tg.x * R88_R;
+    uint t0 = tg.y * R88_T;
+    uint nb = cols / 256;
+    uint nbk = cols / R88_BK;
+
+    float acc[8][8];
+    for (uint i = 0; i < 8; ++i) {
+        for (uint j = 0; j < 8; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    uint lane_r = tid & 15;            // 16 groups of 8 rows   -> 128 rows
+    uint lane_t = tid >> 4;            // 8 groups of 8 tokens  -> 64 tokens
+    uint rb = lane_r * 8;
+    uint tb = lane_t * 8;
+
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * R88_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 128 rows x 32 values: one row per thread, one sub-block ──
+        {
+            uint grow = r0 + tid;
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 144;
+                device const uchar *blk = w_base + row_byte + b * 144;
+                float d = float(read_f16(w_base, row_byte + b * 144));
+                float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+                uint8_t sc, m;
+                q4k_scale_min(blk + 4, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16 + 32 * (sub >> 1);
+                bool hi = (sub & 1) != 0;
+                for (uint u = 0; u < 32; ++u) {
+                    uint byte = (uint)qrow[u];
+                    uint nib = hi ? (byte >> 4) : (byte & 0x0F);
+                    ws[u * R88_PAD_R + tid] = ds * (float)nib - mm;
+                }
+            } else {
+                for (uint u = 0; u < 32; ++u) { ws[u * R88_PAD_R + tid] = 0.0f; }
+            }
+        }
+        // ── stage 64 tokens x 32 values: 2 threads per token, 16 values each ──
+        {
+            uint t = tid >> 1;
+            uint v0 = (tid & 1) * 16;
+            uint gt = t0 + t;
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xs[(v0 + u) * R88_PAD_T + t] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xs[(v0 + u) * R88_PAD_T + t] = 0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── compute: 8 rows x 8 tokens from registers ──
+        for (uint kk = 0; kk < R88_BK; ++kk) {
+            threadgroup float *wp = ws + kk * R88_PAD_R + rb;
+            threadgroup float *xp = xs + kk * R88_PAD_T + tb;
+            float4 w0 = *(threadgroup float4 *)wp;
+            float4 w1 = *(threadgroup float4 *)(wp + 4);
+            float4 x0 = *(threadgroup float4 *)xp;
+            float4 x1 = *(threadgroup float4 *)(xp + 4);
+            float wv[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
+            float xv[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    acc[i][j] += wv[i] * xv[j];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint tbase = t0 + tb;
+    uint rbase = r0 + rb;
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        uint grow = rbase + i;
+        if (grow >= rows) { continue; }
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; ++j) {
+            uint gt = tbase + j;
+            if (gt >= B) { continue; }
+            y[(size_t)gt * rows + grow] = acc[i][j];
+        }
+    }
+}
+
+// ── peak probes: what can this GPU actually do? ────────────────────────────
+// Every GEMM schedule tried (4x4, 8x4, 8x8 register tiles, 128/256 threads,
+// single/double buffered staging, 32/64/128-row tiles, scalar and float4
+// threadgroup reads) lands at 1.2-1.3 TFLOP/s, while llama.cpp measures 4.0 on
+// the same box. These two kernels have no memory traffic at all: they measure
+// the fp32 FMA pipe and the simdgroup_matrix pipe so the ceiling is a fact
+// rather than an inference.
+kernel void peak_fma(device float *out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    float a0 = (float)(tid & 7) * 1e-3f + 1.0f;
+    float a1 = a0 + 0.1f, a2 = a0 + 0.2f, a3 = a0 + 0.3f;
+    float a4 = a0 + 0.4f, a5 = a0 + 0.5f, a6 = a0 + 0.6f, a7 = a0 + 0.7f;
+    float b = 1.0000001f, c = 1e-9f;
+    for (uint i = 0; i < 8192; ++i) {
+        a0 = fma(a0, b, c); a1 = fma(a1, b, c); a2 = fma(a2, b, c); a3 = fma(a3, b, c);
+        a4 = fma(a4, b, c); a5 = fma(a5, b, c); a6 = fma(a6, b, c); a7 = fma(a7, b, c);
+    }
+    if (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 == 12345.0f) { out[tid] = a0; }
+}
+
+kernel void peak_fma16(device float *out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    float a[16];
+    for (uint i = 0; i < 16; ++i) { a[i] = 1.0f + (float)((tid + i) & 7) * 1e-3f; }
+    float b = 1.0000001f, c = 1e-9f;
+    for (uint i = 0; i < 4096; ++i) {
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 16; ++j) { a[j] = fma(a[j], b, c); }
+    }
+    float s = 0.0f;
+    for (uint j = 0; j < 16; ++j) { s += a[j]; }
+    if (s == 12345.0f) { out[tid] = s; }
+}
+
+kernel void peak_mma(device float *out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    simdgroup_matrix<half, 8, 8> A, B;
+    simdgroup_matrix<half, 8, 8> C[4];
+    half v = (half)((tid & 7) * 0.001f + 1.0f);
+    simdgroup_matrix<half, 8, 8> Z;
+    Z = simdgroup_matrix<half, 8, 8>(v);
+    A = Z; B = Z;
+    C[0] = Z; C[1] = Z; C[2] = Z; C[3] = Z;
+    for (uint i = 0; i < 8192; ++i) {
+        simdgroup_multiply_accumulate(C[0], A, B, C[0]);
+        simdgroup_multiply_accumulate(C[1], A, B, C[1]);
+        simdgroup_multiply_accumulate(C[2], A, B, C[2]);
+        simdgroup_multiply_accumulate(C[3], A, B, C[3]);
+    }
+    threadgroup half tmp[64];
+    simdgroup_store(C[0], tmp, 8, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tmp[0] == (half)12345.0f) { out[tid] = (float)tmp[1]; }
+}

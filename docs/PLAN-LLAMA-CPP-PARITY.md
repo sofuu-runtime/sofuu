@@ -1362,3 +1362,69 @@ Two separate gaps, and the first one is the surprise:
 Consequence: arm D is a **GEMV schedule rewrite** (more rows per threadgroup,
 16 B vector loads spread across lanes, fewer barriers, aim >= 60 GB/s at 1.8 MB),
 not a knob flip. Flipping coalesced levels again cannot bridge a 6x gap.
+
+## LEDGER #7 — THE PREFILL CEILING IS THE fp32 PIPE, NOT THE SCHEDULE
+
+### Method first, because the earlier numbers were wrong
+
+Two measurement bugs made the LEDGER #5/#6 prefill rates both noisy and
+understated, and both are now fixed in `bench_tiled_real_shapes`:
+
+1. **One commit per dispatch.** A commit costs ~330 us (measured in LEDGER #6),
+   so every "kernel" time included a launch-latency constant. The bench now
+   issues 8 dispatches inside one commit and divides.
+2. **Sequential variants under drifting load.** The same 32-row tile measured
+   0.41, 0.72 and 0.48 TFLOP/s on the same shape in three runs. The bench now
+   interleaves every variant in every round and reports the MIN per variant.
+
+Corrected numbers at the real shapes (B=128, q4_K, min of 6 interleaved):
+
+| kernel | 6144x1024 | 3072x1024 | 1024x2048 | 1024x3072 | 1024x4096 |
+|---|---|---|---|---|---|
+| 32-row x 64-tok (shipped) | 1.31 | 1.26 | 1.18 | 1.20 | 1.22 |
+| 64-row wide tile | 1.24 | 1.19 | 0.97 | 0.98 | 0.99 |
+| 8x8 register tile + float4 LDS | 1.27 | 1.17 | 0.92 | 0.93 | 0.94 |
+
+(deliberately *identical* across schedules, which is the whole point)
+
+### The four hypotheses that all failed
+
+| change | hypothesis | result |
+|---|---|---|
+| double-buffered k-slice, 1 barrier/slice | exposed staging latency | **20% slower** (25.3 KB threadgroup -> 1 TG/core) |
+| 256 threads, same tile | occupancy (8 -> 16 warps/core) | flat |
+| 8x4 and 8x8 register tiles | threadgroup-bandwidth wall (2.0 -> 1.0 B/FMA) | flat |
+| transposed tiles + `float4` LDS | LDS issue count | flat |
+
+A staging/compute probe split the 32-row tile into 0.36 ms staging + 1.01 ms
+FMA loop (1.6 TFLOP/s compute-only), so staging is not the wall either.
+
+### The actual ceiling, measured with no memory traffic at all
+
+`peak_fma` / `peak_fma16` / `peak_mma` run loop-invariant register math for
+8192 iterations (kernel-dominated, min-of-6, 128 threadgroups):
+
+| pipe | TFLOP/s |
+|---|---|
+| fp32 FMA, 8 accumulators | **2.05** |
+| fp32 FMA, 16 accumulators | **2.14** |
+| `simdgroup_matrix` fp16 | **18.80** |
+
+So this 16-core M2 Pro delivers **~2.1 TFLOP/s of fp32** to a compute kernel,
+not the 5.7 the core/clock arithmetic suggests, and **9x that through the
+matrix pipe**.
+
+### What that means
+
+- Our GEMMs at 0.92-1.31 TFLOP/s are at **45-64% of the fp32 pipe**. There is
+  no schedule left that gets fp32 to 4 TFLOP/s: the pipe is 2.1.
+- llama.cpp measures **4.0 TFLOP/s** on this box (3435 t/s on the 0.6B). That is
+  **2x the fp32 pipe**, so llama.cpp's `mul_mm` is not an fp32 SIMT kernel —
+  it is `simdgroup_matrix` fp16 at ~21% of the 18.8 TFLOP/s matrix ceiling.
+- **Prefill parity therefore requires an MMA kernel.** Every hour spent on fp32
+  tile shapes, occupancy or staging is spent against a 2.1 TFLOP/s wall; the
+  LEDGER #5 note that "MMA bought only 1.2-1.4x" was an artifact of that kernel
+  still doing its dequant staging in the fp32 path, not a property of the pipe.
+
+Arm C's verdict is hereby superseded: MMA is not a 1.2x curiosity, it is the
+only route, with ~9x of headroom over what we are currently doing.

@@ -47,6 +47,11 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q4_k;
     id<MTLComputePipelineState> pso_quantize_q8_k;
     bool pso_quantize_q8_k_live;
+    id<MTLComputePipelineState> pso_peak_fma16;
+    id<MTLComputePipelineState> pso_peak_fma;
+    id<MTLComputePipelineState> pso_peak_mma;
+    id<MTLComputePipelineState> pso_gemm_q4_k_tiled_r88;
+    bool pso_gemm_q4_k_tiled_db_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_wide_fused;
     bool pso_gemm_q4_k_tiled_wide_fused_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_wide;
@@ -330,6 +335,10 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q6_k_t32_live = ctx->pso_gemm_q6_k_t32 != nil;
         ctx->pso_quantize_q8_k = load_pso(@"quantize_q8_k");
         ctx->pso_quantize_q8_k_live = ctx->pso_quantize_q8_k != nil;
+        ctx->pso_peak_fma16 = load_pso(@"peak_fma16");
+        ctx->pso_peak_fma = load_pso(@"peak_fma");
+        ctx->pso_peak_mma = load_pso(@"peak_mma");
+        ctx->pso_gemm_q4_k_tiled_r88 = load_pso(@"gemm_q4_k_tiled_r88");
         ctx->pso_gemm_q4_k_tiled_wide_fused = load_pso(@"gemm_q4_k_tiled_wide_fused");
         ctx->pso_gemm_q4_k_tiled_wide_fused_live = ctx->pso_gemm_q4_k_tiled_wide_fused != nil;
         ctx->pso_gemm_q4_k_tiled_wide = load_pso(@"gemm_q4_k_tiled_wide");
@@ -1737,6 +1746,38 @@ int sofuu_metal_batch_gguf_gemm_tiled(
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }
+int sofuu_metal_batch_gguf_gemm_tiled_r88(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t B
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (rows == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (!ctx->pso_gemm_q4_k_tiled_live) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_tiled_r88];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint Bn = (uint)B;
+    uint rn = (uint)rows;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&Bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
+    uint r_tiles = (uint)((rows + 127) / 128);
+    uint t_tiles = (uint)((B + 63) / 64);
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(r_tiles, t_tiles, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
 
 // arm-E: 64-row tiled variant (x staged once per 64 rows instead of 32).
 int sofuu_metal_batch_gguf_gemm_tiled_wide(
@@ -3122,3 +3163,35 @@ void sofuu_metal_gemv_gate_up_mlx4(void* ctx, void* gate_buf, size_t gate_offset
 
 #endif
 
+extern "C" int sofuu_metal_peak_fma(void* ctx_ptr, void* out_buf, size_t n_blocks) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !out_buf || !ctx->pso_peak_fma) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_peak_fma];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+extern "C" int sofuu_metal_peak_fma16(void* ctx_ptr, void* out_buf, size_t n_blocks) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !out_buf || !ctx->pso_peak_fma16) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_peak_fma16];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+extern "C" int sofuu_metal_peak_mma(void* ctx_ptr, void* out_buf, size_t n_blocks) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !out_buf || !ctx->pso_peak_mma) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_peak_mma];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}

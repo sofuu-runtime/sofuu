@@ -1322,3 +1322,43 @@ model rather than the win it was assumed to be — the extra dispatches cost les
 than the widened staging. Not flipping the default here: at 1.02x on the model
 we tune most, the signal is not worth the change; recorded so the next pass
 starts from the measurement instead of the assumption.
+
+## LEDGER #6 — ARM D DIAGNOSIS: decode is ffn-GEMV bound, and the GEMV is 6x off its class rate
+
+Decode ablation on the 0.6B (48 tokens, same session):
+
+| config | tg/s |
+|---|---|
+| baseline | 51.2 |
+| SOFUU_GPU_SKIP=ffn | **136.5** (2.67x) |
+| SOFUU_GPU_SKIP=attn | 60.8 |
+| skip both | 149.3 |
+
+So the ffn GEMVs are **63% of decode time** (12.2 ms of 19.5 ms/token), attention
+16%, and everything else (norms, lm_head over 151936 vocab, sampler, dispatch)
+34%. That is the right target — but the target is not where the ledger assumed.
+
+`bench_decode_gemv_real_shapes` (committed, `--ignored`) times ONE q4_K GEMV at
+the real per-layer shapes, twice: 28 of them inside a single commit (dispatch
+and sync amortized), then 28 separate commits (what a non-pipelined loop does).
+
+| shape | one commit | 28 commits |
+|---|---|---|
+| 3072x1024 ffn gate (1.8 MB) | 106.5 us · **17 GB/s** | 439.4 us · 4 GB/s |
+| 1024x3072 ffn down (1.8 MB) | 98.6 us · 18 GB/s | 459.0 us · 4 GB/s |
+| 3072x1024 attn qkv (1.8 MB) | 90.9 us · 19 GB/s | 394.4 us · 4 GB/s |
+| 6144x1024 gate+up (3.5 MB) | 172.2 us · 21 GB/s | 326.0 us · 11 GB/s |
+
+Two separate gaps, and the first one is the surprise:
+
+1. **The kernel itself is at 17-21 GB/s**, not the ~100 GB/s the coalesced class
+   measured — a 6x gap that dispatch amortization does not touch. At 1.8 MB per
+   call the schedule is latency-bound: too little work per row (576 B) spread
+   over too many threadgroups, so the DRAM pipe never fills.
+2. **A commit costs ~330 us** when not pipelined (439 vs 106 us). Decode already
+   runs one commit per token, so it is not paying this today — but it prices any
+   future "one commit per op" idea out of existence.
+
+Consequence: arm D is a **GEMV schedule rewrite** (more rows per threadgroup,
+16 B vector loads spread across lanes, fewer barriers, aim >= 60 GB/s at 1.8 MB),
+not a knob flip. Flipping coalesced levels again cannot bridge a 6x gap.

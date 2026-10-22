@@ -7939,6 +7939,79 @@ fn gemm_q4_k_tiled_wide_fused_matches_cpu() {
     println!("[wide-fused] PARITY PASS (64-row == 32-row == CPU)");
 }
 
+/// Arm-D probe: one decode GEMV in isolation, at the real per-layer shapes.
+/// Decode is 63% ffn GEMVs (SOFUU_GPU_SKIP=ffn: 51.2 -> 136.5 tg/s on the
+/// 0.6B) yet those GEMVs only move ~21 GB/s of weights against a ~100 GB/s
+/// class rate. This separates "the kernel is slow" from "the dispatch is".
+/// Run inside ONE open batch (N GEMVs, one commit) and then one-at-a-time, so
+/// the per-dispatch cost is the difference between the two columns.
+#[test]
+#[ignore]
+fn bench_decode_gemv_real_shapes() {
+    use std::time::Instant;
+    let engine = MetalEngine::new().expect("engine");
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    // q4_K rows x cols, B=1: the three ffn shapes and the qkv shape
+    let shapes: [(usize, usize, &str); 4] = [
+        (3072, 1024, "ffn gate"),   // 1.7 MB of weights
+        (1024, 3072, "ffn down"),   // 1.7 MB
+        (3072, 1024, "attn qkv"),   // 1.7 MB
+        (6144, 1024, "gate+up"),    // 3.5 MB
+    ];
+    let slab_bytes = (((4096usize + 6144 * 4) * 4).div_ceil(page)) * page;
+    let sp = mk(slab_bytes);
+    let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(sp, slab_bytes) };
+    for i in 0..slab.len() { slab[i] = 0; }
+    let s_buf = engine.register_zerocopy_only(slab).expect("slab");
+    for (rows, cols, name) in shapes {
+        let nb = cols / 256;
+        let w_bytes = (rows * nb * 144).div_ceil(page) * page;
+        let wp = mk(w_bytes);
+        let w: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(wp, w_bytes) };
+        for i in 0..w.len() { w[i] = ((i * 37 + 11) & 0xFF) as u8; }
+        for blk in 0..(rows * nb) {
+            let o = blk * 144;
+            w[o] = 0x00; w[o + 1] = 0x3C; w[o + 2] = 0x00; w[o + 3] = 0x20;
+        }
+        let w_buf = engine.register_zerocopy_only(w).expect("w");
+        let y_off = 4096 * 4;
+        let mb = (rows * nb * 144) as f64 / 1e6;
+        // (a) 28 layers worth of the same GEMV in ONE batch (28 commits' worth of
+        //     work, one commit): amortizes dispatch/latency away.
+        let n = 28usize;
+        assert!(engine.batch_open());
+        for _ in 0..n {
+            engine.batch_gguf(12, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows, cols);
+        }
+        let t0 = Instant::now();
+        engine.batch_end();
+        let batched = t0.elapsed().as_secs_f64();
+        // (b) the same 28 GEMVs, each its own commit — what decode actually does
+        let t1 = Instant::now();
+        for _ in 0..n {
+            assert!(engine.batch_open());
+            engine.batch_gguf(12, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows, cols);
+            engine.batch_end();
+        }
+        let serial = t1.elapsed().as_secs_f64();
+        println!(
+            "[dec-gemv] {name:9} {rows}x{cols} ({mb:.1} MB): 1 commit {:.1} us/gemv {:.0} GB/s | 28 commits {:.1} us/gemv {:.0} GB/s",
+            batched / n as f64 * 1e6, mb / 1e3 * n as f64 / batched,
+            serial / n as f64 * 1e6, mb / 1e3 * n as f64 / serial
+        );
+        unsafe { libc::munmap(wp as *mut libc::c_void, w_bytes); }
+    }
+    unsafe { libc::munmap(sp as *mut libc::c_void, slab_bytes); }
+}
+
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape
 /// (b=2 rows, 2 priors, 32 heads / 8 kv / hd 64). The CPU mirror is the
 /// textbook serial attention: causal softmax(q·k/√hd) × v over priors.

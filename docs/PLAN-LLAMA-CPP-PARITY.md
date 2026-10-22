@@ -642,3 +642,26 @@ composite bound, ~5e-2 absolute at 0.6B/Paris scale; recorded per step by
 SOFUU_DECODE_PROBE). The default-vs-default gate additionally needs the
 1.8e-2 tiles class removed on one side (the 8x4-tile mirror program) —
 otherwise default CPU text can never equal GPU text on q4_K models.
+
+## LOGITS-TOLERANCE GATE SHIPPED (2026-10-23 — scripts/text_gate.py) — the re-gate runner
+Per the decode pin, "CPU-identical" text is achievable exactly when no
+sampled step sits inside the composite noise band of a top-2 tie; a single
+near-tie flip makes both routes continue greedy in DIFFERENT contexts
+(aftermath rows are context-divergent by construction and must not be
+judged). text_gate.py therefore certifies on the FIRST diverging step:
+IDENTICAL / NEAR-TIE-CERTIFIED (|dtop1| < bound at the fork step) / FORK
+(>= bound = bug class; defaults must not move). Gate set (0.6B i1-Q4_K_M
++ 1B Q8_0, Paris/32 + exact-repeat prompt):
+| gate | verdict |
+|---|---|
+| 0.6B paris32, exact pair (CPU SOFUU_NO_TILES=1) | NEAR-TIE-CERTIFIED (fork step |dtop1|=0.0470 < 0.05) |
+| 0.6B paris32, DEFAULT pair | **FORK (|dtop1|=0.23) = the 1.8e-2 tiles class — defaults stay locked** |
+| 0.6B exact-repeat prompt, both pairs | IDENTICAL (23/23) |
+| 1B Q8_0 paris32, DEFAULT pair | **IDENTICAL (31/31) — full route-to-route text equality on the exact-arithmetic type** |
+Reading: the fleet is route-consistent end-to-end on q8_0; the q4_K
+default pair remains gated by the tiles class (booked: 8x4-tile MSL
+mirror), and the remaining near-tie flips on the exact pair are
+certification-class until the fleet-exact endgame (order-exact ops +
+libm-matching exp) is funded. PROMPT SET for future re-gates: "Write
+three sentences about Paris." (+32) and the exact-repeat string above
+(+24) — re-run scripts/text_gate.py unchanged.

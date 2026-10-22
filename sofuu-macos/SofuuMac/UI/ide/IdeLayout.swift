@@ -75,6 +75,18 @@ struct IdeLayout: View {
             findVisible.toggle()
             if !findVisible { store.ideCoordinator?.endFind() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("IDEGoLineToggle"))) { _ in
+            IDEHUD.showPrompt(title: "Go to line", placeholder: "Line number", initial: "") { value in
+                guard let line = Int(value.trimmingCharacters(in: .whitespaces)), line >= 1 else { return }
+                store.ideCoordinator?.scrollTo(characterLine: line, column: 1)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("IDERefToggle"))) { _ in
+            store.ideCoordinator?.findReferencesAtCaret()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("IDESymbolToggle"))) { _ in
+            store.ideCoordinator?.showWorkspaceSymbols()
+        }
     }
 
     // ── Middle: tabs + code viewport ─────────────────────────────────
@@ -84,6 +96,19 @@ struct IdeLayout: View {
             tabStrip
             Divider().overlay(c.separator)
             editorBody
+            if let path = store.state.activeTab, store.state.readOnlyTabs.contains(path) {
+                HStack(spacing: 8) {
+                    Image(systemName: "eye")
+                        .font(.system(size: 11))
+                        .foregroundStyle(c.textFaint)
+                    Text("Read-only — this file is larger than the 1 MB edit cap.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(c.textMuted)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .background(c.bgCard)
+            }
             // Changed-on-disk-while-editing resolution (file watcher).
             if let path = store.state.activeTab, store.state.externalEdits.contains(path) {
                 HStack(spacing: 10) {
@@ -123,6 +148,11 @@ struct IdeLayout: View {
                     // (first-pass ordering) and fills in on its first pulse.
                     LineGutter(pulse: store.ideGutter, coordinator: store.ideCoordinator)
                         .frame(width: CodeEditor.gutterWidth)
+                    ZStack(alignment: .topLeading) {
+                    if store.indentGuidesOn {
+                        IndentGuidesCanvas(pulse: store.ideGutter, coordinator: store.ideCoordinator, store: store)
+                            .allowsHitTesting(false)
+                    }
                     CodeEditor(
                         text: Binding(
                             get: { store.buffer(path) },
@@ -130,11 +160,13 @@ struct IdeLayout: View {
                         path: path,
                         dark: scheme == .dark,
                         store: store,
+                        editable: !store.state.readOnlyTabs.contains(path),
                         onEdited: { text in
                             store.updateBuffer(path, text)
                             store.scheduleAutoSave(path)
                         })
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
             } else {
                 Text(store.state.openTabs.isEmpty
@@ -214,6 +246,17 @@ struct IdeLayout: View {
                         Label((path as NSString).lastPathComponent, systemImage: "circle.fill")
                     } else {
                         Text((path as NSString).lastPathComponent)
+                    }
+                }
+            }
+            if !store.recentFiles.isEmpty {
+                Divider()
+                Text("Recent")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                ForEach(store.recentFiles.prefix(6), id: \.self) { p in
+                    Button { store.openFile(p) } label: {
+                        Text((p as NSString).lastPathComponent)
                     }
                 }
             }

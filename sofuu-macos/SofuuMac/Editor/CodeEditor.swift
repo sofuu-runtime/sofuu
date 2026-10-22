@@ -31,9 +31,18 @@ struct CodeEditor: NSViewRepresentable {
     var editable: Bool = true
     var onEdited: (String) -> Void
 
-    static let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
     static let gutterTopInset: CGFloat = 6
     static let gutterWidth: CGFloat = 46
+
+    /// The editor typeface resolves from prefs (Settings ▸ Appearance);
+    /// unknown families fall back to the system monospaced.
+    static func makeFont(family: String?, size: Int) -> NSFont {
+        if let family, let f = NSFont(name: family, size: CGFloat(size)) {
+            return f
+        }
+        return NSFont.monospacedSystemFont(ofSize: CGFloat(size), weight: .regular)
+    }
+    static var font: NSFont { makeFont(family: nil, size: 13) }
 
     private var language: Language { Languages.language(forPath: path) }
 
@@ -43,7 +52,7 @@ struct CodeEditor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let tv = SofuuCodeView()
-        tv.font = Self.font
+        tv.font = Self.makeFont(family: store.editorFontFamily, size: store.editorFontSize)
         tv.isEditable = editable
         tv.isRichText = false
         tv.allowsUndo = true
@@ -123,6 +132,15 @@ struct CodeEditor: NSViewRepresentable {
             c.lexerHighlight(text: tv.string, language: language)
         }
         tv.isEditable = editable
+        let fontKey = (store.editorFontFamily, store.editorFontSize)
+        if c.fontKey != fontKey {
+            c.fontKey = fontKey
+            c.fontSize = fontKey.1
+            let newFont = CodeEditor.makeFont(family: fontKey.0, size: fontKey.1)
+            tv.font = newFont
+            c.currentFont = newFont
+            c.lexerHighlight(text: tv.string, language: language)
+        }
         c.refreshCursorStatus()
     }
 
@@ -138,12 +156,17 @@ struct CodeEditor: NSViewRepresentable {
 
         var isDark = true
         var path: String?
+        var fontKey: (family: String?, size: Int) = (nil, 13)
+        var currentFont: NSFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         var restoredPath: String?
+        var fontSize: Int = 13
+        var indentUnitWidth: CGFloat?
         var language: Language = Languages.plain
         var lsp: LSPClient?
         var lspLang: LangID?
         var openedPaths: Set<String> = []
         var onEdited: ((String) -> Void)?
+        var lspMenuReady: Bool { lsp?.isRunning == true }
 
         var lineStarts: [Int] = [0]
         var lineStep: CGFloat?
@@ -221,6 +244,10 @@ struct CodeEditor: NSViewRepresentable {
             if let tv = textView, let lm = tv.layoutManager {
                 calibrateStep(ns: tv.string as NSString, lm: lm)
             }
+            if indentUnitWidth == nil, let tvNow = textView, let font = tvNow.font {
+                let unit = language.indentUnit
+                indentUnitWidth = (unit as NSString).size(withAttributes: [.font: font]).width
+            }
             // Remember the scroll position for tab restore.
             if let tv = textView, let sv = scrollView, let scrollPath = path {
                 let clip = sv.contentView
@@ -260,7 +287,7 @@ struct CodeEditor: NSViewRepresentable {
                     let full = NSRange(location: 0, length: length)
                     storage.beginEditing()
                     storage.setAttributes([
-                        .font: CodeEditor.font,
+                        .font: self.currentFont,
                         .foregroundColor: SyntaxPalette.plain(dark: dark),
                     ], range: full)
                     for token in lexed.tokens
@@ -460,9 +487,20 @@ struct CodeEditor: NSViewRepresentable {
                     lsp.completion(path: path, line: line - 1, character: column - 1, text: tv.string) { items in
                         // Empty prefix (after '.') = member completion — the
                         // server already ordered against the receiver.
-                        let filtered = prefix.isEmpty
-                            ? items
-                            : items.filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+                        // Otherwise FUZZY subsequence ranking (prefix bonus,
+                        // contiguity bonus), ties broken by label length.
+                        let filtered: [LSPWire.CompletionItem]
+                        if prefix.isEmpty {
+                            filtered = items
+                        } else {
+                            filtered = items.compactMap { item -> (LSPWire.CompletionItem, Int)? in
+                                self.fuzzyRank(label: item.label, query: prefix).map { (item, $0) }
+                            }
+                            .sorted { left, right in
+                                left.1 != right.1 ? left.1 > right.1 : left.0.label.count < right.0.label.count
+                            }
+                            .map(\.0)
+                        }
                         guard !filtered.isEmpty else { return }
                         self.gutter.completions = Array(filtered.prefix(50))
                         self.gutter.completionIndex = 0
@@ -474,6 +512,24 @@ struct CodeEditor: NSViewRepresentable {
             }
             completionWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+        }
+
+        private func fuzzyRank(label: String, query: String) -> Int? {
+            let l = label.lowercased(), q = query.lowercased()
+            guard !q.isEmpty else { return 0 }
+            var score = 0
+            var prev = -1
+            var searchStart = l.startIndex
+            for ch in q {
+                guard let r = l.range(of: String(ch), range: searchStart..<l.endIndex) else { return nil }
+                let pos = l.distance(from: l.startIndex, to: r.lowerBound)
+                score += 1
+                if pos == prev + 1 { score += 3 }
+                if pos == 0 { score += 5 }
+                prev = pos
+                searchStart = r.upperBound
+            }
+            return score
         }
 
         private func offerDocumentWords(prefix: String, screenRect: NSRect) {
@@ -647,6 +703,215 @@ struct CodeEditor: NSViewRepresentable {
             return wrapped.location != NSNotFound ? wrapped : nil
         }
 
+        // MARK: - Rename / references / code actions / workspace symbols
+
+        func renameAtCaret() {
+            guard let path, let lsp else {
+                store.systemRow("No language server for rename.")
+                return
+            }
+            let text = textView?.string as NSString? ?? ""
+            let caret = selectedOffset()
+            let (line, column) = lineColumn(ofOffset: caret)
+            var wordStart = min(caret, text.length)
+            while wordStart > 0, isWordByte(text.character(at: wordStart - 1)) { wordStart -= 1 }
+            var wordEnd = wordStart
+            while wordEnd < text.length, isWordByte(text.character(at: wordEnd)) { wordEnd += 1 }
+            let initial = text.substring(with: NSRange(location: wordStart, length: wordEnd - wordStart))
+            IDEHUD.showPrompt(title: "Rename symbol", placeholder: "New name", initial: initial) { [weak self] newName in
+                guard let self, !newName.isEmpty else { return }
+                lsp.rename(path: path, line: line - 1, character: column - 1, newName: newName) { edits in
+                    self.applyWorkspaceEdits(edits)
+                    if edits.isEmpty {
+                        self.store.systemRow("Rename: the server returned no edits.")
+                    }
+                }
+            }
+        }
+
+        private func isWordByte(_ u: unichar?) -> Bool {
+            guard let u else { return false }
+            return (u >= 65 && u <= 90) || (u >= 97 && u <= 122) || (u >= 48 && u <= 57) || u == 0x5F
+        }
+
+        /// Apply an LSP WorkspaceEdit: the CURRENT document gets one
+        /// in-place undoable batch; other files are edited on disk (their
+        /// line starts computed fresh), open tabs reloaded, and the server
+        /// notified about any document it has open.
+        func applyWorkspaceEdits(_ editsByPath: [String: [LSPWire.RawEdit]]) {
+            for (editPath, edits) in editsByPath where !edits.isEmpty {
+                if editPath == path {
+                    applyInDoc(edits)
+                } else {
+                    applyOnDisk(path: editPath, edits: edits)
+                }
+            }
+        }
+
+        private func applyInDoc(_ edits: [LSPWire.RawEdit]) {
+            guard let textView, let storage = textView.textStorage else { return }
+            let nsText = textView.string as NSString
+            let length = nsText.length
+            let starts = lineStarts
+            var ranges: [(NSRange, String)] = []
+            for e in edits {
+                let startLine = min(e.line, starts.count - 1)
+                let endLine = min(e.endLine, starts.count - 1)
+                let start = min(starts[startLine] + e.character, length)
+                let end = min(starts[endLine] + e.endCharacter, length)
+                guard start <= end else { continue }
+                ranges.append((NSRange(location: start, length: end - start), e.newText))
+            }
+            guard !ranges.isEmpty else { return }
+            let new = NSMutableString(string: textView.string)
+            for (range, replacement) in ranges.sorted(by: { $0.0.location > $1.0.location }) {
+                new.replaceCharacters(in: range, with: replacement)
+            }
+            let full = NSRange(location: 0, length: length)
+            textView.shouldChangeText(in: full, replacementString: new as String)
+            storage.replaceCharacters(in: full, with: new as String)
+            textView.didChangeText()
+        }
+
+        private func applyOnDisk(path: String, edits: [LSPWire.RawEdit]) {
+            guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
+                store.systemRow("Rename: could not read \((path as NSString).lastPathComponent).")
+                return
+            }
+            let ns = raw as NSString
+            let length = ns.length
+            var starts: [Int] = [0]
+            var i = 0
+            while i < length {
+                let nl = ns.rangeOfCharacter(from: .newlines, options: [], range: NSRange(location: i, length: length - i))
+                guard nl.location != NSNotFound else { break }
+                starts.append(nl.location + nl.length)
+                i = nl.location + nl.length
+            }
+            let locate: (Int, Int) -> Int = { line, col in
+                let l = min(max(0, line), starts.count - 1)
+                return min(starts[l] + col, length)
+            }
+            let new = NSMutableString(string: raw)
+            for e in edits.sorted(by: { ($0.line, $0.character) > ($1.line, $1.character) }) {
+                let start = locate(e.line, e.character)
+                let end = locate(e.endLine, e.endCharacter)
+                guard start <= end else { continue }
+                new.replaceCharacters(in: NSRange(location: start, length: end - start), with: e.newText)
+            }
+            do {
+                try (new as String).write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                store.systemRow("Rename write failed: \(error.localizedDescription)")
+                return
+            }
+            refreshExternalView(path: path)
+        }
+
+        /// Post-disk-edit freshness: re-list/tick + notify the server when
+        /// it holds that document. Clean open tabs reload via the IDE
+        /// reload notification; dirty tabs keep the user's buffer.
+        private func refreshExternalView(path: String) {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .init("IDEReloadPath"), object: path)
+                self.store.nudgeExternal()
+                if let lsp = self.lsp, lsp.hasOpenDocs,
+                   let text = try? String(contentsOfFile: path, encoding: .utf8) {
+                    lsp.didChange(path: path, text: text)
+                }
+            }
+        }
+
+        func findReferencesAtCaret() {
+            guard let path, let lsp else {
+                store.systemRow("No language server for find references.")
+                return
+            }
+            let (line, column) = lineColumn(ofOffset: selectedOffset())
+            lsp.references(path: path, line: line - 1, character: column - 1, includeDeclaration: true) { locations in
+                guard !locations.isEmpty else {
+                    self.store.systemRow("No references found.")
+                    return
+                }
+                let nodes = locations.map { loc in
+                    LSPWire.OutlineNode(
+                        name: "\((loc.path as NSString).lastPathComponent):\(loc.line + 1)",
+                        kind: 0, line: loc.line, children: [])
+                }
+                IDEHUD.showOutline(nodes) { [weak self] picked in
+                    guard let self, let index = nodes.firstIndex(where: { $0.name == picked.name }) else { return }
+                    let loc = locations[index]
+                    if loc.path == self.path {
+                        self.scrollTo(characterLine: loc.line + 1, column: loc.character + 1)
+                    } else {
+                        self.store.pendingScroll = (path: loc.path, line: loc.line + 1, column: loc.character)
+                        self.store.openFile(loc.path)
+                    }
+                }
+            }
+        }
+
+        func showWorkspaceSymbols() {
+            guard let lsp else {
+                store.systemRow("No language server for workspace symbols.")
+                return
+            }
+            IDEHUD.showPrompt(title: "Find symbols in workspace", placeholder: "Name…", initial: "") { [weak self] query in
+                guard let self else { return }
+                lsp.workspaceSymbols(query: query) { symbols in
+                    guard !symbols.isEmpty else {
+                        self.store.systemRow("No workspace symbols matched \(query).")
+                        return
+                    }
+                    let displays = symbols.map {
+                        "\($0.name) — \(($0.path as NSString).lastPathComponent):\($0.line + 1)"
+                    }
+                    IDEHUD.showList(title: "Workspace symbols", items: displays) { index in
+                        let sym = symbols[index]
+                        if sym.path == self.path {
+                            self.scrollTo(characterLine: sym.line + 1, column: sym.character + 1)
+                        } else {
+                            self.store.pendingScroll = (path: sym.path, line: sym.line + 1, column: sym.character)
+                            self.store.openFile(sym.path)
+                        }
+                    }
+                }
+            }
+        }
+
+        func showCodeActions() {
+            guard let path, let lsp else {
+                store.systemRow("No language server for code actions.")
+                return
+            }
+            let sel = textView?.selectedRange() ?? NSRange(location: 0, length: 0)
+            let (sl, sc) = lineColumn(ofOffset: sel.location)
+            let endOffset = min(NSMaxRange(sel), max(0, (textView?.string.utf16.count ?? 1) - 1))
+            let (el, ec) = lineColumn(ofOffset: endOffset)
+            let diags = (store.ideGutter.diagnostics[path] ?? []).map { d -> [String: Any] in
+                [
+                    "range": [
+                        "start": ["line": d.line, "character": d.character],
+                        "end": ["line": d.endLine, "character": d.endCharacter],
+                    ],
+                    "message": d.message,
+                    "severity": d.severity,
+                ]
+            }
+            lsp.codeActions(
+                path: path, startLine: sl - 1, startChar: sc - 1,
+                endLine: el - 1, endChar: max(0, ec - 1), diagnostics: diags) { actions in
+                let usable = actions.filter { $0.isEditOnly && !$0.edits.isEmpty }
+                guard !usable.isEmpty else {
+                    self.store.systemRow("No quick actions available here.")
+                    return
+                }
+                IDEHUD.showList(title: "Quick actions", items: usable.map(\.title)) { [weak self] index in
+                    self?.applyWorkspaceEdits(usable[index].edits)
+                }
+            }
+        }
+
         // MARK: - Outline (⇧⌘O)
 
         func requestOutline() {
@@ -732,7 +997,7 @@ struct LineGutter: View {
         let diagLines = Dictionary(diags.map { ($0.line, $0.severity) },
                                    uniquingKeysWith: { a, b in min(a, b) })
 
-        let font = Font.system(size: 11, design: .monospaced).monospacedDigit()
+        let font = Font.system(size: max(9, Double(coordinator.fontSize - 2)), design: .monospaced).monospacedDigit()
         let lineColor = Color.primary.opacity(0.45)
 
         var i = max(0, Int(((scrollY - inset) / step).rounded(.down)))
@@ -754,6 +1019,36 @@ struct LineGutter: View {
                 }
             }
             i += 1
+        }
+    }
+}
+
+
+// MARK: - Indent guides (cosmetic vertical columns, scroll-synced)
+
+/// Draws one faint vertical hairline per indent level, scrolling with the
+/// text (fresh clip reads at draw time — the gutter's pattern). Cheap and
+/// decorative; per-scope guides need a parse tree, this is column math.
+struct IndentGuidesCanvas: View {
+    @ObservedObject var pulse: GutterModel
+    let coordinator: CodeEditor.Coordinator?
+    let store: AppStore
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard let coordinator, let tv = coordinator.textView else { return }
+            guard coordinator.fontSize > 4 else { return }
+            guard let unit = coordinator.indentUnitWidth, unit > 2 else { return }
+            let textX = tv.textContainerInset.width
+            for level in 1...12 {
+                let x = textX + CGFloat(level) * unit - unit / 2
+                guard x < size.width else { break }
+                var path = Path()
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: size.height))
+                ctx.stroke(path, with: .color(Color.primary.opacity(0.07)), lineWidth: 1)
+            }
+            _ = pulse
         }
     }
 }

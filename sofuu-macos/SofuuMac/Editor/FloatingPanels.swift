@@ -68,6 +68,45 @@ enum IDEHUD {
         outlinePanel = nil
     }
 
+    // MARK: - Prompt (single field: rename / go-to-line / symbol query)
+
+    static var promptPanel: NSPanel?
+
+    static func showPrompt(title: String, placeholder: String, initial: String,
+                           onCommit: @escaping (String) -> Void) {
+        let view = NSHostingView(rootView:
+            PromptPanelView(title: title, placeholder: placeholder,
+                            initial: initial, onCommit: onCommit))
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1600, height: 900)
+        let frame = NSRect(x: screen.midX - 260, y: screen.maxY - 140, width: 520, height: 92)
+        present(&promptPanel, content: view, frame: frame)
+    }
+
+    static func hidePrompt() {
+        promptPanel?.orderOut(nil)
+        promptPanel = nil
+    }
+
+    // MARK: - Generic pick list (code actions / workspace symbols)
+
+    static var listPanel: NSPanel?
+
+    static func showList(title: String, items: [String], onPick: @escaping (Int) -> Void) {
+        let view = NSHostingView(rootView:
+            ListPanelView(title: title, items: items, onPick: onPick)
+                .frame(width: 480, height: min(420, CGFloat(items.count) * 26 + 48))
+                .background(CompositedTheme.surface))
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1600, height: 900)
+        let frame = NSRect(x: screen.midX - 240, y: screen.midY - 60, width: 480,
+                           height: min(420, CGFloat(items.count) * 26 + 48))
+        present(&listPanel, content: view, frame: frame)
+    }
+
+    static func hideList() {
+        listPanel?.orderOut(nil)
+        listPanel = nil
+    }
+
     // MARK: - Diff (read-only working-tree vs HEAD popup)
 
     static var diffPanel: NSPanel?
@@ -161,8 +200,8 @@ struct CompletionList: View {
                         .font(.system(size: 12, design: .monospaced))
                         .lineLimit(1)
                     Spacer(minLength: 8)
-                    if let detail = item.detail {
-                        Text(detail)
+                    if let detail = item.detail ?? item.documentation {
+                        Text(detail.replacingOccurrences(of: "\n", with: " "))
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
@@ -279,5 +318,110 @@ private struct DiffPanelView: View {
         }
         .background(c.bgRaised)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+
+/// One-line prompt used by rename / go-to-line / workspace-symbol query.
+private struct PromptPanelView: View {
+    let title: String
+    let placeholder: String
+    let initial: String
+    let onCommit: (String) -> Void
+
+    @State private var text = ""
+    @FocusState private var focused: Bool
+    @Environment(\.sofuuColors) private var c
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(c.text)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .monospaced))
+                .focused($focused)
+                .onSubmit(commit)
+                .frame(maxWidth: .infinity)
+            Button("Go", action: commit)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(c.accentContrast)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(c.accent, in: Capsule())
+            Button {
+                IDEHUD.hidePrompt()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(c.textMuted)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(CompositedTheme.surface)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(CompositedTheme.border, lineWidth: 1))
+        .onAppear { text = initial; DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true } }
+        .onExitCommand { IDEHUD.hidePrompt() }
+    }
+
+    private func commit() {
+        let value = text.trimmingCharacters(in: .whitespaces)
+        IDEHUD.hidePrompt()
+        guard !value.isEmpty else { return }
+        onCommit(value)
+    }
+}
+
+/// Generic string list with click-through commits (code actions, refs…).
+private struct ListPanelView: View {
+    let title: String
+    let items: [String]
+    let onPick: (Int) -> Void
+
+    @Environment(\.sofuuColors) private var c
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(c.textMuted)
+                Spacer()
+                Button {
+                    IDEHUD.hideList()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(c.textMuted)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            Divider().overlay(c.separator)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                        Button {
+                            IDEHUD.hideList()
+                            onPick(index)
+                        } label: {
+                            Text(item)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(c.text)
+                                .lineLimit(1)
+                                .padding(.horizontal, 12).padding(.vertical, 5)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(CompositedTheme.border, lineWidth: 1))
+        .onExitCommand { IDEHUD.hideList() }
     }
 }

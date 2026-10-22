@@ -616,7 +616,49 @@ private struct AppearancePane: View {
                             reset: nil)
                 }
             }
+
+            SectionCard(label: "EDITOR") {
+                ControlRow(label: "Editor font size",
+                           desc: "Code text (10–24px; the gutter follows)") {
+                    stepper(value: "\(store.editorFontSize)px",
+                            onMinus: { store.setEditorFont(size: max(10, store.editorFontSize - 1)) },
+                            onPlus: { store.setEditorFont(size: min(24, store.editorFontSize + 1)) },
+                            reset: { store.setEditorFont(size: 13) })
+                }
+                if #available(macOS 13.0, *) {
+                    ControlRow(label: "Editor typeface",
+                               desc: "Fixed-pitch families installed on this Mac") {
+                        Menu {
+                            Button("System Mono") { store.setEditorFontFamily(nil) }
+                            ForEach(availableMonoFamilies, id: \.self) { family in
+                                Button(family) { store.setEditorFontFamily(family) }
+                            }
+                        } label: {
+                            Text(store.editorFontFamily ?? "System Mono")
+                                .font(.system(size: 12))
+                                .frame(width: 180)
+                        }
+                        .menuStyle(.borderedButton)
+                        .frame(width: 190)
+                    }
+                }
+                ToggleRow(label: "Indent guides",
+                          desc: "Faint vertical columns at each indent level",
+                          on: store.indentGuidesOn) { store.setIndentGuides(!store.indentGuidesOn) }
+                Divider().overlay(c.separator)
+                ToggleRow(label: "Format on save",
+                          desc: "Run the file's formatter after every save (⌥⇧F formats manually)",
+                          on: store.formatOnSave) { store.setFormatOnSave(!store.formatOnSave) }
+            }
         }
+    }
+
+    private var availableMonoFamilies: [String] {
+        let wanted = ["SF Mono", "Menlo", "JetBrains Mono", "Fira Code", "Hack",
+                      "Source Code Pro", "IBM Plex Mono", "Cascadia Code",
+                      "Monaco", "Andale Mono", "Courier New"]
+        let installed = NSFontManager.shared.availableFontFamilies
+        return wanted.filter { installed.contains($0) }
     }
 
     private func stepper(value: String,

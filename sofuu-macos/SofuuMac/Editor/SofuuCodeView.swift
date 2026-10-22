@@ -199,12 +199,44 @@ final class SofuuCodeView: NSTextView {
             toggleComment()
             return
         }
+        if event.modifierFlags.contains(.command), event.modifierFlags.contains(.shift),
+           event.keyCode == 15 { // ⇧⌘R — references
+            editor?.findReferencesAtCaret()
+            return
+        }
+        if event.modifierFlags.contains(.command), event.keyCode == 15 { // ⌘R — rename
+            editor?.renameAtCaret()
+            return
+        }
         if event.keyCode == 53 {
             hud?.hoverText = nil
             IDEHUD.hideOutline()
+            IDEHUD.hidePrompt()
+            IDEHUD.hideList()
         }
         super.keyDown(with: event)
     }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event)
+        guard editor?.lspMenuReady == true, let menu else { return menu }
+        let items: [(String, Selector)] = [
+            ("Rename Symbol…", #selector(menuRename)),
+            ("Find References", #selector(menuReferences)),
+            ("Code Actions…", #selector(menuCodeActions)),
+        ]
+        menu.insertItem(NSMenuItem.separator(), at: 0)
+        for (index, pair) in items.enumerated() {
+            let item = NSMenuItem(title: pair.0, action: pair.1, keyEquivalent: "")
+            item.target = self
+            menu.insertItem(item, at: index + 1)
+        }
+        return menu
+    }
+
+    @objc private func menuRename() { editor?.renameAtCaret() }
+    @objc private func menuReferences() { editor?.findReferencesAtCaret() }
+    @objc private func menuCodeActions() { editor?.showCodeActions() }
 
     private func toggleComment() {
         guard let language = editor?.language,

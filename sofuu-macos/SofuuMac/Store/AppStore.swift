@@ -110,6 +110,13 @@ final class AppStore: ObservableObject {
         restoreIdeStateIfNeeded()
         restartWorkspaceWatcher()
         refreshGitStatus()
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("IDEReloadPath"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let path = note.object as? String,
+                  self.state.openTabs.contains(path), !self.isDirty(path) else { return }
+            self.reloadIfChanged(path)
+        }
     }
 
     func shutdown() { engine.shutdown() }
@@ -1257,21 +1264,45 @@ final class AppStore: ObservableObject {
     /// Open a file into a tab: read from disk, mark clean. Binary content
     /// or oversize files refuse with a system row instead of garbling the
     /// editor.
+    /// Files beyond the 1 MB edit cap open view-only up to this size.
+    static let maxPreviewBytes = 20 << 20
+
     func openFile(_ path: String) {
         if openTabsContains(path) { state.activeTab = path; return }
+        recordRecent(path)
         let url = URL(fileURLWithPath: path)
-        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
-              size <= Self.maxCodeFileBytes,
-              let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
-            systemRow("Cannot open that file in the editor (binary or over 1 MB): \(URL(fileURLWithPath: path).lastPathComponent)")
+            systemRow("Cannot open \((path as NSString).lastPathComponent) in the editor (binary or non-UTF-8).")
+            return
+        }
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        let readOnly = size > Self.maxCodeFileBytes
+        guard size <= Self.maxPreviewBytes else {
+            systemRow("Too large to open (over 20 MB): \((path as NSString).lastPathComponent)")
             return
         }
         diskContents[path] = text
         fileBuffers[path] = text
         state.openTabs.append(path)
         state.tabDirty[path] = false
+        if readOnly {
+            state.readOnlyTabs.insert(path)
+            systemRow("Opened read-only — larger than the 1 MB edit cap.")
+        }
         state.activeTab = path
+    }
+
+    func isReadOnly(_ path: String) -> Bool { state.readOnlyTabs.contains(path) }
+
+    /// Most-recently-opened files (MRU, persisted in the IDE state).
+    private(set) var recentFiles: [String] = []
+
+    private func recordRecent(_ path: String) {
+        recentFiles.removeAll { $0 == path }
+        recentFiles.insert(path, at: 0)
+        if recentFiles.count > 10 { recentFiles.removeLast(recentFiles.count - 10) }
+        persistIdeStateSoon()
     }
 
     private func openTabsContains(_ path: String) -> Bool { state.openTabs.contains(path) }
@@ -1322,8 +1353,7 @@ final class AppStore: ObservableObject {
 
     /// Write the buffer back to disk. Returns nil on success, an error
     /// line on failure.
-    @discardableResult
-    func saveFile(_ path: String) -> String? {
+    private func writeThrough(_ path: String) -> String? {
         guard let text = fileBuffers[path] else { return "nothing to save" }
         // A buffer whose file was deleted on disk (by the agent, or a
         // terminal) must NOT resurrect it through an auto-save write.
@@ -1338,6 +1368,117 @@ final class AppStore: ObservableObject {
             return nil
         } catch {
             return "save failed: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func saveFile(_ path: String) -> String? {
+        let err = writeThrough(path)
+        if err == nil { scheduleFormat(path) }
+        return err
+    }
+
+    func scheduleFormat(_ path: String) {
+        guard uiPrefs.ideFormatOnSave else { return }
+        runFormatter(path, savingFirst: false)
+    }
+
+    /// ⌥⇧F / Format on save: run the language's installed formatter on
+    /// this file off-main, then reload the tab from disk when it changes.
+    func formatFile(_ path: String) {
+        guard CodeFormatters.spec(for: Languages.language(forPath: path).id) != nil else {
+            systemRow("No formatter configured for \(Languages.language(forPath: path).name).")
+            return
+        }
+        if isReadOnly(path) {
+            systemRow("Read-only file — nothing to format.")
+            return
+        }
+        // save-without-hook: format-on-save must not re-fire mid-format.
+        if isDirty(path) && writeThrough(path) != nil { return }
+        runFormatter(path, savingFirst: false)
+    }
+
+    func runFormatter(_ path: String, savingFirst: Bool) {
+        let lang = Languages.language(forPath: path)
+        guard let specs = CodeFormatters.spec(for: lang.id) else { return }
+        if savingFirst, isDirty(path) {
+            if let err = saveFile(path) {
+                systemRow(err)
+                return
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for (bin, args) in specs {
+                guard let binary = CodeFormatters.resolve(bin) else { continue }
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: binary)
+                proc.arguments = args.map { $0 == "%PATH%" ? path : $0 }
+                proc.standardOutput = FileHandle.nullDevice
+                let errPipe = Pipe()
+                proc.standardError = errPipe
+                do {
+                    try proc.run()
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    proc.waitUntilExit()
+                    _ = errData
+                    guard proc.terminationStatus == 0 else { continue }
+                    DispatchQueue.main.async {
+                        self?.reloadIfChanged(path)
+                        self?.state.externalTick += 1
+                        self?.systemRow("Formatted with \(bin).")
+                    }
+                    return
+                } catch { continue }
+            }
+            DispatchQueue.main.async {
+                self?.systemRow("No formatter available for \(lang.name) (checked: \(specs.map(\.bin).joined(separator: ", "))).")
+            }
+        }
+    }
+
+    /// Formatter per language: first binary found on PATH wins. %PATH% in
+    /// args is the file.
+    enum CodeFormatters {
+        private static let cacheLock = NSLock()
+        private static var cacheBacking: [String: String?] = [:]
+
+        static var whichCache: [String: String?] {
+            get { cacheLock.lock(); defer { cacheLock.unlock() }; return cacheBacking }
+            set { cacheLock.lock(); defer { cacheLock.unlock() }; cacheBacking = newValue }
+        }
+
+        static func spec(for id: LangID) -> [(bin: String, args: [String])]? {
+            let prettier = [("prettier", ["--write", "%PATH%"])]
+            switch id {
+            case .swift: return [("swift-format", ["format", "--in-place", "%PATH%"])]
+            case .rust: return [("rustfmt", ["%PATH%"])]
+            case .ts, .json, .css, .html, .markdown, .yaml: return prettier
+            case .python: return [("black", ["-q", "%PATH%"]), prettier[0]]
+            case .cLike: return [("clang-format", ["-i", "%PATH%"])]
+            case .go: return [("gofmt", ["-w", "%PATH%"])]
+            default: return nil
+            }
+        }
+
+        static func resolve(_ bin: String) -> String? {
+            if let cached = whichCache[bin] { return cached }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+            proc.arguments = [bin]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            var found: String?
+            if (try? proc.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                let path = String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                found = path.isEmpty ? nil : path
+            }
+            whichCache[bin] = found
+            return found
         }
     }
 
@@ -1378,6 +1519,10 @@ final class AppStore: ObservableObject {
     // ── IDE file operations (create / rename / delete / auto-save) ──────
 
     var ideAutoSaveOn: Bool { uiPrefs.ideAutoSave }
+    var editorFontFamily: String? { uiPrefs.editorFontFamily }
+    var indentGuidesOn: Bool { uiPrefs.indentGuides }
+    var editorFontSize: Int { uiPrefs.editorFontSize }
+    var formatOnSave: Bool { uiPrefs.ideFormatOnSave }
 
     func setIdeAutoSave(_ on: Bool) {
         uiPrefs.ideAutoSave = on
@@ -1584,6 +1729,26 @@ final class AppStore: ObservableObject {
         state.cloudBg = on
     }
 
+    func setEditorFont(size: Int) {
+        uiPrefs.editorFontSize = size
+        // Live font swap happens in the editor's update pass (fontKey).
+        objectWillChange.send()
+    }
+
+    func setEditorFontFamily(_ family: String?) {
+        uiPrefs.editorFontFamily = family
+        objectWillChange.send()
+    }
+
+    func setIndentGuides(_ on: Bool) {
+        uiPrefs.indentGuides = on
+        objectWillChange.send()
+    }
+
+    func setFormatOnSave(_ on: Bool) {
+        uiPrefs.ideFormatOnSave = on
+    }
+
     func setChatFontSize(_ s: Int) {
         uiPrefs.chatFontSize = s
         state.chatFontSize = uiPrefs.chatFontSize
@@ -1672,6 +1837,11 @@ final class AppStore: ObservableObject {
         state.externalEdits.remove(path)
     }
 
+    /// Editor-side nudge: re-list the tree (any state publish does that).
+    func nudgeExternal() {
+        state.externalTick += 1
+    }
+
     // ── Git working-tree badge (read-only) ───────────────────────────
 
     private var gitRefreshAt = Date.distantPast
@@ -1724,6 +1894,7 @@ final class AppStore: ObservableObject {
         if state.openTabs.contains(wantedActive) {
             state.activeTab = wantedActive
         }
+        recentFiles = (ide.optArray("recent") as? [String]) ?? []
         ideExpanded = Set((ide.optArray("expanded") as? [String]) ?? [])
         if let cursors = ide.optObject("cursors") as? [String: String] {
             for (path, pair) in cursors {
@@ -1771,6 +1942,7 @@ final class AppStore: ObservableObject {
             "project": root,
             "tabs": state.openTabs,
             "active": state.activeTab ?? "",
+            "recent": recentFiles,
             "expanded": Array(ideExpanded).sorted(),
             "cursors": ideCursors.mapValues { "\($0.line):\($0.column)" },
             "scrolls": ideScrolls.mapValues { Double($0) },

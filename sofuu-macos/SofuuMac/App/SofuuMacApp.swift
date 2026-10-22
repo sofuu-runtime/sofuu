@@ -153,6 +153,17 @@ final class GlobalKeyMonitor {
     init(store: AppStore) {
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53 else { return event } // esc
+            let hudOpen = MainActor.assumeIsolated {
+                IDEHUD.promptPanel?.isVisible == true || IDEHUD.listPanel?.isVisible == true
+                    || IDEHUD.diffPanel?.isVisible == true
+            }
+            if hudOpen {
+                MainActor.assumeIsolated {
+                    IDEHUD.hidePrompt()
+                    IDEHUD.hideList()
+                }
+                return nil
+            }
             let hasOverlay = MainActor.assumeIsolated {
                 store.state.settingsOpen || store.state.preview != nil
                     || store.state.sheet != nil
@@ -199,6 +210,25 @@ struct SofuuMenus: Commands {
                 NotificationCenter.default.post(name: .init("IDESearchToggle"), object: nil)
             }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
+            Divider()
+            Button("Rename Symbol") { store.ideCoordinator?.renameAtCaret() }
+                .keyboardShortcut("r")
+            Button("Find References") {
+                NotificationCenter.default.post(name: .init("IDERefToggle"), object: nil)
+            }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button("Find Symbol in Workspace") {
+                NotificationCenter.default.post(name: .init("IDESymbolToggle"), object: nil)
+            }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+            Button("Go to Line") {
+                NotificationCenter.default.post(name: .init("IDEGoLineToggle"), object: nil)
+            }
+                .keyboardShortcut("l")
+            Button("Format File") {
+                if let path = store.state.activeTab { store.formatFile(path) }
+            }
+                .keyboardShortcut("f", modifiers: [.command, .option, .shift])
             Button("Document Outline") {
                 NotificationCenter.default.post(name: .init("IDEOutlineToggle"), object: nil)
             }

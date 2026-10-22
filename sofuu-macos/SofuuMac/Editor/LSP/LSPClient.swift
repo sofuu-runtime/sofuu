@@ -238,6 +238,58 @@ final class LSPClient {
         }
     }
 
+    // MARK: - Rename / references / code actions / workspace symbols
+
+    func rename(path: String, line: Int, character: Int, newName: String,
+                then: @escaping ([String: [LSPWire.RawEdit]]) -> Void) {
+        guard ready else { return then([:]) }
+        ensureOpen(path: path, text: nil)
+        request("textDocument/rename", params: [
+            "textDocument": ["uri": LSPWire.uriOf(path)],
+            "position": ["line": line, "character": character],
+            "newName": newName,
+        ]) { result in
+            then(LSPWire.parseWorkspaceEdit(result))
+        }
+    }
+
+    func references(path: String, line: Int, character: Int, includeDeclaration: Bool,
+                    then: @escaping ([LSPWire.Location]) -> Void) {
+        guard ready else { return then([]) }
+        ensureOpen(path: path, text: nil)
+        request("textDocument/references", params: [
+            "textDocument": ["uri": LSPWire.uriOf(path)],
+            "position": ["line": line, "character": character],
+            "context": ["includeDeclaration": includeDeclaration],
+        ]) { result in
+            then(LSPWire.parseLocations(result))
+        }
+    }
+
+    func codeActions(path: String, startLine: Int, startChar: Int, endLine: Int, endChar: Int,
+                     diagnostics: [[String: Any]],
+                     then: @escaping ([LSPWire.CodeAction]) -> Void) {
+        guard ready else { return then([]) }
+        ensureOpen(path: path, text: nil)
+        request("textDocument/codeAction", params: [
+            "textDocument": ["uri": LSPWire.uriOf(path)],
+            "range": [
+                "start": ["line": startLine, "character": startChar],
+                "end": ["line": endLine, "character": endChar],
+            ],
+            "context": ["diagnostics": diagnostics],
+        ]) { result in
+            then(LSPWire.parseCodeActions(result))
+        }
+    }
+
+    func workspaceSymbols(query: String, then: @escaping ([LSPWire.WSSymbol]) -> Void) {
+        guard ready else { return then([]) }
+        request("workspace/symbol", params: ["query": query]) { result in
+            then(LSPWire.parseWorkspaceSymbols(result))
+        }
+    }
+
     // MARK: - Shutdown
 
     func shutdown() {

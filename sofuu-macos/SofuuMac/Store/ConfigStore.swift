@@ -383,6 +383,29 @@ final class UiPrefs {
         set { d.set(newValue, forKey: "ideAutoSave") }
     }
 
+    /// Editor typeface (nil = system monospaced) and point size.
+    var editorFontFamily: String? {
+        get { d.string(forKey: "editorFontFamily") }
+        set { d.set(newValue, forKey: "editorFontFamily") }
+    }
+    var editorFontSize: Int {
+        get { d.object(forKey: "editorFontSize") as? Int ?? 13 }
+        set { d.set(newValue, forKey: "editorFontSize") }
+    }
+    /// ⌥⇧F also runs after every successful save when ON.
+    var ideFormatOnSave: Bool {
+        get { d.object(forKey: "ideFormatOnSave") as? Bool ?? false }
+        set { d.set(newValue, forKey: "ideFormatOnSave") }
+    }
+    var showWhitespace: Bool {
+        get { d.object(forKey: "showWhitespace") as? Bool ?? false }
+        set { d.set(newValue, forKey: "showWhitespace") }
+    }
+    var indentGuides: Bool {
+        get { d.object(forKey: "indentGuides") as? Bool ?? false }
+        set { d.set(newValue, forKey: "indentGuides") }
+    }
+
     /// IDE panel widths in points (the two draggable splitters). 0 means
     /// never dragged — the layout keeps its default. Clamped on both read
     /// and write so a stray write can't squeeze the editor out.

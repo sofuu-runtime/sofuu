@@ -91,13 +91,55 @@ enum LSPWire {
         let insert: String
         let detail: String?
         let kind: Int
+        let documentation: String?
 
-        init(label: String, insert: String? = nil, detail: String? = nil, kind: Int = 0) {
+        init(label: String, insert: String? = nil, detail: String? = nil, kind: Int = 0,
+             documentation: String? = nil) {
             self.label = label
             self.insert = insert ?? label
             self.detail = detail
             self.kind = kind
+            self.documentation = documentation
         }
+    }
+
+    /// LSP snippet → plain insert: drop tab stops ($n / $0), keep and
+    /// unbrace placeholders (${n:text} → text), leave \$ escapes alone.
+    static func unwrapSnippet(_ s: String) -> String {
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let ch = s[i]
+            if ch == "\\", s.index(after: i) < s.endIndex {
+                out.append(ch)
+                i = s.index(after: i)
+                out.append(s[i])
+                i = s.index(after: i)
+                continue
+            }
+            if ch == "$" {
+                let after = s.index(after: i)
+                guard after < s.endIndex else { out.append(ch); i = after; continue }
+                let next = s[after]
+                if next == "{",
+                   let close = s[after...].firstIndex(of: "}") {
+                    let body = String(s[s.index(after: after)..<close])
+                    if let colon = body.firstIndex(of: ":") {
+                        out += String(body[body.index(after: colon)...])
+                    }
+                    i = s.index(after: close)
+                    continue
+                }
+                if next.isNumber {
+                    i = after
+                    while i < s.endIndex, s[i].isNumber { i = s.index(after: i) }
+                    continue
+                }
+            }
+            out.append(ch)
+            i = s.index(after: i)
+        }
+        return out
     }
 
     static func parseCompletionItems(_ any: Any?) -> [CompletionItem] {
@@ -112,12 +154,24 @@ enum LSPWire {
         }
         return items.compactMap { d in
             guard let label = d["label"] as? String else { return nil }
-            let insert = (d["insertText"] as? String)
-                ?? (((d["textEdit"] as? [String: Any])?["newText"] as? String) ?? label)
-            return CompletionItem(label: label,
-                                  insert: insert,
-                                  detail: d["detail"] as? String,
-                                  kind: (d["kind"] as? Int) ?? 0)
+            let raw = (d["insertText"] as? String) ?? nil
+            let fromEdit = (((d["textEdit"] as? [String: Any])?["newText"] as? String) ?? nil)
+            let insert = unwrapSnippet(raw ?? fromEdit ?? label)
+            let documentation: String?
+            if let doc = d["documentation"] as? String {
+                documentation = doc
+            } else if let doc = d["documentation"] as? [String: Any],
+                      let value = doc["value"] as? String {
+                documentation = value
+            } else {
+                documentation = nil
+            }
+            return CompletionItem(
+                label: label,
+                insert: insert,
+                detail: d["detail"] as? String,
+                kind: (d["kind"] as? Int) ?? 0,
+                documentation: documentation)
         }
     }
 
@@ -147,6 +201,82 @@ enum LSPWire {
         }
         let children = (d["children"] as? [[String: Any]])?.compactMap { parseSymbol($0) } ?? []
         return OutlineNode(name: name, kind: kind, line: line, children: children)
+    }
+
+    // MARK: - Workspace edits (rename / code actions)
+
+    /// One edit in LSP Position space (converted per-file by the caller,
+    /// which owns that file's line starts).
+    struct RawEdit {
+        let line: Int
+        let character: Int
+        let endLine: Int
+        let endCharacter: Int
+        let newText: String
+    }
+
+    /// file path → raw LSP edits. `changes` shape only (documentChanges
+    /// with versioned entries is rarer and unsupported here).
+    static func parseWorkspaceEdit(_ any: Any?) -> [String: [RawEdit]] {
+        guard let edit = any as? [String: Any],
+              let changes = edit["changes"] as? [String: Any] else { return [:] }
+        var out: [String: [RawEdit]] = [:]
+        for (uri, list) in changes {
+            guard let arr = list as? [[String: Any]] else { continue }
+            let edits: [RawEdit] = arr.compactMap { te in
+                guard let r = LSPRange.parse(te["range"]),
+                      let newText = te["newText"] as? String else { return nil }
+                return RawEdit(line: r.start.line, character: r.start.character,
+                               endLine: r.end.line, endCharacter: r.end.character,
+                               newText: newText)
+            }
+            out[pathOf(uri)] = edits
+        }
+        return out
+    }
+
+    /// title + the parsed edit set + whether it carries only a command
+    /// (which we cannot run — surfaced honestly in the list).
+    struct CodeAction {
+        let title: String
+        let isEditOnly: Bool
+        let edits: [String: [RawEdit]]
+    }
+
+    static func parseCodeActions(_ any: Any?) -> [CodeAction] {
+        guard let list = any as? [[String: Any]] else { return [] }
+        return list.compactMap { d in
+            guard let title = d["title"] as? String else { return nil }
+            let editList = parseWorkspaceEdit(d["edit"])
+            let hasCommand = d["command"] != nil
+            return CodeAction(title: title,
+                              isEditOnly: !hasCommand,
+                              edits: editList)
+        }
+    }
+
+    /// textDocument/workspaceSymbol hits (flat SymbolInformation).
+    struct WSSymbol {
+        let name: String
+        let kind: Int
+        let path: String
+        let line: Int
+        let character: Int
+    }
+
+    static func parseWorkspaceSymbols(_ any: Any?) -> [WSSymbol] {
+        guard let list = any as? [[String: Any]] else { return [] }
+        return list.compactMap { d in
+            guard let name = d["name"] as? String,
+                  let loc = d["location"] as? [String: Any],
+                  let uri = loc["uri"] as? String,
+                  let r = LSPRange.parse(loc["range"]) else { return nil }
+            return WSSymbol(name: name,
+                            kind: (d["kind"] as? Int) ?? 0,
+                            path: pathOf(uri),
+                            line: r.start.line,
+                            character: r.start.character)
+        }
     }
 
     // MARK: - Definitions / references

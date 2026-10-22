@@ -59,6 +59,8 @@ struct AppState {
     /// Read-only git working-tree status (path → kind), driven by the
     /// watcher + manual refresh.
     var gitStatus: [String: GitStatusKind] = [:]
+    /// Tabs opened beyond the 1 MB edit cap (≤ 20 MB) — view-only.
+    var readOnlyTabs: Set<String> = []
 }
 
 /// One provider's cached model listing (the desktop's model cache).

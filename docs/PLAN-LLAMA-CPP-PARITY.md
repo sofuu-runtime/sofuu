@@ -375,8 +375,17 @@ generations' rate receipts.
 Under load 5-11 the 1B's route runs hit stochastic IOGPU Code=14
 command-buffer failures (torn: partial writes, later ops killed). At calm
 the SAME configs run clean and fast (1B c128-326 = 117.8 tk/s, no assert).
-The failures are NOT 1B-shape-specific (the 0.6B showed single IOGPU
-events too). **Contract shipped: batch_end now returns the completion
+REFINED by the 6-try crash-hunt loop (post-fix binary, load 0.5-3.0):
+the 1B c128-326 run faults the SAME buffer EVERY run at every load —
+the start_pos=128, b=128 chunk (multi-chunk part/fin on 32 heads, hd 64)
+never completes; the other three passes profile fine, and the shipped
+fallback absorbs it into CPU tiles 6/6 with no crash (0 IOGPU escapes).
+So the fault is a deterministic per-shape dispatch fault in the 1B's
+multi-chunk attention-glue class (part/fin/kv/head_rmsnorm at b=128 +
+pos>=128), not load-gated; the 0.6B (16 heads, hd 128) runs the same
+shape fine. Standalone per-op fault isolation at exactly (b=128,
+pos=128..255, 2 chunks, 1B shapes) = the first task of the next
+defect session; a GPU capture would nail it. **Contract shipped: batch_end now returns the completion
 status (C ABI int; header + FFI decls updated) and every production route
 propagates it — prefill GEMM core falls back to the CPU tiles for the
 whole prompt, execute_layers/layers_one_commit/gpu_layer_step/ggpu_head

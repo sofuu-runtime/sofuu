@@ -721,6 +721,7 @@ extern "C" {
         rows: u32,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     );
     fn sofuu_metal_batch_head_rmsnorm_b4(
         ctx: *mut c_void,
@@ -730,6 +731,7 @@ extern "C" {
         rows: u32,
         head_dim: u32, n_heads: u32,
         has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     );
     fn sofuu_metal_batch_llama_attn_part_b4(
         ctx: *mut c_void,
@@ -760,6 +762,7 @@ extern "C" {
         pos_buf: *mut c_void, pos_offset: usize,
         rows: u32,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     ) -> i32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,
@@ -1463,11 +1466,17 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: Option<(&MetalBuffer, usize)>,
     ) {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
-        };        let __t = self.op_tick(K_KVWRITE_B4);
+        };
+        let (tab_handle, tab_off, has_table) = match rope_tab {
+            Some((b, o)) => (b.handle, o, 1u32),
+            None => (pos_buf.handle, 0, 0u32),
+        };
+        let __t = self.op_tick(K_KVWRITE_B4);
         unsafe {
             sofuu_metal_batch_llama_kv_write_b4(
                 self.ctx,
@@ -1481,6 +1490,7 @@ impl MetalEngine {
                 rows as u32,
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
+                tab_handle, tab_off, has_table,
             );
         }
         self.op_tock(K_KVWRITE_B4, __t);
@@ -1496,11 +1506,17 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: Option<(&MetalBuffer, usize)>,
     ) {
         let (w_handle, w_off) = match w_buf {
             Some(b) => (b.handle, w_offset),
             None => (x_buf.handle, 0),
-        };        let __t = self.op_tick(K_HEAD_RMSNORM);
+        };
+        let (tab_handle, tab_off, has_table) = match rope_tab {
+            Some((b, o)) => (b.handle, o, 1u32),
+            None => (x_buf.handle, 0, 0u32),
+        };
+        let __t = self.op_tick(K_HEAD_RMSNORM);
         unsafe {
             sofuu_metal_batch_head_rmsnorm_b4(
                 self.ctx,
@@ -1510,6 +1526,7 @@ impl MetalEngine {
                 rows as u32,
                 head_dim, n_heads,
                 has_norm, eps, rope_base, rope_mode,
+                tab_handle, tab_off, has_table,
             );
         }
         self.op_tock(K_HEAD_RMSNORM, __t);
@@ -1584,6 +1601,7 @@ impl MetalEngine {
         pos_buf: &MetalBuffer, pos_offset: usize,
         rows: usize,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        rope_tab_inert: Option<(&MetalBuffer, usize)>,
     ) -> bool {
         let __t = self.op_tick(K_ATTN_1C);
         let __r = unsafe {
@@ -1596,6 +1614,7 @@ impl MetalEngine {
                 pos_buf.handle, pos_offset,
                 rows as u32,
                 head_dim, n_heads, n_kv_heads, max_seq,
+                q_buf.handle, 0, 0u32,
             ) == 1
         };
         self.op_tock(K_ATTN_1C, __t);

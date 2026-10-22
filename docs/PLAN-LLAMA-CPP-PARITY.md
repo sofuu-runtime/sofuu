@@ -479,3 +479,26 @@ vs GPU route (chunk 128, types=all):
   kv_route_diff as the value gate; if diffs don't collapse, the pos>prompt
   writes mean the position plumbing (not precision) carries a real bug —
   a GPU capture decides. Either way the instrument chain is complete.
+
+## ROPE-TABLE FIX + THE CORRECTED SHAPE (2026-10-22, late)
+- **kv_write_b4/head_rmsnorm_b4/1c now take a CPU-built cos/sin rope table**
+  (exact sofuu_rope_fill_rows mirror: freqs = 1/powf(base, 2j/hd) f32,
+  theta = pos*freq, layout [row]=cos(hd/2)|sin(hd/2); slab region
+  pslots.rope = PRE_B*hd). has_table=0 keeps the legacy on-device path —
+  decode/spec/chain callers unchanged this round.
+- **THE ROPE HYPOTHESIS IS FALSIFIED**: with the table active the KV diff
+  count moved by exactly ONE f32 (1,060,863 vs 1,060,862). Not theta.
+- **THE SHAP CORRECTION that rewrites the story**: the 0.6B head_dim=128
+  (not 64 — the file is exactly 28*8*4096*128*4). With the true shape the
+  diffs live ONLY at prompt positions 0..73 (the earlier pos>prompt reads
+  were a shape artifact), ~50% of live K values, PAIR-STRUCTURED at
+  mid/high j (113/115/116 + 48/49/50/52 = j and j+64 partners). Magnitude
+  (3.5 abs on |K|~100-300) EXCEEDS any theta-precision mechanism =>
+  projection-level (x_norm/W_qkv mid-pass) divergence, not rope.
+- Routes remain self-consistent (read-own-writes); at the probed pos 73
+  BOTH routes sample 576 (tiles_head 14.057 vs prefill_head 14.186 =
+  head-GEMM numeric class); the P2/P60 48-token forks appear at later
+  tie-heavy steps from the KV noise compounding. The instrument chain
+  (KV dump + kv_route_diff + tagged logits probes on all four head paths)
+  is complete; the next step = a real-weights attention/glue oracle
+  (CPU mirror with model weights) to pin the projection-level source.

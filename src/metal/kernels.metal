@@ -880,6 +880,8 @@ kernel void llama_kv_write_b4(
     constant float     &eps            [[buffer(11)]],
     constant float     &rope_base      [[buffer(12)]],
     constant uint      &rope_mode      [[buffer(13)]],
+    device const float *rope_tab      [[buffer(14)]],
+    constant uint      &has_table      [[buffer(15)]],
     uint3 kvtg                         [[threadgroup_position_in_grid]],
     uint lane                         [[thread_index_in_simdgroup]]
 ) {
@@ -887,6 +889,9 @@ kernel void llama_kv_write_b4(
     uint row = kv / n_kv_heads;
     uint kh  = kv % n_kv_heads;
     uint pos = positions[row];
+    // rope table (CPU-built, sofuu_rope_fill_rows-exact): [row] = cos(hd/2)|sin(hd/2).
+    // has_table=0 keeps the legacy on-device theta path (decode/spec callers).
+    uint tab_r = has_table != 0u ? row * head_dim : 0u;
     device float *k_head = k + ((size_t)row * n_kv_heads + kh) * head_dim;
     if (has_norm != 0u) {
         float ss = 0.0f;
@@ -901,9 +906,16 @@ kernel void llama_kv_write_b4(
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
+        float c;
+        float s;
+        if (has_table != 0u) {
+            c = rope_tab[tab_r + j];
+            s = rope_tab[tab_r + head_dim / 2 + j];
+        } else {
+            float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+            c = cos(theta);
+            s = sin(theta);
+        }
         if (rope_mode == 0u) {
             float k0 = k_head[j];
             float k1 = k_head[j + head_dim / 2];
@@ -936,6 +948,8 @@ kernel void head_rmsnorm_b4(
     device const uint  *positions       [[buffer(7)]],
     constant float     &rope_base       [[buffer(8)]],
     constant uint      &rope_mode       [[buffer(9)]],
+    device const float *rope_tab      [[buffer(10)]],
+    constant uint      &has_table      [[buffer(11)]],
     uint3 htg                          [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -956,10 +970,18 @@ kernel void head_rmsnorm_b4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    uint tab_r = has_table != 0u ? row * head_dim : 0u;
     for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
+        float c;
+        float s;
+        if (has_table != 0u) {
+            c = rope_tab[tab_r + j];
+            s = rope_tab[tab_r + head_dim / 2 + j];
+        } else {
+            float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+            c = cos(theta);
+            s = sin(theta);
+        }
         if (rope_mode == 0u) {
             float r0 = rp[j];
             float r1 = rp[j + head_dim / 2];
@@ -1392,6 +1414,8 @@ kernel void llama_attn_1c_b4(
     constant uint      &n_heads         [[buffer(6)]],
     constant uint      &n_kv_heads      [[buffer(7)]],
     constant uint      &max_seq         [[buffer(8)]],
+    device const float *rope_tab      [[buffer(9)]],
+    constant uint      &has_table      [[buffer(10)]],
     uint3 gtg                           [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {

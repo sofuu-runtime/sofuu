@@ -1986,7 +1986,8 @@ int sofuu_metal_batch_llama_attn_1c_b4(
     void* out_buf_ptr, size_t out_offset,
     void* pos_buf_ptr, size_t pos_offset,
     uint32_t rows,
-    uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq
+    uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq,
+    void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table
 ) {
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -2003,6 +2004,11 @@ int sofuu_metal_batch_llama_attn_1c_b4(
     [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:6];
     [ctx->batch_enc setBytes:&n_kv_heads length:sizeof(uint) atIndex:7];
     [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:8];
+    // 1c consumes ALREADY-roped q (head_rmsnorm ran): table bound inert
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)(rope_tab_ptr ? rope_tab_ptr : q_buf_ptr)
+                      offset: (rope_tab_ptr ? rope_tab_offset : 0) atIndex:9];
+    uint ht = has_table;
+    [ctx->batch_enc setBytes:&ht length:sizeof(uint) atIndex:10];
     uint grid = rows * n_heads;
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -2055,7 +2061,8 @@ void sofuu_metal_batch_llama_kv_write_b4(
     void* pos_buf_ptr, size_t pos_offset,
     uint32_t rows,
     uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq,
-    float eps, float rope_base, uint32_t rope_mode
+    float eps, float rope_base, uint32_t rope_mode,
+    void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table
 ) {
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -2080,6 +2087,10 @@ void sofuu_metal_batch_llama_kv_write_b4(
     [ctx->batch_enc setBytes:&eps length:sizeof(float) atIndex:11];
     [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:12];
     [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:13];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)(rope_tab_ptr ? rope_tab_ptr : pos_buf_ptr)
+                      offset: (rope_tab_ptr ? rope_tab_offset : 0) atIndex:14];
+    uint ht = has_table;
+    [ctx->batch_enc setBytes:&ht length:sizeof(uint) atIndex:15];
     uint grid = rows * n_kv_heads;
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -2093,7 +2104,8 @@ void sofuu_metal_batch_head_rmsnorm_b4(
     uint32_t rows,
     uint32_t head_dim, uint32_t n_heads,
     uint32_t has_norm,
-    float eps, float rope_base, uint32_t rope_mode
+    float eps, float rope_base, uint32_t rope_mode,
+    void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table
 ) {
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -2114,6 +2126,10 @@ void sofuu_metal_batch_head_rmsnorm_b4(
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:7];
     [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:8];
     [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:9];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)(rope_tab_ptr ? rope_tab_ptr : x_buf_ptr)
+                      offset: (rope_tab_ptr ? rope_tab_offset : 0) atIndex:10];
+    uint ht = has_table;
+    [ctx->batch_enc setBytes:&ht length:sizeof(uint) atIndex:11];
     uint grid = rows * n_heads;
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];

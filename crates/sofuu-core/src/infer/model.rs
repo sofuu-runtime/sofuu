@@ -1371,6 +1371,7 @@ impl TransformerModel {
                 &self.x_norm,
                 &mut self.logits,
             );
+            self.logits_gap_probe_tagged("tiles_head", start_pos + tokens.len() - 1);
         }
 
         if let Some(t0) = chunk_t0 {
@@ -2890,6 +2891,7 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                     norm_eps, rope_freq_base, rope_mode,
+                    None,
                 );
                 g.engine.batch_head_rmsnorm_b4(
                     &g.act_buf, g.slots.qa,
@@ -2898,6 +2900,7 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_heads as u32,
                     has_q, norm_eps, rope_freq_base, rope_mode,
+                    None,
                 );
                 // pos < 128 (one softmax chunk): part+fin fuse into one
                 // dispatch — one barrier drain instead of two
@@ -2912,6 +2915,7 @@ impl TransformerModel {
                         b,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32,
                         max_seq_len as u32,
+                        None,
                     );
                 if !fused {
                     g.engine.batch_llama_attn_part_b4(
@@ -3140,6 +3144,24 @@ impl TransformerModel {
             for (t, item) in pbb.iter_mut().enumerate() {
                 *item = (start_pos + t) as u32;
             }
+            // rope table: EXACT mirror of sofuu_rope_fill_rows —
+            // freqs[j] = 1/powf(base, 2j/hd) (f32 powf), theta = pos × freq,
+            // layout [row] = cos(hd/2) | sin(hd/2). The kernels take this
+            // instead of on-device pow so the routes share one value source.
+            let half = head_dim / 2;
+            let mut freqs = vec![0f32; half];
+            for (j, f) in freqs.iter_mut().enumerate() {
+                *f = 1.0f32 / rope_freq_base.powf((2 * j) as f32 / head_dim as f32);
+            }
+            let dst = &mut ph_buf[pslots.rope / 4..pslots.rope / 4 + b * head_dim];
+            for t in 0..b {
+                let pos_f = (start_pos + t) as f32;
+                for j in 0..half {
+                    let theta = pos_f * freqs[j];
+                    dst[t * head_dim + j] = theta.cos();
+                    dst[t * head_dim + half + j] = theta.sin();
+                }
+            }
         }
 
         let pass_t = std::time::Instant::now();
@@ -3304,6 +3326,7 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                     norm_eps, rope_freq_base, rope_mode,
+                    Some((pbuf, pslots.rope)),
                 );
                 g.engine.batch_head_rmsnorm_b4(
                     pbuf, pslots.qa,
@@ -3312,6 +3335,7 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_heads as u32,
                     has_q, norm_eps, rope_freq_base, rope_mode,
+                    Some((pbuf, pslots.rope)),
                 );
                 // Per-pass TRUE chunk count for part/fin: the config-level
                 // meta_chunks (32 at msl 4096) spawns 131k mostly-early-return
@@ -3332,6 +3356,7 @@ impl TransformerModel {
                         b,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32,
                         max_seq_len as u32,
+                        Some((pbuf, pslots.rope)),
                     );
                 if !fused {
                     g.engine.batch_llama_attn_part_b4(
@@ -4108,6 +4133,7 @@ struct PrefillSlots {
     xo: usize,
     gate: usize,
     up: usize,
+    rope: usize,
     logits: usize,
 }
 
@@ -4287,6 +4313,7 @@ impl GgufGpu {
                 va: gguf_gpu_slot(&mut pc, PRE_B * kv_rows),
                 ao: gguf_gpu_slot(&mut pc, PRE_B * q_rows),
                 xo: gguf_gpu_slot(&mut pc, PRE_B * dim),
+                rope: gguf_gpu_slot(&mut pc, PRE_B * config.head_dim),
                 gate: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
                 up: gguf_gpu_slot(&mut pc, PRE_B * inter.max(dim)),
                 logits: gguf_gpu_slot(&mut pc, vocab),

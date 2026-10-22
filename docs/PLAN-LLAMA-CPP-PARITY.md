@@ -1163,3 +1163,42 @@ shipped 8-token class below B=16 (weights are still read once per row there,
 so it is the cheaper form at that size). 0.6B 444.4 -> 459.7, 8B 19.5 -> 21.6,
 1B unchanged; text gates re-run after the change (1B still IDENTICAL, 0.6B
 still NEAR-TIE at |dtop1| 0.041).
+
+## LEDGER #5 — ARM C leg 1: simdgroup-matrix GEMM measured (2026-10-22 late)
+
+**Verdict: MMA is NOT the missing 4x. It buys ~1.4x over the SIMT tile and is
+therefore not routed.** `gemm_q4_k_mma` exists (opt-in `SOFUU_GPU_GEMM_MMA`,
+parity-tested, called only by its test — the prefill route does not use it).
+
+Same buffers, 3072x1024, B=128, one process, 5 reps each:
+
+| class | ms | TFLOP/s |
+|---|---|---|
+| shipped 8-token | 4.18-5.40 | 0.15-0.19 |
+| SIMT tiled (32x64) | 1.06-1.30 | 0.62-0.76 |
+| MMA 64 rows x 64 tok | **0.91** | **0.88** |
+| MMA 64 rows x 128 tok | 2.08 | 0.39 |
+| MMA 32 rows x 64 tok | 0.92 | 0.88 |
+
+Why it does not compound: the binding cost in this data flow is **the fp16
+dequant staging that feeds both classes** (one 32-value k-slice: 2048 weights
+x ~10 instructions + 2 threadgroup barriers), not the MAC issue rate the matrix
+units accelerate. Widening the token tile to amortize that staging (128 tok)
+costs more than it saves — half the threadgroups and 32 accumulator fragments
+of register pressure. Shrinking rows for parallelism (32) changes nothing.
+
+Also a class change: the MMA path stages weights/activations as **half**, so its
+output sits at the 2.8e-4-relative class vs 1.3e-6 for the f32 SIMT tile. Any
+future routing needs its own text-gate certification on that basis.
+
+Consequence for the plan: the pp bar's implied 3-4 TFLOP/s is not reachable by
+"add MMA to the tiled class". The remaining pp levers are (a) fewer dispatches
+per layer — the measured 304 ms "rest" block on the 0.6B — and (b) a llama.cpp
+`mul_mm`-style schedule (64x128 tile, 8 warps, one barrier per k-slice, no
+per-fragment reload) which is a multi-day port, not a tweak.
+
+Kernel defects found and fixed while getting MMA to parity (all three are
+out-of-bounds threadgroup writes that silently corrupt the tile — the parity
+test caught each): x staging pass count vs the token tile, a widened token tile
+whose `#define` lived outside the kernel body, and leftover 2-row loops after
+shrinking the row tile.

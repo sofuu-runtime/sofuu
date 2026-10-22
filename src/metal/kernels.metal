@@ -1,3 +1,4 @@
+#include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 using namespace metal;
 
@@ -4084,5 +4085,138 @@ kernel void llama_attn_flash_b4(
         float inv = 1.0f / l_run[r];
         device float *out = head_out + ((size_t)row * n_heads + h) * head_dim;
         for (uint d = lane; d < head_dim; d += 32) { out[d] = o_acc[r][d] * inv; }
+    }
+}
+
+// ── P5 arm-c: simdgroup-matrix (MMA) tiled q4_K GEMM ───────────────────────
+// The SIMT tile (gemm_q4_k_tiled) issues one FMA per lane per cycle: 128
+// MAC/cycle per threadgroup. The matrix units do 8x8x8 per instruction, so the
+// same threadgroup can reach 4x that. Layout: a 64-row x 64-token tile, 4
+// simdgroups each owning 16 rows x 64 tokens (2 x 8 accumulator fragments),
+// weights and activations dequantized to half once per 32-value k-slice in
+// threadgroup memory (the arithmetic class llama.cpp's mul_mm uses).
+// ABI-identical to gemm_q4_k_tiled so the two classes can be A/B'd.
+#define MMA_R 32
+#define MMA_T 64
+#define MMA_BK 32
+#define MMA_PAD 36
+
+kernel void gemm_q4_k_mma(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup half ws[MMA_R][MMA_PAD];
+    threadgroup half xs[MMA_T][MMA_PAD];
+    threadgroup float oc[4][8][8];      // per-simdgroup epilogue scratch
+
+    uint r0 = tg.x * MMA_R;
+    uint t0 = tg.y * MMA_T;
+    uint nb = cols / 256;
+    uint sg = tid >> 5;                 // simdgroup 0..3 -> rows sg*16..+15
+    uint lane = tid & 31;
+
+    simdgroup_matrix<float, 8, 8> acc[1][8];
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < 1; ++i) {
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; ++j) {
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    uint nbk = cols / MMA_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * MMA_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 32 rows x 32 values (128 threads, one pass) ──
+        {
+            uint slot = tid;
+            uint r = slot >> 2;
+            uint v0 = (slot & 3) * 8;
+            uint grow = r0 + r;
+            float wv[8];
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 144;
+                device const uchar *blk = w_base + row_byte + b * 144;
+                float d = float(read_f16(w_base, row_byte + b * 144));
+                float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+                uchar sc, m;
+                q4k_scale_min(blk + 4, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16 + 32 * (sub >> 1);
+                for (uint u = 0; u < 8; ++u) {
+                    uchar byte = qrow[v0 + u];
+                    uint nib = (sub & 1) ? (uint)(byte >> 4) : (uint)(byte & 0x0F);
+                    wv[u] = ds * (float)nib - mm;
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[r][v0 + u] = half(wv[u]); }
+        }
+        // ── stage 64 tokens x 32 values (128 threads, one pass) ──
+        {
+            uint slot = tid;
+            uint t = slot >> 1;
+            uint v0 = (slot & 1) * 16;
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t][v0 + u] = half(xv[u]); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── 4 k-blocks of 8: A rows are row-major, B is loaded transposed ──
+        uint rb = sg * 8;
+        for (uint kk = 0; kk < 4; ++kk) {
+            uint koff = kk * 8;
+            simdgroup_matrix<half, 8, 8> afr[1];
+            simdgroup_matrix<half, 8, 8> bfr[8];
+            simdgroup_load(afr[0], &ws[rb][koff], MMA_PAD, ulong2(0, 0), false);
+            for (uint j = 0; j < 8; ++j) {
+                simdgroup_load(bfr[j], &xs[j * 8][koff], MMA_PAD, ulong2(0, 0), true);
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 1; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], afr[i], bfr[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue: y is token-major [B][rows] — store via guard-safe scratch ──
+    for (uint i = 0; i < 1; ++i) {
+        for (uint j = 0; j < 8; ++j) {
+            simdgroup_store(acc[i][j], &oc[sg][0][0], 8, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64; e += 32) {
+                uint dr = e >> 3;
+                uint dt = e & 7;
+                uint grow = r0 + sg * 8 + i * 8 + dr;
+                uint gt = t0 + j * 8 + dt;
+                if (grow < rows && gt < B) {
+                    y[(size_t)gt * rows + grow] = oc[sg][dr][dt];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }

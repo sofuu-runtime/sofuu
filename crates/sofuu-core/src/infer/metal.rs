@@ -836,6 +836,14 @@ extern "C" {
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_gemm_mma(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+        B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn_flash_b4(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -1956,6 +1964,55 @@ impl MetalEngine {
         };
         self.op_tock(K_ATTN_1C, __t);
         __r
+    }
+
+    /// P5 arm-c: simdgroup-matrix q4_K GEMM (fp16 MMA units, 64x64 tile).
+    /// Same ABI and output layout as `batch_gguf_gemm_tiled`. Opt-in behind
+    /// SOFUU_GPU_GEMM_MMA; false keeps the SIMT tiled class.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_gguf_gemm_mma(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        if ty != 12 || !Self::gemm_mma_enabled() || b < 2 {
+            return false;
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_mma(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// Cached env gate for the MMA GEMM class (default off).
+    pub fn gemm_mma_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var("SOFUU_GPU_GEMM_MMA")
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !(v.is_empty() || v == "0" || v == "false" || v == "off")
+                    })
+                    .unwrap_or(false);
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
     }
 
     /// P5 arm-b: flash-style batched prefill attention. Same math and ABI as
@@ -7402,6 +7459,164 @@ fn attn_flash_matches_cpu_reference() {
             unsafe { libc::munmap(*p as *mut libc::c_void, *sz) };
         }
     }
+}
+
+/// P5 arm-c go/no-go: the simdgroup-matrix q4_K tile vs the CPU dot and vs
+/// the SIMT tiled class, on the 0.6B ffn_gate shape (3072 x 1024, B=128).
+/// fp16 staging is a different arithmetic class than the f32 SIMT path, so
+/// the reference tolerance is the fp16 rounding class (2e-4 relative), not
+/// the SIMT 1e-5 — the text gate is what judges the class change.
+#[test]
+#[ignore]
+fn gemm_q4_k_mma_matches_cpu_and_rates() {
+    use std::time::Instant;
+    let rows = 3072usize;
+    let blocks = 4usize;
+    let cols = blocks * 256;
+    let row_bytes = blocks * 144;
+    let B = 128usize;
+
+    let mut state = 0xA24BAED4963EE407u64;
+    let mut rand = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let f16_bytes = |v: f32| -> [u8; 2] {
+        let b = v.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+        let man = (b >> 13) & 0x3FF;
+        (sign | (exp << 10) | (man as u16)).to_le_bytes()
+    };
+    let mut w = vec![0u8; rows * row_bytes];
+    for r in 0..rows {
+        for b in 0..blocks {
+            let off = r * row_bytes + b * 144;
+            w[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+            w[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+            for j in 0..12 {
+                w[off + 4 + j] = ((rand() & 0x3F) as u8) | (((rand() & 3) as u8) << 6);
+            }
+            for j in 0..128 {
+                w[off + 16 + j] = (rand() % 255) as u8;
+            }
+        }
+    }
+    let toks: Vec<Vec<f32>> = (0..B)
+        .map(|t| {
+            (0..cols)
+                .map(|i| ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5)
+                .collect()
+        })
+        .collect();
+    let mut y_cpu = vec![0f32; B * rows];
+    for t in 0..B {
+        for r in 0..rows {
+            let off = r * row_bytes;
+            y_cpu[t * rows + r] = unsafe {
+                crate::infer::quant::vec_dot_raw_q4_k(w[off..].as_ptr(), toks[t].as_ptr(), blocks)
+            };
+        }
+    }
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    let w_alloc = w.len().div_ceil(page) * page;
+    let w_ptr = mk(w_alloc);
+    let wb: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(w_ptr, w.len()) };
+    wb.copy_from_slice(&w);
+    let engine = MetalEngine::new().expect("engine");
+    let w_buf = engine.register_zerocopy_only(wb).expect("w");
+    let slab_f32 = B * cols + B * rows;
+    let slab_alloc = (slab_f32 * 4).div_ceil(page) * page;
+    let slab_ptr = mk(slab_alloc);
+    let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(slab_ptr, slab_alloc) };
+    let slab_buf = engine.register_zerocopy_only(slab).expect("slab");
+    for t in 0..B {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                toks[t].as_ptr() as *const u8,
+                slab_ptr.add(t * cols * 4),
+                cols * 4,
+            )
+        };
+    }
+    let y_off = B * cols * 4;
+
+    std::env::set_var("SOFUU_GPU_GEMM_MMA", "1");
+    let dispatched = {
+        assert!(engine.batch_open());
+        let ok = engine.batch_gguf_gemm_mma(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B);
+        engine.batch_end();
+        ok
+    };
+    assert!(dispatched, "gemm_q4_k_mma PSO unavailable (shader compile?)");
+    let y_gpu: &[f32] =
+        unsafe { std::slice::from_raw_parts(slab_ptr.add(y_off) as *const f32, B * rows) };
+    let mut worst_rel = 0f32;
+    let mut wi = 0usize;
+    for i in 0..B * rows {
+        let a = y_gpu[i];
+        let b = y_cpu[i];
+        assert!(a.is_finite(), "non-finite MMA output at {i}");
+        let rel = (a - b).abs() / b.abs().max(1.0);
+        if rel > worst_rel {
+            worst_rel = rel;
+            wi = i;
+        }
+        // fp16 staging: weights up to ~59 in this fixture, so a half ulp per
+        // term lands at the 1e-3-relative class. An indexing defect is >=1e-1.
+        assert!(rel <= 2e-3, "MMA parity broken at {i}: gpu={a:.6e} cpu={b:.6e} rel={rel:.2e}");
+    }
+    println!("[mma] rows={rows} cols={cols} B={B} worst_rel={worst_rel:e} at {wi} — PARITY PASS (fp16 class)");
+
+    let mut bench = |label: &str, which: u8| {
+        let reps = 5usize;
+        assert!(engine.batch_open());
+        match which {
+            1 => { engine.batch_gguf_gemm_mma(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B); }
+            2 => { engine.batch_gguf_gemm_tiled(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B); }
+            _ => { engine.batch_gguf_gemm(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B); }
+        }
+        engine.batch_end();
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            assert!(engine.batch_open());
+            let ok = match which {
+                1 => engine.batch_gguf_gemm_mma(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B),
+                2 => engine.batch_gguf_gemm_tiled(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B),
+                _ => engine.batch_gguf_gemm(12, &w_buf, 0, &slab_buf, 0, &slab_buf, y_off, rows, cols, B),
+            };
+            engine.batch_end();
+            assert!(ok, "{label} dispatch failed");
+        }
+        let per = t0.elapsed().as_secs_f64() / reps as f64;
+        let wt = (rows * row_bytes) as f64;
+        let flop = 2.0 * rows as f64 * cols as f64 * B as f64;
+        println!(
+            "[mma-rate] {label:8} {:.3} ms  {:.2} TFLOP/s  {:.1} GB/s",
+            per * 1e3,
+            flop / per / 1e12,
+            wt / per / 1e9
+        );
+    };
+    bench("shipped", 0);
+    bench("tiled", 2);
+    bench("mma", 1);
 }
 
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape

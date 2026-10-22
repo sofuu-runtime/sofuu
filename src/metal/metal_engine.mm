@@ -51,6 +51,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_peak_fma;
     id<MTLComputePipelineState> pso_peak_mma;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_r88;
+    bool pso_gemm_q4_k_tiled_r88_live;
     bool pso_gemm_q4_k_tiled_db_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_wide_fused;
     bool pso_gemm_q4_k_tiled_wide_fused_live;
@@ -339,6 +340,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_peak_fma = load_pso(@"peak_fma");
         ctx->pso_peak_mma = load_pso(@"peak_mma");
         ctx->pso_gemm_q4_k_tiled_r88 = load_pso(@"gemm_q4_k_tiled_r88");
+        ctx->pso_gemm_q4_k_tiled_r88_live = ctx->pso_gemm_q4_k_tiled_r88 != nil;
         ctx->pso_gemm_q4_k_tiled_wide_fused = load_pso(@"gemm_q4_k_tiled_wide_fused");
         ctx->pso_gemm_q4_k_tiled_wide_fused_live = ctx->pso_gemm_q4_k_tiled_wide_fused != nil;
         ctx->pso_gemm_q4_k_tiled_wide = load_pso(@"gemm_q4_k_tiled_wide");
@@ -1757,7 +1759,7 @@ int sofuu_metal_batch_gguf_gemm_tiled_r88(
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
     if (rows == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
-    if (!ctx->pso_gemm_q4_k_tiled_live) return 0;
+    if (!ctx->pso_gemm_q4_k_tiled_r88_live) return 0;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_tiled_r88];
     size_t aligned = w_offset & ~255ULL;

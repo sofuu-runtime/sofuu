@@ -7809,7 +7809,12 @@ fn bench_tiled_real_shapes() {
     ];
     let max_rows = 6144usize;
     let max_cols = 4096usize;
-    let slab_bytes = (((4096usize + 128 * 4) * 4).div_ceil(page)) * page;
+    const B: usize = 128;
+    // x lives at 0 and needs B*cols; y starts at a page boundary after it and
+    // needs rows*B. Sizing this from offsets alone (the first version used 32 KB
+    // for a 3 MB output) let the kernel write past the mapping.
+    let y_off = ((B * max_cols * 4).div_ceil(page)) * page;
+    let slab_bytes = (((y_off + max_rows * B * 4).div_ceil(page)) * page).max(page);
     let sp = mk(slab_bytes);
     let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(sp, slab_bytes) };
     for i in 0..slab.len() { slab[i] = 0; }
@@ -7825,8 +7830,6 @@ fn bench_tiled_real_shapes() {
         }
     }
     let w_buf = engine.register_zerocopy_only(w).expect("w");
-    const B: usize = 128;
-    let y_off = 4096 * 4;
     // Interleaved, min-of-N. Under this machine's load a sequential A/B drifts
     // 2x between variants (the 32-row tile itself measured 0.41, 0.72 and 0.48
     // TFLOP/s on the same shape in three runs), so every variant is sampled in

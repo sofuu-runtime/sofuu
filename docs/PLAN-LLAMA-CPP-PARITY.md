@@ -450,3 +450,32 @@ without a value oracle; the gemms are bit-exact by oracles). The
 part/fin/1c/kv_write value-oracle program (CPU attention mirror) is the
 next concrete instrument; until it lands, treat ALL GEMM-route text
 divergences as bug-class, not reassociation-class.
+
+## KV-CACHE DIFF INSTRUMENT (2026-10-22 late — the P2 pin, to the value level)
+SOFUU_KV_DUMP=<prefix> (model.rs maybe_dump_kv, wired at both prefill
+tail returns) writes k/v/x/logits after prompt prefill; scripts/kv_route_diff.py
+maps byte diffs into (layer, kh, pos, hd). Findings at 0.6B/P2, CPU tiles
+vs GPU route (chunk 128, types=all):
+- **Final residual x: byte-identical.**
+- **The KV caches are NOT identical: ~1M f32 differ (≈67% of the live
+  region, RMS 1e-1), worst |diff| ~3.5 on |K|~100-300 values, HD-LANE
+  STRUCTURED (hd 48-52 + 63 dominate the top hits), spread over ALL
+  positions 0..147 — including positions beyond the 110-token prompt
+  (max-tokens=1) under BOTH routes.**
+- Route-internal invariance proven: tiles@batch4 == tiles@default (0 diff),
+  route@chunk4 == route@chunk128 (0 diff) — the divergence is CROSS-ROUTE,
+  not batch-size dependent.
+- The CPU tile path and the CPU depth path agree with each other where
+  probed; the divergence is specifically CPU-tile-KV vs kv_write-KV.
+- Mechanism hypothesis: the Metal glue computes theta = pos/pow(base, 2j/hd)
+  on-device (MSL pow, per-lane, division) while the CPU rope reads the
+  PRECOMPUTED sofuu_rope_lookup table (1/powf × pos, mul; peer lane already
+  has the table + sofuu_test_rope_table_parity). The on-device pow/div
+  rounding differs lane-wise — but the ~1e-2-relative worst hits are LARGER
+  than pure f32 pow rounding explains, and the pos>prompt writes are
+  unexplained: the fix program = route a CPU-built cos/sin TABLE (exact
+  sofuu_rope_fill_rows sequence mirrored in Rust) through the kv_write/
+  head_rmsnorm/1c kernels (one extra slab row-region + binding each), with
+  kv_route_diff as the value gate; if diffs don't collapse, the pos>prompt
+  writes mean the position plumbing (not precision) carries a real bug —
+  a GPU capture decides. Either way the instrument chain is complete.

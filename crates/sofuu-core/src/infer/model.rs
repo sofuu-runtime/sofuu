@@ -893,6 +893,49 @@ impl TransformerModel {
     /// Uses batched GEMM to reuse model weights across all tokens in the batch, eliminating
     /// redundant memory bandwidth stalls. Slices large token streams into max_prefill_batch() tiles,
     /// snapped to a multiple of 4 so the packed-tile GEMM path stays eligible for every chunk.
+
+    /// SOFUU_KV_DUMP=<prefix>: after prompt prefill, write the model's KV
+    /// caches and the residual x — the CPU-route vs GPU-route byte diff at
+    /// the same pipeline point separates kv_write bugs from attention-read
+    /// bugs (the caches are the same zero-copy memory both routes use).
+    pub fn maybe_dump_kv(&self) {
+        if let Some(prefix) = std::env::var_os("SOFUU_KV_DUMP") {
+            let prefix = prefix.to_string_lossy().to_string();
+            let kvb = self.layers.len()
+                * self.config.n_kv_heads
+                * self.config.max_seq_len
+                * self.config.head_dim
+                * 4;
+            let write = |suffix: &str, bytes: &[u8]| {
+                let _ = std::fs::write(format!("{prefix}.{suffix}"), bytes);
+            };
+            let k: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.k_cache.as_ptr() as *const u8, kvb)
+            };
+            let v: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.v_cache.as_ptr() as *const u8, kvb)
+            };
+            let x: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.x.as_ptr() as *const u8, self.x.len() * 4)
+            };
+            let lg: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.logits.as_ptr() as *const u8, self.logits.len() * 4)
+            };
+            write("k.bin", k);
+            write("v.bin", v);
+            write("x.bin", x);
+            write("logits.bin", lg);
+            if !self.x_norm_batch.is_empty() {
+                let n = self.x_norm_batch.len().min(4096);
+                let xn: &[u8] = unsafe {
+                    std::slice::from_raw_parts(self.x_norm_batch.as_ptr() as *const u8, n * 4)
+                };
+                write("xn.bin", xn);
+            }
+            eprintln!("[kv-dump] wrote {prefix}.k/v/x/logits ({} vars)", self.x.len());
+        }
+    }
+
     pub fn forward_prefill_batch(&mut self, tokens: &[u32], mut start_pos: usize) {
         if tokens.is_empty() {
             return;
@@ -905,6 +948,7 @@ impl TransformerModel {
             self.forward_prefill_batch_chunk(chunk, start_pos);
             start_pos += chunk.len();
         }
+        self.maybe_dump_kv();
     }
 
     /// Prefill all prompt tokens and compute logits for the very last token in a single pass,
@@ -933,12 +977,17 @@ impl TransformerModel {
             // push any 1-3 row remainder through the per-row/small-batch path.
             let main = take - (take % 4);
             if main == take {
-                return self.forward_prefill_batch_chunk_internal(&tokens[off..off + take], cur_pos, true);
+                self.forward_prefill_batch_chunk_internal(&tokens[off..off + take], cur_pos, true);
+                self.maybe_dump_kv();
+                return &self.logits;
             }
             self.forward_prefill_batch_chunk_internal(&tokens[off..off + main], cur_pos, false);
             cur_pos += main;
-            return self.forward_prefill_batch_chunk_internal(&tokens[off + main..off + take], cur_pos, true);
+            self.forward_prefill_batch_chunk_internal(&tokens[off + main..off + take], cur_pos, true);
+            self.maybe_dump_kv();
+            return &self.logits;
         }
+        self.maybe_dump_kv();
         &self.logits
     }
 

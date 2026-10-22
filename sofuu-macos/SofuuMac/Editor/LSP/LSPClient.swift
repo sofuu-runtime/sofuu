@@ -15,6 +15,11 @@ final class LSPClient {
     private var queuedOps: [() -> Void] = []           // ops captured pre-initialize
     private var openVersions: [String: Int] = [:]      // uri → doc version
     private(set) var isRunning = true
+    /// The registry's idle reaper decides on this (main-thread updates).
+    private(set) var lastActivity = Date()
+
+    func touch() { lastActivity = Date() }
+    var hasOpenDocs: Bool { !openVersions.isEmpty }
 
     /// (filesystemPath, diagnostics) per publishDiagnostics — main thread.
     var onDiagnostics: ((String, [LSPWire.Diagnostic]) -> Void)?
@@ -70,6 +75,7 @@ final class LSPClient {
     // MARK: - Wire plumbing
 
     private func request(_ method: String, params: [String: Any]?, then: ((Any?) -> Void)? = nil) {
+        touch()
         let id = nextID
         nextID += 1
         var message: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method]
@@ -127,6 +133,7 @@ final class LSPClient {
 
     /// Open the document on the server (idempotent per path).
     func didOpen(path: String, text: String) {
+        touch()
         whenReady { [weak self] in
             guard let self else { return }
             let uri = LSPWire.uriOf(path)
@@ -147,6 +154,7 @@ final class LSPClient {
 
     /// Full-text sync (universally supported); debounced by the caller.
     func didChange(path: String, text: String) {
+        touch()
         whenReady { [weak self] in
             guard let self else { return }
             let uri = LSPWire.uriOf(path)

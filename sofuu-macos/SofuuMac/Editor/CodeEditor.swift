@@ -359,7 +359,9 @@ struct CodeEditor: NSViewRepresentable {
         private var runningLSP: Bool {
             guard let path else { return false }
             let language = Languages.language(forPath: path)
-            return LSPRegistry.shared.runningClient(langID: language.id.rawValue) != nil
+            let root = store.state.projectDir
+                ?? URL(fileURLWithPath: path).deletingLastPathComponent().path
+            return LSPRegistry.shared.runningClient(langID: language.id.rawValue, rootPath: root) != nil
         }
 
         // MARK: - Diagnostics underlines

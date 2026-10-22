@@ -983,6 +983,9 @@ final class AppStore: ObservableObject {
         // merge into this view.
         if let cur = state.activeSessionId, let m = state.ctx { state.ctxCache[cur] = m }
         configs.setProjectDir(path)
+        // Language servers are (language, root)-keyed: servers from the old
+        // root have nothing left to serve here.
+        LSPRegistry.shared.stopAll(exceptRoot: path)
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         state.projectDir = path
         state.sessions = []

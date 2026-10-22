@@ -103,6 +103,26 @@ private struct Root: View {
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { _ in LSPRegistry.shared.stopAll() }
+
+        // One window by design: the store, engine pump, HUD panels and
+        // escape monitor all assume it. A second SwiftUI window (Window
+        // menu, state restore, scripts) is closed with an explanation
+        // instead of misbehaving silently.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { note in
+            let mains = NSApp.windows.filter {
+                $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
+            }
+            guard mains.count > 1, let extra = note.object as? NSWindow,
+                  extra !== mains.first else { return }
+            extra.orderOut(nil)
+            let alert = NSAlert()
+            alert.messageText = "Sofuu is a one-window app"
+            alert.informativeText = "Sessions, engine state and the IDE live in a single window. The extra window was closed."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 }
 

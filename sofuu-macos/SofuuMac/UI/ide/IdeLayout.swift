@@ -681,6 +681,16 @@ struct EditorStatus: View {
                 Text(language.name)
             }
             Text(hud.lspStatus)
+            Button {
+                store.openSettings(true, tab: "console")
+            } label: {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(c.textMuted)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Engine console (stderr tail + app errors)")
             Spacer()
             if errors > 0 {
                 Label("\(errors)", systemImage: "xmark.octagon.fill")

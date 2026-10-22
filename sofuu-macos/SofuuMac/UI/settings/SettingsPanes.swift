@@ -1,6 +1,6 @@
 import SwiftUI
 
-private let settingsTabs = ["general", "appearance", "models", "providers", "agents", "brain", "usage", "shortcuts"]
+private let settingsTabs = ["general", "appearance", "models", "providers", "agents", "brain", "usage", "shortcuts", "console"]
 
 /// Page margin for the settings content (cards run window-width minus this).
 private let settingsMargin: CGFloat = 28
@@ -51,6 +51,7 @@ struct SettingsScreen: View {
                     case "brain": BrainPane(store: store)
                     case "usage": UsagePane(store: store)
                     case "shortcuts": ShortcutsPane()
+                    case "console": ConsolePane(store: store)
                     default: EmptyView()
                     }
                 }

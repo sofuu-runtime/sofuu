@@ -79,6 +79,15 @@ pub type JSCFunctionDataFn = unsafe extern "C" fn(
 /// The C `JSInterruptHandler`: return != 0 to abort evaluation.
 pub type JSInterruptHandler = unsafe extern "C" fn(*mut JSRuntime, *mut c_void) -> c_int;
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum JSPromiseStateEnum {
+    Invalid = -1,
+    Pending = 0,
+    Fulfilled = 1,
+    Rejected = 2,
+}
+
 /// The C `JSHostPromiseRejectionTracker` callback (JS_SetHostPromiseRejectionTracker):
 /// fired for every rejected promise — `is_handled` is 0 at rejection time,
 /// 1 when a handler is attached later.
@@ -121,6 +130,7 @@ pub struct JSPropertyEnum {
 }
 
 pub const JS_GPN_STRING_MASK: c_int = 1 << 0;
+pub const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 pub const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
 pub const JS_PROP_WRITABLE: u8 = 0x02;
 
@@ -507,7 +517,8 @@ pub const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
 pub const JS_READ_OBJ_BYTECODE: c_int = 1 << 0;
 pub const JS_READ_OBJ_ROM_DATA: c_int = 1 << 1;
 
-/// `JS_CFUNC_constructor` (quickjs.h JSCFunctionEnum) for JS_NewCFunction2.
+/// `JS_CFUNC_generic` and `JS_CFUNC_constructor` (quickjs.h JSCFunctionEnum) for JS_NewCFunction2.
+pub const JS_CFUNC_generic: c_int = 0;
 pub const JS_CFUNC_constructor: c_int = 2;
 
 // ── Direct C exports (linkable from Rust) ─────────────────────────
@@ -627,6 +638,12 @@ extern "C" {
         cb: Option<JSInterruptHandler>,
         opaque: *mut c_void,
     );
+    pub fn JS_GetInterruptCounter(ctx: *mut JSContext) -> c_int;
+    pub fn JS_SetInterruptCounter(ctx: *mut JSContext, counter: c_int);
+    pub fn JS_PromiseState(ctx: *mut JSContext, promise: JSValue) -> JSPromiseStateEnum;
+    pub fn JS_PromiseResult(ctx: *mut JSContext, promise: JSValue) -> JSValue;
+    pub fn JS_GetContextOpaque(ctx: *mut JSContext) -> *mut c_void;
+    pub fn JS_SetContextOpaque(ctx: *mut JSContext, opaque: *mut c_void);
     pub fn JS_NewCFunctionData(
         ctx: *mut JSContext,
         func: JSCFunctionDataFn,

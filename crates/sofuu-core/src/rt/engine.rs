@@ -274,6 +274,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::async_context::mod_async_context_register(ctx);
     }
 
+    // Phase 5: Deterministic Agent Sandboxing & Fuel Meters (sofuu.sandbox.*)
+    unsafe {
+        crate::rt::sandbox::mod_sandbox_register(ctx);
+    }
+
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };
@@ -400,6 +405,13 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"context".as_ptr(), context_mod) };
     } else {
         unsafe { qjs::sofuu_js_free_value(ctx, context_mod) };
+    }
+
+    let sandbox_mod = unsafe { qjs::sofuu_js_get_property_str(ctx, sofuu_obj, c"sandbox".as_ptr()) };
+    if !unsafe { qjs::is_undefined(sandbox_mod) } && !unsafe { qjs::is_null(sandbox_mod) } {
+        unsafe { qjs::sofuu_js_set_property_str(ctx, sofuu, c"sandbox".as_ptr(), sandbox_mod) };
+    } else {
+        unsafe { qjs::sofuu_js_free_value(ctx, sandbox_mod) };
     }
 
     unsafe { qjs::sofuu_js_free_value(ctx, sofuu_obj) };

@@ -502,3 +502,12 @@ vs GPU route (chunk 128, types=all):
   (KV dump + kv_route_diff + tagged logits probes on all four head paths)
   is complete; the next step = a real-weights attention/glue oracle
   (CPU mirror with model weights) to pin the projection-level source.
+
+## PER-TYPE COALESCED FLIP IMPLEMENTED (2026-10-22, late)
+The q8_0 serial GEMV no longer rides SOFUU_Q4K_COALESCED levels 1-2:
+coalesced=2 = c2/b4c for q4_K + coalesced q6_K (the DECIDING A/B winners:
+0.6B 61.4 vs 31.8, MiniCPM 22.0 vs 9.1, 8B 5.6 vs 2.8), and the all-q8_0
+1B keeps the shipped serial class unless coalesced=3 is asked explicitly
+(the 1B regresses 33.2 vs 50.3 under the c2 class). DEFAULT STAYS 0 (all
+off) — the per-model default flips wait on the calm text-gate pass at
+coalesced=2 (the first attempt ran at load 28-39 = tainted, re-gated).

@@ -300,7 +300,12 @@ void* sofuu_metal_init(void) {
         // P2: q8_0 coalesced single-row class — flips the SERIAL decode PSO
         // the same way q4_K/q6_K ride SOFUU_Q4K_COALESCED (nil-degrade to v1)
         id<MTLComputePipelineState> q8c2 = load_pso(@"gemv_q8_0_c2");
-        if (q8c2 != nil && coalesced_level > 0) {
+        // Per-type coalesced flip (phase-4 deciding A/B, calm 1.4-3.5):
+        // coalesced=2 wins on q4/q6 models (0.6B 61.4 vs 31.8, MiniCPM 22.0
+        // vs 9.1, 8B 5.6 vs 2.8) but REGRESSES the all-q8_0 1B (33.2 vs
+        // 50.3 serial) — so the q8_0 serial GEMV keeps the shipped class
+        // unless the caller asks explicitly: coalesced=3 = "q8 c2 too".
+        if (q8c2 != nil && coalesced_level >= 3) {
             ctx->pso_gemv_q8_0 = q8c2;
         }
         ctx->pso_gpu_q8_0_b4multi_live = ctx->pso_gpu_q8_0_b4multi != nil;

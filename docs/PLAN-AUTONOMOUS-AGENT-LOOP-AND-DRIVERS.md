@@ -15,10 +15,10 @@
 | **Phase 2** | Native `AsyncLocalStorage` Context (`sofuu.context`) | **COMPLETE** | `tests/test_agent_context_propagation.js` (6/6 passed), commit [`365c7bc10`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/365c7bc10) |
 | **Phase 3** | Cooperative Scheduling & Concurrent Tool Dispatch | **COMPLETE** | `tests/test_agent_concurrency_yield.js` (5/5 passed), commit [`395509477`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/395509477) |
 | **Phase 4** | Real-Time QTSQ Agent Trace Persistence & Replay | **COMPLETE** | `tests/test_agent_qtsq_trace.js` (7/7 passed), commit [`947d855b9`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/947d855b9) |
-| **Phase 5** | Resilient File Editing (`smart_edit`) & Syntax Dry-Run | **READY** | Whitespace-tolerant line match, `sofuu.parse` compiler gate, diff preview |
+| **Phase 5** | Resilient File Editing (`smart_edit`) & Syntax Dry-Run | **COMPLETE** (local) | `tests/test_agent_smart_edit.js` (37/37 checks), `tests/tools_diff_test.js` (32/32 incl. agent diff events), `tests/tools_edit_literal_e2e.sh` (7/7). Not yet committed/pushed. |
 | **Phase 6** | Custom Agent AOT Bytecode & Full Integration Torture | **PENDING** | `sofuu.agent.loadDir` AOT, 50-run torture test, $\le 5.0\text{ MB}$ audit |
 
-**Overall Progress:** 4 of 6 Phases Completed (67%) | **Stripped Binary Size:** 4.9 MB (Budget: $\le 5.0\text{ MB}$)
+**Overall Progress:** 5 of 6 Phases Completed (83%) | **Stripped Binary Size:** 5,230,672 B = 4.99 MiB (cap 5,242,880 B = 5.0 MiB; **12,208 B headroom** — see the Phase 6 note)
 
 ---
 
@@ -171,7 +171,7 @@ flowchart TD
 
 ---
 
-### Phase 5: Resilient File Editing (`smart_edit`) & Syntax Dry-Run
+### Phase 5: Resilient File Editing (`smart_edit`) & Syntax Dry-Run — ✅ COMPLETE (local, uncommitted)
 - **Problem**: `edit_file` in `tools.js` relies on strict literal string matching. If an LLM introduces minor indentation or whitespace variations, the edit fails, burning tokens and steps on retry apologies.
 - **Deliverables**:
   - **Whitespace-Tolerant Fallback**: If an exact literal match fails:
@@ -181,9 +181,16 @@ flowchart TD
     - For `.js`, `.ts`, `.json` files, pass the replacement candidate through QuickJS parser (`sofuu.parse(code)`).
     - If a syntax error is detected, reject the edit with a precise compiler error message (`SyntaxError: Unexpected token on line 42`) without corrupting the file on disk.
   - **Unified Diff Generation**: Continue stashing bounded, numbered unified diffs in `globalThis.__sofuu_last_diff` for live GUI display.
-- **Verification**: `tests/test_agent_smart_edit.js`:
-  - Test literal matches, whitespace-tolerant fallback matches, and rejection of ambiguous non-unique matches.
-  - Test syntax dry-run catching intentional syntax errors before disk writes.
+- **Delivered** (all in `src/js/tools.js`, bytecode in `src/js/tools.bc`):
+  - `sofuu.parse(code[, { filename, module, ts }])` — new host binding, `crates/sofuu-core/src/rt/syntax.rs`. Compile-only (`JS_EVAL_FLAG_COMPILE_ONLY`), never executes; returns `{ ok: true, mode }` or `{ ok: false, mode, type, error, line }`. `.ts` is stripped by the existing `crate::ts::strip` first (offsets/newlines preserved, so line numbers stay true).
+  - `tolerantMatches(text, oldS)` — line-block match with leading/trailing whitespace ignored. Must still be **unique** unless `replace_all`; a multi-hit miss lists the candidate lines. `reindent(block, base, want)` rebases the replacement onto the matched block's real indentation while keeping relative nesting.
+  - `syntaxGate(before, after, path)` — gated extensions `js, mjs, cjs, ts, json`. Clean ⇒ write. Candidate broken **and** the file parses today ⇒ throw, nothing written. File **already** broken ⇒ write plus a `[warning] ... still does not parse` rider (repairing a broken file is the common case). No verdict (free-form extension, missing `sofuu.parse`, or a module that fails on an unresolvable import rather than a `SyntaxError`) ⇒ never blocks.
+  - Legacy-safe: literal matching, `replace_all`, result strings and `globalThis.__sofuu_last_diff` shapes are unchanged; the tolerant path appends ` [whitespace-tolerant match]` to the result suffix (callers asserting on the prefix are unaffected).
+- **Deviations from the sketch above, and why**:
+  - `.mjs` and ESM-looking `.ts` parse as modules; a failing `.js` is retried in module mode, so `export`/`import` files are never false-positives. A module failure that is not a `SyntaxError` (e.g. `Cannot find module`) is treated as unverified, not broken.
+  - JSON is checked with `JSON.parse`, not the compiler — but that means a JSON**C** file (comments) is permanently "already broken", so it stays editable and warns instead of blocking.
+  - The diff is built from the bytes actually written (the re-indented block on the tolerant path, CRLF-normalized), not from `old_string`; the previous wiring would have painted lines the file never contained.
+- **Verification**: `tests/test_agent_smart_edit.js` (37 checks, wrapper `tests/test_agent_smart_edit_e2e.sh`): literal path unchanged, tolerant re-indent, ambiguous reject, `replace_all` tolerant, JS gate reject, JSON gate reject, already-broken file editable + warning, ESM, TypeScript, `.md` ungated, total miss, CRLF. Regression: `tests/tools_diff_test.js` 32/32 (the stale mock there assumed one call per agent — progressive tool-schema escalation re-streams round 1, so it now re-issues until a tool message exists), `tests/tools_edit_literal_e2e.sh` 7/7, `tests/agent_test.js` ALL PASSED, Phase 1–4 suites 7/7 + 6/6 + 5/5 + 7/7.
 
 ---
 
@@ -196,4 +203,5 @@ flowchart TD
     `sofuu compile-bc src/js/chat.js src/js/chat.bc`
   - Authored comprehensive torture test `tests/test_agent_modernization_torture.js` executing 50 concurrent agent runs combining all 5 modernization tracks.
   - Release binary budget verification strictly $\le 5.0\text{ MB}$.
+    - **Risk, measured today**: the stripped binary is 5,230,672 B with only **12,208 B** of headroom (the "4.9 MB" in earlier revisions of this document was optimistic — it is 4.99 MiB). Phase 5 added 13,582 B of embedded driver bytes (`tools.js` 37,237 -> 46,518 B, `tools.bc` 23,956 -> 28,257 B) plus the small `sofuu.parse` binding; a raw `cargo build --release` of the same sources was measured once at 5,247,184 B (4,304 B OVER the cap) before `make` reproduced 5,230,672 B, so treat the margin as noise-level rather than real. Precompiling agent scripts and any further driver work needs space freed first; the lever is the `include_str!` source fallbacks (496,262 B of the 725,326 B driver footprint), which today duplicate what the `.bc` already carries. Note there is still **no `.js` ↔ `.bc` hash guard**: a stale `.bc` silently wins (`eval_shipped_with_bytecode` returns on first success).
   - OpenQodex code review gate execution and clean git push.

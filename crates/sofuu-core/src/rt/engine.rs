@@ -279,6 +279,12 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::sandbox::mod_sandbox_register(ctx);
     }
 
+    // Phase 5 (agent loop): parse-only syntax gate (sofuu.parse) for the
+    // edit tool's dry run - compiles the candidate, never executes it.
+    unsafe {
+        crate::rt::syntax::mod_syntax_register(ctx);
+    }
+
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };

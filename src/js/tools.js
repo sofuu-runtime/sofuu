@@ -431,9 +431,146 @@
     },
   };
 
+  /* -- Phase 5: resilient edits (whitespace-tolerant match + syntax dry-run) --
+   * Two failure modes used to cost a whole round-trip each: the model
+   * restates a block with indentation the file does not use (the literal
+   * match misses), or it emits code that does not parse (the garbage lands
+   * on disk and the NEXT step discovers it). Both are cheap to catch here.
+   *
+   * 1. Whitespace-tolerant fallback. When the literal search finds nothing,
+   *    lines are compared with leading/trailing whitespace ignored, and the
+   *    match must still be UNIQUE - guessing which of two identical blocks
+   *    to rewrite is how edits corrupt files. The new block inherits the
+   *    matched block's indentation; relative indentation inside it is kept.
+   *
+   * 2. Syntax dry-run. For .js/.mjs/.cjs/.ts/.json the candidate is PARSED
+   *    before it reaches disk (sofuu.parse compiles, never executes). An
+   *    edit that would break a file that currently parses is rejected and
+   *    nothing is written. A file that is ALREADY broken stays editable -
+   *    fixing it is usually why the agent is editing - and the remaining
+   *    error comes back as a warning on the result instead.
+   *
+   * Both paths are additive: literal matching, replace_all and every result
+   * string keep their exact old shape, and the gated extension list is
+   * deliberately short (md/txt/py/... edits are never blocked). */
+
+  var SYNTAX_GATED = { js: 1, mjs: 1, cjs: 1, ts: 1, json: 1 };
+
+  function extOf(p) {
+    var m = /\.([A-Za-z0-9]+)$/.exec(String(p == null ? '' : p));
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  function oneLine(s) {
+    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, 240);
+  }
+
+  /* Verdict for one complete candidate body: { ok, error, line } or null.
+   * null means the gate does not apply here (free-form extension, or a host
+   * runtime without sofuu.parse) - it NEVER means "clean". */
+  function syntaxVerdict(text, p) {
+    var ext = extOf(p);
+    if (!Object.prototype.hasOwnProperty.call(SYNTAX_GATED, ext)) return null;
+    if (ext === 'json') {
+      try {
+        JSON.parse(text);
+        return { ok: true };
+      } catch (e) {
+        var msg = String((e && e.message) || e);
+        var lm = /line (\d+)/i.exec(msg);
+        return { ok: false, error: 'JSON.parse: ' + oneLine(msg), line: lm ? (parseInt(lm[1], 10) | 0) : 0 };
+      }
+    }
+    var parse = (typeof sofuu !== 'undefined' && sofuu) ? sofuu.parse : null;
+    if (typeof parse !== 'function') return null;
+    var isTs = ext === 'ts';
+    var asModule = ext === 'mjs' || (isTs && /(^|\n)[ \t]*(import|export)\b/.test(text));
+    var r = null;
+    try { r = parse(text, { filename: rel(p), module: asModule, ts: isTs }); }
+    catch (eP) { return null; }
+    if (!r || typeof r.ok !== 'boolean') return null;
+    if (r.ok) return { ok: true };
+    if (!asModule) {
+      /* Classic-script mode rejects legal ESM, so retry as a module before
+       * calling the file broken. A module that parses but cannot resolve an
+       * import reports a non-SyntaxError type - that is a dependency
+       * problem, not a syntax one: no verdict (null), never a rejection. */
+      var r2 = null;
+      try { r2 = parse(text, { filename: rel(p), module: true, ts: isTs }); } catch (eP2) { r2 = null; }
+      if (r2 && r2.ok === true) return { ok: true };
+      if (r2 && r2.ok === false && r2.type && r2.type !== 'SyntaxError') return null;
+    }
+    return { ok: false, line: (r.line | 0), error: oneLine(r.error || 'syntax error') };
+  }
+
+  /* Gate a candidate before it is written. Returns '' when the edit may
+   * proceed (no verdict, or clean); throws when it would introduce a syntax
+   * error into a file that parses today; returns a warning rider when the
+   * file was already broken and still is. */
+  function syntaxGate(before, after, p) {
+    var cand = syntaxVerdict(after, p);
+    if (!cand || cand.ok) return '';
+    var orig = syntaxVerdict(before, p);
+    var where = rel(p) + (cand.line > 0 ? ':' + cand.line : '');
+    if (orig && orig.ok === false) {
+      return '\n[warning] ' + where + ' still does not parse (' + cand.error +
+        ') - the file was already broken before this edit.';
+    }
+    if (!orig) return '';
+    throw new Error('edit_file: syntax dry-run rejected the edit in ' + where + ': ' +
+      cand.error + ' - nothing was written to disk; fix the syntax and retry.');
+  }
+
+  function normLine(s) {
+    return String(s).replace(/[ \t\r]+$/, '').replace(/^[ \t]+/, '');
+  }
+
+  /* Line-block matcher that ignores indentation. Returns one entry per
+   * candidate region: { start, end, line, indent }, where [start, end) is
+   * the byte span of the matched lines WITHOUT the final newline. */
+  function tolerantMatches(text, oldS) {
+    var fileLines = String(text).split('\n');
+    var starts = [], off = 0, i;
+    for (i = 0; i < fileLines.length; i++) { starts.push(off); off += fileLines[i].length + 1; }
+    var want = String(oldS == null ? '' : oldS).replace(/\r\n/g, '\n').split('\n');
+    while (want.length && !want[0].trim()) want.shift();
+    while (want.length && !want[want.length - 1].trim()) want.pop();
+    if (!want.length) return [];
+    var wantN = [];
+    for (i = 0; i < want.length; i++) wantN.push(normLine(want[i]));
+    var hits = [];
+    for (var s = 0; s + wantN.length <= fileLines.length; s++) {
+      var ok = true;
+      for (var k = 0; k < wantN.length; k++) {
+        if (normLine(fileLines[s + k]) !== wantN[k]) { ok = false; break; }
+      }
+      if (!ok) continue;
+      var last = s + wantN.length - 1;
+      var lead = /^[ \t]*/.exec(fileLines[s]);
+      var tail = fileLines[last].replace(/[ \t\r]+$/, '');
+      hits.push({ start: starts[s], end: starts[last] + tail.length,
+                  line: s + 1, indent: lead ? lead[0] : '' });
+    }
+    return hits;
+  }
+
+  /* Re-base a candidate block onto the file's own indentation. base is the
+   * candidate's first-line indent (where the model thought the block sat),
+   * want is the matched block's real indent. A line that does not start with
+   * base keeps its own prefix, so deliberate outdents survive. */
+  function reindent(block, base, want) {
+    var ls = String(block == null ? '' : block).split('\n');
+    if (base === want) return ls.join('\n');
+    for (var i = 0; i < ls.length; i++) {
+      if (!ls[i].trim()) { ls[i] = ''; continue; }
+      ls[i] = want + (ls[i].indexOf(base) === 0 ? ls[i].slice(base.length) : ls[i]);
+    }
+    return ls.join('\n');
+  }
+
   TOOLS.edit_file = {
     name: 'edit_file',
-    description: 'Replace an exact string in a file. old_string must match exactly ONE place (quote it from read_file, including whitespace); add surrounding context if it is ambiguous, or set replace_all. Jailed to the project directory.',
+    description: 'Replace a string in a file. old_string must match exactly ONE place (quote it from read_file); add surrounding context if it is ambiguous, or set replace_all. If the text is not found, a whitespace-tolerant line match is tried (it too must be unique) and the block is re-indented to the file. .js/.mjs/.cjs/.ts/.json edits are syntax-checked before writing: an edit that would break a file that parses today is rejected and nothing is written. Jailed to the project directory.',
     parameters: {
       type: 'object',
       properties: {
@@ -449,37 +586,84 @@
       var oldS = String((a && a.old_string) == null ? '' : a.old_string);
       if (!oldS) throw new Error('edit_file: old_string is required (quote it exactly from read_file)');
       var newS = String((a && a.new_string) == null ? '' : a.new_string);
+      var replaceAll = !!(a && a.replace_all);
       var text = await sofuu.fs.readFile(p, 'utf8');
       var count = 0, idx = 0, first = -1;
       while ((idx = text.indexOf(oldS, idx)) >= 0) { count++; if (first < 0) first = idx; idx += oldS.length; }
-      if (count === 0) {
-        throw new Error('edit_file: old_string not found in ' + rel(p) + ' — read_file it and copy the exact text');
-      }
-      if (count > 1 && !(a && a.replace_all)) {
+      if (count > 1 && !replaceAll) {
         throw new Error('edit_file: old_string matches ' + count + ' places in ' + rel(p) +
-          ' — include more surrounding context to make it unique, or pass replace_all:true');
+          ' - include more surrounding context to make it unique, or pass replace_all:true');
       }
+      /* removed is what the diff shows as the OLD side: oldS on the literal
+       * path, the file's real bytes on the tolerant path (they differ there
+       * by indentation - a diff built from oldS would show lines that are
+       * not in the file). */
+      var removed = oldS;
+      var nRep = 1;
+      var how = '';
+      /* applied is what the file actually receives (the tolerant path
+       * re-indents the model's block); the diff must show THESE bytes, not
+       * the raw candidate, or the TUI paints lines the file never had. */
+      var applied = newS;
+      var updated;
+      if (count > 0) {
       /* js-6 (AUDIT-2026-09-07): splice literally — String.replace (the old
        * single-match branch) interprets $&, $$, $` and $' in new_string as
        * replacement patterns, silently corrupting the file when the new
        * text contains those two-char sequences. split/join (replace_all)
        * was already literal; the single-match branch now is too. */
-      var updated = (a && a.replace_all) ? text.split(oldS).join(newS)
-                                         : text.slice(0, first) + newS + text.slice(first + oldS.length);
+        updated = replaceAll ? text.split(oldS).join(newS)
+                             : text.slice(0, first) + newS + text.slice(first + oldS.length);
+        nRep = replaceAll ? count : 1;
+      } else {
+        var hits = tolerantMatches(text, oldS);
+        if (!hits.length) {
+          throw new Error('edit_file: old_string not found in ' + rel(p) +
+            ' - read_file it and copy the exact text (no line block matched either, ignoring indentation)');
+        }
+        if (hits.length > 1 && !replaceAll) {
+          throw new Error('edit_file: old_string matches ' + hits.length + ' places in ' + rel(p) +
+            ' ignoring indentation (lines ' + hits.map(function (h) { return h.line; }).join(', ') +
+            ') - include more surrounding context to make it unique, or pass replace_all:true');
+        }
+        var base = (/^[ \t]*/.exec(newS) || [''])[0];
+        var crlf = text.indexOf('\r\n') >= 0;
+        var spans = hits.slice().sort(function (x, y) { return y.start - x.start; });
+        updated = text;
+        for (var si = 0; si < spans.length; si++) {
+          var sp = spans[si];
+          var repl = reindent(newS, base, sp.indent);
+          /* The span stops before its line terminator, so the file keeps
+           * its own break after the block: a replacement that brings a
+           * trailing newline would leave a blank line behind, so drop it. */
+          while (repl.length && (repl.charAt(repl.length - 1) === '\n' ||
+                                 repl.charAt(repl.length - 1) === '\r')) {
+            repl = repl.slice(0, repl.length - 1);
+          }
+          if (crlf && repl.indexOf('\r') < 0) repl = repl.split('\n').join('\r\n');
+          updated = updated.slice(0, sp.start) + repl + updated.slice(sp.end);
+        }
+        first = hits[0].start;
+        removed = text.slice(hits[0].start, hits[0].end).replace(/\r/g, '');
+        nRep = hits.length;
+        how = ' [whitespace-tolerant match]';
+        applied = reindent(newS, base, hits[0].indent);
+      }
+      /* Dry run BEFORE the write: a rejected edit leaves the file
+       * byte-identical on disk. */
+      var gateWarn = syntaxGate(text, updated, p);
       await sofuu.fs.writeFile(p, updated);
-      setLastDiff('edit_file', buildEditDiff(rel(p), text, first, oldS, newS, count));
-      var res = 'edited ' + rel(p) + ': ' + ((a && a.replace_all) ? count + ' replacements' : '1 replacement') +
-        ' (' + (updated.length - text.length >= 0 ? '+' : '') + (updated.length - text.length) + ' chars)';
+      setLastDiff('edit_file', buildEditDiff(rel(p), text, first, removed, applied, nRep));
+      var res = 'edited ' + rel(p) + ': ' + (nRep === 1 ? '1 replacement' : nRep + ' replacements') +
+        ' (' + (updated.length - text.length >= 0 ? '+' : '') + (updated.length - text.length) + ' chars)' + how;
       try {
         /* Anchor against the FRESH on-disk bytes, not the in-memory splice
-         * — the rider's whole point is independent proof of what happened. */
-        res += anchorRider(await sofuu.fs.readFile(p, 'utf8'),
-                           Math.min(first, updated.length), 2);
+         * - the rider's whole point is independent proof of what happened. */
+        res += anchorRider(await sofuu.fs.readFile(p, 'utf8'), Math.min(first, updated.length), 2);
       } catch (eE) {}
-      return res;
+      return res + gateWarn;
     },
   };
-
   TOOLS.grep = {
     name: 'grep',
     description: 'Search file contents with a regular expression across the project (skips .git/node_modules/target/dist). Returns path:line: text matches, capped.',

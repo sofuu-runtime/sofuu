@@ -401,3 +401,36 @@ implicitly) and pinning WHY Apple's queue restarts under contention.
 3. Decode-chain batch-failure refactor (void fns → fallback contract).
 4. IOGPU restart root-cause under peer load (Metal heap/timeout?).
 5. top-2-gap logits probe (near-tie certification).
+
+## PHASE-4 decode A/B (calm 1.4-3.5, Paris/82 greedy) — coalesced=2 vs default
+| model | bar tg | default | coalesced=2 | winner |
+|---|---|---|---|---|
+| 0.6B i1-Q4 | 224.5 | 31.8 | **61.4** | coalesced 1.9x |
+| 1B Q8_0 | 121.9 | **50.3** | 33.2 | default 1.5x |
+| Spark-4B Q4 | 51.0 | 27.1 | 27.1 | tie |
+| MiniCPM5-2B q6/q8 | 73.0 | 9.1 | **22.0** | coalesced 2.4x |
+| 8B Q4_K_M | 31.2 | 2.8 | **5.6** | coalesced 2.0x |
+
+DECIDING: coalesced wins 3 models + ties 1; the 1B (all-Q8_0) wants the
+DEFAULT serial q8 path — a global flip regresses the 1B 1.5x. The flip
+needs per-type semantics (c2 ON for q4/q6 rows, OFF for the q8 serial
+class) — booked as the flip implementation; nothing flipped yet (the env
+stays the pinned-receipts switch).
+
+## Fault-isolation status (phase-3 residual, 2026-10-22)
+- The standalone per-op test (attn_glue_b4_fault_isolation_1b) passes at
+  every b — the fault needs model context, not a single op.
+- skip=ffn faults (2 IOGPU/run, deterministic); skip=attn never -> the
+  attention SUB-CHAIN carries it at model level.
+- MTL_DEBUG_LAYER=1: fault vanishes (validation masks it — no API-level
+  OOB reported).
+- ncm_pass (per-pass true chunk count for part/fin instead of the
+  config-level 32) landed as index-space-only 16x grid shrink — principled
+  but did NOT remove the fault. Remaining suspicion sits in the large
+  chained encoder (multi-layer one command buffer), which the standalone
+  test cannot reproduce.
+- OPEN containment hole: after a torn buffer, the CPU-tiles fallback can
+  still trip the repack assert in some interleave (2/3 runs at load ~3) —
+  the lldb backtrace attempt hung; next session pins it with SOFUU
+  instrumentation in the CPU prefill path (model.rs lane), not src/simd
+  (peer lane). Defaults are unaffected (route opt-in; battery path clean).

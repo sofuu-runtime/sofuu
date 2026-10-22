@@ -3239,6 +3239,15 @@ impl TransformerModel {
                     head_dim as u32, n_heads as u32,
                     has_q, norm_eps, rope_freq_base, rope_mode,
                 );
+                // Per-pass TRUE chunk count for part/fin: the config-level
+                // meta_chunks (32 at msl 4096) spawns 131k mostly-early-return
+                // threadgroups on 32-head models when b=128 lands at pos>=128
+                // — the deterministic 1B queue fault pass. n_chunks <=
+                // ncm_pass by construction, the meta layout stays sized for
+                // the config chunks (row stride unchanged, content fits the
+                // smaller prefix), and fin loops c < n_chunks — this is
+                // index-space only, bit-identical values.
+                let ncm_pass = ((pos_of_last / 128) + 1) as u32;
                 let fused = (pos_of_last + 1) <= 128
                     && g.engine.batch_llama_attn_1c_b4(
                         pbuf, pslots.qa,
@@ -3260,7 +3269,7 @@ impl TransformerModel {
                         b,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32,
                         max_seq_len as u32,
-                        meta_chunks as u32, meta_per_layer as u32,
+                        ncm_pass, meta_per_layer as u32,
                     );
                     g.engine.batch_llama_attn_fin_b4(
                         &g.meta_buf, meta_layer_off,
@@ -3268,7 +3277,7 @@ impl TransformerModel {
                         pbuf, pslots.posb,
                         b,
                         n_heads as u32, head_dim as u32,
-                        meta_chunks as u32, meta_per_layer as u32,
+                        ncm_pass, meta_per_layer as u32,
                     );
                 }
             }

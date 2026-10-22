@@ -5831,3 +5831,142 @@ fn gemm_q6_k_t32_matches_cpu() {
         unsafe { libc::munmap(slab_ptr as *mut libc::c_void, slab_alloc) };
     }
 }
+
+/// Phase-3 defect pin: the 1B (32 heads, hd 64, nkv 8) faults its GPU queue
+/// on the start_pos=128, b=128 multi-chunk attention pass — every in-model
+/// run, every load. This test dispatches each attention-glue op
+/// (kv_write_b4 / head_rmsnorm_b4 / attn_part_b4 / attn_fin_b4) STANDALONE
+/// at exactly those shapes, each in its own command buffer so batch_end's
+/// completion bool names the faulting op, plus an all-in-one chain.
+/// MTL_SHADER_VALIDATION=1 makes the GPU reject OOB shader accesses with a
+/// named kernel instead of a queue restart. Run:
+/// cargo test -- --ignored --test-threads=1
+#[test]
+#[ignore]
+fn attn_glue_b4_fault_isolation_1b() {
+    std::env::set_var("MTL_SHADER_VALIDATION", "1");
+    let nh = 32u32;
+    let nkv = 8u32;
+    let hd = 64u32;
+    let q_rows = (nh * hd) as usize;
+    let kv_rows = (nkv * hd) as usize;
+    let ncm = 32u32; // meta_chunks at max_seq 4096, as the engine passes it
+    let max_seq = 4096u32;
+    let meta_per_layer =
+        (nh as usize) * (ncm as usize) * 2 + (nh as usize) * (ncm as usize) * (hd as usize);
+
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    let alloc = |bytes: usize| bytes.div_ceil(page) * page;
+
+    let bmax = 128usize;
+    let sizes: Vec<(usize, bool)> = vec![
+        (q_rows * bmax * 4, true),   // q: random f32
+        (kv_rows * bmax * 4, true),  // k
+        (kv_rows * bmax * 4, true),  // v
+        (q_rows * bmax * 4, true),   // out
+        ((nkv as usize) * (max_seq as usize) * (hd as usize) * 4, false), // kv cache
+        (meta_per_layer * 256 * 4, false), // meta (must be zeroed first)
+        (bmax * 4, false),           // positions
+        ((hd as usize) * 4 * 2, true), // q/k norm weights (small)
+    ];
+    let mut ptrs: Vec<(*mut u8, usize)> = Vec::new();
+    for &(bytes, _) in &sizes {
+        let a = alloc(bytes);
+        ptrs.push((mk(a), a));
+    }
+    for (i, &(bytes, random)) in sizes.iter().enumerate() {
+        let (p, a) = ptrs[i];
+        unsafe {
+            let sl = std::slice::from_raw_parts_mut(p, bytes);
+            if random {
+                let f = std::slice::from_raw_parts_mut(sl.as_ptr() as *mut f32, bytes / 4);
+                for (j, v) in f.iter_mut().enumerate() {
+                    *v = (((j as u64 * 2654435761 + 0x9e37) >> 33) % 2003) as f32 / 1000.0 - 1.0;
+                }
+            } else {
+                std::ptr::write_bytes(sl.as_mut_ptr(), 0, bytes);
+            }
+        }
+    }
+    let engine = MetalEngine::new().expect("engine");
+    let registered: Vec<MetalBuffer> = {
+        let mut regs = Vec::new();
+        for i in 0..sizes.len() {
+            let sl = unsafe { std::slice::from_raw_parts_mut(ptrs[i].0, sizes[i].0) };
+            regs.push(engine.register_zerocopy_only(sl).expect("reg"));
+        }
+        regs
+    };
+    let (q_b, k_buf, v_buf, out_b, kvc_b, meta_b, pos_b, w_b) = (
+        &registered[0], &registered[1], &registered[2], &registered[3],
+        &registered[4], &registered[5], &registered[6], &registered[7],
+    );
+    let eps = 1e-5f32;
+    let rope = 500000.0f32;
+    let mut faults: Vec<String> = Vec::new();
+
+    for &b in &[32usize, 60, 64, 100, 128] {
+        // positions 128..128+b-1 — the in-model failing pass shapes
+        unsafe {
+            let ps = std::slice::from_raw_parts_mut(ptrs[6].0, b * 4);
+            for t in 0..b {
+                ps[t * 4..t * 4 + 4].copy_from_slice(&((128 + t) as u32).to_le_bytes());
+            }
+        }
+        let layer8_off = 8 * meta_per_layer * 4;
+        macro_rules! run_isolated {
+            ($name:literal, $ops:expr) => {{
+                engine.batch_open();
+                $ops;
+                let ok = engine.batch_end();
+                println!("[glue-pin] b={b} {} -> {}", $name, if ok { "OK" } else { "FAULT" });
+                if !ok {
+                    faults.push(format!("b={b} {}", $name));
+                }
+            }};
+        }
+        run_isolated!("kv_write_b4", engine.batch_llama_kv_write_b4(
+            k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
+            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32));
+        run_isolated!("head_rmsnorm_b4", engine.batch_head_rmsnorm_b4(
+            q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32));
+        run_isolated!("attn_part_b4", engine.batch_llama_attn_part_b4(
+            q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
+            hd, nh, nkv, max_seq, ncm, meta_per_layer as u32));
+        run_isolated!("attn_fin_b4", engine.batch_llama_attn_fin_b4(
+            meta_b, layer8_off, out_b, 0, pos_b, 0, b, nh, hd, ncm, meta_per_layer as u32));
+        run_isolated!("ALL-IN-ONE", {
+            engine.batch_llama_kv_write_b4(
+                k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
+                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32);
+            engine.batch_head_rmsnorm_b4(
+                q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32);
+            engine.batch_llama_attn_part_b4(
+                q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
+                hd, nh, nkv, max_seq, ncm, meta_per_layer as u32);
+            engine.batch_llama_attn_fin_b4(
+                meta_b, layer8_off, out_b, 0, pos_b, 0, b, nh, hd, ncm, meta_per_layer as u32);
+        });
+    }
+    for f in &faults {
+        eprintln!("[glue-pin] FAULT: {f}");
+    }
+    assert!(faults.is_empty(), "attention-glue faults at 1B shapes: {faults:?}");
+    for (p, a) in &ptrs {
+        unsafe { libc::munmap(*p as *mut libc::c_void, *a) };
+    }
+}

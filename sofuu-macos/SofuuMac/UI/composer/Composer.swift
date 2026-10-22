@@ -41,10 +41,23 @@ struct Composer: View {
     var pendingDraft: String? = nil
     var onConsumeDraft: () -> Void = {}
 
+    /// Voice input — gated by the store on a REAL engine probe
+    /// (sofuu.ai.transcribe surface + OpenAI-compatible active provider).
+    /// `onVoice(data, done)` runs the transcription; done(text, error)
+    /// lands on main with exactly one non-nil.
+    var voiceAvailable: Bool = false
+    var onVoice: ((Data, @escaping (String?, String?) -> Void) -> Void)? = nil
+
     @Environment(\.sofuuColors) private var c
     @State private var text = ""
     @State private var slashIndex = 0
     @State private var slashDismissed = false
+    // Voice capture state: nil = idle; recording holds the recorder +
+    // start instant; transcribing while the engine round-trip runs.
+    @State private var recorder: MicRecorder?
+    @State private var recordingSince: Date?
+    @State private var transcribing = false
+    @State private var voiceError: String?
     @FocusState private var focused: Bool
 
     // ── Slash palette state ──────────────────────────────────────────
@@ -112,6 +125,13 @@ struct Composer: View {
                         IconAction(icon: Icons2.layers, description: "Context layers") { onSheet(.layers) }
                     }
                     Spacer(minLength: 8)
+                    if voiceAvailable, onVoice != nil { micButton }
+                    if let voiceError {
+                        Text(voiceError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(c.err)
+                            .lineLimit(1)
+                    }
                     IconAction(icon: Icons2.attach, description: "Attach files") { attachFiles() }
                     CtxRing(ctx: ctx)
                     if streaming {
@@ -137,7 +157,17 @@ struct Composer: View {
                 onConsumeDraft()
             }
         }
-        .onDisappear { removeKeyMonitor() }
+        .onDisappear {
+            removeKeyMonitor()
+            // A mid-recording composer teardown (mode switch, settings
+            // page) must not leak a running audio engine.
+            if recorder != nil {
+                recorder?.stop()
+                recorder = nil
+                recordingSince = nil
+                transcribing = false
+            }
+        }
         .onChange(of: pendingDraft) { draft in
             guard let draft, !draft.isEmpty else { return }
             text = draft
@@ -207,6 +237,74 @@ struct Composer: View {
     }
 
     // ── Attach: NSOpenPanel → images as data URLs, files @ cursor ────
+
+    // ── Voice capture (mic → WAV → engine transcribe) ────────────────
+
+    private var micButton: some View {
+        Button { toggleVoice() } label: {
+            Group {
+                if transcribing {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                } else if recorder != nil {
+                    HStack(spacing: 3) {
+                        Circle().fill(c.err).frame(width: 6, height: 6)
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                } else {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 12))
+                }
+            }
+            .foregroundStyle(recorder != nil ? c.errStrong : c.textMuted)
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(transcribing ? "Transcribing…" : (recorder != nil ? "Stop & transcribe" : "Voice input"))
+    }
+
+    private func toggleVoice() {
+        if recorder != nil {
+            stopVoice()
+            return
+        }
+        guard !transcribing else { return }
+        voiceError = nil
+        MicRecorder.requestAccess { granted in
+            guard granted else {
+                voiceError = "Microphone access denied"
+                return
+            }
+            let rec = MicRecorder()
+            do {
+                try rec.start()
+                recorder = rec
+                recordingSince = Date()
+            } catch {
+                voiceError = error.localizedDescription
+            }
+        }
+    }
+
+    private func stopVoice() {
+        guard let rec = recorder else { return }
+        recorder = nil
+        recordingSince = nil
+        guard let data = rec.stop() else { return }
+        guard let onVoice else { return }
+        transcribing = true
+        onVoice(data) { transcript, error in
+            transcribing = false
+            if let error {
+                voiceError = error
+            } else if let transcript {
+                text = text.isEmpty ? transcript : text + " " + transcript
+            }
+        }
+    }
 
     private func attachFiles() {
         let panel = NSOpenPanel()

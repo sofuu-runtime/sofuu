@@ -424,4 +424,15 @@ final class UiPrefs {
         }
         set { d.set(min(640, max(280, newValue)), forKey: "ideAgentWidth") }
     }
+
+    /// Chat display names (session id → override), surfaced on the pill
+    /// strip and history popover. The engine's session record itself is
+    /// untouched — overrides are purely host-side, like desktop.json.
+    var sessionNames: [String: String] {
+        get { d.dictionary(forKey: "sessionNames") as? [String: String] ?? [:] }
+        set {
+            if newValue.isEmpty { d.removeObject(forKey: "sessionNames") }
+            else { d.set(newValue, forKey: "sessionNames") }
+        }
+    }
 }

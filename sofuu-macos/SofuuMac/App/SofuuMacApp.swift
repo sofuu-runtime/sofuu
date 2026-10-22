@@ -223,6 +223,7 @@ final class GlobalKeyMonitor {
                 store.state.settingsOpen || store.state.preview != nil
                     || store.state.sheet != nil
                     || store.state.shortcutHelpVisible || store.state.onboardingVisible
+                    || store.state.chatSearchOpen
             }
             if hasOverlay {
                 Task { @MainActor in _ = store.closeTopOverlay() }
@@ -289,6 +290,11 @@ struct SofuuMenus: Commands {
                 NotificationCenter.default.post(name: .init("IDEOutlineToggle"), object: nil)
             }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+            Divider()
+            Button("Search Chat") { store.setChatSearchOpen(true) }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+            Button("Export Chat as Markdown…") { store.exportSessionMarkdown() }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
         }
         CommandMenu("Session") {
             Button("Stop") { store.cancel() }

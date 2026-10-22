@@ -12,6 +12,15 @@ struct ChatScreen: View {
     var streamFrame: Int = 0
     /// Joined think deltas — the live "▸ thinking …" line.
     var liveThink: String = ""
+    /// Chat-search jump handshake (store.jumpToMessage sets both; the
+    /// tick changes so re-picking the same row still scrolls).
+    var jumpTarget: String? = nil
+    var jumpTick: Int = 0
+    /// Hover actions under user bubbles (edit / resend). Captures from
+    /// Shell; nil or streaming=false = read-only transcript.
+    var canActMessages: Bool = false
+    var onEditMessage: ((String) -> Void)? = nil
+    var onResendMessage: ((String) -> Void)? = nil
 
     @Environment(\.sofuuColors) private var c
 
@@ -25,7 +34,10 @@ struct ChatScreen: View {
                         ForEach(messages) { m in
                             MessageRow(m: m, fontSize: chatFontSize,
                                        phase: phase, streamFrame: streamFrame,
-                                       liveThink: liveThink)
+                                       liveThink: liveThink,
+                                       canAct: canActMessages && !streaming,
+                                       onEdit: onEditMessage,
+                                       onResend: onResendMessage)
                                 .id(m.id)
                         }
                     }
@@ -40,6 +52,10 @@ struct ChatScreen: View {
                 .onChange(of: messages.last?.content.count ?? 0) { _ in
                     if let last = messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
+                .onChange(of: jumpTick) { _ in
+                    guard let target = jumpTarget else { return }
+                    proxy.scrollTo(target, anchor: .top)
+                }
             }
         }
     }
@@ -51,21 +67,48 @@ private struct MessageRow: View {
     var phase: String? = nil
     var streamFrame: Int = 0
     var liveThink: String = ""
+    var canAct: Bool = false
+    var onEdit: ((String) -> Void)? = nil
+    var onResend: ((String) -> Void)? = nil
 
     @Environment(\.sofuuColors) private var c
+    @State private var hovered = false
+
+    /// "[image]"-only turns have nothing to edit or resend.
+    private var actionable: Bool { !m.content.isEmpty && m.content != "[image]" }
 
     var body: some View {
         switch m.role {
         case .user:
-            HStack {
+            HStack(alignment: .top) {
                 Spacer(minLength: 40)
-                Text(m.content)
-                    .font(.system(size: CGFloat(fontSize)))
-                    .lineSpacing(4)
-                    .foregroundStyle(c.text)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(c.bgCard, in: RoundedRectangle(cornerRadius: 14))
-                    .padding(.vertical, 6).padding(.horizontal, 4)
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(m.content)
+                        .font(.system(size: CGFloat(fontSize)))
+                        .lineSpacing(4)
+                        .foregroundStyle(c.text)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(c.bgCard, in: RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 4)
+                    // Edit & resend = desktop TUI parity: recall the
+                    // prompt into the input (or resend it as-is) as the
+                    // NEXT turn — the engine keeps its own transcript, so
+                    // nothing is ever truncated behind the user's back.
+                    if canAct && hovered && actionable {
+                        HStack(spacing: 8) {
+                            rowButton("pencil", "Edit — loads this text into the composer") { onEdit?(m.content) }
+                            rowButton("arrow.uturn.up", "Resend as the next message") { onResend?(m.content) }
+                            rowButton("doc.on.doc", "Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(m.content, forType: .string)
+                            }
+                        }
+                        .transition(.opacity)
+                    }
+                }
+                .onHover { hovered = $0 }
+                .animation(.easeOut(duration: 0.12), value: hovered)
+                .padding(.vertical, 6)
             }
 
         case .system:
@@ -112,6 +155,19 @@ private struct MessageRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 8).padding(.bottom, 10)
         }
+    }
+
+    private func rowButton(_ icon: String, _ help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(c.textMuted)
+                .frame(width: 24, height: 20)
+                .background(c.bgCardHover, in: RoundedRectangle(cornerRadius: 5))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 

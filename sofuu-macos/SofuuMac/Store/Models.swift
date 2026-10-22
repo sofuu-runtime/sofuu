@@ -32,6 +32,18 @@ struct AppState {
     var onboardingVisible = false
     /// ⇧⌘/ keyboard-shortcut cheat sheet.
     var shortcutHelpVisible = false
+    /// Chat display-name overrides (session id → name), persisted in
+    /// UiPrefs; rendered by pills and the history popover.
+    var sessionNames: [String: String] = [:]
+    /// ⇧⌘S chat search bar + its jump handshake (target message id; the
+    /// tick changes alongside so re-jumping the same row still scrolls).
+    var chatSearchOpen = false
+    var chatSearchTarget: String?
+    var chatSearchTick = 0
+    /// Engine surface probe says sofuu.ai.transcribe exists in this build.
+    /// The full gate also checks the active provider (Composer param) —
+    /// the engine rejects Local/Anthropic audio at call time as well.
+    var voiceSurfaceOK = false
     var phase: String?
     /// TUI-style live streaming state (chat.rs's answer spinner + think
     /// line + PHASE sweep, ported 1:1).

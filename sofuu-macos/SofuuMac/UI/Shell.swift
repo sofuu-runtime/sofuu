@@ -228,7 +228,12 @@ struct Shell: View {
                             chatFontSize: store.state.chatFontSize,
                             preview: store.state.preview,
                             streamFrame: store.state.streamFrame,
-                            liveThink: store.state.liveThink)
+                            liveThink: store.state.liveThink,
+                            jumpTarget: store.state.chatSearchTarget,
+                            jumpTick: store.state.chatSearchTick,
+                            canActMessages: true,
+                            onEditMessage: { store.receiveSharedText($0) },
+                            onResendMessage: { store.submit($0) })
                     }
                 }
 
@@ -243,6 +248,13 @@ struct Shell: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .top) {
+                // Chat search rides over the transcript's top edge.
+                if store.state.chatSearchOpen {
+                    ChatSearchBar(store: store)
+                        .padding(.top, 8)
+                }
+            }
             .animation(.easeOut(duration: 0.18), value: store.state.approvals.count)
 
             if store.state.preview == nil {
@@ -265,7 +277,9 @@ struct Shell: View {
                     onAddImages: { store.addPickedImages($0) },
                     onSheet: { store.openSheet($0.rawValue) },
                     pendingDraft: store.state.composerDraft,
-                    onConsumeDraft: { store.consumeComposerDraft() })
+                    onConsumeDraft: { store.consumeComposerDraft() },
+                    voiceAvailable: store.voiceAvailable(),
+                    onVoice: { data, done in store.transcribeVoice(data, onDone: done) })
             }
         }
     }
@@ -352,7 +366,8 @@ struct Shell: View {
         let session = store.state.sessions.first { $0.id == sid }
         let creationOrder = store.state.sessions.sorted { $0.startedAt < $1.startedAt }
         let index = session.flatMap { s in creationOrder.firstIndex { $0.id == s.id } } ?? 0
-        let label = sid == nil ? "New chat" : (session?.labelOf(index) ?? "Chat")
+        let label = sid == nil ? "New chat"
+            : session.map { store.sessionTitle($0, index: index) } ?? "Chat"
 
         return HStack(spacing: 6) {
             if active {
@@ -387,6 +402,19 @@ struct Shell: View {
         .onTapGesture {
             if sid == nil { store.newChat() }
             else if let sid { store.setActiveSession(sid) }
+        }
+        .contextMenu {
+            if let sid {
+                Button("Rename…") { requestRename(sid, current: label) }
+            }
+        }
+    }
+
+    /// Rename rides the IDE's prompt HUD — one chrome surface, same Esc
+    /// rules. Empty text clears the override (engine title returns).
+    private func requestRename(_ sid: String, current: String) {
+        IDEHUD.showPrompt(title: "Rename chat", placeholder: "Chat name", initial: current) { text in
+            store.renameSession(sid, to: text)
         }
     }
 
@@ -508,7 +536,7 @@ private struct HistoryList: View {
             ForEach(byRecency) { s in
                 Button { onResume(s) } label: {
                     HStack(spacing: 8) {
-                        Text(s.task.flatMap { $0.nilIfEmpty } ?? "Chat")
+                        Text(store.sessionTitle(s, index: store.state.sessions.firstIndex { $0.id == s.id } ?? 0))
                             .font(.system(size: 12))
                             .foregroundStyle(c.text)
                             .lineLimit(1)
@@ -523,6 +551,14 @@ private struct HistoryList: View {
                 }
                 .buttonStyle(.plain)
                 .onTapGesture(count: 2) { onPick(s) }
+                .contextMenu {
+                    Button("Rename…") {
+                        IDEHUD.showPrompt(title: "Rename chat", placeholder: "Chat name",
+                                          initial: store.sessionTitle(s, index: store.state.sessions.firstIndex { $0.id == s.id } ?? 0)) { text in
+                            store.renameSession(s.id, to: text)
+                        }
+                    }
+                }
             }
 
             if !store.state.sessions.isEmpty {

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The app state holder: folds the engine event stream into UI state and
 /// drives every engine call. The mac twin of the iOS `AppStore` (itself a
@@ -85,6 +86,7 @@ final class AppStore: ObservableObject {
         state.ideMode = uiPrefs.ideMode
         state.ideTreeWidth = CGFloat(uiPrefs.ideTreeWidth)
         state.ideAgentWidth = CGFloat(uiPrefs.ideAgentWidth)
+        state.sessionNames = uiPrefs.sessionNames
 
         // Engine events → state.
         engine.observe { [weak self] ev in
@@ -99,6 +101,7 @@ final class AppStore: ObservableObject {
         // folded from the Keychain before the runtime boots, mirroring the
         // Tauri app's step 5a.
         state.config = configs.redacted(configs.readConfigWithKeys())
+        updateVoiceGate()
         // Engine environment knobs MUST be in place before the runtime is
         // created: SOFUU_NO_ML gates module registration inside the
         // library, so setting it afterwards silently does nothing.
@@ -1044,6 +1047,7 @@ final class AppStore: ObservableObject {
     func patchConfig(_ patch: JSONObject) {
         let merged = configs.updateConfig(patch)
         state.config = configs.redacted(merged)
+        updateVoiceGate()
         // Re-apply model-specific settings the UI can change live.
         refreshModelCache()
     }
@@ -1056,10 +1060,12 @@ final class AppStore: ObservableObject {
             configs.clearKey(provider)
             let merged = configs.readConfig()
             state.config = configs.redacted(merged)
+            updateVoiceGate()
         } else {
             configs.setKey(provider, key)
             let merged = configs.readConfig()
             state.config = configs.redacted(merged)
+            updateVoiceGate()
         }
         refreshModelCache()
     }
@@ -1069,6 +1075,7 @@ final class AppStore: ObservableObject {
         do {
             let merged = try configs.removeProvider(name)
             state.config = configs.redacted(merged)
+            updateVoiceGate()
             state.modelsCache.removeValue(forKey: name)
             refreshModelCache()
             return nil
@@ -1857,10 +1864,195 @@ final class AppStore: ObservableObject {
         if state.preview != nil { state.preview = nil; return true }
         if state.settingsOpen { state.settingsOpen = false; return true }
         if state.shortcutHelpVisible { state.shortcutHelpVisible = false; return true }
+        if state.chatSearchOpen { closeChatSearch(); return true }
         // Dismissing the welcome card also retires the first-run gate —
         // Esc here means "got it".
         if state.onboardingVisible { dismissOnboarding(); return true }
         return false
+    }
+
+    // ── Chat utilities (rename / search / export / voice) ─────────────
+
+    /// Pill/history display title: rename override wins, then the
+    /// engine's task line, then "Chat N" by creation order.
+    func sessionTitle(_ s: SessionInfo, index: Int) -> String {
+        if let n = state.sessionNames[s.id], !n.isEmpty { return n }
+        return s.labelOf(index)
+    }
+
+    /// Display-name override only — the engine's session record (task
+    /// line, mesh id) is intentionally untouched. Empty clears the
+    /// override, back to the engine title.
+    func renameSession(_ id: String, to raw: String) {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var map = uiPrefs.sessionNames
+        if name.isEmpty { map.removeValue(forKey: id) } else { map[id] = name }
+        uiPrefs.sessionNames = map
+        state.sessionNames = map
+    }
+
+    func setChatSearchOpen(_ open: Bool) {
+        state.chatSearchOpen = open
+        if !open { state.chatSearchTarget = nil }
+    }
+
+    func closeChatSearch() { setChatSearchOpen(false) }
+
+    /// Scroll the transcript to a message row. The tick changes with the
+    /// id so re-picking the SAME row still fires ChatScreen's onChange.
+    func jumpToMessage(_ id: String) {
+        state.chatSearchTarget = id
+        state.chatSearchTick += 1
+    }
+
+    /// Write the live transcript to a .md file the user picks. Refuses
+    /// mid-turn — a streaming message's frame churn would produce a
+    /// point-in-time file that contradicts what's on screen.
+    func exportSessionMarkdown() {
+        guard !state.streaming else {
+            systemRow("Stop the running turn before exporting.")
+            return
+        }
+        let messages = state.messages
+        guard !messages.isEmpty else { return }
+
+        let title = sessionTitle(
+            state.sessions.first { $0.id == state.activeSessionId }
+                ?? SessionInfo(id: "active"),
+            index: state.sessions.firstIndex { $0.id == state.activeSessionId } ?? 0)
+        let md = markdownTranscript(messages: messages, title: title)
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType.plainText]
+        let stamp = Self.exportDate.string(from: Date())
+        let safe = title.map { ch in
+            ch.isLetter || ch.isNumber ? ch : "-"
+        }
+        panel.nameFieldStringValue = "sofuu-\(String(safe).lowercased())-\(stamp).md"
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                try md.write(to: url, atomically: true, encoding: .utf8)
+                systemRow("Chat exported → \(url.path)")
+            } catch {
+                systemRow("Export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static let exportDate: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmm"
+        return f
+    }()
+
+    private func markdownTranscript(messages: [ChatMessage], title: String) -> String {
+        var out = "# \(title)\n\n"
+        out += "- Session: `\(state.activeSessionId ?? "active")`\n"
+        out += "- Exported: \(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .short))\n"
+        if let ws = state.projectDir { out += "- Workspace: \(ws)\n" }
+        if let cfg = state.config, !cfg.model.isEmpty { out += "- Model: \(cfg.model)\n" }
+        out += "\n---\n"
+        for m in messages {
+            switch m.role {
+            case .user:
+                out += "\n## You\n\n\(m.content.isEmpty ? "[image]" : m.content)\n"
+            case .assistant:
+                out += "\n## Sofuu\n"
+                if let think = m.thinking, !think.isEmpty {
+                    out += "\n<details><summary>thinking</summary>\n\n\(think)\n\n</details>\n"
+                }
+                let tools = m.timeline.filter { $0.kind == "tool" }
+                if !tools.isEmpty {
+                    out += "\n"
+                    for e in tools {
+                        let mark = (e.ok == false) ? "✗" : "✓"
+                        out += "- \(mark) `\(e.tool ?? e.title)`"
+                        if let d = e.detail, !d.isEmpty { out += " — \(d)" }
+                        if let ms = e.durationMs, ms > 0 { out += " (\(String(format: "%.1f", Double(ms) / 1000))s)" }
+                        out += "\n"
+                    }
+                }
+                if !m.content.isEmpty { out += "\n\(m.content)\n" }
+                if m.status == "done", let u = m.usage, let line = u.line() {
+                    out += "\n> \(line)\n"
+                }
+                if m.status == "error", let err = m.error {
+                    out += "\n> ⚠️ \(err)\n"
+                }
+            case .system:
+                out += "\n> ℹ️ \(m.content)\n"
+            }
+        }
+        return out
+    }
+
+    // ── Voice input (engine-gated) ─────────────────────────────────────
+
+    /// The full gate shown to the Composer: engine surface (probed once,
+    /// retried whenever the config changes until it answers) AND the
+    /// active provider shape. The engine rejects Local/Anthropic/no-model
+    /// calls itself — this mirror only decides whether the mic first
+    /// appears, so a wrong provider never shows a button that must fail.
+    func voiceAvailable() -> Bool {
+        state.voiceSurfaceOK && voiceEligibleFromConfig()
+    }
+
+    private func voiceEligibleFromConfig() -> Bool {
+        guard let cfg = state.config else { return false }
+        let wanted = cfg.active.isEmpty ? cfg.provider : cfg.active
+        let p = cfg.providers.first { $0.name == wanted }
+            ?? cfg.providers.first { $0.name == cfg.provider }
+        guard let p, !p.endpoint.isEmpty else { return false }
+        if SofuuEngine.isLocal(p.endpoint, p.profile) { return false }
+        if SofuuEngine.isAnthropic(p.endpoint, p.profile) { return false }
+        return !(p.model.isEmpty && cfg.model.isEmpty)
+    }
+
+    /// Re-run whenever the redacted config lands (boot + every patch).
+    /// The surface probe stays a no-op once true; if the engine boots
+    /// voice later than the first config load, later patches heal it.
+    func updateVoiceGate() {
+        guard voiceEligibleFromConfig() else {
+            state.voiceSurfaceOK = false
+            return
+        }
+        guard !state.voiceSurfaceOK else { return }
+        Task { [weak self] in
+            let ok = await self?.engine.voiceSurfaceProbe() ?? false
+            self?.state.voiceSurfaceOK = ok
+        }
+    }
+
+    /// Engine transcription for the composer's mic. `onDone(text, error)`
+    /// — exactly one is non-nil — lands on main.
+    func transcribeVoice(_ audioData: Data,
+                         onDone: @escaping (String?, String?) -> Void) {
+        Task { [weak self] in
+            let b64 = audioData.base64EncodedString()
+            guard let self else {
+                onDone(nil, "Engine went away mid-transcription")
+                return
+            }
+            guard let r = await self.engine.voiceTranscribe(b64) else {
+                self.announceTranscriptionFailure(onDone: onDone)
+                return
+            }
+            if r.optBool("ok") == true {
+                let text = r.optString("text")
+                DispatchQueue.main.async {
+                    onDone(text.nilIfEmpty, text.nilIfEmpty == nil ? "Empty transcript" : nil)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    onDone(nil, r.optString("error").nilIfEmpty ?? "Transcription failed")
+                }
+            }
+        }
+    }
+
+    private func announceTranscriptionFailure(onDone: @escaping (String?, String?) -> Void) {
+        DispatchQueue.main.async { onDone(nil, "Transcription failed") }
     }
 
     func resolvedDark(_ systemDark: Bool) -> Bool {

@@ -309,7 +309,12 @@ struct IdeLayout: View {
                             chatFontSize: store.state.chatFontSize,
                             preview: store.state.preview,
                             streamFrame: store.state.streamFrame,
-                            liveThink: store.state.liveThink)
+                            liveThink: store.state.liveThink,
+                            jumpTarget: store.state.chatSearchTarget,
+                            jumpTick: store.state.chatSearchTick,
+                            canActMessages: true,
+                            onEditMessage: { store.receiveSharedText($0) },
+                            onResendMessage: { store.submit($0) })
                     }
                 }
 
@@ -325,6 +330,14 @@ struct IdeLayout: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .top) {
+                // Chat search — same bar as chat mode, over the agent
+                // panel's transcript.
+                if store.state.chatSearchOpen {
+                    ChatSearchBar(store: store)
+                        .padding(.top, 8)
+                }
+            }
             .animation(.easeOut(duration: 0.18), value: store.state.approvals.count)
 
             if store.state.preview == nil {
@@ -347,7 +360,9 @@ struct IdeLayout: View {
                     onAddImages: { store.addPickedImages($0) },
                     onSheet: { store.openSheet($0.rawValue) },
                     pendingDraft: store.state.composerDraft,
-                    onConsumeDraft: { store.consumeComposerDraft() })
+                    onConsumeDraft: { store.consumeComposerDraft() },
+                    voiceAvailable: store.voiceAvailable(),
+                    onVoice: { data, done in store.transcribeVoice(data, onDone: done) })
             }
         }
         .background(c.bgApp.ignoresSafeArea())

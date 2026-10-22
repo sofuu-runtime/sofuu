@@ -1104,6 +1104,7 @@ impl InferEngine {
                 // Sample prediction for root token (item 0 in batch)
                 logits_buf.copy_from_slice(&spec_logits_buf[0..vocab_size]);
                 let root_predicted = sampler.sample(&mut logits_buf, &history);
+                decode_step_probe(&logits_buf, "gen_root", cur_pos, root_predicted);
 
                 // Greedily traverse the tree along matching branches. The walk
                 // asks for the head's prediction at every node it visits, so on
@@ -1144,7 +1145,9 @@ impl InferEngine {
                             self.model
                                 .forward_speculative_head_item(batch_idx, &mut spec_logits_buf);
                         }
-                        sampler.sample(&mut spec_logits_buf[0..vocab_size], &history)
+                        let node_tok = sampler.sample(&mut spec_logits_buf[0..vocab_size], &history);
+                        decode_step_probe(&spec_logits_buf, "gen_node", cur_pos, node_tok);
+                        node_tok
                     },
                 );
 
@@ -1270,6 +1273,7 @@ impl InferEngine {
                 logits_buf.copy_from_slice(next_logits);
                 cur_pos += 1;
                 cur_token = sampler.sample(&mut logits_buf, &history);
+                decode_step_probe(&logits_buf, "gen_serial", cur_pos, cur_token);
                 serial_ns += t_serial.elapsed().as_nanos() as u64;
                 serial_tokens += 1;
             }
@@ -1310,6 +1314,25 @@ impl InferEngine {
 /// costs ~12% (Qwen3-0.6B measured 27.0 t/s with the tree vs 23.7 serial), and
 /// step-cost estimates carry a few percent of run-to-run noise because they are
 /// sampled from a handful of steps.
+/// Decode-step alignment probe (SOFUU_DECODE_PROBE=<path>): appends one line
+/// per sampled step — tag, position, sampled token, top-8 (value,id) — from
+/// the generator's sampling points, so a CPU run and a GPU-route run produce
+/// step-aligned sequences whose first mismatching token pins the fork step.
+/// Env-gated; zero cost unset.
+fn decode_step_probe(logits: &[f32], tag: &str, pos: usize, sampled: u32) {
+    if let Some(p) = std::env::var_os("SOFUU_DECODE_PROBE") {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        let top8: Vec<String> = idx.iter().take(8)
+            .map(|i| format!("({:.4e},{})", logits[*i], i))
+            .collect();
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = writeln!(f, "{tag} pos={pos} tok={sampled} {}", top8.join(" "));
+        }
+    }
+}
+
 fn spec_is_losing(spec_ns: u64, spec_tokens: u32, serial_ns: u64, serial_tokens: u32) -> bool {
     if spec_ns == 0 || serial_ns == 0 || spec_tokens < 8 || serial_tokens < 4 {
         return false;

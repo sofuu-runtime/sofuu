@@ -610,3 +610,35 @@ REVISED BOOKING (supersedes "Metal q8_Kx4 MMQ gemm" for the prefill side):
   unaffected; if the developer wants default-CPU vs default-GPU text
   equality, the 8x4-tile MSL mirror (q8_K per-256 + mmla order) is the
   booked kernel program.
+
+## DECODE-SIDE PIN (2026-10-23 — gen-point probe; the fork class is composite, not one op)
+Instrument: SOFUU_DECODE_PROBE=<path> — per sampled step (gen_root/gen_node/
+gen_serial) {pos, sampled tok, top-8} appended from the generator's sampling
+points (mod.rs), step-ALIGNED across routes by row order. 0.6B Paris/32:
+1. Default CPU (tiles) vs GPU route: matched-step top1 |Δ| 0.23 by pos 8 —
+   the 1.8e-2 tiles prefill class compounding; first token fork pos=9.
+2. EXACT pair (SOFUU_NO_TILES=1 CPU + GPU gemm route): matched-step |Δtop1|
+   3.1e-2 by pos 8; first fork STILL pos=9 — a 0.003-gap near-tie
+   (CPU 18.710/18.682, GPU 18.757/18.649).
+3. KV dump at max-tokens 8, exact pair: decode-written positions
+   (6..12) BYTE-IDENTICAL across routes — the decode KV write path carries
+   NO extra class. Prefill positions 0..5 differ (pair-structured ~half the
+   f32, worst 0.4 on |K|~100-300 = ~1e-3 relative, growing L0→L27).
+4. Stage ground truth at the exact pair (L0 tail chunk): s1.xn 2.4e-7,
+   s2.ka 7.2e-7, s3.kc (post k-norm+rope) 1.8e-4 ABS on |K|~100-300 =
+   ~1e-6 relative — every prefill op is at the 1e-6 f32 class; the ~1e-3
+   relative at L27-K = compounding of MANY 1e-6 seeds (NEON 4-lane f32
+   order vs GPU order per gemm; Metal SFU exp vs libm expf per swiglu).
+
+Verdict: there is NO single decode op to fix — the decode chain writes
+bit-identical KV; the residual is the floating-point noise floor of two
+different-but-valid op implementations compounding through the depth.
+Bit-exact route text would require whole-fleet order-exact ops INCLUDING
+a libm-identical MSL exp (booked only if the developer wants the
+endgame). The shipping bar is therefore the LOGITS-TOLERANCE GATE: a
+full-text gate passes when sampled tokens are identical OR every
+diverging step is certified near-tie (top1−top2 gap < the measured
+composite bound, ~5e-2 absolute at 0.6B/Paris scale; recorded per step by
+SOFUU_DECODE_PROBE). The default-vs-default gate additionally needs the
+1.8e-2 tiles class removed on one side (the 8x4-tile mirror program) —
+otherwise default CPU text can never equal GPU text on q4_K models.

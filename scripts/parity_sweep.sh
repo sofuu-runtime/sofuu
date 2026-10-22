@@ -13,7 +13,7 @@ MODELS=(~/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf
 BIGP=$(python3 -c "print('Harbor wakes under a grey sky while fishermen mend nets and the first ferry pulls away from the quay trailing foam past warehouses that once stored spices silk and salt for a vanished trade. '*6)")
 for M in "${MODELS[@]}"; do
   N=$(basename "$M" .gguf)
-  L=$(llama-bench -m "$M" -t 10 -p 210 -n 82 -r 3 2>/dev/null | grep -oE "\| +[0-9.]+ . [0-9.]+ \|$" | tr -d ' |' | sed 's/-/ /')
+  L=$(llama-bench -m "$M" -t 10 -p 210 -n 82 -r 3 2>/dev/null | grep -oE "\| +[0-9.]+(.[0-9.]+)? . [0-9.]+(.[0-9.]+)? \|$" | tr -d ' |' | sed 's/-/ /;s/\xc2\xb1[^0-9]*[0-9.]*//g')
   LLPP=$(python3 -c "import sys; xs=sys.stdin.read().split(); print(xs[0] if xs else 0)" <<< "$L")
   LLTG=$(python3 -c "import sys; xs=sys.stdin.read().split(); print(xs[1] if len(xs)>1 else 0)" <<< "$L")
   BS=$(env SOFUU_GPU_DECODE=1 ./target/release/sofuu infer "$M" "Write three sentences about Paris." --max-tokens 82 --temp 0 2>&1 | grep "prefill:" | sed 's/\x1b\[[0-9;]*m//g' | tail -1)

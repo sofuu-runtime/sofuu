@@ -435,10 +435,11 @@ void sofuu_metal_buffer_free(void* buf_ptr) {
  * were results — silent wrong answers instead of a loud failure. (Measured:
  * a bf16 kernel on the iOS simulator fails this way with
  * MTLCommandBufferErrorInternal, while f16/f32 kernels complete.) */
-static inline void wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel) {
+static inline bool wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel) {
     [cmd waitUntilCompleted];
     if (cmd.status == MTLCommandBufferStatusError) {
         NSLog(@"Sofuu Metal: %s command buffer failed: %@", kernel, cmd.error);
+        return false;
     }
     // SOFUU_GPU_TIMING=1: device-side execution time of every command
     // buffer (GPUStartTime/GPUEndTime) — the GPU-busy vs CPU-wall split
@@ -449,6 +450,7 @@ static inline void wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel)
         fprintf(stderr, "SOFUU_CMD_TIMING kernel=%s gpu_us=%.0f\n",
                 kernel, (cmd.GPUEndTime - cmd.GPUStartTime) * 1e6);
     }
+    return true;
 }
 
 static inline void ensure_buffers(MetalContext* ctx, size_t x_bytes, size_t y_bytes) {
@@ -2475,10 +2477,10 @@ void sofuu_metal_batch_gemv(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
-void sofuu_metal_batch_end(void* ctx_ptr) {
-    if (!ctx_ptr) return;
+int sofuu_metal_batch_end(void* ctx_ptr) {
+    if (!ctx_ptr) return 1;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->batch_enc == nil) { sofuu_metal_sync(ctx_ptr); return; }
+    if (ctx->batch_enc == nil) { sofuu_metal_sync(ctx_ptr); return 1; }
     @autoreleasepool {
         [ctx->batch_enc endEncoding];
         CFRelease((__bridge CFTypeRef)ctx->batch_enc);
@@ -2486,9 +2488,14 @@ void sofuu_metal_batch_end(void* ctx_ptr) {
         id<MTLCommandBuffer> cmd = ctx->pending_cmd;
         if (cmd != nil) {
             [cmd commit];
-            wait_and_report(cmd, "batch gemv");
+            bool ok = wait_and_report(cmd, "batch gemv");
             ctx->pending_cmd = nil;
             CFRelease((__bridge CFTypeRef)cmd);
+            // 0 = the GPU rejected the buffer: outputs are untouched — the
+            // caller MUST treat this pass as not-happened and fall back
+            // (reading the slab after a failed buffer is how garbage
+            // KV/logits reached the CPU repack on the 1B under load).
+            return ok ? 1 : 0;
         }
         // paired with the startCapture in batch_open: a captured cycle ends
         // exactly at its batch_end so the trace holds whole passes
@@ -2499,6 +2506,7 @@ void sofuu_metal_batch_end(void* ctx_ptr) {
                     g_cap_cycles - 1);
         }
     }
+    return 1;
 }
 
 #else
@@ -2507,7 +2515,7 @@ void sofuu_metal_batch_end(void* ctx_ptr) {
 bool sofuu_metal_available(void) { return false; }
 int sofuu_metal_batch_open(void* ctx) { (void)ctx; return -1; }
 void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)d; }
-void sofuu_metal_batch_end(void* ctx) { (void)ctx; }
+int sofuu_metal_batch_end(void* ctx) { (void)ctx; return 0; }
 void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 void sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; }

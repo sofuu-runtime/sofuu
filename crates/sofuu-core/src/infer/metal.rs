@@ -585,7 +585,7 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, dtype: i32,
     );
-    fn sofuu_metal_batch_end(ctx: *mut c_void);
+    fn sofuu_metal_batch_end(ctx: *mut c_void) -> i32;
     fn sofuu_metal_batch_mlx4(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -876,9 +876,13 @@ impl MetalEngine {
         }
     }
 
-    /// End the batch: end encoding, commit once, wait.
-    pub fn batch_end(&self) {
-        unsafe { sofuu_metal_batch_end(self.ctx) }
+    /// End the batch: end encoding, commit once, wait. Returns false when
+    /// the GPU rejected the command buffer — outputs are then untouched and
+    /// the caller MUST treat the whole pass as not-happened (fall back to
+    /// the CPU route; reading the slab after a failed buffer is how garbage
+    /// KV/logits reached the CPU repack under load).
+    pub fn batch_end(&self) -> bool {
+        unsafe { sofuu_metal_batch_end(self.ctx) != 0 }
     }
 
     /// Batched mlx4 GEMV op (binds mirror the per-op kernel exactly).

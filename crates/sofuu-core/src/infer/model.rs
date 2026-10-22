@@ -1410,7 +1410,9 @@ impl TransformerModel {
             &g.act_buf, g.slots.logits,
             vocab_size, dim,
         );
-        g.engine.batch_end();
+        if !g.engine.batch_end() {
+            return false;
+        }
         out_logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
         self.logits[0..vocab_size].copy_from_slice(&out_logits[0..vocab_size]);
         true
@@ -1866,8 +1868,11 @@ impl TransformerModel {
             && !self.dynamic_ffn.enabled
             && self.kivi.is_none()
         {
-            self.execute_layers_gpu(pos, start_layer, end_layer);
-            return;
+            if self.execute_layers_gpu(pos, start_layer, end_layer) {
+                return;
+            }
+            // the GPU rejected the batch command buffer (outputs untouched —
+            // no KV written): fall through and run the layers on the CPU
         }
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
@@ -2182,7 +2187,7 @@ impl TransformerModel {
 
     /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn ggpu_head(&mut self) {
+    fn ggpu_head(&mut self) -> bool {
         if let Some(g) = self.gpu.as_mut() {
             let dim = self.config.dim;
             let vocab = self.config.vocab_size;
@@ -2198,29 +2203,37 @@ impl TransformerModel {
                 &g.act_buf, g.slots.logits,
                 vocab, dim,
             );
-            g.engine.batch_end();
+            if !g.engine.batch_end() {
+                return false;
+            }
             let src = g.slot_f32(g.slots.logits, vocab);
             self.logits.copy_from_slice(src);
         }
+        true
     }
 
     /// GPU2 decode path: same CPU glue (norms, QK-norms, RoPE, KV, attention,
     /// residuals) with the seven per-layer GEMVs batched into three commits.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn execute_layers_gpu(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+    fn execute_layers_gpu(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let end = end_layer.min(self.config.n_layers);
         // Wrap-around (context past max_seq_len) stays on the 3-commit path,
         // whose KV writes match the CPU modulo arithmetic.
         if self.gpu.as_ref().map(|g| g.one_commit).unwrap_or(false) && pos < self.config.max_seq_len {
-            self.layers_one_commit(pos, start_layer, end);
-            return;
+            if !self.layers_one_commit(pos, start_layer, end) {
+                return false;
+            }
+            return true;
         }
         let windows: Vec<usize> = (0..self.config.n_layers)
             .map(|i| self.layer_sliding_window(i))
             .collect();
         for layer_idx in start_layer..end {
-            self.gpu_layer_step(layer_idx, pos, windows[layer_idx]);
+            if !self.gpu_layer_step(layer_idx, pos, windows[layer_idx]) {
+                return false;
+            }
         }
+        true
     }
 
     /// GPU2.1 decode step: ALL layers across ONE commit each. Norms run as
@@ -2230,7 +2243,7 @@ impl TransformerModel {
     /// the CPU) are all command-buffer-resident between layers; x syncs back
     /// to Vec once per token.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+    fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
@@ -2382,8 +2395,8 @@ impl TransformerModel {
                 dim, hidden_dim);
             g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim);
             }
-            if !token_commit {
-                g.engine.batch_end();
+            if !token_commit && !g.engine.batch_end() {
+                return false;
             }
         }
         let host_us = t_start.elapsed().as_micros() as u64;
@@ -2405,7 +2418,9 @@ impl TransformerModel {
                 &g.act_buf, g.slots.logits,
                 self.config.vocab_size, dim,
             );
-            g.engine.batch_end();
+            if !g.engine.batch_end() {
+                return false;
+            }
             self.logits[..self.config.vocab_size]
                 .copy_from_slice(g.slot_f32(g.slots.logits, self.config.vocab_size));
         }
@@ -2423,6 +2438,7 @@ impl TransformerModel {
             );
         }
         self.x[..dim].copy_from_slice(g.slot_f32(g.slots.x, dim));
+        true
     }
 
     /// GPU spec pass eligibility, for the generate loop's draft shaping.
@@ -2918,7 +2934,9 @@ impl TransformerModel {
                 vocab_size, dim,
             );
         }
-        g.engine.batch_end();
+        if !g.engine.batch_end() {
+            return false;
+        }
         let commit_us = pass_t.elapsed().as_micros() as u64;
         if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
             g.engine.print_op_timing("spec-pass");
@@ -3324,7 +3342,12 @@ impl TransformerModel {
                 vocab_size, dim,
             );
         }
-        g.engine.batch_end();
+        // A rejected command buffer leaves outputs untouched: treat the
+        // pass as not-happened so the caller falls back to the CPU route
+        // instead of reading stale slab values as results.
+        if !g.engine.batch_end() {
+            return false;
+        }
         if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
             g.engine.print_op_timing("prefill-gemm");
         }
@@ -3415,7 +3438,7 @@ impl TransformerModel {
     /// Kept as the fallback for shapes the one-commit kernels don't cover
     /// (sliding windows, biases, past-4096 wraparound).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn gpu_layer_step(&mut self, layer_idx: usize, pos: usize, sliding_window: usize) {
+    fn gpu_layer_step(&mut self, layer_idx: usize, pos: usize, sliding_window: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
@@ -3427,7 +3450,7 @@ impl TransformerModel {
         let gguf = &self.gguf;
         let g = match self.gpu.as_mut() {
             Some(g) => g,
-            None => return,
+            None => return true,
         };
 
         let layer = &self.layers[layer_idx];
@@ -3458,7 +3481,9 @@ impl TransformerModel {
                 rows, dim,
             );
         }
-        g.engine.batch_end();
+        if !g.engine.batch_end() {
+            return false;
+        }
 
         self.q.copy_from_slice(g.slot_f32(g.slots.qa, q_rows));
         self.k.copy_from_slice(g.slot_f32(g.slots.ka, kv_rows));
@@ -3553,7 +3578,9 @@ impl TransformerModel {
             &g.act_buf, g.slots.xo,
             dim, q_rows,
         );
-        g.engine.batch_end();
+        if !g.engine.batch_end() {
+            return false;
+        }
         self.attn_out.copy_from_slice(g.slot_f32(g.slots.xo, dim));
         inline_mad(&mut self.x, &self.attn_out, 1.0);
 
@@ -3590,9 +3617,12 @@ impl TransformerModel {
             &g.act_buf, g.slots.xo,
             dim, hidden_dim,
         );
-        g.engine.batch_end();
+        if !g.engine.batch_end() {
+            return false;
+        }
         self.ffn_out.copy_from_slice(g.slot_f32(g.slots.xo, dim));
         inline_mad(&mut self.x, &self.ffn_out, 1.0);
+        true
     }
     fn forward_impl(&mut self, token_id: u32, pos: usize, compute_logits: bool) {
         let dim = self.config.dim;
@@ -3646,7 +3676,20 @@ impl TransformerModel {
             // GPU2: lm_head GEMV as one Metal batch when eligible.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if self.ggpu_head_active() {
-                self.ggpu_head();
+                if self.ggpu_head() {
+                    return;
+                }
+                // head batch rejected: self.x is already output-normed —
+                // finish with the CPU matvec only (re-norming would be wrong)
+                let out_bytes = Self::tensor_slice(&self.gguf, &self.output);
+                matvec(
+                    out_bytes,
+                    self.output.tensor_type,
+                    self.config.vocab_size,
+                    dim,
+                    &self.x,
+                    &mut self.logits,
+                );
                 return;
             }
 

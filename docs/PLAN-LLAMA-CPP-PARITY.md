@@ -329,3 +329,66 @@ default until receipts justify the per-model flip.
   tk/s**; MiniCPM route c128 types=all **70.4 tk/s** (first real prefill
   GEMM on the q6/q8 mix). Battery default (route off) untouched: 1B
   CPU-tiles prefill 161 t/s at the same load, exit=0, IOGPU=0.
+
+# PROGRESS LEDGER #4 — PHASE 4 deciding sweep (2026-10-22, calm 1.1-2.3)
+
+**DECIDING RESULT: the GPU prefill GEMM route loses to the CPU tiles on
+every model. Flip table = ALL OFF (status quo stands).** The route was a
+dispatch-count fix, not a rate fix:
+
+| model | bar pp | CPU tiles | route c128 | route/CPU |
+|---|---|---|---|---|
+| 0.6B i1-Q4 | 3396 | **583.3** | 33.2 | 0.057x |
+| 1B Q8_0 | 2055 | **380.7** | 128.5 | 0.34x |
+| Spark-4B Q4 | 461 | **68.2** | 74.3 | 1.09x |
+| MiniCPM5-2B Q6 | 865 | **109.6** | 11.5 (types-off) | 0.11x |
+| 8B Q4_K_M | 264 | **46.9** | 2.4 | 0.05x |
+
+(route rows at the sweep default env; 1B c128 ran CLEAN at calm — the
+under-load crashes are contention-gated, see below.)
+
+## Flip decisions (Phase 4)
+- **SOFUU_GPU_PREFILL_GEMM: OFF default everywhere (keep).** No model's
+  route beats CPU tiles except Spark at +9% — immaterial vs its 6.8x gap
+  to the bar, and the route carries the load-gated command-buffer risk.
+- **SOFUU_GEMM_TYPES: OFF default (keep)** until the torn-buffer contract
+  below ships and calm receipts exist.
+- **SOFUU_GEMM_TILE=32: opt-in (keep)** — bitwise-fine, not rate-winning.
+- **Decode side (c2/coalesced/b4multi): NOT flipped today** — the sweep's
+  default-env decode rows (35.7/56.3/31.2/9.9/3.3) are far from the bars
+  AND below the pinned-env receipts (0.6B 73.6 was SOFUU_Q4K_COALESCED=2);
+  the deciding A/B (pinned vs default, calm, per model) is Phase-4's next
+  data point before any default flips.
+- **tg-parity verdict stands:** nothing passes its tg bar yet; prefill
+  parity needs the GPU to beat CPU tiles BEFORE the bars matter.
+
+## The real Phase-5-grade program (what parity actually requires)
+Prefill parity = GPU must first BEAT the CPU tiles (583/381/68/110/47),
+then close to the bars — ~6x over today's route class. The two
+bit-exact kernel generations (tile-8, tile-32) are serial-lane-loop
+bound (0.4-8 GB/s; Mac DRAM band is far higher); the required
+architecture is the simdgroup-matrix GEMM (threadgroup-tiled weights,
+int8 SIMD dots, register tiles). Booked as the kernel program with both
+generations' rate receipts.
+
+## Defect class REFRAMED + contract shipped
+Under load 5-11 the 1B's route runs hit stochastic IOGPU Code=14
+command-buffer failures (torn: partial writes, later ops killed). At calm
+the SAME configs run clean and fast (1B c128-326 = 117.8 tk/s, no assert).
+The failures are NOT 1B-shape-specific (the 0.6B showed single IOGPU
+events too). **Contract shipped: batch_end now returns the completion
+status (C ABI int; header + FFI decls updated) and every production route
+propagates it — prefill GEMM core falls back to the CPU tiles for the
+whole prompt, execute_layers/layers_one_commit/gpu_layer_step/ggpu_head
+report false, execute_layers falls through to the CPU layer loop, and the
+head falls back to the CPU matvec (self.x is already normed there — no
+re-norm). The silent-garbage path is closed; what remains booked is the
+decode-chain void refactor (decode-side GPU fns still take the fallback
+implicitly) and pinning WHY Apple's queue restarts under contention.
+
+## Open items carried
+1. simdgroup-matrix GEMM program (above) — the only path to pp parity.
+2. Decode-side deciding A/B (pinned SOFUU_Q4K_COALESCED vs default) → decode flips.
+3. Decode-chain batch-failure refactor (void fns → fallback contract).
+4. IOGPU restart root-cause under peer load (Metal heap/timeout?).
+5. top-2-gap logits probe (near-tie certification).

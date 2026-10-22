@@ -66,4 +66,5 @@ object Icons2 {
     val Mic = Icons.Outlined.Mic
     val Volume = Icons.Outlined.VolumeUp
     val KeyboardArrowUp = Icons.Outlined.KeyboardArrowUp
+    val Copy = Icons.Outlined.ContentCopy
 }

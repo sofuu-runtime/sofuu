@@ -7,6 +7,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -38,6 +39,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -60,6 +64,9 @@ fun ChatScreen(
     streaming: Boolean,
     chatFontSize: Int,
     preview: SessionPreview?,
+    /** Extra top padding for content that scrolls under the translucent
+     *  top bar gradient — the first message rests just below it. */
+    topInset: androidx.compose.ui.unit.Dp = 12.dp,
     /** Extra bottom padding for content that scrolls under the translucent
      *  composer overlay — when pinned to the bottom, the newest line rests
      *  just above it; scrolled-up text shows through to the screen edge. */
@@ -84,7 +91,7 @@ fun ChatScreen(
     }
 
     if (preview != null) {
-        PreviewPane(preview, chatFontSize)
+        PreviewPane(preview, chatFontSize, topInset, bottomInset)
         return
     }
 
@@ -95,7 +102,7 @@ fun ChatScreen(
                 .fillMaxSize()
                 .padding(horizontal = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 12.dp, bottom = bottomInset),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = topInset, bottom = bottomInset),
         ) {
             // Keys: without them, item identity is positional — every
             // content flush re-attached per-row remember state (expanded
@@ -120,16 +127,20 @@ private fun MessageRow(
     val c = LocalSofuuColors.current
     when (m.role) {
         MsgRole.USER -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-            Text(
-                m.content,
-                fontSize = fontSize.sp,
-                lineHeight = (fontSize + 7).sp,
-                color = c.text,
-                modifier = Modifier
-                    .padding(vertical = 6.dp, horizontal = 4.dp)
-                    .background(c.bgCard, RoundedCornerShape(14.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-            )
+            SelectionContainer {
+                Text(
+                    m.content,
+                    fontSize = fontSize.sp,
+                    lineHeight = (fontSize + 7).sp,
+                    color = c.text,
+                    modifier = Modifier
+                        .padding(vertical = 6.dp, horizontal = 4.dp)
+                        .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp))
+                        .background(c.bgCard)
+                        .border(1.dp, c.border, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                )
+            }
         }
         MsgRole.SYSTEM -> Text(
             m.content,
@@ -198,16 +209,53 @@ private fun MessageRow(
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
-            // Read aloud. Provider-backed, and only offered when the active
-            // provider can actually synthesize — same gate as the mic.
-            if (m.status == "done" && voiceCapable && m.content.isNotBlank()) {
+            // Actions bar: Copy response + Read aloud
+            if (m.status == "done" && m.content.isNotBlank()) {
+                val clipboard = LocalClipboardManager.current
+                var copied by remember { mutableStateOf(false) }
+                LaunchedEffect(copied) {
+                    if (copied) {
+                        kotlinx.coroutines.delay(2000)
+                        copied = false
+                    }
+                }
                 Row(
-                    Modifier.padding(top = 6.dp).clickable { onSpeak(m.content) },
+                    Modifier.padding(top = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Icon(Icons2.Volume, "Read aloud", tint = c.textFaint, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Read aloud", fontSize = 11.sp, color = c.textFaint)
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable {
+                                clipboard.setText(AnnotatedString(m.content))
+                                copied = true
+                            }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            if (copied) Icons2.Check else Icons2.Copy,
+                            "Copy response",
+                            tint = if (copied) c.ok else c.textFaint,
+                            modifier = Modifier.size(15.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (copied) "Copied" else "Copy", fontSize = 12.sp, color = if (copied) c.ok else c.textFaint)
+                    }
+                    if (voiceCapable) {
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .clickable { onSpeak(m.content) }
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons2.Volume, "Read aloud", tint = c.textFaint, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Read aloud", fontSize = 12.sp, color = c.textFaint)
+                        }
+                    }
                 }
             }
         }
@@ -308,7 +356,23 @@ private fun TimelineRow(
     onToggle: (() -> Unit)?,
 ) {
     val c = LocalSofuuColors.current
-    Column(Modifier.fillMaxWidth().clickable(enabled = onToggle != null) { onToggle?.invoke() }.padding(vertical = 3.dp)) {
+    val clipboard = LocalClipboardManager.current
+    var copiedDetail by remember { mutableStateOf(false) }
+
+    LaunchedEffect(copiedDetail) {
+        if (copiedDetail) {
+            kotlinx.coroutines.delay(2000)
+            copiedDetail = false
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(enabled = onToggle != null) { onToggle?.invoke() }
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
                 iconFor(icon),
@@ -317,7 +381,7 @@ private fun TimelineRow(
                     Timeline.ICON_WARN -> c.warn
                     else -> c.textFaint
                 },
-                modifier = Modifier.size(14.dp),
+                modifier = Modifier.size(16.dp),
             )
             Spacer(Modifier.width(8.dp))
             Text(
@@ -339,35 +403,80 @@ private fun TimelineRow(
                 )
             }
             if (onToggle != null && (detail != null || expanded)) {
-                Spacer(Modifier.width(4.dp))
-                Icon(Icons2.ChevronDown, null, tint = c.textFaint, modifier = Modifier.size(14.dp).alpha(if (expanded) 1f else 0.5f))
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    if (expanded) Icons2.KeyboardArrowUp else Icons2.ChevronDown,
+                    null,
+                    tint = c.textFaint,
+                    modifier = Modifier.size(14.dp),
+                )
             }
         }
         if (expanded && detail != null) {
-            Text(
-                detail.take(1500),
-                fontSize = 12.sp,
-                lineHeight = 17.sp,
-                color = c.textFaint,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier
-                    .padding(start = 22.dp, top = 2.dp, bottom = 4.dp)
+            Column(
+                Modifier
+                    .padding(start = 24.dp, top = 4.dp, bottom = 4.dp)
                     .fillMaxWidth()
-                    .background(c.codeBlock, RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.codeBlock)
+                    .border(1.dp, c.border, RoundedCornerShape(8.dp))
                     .padding(8.dp),
-            )
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .clickable {
+                                clipboard.setText(AnnotatedString(detail))
+                                copiedDetail = true
+                            }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            if (copiedDetail) Icons2.Check else Icons2.Copy,
+                            "Copy detail",
+                            tint = if (copiedDetail) c.ok else c.textFaint,
+                            modifier = Modifier.size(12.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            if (copiedDetail) "Copied" else "Copy",
+                            fontSize = 11.sp,
+                            color = if (copiedDetail) c.ok else c.textFaint,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
+                Text(
+                    detail.take(1500),
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    color = c.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
         }
     }
 }
 
 /** Read-only transcript of a past session. */
 @Composable
-private fun PreviewPane(preview: SessionPreview, fontSize: Int) {
+private fun PreviewPane(
+    preview: SessionPreview,
+    fontSize: Int,
+    topInset: androidx.compose.ui.unit.Dp = 12.dp,
+    bottomInset: androidx.compose.ui.unit.Dp = 16.dp,
+) {
     val c = LocalSofuuColors.current
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 12.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 12.dp, bottom = 16.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(top = topInset, bottom = bottomInset),
     ) {
         item {
             Text(

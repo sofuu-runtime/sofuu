@@ -1,6 +1,7 @@
 package com.sofuu.ui.composer
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -33,8 +34,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,6 +76,7 @@ fun Composer(
     onRemoveImage: (Int) -> Unit,
     onMentionsConsumed: () -> Unit,
     onSheet: (ComposerSheet) -> Unit,
+    onTextFieldHeightChanged: (Int) -> Unit = {},
 ) {
     val c = LocalSofuuColors.current
     var text by remember { mutableStateOf("") }
@@ -154,10 +158,33 @@ fun Composer(
         Box(
             Modifier
                 .fillMaxWidth()
-                .background(c.bgCard, RoundedCornerShape(16.dp))
-                .padding(12.dp),
+                .clip(RoundedCornerShape(16.dp))
+                .background(c.bgCard)
+                .border(1.dp, c.border, RoundedCornerShape(16.dp))
+                .padding(12.dp)
+                .onSizeChanged { onTextFieldHeightChanged(it.height) },
         ) {
             Column {
+                if (dictating) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.accent.copy(alpha = 0.12f))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons2.Mic, null, tint = c.accent, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "Listening… speak now or tap Stop",
+                            color = c.accent,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                }
                 BasicTextField(
                     value = text,
                     onValueChange = {
@@ -290,7 +317,8 @@ private fun Pill(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(c.bgCardHover)
+            .background(c.bgCardHover.copy(alpha = 0.85f))
+            .border(0.5.dp, c.border.copy(alpha = 0.70f), RoundedCornerShape(999.dp))
             .clickable { onClick() }
             .heightIn(min = 40.dp)
             .padding(horizontal = 12.dp, vertical = 8.dp),
@@ -302,6 +330,7 @@ private fun Pill(
         Text(
             label,
             fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
             color = c.text,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -366,7 +395,9 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
             .fillMaxWidth()
             .heightIn(max = 220.dp)
             .padding(top = 8.dp)
-            .background(c.bgRaised, RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(10.dp))
+            .background(c.bgRaised)
+            .border(1.dp, c.border, RoundedCornerShape(10.dp))
             .padding(vertical = 4.dp),
     ) {
         LazyColumn(Modifier.heightIn(max = 190.dp)) {
@@ -375,16 +406,20 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
                 Row(
                     Modifier
                         .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
                         .clickable { onPick(cmd) }
                         .background(if (active) c.bgCardHover else androidx.compose.ui.graphics.Color.Transparent)
-                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                        .heightIn(min = 40.dp)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                    Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
                     if (cmd.arg != null) {
+                        Spacer(Modifier.width(4.dp))
                         Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
                     }
                     Spacer(Modifier.width(8.dp))
-                    Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1)
+                    Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }

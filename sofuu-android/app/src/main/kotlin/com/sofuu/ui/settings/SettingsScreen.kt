@@ -3,54 +3,65 @@ package com.sofuu.ui.settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
-import androidx.compose.material3.Switch
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.util.concurrent.TimeUnit
 import com.sofuu.store.AppStore
+import com.sofuu.ui.CloudBackground
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.theme.LocalSofuuColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import androidx.compose.runtime.rememberCoroutineScope
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 private val TABS = listOf("general", "appearance", "models", "providers", "agents", "brain", "usage")
 
@@ -59,47 +70,137 @@ private val TABS = listOf("general", "appearance", "models", "providers", "agent
 @Composable
 fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
     val c = LocalSofuuColors.current
+    val density = LocalDensity.current
     var tab by remember { mutableStateOf(store.state.settingsTab) }
     // External tab requests (ModelSheet → "＋ Add provider", composer rows)
     // fire while Settings is already composed — a remember-once initial
     // value would silently ignore them. Local tab taps never write the
     // store, so this only fires on external change.
     LaunchedEffect(store.state.settingsTab) { tab = store.state.settingsTab }
-    Box(Modifier.fillMaxSize().background(c.bgApp).statusBarsPadding()) {
-        Column(Modifier.fillMaxSize()) {
-            // Header + tab bar.
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Settings", style = MaterialTheme.typography.titleLarge, color = c.text, modifier = Modifier.weight(1f))
-                Icon(Icons2.Close, "Close", tint = c.textMuted, modifier = Modifier.size(36.dp).clickable { onClose() }.padding(8.dp))
+
+    val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    var headerPx by remember { mutableStateOf(0) }
+    val headerHeight = with(density) { headerPx.toDp() }
+    val effectiveTopBand = statusTop + if (headerPx > 0) headerHeight else 88.dp
+
+    Box(Modifier.fillMaxSize().background(c.bgApp)) {
+        if (store.state.cloudBg) CloudBackground()
+
+        // ── Settings Content: starts close to buttons and scrolls UNDER top band ──
+        Column(
+            Modifier
+                .fillMaxSize()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(
+                    top = effectiveTopBand + 2.dp,
+                    start = 16.dp,
+                    end = 16.dp,
+                    bottom = 28.dp,
+                ),
+        ) {
+            when (tab) {
+                "general" -> GeneralPane(store)
+                "appearance" -> AppearancePane(store)
+                "models" -> ModelsPane(store)
+                "providers" -> ProvidersPane(store)
+                "agents" -> AgentsPane(store)
+                "brain" -> BrainPane(store)
+                "usage" -> UsagePane(store)
             }
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TABS.forEach { t ->
-                    val active = t == tab
+        }
+
+        // ── Top Transparency Band (Only top area for settings) ─────
+        // Pinned to screen top: fades from opaque background (status bar)
+        // down to fully transparent (alpha = 0f) at the bottom edge of
+        // the category tabs.
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(effectiveTopBand)
+                .align(Alignment.TopCenter)
+                .background(
+                    Brush.verticalGradient(
+                        0f to c.bgApp,
+                        0.55f to c.bgApp.copy(alpha = 0.70f),
+                        1f to c.bgApp.copy(alpha = 0f),
+                    ),
+                ),
+        )
+
+        // ── Header Controls: Title + Close + Category Pills ────────
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .statusBarsPadding(),
+        ) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { headerPx = it.height },
+            ) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(
-                        t.replaceFirstChar { it.uppercase() },
-                        fontSize = 13.sp,
-                        color = if (active) c.accentContrast else c.textMuted,
+                        "Settings",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = c.text,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        Icons2.Close,
+                        "Close",
+                        tint = c.textMuted,
                         modifier = Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(if (active) c.accent else c.bgCard)
-                            .clickable { tab = t }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .clickable { onClose() }
+                            .padding(8.dp),
                     )
                 }
-            }
-            Spacer(Modifier.height(8.dp))
-            Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-                when (tab) {
-                    "general" -> GeneralPane(store)
-                    "appearance" -> AppearancePane(store)
-                    "models" -> ModelsPane(store)
-                    "providers" -> ProvidersPane(store)
-                    "agents" -> AgentsPane(store)
-                    "brain" -> BrainPane(store)
-                    "usage" -> UsagePane(store)
+                Box(Modifier.padding(bottom = 6.dp)) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TABS.forEach { t ->
+                            val active = t == tab
+                            Text(
+                                t.replaceFirstChar { it.uppercase() },
+                                fontSize = 13.5.sp,
+                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                                color = if (active) c.accentContrast else c.textMuted,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(if (active) c.accent else c.bgCard.copy(alpha = 0.85f))
+                                    .border(
+                                        0.5.dp,
+                                        if (active) c.accent else c.border.copy(alpha = 0.70f),
+                                        RoundedCornerShape(999.dp),
+                                    )
+                                    .clickable { tab = t }
+                                    .padding(horizontal = 15.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
+                    Box(
+                        Modifier
+                            .align(Alignment.CenterEnd)
+                            .width(28.dp)
+                            .height(38.dp)
+                            .background(
+                                Brush.horizontalGradient(listOf(Color.Transparent, c.bgApp.copy(alpha = 0.8f), c.bgApp)),
+                            ),
+                    )
                 }
             }
         }
@@ -107,16 +208,56 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
 }
 
 @Composable
-private fun Section(label: String) {
-    Text(label, fontSize = 12.sp, color = LocalSofuuColors.current.textFaint, modifier = Modifier.padding(top = 22.dp, bottom = 6.dp))
+private fun SettingsCard(
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val c = LocalSofuuColors.current
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(c.bgCard)
+            .border(1.dp, c.border, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        content = content,
+    )
+}
+
+@Composable
+private fun CardDivider(modifier: Modifier = Modifier) {
+    val c = LocalSofuuColors.current
+    Box(
+        modifier
+            .fillMaxWidth()
+            .padding(vertical = 10.dp)
+            .height(0.8.dp)
+            .background(c.border.copy(alpha = 0.6f)),
+    )
+}
+
+@Composable
+private fun Section(label: String, isFirst: Boolean = false) {
+    Text(
+        label.uppercase(),
+        fontSize = 11.5.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.8.sp,
+        color = LocalSofuuColors.current.textFaint,
+        modifier = Modifier.padding(top = if (isFirst) 4.dp else 18.dp, bottom = 6.dp, start = 2.dp),
+    )
 }
 
 @Composable
 private fun Row_(label: String, desc: String?, content: @Composable () -> Unit) {
     val c = LocalSofuuColors.current
-    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Text(label, fontSize = 14.sp, color = c.text)
-        if (desc != null) Text(desc, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp))
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+        if (desc != null) {
+            Text(desc, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp, bottom = 8.dp))
+        } else {
+            Spacer(Modifier.height(6.dp))
+        }
         content()
     }
 }
@@ -124,19 +265,37 @@ private fun Row_(label: String, desc: String?, content: @Composable () -> Unit) 
 @Composable
 private fun Segmented(options: List<String>, selected: String, onSelect: (String) -> Unit) {
     val c = LocalSofuuColors.current
-    Row(Modifier.clip(RoundedCornerShape(8.dp)).background(c.bgCard).padding(3.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(c.monoFieldBg)
+            .border(1.dp, c.border, RoundedCornerShape(10.dp))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         options.forEach { o ->
             val active = o == selected
-            Text(
-                o.replaceFirstChar { it.uppercase() },
-                fontSize = 12.sp,
-                color = if (active) c.text else c.textMuted,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (active) c.bgRaised else Color.Transparent)
+            val label = when (o) {
+                "prompt" -> "Ask me"
+                else -> o.replaceFirstChar { it.uppercase() }
+            }
+            Box(
+                Modifier
+                    .weight(1f, fill = false)
+                    .clip(RoundedCornerShape(7.dp))
+                    .background(if (active) c.accent else Color.Transparent)
                     .clickable { onSelect(o) }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            )
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    fontSize = 13.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                    color = if (active) c.accentContrast else c.textMuted,
+                )
+            }
         }
     }
 }
@@ -150,29 +309,31 @@ private fun TextFieldRow(
     modifier: Modifier = Modifier,
 ) {
     val c = LocalSofuuColors.current
-    // Local echo keeps the cursor stable while the caller's value makes a
-    // round trip; every edit is still pushed to [onChange]. (This used to
-    // type into local state and never call back at all, so every settings
-    // field — including the provider form — read as empty.)
     var text by remember { mutableStateOf(value) }
-    LaunchedEffect(value) { text = value }
+    var focused by remember { mutableStateOf(false) }
+    LaunchedEffect(value, focused) {
+        if (!focused || value.isEmpty()) text = value
+    }
     androidx.compose.foundation.text.BasicTextField(
         value = text,
         onValueChange = {
             text = it
             onChange(it)
         },
-        textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontFamily = FontFamily.Monospace, fontSize = 13.sp),
+        singleLine = true,
+        textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontFamily = FontFamily.Monospace, fontSize = 13.5.sp),
         cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
         modifier = modifier
+            .onFocusChanged { focused = it.isFocused }
             .fillMaxWidth()
-            .heightIn(min = 44.dp)
+            .heightIn(min = 46.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(c.monoFieldBg)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .border(1.dp, if (focused) c.accent else c.border, RoundedCornerShape(8.dp))
+            .padding(horizontal = 12.dp, vertical = 12.dp),
         decorationBox = { inner ->
             Box {
-                if (text.isEmpty()) Text(placeholder, color = c.textFaint, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                if (text.isEmpty()) Text(placeholder, color = c.textFaint, fontFamily = FontFamily.Monospace, fontSize = 13.5.sp)
                 inner()
             }
         },
@@ -192,25 +353,32 @@ private fun AppliedFieldRow(
     onApply: (String) -> Unit,
 ) {
     val c = LocalSofuuColors.current
-    var text by remember { mutableStateOf(value) }
+    var text by remember(value) { mutableStateOf(value) }
     LaunchedEffect(value) { text = value }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Box(Modifier.weight(1f)) {
             TextFieldRow(label, text, placeholder, { text = it })
         }
-        Text(
-            "Apply",
-            fontSize = 12.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .clip(RoundedCornerShape(999.dp))
+        Box(
+            Modifier
+                .height(46.dp)
+                .clip(RoundedCornerShape(8.dp))
                 .background(c.accent)
                 .clickable { onApply(text) }
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-        )
+                .padding(horizontal = 16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "Apply",
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = c.accentContrast,
+            )
+        }
     }
 }
 
@@ -218,25 +386,27 @@ private fun AppliedFieldRow(
 @Composable
 private fun EngineCell(key: String, value: String, mono: Boolean = false) {
     val c = LocalSofuuColors.current
-    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.Top) {
-        Text(key, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.width(96.dp))
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(key, fontSize = 12.5.sp, color = c.textFaint, modifier = Modifier.width(115.dp))
         Text(
             value,
-            fontSize = 12.sp,
+            fontSize = 13.sp,
             color = c.text,
+            fontWeight = if (mono) FontWeight.Normal else FontWeight.Medium,
             fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         )
     }
 }
 
 /**
  * The native vector engine (H-E1/M1) as a diagnostic card.
- *
- * This is deliberately a *manifest + verify box*, not a search product:
- * the four exported entry points exist and now work from Kotlin, and the
- * thing worth proving on-device is that the default space (`hash-768`)
- * is the same space the brain stores in — so an embedded string can be
- * remembered without a space argument.
  */
 @Composable
 private fun VectorEngineCard(store: AppStore) {
@@ -251,93 +421,118 @@ private fun VectorEngineCard(store: AppStore) {
     }
 
     Section("Vector engine")
-    if (manifest == null) {
-        Text("Loading the embedding manifest…", fontSize = 12.sp, color = c.textFaint)
-    } else {
-        val m = manifest!!
-        EngineCell(
-            "Default space",
-            m.optString("default_space").ifEmpty { "—" } + "  (the brain's space)",
-            mono = true,
-        )
-        val spaces = m.optJSONArray("spaces")
-        if (spaces != null) {
-            for (i in 0 until spaces.length()) {
-                val s = spaces.optJSONObject(i) ?: continue
-                val id = s.optString("space")
-                // The hash space is inlined in the manifest; the learned +
-                // image spaces nest a `model` object. Read both shapes.
-                val model = s.optJSONObject("model")
-                val dim = s.optInt("dimension").takeIf { it > 0 }
-                    ?: model?.optInt("dimension")?.takeIf { it > 0 }
-                    ?: model?.optInt("dim")?.takeIf { it > 0 }
-                    ?: 0
-                val avail = s.optBoolean("available", true) &&
-                    (model == null || model.optBoolean("available", true))
-                val modelId = s.optString("id").ifEmpty { model?.optString("id").orEmpty() }
-                Text(
-                    "  $id" + if (dim > 0) "  ·  ${dim}-dim" else "" +
-                        if (modelId.isNotEmpty()) "  ·  $modelId" else "",
-                    fontSize = 11.sp,
-                    color = if (avail) c.textMuted else c.err,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(top = 3.dp),
-                )
-                if (!avail) {
-                    Text(
-                        "     artifact unavailable",
-                        fontSize = 10.sp,
-                        color = c.err,
-                        modifier = Modifier.padding(top = 1.dp),
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.height(10.dp))
-        TextFieldRow("probe", probe, "text to embed locally", { probe = it })
-        Text(
-            if (probing) "Embedding…" else "Embed",
-            fontSize = 12.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .padding(top = 8.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(if (probing) c.bgCardHover else c.accent)
-                .clickable(enabled = !probing && probe.isNotBlank()) {
-                    probing = true
-                    probeResult = null
-                }
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        )
-        val res = probeResult
-        if (res != null) {
-            Text(res, fontSize = 11.sp, color = c.textMuted, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 8.dp))
-        }
-        // Launch the probe out here so the click handler stays cheap.
-        LaunchedEffect(probing, probe) {
-            if (!probing) return@LaunchedEffect
-            val text = probe
-            probeResult = withContext(Dispatchers.IO) {
-                val v = runCatching { store.embedText(text) }.getOrNull()
-                when {
-                    v == null -> "Embed failed — space unknown or the baked artifact is unavailable."
-                    else -> {
-                        var sum = 0.0
-                        for (x in v) sum += (x * x).toDouble()
-                        val norm = Math.sqrt(sum)
-                        val head = v.take(6).joinToString(" ") { String.format("%.4f", it) }
-                        "dim ${v.size}  ·  ‖v‖ ${String.format("%.4f", norm)}\n$head …"
+    SettingsCard {
+        if (manifest == null) {
+            Text("Loading the embedding manifest…", fontSize = 13.5.sp, color = c.textFaint)
+        } else {
+            val m = manifest!!
+            EngineCell(
+                "Default space",
+                m.optString("default_space").ifEmpty { "—" } + "  (the brain's space)",
+                mono = true,
+            )
+            val spaces = m.optJSONArray("spaces")
+            if (spaces != null) {
+                CardDivider()
+                Text("SPACES", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint, letterSpacing = 0.5.sp)
+                Spacer(Modifier.height(4.dp))
+                for (i in 0 until spaces.length()) {
+                    val s = spaces.optJSONObject(i) ?: continue
+                    val id = s.optString("space")
+                    val model = s.optJSONObject("model")
+                    val dim = s.optInt("dimension").takeIf { it > 0 }
+                        ?: model?.optInt("dimension")?.takeIf { it > 0 }
+                        ?: model?.optInt("dim")?.takeIf { it > 0 }
+                        ?: 0
+                    val avail = s.optBoolean("available", true) &&
+                        (model == null || model.optBoolean("available", true))
+                    val modelId = s.optString("id").ifEmpty { model?.optString("id").orEmpty() }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            id,
+                            fontSize = 12.5.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (avail) c.text else c.err,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (dim > 0) {
+                            Text(
+                                "${dim}-dim",
+                                fontSize = 11.5.sp,
+                                color = c.textMuted,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.padding(end = 6.dp),
+                            )
+                        }
+                        Text(
+                            if (avail) (if (modelId.isNotEmpty()) modelId else "ready") else "unavailable",
+                            fontSize = 11.5.sp,
+                            color = if (avail) c.ok else c.err,
+                        )
                     }
                 }
             }
-            probing = false
+            CardDivider()
+            Text("Test Local Embedding", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+            Text(
+                "Embeddings run entirely on-device — no provider, no network, no API key.",
+                fontSize = 12.sp,
+                color = c.textFaint,
+                modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
+            )
+            TextFieldRow("probe", probe, "text to embed locally", { probe = it })
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SmallButton(
+                    if (probing) c.bgCardHover else c.accent,
+                    if (probing) c.textMuted else c.accentContrast,
+                    if (probing) "Embedding…" else "Embed",
+                ) {
+                    if (!probing && probe.isNotBlank()) {
+                        probing = true
+                        probeResult = null
+                    }
+                }
+            }
+            val res = probeResult
+            if (res != null) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(c.monoFieldBg)
+                        .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                        .padding(10.dp),
+                ) {
+                    Text(res, fontSize = 12.sp, color = c.textMuted, fontFamily = FontFamily.Monospace)
+                }
+            }
+            LaunchedEffect(probing, probe) {
+                if (!probing) return@LaunchedEffect
+                val text = probe
+                probeResult = withContext(Dispatchers.IO) {
+                    val v = runCatching { store.embedText(text) }.getOrNull()
+                    when {
+                        v == null -> "Embed failed — space unknown or artifact unavailable."
+                        else -> {
+                            var sum = 0.0
+                            for (x in v) sum += (x * x).toDouble()
+                            val norm = Math.sqrt(sum)
+                            val head = v.take(6).joinToString(" ") { String.format("%.4f", it) }
+                            "dim ${v.size}  ·  ‖v‖ ${String.format("%.4f", norm)}\n$head …"
+                        }
+                    }
+                }
+                probing = false
+            }
         }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "Embeddings run entirely on-device — no provider, no network, no API key.",
-            fontSize = 11.sp,
-            color = c.textFaint,
-        )
     }
 }
 
@@ -347,111 +542,153 @@ private fun VectorEngineCard(store: AppStore) {
 private fun GeneralPane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
-    // Live engine card (desktop parity): chat.state() polled while the
-    // pane is open, so Model/Provider/Session/History/Context/Spend are
-    // real rather than a guess from config.json.
     var live by remember { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(Unit) {
         while (true) {
-            // chat.state() is a blocking engine query — keep it off the
-            // main thread or the card stalls the UI (and risks an ANR).
             live = withContext(Dispatchers.IO) { store.engineChatState() }
-            kotlinx.coroutines.delay(2000)
+            delay(2000)
         }
     }
-    Column(Modifier.verticalScroll(rememberScrollState())) {
-        Section("Engine")
+    Column {
+        Section("Engine status", isFirst = true)
         if (live == null) {
-            Text("Connecting to the engine…", fontSize = 12.sp, color = c.textFaint)
+            SettingsCard {
+                Text("Connecting to the engine…", fontSize = 13.5.sp, color = c.textFaint)
+            }
         } else {
             val e = live!!
-            EngineCell("Model", e.optString("model").ifEmpty { "None" }, mono = true)
-            EngineCell("Provider", e.optString("provider").ifEmpty { "None" })
-            EngineCell("Session", e.optString("sessionId").let { if (it.isEmpty()) "None yet" else it.take(10) + "…" }, mono = true)
-            EngineCell("History", "${e.optInt("historyTurns")} turns")
-            EngineCell("Context", "${e.optInt("contextTokens")} tk")
-            EngineCell("Session spend", "$" + "%.4f".format(e.optDouble("sessionSpendUsd")))
-            if (e.optBoolean("streaming") || e.optInt("pendingApprovals") > 0) {
-                Text(
-                    buildString {
-                        if (e.optBoolean("streaming")) append("Generating…")
-                        val n = e.optInt("pendingApprovals")
-                        if (n > 0) { if (isNotEmpty()) append(" · "); append("$n awaiting approval") }
-                    },
-                    fontSize = 11.sp,
-                    color = c.accent,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
+            SettingsCard {
+                EngineCell("Model", e.optString("model").ifEmpty { "None" }, mono = true)
+                CardDivider()
+                EngineCell("Provider", e.optString("provider").ifEmpty { "None" })
+                CardDivider()
+                EngineCell("Session", e.optString("sessionId").let { if (it.isEmpty()) "None yet" else it.take(10) + "…" }, mono = true)
+                CardDivider()
+                EngineCell("History", "${e.optInt("historyTurns")} turns")
+                CardDivider()
+                EngineCell("Context", "${e.optInt("contextTokens")} tk")
+                CardDivider()
+                val spend = e.optDouble("sessionSpendUsd")
+                EngineCell("Session spend", if (spend.isNaN() || spend < 0) "$0.0000" else "$" + "%.4f".format(spend))
+                if (e.optBoolean("streaming") || e.optInt("pendingApprovals") > 0) {
+                    CardDivider()
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(c.accent))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            buildString {
+                                if (e.optBoolean("streaming")) append("Generating…")
+                                val n = e.optInt("pendingApprovals")
+                                if (n > 0) { if (isNotEmpty()) append(" · "); append("$n awaiting approval") }
+                            },
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = c.accent,
+                        )
+                    }
+                }
             }
         }
-        Row_("Project folder", "Workspace root and per-project storage (.sofuu/ — sessions, memory, settings).", {
-            Text(state.projectDir ?: "(none)", fontSize = 12.sp, color = c.textMuted, fontFamily = FontFamily.Monospace)
-        })
-        Row_("Tool permission profile", "Applied live in the engine and re-applied on launch.", {
-            Segmented(listOf("full", "edit", "plan", "prompt"), state.permissions) { store.setPermissions(it) }
-        })
-        Row_("Memory (brain)", "Recall saved project memories into each turn (.sofuu/brain/).", {
-            Segmented(listOf("on", "off"), if (state.config?.brain != false) "on" else "off") {
-                store.patchConfig(JSONObject().put("brain", it == "on"))
-            }
-        })
-        Row_("Smart context filters", "On-device neural filters (freshness, compaction, relevance, allocation).", {
-            Segmented(listOf("on", "off"), if (state.config?.ml != false) "on" else "off") {
-                store.patchConfig(JSONObject().put("ml", it == "on"))
-            }
-        })
-        Row_("RLM sandbox", "Route very long-context turns through the local reasoning sandbox.", {
-            Segmented(listOf("off", "on", "auto"), state.config?.rlm ?: "off") {
-                store.patchConfig(JSONObject().put("rlm", it))
-            }
-        })
-        Row_("Context window", "Override the model's window (0 = engine-resolved truth).", {
-            AppliedFieldRow("ctx", state.config?.ctxWindow?.toString().orEmpty(), "auto", { v ->
-                v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("ctx_window", n)) }
+
+        Section("Workspace & permissions")
+        SettingsCard {
+            Row_("Project folder", "Workspace root and per-project storage (.sofuu/ — sessions, memory, settings).", {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(c.monoFieldBg)
+                        .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    Text(state.projectDir ?: "(none)", fontSize = 13.sp, color = c.text, fontFamily = FontFamily.Monospace)
+                }
             })
-        })
-        Row_("Max output tokens", "Override the per-request output cap (0 = model default).", {
-            AppliedFieldRow("maxout", state.config?.maxOutput?.toString().orEmpty(), "model default", { v ->
-                v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("max_output", n)) }
+            CardDivider()
+            Row_("Tool permission profile", "Applied live in the engine and re-applied on launch.", {
+                Segmented(listOf("full", "edit", "plan", "prompt"), state.permissions) { store.setPermissions(it) }
             })
-        })
-        Row_("Session budget (USD)", "The engine refuses new turns past the cap (0 = uncapped).", {
-            AppliedFieldRow("budget", state.config?.budgetUsd?.takeIf { it > 0 }?.toString().orEmpty(), "uncapped", { v ->
-                v.trim().toDoubleOrNull()?.let { n -> store.patchConfig(JSONObject().put("budget_usd", n)) }
+        }
+
+        Section("Context & reasoning")
+        SettingsCard {
+            Row_("Memory (brain)", "Recall saved project memories into each turn (.sofuu/brain/).", {
+                Segmented(listOf("on", "off"), if (state.config?.brain != false) "on" else "off") {
+                    store.patchConfig(JSONObject().put("brain", it == "on"))
+                }
             })
-        })
+            CardDivider()
+            Row_("Smart context filters", "On-device neural filters (freshness, compaction, relevance, allocation).", {
+                Segmented(listOf("on", "off"), if (state.config?.ml != false) "on" else "off") {
+                    store.patchConfig(JSONObject().put("ml", it == "on"))
+                }
+            })
+            CardDivider()
+            Row_("RLM sandbox", "Route very long-context turns through the local reasoning sandbox.", {
+                Segmented(listOf("off", "on", "auto"), state.config?.rlm ?: "off") {
+                    store.patchConfig(JSONObject().put("rlm", it))
+                }
+            })
+        }
+
+        Section("Budgets & limits")
+        SettingsCard {
+            Row_("Context window", "Override the model's window (0 = engine-resolved truth).", {
+                AppliedFieldRow("ctx", state.config?.ctxWindow?.toString().orEmpty(), "auto", { v ->
+                    v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("ctx_window", n)) }
+                })
+            })
+            CardDivider()
+            Row_("Max output tokens", "Override the per-request output cap (0 = model default).", {
+                AppliedFieldRow("maxout", state.config?.maxOutput?.toString().orEmpty(), "model default", { v ->
+                    v.trim().toIntOrNull()?.let { n -> store.patchConfig(JSONObject().put("max_output", n)) }
+                })
+            })
+            CardDivider()
+            Row_("Session budget (USD)", "The engine refuses new turns past the cap (0 = uncapped).", {
+                AppliedFieldRow("budget", state.config?.budgetUsd?.takeIf { it > 0 }?.toString().orEmpty(), "uncapped", { v ->
+                    v.trim().toDoubleOrNull()?.let { n -> store.patchConfig(JSONObject().put("budget_usd", n)) }
+                })
+            })
+        }
+
         Section("Memory & recall")
-        Text(
-            "How aggressively saved project memories are pulled into a turn. " +
-                "Leave at 0 to use the engine defaults.",
-            fontSize = 11.sp,
-            color = c.textFaint,
-            modifier = Modifier.padding(bottom = 4.dp),
-        )
-        Row_("Recall similarity floor", "Minimum match score for a memory to be recalled (0 = default 0.30).", {
-            AppliedFieldRow("recall_min", state.config?.recallMin?.takeIf { it > 0 }?.toString().orEmpty(), "default 0.30", { v ->
-                v.trim().toDoubleOrNull()?.let { n ->
-                    store.patchConfig(JSONObject().put("recall_min", n.coerceIn(0.0, 1.0)))
-                }
+        SettingsCard {
+            Text(
+                "How aggressively saved project memories are pulled into a turn. Leave at 0 to use engine defaults.",
+                fontSize = 12.sp,
+                color = c.textFaint,
+                modifier = Modifier.padding(bottom = 6.dp),
+            )
+            Row_("Recall similarity floor", "Minimum match score for a memory to be recalled (0 = default 0.30).", {
+                AppliedFieldRow("recall_min", state.config?.recallMin?.takeIf { it > 0 }?.toString().orEmpty(), "default 0.30", { v ->
+                    v.trim().toDoubleOrNull()?.let { n ->
+                        store.patchConfig(JSONObject().put("recall_min", n.coerceIn(0.0, 1.0)))
+                    }
+                })
             })
-        })
-        Row_("Recall token budget", "Max tokens of memories injected per turn (0 = auto ≈2% of window, 1k–16k).", {
-            AppliedFieldRow("recall_budget", state.config?.recallBudget?.takeIf { it > 0 }?.toString().orEmpty(), "auto", { v ->
-                v.trim().toLongOrNull()?.let { n ->
-                    store.patchConfig(JSONObject().put("recall_budget", n.coerceIn(0L, 16_000L)))
-                }
+            CardDivider()
+            Row_("Recall token budget", "Max tokens of memories injected per turn (0 = auto ≈2% of window, 1k–16k).", {
+                AppliedFieldRow("recall_budget", state.config?.recallBudget?.takeIf { it > 0 }?.toString().orEmpty(), "auto", { v ->
+                    v.trim().toLongOrNull()?.let { n ->
+                        store.patchConfig(JSONObject().put("recall_budget", n.coerceIn(0L, 16_000L)))
+                    }
+                })
             })
-        })
-        Row_("Embeddings — provider", "Optional OpenAI-compatible provider for memory embeddings. Blank = the bundled offline embedder.", {
-            AppliedFieldRow("embed_provider", state.config?.embedProvider.orEmpty(), "bundled offline embedder", { v ->
-                store.patchConfig(JSONObject().put("embed_provider", v.trim()))
+            CardDivider()
+            Row_("Embeddings — provider", "Optional OpenAI-compatible provider for memory embeddings. Blank = bundled offline embedder.", {
+                AppliedFieldRow("embed_provider", state.config?.embedProvider.orEmpty(), "bundled offline embedder", { v ->
+                    store.patchConfig(JSONObject().put("embed_provider", v.trim()))
+                })
             })
-        })
-        Row_("Embeddings — model", "Embedding model id used for memory vectors.", {
-            AppliedFieldRow("embed_model", state.config?.embedModel.orEmpty(), "default", { v ->
-                store.patchConfig(JSONObject().put("embed_model", v.trim()))
+            CardDivider()
+            Row_("Embeddings — model", "Embedding model id used for memory vectors.", {
+                AppliedFieldRow("embed_model", state.config?.embedModel.orEmpty(), "default", { v ->
+                    store.patchConfig(JSONObject().put("embed_model", v.trim()))
+                })
             })
-        })
+        }
+
         VectorEngineCard(store)
         PhoneToolsCard(store)
         EngineEnvCard(store)
@@ -461,20 +698,12 @@ private fun GeneralPane(store: AppStore) {
 
 // ── Phone tools + engine knobs ──────────────────────────────────
 
-/**
- * What the phone adds over a terminal.
- *
- * Host tools are registered on the engine thread at boot and appear in
- * /tools alongside the built-ins; listing them here is the only place a
- * user can see what the device can do that a CLI cannot.
- */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun PhoneToolsCard(store: AppStore) {
     val c = LocalSofuuColors.current
     var tools by remember { mutableStateOf<List<String>>(emptyList()) }
     LaunchedEffect(Unit) {
-        // The engine fills the list during boot, which may not be done the
-        // first time this pane is drawn.
         while (true) {
             tools = store.engine.hostTools.toList()
             delay(500)
@@ -482,157 +711,176 @@ private fun PhoneToolsCard(store: AppStore) {
     }
 
     Section("Phone tools")
-    Text(
-        "Native capabilities the agent can call. Registered on the engine at " +
-            "boot, so they obey the permission profile and show up in /tools.",
-        fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
-    )
-    if (tools.isEmpty()) {
-        Text("None registered yet.", fontSize = 12.sp, color = c.textFaint)
-    } else {
-        for (t in tools) {
-            Text(
-                "  ·  $t",
-                fontSize = 12.sp, color = c.text,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.padding(vertical = 2.dp),
-            )
+    SettingsCard {
+        Text(
+            "Native capabilities registered on the engine at boot. Obey the permission profile and appear in /tools.",
+            fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
+        )
+        if (tools.isEmpty()) {
+            Text("None registered yet.", fontSize = 13.5.sp, color = c.textFaint)
+        } else {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                for (t in tools) {
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(c.monoFieldBg)
+                            .border(0.5.dp, c.border, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                    ) {
+                        Text(t, fontSize = 12.5.sp, color = c.text, fontFamily = FontFamily.Monospace)
+                    }
+                }
+            }
         }
     }
 }
 
-/**
- * The library's env-var switches.
- *
- * These are plain process configuration the engine reads through
- * std::env::var — there is no ABI call for them. Most are consulted per
- * turn, so a change applies to the next message; SOFUU_NO_ML gates module
- * registration and so needs a restart, which the UI says outright rather
- * than letting a user wonder why nothing moved.
- */
 @Composable
 private fun EngineEnvCard(store: AppStore) {
     val c = LocalSofuuColors.current
     val env = store.runtimeEnv
 
     Section("Engine controls")
-    Text(
-        "These are the runtime's own environment knobs, set before the engine " +
-            "boots. Most take effect on the next message.",
-        fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
-    )
+    SettingsCard {
+        Text(
+            "Runtime environment switches set before the engine boots. Most take effect on the next message.",
+            fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+        )
 
-    var noTools by remember { mutableStateOf(env.noTools) }
-    var noShell by remember { mutableStateOf(env.noShell) }
-    var noMl by remember { mutableStateOf(env.noMl) }
-    var allowInternal by remember { mutableStateOf(env.webAllowInternal) }
-    var backend by remember { mutableStateOf(env.memoryBackend) }
-    var engine by remember { mutableStateOf(env.webEngine) }
-    var phaseMetrics by remember { mutableStateOf(env.phaseMetrics) }
+        var noTools by remember { mutableStateOf(env.noTools) }
+        var noShell by remember { mutableStateOf(env.noShell) }
+        var noMl by remember { mutableStateOf(env.noMl) }
+        var allowInternal by remember { mutableStateOf(env.webAllowInternal) }
+        var backend by remember { mutableStateOf(env.memoryBackend) }
+        var engine by remember { mutableStateOf(env.webEngine) }
+        var phaseMetrics by remember { mutableStateOf(env.phaseMetrics) }
 
-    ToggleRow("Coding tools", "All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.", noTools)
-    { noTools = it; env.noTools = it; store.applyRuntimeEnv() }
-    ToggleRow("Shell", "Keep bash listed but refuse every invocation. Does not stop an MCP server that shells out itself.", noShell)
-    { noShell = it; env.noShell = it; store.applyRuntimeEnv() }
-    ToggleRow("Context gates (ML)", "Drop the whole sofuu.ml gate layer. This one needs a restart — it is decided when the engine loads.", noMl)
-    { noMl = it; env.noMl = it; store.restartEngineForEnv() }
-    ToggleRow("Allow private addresses", "Let web.open reach loopback and LAN addresses. The SSRF guard blocks them otherwise.", allowInternal)
-    // M4: these three only wrote the SharedPreference, so the process
-    // environment — and therefore the engine — kept the old value until
-    // an unrelated restart. Every knob below re-applies.
-    { allowInternal = it; env.webAllowInternal = it; store.applyRuntimeEnv() }
-
-    Row_("Memory backend", "Auto uses the semantic projector when its artifact is present, else hash-768.") {
-        Segmented(listOf("auto", "hash", "semantic"), backend.ifEmpty { "auto" }) {
-            backend = it; env.memoryBackend = if (it == "auto") "" else it
-            store.applyRuntimeEnv()
-        }
-    }
-    Row_("Web search engine", "Default engine for web_search. Blank picks the keyless one.") {
-        Segmented(listOf("auto", "brave", "tavily"), engine.ifEmpty { "auto" }) {
-            engine = it; env.webEngine = if (it == "auto") "" else it
-            store.applyRuntimeEnv()
-        }
-    }
-    Row_("Turn step budget", "Tool rounds allowed per turn. 0 uses the engine default (200).") {
-        TextFieldRow(
-            "maxsteps",
-            if (env.chatMaxSteps > 0) env.chatMaxSteps.toString() else "",
-            "200 (engine default)",
-            onChange = {
-                val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
-                env.chatMaxSteps = n
+        ToggleRow("Coding tools", "All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.", noTools)
+        { noTools = it; env.noTools = it; store.applyRuntimeEnv() }
+        CardDivider()
+        ToggleRow("Shell", "Keep bash listed but refuse every invocation. Does not stop an MCP server that shells out itself.", noShell)
+        { noShell = it; env.noShell = it; store.applyRuntimeEnv() }
+        CardDivider()
+        ToggleRow("Context gates (ML)", "Drop the whole sofuu.ml gate layer. Needs a restart.", noMl)
+        { noMl = it; env.noMl = it; store.restartEngineForEnv() }
+        CardDivider()
+        ToggleRow("Allow private addresses", "Let web.open reach loopback and LAN addresses.", allowInternal)
+        { allowInternal = it; env.webAllowInternal = it; store.applyRuntimeEnv() }
+        CardDivider()
+        Row_("Memory backend", "Auto uses the semantic projector when present, else hash-768.") {
+            Segmented(listOf("auto", "hash", "semantic"), backend.ifEmpty { "auto" }) {
+                backend = it; env.memoryBackend = if (it == "auto") "" else it
                 store.applyRuntimeEnv()
-            },
-        )
-    }
-    Row_("Stalled-request timeout", "Seconds before an unresponsive endpoint gives up. 0 uses the engine default (300).") {
-        TextFieldRow(
-            "stall",
-            if (env.stallTimeoutSecs > 0) env.stallTimeoutSecs.toString() else "",
-            "300 (engine default)",
-            onChange = {
-                val n = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
-                env.stallTimeoutSecs = n
+            }
+        }
+        CardDivider()
+        Row_("Web search engine", "Default engine for web_search. Blank picks the keyless one.") {
+            Segmented(listOf("auto", "brave", "tavily"), engine.ifEmpty { "auto" }) {
+                engine = it; env.webEngine = if (it == "auto") "" else it
                 store.applyRuntimeEnv()
-            },
-        )
+            }
+        }
+        CardDivider()
+        Row_("Turn step budget", "Tool rounds allowed per turn. 0 uses the engine default (200).") {
+            TextFieldRow(
+                "maxsteps",
+                if (env.chatMaxSteps > 0) env.chatMaxSteps.toString() else "",
+                "200 (engine default)",
+                onChange = {
+                    val n = it.filter { ch -> ch.isDigit() }.toIntOrNull() ?: 0
+                    env.chatMaxSteps = n
+                    store.applyRuntimeEnv()
+                },
+            )
+        }
+        CardDivider()
+        Row_("Stalled-request timeout", "Seconds before an unresponsive endpoint gives up. 0 uses the engine default (300).") {
+            TextFieldRow(
+                "stall",
+                if (env.stallTimeoutSecs > 0) env.stallTimeoutSecs.toString() else "",
+                "300 (engine default)",
+                onChange = {
+                    val n = it.filter { ch -> ch.isDigit() }.toIntOrNull() ?: 0
+                    env.stallTimeoutSecs = n
+                    store.applyRuntimeEnv()
+                },
+            )
+        }
+        CardDivider()
+        Row_("CPU threads for inference", "Kernel-pool threads decoding locally. 0 = auto (4). Apply restarts.") {
+            AppliedFieldRow(
+                "threads",
+                if (env.numThreads > 0) env.numThreads.toString() else "",
+                "auto (4)",
+                onApply = {
+                    env.numThreads = it.filter { ch -> ch.isDigit() }.toIntOrNull() ?: 0
+                    store.restartEngineForEnv()
+                },
+            )
+        }
+        CardDivider()
+        Row_("Prefill threads", "Threads for batched prompt pass. 0 = auto (8). Apply restarts.") {
+            AppliedFieldRow(
+                "prefill",
+                if (env.prefillThreads > 0) env.prefillThreads.toString() else "",
+                "auto (8)",
+                onApply = {
+                    env.prefillThreads = it.filter { ch -> ch.isDigit() }.toIntOrNull() ?: 0
+                    store.restartEngineForEnv()
+                },
+            )
+        }
+        CardDivider()
+        Row_("Decode threads", "Threads for token generation. 0 = auto (4). Apply restarts.") {
+            AppliedFieldRow(
+                "decode",
+                if (env.decodeThreads > 0) env.decodeThreads.toString() else "",
+                "auto (4)",
+                onApply = {
+                    env.decodeThreads = it.filter { ch -> ch.isDigit() }.toIntOrNull() ?: 0
+                    store.restartEngineForEnv()
+                },
+            )
+        }
+        CardDivider()
+        ToggleRow("Phase metrics", "Write per-token engine split to files/phase-metrics.log every 256 tokens. Restart to apply.", phaseMetrics)
+        { phaseMetrics = it; env.phaseMetrics = it; store.restartEngineForEnv() }
     }
-    Row_("CPU threads for inference", "Kernel-pool threads decoding locally. 0 = auto (4 on this class of phone). Apply restarts the engine — watch the tok/s line to compare.") {
-        AppliedFieldRow(
-            "threads",
-            if (env.numThreads > 0) env.numThreads.toString() else "",
-            "auto (4)",
-            onApply = {
-                env.numThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
-                store.restartEngineForEnv()
-            },
-        )
-    }
-    Row_("Prefill threads", "Threads for the batched prompt pass — compute-bound, scales with the big cluster. 0 = auto (8). Apply restarts; TTFT is the scoreboard.") {
-        AppliedFieldRow(
-            "prefill",
-            if (env.prefillThreads > 0) env.prefillThreads.toString() else "",
-            "auto (8)",
-            onApply = {
-                env.prefillThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
-                store.restartEngineForEnv()
-            },
-        )
-    }
-    Row_("Decode threads", "Threads for token generation — bandwidth-bound, tune for the tok/s readout. 0 = auto (4). Apply restarts the engine.") {
-        AppliedFieldRow(
-            "decode",
-            if (env.decodeThreads > 0) env.decodeThreads.toString() else "",
-            "auto (4)",
-            onApply = {
-                env.decodeThreads = it.filter { c -> c.isDigit() }.toIntOrNull() ?: 0
-                store.restartEngineForEnv()
-            },
-        )
-    }
-    ToggleRow("Phase metrics", "Write the per-token engine split (forward / sampler / glue) to files/phase-metrics.log every 256 tokens. Restart to apply. Readable over adb.", phaseMetrics)
-    { phaseMetrics = it; env.phaseMetrics = it; store.restartEngineForEnv() }
-    Text(
-        "Context gates and CPU threads need a restart; everything else is read while a turn " +
-            "runs, so it applies to the next message.",
-        fontSize = 10.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp),
-    )
 }
 
 @Composable
 private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     val c = LocalSofuuColors.current
     Row(
-        Modifier.fillMaxWidth().heightIn(min = 44.dp).clickable { onChange(!checked) }
-            .padding(vertical = 6.dp),
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable { onChange(!checked) }
+            .padding(vertical = 8.dp, horizontal = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(label, fontSize = 14.sp, color = c.text)
-            Text(desc, fontSize = 11.sp, color = c.textFaint)
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+            Text(desc, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
         }
-        Switch(checked = checked, onCheckedChange = onChange)
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = c.accentContrast,
+                checkedTrackColor = c.accent,
+                checkedBorderColor = Color.Transparent,
+                uncheckedThumbColor = c.textFaint,
+                uncheckedTrackColor = c.toggleOff,
+                uncheckedBorderColor = c.border,
+            ),
+        )
     }
 }
 
@@ -642,16 +890,36 @@ private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (
 private fun AppearancePane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
-    Column(Modifier.verticalScroll(rememberScrollState())) {
-        Row_("Theme", "Follows the system unless you pick one.", {
-            Segmented(listOf("light", "dark", "system"), state.theme) { store.setTheme(it) }
-        })
-        Row_("Cloud background", "Procedural gradient backdrop.", {
-            Segmented(listOf("on", "off"), if (state.cloudBg) "on" else "off") { store.setCloudBg(it == "on") }
-        })
-        Row_("Chat font size", "Body text size in the chat pane.", {
-            Segmented(listOf("13", "15", "17", "19"), state.chatFontSize.toString()) { store.setChatFontSize(it.toInt()) }
-        })
+    Column {
+        Section("Theme & Display", isFirst = true)
+        SettingsCard {
+            Row_("Theme", "Follows the system unless you pick one.", {
+                Segmented(listOf("light", "dark", "system"), state.theme) { store.setTheme(it) }
+            })
+            CardDivider()
+            Row_("Cloud background", "Procedural animated ambient gradient backdrop.", {
+                Segmented(listOf("on", "off"), if (state.cloudBg) "on" else "off") { store.setCloudBg(it == "on") }
+            })
+            CardDivider()
+            Row_("Chat font size", "Body text size in the chat pane.", {
+                Segmented(listOf("13", "15", "17", "19"), state.chatFontSize.toString()) { store.setChatFontSize(it.toInt()) }
+            })
+            Spacer(Modifier.height(6.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.monoFieldBg)
+                    .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                    .padding(10.dp),
+            ) {
+                Text(
+                    "Sample chat preview at ${state.chatFontSize}sp",
+                    fontSize = state.chatFontSize.sp,
+                    color = c.text,
+                )
+            }
+        }
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -662,103 +930,179 @@ private fun AppearancePane(store: AppStore) {
 private fun ModelsPane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
-    Column(Modifier.verticalScroll(rememberScrollState())) {
+    val pickModelFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) store.importLocalModel(uri) }
 
-        // ── On-device models ─────────────────────────────────────
-        // Above the providers: a phone running its own model needs no
-        // endpoint at all, and it is the only option that works offline.
-        val pickModelFile = rememberLauncherForActivityResult(
-            ActivityResultContracts.OpenDocument()
-        ) { uri -> if (uri != null) store.importLocalModel(uri) }
-
-        Section("On this device")
-        if (state.localModels.isEmpty()) {
+    Column {
+        Section("On this device", isFirst = true)
+        SettingsCard {
             Text(
-                "No models installed. Import a .gguf file — it runs entirely on the phone, no network and no API key.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+                "Local models (.gguf) run entirely on the phone — no network and no API key.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
             )
-        } else {
-            for (path in state.localModels) {
-                // Header-derived label ("Llama 3.2 1B Instruct · Q8_0"),
-                // identical to the composer pill; file-name fallback.
-                val label = state.localModelLabels[path] ?: com.sofuu.store.fallbackModelLabel(path)
-                val active = state.config?.model == path
-                Row(
-                    Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+            if (state.localModels.isEmpty()) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(c.monoFieldBg)
+                        .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                        .padding(14.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Column(Modifier.weight(1f).clickable { store.pickLocalModel(path) }) {
-                        Text(
-                            label,
-                            fontSize = 13.sp,
-                            color = if (active) c.accent else c.text,
-                            fontFamily = FontFamily.Monospace,
-                        )
+                    Text(
+                        "No local models installed yet.",
+                        fontSize = 13.sp,
+                        color = c.textFaint,
+                    )
+                }
+            } else {
+                state.localModels.forEachIndexed { idx, path ->
+                    if (idx > 0) CardDivider()
+                    val label = state.localModelLabels[path] ?: com.sofuu.store.fallbackModelLabel(path)
+                    val active = state.config?.model == path
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (active) c.bgCardHover else Color.Transparent)
+                            .clickable { store.pickLocalModel(path) }
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                label,
+                                fontSize = 13.5.sp,
+                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (active) c.accent else c.text,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                            if (active) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                ) {
+                                    Box(
+                                        Modifier
+                                            .size(6.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                            .background(c.ok),
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Active · running on device", fontSize = 11.5.sp, color = c.ok)
+                                }
+                            }
+                        }
                         if (active) {
-                            Text("in use — runs locally", fontSize = 11.sp, color = c.textFaint)
+                            Text("✓", color = c.accent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        } else {
+                            Icon(
+                                Icons2.Delete,
+                                "Remove",
+                                tint = c.textFaint,
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .clickable { store.deleteLocalModel(path) }
+                                    .padding(8.dp),
+                            )
                         }
                     }
-                    if (!active) {
-                        Icon(
-                            Icons2.Close, "Remove", tint = c.textFaint,
-                            modifier = Modifier.size(16.dp).clickable { store.deleteLocalModel(path) },
-                        )
-                    }
                 }
             }
-            if (state.config?.model?.endsWith(".gguf") == true) {
-                Text(
-                    "Switching back to a hosted provider: pick one below.",
-                    fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 4.dp),
-                )
+            Spacer(Modifier.height(12.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.accent)
+                    .clickable { pickModelFile.launch(arrayOf("*/*")) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons2.Folder, null, tint = c.accentContrast, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Import a model (.gguf)",
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = c.accentContrast,
+                    )
+                }
             }
         }
-        Text(
-            "Import a model…",
-            fontSize = 13.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .padding(top = 8.dp, bottom = 4.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(c.accent)
-                .clickable {
-                    // .gguf has no registered MIME type on most devices,
-                    // so an explicit allow-list beats a wildcard.
-                    pickModelFile.launch(arrayOf("*/*"))
-                }
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-        )
 
-        Spacer(Modifier.height(18.dp))
         Section("Hosted providers")
         val providers = state.config?.providers ?: emptyList()
-        providers.forEach { p ->
-            Row_("Provider: ${p.name}", p.endpoint, {
-                val models = (state.modelsCache[p.name]?.models ?: emptyList())
-                if (models.isEmpty()) {
-                    Text("No model list yet — tap refresh.", fontSize = 12.sp, color = c.textFaint)
-                } else {
-                    models.take(30).forEach { m ->
-                        Row(
-                            Modifier.fillMaxWidth().clickable { store.pickModel(p.name, m) }.heightIn(min = 44.dp).padding(vertical = 8.dp),
+        if (providers.isEmpty()) {
+            SettingsCard {
+                Text("No hosted providers configured. Add one in the Providers tab.", fontSize = 13.sp, color = c.textFaint)
+            }
+        } else {
+            providers.forEach { p ->
+                SettingsCard(modifier = Modifier.padding(bottom = 10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) {
+                            Text(p.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                            Text(p.endpoint, fontSize = 11.5.sp, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        }
+                        if (p.name == state.config?.active) {
+                            Box(
+                                Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(c.accent.copy(alpha = 0.15f))
+                                    .padding(horizontal = 6.dp, vertical = 3.dp),
+                            ) {
+                                Text("ACTIVE", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                            }
+                        }
+                    }
+                    CardDivider()
+                    val models = (state.modelsCache[p.name]?.models ?: emptyList())
+                    if (models.isEmpty()) {
+                        Text("No models cached yet. Tap Refresh below to fetch.", fontSize = 12.5.sp, color = c.textFaint)
+                    } else {
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 220.dp)
+                                .verticalScroll(rememberScrollState()),
                         ) {
-                            Text(m, fontSize = 13.sp, color = if (m == p.model) c.accent else c.text, fontFamily = FontFamily.Monospace)
+                            models.forEach { m ->
+                                val active = m == p.model && p.name == state.config?.active
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(if (active) c.bgCardHover else Color.Transparent)
+                                        .clickable { store.pickModel(p.name, m) }
+                                        .padding(horizontal = 8.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        m,
+                                        fontSize = 13.sp,
+                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (active) c.accent else c.text,
+                                        fontFamily = FontFamily.Monospace,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (active) {
+                                        Text("✓", color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            })
+            }
         }
-        Text(
-            "Refresh",
-            fontSize = 13.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .padding(top = 12.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(c.accent)
-                .clickable { store.refreshModelCache() }
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-        )
+        SmallButton(c.accent, c.accentContrast, "Refresh Model Lists") {
+            store.refreshModelCache()
+        }
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -777,184 +1121,189 @@ private fun ProvidersPane(store: AppStore) {
     var addNote by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(emptySet<String>()) }
 
-    Column(Modifier.verticalScroll(rememberScrollState())) {
-        Section("Add provider")
-        val fieldGap = Modifier.padding(bottom = 8.dp)
-        TextFieldRow("name", newName, "name (e.g. openai)", { newName = it }, fieldGap)
-        TextFieldRow("endpoint", newEndpoint, "https://…/v1/chat/completions", { newEndpoint = it }, fieldGap)
-        TextFieldRow("model", newModel, "model id", { newModel = it }, fieldGap)
-        TextFieldRow("key", newKey, "API key (stored in the Android Keystore)", { newKey = it }, fieldGap)
-        Text(
-            "Add",
-            fontSize = 13.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .padding(top = 10.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(c.accent)
-                .clickable {
-                    val name = newName.trim()
-                    val endpoint = newEndpoint.trim()
-                    val model = newModel.trim()
-                    addNote = null
-                    if (name.isEmpty() || endpoint.isEmpty()) {
-                        // The button used to fail silently here, which read
-                        // as "Add does nothing".
-                        addError = "Name and endpoint are required."
-                    } else {
-                        val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
-                        providers.add(
-                            JSONObject().put("name", name).put("endpoint", endpoint)
-                                .put("model", model).put("profile", ""),
-                        )
-                        val patch = JSONObject()
-                            .put("providers", org.json.JSONArray(providers))
-                        if (model.isNotEmpty()) {
-                            // chat.js resolves the model from the active
-                            // provider entry, but the flat mirror drives the
-                            // composer pill — keep both in step.
-                            patch.put("active", name).put("provider", name).put("model", model)
-                            addNote = null
+    Column {
+        Section("Add provider", isFirst = true)
+        SettingsCard {
+            val fieldGap = Modifier.padding(bottom = 8.dp)
+            TextFieldRow("name", newName, "Name (e.g. openai, anthropic)", { newName = it }, fieldGap)
+            TextFieldRow("endpoint", newEndpoint, "Endpoint (https://…/v1/chat/completions)", { newEndpoint = it }, fieldGap)
+            TextFieldRow("model", newModel, "Default model ID (e.g. gpt-4o, claude-3-5-sonnet)", { newModel = it }, fieldGap)
+            TextFieldRow("key", newKey, "API key (stored securely in Keystore)", { newKey = it }, fieldGap)
+
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.accent)
+                    .clickable {
+                        val name = newName.trim()
+                        val endpoint = newEndpoint.trim()
+                        val model = newModel.trim()
+                        addNote = null
+                        if (name.isEmpty() || endpoint.isEmpty()) {
+                            addError = "Name and endpoint are required."
                         } else {
-                            // Switching to an entry with no model would keep
-                            // sending the previous provider's model id to the
-                            // new endpoint. Add it, leave it inactive, and say
-                            // how to finish the switch.
-                            addNote = "Added $name — open the model sheet in the composer, pick one of its models, and it becomes active."
+                            val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
+                            providers.add(
+                                JSONObject().put("name", name).put("endpoint", endpoint)
+                                    .put("model", model).put("profile", ""),
+                            )
+                            val patch = JSONObject().put("providers", org.json.JSONArray(providers))
+                            if (model.isNotEmpty()) {
+                                patch.put("active", name).put("provider", name).put("model", model)
+                                addNote = null
+                            } else {
+                                addNote = "Added $name — open the model sheet in the composer, pick one of its models, and it becomes active."
+                            }
+                            store.patchConfig(patch)
+                            if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
+                            newName = ""; newEndpoint = ""; newModel = ""; newKey = ""
+                            addError = null
                         }
-                        store.patchConfig(patch)
-                        if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
-                        newName = ""; newEndpoint = ""; newModel = ""; newKey = ""
-                        addError = null
-                    }
-                }
-                .padding(horizontal = 18.dp, vertical = 10.dp),
-        )
-        addError?.let {
-            Text(it, fontSize = 11.sp, color = c.errStrong, modifier = Modifier.padding(top = 6.dp))
-        }
-        addNote?.let {
-            Text(it, fontSize = 11.sp, color = c.ok, modifier = Modifier.padding(top = 6.dp))
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.accentContrast)
+            }
+            addError?.let {
+                Text(it, fontSize = 12.sp, color = c.errStrong, modifier = Modifier.padding(top = 8.dp))
+            }
+            addNote?.let {
+                Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 8.dp))
+            }
         }
 
         Section("Configured providers")
-        for (p in state.config?.providers ?: emptyList()) {
-            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(p.name, fontSize = 14.sp, color = c.text)
-                        Text(p.endpoint, fontSize = 11.sp, color = c.textFaint, maxLines = 1)
-                        Text(
-                            if (p.hasApiKey) "key saved · Keystore" else "no key",
-                            fontSize = 11.sp,
-                            color = if (p.hasApiKey) c.ok else c.warn,
-                        )
-                    }
-                    if (p.name != state.config?.active) {
-                        Text(
-                            "Remove",
-                            fontSize = 12.sp,
-                            color = c.errStrong,
-                            modifier = Modifier.clickable { store.removeProvider(p.name) }.padding(8.dp),
-                        )
-                    } else {
-                        Text("active", fontSize = 11.sp, color = c.accent, modifier = Modifier.padding(8.dp))
-                    }
-                    Text(
-                        if (editing.contains(p.name)) "Cancel" else "Edit",
-                        fontSize = 12.sp,
-                        color = c.accent,
-                        modifier = Modifier.clickable {
-                            editing = if (editing.contains(p.name)) editing - p.name else editing + p.name
-                        }.padding(8.dp),
-                    )
-                }
-                // In-place edit. Previously the only way to change a
-                // provider's model or endpoint was Remove + re-add, which
-                // also discards the stored key.
-                if (editing.contains(p.name)) {
-                    var ep by remember(p.name, p.endpoint) { mutableStateOf(p.endpoint) }
-                    var md by remember(p.name, p.model) { mutableStateOf(p.model) }
-                    var pf by remember(p.name, p.profile) { mutableStateOf(p.profile) }
-                    TextFieldRow("endpoint", ep, "https://…/v1/chat/completions", { ep = it }, Modifier.padding(top = 8.dp))
-                    TextFieldRow("model", md, "model id", { md = it }, Modifier.padding(top = 8.dp))
-                    TextFieldRow("profile", pf, "openai | anthropic | local", { pf = it }, Modifier.padding(top = 8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
-                        Text(
-                            "Save",
-                            fontSize = 12.sp,
-                            color = c.accentContrast,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(c.accent)
-                                .clickable {
-                                    if (ep.isNotBlank()) {
-                                        store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
-                                        editing = editing - p.name
+        val providers = state.config?.providers ?: emptyList()
+        if (providers.isEmpty()) {
+            SettingsCard {
+                Text("No providers added yet.", fontSize = 13.sp, color = c.textFaint)
+            }
+        } else {
+            providers.forEach { p ->
+                SettingsCard(modifier = Modifier.padding(bottom = 10.dp)) {
+                    val isActive = p.name == state.config?.active
+                    val isEditing = editing.contains(p.name)
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                                if (isActive) {
+                                    Spacer(Modifier.width(8.dp))
+                                    Box(
+                                        Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(c.accent.copy(alpha = 0.15f))
+                                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                                    ) {
+                                        Text("ACTIVE", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = c.accent)
                                     }
                                 }
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                        )
-                        // Only offered for a non-active provider; the
-                        // condition was inverted, so the one provider the
-                        // button appeared on was the one it could not switch.
-                        if (p.name != state.config?.active) {
+                            }
+                            Text(p.endpoint, fontSize = 12.sp, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                                Box(
+                                    Modifier
+                                        .size(6.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(if (p.hasApiKey) c.ok else c.warn),
+                                )
+                                Spacer(Modifier.width(5.dp))
+                                Text(
+                                    if (p.hasApiKey) "key saved · Keystore" else "no API key",
+                                    fontSize = 11.5.sp,
+                                    color = if (p.hasApiKey) c.ok else c.warn,
+                                )
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            if (!isActive) {
+                                Text(
+                                    "Remove",
+                                    fontSize = 13.sp,
+                                    color = c.errStrong,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { store.removeProvider(p.name) }
+                                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                                )
+                            }
                             Text(
-                                "Set as active",
-                                fontSize = 12.sp,
+                                if (isEditing) "Cancel" else "Edit",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
                                 color = c.accent,
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(c.bgCardHover)
+                                    .clip(RoundedCornerShape(6.dp))
                                     .clickable {
-                                        store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
-                                        store.setActiveProvider(p.name)
-                                        editing = editing - p.name
+                                        editing = if (isEditing) editing - p.name else editing + p.name
                                     }
-                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
                             )
                         }
                     }
-                }
-                // Key entry: explicit save (never a write per keystroke).
-                var keyText by remember(p.name, p.hasApiKey) { mutableStateOf("") }
-                if (keyText.isEmpty() && p.hasApiKey) {
-                    Text(
-                        "Replace key",
-                        fontSize = 12.sp,
-                        color = c.accent,
-                        modifier = Modifier
-                            .clickable { keyText = " " }
-                            .padding(vertical = 6.dp),
-                    )
-                } else {
-                    TextFieldRow("key", keyText.trim(), "paste API key", { keyText = it }, Modifier.padding(bottom = 10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            "Save key",
-                            fontSize = 12.sp,
-                            color = c.accentContrast,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(c.accent)
-                                .clickable {
-                                    if (keyText.isNotBlank()) {
-                                        store.setProviderKey(p.name, keyText.trim())
-                                        keyText = ""
-                                    }
+
+                    if (isEditing) {
+                        CardDivider()
+                        var ep by remember(p.name, p.endpoint) { mutableStateOf(p.endpoint) }
+                        var md by remember(p.name, p.model) { mutableStateOf(p.model) }
+                        var pf by remember(p.name, p.profile) { mutableStateOf(p.profile) }
+                        TextFieldRow("endpoint", ep, "https://…/v1/chat/completions", { ep = it }, Modifier.padding(bottom = 6.dp))
+                        TextFieldRow("model", md, "model id", { md = it }, Modifier.padding(bottom = 6.dp))
+                        TextFieldRow("profile", pf, "openai | anthropic | local", { pf = it }, Modifier.padding(bottom = 8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SmallButton(c.accent, c.accentContrast, "Save Changes") {
+                                if (ep.isNotBlank()) {
+                                    store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
+                                    editing = editing - p.name
                                 }
-                                .padding(horizontal = 14.dp, vertical = 8.dp),
-                        )
-                        Text(
-                            "Clear",
-                            fontSize = 12.sp,
-                            color = c.errStrong,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(c.bgCardHover)
-                                .clickable { store.setProviderKey(p.name, ""); keyText = "" }
-                                .padding(horizontal = 14.dp, vertical = 8.dp),
-                        )
+                            }
+                            if (!isActive) {
+                                SmallButton(c.bgCardHover, c.accent, "Set as active") {
+                                    store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
+                                    store.setActiveProvider(p.name)
+                                    editing = editing - p.name
+                                }
+                            }
+                        }
+                    }
+
+                    // Key management
+                    CardDivider()
+                    var keyText by remember(p.name, p.hasApiKey) { mutableStateOf("") }
+                    if (keyText.isEmpty() && p.hasApiKey) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("API Key", fontSize = 13.sp, color = c.textMuted)
+                            Text(
+                                "Replace key",
+                                fontSize = 13.sp,
+                                color = c.accent,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable { keyText = " " }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                            )
+                        }
+                    } else {
+                        TextFieldRow("key", keyText, "paste new API key", { keyText = it }, Modifier.padding(bottom = 6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SmallButton(c.accent, c.accentContrast, "Save key") {
+                                if (keyText.isNotBlank()) {
+                                    store.setProviderKey(p.name, keyText.trim())
+                                    keyText = ""
+                                }
+                            }
+                            SmallButton(c.bgCardHover, c.errStrong, "Clear") {
+                                store.setProviderKey(p.name, "")
+                                keyText = ""
+                            }
+                        }
                     }
                 }
             }
@@ -970,89 +1319,139 @@ private fun UsagePane(store: AppStore) {
     val c = LocalSofuuColors.current
     var usage by remember { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(Unit) {
-        // Bounded and guarded: this had no deadline at all, so an engine
-        // that never answered left the pane spinning for the whole visit.
         usage = runCatching {
             store.engine.usageReport().get(10, TimeUnit.SECONDS)
         }.getOrNull()
     }
-    Column(Modifier.verticalScroll(rememberScrollState())) {
+    Column {
+        Section("Workspace spend & tokens", isFirst = true)
         val totals = usage?.optJSONObject("totals")
-        Row_("Session spend", "Tokens + cost across this workspace's sessions.", {
+        SettingsCard {
+            val cost = totals?.optDouble("cost") ?: 0.0
+            val pt = totals?.optDouble("pt") ?: 0.0
+            val ct = totals?.optDouble("ct") ?: 0.0
+            Text("TOTAL SPEND", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint, letterSpacing = 0.5.sp)
             Text(
-                "$" + "%.4f".format(totals?.optDouble("cost") ?: 0.0) + "  ·  " +
-                    "%,.0f".format(totals?.optDouble("pt") ?: 0.0) + " in  ·  " +
-                    "%,.0f".format(totals?.optDouble("ct") ?: 0.0) + " out",
-                fontSize = 13.sp,
+                "$" + "%.4f".format(cost),
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
                 color = c.text,
                 fontFamily = FontFamily.Monospace,
+                modifier = Modifier.padding(vertical = 4.dp),
             )
-        })
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Column {
+                    Text("Prompt tokens", fontSize = 11.sp, color = c.textFaint)
+                    Text("%,.0f".format(pt), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                }
+                Column {
+                    Text("Completion tokens", fontSize = 11.sp, color = c.textFaint)
+                    Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                }
+            }
+        }
+
         Section("Per day")
         val days = usage?.optJSONArray("days")
-        if (days == null || days.length() == 0) {
-            Text("No usage yet.", fontSize = 13.sp, color = c.textFaint)
-        } else {
-            for (i in 0 until days.length()) {
-                val d = days.optJSONObject(i) ?: continue
-                Text(
-                    "${d.optString("day")}  ·  ${d.optInt("turns")} turns  ·  " +
-                        "%,.0f".format(d.optDouble("pt")) + " in  ·  " + "%,.0f".format(d.optDouble("ct")) + " out",
-                    fontSize = 12.sp,
-                    color = c.textMuted,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(vertical = 3.dp),
-                )
+        SettingsCard {
+            if (days == null || days.length() == 0) {
+                Text("No daily usage recorded yet.", fontSize = 13.sp, color = c.textFaint)
+            } else {
+                for (i in 0 until days.length()) {
+                    if (i > 0) CardDivider()
+                    val d = days.optJSONObject(i) ?: continue
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(d.optString("day"), fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.text)
+                            Text("${d.optInt("turns")} turns", fontSize = 11.5.sp, color = c.textFaint)
+                        }
+                        Text(
+                            "%,.0f in · %,.0f out".format(d.optDouble("pt"), d.optDouble("ct")),
+                            fontSize = 12.sp,
+                            color = c.textMuted,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
             }
         }
+
         Section("Per session")
         val sess = usage?.optJSONArray("sessions")
-        if (sess == null || sess.length() == 0) {
-            Text("No sessions yet.", fontSize = 13.sp, color = c.textFaint)
-        } else {
-            for (i in 0 until minOf(sess.length(), 20)) {
-                val d = sess.optJSONObject(i) ?: continue
-                Text(
-                    "${d.optString("task").ifEmpty { d.optString("id") }.take(28)}  ·  ${d.optString("model")}  ·  $" + "%.4f".format(d.optDouble("cost")),
-                    fontSize = 12.sp,
-                    color = c.textMuted,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(vertical = 3.dp),
-                )
+        SettingsCard {
+            if (sess == null || sess.length() == 0) {
+                Text("No session records found.", fontSize = 13.sp, color = c.textFaint)
+            } else {
+                for (i in 0 until minOf(sess.length(), 20)) {
+                    if (i > 0) CardDivider()
+                    val d = sess.optJSONObject(i) ?: continue
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                d.optString("task").ifEmpty { d.optString("id") }.take(28),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = c.text,
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                            Text(d.optString("model"), fontSize = 11.5.sp, color = c.textFaint, fontFamily = FontFamily.Monospace)
+                        }
+                        Text(
+                            "$" + "%.4f".format(d.optDouble("cost")),
+                            fontSize = 13.sp,
+                            color = c.text,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
             }
         }
+
         Section("Per model")
         val models = usage?.optJSONArray("models")
-        if (models == null || models.length() == 0) {
-            Text("No usage yet.", fontSize = 13.sp, color = c.textFaint)
-        } else {
-            for (i in 0 until models.length()) {
-                val m = models.optJSONObject(i) ?: continue
-                Text(
-                    "${m.optString("model")}  ·  ${m.optInt("turns")} turns  ·  $" + "%.4f".format(m.optDouble("cost")),
-                    fontSize = 12.sp,
-                    color = c.textMuted,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(vertical = 3.dp),
-                )
+        SettingsCard {
+            if (models == null || models.length() == 0) {
+                Text("No model records found.", fontSize = 13.sp, color = c.textFaint)
+            } else {
+                for (i in 0 until models.length()) {
+                    if (i > 0) CardDivider()
+                    val m = models.optJSONObject(i) ?: continue
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(m.optString("model"), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                            Text("${m.optInt("turns")} turns", fontSize = 11.5.sp, color = c.textFaint)
+                        }
+                        Text(
+                            "$" + "%.4f".format(m.optDouble("cost")),
+                            fontSize = 13.sp,
+                            color = c.text,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
             }
         }
         Spacer(Modifier.height(24.dp))
     }
 }
 
-
 // ── Brain ───────────────────────────────────────────────────────
 
-/**
- * The CMA brain and the vector spaces behind it.
- *
- * This is what `/remember`, `/why` and `/brain` sit on in the CLI, made
- * visible: what is stored, in which embedding space, and the operations
- * that change it. Every call routes through the ONE cached brain handle
- * on the engine thread, because two handles on one QTSQ file clobber each
- * other on flush.
- */
 @Composable
 private fun BrainPane(store: AppStore) {
     val c = LocalSofuuColors.current
@@ -1062,8 +1461,6 @@ private fun BrainPane(store: AppStore) {
     var err by remember { mutableStateOf<String?>(null) }
     var spaces by remember { mutableStateOf<JSONObject?>(null) }
     var reload by remember { mutableStateOf(0) }
-    // Click handlers are not composable scope, so they cannot host a
-    // LaunchedEffect; this scope is the same one the effects above run in.
     val scope = rememberCoroutineScope()
     var hits by remember { mutableStateOf<org.json.JSONArray?>(null) }
     var recalled by remember { mutableStateOf("") }
@@ -1106,8 +1503,6 @@ private fun BrainPane(store: AppStore) {
     var simB by remember { mutableStateOf("a feline rested") }
     var sim by remember { mutableStateOf<JSONObject?>(null) }
 
-    // Reload is a counter, not a function: LaunchedEffect has to be called
-    // from the composable's own scope, so the trigger is the key.
     LaunchedEffect(reload) {
         val r = withContext(Dispatchers.IO) { surface.brainInfo() }
         info = r?.takeIf { it.optBoolean("ok") }
@@ -1125,264 +1520,283 @@ private fun BrainPane(store: AppStore) {
         sim = withContext(Dispatchers.IO) { surface.similarity(simA, simB) }
     }
 
-    Column(Modifier.verticalScroll(rememberScrollState())) {
-
-        Section("Stored")
-        when {
-            err != null -> Text(err!!, fontSize = 12.sp, color = c.err)
-            info == null -> Text("Reading the brain…", fontSize = 12.sp, color = c.textFaint)
-            else -> {
-                val i = info!!
-                Text(
-                    "${i.optLong("count")} memories",
-                    fontSize = 20.sp, color = c.text, fontFamily = FontFamily.Monospace,
-                )
-                Text(
-                    "space ${i.optString("backend") ?: "?"} · ${i.optInt("dim")}-dim" +
-                        if (i.optBoolean("semantic")) " · semantic channel on" else "",
-                    fontSize = 11.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
-        }
-
-        Spacer(Modifier.height(10.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            SmallButton(c.accent, c.accentContrast, "Refresh") { reload++ }
-            SmallButton(c.accent, c.accentContrast, "Consolidate") {
-                scope.launch {
-                    val r = withContext(Dispatchers.IO) { surface.brainConsolidate() }
-                    err = r?.optString("error")?.takeIf { it.isNotEmpty() }
-                    reload++
+    Column {
+        Section("Stored memories", isFirst = true)
+        SettingsCard {
+            when {
+                err != null -> Text(err!!, fontSize = 13.5.sp, color = c.err)
+                info == null -> Text("Reading the brain…", fontSize = 13.5.sp, color = c.textFaint)
+                else -> {
+                    val i = info!!
+                    Text(
+                        "${i.optLong("count")} memories",
+                        fontSize = 22.sp, fontWeight = FontWeight.Bold, color = c.text, fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        "space ${i.optString("backend") ?: "?"} · ${i.optInt("dim")}-dim" +
+                            if (i.optBoolean("semantic")) " · semantic channel on" else "",
+                        fontSize = 12.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(top = 2.dp, bottom = 10.dp),
+                    )
                 }
             }
-            SmallButton(
-                if (decayArmed) c.warn else c.accent,
-                if (decayArmed) c.bgApp else c.accentContrast,
-                if (decayArmed) "Confirm decay" else "Decay tick",
-            ) {
-                if (decayArmed) {
-                    decayArmed = false
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SmallButton(c.accent, c.accentContrast, "Refresh") { reload++ }
+                SmallButton(c.accent, c.accentContrast, "Consolidate") {
                     scope.launch {
-                        val r = withContext(Dispatchers.IO) { surface.brainDecay() }
+                        val r = withContext(Dispatchers.IO) { surface.brainConsolidate() }
                         err = r?.optString("error")?.takeIf { it.isNotEmpty() }
                         reload++
                     }
-                } else {
-                    decayArmed = true
+                }
+                SmallButton(
+                    if (decayArmed) c.warn else c.accent,
+                    if (decayArmed) c.bgApp else c.accentContrast,
+                    if (decayArmed) "Confirm decay" else "Decay tick",
+                ) {
+                    if (decayArmed) {
+                        decayArmed = false
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { surface.brainDecay() }
+                            err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                            reload++
+                        }
+                    } else {
+                        decayArmed = true
+                    }
                 }
             }
-        }
-        if (decayArmed) {
-            Text(
-                "Decay weakens and prunes old memories. Tap again to run it.",
-                fontSize = 10.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
-            )
+            if (decayArmed) {
+                Text(
+                    "Decay weakens and prunes old memories. Tap again to run it.",
+                    fontSize = 12.sp, color = c.warn, modifier = Modifier.padding(top = 6.dp),
+                )
+            }
         }
 
-        Section("Search")
-        TextFieldRow("recall", recalled, "a fact to recall", onChange = { recalled = it })
-        hits?.let { h ->
-            Spacer(Modifier.height(8.dp))
-            if (h.length() == 0) {
-                Text("No memories matched.", fontSize = 12.sp, color = c.textFaint)
-            }
-            for (i in 0 until h.length()) {
-                val o = h.optJSONObject(i) ?: continue
-                val id = o.optInt("id", -1)
-                Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            o.optString("text").ifEmpty { o.optString("kind") },
-                            fontSize = 12.sp, color = c.text,
-                        )
-                        Text(
-                            "score ${"%.3f".format(o.optDouble("score"))} · ${o.optString("tier")}",
-                            fontSize = 10.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
-                        )
-                    }
-                    if (id >= 0) {
-                        Icon(
-                            Icons2.Close, "Forget", tint = c.textFaint,
-                            modifier = Modifier.size(16.dp).clickable {
-                                scope.launch {
-                                    val r = withContext(Dispatchers.IO) { surface.brainForget(id) }
-                                    err = r?.optString("error")?.takeIf { it.isNotEmpty() }
-                                    hits = null
-                                    reload++
-                                }
-                            },
-                        )
+        Section("Search & recall")
+        SettingsCard {
+            TextFieldRow("recall", recalled, "Search memories (e.g. user preferences, rules)", onChange = { recalled = it })
+            hits?.let { h ->
+                CardDivider()
+                if (h.length() == 0) {
+                    Text("No memories matched.", fontSize = 13.sp, color = c.textFaint)
+                }
+                for (i in 0 until h.length()) {
+                    val o = h.optJSONObject(i) ?: continue
+                    val id = o.optInt("id", -1)
+                    if (i > 0) CardDivider()
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                o.optString("text").ifEmpty { o.optString("kind") },
+                                fontSize = 13.5.sp, color = c.text,
+                            )
+                            Text(
+                                "score ${"%.3f".format(o.optDouble("score"))} · ${o.optString("tier")}",
+                                fontSize = 11.5.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                        if (id >= 0) {
+                            Icon(
+                                Icons2.Delete, "Forget", tint = c.textFaint,
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable {
+                                        scope.launch {
+                                            val r = withContext(Dispatchers.IO) { surface.brainForget(id) }
+                                            err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                                            hits = null
+                                            reload++
+                                        }
+                                    }
+                                    .padding(6.dp),
+                            )
+                        }
                     }
                 }
             }
         }
 
         Section("Embedding spaces")
-        val sp = spaces?.optJSONObject("info")
-        if (sp == null) {
-            Text("No embedding manifest yet.", fontSize = 12.sp, color = c.textFaint)
-        } else {
-            SpaceLine(c.text, c.err, c.textFaint, "hash-768 (default)", sp.optJSONObject("hash")?.optInt("dimension") ?: 0, true)
-            val sem = sp.optJSONObject("semantic")
-            SpaceLine(c.text, c.err, c.textFaint, "semantic", sem?.optInt("dimension") ?: 0, sem?.optBoolean("available", false) ?: false)
-            val v2 = spaces?.optJSONObject("v2")
-            if (v2 != null) {
-                SpaceLine(c.text, c.err, c.textFaint, "semantic v2", v2.optInt("dimension"), v2.optBoolean("available", false))
+        SettingsCard {
+            val sp = spaces?.optJSONObject("info")
+            if (sp == null) {
+                Text("No embedding manifest yet.", fontSize = 13.5.sp, color = c.textFaint)
+            } else {
+                SpaceLine(c.text, c.err, c.textFaint, "hash-768 (default)", sp.optJSONObject("hash")?.optInt("dimension") ?: 0, true)
+                CardDivider()
+                val sem = sp.optJSONObject("semantic")
+                SpaceLine(c.text, c.err, c.textFaint, "semantic", sem?.optInt("dimension") ?: 0, sem?.optBoolean("available", false) ?: false)
+                val v2 = spaces?.optJSONObject("v2")
+                if (v2 != null) {
+                    CardDivider()
+                    SpaceLine(c.text, c.err, c.textFaint, "semantic v2", v2.optInt("dimension"), v2.optBoolean("available", false))
+                }
             }
         }
 
-        Section("Context gates")
-        val m = ml
-        if (m == null) {
-            Text("The sofuu.ml layer is not loaded in this build.", fontSize = 12.sp, color = c.textFaint)
-        } else if (m.optBoolean("ok") != true) {
-            Text(m.optString("error").ifEmpty { "unavailable" }, fontSize = 12.sp, color = c.err)
-        } else {
-            val info = m.optJSONObject("info")
-            val ws = m.optJSONObject("workset")
-            Text(
-                "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · " +
-                    "${ws?.optLong("segments") ?: 0} segments",
-                fontSize = 12.sp, color = c.text, fontFamily = FontFamily.Monospace,
-            )
-            val on = info?.optJSONObject("on")
-            if (on != null) {
-                val keys = on.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val state = if (on.optBoolean(k)) "on" else "off"
-                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                        Text(
-                            k, fontSize = 11.sp, color = c.textFaint,
-                            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            state, fontSize = 11.sp,
-                            color = if (state == "on") c.accent else c.textMuted,
-                        )
-                    }
-                }
-            }
-            val learner = info?.optJSONObject("online")
-            if (learner != null && learner.optBoolean("enabled")) {
+        Section("Context gates (sofuu.ml)")
+        SettingsCard {
+            val m = ml
+            if (m == null) {
+                Text("The sofuu.ml layer is not loaded in this build.", fontSize = 13.5.sp, color = c.textFaint)
+            } else if (m.optBoolean("ok") != true) {
+                Text(m.optString("error").ifEmpty { "unavailable" }, fontSize = 13.5.sp, color = c.err)
+            } else {
+                val info = m.optJSONObject("info")
+                val ws = m.optJSONObject("workset")
                 Text(
-                    "Online learning is on" + if (learner.optBoolean("pending")) " · a candidate is pending" else "",
-                    fontSize = 11.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
+                    "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · ${ws?.optLong("segments") ?: 0} segments",
+                    fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace,
                 )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
-                SmallButton(c.accent, c.accentContrast, "Label wrong") {
-                    scope.launch {
-                        val r = withContext(Dispatchers.IO) { surface.mlFeedback("wrong") }
-                        m2 = r?.optBoolean("ok") == true
-                        reload++
+                val on = info?.optJSONObject("on")
+                if (on != null) {
+                    CardDivider()
+                    val keys = on.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val st = if (on.optBoolean(k)) "on" else "off"
+                        Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                            Text(
+                                k, fontSize = 12.5.sp, color = c.textFaint,
+                                fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                st, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold,
+                                color = if (st == "on") c.accent else c.textMuted,
+                            )
+                        }
                     }
                 }
-                SmallButton(c.accent, c.accentContrast, "Label wasted") {
-                    scope.launch {
-                        val r = withContext(Dispatchers.IO) { surface.mlFeedback("wasted") }
-                        m2 = r?.optBoolean("ok") == true
-                        reload++
+                val learner = info?.optJSONObject("online")
+                if (learner != null && learner.optBoolean("enabled")) {
+                    Text(
+                        "Online learning is on" + if (learner.optBoolean("pending")) " · a candidate is pending" else "",
+                        fontSize = 12.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                CardDivider()
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmallButton(c.accent, c.accentContrast, "Label wrong") {
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { surface.mlFeedback("wrong") }
+                            m2 = r?.optBoolean("ok") == true
+                            reload++
+                        }
+                    }
+                    SmallButton(c.accent, c.accentContrast, "Label wasted") {
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { surface.mlFeedback("wasted") }
+                            m2 = r?.optBoolean("ok") == true
+                            reload++
+                        }
                     }
                 }
-            }
-            if (m2 != null) {
-                Text(
-                    if (m2 == true) "Label recorded." else "The engine declined that label — it needs an observed call to attach to.",
-                    fontSize = 10.sp, color = if (m2 == true) c.textFaint else c.warn,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
+                if (m2 != null) {
+                    Text(
+                        if (m2 == true) "Label recorded." else "The engine declined that label — it needs an observed call to attach to.",
+                        fontSize = 12.sp, color = if (m2 == true) c.ok else c.warn,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
             }
         }
 
         Section("Gate check")
-        Text(
-            "Ask what the gates would say about a call before the agent makes it.",
-            fontSize = 11.sp, color = c.textFaint,
-        )
-        TextFieldRow("tool", probeTool, "read_file", onChange = { probeTool = it })
-        TextFieldRow("args", probeArgs, "{\"path\":\"README.md\"}", onChange = { probeArgs = it })
-        Text(
-            "Check",
-            fontSize = 12.sp,
-            color = c.accentContrast,
-            modifier = Modifier
-                .padding(top = 6.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(c.accent)
-                .clickable {
-                    scope.launch {
-                        val parsed = try { JSONObject(probeArgs) } catch (e: Exception) { JSONObject() }
-                        verdict = withContext(Dispatchers.IO) { surface.mlCheck(probeTool, parsed) }
-                    }
-                }
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-        )
-        verdict?.let { v ->
-            Spacer(Modifier.height(6.dp))
+        SettingsCard {
             Text(
-                if (v.optBoolean("ok")) "pass · ${v.optString("source")} · ${"%.3f".format(v.optDouble("score"))}" +
-                    (v.optString("nudge").takeIf { it.isNotEmpty() && it != "null" }?.let { " · nudge: $it" } ?: "")
-                else "blocked · ${v.optString("reason")}",
-                fontSize = 11.sp, color = if (v.optBoolean("ok")) c.textMuted else c.warn,
+                "Ask what the gates would say about a call before the agent makes it.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
             )
-        }
-
-        Section("Memory")
-        Text(
-            "One runtime lives for the whole process on a phone, so nothing else " +
-                "would run the collector at the right moment. Do this after a big " +
-                "headless run or a batch embed.",
-            fontSize = 11.sp, color = c.textFaint,
-        )
-        SmallButton(c.accent, c.accentContrast, "Collect garbage") {
-            scope.launch {
-                val okRun = withContext(Dispatchers.IO) { surface.collectGarbage() }
-                gcNote = if (okRun) "Collected." else "The runtime did not expose __sofuu_gc in this build."
+            TextFieldRow("tool", probeTool, "tool name (e.g. read_file)", onChange = { probeTool = it })
+            Spacer(Modifier.height(6.dp))
+            TextFieldRow("args", probeArgs, "JSON arguments (e.g. {\"path\":\"README.md\"})", onChange = { probeArgs = it })
+            Spacer(Modifier.height(8.dp))
+            SmallButton(c.accent, c.accentContrast, "Check Verdict") {
+                scope.launch {
+                    val parsed = try { JSONObject(probeArgs) } catch (e: Exception) { JSONObject() }
+                    verdict = withContext(Dispatchers.IO) { surface.mlCheck(probeTool, parsed) }
+                }
+            }
+            verdict?.let { v ->
+                CardDivider()
+                val ok = v.optBoolean("ok")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (ok) c.ok else c.warn))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (ok) "PASS · ${v.optString("source")} · score ${"%.3f".format(v.optDouble("score"))}" +
+                            (v.optString("nudge").takeIf { it.isNotEmpty() && it != "null" }?.let { " · nudge: $it" } ?: "")
+                        else "BLOCKED · ${v.optString("reason")}",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = if (ok) c.ok else c.warn,
+                    )
+                }
             }
         }
-        gcNote?.let { Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 4.dp)) }
+
+        Section("Garbage collection")
+        SettingsCard {
+            Text(
+                "One runtime lives for the whole process on a phone. Collect memory after large runs or batch embeds.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+            )
+            SmallButton(c.accent, c.accentContrast, "Collect garbage") {
+                scope.launch {
+                    val okRun = withContext(Dispatchers.IO) { surface.collectGarbage() }
+                    gcNote = if (okRun) "Collected successfully." else "The runtime did not expose __sofuu_gc in this build."
+                }
+            }
+            gcNote?.let { Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 6.dp)) }
+        }
 
         Section("Image vectors")
-        Text(
-            "The multimodal tower embeds a picture into the same space a text " +
-                "query lands in, so you can ask what an image looks like.",
-            fontSize = 11.sp, color = c.textFaint,
-        )
-        SmallButton(c.accent, c.accentContrast, "Pick an image") { pickImage.launch("image/*") }
-        imgNote?.let {
-            Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
-        }
-        if (imgPath != null) {
-            TextFieldRow("describe", imgQuery, "what to look for", onChange = { imgQuery = it })
-            SmallButton(c.accent, c.accentContrast, "Compare to text") {
-                scope.launch {
-                    imgSim = withContext(Dispatchers.IO) { surface.imageTextSimilarity(imgPath!!, imgQuery) }
-                }
+        SettingsCard {
+            Text(
+                "Embed an image into the multimodal space and compare it against a text query.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+            )
+            SmallButton(c.accent, c.accentContrast, "Pick an image") { pickImage.launch("image/*") }
+            imgNote?.let {
+                Text(it, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
             }
-            imgSim?.let { r ->
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    if (r.optBoolean("ok")) "cosine ${"%.4f".format(r.optDouble("similarity"))}" +
-                        " · ${r.optInt("dim")}-dim"
-                    else r.optString("error").ifEmpty { "spaces do not line up" },
-                    fontSize = 12.sp,
-                    color = if (r.optBoolean("ok")) c.text else c.warn,
-                    fontFamily = FontFamily.Monospace,
-                )
+            if (imgPath != null) {
+                CardDivider()
+                TextFieldRow("describe", imgQuery, "what to look for", onChange = { imgQuery = it })
+                Spacer(Modifier.height(8.dp))
+                SmallButton(c.accent, c.accentContrast, "Compare to text") {
+                    scope.launch {
+                        imgSim = withContext(Dispatchers.IO) { surface.imageTextSimilarity(imgPath!!, imgQuery) }
+                    }
+                }
+                imgSim?.let { r ->
+                    CardDivider()
+                    Text(
+                        if (r.optBoolean("ok")) "cosine ${"%.4f".format(r.optDouble("similarity"))} · ${r.optInt("dim")}-dim"
+                        else r.optString("error").ifEmpty { "spaces do not line up" },
+                        fontSize = 13.5.sp,
+                        color = if (r.optBoolean("ok")) c.text else c.warn,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
             }
         }
 
-        Section("Similarity")
-        TextFieldRow("a", simA, "first string", onChange = { simA = it })
-        TextFieldRow("b", simB, "second string", onChange = { simB = it })
-        sim?.let {
+        Section("String similarity")
+        SettingsCard {
+            TextFieldRow("a", simA, "first string", onChange = { simA = it })
             Spacer(Modifier.height(6.dp))
-            Text(
-                "cosine ${"%.4f".format(it.optDouble("similarity"))} · ${it.optInt("dim")}-dim",
-                fontSize = 12.sp, color = c.text, fontFamily = FontFamily.Monospace,
-            )
+            TextFieldRow("b", simB, "second string", onChange = { simB = it })
+            sim?.let {
+                CardDivider()
+                Text(
+                    "cosine similarity: ${"%.4f".format(it.optDouble("similarity"))} · ${it.optInt("dim")}-dim",
+                    fontSize = 13.5.sp, color = c.text, fontFamily = FontFamily.Monospace,
+                )
+            }
         }
         Spacer(Modifier.height(24.dp))
     }
@@ -1392,39 +1806,37 @@ private fun BrainPane(store: AppStore) {
 private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim: Int, available: Boolean) {
     Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Text(
-            label, fontSize = 12.sp, color = if (available) text else err,
+            label, fontSize = 13.5.sp, color = if (available) text else err,
             fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
         )
         Text(
             if (available) "$dim-dim" else "artifact unavailable",
-            fontSize = 11.sp, color = if (available) faint else err,
+            fontSize = 12.sp, color = if (available) faint else err,
         )
     }
 }
 
 @Composable
 private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit) {
-    Text(
-        label, fontSize = 12.sp, color = fg,
-        modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
             .background(bg)
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 8.dp),
-    )
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = fg,
+        )
+    }
 }
 
 // ── Agents ──────────────────────────────────────────────────────
 
-/**
- * Registered agents, and the form to add one from a phone.
- *
- * `define` is the runtime's own registry — an agent added here is a
- * first-class entry that the chat turn, `/agents` and `delegate` all see,
- * not a local preset. Its tools are named the way `sofuu.tools.TOOLS`
- * names them, which after host-tool registration includes the phone's own
- * capabilities (device_info, share_text, …).
- */
 @Composable
 private fun AgentsPane(store: AppStore) {
     val c = LocalSofuuColors.current
@@ -1449,21 +1861,20 @@ private fun AgentsPane(store: AppStore) {
         list = withContext(Dispatchers.IO) { surface.agents() }
     }
 
-    Column(Modifier.verticalScroll(rememberScrollState())) {
-
-        Section("Registered")
+    Column {
+        Section("Registered agents", isFirst = true)
         val l = list
         if (l == null) {
-            Text("Reading the registry…", fontSize = 12.sp, color = c.textFaint)
+            SettingsCard { Text("Reading the registry…", fontSize = 13.5.sp, color = c.textFaint) }
         } else if (l.length() == 0) {
-            Text("No agents defined yet. Add one below.", fontSize = 12.sp, color = c.textFaint)
+            SettingsCard { Text("No agents defined yet. Add one below.", fontSize = 13.5.sp, color = c.textFaint) }
         } else {
             for (i in 0 until l.length()) {
                 val a = l.optJSONObject(i) ?: continue
-                Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                SettingsCard(modifier = Modifier.padding(bottom = 8.dp)) {
                     Text(
                         a.optString("name"),
-                        fontSize = 14.sp, color = c.text, fontFamily = FontFamily.Monospace,
+                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
                     )
                     val tools = a.optJSONArray("tools")
                     val subs = a.optInt("agents")
@@ -1478,20 +1889,22 @@ private fun AgentsPane(store: AppStore) {
                             if (subs > 0) append(" · $subs sub-agent slots")
                             a.optString("provider").takeIf { it.isNotEmpty() }?.let { append(" · $it") }
                         },
-                        fontSize = 11.sp, color = c.textFaint,
+                        fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp),
                     )
                 }
             }
         }
 
         Section("Define an agent")
-        TextFieldRow("name", name, "reviewer", onChange = { name = it })
-        TextFieldRow("system", system, "what this agent is for", onChange = { system = it })
-        TextFieldRow("max steps", maxSteps, "24", onChange = { maxSteps = it })
-        ToggleRow("Web tools", "web_search and web_open", withWeb) { withWeb = it }
-        ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 10.dp)) {
-            SmallButton(c.accent, c.accentContrast, "Register") {
+        SettingsCard {
+            TextFieldRow("name", name, "Agent name (e.g. reviewer)", onChange = { name = it }, modifier = Modifier.padding(bottom = 6.dp))
+            TextFieldRow("system", system, "System prompt (what this agent does)", onChange = { system = it }, modifier = Modifier.padding(bottom = 6.dp))
+            TextFieldRow("max steps", maxSteps, "Max steps (e.g. 24)", onChange = { maxSteps = it }, modifier = Modifier.padding(bottom = 8.dp))
+            ToggleRow("Web tools", "web_search and web_open", withWeb) { withWeb = it }
+            CardDivider()
+            ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
+            Spacer(Modifier.height(10.dp))
+            SmallButton(c.accent, c.accentContrast, "Register Agent") {
                 scope.launch {
                     val tools = buildList {
                         if (withWeb) add("web")
@@ -1509,16 +1922,23 @@ private fun AgentsPane(store: AppStore) {
                     reload++
                 }
             }
-        }
-        note?.let {
-            Text(it, fontSize = 11.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
+            note?.let {
+                Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 8.dp))
+            }
         }
 
         Section("Run headlessly")
-        TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it })
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
-            SmallButton(if (running) c.bgCardHover else c.accent, if (running) c.textFaint else c.accentContrast,
-                if (running) "Running…" else "Run") {
+        SettingsCard {
+            Text(
+                "Runs through the agent loop headlessly and returns the final collected answer.",
+                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+            )
+            TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 8.dp))
+            SmallButton(
+                if (running) c.bgCardHover else c.accent,
+                if (running) c.textFaint else c.accentContrast,
+                if (running) "Running…" else "Run Task",
+            ) {
                 if (running || task.isBlank()) return@SmallButton
                 running = true; answer = null
                 scope.launch {
@@ -1531,27 +1951,21 @@ private fun AgentsPane(store: AppStore) {
                     running = false
                 }
             }
-        }
-        Text(
-            "A run goes through the same agent loop, tools, budget and brain as a " +
-                "chat turn — the only difference is that the answer is collected " +
-                "instead of streamed.",
-            fontSize = 10.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp),
-        )
-        answer?.let { a ->
-            Spacer(Modifier.height(10.dp))
-            if (a.optBoolean("ok") != true) {
-                Text(a.optString("error").ifEmpty { "run failed" }, fontSize = 12.sp, color = c.err)
-            } else {
-                Text(
-                    "${a.optInt("steps")} steps" + (a.optString("stopped").takeIf { it.isNotEmpty() && it != "null" }
-                        ?.let { " · stopped: $it" } ?: ""),
-                    fontSize = 11.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
-                )
-                Text(
-                    a.optString("answer"),
-                    fontSize = 13.sp, color = c.text, modifier = Modifier.padding(top = 4.dp),
-                )
+            answer?.let { a ->
+                CardDivider()
+                if (a.optBoolean("ok") != true) {
+                    Text(a.optString("error").ifEmpty { "run failed" }, fontSize = 13.5.sp, color = c.err)
+                } else {
+                    Text(
+                        "${a.optInt("steps")} steps" + (a.optString("stopped").takeIf { it.isNotEmpty() && it != "null" }
+                            ?.let { " · stopped: $it" } ?: ""),
+                        fontSize = 12.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        a.optString("answer"),
+                        fontSize = 13.5.sp, color = c.text, modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
             }
         }
         Spacer(Modifier.height(24.dp))

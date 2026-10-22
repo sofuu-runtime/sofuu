@@ -1,6 +1,7 @@
 package com.sofuu.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -8,14 +9,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -33,7 +38,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -53,104 +61,192 @@ import com.sofuu.ui.theme.LocalSofuuColors
 fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boolean = { false }) {
     val state = store.state
     val c = LocalSofuuColors.current
+    val density = LocalDensity.current
     val historyOpen = state.historyOpen
+
+    val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val bottomPadding = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding()
+
+    var topBarPx by remember { mutableStateOf(0) }
+    var textFieldPx by remember { mutableStateOf(0) }
+    var composerTotalPx by remember { mutableStateOf(0) }
+
+    val topBarHeight = with(density) { topBarPx.toDp() }
+    val textFieldHeight = with(density) { textFieldPx.toDp() }
+    val composerTotalHeight = with(density) { composerTotalPx.toDp() }
+
+    val effectiveTopBand = if (topBarPx > 0) (statusTop + topBarHeight) else (statusTop + 48.dp)
+    // 6.dp is composer's bottom vertical padding inside Composer.kt
+    val effectiveBottomBand = if (textFieldPx > 0) (bottomPadding + 6.dp + textFieldHeight) else (bottomPadding + 110.dp)
+    val effectiveComposerTotal = if (composerTotalPx > 0) (bottomPadding + composerTotalHeight) else (bottomPadding + 160.dp)
 
     Box(Modifier.fillMaxSize().background(c.bgApp)) {
         LaunchedEffect(state.cloudBg) {
             android.util.Log.i("sofuu-cloud", "cloudBg enabled=${state.cloudBg}")
         }
         if (state.cloudBg) CloudBackground()
-        // safeDrawingPadding = the union of system bars + IME + cutout,
-        // so the keyboard pushes the composer up with it and, when the
-        // keyboard is closed, the gesture bar never sits on top of it.
-        // It self-corrects across regimes: on API 30+ the IME inset is the
-        // only source of the offset (adjustResize is ignored for
-        // edge-to-edge apps from Android 15), and on older platforms the
-        // window itself resizes — there the IME inset reads 0, so the same
-        // modifier adds only the nav bar. One path, no version branch.
-        Column(Modifier.fillMaxSize().safeDrawingPadding()) {
-            // ── TopBar: hamburger + session pills + overflow ──────
-            Row(
+
+        // ── Main Content Viewport (chat / starter prompt / preview) ──
+        // The chat fills the full screen and scrolls UNDER the top bar
+        // and composer gradients, so content flows seamlessly edge-to-edge.
+        Box(Modifier.fillMaxSize()) {
+            if (state.bootError != null) {
+                Box(Modifier.fillMaxWidth().statusBarsPadding().padding(top = topBarHeight).align(Alignment.TopCenter)) {
+                    Banner(state.bootError!!, isError = true)
+                }
+            }
+            if (state.preview != null) {
+                Box(Modifier.fillMaxWidth().statusBarsPadding().padding(top = topBarHeight).align(Alignment.TopCenter)) {
+                    PreviewBar(state.preview!!.label) { store.closePreview() }
+                }
+            }
+            if (state.messages.isEmpty() && state.preview == null) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(top = effectiveTopBand, bottom = effectiveComposerTotal),
+                ) {
+                    HomePrompt(
+                        state.projectDir?.let { "Workspace: ${it.substringAfterLast('/')}" },
+                        onPromptSelect = { store.submit(it, emptyList()) },
+                    )
+                }
+            } else {
+                ChatScreen(
+                    messages = state.messages,
+                    phase = state.phase,
+                    streaming = state.streaming,
+                    chatFontSize = state.chatFontSize,
+                    preview = state.preview,
+                    topInset = effectiveTopBand + 8.dp,
+                    bottomInset = effectiveComposerTotal + 8.dp,
+                    liveMetrics = state.liveMetrics,
+                    voiceCapable = store.voiceCapable(),
+                    onSpeak = { store.speak(it) },
+                )
+            }
+        }
+
+        // ── Bottom Transparency Band ───────────────────────────────
+        // Pinned to the bottom of the screen with height extending exactly
+        // to the top edge of the text field box ("at the end of text field
+        // box not a bit more then that"). The gradient runs from opaque app
+        // background at the screen bottom (covering nav bar / gesture bar)
+        // to fully transparent (alpha = 0f) at the top of the text field box.
+        if (state.preview == null) {
+            Box(
                 Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                    .height(effectiveBottomBand)
+                    .align(Alignment.BottomCenter)
+                    .background(
+                        Brush.verticalGradient(
+                            0f to c.bgApp.copy(alpha = 0f),
+                            0.45f to c.bgApp.copy(alpha = 0.70f),
+                            1f to c.bgApp,
+                        ),
+                    ),
+            )
+        }
+
+        // ── Top Transparency Band ──────────────────────────────────
+        // Pinned to the top of the screen with height extending to the
+        // bottom edge of the "New chat" button row. The gradient runs from
+        // opaque app background at the top edge (covering status bar) to
+        // fully transparent (alpha = 0f) at the end of the top bar.
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(effectiveTopBand)
+                .align(Alignment.TopCenter)
+                .background(
+                    Brush.verticalGradient(
+                        0f to c.bgApp,
+                        0.55f to c.bgApp.copy(alpha = 0.70f),
+                        1f to c.bgApp.copy(alpha = 0f),
+                    ),
+                ),
+        )
+
+        // ── TopBar: hamburger + session pills + overflow ───────────
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(horizontal = 6.dp, vertical = 4.dp)
+                .onSizeChanged { topBarPx = it.height },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BarIcon(Icons2.Menu, "Workspaces") { store.setDrawer(true) }
+            // Session pills strip (scrollable, active highlighted).
+            Row(
+                Modifier
+                    .weight(1f)
+                    .padding(horizontal = 4.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                BarIcon(Icons2.Menu, "Workspaces") { store.setDrawer(true) }
-                // Session pills strip (scrollable, active highlighted).
-                Row(
-                    Modifier
-                        .weight(1f)
-                        .padding(horizontal = 4.dp)
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // Pills follow creation order (desktop: task || "Chat N"),
-                    // newest first, capped with overflow in the history sheet.
-                    val ordered = state.sessions.sortedBy { it.startedAt }
-                    val pills = if (ordered.isEmpty()) listOf<String?>(null) else ordered.reversed().take(6).map { it.id }
-                    for (sid in pills) {
-                        val active = sid == state.activeSessionId
-                        val s = ordered.firstOrNull { it.id == sid }
-                        val label = if (sid == null) "New chat" else (s?.labelOf(ordered.indexOf(s)) ?: "Chat")
-                        Row(
-                            Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(if (active) c.bgCardHover else Color.Transparent)
-                                .clickable {
-                                    if (sid == null) store.newChat()
-                                    else store.setActiveSession(sid)
-                                }
-                                .heightIn(min = 36.dp)
-                                .padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(label, fontSize = 13.sp, color = if (active) c.text else c.textMuted, maxLines = 1)
-                            if (active && sid != null) {
-                                Icon(Icons2.Close, "Delete", tint = c.textFaint, modifier = Modifier.size(14.dp).clickable { store.deleteSession(sid) })
+                // Pills follow creation order (desktop: task || "Chat N"),
+                // newest first, capped with overflow in the history sheet.
+                val ordered = state.sessions.sortedBy { it.startedAt }
+                val pills = if (ordered.isEmpty()) listOf<String?>(null) else ordered.reversed().take(6).map { it.id }
+                for (sid in pills) {
+                    val active = sid == state.activeSessionId
+                    val s = ordered.firstOrNull { it.id == sid }
+                    val label = if (sid == null) "New chat" else (s?.labelOf(ordered.indexOf(s)) ?: "Chat")
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(if (active) c.bgCardHover.copy(alpha = 0.85f) else Color.Transparent)
+                            .border(
+                                if (active) 0.5.dp else 0.dp,
+                                if (active) c.border.copy(alpha = 0.60f) else Color.Transparent,
+                                RoundedCornerShape(999.dp),
+                            )
+                            .clickable {
+                                if (sid == null) store.newChat()
+                                else store.setActiveSession(sid)
                             }
+                            .heightIn(min = 36.dp)
+                            .padding(start = 12.dp, end = if (active && sid != null) 6.dp else 12.dp, top = 6.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(label, fontSize = 13.sp, color = if (active) c.text else c.textMuted, maxLines = 1)
+                        if (active && sid != null) {
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons2.Close,
+                                "Delete chat",
+                                tint = c.textFaint,
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { store.deleteSession(sid) }
+                                    .padding(5.dp),
+                            )
                         }
                     }
                 }
-                Spacer(Modifier.width(4.dp))
-                BarIcon(Icons2.Plus, "New chat") { store.newChat() }
-                Spacer(Modifier.width(2.dp))
-                BarIcon(Icons2.MoreVert, "More") { store.openHistory() }
             }
+            Spacer(Modifier.width(4.dp))
+            BarIcon(Icons2.Plus, "New chat") { store.newChat() }
+            Spacer(Modifier.width(2.dp))
+            BarIcon(Icons2.MoreVert, "More") { store.openHistory() }
+        }
 
-            // ── Chat (edge-to-edge; the composer overlays it) ──────
-            // The chat fills the whole remaining height and scrolls UNDER
-            // the translucent composer, so no line is ever cropped at the
-            // panel boundary — text stays visible to the screen edge. The
-            // list's bottom inset keeps the newest line readable above the
-            // composer when pinned to the bottom.
-            Box(Modifier.weight(1f)) {
-                if (state.bootError != null) {
-                    Banner(state.bootError!!, isError = true)
-                }
-                if (state.preview != null) {
-                    PreviewBar(state.preview!!.label) { store.closePreview() }
-                }
-                if (state.messages.isEmpty() && state.preview == null) {
-                    HomePrompt(state.projectDir?.let { "Workspace: ${it.substringAfterLast('/')}" })
-                } else {
-                    ChatScreen(
-                        messages = state.messages,
-                        phase = state.phase,
-                        streaming = state.streaming,
-                        chatFontSize = state.chatFontSize,
-                        preview = state.preview,
-                        bottomInset = 200.dp,
-                        liveMetrics = state.liveMetrics,
-                        voiceCapable = store.voiceCapable(),
-                        onSpeak = { store.speak(it) },
-                    )
-                }
-                // Approval float. One at a time (desktop parity — the
-                // queue resolves in order), but on a phone the queued
-                // ones were invisible, so a second call could sit waiting
-                // with no hint that the turn was half-blocked.
+        // ── Composer overlay ───────────────────────────────────────
+        // Aligned to the bottom of the screen, with navigation bars and IME
+        // padding. Pending tool approvals cleanly stack directly above.
+        if (state.preview == null) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .onSizeChanged { composerTotalPx = it.height },
+            ) {
                 if (state.approvals.isNotEmpty()) {
                     ApprovalSheet(
                         state.approvals.first(),
@@ -159,46 +255,39 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                         store.approve(state.approvals.first().id, allow, always)
                     }
                 }
-
-                // Composer overlay — aligned to the bottom of the same Box
-                // the chat fills, so chat text scrolls behind its
-                // translucent chrome instead of being cut at a panel edge.
-                if (state.preview == null) {
-                    Column(Modifier.align(Alignment.BottomCenter)) {
-                        Composer(
-                            streaming = state.streaming,
-                            mode = state.mode,
-                            permissions = state.permissions,
-                            config = state.config,
-                            localModelLabels = state.localModelLabels,
-                            ctx = state.ctx,
-                            images = state.pickedImages,
-                            pendingMentions = state.pendingMentions,
-                            onSubmit = { t, imgs ->
-                                store.submit(t, imgs)
-                                store.clearPickedImages()
-                            },
-                            onCancel = { store.cancel() },
-                            onModeChange = { store.setMode(it) },
-                            onPermissionsChange = { store.setPermissions(it) },
-                            onConfigPatch = { patch ->
-                                store.patchConfig(org.json.JSONObject().apply { patch.forEach { (k, v) -> put(k, v) } })
-                            },
-                            onOpenSettings = { tab -> store.openSettings(true, tab) },
-                            onAttach = { onPickFiles() },
-                            dictating = state.dictating,
-                            voiceCapable = store.voiceCapable(),
-                            onMic = {
-                                // Ask first, then record — the launcher restarts
-                                // toggleDictation() once permission lands.
-                                if (onRequestMic()) store.toggleDictation()
-                            },
-                            onRemoveImage = { i -> store.removePickedImage(i) },
-                            onMentionsConsumed = { store.consumeMentions() },
-                            onSheet = { store.openSheet(it.name.lowercase()) },
-                        )
-                    }
-                }
+                Composer(
+                    streaming = state.streaming,
+                    mode = state.mode,
+                    permissions = state.permissions,
+                    config = state.config,
+                    localModelLabels = state.localModelLabels,
+                    ctx = state.ctx,
+                    images = state.pickedImages,
+                    pendingMentions = state.pendingMentions,
+                    onSubmit = { t, imgs ->
+                        store.submit(t, imgs)
+                        store.clearPickedImages()
+                    },
+                    onCancel = { store.cancel() },
+                    onModeChange = { store.setMode(it) },
+                    onPermissionsChange = { store.setPermissions(it) },
+                    onConfigPatch = { patch ->
+                        store.patchConfig(org.json.JSONObject().apply { patch.forEach { (k, v) -> put(k, v) } })
+                    },
+                    onOpenSettings = { tab -> store.openSettings(true, tab) },
+                    onAttach = { onPickFiles() },
+                    dictating = state.dictating,
+                    voiceCapable = store.voiceCapable(),
+                    onMic = {
+                        // Ask first, then record — the launcher restarts
+                        // toggleDictation() once permission lands.
+                        if (onRequestMic()) store.toggleDictation()
+                    },
+                    onRemoveImage = { i -> store.removePickedImage(i) },
+                    onMentionsConsumed = { store.consumeMentions() },
+                    onSheet = { store.openSheet(it.name.lowercase()) },
+                    onTextFieldHeightChanged = { textFieldPx = it },
+                )
             }
         }
 
@@ -228,8 +317,8 @@ private fun BarIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, descr
     val c = LocalSofuuColors.current
     Box(
         Modifier
-            .size(40.dp)
-            .clip(RoundedCornerShape(20.dp))
+            .size(44.dp)
+            .clip(RoundedCornerShape(22.dp))
             .clickable { onClick() },
         contentAlignment = Alignment.Center,
     ) {
@@ -252,16 +341,49 @@ private fun Banner(text: String, isError: Boolean) {
 }
 
 @Composable
-private fun HomePrompt(subtitle: String?) {
+private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {}) {
     val c = LocalSofuuColors.current
+    val starters = listOf(
+        "Explain this project" to "Walk through architecture and entry points",
+        "Review git diff" to "Inspect uncommitted code changes",
+        "Find bugs & tests" to "Analyze test coverage and failure modes",
+        "Health check" to "Run doctor diagnostics on the runtime",
+    )
     Column(
-        Modifier.fillMaxSize().padding(24.dp),
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("What should we work on?", style = MaterialTheme.typography.titleLarge, color = c.text)
+        Text("What should we work on?", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium, color = c.text)
         if (subtitle != null) {
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = c.textFaint, modifier = Modifier.padding(top = 6.dp, bottom = 24.dp))
+        } else {
+            Spacer(Modifier.height(24.dp))
+        }
+        Column(
+            Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            starters.forEach { (title, desc) ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(c.bgCard)
+                        .border(1.dp, c.border, RoundedCornerShape(12.dp))
+                        .clickable { onPromptSelect(title) }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text)
+                        Text(desc, fontSize = 11.sp, color = c.textFaint)
+                    }
+                    Icon(Icons2.ChevronRight, null, tint = c.textFaint, modifier = Modifier.size(16.dp))
+                }
+            }
         }
     }
 }
@@ -293,12 +415,22 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 .fillMaxSize()
                 .background(c.bgSidebar)
                 .statusBarsPadding()
+                .navigationBarsPadding()
                 .clickable { }
                 .padding(16.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Workspaces", style = MaterialTheme.typography.titleMedium, color = c.text, modifier = Modifier.weight(1f))
-                Icon(Icons2.Gear, "Settings", tint = c.textMuted, modifier = Modifier.size(36.dp).clickable { onClose(); store.openSettings(true) }.padding(8.dp))
+                Text("Workspaces", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f))
+                Icon(
+                    Icons2.Gear,
+                    "Settings",
+                    tint = c.textMuted,
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(22.dp))
+                        .clickable { onClose(); store.openSettings(true) }
+                        .padding(11.dp),
+                )
             }
             Spacer(Modifier.height(8.dp))
             Row(
@@ -311,7 +443,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
             ) {
                 Icon(Icons2.Plus, null, tint = c.accent, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Add workspace", fontSize = 14.sp, color = c.accent)
+                Text("Add workspace", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = c.accent)
             }
             Spacer(Modifier.height(8.dp))
             Column(Modifier.verticalScroll(rememberScrollState())) {
@@ -328,14 +460,23 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                             .background(if (active) c.bgSidebarActive else Color.Transparent)
                             .clickable { onClose(); store.openWorkspace(ws) }
                             .heightIn(min = 44.dp)
-                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(Icons2.Folder, null, tint = if (active) c.accent else c.textFaint, modifier = Modifier.size(16.dp))
+                        Icon(Icons2.Folder, null, tint = if (active) c.accent else c.textFaint, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(ws.substringAfterLast('/'), fontSize = 14.sp, color = c.text, modifier = Modifier.weight(1f))
                         if (state.workspaces.size > 1) {
-                            Icon(Icons2.Close, "Remove", tint = c.textFaint, modifier = Modifier.size(16.dp).clickable { store.removeWorkspace(ws) })
+                            Icon(
+                                Icons2.Close,
+                                "Remove",
+                                tint = c.textFaint,
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable { store.removeWorkspace(ws) }
+                                    .padding(6.dp),
+                            )
                         }
                     }
                 }
@@ -355,33 +496,59 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
         Column(
             Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 60.dp, end = 12.dp)
-                .width(280.dp)
-                .background(c.bgRaised, RoundedCornerShape(12.dp))
-                .padding(8.dp)
+                .statusBarsPadding()
+                .padding(top = 16.dp, end = 12.dp)
+                .width(290.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(c.bgRaised)
+                .border(1.dp, c.border, RoundedCornerShape(14.dp))
+                .padding(10.dp)
                 .clickable { },
         ) {
-            Text("Chat history", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textMuted, modifier = Modifier.padding(8.dp))
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Chat history", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f))
+                Icon(
+                    Icons2.Close,
+                    "Close",
+                    tint = c.textMuted,
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable { onClose() }
+                        .padding(5.dp),
+                )
+            }
             if (state.sessions.isEmpty()) {
                 Text("No chats yet", fontSize = 13.sp, color = c.textFaint, modifier = Modifier.padding(12.dp))
             }
             val ordered = state.sessions.sortedBy { it.startedAt }
-            state.sessions.sortedByDescending { it.lastSeen }.forEach { s ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clickable { onClose(); store.openPreview(s) }
-                        .heightIn(min = 44.dp)
-                        .padding(horizontal = 8.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, color = c.text, modifier = Modifier.weight(1f), maxLines = 1)
-                    Spacer(Modifier.width(8.dp))
-                    Text(ageOf(s.lastSeen), fontSize = 11.sp, color = c.textFaint)
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 340.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                state.sessions.sortedByDescending { it.lastSeen }.forEach { s ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onClose(); store.openPreview(s) }
+                            .heightIn(min = 44.dp)
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, color = c.text, modifier = Modifier.weight(1f), maxLines = 1)
+                        Spacer(Modifier.width(8.dp))
+                        Text(ageOf(s.lastSeen), fontSize = 11.sp, color = c.textFaint)
+                    }
                 }
             }
             if (state.sessions.isNotEmpty()) {
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(6.dp))
                 Box(Modifier.fillMaxWidth().height(1.dp).background(c.separator))
                 Text(
                     if (clearArmed) "Click again to confirm" else "Delete all chats in workspace",
@@ -390,7 +557,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { if (clearArmed) { onClose(); store.clearSessions() } else clearArmed = true }
-                        .padding(12.dp),
+                        .padding(10.dp),
                 )
             }
         }
@@ -415,12 +582,14 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
     Column(
         Modifier
             .fillMaxWidth()
-            .padding(12.dp)
-            .background(c.bgRaised, RoundedCornerShape(14.dp))
+            .padding(10.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(c.bgRaised)
+            .border(1.dp, c.border, RoundedCornerShape(16.dp))
             .padding(14.dp),
     ) {
-        Text("Tool approval", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.accent)
-        Text(approval.tool, fontSize = 14.sp, color = c.text, modifier = Modifier.padding(top = 4.dp))
+        Text("Tool approval", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.accent)
+        Text(approval.tool, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = c.text, modifier = Modifier.padding(top = 4.dp))
         // write/edit approvals get a real diff (desktop parity); anything
         // else shows the plain args.
         val args = approval.args

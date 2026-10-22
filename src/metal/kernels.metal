@@ -3100,10 +3100,9 @@ kernel void quantize_q8_k(
     float iscale = -127.0f / max;
     o->d = 1.0f / iscale;
     for (uint j = 0; j < 256; ++j) {
-        float q = xb[j] * iscale;
-        q += 12582912.0f;
-        q -= 12582912.0f;
-        o->qs[j] = (char)(int)q;
+        // round-to-nearest-even (the CPU's f32 magic-add trick); rint is the
+        // same rounding and cannot be contracted away by the MSL compiler
+        o->qs[j] = (char)rint(xb[j] * iscale);
     }
 }
 

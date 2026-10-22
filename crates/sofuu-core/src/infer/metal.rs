@@ -6057,6 +6057,235 @@ fn attn_glue_b4_fault_isolation_1b() {
     }
 }
 
+/// Dual-kernel MMQ probe (SOFUU_TILE_MMQ_PROBE): the shipped CPU tile gemm
+/// (sofuu_gemm_q4_k, with tile_warm — production parity) vs the GPU mirror
+/// (batch_quantize_q8_k + batch_gemm_q4_k_mmq) on the SAME synthetic
+/// weights/activations at rows=8/cols=256/batch=4. Structured scale bytes
+/// make any scale/min mapping difference show up as a per-(row, subblock)
+/// delta pattern; the quantizer diff shows up as a d-column delta. This is
+/// the byte-identity receipt for the 8x4-tile mirror. Run: cargo test --
+/// --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn mmq_tile_value_probe() {
+    use std::os::raw::c_void;
+    extern "C" {
+        fn sofuu_gemm_q4_k(
+            w: *const u8, x: *const f32, out: *mut f32,
+            rows: usize, cols: usize, batch: usize,
+        );
+        fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
+    }
+    let rows = 8usize;
+    let cols = 256usize;
+    let batch = 4usize;
+    // weights: 1 block per row; d=1.0, dmin=0.25; scales bytes = structured
+    let mut w: Vec<u8> = Vec::with_capacity(rows * 144);
+    for r in 0..rows {
+        w.extend_from_slice(&1.0f32.to_le_bytes()[..2]); // f16 1.0
+        w.extend_from_slice(&(0x3CA0u16).to_le_bytes()); // f16 0.03125
+        let mut sb = Vec::with_capacity(12);
+        for i in 0..12 {
+            sb.push(((r * 31 + i * 17 + 5) & 0xFF) as u8);
+        }
+        w.extend_from_slice(&sb);
+        // qs: deterministic nibble pattern
+        for i in 0..128 {
+            w.push(((i * 37 + r * 91 + 11) & 0xFF) as u8);
+        }
+    }
+    // activations: 4 tokens
+    let mut x: Vec<f32> = Vec::with_capacity(batch * cols);
+    for t in 0..batch {
+        for j in 0..cols {
+            x.push(((j * 7 + t * 61) % 253) as f32 / 25.0 - 5.0);
+        }
+    }
+
+    // ---- CPU shipped kernel (production parity: warm first) ----
+    let warm = unsafe { sofuu_tile_warm(w.as_ptr(), rows, cols, 12) };
+    eprintln!("[probe] tile_warm = {warm}");
+    let mut cpu_out = vec![0f32; batch * rows];
+    unsafe {
+        sofuu_gemm_q4_k(w.as_ptr(), x.as_ptr(), cpu_out.as_mut_ptr(), rows, cols, batch);
+    }
+
+    // ---- host model of the pipeline (my p-algorithm reduction) ----
+    fn gsmk(j: usize, q: &[u8]) -> (u8, u8) {
+        if j < 4 {
+            (q[j] & 63, q[j + 4] & 63)
+        } else {
+            (
+                (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+            )
+        }
+    }
+    let host_out = {
+        #[inline]
+        fn magic_round(v: f32) -> i32 {
+            let q = v + 12582912.0f32;
+            (q - 12582912.0f32) as i32
+        }
+        let mut out = vec![0f32; batch * rows];
+        for t in 0..batch {
+            let seg = &x[t * cols..(t + 1) * cols];
+            let amax = seg.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let mut mx = 0.0f32;
+            for v in seg.iter() {
+                if v.abs() == amax { mx = *v; break; }
+            }
+            let iscale = if amax != 0.0 { -127.0f32 / mx } else { 0.0 };
+            let d8 = if amax != 0.0 { 1.0 / iscale } else { 0.0 };
+            let q8: Vec<i32> = seg.iter().map(|v| magic_round(v * iscale)).collect();
+            for r in 0..rows {
+                let blk = &w[r * 144..(r + 1) * 144];
+                let d = half_to_f32((blk[1] as u16) << 8 | blk[0] as u16);
+                let dmin = half_to_f32((blk[3] as u16) << 8 | blk[2] as u16);
+                let scales = &blk[4..16];
+                let qs = &blk[16..144];
+                let sbd_scale = d * d8;
+                let sbd_min = dmin * d8;
+                let mut acc = 0.0f32;
+                let mut bias: i32 = 0;
+                for s in 0..4 {
+                    let (sc_lo, m_lo) = gsmk(s * 2, scales);
+                    let (sc_hi, m_hi) = gsmk(s * 2 + 1, scales);
+                    let mut acc_lo = 0i32;
+                    let mut acc_hi = 0i32;
+                    let mut bsum_lo = 0i32;
+                    let mut bsum_hi = 0i32;
+                    for k in 0..32usize {
+                        let wq = qs[s * 32 + k];
+                        let ql = q8[s * 64 + k];
+                        let qh = q8[s * 64 + 32 + k];
+                        acc_lo += ((wq & 0x0F) as i32) * ql;
+                        acc_hi += ((wq >> 4) as i32) * qh;
+                        bsum_lo += ql;
+                        bsum_hi += qh;
+                    }
+                    let sum_int = (sc_lo as i32) * acc_lo + (sc_hi as i32) * acc_hi;
+                    acc = acc + sbd_scale * (sum_int as f32); // host f32 approx
+                    bias += (m_lo as i32) * bsum_lo + (m_hi as i32) * bsum_hi;
+                }
+                acc -= sbd_min * (bias as f32);
+                out[t * rows + r] = acc;
+            }
+        }
+        out
+    };
+
+    // ---- GPU mirror ----
+    let page = 16384usize;
+    let engine = MetalEngine::new().expect("engine");
+    let mk = |bytes: usize| -> (*mut u8, usize) {
+        let sz = bytes.div_ceil(page) * page;
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), sz, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        (p as *mut u8, sz)
+    };
+    let (wp, wsz) = mk(w.len());
+    unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wp, w.len()) };
+    let w_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(wp, wsz) }).expect("w");
+    let (xp, xsz) = mk(x.len() * 4);
+    unsafe { std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, xp, x.len() * 4) };
+    let x_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(xp, xsz) }).expect("x");
+    let xq8_bytes = batch * (cols / 256) * 260;
+    let (qp, qsz) = mk(xq8_bytes);
+    let q_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(qp, qsz) }).expect("q");
+    let (op, osz) = mk(batch * rows * 4);
+    let o_buf = engine.register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(op, osz) }).expect("o");
+    let dispatched = {
+        assert!(engine.batch_open());
+        let q_ok = engine.batch_quantize_q8_k(&x_buf, 0, &q_buf, 0, cols, batch);
+        let g_ok = q_ok && engine.batch_gemm_q4_k_mmq(&w_buf, 0, &q_buf, 0, &o_buf, 0, rows, cols, batch);
+        engine.batch_end();
+        q_ok && g_ok
+    };
+    assert!(dispatched, "probe: PSO unavailable");
+    let gpu_out: Vec<f32> = (0..batch * rows)
+        .map(|i| unsafe { (op as *const f32).add(i).read() })
+        .collect();
+
+    // dump the GPU quantized block for token 0
+    let d0 = unsafe { (qp as *const f32).read() };
+    eprintln!("[probe] GPU xq8 d[token0] = {d8_repr}", d8_repr = d0);
+    // reconstruct the host-side quantized ints for token 0 and diff against
+    // the GPU's qs bytes
+    let seg0 = &x[0..cols];
+    let amax0 = seg0.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let mut mx0 = 0.0f32;
+    for v in seg0.iter() {
+        if v.abs() == amax0 { mx0 = *v; break; }
+    }
+    let iscale0 = if amax0 != 0.0 { -127.0f32 / mx0 } else { 0.0 };
+    let mut q_mismatch = 0usize;
+    for j in 0..cols {
+        let qh = ((seg0[j] * iscale0 + 12582912.0f32) - 12582912.0f32) as i32 as i8;
+        let qg = unsafe { *((qp as *const i8).add(4 + j)) }; // d at 0..4
+        if qh != qg { q_mismatch += 1; }
+    }
+    eprintln!(
+        "[probe] token0 qs: mismatches={q_mismatch}/256 host_q[0..8]={:?} gpu_q[0..8]={:?}",
+        (0..8).map(|j| ((seg0[j] * iscale0 + 12582912.0f32) - 12582912.0f32) as i32 as i8).collect::<Vec<_>>(),
+        (0..8).map(|j| unsafe { *((qp as *const i8).add(4 + j)) }).collect::<Vec<_>>(),
+    );
+
+    let mut worst = 0f32;
+    let mut wr = 0usize;
+    for t in 0..batch {
+        for r in 0..rows {
+            let i = t * rows + r;
+            let d = (cpu_out[i] - gpu_out[i]).abs();
+            if d > worst { worst = d; wr = i; }
+        }
+    }
+    let mut worst_host = 0f32;
+    for t in 0..batch {
+        for r in 0..rows {
+            let i = t * rows + r;
+            let d = (cpu_out[i] - host_out[i]).abs();
+            if d > worst_host { worst_host = d; }
+        }
+    }
+    eprintln!(
+        "[probe] CPU-vs-GPU worst={worst:.4e} at idx {wr} (tok{} row{}) | CPU-vs-HOSTMODEL worst={worst_host:.4e}",
+        wr / rows, wr % rows
+    );
+    for t in 0..batch {
+        for r in 0..rows {
+            eprintln!(
+                "r{r} t{t}: cpu={:+.6} gpu={:+.6} host={:+.6}",
+                cpu_out[t * rows + r], gpu_out[t * rows + r], host_out[t * rows + r]
+            );
+        }
+    }
+    unsafe { libc::munmap(wp as *mut libc::c_void, wsz) };
+    unsafe { libc::munmap(xp as *mut libc::c_void, xsz) };
+    unsafe { libc::munmap(qp as *mut libc::c_void, qsz) };
+    unsafe { libc::munmap(op as *mut libc::c_void, osz) };
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            (sign << 31) | (113 << 23) | (mant << 13)
+        }
+    } else if exp == 31 {
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape
 /// (b=2 rows, 2 priors, 32 heads / 8 kv / hd 64). The CPU mirror is the
 /// textbook serial attention: causal softmax(q·k/√hd) × v over priors.

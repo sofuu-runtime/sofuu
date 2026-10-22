@@ -707,3 +707,24 @@ IDENTICAL/CERTIFIED) stays open until then; NO defaults moved.
   an int pipeline; the 9.8e-2/r0 deltas are cancellation amplification of a
   small systematic difference (prime suspect: q8-tile bsum interleave or
   lane-mapping in my extraction, or a quant flip cascade).
+
+## MIRROR BIT-IDENTITY CLOSED FOR q4_K (2026-10-23 — the quantizer receipt)
+`mmq_tile_value_probe` (metal.rs): shipped CPU `sofuu_gemm_q4_k` (with
+production-parity `sofuu_tile_warm`) vs GPU `batch_quantize_q8_k +
+batch_gemm_q4_k_mmq` on synthetic structured-scale W at rows=8/cols=256/
+batch=4 — CPU == host-model EXACTLY (the shipped kernel IS the p-pipeline as
+modeled), and the GPU was the deviator: MSL `q += 12582912; q -= 12582912`
+gets CANCELLED by the MSL compiler (the fp-contract pragma is not honored)
+so `(int)q` truncated instead of round-nearest-even → 26/256 quants off by 1.
+Fix: `(char)rint(xb[j] * iscale)` — un-cancellable. Probe now reports
+CPU-vs-GPU worst=0.0000e0 (BIT-IDENTICAL, qs 0/256 mismatches), and the live
+stage bisect dropped s2.qa 9.8e-2 → 9.5e-7 (f32 class), s3.kc → 6.1e-5.
+REMAINING class: attn_v + ffn_down are **q6_K (type 14)** in the i1 file —
+the CPU q6_K tile pipeline (`ggml_gemm_q6_K_8x4_q8_K`) still rides GPU-exact
+on the mirror side (s2.va unchanged 1.085e-2) and the default-pair gate
+stays FORK (|dtop1| 0.258 at step 2). BOOKED: extend mmq_tile_value_probe to
+a q6_K synthetic triple (CPU/GPU/host — the q6 scale-map runs
+sc[is+0/2/4/6] per part-half per the repo's own sofuu_dequantize_row_q6_k),
+mirror `gemm_q6_k_mmq`, wire the macro for type 14, then re-gate. The
+q6_K dequant reference to mirror = sofuu_dequantize_row_q6_k (infer_kernels
+.cpp:810) — n×part halves, is=part, sc stride 2 per part.

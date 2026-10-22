@@ -3068,6 +3068,85 @@ void sofuu_swiglu(float *out, const float *gate, const float *up, size_t n) {
 #endif
 }
 
+// ── GeGLU (exact-erf GELU) ───────────────────────────────────────────
+// gelu_erf(x) = 0.5 * x * (1 + erf(x / sqrt2)); Spark-X2.5's FFN activation.
+// The Spark backend used a per-element scalar loop (A&S 7.1.26 poly + expf)
+// over n_layers * hidden_dim * batch — measured as the bulk of its prefill
+// "other" bucket (36 layers x 10240 x 128 per 128-token chunk on Pi 5).
+// Same formula and association order as that scalar loop; the exp is the
+// usual 2^k * degree-6 poly (|r| <= ln2/2).
+static inline float sofuu_gelu_erf_scalar(float x) {
+    const float z = x * 0.70710678118654752440f;
+    const float sign = z < 0.0f ? -1.0f : 1.0f;
+    const float ax = fabsf(z);
+    const float t = 1.0f / (1.0f + 0.3275911f * ax);
+    const float y = 1.0f -
+                    ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t +
+                     0.254829592f) *
+                        t * expf(-ax * ax);
+    return 0.5f * x * (1.0f + sign * y);
+}
+
+#if defined(SOFUU_NEON)
+// exp(x) for x <= 0, clamped at -87 (2^-126): |error| <= ~1e-8 relative.
+static inline float32x4_t sofuu_neon_exp_neg(float32x4_t x) {
+    const float32x4_t ln2 = vdupq_n_f32(0.6931471805599453f);
+    const float32x4_t inv_ln2 = vdupq_n_f32(1.4426950408889634f);
+    x = vmaxq_f32(x, vdupq_n_f32(-87.0f));
+    const float32x4_t kf = vrndnq_f32(vmulq_f32(x, inv_ln2));
+    const float32x4_t r = vfmsq_f32(x, kf, ln2);
+    float32x4_t p = vdupq_n_f32(1.0f / 720.0f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
+    const int32x4_t ki = vcvtq_s32_f32(kf);
+    const float32x4_t scale =
+        vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ki, vdupq_n_s32(127)), 23));
+    return vmulq_f32(p, scale);
+}
+#endif
+
+void sofuu_geglu_erf(float *gate, const float *up, size_t n) {
+#if defined(SOFUU_NEON)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t inv_sqrt2 = vdupq_n_f32(0.7071067811865476f);
+    const float32x4_t q = vdupq_n_f32(0.3275911f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        for (int lane = 0; lane < 16; lane += 4) {
+            const float32x4_t g = vld1q_f32(gate + i + lane);
+            const float32x4_t u = vld1q_f32(up + i + lane);
+            const float32x4_t z = vmulq_f32(g, inv_sqrt2);
+            const float32x4_t sign = vbslq_f32(vcltq_f32(z, zero), vnegq_f32(one), one);
+            const float32x4_t ax = vabsq_f32(z);
+            const float32x4_t t = vdivq_f32(one, vfmaq_f32(one, q, ax));
+            float32x4_t p = vdupq_n_f32(1.061405429f);
+            p = vfmaq_f32(vdupq_n_f32(-1.453152027f), p, t);
+            p = vfmaq_f32(vdupq_n_f32(1.421413741f), p, t);
+            p = vfmaq_f32(vdupq_n_f32(-0.284496736f), p, t);
+            p = vfmaq_f32(vdupq_n_f32(0.254829592f), p, t);
+            const float32x4_t e = sofuu_neon_exp_neg(vnegq_f32(vmulq_f32(ax, ax)));
+            const float32x4_t y = vfmsq_f32(one, vmulq_f32(p, t), e);
+            const float32x4_t erf = vmulq_f32(sign, y);
+            const float32x4_t act = vmulq_f32(vmulq_f32(half, g), vaddq_f32(one, erf));
+            vst1q_f32(gate + i + lane, vmulq_f32(act, u));
+        }
+    }
+    for (; i < n; ++i) {
+        gate[i] = sofuu_gelu_erf_scalar(gate[i]) * up[i];
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        gate[i] = sofuu_gelu_erf_scalar(gate[i]) * up[i];
+    }
+#endif
+}
+
 // ── Numerically Stable Softmax ───────────────────────────────────────
 // ── Batched elementwise glue: one FFI call per layer instead of one per
 // token; internally parallel over rows. Kills per-call FFI overhead that
@@ -4327,6 +4406,139 @@ static void sofuu_attn_fa2_range(
     }
 }
 
+// ── GQA-fused decode attention (n_rep = 4) ───────────────────────────
+// Four query heads share one KV head (Llama-3.2-1B, MiniCPM, Spark-X2.5).
+// The per-head loop streams the same K and V rows four times: on Spark-4B
+// that is ~88 MB per decode token for ~7.8 ms of real traffic, and the
+// bucket measured 17.5 ms. These two kernels load each row once and apply it
+// to all four heads. The per-head accumulation order is copied verbatim from
+// sofuu_attn_qk_range / sofuu_attn_vacc_range (16-wide strips into four
+// per-lane-block accumulators, pairwise combine, 4-wide continue, vaddvq,
+// scalar tail), so results are bit-identical to the per-head path.
+static std::atomic<uint64_t> g_gqa4_groups{0};
+
+static bool gqa4_enabled() {
+    static int v = getenv("SOFUU_GQA4") ? (strcmp(getenv("SOFUU_GQA4"), "0") == 0 ? 0 : 1) : 1;
+    return v != 0;
+}
+
+static void sofuu_attn_qk_gqa4_f32(const float *const q[4], const float *k_base, size_t k_stride,
+                                   size_t head_dim, size_t count, float scale,
+                                   float *const s[4]) {
+#if defined(SOFUU_NEON)
+    for (size_t p = 0; p < count; ++p) {
+        const float *k_row = k_base + p * k_stride;
+        float32x4_t a0[4], a1[4], a2[4], a3[4];
+        for (int h = 0; h < 4; ++h) {
+            a0[h] = vdupq_n_f32(0.0f);
+            a1[h] = vdupq_n_f32(0.0f);
+            a2[h] = vdupq_n_f32(0.0f);
+            a3[h] = vdupq_n_f32(0.0f);
+        }
+        size_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) {
+            const float32x4_t kv0 = vld1q_f32(k_row + i);
+            const float32x4_t kv1 = vld1q_f32(k_row + i + 4);
+            const float32x4_t kv2 = vld1q_f32(k_row + i + 8);
+            const float32x4_t kv3 = vld1q_f32(k_row + i + 12);
+            for (int h = 0; h < 4; ++h) {
+                const float *qh = q[h] + i;
+                a0[h] = vfmaq_f32(a0[h], vld1q_f32(qh), kv0);
+                a1[h] = vfmaq_f32(a1[h], vld1q_f32(qh + 4), kv1);
+                a2[h] = vfmaq_f32(a2[h], vld1q_f32(qh + 8), kv2);
+                a3[h] = vfmaq_f32(a3[h], vld1q_f32(qh + 12), kv3);
+            }
+        }
+        float32x4_t c[4];
+        for (int h = 0; h < 4; ++h) {
+            c[h] = vaddq_f32(vaddq_f32(a0[h], a1[h]), vaddq_f32(a2[h], a3[h]));
+        }
+        size_t j = i;
+        for (; j + 4 <= head_dim; j += 4) {
+            const float32x4_t kv = vld1q_f32(k_row + j);
+            for (int h = 0; h < 4; ++h) {
+                c[h] = vfmaq_f32(c[h], vld1q_f32(q[h] + j), kv);
+            }
+        }
+        float t[4];
+        for (int h = 0; h < 4; ++h) t[h] = vaddvq_f32(c[h]);
+        for (; j < head_dim; ++j) {
+            const float kv = k_row[j];
+            for (int h = 0; h < 4; ++h) t[h] += q[h][j] * kv;
+        }
+        for (int h = 0; h < 4; ++h) s[h][p] = t[h] * scale;
+    }
+#else
+    for (int h = 0; h < 4; ++h) {
+        sofuu_attn_qk_range(q[h], k_base, k_stride, head_dim, 0, count, scale, s[h]);
+    }
+#endif
+}
+
+static void sofuu_attn_vacc_gqa4_f32(float *const out[4], const float *v_base, size_t v_stride,
+                                     size_t head_dim, size_t count, const float *const s[4]) {
+#if defined(SOFUU_NEON)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t d0[4], d1[4], d2[4], d3[4];
+            for (int h = 0; h < 4; ++h) {
+                d0[h] = vld1q_f32(out[h] + i);
+                d1[h] = vld1q_f32(out[h] + i + 4);
+                d2[h] = vld1q_f32(out[h] + i + 8);
+                d3[h] = vld1q_f32(out[h] + i + 12);
+            }
+            for (int a = 0; a < 4; ++a) {
+                const float *vrow = v_base + (p + a) * v_stride;
+                const float32x4_t vv0 = vld1q_f32(vrow + i);
+                const float32x4_t vv1 = vld1q_f32(vrow + i + 4);
+                const float32x4_t vv2 = vld1q_f32(vrow + i + 8);
+                const float32x4_t vv3 = vld1q_f32(vrow + i + 12);
+                for (int h = 0; h < 4; ++h) {
+                    const float32x4_t sv = vdupq_n_f32(s[h][p + a]);
+                    d0[h] = vmlaq_f32(d0[h], vv0, sv);
+                    d1[h] = vmlaq_f32(d1[h], vv1, sv);
+                    d2[h] = vmlaq_f32(d2[h], vv2, sv);
+                    d3[h] = vmlaq_f32(d3[h], vv3, sv);
+                }
+            }
+            for (int h = 0; h < 4; ++h) {
+                vst1q_f32(out[h] + i, d0[h]);
+                vst1q_f32(out[h] + i + 4, d1[h]);
+                vst1q_f32(out[h] + i + 8, d2[h]);
+                vst1q_f32(out[h] + i + 12, d3[h]);
+            }
+        }
+        for (int a = 0; a < 4; ++a) {
+            const float *vrow = v_base + (p + a) * v_stride;
+            for (int h = 0; h < 4; ++h) {
+                const float32x4_t sv = vdupq_n_f32(s[h][p + a]);
+                size_t it = i16;
+                for (; it + 4 <= head_dim; it += 4) {
+                    float32x4_t d = vld1q_f32(out[h] + it);
+                    d = vmlaq_f32(d, vld1q_f32(vrow + it), sv);
+                    vst1q_f32(out[h] + it, d);
+                }
+                for (; it < head_dim; ++it) out[h][it] += vrow[it] * s[h][p + a];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        const float *vrow = v_base + p * v_stride;
+        for (int h = 0; h < 4; ++h) {
+            sofuu_vec_mad_f32(out[h], vrow, s[h][p], head_dim);
+        }
+    }
+#else
+    for (int h = 0; h < 4; ++h) {
+        for (size_t p = 0; p < count; ++p) {
+            sofuu_vec_mad_f32(out[h], v_base + p * v_stride, s[h][p], head_dim);
+        }
+    }
+#endif
+}
+
 // ── Multi-core Parallel Attention with Sliding Window & Attention Sinks ──
 void sofuu_batched_attention_ext(
     const float *q_batch,
@@ -4347,13 +4559,55 @@ void sofuu_batched_attention_ext(
     size_t q_dim = n_heads * head_dim;
     size_t n_rep = n_heads / n_kv_heads;
     float inv_sqrt_head_dim = 1.0f / sqrtf((float)head_dim);
+    // Decode with four query heads per KV head reads each K/V row once for the
+    // whole group instead of once per head. Restricted to the plain full-range
+    // case (SWA layers whose window already covers the context qualify); the
+    // fused kernels reproduce the per-head accumulation order, so this is a
+    // traffic change only.
+    const size_t gqa_pos = start_pos;
+    const size_t gqa_seq_len = (gqa_pos + 1 < max_seq_len) ? (gqa_pos + 1) : max_seq_len;
+    const bool gqa_full_range = !(sliding_window > 0 && gqa_seq_len > sliding_window);
+    const bool use_gqa4 = b_size == 1 && n_rep == 4 && n_heads == n_kv_heads * 4 && gqa_full_range &&
+                          gqa4_enabled() && !(fa2_enabled() && head_dim <= 4096);
     // Plain-path rows go 8 batch rows per item so sofuu_attn_qk_rows8 can
     // share the two K strips across them; SWA/window and FA2 keep the
     // (row, head) domain (their per-row score ranges differ structurally).
     const bool use_rows8 = sliding_window == 0 && !(fa2_enabled() && head_dim <= 4096);
-    size_t total_work = use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads;
+    size_t total_work = use_gqa4 ? n_kv_heads
+                                 : (use_rows8 ? ((b_size + 7) / 8) * n_heads : b_size * n_heads);
 
     auto compute_head_slice = [=](size_t start, size_t end) {
+        if (use_gqa4) {
+            alignas(32) float gscore_stack[4][4096];
+            std::vector<float> gqa_heap;
+            float *gscore[4];
+            for (size_t r = 0; r < 4; ++r) gscore[r] = gscore_stack[r];
+            if (max_seq_len > 4096) {
+                gqa_heap.resize(4 * max_seq_len);
+                for (size_t r = 0; r < 4; ++r) gscore[r] = gqa_heap.data() + r * max_seq_len;
+            }
+            for (size_t kv_h = start; kv_h < end; ++kv_h) {
+                const size_t head_base = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim;
+                const float *k_past = k_cache + head_base;
+                const float *v_past = v_cache + head_base;
+                const float *q[4];
+                float *out[4];
+                for (size_t r = 0; r < 4; ++r) {
+                    const size_t h = kv_h * n_rep + r;
+                    q[r] = q_batch + h * head_dim;
+                    out[r] = head_out_batch + h * head_dim;
+                }
+                sofuu_attn_qk_gqa4_f32(q, k_past, head_dim, head_dim, gqa_seq_len,
+                                       inv_sqrt_head_dim, gscore);
+                for (size_t r = 0; r < 4; ++r) {
+                    sofuu_softmax(gscore[r], gqa_seq_len);
+                    std::memset(out[r], 0, head_dim * sizeof(float));
+                }
+                sofuu_attn_vacc_gqa4_f32(out, v_past, head_dim, head_dim, gqa_seq_len, gscore);
+                g_gqa4_groups.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
         if (use_rows8) {
             alignas(32) float gscore_stack[8][4096];
             std::vector<float> heap_scores;
@@ -4503,6 +4757,10 @@ void sofuu_batched_attention_ext(
 
     size_t effective_len = (sliding_window > 0 && start_pos > sliding_window) ? sliding_window : (start_pos + b_size / 2 + 1);
     bool run_parallel = (total_work >= 32) || (total_work >= 16 && effective_len >= 128);
+    // One work item per KV head is only four items on these shapes; the
+    // per-item traffic is the whole group's K/V, so spread it once the
+    // context is long enough to pay for the dispatch.
+    if (use_gqa4) run_parallel = (n_kv_heads >= 4 && gqa_seq_len >= 128);
 
     if (run_parallel) {
         g_pool.parallel_for(0, total_work, compute_head_slice);
@@ -4552,6 +4810,12 @@ extern "C" void sofuu_test_qk_rows8_f32(const float *q, const float *k, size_t h
     size_t counts[1] = { count };
     float *outs[1] = { out };
     sofuu_attn_qk_rows8(q, head_dim, k, head_dim, head_dim, 0, counts, outs, scale, 1);
+}
+
+// Non-vacuity probe for the n_rep=4 fused decode path (the Rust test asserts
+// it moved), and a mode setter for A/B receipts.
+extern "C" uint64_t sofuu_gqa4_attn_groups(void) {
+    return g_gqa4_groups.load(std::memory_order_relaxed);
 }
 
 extern "C" void sofuu_test_qk_rows8_k16(const float *q, const uint16_t *k, size_t head_dim,

@@ -323,6 +323,12 @@ pub fn set_gqa_attn(mode: i32) {
     unsafe { sofuu_set_gqa_attn(mode) };
 }
 
+/// Count of n_rep=4 fused attention groups (one per KV head) — assert-able
+/// proof that the fused decode path actually ran.
+pub fn gqa4_attn_groups() -> u64 {
+    unsafe { sofuu_gqa4_attn_groups() }
+}
+
 pub fn set_thread_count(n: usize) {
     unsafe {
         sofuu_set_threads(n as i32);
@@ -529,6 +535,7 @@ extern "C" {
         max_seq_len: usize, freq_base: f32, rope_mode: i32,
     );
     fn sofuu_swiglu(out: *mut f32, gate: *const f32, up: *const f32, n: usize);
+    fn sofuu_geglu_erf(gate: *mut f32, up: *const f32, n: usize);
     fn sofuu_softmax(scores: *mut f32, n: usize);
     fn sofuu_rope(vec: *mut f32, n_heads: usize, head_dim: usize, pos: usize, freq_base: f32, rope_style: i32);
     fn sofuu_rope_shift(vec: *mut f32, n_heads: usize, head_dim: usize, delta_pos: i64, freq_base: f32, rope_style: i32);
@@ -578,6 +585,7 @@ extern "C" {
     fn sofuu_bench_attn(b: i32, heads: i32, kv_heads: i32, head_dim: i32, seq: i32, iters: i32);
     fn sofuu_set_gqa_attn(mode: i32);
     fn sofuu_gqa_attn_calls() -> u64;
+    fn sofuu_gqa4_attn_groups() -> u64;
     fn sofuu_kv16_fast_path() -> i32;
     fn sofuu_simd_features() -> i32;
     fn sofuu_test_qk_rows8_f32(q: *const f32, k: *const f32, head_dim: usize, count: usize, out: *mut f32, scale: f32);
@@ -1731,6 +1739,64 @@ pub fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
     let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     unsafe {
         sofuu_swiglu(gate.as_mut_ptr(), gate.as_ptr(), up.as_ptr(), gate.len());
+    }
+}
+
+/// In-place GeGLU activation (exact-erf GELU): gate = gelu_erf(gate) * up via
+/// C++ SIMD. Same A&S 7.1.26 erf the Spark backend used scalar.
+#[inline]
+pub fn geglu_erf_in_place(gate: &mut [f32], up: &[f32]) {
+    assert_eq!(gate.len(), up.len());
+    // A/B reference: the scalar expression the Spark backend ran before the
+    // SIMD kernel. Under SOFUU_PROFILE it also reports how far the kernel
+    // deviates on live activations (sampled — one line per 512 calls).
+    if std::env::var_os("SOFUU_GEGLU_SCALAR").is_some() {
+        let before = gate.to_vec();
+        geglu_erf_scalar(gate, up);
+        if prof::enabled() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            if CALLS.fetch_add(1, Ordering::Relaxed) % 512 == 0 {
+                let mut fast = before;
+                unsafe {
+                    sofuu_geglu_erf(fast.as_mut_ptr(), up.as_ptr(), fast.len());
+                }
+                let mut max_rel = 0.0f32;
+                for i in 0..fast.len() {
+                    let d = (fast[i] - gate[i]).abs() / gate[i].abs().max(1.0);
+                    if d > max_rel {
+                        max_rel = d;
+                    }
+                }
+                eprintln!("[geglu] n={} neon-vs-scalar max_rel={max_rel:.3e}", fast.len());
+            }
+        }
+        return;
+    }
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
+    unsafe {
+        sofuu_geglu_erf(gate.as_mut_ptr(), up.as_ptr(), gate.len());
+    }
+}
+
+/// Scalar A&S 7.1.26 exact-erf GeGLU — the reference expression.
+fn geglu_erf_scalar(gate: &mut [f32], up: &[f32]) {
+    fn erf32(x: f32) -> f32 {
+        let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
+        let x = x.abs();
+        let t = 1.0f32 / (1.0f32 + 0.3275911f32 * x);
+        let y = 1.0f32
+            - ((((1.061405429f32 * t - 1.453152027f32) * t + 1.421413741f32) * t
+                - 0.284496736f32)
+                * t
+                + 0.254829592f32)
+                * t
+                * (-x * x).exp();
+        sign * y
+    }
+    for i in 0..gate.len() {
+        let g = gate[i];
+        gate[i] = 0.5f32 * g * (1.0f32 + erf32(g * std::f32::consts::FRAC_1_SQRT_2)) * up[i];
     }
 }
 
@@ -3144,10 +3210,113 @@ fn check_attention_k16_parity(head_dim: usize) {
         }
     }
 
+    /// The NEON GeGLU must stay within f32 noise of the scalar A&S 7.1.26
+    /// loop it replaced (Spark's FFN activation). Same clause: a broken lane or
+    /// clamp shows up far above 1e-6 relative.
+    #[test]
+    fn test_geglu_erf_matches_scalar_reference() {
+        fn erf32(x: f32) -> f32 {
+            let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
+            let x = x.abs();
+            let t = 1.0f32 / (1.0f32 + 0.3275911f32 * x);
+            let y = 1.0f32
+                - ((((1.061405429f32 * t - 1.453152027f32) * t + 1.421413741f32) * t
+                    - 0.284496736f32)
+                    * t
+                    + 0.254829592f32)
+                    * t
+                    * (-x * x).exp();
+            sign * y
+        }
+        let gelu = |x: f32| 0.5f32 * x * (1.0f32 + erf32(x * std::f32::consts::FRAC_1_SQRT_2));
+
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 33) as f32 / (u32::MAX >> 1) as f32) - 0.5
+        };
+        // 19 exercises the scalar remainder after the 16-wide strip; the
+        // i % 97 rows push |x| out to where erf saturates.
+        for n in [1usize, 4, 16, 19, 4096] {
+            let mut gate = vec![0.0f32; n];
+            let mut up = vec![0.0f32; n];
+            for i in 0..n {
+                gate[i] = if i % 97 == 0 { next() * 60.0 } else { next() * 12.0 };
+                up[i] = next() * 4.0;
+            }
+            let want: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| gelu(g) * u).collect();
+            let mut got = gate.clone();
+            geglu_erf_in_place(&mut got, &up);
+            for i in 0..n {
+                let tol = 1e-6 * want[i].abs().max(1.0);
+                assert!(
+                    (got[i] - want[i]).abs() <= tol,
+                    "geglu[{i}] of {n}: {} vs reference {}",
+                    got[i], want[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_attention_k16_matches_f32_for_f16_exact_kv() {
         for head_dim in [32usize, 34, 36] {
             check_attention_k16_parity(head_dim);
+        }
+    }
+
+    /// n_rep=4 fused decode attention must be bit-identical to the per-head
+    /// path: b==1 takes the fused branch while the same row inside a b==2 call
+    /// takes the per-head rows8 branch, and both accumulate in one order.
+    #[test]
+    fn test_attention_gqa4_fused_matches_per_head_path() {
+        let (n_heads, n_kv_heads) = (8usize, 2usize);
+        for head_dim in [32usize, 36, 256] {
+            let q_dim = n_heads * head_dim;
+            let max_seq = 24usize;
+            let pos = 17usize;
+            let mut rng: u64 = 0x243f_6a88_85a3_08d3;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                ((rng >> 33) as f32 / (u32::MAX >> 1) as f32) - 0.5
+            };
+            // Row 0 is shared by both calls; row 1 only exists to force the
+            // per-head decomposition on the second call.
+            let q: Vec<f32> = (0..2 * q_dim).map(|_| next()).collect();
+            let kv_len = n_kv_heads * max_seq * head_dim;
+            let k: Vec<f32> = (0..kv_len).map(|_| next()).collect();
+            let v: Vec<f32> = (0..kv_len).map(|_| next()).collect();
+
+            let groups_before = gqa4_attn_groups();
+            let mut out1 = vec![0.0f32; q_dim];
+            batched_attention_ext(
+                &q[..q_dim], &k, &v, &mut out1, 1, pos, 0, n_heads, n_kv_heads, head_dim, max_seq,
+                0, 0,
+            );
+            let groups_after = gqa4_attn_groups();
+            let mut out2 = vec![0.0f32; 2 * q_dim];
+            batched_attention_ext(
+                &q, &k, &v, &mut out2, 2, pos, 0, n_heads, n_kv_heads, head_dim, max_seq, 0, 0,
+            );
+
+            assert!(
+                groups_after > groups_before,
+                "head_dim {head_dim}: fused n_rep=4 path did not run"
+            );
+            assert!(out1.iter().any(|x| x.abs() > 1e-6), "head_dim {head_dim}: zero output");
+            for i in 0..q_dim {
+                assert_eq!(
+                    out1[i].to_bits(),
+                    out2[i].to_bits(),
+                    "head_dim {head_dim} idx {i}: fused {} vs per-head {}",
+                    out1[i],
+                    out2[i]
+                );
+            }
         }
     }
 

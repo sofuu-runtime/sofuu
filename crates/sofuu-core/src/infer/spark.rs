@@ -19,8 +19,9 @@ use super::gguf::{GgufFile, GgufValue};
 use super::model::{AnonBuffer, ModelConfig, TensorView, max_prefill_batch};
 use super::quant::{
     batched_attention_ext, dequantize_q4_0_row, dequantize_q4_k_row, dequantize_q6_k_row,
-    dequantize_q8_0_row, f16_to_f32, matmat, matvec, prof, rmsnorm, rope_style, type_row_size,
-    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    dequantize_q8_0_row, f16_to_f32, geglu_erf_in_place, matmat, matvec, prof, rmsnorm, rope_style,
+    type_row_size, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
 };
 
 #[derive(Clone)]
@@ -93,34 +94,6 @@ fn inline_mad(dst: &mut [f32], src: &[f32], scalar: f32) {
     }
 }
 
-/// Exact-erf GELU matching llama.cpp ggml_gelu (spark FFN activation).
-#[inline(always)]
-fn erf32(x: f32) -> f32 {
-    // Abramowitz & Stegun 7.1.26 approximation, max abs error 1.5e-7.
-    let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
-    let x = x.abs();
-    let t = 1.0f32 / (1.0f32 + 0.3275911f32 * x);
-    let y = 1.0f32
-        - ((((1.061405429f32 * t - 1.453152027f32) * t + 1.421413741f32) * t - 0.284496736f32) * t
-            + 0.254829592f32)
-            * t
-            * (-x * x).exp();
-    sign * y
-}
-
-#[inline(always)]
-fn gelu_erf(x: f32) -> f32 {
-    0.5f32 * x * (1.0f32 + erf32(x * std::f32::consts::FRAC_1_SQRT_2))
-}
-
-/// In-place GeGLU: gate[i] = gelu_erf(gate[i]) * up[i].
-fn geglu_erf_in_place(gate: &mut [f32], up: &[f32]) {
-    let len = gate.len().min(up.len());
-    for i in 0..len {
-        gate[i] = gelu_erf(gate[i]) * up[i];
-    }
-}
-
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 {
     1.0f32 / (1.0f32 + (-x).exp())
@@ -132,6 +105,7 @@ fn sigmoid(x: f32) -> f32 {
 /// through (partial rope).
 #[inline]
 fn rope_apply(vec: &mut [f32], n_heads: usize, head_dim: usize, n_rot: usize, pos: usize, base: f32) {
+    let _p = prof::Scope::new(&prof::ROPE_NS, &prof::ROPE_CALLS);
     if n_rot >= head_dim {
         rope_style(vec, n_heads, head_dim, pos, base, 0);
         return;

@@ -867,3 +867,63 @@ fixture address, aliasing another test's entry (observed as intermittent
 Implication for the next lever list: decode bytes are the only remaining
 knob (KV f32 39 MB/token = KIVI's lane; lm-head bound-skip; Q3_K kernels),
 and the ~13 GB/s stream ceiling bounds all of it.
+
+## Session 4 (2026-10-22) — Spark GeGLU + n_rep=4 fused decode, per-model scoreboard
+
+**Spark-X2.5-4B prefill was the last measured deficit** (22.4-22.6 vs llama
+22.0-22.9, temp 0, 234-token prompt, three alternating reps). `SOFUU_PROFILE`
+attributed it: gemm 8.95 s of 11.1 s, attn 0.64 s, and **1.42 s in `other`** —
+Spark's layer path had no scopes, so `rope`/`glue`/`embed` all read 0 ms. Two
+edits, both confined to Spark:
+
+1. **GeGLU is SIMD now.** `spark.rs` ran `gelu_erf` per element (A&S 7.1.26
+   polynomial + `expf`) over 36 layers x hidden_dim 10240 x batch — ~1.2 s per
+   252-token prefill. New `sofuu_geglu_erf` (NEON 2^k exp, same polynomial,
+   16-wide strips + scalar tail) drops that bucket to 0.31 s and turns the rest
+   of `other` into attributed rope (56 ms) and glue. **Prefill 22.4-22.6 ->
+   24.3-24.7 tk/s.**
+   Numerics: `test_geglu_erf_matches_scalar_reference` (1e-6 rel) plus an
+   on-device oracle (`SOFUU_GEGLU_SCALAR=1 SOFUU_PROFILE=1`) that measured
+   **max_rel <= 1.8e-7 on live 10240-wide activations** — f32 rounding of the
+   same formula. 3 of 4 greedy probe prompts are byte-identical; the one that
+   flips does so inside two Czech continuations (this model answers Czech on
+   templated instructions through our template, while llama.cpp's template
+   yields English, so neither branch is the "reference" text).
+   `SOFUU_GEGLU_SCALAR=1` reproduces the pre-change binary byte-for-byte.
+
+2. **n_rep=4 fused decode attention.** Spark is 16 q heads / 4 kv heads with an
+   **f32** KV cache; the per-head loop re-streamed each K/V row 4x, so the attn
+   bucket read 17.5 ms/token against a ~7.8 ms traffic floor. New
+   `sofuu_attn_qk_gqa4_f32` / `sofuu_attn_vacc_gqa4_f32` load each row once and
+   apply it to all four heads, copying the per-head accumulation order verbatim
+   (`test_attention_gqa4_fused_matches_per_head_path` asserts b==1 fused == b==2
+   per-head bit-for-bit at head_dim 32/36/256; `sofuu_gqa4_attn_groups()` proves
+   the branch ran). **Attn 17.5 -> 9.3 ms/token, decode 4.02 -> 4.2 tk/s**,
+   generated text unchanged byte-for-byte. Escape hatch `SOFUU_GQA4=0`.
+
+**Scoreboard (Pi 5, governor performance, greedy, same window, ours 2-3 reps
+vs llama.cpp -t 4):**
+
+| model | prefill ours | llama | decode ours | llama |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_K_M (Downloads, 396 MB) n=128 | 183.7-185.3 | 177.4 | 28.1 | 23.5 |
+| Qwen3-0.6B Q4_K_M (models/, 484 MB) n=128 | 184.2-185.0 | 177.5 | 24.0-24.2 | 24.2 |
+| Llama-3.2-1B Q8_0 n=40 | 140.8-140.9 | 58.5 | 14.8 | 8.5 |
+| SmolLM2-360M Q8_0 (short prompt) n=32 | 69-70 (5 tk) | — | 61.7 | 31.1 |
+| Sharp-MiniCPM5-2B Q6_K_XL n=40 | 37.7-38.4 | 38.4 | 7.2-7.5* | 5.8* |
+| Spark-X2.5-4B Q4_K_M n=40 | 24.3-24.6 | 22.0 | 4.2 | 4.1 |
+| Ternary-9B PQ2_0 n=4 | 1.2-1.4 | n/a (type 142) | 0.1 | n/a |
+| Qwen3-0.6B Q3_K_S / UD-IQ3_XXS | load error (types 11/13) | runs | — | — |
+
+\* decode measured on a short prompt: on the 234-token prompt MiniCPM (and
+SmolLM2) immediately emit EOS through our template, while llama.cpp's chat
+template keeps them generating, so that long-prompt cell is not comparable.
+
+**Not a completion model:** `laya_multilingual_q8_0.gguf` is `general.architecture
+= ggmlc` (laya: `max_opts`, `length_buckets`, cls/sep/mask tokens). Neither
+engine supports it — llama.cpp: "unknown model architecture: 'ggmlc'".
+
+**Still open for "not a bit less" everywhere:** MiniCPM prefill sits at parity
+(37.7-38.4 vs 38.4, needs the q6_K GEMM point); Qwen 3-bit tiers need real
+q3_K/IQ3 kernels before the loader will accept them; Ternary-9B needs a ternary
+GEMV (currently 0.1 tk/s on the per-row digit-gen fallback).

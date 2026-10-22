@@ -2182,6 +2182,19 @@
    */
   async function run(target, task, opts) {
     opts = opts || {};
+    var parentCtx = (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function')
+      ? sofuu.context.getStore()
+      : null;
+
+    if (parentCtx) {
+      if (!opts._cancelState && parentCtx.state) opts._cancelState = parentCtx.state;
+      if (!opts._treeUsage && parentCtx.tree) opts._treeUsage = parentCtx.tree;
+      if (!opts.traceId && parentCtx.traceId) opts.traceId = parentCtx.traceId;
+      if (!opts.sessionId && parentCtx.sessionId) opts.sessionId = parentCtx.sessionId;
+      if (typeof opts.depth !== 'number' && typeof parentCtx.depth === 'number') opts.depth = parentCtx.depth + 1;
+      if (!opts.chain && parentCtx.chain) opts.chain = parentCtx.chain.slice();
+    }
+
     var d = resolveDef(target);
     /* LONG-HORIZON: a caller may hand the run a budget override (see
      * execDelegate — sub-agents inherit the parent's long-horizon budget
@@ -2218,6 +2231,42 @@
     var tree = opts._treeUsage || { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmCalls: 0, toolCalls: 0 };
     var trace = [];
     var subRuns = [];
+
+    var runStore = {
+      runId: runId,
+      agentName: d.name,
+      depth: depth,
+      chain: chain.slice(),
+      traceId: opts.traceId || (parentCtx && parentCtx.traceId) || runId,
+      sessionId: opts.sessionId || (parentCtx && parentCtx.sessionId) || null,
+      signal: cancelId,
+      budget: d.budget,
+      state: state,
+      tree: tree,
+    };
+    runStore.agent = runStore;
+
+    // Listen to AbortSignal if passed as signal or from parent context
+    var sig = opts.signal;
+    if (!sig && parentCtx && parentCtx.signal && typeof parentCtx.signal.addEventListener === 'function') {
+      sig = parentCtx.signal;
+    }
+    if (sig && typeof sig.addEventListener === 'function') {
+      if (sig.aborted) {
+        state.cancelled = true;
+      } else {
+        sig.addEventListener('abort', function () {
+          state.cancelled = true;
+          for (var i = 0; i < state.aborts.length; i++) {
+            try { state.aborts[i](); } catch (e) {}
+          }
+        });
+      }
+    }
+
+    if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
+      sofuu.context.enterWith(runStore);
+    }
     /* Live per-tool histogram for the breach report — (2026-10-15) the
      * report used to re-scan the trace for kind:'tool' entries, but
      * TRACE_CAP demotion deletes old payloads, so a long run's report read
@@ -3782,7 +3831,13 @@
                                 llmCalls: 0, toolCalls: 0 },
                        trace: [], stopped: 'error', error: emsg };
           subRuns.push(childRes);
+          if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
+            sofuu.context.enterWith(runStore);
+          }
           return 'tool error: sub-agent \'' + childName + '\' failed: ' + emsg;
+        }
+        if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.enterWith === 'function') {
+          sofuu.context.enterWith(runStore);
         }
         subRuns.push(childRes);
         own.llmCalls += childRes.usage.llmCalls;
@@ -5003,6 +5058,15 @@
   A.cancel = cancel;
   A.list = list;
   A.loadDir = loadDir;
+  /* Phase 2: Active context reader via AsyncLocalStorage */
+  A.current = function () {
+    if (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function') {
+      var s = sofuu.context.getStore();
+      if (s && s.agent) return s.agent;
+      if (s && s.runId) return s;
+    }
+    return null;
+  };
   /* AGENTS.md (2026-09-12): drivers call this for /remember so a pinned
    * fact lands in BOTH stores — the brain (semantic recall) and the
    * project context file (explicit standing context). */

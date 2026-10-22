@@ -7619,6 +7619,82 @@ fn gemm_q4_k_mma_matches_cpu_and_rates() {
     bench("mma", 1);
 }
 
+/// Arm-E probe: the tiled class at the REAL 0.6B prefill shapes, to see how
+/// much of the 489 ms pass the GEMMs actually explain. Each shape is timed
+/// alone (5 reps) after a warmup, buffers reused, no CPU reference.
+#[test]
+#[ignore]
+fn bench_tiled_real_shapes() {
+    use std::time::Instant;
+    std::env::set_var("SOFUU_GPU_GEMM_TILED", "1");
+    let engine = MetalEngine::new().expect("engine");
+    // (rows, cols, B, ty) — the four per-layer GEMM shapes of a 0.6B chunk-128
+    let shapes: [(usize, usize, usize, u32); 5] = [
+        (6144, 1024, 128, 12), // ffn gate+up (q4_K layers)
+        (3072, 1024, 128, 12), // attn qkv (q4_K layers)
+        (1024, 2048, 128, 12), // attn o-proj, resid epilogue
+        // q6_K shares the tile geometry; ty=12 stands in as a rate proxy
+        (1024, 3072, 128, 12), // ffn down
+        (1024, 4096, 128, 12), // ffn gate+up, wide variant
+    ];
+    let page = 16384usize;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    for (rows, cols, B, ty) in shapes {
+        let bb = if ty == 14 { 210 } else { 144 };
+        let w_bytes = (rows * (cols / 256) * bb).div_ceil(page) * page;
+        let wp = mk(w_bytes);
+        let w: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(wp, w_bytes) };
+        for i in 0..w.len() { w[i] = ((i * 37 + 11) & 0xFF) as u8; }
+        // keep the f16 d fields sane (0x3C00 = 1.0) so dequant stays finite
+        for blk in 0..(rows * (cols / 256)) {
+            let off = blk * bb;
+            w[off] = 0x00; w[off + 1] = 0x3C;
+            if ty == 12 { w[off + 2] = 0x00; w[off + 3] = 0x20; }
+        }
+        let w_buf = engine.register_zerocopy_only(w).expect("w");
+        let slab_bytes = ((B * cols + B * rows) * 4).div_ceil(page) * page;
+        let sp = mk(slab_bytes);
+        let slab: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(sp, slab_bytes) };
+        for i in 0..slab.len() { slab[i] = 0; }
+        let s_buf = engine.register_zerocopy_only(slab).expect("slab");
+        let y_off = B * cols * 4;
+        let run = |n: usize| {
+            let t0 = Instant::now();
+            for _ in 0..n {
+                assert!(engine.batch_open());
+                // the plain tiled entry is q4_K-only; q6_K shapes go through
+                // the acc form (which is how the route dispatches them)
+                let ok = if ty == 12 {
+                    engine.batch_gguf_gemm_tiled(ty, &w_buf, 0, &s_buf, 0, &s_buf, y_off, rows, cols, B)
+                } else {
+                    engine.batch_gguf_gemm_tiled_acc(ty, &w_buf, 0, &s_buf, 0, &s_buf, 0, 0, &s_buf, y_off, rows, cols, B)
+                };
+                engine.batch_end();
+                assert!(ok, "tiled {rows}x{cols} ty={ty}");
+            }
+            t0.elapsed().as_secs_f64() / n as f64
+        };
+        run(2);
+        let per = run(5);
+        let flop = 2.0 * rows as f64 * cols as f64 * B as f64;
+        println!(
+            "[real-shape] ty={ty} {rows}x{cols} B={B}: {:.3} ms  {:.2} TFLOP/s",
+            per * 1e3, flop / per / 1e12
+        );
+        unsafe {
+            libc::munmap(wp as *mut libc::c_void, w_bytes);
+            libc::munmap(sp as *mut libc::c_void, slab_bytes);
+        }
+    }
+}
+
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape
 /// (b=2 rows, 2 priors, 32 heads / 8 kv / hd 64). The CPU mirror is the
 /// textbook serial attention: causal softmax(q·k/√hd) × v over priors.

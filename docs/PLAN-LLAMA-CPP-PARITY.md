@@ -1202,3 +1202,35 @@ out-of-bounds threadgroup writes that silently corrupt the tile — the parity
 test caught each): x staging pass count vs the token tile, a widened token tile
 whose `#define` lived outside the kernel body, and leftover 2-row loops after
 shrinking the row tile.
+
+## LEDGER #5 — REAL-SHAPE GEMM PROBE: the ffn gate/up shape is x-traffic bound
+
+`bench_tiled_real_shapes` (committed, `--ignored`) times the tiled class alone
+at the four per-layer shapes of a 0.6B chunk-128 prefill, same buffers, 5 reps:
+
+| shape | role | ms | TFLOP/s |
+|---|---|---|---|
+| 6144x1024 | ffn gate+up | 2.97-4.18 | **0.39-0.64** |
+| 3072x1024 | attn qkv | 0.89-1.29 | 0.62-0.91 |
+| 1024x2048 | attn o-proj (resid) | 0.85-1.05 | 0.51-0.63 |
+| 1024x3072 | ffn down (resid) | 0.83 | 0.97 |
+| 1024x4096 | ffn gate+up (wide) | 1.42 | 0.75 |
+
+The largest GEMM is the *slowest* — and the reason is traffic, not MACs:
+at rows=6144 the weight matrix is only 3.5 MB while **the activation tile is
+re-staged once per 32-row output block**: 192 row-tiles x 2 token-tiles x
+256 KB = **98 MB of x traffic per call**, against 3.5 MB of weights. The tile
+is sized for the weight-reuse case (rows small, B large: decode and the
+o/down shapes) and is upside-down for gate/up, where rows are 48x the token
+count.
+
+Two consequences:
+1. The pp budget reconciles: ~176 GFLOP of GEMM over the 207-token pass at
+   0.6 TFLOP/s = ~293 ms of the 489 ms pass (60%), attention 31 ms, and
+   ~165 ms of norms/kv/dispatch. So pp is GEMM-bound, but not MAC-bound.
+2. The next GEMM lever is a **taller row tile** (64 or 128 rows per
+   threadgroup) so x is staged once per 128 rows instead of once per 32 —
+   a 4x cut in activation traffic on the dominant shape. That needs a new
+   compute mapping (the 16x8 thread grid with a 4x4 register tile only
+   covers 32 rows), which is the concrete next step, ahead of any further
+   MMA work.

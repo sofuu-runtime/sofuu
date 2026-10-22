@@ -2334,13 +2334,11 @@ impl TransformerModel {
             )
     }
 
-    /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-
     /// SOFUU_LOGITS_GAP_PROBE=<path>: append the top-8 (value, id) of the
     /// just-computed logits — one line per token, CPU and GPU routes
     /// append to their own files; the top-2 gap at the first divergent
     /// line classifies a text fork as near-tie (reassociation) vs real.
+    /// Shared by every target: the CPU tile/head call sites are not Apple-only.
     fn logits_gap_probe_tagged(&self, tag: &str, pos: usize) {
         if let Some(p) = std::env::var_os("SOFUU_LOGITS_GAP_PROBE") {
             let mut idx: Vec<usize> = (0..self.logits.len()).collect();
@@ -2355,6 +2353,8 @@ impl TransformerModel {
         }
     }
 
+    /// lm_head as one Metal batch (CPU norm; staged slot in, logits out).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn ggpu_head(&mut self) -> bool {
         let decode_mmq_head = std::env::var("SOFUU_DECODE_MMQ")
             .map(|v| v == "1")

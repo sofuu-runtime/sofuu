@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use super::gguf::{GgufFile, GgufValue};
 use super::model::ModelConfig;
-use super::quant::{bf16_to_f32, f16_to_f32, ptq1_0_dequant_row};
+use super::quant::{bf16_to_f32, f16_to_f32, prof, ptq1_0_dequant_row};
 
 /// GGML tensor type id for PTQ1_0 (prism ternary, 28 bytes per 128 values).
 const GGML_TYPE_PTQ1_0: u32 = 143;
@@ -54,8 +54,14 @@ const PRE_FILL_CHUNK: usize = 128;
 /// Thread fan-out uses available cores but is not part of the result: chunk
 /// boundaries are pure index math, so every output row runs the identical
 /// dequant + dot sequence no matter how many threads join in.
+///
+/// `available_parallelism()` reports 1 in the static-musl Pi 5 build even
+/// with four cores online and an unrestricted affinity mask (its
+/// sched_getaffinity path fails and Rust falls back to 1), which silently
+/// pinned every fan-out here to one core. The C++ worker pool detects the
+/// real count, so borrow it.
 fn thread_budget() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
+    super::quant::get_thread_count().clamp(1, 8)
 }
 
 /// GDN state geometry (default; actual values come from the GGUF header).
@@ -304,6 +310,7 @@ fn hadamard_prep(block: usize, dst: &mut [f32], src: &[f32], signs: &[f32]) {
 
 /// Signs + Hadamard applied in place (activation already staged in x).
 fn hadamard_prep_in_place(block: usize, x: &mut [f32], signs: &[f32]) {
+    let _p = prof::Scope::new(&prof::ROPE_NS, &prof::ROPE_CALLS);
     for (v, &s) in x.iter_mut().zip(signs) {
         *v *= s;
     }
@@ -381,6 +388,70 @@ fn dequant_trits_i8(src: &[u8], trits: &mut [i8], scales: &mut [f32]) {
     }
 }
 
+/// Expand one PQ2_0 block's 32 code bytes into 128 int8 levels.
+///
+/// Value 4k+m lives in byte k at shift 2m, so the four shift/and passes are
+/// exactly the four interleaved streams `vst4` writes back in value order.
+/// The scalar loop this replaces ran 128 shift/and/sub triples per block; the
+/// integer band dot is exact regardless of how the levels were produced, so
+/// results stay bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn decode_pq2_codes_neon(codes: &[u8], out: &mut [i8]) {
+    debug_assert_eq!(codes.len(), PQ2_0_BLOCK_VALUES / 4);
+    debug_assert_eq!(out.len(), PQ2_0_BLOCK_VALUES);
+    unsafe {
+        use std::arch::aarch64::*;
+        let m3 = vdupq_n_u8(0x03);
+        let one = vdupq_n_s8(1);
+        for half in 0..(PQ2_0_BLOCK_VALUES / 64) {
+            let v = vld1q_u8(codes.as_ptr().add(half * 16));
+            let c0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m3)), one);
+            let c1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3)), one);
+            let c2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3)), one);
+            let c3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 6)), one);
+            vst4q_s8(out.as_mut_ptr().add(half * 64), int8x16x4_t(c0, c1, c2, c3));
+        }
+    }
+}
+
+/// Fused PQ2_0 block dot: expand the 32 code bytes and sdot them against the
+/// activation band without leaving registers. The buffer shape decoded into a
+/// 128-byte stack array and re-loaded it (`vst4q` then eight `vld1q` from the
+/// same lines), which stalls on store forwarding on A76. Value j is 4k+m in
+/// byte k at shift 2m, so `vld4q_s8` of the band hands back exactly the four
+/// interleaved activation streams the four decoded groups need.
+///
+/// Integer dot products are exact and order-independent, so this returns the
+/// same i32 as `sdot_group(decoded_levels, band)`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn p2_block_dot_neon(codes: *const u8, a: *const i8) -> i32 {
+    use std::arch::aarch64::*;
+    let m3 = vdupq_n_u8(0x03);
+    let one = vdupq_n_s8(1);
+    let mut acc = vdupq_n_s32(0);
+    for q in 0..(PQ2_0_BLOCK_VALUES / 64) {
+        let v = vld1q_u8(codes.add(q * 16));
+        let c0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m3)), one);
+        let c1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3)), one);
+        let c2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3)), one);
+        let c3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 6)), one);
+        let a4 = vld4q_s8(a.add(q * 64));
+        for (wv, av) in [(c0, a4.0), (c1, a4.1), (c2, a4.2), (c3, a4.3)] {
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {wv:v}.16b, {av:v}.16b",
+                acc = inout(vreg) acc,
+                wv = in(vreg) wv,
+                av = in(vreg) av,
+                options(pure, nomem, nostack)
+            );
+        }
+    }
+    vaddvq_s32(acc)
+}
+
 /// Dequantize one PQ2_0 (GGML type 142, prism 2-bit at group 128) row into
 /// per-value int8 levels in {-1, 0, +1, +2} plus the per-128-value f16 block
 /// scale — the same slab contract as `dequant_trits_i8`, so every sdot/slab
@@ -398,6 +469,9 @@ fn dequant_pq2_i8(src: &[u8], levels: &mut [i8], scales: &mut [f32]) {
         let b_offset = blk * BLOCK;
         scales[blk] = f16_to_f32(u16::from_le_bytes([src[b_offset], src[b_offset + 1]]));
         let codes = &src[b_offset + 2..b_offset + BLOCK];
+        #[cfg(target_arch = "aarch64")]
+        decode_pq2_codes_neon(codes, &mut levels[blk * QK..(blk + 1) * QK]);
+        #[cfg(not(target_arch = "aarch64"))]
         for j in 0..QK {
             let code = codes[j / 4] >> ((j % 4) * 2);
             levels[blk * QK + j] = (code & 3) as i8 - 1;
@@ -700,15 +774,31 @@ unsafe fn packed_row_dot_t143(row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -
 /// `sdot_group` fold the slab paths use, so file-direct and slab results are
 /// bit-identical. The scale rides block-first (`d` at bytes 0..2).
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 unsafe fn packed_row_dot_t142(row: &[u8], aq: &ActQ, arow: usize, n_in: usize) -> f32 {
     let blocks = n_in / PQ2_0_BLOCK_VALUES;
     debug_assert_eq!(row.len(), blocks * PQ2_0_BLOCK_BYTES);
     let mut acc = 0.0f32;
+    let band_base = aq.q.as_ptr().add(arow * n_in);
+    if dotprod_available() {
+        for c in 0..blocks {
+            let blk = row.as_ptr().add(c * PQ2_0_BLOCK_BYTES);
+            let scale = f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)]));
+            let iacc = unsafe {
+                p2_block_dot_neon(blk.add(2), band_base.add(c * PQ2_0_BLOCK_VALUES))
+            };
+            acc += scale * *aq.scales.get_unchecked(arow * blocks + c) * iacc as f32;
+        }
+        return acc;
+    }
     let mut levels = [0i8; PQ2_0_BLOCK_VALUES];
     for c in 0..blocks {
         let blk = &row[c * PQ2_0_BLOCK_BYTES..(c + 1) * PQ2_0_BLOCK_BYTES];
         let scale = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let codes = &blk[2..];
+        #[cfg(target_arch = "aarch64")]
+        decode_pq2_codes_neon(codes, &mut levels);
+        #[cfg(not(target_arch = "aarch64"))]
         for (j, lv) in levels.iter_mut().enumerate() {
             let code = codes[j / 4] >> ((j % 4) * 2);
             *lv = (code & 3) as i8 - 1;
@@ -912,6 +1002,7 @@ fn ensure_t143_slab(data: &[u8], m: &RawMat) -> Option<std::sync::Arc<SlabT143>>
 }
 
 fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
+    let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     let n_in = m.n_in;
     let blocks = n_in / PTQ1_0_BLOCK_VALUES;
     debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);
@@ -2475,6 +2566,40 @@ impl Qwen35Model {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// Isolated throughput of the file-direct PQ2_0 row dot (the ternary
+    /// decode hot loop). Not an assertion — run with
+    /// `cargo test -p sofuu-core --lib bench_packed_row_dot_t142 -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_packed_row_dot_t142() {
+        for n_in in [4096usize, 8192] {
+            let blocks = n_in / PQ2_0_BLOCK_VALUES;
+            let mut row = vec![0u8; blocks * PQ2_0_BLOCK_BYTES];
+            for (i, chunk) in row.chunks_mut(PQ2_0_BLOCK_BYTES).enumerate() {
+                // d = 2^-9, codes spread over all four values.
+                chunk[0..2].copy_from_slice(&0x1C00u16.to_le_bytes());
+                for k in 2..PQ2_0_BLOCK_BYTES {
+                    chunk[k] = (k as u8).wrapping_mul(37).wrapping_add(i as u8);
+                }
+            }
+            let acts: Vec<f32> = (0..n_in).map(|i| ((i * 37 % 251) as f32 / 251.0) - 0.5).collect();
+            let aq = quantize_acts(&acts, 1, n_in, blocks);
+            let iters = 400_000usize;
+            let mut acc = 0.0f32;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                acc += unsafe { packed_row_dot_t142(&row, &aq, 0, n_in) };
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let gbs = (iters * row.len()) as f64 / dt / 1e9;
+            println!(
+                "packed_row_dot_t142 n_in={n_in}: {:.2} GB/s, {:.1} ns/block, acc={acc:.3}",
+                gbs,
+                dt * 1e9 / (iters * blocks) as f64
+            );
+        }
+    }
 
     /// PQ2_0 decode: d rides block-first, codes are little-endian 2-bit and
     /// map (c − 1) — exactly the PrismML-Eng/llama.cpp prism-branch contract.

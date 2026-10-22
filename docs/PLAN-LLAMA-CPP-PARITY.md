@@ -931,3 +931,21 @@ gate stays NEAR-TIE-CERTIFIED (step 19, 0.089 — unchanged happy path); the
 1B 219-token chunk-128 GEMM-route run (the previously-faulting shape) runs
 clean end-to-end with correct state (counted the 36 repeated words; prefill
 96.8 tk/s / decode 56.0 tk/s).
+
+## DECODE-FLIP DECIDING TABLE + FAULT-SHAPE STATUS (2026-10-24 — items a+c)
+Item (a) — the decode flip is now DATA-BACKED: the old c2 "bug-class" DIFFER
+on the 0.6B and 8B was the arithmetic-class split, and under the mirrors both
+are **NEAR-TIE-CERTIFIED** with coalesced=2 (0.6B: fork |dtop1|=0.126 ≤
+matched-band 0.355 @ step 19; 8B: 0.237 ≤ 0.653 @ step 14). Combined with
+the rate receipts (0.6B 61.4 vs 31.8 tg; 8B 5.6 vs 2.8; MiniCPM 22.0 vs
+9.1; 1B default wins 50.3): **c2+mirrors is a gate-clean, rate-winning
+decode config for 0.6B-class and 8B-class models** — the actual default
+flip awaits the per-model defaults machinery (peer lane; a global flip
+regresses the 1B 1.5×).
+Item (c) — the 1B fault shape (chunk-128 route, pos=128 b=128, 32-head/
+hd-64) EXERCISED at exactly 256 tokens: **exit 0, no crash, correct output
+（counted correctly), but prefill 922 s @ 0.3 tk/s** — the deterministic
+device-side dispatch fault persists and the fallback contract contains it
+into CPU tiles through retry cycles. Contained, slow, route-off by default
+⇒ no shipped-path impact; the device-side root cause still wants a Metal
+capture session (the only remaining unknown in item c).

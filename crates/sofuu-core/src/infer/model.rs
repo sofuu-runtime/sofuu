@@ -16,10 +16,11 @@ use super::quant::{
     batched_rope_kv_f16,
     batched_swiglu, matmat_residual, matmat_pair,
     batched_attention_ext, batched_attention_ext_k16, dequantize_q4_0_row, dequantize_q4_k_row,
-    dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style, matmat, matvec,
+    dequantize_q3_k_row, dequantize_q6_k_row, dequantize_q8_0_row, f16_to_f32, kv_compact_style,
+    matmat, matvec,
     prefetch_streaming_slice, prefetch_temporal_slice, prof,
     rmsnorm, rmsnorm_in_place, rope_style, swiglu_in_place, tree_attention, tree_rope, type_row_size,
-    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
 };
 
@@ -415,19 +416,20 @@ impl TransformerModel {
                 .ok_or_else(|| format!("tensor not found: {name}"))?;
             // Gate unsupported quant types at load with a loud, actionable
             // error instead of a mid-forward panic (type_row_size's fallback
-            // sizes Q3_K/IQ* as f32 and corrupts the slice math). The llama
+            // sizes IQ* as f32 and corrupts the slice math). The llama
             // matvec path handles exactly these types.
-            const SUPPORTED: [u32; 6] = [
+            const SUPPORTED: [u32; 7] = [
                 crate::infer::quant::GGML_TYPE_F32,
                 crate::infer::quant::GGML_TYPE_F16,
                 crate::infer::quant::GGML_TYPE_Q4_0,
                 crate::infer::quant::GGML_TYPE_Q8_0,
                 crate::infer::quant::GGML_TYPE_Q4_K,
                 crate::infer::quant::GGML_TYPE_Q6_K,
+                crate::infer::quant::GGML_TYPE_Q3_K,
             ];
             if !SUPPORTED.contains(&info.tensor_type) {
                 return Err(format!(
-                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
+                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k, q3_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
                     info.tensor_type
                 ));
             }
@@ -544,7 +546,7 @@ impl TransformerModel {
                 [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
             }))
         {
-            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K) && tv.shape.len() == 2 {
+            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q3_K) && tv.shape.len() == 2 {
                 if let Some(slice) = gguf.mmap.slice(gguf.data_offset + tv.offset, 64) {
                     super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
                 }
@@ -866,6 +868,9 @@ impl TransformerModel {
             }
             GGML_TYPE_Q6_K => {
                 dequantize_q6_k_row(row_slice, dst);
+            }
+            GGML_TYPE_Q3_K => {
+                dequantize_q3_k_row(row_slice, dst);
             }
             GGML_TYPE_F32 => {
                 let f32_ptr = row_slice.as_ptr() as *const f32;
@@ -4283,14 +4288,14 @@ mod tests {
 
     #[test]
     fn unsupported_tensor_type_fails_load_loudly() {
-        // token_embd in an unsupported quant (Q3_K family, type 11): the load
+        // token_embd in an unsupported quant (IQ3_XXS, type 18): the load
         // must reject the file with an actionable error, never reach the
         // mid-forward tensor_slice panic.
         let mut gguf = synth_gguf(Some(GGML_TYPE_Q8_0));
         let bad = gguf.tensors.get("token_embd.weight").unwrap().clone();
         gguf.tensors.insert(
             "token_embd.weight".into(),
-            TensorInfo { tensor_type: 11, ..bad },
+            TensorInfo { tensor_type: 18, ..bad },
         );
         let err = match TransformerModel::from_gguf(gguf, 512, 256) {
             Err(e) => e,
@@ -4304,7 +4309,7 @@ mod tests {
     fn present_but_unsupported_output_weight_is_not_treated_as_tied() {
         // output.weight EXISTS in an unsupported type: the load must fail —
         // silently tying embeddings would produce wrong logits.
-        let gguf = synth_gguf(Some(11));
+        let gguf = synth_gguf(Some(18));
         let err = match TransformerModel::from_gguf(gguf, 512, 256) {
             Err(e) => e,
             Ok(_) => panic!("unsupported output.weight must fail the load"),

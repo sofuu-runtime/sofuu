@@ -202,5 +202,88 @@ static inline float sofuu_vec_dot_q6_k_dotprod_a76(const struct block_q6_K *bloc
     return total_sum;
 }
 
+// 3-bit K-quant dot (ggml type 11) against q8_K activations. Value layout
+// mirrors llama.cpp's dequantize_row_q3_K: per 128-value half, four 32-value
+// groups; group j shifts the two low bits by 2j, takes values 0..15 from
+// qs[0..15] and 16..31 from qs[16..31], and uses hmask bit
+// `1 << (half*4 + j)` to pick the 0..3 (set) or -4..-1 (clear) half of the
+// lattice. Scales are 6-bit, biased -32, one per 16 values.
+// `sofuu_q3_k_expand_scales` is defined by the including TU ahead of this
+// header.
+//
+// Same shape as llama.cpp's NEON kernel: the -4 correction is `vbic(mask, h)`
+// shifted back into the 4's place (2 ops, no compare), and the per-group dot
+// is reduced into one int32 per block that takes the activation scale once —
+// the scale chain stays integer so no float rounding accumulates.
+static inline float sofuu_vec_dot_q3_k_q8k_a76(const struct block_q3_K *blocks,
+                                               const struct tile_block_q8_K *y,
+                                               size_t n_blocks) {
+    const uint8x16_t m3b = vdupq_n_u8(0x03);
+    const uint8x16_t m0 = vdupq_n_u8(1);
+    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
+    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
+    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
+    float sum = 0.0f;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const struct block_q3_K *blk = &blocks[b];
+        const float d = y[b].d * sofuu_arch_f16_to_f32(blk->d);
+        const uint8_t *qs = blk->qs;
+        const int8_t *q8 = y[b].qs;
+        int32_t sc[16];
+        {
+            int8_t raw[16];
+            sofuu_q3_k_expand_scales(blk, raw);
+            for (int i = 0; i < 16; ++i) sc[i] = (int32_t)raw[i] - 32;
+        }
+        int32_t isum = 0;
+        uint8x16_t h0 = vld1q_u8(blk->hmask);
+        uint8x16_t h1 = vld1q_u8(blk->hmask + 16);
+        for (int half = 0; half < 2; ++half) {
+            const uint8x16_t q0 = vld1q_u8(qs + half * 32);
+            const uint8x16_t q1 = vld1q_u8(qs + half * 32 + 16);
+            const int8_t *qg = q8 + half * 128;
+            const int s0 = half * 8;
+            // 0..3 minus 4 where the hmask bit is clear.
+            const int8x16_t v0 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(q0, m3b)),
+                vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, h0), 2)));
+            const int8x16_t v1 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(q1, m3b)),
+                vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, h1), 2)));
+            const int8x16_t v2 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 2), m3b)),
+                vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, h0), 1)));
+            const int8x16_t v3 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 2), m3b)),
+                vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, h1), 1)));
+            const int8x16_t v4 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 4), m3b)),
+                vreinterpretq_s8_u8(vbicq_u8(m2, h0)));
+            const int8x16_t v5 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 4), m3b)),
+                vreinterpretq_s8_u8(vbicq_u8(m2, h1)));
+            const int8x16_t v6 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 6), m3b)),
+                vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, h0), 1)));
+            const int8x16_t v7 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 6), m3b)),
+                vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, h1), 1)));
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v0, vld1q_s8(qg + 0))) * sc[s0 + 0];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v1, vld1q_s8(qg + 16))) * sc[s0 + 1];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v2, vld1q_s8(qg + 32))) * sc[s0 + 2];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v3, vld1q_s8(qg + 48))) * sc[s0 + 3];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v4, vld1q_s8(qg + 64))) * sc[s0 + 4];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v5, vld1q_s8(qg + 80))) * sc[s0 + 5];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v6, vld1q_s8(qg + 96))) * sc[s0 + 6];
+            isum += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), v7, vld1q_s8(qg + 112))) * sc[s0 + 7];
+            // bits 4..7 of the same 32 hmask bytes describe the second half
+            h0 = vshrq_n_u8(h0, 4);
+            h1 = vshrq_n_u8(h1, 4);
+        }
+        sum += d * (float)isum;
+    }
+    return sum;
+}
+
 #endif
 #endif

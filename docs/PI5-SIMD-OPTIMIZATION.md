@@ -927,3 +927,66 @@ engine supports it — llama.cpp: "unknown model architecture: 'ggmlc'".
 (37.7-38.4 vs 38.4, needs the q6_K GEMM point); Qwen 3-bit tiers need real
 q3_K/IQ3 kernels before the loader will accept them; Ternary-9B needs a ternary
 GEMV (currently 0.1 tk/s on the per-row digit-gen fallback).
+
+## Session 12 (2026-10-22) — Q3_K (ggml type 11) landed: loader → coherent text → 1.96x prefill
+
+The 3-bit Qwen tier used to be rejected at load ("type 11 not supported"). It
+now runs end to end, and the work decomposed into three measurement-driven
+steps (t1p49 → t1p55 → t1p57; every number below is Pi 5, governor
+`performance`, greedy, same window, llama.cpp `-t 4`, 234-token prompt, n=80).
+
+**1. Bit layout + first kernels (t1p49).** `block_q3_K` = `hmask[32] | qs[64] |
+scales[12] | f16 d` (110 B / 256 values). Value for position p: half = p/128,
+group j = (p%128)/32, low bits `qs[half*32 + part*16 + l] >> 2j & 3`, minus 4
+when hmask bit `1 << (half*4 + j)` is clear; sixteen 6-bit scales (bias -32)
+expanded by llama.cpp's aux[4]/kmask permutation, one per 16 values. The C++
+dequant is gated bit-exactly against an independent Rust transcription of
+`dequantize_row_q3_K` (`test_q3_k_dequant_matches_reference`), and the dot
+against that dequant (`test_q3_k_gemv_gemm_matches_dequant_dot`).
+Measured 44-46 prefill / 20.0 decode — llama.cpp 73.2 / 27.7.
+
+**2. Kernel reshaped to llama.cpp's NEON structure (t1p55).** `vbic(mask, h)`
++ a single constant shift replaces the compare/and correction (2 ops instead of
+3 per 16 values), the per-group reduction folds into ONE int32 per block
+(`isum += vaddvq * scale`, one float multiply per block), and the activation
+side switched from the per-32 `sofuu_q8_block_ext` to the per-256 `q8_K` form
+llama.cpp uses (one `d` per block). **65.2 prefill / 22.5 decode.**
+
+**3. q3_K → q6_K tile for the GEMM (t1p57).** The 3-bit lattice (-4..3) and its
+per-16 6-bit scales are an exact SUBSET of q6_K's (-32..31 values, int8
+per-16 scales) with `d` unchanged, so a q3_K block converts into a q6_K block
+by byte shuffling alone — no requantization. `sofuu_tile_warm` type 11 rewrites
+the whole tensor into the stock `tile_block_q6_Kx8` layout (~1.9x bytes) and
+`sofuu_gemm_q3_k` rides `ggml_gemm_q6_K_8x4_q8_K`; the decode GEMV keeps
+reading the native 110-byte stream, so DRAM-bound decode does not pay the 1.9x.
+**143.6-144.1 prefill / 27.2 decode.** Mutation-tested: flipping the packer's
+`v + 32` to `v + 31` fails the tiled-GEMM gate (`tile (0,3): got 419.0 vs ref
+297.2`), so the test really covers the tile path, not just the fallback.
+
+| Qwen3-0.6B-Q3_K_S (323 MB) | prefill | decode |
+|---|---|---|
+| ours before (t1p49) | 44-46 | 20.0 |
+| ours + kernel reshape (t1p55) | 65.2-65.3 | 22.5 |
+| ours + q6_K tile GEMM (t1p57/t1p60) | 142.6-144.1 | 27.2 |
+| llama.cpp `-t 4` | 73.3-73.4 | 27.7-28.1 |
+
+Prefill is **1.95x ahead**. Decode is 2% behind, and the remaining debt is
+attributed, not guessed: the decode profile is gemv 82.8% / attn 13.3% /
+everything else 4%, and the q3_K stream runs at ~10.3 GB/s at the 1-3 MB matrix
+sizes decode hits versus 12.45 GB/s for q4_K's interleaved 8-row tile (measured
+by the same decomposition: q4_K_M 36.8 ms/token, 317 MB, 12.45 GB/s). The fix
+is a native 8-row q3_K GEMV tile (byte-neutral, +3.6% for pre-expanded
+scales); a first attempt at row-level ILP without a tile — four independent
+accumulate chains sharing the activation loads — measured 22.8-24.0, i.e.
+*slower*, because the per-row scale arrays spill, so it was reverted rather
+than shipped. Also measured and rejected: speculative lookahead on this tier
+(26.1 vs 27.2 serial; rows=8 trees 22.7, always-on 17.6) — the verify GEMM is
+DRAM-bound at 1.9x tile bytes and the accepted-token rate cannot pay for it.
+
+**Gates:** `test_q3_k_dequant_matches_reference` (bit-exact vs upstream),
+`test_q3_k_gemv_hand_block` (mixed hmask, every shift/half → catches a wrong
+hmask half, which the random fixture passed), `test_q3_k_gemv_gemm_matches_dequant_dot`
+(GEMV, native GEMM and tiled GEMM each within 2% of row L1 vs the dequant
+oracle, plus the residual-fused variant). Loader: Q3_K is in the SUPPORTED set
+and the tile warm list; the two loader tests that used type 11 as the
+"unsupported" example now use IQ3_XXS (type 18).

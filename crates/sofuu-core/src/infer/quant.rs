@@ -7,6 +7,9 @@ pub const GGML_TYPE_F16: u32 = 1;
 pub const GGML_TYPE_Q4_0: u32 = 2;
 pub const GGML_TYPE_Q4_1: u32 = 3;
 pub const GGML_TYPE_Q8_0: u32 = 8;
+/// 3-bit K-quant: 110 B per 256 values (hmask 32, qs 64, 12 packed 6-bit
+/// scales, f16 super-scale), values in -4..3 with a per-16 scale.
+pub const GGML_TYPE_Q3_K: u32 = 11;
 pub const GGML_TYPE_Q4_K: u32 = 12;
 pub const GGML_TYPE_Q6_K: u32 = 14;
 /// Prism-private ternary at group size 128 (ggml type 143).
@@ -82,6 +85,7 @@ pub fn type_row_size(type_id: u32, n: usize) -> usize {
         GGML_TYPE_Q4_0 => (n / QK4_0) * 18,
         GGML_TYPE_Q8_0 => (n / QK8_0) * 34,
         GGML_TYPE_Q4_K => (n / QK_K) * 144,
+        GGML_TYPE_Q3_K => (n / QK_K) * 110,
         GGML_TYPE_Q6_K => (n / QK_K) * 210,
         _ => n * 4,
     }
@@ -236,6 +240,14 @@ pub fn dequantize_q6_k_row(src: &[u8], dst: &mut [f32]) {
     assert_eq!(dst.len() % QK_K, 0);
     unsafe {
         sofuu_dequantize_row_q6_k(src.as_ptr(), dst.as_mut_ptr(), dst.len());
+    }
+}
+
+/// Dequantize Q3_K block row into destination f32 buffer.
+pub fn dequantize_q3_k_row(src: &[u8], dst: &mut [f32]) {
+    assert_eq!(dst.len() % QK_K, 0);
+    unsafe {
+        sofuu_dequantize_row_q3_k(src.as_ptr(), dst.as_mut_ptr(), dst.len());
     }
 }
 
@@ -468,6 +480,7 @@ extern "C" {
     // infer_kernels.cpp:2159/2329 — no Rust extern decl needed.)
     fn sofuu_dequantize_row_q4_k(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_dequantize_row_q6_k(src: *const u8, dst: *mut f32, k: usize);
+    fn sofuu_dequantize_row_q3_k(src: *const u8, dst: *mut f32, k: usize);
     fn sofuu_vec_dot_q4_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32;
     fn sofuu_vec_dot_q8_0(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32;
     fn sofuu_vec_dot_q4_k(weight_bytes: *const u8, x: *const f32, n_blocks: usize) -> f32;
@@ -476,6 +489,7 @@ extern "C" {
     fn sofuu_gemv_q8_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_q4_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     fn sofuu_gemv_q6_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
+    fn sofuu_gemv_q3_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     pub(crate) fn sofuu_gemv_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     pub(crate) fn sofuu_gemv_f16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
     pub(crate) fn sofuu_gemv_bf16(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize);
@@ -506,9 +520,11 @@ extern "C" {
     fn sofuu_gemm_q8_0(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q4_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q6_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
+    fn sofuu_gemm_q3_k(weight_bytes: *const u8, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
     fn sofuu_gemm_q8_0_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_q4_k_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_q6_k_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
+    fn sofuu_gemm_q3_k_acc(weight_bytes: *const u8, x: *const f32, out_acc: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_q4_k_pair(w1: *const u8, w2: *const u8, x: *const f32, out1: *mut f32, out2: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_q8_0_pair(w1: *const u8, w2: *const u8, x: *const f32, out1: *mut f32, out2: *mut f32, rows: usize, cols: usize, batch_size: usize) -> i32;
     fn sofuu_gemm_f32(weight_bytes: *const f32, x: *const f32, out: *mut f32, rows: usize, cols: usize, batch_size: usize);
@@ -1352,6 +1368,11 @@ pub fn matvec(w_bytes: &[u8], type_id: u32, rows: usize, cols: usize, x: &[f32],
                 sofuu_gemv_q6_k(w_bytes.as_ptr(), x.as_ptr(), y.as_mut_ptr(), rows, cols);
             }
         }
+        GGML_TYPE_Q3_K => {
+            unsafe {
+                sofuu_gemv_q3_k(w_bytes.as_ptr(), x.as_ptr(), y.as_mut_ptr(), rows, cols);
+            }
+        }
         GGML_TYPE_F32 => {
             unsafe {
                 let f32_ptr = w_bytes.as_ptr() as *const f32;
@@ -1408,6 +1429,9 @@ pub fn matmat(
         GGML_TYPE_Q6_K => unsafe {
             sofuu_gemm_q6_k(w_bytes.as_ptr(), x_batch.as_ptr(), y_batch.as_mut_ptr(), rows, cols, batch_size);
         },
+        GGML_TYPE_Q3_K => unsafe {
+            sofuu_gemm_q3_k(w_bytes.as_ptr(), x_batch.as_ptr(), y_batch.as_mut_ptr(), rows, cols, batch_size);
+        },
         GGML_TYPE_F32 => unsafe {
             let f32_ptr = w_bytes.as_ptr() as *const f32;
             sofuu_gemm_f32(f32_ptr, x_batch.as_ptr(), y_batch.as_mut_ptr(), rows, cols, batch_size);
@@ -1457,6 +1481,9 @@ pub fn matmat_residual(
         },
         GGML_TYPE_Q6_K => unsafe {
             sofuu_gemm_q6_k_acc(w_bytes.as_ptr(), x_batch.as_ptr(), acc.as_mut_ptr(), rows, cols, batch_size) == 0
+        },
+        GGML_TYPE_Q3_K => unsafe {
+            sofuu_gemm_q3_k_acc(w_bytes.as_ptr(), x_batch.as_ptr(), acc.as_mut_ptr(), rows, cols, batch_size) == 0
         },
         _ => false,
     };
@@ -2921,6 +2948,245 @@ mod tests {
         let re = (e + 15.0) as u16;
         let mm = (m as u16) & 0x3FF;
         s | (re << 10) | mm
+    }
+
+    /// Independent transcription of llama.cpp's `dequantize_row_q3_K`
+    /// (ggml-quants.c) used only as the oracle for the q3_K kernel tests.
+    /// Bit layout: hmask[32] | qs[64] | scales[12] | f16 d, 110 B per 256
+    /// values. The 12 scale bytes expand to sixteen 6-bit scales (biased
+    /// -32) by the aux[4] permutation; `m` walks the hmask bit per
+    /// 32-value shift group, continuing across the two 128-value halves.
+    fn ref_dequant_q3_k(block: &[u8], out: &mut [f32]) {
+        assert_eq!(block.len(), 110);
+        let hm = &block[0..32];
+        let qs = &block[32..96];
+        let scb = &block[96..108];
+        let d_all = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+
+        let mut aux = [0u32; 4];
+        for i in 0..3 {
+            aux[i] = u32::from_le_bytes([scb[i * 4], scb[i * 4 + 1], scb[i * 4 + 2], scb[i * 4 + 3]]);
+        }
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0f0f_0f0f) | (((tmp >> 4) & 0x0303_0303) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0f0f_0f0f) | (((tmp >> 6) & 0x0303_0303) << 4);
+        aux[0] = (aux[0] & 0x0f0f_0f0f) | (((tmp >> 0) & 0x0303_0303) << 4);
+        aux[1] = (aux[1] & 0x0f0f_0f0f) | (((tmp >> 2) & 0x0303_0303) << 4);
+        let mut scales = [0i32; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                scales[i * 4 + j] = ((aux[i] >> (8 * j)) & 0xff) as u8 as i8 as i32;
+            }
+        }
+
+        let mut y = 0usize;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        for half in 0..2usize {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                let dl = d_all * (scales[is] - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    let q = (qs[half * 32 + l] >> shift) & 3;
+                    let v = q as i32 - if hm[l] & m != 0 { 0 } else { 4 };
+                    out[y] = dl * v as f32;
+                    y += 1;
+                }
+                let dl = d_all * (scales[is] - 32) as f32;
+                is += 1;
+                for l in 0..16 {
+                    let q = (qs[half * 32 + 16 + l] >> shift) & 3;
+                    let v = q as i32 - if hm[16 + l] & m != 0 { 0 } else { 4 };
+                    out[y] = dl * v as f32;
+                    y += 1;
+                }
+                shift += 2;
+                m = m.wrapping_shl(1);
+            }
+        }
+        assert_eq!(y, out.len());
+    }
+
+    fn q3_k_fixture(rows: usize, cols: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
+        assert_eq!(cols % QK_K, 0);
+        let nb = cols / QK_K;
+        let row_stride = nb * 110;
+        let mut rng = seed;
+        let mut next_b = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng >> 24) as u8
+        };
+        let mut w = vec![0u8; rows * row_stride];
+        for b in w.iter_mut() {
+            *b = next_b();
+        }
+        // Sanitize every block header: random bytes make f16 NaNs, and a NaN d
+        // turns the whole row into NaN while still "matching" a NaN reference.
+        for r in 0..rows {
+            for blk in 0..nb {
+                let h = r * row_stride + blk * 110;
+                let bits = ggml_fp32_to_fp16_bits(0.125f32 + 0.03125 * ((r + blk) % 8) as f32);
+                w[h + 108..h + 110].copy_from_slice(&bits.to_le_bytes());
+                // keep the 6-bit scales spread over both signs of the -32 bias
+                for k in 0..12 {
+                    w[h + 96 + k] = (((r + blk) * 7 + k * 13) % 64) as u8;
+                }
+            }
+        }
+        let mut refw = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for blk in 0..nb {
+                let h = r * row_stride + blk * 110;
+                ref_dequant_q3_k(
+                    &w[h..h + 110],
+                    &mut refw[r * cols + blk * QK_K..r * cols + (blk + 1) * QK_K],
+                );
+            }
+        }
+        (w, refw)
+    }
+
+    /// q3_K dequant must reproduce the reference layout exactly: wrong hmask
+    /// bit order or a wrong scale-slot mapping shows up as a large element
+    /// error, not a rounding one, so this gate is bit-exact.
+    #[test]
+    fn test_q3_k_dequant_matches_reference() {
+        let (w, refw) = q3_k_fixture(4, 2 * QK_K, 0x51f3);
+        let row_stride = 2 * 110;
+        let mut got = vec![0f32; 2 * QK_K];
+        for r in 0..4 {
+            dequantize_q3_k_row(&w[r * row_stride..], &mut got);
+            for c in 0..2 * QK_K {
+                let (a, b) = (got[c], refw[r * 2 * QK_K + c]);
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "row {r} col {c}: kernel {a} vs reference {b}"
+                );
+            }
+        }
+    }
+
+    /// Single-block fixture with every hmask half and 2-bit group exercised
+    /// (mixed bits, all four shifts, both 128-value halves) against the
+    /// dequant oracle. The random fixture above can pass a wrong hmask half
+    /// by luck; this one cannot.
+    #[test]
+    fn test_q3_k_gemv_hand_block() {
+        let cols = QK_K;
+        let rows = 4usize;
+        // scale bytes: every 6-bit slot expands to 34 -> biased +2.
+        let mut block = [0u8; 110];
+        block[0..32].fill(0xA5);          // hmask: mixed bits (exercises -4 corr)
+        block[32..96].fill(0b11_10_01_00); // groups 0..3 -> 0,1,2,3
+        block[96..108].fill(0x22);
+        block[108..110].copy_from_slice(&ggml_fp32_to_fp16_bits(1.0).to_le_bytes());
+        let w: Vec<u8> = block.iter().copied().cycle().take(rows * 110).collect();
+
+        // Oracle: the reference dequant (the byte-level gate above proves it
+        // matches llama.cpp). The hand fixture only pins the geometry the
+        // 4-row kernel walks.
+        let mut refw = vec![0f32; cols];
+        ref_dequant_q3_k(&block, &mut refw);
+        let x: Vec<f32> = (0..cols)
+            .map(|i| (((i % 23) as f32) * 0.37 - 3.0).sin())
+            .collect();
+        let want: f32 = (0..cols).map(|c| refw[c] * x[c]).sum();
+
+        let mut y = vec![0f32; rows];
+        matvec(&w, GGML_TYPE_Q3_K, rows, cols, &x, &mut y);
+        for r in 0..rows {
+            let l1: f32 = (0..cols).map(|c| (refw[c] * x[c]).abs()).sum();
+            let err = (y[r] - want).abs();
+            assert!(err <= 0.02 * l1 + 1e-3, "row {r}: got {} vs {want} (l1 {l1})", y[r]);
+        }
+    }
+
+    /// GEMV and GEMM route through the int8 SDOT kernel on aarch64, so they
+    /// are compared at the row L1 scale (activation quant is ≤0.4%/element).
+    /// The GEMM is checked on both paths: native blocks (no tile) and the
+    /// warmed q3_K→q6_K layout tile.
+    #[test]
+    fn test_q3_k_gemv_gemm_matches_dequant_dot() {
+        let _guard = tile_test_guard();
+        let rows = 8usize;
+        let cols = 2 * QK_K;
+        let batch = 8usize;
+        let (w, refw) = q3_k_fixture(rows, cols, 0x9d21);
+        let mut rng = 77u32;
+        let x: Vec<f32> = (0..batch * cols).map(|_| next_x(&mut rng)).collect();
+
+        let mut refout = vec![0f32; batch * rows];
+        for b in 0..batch {
+            for r in 0..rows {
+                let mut sum = 0f32;
+                for c in 0..cols {
+                    sum += refw[r * cols + c] * x[b * cols + c];
+                }
+                refout[b * rows + r] = sum;
+            }
+        }
+
+        let mut y1 = vec![0f32; rows];
+        matvec(&w, GGML_TYPE_Q3_K, rows, cols, &x[0..cols], &mut y1);
+        let mut yb = vec![0f32; batch * rows];
+        matmat(&w, GGML_TYPE_Q3_K, rows, cols, &x, batch, &mut yb);
+
+        for b in 0..batch {
+            for r in 0..rows {
+                let got = if b == 0 { y1[r] } else { yb[b * rows + r] };
+                let l1: f32 = (0..cols).map(|c| (refw[r * cols + c] * x[b * cols + c]).abs()).sum();
+                let err = (got - refout[b * rows + r]).abs();
+                assert!(
+                    err <= 0.02 * l1 + 1e-3,
+                    "({b},{r}): got {got} vs ref {} (err {err}, l1 {l1})",
+                    refout[b * rows + r]
+                );
+            }
+        }
+
+        // Warmed tile (q3_K repacked into the q6_K layout, exact): same gate.
+        tile_warm(w.as_ptr(), rows, cols, GGML_TYPE_Q3_K);
+        let mut yt = vec![0f32; batch * rows];
+        matmat(&w, GGML_TYPE_Q3_K, rows, cols, &x, batch, &mut yt);
+        for b in 0..batch {
+            for r in 0..rows {
+                let l1: f32 = (0..cols).map(|c| (refw[r * cols + c] * x[b * cols + c]).abs()).sum();
+                let err = (yt[b * rows + r] - refout[b * rows + r]).abs();
+                assert!(
+                    err <= 0.02 * l1 + 1e-3,
+                    "tile ({b},{r}): got {} vs ref {} (err {err}, l1 {l1})",
+                    yt[b * rows + r],
+                    refout[b * rows + r]
+                );
+            }
+        }
+
+        // Residual-fused variant: same value plus the preloaded accumulator.
+        // Only the aarch64 build dispatches the fused kernel at all.
+        if !cfg!(target_arch = "aarch64") {
+            return;
+        }
+        let mut acc = vec![0f32; batch * rows];
+        for (i, a) in acc.iter_mut().enumerate() {
+            *a = 0.25 * (i as f32) - 1.0;
+        }
+        let pre = acc.clone();
+        let fused = matmat_residual(&w, GGML_TYPE_Q3_K, rows, cols, &x, batch, &mut acc);
+        assert!(fused, "q3_K residual path should be available on aarch64");
+        for b in 0..batch {
+            for r in 0..rows {
+                let l1: f32 = (0..cols).map(|c| (refw[r * cols + c] * x[b * cols + c]).abs()).sum();
+                let want = pre[b * rows + r] + refout[b * rows + r];
+                let err = (acc[b * rows + r] - want).abs();
+                assert!(
+                    err <= 0.02 * l1 + 1e-3,
+                    "fused ({b},{r}): got {} vs ref {want}",
+                    acc[b * rows + r]
+                );
+            }
+        }
     }
 
     #[test]

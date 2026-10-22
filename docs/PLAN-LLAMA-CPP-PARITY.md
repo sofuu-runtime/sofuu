@@ -511,3 +511,19 @@ coalesced=2 = c2/b4c for q4_K + coalesced q6_K (the DECIDING A/B winners:
 (the 1B regresses 33.2 vs 50.3 under the c2 class). DEFAULT STAYS 0 (all
 off) — the per-model default flips wait on the calm text-gate pass at
 coalesced=2 (the first attempt ran at load 28-39 = tainted, re-gated).
+
+## CALM coalesced=2 TEXT GATES (2026-10-23 02:48Z, load 1.74) — the flip verdict
+| model | c2 text | c2 decode t/s | flip |
+|---|---|---|---|
+| 0.6B i1-Q4_K_M | **DIFFER** | (rate line lost) | OFF — c2 bug-class on i1 quants |
+| 1B Q8_0 | IDENTICAL (vacuous: L2 flips nothing on q8) | n/a | n/a |
+| Spark-4B Q4_K_M | IDENTICAL | 25.4 | **flippable** |
+| MiniCPM5-2B q6/q8 | IDENTICAL | 29.7 | **flippable** |
+| 8B Q4_K_M | **DIFFER** | 2.1 | OFF — c2 bug-class |
+The c2 class changes sampled text vs CPU on 2 of 5 models CONSISTENTLY
+(the load-28 pass: same pattern) — bug-class in the c2 GEMV summation on
+those models (the glue-oracle program absorbs it: c2 ≠ serial summation
+order reaching tie-heavy argmaxes, same family as the KV projection
+noise). Per-model DEFAULT flips need the per-model defaults machinery
+(peer: per-model spec/pool defaults) — until then SOFUU_Q4K_COALESCED=2
+per-run stays the documented fast path for Spark/MiniCPM-class models.

@@ -261,6 +261,9 @@ struct IdeLayout: View {
                 }
             }
             Divider()
+            Button("Collapse all folds") { store.ideCoordinator?.collapseAllFolds() }
+            Button("Expand all folds") { store.ideCoordinator?.expandAllFolds() }
+            Divider()
             Button("Close all tabs") { store.closeAllTabs() }
         } label: {
             Image(systemName: "chevron.down")

@@ -203,6 +203,54 @@ enum LSPWire {
         return OutlineNode(name: name, kind: kind, line: line, children: children)
     }
 
+    // MARK: - Semantic tokens
+
+    /// legend.tokenTypes from capabilities (nil when unsupported). The
+    /// provider may be a bare boolean (no legend → unusable here).
+    static func parseSemanticLegend(_ result: Any?) -> [String]? {
+        guard let root = result as? [String: Any],
+              let caps = root["capabilities"] as? [String: Any],
+              caps["semanticTokensProvider"] != nil else { return nil }
+        guard let provider = caps["semanticTokensProvider"] as? [String: Any],
+              let legend = provider["legend"] as? [String: Any],
+              let types = legend["tokenTypes"] as? [String], !types.isEmpty else { return nil }
+        return types
+    }
+
+    /// Decoded semantic spans in LSP line/character space.
+    struct SemanticSpan {
+        let line: Int
+        let startCharacter: Int
+        let length: Int
+        let tokenType: String
+    }
+
+    static func decodeSemanticTokens(_ data: [Int], legend: [String]) -> [SemanticSpan] {
+        var spans: [SemanticSpan] = []
+        spans.reserveCapacity(data.count / 5)
+        var line = 0
+        var startCharacter = 0
+        var i = 0
+        while i + 4 < data.count {
+            let deltaLine = data[i]
+            let deltaStart = data[i + 1]
+            let length = data[i + 2]
+            let typeIndex = data[i + 3]
+            if deltaLine > 0 {
+                line += deltaLine
+                startCharacter = deltaStart
+            } else {
+                startCharacter += deltaStart
+            }
+            if typeIndex >= 0, typeIndex < legend.count {
+                spans.append(SemanticSpan(line: line, startCharacter: startCharacter,
+                                          length: length, tokenType: legend[typeIndex]))
+            }
+            i += 5
+        }
+        return spans
+    }
+
     // MARK: - Workspace edits (rename / code actions)
 
     /// One edit in LSP Position space (converted per-file by the caller,

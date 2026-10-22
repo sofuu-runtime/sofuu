@@ -62,7 +62,7 @@ final class LSPClient {
             ]],
         ]) { [weak self] result in
             guard let self else { return }
-            _ = result
+            self.semanticLegend = LSPWire.parseSemanticLegend(result)
             self.notify("initialized", params: [:])
             self.ready = true
             let ops = self.queuedOps
@@ -287,6 +287,22 @@ final class LSPClient {
         guard ready else { return then([]) }
         request("workspace/symbol", params: ["query": query]) { result in
             then(LSPWire.parseWorkspaceSymbols(result))
+        }
+    }
+
+    /// Semantic-token legend from server capabilities (nil when the
+    /// server does not support them — the editor then stays lexer-only).
+    private(set) var semanticLegend: [String]?
+
+    /// textDocument/semanticTokens/full — the flat delta-encoded array
+    /// (groups of 5: deltaLine, deltaStart, length, tokenType, modifiers).
+    func semanticTokens(path: String, then: @escaping ([Int]) -> Void) {
+        guard ready, semanticLegend != nil else { return then([]) }
+        request("textDocument/semanticTokens/full", params: [
+            "textDocument": ["uri": LSPWire.uriOf(path)],
+        ]) { result in
+            let data = (result as? [String: Any])?["data"]
+            then((data as? [NSNumber])?.map { $0.intValue } ?? [])
         }
     }
 

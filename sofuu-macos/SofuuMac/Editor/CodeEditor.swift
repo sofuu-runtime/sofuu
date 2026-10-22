@@ -17,6 +17,8 @@ final class GutterModel: ObservableObject {
     @Published var cursor: (line: Int, column: Int) = (1, 1)
     @Published var lspStatus: String = "LSP off"
     @Published var outline: [LSPWire.OutlineNode] = []
+    /// line (0-based) → folded? for foldable blocks (drives chevrons).
+    @Published var foldLines: [Int: Bool] = [:]
 }
 
 /// The IDE code viewport: a hand-written NSTextView (SofuuCodeView) with
@@ -34,7 +36,7 @@ struct CodeEditor: NSViewRepresentable {
     static let gutterTopInset: CGFloat = 6
     static let gutterWidth: CGFloat = 46
 
-    /// The editor typeface resolves from prefs (Settings ▸ Appearance);
+    /// The editor typeface resolves from prefs (Settings  Appearance);
     /// unknown families fall back to the system monospaced.
     static func makeFont(family: String?, size: Int) -> NSFont {
         if let family, let f = NSFont(name: family, size: CGFloat(size)) {
@@ -73,6 +75,12 @@ struct CodeEditor: NSViewRepresentable {
         tv.isAutomaticSpellingCorrectionEnabled = false
         tv.isContinuousSpellCheckingEnabled = false
 
+        let whitespace = WhitespaceOverlay()
+        whitespace.frame = tv.bounds
+        whitespace.autoresizingMask = [.width, .height]
+        whitespace.isHidden = !store.showWhitespace
+        tv.addSubview(whitespace)
+
         let scrollView = NSScrollView()
         scrollView.documentView = tv
         scrollView.hasVerticalScroller = true
@@ -81,6 +89,8 @@ struct CodeEditor: NSViewRepresentable {
         scrollView.drawsBackground = false
 
         context.coordinator.attach(scrollView)
+        context.coordinator.whitespaceOverlay = whitespace
+        tv.layoutManager?.delegate = context.coordinator
         context.coordinator.onEdited = onEdited
         context.coordinator.path = path
         context.coordinator.language = language
@@ -111,7 +121,7 @@ struct CodeEditor: NSViewRepresentable {
             c.push()
         }
         // Per-tab restore (cursor + scroll fraction) and a pending search
-        // target — each applied exactly once per path switch.
+        // target  each applied exactly once per path switch.
         if c.restoredPath != path {
             c.restoredPath = path
             if let scroll = store.pendingScroll, scroll.path == path {
@@ -141,11 +151,12 @@ struct CodeEditor: NSViewRepresentable {
             c.currentFont = newFont
             c.lexerHighlight(text: tv.string, language: language)
         }
+        c.whitespaceOverlay?.isHidden = !store.showWhitespace
         c.refreshCursorStatus()
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
         let store: AppStore
         let gutter: GutterModel
         weak var textView: SofuuCodeView?
@@ -161,6 +172,15 @@ struct CodeEditor: NSViewRepresentable {
         var restoredPath: String?
         var fontSize: Int = 13
         var indentUnitWidth: CGFloat?
+        /// Latest server semantic spans (LSP line/char space) for the
+        /// current path  applied over the lexer in the highlight pass.
+        var semanticSpans: [LSPWire.SemanticSpan] = []
+        private var semanticWork: DispatchWorkItem?
+        weak var whitespaceOverlay: WhitespaceOverlay?
+        // Folding (glyph-nulling; document offsets stay intact for LSP).
+        var foldablePairs: [(start: Int, end: Int)] = []   // char offsets
+        var foldedStarts: Set<Int> = []
+        private(set) var hiddenRanges: [NSRange] = []
         var language: Language = Languages.plain
         var lsp: LSPClient?
         var lspLang: LangID?
@@ -225,6 +245,27 @@ struct CodeEditor: NSViewRepresentable {
             refreshCursorStatus()
         }
 
+        /// Hide folded glyphs: mark them .null; the layout (and every LSP
+        /// offset) stays intact  only drawing skips.
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
+            properties: UnsafeMutablePointer<NSLayoutManager.GlyphProperty>,
+            characterIndexes: UnsafePointer<Int>,
+            font aFont: NSFont,
+            forGlyphRange glyphRange: NSRange
+        ) -> Int {
+            guard !hiddenRanges.isEmpty else { return 0 }
+            var touched = false
+            for i in 0..<glyphRange.length {
+                if hiddenRanges.contains(where: { NSLocationInRange(characterIndexes[i], $0) }) {
+                    properties[i].insert(.null)
+                    touched = true
+                }
+            }
+            return touched ? glyphRange.length : 0
+        }
+
         func rebuildLineIndex() {
             let text = textView?.string ?? ""
             var starts: [Int] = [0]
@@ -256,7 +297,101 @@ struct CodeEditor: NSViewRepresentable {
                     store.ideRecordScroll(scrollPath, fraction: clip.bounds.origin.y / (docH - clip.bounds.height))
                 }
             }
+            whitespaceOverlay?.needsDisplay = true
             gutter.objectWillChange.send()
+        }
+
+        /// From the lexer's bracket pairs: multi-line blocks become fold
+        /// affordances; folded ones turn into hidden glyph ranges.
+        func applyFoldables(pairs: [(NSRange, NSRange)], textLength: Int) {
+            var foldable: [(Int, Int)] = []
+            for (open, close) in pairs where open.location < close.location {
+                if lineOf(charOffset: open.location) != lineOf(charOffset: close.location) {
+                    foldable.append((open.location, close.location + 1))
+                }
+            }
+            foldablePairs = foldable
+            hiddenRanges = foldablePairs.compactMap { pair in
+                foldedStarts.contains(pair.start)
+                    ? NSRange(location: pair.start, length: max(1, pair.end - pair.start))
+                    : nil
+            }
+            if let tv = textView, let lm = tv.layoutManager {
+                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: textLength),
+                                    changeInLength: 0, actualCharacterRange: nil)
+            }
+            publishFoldLines()
+    }
+
+        private func lineOf(charOffset: Int) -> Int {
+            var lo = 0, hi = lineStarts.count - 1
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2
+                if lineStarts[mid] <= charOffset { lo = mid } else { hi = mid - 1 }
+            }
+            return lo
+        }
+
+        func toggleFold(atLine line: Int) {
+            let offset = lineStarts.indices.contains(line) ? lineStarts[line] : nil
+            guard let offset else { return }
+            guard let pair = foldablePairs.first(where: { $0.start == offset }) else { return }
+            if foldedStarts.contains(pair.start) {
+                foldedStarts.remove(pair.start)
+            } else {
+                foldedStarts.insert(pair.start)
+            }
+            if let tv = textView, let lm = tv.layoutManager {
+                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
+                                    changeInLength: 0, actualCharacterRange: nil)
+            }
+            hiddenRanges = foldablePairs.compactMap { p in
+                foldedStarts.contains(p.start)
+                    ? NSRange(location: p.start, length: max(1, p.end - p.start))
+                    : nil
+            }
+            publishFoldLines()
+            push()
+        }
+
+        func collapseAllFolds() {
+            foldedStarts = Set(foldablePairs.map(\.0))
+            if let tv = textView, let lm = tv.layoutManager {
+                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
+                                    changeInLength: 0, actualCharacterRange: nil)
+            }
+            hiddenRanges = foldablePairs.compactMap { p in
+                foldedStarts.contains(p.start)
+                    ? NSRange(location: p.start, length: max(1, p.end - p.start))
+                    : nil
+            }
+            publishFoldLines()
+            push()
+        }
+
+        func expandAllFolds() {
+            foldedStarts = []
+            hiddenRanges = []
+            if let tv = textView, let lm = tv.layoutManager {
+                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
+                                    changeInLength: 0, actualCharacterRange: nil)
+            }
+            publishFoldLines()
+            push()
+        }
+
+        var foldableLines: Set<Int> {
+            Set(foldablePairs.map { lineOf(charOffset: $0.start) })
+        }
+
+        private func publishFoldLines() {
+            var map: [Int: Bool] = [:]
+            for pair in foldablePairs {
+                let line = lineOf(charOffset: pair.start)
+                map[line] = foldedStarts.contains(pair.start)
+            }
+            gutter.foldLines = map
+            push()
         }
 
         func calibrateStep(ns: NSString, lm: NSLayoutManager) {
@@ -297,7 +432,14 @@ struct CodeEditor: NSViewRepresentable {
                             value: SyntaxPalette.color(token.kind, dark: dark),
                             range: token.range)
                     }
+                    // Semantic overlay: where the server identified a token
+                    // kind we care about, its color wins over the lexer.
+                    if !self.semanticSpans.isEmpty {
+                        self.applySemanticOverlay(storage: storage, text: text as NSString, dark: dark)
+                    }
                     storage.endEditing()
+                    self.applyFoldables(pairs: lexed.pairs, textLength: length)
+                    self.whitespaceOverlay?.needsDisplay = true
                     self.applyDiagnosticUnderlines(text: text)
                     if !self.runningLSP {
                         self.gutter.outline = lexed.outline.map {
@@ -325,8 +467,8 @@ struct CodeEditor: NSViewRepresentable {
             if lsp == nil || lsp?.isRunning != true {
                 // Async launch: makeNSView/updateNSView must never wait on
                 // a subprocess (main-thread task waits pump the run loop
-                // and re-enter SwiftUI — hard deadlock).
-                gutter.lspStatus = "\(language.name) LSP: starting…"
+                // and re-enter SwiftUI  hard deadlock).
+                gutter.lspStatus = "\(language.name) LSP: starting"
                 LSPRegistry.shared.clientAsync(for: language, rootPath: root) { [weak self] client in
                     guard let self else { return }
                     guard let client else {
@@ -377,9 +519,27 @@ struct CodeEditor: NSViewRepresentable {
             let work = DispatchWorkItem { [weak self] in
                 self?.lspChangeWork = nil
                 self?.lsp?.didChange(path: path, text: text)
+                self?.scheduleSemanticTokens(path: path, text: text)
             }
             lspChangeWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+        }
+
+        private func scheduleSemanticTokens(path: String, text: String) {
+            semanticWork?.cancel()
+            guard let lsp = lsp, lsp.semanticLegend != nil else { return }
+            let work = DispatchWorkItem { [weak self] in
+                self?.semanticWork = nil
+                lsp.semanticTokens(path: path) { [weak self] data in
+                    guard let self else { return }
+                    // Drop stale replies: the doc moved on meanwhile.
+                    guard self.path == path, self.textView?.string == text else { return }
+                    self.semanticSpans = LSPWire.decodeSemanticTokens(data, legend: lsp.semanticLegend ?? [])
+                    self.lexerHighlight(text: text, language: self.language)
+                }
+            }
+            semanticWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
         }
 
         /// Send any pending document change NOW. Completion/targeted
@@ -474,7 +634,7 @@ struct CodeEditor: NSViewRepresentable {
 
         private var completionWork: DispatchWorkItem?
 
-        /// Debounced (0.08 s) — one keystroke must not equal one server
+        /// Debounced (0.08 s)  one keystroke must not equal one server
         /// request + one HUD rebuild; the anchor rect is recomputed at
         /// fire time from the captured caret location.
         func requestCompletion(prefix: String, line: Int, column: Int, location: Int) {
@@ -485,7 +645,7 @@ struct CodeEditor: NSViewRepresentable {
                 if let lsp = self.lsp, let path = self.path {
                     self.flushLSPChangeNow()
                     lsp.completion(path: path, line: line - 1, character: column - 1, text: tv.string) { items in
-                        // Empty prefix (after '.') = member completion — the
+                        // Empty prefix (after '.') = member completion  the
                         // server already ordered against the receiver.
                         // Otherwise FUZZY subsequence ranking (prefix bonus,
                         // contiguity bonus), ties broken by label length.
@@ -577,7 +737,7 @@ struct CodeEditor: NSViewRepresentable {
             textView?.insertCompletionText(item.insert)
         }
 
-        // MARK: - Find (⌘F)
+        // MARK: - Find (F)
 
         func findMatches(query: String, caseSensitive: Bool) -> Int {
             guard !query.isEmpty, let text = textView?.string else { return 0 }
@@ -701,6 +861,42 @@ struct CodeEditor: NSViewRepresentable {
             if hit.location != NSNotFound { return hit }
             let wrapped = text.range(of: query, options: options, range: NSRange(location: 0, length: max(0, start)))
             return wrapped.location != NSNotFound ? wrapped : nil
+        }
+
+        /// Map server token types onto our palette. Kinds our lexer already
+        /// colors equally are skipped so servers disagree rarely visible.
+        private static let semanticKindMap: [String: Lexer.Kind] = [
+            "comment": .comment,
+            "keyword": .keyword,
+            "string": .string,
+            "number": .number,
+            "operator": .op,
+            "decorator": .decorator,
+            "macro": .decorator,
+            "attribute": .decorator,
+            "type": .type,
+            "class": .type,
+            "enum": .type,
+            "interface": .type,
+            "struct": .type,
+            "namespace": .type,
+            "enumMember": .type,
+        ]
+
+        private func applySemanticOverlay(storage: NSTextStorage, text ns: NSString, dark: Bool) {
+            let length = ns.length
+            for span in semanticSpans {
+                guard span.line + 1 < lineStarts.count || (span.line < lineStarts.count && lineStarts[span.line] < length) else { continue }
+                guard span.line < lineStarts.count else { continue }
+                let start = min(lineStarts[span.line] + span.startCharacter, length)
+                let end = min(start + span.length, length)
+                guard end > start else { continue }
+                guard let kind = CodeEditor.Coordinator.semanticKindMap[span.tokenType] else { continue }
+                storage.addAttribute(
+                    .foregroundColor,
+                    value: SyntaxPalette.color(kind, dark: dark),
+                    range: NSRange(location: start, length: end - start))
+            }
         }
 
         // MARK: - Rename / references / code actions / workspace symbols
@@ -856,7 +1052,7 @@ struct CodeEditor: NSViewRepresentable {
                 store.systemRow("No language server for workspace symbols.")
                 return
             }
-            IDEHUD.showPrompt(title: "Find symbols in workspace", placeholder: "Name…", initial: "") { [weak self] query in
+            IDEHUD.showPrompt(title: "Find symbols in workspace", placeholder: "Name", initial: "") { [weak self] query in
                 guard let self else { return }
                 lsp.workspaceSymbols(query: query) { symbols in
                     guard !symbols.isEmpty else {
@@ -864,7 +1060,7 @@ struct CodeEditor: NSViewRepresentable {
                         return
                     }
                     let displays = symbols.map {
-                        "\($0.name) — \(($0.path as NSString).lastPathComponent):\($0.line + 1)"
+                        "\($0.name)  \(($0.path as NSString).lastPathComponent):\($0.line + 1)"
                     }
                     IDEHUD.showList(title: "Workspace symbols", items: displays) { index in
                         let sym = symbols[index]
@@ -912,7 +1108,7 @@ struct CodeEditor: NSViewRepresentable {
             }
         }
 
-        // MARK: - Outline (⇧⌘O)
+        // MARK: - Outline (O)
 
         func requestOutline() {
             guard let path else { return }
@@ -976,7 +1172,23 @@ struct LineGutter: View {
             draw(ctx: ctx, size: size)
         }
         .background(c.bgRaised)
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0).onEnded { gesture in
+            handleTap(at: gesture.location
+                .applying(.identity))
+        })
         .onAppear { pulse.objectWillChange.send() }
+    }
+
+    private func handleTap(at point: CGPoint) {
+        guard let coordinator else { return }
+        guard !pulse.foldLines.isEmpty, let tv = coordinator.textView else { return }
+        let scrollY = coordinator.scrollView?.contentView.bounds.origin.y ?? 0
+        let step = coordinator.lineStep ?? 13.0
+        guard step > 0 else { return }
+        let line = Int(((point.y + scrollY - CodeEditor.gutterTopInset) / step).rounded(.down))
+        guard coordinator.foldableLines.contains(line) else { return }
+        coordinator.toggleFold(atLine: line)
     }
 
     private func draw(ctx: GraphicsContext, size: CGSize) {
@@ -1005,6 +1217,22 @@ struct LineGutter: View {
             let y = inset + CGFloat(i) * step - scrollY
             if y > size.height { break }
             if y >= -step {
+                // Folding chevron on foldable lines: ▾ open / ▸ folded.
+                if let folded = pulse.foldLines[i] {
+                    let cx = CodeEditor.gutterWidth - 38
+                    var arrow = Path()
+                    let cy = y + step / 2
+                    if folded {
+                        arrow.move(to: CGPoint(x: cx, y: cy - 3))
+                        arrow.addLine(to: CGPoint(x: cx + 4, y: cy))
+                        arrow.addLine(to: CGPoint(x: cx, y: cy + 3))
+                    } else {
+                        arrow.move(to: CGPoint(x: cx - 3, y: cy - 2))
+                        arrow.addLine(to: CGPoint(x: cx + 3, y: cy - 2))
+                        arrow.addLine(to: CGPoint(x: cx - 3, y: cy + 2))
+                    }
+                    ctx.stroke(arrow, with: .color(.secondary), lineWidth: 1.2)
+                }
                 let text = ctx.resolve(
                     Text(String(i + 1)).font(font).foregroundColor(lineColor))
                 let w = text.measure(in: CGSize(width: CodeEditor.gutterWidth, height: .infinity)).width
@@ -1027,7 +1255,7 @@ struct LineGutter: View {
 // MARK: - Indent guides (cosmetic vertical columns, scroll-synced)
 
 /// Draws one faint vertical hairline per indent level, scrolling with the
-/// text (fresh clip reads at draw time — the gutter's pattern). Cheap and
+/// text (fresh clip reads at draw time  the gutter's pattern). Cheap and
 /// decorative; per-scope guides need a parse tree, this is column math.
 struct IndentGuidesCanvas: View {
     @ObservedObject var pulse: GutterModel
@@ -1049,6 +1277,56 @@ struct IndentGuidesCanvas: View {
                 ctx.stroke(path, with: .color(Color.primary.opacity(0.07)), lineWidth: 1)
             }
             _ = pulse
+        }
+    }
+}
+
+
+// MARK: - Visible whitespace (dot pass over the live glyphs)
+
+/// A subview OF the text view, so it scrolls with the content for free.
+/// Draws a faint tick for every space and a longer dash for every tab in
+/// the visible character range  nothing is inserted into the text.
+final class WhitespaceOverlay: NSView {
+    weak var textView: NSTextView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let tv = textView, let lm = tv.layoutManager,
+              let storage = tv.textStorage, let container = tv.textContainer,
+              let clip = tv.enclosingScrollView?.contentView else { return }
+        let visible = NSRect(x: 0, y: clip.bounds.origin.y,
+                             width: max(1, tv.bounds.width),
+                             height: max(1, clip.bounds.height))
+        let glyphRange = lm.glyphRange(forBoundingRect: visible, in: container)
+        let charRange = lm.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+        NSColor.labelColor.withAlphaComponent(0.14).setFill()
+        let ns = storage.string as NSString
+        var index = charRange.location
+        let end = charRange.location + charRange.length
+        while index < end {
+            let ch = ns.character(at: index)
+            let isTab = ch == 0x09
+            let isSpace = ch == 0x20
+            if isSpace || isTab {
+                let gr = lm.glyphRange(forCharacterRange: NSRange(location: index, length: 1),
+                                       actualCharacterRange: nil)
+                if gr.length > 0 {
+                    var rect = lm.boundingRect(forGlyphRange: gr, in: container)
+                    rect.origin.x += tv.textContainerInset.width
+                    rect.origin.y += tv.textContainerInset.height
+                    if isSpace {
+                        let dot = CGRect(x: rect.midX - 0.75, y: rect.maxY - 3.5, width: 1.5, height: 1.5)
+                        NSBezierPath(ovalIn: dot).fill()
+                    } else {
+                        let dash = CGRect(x: rect.minX + 1, y: rect.maxY - 3.0,
+                                          width: max(2, rect.width - 2), height: 1.2)
+                        NSBezierPath(roundedRect: dash, xRadius: 0.6, yRadius: 0.6).fill()
+                    }
+                }
+            }
+            index += 1
         }
     }
 }

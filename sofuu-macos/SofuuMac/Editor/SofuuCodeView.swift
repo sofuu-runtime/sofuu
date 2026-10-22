@@ -13,6 +13,15 @@ final class SofuuCodeView: NSTextView {
     private var trackingArea: NSTrackingArea?
     private var hoverTimer: Timer?
     private var lastHoverPoint: CGPoint?
+    /// Scoped multi-cursor: ⌥-click adds/removes carets; typing and
+    /// backspace replicate across all of them; movement clears.
+    private var extraCarets: [Int] = []
+    private lazy var caretOverlay: CaretOverlay = {
+        let v = CaretOverlay()
+        v.textView = self
+        addSubview(v)
+        return v
+    }()
 
     // MARK: - Lifecycle
 
@@ -68,7 +77,35 @@ final class SofuuCodeView: NSTextView {
     override func insertText(_ insert: Any, replacementRange: NSRange) {
         guard let typed = insert as? String, typed.count == 1, collapsed(),
               let ch = typed.first else {
+            if !extraCarets.isEmpty {
+                // Multi-caret insertion of arbitrary text (paste etc.):
+                // apply at each caret, back-to-front.
+                for offset in extraCarets.sorted(by: >) {
+                    super.insertText(insert, replacementRange: NSRange(location: offset, length: 0))
+                }
+                let delta = (insert as? String).map { $0.utf16.count } ?? 0
+                extraCarets = extraCarets.map { $0 + delta }
+                caretOverlay.carets = extraCarets
+                caretOverlay.needsDisplay = true
+                didChangeText()
+                return
+            }
             return super.insertText(insert, replacementRange: replacementRange)
+        }
+        if !extraCarets.isEmpty {
+            let isCloser = ch == ")" || ch == "]" || ch == "}" || ch == "\"" || ch == "'" || ch == "`"
+            if isCloser {
+                clearExtraCarets()   // pair/auto-close logic stays single-caret
+            } else {
+                for offset in extraCarets.sorted(by: >) {
+                    super.insertText(typed, replacementRange: NSRange(location: offset, length: 0))
+                }
+                extraCarets = extraCarets.map { $0 + 1 }
+                caretOverlay.carets = extraCarets
+                caretOverlay.needsDisplay = true
+                didChangeText()
+                return
+            }
         }
         let closers: Set<Character> = [")", "]", "}", "\"", "'", "`"]
 
@@ -213,6 +250,11 @@ final class SofuuCodeView: NSTextView {
             IDEHUD.hideOutline()
             IDEHUD.hidePrompt()
             IDEHUD.hideList()
+            clearExtraCarets()
+        }
+        // Movement/selection keys drop the extra carets.
+        if [123, 124, 125, 126, 115, 119].contains(event.keyCode), !extraCarets.isEmpty {
+            clearExtraCarets()
         }
         super.keyDown(with: event)
     }
@@ -294,14 +336,37 @@ final class SofuuCodeView: NSTextView {
     // MARK: - Mouse: ⌘-click definition, hover tracking
 
     override func mouseDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.command) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) {
             let point = convert(event.locationInWindow, from: nil)
             let index = insertionIndex(at: point)
             editor?.goToDefinition(at: index)
             return
         }
+        if flags.contains(.option) {
+            let point = convert(event.locationInWindow, from: nil)
+            let index = insertionIndex(at: point)
+            if let existing = extraCarets.firstIndex(of: index) {
+                extraCarets.remove(at: existing)
+            } else {
+                extraCarets.append(index)
+            }
+            caretOverlay.carets = extraCarets
+            caretOverlay.needsDisplay = true
+            return
+        }
+        if !extraCarets.isEmpty {
+            clearExtraCarets()
+        }
         hud?.completions = nil
         super.mouseDown(with: event)
+    }
+
+    private func clearExtraCarets() {
+        guard !extraCarets.isEmpty else { return }
+        extraCarets = []
+        caretOverlay.carets = []
+        caretOverlay.needsDisplay = true
     }
 
     func insertionIndex(at point: CGPoint) -> Int {
@@ -324,6 +389,20 @@ final class SofuuCodeView: NSTextView {
             let rect = self.screenRect(at: index)
             self.editor?.requestHover(line: line, column: column, screenRect: rect)
         }
+    }
+
+    override func deleteBackward(_ sender: Any?) {
+        if !extraCarets.isEmpty {
+            for offset in extraCarets.sorted(by: >) where offset > 0 {
+                insertText("", replacementRange: NSRange(location: offset - 1, length: 1))
+            }
+            extraCarets = extraCarets.map { max(0, $0 - 1) }
+            caretOverlay.carets = extraCarets
+            caretOverlay.needsDisplay = true
+            didChangeText()
+            return
+        }
+        super.deleteBackward(sender)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -415,5 +494,42 @@ final class SofuuCodeView: NSTextView {
     func select(range: NSRange) {
         setSelectedRange(range)
         scrollRangeToVisible(range)
+    }
+}
+
+
+// MARK: - Multi-caret drawing
+
+/// Thin accent rectangles at every extra caret position. Subview of the
+/// text view (scrolls with content); hit-test transparent.
+final class CaretOverlay: NSView {
+    weak var textView: NSTextView?
+    var carets: [Int] = []
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func makeBackingLayer() -> CALayer { super.makeBackingLayer() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard carets.isEmpty == false, let tv = textView,
+              let lm = tv.layoutManager, let container = tv.textContainer else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+        for offset in carets {
+            let range = NSRange(location: min(offset, tv.string.utf16.count), length: 1)
+            let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            var rect = lm.boundingRect(forGlyphRange: gr, in: container)
+            if rect.width < 1.5 { rect.size.width = 1.5 }
+            rect.origin.x += tv.textContainerInset.width
+            rect.origin.y += tv.textContainerInset.height
+            rect.size.width = 1.5
+            strokeRect(rect, 1.5)  // fallback fill via bezier below
+        }
+    }
+
+    private func strokeRect(_ rect: CGRect, _ width: CGFloat) {
+        let path = NSBezierPath(rect: CGRect(x: rect.midX - width / 2, y: rect.minY + 1,
+                                             width: width, height: max(4, rect.height - 3)))
+        path.fill()
     }
 }

@@ -1521,6 +1521,7 @@ final class AppStore: ObservableObject {
     var ideAutoSaveOn: Bool { uiPrefs.ideAutoSave }
     var editorFontFamily: String? { uiPrefs.editorFontFamily }
     var indentGuidesOn: Bool { uiPrefs.indentGuides }
+    var showWhitespace: Bool { uiPrefs.showWhitespace }
     var editorFontSize: Int { uiPrefs.editorFontSize }
     var formatOnSave: Bool { uiPrefs.ideFormatOnSave }
 

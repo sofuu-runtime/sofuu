@@ -1931,9 +1931,17 @@ kernel void gemm_q4_k(
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    // Lane = VALUE INDEX inside the 64-value group (the q6_K/q8_0 mapping),
+    // not the block index. The old mapping gave each lane its own 144-byte
+    // block, so a warp's 32 lanes touched 32 addresses 144 B apart: one
+    // 32-byte sector fetched per lane per instruction (8x over-fetch) and no
+    // cross-lane reuse of the x stream. Measured at fleet shapes that class
+    // ran 20x slower than gemm_q6_k on the SAME grid (0.02 vs 0.44 TFLOP/s,
+    // bench_gemm_rate_bands). Here a group read is 32 consecutive nibble
+    // bytes and the two values it encodes are the two 32-wide halves of the
+    // group — so weights, scales and x are all lane-contiguous.
     uint row = tg.x;
-    uint ts = tg.y;
-    uint t0 = ts * GEMM_TS;
+    uint t0 = tg.y * GEMM_TS;
     uint nb = cols / 256;
     uint row_byte = w_rem + row * nb * 144;
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
@@ -1948,50 +1956,37 @@ kernel void gemm_q4_k(
     device const float *x5 = x + (v5 ? (t0 + 5) * cols : 0);
     device const float *x6 = x + (v6 ? (t0 + 6) * cols : 0);
     device const float *x7 = x + (v7 ? (t0 + 7) * cols : 0);
-    for (uint b = lane; b < nb; b += 32) {
-        float d  = float(read_f16(w_base, row_byte + b * 144));
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d    = float(read_f16(w_base, row_byte + b * 144));
         float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
-        device const uchar *scales = w_base + row_byte + b * 144 + 4;
-        device const uchar *qs = w_base + row_byte + b * 144 + 16;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-        uint is = 0;
-        for (uint j = 0; j < 256; j += 64) {
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        // Same value order as sofuu_dequantize_row_q4_k / gemv_q4_k:
+        // group g covers values [64g, 64g+64); byte l carries value 64g+l in
+        // its low nibble (scale 2g) and value 64g+32+l in its high nibble
+        // (scale 2g+1).
+        for (uint g = 0; g < 4; ++g) {
             uint8_t sc1, m1, sc2, m2;
-            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 1, &sc2, &m2);
             float d1 = d * (float)sc1;
             float mm1 = dmin * (float)m1;
-            q4k_scale_min(scales, is + 1, &sc2, &m2);
             float d2 = d * (float)sc2;
             float mm2 = dmin * (float)m2;
-            uint qb = j / 2;
-            uint xb = b * 256;
-            for (uint l = 0; l < 32; ++l) {
-                float wlo = d1 * (float)(qs[qb + l] & 0x0F) - mm1;
-                float whi = d2 * (float)(qs[qb + l] >> 4) - mm2;
-                uint k0 = xb + j + l;
-                if (v0) { a0 += wlo * x0[k0]; }
-                if (v1) { a1 += wlo * x1[k0]; }
-                if (v2) { a2 += wlo * x2[k0]; }
-                if (v3) { a3 += wlo * x3[k0]; }
-                if (v4) { a4 += wlo * x4[k0]; }
-                if (v5) { a5 += wlo * x5[k0]; }
-                if (v6) { a6 += wlo * x6[k0]; }
-                if (v7) { a7 += wlo * x7[k0]; }
-                uint k32 = k0 + 32;
-                if (v0) { a0 += whi * x0[k32]; }
-                if (v1) { a1 += whi * x1[k32]; }
-                if (v2) { a2 += whi * x2[k32]; }
-                if (v3) { a3 += whi * x3[k32]; }
-                if (v4) { a4 += whi * x4[k32]; }
-                if (v5) { a5 += whi * x5[k32]; }
-                if (v6) { a6 += whi * x6[k32]; }
-                if (v7) { a7 += whi * x7[k32]; }
-            }
-            is += 2;
+            uchar byte = qs[g * 32 + lane];
+            float wlo = d1 * (float)(byte & 0x0F) - mm1;
+            float whi = d2 * (float)(byte >> 4) - mm2;
+            uint k = b * 256 + g * 64 + lane;
+            if (v0) { acc0 += wlo * x0[k] + whi * x0[k + 32]; }
+            if (v1) { acc1 += wlo * x1[k] + whi * x1[k + 32]; }
+            if (v2) { acc2 += wlo * x2[k] + whi * x2[k + 32]; }
+            if (v3) { acc3 += wlo * x3[k] + whi * x3[k + 32]; }
+            if (v4) { acc4 += wlo * x4[k] + whi * x4[k + 32]; }
+            if (v5) { acc5 += wlo * x5[k] + whi * x5[k + 32]; }
+            if (v6) { acc6 += wlo * x6[k] + whi * x6[k + 32]; }
+            if (v7) { acc7 += wlo * x7[k] + whi * x7[k + 32]; }
         }
-        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
-        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
     }
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
     acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
@@ -2079,42 +2074,36 @@ kernel void gemm_q4_k_multi(
     uint row_byte = sec_off + sec_rem + local_row * nb * 144;
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
-    for (uint b = lane; b < nb; b += 32) {
-        float d  = float(read_f16(w_base, row_byte + b * 144));
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d    = float(read_f16(w_base, row_byte + b * 144));
         float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
-        device const uchar *scales = w_base + row_byte + b * 144 + 4;
-        device const uchar *qs = w_base + row_byte + b * 144 + 16;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-        uint is = 0;
-        for (uint j = 0; j < 256; j += 64) {
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        // Lane = value index in the 64-value group (the coalesced mapping of
+        // gemm_q4_k / gemm_q6_k): byte l carries value 64g+l (scale 2g) in
+        // its low nibble and 64g+32+l (scale 2g+1) in its high nibble.
+        for (uint g = 0; g < 4; ++g) {
             uint8_t sc1, m1, sc2, m2;
-            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 1, &sc2, &m2);
             float d1 = d * (float)sc1;
             float mm1 = dmin * (float)m1;
-            q4k_scale_min(scales, is + 1, &sc2, &m2);
             float d2 = d * (float)sc2;
             float mm2 = dmin * (float)m2;
-            uint qb = j / 2;
-            uint xb = b * 256;
-            for (uint l = 0; l < 32; ++l) {
-                float wlo = d1 * (float)(qs[qb + l] & 0x0F) - mm1;
-                float whi = d2 * (float)(qs[qb + l] >> 4) - mm2;
-                uint k0 = xb + j + l;
-                uint k32 = k0 + 32;
-                if (v0) { a0 += wlo * x0[k0]; a0 += whi * x0[k32]; }
-                if (v1) { a1 += wlo * x1[k0]; a1 += whi * x1[k32]; }
-                if (v2) { a2 += wlo * x2[k0]; a2 += whi * x2[k32]; }
-                if (v3) { a3 += wlo * x3[k0]; a3 += whi * x3[k32]; }
-                if (v4) { a4 += wlo * x4[k0]; a4 += whi * x4[k32]; }
-                if (v5) { a5 += wlo * x5[k0]; a5 += whi * x5[k32]; }
-                if (v6) { a6 += wlo * x6[k0]; a6 += whi * x6[k32]; }
-                if (v7) { a7 += wlo * x7[k0]; a7 += whi * x7[k32]; }
-            }
-            is += 2;
+            uchar byte = qs[g * 32 + lane];
+            float wlo = d1 * (float)(byte & 0x0F) - mm1;
+            float whi = d2 * (float)(byte >> 4) - mm2;
+            uint k = b * 256 + g * 64 + lane;
+            if (v0) { acc0 += wlo * x0[k] + whi * x0[k + 32]; }
+            if (v1) { acc1 += wlo * x1[k] + whi * x1[k + 32]; }
+            if (v2) { acc2 += wlo * x2[k] + whi * x2[k + 32]; }
+            if (v3) { acc3 += wlo * x3[k] + whi * x3[k + 32]; }
+            if (v4) { acc4 += wlo * x4[k] + whi * x4[k + 32]; }
+            if (v5) { acc5 += wlo * x5[k] + whi * x5[k + 32]; }
+            if (v6) { acc6 += wlo * x6[k] + whi * x6[k + 32]; }
+            if (v7) { acc7 += wlo * x7[k] + whi * x7[k + 32]; }
         }
-        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
-        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
     }
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
     acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
@@ -2167,42 +2156,36 @@ kernel void gemm_q4_k_acc(
     uint row_byte = w_rem + row * nb * 144;
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
-    for (uint b = lane; b < nb; b += 32) {
-        float d  = float(read_f16(w_base, row_byte + b * 144));
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d    = float(read_f16(w_base, row_byte + b * 144));
         float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
-        device const uchar *scales = w_base + row_byte + b * 144 + 4;
-        device const uchar *qs = w_base + row_byte + b * 144 + 16;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-        uint is = 0;
-        for (uint j = 0; j < 256; j += 64) {
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        // Lane = value index in the 64-value group (the coalesced mapping of
+        // gemm_q4_k / gemm_q6_k): byte l carries value 64g+l (scale 2g) in
+        // its low nibble and 64g+32+l (scale 2g+1) in its high nibble.
+        for (uint g = 0; g < 4; ++g) {
             uint8_t sc1, m1, sc2, m2;
-            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 0, &sc1, &m1);
+            q4k_scale_min(scales, 2 * g + 1, &sc2, &m2);
             float d1 = d * (float)sc1;
             float mm1 = dmin * (float)m1;
-            q4k_scale_min(scales, is + 1, &sc2, &m2);
             float d2 = d * (float)sc2;
             float mm2 = dmin * (float)m2;
-            uint qb = j / 2;
-            uint xb = b * 256;
-            for (uint l = 0; l < 32; ++l) {
-                float wlo = d1 * (float)(qs[qb + l] & 0x0F) - mm1;
-                float whi = d2 * (float)(qs[qb + l] >> 4) - mm2;
-                uint k0 = xb + j + l;
-                uint k32 = k0 + 32;
-                if (v0) { a0 += wlo * x0[k0]; a0 += whi * x0[k32]; }
-                if (v1) { a1 += wlo * x1[k0]; a1 += whi * x1[k32]; }
-                if (v2) { a2 += wlo * x2[k0]; a2 += whi * x2[k32]; }
-                if (v3) { a3 += wlo * x3[k0]; a3 += whi * x3[k32]; }
-                if (v4) { a4 += wlo * x4[k0]; a4 += whi * x4[k32]; }
-                if (v5) { a5 += wlo * x5[k0]; a5 += whi * x5[k32]; }
-                if (v6) { a6 += wlo * x6[k0]; a6 += whi * x6[k32]; }
-                if (v7) { a7 += wlo * x7[k0]; a7 += whi * x7[k32]; }
-            }
-            is += 2;
+            uchar byte = qs[g * 32 + lane];
+            float wlo = d1 * (float)(byte & 0x0F) - mm1;
+            float whi = d2 * (float)(byte >> 4) - mm2;
+            uint k = b * 256 + g * 64 + lane;
+            if (v0) { acc0 += wlo * x0[k] + whi * x0[k + 32]; }
+            if (v1) { acc1 += wlo * x1[k] + whi * x1[k + 32]; }
+            if (v2) { acc2 += wlo * x2[k] + whi * x2[k + 32]; }
+            if (v3) { acc3 += wlo * x3[k] + whi * x3[k + 32]; }
+            if (v4) { acc4 += wlo * x4[k] + whi * x4[k + 32]; }
+            if (v5) { acc5 += wlo * x5[k] + whi * x5[k + 32]; }
+            if (v6) { acc6 += wlo * x6[k] + whi * x6[k + 32]; }
+            if (v7) { acc7 += wlo * x7[k] + whi * x7[k + 32]; }
         }
-        acc0 += a0; acc1 += a1; acc2 += a2; acc3 += a3;
-        acc4 += a4; acc5 += a5; acc6 += a6; acc7 += a7;
     }
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
     acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
@@ -3384,5 +3367,602 @@ kernel void quantize_q8_k_pos(
     o->d = amax / 127.0f;
     for (uint j = 0; j < 256; ++j) {
         o->qs[j] = (char)rint(xb[j] * id);
+    }
+}
+
+// ── P4 arm-d: threadgroup-tiled q4_K GEMM ──────────────────────────────────
+// The 8-token grid re-reads every weight row B/8 times (16x at chunk-128) and
+// re-reads the whole x tile once per output row; measured at 0.3 TFLOP/s that
+// class cannot beat the CPU tile path (0.7 TFLOP/s) let alone llama.cpp's
+// Metal batched GEMM (the bar implies 3-4 TFLOP/s).
+//
+// Here one threadgroup owns a 32-row x 64-token output tile and streams k in
+// 32-value slices: the weights of those 32 rows and the 64 token vectors are
+// dequantized into threadgroup memory ONCE and then reused by every thread in
+// the group (weight traffic drops 8x at B=128; x is read once per row-block
+// instead of once per row). Each k-slice is exactly one q4_K sub-block, so
+// every staged value shares one (scale, min) pair — the dequant is hoisted out
+// of the value loop.
+//
+// Thread map: 128 threads = 32 rows x 4 value-chunks in the staging phase;
+// 16x8 in the compute phase (each thread owns a 4x4 output tile).
+// Grid: (ceil(rows/32), ceil(B/64)); y is [B x rows] row-major.
+#define TILED_R 32
+#define TILED_T 64
+#define TILED_BK 32
+#define TILED_PAD 33
+#define TILED_THREADS 128
+
+kernel void gemm_q4_k_tiled(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float ws[TILED_R * TILED_PAD];
+    threadgroup float xs[TILED_T * TILED_PAD];
+
+    uint r0 = tg.x * TILED_R;
+    uint t0 = tg.y * TILED_T;
+    uint nb = cols / 256;
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    uint nbk = cols / TILED_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * TILED_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 32 rows x 32 values (one sub-block each) ──
+        {
+            uint r = tid >> 2;             // 0..31
+            uint v0 = (tid & 3) * 8;       // 0/8/16/24
+            uint grow = r0 + r;
+            float wv[8];
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 144;
+                device const uchar *blk = w_base + row_byte + b * 144;
+                float d = float(read_f16(w_base, row_byte + b * 144));
+                float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+                uint8_t sc, m;
+                q4k_scale_min(blk + 4, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16 + 32 * (sub >> 1);
+                for (uint u = 0; u < 8; ++u) {
+                    uchar byte = qrow[v0 + u];
+                    uint nib = (sub & 1) ? (uint)(byte >> 4) : (uint)(byte & 0x0F);
+                    wv[u] = ds * (float)nib - mm;
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[r * TILED_PAD + v0 + u] = wv[u]; }
+        }
+        // ── stage 64 tokens x 32 values ──
+        {
+            uint t = tid >> 1;             // 0..63
+            uint v0 = (tid & 1) * 16;      // 0 or 16
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t * TILED_PAD + v0 + u] = xv[u]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── compute: 16 threads in token x 8 threads in row ──
+        uint tx = tid & 15;                // 0..15 -> tokens tx*4 .. +3
+        uint ry = tid >> 4;                // 0..7  -> rows  ry*4 .. +3
+        uint tbase = tx * 4;
+        uint rbase = ry * 4;
+        for (uint kk = 0; kk < TILED_BK; ++kk) {
+            float xv0 = xs[(tbase + 0) * TILED_PAD + kk];
+            float xv1 = xs[(tbase + 1) * TILED_PAD + kk];
+            float xv2 = xs[(tbase + 2) * TILED_PAD + kk];
+            float xv3 = xs[(tbase + 3) * TILED_PAD + kk];
+            float wv0 = ws[(rbase + 0) * TILED_PAD + kk];
+            float wv1 = ws[(rbase + 1) * TILED_PAD + kk];
+            float wv2 = ws[(rbase + 2) * TILED_PAD + kk];
+            float wv3 = ws[(rbase + 3) * TILED_PAD + kk];
+            acc[0][0] += wv0 * xv0; acc[0][1] += wv0 * xv1;
+            acc[0][2] += wv0 * xv2; acc[0][3] += wv0 * xv3;
+            acc[1][0] += wv1 * xv0; acc[1][1] += wv1 * xv1;
+            acc[1][2] += wv1 * xv2; acc[1][3] += wv1 * xv3;
+            acc[2][0] += wv2 * xv0; acc[2][1] += wv2 * xv1;
+            acc[2][2] += wv2 * xv2; acc[2][3] += wv2 * xv3;
+            acc[3][0] += wv3 * xv0; acc[3][1] += wv3 * xv1;
+            acc[3][2] += wv3 * xv2; acc[3][3] += wv3 * xv3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue ──
+    uint tx2 = tid & 15;
+    uint ry2 = tid >> 4;
+    uint tbase2 = t0 + tx2 * 4;
+    uint rbase2 = r0 + ry2 * 4;
+    for (uint i = 0; i < 4; ++i) {
+        uint grow = rbase2 + i;
+        if (grow >= rows) { continue; }
+        for (uint j = 0; j < 4; ++j) {
+            uint gt = tbase2 + j;
+            if (gt >= B) { continue; }
+            y[(size_t)gt * rows + grow] = acc[i][j];
+        }
+    }
+}
+
+// ── P4 arm-d: tiled fused GEMM (multi-section + optional resid epilogue) ────
+// The prefill route's dispatches are all fused (qkv = 3 sections, gate_up = 2,
+// o/down = resid epilogue), so the tiled kernel above must speak the same
+// section table to be usable there. Per-row section resolution happens ONCE
+// per thread before the k loop (weight cursor) and once in the epilogue (y
+// cursor): a 32-row tile may straddle a section boundary, so both are per row,
+// never per threadgroup. res_stride == 0 disables the epilogue add — with one
+// synthesized section the same kernel is the plain tiled GEMM.
+kernel void gemm_q4_k_tiled_fused(
+    device const uchar      *w_base     [[buffer(0)]],
+    device const float      *x          [[buffer(1)]],
+    device const float      *res        [[buffer(2)]],
+    device float            *y          [[buffer(3)]],
+    constant uint           &cols       [[buffer(4)]],
+    constant uint           &B          [[buffer(5)]],
+    constant uint           &rows_tot   [[buffer(6)]],
+    constant uint           &res_stride [[buffer(7)]],
+    constant GemmSection    *secs       [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float ws[TILED_R * TILED_PAD];
+    threadgroup float xs[TILED_T * TILED_PAD];
+
+    uint r0 = tg.x * TILED_R;
+    uint t0 = tg.y * TILED_T;
+    uint nb = cols / 256;
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    // staging cursor for this thread's row — resolved ONCE (it is
+    // section-dependent and k-independent). d/dmin are per 256-value block,
+    // so they stay inside the k loop below.
+    uint srow = r0 + (tid >> 2);
+    device const uchar *s_blk = w_base;
+    bool s_live = false;
+    {
+        uint prev_end = 0u, sec_off = 0u, sec_rem = 0u;
+        for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+            uint end_i = secs[i].rows_end;
+            if (srow >= prev_end && srow < end_i) {
+                sec_off = secs[i].off;
+                sec_rem = secs[i].rem;
+                break;
+            }
+            prev_end = end_i;
+        }
+        if (srow < rows_tot) {
+            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb * 144;
+            s_live = true;
+        }
+    }
+    uint sv0 = (tid & 3) * 8;
+
+    uint nbk = cols / TILED_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * TILED_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 32 rows x 32 values ──
+        {
+            float wv[8];
+            if (s_live) {
+                device const uchar *blk = s_blk + b * 144;
+                float d = float(read_f16(s_blk, b * 144));
+                float dmin = float(read_f16(s_blk, b * 144 + 2));
+                uint8_t sc, m;
+                q4k_scale_min(blk + 4, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16 + 32 * (sub >> 1);
+                for (uint u = 0; u < 8; ++u) {
+                    uchar byte = qrow[sv0 + u];
+                    uint nib = (sub & 1) ? (uint)(byte >> 4) : (uint)(byte & 0x0F);
+                    wv[u] = ds * (float)nib - mm;
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[(tid >> 2) * TILED_PAD + sv0 + u] = wv[u]; }
+        }
+        // ── stage 64 tokens x 32 values ──
+        {
+            uint t = tid >> 1;
+            uint v0 = (tid & 1) * 16;
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t * TILED_PAD + v0 + u] = xv[u]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tx = tid & 15;
+        uint ry = tid >> 4;
+        uint tbase = tx * 4;
+        uint rbase = ry * 4;
+        for (uint kk = 0; kk < TILED_BK; ++kk) {
+            float xv0 = xs[(tbase + 0) * TILED_PAD + kk];
+            float xv1 = xs[(tbase + 1) * TILED_PAD + kk];
+            float xv2 = xs[(tbase + 2) * TILED_PAD + kk];
+            float xv3 = xs[(tbase + 3) * TILED_PAD + kk];
+            float wv0 = ws[(rbase + 0) * TILED_PAD + kk];
+            float wv1 = ws[(rbase + 1) * TILED_PAD + kk];
+            float wv2 = ws[(rbase + 2) * TILED_PAD + kk];
+            float wv3 = ws[(rbase + 3) * TILED_PAD + kk];
+            acc[0][0] += wv0 * xv0; acc[0][1] += wv0 * xv1;
+            acc[0][2] += wv0 * xv2; acc[0][3] += wv0 * xv3;
+            acc[1][0] += wv1 * xv0; acc[1][1] += wv1 * xv1;
+            acc[1][2] += wv1 * xv2; acc[1][3] += wv1 * xv3;
+            acc[2][0] += wv2 * xv0; acc[2][1] += wv2 * xv1;
+            acc[2][2] += wv2 * xv2; acc[2][3] += wv2 * xv3;
+            acc[3][0] += wv3 * xv0; acc[3][1] += wv3 * xv1;
+            acc[3][2] += wv3 * xv2; acc[3][3] += wv3 * xv3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue: per-row section (y cursor) + optional residual ──
+    uint ey = tid >> 4;
+    uint et = tid & 15;
+    uint gt0 = t0 + et * 4;
+    for (uint i = 0; i < 4; ++i) {
+        uint grow = r0 + ey * 4 + i;
+        if (grow >= rows_tot) { continue; }
+        uint prev_end = 0u, y_off = 0u, y_str = 0u;
+        for (uint s = 0u; s < GEMM_MAX_SECTIONS; ++s) {
+            uint end_i = secs[s].rows_end;
+            if (grow >= prev_end && grow < end_i) {
+                y_off = secs[s].y_off;
+                y_str = secs[s].y_stride;
+                break;
+            }
+            prev_end = end_i;
+        }
+        uint local_row = grow - prev_end;
+        device float *yr = y + (y_off >> 2) + local_row;
+        device const float *rr = res + (size_t)grow;
+        for (uint j = 0; j < 4; ++j) {
+            uint gt = gt0 + j;
+            if (gt >= B) { continue; }
+            float v = acc[i][j];
+            if (res_stride != 0u) { v += rr[(size_t)gt * res_stride]; }
+            yr[(size_t)gt * y_str] = v;
+        }
+    }
+}
+
+// ── P4 arm-d: tiled fused GEMM, q6_K weights ───────────────────────────────
+// Same 32-row x 64-token threadgroup tile and section-table ABI as
+// gemm_q4_k_tiled_fused; only the weight staging differs (q6_K super-block:
+// ql[128] + qh[64] + scales[16] + f16 d, 210 bytes per 256 values).
+kernel void gemm_q6_k_tiled_fused(
+    device const uchar      *w_base     [[buffer(0)]],
+    device const float      *x          [[buffer(1)]],
+    device const float      *res        [[buffer(2)]],
+    device float            *y          [[buffer(3)]],
+    constant uint           &cols       [[buffer(4)]],
+    constant uint           &B          [[buffer(5)]],
+    constant uint           &rows_tot   [[buffer(6)]],
+    constant uint           &res_stride [[buffer(7)]],
+    constant GemmSection    *secs       [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float ws[TILED_R * TILED_PAD];
+    threadgroup float xs[TILED_T * TILED_PAD];
+
+    uint r0 = tg.x * TILED_R;
+    uint t0 = tg.y * TILED_T;
+    uint nb = cols / 256;
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    // staging cursor for this thread's row — resolved ONCE (it is
+    // section-dependent and k-independent). d/dmin are per 256-value block,
+    // so they stay inside the k loop below.
+    uint srow = r0 + (tid >> 2);
+    device const uchar *s_blk = w_base;
+    bool s_live = false;
+    {
+        uint prev_end = 0u, sec_off = 0u, sec_rem = 0u;
+        for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+            uint end_i = secs[i].rows_end;
+            if (srow >= prev_end && srow < end_i) {
+                sec_off = secs[i].off;
+                sec_rem = secs[i].rem;
+                break;
+            }
+            prev_end = end_i;
+        }
+        if (srow < rows_tot) {
+            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb * 210;
+            s_live = true;
+        }
+    }
+    uint sv0 = (tid & 3) * 8;
+
+    uint nbk = cols / TILED_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * TILED_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 32 rows x 32 values ──
+        {
+            float wv[8];
+            if (s_live) {
+                device const uchar *blk = s_blk + b * 210;
+                float d = float(read_f16(s_blk, b * 210 + 208));
+                uint hsel = sub >> 2;              // 0/1 -> 128-value half
+                uint quart = sub & 3;              // quarter inside the half
+                uint ql_off = 64 * hsel + ((quart & 1) ? 32 : 0);
+                uint qh_off = 128 + 32 * hsel;
+                uint shift = 2 * quart;
+                uint nib_hi = (quart >= 2) ? 1u : 0u;
+                uint si = 8 * hsel + 2 * quart + (sv0 >> 4);
+                int sc = (int)blk[192 + si];
+                if (sc > 127) { sc -= 256; }       // int8 scale
+                float ds = d * (float)sc;
+                for (uint u = 0; u < 8; ++u) {
+                    uint l = sv0 + u;
+                    uint b6 = (uint)blk[ql_off + l];
+                    uint nib = nib_hi ? (b6 >> 4) : (b6 & 0x0F);
+                    uint hi = ((uint)blk[qh_off + l] >> shift) & 3u;
+                    int qv = (int)(nib | (hi << 4)) - 32;
+                    wv[u] = ds * (float)qv;
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[(tid >> 2) * TILED_PAD + sv0 + u] = wv[u]; }
+        }
+        // ── stage 64 tokens x 32 values ──
+        {
+            uint t = tid >> 1;
+            uint v0 = (tid & 1) * 16;
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t * TILED_PAD + v0 + u] = xv[u]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tx = tid & 15;
+        uint ry = tid >> 4;
+        uint tbase = tx * 4;
+        uint rbase = ry * 4;
+        for (uint kk = 0; kk < TILED_BK; ++kk) {
+            float xv0 = xs[(tbase + 0) * TILED_PAD + kk];
+            float xv1 = xs[(tbase + 1) * TILED_PAD + kk];
+            float xv2 = xs[(tbase + 2) * TILED_PAD + kk];
+            float xv3 = xs[(tbase + 3) * TILED_PAD + kk];
+            float wv0 = ws[(rbase + 0) * TILED_PAD + kk];
+            float wv1 = ws[(rbase + 1) * TILED_PAD + kk];
+            float wv2 = ws[(rbase + 2) * TILED_PAD + kk];
+            float wv3 = ws[(rbase + 3) * TILED_PAD + kk];
+            acc[0][0] += wv0 * xv0; acc[0][1] += wv0 * xv1;
+            acc[0][2] += wv0 * xv2; acc[0][3] += wv0 * xv3;
+            acc[1][0] += wv1 * xv0; acc[1][1] += wv1 * xv1;
+            acc[1][2] += wv1 * xv2; acc[1][3] += wv1 * xv3;
+            acc[2][0] += wv2 * xv0; acc[2][1] += wv2 * xv1;
+            acc[2][2] += wv2 * xv2; acc[2][3] += wv2 * xv3;
+            acc[3][0] += wv3 * xv0; acc[3][1] += wv3 * xv1;
+            acc[3][2] += wv3 * xv2; acc[3][3] += wv3 * xv3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue: per-row section (y cursor) + optional residual ──
+    uint ey = tid >> 4;
+    uint et = tid & 15;
+    uint gt0 = t0 + et * 4;
+    for (uint i = 0; i < 4; ++i) {
+        uint grow = r0 + ey * 4 + i;
+        if (grow >= rows_tot) { continue; }
+        uint prev_end = 0u, y_off = 0u, y_str = 0u;
+        for (uint s = 0u; s < GEMM_MAX_SECTIONS; ++s) {
+            uint end_i = secs[s].rows_end;
+            if (grow >= prev_end && grow < end_i) {
+                y_off = secs[s].y_off;
+                y_str = secs[s].y_stride;
+                break;
+            }
+            prev_end = end_i;
+        }
+        uint local_row = grow - prev_end;
+        device float *yr = y + (y_off >> 2) + local_row;
+        device const float *rr = res + (size_t)grow;
+        for (uint j = 0; j < 4; ++j) {
+            uint gt = gt0 + j;
+            if (gt >= B) { continue; }
+            float v = acc[i][j];
+            if (res_stride != 0u) { v += rr[(size_t)gt * res_stride]; }
+            yr[(size_t)gt * y_str] = v;
+        }
+    }
+}
+
+
+// ── P4 arm-d: tiled fused GEMM, q8_0 weights ───────────────────────────────
+// q8_0 blocks are 34 bytes (f16 d + 32 int8), so one 32-value k-slice is
+// exactly one block and the dequant is a single multiply per value.
+kernel void gemm_q8_0_tiled_fused(
+    device const uchar      *w_base     [[buffer(0)]],
+    device const float      *x          [[buffer(1)]],
+    device const float      *res        [[buffer(2)]],
+    device float            *y          [[buffer(3)]],
+    constant uint           &cols       [[buffer(4)]],
+    constant uint           &B          [[buffer(5)]],
+    constant uint           &rows_tot   [[buffer(6)]],
+    constant uint           &res_stride [[buffer(7)]],
+    constant GemmSection    *secs       [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float ws[TILED_R * TILED_PAD];
+    threadgroup float xs[TILED_T * TILED_PAD];
+
+    uint r0 = tg.x * TILED_R;
+    uint t0 = tg.y * TILED_T;
+    uint nb = cols / 256;
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    // staging cursor for this thread's row — resolved ONCE (it is
+    // section-dependent and k-independent). d/dmin are per 256-value block,
+    // so they stay inside the k loop below.
+    uint srow = r0 + (tid >> 2);
+    device const uchar *s_blk = w_base;
+    bool s_live = false;
+    {
+        uint prev_end = 0u, sec_off = 0u, sec_rem = 0u;
+        for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+            uint end_i = secs[i].rows_end;
+            if (srow >= prev_end && srow < end_i) {
+                sec_off = secs[i].off;
+                sec_rem = secs[i].rem;
+                break;
+            }
+            prev_end = end_i;
+        }
+        if (srow < rows_tot) {
+            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb * 8 * 34;
+            s_live = true;
+        }
+    }
+    uint sv0 = (tid & 3) * 8;
+
+    uint nbk = cols / TILED_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * TILED_BK;
+        uint b = k0 / 256;
+        uint sub = (k0 % 256) / 32;
+
+        // ── stage 32 rows x 32 values ──
+        {
+            float wv[8];
+            if (s_live) {
+                device const uchar *blk = s_blk + kb * 34;
+                float d = float(read_f16(s_blk, kb * 34));
+                for (uint u = 0; u < 8; ++u) {
+                    int qv = (int)blk[2 + sv0 + u];
+                    if (qv > 127) { qv -= 256; }   // int8 quants
+                    wv[u] = d * (float)qv;
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[(tid >> 2) * TILED_PAD + sv0 + u] = wv[u]; }
+        }
+        // ── stage 64 tokens x 32 values ──
+        {
+            uint t = tid >> 1;
+            uint v0 = (tid & 1) * 16;
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t * TILED_PAD + v0 + u] = xv[u]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tx = tid & 15;
+        uint ry = tid >> 4;
+        uint tbase = tx * 4;
+        uint rbase = ry * 4;
+        for (uint kk = 0; kk < TILED_BK; ++kk) {
+            float xv0 = xs[(tbase + 0) * TILED_PAD + kk];
+            float xv1 = xs[(tbase + 1) * TILED_PAD + kk];
+            float xv2 = xs[(tbase + 2) * TILED_PAD + kk];
+            float xv3 = xs[(tbase + 3) * TILED_PAD + kk];
+            float wv0 = ws[(rbase + 0) * TILED_PAD + kk];
+            float wv1 = ws[(rbase + 1) * TILED_PAD + kk];
+            float wv2 = ws[(rbase + 2) * TILED_PAD + kk];
+            float wv3 = ws[(rbase + 3) * TILED_PAD + kk];
+            acc[0][0] += wv0 * xv0; acc[0][1] += wv0 * xv1;
+            acc[0][2] += wv0 * xv2; acc[0][3] += wv0 * xv3;
+            acc[1][0] += wv1 * xv0; acc[1][1] += wv1 * xv1;
+            acc[1][2] += wv1 * xv2; acc[1][3] += wv1 * xv3;
+            acc[2][0] += wv2 * xv0; acc[2][1] += wv2 * xv1;
+            acc[2][2] += wv2 * xv2; acc[2][3] += wv2 * xv3;
+            acc[3][0] += wv3 * xv0; acc[3][1] += wv3 * xv1;
+            acc[3][2] += wv3 * xv2; acc[3][3] += wv3 * xv3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue: per-row section (y cursor) + optional residual ──
+    uint ey = tid >> 4;
+    uint et = tid & 15;
+    uint gt0 = t0 + et * 4;
+    for (uint i = 0; i < 4; ++i) {
+        uint grow = r0 + ey * 4 + i;
+        if (grow >= rows_tot) { continue; }
+        uint prev_end = 0u, y_off = 0u, y_str = 0u;
+        for (uint s = 0u; s < GEMM_MAX_SECTIONS; ++s) {
+            uint end_i = secs[s].rows_end;
+            if (grow >= prev_end && grow < end_i) {
+                y_off = secs[s].y_off;
+                y_str = secs[s].y_stride;
+                break;
+            }
+            prev_end = end_i;
+        }
+        uint local_row = grow - prev_end;
+        device float *yr = y + (y_off >> 2) + local_row;
+        device const float *rr = res + (size_t)grow;
+        for (uint j = 0; j < 4; ++j) {
+            uint gt = gt0 + j;
+            if (gt >= B) { continue; }
+            float v = acc[i][j];
+            if (res_stride != 0u) { v += rr[(size_t)gt * res_stride]; }
+            yr[(size_t)gt * y_str] = v;
+        }
     }
 }

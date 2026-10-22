@@ -364,10 +364,14 @@ default until receipts justify the per-model flip.
    certified near-tie flips.
 
 ## REMAINING (the honest board)
-- **(d) simdgroup-matrix GEMM program — NOT STARTED.** The rate side: the
-  GEMM-prefill route is still ~6× under the CPU tiles (0.6B 33 vs 583);
-  bars pp 3416/2055/461/865/264 need it. Entry point: the kernel program in
-  LEDGER #4 ("The real Phase-5-grade program").
+- **(d) GEMM rate program — STARTED (LEDGER #5).** The 8-token GEMM class
+  was replaced by a threadgroup-tiled class: q4_K coalesced-lane mapping
+  (8-15x kernel rate), then a 32-row x 64-token tile with threadgroup-memory
+  weight/activation staging for q4_K/q6_K/q8_0 (5.4x over the shipped class
+  at 3072x1024/B=128). The route moved 143->304 (0.6B), 106->279 (1B),
+  11.4->122 (MiniCPM), 7.9->20.5 (8B) tk/s but still trails the CPU tiles
+  and the bars. Next: simdgroup-matrix (MMA) tiles + the attention kernel
+  (now the largest single prefill cost, 283 of 711 ms on the 0.6B).
 - **(e) fleet-exact endgame — NOT STARTED.** Order-exact ops + a
   libm-matching MSL exp/log; the ONLY route to unconditional IDENTICAL on
   near-tie-heavy q4/q6 prompts. Entry point: mirror the fleet op order from
@@ -1004,3 +1008,104 @@ device-side dispatch fault persists and the fallback contract contains it
 into CPU tiles through retry cycles. Contained, slow, route-off by default
 ⇒ no shipped-path impact; the device-side root cause still wants a Metal
 capture session (the only remaining unknown in item c).
+
+
+# PROGRESS LEDGER #5 — GEMM RATE PROGRAM, first leg (2026-10-22, calm)
+
+Scope: the prefill GEMM class only (the plan's arm d). Every kernel change
+is parity-gated before the rate receipt below; nothing here flips a default
+(`SOFUU_GPU_GEMM_TILED` stays opt-in).
+
+## Landed
+
+1. **q4_K GEMM coalescing (the 20x-class defect).** `gemm_q4_k` used
+   lane = block-index: each lane straddled its own 144-byte block and read x
+   with scalar strides. Rewritten to the q6_K mapping (lane = value index in
+   the 64-value group, `q4k_scale_min(scales, 2g)`/`(2g+1)`), which makes
+   the weight bytes and the x lanes contiguous. `gemm_q4_k_multi` and
+   `gemm_q4_k_acc` (the shapes the prefill route actually dispatches) got
+   the same body.
+   - Rate (B=128, tok/s-eq): 1024x1024 10,057 -> 60,026; 3072x1024
+     3,462 -> 50,302; 1024x3072 8,084 -> 46,213; 1024x2048 9,523 -> 56,074.
+   - Parity: `gemm_q4_k_matches_cpu` PASS (worst_abs 3.9e-3 over
+     1.7e4 magnitudes); `gemm_q4_k_multi_matches_split` fails=0 worst=0.
+
+2. **Threadgroup-tiled GEMM class** (`gemm_q4_k_tiled`,
+   `gemm_q4_k_tiled_fused`, `gemm_q6_k_tiled_fused`,
+   `gemm_q8_0_tiled_fused`). One threadgroup owns a 32-row x 64-token
+   output tile and streams k in 32-value slices (one q4_K/q6_K sub-block, one
+   q8_0 block), dequantizing weights and activations into threadgroup memory
+   once per tile: weight traffic drops from B/8 reads per row to B/64
+   (8x less at chunk-128) and x is read once per row-block instead of once
+   per row. Padding to 33 floats kills the shared-memory bank conflict.
+   - `_fused` speaks the existing section-table ABI, so qkv (3 sections),
+     gate_up (2) and the o/down resid epilogue keep their fusion; per-row
+     section resolution is done once for the weight cursor and once in the
+     epilogue (a 32-row tile can straddle a section boundary).
+   - Rate: 3072x1024 B=128 4.836 -> 0.893 ms (**5.42x**, 0.90 TFLOP/s vs
+     0.17), same buffers, same dispatch contract.
+   - Parity: `gemm_q4_k_tiled_matches_cpu` PASS (worst_rel 1.3e-6);
+     `gemm_tiled_q6_k_matches_cpu` PASS for ty=14 (1.0e-4, q6_K ±32 quant
+     cancellation class) and ty=8 (2.4e-5).
+
+3. **Wiring.** `batch_gguf_gemm_tiled_multi` / `..._tiled_acc` (Rust +
+   C ABI + MSL) tried first on the prefill route behind
+   `SOFUU_GPU_GEMM_TILED=1`, falling through to the shipped 8-token
+   multi/acc for anything the tiled class rejects (and for models whose
+   tensors are not q4_K/q6_K/q8_0).
+
+## Receipts (207-token prompt, --max-tokens 1, same box, calm)
+
+| model | bar pp | CPU tiles | route shipped | route + tiled | tiled/bar |
+|---|---|---|---|---|---|
+| 0.6B i1-Q4 | 3396 | 636.3 | 143.4 | **303.9** | 0.089x |
+| 1B Q8_0 | 2055 | 443.2 | 106.2 | **279.1** | 0.136x |
+| Spark-4B Q4 | 461 | 76.5 | 73.2 | **75.0** | 0.163x |
+| MiniCPM5-2B Q6 | 865 | 123.7 | 11.4 | **121.8** | 0.141x |
+| 8B Q4_K_M | 264 | 45.5 | 7.9 | **20.5** | 0.078x |
+
+Text gates with the tiled class on (bound auto):
+- 0.6B `NEAR-TIE-CERTIFIED` first-fork-step 6, |dtop1| 0.041 (bound 0.308)
+- 1B Q8_0 `NEAR-TIE-CERTIFIED` first-fork-step 34, |dtop1| 0.051 (bound 0.697)
+
+**Verdict unchanged: the GPU prefill route still loses to the CPU tiles on
+0.6B/1B/8B, so no default moves.** Spark-4B is the exception in shape (its
+prefill is attention/SWA-bound, not GEMM-bound: 73 -> 75).
+
+## Where the prefill time now sits (0.6B, ablation, tiled class on)
+
+| config | tk/s | ms |
+|---|---|---|
+| baseline (all ops) | 291.0 | 711 |
+| `SOFUU_GPU_SKIP=attn` | 483.8 | 428 |
+| `SOFUU_GPU_SKIP=ffn` | 375.0 | 552 |
+| `SOFUU_GPU_SKIP=attn,ffn` | 719.2 | 288 |
+
+Attention ≈ 283 ms (40%), ffn ≈ 159 ms (22%), everything else (norms,
+kv_write, qkv/o/head, dispatch, x staging) ≈ 288 ms (40%). The GEMM class
+itself is now ~30% of the pass — the next 3x is **the batched-prefill
+attention kernel** (it computes ~4.9 GFLOP of dots in 283 ms ≈ 17 GFLOP/s,
+50-100x under what the box does), then MMA tiles, then the op count.
+
+## Defect lessons (all three bit the fleet before being caught)
+
+1. `d`/`dmin` are **per 256-value block**, never per row — hoisting them
+   out of the k loop silently mixes scales across blocks (found by the
+   0.6B text gate, not by the single-block unit test).
+2. The per-row weight cursor must use the **dtype's** block bytes
+   (144 / 210 / 34) — the q6_K/q8_0 copies inherited q4_K's 144 and read
+   past the tensor into NaN territory.
+3. **q8_0 blocks hold 32 values**, not 256: its block index is k/32 and a
+   row is 8x nb blocks wide. Both wrong forms passed compilation and only
+   showed up as a scaled/sign-flipped dot.
+
+Unit-test fixtures must mirror the same geometry (the q8_0 rows in
+`gemm_tiled_q6_k_matches_cpu` were 2 blocks wide before the fix).
+
+## Next in this arm
+
+1. Batched-prefill attention (flash-style tiling over positions with the KV
+   in threadgroup/registers) — the largest single cost, ~40% of the pass.
+2. simdgroup-matrix (MMA) variants of the tiled GEMM: the SIMT tile is at
+   0.9 TFLOP/s; the bar implies 3-4.
+3. Only then re-run the sweep and re-decide the flip.

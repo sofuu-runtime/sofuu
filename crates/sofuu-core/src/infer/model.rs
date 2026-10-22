@@ -3505,7 +3505,12 @@ impl TransformerModel {
                             blob[j][3] = *y_off as u32;
                             blob[j][4] = *y_stride as u32;
                         }
-                        g.engine.batch_gguf_gemm_multi(
+                        // tiled class first (q4_K only; falls through to
+                        // the shipped 8-token multi for q6_K/q8_0)
+                        g.engine.batch_gguf_gemm_tiled_multi(
+                            *ty, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
+                            end as usize, $cols, b, &blob,
+                        ) || g.engine.batch_gguf_gemm_multi(
                             *ty, &g.w_buf, base, pbuf, $x_off, pbuf, 0,
                             end as usize, $cols, b, &blob,
                         )
@@ -3713,13 +3718,19 @@ impl TransformerModel {
                             l.attn_output.tensor_type,
                             GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
                         )))
-                && g.engine.batch_gguf_gemm_acc(
+                && (g.engine.batch_gguf_gemm_tiled_acc(
                     l.attn_output.tensor_type, &g.w_buf, gguf.data_offset + l.attn_output.offset,
                     pbuf, pslots.ao,
                     pbuf, pslots.x, dim,
                     pbuf, pslots.x,
                     dim, q_rows, b,
-                );
+                ) || g.engine.batch_gguf_gemm_acc(
+                    l.attn_output.tensor_type, &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    pbuf, pslots.ao,
+                    pbuf, pslots.x, dim,
+                    pbuf, pslots.x,
+                    dim, q_rows, b,
+                ));
             if !o_ok {
                 gemm!(l.attn_output, pslots.ao, pslots.xo, dim, q_rows);
                 if !g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim) {
@@ -3757,13 +3768,19 @@ impl TransformerModel {
                                 l.ffn_down.tensor_type,
                                 GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
                             )))
-                    && g.engine.batch_gguf_gemm_acc(
+                    && (g.engine.batch_gguf_gemm_tiled_acc(
                         l.ffn_down.tensor_type, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
                         pbuf, pslots.gate,
                         pbuf, pslots.x, dim,
                         pbuf, pslots.x,
                         dim, hidden_dim, b,
-                    );
+                    ) || g.engine.batch_gguf_gemm_acc(
+                        l.ffn_down.tensor_type, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                        pbuf, pslots.gate,
+                        pbuf, pslots.x, dim,
+                        pbuf, pslots.x,
+                        dim, hidden_dim, b,
+                    ));
                 if !d_ok {
                     gemm!(l.ffn_down, pslots.gate, pslots.xo, dim, hidden_dim);
                     if !g.engine.batch_add(pbuf, pslots.x, pbuf, pslots.xo, b * dim) {

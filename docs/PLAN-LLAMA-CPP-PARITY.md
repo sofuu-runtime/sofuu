@@ -1109,3 +1109,46 @@ Unit-test fixtures must mirror the same geometry (the q8_0 rows in
 2. simdgroup-matrix (MMA) variants of the tiled GEMM: the SIMT tile is at
    0.9 TFLOP/s; the bar implies 3-4.
 3. Only then re-run the sweep and re-decide the flip.
+
+## LEDGER #5 — ADDENDUM: flash prefill attention (arm b), 2026-10-22 late
+
+**Kernel: `llama_attn_flash_b4`** (opt-in via `SOFUU_GPU_ATTN_FLASH`).
+The shipped `llama_attn_1c_b4` was the largest single prefill cost (283 of
+711 ms on the 0.6B = 40%) because of three defects:
+
+1. every Q·K dot was computed **three times** (max pass, sum pass, then the
+   weight table) instead of once;
+2. K was read with a **512-byte lane stride** (lane = position), so each lane
+   pulled its own cache line per element;
+3. one 32-lane threadgroup served **one (row, head)**, so all 128 query rows
+   of a chunk re-streamed the same K/V for that head.
+
+The new kernel: one threadgroup = one head × 4 query rows (one simdgroup per
+row), lanes stride the head_dim (K/V coalesce, q broadcasts), one score
+computation, and the softmax runs **online in 64-position blocks** (flash), so
+a single dispatch covers any context length — it replaces `attn_1c` for
+t_end ≤ 128 *and* the `attn_part`+`attn_fin` pair beyond it. Chain causality
+is preserved: the tile's last row bounds the block loop (positions are
+consecutive inside a chunk) and per-row masking zeroes the future columns.
+
+Parity: `attn_flash_matches_cpu_reference` — b=2/priors=2 worst|d| 1.19e-7,
+b=5/priors=200 (multi-block + mixed-tile causality) worst|d| 1.64e-7.
+Text gates: 0.6B NEAR-TIE-CERTIFIED (fork step 6, |dtop1| 0.041 — unchanged
+from the pre-flash run); **1B Q8_0 IDENTICAL** (39/39 token-equal, up from
+NEAR-TIE at 0.051 — the flash summation order is closer to the CPU reference).
+
+Cost: attention 283 → **31 ms** on the 0.6B (9.1×). Pass 711 → 489 ms.
+
+| model | tiled GEMM | + flash attn | bar | gain | vs bar |
+|---|---|---|---|---|---|
+| 0.6B | 280.9 | **444.7** | 3396 | 1.58x | 13.1% |
+| 1B Q8_0 | 276.5 | **348.4** | 2055 | 1.26x | 17.0% |
+| Spark-4B | 73.8 | 69.9 | 461 | 0.95x | 15.2% |
+| MiniCPM5-2B | 115.9 | **147.6** | 865 | 1.27x | 17.1% |
+| 8B | 17.3 | 19.5 | 264 | 1.13x | 7.4% |
+
+Spark-4B regresses ~5% — its rows-per-tile economics differ and it is already
+attention-light at this prompt; the flag stays opt-in and the per-model
+defaults work decides it. Post-flash ablation (0.6B): attn ~31 ms, ffn ~154 ms,
+rest ~304 ms of 489 ms — **the non-GEMM rest is now the largest block** (arm E,
+op count/fusion), and the ffn block is arm C (MMA).

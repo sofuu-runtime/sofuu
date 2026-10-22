@@ -3966,3 +3966,123 @@ kernel void gemm_q8_0_tiled_fused(
         }
     }
 }
+
+// ── P5 arm-b: flash-style batched prefill attention ────────────────────────
+// The shipped llama_attn_1c_b4 recomputes every Q·K dot THREE times (max
+// pass, sum pass, weight table), reads K with a 512-byte lane stride, and
+// gives one 32-lane threadgroup to a single (row, head) — so 128 query rows
+// each re-stream the same K/V for that head. Measured 43 GFLOP/s on the 0.6B
+// (4.9 GFLOP of dots in 283 ms, 40% of the whole prefill pass).
+//
+// This kernel: one threadgroup = one head x ATTN_FQROWS query rows (one
+// simdgroup per row), lanes stride the head_dim (K/V reads coalesce, q
+// broadcasts), each score is computed once, and the softmax runs online
+// (flash) in ATTN_FTB-position blocks — so one dispatch covers any context
+// length, replacing attn_1c for <=128 and the part+fin pair beyond it.
+//
+// Chain causality: row r attends to 0..positions[r]; within a prefill chunk
+// the positions are consecutive and increasing, so the tile's last row bounds
+// the block loop and per-row masking zeroes the future columns.
+#define ATTN_FQROWS 4
+#define ATTN_FTB 64
+#define ATTN_FMAXD 256
+
+kernel void llama_attn_flash_b4(
+    device const float *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device float       *head_out        [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    device const float *rope_tab        [[buffer(9)]],
+    constant uint      &has_table       [[buffer(10)]],
+    constant uint      &rows            [[buffer(11)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float s_tile[ATTN_FQROWS][ATTN_FTB];
+    threadgroup float o_acc[ATTN_FQROWS][ATTN_FMAXD];
+    threadgroup float m_run[ATTN_FQROWS];
+    threadgroup float l_run[ATTN_FQROWS];
+
+    uint r = tid >> 5;                 // simdgroup index == row slot
+    uint lane = tid & 31;
+    uint h = tg.y;
+    uint row0 = tg.x * ATTN_FQROWS;
+    uint row = row0 + r;
+    bool live = row < rows;
+    float scale = rsqrt(float(head_dim));
+    uint kv = h / (n_heads / n_kv_heads);
+
+    uint pos_row = live ? positions[row] : 0u;
+    uint last_row = min(row0 + ATTN_FQROWS - 1u, rows - 1u);
+    uint tmax = positions[last_row] + 1u;
+
+    device const float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+
+    if (lane == 0) { m_run[r] = -INFINITY; l_run[r] = 0.0f; }
+    for (uint d = lane; d < head_dim; d += 32) { o_acc[r][d] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint tb = 0; tb < tmax; tb += ATTN_FTB) {
+        uint tn = min((uint)ATTN_FTB, tmax - tb);
+
+        // ── scores (one pass; lanes stride head_dim) ──
+        for (uint j = 0; j < tn; ++j) {
+            uint t = tb + j;
+            float part = 0.0f;
+            if (live && t <= pos_row) {
+                device const float *kt = kbase + (size_t)t * head_dim;
+                for (uint d = lane; d < head_dim; d += 32) { part += q_head[d] * kt[d]; }
+                part = simd_sum(part) * scale;
+            } else {
+                part = -INFINITY;
+            }
+            if (lane == 0) { s_tile[r][j] = part; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── online softmax: rescale the running state, exp into weights ──
+        float bmx = -INFINITY;
+        for (uint j = lane; j < tn; j += 32) { bmx = max(bmx, s_tile[r][j]); }
+        bmx = simd_max(bmx);
+        float m_old = m_run[r];
+        float m_new = max(m_old, bmx);
+        float alpha = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        float lpart = 0.0f;
+        for (uint j = lane; j < tn; j += 32) {
+            float sc = s_tile[r][j];
+            float w = (sc == -INFINITY) ? 0.0f : exp(sc - m_new);
+            s_tile[r][j] = w;
+            lpart += w;
+        }
+        lpart = simd_sum(lpart);
+        for (uint d = lane; d < head_dim; d += 32) { o_acc[r][d] *= alpha; }
+        if (lane == 0) {
+            m_run[r] = m_new;
+            l_run[r] = l_run[r] * alpha + lpart;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── weighted V (broadcast weight, coalesced V) ──
+        for (uint d = lane; d < head_dim; d += 32) {
+            float acc = o_acc[r][d];
+            for (uint j = 0; j < tn; ++j) {
+                acc += s_tile[r][j] * vbase[(size_t)(tb + j) * head_dim + d];
+            }
+            o_acc[r][d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (live) {
+        float inv = 1.0f / l_run[r];
+        device float *out = head_out + ((size_t)row * n_heads + h) * head_dim;
+        for (uint d = lane; d < head_dim; d += 32) { out[d] = o_acc[r][d] * inv; }
+    }
+}

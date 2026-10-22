@@ -47,6 +47,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q4_k;
     id<MTLComputePipelineState> pso_quantize_q8_k;
     bool pso_quantize_q8_k_live;
+    id<MTLComputePipelineState> pso_attn_flash_b4;
+    bool pso_attn_flash_b4_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled;
     bool pso_gemm_q4_k_tiled_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_tiled_fused;
@@ -314,6 +316,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q6_k_t32_live = ctx->pso_gemm_q6_k_t32 != nil;
         ctx->pso_quantize_q8_k = load_pso(@"quantize_q8_k");
         ctx->pso_quantize_q8_k_live = ctx->pso_quantize_q8_k != nil;
+        ctx->pso_attn_flash_b4 = load_pso(@"llama_attn_flash_b4");
+        ctx->pso_attn_flash_b4_live = ctx->pso_attn_flash_b4 != nil;
         ctx->pso_gemm_q4_k_tiled = load_pso(@"gemm_q4_k_tiled");
         ctx->pso_gemm_q4_k_tiled_live = ctx->pso_gemm_q4_k_tiled != nil;
         ctx->pso_gemm_q4_k_tiled_fused = load_pso(@"gemm_q4_k_tiled_fused");
@@ -1633,6 +1637,50 @@ int sofuu_metal_batch_gguf_gemm(
     return 1;
 }
 
+// P5 arm-b: flash-style batched prefill attention (same ABI as the 1c
+// variant plus the row count; grid = (ceil(rows/4), n_heads), 128 threads).
+int sofuu_metal_batch_llama_attn_flash_b4(
+    void* ctx_ptr,
+    void* q_buf_ptr, size_t q_offset,
+    void* kc_buf_ptr, size_t kc_offset,
+    void* vc_buf_ptr, size_t vc_offset,
+    void* out_buf_ptr, size_t out_offset,
+    void* pos_buf_ptr, size_t pos_offset,
+    uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
+    uint32_t max_seq, uint32_t has_table
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !q_buf_ptr || !kc_buf_ptr || !vc_buf_ptr || !out_buf_ptr || !pos_buf_ptr) return 0;
+    if (rows == 0 || head_dim == 0 || head_dim > 256 || n_heads == 0 || n_kv_heads == 0 || max_seq == 0) return 0;
+    if (n_heads % n_kv_heads != 0) return 0;
+    if (!ctx->pso_attn_flash_b4_live) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_attn_flash_b4];
+    uint hd = head_dim;
+    uint nh = n_heads;
+    uint nkv = n_kv_heads;
+    uint ms = max_seq;
+    uint ht = has_table;
+    uint rn = rows;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_buf_ptr offset:vc_offset atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:4];
+    [ctx->batch_enc setBytes:&hd length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&nh length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc setBytes:&nkv length:sizeof(uint) atIndex:7];
+    [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:9];
+    [ctx->batch_enc setBytes:&ht length:sizeof(uint) atIndex:10];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:11];
+    uint r_tiles = (rows + 3) / 4;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(r_tiles, n_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
 // P4 arm-d: threadgroup-tiled q4_K GEMM (32-row x 64-token tile, weights and
 // activations staged in threadgroup memory). Same contract as
 // sofuu_metal_batch_gguf_gemm for ty=12; returns 0 when the pipeline is
@@ -2908,6 +2956,7 @@ int sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w, size_t wo, void* x, 
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c; }
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
+int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q, size_t qo, void* kc, size_t kco, void* vc, size_t vco, void* o, size_t oo, void* p, size_t po, uint32_t rows, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, uint32_t ht) { (void)ctx;(void)q;(void)qo;(void)kc;(void)kco;(void)vc;(void)vco;(void)o;(void)oo;(void)p;(void)po;(void)rows;(void)hd;(void)nh;(void)nkv;(void)ms;(void)ht; return 0; }
 int sofuu_metal_batch_gguf_gemm_tiled_multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t yo, size_t rt, size_t c, size_t B, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)yo;(void)rt;(void)c;(void)B;(void)secs;(void)ns; return 0; }
 int sofuu_metal_batch_gguf_gemm_tiled_acc(void* ctx, uint32_t ty, void* w, size_t wo, void* x, size_t xo, void* res, size_t ro, size_t rs, void* y, size_t yo, size_t r, size_t c, size_t B) { (void)ctx;(void)ty;(void)w;(void)wo;(void)x;(void)xo;(void)res;(void)ro;(void)rs;(void)y;(void)yo;(void)r;(void)c;(void)B; return 0; }
 int sofuu_metal_batch_gguf_gemm_multi(void* ctx, uint32_t ty, void* w, size_t wbo, void* x, size_t xo, void* y, size_t yo, size_t rt, size_t c, size_t B, const uint32_t* secs, size_t ns) { (void)ctx;(void)ty;(void)w;(void)wbo;(void)x;(void)xo;(void)y;(void)yo;(void)rt;(void)c;(void)B;(void)secs;(void)ns; return 0; }

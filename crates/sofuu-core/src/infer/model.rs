@@ -3084,8 +3084,17 @@ impl TransformerModel {
                 );
                 // pos < 128 (one softmax chunk): part+fin fuse into one
                 // dispatch — one barrier drain instead of two
-                let fused = (pos_of_last + 1) <= 128
-                    && fuse_on
+                let flashed = g.engine.batch_llama_attn_flash_b4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                );
+                let fused = flashed || (fuse_on
                     && g.engine.batch_llama_attn_1c_b4(
                         &g.act_buf, g.slots.qa,
                         &g.k_buf, kc_layer,
@@ -3096,7 +3105,7 @@ impl TransformerModel {
                         head_dim as u32, n_heads as u32, n_kv_heads as u32,
                         max_seq_len as u32,
                         None,
-                    );
+                    ));
                 if !fused {
                     g.engine.batch_llama_attn_part_b4(
                         &g.act_buf, g.slots.qa,
@@ -3673,8 +3682,17 @@ impl TransformerModel {
                 // smaller prefix), and fin loops c < n_chunks — this is
                 // index-space only, bit-identical values.
                 let ncm_pass = ((pos_of_last / 128) + 1) as u32;
-                let fused = (pos_of_last + 1) <= 128
-                    && g.engine.batch_llama_attn_1c_b4(
+                let flashed = g.engine.batch_llama_attn_flash_b4(
+                    pbuf, pslots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    pbuf, pslots.ao,
+                    pbuf, pslots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                );
+                let fused = flashed || (g.engine.batch_llama_attn_1c_b4(
                         pbuf, pslots.qa,
                         &g.k_buf, kc_layer,
                         &g.v_buf, kc_layer,
@@ -3684,7 +3702,7 @@ impl TransformerModel {
                         head_dim as u32, n_heads as u32, n_kv_heads as u32,
                         max_seq_len as u32,
                         Some((pbuf, pslots.rope)),
-                    );
+                    ));
                 if !fused {
                     g.engine.batch_llama_attn_part_b4(
                         pbuf, pslots.qa,

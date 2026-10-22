@@ -836,6 +836,17 @@ extern "C" {
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
     ) -> i32;
+    fn sofuu_metal_batch_llama_attn_flash_b4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        has_table: u32,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1940,6 +1951,64 @@ impl MetalEngine {
         };
         self.op_tock(K_ATTN_1C, __t);
         __r
+    }
+
+    /// P5 arm-b: flash-style batched prefill attention. Same math and ABI as
+    /// `batch_llama_attn_1c_b4` (plus the row count), but each score is
+    /// computed once, lanes stride the head_dim (coalesced K/V), a threadgroup
+    /// covers 4 rows (shared K/V), and the softmax runs online in 64-position
+    /// blocks so ONE dispatch covers any context length.
+    /// Env-gated by SOFUU_GPU_ATTN_FLASH; false keeps the existing route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_flash_b4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+    ) -> bool {
+        if !Self::attn_flash_enabled() || rows < 2 {
+            return false;
+        }
+        let __t = self.op_tick(K_ATTN_1C);
+        let __r = unsafe {
+            sofuu_metal_batch_llama_attn_flash_b4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                0u32,
+            ) == 1
+        };
+        self.op_tock(K_ATTN_1C, __t);
+        __r
+    }
+
+    /// Cached env gate for the flash prefill attention (default off).
+    pub fn attn_flash_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var("SOFUU_GPU_ATTN_FLASH")
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !(v.is_empty() || v == "0" || v == "false" || v == "off")
+                    })
+                    .unwrap_or(false);
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
     }
 
     /// B4 q4_K GEMV with the resid-add epilogue (o/down: out width ==
@@ -7216,6 +7285,118 @@ fn half_to_f32(h: u16) -> f32 {
         (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
     };
     f32::from_bits(bits)
+}
+
+/// P5 arm-b parity: flash prefill attention vs the CPU textbook serial
+/// attention. Two shapes: (2 rows, 2 priors) covers the row-guard tile and a
+/// single softmax block; (5 rows, 200 priors) covers multi-block online
+/// softmax with mixed per-row causality inside one 4-row tile.
+#[test]
+#[ignore]
+fn attn_flash_matches_cpu_reference() {
+    std::env::set_var("SOFUU_GPU_ATTN_FLASH", "1");
+    for (b, priors, first_pos) in [(2usize, 2usize, 0usize), (5usize, 200usize, 197usize)] {
+        let nh = 32usize;
+        let nkv = 8usize;
+        let hd = 64usize;
+        let mut state = 0xfeedbeefcafeu64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) % 2003) as f32 / 1000.0f32 - 1.0f32
+        };
+        // the KV cache must hold every position the rows attend to
+        let kv_len = first_pos + b;
+        let q: Vec<f32> = (0..b * nh * hd).map(|_| rand()).collect();
+        let kc: Vec<f32> = (0..nkv * kv_len * hd).map(|_| rand()).collect();
+        let vc: Vec<f32> = (0..nkv * kv_len * hd).map(|_| rand()).collect();
+        let posb: Vec<u32> = (0..b).map(|t| (first_pos + t) as u32).collect();
+        let mut expected = vec![0f32; b * nh * hd];
+        for row in 0..b {
+            let pos = posb[row] as usize;
+            for h in 0..nh {
+                let kvh = h * nkv / nh;
+                let qo = (row * nh + h) * hd;
+                let mut mx = f32::NEG_INFINITY;
+                let mut scores = vec![0f32; pos + 1];
+                for t in 0..=pos {
+                    let ko = (kvh * kv_len + t) * hd;
+                    let s: f32 = (0..hd).map(|i| q[qo + i] * kc[ko + i]).sum();
+                    scores[t] = s / (hd as f32).sqrt();
+                    if scores[t] > mx { mx = scores[t]; }
+                }
+                let esum: f32 = scores.iter().map(|s| (s - mx).exp()).sum();
+                for i in 0..hd {
+                    let mut acc = 0f32;
+                    for t in 0..=pos {
+                        let vo = (kvh * kv_len + t) * hd;
+                        acc += vc[vo + i] * ((scores[t] - mx).exp() / esum);
+                    }
+                    expected[(row * nh + h) * hd + i] = acc;
+                }
+            }
+        }
+        let page = 16384usize;
+        let mk = |bytes: usize| -> *mut u8 {
+            let p = unsafe {
+                libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            };
+            assert!(p != libc::MAP_FAILED);
+            p as *mut u8
+        };
+        let alloc = |bytes: usize| bytes.div_ceil(page) * page;
+        let engine = MetalEngine::new().expect("engine");
+        let mut ptrs: Vec<(*mut u8, usize)> = Vec::new();
+        let mut sub: Vec<(*mut u8, MetalBuffer)> = Vec::new();
+        for f in [&q, &kc, &vc, &expected] {
+            let sz = alloc(f.len() * 4);
+            let p = mk(sz);
+            ptrs.push((p, sz));
+            unsafe { std::ptr::copy_nonoverlapping(f.as_ptr() as *const u8, p, f.len() * 4) };
+            let buf = engine.register_zerocopy_only(unsafe {
+                std::slice::from_raw_parts_mut(p, sz)
+            }).expect("reg");
+            sub.push((p, buf));
+        }
+        let pos_sz = alloc(b * 4);
+        let posptr = mk(pos_sz);
+        ptrs.push((posptr, pos_sz));
+        for (t, v) in posb.iter().enumerate() {
+            unsafe { (posptr as *mut u32).add(t).write_unaligned(*v) };
+        }
+        let posbuf = engine.register_zerocopy_only(unsafe {
+            std::slice::from_raw_parts_mut(posptr, pos_sz)
+        }).expect("reg pos");
+        let out_buf = engine.register_zerocopy_only(unsafe {
+            std::slice::from_raw_parts_mut(sub[3].0, alloc(expected.len() * 4))
+        }).expect("reg out");
+        let dispatched = {
+            assert!(engine.batch_open());
+            let ok = engine.batch_llama_attn_flash_b4(
+                &sub[0].1, 0,
+                &sub[1].1, 0,
+                &sub[2].1, 0,
+                &out_buf, 0,
+                &posbuf, 0,
+                b,
+                hd as u32, nh as u32, nkv as u32, kv_len as u32,
+            );
+            engine.batch_end();
+            ok
+        };
+        assert!(dispatched, "flash attn dispatch unavailable");
+        let mut worst = 0f32;
+        let mut wi = 0usize;
+        for (i, e) in expected.iter().enumerate() {
+            let g = unsafe { (sub[3].0 as *const f32).add(i).read() };
+            let d = (g - e).abs();
+            if d > worst { worst = d; wi = i; }
+            assert!(d <= 2e-3, "flash attn mismatch b={b} priors={priors} idx {i}: gpu={g:.6} cpu={e:.6}");
+        }
+        println!("[attn_flash] b={b} priors={priors} first_pos={first_pos} worst|d|={worst:.3e} at idx {wi} — VALUES PASS");
+        for (p, sz) in &ptrs {
+            unsafe { libc::munmap(*p as *mut libc::c_void, *sz) };
+        }
+    }
 }
 
 /// THE FINAL PIN: 1c attention VALUES at the P2 tail-chunk micro-shape

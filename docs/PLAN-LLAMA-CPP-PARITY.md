@@ -1152,3 +1152,14 @@ attention-light at this prompt; the flag stays opt-in and the per-model
 defaults work decides it. Post-flash ablation (0.6B): attn ~31 ms, ffn ~154 ms,
 rest ~304 ms of 489 ms — **the non-GEMM rest is now the largest block** (arm E,
 op count/fusion), and the ffn block is arm C (MMA).
+
+### Addendum note: the prefill's chunk split (2026-10-22, found while tracing ffn rate)
+
+`SOFUU_TILED_DEBUG` on a 207-token prompt shows the prefill splits into
+**128 + 76 + 3** tokens, and before this fix the 3-token tail ran the whole
+layer loop through a 64-token tile — 3/64 utilization on every GEMM, i.e. a
+full weight pass for 3 tokens. The tiled entry points now hand off to the
+shipped 8-token class below B=16 (weights are still read once per row there,
+so it is the cheaper form at that size). 0.6B 444.4 -> 459.7, 8B 19.5 -> 21.6,
+1B unchanged; text gates re-run after the change (1B still IDENTICAL, 0.6B
+still NEAR-TIE at |dtop1| 0.041).

@@ -1391,7 +1391,12 @@ impl MetalEngine {
         rows_total: usize, cols: usize, b: usize,
         secs: &[[u32; 5]],
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || !Self::gemm_tiled_enabled() {
+        // b < 16: the 64-token tile would run at <25% utilization while the
+        // shipped 8-token class still reads every weight row once — the
+        // prefill's 3-token tail chunk was paying a full tile pass per GEMM.
+        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || !Self::gemm_tiled_enabled()
+            || b < 16
+        {
             return false;
         }
         if std::env::var_os("SOFUU_TILED_DEBUG").is_some() {
@@ -1423,7 +1428,7 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_tiled_enabled() {
+        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_tiled_enabled() || b < 16 {
             return false;
         }
         if std::env::var_os("SOFUU_TILED_DEBUG").is_some() {

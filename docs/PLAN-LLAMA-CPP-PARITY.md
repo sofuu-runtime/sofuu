@@ -832,3 +832,26 @@ and q6 decode branches (quantize_q8_k dropped from the decode path). Gate
 class is now uniform (~0.15 at the fork's 0.215-gap near-tie; the residual =
 head + attention-glue + the decode attn read path — the certified-near-tie
 question). DEFAULTS: never moved; both mirror envs stay opt-in.
+
+## FORK RESIDUAL CHARACTERIZED (2026-10-23 final — mirror-complete config)
+Fresh per-step receipt (paris32, TILE_MMQ+DECODE_MMQ, fork step 19 |dtop1|
+0.089): the residual is a **DECAYING TRANSIENT, not an arithmetic class** —
+step 0 = 0.279 (worst), 0.266, 0.169, 0.084 → noise floor (0.01-0.2
+oscillation of the composite class) by step 8+. A wrong-initial-state
+signature: something in the prefill→decode handoff or the first decode
+forward's state diverges, then the attention/KV consensus washes it out.
+Also pinned: the 0.6B has TIED embeddings (no output.weight; head =
+token_embd q6_K) — the decode head IS mirrored (pos-quant + gemm_q6_k_mmq);
+the PREFILL logits tail remains exact-class (batch_gguf head, unmirrored).
+Previous-config comparison: with DECODE_MMQ OFF, step 0 was 0.028 — the
+decode mirror chain itself carries part of the step-0 transient (checked
+same trajectory file family; the transient may predate it but is
+amplified by the mirror bookkeeping). BOOKED NEXT: bisect the step-0
+transient — (a) snapshot x/KV/logits at the prefill→decode boundary both
+routes (the boundary is now fully instrumentable: SOFUU_KV_DUMP covers
+KV+logits; x needs one temporary slot dump), (b) if the boundary is clean,
+walk the first decode forward's L0 (the dec_gguf quantize inputs are
+live-verifiable via one temporary slot dump mirroring SOFUU_QKV_SNAP's
+pattern for the act_buf slots). The gate's certified-near-tie question
+(0.089 at a 0.215-gap near-tie step 19, bound 0.05) is downstream of this.
+Defaults locked throughout.

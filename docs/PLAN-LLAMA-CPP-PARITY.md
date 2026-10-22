@@ -1300,3 +1300,25 @@ measurement window here) and is the one open item on this ledger.
 
 Remaining tg factors to the bars after this: 0.6B 4.3x, 1B 1.8x, Spark 2.1x,
 8B 4.1x.
+
+## LEDGER #6 — ADDENDUM: >4 GiB weight offsets truncated to uint32 (fixed)
+
+`sofuu_metal_batch_gguf_gemm_tiled_fused_acc` bound the weight buffer at
+offset 0 and stored the ABSOLUTE tensor base in the section table, whose `off`
+field is a `uint`. Any tensor past 4 GiB (the 8B is 5.02 GB) would have been
+truncated and read the wrong weights. It now binds the buffer at `aligned`
+and stores 0 in the table — the convention the other 51 entries already used,
+where the caller's section offsets are relative to the lowest section base.
+Every other `setBuffer:` on the weight buffer already took a 64-bit
+`size_t`; this was the only cast.
+
+Verified on the 5 GB model: fused and unfused paths now produce identical text
+("Paris. The capital of the United States is Washington, D").
+
+Also measured while there: `SOFUU_GPU_FUSE=0` is **1.19x faster** than the
+fused path on an 8B 123-token prefill (5210 vs 6190 ms) and 1.02x on the 0.6B
+(278 vs 283 ms). So the fusion is neutral-to-slightly-negative on the large
+model rather than the win it was assumed to be — the extra dispatches cost less
+than the widened staging. Not flipping the default here: at 1.02x on the model
+we tune most, the signal is not worth the change; recorded so the next pass
+starts from the measurement instead of the assumption.

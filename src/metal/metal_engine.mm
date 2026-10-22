@@ -1928,10 +1928,14 @@ int sofuu_metal_batch_gguf_gemm_tiled_acc(
     uint Bn = (uint)B;
     uint rn = (uint)rows;
     uint rs = (uint)res_stride;
-    uint sblob[20] = { (uint)aligned, rem, (uint)rows, 0u, (uint)rows, 0u, 0u, 0u,
+    // The caller's section offsets are already RELATIVE to the lowest section
+    // base, so the buffer is bound at that base and the table holds 0. Storing
+    // the absolute base in the table truncates it to uint32 and silently reads
+    // the wrong weights for any tensor past 4 GiB (the 8B model is 5.02 GB).
+    uint sblob[20] = { 0u, rem, (uint)rows, 0u, (uint)rows, 0u, 0u, 0u,
                        (uint)rows, 0u, 0u, 0u, (uint)rows, 0u, 0u, 0u,
                        (uint)rows, 0u, 0u, 0u };
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)res_buf_ptr offset:res_offset atIndex:2];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:3];

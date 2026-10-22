@@ -20,6 +20,73 @@ pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
 pub const QK_PTQ1_0: usize = 128;
 
+/// Loud, non-fatal rejection of a malformed weight-matrix dispatch.
+///
+/// Two failure modes matter on device. The release profile is
+/// `panic = "abort"`, so an `assert!` on a shape mismatch kills the process
+/// mid-generation; and the C++ kernels take no length, they read
+/// `rows * type_row_size(cols)` bytes — so a short weights slice (truncated
+/// model file, failed mmap range) becomes an out-of-bounds read (SIGSEGV or
+/// garbage logits). Both are checked here instead: the caller zeroes the
+/// output, one diagnostic line is printed, and the engine keeps a consistent
+/// state under heavy load rather than dying.
+fn reject_bad_dispatch(tag: &str, type_id: u32, rows: usize, cols: usize, have: usize, need: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let n = REPORTED.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 1024 == 0 {
+        eprintln!(
+            "[matmul] {tag} rejected ({} so far): type {type_id} {rows}x{cols} needs {need} B, \
+             weights slice is {have} B — output zeroed, engine keeps running",
+            n + 1
+        );
+    }
+}
+
+/// Values per quantization block for the formats the CPU route dispatches.
+/// `None` for unquantized/unknown types (no block geometry to satisfy).
+#[inline]
+fn type_block_len(type_id: u32) -> Option<usize> {
+    match type_id {
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q8_0 => Some(QK8_0),
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K => Some(QK_K),
+        _ => None,
+    }
+}
+
+/// True when `w_bytes` really covers `rows` rows of `type_id` at `cols` wide.
+/// Unknown types fall back to the f32 row size, which is the conservative
+/// (largest) estimate for every format the CPU route accepts.
+#[inline]
+fn dispatch_shape_ok(tag: &str, w_bytes: &[u8], type_id: u32, rows: usize, cols: usize) -> bool {
+    if rows == 0 || cols == 0 {
+        return false;
+    }
+    // Block formats are only defined when the row is a whole number of
+    // blocks. `type_row_size` floors, so a 250-wide q4_K row would report
+    // 0 bytes and the kernel would still read one full block — past the
+    // slice. Reject the geometry instead.
+    if let Some(block) = type_block_len(type_id) {
+        if cols % block != 0 {
+            let need = type_row_size(type_id, cols.saturating_add(block));
+            reject_bad_dispatch(tag, type_id, rows, cols, w_bytes.len(), need);
+            return false;
+        }
+    }
+    match type_row_size(type_id, cols).checked_mul(rows) {
+        Some(need) if w_bytes.len() >= need => true,
+        Some(need) => {
+            reject_bad_dispatch(tag, type_id, rows, cols, w_bytes.len(), need);
+            false
+        }
+        None => {
+            // rows*cols overflowed usize: nonsense geometry, never dispatch.
+            reject_bad_dispatch(tag, type_id, rows, cols, w_bytes.len(), usize::MAX);
+            false
+        }
+    }
+}
+
 /// Convert IEEE 754 half-precision (16-bit) float to 32-bit single precision.
 #[inline(always)]
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -80,14 +147,16 @@ pub fn f32_to_f16(val: f32) -> u16 {
 /// Calculate byte length for a 1D tensor row of length `n` given GGML tensor type.
 pub fn type_row_size(type_id: u32, n: usize) -> usize {
     match type_id {
-        GGML_TYPE_F32 => n * 4,
-        GGML_TYPE_F16 => n * 2,
+        // saturating: a corrupt shape from a file must drive a bounds-check
+        // failure, not a wrapped (small) size that reads past the tensor.
+        GGML_TYPE_F32 => n.saturating_mul(4),
+        GGML_TYPE_F16 => n.saturating_mul(2),
         GGML_TYPE_Q4_0 => (n / QK4_0) * 18,
         GGML_TYPE_Q8_0 => (n / QK8_0) * 34,
         GGML_TYPE_Q4_K => (n / QK_K) * 144,
         GGML_TYPE_Q3_K => (n / QK_K) * 110,
         GGML_TYPE_Q6_K => (n / QK_K) * 210,
-        _ => n * 4,
+        _ => n.saturating_mul(4),
     }
 }
 
@@ -342,8 +411,14 @@ pub fn gqa4_attn_groups() -> u64 {
 }
 
 pub fn set_thread_count(n: usize) {
+    // 0 keeps its historical "auto" meaning (the C++ side picks the core
+    // count). Anything else is clamped to [1, 64]: past that the work is
+    // memory-bound and the extra threads only add barrier overhead. Called
+    // from inside a pool task the C++ side ignores the resize (nesting would
+    // tear the pool down under its own workers).
+    let n = if n == 0 { 0 } else { n.clamp(1, 64) as i32 };
     unsafe {
-        sofuu_set_threads(n as i32);
+        sofuu_set_threads(n);
     }
 }
 
@@ -352,6 +427,30 @@ pub fn get_thread_count() -> usize {
     unsafe {
         sofuu_get_threads() as usize
     }
+}
+
+/// Exercise the worker pool's resilience paths from inside the pool:
+/// nested dispatch, a worker throwing, and a normal job after the throw.
+/// Returns 0 when all three behaved (nested job completed, the throw was
+/// contained and counted, the next job still ran). Any other value is a
+/// bitmask of the checks that failed. Runs in ~1 ms; safe to call at
+/// startup on device as a smoke test, and never resizes the pool.
+pub fn pool_selftest() -> i32 {
+    unsafe { sofuu_pool_selftest() }
+}
+
+/// Number of pool tasks that threw and were contained. A non-zero value
+/// means a kernel hit an unexpected state (the engine kept running, but the
+/// affected matmul output is partial — the caller decides what to do).
+pub fn pool_failures() -> u64 {
+    unsafe { sofuu_pool_failures() }
+}
+
+/// Number of times the pool had to run with fewer workers than requested
+/// because thread creation failed (address-space or thread-count limits).
+/// Non-zero only under heavy memory pressure: the engine is slower, not dead.
+pub fn pool_short_fallback() -> u64 {
+    unsafe { sofuu_pool_short_fallback() }
 }
 
 /// Non-temporal streaming prefetch for single-use weight buffers.
@@ -469,6 +568,9 @@ pub fn vec_dot_raw_f32(a: *const f32, b: *const f32, n: usize) -> f32 {
 extern "C" {
     fn sofuu_set_threads(n: i32);
     fn sofuu_get_threads() -> i32;
+    fn sofuu_pool_selftest() -> i32;
+    fn sofuu_pool_failures() -> u64;
+    fn sofuu_pool_short_fallback() -> u64;
     fn sofuu_tile_warm(w: *const u8, rows: usize, cols: usize, ty: u32) -> i32;
     fn sofuu_tile_scale_sidecar_mode(disable: i32);
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
@@ -1343,8 +1445,15 @@ pub fn gemv_mlx4_multi(
 /// where W has shape [rows, cols] in row-major layout with GGML type `type_id`.
 /// Executes via hardware-tuned C++ SIMD microkernels (NEON / AVX2).
 pub fn matvec(w_bytes: &[u8], type_id: u32, rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
-    assert_eq!(x.len(), cols, "x.len() must match cols");
-    assert_eq!(y.len(), rows, "y.len() must match rows");
+    if x.len() != cols || y.len() != rows {
+        reject_bad_dispatch("matvec dims", type_id, rows, cols, x.len(), cols);
+        y.fill(0.0);
+        return;
+    }
+    if !dispatch_shape_ok("matvec", w_bytes, type_id, rows, cols) {
+        y.fill(0.0);
+        return;
+    }
 
     let _prof = prof::Scope::new(&prof::GEMV_NS, &prof::GEMV_CALLS);
     match type_id {
@@ -1404,10 +1513,16 @@ pub fn matmat(
     batch_size: usize,
     y_batch: &mut [f32],
 ) {
-    assert_eq!(x_batch.len(), batch_size * cols, "x_batch.len() must match batch_size * cols");
-    assert_eq!(y_batch.len(), batch_size * rows, "y_batch.len() must match batch_size * rows");
-
     if batch_size == 0 {
+        return;
+    }
+    if x_batch.len() != batch_size * cols || y_batch.len() != batch_size * rows {
+        reject_bad_dispatch("matmat dims", type_id, rows, cols, x_batch.len(), batch_size * cols);
+        y_batch.fill(0.0);
+        return;
+    }
+    if !dispatch_shape_ok("matmat", w_bytes, type_id, rows, cols) {
+        y_batch.fill(0.0);
         return;
     }
     if batch_size == 1 {
@@ -1465,8 +1580,13 @@ pub fn matmat_residual(
     if batch_size < 2 || batch_size > 512 {
         return false;
     }
-    assert_eq!(x_batch.len(), batch_size * cols, "x_batch.len() must match batch_size * cols");
-    assert_eq!(acc.len(), batch_size * rows, "acc.len() must match batch_size * rows");
+    if x_batch.len() != batch_size * cols || acc.len() != batch_size * rows {
+        reject_bad_dispatch("matmat_residual dims", type_id, rows, cols, x_batch.len(), batch_size * cols);
+        return false;
+    }
+    if !dispatch_shape_ok("matmat_residual", w_bytes, type_id, rows, cols) {
+        return false;
+    }
     if !cfg!(target_arch = "aarch64") {
         return false;
     }
@@ -1517,9 +1637,15 @@ pub fn matmat_pair(
     if batch_size < 4 || batch_size % 4 != 0 || batch_size > 512 {
         return false;
     }
-    assert_eq!(x_batch.len(), batch_size * cols, "x_batch.len() must match batch_size * cols");
-    assert_eq!(y1_batch.len(), batch_size * rows);
-    assert_eq!(y2_batch.len(), batch_size * rows);
+    if x_batch.len() != batch_size * cols || y1_batch.len() != batch_size * rows || y2_batch.len() != batch_size * rows {
+        reject_bad_dispatch("matmat_pair dims", type_id, rows, cols, x_batch.len(), batch_size * cols);
+        return false;
+    }
+    if !dispatch_shape_ok("matmat_pair w1", w1_bytes, type_id, rows, cols)
+        || !dispatch_shape_ok("matmat_pair w2", w2_bytes, type_id, rows, cols)
+    {
+        return false;
+    }
     if !cfg!(target_arch = "aarch64") {
         return false;
     }
@@ -3436,6 +3562,77 @@ fn check_attention_k16_parity(head_dim: usize) {
     check(&ob32, &ob16, "batched attention");
 
 }
+
+    /// The worker pool must survive the three failure modes that would
+    /// otherwise kill the process on device (release is `panic = "abort"`):
+    /// a kernel dispatching again from inside a pool task, a task throwing,
+    /// and a normal job issued after the throw. `sofuu_pool_selftest` drives
+    /// all three; the bitmask names whichever failed.
+    #[test]
+    fn test_pool_resilience_selftest() {
+        let rc = pool_selftest();
+        assert_eq!(
+            rc, 0,
+            "pool selftest bitmask {rc:#x}: 1=nested dispatch corrupts the single task \
+             slot, 2=a throw escaped its worker, 4=pool wedged after a throw"
+        );
+        assert!(
+            (1..=64).contains(&get_thread_count()),
+            "thread count {} outside the clamped range",
+            get_thread_count()
+        );
+        // A short-weights dispatch must not disturb the pool either.
+        assert_eq!(pool_selftest(), 0, "pool not reusable after the first selftest");
+    }
+
+    /// A short weights slice (truncated model file, failed mmap range) must
+    /// zero the output and keep running: the C++ kernels take no length, so
+    /// without the Rust guard they read past the slice, and the old `assert!`
+    /// on a dims mismatch aborted the process under `panic = "abort"`.
+    #[test]
+    fn test_matvec_rejects_short_weights() {
+        let _g = tile_test_guard();
+        let (rows, cols) = (8usize, 256usize);
+        let full = build_q4_k_fixture(rows, cols);
+        let short = &full[..full.len() - 1];
+        let x = vec![0.5f32; cols];
+
+        let mut y = vec![f32::NAN; rows];
+        matvec(short, GGML_TYPE_Q4_K, rows, cols, &x, &mut y);
+        assert!(y.iter().all(|v| *v == 0.0), "short weights must zero the output, got {y:?}");
+
+        // Dims mismatch: same treatment (was `assert_eq!` → abort).
+        let mut y2 = vec![7.0f32; rows];
+        matvec(&full, GGML_TYPE_Q4_K, rows, cols, &x[..cols - 1], &mut y2);
+        assert!(y2.iter().all(|v| *v == 0.0), "dims mismatch must zero the output");
+
+        // The intact fixture still computes, so the guard is not over-eager.
+        let mut y3 = vec![0.0f32; rows];
+        matvec(&full, GGML_TYPE_Q4_K, rows, cols, &x, &mut y3);
+        assert!(y3.iter().any(|v| v.abs() > 1e-6), "full-size dispatch must still compute");
+
+        // matmat and both fused variants share the same guard.
+        let batch = 4usize;
+        let xb = vec![0.25f32; batch * cols];
+        let mut yb = vec![9.0f32; batch * rows];
+        matmat(short, GGML_TYPE_Q4_K, rows, cols, &xb, batch, &mut yb);
+        assert!(yb.iter().all(|v| *v == 0.0), "matmat short weights must zero the output");
+
+        let mut y1 = vec![9.0f32; batch * rows];
+        let mut y2 = vec![9.0f32; batch * rows];
+        assert!(
+            !matmat_pair(short, short, GGML_TYPE_Q4_K, rows, cols, &xb, batch, &mut y1, &mut y2),
+            "fused pair must decline short weights"
+        );
+        let mut yr = vec![9.0f32; batch * rows];
+        assert!(
+            !matmat_residual(short, GGML_TYPE_Q4_K, rows, cols, &xb, batch, &mut yr),
+            "residual-fused matmat must decline short weights"
+        );
+
+        // And the engine is still healthy after all of it.
+        assert_eq!(pool_selftest(), 0, "pool damaged by rejected dispatches");
+    }
 
     /// The vectorized sigmoid in sofuu_swiglu must stay within f32 noise of the
     /// scalar reference it replaced: the NEON path uses a degree-6 polynomial

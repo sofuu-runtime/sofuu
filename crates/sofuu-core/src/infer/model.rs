@@ -63,6 +63,10 @@ pub fn max_prefill_batch() -> usize {
 pub struct AnonBuffer {
     ptr: *mut f32,
     len: usize,
+    /// True when the bytes came from the `vec!` fallback (heap) rather than
+    /// mmap. Drop must use the matching deallocator: `munmap` on a heap
+    /// pointer tears down allocator pages under concurrent threads.
+    heap: bool,
 }
 
 unsafe impl Send for AnonBuffer {}
@@ -74,9 +78,11 @@ impl AnonBuffer {
             return Self {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                heap: false,
             };
         }
         let byte_len = len.checked_mul(std::mem::size_of::<f32>()).expect("buffer size overflow");
+        let mut heap = false;
         let ptr = unsafe {
             #[cfg(unix)]
             {
@@ -89,6 +95,7 @@ impl AnonBuffer {
                     0,
                 );
                 if p == libc::MAP_FAILED {
+                    heap = true;
                     let mut v = vec![0.0f32; len];
                     let p_fall = v.as_mut_ptr();
                     std::mem::forget(v);
@@ -99,13 +106,60 @@ impl AnonBuffer {
             }
             #[cfg(not(unix))]
             {
+                heap = true;
                 let mut v = vec![0.0f32; len];
                 let p = v.as_mut_ptr();
                 std::mem::forget(v);
                 p
             }
         };
-        Self { ptr, len }
+        Self { ptr, len, heap }
+    }
+
+    /// Fallible, mmap-only variant for the buffers that dominate a model's
+    /// resident footprint (the KV caches). An exhausted address space comes
+    /// back as an error the loader can report and the CLI can print, instead
+    /// of the Rust allocator aborting the process (release is panic = "abort").
+    pub fn try_new(len: usize) -> Result<Self, String> {
+        if len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+                heap: false,
+            });
+        }
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "buffer size overflow".to_string())?;
+        #[cfg(unix)]
+        {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    byte_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(format!(
+                    "cannot reserve {} MB: {}",
+                    byte_len >> 20,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self {
+                ptr: p as *mut f32,
+                len,
+                heap: false,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::new(len))
+        }
     }
 }
 
@@ -139,10 +193,15 @@ impl Drop for AnonBuffer {
             unsafe {
                 #[cfg(unix)]
                 {
-                    libc::munmap(self.ptr as *mut libc::c_void, byte_len);
+                    if self.heap {
+                        let _ = Vec::from_raw_parts(self.ptr, self.len, self.len);
+                    } else {
+                        libc::munmap(self.ptr as *mut libc::c_void, byte_len);
+                    }
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = byte_len;
                     let _ = Vec::from_raw_parts(self.ptr, self.len, self.len);
                 }
             }
@@ -537,27 +596,18 @@ impl TransformerModel {
             .map(|(t, _)| *t)
             .unwrap_or(GGML_TYPE_F32);
 
-        // Warm packed-tile GEMM/GEMV cache for all quantized 2-D matrices
-        // (q8_0 / q4_K / q6_K). Non-quantized or odd-geometry tensors are
-        // ignored by the tile layer and fall back to the generic kernels.
-        for tv in std::iter::once(&token_embd)
-            .chain(std::iter::once(&output))
-            .chain(layers.iter().flat_map(|l| {
-                [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
-            }))
-        {
-            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q3_K) && tv.shape.len() == 2 {
-                if let Some(slice) = gguf.mmap.slice(gguf.data_offset + tv.offset, 64) {
-                    super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
-                }
-            }
-        }
-
         // KV caches hoisted so the GPU client can register them zero-copy:
         // one physical cache, written by whichever path runs (GPU kernels or
-        // the CPU fallback), read by both.
-        let k_cache = AnonBuffer::new(kv_cache_size);
-        let v_cache = AnonBuffer::new(kv_cache_size);
+        // the CPU fallback), read by both. They are allocated *before* the
+        // optional packed tiles: under memory pressure the tile layer must
+        // yield (it falls back to the per-row kernels) rather than starve the
+        // KV cache and abort the load.
+        let kv_mb = kv_cache_size / (1 << 18); // f32 bytes / 2^20
+        let k_cache = AnonBuffer::try_new(kv_cache_size).map_err(|e| {
+            format!("cannot allocate the KV cache ({kv_mb} MB x2 for the configured context): {e}")
+        })?;
+        let v_cache = AnonBuffer::try_new(kv_cache_size)
+            .map_err(|e| format!("cannot allocate the second KV cache ({kv_mb} MB): {e}"))?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let gpu = {
             let wanted = gpu_allowed
@@ -582,8 +632,28 @@ impl TransformerModel {
             && !gpu_armed
             && kv_cache_size % 2 == 0
             && std::env::var("SOFUU_KV_F16").map(|v| v != "0").unwrap_or(true);
-        let k16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
-        let v16_cache = kv_f16.then(|| AnonBuffer::new(kv_cache_size / 2));
+        // The f16 shadows are an optimization, not a requirement: when the
+        // extra reservation fails under pressure, run with the f32 caches
+        // (the pre-shadow behaviour) instead of aborting the load.
+        let (k16_cache, v16_cache, kv_f16) = if kv_f16 {
+            match (
+                AnonBuffer::try_new(kv_cache_size / 2),
+                AnonBuffer::try_new(kv_cache_size / 2),
+            ) {
+                (Ok(k), Ok(v)) => (Some(k), Some(v), true),
+                _ => {
+                    eprintln!(
+                        "[infer] f16 KV shadows disabled: cannot reserve {} MB more \
+                         (running with the f32 cache)",
+                        kv_cache_size >> 18
+                    );
+                    (None, None, false)
+                }
+            }
+        } else {
+            (None, None, false)
+        };
+
         if kv_f16 && std::env::var_os("SOFUU_PROFILE").is_some() {
             let feat = super::quant::simd_features();
             eprintln!(
@@ -600,7 +670,7 @@ impl TransformerModel {
             );
         }
 
-        Ok(Self {
+        let model = Self {
             config,
             gguf,
             token_embd,
@@ -651,7 +721,26 @@ impl TransformerModel {
             tree_k_layers: vec![0.0f32; n_layers * 16 * kv_dim],
             tree_v_layers: vec![0.0f32; n_layers * 16 * kv_dim],
             tree_max_nodes: 16,
-        })
+        };
+
+        // Warm the packed-tile GEMM/GEMV cache LAST: it is the only large
+        // allocation the engine can do without, so the KV caches and every
+        // fixed working buffer above are claimed first and the tiles take
+        // whatever remains (the warm is OOM-safe; kernels fall back to the
+        // per-row path, same math, slower).
+        for tv in std::iter::once(&model.token_embd)
+            .chain(std::iter::once(&model.output))
+            .chain(model.layers.iter().flat_map(|l| {
+                [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
+            }))
+        {
+            if matches!(tv.tensor_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q3_K) && tv.shape.len() == 2 {
+                if let Some(slice) = model.gguf.mmap.slice(model.gguf.data_offset + tv.offset, 64) {
+                    super::quant::tile_warm(slice.as_ptr(), tv.shape[1], tv.shape[0], tv.tensor_type);
+                }
+            }
+        }
+        Ok(model)
     }
 
     /// Returns the effective sliding window for a given layer.

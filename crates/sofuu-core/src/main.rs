@@ -1681,6 +1681,21 @@ fn main() -> ExitCode {
             }
         }
         "infer" => {
+            // Pool resilience smoke test (no model needed): drives the three
+            // paths that used to kill the engine — nested dispatch, a throwing
+            // task, and a normal job after the throw — on the live pool.
+            // Prints the contained-failure counters as a device receipt.
+            if std::env::var_os("SOFUU_POOL_SELFTEST").is_some() {
+                let rc = sofuu_core::infer::quant::pool_selftest();
+                eprintln!(
+                    "[pool] selftest rc={:#x} contained_failures={} (1 injected by the selftest) \
+                     short_thread_fallback={}",
+                    rc,
+                    sofuu_core::infer::quant::pool_failures(),
+                    sofuu_core::infer::quant::pool_short_fallback()
+                );
+                return if rc == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            }
             if let Ok(spec) = std::env::var("SOFUU_BENCH_GEMV") {
                 // type,rows,cols,iters — serial-decode weight-stream rate.
                 let parts: Vec<usize> = spec

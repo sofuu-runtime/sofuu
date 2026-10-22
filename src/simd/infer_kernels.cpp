@@ -30,6 +30,10 @@
 #endif
 #endif
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #define SOFUU_AVX2 1
@@ -53,6 +57,27 @@ struct WorkerSlice {
     size_t start = 0;
     size_t end = 0;
 };
+
+// ── Pool resilience state ────────────────────────────────────────────
+// The pool has exactly ONE task slot. A kernel that dispatches again from
+// inside a task (a nested parallel_for) would overwrite `current_task_`,
+// corrupt the outer job, and then deadlock — the calling worker would wait on
+// its own slice's done flag. `g_in_pool_task` marks threads running pool work
+// so a nested dispatch executes inline instead.
+//
+// The second failure mode is an exception. The release build stops on the
+// first unwind (the Rust half is panic = "abort"; an uncaught C++ exception
+// calls std::terminate), so one std::bad_alloc from a scratch buffer would
+// take the engine down mid-generation. Every task invocation is wrapped: a
+// failure is counted and the barrier still completes, leaving the pool and the
+// caller consistent.
+static thread_local int g_in_pool_task = 0;
+static std::atomic<uint64_t> g_pool_task_failures{0};
+static std::atomic<size_t> g_pool_short_fallback{0};
+
+// Defined with the other tile-admission helpers; declared here because the
+// per-format optional-memory gates (sidecar, planes, tiles) all consult it.
+static size_t optional_headroom();
 
 class WorkerThreadPool {
 public:
@@ -84,6 +109,10 @@ public:
         if (n <= 0) {
             n = detect_optimal_threads();
         }
+        // Re-entrant resize (from inside a task, or from a worker): joining the
+        // worker set from one of its own threads would deadlock and, with the
+        // pool mid-task, also corrupt the running job. Keep the current count.
+        if (g_in_pool_task > 0) return;
         std::unique_lock<std::mutex> lock(config_mutex_);
         if (n == user_threads_ && !workers_.empty()) return;
 
@@ -104,8 +133,22 @@ public:
 
         sofuu_set_current_thread_affinity(0);
         for (size_t i = 0; i < bg_count; ++i) {
-            workers_.emplace_back(&WorkerThreadPool::worker_loop, this, i);
-            sofuu_set_worker_affinity(workers_.back(), (int)(i + 1));
+            try {
+                workers_.emplace_back(&WorkerThreadPool::worker_loop, this, i);
+                sofuu_set_worker_affinity(workers_.back(), (int)(i + 1));
+            } catch (...) {
+                // A thread limit / memory failure must not leave the engine
+                // unusable: keep the workers that exist and run the rest of
+                // every job on the calling thread (parallel_for partitions by
+                // workers_.size(), so a short set is still consistent).
+                fprintf(stderr,
+                        "[pool] worker creation failed at %zu/%zu (thread or memory limit) — running with %zu worker thread(s)\n",
+                        i, bg_count, workers_.size());
+                break;
+            }
+        }
+        if (workers_.size() + 1 < (size_t)n) {
+            g_pool_short_fallback.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -118,8 +161,24 @@ public:
         size_t total = end - start;
         if (total == 0) return;
 
-        if (total <= 64 || user_threads_ <= 1 || workers_.empty()) {
+        // Nested dispatch (a kernel called from inside a task): run inline.
+        // Publishing would overwrite the outer task slot and deadlock.
+        if (g_in_pool_task > 0) {
             task(start, end);
+            return;
+        }
+
+        if (total <= 64 || user_threads_ <= 1 || workers_.empty()) {
+            // Inline path: still contain a throw, because this frame is the
+            // last C++ one before an extern "C" boundary — an unwind across it
+            // is undefined behaviour and in practice std::terminate.
+            g_in_pool_task++;
+            try {
+                task(start, end);
+            } catch (...) {
+                g_pool_task_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_in_pool_task--;
             return;
         }
 
@@ -149,11 +208,18 @@ public:
             cv_.notify_all();
         }
 
-        // Main thread executes chunk 0
+        // Main thread executes chunk 0. A throw here used to skip the barrier
+        // below entirely, leaving `current_task_` dangling and the workers
+        // mid-flight; contain it so the barrier always runs.
         size_t main_s = start;
         size_t main_e = std::min(start + chunk, end);
+        g_in_pool_task++;
         if (main_s < main_e) {
-            task(main_s, main_e);
+            try {
+                task(main_s, main_e);
+            } catch (...) {
+                g_pool_task_failures.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         // Barrier: Wait for all background workers to finish this specific job sequence
@@ -174,6 +240,7 @@ public:
         }
 
         current_task_ = nullptr;
+        g_in_pool_task--;
     }
 
 private:
@@ -208,7 +275,17 @@ private:
             size_t s = slices_[worker_id].start;
             size_t e = slices_[worker_id].end;
             if (task_ptr && s < e) {
-                (*task_ptr)(s, e);
+                // Contain exceptions: an unwind escaping a worker thread calls
+                // std::terminate, and the release engine must survive a bad
+                // allocation under memory pressure. Count it and let the
+                // barrier complete so the pool stays usable.
+                g_in_pool_task++;
+                try {
+                    (*task_ptr)(s, e);
+                } catch (...) {
+                    g_pool_task_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                g_in_pool_task--;
             }
 
             // Signal slice completion for this target_seq atomically
@@ -454,6 +531,7 @@ static bool nibble_planes_auto(size_t rows, size_t cols) {
     if (elems > (size_t)16 << 20) return false;
     static std::atomic<size_t> used{0};
     const size_t need = elems / 2;  // one extra byte per element (lo+hi vs packed nibble)
+    if (need > optional_headroom()) return false;
     const size_t budget = nibble_planes_budget_bytes();
     size_t u = used.load(std::memory_order_relaxed);
     while (true) {
@@ -482,6 +560,7 @@ static bool q4_ss_admit(size_t rows, size_t cols) {
     if (!q4_ss_eligible(rows, cols)) return false;
     static std::atomic<size_t> used{0};
     const size_t need = (rows * cols) / 256 * 192;
+    if (need > optional_headroom()) return false;
     static const size_t budget = [] {
         const char * e = getenv("SOFUU_Q4_SS_MB");
         return e ? (size_t)strtoull(e, nullptr, 10) << 20 : (size_t)768 << 20;
@@ -489,6 +568,79 @@ static bool q4_ss_admit(size_t rows, size_t cols) {
     size_t u = used.load(std::memory_order_relaxed);
     while (true) {
         if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
+}
+
+// q3_K tile admission. The q6_K-layout tile costs 210 B per 256 values versus
+// the 110 B the model occupies, so tiling every q3_K tensor would nearly double
+// the model's resident footprint — on an 8 GB Pi that is the difference between
+// fitting and OOM-killing under load. Per-tensor cap plus a global budget;
+// `SOFUU_Q3K_TILE_MB` overrides (0 = unlimited). A skipped tensor is not an
+// error: sofuu_gemm_q3_k falls back to the per-row kernel (slower, same math).
+static bool q3_tile_admit(size_t rows, size_t cols) {
+    if (rows * cols > (size_t)64 << 20) return false;
+    const size_t need = (rows * cols) / 256 * 210;
+    if (need > optional_headroom()) return false;
+    static const size_t budget = [] {
+        const char *e = getenv("SOFUU_Q3K_TILE_MB");
+        return e ? (size_t)strtoull(e, nullptr, 10) << 20 : (size_t)768 << 20;
+    }();
+    static std::atomic<size_t> used{0};
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
+}
+
+// Address space still safely usable for optional (tile) allocations.
+// SIZE_MAX means "no process limit, don't constrain": the usual Pi run has
+// no RLIMIT_AS. When a limit exists (ulimit -v, sandbox, some Android
+// deployments) a fixed tile budget is not enough — the limit can be hit by
+// the tiles themselves, and then a small later allocation (sampler scratch)
+// aborts the process. Leaving a reserve keeps the runtime alive: tiles are
+// refused and the per-row kernels carry the same math at a lower rate.
+// `SOFUU_TILE_RESERVE_MB` overrides the reserve (default 256 MB).
+static size_t optional_headroom() {
+#if defined(__linux__)
+    static const size_t reserve = [] {
+        const char *e = getenv("SOFUU_TILE_RESERVE_MB");
+        return (e ? (size_t)strtoull(e, nullptr, 10) : (size_t)256) << 20;
+    }();
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_AS, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) return SIZE_MAX;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return SIZE_MAX;
+    unsigned long pages = 0;
+    const int got = fscanf(f, "%lu", &pages);
+    fclose(f);
+    if (got != 1) return SIZE_MAX;
+    const size_t vm = (size_t)pages * (size_t)sysconf(_SC_PAGESIZE);
+    const size_t limit = (size_t)rl.rlim_cur;
+    return (vm + reserve < limit) ? limit - vm - reserve : 0;
+#else
+    return SIZE_MAX;
+#endif
+}
+
+// Optional budget for the packed tiles themselves. The q4_K/q6_K/q8_0 tiles
+// are ~1.0x the model bytes (q3_K's is 1.9x and already has its own default
+// cap), which is fine for one model on an 8 GB device but not for two engine
+// instances: a second instance doubles the tile footprint and can push the
+// host into the OOM killer. Default 0 = unlimited so single-model device
+// rates are unchanged; multi-instance hosts set `SOFUU_TILE_MB`.
+static bool tile_budget_admit(size_t need) {
+    static const size_t budget = [] {
+        const char *e = getenv("SOFUU_TILE_MB");
+        return e ? (size_t)strtoull(e, nullptr, 10) << 20 : (size_t)0;
+    }();
+    if (need > optional_headroom()) return false;
+    if (budget == 0) return true;
+    static std::atomic<size_t> used{0};
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (u + need > budget) return false;
         if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
     }
 }
@@ -528,7 +680,28 @@ static void sofuu_q3k_block_to_q6k(const struct block_q3_K *src, struct tile_blo
     }
 }
 
+// Tile warming allocates a repacked copy of the tensor (q4_K 1.0x, q6_K 1.0x,
+// q3_K 1.9x the model bytes). On an 8 GB device under memory pressure that
+// allocation can fail, and an escaping std::bad_alloc would abort the whole
+// engine at load. Fail the warm instead: callers fall back to the per-row
+// kernels (slower, byte-identical results).
+static int sofuu_tile_warm_impl(const void *w, size_t rows, size_t cols, unsigned type);
+
 extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned type) {
+    try {
+        return sofuu_tile_warm_impl(w, rows, cols, type);
+    } catch (const std::bad_alloc &) {
+        fprintf(stderr,
+                "[tiles] out of memory warming a %zux%zu type-%u tile — continuing without tiles for it\n",
+                rows, cols, type);
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "[tiles] tile warm failed for type %u — continuing without tiles for it\n", type);
+        return -1;
+    }
+}
+
+static int sofuu_tile_warm_impl(const void *w, size_t rows, size_t cols, unsigned type) {
     if (getenv("SOFUU_NO_TILES")) return -1; // runtime kill-switch
     bool aligned;
     const bool want_sc = (type == 12) && (scale_sidecar_disabled_state() == 0);
@@ -549,6 +722,7 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
     e.type = type; e.rows = rows; e.cols = cols; e.fp = fp;
     if (type == 12) {
         const int64_t nb = cols / 256, r8 = rows / 8;
+        if (!tile_budget_admit((size_t)r8 * nb * sizeof(tile_block_q4_Kx8))) return -1;
         e.data.resize((size_t)r8 * nb * sizeof(tile_block_q4_Kx8));
         uint8_t *dst = e.data.data();
         const uint8_t *src = (const uint8_t *)w;
@@ -627,11 +801,13 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
         }
 #endif
     } else if (type == 11) {
+        if (!q3_tile_admit(rows, cols)) return -1;
         // q3_K: exact per-block conversion into the q6_K layout, then the
         // stock 8-row interleave. Byte cost is 210/110 per block (~1.9x), so
         // this tile serves the GEMM (prefill + spec verify) only — the decode
         // GEMV stays on the native 110-byte stream.
         const int64_t nb = cols / 256, r8 = rows / 8;
+        if (!tile_budget_admit((size_t)r8 * nb * sizeof(tile_block_q6_Kx8))) return -1;
         e.data.resize((size_t)r8 * nb * sizeof(tile_block_q6_Kx8));
         uint8_t *dst = e.data.data();
         const uint8_t *src = (const uint8_t *)w;
@@ -660,6 +836,7 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
         }
     } else if (type == 14) {
         const int64_t nb = cols / 256, r8 = rows / 8;
+        if (!tile_budget_admit((size_t)r8 * nb * sizeof(tile_block_q6_Kx8))) return -1;
         e.data.resize((size_t)r8 * nb * sizeof(tile_block_q6_Kx8));
         if (r8 >= 16) {
             g_pool.parallel_for(0, (size_t)r8, [=, &e](size_t g0, size_t g1) {
@@ -670,6 +847,7 @@ extern "C" int sofuu_tile_warm(const void *w, size_t rows, size_t cols, unsigned
         }
     } else {
         const int64_t nb = cols / 32, r4 = rows / 4;
+        if (!tile_budget_admit((size_t)r4 * nb * sizeof(tile_block_q8_0x4))) return -1;
         e.data.resize((size_t)r4 * nb * sizeof(tile_block_q8_0x4));
         if (r4 >= 16) {
             g_pool.parallel_for(0, (size_t)r4, [=, &e](size_t g0, size_t g1) {
@@ -5101,6 +5279,40 @@ extern "C" int sofuu_kv16_fast_path(void) {
 #else
     return 0;
 #endif
+}
+
+// Pool resilience self-test (device + CI): exercises the three paths that used
+// to be fatal — a nested dispatch, an exception escaping a task on the calling
+// thread, and a second job after that failure. Returns 0 when all three behave;
+// bit N names the failing case. Interrupts nothing: it runs on the live pool.
+extern "C" int sofuu_pool_selftest(void) {
+    int rc = 0;
+    std::atomic<size_t> hits{0};
+    // 1. nested: an outer task dispatching again must run inline, not deadlock.
+    g_pool.parallel_for(0, (size_t)1024, [&](size_t s, size_t e) {
+        g_pool.parallel_for(s, e, [&](size_t a, size_t b) { hits.fetch_add(b - a); });
+    });
+    if (hits.load() != 1024) rc |= 1;
+    // 2. throwing task: contained (counted), barrier completes, no terminate.
+    const uint64_t before = g_pool_task_failures.load(std::memory_order_relaxed);
+    g_pool.parallel_for(0, (size_t)1024, [](size_t s, size_t) {
+        if (s == 0) throw 1;  // NOLINT: the point is an arbitrary exception
+    });
+    if (g_pool_task_failures.load(std::memory_order_relaxed) == before) rc |= 2;
+    // 3. the pool still does correct work after a contained failure.
+    hits.store(0);
+    g_pool.parallel_for(0, (size_t)4096, [&](size_t s, size_t e) { hits.fetch_add(e - s); });
+    if (hits.load() != 4096) rc |= 4;
+    return rc;
+}
+
+// Counters for receipts: contained task failures and builds that had to fall
+// back to fewer worker threads than requested.
+extern "C" uint64_t sofuu_pool_failures(void) {
+    return g_pool_task_failures.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t sofuu_pool_short_fallback(void) {
+    return g_pool_short_fallback.load(std::memory_order_relaxed);
 }
 
 // Compile-time SIMD feature bits, printable from the CLI under SOFUU_PROFILE.

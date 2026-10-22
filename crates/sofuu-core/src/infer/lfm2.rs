@@ -689,8 +689,13 @@ impl Lfm2Model {
         let attn_out = vec![0.0f32; dim];
 
         let kv_cache_len = n_layers * n_kv_heads * effective_max_seq_len * head_dim;
-        let k_cache = AnonBuffer::new(kv_cache_len);
-        let v_cache = AnonBuffer::new(kv_cache_len);
+        // Required buffers get a fallible reservation so an exhausted address
+        // space becomes a load error, not an allocator abort.
+        let kv_mb = kv_cache_len >> 18;
+        let k_cache = AnonBuffer::try_new(kv_cache_len)
+            .map_err(|e| format!("cannot allocate the LFM2 KV cache ({kv_mb} MB x2): {e}"))?;
+        let v_cache = AnonBuffer::try_new(kv_cache_len)
+            .map_err(|e| format!("cannot allocate the second LFM2 KV cache ({kv_mb} MB): {e}"))?;
 
         let actual_hidden_dim = layers.first().map(|l| match l {
             Lfm2LayerWeights::Conv { w1, .. } => w1.rows(),

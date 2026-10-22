@@ -1037,3 +1037,110 @@ and dots 4 tokens per SDOT group, so the remaining rate — 9B params ≈ 18
 GMAC/token at 1.4 tk/s ≈ 25 GMAC/s, versus ~200 GMAC/s for the q4_K tile GEMM —
 is kernel efficiency, not redundant weight reads. There is no llama.cpp baseline
 (type 142 is Prism-private).
+
+## Session 13 (2026-10-22) — Persistence hardening (Pi 5 lane)
+
+Charter: the engine must stay up and consistent under heavy conditions —
+memory pressure, concurrent instances, malformed or truncated model files —
+and never abort mid-generation. Nothing here changes the math or the fast
+paths: every guard is a refusal or fallback whose output consumers already
+handle (the per-row kernels are the same arithmetic the tile GEMM wraps, and
+a rejected dispatch zeroes its output instead of reading garbage).
+
+### Why each failure mode was fatal
+
+- Release is `panic = "abort"` (Cargo.toml:36): one Rust `assert!` or one
+  failed allocator call is SIGABRT.
+- The C++ kernels take no length; they read `rows * type_row_size(cols)`
+  bytes from a pointer. A short weights slice (truncated file, failed mmap
+  range) was an out-of-bounds read.
+- The worker pool has ONE task slot: a nested `parallel_for` overwrote
+  `current_task_` and deadlocked, and a `std::bad_alloc` escaping a task
+  called `std::terminate` (also fatal).
+- Loading a truncated GGUF was only caught by
+  `tensor_slice(...).expect("valid tensor slice")` — after the model was
+  built, at the first matmul. Corrupt counts/lengths could panic in the
+  parser (`pos + len`, `checked_mul(...).expect(...)`,
+  `Vec::with_capacity(count)`).
+- Tile warming ran *before* the KV cache. Under an address-space limit the
+  optional tiles took the space the KV cache needed, and
+  `AnonBuffer::new`'s `vec![...]` fallback aborted. That fallback was also
+  freed with `munmap` (a latent heap corruption on the same path).
+- `SOFUU_Q3K_TILE_MB` exists because a q3_K tile is 210 B per 256 values
+  against the 110 B the model occupies (~1.9x).
+
+### What is now guaranteed, and by what
+
+| surface | injected condition | new behaviour |
+|---|---|---|
+| nested dispatch | kernel calls `parallel_for` inside a task | runs inline; selftest sees 1024/1024 slices |
+| throwing task | injected `throw 1` (selftest) | contained, counted, barrier completes |
+| worker creation fails | thread/memory limit | keeps existing workers, one log line, `short_thread_fallback` counter |
+| `set_thread_count` from a task | nested call | ignored (no join-under-self deadlock); Rust clamps to [1,64], 0 = auto |
+| tile allocation fails | `ulimit -v`, RAM pressure | warm returns -1 (one line), per-row kernels continue |
+| optional tile footprint | `RLIMIT_AS` present | per-tensor admission vs address-space headroom (limit − VmSize − 256 MB reserve) + optional `SOFUU_TILE_MB` |
+| short weights slice / wrong dims | truncated file, mismatched `x` | output zeroed, one diagnostic line per 1024, no abort, no OOB read |
+| cols not a whole block | malformed tensor geometry | dispatch refused (`type_row_size` floors, which would under-count) |
+| truncated GGUF | last 1 MB removed | load error naming tensor and byte range; exit 1 |
+| corrupt GGUF header | absurd counts/dims/array lengths, overflowing lengths | load error; no allocator abort |
+| KV cache reservation fails | `ulimit -v` 450–1200 MB | load error naming the cache size; exit 1 |
+| f16 KV shadow reservation fails | `ulimit -v` 1400 MB | warning, engine runs on the f32 cache |
+| allocation order | any of the above | KV caches and every working buffer first, tiles last |
+| `AnonBuffer` Vec fallback | mmap failure | `Drop` frees with the matching allocator (`heap` flag) |
+
+### Device receipts (t1p67, Pi 5, governor `performance`)
+
+- Pool selftest: `[pool] selftest rc=0x0 contained_failures=1 (1 injected by
+  the selftest) short_thread_fallback=0` → exit 0.
+- Truncated (tail 1 MB removed):
+  `Error loading model: ... tensor 'blk.27.ffn_up.weight' needs bytes
+  394936000..396705472 but the file is 395705472 B` → exit 1. Before: load
+  succeeded, first matmul read past the mapping.
+- `ulimit -v 450000` → `cannot allocate the KV cache (448 MB x2 for the
+  configured context): ... Out of memory` → exit 1.
+- `ulimit -v 900000` → `cannot allocate the second KV cache (448 MB)` → exit 1.
+- `ulimit -v 1200000` → same clean error. Before these three: exit 134 with a
+  bare `memory allocation of 469762048 bytes failed`.
+- `ulimit -v 1400000` → tiles refused up-front, model loads in 52 ms,
+  generation completes (12.9 tk/s short decode), exit 0. Before: exit 134 with
+  `memory allocation of 607744 bytes failed` (the logits buffer) because the
+  tiles had consumed the remaining address space.
+- Ternary-9B (PQ2_0/type 142 + PTQ1_0/type 143) still loads: the new
+  tensor-bounds check is row-layout aware for the prism codecs (34 B and 28 B
+  per 128 values); an unknown type is skipped rather than guessed.
+- Concurrency, all exit 0, no kernel OOM kills in the window:
+  2 × Qwen3-0.6B-Q3_K_S (10.5 / 10.3 tk/s each);
+  3 × Qwen3-0.6B-Q4_K_M (5.0 / 4.9 / 5.0 each, 12 threads on 4 cores);
+  Spark-X2.5-4B with `SOFUU_TILE_MB=1024` + Qwen3-0.6B-Q4_K_M
+  (3.8 / 9.0 tk/s).
+- No perf regression, same-window A/B `t1p60` (pre-hardening) vs `t1p66`
+  (identical compute path to t1p67), 1210-token prompt, `-n 40`, greedy:
+
+| model | pp t1p60 | pp t1p66 | tg t1p60 | tg t1p66 |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_K_M | 118.4 / 124.8 | 119.2 / 122.3 | 5.6 / 5.7 | 5.7 / 5.6 |
+| Qwen3-0.6B Q3_K_S | 100.9 / 101.3 (r3/r4: 101.5 / 103.1) | 98.8 / 99.0 (r3/r4: 100.3 / 102.4) | 5.7 / 5.6 | 5.6 / 5.8 |
+| Llama-3.2-1B Q8_0 | 120.6 / 120.2 (r3/r4) | 119.3 / 119.9 | 5.5 / 5.2 | 5.5 / 5.6 |
+| Spark-X2.5-4B Q4_K_M | 20.7 | 20.8 | 2.6 | 2.7 |
+
+The long-prompt decode cell (5–6 tk/s) is attention-over-1210-positions, not
+the short-prompt decode rate in the tables above; it is quoted here only for
+the A/B. Llama-1B's first `t1p60` run read 67.2 tk/s on a cold page cache and
+was excluded; the steady-state pairs above were rerun back-to-back.
+
+### Knobs (Pi 5)
+
+| env | default | effect |
+|---|---|---|
+| `SOFUU_TILE_MB` | 0 (unlimited) | total packed-tile budget; set on multi-instance hosts |
+| `SOFUU_Q3K_TILE_MB` | 768 | q3_K tile budget (its tile is 1.9x the model) |
+| `SOFUU_Q4_SS_MB` | 768 | q4_K pre-decoded-scale sidecar budget |
+| `SOFUU_TILE_RESERVE_MB` | 256 | address space kept free when `RLIMIT_AS` is set |
+| `SOFUU_NO_TILES` | unset | disables all tiles (per-row kernels, same math) |
+| `SOFUU_NUM_THREADS` | unset | worker count override (clamped 1–64) |
+| `SOFUU_KV_F16=0` | f16 shadows on | disables the CPU f16 KV shadows |
+| `SOFUU_POOL_SELFTEST=1` | — | runs the pool resilience self-test and exits |
+
+Tests: `test_pool_resilience_selftest`, `test_matvec_rejects_short_weights`,
+`test_truncated_gguf_is_a_clean_error`, `test_corrupt_gguf_header_is_rejected`
+(112 infer tests pass on the Mac lane).

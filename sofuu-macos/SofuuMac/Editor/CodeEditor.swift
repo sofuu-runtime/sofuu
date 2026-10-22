@@ -101,6 +101,23 @@ struct CodeEditor: NSViewRepresentable {
             c.syncLSPDocument(path: path, text: text, language: language)
             c.push()
         }
+        // Per-tab restore (cursor + scroll fraction) and a pending search
+        // target — each applied exactly once per path switch.
+        if c.restoredPath != path {
+            c.restoredPath = path
+            if let scroll = store.pendingScroll, scroll.path == path {
+                store.pendingScroll = nil
+                c.scrollTo(characterLine: scroll.line, column: max(1, scroll.column + 1))
+            } else if let cursor = store.ideCursor(for: path) {
+                c.scrollTo(characterLine: cursor.line, column: cursor.column)
+            } else if let fraction = store.ideScrollFraction(for: path), fraction > 0.005,
+                      let sv = c.scrollView {
+                let clip = sv.contentView
+                let docH = max(tv.frame.height, clip.bounds.height)
+                clip.scroll(to: NSPoint(x: 0, y: fraction * max(0, docH - clip.bounds.height)))
+                sv.reflectScrolledClipView(clip)
+            }
+        }
         if c.isDark != dark {
             c.isDark = dark
             c.lexerHighlight(text: tv.string, language: language)
@@ -121,6 +138,7 @@ struct CodeEditor: NSViewRepresentable {
 
         var isDark = true
         var path: String?
+        var restoredPath: String?
         var language: Language = Languages.plain
         var lsp: LSPClient?
         var lspLang: LangID?
@@ -202,6 +220,14 @@ struct CodeEditor: NSViewRepresentable {
         func push() {
             if let tv = textView, let lm = tv.layoutManager {
                 calibrateStep(ns: tv.string as NSString, lm: lm)
+            }
+            // Remember the scroll position for tab restore.
+            if let tv = textView, let sv = scrollView, let scrollPath = path {
+                let clip = sv.contentView
+                let docH = max(tv.frame.height, clip.bounds.height)
+                if docH > clip.bounds.height + 1 {
+                    store.ideRecordScroll(scrollPath, fraction: clip.bounds.origin.y / (docH - clip.bounds.height))
+                }
             }
             gutter.objectWillChange.send()
         }
@@ -387,6 +413,12 @@ struct CodeEditor: NSViewRepresentable {
         func refreshCursorStatus() {
             let (line, column) = lineColumn(ofOffset: Int(textView?.selectedRange().location ?? 0))
             gutter.cursor = (line: line, column: column)
+            ideRecordCursor(line: line, column: column)
+        }
+
+        private func ideRecordCursor(line: Int, column: Int) {
+            guard let path, let view = textView, view.window?.firstResponder === view else { return }
+            store.ideRecordCursor(path, line: line, column: column)
         }
 
         func selectedOffset() -> Int {
@@ -540,6 +572,79 @@ struct CodeEditor: NSViewRepresentable {
 
         func endFind() {
             // Hook reserved for find teardown (selection retention is fine).
+        }
+
+        // MARK: - Replace
+
+        /// Replace the current selection when it matches, else find and
+        /// replace the next match, then select the following one.
+        func replaceOne(query: String, replacement: String, caseSensitive: Bool) {
+            guard let view = textView, let storage = view.textStorage else { return }
+            let length = (view.string as NSString).length
+            let options: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+            let viewRange = view.selectedRange()
+
+            let target: NSRange
+            let selectedLength = viewRange.length
+            let selectedMatches = selectedLength > 0
+                && viewRange.location + viewRange.length <= length
+                && (view.string as NSString).substring(with: viewRange)
+                    .compare(query, options: options) == .orderedSame
+            if selectedMatches {
+                target = viewRange
+            } else {
+                guard let hit = nextMatch(query: query, caseSensitive: caseSensitive, from: viewRange.location) else { return }
+                target = hit
+            }
+            view.shouldChangeText(in: target, replacementString: replacement)
+            storage.replaceCharacters(in: target, with: replacement)
+            view.didChangeText()
+        }
+
+        /// Replace every occurrence in one undoable edit. Returns the count.
+        @discardableResult
+        func replaceAll(query: String, replacement: String, caseSensitive: Bool) -> Int {
+            guard let view = textView, let storage = view.textStorage else { return 0 }
+            let text = view.string as NSString
+            let length = text.length
+            let options: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+            var ranges: [NSRange] = []
+            var probe = 0
+            while probe <= length {
+                let found = text.range(
+                    of: query, options: options,
+                    range: NSRange(location: probe, length: length - probe))
+                guard found.location != NSNotFound, found.length > 0 else { break }
+                ranges.append(found)
+                probe = NSMaxRange(found)
+            }
+            guard !ranges.isEmpty else { return 0 }
+
+            let replaced = NSMutableString(string: text)
+            for range in ranges.reversed() {
+                replaced.replaceCharacters(in: range, with: replacement)
+            }
+            let full = NSRange(location: 0, length: length)
+            view.shouldChangeText(in: full, replacementString: replaced as String)
+            storage.replaceCharacters(in: full, with: replaced as String)
+            view.didChangeText()
+            return ranges.count
+        }
+
+        /// The next match strictly after `from`, wrapping once.
+        private func nextMatch(query: String, caseSensitive: Bool, from: Int) -> NSRange? {
+            guard let view = textView else { return nil }
+            let text = view.string as NSString
+            let length = text.length
+            let options: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+            if length == 0 { return nil }
+            let start = min(max(0, from), length - 1)
+            let hit = text.range(
+                of: query, options: options,
+                range: NSRange(location: start, length: length - start))
+            if hit.location != NSNotFound { return hit }
+            let wrapped = text.range(of: query, options: options, range: NSRange(location: 0, length: max(0, start)))
+            return wrapped.location != NSNotFound ? wrapped : nil
         }
 
         // MARK: - Outline (⇧⌘O)

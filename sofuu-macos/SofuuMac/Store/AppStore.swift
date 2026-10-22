@@ -106,6 +106,10 @@ final class AppStore: ObservableObject {
         NSLog("[sofuu-engine] env applied: \(appliedEnv)")
         engine.start()
         state.localModels = LocalModels.list().map(\.path)
+
+        restoreIdeStateIfNeeded()
+        restartWorkspaceWatcher()
+        refreshGitStatus()
     }
 
     func shutdown() { engine.shutdown() }
@@ -986,6 +990,9 @@ final class AppStore: ObservableObject {
         // Language servers are (language, root)-keyed: servers from the old
         // root have nothing left to serve here.
         LSPRegistry.shared.stopAll(exceptRoot: path)
+        state.externalEdits = []
+        state.gitStatus = [:]
+        restartWorkspaceWatcher()
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         state.projectDir = path
         state.sessions = []
@@ -1003,6 +1010,8 @@ final class AppStore: ObservableObject {
             configs.setWorkspaces(list)
             state.workspaces = list
         }
+        restoreIdeStateIfNeeded()
+        refreshGitStatus(force: true)
     }
 
     func addWorkspace(_ path: String) {
@@ -1599,6 +1608,220 @@ final class AppStore: ObservableObject {
 
     func resolvedDark(_ systemDark: Bool) -> Bool {
         state.theme == "dark" || (state.theme == "system" && systemDark)
+    }
+
+    // ── Workspace file watching (external changes) ───────────────────
+
+    private var fileWatcher: FileWatcher?
+    private var externalChangeWork: DispatchWorkItem?
+    private var pendingExternalPaths: Set<String> = []
+
+    func restartWorkspaceWatcher() {
+        fileWatcher?.stop()
+        fileWatcher = nil
+        guard let root = state.projectDir else { return }
+        fileWatcher = FileWatcher(root: root) { [weak self] paths in
+            self?.coalesceExternalChanges(paths)
+        }
+    }
+
+    private func coalesceExternalChanges(_ paths: [String]) {
+        for p in paths { pendingExternalPaths.insert(p) }
+        externalChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let paths = self.pendingExternalPaths
+            self.pendingExternalPaths = []
+            self.applyExternalChanges(paths: paths)
+        }
+        externalChangeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func applyExternalChanges(paths: Set<String>) {
+        guard !paths.isEmpty else { return }
+        // The tree re-lists from disk on every render — a published nudge
+        // is all the tree needs to follow the disk.
+        state.externalTick += 1
+        refreshGitStatus()
+        var externallyEdited: Set<String> = []
+        for path in state.openTabs where paths.contains(path) {
+            if isDirty(path) {
+                externallyEdited.insert(path)
+            } else if let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text != diskContents[path] {
+                diskContents[path] = text
+                fileBuffers[path] = text
+            }
+        }
+        if !externallyEdited.isEmpty {
+            state.externalEdits.formUnion(externallyEdited)
+        }
+    }
+
+    func reloadExternalEdit(_ path: String) {
+        if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+            diskContents[path] = text
+            fileBuffers[path] = text
+            state.tabDirty[path] = false
+        }
+        state.externalEdits.remove(path)
+    }
+
+    func dismissExternalEdit(_ path: String) {
+        state.externalEdits.remove(path)
+    }
+
+    // ── Git working-tree badge (read-only) ───────────────────────────
+
+    private var gitRefreshAt = Date.distantPast
+
+    func refreshGitStatus(force: Bool = false) {
+        guard let root = state.projectDir else { return }
+        let now = Date()
+        guard force || now.timeIntervalSince(gitRefreshAt) > 0.8 else { return }
+        gitRefreshAt = now
+        GitMonitor.status(root: root) { [weak self] map in
+            Task { @MainActor in self?.state.gitStatus = map }
+        }
+    }
+
+    /// Working tree vs HEAD in the floating diff panel.
+    func showGitDiff(_ path: String) {
+        guard let root = state.projectDir else { return }
+        let rel = path.hasPrefix(root + "/") ? String(path.dropFirst(root.count + 1)) : path
+        let kind = state.gitStatus[path]
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let old = (kind != .untracked) ? GitMonitor.headText(root: root, relativePath: rel) : ""
+            let new = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+            DispatchQueue.main.async {
+                IDEHUD.showDiff(
+                    title: (path as NSString).lastPathComponent + " — working tree vs HEAD",
+                    oldText: old, newText: new)
+            }
+        }
+    }
+
+    // ── IDE state persistence (tabs / tree expansion / carets) ───────
+
+    private var ideSaveWork: DispatchWorkItem?
+    private(set) var ideExpanded: Set<String> = []
+    private var ideCursors: [String: (line: Int, column: Int)] = [:]
+    private var ideScrolls: [String: CGFloat] = [:]
+    private var ideRestoredFor: String?
+
+    func restoreIdeStateIfNeeded() {
+        guard ideRestoredFor != state.projectDir, let root = state.projectDir else { return }
+        ideRestoredFor = root
+        guard state.openTabs.isEmpty else { return }   // a live session wins
+        let ide = configs.readIdeState()
+        guard ide.optString("project") == root else { return }
+        let tabs = (ide.optArray("tabs") as? [String]) ?? []
+        for p in tabs.prefix(12) where FileManager.default.fileExists(atPath: p) {
+            openFile(p)
+        }
+        let wantedActive = ide.optString("active")
+        if state.openTabs.contains(wantedActive) {
+            state.activeTab = wantedActive
+        }
+        ideExpanded = Set((ide.optArray("expanded") as? [String]) ?? [])
+        if let cursors = ide.optObject("cursors") as? [String: String] {
+            for (path, pair) in cursors {
+                let parts = pair.split(separator: ":").compactMap { Int($0) }
+                if parts.count == 2 { ideCursors[path] = (parts[0], parts[1]) }
+            }
+        }
+        if let scrolls = ide.optObject("scrolls") as? [String: Double] {
+            ideScrolls = scrolls.mapValues { CGFloat($0) }
+        }
+    }
+
+    func ideRecordExpanded(_ set: Set<String>) {
+        ideExpanded = set
+        persistIdeStateSoon()
+    }
+
+    func ideCursor(for path: String) -> (line: Int, column: Int)? { ideCursors[path] }
+    func ideScrollFraction(for path: String) -> CGFloat? { ideScrolls[path] }
+
+    func ideRecordCursor(_ path: String?, line: Int, column: Int) {
+        guard let path else { return }
+        if let existing = ideCursors[path], existing == (line: line, column: column) { return }
+        ideCursors[path] = (line, column)
+        persistIdeStateSoon()
+    }
+
+    func ideRecordScroll(_ path: String, fraction: CGFloat) {
+        let clamped = max(0, min(1, fraction))
+        guard abs((ideScrolls[path] ?? -1) - clamped) > 0.005 else { return }
+        ideScrolls[path] = clamped
+        persistIdeStateSoon()
+    }
+
+    func persistIdeStateSoon() {
+        ideSaveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistIdeState() }
+        ideSaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    private func persistIdeState() {
+        guard let root = state.projectDir else { return }
+        let obj: JSONObject = [
+            "project": root,
+            "tabs": state.openTabs,
+            "active": state.activeTab ?? "",
+            "expanded": Array(ideExpanded).sorted(),
+            "cursors": ideCursors.mapValues { "\($0.line):\($0.column)" },
+            "scrolls": ideScrolls.mapValues { Double($0) },
+        ]
+        configs.writeIdeState(obj)
+    }
+
+    /// Pending scroll target for a just-opened file (search results).
+    var pendingScroll: (path: String, line: Int, column: Int)?
+
+    // ── Tree drag & drop: internal moves + Finder ingest ─────────────
+
+    func movePath(_ src: String, toFolder folder: String) {
+        let name = (src as NSString).lastPathComponent
+        let target = folder + "/" + name
+        guard target != src else { return }
+        guard !target.hasPrefix(src + "/") else {
+            systemRow("Cannot move a folder into itself.")
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: target) else {
+            systemRow("\u{201C}\(name)\u{201D} already exists there.")
+            return
+        }
+        do {
+            try FileManager.default.moveItem(atPath: src, toPath: target)
+        } catch {
+            systemRow("Move failed: \(error.localizedDescription)")
+            return
+        }
+        remapTabPaths(src, to: target)
+        refreshGitStatus(force: true)
+    }
+
+    func ingestExternalFile(_ url: URL, toFolder folder: String) {
+        let name = url.lastPathComponent
+        var target = folder + "/" + name
+        var n = 2
+        let stem = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        while FileManager.default.fileExists(atPath: target) {
+            target = folder + "/" + (ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)")
+            n += 1
+        }
+        do {
+            try FileManager.default.copyItem(at: url, to: URL(fileURLWithPath: target))
+            systemRow("Copied \(name) into the workspace.")
+        } catch {
+            systemRow("Copy failed: \(error.localizedDescription)")
+        }
+        refreshGitStatus(force: true)
     }
 }
 

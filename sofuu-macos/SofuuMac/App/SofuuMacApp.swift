@@ -195,6 +195,10 @@ struct SofuuMenus: Commands {
                 NotificationCenter.default.post(name: .init("IDEFindToggle"), object: nil)
             }
                 .keyboardShortcut("f")
+            Button("Search Project") {
+                NotificationCenter.default.post(name: .init("IDESearchToggle"), object: nil)
+            }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
             Button("Document Outline") {
                 NotificationCenter.default.post(name: .init("IDEOutlineToggle"), object: nil)
             }

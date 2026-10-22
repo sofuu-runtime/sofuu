@@ -50,6 +50,15 @@ struct AppState {
     // IDE panel widths (the splitters); AppStore seeds these from UiPrefs.
     var ideTreeWidth: CGFloat = 230
     var ideAgentWidth: CGFloat = 380
+    /// File-watcher pulse: bumped (debounced) whenever the workspace
+    /// changed on disk — the tree re-lists on any state change, so a
+    /// nudge is all it takes.
+    var externalTick = 0
+    /// Dirty tabs whose file changed on disk while we hold unsaved work.
+    var externalEdits: Set<String> = []
+    /// Read-only git working-tree status (path → kind), driven by the
+    /// watcher + manual refresh.
+    var gitStatus: [String: GitStatusKind] = [:]
 }
 
 /// One provider's cached model listing (the desktop's model cache).

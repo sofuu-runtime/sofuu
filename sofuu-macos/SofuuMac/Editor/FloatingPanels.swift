@@ -68,6 +68,24 @@ enum IDEHUD {
         outlinePanel = nil
     }
 
+    // MARK: - Diff (read-only working-tree vs HEAD popup)
+
+    static var diffPanel: NSPanel?
+
+    static func showDiff(title: String, oldText: String, newText: String) {
+        let view = NSHostingView(rootView:
+            DiffPanelView(title: title, oldText: oldText, newText: newText)
+        )
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1600, height: 900)
+        let frame = NSRect(x: screen.midX - 440, y: screen.midY - 320, width: 880, height: 640)
+        present(&diffPanel, content: view, frame: frame)
+    }
+
+    static func hideDiff() {
+        diffPanel?.orderOut(nil)
+        diffPanel = nil
+    }
+
     private static func present(_ panel: inout NSPanel?, content: NSView, frame: NSRect) {
         if let existing = panel {
             existing.setFrame(frame, display: true)
@@ -215,5 +233,51 @@ struct OutlineList: View {
             out.append(contentsOf: flatten(node.children, depth: depth + 1))
         }
         return out
+    }
+}
+
+
+/// Read-only git diff in a floating non-activating panel: title row with
+/// close, then the chat-surface DiffView for old (HEAD) vs new (disk).
+private struct DiffPanelView: View {
+    let title: String
+    let oldText: String
+    let newText: String
+
+    @Environment(\.sofuuColors) private var c
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(c.text)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button {
+                    IDEHUD.hideDiff()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(c.textMuted)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Close")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Divider().overlay(c.separator)
+            ScrollView {
+                DiffView(oldText: oldText, newText: newText)
+                    .padding(10)
+            }
+        }
+        .background(c.bgRaised)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

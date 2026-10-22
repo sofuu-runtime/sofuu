@@ -235,6 +235,18 @@ final class ConfigStore {
         writeState(s)
     }
 
+    // ── IDE session state (open tabs / tree expansion / carets) ──────
+
+    func readIdeState() -> JSONObject {
+        readState().optObject("ide") ?? [:]
+    }
+
+    func writeIdeState(_ o: JSONObject) {
+        var s = readState()
+        s["ide"] = o
+        writeState(s)
+    }
+
     // ── Key passthrough (the 0600 config file owns the secrets) ──────
 
     /// Raw provider entry lookup by name (config.rs's provider_entry).

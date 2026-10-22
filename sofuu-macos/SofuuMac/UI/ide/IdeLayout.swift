@@ -15,6 +15,7 @@ struct IdeLayout: View {
     @State private var findQuery = ""
     @State private var findCaseSensitive = false
     @State private var findCount = 0
+    @State private var replaceText = ""
 
     var body: some View {
         HStack(spacing: 0) {
@@ -44,6 +45,7 @@ struct IdeLayout: View {
                     if findVisible {
                         FindBar(
                             query: $findQuery,
+                            replacement: $replaceText,
                             caseSensitive: $findCaseSensitive,
                             count: $findCount,
                             store: store,
@@ -82,6 +84,31 @@ struct IdeLayout: View {
             tabStrip
             Divider().overlay(c.separator)
             editorBody
+            // Changed-on-disk-while-editing resolution (file watcher).
+            if let path = store.state.activeTab, store.state.externalEdits.contains(path) {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.yellow)
+                    Text("\((path as NSString).lastPathComponent) changed on disk while you were editing.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(c.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Button("Load disk") { store.reloadExternalEdit(path) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(c.accentContrast)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(c.accent, in: Capsule())
+                    Button("Keep mine") { store.dismissExternalEdit(path) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(c.textMuted)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(c.bgCard)
+            }
             Divider().overlay(c.separator)
             EditorStatus(hud: store.ideGutter, store: store)
         }
@@ -587,6 +614,7 @@ enum HorizontalEdge { case leading, trailing }
 /// through the live coordinator.
 struct FindBar: View {
     @Binding var query: String
+    @Binding var replacement: String
     @Binding var caseSensitive: Bool
     @Binding var count: Int
     let store: AppStore
@@ -613,6 +641,33 @@ struct FindBar: View {
             Text(count > 0 ? "\(count) match\(count == 1 ? "" : "es")" : "no matches")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
+            TextField("Replace with", text: $replacement)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .frame(width: 180)
+                .help("Replacement")
+            Button {
+                store.ideCoordinator?.replaceOne(query: query, replacement: replacement, caseSensitive: caseSensitive)
+            } label: {
+                Text("Rep")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 26, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Replace current, advance to the next match")
+            Button {
+                let n = store.ideCoordinator?.replaceAll(query: query, replacement: replacement, caseSensitive: caseSensitive) ?? 0
+                count = store.ideCoordinator?.findMatches(query: query, caseSensitive: caseSensitive) ?? 0
+                if n > 0 { store.systemRow("Replaced \(n) \(n == 1 ? "occurrence" : "occurrences").") }
+            } label: {
+                Text("All")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 26, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Replace every match in this file (one undo step)")
             Button {
                 store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: false)
             } label: {

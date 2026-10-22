@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// IDE left panel — the workspace file tree, with real-IDE file ops:
 ///
@@ -20,6 +21,13 @@ struct FileTree: View {
     @State private var composer: EntryComposer?
     @FocusState private var composerFocused: Bool
 
+    // Project-wide search (⇧⌘F) — lives above the tree rows.
+    @State private var searchVisible = false
+    @State private var searchQuery = ""
+    @State private var searchCase = false
+    @State private var searchHits: [SearchHit] = []
+    @State private var searching = false
+
     struct EntryComposer: Equatable {
         enum Mode { case newFile, newFolder, rename }
         let mode: Mode
@@ -37,11 +45,16 @@ struct FileTree: View {
             Divider().overlay(Color.primary.opacity(0.06))
             if let root = store.state.projectDir {
                 ScrollView {
-                    DirectoryRows(
-                        store: store, dir: root, depth: 0,
-                        expanded: $expanded, composer: $composer,
-                        composerFocused: $composerFocused)
-                        .padding(.vertical, 4)
+                    VStack(spacing: 0) {
+                        if searchVisible {
+                            searchSection
+                        }
+                        DirectoryRows(
+                            store: store, dir: root, depth: 0,
+                            expanded: $expanded, composer: $composer,
+                            composerFocused: $composerFocused)
+                            .padding(.vertical, 4)
+                    }
                 }
                 // Fresh row identity on workspace change AND refresh:
                 // everything re-lists from disk; expansion survives.
@@ -49,6 +62,20 @@ struct FileTree: View {
                 .onChange(of: store.state.projectDir) { _ in
                     expanded = []
                     composer = nil
+                    searchVisible = false
+                    searchHits = []
+                }
+                .onChange(of: expanded) { store.ideRecordExpanded($0) }
+                .onDrop(of: [UTType.text, UTType.fileURL], isTargeted: nil) { providers in
+                    FileTree.handleDrop(store, providers, folder: root)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: Notification.Name("IDESearchToggle"))) { _ in
+                    searchVisible.toggle()
+                }
+                .onAppear {
+                    if expanded.isEmpty && !store.ideExpanded.isEmpty {
+                        expanded = store.ideExpanded
+                    }
                 }
             } else {
                 Spacer()
@@ -58,6 +85,135 @@ struct FileTree: View {
                 Spacer()
             }
         }
+    }
+
+    // MARK: - Project search section
+
+    private var searchSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                TextField("Search this workspace", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .onSubmit { runSearch() }
+                Button {
+                    searchCase.toggle()
+                    if !searchQuery.isEmpty { runSearch() }
+                } label: {
+                    Text("Aa")
+                        .font(.system(size: 10, weight: searchCase ? .bold : .regular))
+                        .foregroundColor(searchCase ? Color.accentColor : .secondary)
+                        .frame(width: 22, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Match case")
+                if searching {
+                    ProgressView().scaleEffect(0.6)
+                }
+                Button {
+                    searchVisible = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close search")
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+            .padding(.horizontal, 6)
+
+            ForEach(Array(searchHits.prefix(120).enumerated()), id: \.offset) { _, hit in
+                Button {
+                    store.pendingScroll = (path: hit.path, line: hit.line, column: max(0, hit.column))
+                    store.openFile(hit.path)
+                } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Text((hit.path as NSString).lastPathComponent)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(Color.accentColor)
+                            Text(":\(hit.line)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            Spacer(minLength: 0)
+                        }
+                        Text(hit.snippet)
+                            .font(.system(size: 10))
+                            .foregroundColor(.primary.opacity(0.7))
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            if searchHits.count > 120 {
+                Text("…and \(searchHits.count - 120) more")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 10)
+            } else if searchHits.isEmpty && !searchQuery.isEmpty && !searching {
+                Text("No matches.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 10)
+            }
+            Divider().overlay(Color.primary.opacity(0.06))
+        }
+        .padding(.top, 4)
+    }
+
+    private func runSearch() {
+        guard let root = store.state.projectDir else { return }
+        let q = searchQuery.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else {
+            searchHits = []
+            return
+        }
+        searching = true
+        ProjectSearch.search(root: root, query: q, caseSensitive: searchCase) { hits in
+            searching = false
+            searchHits = hits
+        }
+    }
+
+    /// All drops funnel here: text payloads are internal moves (drag a
+    /// row onto a folder), file-URL payloads are Finder copies in.
+    static func handleDrop(_ store: AppStore, _ providers: [NSItemProvider], folder: String) -> Bool {
+        var accepted = false
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+                accepted = true
+                provider.loadItem(
+                    forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                    DispatchQueue.main.async {
+                        if let s = item as? String, s.hasPrefix("/") {
+                            store.movePath(s, toFolder: folder)
+                        }
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                accepted = true
+                provider.loadItem(
+                    forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    DispatchQueue.main.async {
+                        if let data = item as? Data,
+                           let url = try? URL(dataRepresentation: data, relativeTo: nil) {
+                            store.ingestExternalFile(url, toFolder: folder)
+                        }
+                    }
+                }
+            }
+        }
+        return accepted
     }
 
     private var header: some View {
@@ -90,11 +246,21 @@ struct FileTree: View {
             .disabled(store.state.projectDir == nil)
             .help("New folder")
 
+            // Project-wide search (⇧⌘F) — the section appears above rows.
+            Button {
+                searchVisible.toggle()
+            } label: {
+                Image(systemName: "magnifyingglass").iconFrame()
+            }
+            .buttonStyle(.plain)
+            .help("Search project (⇧⌘F)")
+
             // Refresh re-lists from disk and reloads clean open tabs —
             // the agent may have created or edited files behind our back.
             Button {
                 refreshTick += 1
                 store.refreshTabsAfterTurn()
+                store.refreshGitStatus(force: true)
             } label: {
                 Image(systemName: "arrow.clockwise").iconFrame()
             }
@@ -231,6 +397,14 @@ private struct EntryRow: View {
                     .truncationMode(.middle)
                     .foregroundColor(isSelected ? .primary : Color.primary.opacity(0.85))
 
+                if let kind = store.state.gitStatus[entry.path] {
+                    Circle()
+                        .fill(kind == .untracked
+                              ? Color.green.opacity(0.9)
+                              : (kind == .changed ? Color.orange : Color.red))
+                        .frame(width: 5, height: 5)
+                }
+
                 Spacer(minLength: 0)
 
                 // Hover quick-create on folders: new file / new folder
@@ -269,6 +443,11 @@ private struct EntryRow: View {
                     .fill(isSelected ? Color.primary.opacity(0.08) : Color.clear)
             )
             .contentShape(Rectangle())
+            .onDrag { NSItemProvider(object: entry.path as NSString) }
+            .onDrop(of: [UTType.text, UTType.fileURL], isTargeted: nil) { providers in
+                guard entry.isDir else { return false }
+                return FileTree.handleDrop(store, providers, folder: entry.path)
+            }
             .onHover { hovering = $0 }
             .onTapGesture {
                 if entry.isDir {
@@ -278,6 +457,10 @@ private struct EntryRow: View {
                 }
             }
             .contextMenu {
+                if store.state.gitStatus[entry.path] != nil {
+                    Button("Show Git Diff") { store.showGitDiff(entry.path) }
+                    Divider()
+                }
                 Button("Rename…") {
                     composer = FileTree.EntryComposer(
                         mode: .rename, dir: parentDir, initial: entry.name,

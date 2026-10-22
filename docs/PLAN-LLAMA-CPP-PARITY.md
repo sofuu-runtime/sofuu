@@ -855,3 +855,21 @@ live-verifiable via one temporary slot dump mirroring SOFUU_QKV_SNAP's
 pattern for the act_buf slots). The gate's certified-near-tie question
 (0.089 at a 0.215-gap near-tie step 19, bound 0.05) is downstream of this.
 Defaults locked throughout.
+
+## STEP-0 TRANSIENT LOCATED (2026-10-24 — boundary bisect)
+Boundary receipts (prefill→decode, both routes, SOFUU_KV_DUMP, the 8 prefill
+gemms mirrored): **x.bin = BYTE-IDENTICAL (0/512)** — the residual handoff is
+perfect; **L0 K/V = f32-noise (worst 1e-4)** — L0 matches the s3.kc receipt;
+**L2+ K/V diverge at TILE-CLASS magnitude (1.0–2.0 abs on |K|~100–300,
+L1 borderline 0.01)** — the old coarse-actquant signature LIVES in the
+prefill KV chain from layer 1 up, despite every prefill GEMM being mirrored.
+That is geometric amplification of a small seed (1e-7 swiglu-exp class ×
+nonlinear gates) OR an unmirrored per-layer op — NOT the handoff. The
+step-0 decode transient (0.279, decaying) = this KV divergence entering the
+first attention reads. BOOKED NEXT: per-layer localization of the L1
+jump (L0→L1 = 1e-4→1e-2): snap L1's stage values (s1/s2/s3 pattern for
+layer 1 — the QKV snap machinery is layer-0-only today; parameterize the
+layer index or reorder) and test the swiglu-exp hypothesis by feeding the
+GPU swiglu's inputs/outputs to a host recompute. The gate verdict remains
+downstream of this class; certified-near-tie needs it bounded. Defaults
+locked.

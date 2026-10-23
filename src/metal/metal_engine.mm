@@ -57,6 +57,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_peak_fma16;
     id<MTLComputePipelineState> pso_peak_fma;
     id<MTLComputePipelineState> pso_peak_mma;
+    id<MTLComputePipelineState> pso_gemm_q8_0_mma64;
+    bool pso_gemm_q8_0_mma64_live;
     id<MTLComputePipelineState> pso_gemm_q6_k_mma64;
     bool pso_gemm_q6_k_mma64_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_mma64;
@@ -356,6 +358,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_peak_fma16 = load_pso(@"peak_fma16");
         ctx->pso_peak_fma = load_pso(@"peak_fma");
         ctx->pso_peak_mma = load_pso(@"peak_mma");
+        ctx->pso_gemm_q8_0_mma64 = load_pso(@"gemm_q8_0_mma64");
+        ctx->pso_gemm_q8_0_mma64_live = ctx->pso_gemm_q8_0_mma64 != nil;
         ctx->pso_gemm_q6_k_mma64 = load_pso(@"gemm_q6_k_mma64");
         ctx->pso_gemm_q6_k_mma64_live = ctx->pso_gemm_q6_k_mma64 != nil;
         ctx->pso_gemm_q4_k_mma64 = load_pso(@"gemm_q4_k_mma64");
@@ -2021,6 +2025,7 @@ int sofuu_metal_batch_gguf_gemm_mma64_acc(
     switch (ty) {
         case 12: pso = ctx->pso_gemm_q4_k_mma64_live ? ctx->pso_gemm_q4_k_mma64 : nil; break;
         case 14: pso = ctx->pso_gemm_q6_k_mma64_live ? ctx->pso_gemm_q6_k_mma64 : nil; break;
+        case 8:  pso = ctx->pso_gemm_q8_0_mma64_live ? ctx->pso_gemm_q8_0_mma64 : nil; break;
         default: return 0;
     }
     if (pso == nil) return 0;
@@ -2066,6 +2071,7 @@ int sofuu_metal_batch_gguf_gemm_mma64_multi(
     switch (ty) {
         case 12: pso = ctx->pso_gemm_q4_k_mma64_live ? ctx->pso_gemm_q4_k_mma64 : nil; break;
         case 14: pso = ctx->pso_gemm_q6_k_mma64_live ? ctx->pso_gemm_q6_k_mma64 : nil; break;
+        case 8:  pso = ctx->pso_gemm_q8_0_mma64_live ? ctx->pso_gemm_q8_0_mma64 : nil; break;
         default: return 0;
     }
     if (pso == nil) return 0;

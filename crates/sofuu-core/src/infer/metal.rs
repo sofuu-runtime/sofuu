@@ -2100,7 +2100,7 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
-        if !matches!(ty, 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 {
+        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 {
             return false;
         }
         let __t = self.op_tick(K_GGUF_GEMM);
@@ -2129,7 +2129,7 @@ impl MetalEngine {
         secs: &[[u32; 5]; 4],
     ) -> bool {
         let secs: &[[u32; 5]] = &secs[..];
-        if !matches!(ty, 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 || secs.is_empty() {
+        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 || secs.is_empty() {
             return false;
         }
         let n_sec = secs.len();

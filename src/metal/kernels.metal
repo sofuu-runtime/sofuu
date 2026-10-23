@@ -5140,3 +5140,108 @@ kernel void gemv_q4_k_v4(
     acc = simd_sum(acc);
     if (lane == 0) { y[row] = acc; }
 }
+
+// ── matrix pipe for q8_0 ────────────────────────────────────────────────────
+// q8_0 is 34 bytes per 32 values (f16 d + 32 int8), so a 32-value k-slice IS one
+// block: no sub-slicing, one scale for the whole slice, which makes this the
+// cheapest of the three dequants. Same geometry as gemm_q4_k_mma64.
+kernel void gemm_q8_0_mma64(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    device const float  *res            [[buffer(7)]],
+    constant uint       &do_acc         [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]],
+    uint sgid                           [[simdgroup_index_in_threadgroup]],
+    uint lane                            [[thread_index_in_simdgroup]]
+) {
+    threadgroup half ws[MM_R][MM_PADK];
+    threadgroup half xs[MM_T][MM_PADK];
+    threadgroup float oc[4][64];
+
+    uint r0 = tg.x * MM_R;
+    uint t0 = tg.y * MM_T;
+    uint nb = cols / 32;            // q8_0 blocks per row
+    uint nbk = cols / MM_BK;
+
+    simdgroup_matrix<float, 8, 8> acc[2][8];
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); }
+    }
+
+    uint srow = tid >> 1;
+    uint sk = (tid & 1) * 16;
+
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * MM_BK;
+        uint b = k0 / 32;           // one block per slice
+        {
+            uint grow = r0 + srow;
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 34;
+                device const uchar *blk = w_base + row_byte + b * 34;
+                float d = float(read_f16(w_base, row_byte + b * 34));
+                device const char *qv = (device const char *)(blk + 2) + sk;
+                for (uint u = 0; u < 16; ++u) {
+                    ws[srow][sk + u] = (half)(d * (float)qv[u]);
+                }
+            } else {
+                for (uint u = 0; u < 16; ++u) { ws[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        {
+            uint gt = t0 + srow;
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + sk;
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint rl = sgid * 16;
+        for (uint kk = 0; kk < MM_BK; kk += 8) {
+            simdgroup_matrix<half, 8, 8> afr[2];
+            simdgroup_matrix<half, 8, 8> bfr[8];
+            simdgroup_load(afr[0], &ws[rl + 0][kk], MM_PADK, ulong2(0, 0), false);
+            simdgroup_load(afr[1], &ws[rl + 8][kk], MM_PADK, ulong2(0, 0), false);
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < 8; ++j) {
+                simdgroup_load(bfr[j], &xs[j * 8][kk], MM_PADK, ulong2(0, 0), true);
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], afr[i], bfr[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) {
+            simdgroup_store(acc[i][j], &oc[sgid][0], 8, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            uint grow = r0 + sgid * 16 + i * 8 + (lane >> 3);
+            uint gt = t0 + j * 8 + (lane & 7);
+            if (grow < rows && gt < B) {
+                float pv = (do_acc != 0) ? res[(size_t)gt * rows + grow] : 0.0f;
+                y[(size_t)gt * rows + grow] = pv + oc[sgid][lane];
+            }
+            uint grow2 = grow + 4;
+            if (grow2 < rows && gt < B) {
+                float pv2 = (do_acc != 0) ? res[(size_t)gt * rows + grow2] : 0.0f;
+                y[(size_t)gt * rows + grow2] = pv2 + oc[sgid][lane + 32];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}

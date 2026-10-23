@@ -3834,3 +3834,49 @@ what code reading suggested:
   pending-slot reclamation (the JS-only race would leak a slot per timeout).
 - **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: M1d, then S4
   (one policy evaluator) and M2 (HTTP transport).
+
+## 2026-10-23 — workstream 6 phase 3: one policy evaluator (S4, SPEC R7)
+
+- **New `rt/policy.rs` — one evaluator for tools, shell, files, network and
+  MCP.** Pure `evaluate(request, policy) -> {decision, rule, reason}` with
+  deny-wins, fail-closed on an unparseable request, and stable rule ids
+  (`R7.6/tools.deny`, `R7.6/tools.allow`, `R7.6/shell.enabled`,
+  `R7.6/shell.allow`, `R7.6/fs.write`, `R7.6/fs.roots`, `R7.1/net.deny`,
+  `R7.1/net.allow`, `R7.7/mcp.allow`, `R7.4/approval.mode`). Net matching is
+  the same suffix-anchored wildcard the agent netPolicy uses
+  (`*.example.com` never matches `api.example.com.attacker.io`); bare
+  domains match themselves and subdomains; `path_under` is segment-correct
+  (`/work/proj2` is not under `/work/proj`).
+- **JS surface `sofuu.policy`** — `set` (validate + install; invalid leaves
+  the previous policy), `get`, `evaluate`, `load`, `clear`. The policy lives
+  on the runtime's global (`__sofuu_policy_json`), so two engines on one
+  thread cannot see each other's policy. `load()` merges
+  `~/.sofuu/policy.json` then `<cwd>/.sofuu/policy.json` (project wins
+  scalars; every `deny` array is unioned); malformed files are reported and
+  never overwrite a good policy. The drivers call `load()` at boot when the
+  surface exists; missing files are a no-op.
+- **Wiring (all surfaces that exist today).** The agent gate runs the policy
+  BEFORE approval: a deny never reaches the host as a prompt, and the trace
+  gets `{kind:"policy", decision, rule, op, tool, reason}`. The built-in
+  tools consult the same evaluator directly (bash maps to `tool.run` on
+  `bash`, which carries both the tool and shell checks; `readInRoot` checks
+  `fs.read`; `mustBeInRoot` checks `fs.write`), so a plain script or a host
+  calling a tool cannot bypass a project/user deny. The agent's netPolicy
+  wrappers consult `net.fetch` after the caller-level rules. The
+  `sofuu.mcp.connect` wrapper consults `mcp.connect` with the configured
+  server id (agent/chat pass it; a plain caller falls back to the command),
+  so the MCP allowlist applies to every consumer.
+- **Receipts:** `rt::policy` **10/10** (deny wins, allowlists, shell glob,
+  fs off/roots, net suffix anchoring + deny precedence, MCP allowlist,
+  layer merge); new `tests/policy_test.js` **12/12** (direct tools + MCP
+  connect); agent battery **285 PASS / 0 FAIL** including the policy-deny
+  trace check; conformance still 0 failures / 0 gaps. Release binary
+  4,933,920 B stripped ≤ 5,242,880 B cap (~309 KB headroom); all three
+  regenerated `.bc` snapshots are byte-identical under the release
+  compiler.
+- **Deliberately not in this slice:** native `sofuu.fs.setRoot` (S1b), the
+  C-ABI/HTTP policy surfaces (S5), per-server MCP tool filters and
+  `env`/`cwd` (rest of S6), and `approval.mode` enforcement (the evaluator
+  reports `ask`; the def-level `approve` remains authoritative until S5).
+- **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: S5 policy on
+  C-ABI/HTTP or M1d/M2 (MCP timeout + HTTP transport).

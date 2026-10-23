@@ -71,6 +71,32 @@
     SHELL_DISABLED = !!(typeof process !== 'undefined' && process.env && process.env.SOFUU_NO_SHELL);
   } catch (eSh) {}
 
+  /* S4 (2026-10-23): the shared policy floor (SPEC R7). Every executor in
+   * this driver consults the same evaluator the agent loop uses, so a host
+   * calling a tool directly cannot bypass a project/user deny. */
+  function policyDecision(op, fields) {
+    try {
+      if (typeof sofuu === 'undefined' || !sofuu.policy ||
+          typeof sofuu.policy.evaluate !== 'function') return null;
+      var req = { surface: 'js', op: op };
+      if (fields) {
+        for (var k in fields) {
+          if (Object.prototype.hasOwnProperty.call(fields, k) && fields[k] !== undefined) {
+            req[k] = fields[k];
+          }
+        }
+      }
+      var raw = sofuu.policy.evaluate(req);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+  function policyCheck(op, fields) {
+    var d = policyDecision(op, fields);
+    if (d && d.decision === 'deny') {
+      throw new Error(op + ': denied by policy (' + d.rule + '): ' + (d.reason || ''));
+    }
+  }
+
   function cwd() { try { return process.cwd() || '.'; } catch (e) { return '.'; } }
 
   /* Lexical normalization: collapses '.', '..' and duplicate separators.
@@ -126,14 +152,17 @@
       try { targetReal = await sofuu.fs.realpath(abs); } catch (e) {
         /* Target does not exist (or is unreadable): the lexical check above
          * already ran and the native read will report the real error. */
+        policyCheck('fs.read', { path: abs });
         return abs;
       }
       if (targetReal !== rootRealPath && targetReal.indexOf(rootRealPath + '/') !== 0) {
         throw new Error(who + ': path resolves (via symlink) outside the project directory: ' + p +
           ' → ' + targetReal);
       }
+      policyCheck('fs.read', { path: targetReal });
       return targetReal;
     }
+    policyCheck('fs.read', { path: abs });
     return abs;
   }
 
@@ -185,12 +214,14 @@
            * this check now fails with ELOOP instead of being followed, and
            * a symlink that legitimately stays inside the project keeps
            * working because we open its already-vetted real target. */
+          policyCheck('fs.write', { path: canonical });
           return canonical;
         }
         /* targetReal === null: no existing ancestor within reach — the
          * lexical check above already ran, nothing more to verify. */
       }
     }
+    policyCheck('fs.write', { path: abs });
     return abs;
   }
 
@@ -851,6 +882,9 @@
       if (process.env.SOFUU_NO_SHELL) throw new Error('bash: disabled (SOFUU_NO_SHELL is set)');
       var cmd = String((a && a.command) || '');
       if (!cmd.trim()) throw new Error('bash: command required');
+      /* S4: tool.run on bash also carries the shell checks (tools.deny,
+       * shell.enabled and shell.allow all decide this one call). */
+      policyCheck('tool.run', { tool: 'bash', command: cmd });
       /* P3 deny-list: a small set of unambiguously catastrophic patterns is
        * refused EVEN when the user approves — a mistyped approval on `rm -rf /`
        * should not need a post-mortem. Matched against the raw command; the
@@ -1061,7 +1095,18 @@
       }
       return step();
     }
-    sofuu.mcp.connect = function (command) {
+    sofuu.mcp.connect = function (arg, opts) {
+      var command = (typeof arg === 'string') ? arg
+        : (arg && arg.command ? String(arg.command) : '');
+      var server = (opts && opts.server) ? String(opts.server)
+        : ((arg && typeof arg === 'object' && arg.server) ? String(arg.server) : command);
+      /* S6/S4: the MCP allowlist is a policy decision on the server id (or
+       * the raw command for a plain-script caller). */
+      var pd = policyDecision('mcp.connect', { server: server, command: command });
+      if (pd && pd.decision === 'deny') {
+        return Promise.reject(new Error('mcp.connect: denied by policy (' + pd.rule + '): ' +
+          (pd.reason || '')));
+      }
       return Promise.resolve(realConnect(command)).then(function (client) {
         if (!client || client.__paged) return client;
         try {
@@ -1130,6 +1175,13 @@
       meta: { contentBlocks: blocks.length, images: images, truncated: truncated },
     };
   };
+
+  /* S4: install the user/project policy when present. Missing files are a
+   * no-op; a malformed one leaves the policy in place and is reported by an
+   * explicit load() caller (we must not take a driver down over it). */
+  try {
+    if (sofuu.policy && typeof sofuu.policy.load === 'function') sofuu.policy.load();
+  } catch (ePol) {}
 
   /* The "code" group — everything above. Opt out of the shell by listing
    * individual names instead, or by exporting SOFUU_NO_SHELL. S3: when the

@@ -279,6 +279,12 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::sandbox::mod_sandbox_register(ctx);
     }
 
+    // S4 (R7): one policy evaluator (sofuu.policy.*) — registered before the
+    // shipped drivers load so tools.js/agent.js can consult it.
+    unsafe {
+        crate::rt::policy::mod_policy_register(ctx);
+    }
+
     // Phase 5 (agent loop): parse-only syntax gate (sofuu.parse) for the
     // edit tool's dry run - compiles the candidate, never executes it.
     unsafe {

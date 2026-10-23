@@ -38,6 +38,7 @@ pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agen
 pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod async_context; // Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
+pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP
 pub mod syntax; // Phase 5 (agent plan): sofuu.parse - parse-only gate for file edits
 pub mod bytecode; // Phase 6 (agent plan): sofuu.aotEval - AOT bytecode snapshots for agent scripts
 pub mod engine; // M10: engine.c + sofuu.c + repl.c (boot, loader, Sofuu aliases, eval, destroy)

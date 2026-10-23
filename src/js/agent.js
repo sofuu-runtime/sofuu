@@ -110,6 +110,25 @@
     if (p === 'plan') return 'plan mode';           /* no writes, no shell */
     return null;
   }
+  /* S4 (2026-10-23): the shared policy floor (SPEC R7). Returns the decoded
+   * decision or null when no policy surface is present. The def-level
+   * approve/netPolicy/shell settings stay the caller override above it. */
+  function policyDecision(op, fields) {
+    try {
+      if (typeof sofuu === 'undefined' || !sofuu.policy ||
+          typeof sofuu.policy.evaluate !== 'function') return null;
+      var req = { surface: 'js', op: op };
+      if (fields) {
+        for (var k in fields) {
+          if (Object.prototype.hasOwnProperty.call(fields, k) && fields[k] !== undefined) {
+            req[k] = fields[k];
+          }
+        }
+      }
+      var raw = sofuu.policy.evaluate(req);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
   /* Rough per-image token cost for budget math — a conservative flat tax
    * (real cost is model-specific tiling; no hardcoding per model). */
   var IMAGE_TOKEN_TAX = 1200;
@@ -1394,11 +1413,13 @@
   /* ── MCP pool (lazy, one connection per command; idle-disconnect so
    *    child processes never pin the event loop at exit) ─────────── */
 
-  function mcpConnect(command) {
+  function mcpConnect(command, serverName) {
     if (MCP_POOL[command]) return MCP_POOL[command];
     if (!sofuu.mcp || !sofuu.mcp.connect) return Promise.reject(new Error('sofuu.mcp unavailable'));
     MCP_POOL[command] = (async function () {
-      var client = await sofuu.mcp.connect(command);
+      /* S6/S4: the server name rides the connect options so the policy
+       * allowlist can match a configured id instead of a raw command. */
+      var client = await sofuu.mcp.connect(command, { server: serverName || command });
       var res = await client.listTools();
       return { client: client, tools: (res && res.tools) || [] };
     })();
@@ -1472,7 +1493,7 @@
     for (var m = 0; m < d.mcpSets.length; m++) {
       var set = d.mcpSets[m];
       var conn;
-      try { conn = await mcpConnect(set.command); }
+      try { conn = await mcpConnect(set.command, set.name); }
       catch (e) { warn({ mcp: set.name, note: 'unreachable: ' + clip(String(e.message || e), 120) }); continue; }
       for (var k = 0; k < conn.tools.length; k++) {
         var mt = conn.tools[k];
@@ -1576,6 +1597,14 @@
         for (var di = 0; di < d.netPolicy.deny.length; di++) {
           if (checkOne(d.netPolicy.deny[di], true) === true) return false;
         }
+      }
+      /* S4: the shared policy floor (a deny in net.deny or an allow-list
+       * miss). The def-level netPolicy above is the caller override. */
+      var pdNet = policyDecision('net.fetch', { host: host });
+      if (pdNet && pdNet.decision === 'deny') {
+        emit('policy', { decision: 'deny', rule: pdNet.rule, op: 'net.fetch',
+                         host: host, reason: pdNet.reason || '', surface: 'js' });
+        return false;
       }
       return true;
     }
@@ -3590,6 +3619,22 @@
                                 ok: false, source: toolSource,
                                 duration_ms: Date.now() - toolStartedAt });
           return gateMsg;
+        }
+        /* S4: the policy floor runs BEFORE approval — a deny never reaches
+         * the host as a prompt, and the trace carries the rule id (R7.3). */
+        var polDec = policyDecision(name === 'bash' ? 'shell.run' : 'tool.run',
+          { tool: name,
+            command: name === 'bash' ? String((args && args.command) || '') : undefined });
+        if (polDec && polDec.decision === 'deny') {
+          var polMsg = 'denied by policy (' + polDec.rule + '): ' +
+            (polDec.reason || name);
+          emit('policy', { decision: 'deny', rule: polDec.rule,
+                           op: name === 'bash' ? 'shell.run' : 'tool.run',
+                           tool: name, reason: polDec.reason || '', surface: 'js' });
+          emit('tool_result', { name: name, blocked: 'policy', result: clip(polMsg, 200),
+                                ok: false, source: toolSource,
+                                duration_ms: Date.now() - toolStartedAt });
+          return polMsg;
         }
         /* ── P2.1 interactive approval (2026-10-15) ──────────────────────
          * Port of chat.js's requestApproval gate into the shared loop:

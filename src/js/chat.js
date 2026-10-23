@@ -621,7 +621,7 @@
     }
     S.mcpConnecting = (async function () {
       var results = await Promise.allSettled(list.map(async function (srv) {
-        var client = await sofuu.mcp.connect(srv.command);
+        var client = await sofuu.mcp.connect(srv.command, { server: srv.name });
         var res = await client.listTools();
         var arr = (res && res.tools) || [];
         return { name: srv.name, client: client, tools: arr };

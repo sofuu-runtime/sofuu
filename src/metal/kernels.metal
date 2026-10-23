@@ -4827,3 +4827,64 @@ kernel void gemm_q4_k_mma64(
         }
     }
 }
+
+// ── decode GEMV v2: 8 rows per threadgroup, one warp per row ───────────────
+// LEDGER #6/arm-D measured the shipped q4_K decode GEMV at 17-21 GB/s on the
+// 1.8 MB shapes while Q8_0 reaches 91 on the same path, so the gap is the
+// kernel's instruction mix, not DRAM. gemv_q4_k_c gives every row its own
+// 32-thread threadgroup and reads one qs BYTE per lane per iteration; this one
+// gives a warp one row, reads 8 bytes of qs (uint2) and 8 floats of x
+// (two float4) per block, and hoists the (scale, min) pair for the lane's own
+// 32-value sub-block out of the value loop. Lane L owns sub-block L/4 and
+// values 8*(L%4) .. +7 of it, so 32 lanes cover exactly the block's 256 values.
+#define GV2_ROWS 8
+#define GV2_THREADS 256
+
+kernel void gemv_q4_k_v2(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint tgid                           [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]],
+    uint wid                            [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * GV2_ROWS + wid;
+    if (row >= rows) { return; }
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    uint sub = lane >> 2;                 // 0..7
+    uint vbase = (lane & 3) * 8;           // 0/8/16/24 inside the sub-block
+    uint qoff = 16 + 32 * (sub >> 1) + vbase;
+    bool high = (sub & 1) != 0;
+    uint xbase = 32 * sub + vbase;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        uint8_t sc, m;
+        q4k_scale_min(blk + 4, sub, &sc, &m);
+        float ds = d * (float)sc;
+        float mm = dmin * (float)m;
+        uint q0 = *(device const uint *)(blk + qoff);
+        uint q1 = *(device const uint *)(blk + qoff + 4);
+        uint xo = b * 256 + xbase;
+        device const float4 *xf = (device const float4 *)(x + xo);
+        float4 xa = xf[0];
+        float4 xb = xf[1];
+        uint sh = high ? 4u : 0u;
+        acc += (ds * (float)((q0 >> (0u + sh)) & 0xFu) - mm) * xa.x;
+        acc += (ds * (float)((q0 >> (8u + sh)) & 0xFu) - mm) * xa.y;
+        acc += (ds * (float)((q0 >> (16u + sh)) & 0xFu) - mm) * xa.z;
+        acc += (ds * (float)((q0 >> (24u + sh)) & 0xFu) - mm) * xa.w;
+        acc += (ds * (float)((q1 >> (0u + sh)) & 0xFu) - mm) * xb.x;
+        acc += (ds * (float)((q1 >> (8u + sh)) & 0xFu) - mm) * xb.y;
+        acc += (ds * (float)((q1 >> (16u + sh)) & 0xFu) - mm) * xb.z;
+        acc += (ds * (float)((q1 >> (24u + sh)) & 0xFu) - mm) * xb.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) { y[row] = acc; }
+}

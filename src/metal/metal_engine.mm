@@ -1,3 +1,4 @@
+#define GV2_ROWS_HOST 8
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "metal_engine.h"
@@ -26,6 +27,8 @@ struct MetalContext {
     // G2: GGUF dequant-dot GEMV kernels.
     id<MTLComputePipelineState> pso_gemv_q8_0;
     id<MTLComputePipelineState> pso_gemv_q4_0;
+    id<MTLComputePipelineState> pso_gemv_q4_k_v2;
+    bool pso_gemv_q4_k_v2_live;
     id<MTLComputePipelineState> pso_gemv_q4_k;
     id<MTLComputePipelineState> pso_gemv_q6_k;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4;
@@ -280,6 +283,8 @@ void* sofuu_metal_init(void) {
             // 107/50 GB/s compact/5G vs vec4 46/37 — but the vec4 WINS the
             // single-row shape as the 12.4 t/s serial receipt showed):
             // batched pass GEMVs = byte-lane b4c, single-row = vec4 c2.
+            ctx->pso_gemv_q4_k_v2 = load_pso(@"gemv_q4_k_v2");
+            ctx->pso_gemv_q4_k_v2_live = ctx->pso_gemv_q4_k_v2 != nil;
             ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k_c2");
             ctx->pso_gemv_q4_k_b4 = load_pso(@"gemv_q4_k_b4c");
         } else if (coalesced_level == 1) {
@@ -1894,6 +1899,36 @@ int sofuu_metal_batch_gguf_gemm_mma(
 // Section-fused MMA: the kernel is single-tensor, so sections are dispatched
 // back to back inside the caller's commit. Sections are independent (they write
 // disjoint y regions), and the fused benefit is x reuse in L2 plus one commit.
+// decode GEMV v2: 8 rows per 256-thread threadgroup, one warp per row.
+extern "C" int sofuu_metal_batch_gguf_gemv_q4k_v2(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0) return 0;
+    if (!ctx->pso_gemv_q4_k_v2_live) return 0;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_v2];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
+    uint groups = (uint)((rows + GV2_ROWS_HOST - 1) / GV2_ROWS_HOST);
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
 int sofuu_metal_batch_gguf_gemm_mma64_multi(
     void* ctx_ptr,
     uint32_t ty,

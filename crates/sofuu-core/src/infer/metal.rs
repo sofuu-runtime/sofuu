@@ -839,6 +839,13 @@ extern "C" {
     fn sofuu_metal_peak_fma16(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
     fn sofuu_metal_peak_fma(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
     fn sofuu_metal_peak_mma(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_v2(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_mma64_multi(
         ctx: *mut c_void,
         ty: u32,
@@ -1116,7 +1123,18 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize,
-    ) -> bool {        let __t = self.op_tick(K_GGUF);
+    ) -> bool {
+        if ty == 12 && Self::gemv_v2_enabled() && cols % 256 == 0
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_v2(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
+        }
+        let __t = self.op_tick(K_GGUF);
         let __r = unsafe { sofuu_metal_batch_gguf(
                 self.ctx,
                 ty,
@@ -2225,6 +2243,27 @@ impl MetalEngine {
         };
         self.op_tock(K_GGUF_GEMM, __t);
         __r
+    }
+
+    /// Decode GEMV v2 (8 rows per threadgroup, vectorized qs/x loads).
+    /// SOFUU_GEMV_V2=0 opts out; default off until its e2e receipt lands.
+    fn gemv_v2_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var("SOFUU_GEMV_V2")
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        v == "1" || v == "true" || v == "on"
+                    })
+                    .unwrap_or(false);
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
     }
 
     /// Cached env gate for the MMA GEMM class (default off).

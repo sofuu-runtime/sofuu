@@ -1467,3 +1467,41 @@ Two bugs worth recording, both caught by measurement rather than review:
 
 MMA stays opt-in (`SOFUU_GPU_GEMM_MMA=1`) until the non-GEMM overhead is gone
 and the combined effect can be measured in one receipt.
+
+## LEDGER #8 — ARM A MISATTRIBUTED: MMQ IS A 41% DECODE REGRESSION
+
+Arm A flipped two defaults together (SOFUU_Q4K_COALESCED=2 and SOFUU_DECODE_MMQ=on)
+and credited the whole 38.3 -> 52.0 tg/s gain to "both". Separating them on the
+0.6B (32 tokens, max of 3, one session):
+
+| config | tg/s |
+|---|---|
+| shipped defaults (coalesced 2 + MMQ on) | 50.6 |
+| **MMQ off** (coalesced 2 only) | **71.6** |
+| MMQ off + SOFUU_Q4K_COALESCED=0 | 38.1 |
+
+So the coalesced-2 GEMV carries the entire gain and **MMQ costs 21 tg/s on top
+of it** — it bypasses the coalesced kernel and its act-quantized path is slower
+than the kernel it replaces. MMQ is now opt-in (SOFUU_DECODE_MMQ=1); turning it
+off also *raises* precision, since it was quantizing activations to int8.
+
+Fleet after the flip (32-token decode, max of 3):
+
+| model | tg/s | bar | ratio |
+|---|---|---|---|
+| 0.6B Q4_K_M | 50.6 -> **71.6** | 217.5 | 0.33x |
+| 1B Q8_0 | 68.8 -> 67.4 | 121.9 | 0.55x |
+| Spark-4B | 24.8 -> **30.6** | 51.9 | 0.59x |
+| 8B Q4_K_M | 7.6 -> **11.3** | 31.2 | 0.36x |
+
+Also tried: a rewritten single-token GEMV (gemv_q4_k_v2: 8 rows per 256-thread
+threadgroup, one warp per row, 8-byte qs and two float4 x loads, hoisted
+per-sublock scales). It is **1.06-1.09x** over gemv_q4_k_c2 and therefore not a
+default — the coalesced-2 kernel already vectorizes, so the remaining decode gap
+is not the row loop's instruction mix. Kept behind SOFUU_GEMV_V2=1 as a measured
+dead end.
+
+Decode effective bandwidth is now 28 GB/s on the 0.6B against llama.cpp's 86.
+What the v2 experiment does rule in: giving 8 rows to one 256-thread threadgroup
+with the same inner loop changes nothing, so the cost is not per-row launch — it
+is per-DISPATCH fixed cost plus the number of dispatches per token.

@@ -2465,9 +2465,15 @@ impl TransformerModel {
     /// gate-clean fleet-wide and are the decode-parity counterpart of the
     /// prefill tile MMQ. Opt out with SOFUU_DECODE_MMQ=0.
     fn decode_mmq_enabled() -> bool {
-        !matches!(
+        // Opt-in since the coalesced-2 GEMV landed: MMQ bypasses that kernel,
+        // and with both armed the 0.6B decodes at 50.6 tg/s against 71.6 with
+        // MMQ off (max of 3, same session). Arm A's receipt attributed the
+        // whole 38.3 -> 52.0 gain to MMQ while SOFUU_Q4K_COALESCED=2 shipped in
+        // the same commit; the honest split is that coalesced-2 carries it and
+        // MMQ costs 21 tg/s on top of it.
+        matches!(
             std::env::var("SOFUU_DECODE_MMQ").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
+            Ok("1") | Ok("on") | Ok("true")
         )
     }
 

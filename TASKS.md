@@ -3880,3 +3880,47 @@ what code reading suggested:
   reports `ask`; the def-level `approve` remains authoritative until S5).
 - **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: S5 policy on
   C-ABI/HTTP or M1d/M2 (MCP timeout + HTTP transport).
+
+## 2026-10-23 — workstream 6 phase 4: M1d call deadlines + S6 config v2
+
+- **M1d — per-call MCP deadlines.** `client.call(method, params, {timeoutMs})`
+  (or a bare number) arms a deadline for that request only. One unref'd
+  `uv_timer` per client (50 ms tick) scans the pending table; an expired call
+  sends `notifications/cancelled {requestId, reason}`, rejects its promise
+  with `MCP call timed out after N ms`, and swap-removes the pending slot, so
+  a hung server can never exhaust the 64-slot table. The timer disarms when no
+  timed call remains, and is closed on the spawn-failure and server-exit paths
+  (closing fence 4 → 5 handles). Timeouts are clamped to 600 s; a non-number
+  `timeoutMs` is ignored rather than throwing inside the argument parse.
+- **S6a — spawn options.** `mcp.connect` accepts a v2 object
+  `{command, args[], env{}, cwd}` (legacy command string still works). The
+  native connect appends `args` to the tokenized command, passes `cwd` to
+  `uv_spawn`, and builds the child env from the existing functional allowlist
+  PLUS `env{}` (`null` removes a name). A non-string env value now throws
+  before any handle is allocated instead of silently spawning with an empty
+  environment.
+- **S6b — one loader.** `sofuu.mcp.loadConfig()` owns
+  `~/.sofuu/mcp.json` (and `SOFUU_MCP_CONFIG` for tests/projects): v2 entries
+  `{name, command, args[], env{}, cwd, enabled, tools{allow,deny}}`, legacy
+  `{name, command}` still parses, `enabled:false` and command-less entries are
+  skipped. A missing file means "no servers"; a corrupt file returns
+  `{ok:false, error}` and is left in place. Chat's private parser is gone —
+  chat now warns once with the path and keeps working.
+- **S6c — per-server visibility.** Both the agent tool resolver and chat's
+  connector apply `tools{allow,deny}` to a server's inventory before naming:
+  deny wins, a non-empty allow is a whitelist, and a filtered tool cannot
+  claim a name slot or reach the model. The agent MCP pool is keyed by
+  `(server name, command)` so two config entries cannot cross wires.
+- **Receipts:** conformance **0 failures / 0 known gaps** (new checks: timeout
+  rejection near the deadline, `notifications/cancelled` observed by the mock,
+  five sequential deadlines leave the client usable, args/env/cwd observed in
+  the child, loader v2 fields / skipping / corrupt / `SOFUU_MCP_CONFIG`);
+  release battery **286 PASS / 0 FAIL** including the S6c deny-wins filter;
+  `rt::mcp` **15/15**, `rt::policy` 10/10, sandbox 37/37; new
+  `tests/chat_mcp_e2e.sh` **3/3** (v2 config → chat MCP call → answer, denied
+  tool never advertised). Release binary 4,923,096 B stripped ≤ 5,242,880 B
+  cap; regenerated `.bc` snapshots byte-identical under the release compiler.
+- **Deliberately not in this slice:** Streamable HTTP transport (M2),
+  server-side resources/prompts (M3), MCP through the C funnel (M4), policy
+  on the C-ABI/HTTP surfaces (S5).
+- **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: S5, M2, or M3.

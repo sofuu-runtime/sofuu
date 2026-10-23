@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicI32, Ordering};
 
 use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
-use sofuu_ffi::uv::{self, UvHandle, UvPipe, UvProcess, UvStream, UvWriteReq};
+use sofuu_ffi::uv::{self, UvHandle, UvPipe, UvProcess, UvStream, UvTimer, UvWriteReq};
 
 use crate::mcp::jsonrpc::Inbound;
 use crate::rt::event_loop::sofuu_loop_get;
@@ -50,6 +50,10 @@ struct PendingCall {
     id: i32,
     promise: *mut PromiseHandle,
     ctx: *mut JSContext,
+    /* M1d (2026-10-23): per-call deadline. None = wait indefinitely (the
+     * caller's own timeout still applies, but no timer is armed). */
+    deadline: Option<std::time::Instant>,
+    timeout_ms: u64,
 }
 
 // ── MCP Client ──────────────────────────────────────────────────────
@@ -70,6 +74,12 @@ struct McpClient {
 
     pending: [PendingCall; MAX_PENDING],
     pending_count: usize,
+
+    /* M1d: one unref'd repeating timer per client scans pending deadlines.
+     * Started only while a timed call is outstanding, so a connected MCP
+     * server never holds the loop open. Counted in the close fence. */
+    timeout_timer: *mut UvTimer,
+    timer_armed: c_int,
 
     initialized: c_int,   /* whether initialize handshake done */
     initialize_id: i32,   /* req id of the initialize call */
@@ -111,6 +121,7 @@ unsafe fn mcp_client_free(client: *mut McpClient) {
     libc::free((*client).stdin_pipe as *mut c_void);
     libc::free((*client).stdout_pipe as *mut c_void);
     libc::free((*client).stderr_pipe as *mut c_void);
+    libc::free((*client).timeout_timer as *mut c_void);
     drop(Box::from_raw(client));
 }
 
@@ -326,6 +337,7 @@ unsafe fn mcp_handle_response(
         /* Remove from pending */
         (*client).pending[i] = (*client).pending[(*client).pending_count - 1];
         (*client).pending_count -= 1;
+        mcp_maybe_disarm_timeout(client);
 
         sofuu_flush_jobs(ctx);
 
@@ -405,6 +417,74 @@ fn jsonrpc_response_cstr(id: i32, result_json: &str) -> CString {
 fn jsonrpc_error_cstr(id: i32, code: i32, message: &str) -> CString {
     let s = crate::mcp::jsonrpc::error(id as u32, code, message);
     cstr_json(&s)
+}
+
+/* ── M1d: per-call deadlines (2026-10-23) ──────────────────────────
+ * `client.call(method, params, {timeoutMs})` arms one unref'd repeating
+ * timer per client. On expiry the request is cancelled on the wire
+ * (notifications/cancelled), its promise rejects with a typed timeout
+ * error, and the pending slot is reclaimed — so a hung server can never
+ * wedge the 64-slot pending table. The timer stops itself when no timed
+ * call remains. */
+
+unsafe fn mcp_has_timed_pending(client: *mut McpClient) -> bool {
+    (0..(*client).pending_count).any(|i| (*client).pending[i].deadline.is_some())
+}
+
+unsafe fn mcp_maybe_disarm_timeout(client: *mut McpClient) {
+    if (*client).timer_armed == 0 || (*client).timeout_timer.is_null() {
+        return;
+    }
+    if !mcp_has_timed_pending(client) {
+        uv::uv_timer_stop((*client).timeout_timer);
+        (*client).timer_armed = 0;
+    }
+}
+
+unsafe fn mcp_arm_timeout(client: *mut McpClient) {
+    if (*client).timeout_timer.is_null() || (*client).timer_armed != 0 {
+        return;
+    }
+    (*client).timer_armed = 1;
+    uv::uv_timer_start((*client).timeout_timer, Some(mcp_timeout_tick), 50, 50);
+}
+
+unsafe extern "C" fn mcp_timeout_tick(timer: *mut UvTimer) {
+    let client = *(timer as *mut *mut McpClient);
+    if client.is_null() || (*client).done != 0 {
+        return;
+    }
+    let ctx = (*client).ctx;
+    let now = std::time::Instant::now();
+    let mut expired_any = false;
+    let mut i = 0usize;
+    while i < (*client).pending_count {
+        let expired = (*client).pending[i].deadline.map_or(false, |d| now >= d);
+        if !expired {
+            i += 1;
+            continue;
+        }
+        let id = (*client).pending[i].id;
+        let promise = (*client).pending[i].promise;
+        let ms = (*client).pending[i].timeout_ms;
+        let params = format!(
+            "{{\"requestId\":{},\"reason\":\"call timed out after {} ms\"}}",
+            id, ms
+        );
+        let notif = jsonrpc_notify_cstr("notifications/cancelled", Some(&params));
+        mcp_client_send(client, notif.as_bytes());
+        let msg = format!("MCP call timed out after {} ms", ms);
+        let cm = cstr_text(&msg);
+        let err = qjs::sofuu_js_new_string(ctx, cm.as_ptr());
+        sofuu_promise_reject(promise, err);
+        (*client).pending[i] = (*client).pending[(*client).pending_count - 1];
+        (*client).pending_count -= 1;
+        expired_any = true;
+    }
+    if expired_any {
+        sofuu_flush_jobs(ctx);
+    }
+    mcp_maybe_disarm_timeout(client);
 }
 
 /// Called by libuv when data arrives from child stdout.
@@ -522,11 +602,16 @@ unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, _exit_status: i64, _term
      * is UV_IGNORE'd for the child, so it must be closed too (else its
      * storage leaks and the handle stays in the loop). */
     uv::uv_read_stop((*client).stdout_pipe as *mut UvStream);
-    (*client).closing = 4;
+    if !(*client).timeout_timer.is_null() {
+        uv::uv_timer_stop((*client).timeout_timer);
+        (*client).timer_armed = 0;
+    }
+    (*client).closing = 5;
     uv::uv_close((*client).stdin_pipe as *mut UvHandle, Some(mcp_client_close_cb));
     uv::uv_close((*client).stdout_pipe as *mut UvHandle, Some(mcp_client_close_cb));
     uv::uv_close((*client).stderr_pipe as *mut UvHandle, Some(mcp_client_close_cb));
     uv::uv_close(_proc as *mut UvHandle, Some(mcp_client_close_cb));
+    uv::uv_close((*client).timeout_timer as *mut UvHandle, Some(mcp_client_close_cb));
 }
 
 // ── JS: client.call / listTools / listResources / disconnect ────────
@@ -565,6 +650,31 @@ unsafe extern "C" fn js_mcp_call(
                 qjs::sofuu_js_free_cstring(ctx, s);
             }
             qjs::sofuu_js_free_value(ctx, json_str);
+        }
+    }
+
+    /* M1d: optional call timeout — `{timeoutMs:N}` or a bare number as the
+     * third argument. Clamped to 10 minutes. */
+    let mut timeout_ms: u64 = 0;
+    if argc > 2 {
+        let opt = *argv.add(2);
+        if qjs::is_object(opt) {
+            let tv = qjs::sofuu_js_get_property_str(ctx, opt, c"timeoutMs".as_ptr());
+            if qjs::sofuu_js_is_number(tv) != 0 {
+                let mut f: f64 = 0.0;
+                if qjs::JS_ToFloat64(ctx, &mut f, tv) == 0 && f > 0.0 {
+                    timeout_ms = f as u64;
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, tv);
+        } else if qjs::sofuu_js_is_number(opt) != 0 {
+            let mut f: f64 = 0.0;
+            if qjs::JS_ToFloat64(ctx, &mut f, opt) == 0 && f > 0.0 {
+                timeout_ms = f as u64;
+            }
+        }
+        if timeout_ms > 600_000 {
+            timeout_ms = 600_000;
         }
     }
 
@@ -607,6 +717,12 @@ unsafe extern "C" fn js_mcp_call(
     (*client).pending[(*client).pending_count].id = id;
     (*client).pending[(*client).pending_count].promise = promise_out;
     (*client).pending[(*client).pending_count].ctx = ctx;
+    (*client).pending[(*client).pending_count].deadline = if timeout_ms > 0 {
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+    (*client).pending[(*client).pending_count].timeout_ms = timeout_ms;
     (*client).pending_count += 1;
 
     let msg_bytes = msg.as_bytes();
@@ -622,6 +738,8 @@ unsafe extern "C" fn js_mcp_call(
         let err = qjs::sofuu_js_new_string(ctx, c"MCP write failed (server unreachable)".as_ptr());
         sofuu_promise_reject(p, err); /* consumes err */
         sofuu_flush_jobs(ctx);
+    } else if timeout_ms > 0 {
+        mcp_arm_timeout(client);
     }
 
     ret
@@ -796,17 +914,79 @@ unsafe extern "C" fn js_mcp_connect(
         return qjs::JS_ThrowTypeError(ctx, c"mcp.connect: command required".as_ptr());
     }
 
-    let cmd_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
-    if cmd_ptr.is_null() {
-        return qjs::sofuu_js_exception();
+    /* S6 (2026-10-23): connect accepts either the legacy command string or
+     * an options object {command, args[], env{}, cwd}. The JS wrapper also
+     * passes {server} for the policy allowlist; unknown keys are ignored. */
+    let mut opts_val: JSValueConst = qjs::sofuu_js_undefined();
+    let mut cmd = String::new();
+    let mut extra_args: Vec<String> = Vec::new();
+    if qjs::is_object(*argv) {
+        opts_val = *argv;
+        let cv = qjs::sofuu_js_get_property_str(ctx, opts_val, c"command".as_ptr());
+        if qjs::sofuu_js_is_string(cv) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, cv);
+            if !p.is_null() {
+                cmd = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, cv);
+    } else {
+        let cmd_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+        if cmd_ptr.is_null() {
+            return qjs::sofuu_js_exception();
+        }
+        cmd = CStr::from_ptr(cmd_ptr).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, cmd_ptr);
+        if argc > 1 && qjs::is_object(*argv.add(1)) {
+            opts_val = *argv.add(1);
+        }
     }
-    let cmd = CStr::from_ptr(cmd_ptr).to_string_lossy().into_owned();
-    qjs::sofuu_js_free_cstring(ctx, cmd_ptr);
+    if cmd.is_empty() {
+        return qjs::JS_ThrowTypeError(ctx, c"mcp.connect: command required".as_ptr());
+    }
 
-    let args_arr = tokenize_command(&cmd);
+    let mut args_arr = tokenize_command(&cmd);
+    /* S6: explicit args (v2 config) append to the tokenized command. */
+    if !qjs::is_undefined(opts_val) {
+        let av = qjs::sofuu_js_get_property_str(ctx, opts_val, c"args".as_ptr());
+        if qjs::JS_IsArray(ctx, av) != 0 {
+            let lv = qjs::sofuu_js_get_property_str(ctx, av, c"length".as_ptr());
+            let mut n: i32 = 0;
+            if qjs::JS_ToInt32(ctx, &mut n, lv) == 0 {
+                for ai in 0..n.max(0) as u32 {
+                    let item = qjs::JS_GetPropertyUint32(ctx, av, ai);
+                    let ip = qjs::sofuu_js_to_cstring(ctx, item);
+                    if !ip.is_null() {
+                        extra_args.push(CStr::from_ptr(ip).to_string_lossy().into_owned());
+                        qjs::sofuu_js_free_cstring(ctx, ip);
+                    }
+                    qjs::sofuu_js_free_value(ctx, item);
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, lv);
+        }
+        qjs::sofuu_js_free_value(ctx, av);
+    }
+    args_arr.extend(extra_args);
     if args_arr.is_empty() {
         return qjs::JS_ThrowTypeError(ctx, c"mcp.connect: empty command".as_ptr());
     }
+
+    /* MCP servers are third-party code — the child env must be the
+     * functional allowlist, NEVER the full parent environment (provider
+     * keys live in env; one `console.log(process.env)` from a hostile
+     * server would exfiltrate them). Parsed BEFORE any pipe/client
+     * allocation so a bad `env` value throws without leaking handles. */
+    let env_c = match crate::rt::process_spawn::build_child_env(ctx, opts_val) {
+        Ok(v) => v,
+        Err(_) => {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"mcp.connect: env values must be strings (null removes a name)".as_ptr(),
+            )
+        }
+    };
     let args_count = args_arr.len();
 
     /* Allocate client */
@@ -823,8 +1003,12 @@ unsafe extern "C" fn js_mcp_connect(
             id: 0,
             promise: ptr::null_mut(),
             ctx: ptr::null_mut(),
+            deadline: None,
+            timeout_ms: 0,
         }; MAX_PENDING],
         pending_count: 0,
+        timeout_timer: ptr::null_mut(),
+        timer_armed: 0,
         initialized: 0,
         initialize_id: 0,
         protocol_version: [0u8; 32],
@@ -845,14 +1029,19 @@ unsafe extern "C" fn js_mcp_connect(
     let stdout_pipe = libc::malloc(uv::sofuu_uv_pipe_size()) as *mut UvPipe;
     let stderr_pipe = libc::malloc(uv::sofuu_uv_pipe_size()) as *mut UvPipe;
     let process = libc::malloc(uv::sofuu_uv_process_size()) as *mut UvProcess;
+    let timeout_timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
     client.stdin_pipe = stdin_pipe;
     client.stdout_pipe = stdout_pipe;
     client.stderr_pipe = stderr_pipe;
     client.process = process;
+    client.timeout_timer = timeout_timer;
 
     uv::uv_pipe_init(loop_, stdin_pipe, 0);
     uv::uv_pipe_init(loop_, stdout_pipe, 0);
     uv::uv_pipe_init(loop_, stderr_pipe, 0);
+    uv::uv_timer_init(loop_, timeout_timer);
+    /* Unref'd: the timer must never keep the loop alive on its own. */
+    uv::uv_unref(timeout_timer as *mut UvHandle);
 
     let mut stdio: [uv::UvStdioContainer; 3] = [
         uv::UvStdioContainer { flags: 0, data: uv::UvStdioData { stream: ptr::null_mut() } },
@@ -875,21 +1064,33 @@ unsafe extern "C" fn js_mcp_connect(
     let mut argv_ptr: Vec<*mut c_char> = argv_c.iter().map(|c| c.as_ptr() as *mut c_char).collect();
     argv_ptr.push(ptr::null_mut());
 
-    /* P1-10 (AUDIT-2026-09-07): MCP servers are third-party code — the
-     * child env must be the functional allowlist, NEVER the full parent
-     * environment (provider keys live in env; one `console.log(process.env)`
-     * from a hostile server would exfiltrate them). */
-    let env_c = crate::rt::process_spawn::build_child_env(ctx, qjs::sofuu_js_undefined())
-        .unwrap_or_default();
+    /* P1-10 (AUDIT-2026-09-07): env_c was built above, before allocation. */
     let mut env_ptr: Vec<*mut c_char> = env_c.iter().map(|e| e.as_ptr() as *mut c_char).collect();
     env_ptr.push(ptr::null_mut());
+
+    /* S6: per-server cwd (the v2 config's `cwd`); inherits when absent. */
+    let mut cwd_c: Option<CString> = None;
+    if !qjs::is_undefined(opts_val) {
+        let cv = qjs::sofuu_js_get_property_str(ctx, opts_val, c"cwd".as_ptr());
+        if qjs::sofuu_js_is_string(cv) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, cv);
+            if !p.is_null() {
+                let cwd_s = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+                if !cwd_s.is_empty() {
+                    cwd_c = CString::new(cwd_s).ok();
+                }
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, cv);
+    }
 
     let opts = uv::UvProcessOptions {
         exit_cb: Some(mcp_on_exit),
         file: argv_c[0].as_ptr(),
         args: argv_ptr.as_mut_ptr(),
         env: env_ptr.as_mut_ptr(),
-        cwd: ptr::null(),
+        cwd: cwd_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
         flags: 0,
         stdio_count: 3,
         stdio: stdio.as_mut_ptr(),
@@ -920,6 +1121,7 @@ unsafe extern "C" fn js_mcp_connect(
         uv::uv_close(stdout_pipe as *mut UvHandle, Some(free_pipe_cb));
         uv::uv_close(stderr_pipe as *mut UvHandle, Some(free_pipe_cb));
         uv::uv_close(process as *mut UvHandle, Some(free_pipe_cb));
+        uv::uv_close(timeout_timer as *mut UvHandle, Some(free_pipe_cb));
         drop(Box::from_raw(client_ptr));
         return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), uv::uv_strerror(r));
     }
@@ -938,6 +1140,7 @@ unsafe extern "C" fn js_mcp_connect(
     *(stdin_pipe as *mut *mut McpClient) = client_ptr;
     *(stdout_pipe as *mut *mut McpClient) = client_ptr;
     *(stderr_pipe as *mut *mut McpClient) = client_ptr;
+    *(timeout_timer as *mut *mut McpClient) = client_ptr;
     let _rs_rc = uv::uv_read_start(stdout_pipe as *mut UvStream, Some(mcp_on_alloc), Some(mcp_on_read));
 
     /* F-2: all four handles are armed per-ctx — a multi-engine teardown must
@@ -949,6 +1152,7 @@ unsafe extern "C" fn js_mcp_connect(
         crate::rt::event_loop::track_handle(ctx, stdin_pipe as *mut UvHandle, Some(free_pipe_cb));
         crate::rt::event_loop::track_handle(ctx, stdout_pipe as *mut UvHandle, Some(free_pipe_cb));
         crate::rt::event_loop::track_handle(ctx, stderr_pipe as *mut UvHandle, Some(free_pipe_cb));
+        crate::rt::event_loop::track_handle(ctx, timeout_timer as *mut UvHandle, Some(free_pipe_cb));
     }
 
     /* Create the connect promise */
@@ -1947,8 +2151,10 @@ mod tests {
                 self_val: qjs::sofuu_js_undefined(),
                 read_buf: [0u8; MCP_READ_BUF],
                 read_len: 0,
-                pending: [PendingCall { id: 0, promise: ptr::null_mut(), ctx: ptr::null_mut() }; MAX_PENDING],
+                pending: [PendingCall { id: 0, promise: ptr::null_mut(), ctx: ptr::null_mut(), deadline: None, timeout_ms: 0 }; MAX_PENDING],
                 pending_count: 0,
+                timeout_timer: ptr::null_mut(),
+                timer_armed: 0,
                 initialized: 0,
                 initialize_id: 0,
                 protocol_version: [0u8; 32],

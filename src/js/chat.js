@@ -584,36 +584,38 @@
   }
 
   /* ── MCP tool wiring (ported from the DRIVER; lazy, never fatal) ── */
-  /* Corrupt mcp.json must not break chat (empty list) but must not be
-   * SILENT either — the user's MCP servers silently vanished. Warn once
-   * per process; the file is left in place — mirrors ChatConfig::mcp_servers
-   * in chat.rs. A raw non-array JSON body is malformed for this file but
-   * stays quiet (server entries could not have parsed anyway). */
+  /* S6 (2026-10-23): one shared loader (sofuu.mcp.loadConfig) now owns the
+   * v2 schema, SOFUU_MCP_CONFIG and the corrupt-file rule. Corrupt config
+   * must not break chat (empty list) but must not be SILENT either — the
+   * user's MCP servers silently vanished. Warn once per process; the file
+   * is left in place. */
   var MCP_WARNED = false;
-  function mcpServersList() {
-    var raw = null;
-    try {
-      raw = (typeof __session_read_file === 'function')
-        ? __session_read_file(home() + '/.sofuu/mcp.json') : null;
-    } catch (e) { raw = null; }
-    if (!raw) return [];
-    var list = [];
-    try {
-      list = JSON.parse(raw);
-    } catch (eParse) {
+  async function mcpServersList() {
+    if (!sofuu.mcp || typeof sofuu.mcp.loadConfig !== 'function') {
       if (!MCP_WARNED) {
         MCP_WARNED = true;
-        var line = 'Warning: ' + home() + '/.sofuu/mcp.json is corrupt — MCP servers disabled until it is fixed (left in place, not overwritten)';
-        try { console.warn(line); } catch (e2) {}
-        emit({ kind: 'warn', payload: { message: home() + '/.sofuu/mcp.json is corrupt — MCP servers disabled until it is fixed (left in place, not overwritten)' } });
+        emit({ kind: 'warn', payload: { message: 'sofuu.mcp.loadConfig unavailable — MCP tools off' } });
       }
       return [];
     }
-    return Array.isArray(list) ? list : [];
+    var cfg;
+    try { cfg = await sofuu.mcp.loadConfig(); }
+    catch (e) { cfg = { ok: false, path: '', error: String(e && e.message || e), servers: [] }; }
+    if (!cfg || !cfg.ok) {
+      if (!MCP_WARNED) {
+        MCP_WARNED = true;
+        var msg = 'Warning: ' + ((cfg && cfg.path) || 'mcp config') + ' is corrupt (' +
+          ((cfg && cfg.error) || 'unreadable') + ') — MCP servers disabled until it is fixed (left in place, not overwritten)';
+        try { console.warn(msg); } catch (e2) {}
+        emit({ kind: 'warn', payload: { message: msg } });
+      }
+      return [];
+    }
+    return (cfg && cfg.servers) || [];
   }
   async function connectMcpServers() {
     if (S.mcpConnecting) return S.mcpConnecting; /* one connect at a time */
-    var list = mcpServersList();
+    var list = await mcpServersList();
     if (!list.length) return;
     if (!sofuu.mcp || !sofuu.mcp.connect) {
       emit({ kind: 'warn', payload: { message: 'sofuu.mcp unavailable — tools off' } });
@@ -621,9 +623,18 @@
     }
     S.mcpConnecting = (async function () {
       var results = await Promise.allSettled(list.map(async function (srv) {
-        var client = await sofuu.mcp.connect(srv.command, { server: srv.name });
+        var client = await sofuu.mcp.connect(srv, { server: srv.name });
         var res = await client.listTools();
         var arr = (res && res.tools) || [];
+        var t = srv.tools || null;
+        if (t) {
+          arr = arr.filter(function (x) {
+            var n = String((x && x.name) || '');
+            if (t.deny && t.deny.indexOf(n) >= 0) return false;
+            if (t.allow && t.allow.length && t.allow.indexOf(n) < 0) return false;
+            return true;
+          });
+        }
         return { name: srv.name, client: client, tools: arr };
       }));
       var connected = 0, failed = 0;
@@ -1465,8 +1476,9 @@
       throw new Error('agent runtime unavailable (src/js/agent.js failed to load)');
     }
     /* MCP is lazy: connect on demand only when a tool-using turn starts
-     * (pure chat turns never invoke tools, so skip the handshake). */
-    if (!noTools && S.mcpTools.length === 0 && mcpServersList().length > 0) {
+     * (pure chat turns never invoke tools, so skip the handshake). The
+     * connector reads the shared v2 config and no-ops on an empty list. */
+    if (!noTools && S.mcpTools.length === 0) {
       await connectMcpServers();
     }
     /* Sub-agents from ~/.sofuu/agents/*.js (loaded once per session). */

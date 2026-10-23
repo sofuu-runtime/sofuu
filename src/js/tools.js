@@ -1064,6 +1064,69 @@
     },
   };
 
+  /* ── S6 (2026-10-23): one MCP config loader ──────────────────────
+   * v2 entry: {name, command, args?, env?, cwd?, enabled?, tools?{allow,deny}}
+   * Backward compatible with {name, command}. SOFUU_MCP_CONFIG overrides the
+   * path (tests, project-local configs); otherwise ~/.sofuu/mcp.json. A
+   * missing file is "no servers", a corrupt one is {ok:false} and must be
+   * surfaced — never silently rewritten. */
+  sofuu.mcp.loadConfig = async function (opts) {
+    opts = opts || {};
+    var path = opts.path ? String(opts.path) : '';
+    if (!path) {
+      try {
+        path = (typeof process !== 'undefined' && process.env && process.env.SOFUU_MCP_CONFIG) || '';
+      } catch (e0) {}
+    }
+    var home = '';
+    try { home = (typeof process !== 'undefined' && process.env && process.env.HOME) || ''; } catch (eH) {}
+    if (!path && home) path = home + '/.sofuu/mcp.json';
+    if (!path) return { ok: true, path: '', servers: [] };
+
+    var raw = null;
+    try { raw = await sofuu.fs.readFile(path, 'utf8'); }
+    catch (e) {
+      /* ENOENT and friends: no config is a normal state. */
+      return { ok: true, path: path, servers: [] };
+    }
+    var list;
+    try { list = JSON.parse(raw); }
+    catch (eP) {
+      return { ok: false, path: path, error: 'mcp config is corrupt (left in place)', servers: [] };
+    }
+    if (!Array.isArray(list)) {
+      return { ok: false, path: path, error: 'mcp config must be a JSON array', servers: [] };
+    }
+    var servers = [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i] || {};
+      if (s.enabled === false) continue;
+      var command = String(s.command || '');
+      if (!command) continue;
+      var entry = { name: String(s.name || ('mcp' + (i + 1))), command: command };
+      if (Array.isArray(s.args)) entry.args = s.args.map(String);
+      if (s.env && typeof s.env === 'object') {
+        var env = {};
+        for (var k in s.env) {
+          if (Object.prototype.hasOwnProperty.call(s.env, k)) {
+            /* null removes an inherited allowlisted variable. */
+            env[k] = (s.env[k] === null) ? null : String(s.env[k]);
+          }
+        }
+        entry.env = env;
+      }
+      if (typeof s.cwd === 'string' && s.cwd) entry.cwd = s.cwd;
+      if (s.tools && typeof s.tools === 'object') {
+        entry.tools = {
+          allow: Array.isArray(s.tools.allow) ? s.tools.allow.map(String) : null,
+          deny: Array.isArray(s.tools.deny) ? s.tools.deny.map(String) : null,
+        };
+      }
+      servers.push(entry);
+    }
+    return { ok: true, path: path, servers: servers };
+  };
+
   /* ── M1 (2026-10-23): paged MCP lists ─────────────────────────────
    * MCP list methods are cursor-based; the native client exposes one page
    * (`client.call`). Wrapping connect() gives every consumer (agent, chat,
@@ -1096,8 +1159,19 @@
       return step();
     }
     sofuu.mcp.connect = function (arg, opts) {
-      var command = (typeof arg === 'string') ? arg
-        : (arg && arg.command ? String(arg.command) : '');
+      /* S6: normalize both call shapes into the v2 object the native
+       * connect() understands. Config entries also carry {name, tools};
+       * those are caller-side fields and stay out of the child spec. */
+      var cfg = { command: '' };
+      if (typeof arg === 'string') cfg.command = arg;
+      else if (arg && typeof arg === 'object' && arg.command) cfg.command = String(arg.command);
+      var src = (arg && typeof arg === 'object') ? arg : opts;
+      if (src && typeof src === 'object') {
+        if (Array.isArray(src.args)) cfg.args = src.args.map(String);
+        if (src.env && typeof src.env === 'object') cfg.env = src.env;
+        if (typeof src.cwd === 'string' && src.cwd) cfg.cwd = src.cwd;
+      }
+      var command = cfg.command || '';
       var server = (opts && opts.server) ? String(opts.server)
         : ((arg && typeof arg === 'object' && arg.server) ? String(arg.server) : command);
       /* S6/S4: the MCP allowlist is a policy decision on the server id (or
@@ -1107,7 +1181,7 @@
         return Promise.reject(new Error('mcp.connect: denied by policy (' + pd.rule + '): ' +
           (pd.reason || '')));
       }
-      return Promise.resolve(realConnect(command)).then(function (client) {
+      return Promise.resolve(realConnect(cfg)).then(function (client) {
         if (!client || client.__paged) return client;
         try {
           client.listTools = function () { return all(client, 'tools/list', 'tools'); };

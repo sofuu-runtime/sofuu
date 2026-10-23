@@ -685,7 +685,19 @@
         for (var j = 0; j < t.mcp.length; j++) {
           var s = t.mcp[j];
           if (!s || !s.command) throw new Error('agent.define: mcp set entry needs {name, command}');
-          d.mcpSets.push({ name: String(s.name || ('mcp' + (j + 1))), command: String(s.command) });
+          /* S6 (2026-10-23): v2 fields carry through to the child spawn and
+           * the per-server tool filter. */
+          var mset = { name: String(s.name || ('mcp' + (j + 1))), command: String(s.command) };
+          if (Array.isArray(s.args)) mset.args = s.args.map(String);
+          if (s.env && typeof s.env === 'object') mset.env = s.env;
+          if (typeof s.cwd === 'string' && s.cwd) mset.cwd = s.cwd;
+          if (s.tools && typeof s.tools === 'object') {
+            mset.tools = {
+              allow: Array.isArray(s.tools.allow) ? s.tools.allow.map(String) : null,
+              deny: Array.isArray(s.tools.deny) ? s.tools.deny.map(String) : null,
+            };
+          }
+          d.mcpSets.push(mset);
         }
         continue;
       }
@@ -1413,26 +1425,46 @@
   /* ── MCP pool (lazy, one connection per command; idle-disconnect so
    *    child processes never pin the event loop at exit) ─────────── */
 
-  function mcpConnect(command, serverName) {
-    if (MCP_POOL[command]) return MCP_POOL[command];
+  function mcpConnect(set) {
+    var command = (typeof set === 'string') ? set : String((set && set.command) || '');
+    var serverName = (set && typeof set === 'object' && set.name) ? String(set.name) : command;
+    /* S6: one pool slot per (name, command) — env/cwd differ per config
+     * entry, but two entries with the same id+command are the same server. */
+    var key = serverName + '\u0001' + command;
+    if (MCP_POOL[key]) return MCP_POOL[key];
     if (!sofuu.mcp || !sofuu.mcp.connect) return Promise.reject(new Error('sofuu.mcp unavailable'));
-    MCP_POOL[command] = (async function () {
+    MCP_POOL[key] = (async function () {
+      var spec = { command: command, server: serverName };
+      if (set && typeof set === 'object') {
+        if (Array.isArray(set.args)) spec.args = set.args;
+        if (set.env && typeof set.env === 'object') spec.env = set.env;
+        if (typeof set.cwd === 'string' && set.cwd) spec.cwd = set.cwd;
+      }
       /* S6/S4: the server name rides the connect options so the policy
        * allowlist can match a configured id instead of a raw command. */
-      var client = await sofuu.mcp.connect(command, { server: serverName || command });
+      var client = await sofuu.mcp.connect(spec, { server: serverName });
       var res = await client.listTools();
       return { client: client, tools: (res && res.tools) || [] };
     })();
-    MCP_POOL[command].catch(function () { delete MCP_POOL[command]; });
-    return MCP_POOL[command];
+    MCP_POOL[key].catch(function () { delete MCP_POOL[key]; });
+    return MCP_POOL[key];
   }
   function mcpIdleDisconnect() {
     if (ACTIVE_COUNT > 0) return;
     var pool = MCP_POOL; MCP_POOL = {};
-    Object.keys(pool).forEach(function (cmd) {
-      pool[cmd].then(function (c) { try { c.client.disconnect(); } catch (e) {} },
-                      function () {});
+    Object.keys(pool).forEach(function (k) {
+      pool[k].then(function (c) { try { c.client.disconnect(); } catch (e) {} },
+                    function () {});
     });
+  }
+  /* S6c: deny wins; a non-empty allow is a whitelist. */
+  function mcpToolVisible(set, name) {
+    var t = set && set.tools;
+    if (!t) return true;
+    var n = String(name || '');
+    if (t.deny && t.deny.indexOf(n) >= 0) return false;
+    if (t.allow && t.allow.length && t.allow.indexOf(n) < 0) return false;
+    return true;
   }
   function runTick(fn) { try { setTimeout(fn, 0); } catch (e) { fn(); } }
 
@@ -1493,12 +1525,15 @@
     for (var m = 0; m < d.mcpSets.length; m++) {
       var set = d.mcpSets[m];
       var conn;
-      try { conn = await mcpConnect(set.command, set.name); }
+      try { conn = await mcpConnect(set); }
       catch (e) { warn({ mcp: set.name, note: 'unreachable: ' + clip(String(e.message || e), 120) }); continue; }
       for (var k = 0; k < conn.tools.length; k++) {
         var mt = conn.tools[k];
         var mname = String(mt.name || '');
         if (!mname) continue;
+        /* S6: per-server allow/deny decides what the model can SEE. The
+         * filter runs before naming so a hidden tool cannot claim a slot. */
+        if (!mcpToolVisible(set, mname)) continue;
         /* T2 (2026-10-23): a clash no longer SILENTLY shadows the MCP copy
          * (the model could never reach it). The inline/builtin owner keeps
          * the bare name; the MCP tool is exposed as `server__tool`. */

@@ -2948,19 +2948,6 @@ impl TransformerModel {
             ) {
                 return false;
             }
-            // Experiment: dispatch the lm_head a second time. If decode grows by the
-            // head's own streaming cost (~1.3 ms) it is a normal dispatch and its
-            // 5 ms in situ is a batch-tail artifact; if it grows by 5 ms, the
-            // dispatch really costs that.
-            if std::env::var_os("SOFUU_HEAD_TWICE").is_some() {
-                let _ = g.engine.batch_gguf(
-                    self.output.tensor_type,
-                    &g.w_buf, g.w_offset(gguf2, &self.output),
-                    &g.act_buf, g.slots.xn,
-                    &g.act_buf, g.slots.xo,
-                    self.config.vocab_size, dim,
-                );
-            }
             if !g.engine.batch_end() {
                 return false;
             }
@@ -5064,9 +5051,10 @@ impl GgufGpu {
             let per = |ty: u32| -> f64 {
                 match ty { 12 => 144.0 / 256.0, 14 => 210.0 / 256.0, 8 => 34.0 / 32.0, _ => 4.0 }
             };
-            let total_bytes: usize = plan.iter()
-                .map(|(ty, rows, cols, _)| (*rows as f64 * *cols as f64 * per(*ty)) as usize)
-                .sum();
+            // NOTE: computed from the FULL plan on purpose-visible order: truncation
+            // happens below, so this must be recomputed after it or every truncated
+            // run reports the whole plan's bytes (which is exactly what made an
+            // 8-dispatch run look like 81.6 GB/s while reading 16.8 MB).
             // zero the activation slab: uninitialised floats include denormals and
             // NaNs, and a denormal-bound kernel looks exactly like a slow kernel.
             unsafe { std::ptr::write_bytes(act.as_ptr() as *mut u8, 0, act_bytes); }
@@ -5083,6 +5071,10 @@ impl GgufGpu {
                         t0.elapsed().as_secs_f64() * 1e6);
                 }
             }
+            if plan.len() > bench_n { plan.truncate(bench_n); }
+            let total_bytes: usize = plan.iter()
+                .map(|(ty, rows, cols, _)| (*rows as f64 * *cols as f64 * per(*ty)) as usize)
+                .sum();
             let mut best = 0.0f64;
             for rep in 0..4 {
                 if !engine.batch_open() { eprintln!("[gemv-bench] open failed"); break; }

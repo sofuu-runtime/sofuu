@@ -350,6 +350,11 @@
 > `sofuu_flush_jobs_bounded` is the engine peer's in-flight export; my wrappers export nothing
 > new. Evidence: capi 51/51 (4 new tests); headless samples green on the unwind dylib (4.7 MB);
 > abi-check green; size-check 4.8 MB ≤ 5.0 MB CLI (unchanged, abort); JS battery 278 PASS.
+> Plan: `docs/PLAN-C-API-FUNNEL.md` (local-only per the docs policy) — the
+> consolidated funnel picture: implemented B1–B9 with receipts, remaining
+> F1 ABI-freeze prep, F2 method-scope + stale-`.bc` gate, F3 live dist
+> channels, F4 containment red-team; PLAN-HEADLESS.md points here as its
+> successor.
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`

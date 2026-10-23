@@ -1582,3 +1582,44 @@ None of the above is tuned for the scores; it is the accumulated effect of four
 structural fixes (matrix pipe for q4_K and q6_K, accumulate routing, MMQ off,
 all-types batching). The remaining prefill gap is still the ~3700 enqueues per
 pass from LEDGER #9 plus the 1.7x kernel-rate gap.
+
+## LEDGER #11 — DECODE'S GAP IS COMMITS, NOT THE MATVEC
+
+Four GEMV geometries were built and measured against the shipped coalesced
+kernel. All four are dead ends:
+
+| variant | geometry | 0.6B e2e | Spark e2e |
+|---|---|---|---|
+| v1 gemv_q4_k_c2 (shipped) | 1 row / 32 threads | - | - |
+| v2 | 8 rows / 256 threads, uint2 qs + float4 x | 1.08x | 1.09x |
+| v3 | split-K, 4 warps per row | 0.96x | 1.03x |
+| v4 | v2 + x staged in threadgroup memory | 0.90x | 0.66x |
+
+Each is behind its own env gate (SOFUU_GEMV_V2/V3/V4); none is a default. The
+isolated bench was not usable to rank them: the *same* kernel measured 60.4 us
+for a 3072x1024 q4_K GEMV in one process and 159.4 us in the next, a 2.6x
+swing purely from machine load. Only interleaved in-commit timing is trustworthy
+on this box, which is the same lesson LEDGER #7 forced on the GEMM bench.
+
+That bench did produce the important number, though. The same 28 GEMVs measured:
+
+| issue pattern | per GEMV | rate |
+|---|---|---|
+| 28 dispatches inside ONE commit | 60.4 us | **29 GB/s** |
+| 28 commits, one dispatch each | 299.3 us | **6 GB/s** |
+
+**A commit costs ~240 us.** Decode commits three times per layer (commit A:
+qkv + attention, commit B: o-projection, commit C: gate/up/swiglu/down), and
+between them the host reads results back - `slot_f32(...).copy_from_slice(...)`
+into `self.x` after every stage - which forces a wait before the next commit can
+even be encoded. So the GEMVs run in the 6 GB/s regime, not the 29 GB/s one, and
+the 3x gap to llama.cpp's 86 GB/s is the *synchronisation structure*, not the
+kernel: llama.cpp encodes the whole token as one graph and never round-trips.
+
+This also explains why every geometry change was invisible end to end: the
+kernel was never the binding constraint.
+
+Next decode work, in order: (1) keep the residual add and RMSNorm on the GPU so
+a layer needs one commit instead of three; (2) remove the per-stage host
+readbacks from the hot loop (they exist so the CPU sampler and spec path can see
+`self.x`); (3) only then revisit the matvec, against a 29 GB/s floor.

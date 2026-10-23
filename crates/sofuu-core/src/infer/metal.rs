@@ -8352,6 +8352,7 @@ fn bench_decode_gemv_real_shapes() {
         );
         unsafe { libc::munmap(wp as *mut libc::c_void, w_bytes); }
     }
+
     unsafe { libc::munmap(sp as *mut libc::c_void, slab_bytes); }
 }
 

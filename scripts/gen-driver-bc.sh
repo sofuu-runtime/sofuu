@@ -15,7 +15,7 @@ if [ ! -f "$SOFUU" ]; then
     exit 1
 fi
 
-cd "$ROOT"
+cd "$ROOT" || exit 1
 for js in src/js/*.js; do
     name="$(basename "$js" .js)"
     "$SOFUU" compile-bc "$js" "src/js/$name.bc" >/dev/null

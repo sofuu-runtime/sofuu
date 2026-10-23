@@ -30,7 +30,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # compile-bc embeds the input path in the bytecode, so the paths here must
 # match the ones scripts/gen-driver-bc.sh used: relative to the repo root.
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 fail=0
 n=0

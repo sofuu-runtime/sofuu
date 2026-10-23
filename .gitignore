@@ -143,3 +143,8 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 # tests + docs). Nothing in the runtime, Makefile, or CI references it —
 # the shipped embedders are hash-768/sem1/sem2/img1, built elsewhere.
 /emb-m/
+
+# first-party docs and tests are local-only (developer preference)
+/docs/
+/crates/sofuu-core/tests/
+/sofuu-ios/docs/

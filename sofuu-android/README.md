@@ -14,7 +14,7 @@ the slash-command surface, and the same cream/warm-dark design language.
 ┌──────────────────────────────────────────────────────────┐
 │  Kotlin / Jetpack Compose (app/src/main/kotlin/com/sofuu)  │
 │  ui/        Shell (drawer + topbar), Composer + sheets,   │
-│             Settings (6 panes), ChatScreen, Markdown,     │
+│             Settings (7 panes), ChatScreen, Markdown,     │
 │             DiffView, CloudBackground                      │
 │  store/     AppStore (the engine-event reducer — a port   │
 │             of the desktop's store.ts), ConfigStore       │
@@ -117,7 +117,8 @@ Android SDK, so anything platform-specific has to be answered by the host.
 It was declared in `include/sofuu_embed.h` and wired through
 `crates/sofuu-capi`, and exposed by **no** binding at all until now.
 
-Four ship, all permission-light so none of them silently fails:
+Five ship. Four are permission-light; `run_command` is the one that can do
+damage, so it is gated twice (see below):
 
 | Tool | Does |
 |---|---|
@@ -125,6 +126,7 @@ Four ship, all permission-light so none of them silently fails:
 | `open_url` | opens a link in the phone's browser |
 | `share_text` | opens the Android share sheet |
 | `vibrate` | a short buzz, to get the user's attention |
+| `run_command` | runs one local command with a hard deadline; refused entirely when `SOFUU_NO_SHELL` is set |
 
 They register as ordinary agent tools, so `/tools` lists them, the
 permission profile applies (`plan` refuses them), and they land in the
@@ -148,7 +150,7 @@ through the engine's existing eval path:
 - **Brain** — count, recall search with per-hit scores, forget,
   consolidate, decay, the embedding-space manifest with unavailable
   artifacts called out, text similarity, and the multimodal tower
-  (pick an image, embed it, compare against a text query in img1's space).
+  (pick an image, embed it, compare against a text query in the joint sem2-64 space).
   Every call goes through `sofuu.agent.brainFor`, the ONE cached handle —
   a QTSQ flush rewrites the whole file, so a second handle would clobber
   the first on every write.

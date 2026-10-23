@@ -278,4 +278,9 @@ class UiPrefs(context: Context) {
     var chatFontSize: Int
         get() = prefs.getInt("chatFontSize", 15)
         set(v) = prefs.edit().putInt("chatFontSize", v.coerceIn(13, 22)).apply()
+
+    /** The pane Settings reopens on — a local `remember` lost it every time. */
+    var settingsTab: String
+        get() = prefs.getString("settingsTab", "general") ?: "general"
+        set(v) = prefs.edit().putString("settingsTab", v).apply()
 }

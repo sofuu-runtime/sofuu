@@ -192,7 +192,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                                         if (active) c.accent else c.border.copy(alpha = 0.70f),
                                         RoundedCornerShape(999.dp),
                                     )
-                                    .clickable { tab = t }
+                                    .clickable { tab = t; store.setSettingsTab(t) }
                                     .padding(horizontal = 15.dp, vertical = 8.dp),
                             )
                         }
@@ -566,7 +566,11 @@ private fun GeneralPane(store: AppStore) {
     var live by remember { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(Unit) {
         while (true) {
-            live = withContext(Dispatchers.IO) { store.engineChatState() }
+            // A null answer means "no update" (the engine is mid-turn, the 2 s
+            // deadline expired) — keep the last card instead of flickering
+            // back to "Connecting…" whenever a turn is streaming.
+            val next = withContext(Dispatchers.IO) { store.engineChatState() }
+            if (next != null) live = next
             delay(2000)
         }
     }
@@ -1179,6 +1183,10 @@ private fun ProvidersPane(store: AppStore) {
     var newKey by remember { mutableStateOf("") }
     var addError by remember { mutableStateOf<String?>(null) }
     var addNote by remember { mutableStateOf<String?>(null) }
+    // removeProvider returns the refusal reason (e.g. "cannot remove the
+    // active provider"); the pane used to throw it away, so the × looked
+    // broken when it was actually protecting you.
+    var removeNote by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(emptySet<String>()) }
 
     Column {
@@ -1235,6 +1243,12 @@ private fun ProvidersPane(store: AppStore) {
         }
 
         Section("Configured providers")
+        removeNote?.let {
+            Text(
+                it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.errStrong,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
         val providers = state.config?.providers ?: emptyList()
         if (providers.isEmpty()) {
             SettingsCard {
@@ -1248,7 +1262,13 @@ private fun ProvidersPane(store: AppStore) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = c.text)
+                                Text(
+                                    p.name,
+                                    fontSize = 16.sp, fontWeight = FontWeight.Bold, color = c.text,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
                                 if (isActive) {
                                     Spacer(Modifier.width(8.dp))
                                     Box(
@@ -1287,7 +1307,7 @@ private fun ProvidersPane(store: AppStore) {
                                     color = c.errStrong,
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(6.dp))
-                                        .clickable { store.removeProvider(p.name) }
+                                        .clickable { removeNote = store.removeProvider(p.name) }
                                         .padding(horizontal = 8.dp, vertical = 6.dp),
                                 )
                             }
@@ -1380,7 +1400,10 @@ private fun ProvidersPane(store: AppStore) {
 private fun UsagePane(store: AppStore) {
     val c = LocalSofuuColors.current
     var usage by remember { mutableStateOf<JSONObject?>(null) }
-    LaunchedEffect(Unit) {
+    var reload by remember { mutableStateOf(0) }
+    // Keyed on `reload`: the numbers move as turns land, and the pane used to
+    // read once per composition with no way to ask again.
+    LaunchedEffect(reload) {
         // LaunchedEffect runs on Main; the engine future can take 10 s.
         usage = withContext(Dispatchers.IO) {
             runCatching { store.engine.usageReport().get(10, TimeUnit.SECONDS) }.getOrNull()
@@ -1388,6 +1411,9 @@ private fun UsagePane(store: AppStore) {
     }
     Column {
         Section("Workspace spend & tokens", isFirst = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
+            SmallButton(c.bgCardHover, c.text, "Refresh usage") { reload++ }
+        }
         val totals = usage?.optJSONObject("totals")
         SettingsCard {
             val cost = totals?.optDouble("cost") ?: 0.0

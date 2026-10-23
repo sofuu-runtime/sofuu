@@ -254,6 +254,7 @@ val runtimeEnv = RuntimeEnv(app)
                 )
             }
             is EngineEvent.TurnStarted -> {
+                systemRowsThisTurn = 0
                 if (ev.sid != null && ev.sid != state.activeSessionId) {
                     state = state.copy(activeSessionId = ev.sid)
                     saveCurrentSessionMessages()
@@ -317,6 +318,8 @@ val runtimeEnv = RuntimeEnv(app)
     // "null". These track what the recall step itself reported.
     @Volatile private var lastRecallAt = 0L
     @Volatile private var lastRecallCount = 0L
+    /** Notice rows emitted this turn — see the cap in systemRow. */
+    private var systemRowsThisTurn = 0
     @Volatile private var lastRecallScope = ""
     @Volatile private var lastRecallDropped = 0L
 
@@ -647,6 +650,15 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun systemRow(text: String) {
+        // Consecutive duplicates are pure noise (a retrying provider repeats
+        // the same line); during a turn, cap how many notices can bury the
+        // answer. Commands run outside a turn and are never capped.
+        val last = state.messages.lastOrNull()
+        if (last != null && last.role == MsgRole.SYSTEM && last.content == text) return
+        if (state.streaming) {
+            if (systemRowsThisTurn >= 24) return
+            systemRowsThisTurn++
+        }
         state = state.copy(messages = state.messages + ChatMessage(nextId("m"), MsgRole.SYSTEM, text))
         saveCurrentSessionMessages()
     }
@@ -807,7 +819,16 @@ val runtimeEnv = RuntimeEnv(app)
                     if (r?.optBoolean("ok") != true) systemRow("tools: ${r?.optString("error") ?: "unavailable"}")
                     else {
                         val b = r.optJSONArray("builtin")?.let { arr -> (0 until arr.length()).joinToString(", ") { arr.optString(it) } } ?: "—"
-                        systemRow("Built-in: $b\nMCP: ${r.optJSONArray("mcp") ?: JSONArray()}")
+                        // chat.state() has no mcpTools, and MCP needs a
+                        // process spawn this app does not have — say that
+                        // instead of printing an empty list.
+                        val mcp = r.optJSONArray("mcp")
+                        val mcpText = if (mcp == null || mcp.length() == 0) {
+                            "MCP: unavailable on Android (no process spawn)"
+                        } else {
+                            "MCP: " + (0 until mcp.length()).joinToString(", ") { mcp.optString(it) }
+                        }
+                        systemRow("Built-in: $b\n$mcpText")
                     }
                 }
                 "agents" -> {
@@ -1422,9 +1443,18 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun removeWorkspace(path: String) {
+        val wasActive = path == state.projectDir
         val list = state.workspaces.filterNot { it == path }
+        if (wasActive && list.isEmpty()) {
+            systemRow("That is the only workspace — add another one before removing it.")
+            return
+        }
         configs.setWorkspaces(list)
         state = state.copy(workspaces = list)
+        // Removing the workspace you are IN used to leave the engine writing
+        // there. Move to the first survivor (openWorkspace also calls
+        // setProject, so the engine follows).
+        if (wasActive) openWorkspace(list.first())
     }
 
     // ── Config ────────────────────────────────────────────────────
@@ -1614,9 +1644,8 @@ val runtimeEnv = RuntimeEnv(app)
         val cores = Runtime.getRuntime().availableProcessors()
         val candidates = listOf(4, 6, 8).filter { it <= cores }.distinct()
         if (candidates.size <= 1) return
-        withContext(Dispatchers.Main) {
-            systemRow("Auto-tuning decode threads — the tok/s winner is saved for this model.")
-        }
+        // No per-candidate transcript rows: progress rides the composer's
+        // neutral live-metrics line, and the transcript gets ONE result row.
         var best = -1
         var bestTps = 0.0
         var sawFailure = false
@@ -1644,25 +1673,13 @@ val runtimeEnv = RuntimeEnv(app)
             val n = r?.optInt("n", 0) ?: 0
             val ms = r?.optLong("ms", 0) ?: 0
             val ttft = r?.optLong("ttft", 0) ?: 0
-            val errText = r?.optString("err", "").orEmpty()
             if (r == null || r.has("timeout") || n < 8 || ms <= 0) {
                 sawFailure = true
-                withContext(Dispatchers.Main) {
-                    val why = when {
-                        r == null -> "engine did not answer"
-                        r.has("timeout") -> "timed out after ${ms}ms"
-                        else -> "only $n tokens"
-                    }
-                    systemRow("tune $t threads: no data ($why)${if (errText.isNotEmpty()) " err=" + errText.take(140) else ""}")
-                }
                 continue
             }
             first = false
             val tps = n * 1000.0 / ms
             appendBenchReceipt(path, t, n, ms, ttft, tps, "decode-tune")
-            withContext(Dispatchers.Main) {
-                systemRow("tune $t threads: " + "%.1f".format(java.util.Locale.US, tps) + " tok/s (" + n + " tok / " + ms + "ms, first " + ttft + "ms)")
-            }
             if (tps > bestTps) {
                 bestTps = tps
                 best = t
@@ -1964,8 +1981,16 @@ val runtimeEnv = RuntimeEnv(app)
         state = state.copy(chatFontSize = uiPrefs.chatFontSize)
     }
 
-    fun openSettings(open: Boolean, tab: String = "general") {
-        state = state.copy(settingsOpen = open, settingsTab = tab)
+    fun openSettings(open: Boolean, tab: String? = null) {
+        // No explicit pane = the last one viewed (persisted), not "general".
+        val t = tab ?: uiPrefs.settingsTab
+        state = state.copy(settingsOpen = open, settingsTab = t)
+    }
+
+    /** A tab tap: remember it so the next open lands where you left off. */
+    fun setSettingsTab(tab: String) {
+        uiPrefs.settingsTab = tab
+        state = state.copy(settingsTab = tab)
     }
 
     fun setDrawer(open: Boolean) {

@@ -2515,7 +2515,13 @@ impl MetalEngine {
     /// the chunked path, so chunked is now only the >4096 fallback.
     pub fn attn_chunk_min() -> u32 {
         static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        *N.get_or_init(|| std::env::var("SOFUU_ATTN_CHUNK_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+        // Clamped to the warp kernel's staging limit: above it that kernel declines
+        // and the batch would fail instead of falling back to the chunked path.
+        *N.get_or_init(|| {
+            std::env::var("SOFUU_ATTN_CHUNK_MIN")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
+                .min(4096)
+        })
     }
 
     pub fn attn_w4_enabled() -> bool {

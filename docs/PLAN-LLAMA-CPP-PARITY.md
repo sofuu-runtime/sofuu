@@ -1546,3 +1546,39 @@ structure, and two structural causes are now measured:
   receipts: 0.6B prefill 289 -> **253 ms** (1.14x) with 123 tokens; text gates
   0.6B NEAR-TIE-CERTIFIED at |dtop1| 0.3150 / bound 1.112 (the same drift the
   fp32 path shows) and Spark-4B **IDENTICAL 19/19**.
+
+## LEDGER #10 — THE BIGGEST PREFILL BUG WAS A ONE-LINE GATE
+
+`SOFUU_GEMM_TYPES` defaulted to q4_K-only, so q6_K and q8_0 tensors never took
+the batched route. In every Q4_K_M model the **o and down projections are q6_K**,
+and the only other route is `batch_gguf`, which is the *single-token* GEMV entry.
+So a batched prefill was running those two projections once per token per layer:
+the `SOFUU_GGUF_DBG` signature histogram shows exactly one call per layer per
+token (`ty=14 rows=1024 cols=3072` and `cols=1024`), scaling linearly with
+prompt length.
+
+| model | 123-token prefill, q4_K only | all types | |
+|---|---|---|---|
+| 8B Q4_K_M | 9610 ms | **3820 ms** | 2.52x |
+| 0.6B Q4_K_M | 247 ms | **213 ms** | 1.16x |
+| 1B Q8_0 | 112 t/s | **359 t/s** | 3.2x |
+
+Gates are unchanged by the flip, which is the point: the batched path is the one
+that already had the receipts. 0.6B NEAR-TIE `|dtop1|` 0.3150 (bound 1.112),
+Spark-4B IDENTICAL 19/19, 1B Q8_0 NEAR-TIE 0.0240 (bound 0.223) — each is the
+same number it was before the flip. `SOFUU_GEMM_TYPES=q4k` restores the old gate.
+
+Fleet after this and LEDGER #8/#9 (123-token prefill, 24-token decode, single
+session; decode drifts up to 40% run to run on this box):
+
+| model | pp t/s | of bar | tg t/s | of bar |
+|---|---|---|---|---|
+| 0.6B Q4_K_M | 486 | 0.14x | 86.2 | 0.40x |
+| 1B Q8_0 | 359 | 0.17x | 46.4 | 0.38x |
+| Spark-4B | 75 | 0.15x | 21.3 | 0.41x |
+| 8B Q4_K_M | 18-32 | 0.07-0.12x | 10.7 | 0.34x |
+
+None of the above is tuned for the scores; it is the accumulated effect of four
+structural fixes (matrix pipe for q4_K and q6_K, accumulate routing, MMQ off,
+all-types batching). The remaining prefill gap is still the ~3700 enqueues per
+pass from LEDGER #9 plus the 1.7x kernel-rate gap.

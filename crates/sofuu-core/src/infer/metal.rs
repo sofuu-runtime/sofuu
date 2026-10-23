@@ -1134,12 +1134,7 @@ impl MetalEngine {
         rows: usize, cols: usize,
     ) -> bool {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 24 || n % 500 == 0 {
-                eprintln!("[gguf-dbg] n={n} ty={ty} rows={rows} cols={cols}");
-            }
+            Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
         }
         if ty == 12 && Self::gemv_v2_enabled() && cols % 256 == 0
             && unsafe {
@@ -2289,6 +2284,30 @@ impl MetalEngine {
         };
         self.op_tock(K_GGUF_GEMM, __t);
         __r
+    }
+
+    /// Signature histogram for the single-token GEMV entry, so a per-token
+    /// dispatch inside a batched pass can be identified by shape.
+    fn gguf_histogram() -> &'static std::sync::Mutex<std::collections::HashMap<(u32, usize, usize), u64>> {
+        static H: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, usize, usize), u64>>> =
+            std::sync::OnceLock::new();
+        H.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// Dumps (and clears) the batch_gguf signature histogram.
+    pub fn print_gguf_histogram(&self, label: &str) {
+        if std::env::var_os("SOFUU_GGUF_DBG").is_none() {
+            return;
+        }
+        let mut h = match Self::gguf_histogram().lock() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let mut rows: Vec<_> = h.drain().collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for ((ty, rows, cols), c) in rows {
+            eprintln!("[gguf-hist {label}] ty={ty} rows={rows} cols={cols} calls={c}");
+        }
     }
 
     /// Decode GEMV v2 (8 rows per threadgroup, vectorized qs/x loads).

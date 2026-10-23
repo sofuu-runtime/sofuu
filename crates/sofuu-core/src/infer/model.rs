@@ -3500,9 +3500,15 @@ impl TransformerModel {
         // stays the default gate for every model. Declared before the gemm!
         // macro below (macro_rules hygiene: the body resolves in the
         // definition context).
+        // q6_K and q8_0 now share the batched route by default: leaving them
+        // out put every o and down projection (q6_K in Q4_K_M, q8_0's everywhere)
+        // through the single-token GEMV once per token per layer, which the
+        // SOFUU_GGUF_DBG histogram shows as one call per layer per token. On
+        // the 8B that is 9.6 s -> 3.8 s for a 123-token prefill (2.52x).
+        // SOFUU_GEMM_TYPES=q4k restores the old q4_K-only gate.
         let gemm_types_all = std::env::var("SOFUU_GEMM_TYPES")
-            .map(|v| v == "all")
-            .unwrap_or(false);
+            .map(|v| v.trim() != "q4k")
+            .unwrap_or(true);
         // SOFUU_QKV_SNAP_LAYER: which layer the QKV stage bisect snapshots
         // (default 0; set 1+ to localize mid-network divergence).
         let snap_layer: usize = std::env::var("SOFUU_QKV_SNAP_LAYER")
@@ -3998,6 +4004,7 @@ impl TransformerModel {
         }
         if std::env::var("SOFUU_GPU_TIMING").map(|v| v.trim() == "2").unwrap_or(false) {
             g.engine.print_op_timing("prefill-gemm");
+            g.engine.print_gguf_histogram("prefill-gemm");
         }
         if std::env::var_os("SOFUU_PREFILL_DEBUG_DUMP").is_some() {
             let ph = g.pref_act.as_ref().unwrap();

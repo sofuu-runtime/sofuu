@@ -3858,7 +3858,13 @@ impl TransformerModel {
                             l.attn_output.tensor_type,
                             GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
                         )))
-                && (g.engine.batch_gguf_gemm_tiled_acc(
+                && (g.engine.batch_gguf_gemm_mma64_acc(
+                    l.attn_output.tensor_type, &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    pbuf, pslots.ao,
+                    pbuf, pslots.x, dim,
+                    pbuf, pslots.x,
+                    dim, q_rows, b,
+                ) || g.engine.batch_gguf_gemm_tiled_acc(
                     l.attn_output.tensor_type, &g.w_buf, gguf.data_offset + l.attn_output.offset,
                     pbuf, pslots.ao,
                     pbuf, pslots.x, dim,
@@ -3908,7 +3914,13 @@ impl TransformerModel {
                                 l.ffn_down.tensor_type,
                                 GGML_TYPE_Q6_K | GGML_TYPE_Q8_0
                             )))
-                    && (g.engine.batch_gguf_gemm_tiled_acc(
+                    && (g.engine.batch_gguf_gemm_mma64_acc(
+                        l.ffn_down.tensor_type, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                        pbuf, pslots.gate,
+                        pbuf, pslots.x, dim,
+                        pbuf, pslots.x,
+                        dim, hidden_dim, b,
+                    ) || g.engine.batch_gguf_gemm_tiled_acc(
                         l.ffn_down.tensor_type, &g.w_buf, gguf.data_offset + l.ffn_down.offset,
                         pbuf, pslots.gate,
                         pbuf, pslots.x, dim,

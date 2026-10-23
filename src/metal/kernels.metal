@@ -4722,6 +4722,8 @@ kernel void gemm_q4_k_mma64(
     constant uint       &w_rem          [[buffer(4)]],
     constant uint       &B              [[buffer(5)]],
     constant uint       &rows           [[buffer(6)]],
+    device const float  *res            [[buffer(7)]],
+    constant uint       &do_acc         [[buffer(8)]],
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint tid                            [[thread_index_in_threadgroup]],
     uint sgid                           [[simdgroup_index_in_threadgroup]],
@@ -4815,13 +4817,15 @@ kernel void gemm_q4_k_mma64(
             uint grow = r0 + sgid * 16 + i * 8 + (lane >> 3);
             uint gt = t0 + j * 8 + (lane & 7);
             if (grow < rows && gt < B) {
-                y[(size_t)gt * rows + grow] = oc[sgid][lane];
+                float pv = (do_acc != 0) ? res[(size_t)gt * rows + grow] : 0.0f;
+                y[(size_t)gt * rows + grow] = pv + oc[sgid][lane];
             }
             // each lane holds row (lane>>3), token (lane&7); cover the other
             // half of the 8x8 tile (rows 4..7) with a second pass
             uint grow2 = r0 + sgid * 16 + i * 8 + ((lane >> 3) + 4);
             if (grow2 < rows && gt < B) {
-                y[(size_t)gt * rows + grow2] = oc[sgid][lane + 32];
+                float pv2 = (do_acc != 0) ? res[(size_t)gt * rows + grow2] : 0.0f;
+                y[(size_t)gt * rows + grow2] = pv2 + oc[sgid][lane + 32];
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -4887,4 +4891,125 @@ kernel void gemv_q4_k_v2(
     }
     acc = simd_sum(acc);
     if (lane == 0) { y[row] = acc; }
+}
+
+// ── matrix pipe for q6_K: the lm_head is 26% of prefill FLOPs ───────────────
+// Same geometry as gemm_q4_k_mma64, different dequant. A q6_K block is 256
+// values in 210 bytes (ql[128] @0, qh[64] @128, scales[16] int8 @192, d @208)
+// and a 32-value k-slice is one (n, part) pair of it, so the slice's scale
+// index is 8n + 2*part + (l/16) and a 16-value thread half falls inside one
+// scale. The head is q6_K in every Q4_K_M model in the fleet, and at B=128 it
+// is 2*151936*1024*128 = 39.8 GFLOP of a 152 GFLOP pass.
+kernel void gemm_q6_k_mma64(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &B              [[buffer(5)]],
+    constant uint       &rows           [[buffer(6)]],
+    device const float  *res            [[buffer(7)]],
+    constant uint       &do_acc         [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]],
+    uint sgid                           [[simdgroup_index_in_threadgroup]],
+    uint lane                            [[thread_index_in_simdgroup]]
+) {
+    threadgroup half ws[MM_R][MM_PADK];
+    threadgroup half xs[MM_T][MM_PADK];
+    threadgroup float oc[4][64];
+
+    uint r0 = tg.x * MM_R;
+    uint t0 = tg.y * MM_T;
+    uint nb = cols / 256;
+    uint nbk = cols / MM_BK;
+
+    simdgroup_matrix<float, 8, 8> acc[2][8];
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); }
+    }
+
+    uint srow = tid >> 1;
+    uint sk = (tid & 1) * 16;
+
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * MM_BK;
+        uint b = k0 / 256;
+        uint o = k0 % 256;          // 0,32,...,224
+        uint n = o / 128;           // 0 or 1
+        uint part = (o % 128) / 32; // 0..3
+        uint scidx = 8 * n + 2 * part + (sk / 16);
+        {
+            uint grow = r0 + srow;
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 210;
+                device const uchar *blk = w_base + row_byte + b * 210;
+                float d = float(read_f16(w_base, row_byte + b * 210 + 208));
+                float s = d * (float)((int)((device const char *)(blk + 192))[scidx]);
+                uint4 ql4 = *(device const uint4 *)(blk + n * 64 + ((part & 1) ? 32 : 0) + (sk & ~3u));
+                uint4 qh4 = *(device const uint4 *)(blk + 128 + n * 32 + (sk & ~3u));
+                uint qlw[4] = { ql4.x, ql4.y, ql4.z, ql4.w };
+                uint qhw[4] = { qh4.x, qh4.y, qh4.z, qh4.w };
+                uint sh = 2 * part;
+                uint nib = (part < 2) ? 0u : 4u;
+                for (uint u = 0; u < 16; ++u) {
+                    uint qlb = (qlw[u >> 2] >> (8 * (u & 3))) & 0xFFu;
+                    uint qhb = (qhw[u >> 2] >> (8 * (u & 3))) & 0xFFu;
+                    uint q6 = ((qlb >> nib) & 0x0Fu) | (((qhb >> sh) & 0x03u) << 4);
+                    ws[srow][sk + u] = (half)(s * (float)((int)q6 - 32));
+                }
+            } else {
+                for (uint u = 0; u < 16; ++u) { ws[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        {
+            uint gt = t0 + srow;
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + sk;
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xs[srow][sk + u] = (half)0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint rl = sgid * 16;
+        for (uint kk = 0; kk < MM_BK; kk += 8) {
+            simdgroup_matrix<half, 8, 8> afr[2];
+            simdgroup_matrix<half, 8, 8> bfr[8];
+            simdgroup_load(afr[0], &ws[rl + 0][kk], MM_PADK, ulong2(0, 0), false);
+            simdgroup_load(afr[1], &ws[rl + 8][kk], MM_PADK, ulong2(0, 0), false);
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < 8; ++j) {
+                simdgroup_load(bfr[j], &xs[j * 8][kk], MM_PADK, ulong2(0, 0), true);
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], afr[i], bfr[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 8; ++j) {
+            simdgroup_store(acc[i][j], &oc[sgid][0], 8, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            uint grow = r0 + sgid * 16 + i * 8 + (lane >> 3);
+            uint gt = t0 + j * 8 + (lane & 7);
+            if (grow < rows && gt < B) {
+                float pv = (do_acc != 0) ? res[(size_t)gt * rows + grow] : 0.0f;
+                y[(size_t)gt * rows + grow] = pv + oc[sgid][lane];
+            }
+            uint grow2 = grow + 4;
+            if (grow2 < rows && gt < B) {
+                float pv2 = (do_acc != 0) ? res[(size_t)gt * rows + grow2] : 0.0f;
+                y[(size_t)gt * rows + grow2] = pv2 + oc[sgid][lane + 32];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
 }

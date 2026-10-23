@@ -846,6 +846,15 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_gemm_mma64_acc(
+        ctx: *mut c_void,
+        ty: u32,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        res_buf: *mut c_void, res_offset: usize, res_stride: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm_mma64_multi(
         ctx: *mut c_void,
         ty: u32,
@@ -1124,6 +1133,14 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize,
     ) -> bool {
+        if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 24 || n % 500 == 0 {
+                eprintln!("[gguf-dbg] n={n} ty={ty} rows={rows} cols={cols}");
+            }
+        }
         if ty == 12 && Self::gemv_v2_enabled() && cols % 256 == 0
             && unsafe {
                 sofuu_metal_batch_gguf_gemv_q4k_v2(
@@ -2043,6 +2060,35 @@ impl MetalEngine {
 
     /// LEDGER #7: section-fused matrix-pipe GEMM (one dispatch per section,
     /// all inside the caller's commit). q4_K only for now.
+    /// Matrix-pipe GEMM that adds into the residual (o and down projections).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_gguf_gemm_mma64_acc(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        res_buf: &MetalBuffer, res_offset: usize, res_stride: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        if !matches!(ty, 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 {
+            return false;
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_mma64_acc(
+                self.ctx, ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                res_buf.handle, res_offset, res_stride,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn batch_gguf_gemm_mma64_multi(
         &self,
@@ -2054,7 +2100,7 @@ impl MetalEngine {
         secs: &[[u32; 5]; 4],
     ) -> bool {
         let secs: &[[u32; 5]] = &secs[..];
-        if ty != 12 || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 || secs.is_empty() {
+        if !matches!(ty, 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 || secs.is_empty() {
             return false;
         }
         let n_sec = secs.len();
@@ -2274,12 +2320,18 @@ impl MetalEngine {
             1 => true,
             2 => false,
             _ => {
+                // Default ON: the matrix pipe is 2.1x the fp32 tile on the
+                // kernel and 1.14x on the 0.6B pass, and its text gate is
+                // NEAR-TIE-CERTIFIED at |dtop1| 0.3150 against bound 1.112 -
+                // the same drift the fp32 path shows, so the arithmetic class
+                // change buys speed without moving quality. SOFUU_GPU_GEMM_MMA=0
+                // opts out.
                 let on = std::env::var("SOFUU_GPU_GEMM_MMA")
                     .map(|v| {
                         let v = v.trim().to_ascii_lowercase();
-                        !(v.is_empty() || v == "0" || v == "false" || v == "off")
+                        !(v == "0" || v == "false" || v == "off")
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }

@@ -1505,3 +1505,44 @@ Decode effective bandwidth is now 28 GB/s on the 0.6B against llama.cpp's 86.
 What the v2 experiment does rule in: giving 8 rows to one 256-thread threadgroup
 with the same inner loop changes nothing, so the cost is not per-row launch — it
 is per-DISPATCH fixed cost plus the number of dispatches per token.
+
+## LEDGER #9 — THE PASS IS DISPATCH-BOUND, NOT MATMUL-BOUND
+
+Attributing the 0.6B 123-token prefill by differencing `SOFUU_GPU_SKIP` runs
+(260 ms with the q4_K matrix pipe on):
+
+| part | ms |
+|---|---|
+| attention | 20-25 |
+| ffn matmuls | 75 |
+| everything else (norms, kv_write, qkv/o projections, head, sampler, dispatch) | **165** |
+
+The ffn bucket implies 0.87 TFLOP/s end to end against 3.00 TFLOP/s for the same
+kernel measured in isolation. That factor of 3.4 is not arithmetic — it is
+structure, and two structural causes are now measured:
+
+1. **The o and down projections were not using the matrix pipe at all.** They
+   route through the fused-acc kernel (they must add into the residual), and
+   `SOFUU_TILED_DEBUG` shows `acc ty=12 rows=1024 cols=2048/3072 B=56` for every
+   layer. The matrix-pipe kernel now has an accumulate mode (`do_acc` + a
+   residual buffer, same index mapping), and `batch_gguf_gemm_mma64_acc` takes
+   that route ahead of the fp32 kernel.
+2. **The per-op counters show ~3700 host enqueues for a single 123-token pass**
+   (3360 in the `gguf` bucket, 154 gemm, 56 norm, 28 kv_write, 28 head norm,
+   28 attention, 28 swiglu, 14 add). At even 20 us of fixed cost per dispatch
+   that is ~75 ms of the pass — the same order as the 165 ms "everything else"
+   bucket. llama.cpp compiles the whole layer into one graph with no per-op
+   round trips, which is why its 36 ms pass is essentially all matmul.
+
+### What shipped
+
+* `gemm_q6_k_mma64` — the matrix pipe for q6_K (the lm_head and the down
+  projections in every Q4_K_M model; the head alone is 26% of a 128-token
+  pass). Slices of 32 values decode from one (n, part) pair, so a 16-value
+  thread half lands inside a single int8 scale.
+* `gemm_q4_k_mma64` / `gemm_q6_k_mma64` accumulate mode + the `_acc` route for
+  o and down.
+* The matrix pipe is now **default on** (`SOFUU_GPU_GEMM_MMA=0` opts out). Its
+  receipts: 0.6B prefill 289 -> **253 ms** (1.14x) with 123 tokens; text gates
+  0.6B NEAR-TIE-CERTIFIED at |dtop1| 0.3150 / bound 1.112 (the same drift the
+  fp32 path shows) and Spark-4B **IDENTICAL 19/19**.

@@ -160,6 +160,16 @@ jobs:
           # explicitly with the minimal Pod::Spec shim.
           ruby scripts/check_podspec.rb
 
+      # sdk-jvm-check drives the REAL Kotlin wrapper end-to-end on the host
+      # JVM (streaming, cancel, UTF-8 boundary, host tools, close semantics)
+      # against the freshly built dist/libsofuu — the Android bindings are
+      # otherwise never executed by CI. Skips cleanly (exit 0, yellow note)
+      # when a toolchain piece is missing on the runner; the Makefile target
+      # existed for a long time but was never wired into CI, so the wrapper
+      # could rot silently (embed-SDK audit follow-up, 2026-10-16).
+      - name: JVM SDK check (Android wrapper end-to-end)
+        run: make sdk-jvm-check
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:

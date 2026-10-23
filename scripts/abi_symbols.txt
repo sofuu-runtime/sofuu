@@ -9,6 +9,7 @@ sofuu_engine_ctx
 sofuu_eval_file
 sofuu_eval_string
 sofuu_flush_jobs
+sofuu_flush_jobs_bounded
 sofuu_free
 sofuu_get_engine
 sofuu_init

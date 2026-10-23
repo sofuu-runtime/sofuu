@@ -4665,6 +4665,8 @@ mod tests {
             "agent.list",
             "agent.cancel",
             "agent.renderTrace",
+            "agent.resolveApproval",
+            "agent.pendingApprovals",
             "rlm.query",
             "rlm.route",
             "http.serve",
@@ -4676,7 +4678,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            38,
+            40,
             "the funnel contract list changed length — update it deliberately"
         );
 
@@ -5116,11 +5118,20 @@ mod tests {
         assert_eq!(env["error"]["code"], "panic", "envelope: {env}");
         unsafe { sofuu_free(out as *mut c_void) };
 
-        // The runtime must remain usable after the contained panic.
+        // PROCESS-survival is the contract: the panic crossed QuickJS C
+        // frames on its way out, so the POISONED runtime's interpreter
+        // state is not guaranteed recoverable (the first test cut probed
+        // it in place and deadlocked the engine). The honest host recipe
+        // is what the second half proves: drop the runtime, make a fresh
+        // one, keep going. The host application never dies.
+        unsafe { sofuu_rt_free(rt) };
+
+        let rt2 = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt2.is_null(), "a fresh runtime starts after a contained panic");
         let probe = CString::new("JSON.stringify({ alive: 1 + 1 })").unwrap();
         let mut out: *mut c_char = ptr::null_mut();
-        let rc = unsafe { sofuu_rt_eval(rt, probe.as_ptr(), &mut out) };
-        assert_eq!(rc, 0, "runtime must survive a contained panic");
+        let rc = unsafe { sofuu_rt_eval(rt2, probe.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "the library keeps working after a contained panic");
         let env: JsonValue = serde_json::from_str(
             unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref(),
         )
@@ -5128,7 +5139,7 @@ mod tests {
         assert_eq!(env["result"], "{\"alive\":2}", "envelope: {env}");
         unsafe { sofuu_free(out as *mut c_void) };
 
-        unsafe { sofuu_rt_free(rt) };
+        unsafe { sofuu_rt_free(rt2) };
     }
 
     // ── Interactive approvals end-to-end (audit M2 → C funnel) ───────
@@ -5136,13 +5147,25 @@ mod tests {
     /// One mock provider for both approval runs: round 1 demands the gated
     /// tool; later rounds read the transcript and report what happened —
     /// the tool ran (approval allowed) or the refusal reached the model.
-    fn approval_agent_js(agent: &str) -> String {
+    fn approval_agent_js(agent: &str, allow: bool) -> String {
         let agent_json = serde_json::to_string(agent).unwrap();
         format!(
             r#"(function(){{
   var round = 0;
+  var ALLOW = {allow};
   sofuu.ai.stream = function(opts) {{
     round++;
+    /* The resolver timer is scheduled from INSIDE the run: a pre-armed
+     * setTimeout would fire during the setup eval's own drain (pending
+     * timers keep the uv pump alive there), and the parked approval would
+     * inherit an event-less loop — a deadlock. From here the timer lives
+     * exactly as long as the parking window and fires mid-drain. */
+    if (round === 1) {{
+      setTimeout(function () {{
+        var ps = sofuu.agent.pendingApprovals();
+        if (ps.length) sofuu.agent.resolveApproval(ps[0].id, ALLOW, ALLOW);
+      }}, 60);
+    }}
     var mk = function(chunks, toolCalls) {{
       var i = 0;
       var it = {{
@@ -5187,22 +5210,10 @@ mod tests {
     fn run_approval(rt: *mut CapiRuntime, agent: &str, allow: bool) -> Vec<String> {
         AP_EVENTS.lock().unwrap().clear();
 
-        let setup = CString::new(approval_agent_js(agent)).unwrap();
+        let setup = CString::new(approval_agent_js(agent, allow)).unwrap();
         let mut out: *mut c_char = ptr::null_mut();
         assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0,
                    "approval agent setup should eval");
-        unsafe { sofuu_free(out as *mut c_void) };
-
-        let arm = CString::new(format!(
-            r#"setTimeout(function () {{
-                 var ps = sofuu.agent.pendingApprovals();
-                 if (ps.length) sofuu.agent.resolveApproval(ps[0].id, {allow}, {always});
-               }}, 60);"#,
-            allow = allow, always = allow
-        ))
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, arm.as_ptr(), &mut out) }, 0);
         unsafe { sofuu_free(out as *mut c_void) };
 
         unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {

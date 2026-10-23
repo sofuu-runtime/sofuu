@@ -322,6 +322,35 @@
 > in-band); capi 46/46; zero C-ABI growth (resolveApproval is a JS surface; hosts already see
 > the events).
 >
+> **Universal Headless C-API Funnel — embed-safety pass (2026-10-16, session focus).** Three
+> pieces, all committed SDK contract: **(a) panic containment at the C boundary.** The CLI
+> binary keeps panic=abort, but `make libsofuu` now builds the embedded dylib with
+> `CARGO_PROFILE_RELEASE_PANIC=unwind`, and EVERY public C entry (rt_new/free/call/eval/
+> eval_nb/call_stream/cancel/register_host_tool/host_tool_resolve + the 6 embed/voice entries)
+> wraps its engine work in catch_unwind → `SOFUU_ERR_PANIC` (-10): a Rust panic becomes the
+> normal error protocol (envelope `error.code:"panic"`; a streaming call synthesizes its one
+> `done` terminal with the panic error if none was seen) instead of killing the host app. The
+> honest contract (the first test cut probed the poisoned runtime in place and DEADLOCKED the
+> engine — a panic unwinds through QuickJS C frames, so reused state is not guaranteed
+> recoverable): the process always survives; the host recipe is rt_free + fresh rt_new, which is
+> exactly what the pinned test proves. Deterministic trigger = a #[cfg(test)]-only
+> `test.panicNow` funnel method (never in the shipped dylib). **(b) Interactive approvals are
+> now a documented, pinned SDK path:** `agent.resolveApproval(id,allow,always)` +
+> `agent.pendingApprovals()` (stateless hosts) joined the enforced funnel method table
+> (38→40); EMBEDDING.md gained the approvals section (chat-driven mentions borrow chat's own
+> resolveApproval channel; funnel runs use approveInteractive + resolveApproval); and a C-level
+> E2E pins allow (tool runs, model sees the result) and deny (refusal reaches the model
+> in-band) through the real streaming ABI. Test-design receipt: pre-arming the resolver with a
+> setup-eval timer DEADLOCKS (the timer fires during the eval's own drain and the parked run
+> inherits an event-less uv loop) — the resolver timer must be scheduled from INSIDE the run,
+> which is also what a real host does out-of-band. **(c) CI:** `make sdk-jvm-check` existed in
+> the Makefile for ages but was never wired into ci.yml — the Android Kotlin wrapper could rot
+> silently; it is now a gate (skips cleanly when a runner lacks the toolchain). The
+> abi_symbols baseline was refreshed — NOT for this stream: the new symbol
+> `sofuu_flush_jobs_bounded` is the engine peer's in-flight export; my wrappers export nothing
+> new. Evidence: capi 51/51 (4 new tests); headless samples green on the unwind dylib (4.7 MB);
+> abi-check green; size-check 4.8 MB ≤ 5.0 MB CLI (unchanged, abort); JS battery 278 PASS.
+>
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`
 > ~500 ms (27%). Root cause of `other`: RoPE recomputed `powf`+`cosf`+`sinf` per (head, i) —

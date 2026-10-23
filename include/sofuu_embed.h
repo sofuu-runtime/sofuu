@@ -23,6 +23,47 @@
  * Multiple runtimes per process are supported, each on its own thread; they
  * share the centralized libuv loop, so concurrent loop-driven work is
  * serialized on it (see docs/EMBEDDING.md).
+ *
+ * ── Threading contract, per entry (v2 freeze, 2026-10-16) ──────────────
+ * The owning-thread rule above is the base. Per entry, the truth is:
+ *
+ *   sofuu_rt_new                owning thread (thread becomes the owner)
+ *   sofuu_rt_free               owning thread
+ *   sofuu_rt_call               owning thread (blocks; drains the loop)
+ *   sofuu_rt_call_stream        owning thread (blocks; pumps the loop)
+ *   sofuu_rt_cancel             owning thread (it RUNS JS to flag the cancel,
+ *                               and reads the stream registry thread-locals —
+ *                               cross-thread cancel is undefined today;
+ *                               cross-thread STOPPING still works through
+ *                               host_tool_resolve-side cancellation and the
+ *                               opts.signal token flowing in JS)
+ *   sofuu_rt_eval               owning thread (blocks)
+ *   sofuu_rt_eval_nb            owning thread (queues; never waits on I/O)
+ *   sofuu_rt_register_host_tool owning thread
+ *   sofuu_rt_host_tool_resolve  ANY thread (header-documented exception; the
+ *                               result is marshalled onto the owning thread
+ *                               through the runtime's event loop)
+ *   sofuu_embed_set_log_cb      any thread BEFORE runtimes exist; process glob
+ *   sofuu_embed_local/batch/
+ *   image/info + voice        any thread (stateless pure functions)
+ * Contained-panic note: after SOFUU_ERR_PANIC, the runtime is POISONED —
+ * rt_free it and create a fresh one on the owning thread; the process
+ * survives by contract.
+ *
+ * ── Stability: v2 FROZEN (2026-10-16) ─────────────────────────────────
+ * v2 is frozen: existing signatures, existing semantic guarantees (one-done
+ * streaming, error envelope, handle tombstones), and existing code numbering
+ * do not change. The amendment ladder, in increasing severity:
+ *   1. additive: new error ENUM values, new optional config keys, new funnel
+ *      METHODS via the existing string funnel (no new symbols) — any minor.
+ *   2. additive symbol: a genuinely new export — any minor, abi-check
+ *      baseline acknowledged in the same commit.
+ *   3. wire-shape change to an existing envelope/event — requires a bump to
+ *      v3 and a migration note; never silently.
+ * Enforcement = scripts/abi_symbols.txt + scripts/check_abi.sh (the dylib's
+ * exported symbol set must equal the acknowledged baseline); linker-level
+ * symbol versioning is deliberately NOT used (ELF/MachO divergence, and the
+ * baseline gate already fails any un-acknowledged export).
  */
 #ifndef SOFUU_EMBED_H
 #define SOFUU_EMBED_H
@@ -62,8 +103,11 @@ typedef void (*sofuu_event_cb)(const char *event_json, void *opaque);
 #define SOFUU_ERR_PANIC         -10  /* Rust panic contained at the ABI    */
 
 /* ── Versioning ────────────────────────────────────────────────── */
-/* Returns the ABI version this library implements (v2 = 2). The ABI is
- * `experimental` for one release, then frozen with symbol versioning. */
+/* Returns the ABI version this library implements (v2 = 2). v2 is FROZEN
+ * (2026-10-16): semantics and signatures above are stable under the
+ * amendment ladder in the header preamble — additive enum values and new
+ * funnel methods are minor; any change to an existing wire shape or
+ * signature bumps to v3 and requires a migration note. */
 uint32_t sofuu_embed_abi_version(void);
 
 /* ── Host log callback ─────────────────────────────────────────── */

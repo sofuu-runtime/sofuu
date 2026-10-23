@@ -91,6 +91,12 @@ c-only:
 bc-check: $(TARGET)
 	@./scripts/check-driver-bc.sh
 
+# ── Distribution dry-run (funnel plan F3): every channel's LOCAL half ──
+# SwiftPM manifest+checksum, podspec lint, Gradle evaluate, npm pack --dry-run.
+# Live pushes (pod trunk, Maven Central, npm publish) remain owner-gated.
+dist-dryrun: libsofuu
+	@bash scripts/dist-dryrun.sh
+
 # ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
 size-check: $(TARGET)
 	@SIZE=$$(stat -f%z $(TARGET) 2>/dev/null || stat -c%s $(TARGET) 2>/dev/null); \
@@ -313,7 +319,10 @@ dist-all:
 # went red in CI ("nothing to run", then clang on a missing file).
 HEADLESS_SAMPLES := $(wildcard examples/headless/*.c)
 
-headless-test: libsofuu
+# bc freshness is a HARD dependency of the dist path: a release build
+# embeds src/js/<driver>.bc with no source fallback, so a snapshot lags its
+# .js → stale code ships with zero runtime signal (QTSQ Phase 6 guard).
+headless-test: libsofuu bc-check
 ifeq ($(strip $(HEADLESS_SAMPLES)),)
 	@echo "\033[33m— examples/ is local-only (gitignored); nothing to run\033[0m"
 else
@@ -373,6 +382,14 @@ else
 	@echo ""
 	@echo "\033[36m--- Run c_llm against the library (no key → mock) ---\033[0m"
 	@examples/headless/c_llm
+	@echo ""
+	@echo "\033[36m--- Compile c_soak.c against libsofuu (host-abuse soak) ---\033[0m"
+	@cc examples/headless/c_soak.c -Idist -Ldist -lsofuu -o examples/headless/c_soak \
+		-Wl,-rpath,dist 2>&1 || \
+		(echo "\033[31m✗ Compile failed (c_soak)\033[0m"; exit 1)
+	@echo "\033[32m✓ Compiled\033[0m"
+	@echo "\033[36m--- Run c_soak (host-abuse soak, 12 fresh runtimes) ---\033[0m"
+	@examples/headless/c_soak
 	@echo ""
 	@echo "\033[32m✓ Headless tests passed\033[0m"
 	@echo ""

@@ -4670,6 +4670,8 @@ mod tests {
             "rlm.query",
             "rlm.route",
             "http.serve",
+            "web.search",
+            "web.open",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -4678,7 +4680,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            40,
+            42,
             "the funnel contract list changed length — update it deliberately"
         );
 
@@ -5318,6 +5320,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(env["result"]["ok"], false, "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    // ── F1.3: the header's error catalogue IS the contract ────────────
+    // Every SOFUU_ERR_* #define in sofuu_embed.h must be exactly the set
+    // the funnel can emit — a new code lands in both on the same commit,
+    // or this fails. Parses the real header (compile-time include_str),
+    // so doc drift between header and implementation is impossible.
+
+    #[test]
+    fn header_error_catalogue_matches_the_funnel() {
+        let header = include_str!("../../../include/sofuu_embed.h");
+        let mut codes: Vec<(String, i32)> = Vec::new();
+        for line in header.lines() {
+            let line: &str = line.trim();
+            if let Some(rest) = line.strip_prefix("#define SOFUU_") {
+                let rest: &str = rest.trim_start_matches('#');
+                let mut it = rest.split_whitespace();
+                let name = it.next().unwrap_or("");
+                let val = it.next().unwrap_or("");
+                if (name.starts_with("ERR_") || name == "OK")
+                    && val.chars().all(|c| c.is_ascii_digit() || c == '-')
+                {
+                    codes.push((name.to_string(), val.parse().unwrap_or(i32::MIN)));
+                }
+            }
+        }
+        codes.sort();
+        // What the funnel contractually emits today (name, value):
+        let expected = [
+            ("OK", 0),
+            ("ERR_INVALID_ARG", -1),
+            ("ERR_NOT_IMPL", -2),
+            ("ERR_UNKNOWN_METHOD", -3),
+            ("ERR_JS_EXCEPTION", -4),
+            ("ERR_BAD_CONFIG", -5),
+            ("ERR_INTERNAL", -6),
+            ("ERR_UNKNOWN_SPACE", -7),
+            ("ERR_MODEL_UNAVAIL", -8),
+            ("ERR_NOMEM", -9),
+            ("ERR_PANIC", -10),
+        ];
+        let mut expected: Vec<(String, i32)> = expected
+            .iter()
+            .map(|(n, v)| (n.to_string(), *v))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            codes, expected,
+            "header error catalogue and the funnel contract diverged — \
+             land header + implementation in the same commit"
+        );
+    }
+
+    // ── F2: promoted web methods — the funnel→method dispatch contract ──
+    // web.search/web.open are PROMOTED surface: a host calls them directly
+    // (host-initiated, network-touching). The model-facing agent path has
+    // its own policy layers (netPolicy wrappers) — those live in the agent
+    // drivers and do not apply to direct host calls. The test injects fakes
+    // so the CONTRACT (method dispatch, argument plumb, envelope shape) is
+    // pinned without any network.
+
+    #[test]
+    fn promoted_web_methods_plumb_args_and_envelopes() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let setup = CString::new(r#"(function(){
+  globalThis.__SEARCH_ARGS = null;
+  globalThis.__OPEN_ARGS = null;
+  sofuu.web.search = async function (q, opts) {
+    globalThis.__SEARCH_ARGS = { query: q, opts: opts };
+    return { results: [ { title: "R1", url: "https://example.com/a", snippet: "s" } ] };
+  };
+  sofuu.web.open = async function (url, opts) {
+    globalThis.__OPEN_ARGS = { url: url, opts: opts };
+    return { title: "Page", text: "PAGE-BODY-9131" };
+  };
+})()"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        // web.search: object opts, awaited result reaches out_json.
+        let m = CString::new("web.search").unwrap();
+        let a = CString::new(r#"{"query":"rust","count":3}"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "web.search resolves through the funnel");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(env["result"]["results"][0]["title"], "R1", "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        // Argument plumb: the method received exactly what the host sent.
+        let m = CString::new("web.open").unwrap();
+        let a = CString::new(r#"{"url":"https://example.com/rust"}"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "web.open resolves through the funnel");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(env["result"]["text"], "PAGE-BODY-9131", "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        // Both calls plumbed their args.
+        let m = CString::new("ai.complete").unwrap();
+        let a = CString::new(r#"{"prompt":"probe"}"#).unwrap();
+        let plumb = CString::new("JSON.stringify({ s: globalThis.__SEARCH_ARGS, o: globalThis.__OPEN_ARGS })").unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let _ = unsafe { sofuu_rt_eval(rt, plumb.as_ptr(), &mut out) };
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+        let res = env["result"].as_str().unwrap_or("");
+        assert!(res.contains("\"query\":\"rust\"") && res.contains("\"count\":3"),
+                "web.search received the host args: {res}");
+        assert!(res.contains("example.com/rust"), "web.open received the url: {res}");
         unsafe { sofuu_free(out as *mut c_void) };
 
         unsafe { sofuu_rt_free(rt) };

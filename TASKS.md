@@ -355,6 +355,33 @@
 > F1 ABI-freeze prep, F2 method-scope + stale-`.bc` gate, F3 live dist
 > channels, F4 containment red-team; PLAN-HEADLESS.md points here as its
 > successor.
+> **Funnel REMAINING-phases pass (2026-10-16, F1–F4): landed.** F1: the v2
+> header preamble now carries the per-entry THREADING CONTRACT (the honest one
+> — rt_cancel runs JS and is owning-thread-only; host_tool_resolve is the only
+> any-thread entry) + v2 FROZEN with an amendment ladder (additive enum →
+> additive symbol → wire change ⇒ v3, never silent); linker symbol versioning
+> deliberately declined, recorded in the header. The header↔code error
+> catalogue is machine-pinned (`header_error_catalogue_matches_the_funnel` —
+> include_str!s the real header, so a new code lands in both or fails). F2:
+> `web.search`/`web.open` PROMOTED into the enforced table (42; dispatch test
+> with injected fakes — no network); `tools.read` DEFERRED until the QTSQ
+> Phase 5 settles in tools.js (collision avoidance, written); `ml.*`/`chat.*`
+> declined-by-design (written). The stale-`.bc` gate is now a HARD dependency
+> of `make headless-test` (bc-check: a lagging snapshot means stale code ships
+> with zero runtime signal — that guard failed a build the same day it was
+> wired, correctly, on a WIP tree). F3: `make dist-dryrun` — SwiftPM manifest
+> + checksum, podspec shim, Gradle eval (missing-Android-SDK is a per-channel
+> skip with the reason, not a fail), npm pack --dry-run; live pushes remain
+> owner-gated. F4: the capi fuzz target walks the containment boundary (fuzzer
+> cancel ids, unknown host-tool resolves, REUSE of the same runtime after
+> garbage); `examples/headless/c_soak.c` takes the funnel through
+> unknown-method/bad-args/junk-handle/bogus-approval/bad-model across 12 fresh
+> runtimes (one soak lesson re-pinned: unknown method is rc 0 +
+> envelope-unknown_method, not an error rc). Evidence: capi 53/53; samples
+> 6/6 on a rebuilt unwind dylib; bc-check OK; abi-check OK; size-check 4.9 MB
+> ≤ 5.0; JS battery unchanged (no shipped-JS deltas this round). F4.1 (one
+> completed review receipt for the embed-safety delta) stays open — the
+> reviewer service is still crashing.
 >
 > **2026-10-14 — Pi 5: attention + RoPE prefill wave — Qwen 128 → 158 t/s (0.89× llama.cpp), Llama-1B 2.28×.**
 > Profiling split the remaining Qwen prefill deficit: attn bucket 246 ms/prompt and `other`

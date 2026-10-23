@@ -5676,6 +5676,13 @@ void sofuu_batched_attention_ext(
     // per-item traffic is the whole group's K/V, so spread it once the
     // context is long enough to pay for the dispatch.
     if (use_gqa4) run_parallel = (n_kv_heads >= 4 && gqa_seq_len >= 128);
+    // SOFUU_ATTN_SERIAL=1 runs the whole call on the calling thread. Prefill
+    // attention is bit-identical either way *within* one process in almost
+    // every call, but the pool path has a rare (≈1%/call) single-(row, head)
+    // divergence that propagates through the rest of the prefill — see
+    // docs/PI5-SIMD-OPTIMIZATION.md Session 16. Opt in when a run must be
+    // reproducible at any cost: prefill drops (98.6 → 46 tk/s at 2419 tk).
+    if (getenv("SOFUU_ATTN_SERIAL")) run_parallel = false;
 
     if (run_parallel) {
         g_pool.parallel_for(0, total_work, compute_head_slice);

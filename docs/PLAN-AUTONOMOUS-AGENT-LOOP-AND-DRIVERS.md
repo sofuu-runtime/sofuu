@@ -15,10 +15,10 @@
 | **Phase 2** | Native `AsyncLocalStorage` Context (`sofuu.context`) | **COMPLETE** | `tests/test_agent_context_propagation.js` (6/6 passed), commit [`365c7bc10`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/365c7bc10) |
 | **Phase 3** | Cooperative Scheduling & Concurrent Tool Dispatch | **COMPLETE** | `tests/test_agent_concurrency_yield.js` (5/5 passed), commit [`395509477`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/395509477) |
 | **Phase 4** | Real-Time QTSQ Agent Trace Persistence & Replay | **COMPLETE** | `tests/test_agent_qtsq_trace.js` (7/7 passed), commit [`947d855b9`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/947d855b9) |
-| **Phase 5** | Resilient File Editing (`smart_edit`) & Syntax Dry-Run | **COMPLETE** (local) | `tests/test_agent_smart_edit.js` (37/37 checks), `tests/tools_diff_test.js` (32/32 incl. agent diff events), `tests/tools_edit_literal_e2e.sh` (7/7). Not yet committed/pushed. |
-| **Phase 6** | Custom Agent AOT Bytecode & Full Integration Torture | **PENDING** | `sofuu.agent.loadDir` AOT, 50-run torture test, $\le 5.0\text{ MB}$ audit |
+| **Phase 5** | Resilient File Editing (`smart_edit`) & Syntax Dry-Run | **COMPLETE** | `tests/test_agent_smart_edit.js` (37/37 checks), `tests/tools_diff_test.js` (32/32 incl. agent diff events), `tests/tools_edit_literal_e2e.sh` (7/7), commit [`8e5551824`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/8e5551824) |
+| **Phase 6** | Custom Agent AOT Bytecode & Full Integration Torture | **COMPLETE** (local) | `tests/test_agent_aot_loaddir.js` (37/37), `tests/test_agent_modernization_torture.js` (15/15, 50 concurrent runs), binary 4,818,544 B = 4.60 MiB |
 
-**Overall Progress:** 5 of 6 Phases Completed (83%) | **Stripped Binary Size:** 5,230,672 B = 4.99 MiB (cap 5,242,880 B = 5.0 MiB; **12,208 B headroom** — see the Phase 6 note)
+**Overall Progress:** 6 of 6 Phases Completed (100%) | **Stripped Binary Size:** 4,818,544 B = 4.60 MiB (cap 5,242,880 B = 5.0 MiB; **424,336 B headroom** — release now embeds driver bytecode only, see the Phase 6 note)
 
 ---
 
@@ -195,13 +195,81 @@ flowchart TD
 ---
 
 ### Phase 6: Custom Agent AOT Bytecode & Full Integration Torture Suite
-- **Deliverables**:
-  - Extend `sofuu.agent.loadDir(dir)` to automatically precompile custom agent scripts (`~/.sofuu/agents/*.js`) into `.bc` bytecode snapshots using `sofuu compile-bc`.
-  - Recompile all shipped drivers into updated bytecode snapshots:
-    `sofuu compile-bc src/js/agent.js src/js/agent.bc`
-    `sofuu compile-bc src/js/tools.js src/js/tools.bc`
-    `sofuu compile-bc src/js/chat.js src/js/chat.bc`
-  - Authored comprehensive torture test `tests/test_agent_modernization_torture.js` executing 50 concurrent agent runs combining all 5 modernization tracks.
-  - Release binary budget verification strictly $\le 5.0\text{ MB}$.
-    - **Risk, measured today**: the stripped binary is 5,230,672 B with only **12,208 B** of headroom (the "4.9 MB" in earlier revisions of this document was optimistic — it is 4.99 MiB). Phase 5 added 13,582 B of embedded driver bytes (`tools.js` 37,237 -> 46,518 B, `tools.bc` 23,956 -> 28,257 B) plus the small `sofuu.parse` binding; a raw `cargo build --release` of the same sources was measured once at 5,247,184 B (4,304 B OVER the cap) before `make` reproduced 5,230,672 B, so treat the margin as noise-level rather than real. Precompiling agent scripts and any further driver work needs space freed first; the lever is the `include_str!` source fallbacks (496,262 B of the 725,326 B driver footprint), which today duplicate what the `.bc` already carries. Note there is still **no `.js` ↔ `.bc` hash guard**: a stale `.bc` silently wins (`eval_shipped_with_bytecode` returns on first success).
-  - OpenQodex code review gate execution and clean git push.
+
+**Delivered**
+
+- **`sofuu.aotEval(jsPath, bcPath)`** — new host binding, `crates/sofuu-core/src/rt/bytecode.rs`.
+  Reads the source, hashes it (FNV-1a 32), and returns
+  `{ status, bytes, hash, error }`:
+  `hit` (a snapshot for exactly this source ran), `compiled` (no usable snapshot: compiled,
+  written next to the script, then run), `threw` (the bytecode ran and threw — the source is
+  **not** re-run, so a script's side effects can never happen twice), `unavailable` (source
+  unreadable or it does not compile; the caller must eval the source itself so the real error
+  surfaces). Snapshots carry a 17-byte header (`SOFUBC1 ` + 8 hex hash + `0x0a` + QuickJS
+  bytecode), so a changed source, a truncated file or a foreign blob all fall back to a compile
+  instead of loading stale code.
+- **`sofuu.agent.loadDir(dir)`** (`src/js/agent.js`) now routes every `*.js` in the agents
+  folder through `sofuu.aotEval` and reports `{ loaded, broken, aotHits, compiled }`. The source
+  eval remains the fallback for every unhappy path (no binding, stale snapshot, compile error),
+  so AOT is a speed layer, never a dependency — verified by a test that deletes the binding.
+  Second start of an unedited script: 0 compiles, 0 source evals.
+- **All seven shipped snapshots recompiled**: `agent.bc` 109,142, `chat.bc` 50,287,
+  `tools.bc` 28,398, `web.bc` 29,092, `extractor.bc` 7,034, `rlm.bc` 6,348,
+  `storage.bc` 3,749 B (`scripts/gen-driver-bc.sh`).
+- **Build-time freshness guard** (`scripts/check-driver-bc.sh`, `make bc-check`): recompiles every
+  driver and fails on any byte difference. This closes the risk flagged in the previous revision
+  of this document — a stale `.bc` used to win silently. Byte comparison is sound: `compile-bc`
+  compiles in a bare QuickJS runtime (no drivers evaluated) with the input path as the function
+  name, so output is a pure function of (source, path form) — recompiling twice is byte-identical,
+  and the check still passes after a rebuild. Both scripts use repo-relative paths for exactly
+  that reason; an absolute path changes the output.
+- **Torture suite** `tests/test_agent_modernization_torture.js` (wrapper
+  `tests/test_agent_modernization_torture_e2e.sh`, scratch project + isolated HOME): 50 agent
+  runs dispatched through `agent.runMany(…, { concurrency: 50 })`, each executing all five
+  tracks — sandboxed `code_eval` computation, an inline tool reading `sofuu.agent.current()`,
+  cooperative scheduling under 50 live streams, a QTSQ trace replayed via `getTrace(runId)`,
+  and a per-run `edit_file` rewrite. 15 checks: 150 provider requests, 50 overlapping streams
+  observed, 50/50 answers carrying only their own nonce (no cross-run bleed), 25/25 sandbox
+  tokens, 25/25 fixtures rewritten, 50/50 traces with exactly 2 tool events, 1.9 s wall time.
+- **Binary budget: 4,818,544 B = 4.60 MiB**, 424,336 B under the 5,242,880 B cap.
+
+**The budget decision (breaking, deliberate)**
+
+Release builds no longer embed the driver sources. Both (sources 507,566 B + bytecode 234,050 B =
+741,616 B) never fit beside the engine; Phase 5 had already spent the margin down to 12,208 B and
+adding the Phase 6 binding put the binary 37,600 B over the cap. `shipped.rs` now compiles to
+
+- `#[cfg(debug_assertions)]` — source **and** bytecode (development keeps the readable path,
+  `cargo test` still asserts on the source text);
+- release — bytecode only (496 KB freed).
+
+What keeps that honest: `make bc-check` (byte-identical recompilation), and a release build that
+finds an unloadable snapshot now prints
+`[sofuu] <driver> unavailable: bytecode load failed and this build carries no source fallback`
+instead of starting silently without the driver.
+
+**Verification (this build)**
+
+| Suite | Result |
+| :--- | :--- |
+| `tests/test_agent_code_eval.js` (Phase 1) | 7/7 |
+| `tests/test_agent_context_propagation.js` (Phase 2) | 6/6 |
+| `tests/test_agent_concurrency_yield.js` (Phase 3) | 5/5 |
+| `tests/test_agent_qtsq_trace.js` (Phase 4) | 7/7 |
+| `tests/test_agent_smart_edit_e2e.sh` (Phase 5) | 37/37 checks, wrapper PASSED |
+| `tests/test_agent_aot_loaddir.js` (Phase 6) | 37/37 checks |
+| `tests/test_agent_modernization_torture_e2e.sh` (Phase 6) | 15/15 checks, 50 runs, 1.9 s |
+| `tests/agent_test.js` | ALL PASSED |
+| `tests/test_bytecode_hydration.js` | 7/7 subsystems hydrated |
+| `tests/tools_diff_e2e.sh`, `tests/tools_edit_literal_e2e.sh` | 32/32, 7/7 |
+| `make bc-check` | 7/7 snapshots match their source |
+| `make size-check` | 4,818,544 B <= 5,242,880 B |
+
+**Still open**
+
+- The OpenQodex review gate and the push for this phase.
+- `tests/` is gitignored; the Phase 6 suites are force-added like the Phase 3–5 ones.
+- The workspace `cargo build --release` was red while this phase finished (`sofuu-capi`
+  `lib.rs:5096`, a concurrent session's in-flight edit), so the binary above was built with
+  `cargo build --release -p sofuu-core --bin sofuu` + `strip -x` + ad-hoc codesign, which is
+  exactly what `make` does after its workspace-wide build.

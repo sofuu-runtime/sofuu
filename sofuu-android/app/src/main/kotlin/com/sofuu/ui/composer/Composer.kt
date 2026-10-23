@@ -191,7 +191,7 @@ fun Composer(
                         text = it
                         slashIdx = 0
                     },
-                    textStyle = TextStyle(color = c.text, fontSize = 15.sp, fontFamily = FontFamily.Monospace),
+                    textStyle = TextStyle(color = c.text, fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace),
                     cursorBrush = SolidColor(c.accent),
                     modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp, max = 160.dp),
                     decorationBox = { inner ->
@@ -200,6 +200,7 @@ fun Composer(
                                 "Ask, @mention files, or type / for commands…",
                                 color = c.textFaint,
                                 fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
                                 fontFamily = FontFamily.Monospace,
                             )
                         }
@@ -330,7 +331,7 @@ private fun Pill(
         Text(
             label,
             fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
+            fontWeight = FontWeight.SemiBold,
             color = c.text,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,

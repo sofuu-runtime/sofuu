@@ -132,6 +132,7 @@ private fun MessageRow(
                     m.content,
                     fontSize = fontSize.sp,
                     lineHeight = (fontSize + 7).sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.text,
                     modifier = Modifier
                         .padding(vertical = 6.dp, horizontal = 4.dp)
@@ -241,7 +242,7 @@ private fun MessageRow(
                             modifier = Modifier.size(15.dp),
                         )
                         Spacer(Modifier.width(4.dp))
-                        Text(if (copied) "Copied" else "Copy", fontSize = 12.sp, color = if (copied) c.ok else c.textFaint)
+                        Text(if (copied) "Copied" else "Copy", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = if (copied) c.ok else c.textFaint)
                     }
                     if (voiceCapable) {
                         Row(
@@ -253,7 +254,7 @@ private fun MessageRow(
                         ) {
                             Icon(Icons2.Volume, "Read aloud", tint = c.textFaint, modifier = Modifier.size(15.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("Read aloud", fontSize = 12.sp, color = c.textFaint)
+                            Text("Read aloud", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint)
                         }
                     }
                 }
@@ -279,6 +280,7 @@ fun PhaseLine(phase: String?, streaming: Boolean) {
         "${phase ?: "Thinking"}…",
         color = c.textMuted,
         fontSize = 13.sp,
+        fontWeight = FontWeight.SemiBold,
         modifier = Modifier.padding(vertical = 4.dp).alpha(alpha),
     )
 }
@@ -388,18 +390,19 @@ private fun TimelineRow(
                 title,
                 fontSize = 13.sp,
                 color = c.textMuted,
-                fontWeight = FontWeight.Medium,
+                fontWeight = FontWeight.SemiBold,
             )
             if (badge != null) {
                 Spacer(Modifier.width(6.dp))
-                Text(badge, fontSize = 12.sp, color = c.textFaint)
+                Text(badge, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             }
             if (ok != null) {
                 Spacer(Modifier.width(6.dp))
                 Text(
                     if (ok) "✓" else "✗",
-                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
                     color = if (ok) c.ok else c.err,
+                    fontSize = 12.sp,
                 )
             }
             if (onToggle != null && (detail != null || expanded)) {

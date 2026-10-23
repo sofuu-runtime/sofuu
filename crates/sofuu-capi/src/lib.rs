@@ -11,7 +11,7 @@
 // allocator. NULL inputs are tolerated everywhere by returning NULL/error.
 //
 // Error model: every fallible call returns an int (0 = SOFUU_OK, negative
-// = SOFUU_ERR_*) AND, when out_json is provided, a JSON envelope:
+// = SOFUU_ERR_*, -10 = contained panic) AND, when out_json is provided, a JSON envelope:
 //   {"ok":true,"result":...}
 //   {"ok":false,"error":{"code":"<stable_code>","message":"<human text>"}}
 //
@@ -572,8 +572,42 @@ fn install_android_panic_hook() {
     // Desktop hosts keep default panic reporting on stderr.
 }
 
+// ── Panic containment at the C boundary (embed-safety, 2026-10-16) ──
+// The `sofuu` CLI binary keeps panic=abort (deliberate, size+hardening).
+// The EMBEDDED dylib is built with unwind (make libsofuu overrides the
+// profile), and every public C entry wraps its engine work in
+// catch_unwind: a Rust panic becomes the normal error protocol —
+// SOFUU_ERR_PANIC (with an error envelope / synthesized stream `done`)
+// — instead of killing the host process. AssertUnwindSafe is honest
+// here: engine state is process-global and single-threaded per runtime;
+// the runtime stays usable for the next call.
+fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "engine panic (non-string payload)".to_string()
+    }
+}
+
+thread_local! {
+    /// Set when js_stream_callback forwarded a terminal `done` event — the
+    /// stream panic fallback must never double-emit a terminal.
+    static STREAM_TERMINAL_SEEN: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+#[no_mangle]
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRuntime {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_new_impl(config_json))) {
+        Ok(p) => p,
+        Err(_) => ptr::null_mut(), /* contained panic reads as a create failure */
+    }
+}
+
+unsafe fn sofuu_rt_new_impl(config_json: *const c_char) -> *mut CapiRuntime {
     #[cfg(target_os = "android")]
     if !ANDROID_PANIC_HOOK.swap(true, std::sync::atomic::Ordering::SeqCst) {
         install_android_panic_hook();
@@ -727,7 +761,12 @@ pub unsafe extern "C" fn sofuu_rt_new(config_json: *const c_char) -> *mut CapiRu
 
 /// Destroy a runtime and release its engine. NULL-tolerant.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_free(rt: *mut CapiRuntime) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_free_impl(rt)));
+}
+
+unsafe fn sofuu_rt_free_impl(rt: *mut CapiRuntime) {
     if !rt.is_null() {
         // E2: drop host tools with the runtime — the host's opaque pointers
         // must never be called after it freed the runtime that owned them.
@@ -756,7 +795,26 @@ pub unsafe extern "C" fn sofuu_free(ptr: *mut c_void) {
 /// On return, *out_json (when non-NULL) is a malloc'd JSON envelope the
 /// host frees with sofuu_free(). Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_call(
+    rt: *mut CapiRuntime,
+    method: *const c_char,
+    args_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_call_impl(rt, method, args_json, out_json))) {
+        Ok(rc) => rc,
+        Err(p) => {
+            let msg = panic_msg(&p);
+            if !out_json.is_null() {
+                *out_json = error_envelope("panic", &msg);
+            }
+            -10 // SOFUU_ERR_PANIC
+        }
+    }
+}
+
+unsafe fn sofuu_rt_call_impl(
     rt: *mut CapiRuntime,
     method: *const c_char,
     args_json: *const c_char,
@@ -779,6 +837,15 @@ pub unsafe extern "C" fn sofuu_rt_call(
             return -1;
         }
     };
+
+    /* cfg(test) only: a deterministic Rust-panic trigger so the containment
+     * test drives the REAL funnel entry. Never compiled into the shipped
+     * dylib — the panic contract is testable without shipping a crash-me
+     * method. */
+    #[cfg(test)]
+    if method_str == "test.panicNow" {
+        panic!("capi panic containment probe");
+    }
 
     // Parse args: NULL/"" → no args, JSON object → single arg, JSON array → spread.
     let mut args_is_array = false;
@@ -852,7 +919,25 @@ pub unsafe extern "C" fn sofuu_rt_call(
 /// The event loop is drained after evaluation.
 /// Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_eval(
+    rt: *mut CapiRuntime,
+    source: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_eval_impl(rt, source, out_json))) {
+        Ok(rc) => rc,
+        Err(p) => {
+            let msg = panic_msg(&p);
+            if !out_json.is_null() {
+                *out_json = error_envelope("panic", &msg);
+            }
+            -10 // SOFUU_ERR_PANIC
+        }
+    }
+}
+
+unsafe fn sofuu_rt_eval_impl(
     rt: *mut CapiRuntime,
     source: *const c_char,
     out_json: *mut *mut c_char,
@@ -949,7 +1034,25 @@ pub unsafe extern "C" fn sofuu_rt_eval(
 /// `{}`) progresses across repeated tick evals while the thread stays
 /// free for the host's pump, cancel pokes, and bounded queries.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_eval_nb(
+    rt: *mut CapiRuntime,
+    source: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_eval_nb_impl(rt, source, out_json))) {
+        Ok(rc) => rc,
+        Err(p) => {
+            let msg = panic_msg(&p);
+            if !out_json.is_null() {
+                *out_json = error_envelope("panic", &msg);
+            }
+            -10 // SOFUU_ERR_PANIC
+        }
+    }
+}
+
+unsafe fn sofuu_rt_eval_nb_impl(
     rt: *mut CapiRuntime,
     source: *const c_char,
     out_json: *mut *mut c_char,
@@ -1097,6 +1200,13 @@ unsafe extern "C" fn js_stream_callback(
         }
     };
 
+    // Terminal marker for the stream panic fallback (one `done`, ever).
+    if let Some(ref j) = event_str {
+        if j.contains("\"kind\":\"done\"") {
+            STREAM_TERMINAL_SEEN.with(|f| f.set(true));
+        }
+    }
+
     // Forward to the host callback.
     STREAM_CB.with(|cell| {
         if let Some((cb, opaque)) = cell.get() {
@@ -1121,7 +1231,39 @@ unsafe extern "C" fn js_stream_callback(
 /// *out_cancel_id receives a token usable with sofuu_rt_cancel.
 /// Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_call_stream(
+    rt: *mut CapiRuntime,
+    method: *const c_char,
+    args_json: *const c_char,
+    on_event: Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
+    opaque: *mut c_void,
+    out_cancel_id: *mut u64,
+) -> c_int {
+    STREAM_TERMINAL_SEEN.with(|f| f.set(false));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_call_stream_impl(rt, method, args_json, on_event, opaque, out_cancel_id))) {
+        Ok(rc) => rc,
+        Err(p) => {
+            let msg = panic_msg(&p);
+            /* One-terminal contract: if no `done` reached the host before
+             * the panic, synthesize the terminal with the panic error. */
+            let seen = STREAM_TERMINAL_SEEN.with(|f| f.get());
+            if !seen {
+                if let Some((cb, opq)) = STREAM_CB.with(|cell| cell.get()) {
+                    let payload = serde_json::json!({
+                        "kind": "done", "error": { "code": "panic", "message": msg }
+                    }).to_string();
+                    let c_payload = CString::new(payload).unwrap_or_default();
+                    cb(c_payload.as_ptr(), opq);
+                }
+            }
+            STREAM_CB.with(|cell| cell.set(None));
+            -10 // SOFUU_ERR_PANIC
+        }
+    }
+}
+
+unsafe fn sofuu_rt_call_stream_impl(
     rt: *mut CapiRuntime,
     method: *const c_char,
     args_json: *const c_char,
@@ -1319,7 +1461,18 @@ pub unsafe extern "C" fn sofuu_rt_call_stream(
 /// checks once per chunk; otherwise we fall back to `sofuu.agent.cancel(id)`
 /// (agent.run). Returns SOFUU_OK if the cancel ID was recognized, -1 if not.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_cancel(
+    rt: *mut CapiRuntime,
+    cancel_id: u64,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_cancel_impl(rt, cancel_id))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_rt_cancel_impl(
     rt: *mut CapiRuntime,
     cancel_id: u64,
 ) -> c_int {
@@ -1584,7 +1737,22 @@ unsafe extern "C" fn js_host_tool_call(
 /// Registering the same name twice replaces the earlier registration.
 /// Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_register_host_tool(
+    rt: *mut CapiRuntime,
+    name: *const c_char,
+    description: *const c_char,
+    parameters_json: *const c_char,
+    cb: Option<SofuuHostToolFn>,
+    opaque: *mut c_void,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_register_host_tool_impl(rt, name, description, parameters_json, cb, opaque))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_rt_register_host_tool_impl(
     rt: *mut CapiRuntime,
     name: *const c_char,
     description: *const c_char,
@@ -1651,7 +1819,20 @@ pub unsafe extern "C" fn sofuu_rt_register_host_tool(
 /// NULL). Returns SOFUU_OK, or -1 when the id is unknown (already settled,
 /// never pending, or a zero id).
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_host_tool_resolve(
+    rt: *mut CapiRuntime,
+    call_id: u64,
+    result_json: *const c_char,
+    error: *const c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_rt_host_tool_resolve_impl(rt, call_id, result_json, error))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_rt_host_tool_resolve_impl(
     rt: *mut CapiRuntime,
     call_id: u64,
     result_json: *const c_char,
@@ -1886,7 +2067,21 @@ fn embed_text(space: EmbedSpace, text: &str) -> Option<Vec<f32>> {
 /// `space` NULL/"" selects the default (`hash-768` — the brain's own space).
 /// `rt` is reserved and may be NULL.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_embed_local(
+    _rt: *mut CapiRuntime,
+    text: *const c_char,
+    space: *const c_char,
+    out: *mut *mut f32,
+    out_dim: *mut usize,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_embed_local_impl(_rt, text, space, out, out_dim))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_embed_local_impl(
     _rt: *mut CapiRuntime,
     text: *const c_char,
     space: *const c_char,
@@ -1924,7 +2119,23 @@ pub unsafe extern "C" fn sofuu_embed_local(
 /// SOFUU_ERR_INVALID_ARG. `space` is resolved once for the whole batch.
 /// `rt` is reserved and may be NULL.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_embed_batch(
+    _rt: *mut CapiRuntime,
+    texts: *const *const c_char,
+    n: usize,
+    space: *const c_char,
+    out: *mut *mut f32,
+    out_n: *mut usize,
+    out_dim: *mut usize,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_embed_batch_impl(_rt, texts, n, space, out, out_n, out_dim))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_embed_batch_impl(
     _rt: *mut CapiRuntime,
     texts: *const *const c_char,
     n: usize,
@@ -1977,7 +2188,21 @@ pub unsafe extern "C" fn sofuu_embed_batch(
 /// undecodable bytes: no vector exists for them; SOFUU_ERR_MODEL_UNAVAIL
 /// per sofuu_embed.h), -9 nomem.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_embed_image(
+    _rt: *mut CapiRuntime,
+    bytes: *const u8,
+    len: usize,
+    out: *mut *mut f32,
+    out_dim: *mut usize,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_embed_image_impl(_rt, bytes, len, out, out_dim))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_embed_image_impl(
     _rt: *mut CapiRuntime,
     bytes: *const u8,
     len: usize,
@@ -2007,7 +2232,18 @@ pub unsafe extern "C" fn sofuu_embed_image(
 /// with sofuu_free(). Combines the baked SEM1/SEM2 manifests with the
 /// hash-v1 descriptor. `rt` is reserved and may be NULL.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_embed_info(
+    _rt: *mut CapiRuntime,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_embed_info_impl(_rt, out_json))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_embed_info_impl(
     _rt: *mut CapiRuntime,
     out_json: *mut *mut c_char,
 ) -> c_int {
@@ -2055,7 +2291,20 @@ fn b64_alphabet_ok(s: &str) -> bool {
 /// Transcribe base64 audio. Returns the funnel rc (0 + `{ok,result:{text}}`
 /// envelope, or provider error envelope).
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_voice_transcribe(
+    rt: *mut CapiRuntime,
+    audio_b64: *const c_char,
+    opts_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_voice_transcribe_impl(rt, audio_b64, opts_json, out_json))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_voice_transcribe_impl(
     rt: *mut CapiRuntime,
     audio_b64: *const c_char,
     opts_json: *const c_char,
@@ -2080,7 +2329,20 @@ pub unsafe extern "C" fn sofuu_voice_transcribe(
 /// Speak text. Returns the funnel rc (0 + `{ok,result:{audio,format}}`
 /// envelope; `audio` is an indexed-byte object over JSON transport).
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_voice_speak(
+    rt: *mut CapiRuntime,
+    text: *const c_char,
+    opts_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sofuu_voice_speak_impl(rt, text, opts_json, out_json))) {
+        Ok(rc) => rc,
+        Err(_) => -10, // SOFUU_ERR_PANIC
+    }
+}
+
+unsafe fn sofuu_voice_speak_impl(
     rt: *mut CapiRuntime,
     text: *const c_char,
     opts_json: *const c_char,
@@ -4824,6 +5086,228 @@ mod tests {
             "SALVAGE-OK",
             "the salvage round surfaces a usable answer: {budget}"
         );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    // ── Panic containment at the C boundary (embed-safety) ───────────
+
+    #[test]
+    fn rust_panic_at_the_abi_boundary_is_contained() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        // Drive the REAL funnel entry into a Rust panic. The trigger is a
+        // #[cfg(test)]-only method: the shipped dylib never contains it.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); /* silence the intentional panic */
+        let method = CString::new("test.panicNow").unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, method.as_ptr(), ptr::null(), &mut out) };
+        std::panic::set_hook(prev_hook);
+        assert_eq!(rc, -10, "contained panic must return SOFUU_ERR_PANIC, got {}", rc);
+        assert!(!out.is_null(), "panic must still produce an error envelope");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref(),
+        )
+        .expect("envelope is JSON");
+        assert_eq!(env["ok"], false, "envelope: {env}");
+        assert_eq!(env["error"]["code"], "panic", "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        // The runtime must remain usable after the contained panic.
+        let probe = CString::new("JSON.stringify({ alive: 1 + 1 })").unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval(rt, probe.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "runtime must survive a contained panic");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(env["result"], "{\"alive\":2}", "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    // ── Interactive approvals end-to-end (audit M2 → C funnel) ───────
+
+    /// One mock provider for both approval runs: round 1 demands the gated
+    /// tool; later rounds read the transcript and report what happened —
+    /// the tool ran (approval allowed) or the refusal reached the model.
+    fn approval_agent_js(agent: &str) -> String {
+        let agent_json = serde_json::to_string(agent).unwrap();
+        format!(
+            r#"(function(){{
+  var round = 0;
+  sofuu.ai.stream = function(opts) {{
+    round++;
+    var mk = function(chunks, toolCalls) {{
+      var i = 0;
+      var it = {{
+        usage: {{ promptTokens: 7, completionTokens: 3, finishReason: "stop" }},
+        toolCalls: toolCalls, abort: function() {{}},
+        next: function() {{
+          if (i < chunks.length) return Promise.resolve({{ value: chunks[i++], done: false }});
+          return Promise.resolve({{ value: undefined, done: true }});
+        }}
+      }};
+      it[Symbol.asyncIterator] = function() {{ return it; }};
+      return it;
+    }};
+    if (round === 1) {{
+      return mk([], [{{ index: 0, id: "call_1",
+                        function: {{ name: "tick", arguments: "{{}}" }} }}]);
+    }}
+    var seen = JSON.stringify((opts && opts.messages) || []);
+    var verdict = seen.indexOf("TICK-RUN-7") >= 0 ? "APPROVAL-FLOW-OK"
+                : seen.indexOf("denied by user") >= 0 ? "DENIED-OK" : "UNEXPECTED";
+    return mk([{{ text: verdict }}], []);
+  }};
+  sofuu.agent.define({{
+    name: {agent_json},
+    system: "You are a test agent.",
+    provider: "mock",
+    model: "mock-ap",
+    tools: [{{ name: "tick", description: "gated probe",
+               parameters: {{ type: "object", properties: {{}} }},
+               execute: function() {{ return "TICK-RUN-7"; }} }}],
+    approve: "sensitive",
+    budget: {{ maxSteps: 4 }}
+  }});
+}})()"#)
+    }
+
+    static AP_EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Prep the agent, then run it over the streaming ABI with
+    /// approveInteractive, resolving the parked approval from a libuv timer
+    /// through the JS facade (exactly how a UI host would settle it).
+    fn run_approval(rt: *mut CapiRuntime, agent: &str, allow: bool) -> Vec<String> {
+        AP_EVENTS.lock().unwrap().clear();
+
+        let setup = CString::new(approval_agent_js(agent)).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0,
+                   "approval agent setup should eval");
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        let arm = CString::new(format!(
+            r#"setTimeout(function () {{
+                 var ps = sofuu.agent.pendingApprovals();
+                 if (ps.length) sofuu.agent.resolveApproval(ps[0].id, {allow}, {always});
+               }}, 60);"#,
+            allow = allow, always = allow
+        ))
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, arm.as_ptr(), &mut out) }, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            AP_EVENTS.lock().unwrap().push(s);
+        }
+
+        let method = CString::new("agent.run").unwrap();
+        let args = CString::new(
+            serde_json::json!({
+                "target": agent, "task": "use tick please",
+                "approveInteractive": true, "toolTimeoutMs": 15000
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut cancel_id: u64 = 0;
+        let rc = unsafe {
+            sofuu_rt_call_stream(
+                rt,
+                method.as_ptr(),
+                args.as_ptr(),
+                Some(collect),
+                ptr::null_mut(),
+                &mut cancel_id,
+            )
+        };
+        assert_eq!(rc, 0, "agent.run with approveInteractive should return OK");
+        AP_EVENTS.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn interactive_approval_allow_runs_the_tool() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let events = run_approval(rt, "capi-ap-allow", true);
+        let joined = events.join("\n");
+        assert!(
+            events.iter().any(|e| e.contains("\"kind\":\"approval_request\"")),
+            "an approval_request event must reach the host, events: {joined}"
+        );
+        assert!(
+            events.iter().any(|e| e.contains("\"approval_resolved\"") && e.contains("\"allowed\":true")),
+            "the resolution event must say allowed:true, events: {joined}"
+        );
+        let done = events
+            .iter()
+            .find(|e| e.contains("\"kind\":\"done\""))
+            .expect("exactly one terminal done event");
+        assert!(
+            done.contains("APPROVAL-FLOW-OK"),
+            "the allowed run executed the gated tool and the model saw it: {done}"
+        );
+        assert!(!done.contains("\"error\""), "done must carry no error: {done}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    #[test]
+    fn interactive_approval_deny_refuses_in_band() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let events = run_approval(rt, "capi-ap-deny", false);
+        let joined = events.join("\n");
+        assert!(
+            events.iter().any(|e| e.contains("\"kind\":\"approval_request\"")),
+            "a prompt was raised, events: {joined}"
+        );
+        assert!(
+            events.iter().any(|e| e.contains("\"approval_resolved\"") && e.contains("\"allowed\":false")),
+            "the resolution event must say allowed:false, events: {joined}"
+        );
+        let done = events
+            .iter()
+            .find(|e| e.contains("\"kind\":\"done\""))
+            .expect("terminal done event");
+        assert!(
+            done.contains("DENIED-OK"),
+            "the refusal reached the model in-band and the run lived: {done}"
+        );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
+    #[test]
+    fn resolve_approval_unknown_id_is_a_clean_refusal() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let method = CString::new("agent.resolveApproval").unwrap();
+        let args = CString::new(r#"{"id":"ap-bogus-id","allow":true}"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, method.as_ptr(), args.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "the call itself resolves (envelope carries the outcome)");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(env["result"]["ok"], false, "envelope: {env}");
+        unsafe { sofuu_free(out as *mut c_void) };
 
         unsafe { sofuu_rt_free(rt) };
     }

@@ -88,7 +88,7 @@ private fun SheetTitle(t: String, onClose: (() -> Unit)? = null) {
             .padding(bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(t, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f))
+        Text(t, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text, modifier = Modifier.weight(1f))
         if (onClose != null) {
             Icon(
                 Icons2.Close,
@@ -113,7 +113,7 @@ private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit
             .clickable { onClick() }
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
-        Text(label, fontSize = 13.sp, color = fg)
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
     }
 }
 
@@ -131,10 +131,10 @@ private fun SheetRow(label: String, hint: String?, selected: Boolean, onClick: (
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(label, fontSize = 14.sp, color = c.text)
-            if (hint != null) Text(hint, fontSize = 11.sp, color = c.textFaint)
+            Text(label, fontSize = 14.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold, color = c.text)
+            if (hint != null) Text(hint, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
         }
-        if (selected) Text("✓", color = c.accent, fontSize = 14.sp)
+        if (selected) Text("✓", color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
     }
 }
 
@@ -196,7 +196,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 value = search,
                 onValueChange = { search = it },
                 singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp),
+                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp, fontWeight = FontWeight.Medium),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -207,7 +207,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 decorationBox = { inner ->
                     androidx.compose.foundation.layout.Box {
                         if (search.isEmpty()) {
-                            Text("Search models…", color = c.textFaint, fontSize = 13.sp)
+                            Text("Search models…", color = c.textFaint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                         }
                         inner()
                     }
@@ -252,7 +252,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 value = manual,
                 onValueChange = { manual = it },
                 singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp),
+                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp, fontWeight = FontWeight.Medium),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -262,7 +262,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                     .padding(horizontal = 12.dp, vertical = 12.dp),
                 decorationBox = { inner ->
                     androidx.compose.foundation.layout.Box {
-                        if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.sp)
+                        if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                         inner()
                     }
                 },
@@ -331,8 +331,8 @@ private fun ToggleRow(label: String, hint: String, on: Boolean, onToggle: () -> 
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(label, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = c.text)
-            Text(hint, fontSize = 12.sp, color = c.textFaint)
+            Text(label, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+            Text(hint, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
         }
         Box(
             Modifier

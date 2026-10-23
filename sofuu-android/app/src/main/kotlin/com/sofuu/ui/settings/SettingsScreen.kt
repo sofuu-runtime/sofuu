@@ -1,7 +1,12 @@
 package com.sofuu.ui.settings
 
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -149,7 +154,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                     Text(
                         "Settings",
                         style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
+                        fontWeight = FontWeight.Bold,
                         color = c.text,
                         modifier = Modifier.weight(1f),
                     )
@@ -177,7 +182,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                             Text(
                                 t.replaceFirstChar { it.uppercase() },
                                 fontSize = 13.5.sp,
-                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                                 color = if (active) c.accentContrast else c.textMuted,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(999.dp))
@@ -241,7 +246,7 @@ private fun Section(label: String, isFirst: Boolean = false) {
     Text(
         label.uppercase(),
         fontSize = 11.5.sp,
-        fontWeight = FontWeight.SemiBold,
+        fontWeight = FontWeight.Bold,
         letterSpacing = 0.8.sp,
         color = LocalSofuuColors.current.textFaint,
         modifier = Modifier.padding(top = if (isFirst) 4.dp else 18.dp, bottom = 6.dp, start = 2.dp),
@@ -252,9 +257,9 @@ private fun Section(label: String, isFirst: Boolean = false) {
 private fun Row_(label: String, desc: String?, content: @Composable () -> Unit) {
     val c = LocalSofuuColors.current
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+        Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
         if (desc != null) {
-            Text(desc, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp, bottom = 8.dp))
+            Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp, bottom = 8.dp))
         } else {
             Spacer(Modifier.height(6.dp))
         }
@@ -292,7 +297,7 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
                 Text(
                     label,
                     fontSize = 13.sp,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                    fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                     color = if (active) c.accentContrast else c.textMuted,
                 )
             }
@@ -321,7 +326,12 @@ private fun TextFieldRow(
             onChange(it)
         },
         singleLine = true,
-        textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontFamily = FontFamily.Monospace, fontSize = 13.5.sp),
+        textStyle = androidx.compose.ui.text.TextStyle(
+            color = c.text,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.Medium,
+        ),
         cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
         modifier = modifier
             .onFocusChanged { focused = it.isFocused }
@@ -333,7 +343,15 @@ private fun TextFieldRow(
             .padding(horizontal = 12.dp, vertical = 12.dp),
         decorationBox = { inner ->
             Box {
-                if (text.isEmpty()) Text(placeholder, color = c.textFaint, fontFamily = FontFamily.Monospace, fontSize = 13.5.sp)
+                if (text.isEmpty()) {
+                    Text(
+                        placeholder,
+                        color = c.textFaint,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
                 inner()
             }
         },
@@ -375,7 +393,7 @@ private fun AppliedFieldRow(
             Text(
                 "Apply",
                 fontSize = 13.5.sp,
-                fontWeight = FontWeight.SemiBold,
+                fontWeight = FontWeight.Bold,
                 color = c.accentContrast,
             )
         }
@@ -392,12 +410,12 @@ private fun EngineCell(key: String, value: String, mono: Boolean = false) {
             .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(key, fontSize = 12.5.sp, color = c.textFaint, modifier = Modifier.width(115.dp))
+        Text(key, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.width(115.dp))
         Text(
             value,
             fontSize = 13.sp,
             color = c.text,
-            fontWeight = if (mono) FontWeight.Normal else FontWeight.Medium,
+            fontWeight = if (mono) FontWeight.Medium else FontWeight.SemiBold,
             fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
             maxLines = 1,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
@@ -423,7 +441,7 @@ private fun VectorEngineCard(store: AppStore) {
     Section("Vector engine")
     SettingsCard {
         if (manifest == null) {
-            Text("Loading the embedding manifest…", fontSize = 13.5.sp, color = c.textFaint)
+            Text("Loading the embedding manifest…", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
         } else {
             val m = manifest!!
             EngineCell(
@@ -434,7 +452,7 @@ private fun VectorEngineCard(store: AppStore) {
             val spaces = m.optJSONArray("spaces")
             if (spaces != null) {
                 CardDivider()
-                Text("SPACES", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint, letterSpacing = 0.5.sp)
+                Text("SPACES", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = c.textFaint, letterSpacing = 0.5.sp)
                 Spacer(Modifier.height(4.dp))
                 for (i in 0 until spaces.length()) {
                     val s = spaces.optJSONObject(i) ?: continue
@@ -456,7 +474,7 @@ private fun VectorEngineCard(store: AppStore) {
                         Text(
                             id,
                             fontSize = 12.5.sp,
-                            fontWeight = FontWeight.Medium,
+                            fontWeight = FontWeight.SemiBold,
                             color = if (avail) c.text else c.err,
                             fontFamily = FontFamily.Monospace,
                             modifier = Modifier.weight(1f),
@@ -465,6 +483,7 @@ private fun VectorEngineCard(store: AppStore) {
                             Text(
                                 "${dim}-dim",
                                 fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
                                 color = c.textMuted,
                                 fontFamily = FontFamily.Monospace,
                                 modifier = Modifier.padding(end = 6.dp),
@@ -473,16 +492,18 @@ private fun VectorEngineCard(store: AppStore) {
                         Text(
                             if (avail) (if (modelId.isNotEmpty()) modelId else "ready") else "unavailable",
                             fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = if (avail) c.ok else c.err,
                         )
                     }
                 }
             }
             CardDivider()
-            Text("Test Local Embedding", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+            Text("Test Local Embedding", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text)
             Text(
                 "Embeddings run entirely on-device — no provider, no network, no API key.",
                 fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
                 color = c.textFaint,
                 modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
             )
@@ -511,7 +532,7 @@ private fun VectorEngineCard(store: AppStore) {
                         .border(1.dp, c.border, RoundedCornerShape(8.dp))
                         .padding(10.dp),
                 ) {
-                    Text(res, fontSize = 12.sp, color = c.textMuted, fontFamily = FontFamily.Monospace)
+                    Text(res, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textMuted, fontFamily = FontFamily.Monospace)
                 }
             }
             LaunchedEffect(probing, probe) {
@@ -553,7 +574,7 @@ private fun GeneralPane(store: AppStore) {
         Section("Engine status", isFirst = true)
         if (live == null) {
             SettingsCard {
-                Text("Connecting to the engine…", fontSize = 13.5.sp, color = c.textFaint)
+                Text("Connecting to the engine…", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             }
         } else {
             val e = live!!
@@ -582,7 +603,7 @@ private fun GeneralPane(store: AppStore) {
                                 if (n > 0) { if (isNotEmpty()) append(" · "); append("$n awaiting approval") }
                             },
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
+                            fontWeight = FontWeight.SemiBold,
                             color = c.accent,
                         )
                     }
@@ -601,12 +622,48 @@ private fun GeneralPane(store: AppStore) {
                         .border(1.dp, c.border, RoundedCornerShape(8.dp))
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                 ) {
-                    Text(state.projectDir ?: "(none)", fontSize = 13.sp, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text(state.projectDir ?: "(none)", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
                 }
             })
             CardDivider()
             Row_("Tool permission profile", "Applied live in the engine and re-applied on launch.", {
                 Segmented(listOf("full", "edit", "plan", "prompt"), state.permissions) { store.setPermissions(it) }
+            })
+            CardDivider()
+            val context = LocalContext.current
+            val hasAllFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else true
+            Row_("Phone storage access", if (hasAllFiles) "Full phone filesystem access is active. The engine can access and edit any folder." else "Grant All Files Access so the engine can access and edit any phone directory.", {
+                if (hasAllFiles) {
+                    Text("Granted", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.ok)
+                } else {
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.accent)
+                            .clickable {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    try {
+                                        val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                            data = Uri.parse("package:" + context.packageName)
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        context.startActivity(intent)
+                                    } catch (_: Exception) {
+                                        val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        context.startActivity(intent)
+                                    }
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Grant access", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
+                    }
+                }
             })
         }
 
@@ -657,6 +714,7 @@ private fun GeneralPane(store: AppStore) {
             Text(
                 "How aggressively saved project memories are pulled into a turn. Leave at 0 to use engine defaults.",
                 fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
                 color = c.textFaint,
                 modifier = Modifier.padding(bottom = 6.dp),
             )
@@ -714,10 +772,10 @@ private fun PhoneToolsCard(store: AppStore) {
     SettingsCard {
         Text(
             "Native capabilities registered on the engine at boot. Obey the permission profile and appear in /tools.",
-            fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
+            fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
         )
         if (tools.isEmpty()) {
-            Text("None registered yet.", fontSize = 13.5.sp, color = c.textFaint)
+            Text("None registered yet.", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
         } else {
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -732,7 +790,7 @@ private fun PhoneToolsCard(store: AppStore) {
                             .border(0.5.dp, c.border, RoundedCornerShape(6.dp))
                             .padding(horizontal = 8.dp, vertical = 5.dp),
                     ) {
-                        Text(t, fontSize = 12.5.sp, color = c.text, fontFamily = FontFamily.Monospace)
+                        Text(t, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
                     }
                 }
             }
@@ -749,7 +807,7 @@ private fun EngineEnvCard(store: AppStore) {
     SettingsCard {
         Text(
             "Runtime environment switches set before the engine boots. Most take effect on the next message.",
-            fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+            fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
         )
 
         var noTools by remember { mutableStateOf(env.noTools) }
@@ -866,8 +924,8 @@ private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
-            Text(desc, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
+            Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
+            Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
         }
         Switch(
             checked = checked,
@@ -916,6 +974,7 @@ private fun AppearancePane(store: AppStore) {
                 Text(
                     "Sample chat preview at ${state.chatFontSize}sp",
                     fontSize = state.chatFontSize.sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.text,
                 )
             }
@@ -939,7 +998,7 @@ private fun ModelsPane(store: AppStore) {
         SettingsCard {
             Text(
                 "Local models (.gguf) run entirely on the phone — no network and no API key.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 10.dp),
             )
             if (state.localModels.isEmpty()) {
                 Box(
@@ -954,6 +1013,7 @@ private fun ModelsPane(store: AppStore) {
                     Text(
                         "No local models installed yet.",
                         fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
                         color = c.textFaint,
                     )
                 }
@@ -975,7 +1035,7 @@ private fun ModelsPane(store: AppStore) {
                             Text(
                                 label,
                                 fontSize = 13.5.sp,
-                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                                 color = if (active) c.accent else c.text,
                                 fontFamily = FontFamily.Monospace,
                             )
@@ -991,7 +1051,7 @@ private fun ModelsPane(store: AppStore) {
                                             .background(c.ok),
                                     )
                                     Spacer(Modifier.width(6.dp))
-                                    Text("Active · running on device", fontSize = 11.5.sp, color = c.ok)
+                                    Text("Active · running on device", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.ok)
                                 }
                             }
                         }
@@ -1028,7 +1088,7 @@ private fun ModelsPane(store: AppStore) {
                     Text(
                         "Import a model (.gguf)",
                         fontSize = 13.5.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        fontWeight = FontWeight.Bold,
                         color = c.accentContrast,
                     )
                 }
@@ -1039,15 +1099,15 @@ private fun ModelsPane(store: AppStore) {
         val providers = state.config?.providers ?: emptyList()
         if (providers.isEmpty()) {
             SettingsCard {
-                Text("No hosted providers configured. Add one in the Providers tab.", fontSize = 13.sp, color = c.textFaint)
+                Text("No hosted providers configured. Add one in the Providers tab.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             }
         } else {
             providers.forEach { p ->
                 SettingsCard(modifier = Modifier.padding(bottom = 10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
-                            Text(p.name, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = c.text)
-                            Text(p.endpoint, fontSize = 11.5.sp, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Text(p.name, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text)
+                            Text(p.endpoint, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         }
                         if (p.name == state.config?.active) {
                             Box(
@@ -1063,7 +1123,7 @@ private fun ModelsPane(store: AppStore) {
                     CardDivider()
                     val models = (state.modelsCache[p.name]?.models ?: emptyList())
                     if (models.isEmpty()) {
-                        Text("No models cached yet. Tap Refresh below to fetch.", fontSize = 12.5.sp, color = c.textFaint)
+                        Text("No models cached yet. Tap Refresh below to fetch.", fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                     } else {
                         Column(
                             Modifier
@@ -1085,7 +1145,7 @@ private fun ModelsPane(store: AppStore) {
                                     Text(
                                         m,
                                         fontSize = 13.sp,
-                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                        fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                                         color = if (active) c.accent else c.text,
                                         fontFamily = FontFamily.Monospace,
                                         modifier = Modifier.weight(1f),
@@ -1164,13 +1224,13 @@ private fun ProvidersPane(store: AppStore) {
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.accentContrast)
+                Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
             }
             addError?.let {
-                Text(it, fontSize = 12.sp, color = c.errStrong, modifier = Modifier.padding(top = 8.dp))
+                Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.errStrong, modifier = Modifier.padding(top = 8.dp))
             }
             addNote?.let {
-                Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 8.dp))
+                Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.ok, modifier = Modifier.padding(top = 8.dp))
             }
         }
 
@@ -1178,7 +1238,7 @@ private fun ProvidersPane(store: AppStore) {
         val providers = state.config?.providers ?: emptyList()
         if (providers.isEmpty()) {
             SettingsCard {
-                Text("No providers added yet.", fontSize = 13.sp, color = c.textFaint)
+                Text("No providers added yet.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             }
         } else {
             providers.forEach { p ->
@@ -1188,7 +1248,7 @@ private fun ProvidersPane(store: AppStore) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                                Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = c.text)
                                 if (isActive) {
                                     Spacer(Modifier.width(8.dp))
                                     Box(
@@ -1201,7 +1261,7 @@ private fun ProvidersPane(store: AppStore) {
                                     }
                                 }
                             }
-                            Text(p.endpoint, fontSize = 12.sp, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Text(p.endpoint, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
                                 Box(
                                     Modifier
@@ -1213,6 +1273,7 @@ private fun ProvidersPane(store: AppStore) {
                                 Text(
                                     if (p.hasApiKey) "key saved · Keystore" else "no API key",
                                     fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium,
                                     color = if (p.hasApiKey) c.ok else c.warn,
                                 )
                             }
@@ -1222,6 +1283,7 @@ private fun ProvidersPane(store: AppStore) {
                                 Text(
                                     "Remove",
                                     fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
                                     color = c.errStrong,
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(6.dp))
@@ -1232,7 +1294,7 @@ private fun ProvidersPane(store: AppStore) {
                             Text(
                                 if (isEditing) "Cancel" else "Edit",
                                 fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
+                                fontWeight = FontWeight.SemiBold,
                                 color = c.accent,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(6.dp))
@@ -1278,12 +1340,12 @@ private fun ProvidersPane(store: AppStore) {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text("API Key", fontSize = 13.sp, color = c.textMuted)
+                            Text("API Key", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted)
                             Text(
                                 "Replace key",
                                 fontSize = 13.sp,
                                 color = c.accent,
-                                fontWeight = FontWeight.Medium,
+                                fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(6.dp))
                                     .clickable { keyText = " " }
@@ -1330,11 +1392,11 @@ private fun UsagePane(store: AppStore) {
             val cost = totals?.optDouble("cost") ?: 0.0
             val pt = totals?.optDouble("pt") ?: 0.0
             val ct = totals?.optDouble("ct") ?: 0.0
-            Text("TOTAL SPEND", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint, letterSpacing = 0.5.sp)
+            Text("TOTAL SPEND", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = c.textFaint, letterSpacing = 0.5.sp)
             Text(
                 "$" + "%.4f".format(cost),
                 fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
+                fontWeight = FontWeight.ExtraBold,
                 color = c.text,
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier.padding(vertical = 4.dp),
@@ -1346,12 +1408,12 @@ private fun UsagePane(store: AppStore) {
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Column {
-                    Text("Prompt tokens", fontSize = 11.sp, color = c.textFaint)
-                    Text("%,.0f".format(pt), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text("Prompt tokens", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                    Text("%,.0f".format(pt), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
                 }
                 Column {
-                    Text("Completion tokens", fontSize = 11.sp, color = c.textFaint)
-                    Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text("Completion tokens", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                    Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
                 }
             }
         }
@@ -1360,7 +1422,7 @@ private fun UsagePane(store: AppStore) {
         val days = usage?.optJSONArray("days")
         SettingsCard {
             if (days == null || days.length() == 0) {
-                Text("No daily usage recorded yet.", fontSize = 13.sp, color = c.textFaint)
+                Text("No daily usage recorded yet.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else {
                 for (i in 0 until days.length()) {
                     if (i > 0) CardDivider()
@@ -1370,12 +1432,13 @@ private fun UsagePane(store: AppStore) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(d.optString("day"), fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.text)
-                            Text("${d.optInt("turns")} turns", fontSize = 11.5.sp, color = c.textFaint)
+                            Text(d.optString("day"), fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                            Text("${d.optInt("turns")} turns", fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                         }
                         Text(
                             "%,.0f in · %,.0f out".format(d.optDouble("pt"), d.optDouble("ct")),
                             fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = c.textMuted,
                             fontFamily = FontFamily.Monospace,
                         )
@@ -1388,7 +1451,7 @@ private fun UsagePane(store: AppStore) {
         val sess = usage?.optJSONArray("sessions")
         SettingsCard {
             if (sess == null || sess.length() == 0) {
-                Text("No session records found.", fontSize = 13.sp, color = c.textFaint)
+                Text("No session records found.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else {
                 for (i in 0 until minOf(sess.length(), 20)) {
                     if (i > 0) CardDivider()
@@ -1401,16 +1464,17 @@ private fun UsagePane(store: AppStore) {
                             Text(
                                 d.optString("task").ifEmpty { d.optString("id") }.take(28),
                                 fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
+                                fontWeight = FontWeight.SemiBold,
                                 color = c.text,
                                 maxLines = 1,
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                             )
-                            Text(d.optString("model"), fontSize = 11.5.sp, color = c.textFaint, fontFamily = FontFamily.Monospace)
+                            Text(d.optString("model"), fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace)
                         }
                         Text(
                             "$" + "%.4f".format(d.optDouble("cost")),
                             fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = c.text,
                             fontFamily = FontFamily.Monospace,
                         )
@@ -1423,7 +1487,7 @@ private fun UsagePane(store: AppStore) {
         val models = usage?.optJSONArray("models")
         SettingsCard {
             if (models == null || models.length() == 0) {
-                Text("No model records found.", fontSize = 13.sp, color = c.textFaint)
+                Text("No model records found.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else {
                 for (i in 0 until models.length()) {
                     if (i > 0) CardDivider()
@@ -1433,12 +1497,13 @@ private fun UsagePane(store: AppStore) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(m.optString("model"), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
-                            Text("${m.optInt("turns")} turns", fontSize = 11.5.sp, color = c.textFaint)
+                            Text(m.optString("model"), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
+                            Text("${m.optInt("turns")} turns", fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                         }
                         Text(
                             "$" + "%.4f".format(m.optDouble("cost")),
                             fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = c.text,
                             fontFamily = FontFamily.Monospace,
                         )
@@ -1524,18 +1589,18 @@ private fun BrainPane(store: AppStore) {
         Section("Stored memories", isFirst = true)
         SettingsCard {
             when {
-                err != null -> Text(err!!, fontSize = 13.5.sp, color = c.err)
-                info == null -> Text("Reading the brain…", fontSize = 13.5.sp, color = c.textFaint)
+                err != null -> Text(err!!, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.err)
+                info == null -> Text("Reading the brain…", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                 else -> {
                     val i = info!!
                     Text(
                         "${i.optLong("count")} memories",
-                        fontSize = 22.sp, fontWeight = FontWeight.Bold, color = c.text, fontFamily = FontFamily.Monospace,
+                        fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = c.text, fontFamily = FontFamily.Monospace,
                     )
                     Text(
                         "space ${i.optString("backend") ?: "?"} · ${i.optInt("dim")}-dim" +
                             if (i.optBoolean("semantic")) " · semantic channel on" else "",
-                        fontSize = 12.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
                         modifier = Modifier.padding(top = 2.dp, bottom = 10.dp),
                     )
                 }
@@ -1569,7 +1634,7 @@ private fun BrainPane(store: AppStore) {
             if (decayArmed) {
                 Text(
                     "Decay weakens and prunes old memories. Tap again to run it.",
-                    fontSize = 12.sp, color = c.warn, modifier = Modifier.padding(top = 6.dp),
+                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.warn, modifier = Modifier.padding(top = 6.dp),
                 )
             }
         }
@@ -1580,7 +1645,7 @@ private fun BrainPane(store: AppStore) {
             hits?.let { h ->
                 CardDivider()
                 if (h.length() == 0) {
-                    Text("No memories matched.", fontSize = 13.sp, color = c.textFaint)
+                    Text("No memories matched.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                 }
                 for (i in 0 until h.length()) {
                     val o = h.optJSONObject(i) ?: continue
@@ -1590,11 +1655,11 @@ private fun BrainPane(store: AppStore) {
                         Column(Modifier.weight(1f)) {
                             Text(
                                 o.optString("text").ifEmpty { o.optString("kind") },
-                                fontSize = 13.5.sp, color = c.text,
+                                fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text,
                             )
                             Text(
                                 "score ${"%.3f".format(o.optDouble("score"))} · ${o.optString("tier")}",
-                                fontSize = 11.5.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
                             )
                         }
                         if (id >= 0) {
@@ -1623,7 +1688,7 @@ private fun BrainPane(store: AppStore) {
         SettingsCard {
             val sp = spaces?.optJSONObject("info")
             if (sp == null) {
-                Text("No embedding manifest yet.", fontSize = 13.5.sp, color = c.textFaint)
+                Text("No embedding manifest yet.", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else {
                 SpaceLine(c.text, c.err, c.textFaint, "hash-768 (default)", sp.optJSONObject("hash")?.optInt("dimension") ?: 0, true)
                 CardDivider()
@@ -1641,15 +1706,15 @@ private fun BrainPane(store: AppStore) {
         SettingsCard {
             val m = ml
             if (m == null) {
-                Text("The sofuu.ml layer is not loaded in this build.", fontSize = 13.5.sp, color = c.textFaint)
+                Text("The sofuu.ml layer is not loaded in this build.", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else if (m.optBoolean("ok") != true) {
-                Text(m.optString("error").ifEmpty { "unavailable" }, fontSize = 13.5.sp, color = c.err)
+                Text(m.optString("error").ifEmpty { "unavailable" }, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.err)
             } else {
                 val info = m.optJSONObject("info")
                 val ws = m.optJSONObject("workset")
                 Text(
                     "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · ${ws?.optLong("segments") ?: 0} segments",
-                    fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace,
+                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
                 )
                 val on = info?.optJSONObject("on")
                 if (on != null) {
@@ -1660,11 +1725,11 @@ private fun BrainPane(store: AppStore) {
                         val st = if (on.optBoolean(k)) "on" else "off"
                         Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                             Text(
-                                k, fontSize = 12.5.sp, color = c.textFaint,
+                                k, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
                                 fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
                             )
                             Text(
-                                st, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold,
+                                st, fontSize = 12.5.sp, fontWeight = FontWeight.Bold,
                                 color = if (st == "on") c.accent else c.textMuted,
                             )
                         }
@@ -1674,7 +1739,7 @@ private fun BrainPane(store: AppStore) {
                 if (learner != null && learner.optBoolean("enabled")) {
                     Text(
                         "Online learning is on" + if (learner.optBoolean("pending")) " · a candidate is pending" else "",
-                        fontSize = 12.sp, color = c.warn, modifier = Modifier.padding(top = 4.dp),
+                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.warn, modifier = Modifier.padding(top = 4.dp),
                     )
                 }
                 CardDivider()
@@ -1697,7 +1762,7 @@ private fun BrainPane(store: AppStore) {
                 if (m2 != null) {
                     Text(
                         if (m2 == true) "Label recorded." else "The engine declined that label — it needs an observed call to attach to.",
-                        fontSize = 12.sp, color = if (m2 == true) c.ok else c.warn,
+                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = if (m2 == true) c.ok else c.warn,
                         modifier = Modifier.padding(top = 6.dp),
                     )
                 }
@@ -1708,7 +1773,7 @@ private fun BrainPane(store: AppStore) {
         SettingsCard {
             Text(
                 "Ask what the gates would say about a call before the agent makes it.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
             )
             TextFieldRow("tool", probeTool, "tool name (e.g. read_file)", onChange = { probeTool = it })
             Spacer(Modifier.height(6.dp))
@@ -1731,7 +1796,7 @@ private fun BrainPane(store: AppStore) {
                             (v.optString("nudge").takeIf { it.isNotEmpty() && it != "null" }?.let { " · nudge: $it" } ?: "")
                         else "BLOCKED · ${v.optString("reason")}",
                         fontSize = 12.5.sp,
-                        fontWeight = FontWeight.Medium,
+                        fontWeight = FontWeight.SemiBold,
                         color = if (ok) c.ok else c.warn,
                     )
                 }
@@ -1742,7 +1807,7 @@ private fun BrainPane(store: AppStore) {
         SettingsCard {
             Text(
                 "One runtime lives for the whole process on a phone. Collect memory after large runs or batch embeds.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
             )
             SmallButton(c.accent, c.accentContrast, "Collect garbage") {
                 scope.launch {
@@ -1750,18 +1815,18 @@ private fun BrainPane(store: AppStore) {
                     gcNote = if (okRun) "Collected successfully." else "The runtime did not expose __sofuu_gc in this build."
                 }
             }
-            gcNote?.let { Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 6.dp)) }
+            gcNote?.let { Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.ok, modifier = Modifier.padding(top = 6.dp)) }
         }
 
         Section("Image vectors")
         SettingsCard {
             Text(
                 "Embed an image into the multimodal space and compare it against a text query.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
             )
             SmallButton(c.accent, c.accentContrast, "Pick an image") { pickImage.launch("image/*") }
             imgNote?.let {
-                Text(it, fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
+                Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textFaint, modifier = Modifier.padding(top = 6.dp))
             }
             if (imgPath != null) {
                 CardDivider()
@@ -1778,6 +1843,7 @@ private fun BrainPane(store: AppStore) {
                         if (r.optBoolean("ok")) "cosine ${"%.4f".format(r.optDouble("similarity"))} · ${r.optInt("dim")}-dim"
                         else r.optString("error").ifEmpty { "spaces do not line up" },
                         fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold,
                         color = if (r.optBoolean("ok")) c.text else c.warn,
                         fontFamily = FontFamily.Monospace,
                     )
@@ -1794,7 +1860,7 @@ private fun BrainPane(store: AppStore) {
                 CardDivider()
                 Text(
                     "cosine similarity: ${"%.4f".format(it.optDouble("similarity"))} · ${it.optInt("dim")}-dim",
-                    fontSize = 13.5.sp, color = c.text, fontFamily = FontFamily.Monospace,
+                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
                 )
             }
         }
@@ -1806,12 +1872,12 @@ private fun BrainPane(store: AppStore) {
 private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim: Int, available: Boolean) {
     Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Text(
-            label, fontSize = 13.5.sp, color = if (available) text else err,
+            label, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = if (available) text else err,
             fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
         )
         Text(
             if (available) "$dim-dim" else "artifact unavailable",
-            fontSize = 12.sp, color = if (available) faint else err,
+            fontSize = 12.sp, fontWeight = FontWeight.Medium, color = if (available) faint else err,
         )
     }
 }
@@ -1829,7 +1895,7 @@ private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit
         Text(
             label,
             fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
+            fontWeight = FontWeight.Bold,
             color = fg,
         )
     }
@@ -1865,16 +1931,16 @@ private fun AgentsPane(store: AppStore) {
         Section("Registered agents", isFirst = true)
         val l = list
         if (l == null) {
-            SettingsCard { Text("Reading the registry…", fontSize = 13.5.sp, color = c.textFaint) }
+            SettingsCard { Text("Reading the registry…", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint) }
         } else if (l.length() == 0) {
-            SettingsCard { Text("No agents defined yet. Add one below.", fontSize = 13.5.sp, color = c.textFaint) }
+            SettingsCard { Text("No agents defined yet. Add one below.", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint) }
         } else {
             for (i in 0 until l.length()) {
                 val a = l.optJSONObject(i) ?: continue
                 SettingsCard(modifier = Modifier.padding(bottom = 8.dp)) {
                     Text(
                         a.optString("name"),
-                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
+                        fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text, fontFamily = FontFamily.Monospace,
                     )
                     val tools = a.optJSONArray("tools")
                     val subs = a.optInt("agents")
@@ -1889,7 +1955,7 @@ private fun AgentsPane(store: AppStore) {
                             if (subs > 0) append(" · $subs sub-agent slots")
                             a.optString("provider").takeIf { it.isNotEmpty() }?.let { append(" · $it") }
                         },
-                        fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(top = 2.dp),
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp),
                     )
                 }
             }
@@ -1923,7 +1989,7 @@ private fun AgentsPane(store: AppStore) {
                 }
             }
             note?.let {
-                Text(it, fontSize = 12.sp, color = c.ok, modifier = Modifier.padding(top = 8.dp))
+                Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.ok, modifier = Modifier.padding(top = 8.dp))
             }
         }
 
@@ -1931,7 +1997,7 @@ private fun AgentsPane(store: AppStore) {
         SettingsCard {
             Text(
                 "Runs through the agent loop headlessly and returns the final collected answer.",
-                fontSize = 12.sp, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
             )
             TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 8.dp))
             SmallButton(
@@ -1954,16 +2020,16 @@ private fun AgentsPane(store: AppStore) {
             answer?.let { a ->
                 CardDivider()
                 if (a.optBoolean("ok") != true) {
-                    Text(a.optString("error").ifEmpty { "run failed" }, fontSize = 13.5.sp, color = c.err)
+                    Text(a.optString("error").ifEmpty { "run failed" }, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.err)
                 } else {
                     Text(
                         "${a.optInt("steps")} steps" + (a.optString("stopped").takeIf { it.isNotEmpty() && it != "null" }
                             ?.let { " · stopped: $it" } ?: ""),
-                        fontSize = 12.sp, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
                     )
                     Text(
                         a.optString("answer"),
-                        fontSize = 13.5.sp, color = c.text, modifier = Modifier.padding(top = 4.dp),
+                        fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.text, modifier = Modifier.padding(top = 4.dp),
                     )
                 }
             }

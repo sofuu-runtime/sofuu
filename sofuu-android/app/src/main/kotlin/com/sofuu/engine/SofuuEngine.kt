@@ -462,7 +462,17 @@ class SofuuEngine(
         query("Promise.resolve(sofuu.chat.compact())").thenCast()
 
     fun sessions(): CompletableFuture<JSONArray?> =
-        query("JSON.stringify((sofuu.chat && sofuu.chat.sessions) ? sofuu.chat.sessions() : [])").thenArray()
+        query(
+            "JSON.stringify((function(){ " +
+                "try { " +
+                "  if (!sofuu.chat || !sofuu.chat.sessions) return []; " +
+                "  var s = sofuu.chat.sessions(); " +
+                "  if (Array.isArray(s)) return s; " +
+                "  if (s && Array.isArray(s.sessions)) return s.sessions; " +
+                "  return []; " +
+                "} catch (e) { return []; } " +
+                "})())"
+        ).thenArray()
 
     fun sessionTurns(id: String): CompletableFuture<JSONArray?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.sessionTurns) ? sofuu.chat.sessionTurns(${jsonString(id)}) : [])").thenArray()
@@ -738,7 +748,13 @@ class SofuuEngine(
         thenApply { v -> v as? JSONObject }
 
     private fun CompletableFuture<Any?>.thenArray(): CompletableFuture<JSONArray?> =
-        thenApply { v -> v as? JSONArray }
+        thenApply { v ->
+            when (v) {
+                is JSONArray -> v
+                is JSONObject -> v.optJSONArray("sessions")
+                else -> null
+            }
+        }
 
     private fun CompletableFuture<Any?>.thenCast(): CompletableFuture<JSONObject?> =
         thenApply { v -> v as? JSONObject }
@@ -807,6 +823,25 @@ class SofuuEngine(
               globalThis.__sofuu_push = function (e) { try { globalThis.__evq.push(e); } catch (x) {} };
               globalThis.__rq = [];
               globalThis.__reply_put = function (j) { try { globalThis.__rq.push(j); } catch (x) {} };
+              if (typeof sofuu !== 'undefined' && typeof sofuu.spawn === 'function') {
+                var _origSpawn = sofuu.spawn;
+                sofuu.spawn = function(opts) {
+                  if (opts && (opts.command === '/bin/sh' || opts.command === 'sh')) {
+                    try {
+                      if (typeof sofuu.fs !== 'undefined' && sofuu.fs.exists) {
+                        if (!sofuu.fs.exists('/bin/sh') && sofuu.fs.exists('/system/bin/sh')) {
+                          opts.command = '/system/bin/sh';
+                        }
+                      } else {
+                        opts.command = '/system/bin/sh';
+                      }
+                    } catch (_) {
+                      opts.command = '/system/bin/sh';
+                    }
+                  }
+                  return _origSpawn.call(this, opts);
+                };
+              }
               return true;
             })()
         """.trimIndent()

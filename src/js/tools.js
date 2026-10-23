@@ -812,10 +812,16 @@
           resolve(s);
         }
         var shArgs = ['-c', cmd];
+        var shCmd = '/bin/sh';
+        try {
+          if (typeof sofuu !== 'undefined' && sofuu.fs && !sofuu.fs.exists('/bin/sh') && sofuu.fs.exists('/system/bin/sh')) {
+            shCmd = '/system/bin/sh';
+          }
+        } catch (_) {}
         var proc;
         try {
           proc = sofuu.spawn({
-            command: '/bin/sh',
+            command: shCmd,
             args: shArgs,
             onStdout: function (chunk) { capAdd(String(chunk)); },
             onStderr: function (chunk) { capErr(String(chunk)); },

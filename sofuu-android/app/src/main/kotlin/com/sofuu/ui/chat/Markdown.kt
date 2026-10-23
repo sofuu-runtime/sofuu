@@ -78,16 +78,17 @@ fun MarkdownBody(text: String, fontSize: Int = 15) {
                     inlineMd(b.text),
                     fontSize = fontSize.sp,
                     lineHeight = (fontSize + 7).sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.text,
                     modifier = Modifier.padding(vertical = 2.dp),
                 )
                 is MdBlock.Bullet -> Row(modifier = Modifier.padding(vertical = 1.dp)) {
-                    Text("·  ", color = c.textMuted, fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp)
-                    Text(inlineMd(b.text), fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, color = c.text)
+                    Text("·  ", color = c.textMuted, fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, fontWeight = FontWeight.Bold)
+                    Text(inlineMd(b.text), fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, fontWeight = FontWeight.Medium, color = c.text)
                 }
                 is MdBlock.Numbered -> Row(modifier = Modifier.padding(vertical = 1.dp)) {
-                    Text("${b.index}.  ", color = c.textMuted, fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp)
-                    Text(inlineMd(b.text), fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, color = c.text)
+                    Text("${b.index}.  ", color = c.textMuted, fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, fontWeight = FontWeight.SemiBold)
+                    Text(inlineMd(b.text), fontSize = fontSize.sp, lineHeight = (fontSize + 7).sp, fontWeight = FontWeight.Medium, color = c.text)
                 }
                 is MdBlock.Quote -> Row(modifier = Modifier.padding(vertical = 2.dp)) {
                     Spacer(Modifier.width(10.dp).height(0.dp))
@@ -95,6 +96,7 @@ fun MarkdownBody(text: String, fontSize: Int = 15) {
                         inlineMd(b.text),
                         fontSize = fontSize.sp,
                         lineHeight = (fontSize + 7).sp,
+                        fontWeight = FontWeight.Medium,
                         color = c.textMuted,
                         modifier = Modifier
                             .padding(start = 8.dp)

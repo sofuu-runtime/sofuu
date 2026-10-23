@@ -5218,15 +5218,17 @@
   }
 
   /* Load ~/.sofuu/agents/*.js (or an explicit dir). Each file is a plain
-   * script that calls sofuu.agent.define({...}) — evaluated in global
+   * script that calls sofuu.agent.define({...}) - evaluated in global
    * scope with the runtime's own eval, i.e. trusted like any user script
-   * (documented trust model). Invalid files are listed, never fatal. */
+   * (documented trust model). A script's first load also writes a
+   * hash-keyed .bc snapshot next to it (sofuu.aotEval) so later loads
+   * skip parse+compile. Invalid files are listed, never fatal. */
   async function loadDir(dir) {
-    var out = { loaded: [], broken: [] };
+    var out = { loaded: [], broken: [], aotHits: 0, compiled: 0 };
     dir = dir || (sofuuDir() + '/agents');
     if (!sofuu.fs || !sofuu.fs.readdir) return out;
     /* The agents folder is sofuu's to provide: create it on load so the user
-     * only ever drops .js files in. Best-effort — a read-only home falls
+     * only ever drops .js files in. Best-effort - a read-only home falls
      * through to the readdir below and yields an empty registry. */
     if (sofuu.fs.mkdir) {
       try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (e) {}
@@ -5236,10 +5238,31 @@
     var files = names.filter(function (f) { return /\.js$/.test(String(f)); }).sort();
     for (var i = 0; i < files.length; i++) {
       var before = Object.keys(REGISTRY).slice();
+      var jsPath = dir + '/' + files[i];
       try {
-        var src = await sofuu.fs.readFile(dir + '/' + files[i]);
+        var src = await sofuu.fs.readFile(jsPath);
         if (typeof src !== 'string') src = String(src);
-        (0, eval)(src); /* indirect eval → global scope */
+        /* AOT (Phase 6): the script is compiled once into a .bc snapshot
+         * beside it, keyed by a hash of its source, so later starts skip
+         * parse+compile. Every unhappy path (no host binding, stale or
+         * corrupt snapshot, compile error) falls back to the source eval
+         * below - a speed layer, never a dependency. A bytecode run that
+         * THREW is reported as-is instead of re-running the script, so a
+         * side effect can never happen twice. */
+        var aot = null;
+        try {
+          aot = typeof sofuu.aotEval === 'function'
+            ? sofuu.aotEval(jsPath, jsPath.replace(/\.js$/, '.bc'))
+            : null;
+        } catch (eAot) { aot = null; }
+        var aotStatus = aot && aot.status;
+        if (aotStatus === 'hit') out.aotHits++;
+        else if (aotStatus === 'compiled') out.compiled++;
+        else if (aotStatus === 'threw') {
+          throw new Error(aot.error || 'bytecode run threw');
+        } else {
+          (0, eval)(src); /* indirect eval -> global scope */
+        }
         var after = Object.keys(REGISTRY);
         for (var k = 0; k < after.length; k++) {
           if (before.indexOf(after[k]) < 0) out.loaded.push(after[k]);
@@ -5448,5 +5471,16 @@
     delete AGENT_PENDING_APPROVALS[key];
     p.resolve(allow ? (always ? { allow: true, always: true } : true) : false);
     return { ok: true };
+  };
+  /* Snapshot of the parked interactive approvals ({id, tool}) — a host
+   * can list what it owes a decision on without keeping ids around from
+   * the event stream (approval_request payloads already carry both).
+   * Non-pending state reads as []; cheap enough to poll. */
+  A.pendingApprovals = function () {
+    var out = [];
+    for (var k in AGENT_PENDING_APPROVALS) {
+      out.push({ id: k, tool: AGENT_PENDING_APPROVALS[k].tool });
+    }
+    return out;
   };
 })();

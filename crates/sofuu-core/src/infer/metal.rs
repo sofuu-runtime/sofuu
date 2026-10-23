@@ -839,6 +839,20 @@ extern "C" {
     fn sofuu_metal_peak_fma16(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
     fn sofuu_metal_peak_fma(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
     fn sofuu_metal_peak_mma(ctx: *mut c_void, out_buf: *mut c_void, n_blocks: usize) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_v4(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_v3(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemv_q4k_v2(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1135,6 +1149,26 @@ impl MetalEngine {
     ) -> bool {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
             Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
+        }
+        if ty == 12 && Self::gemv_v4_enabled() && cols % 256 == 0 && cols <= 4096
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_v4(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
+        }
+        if ty == 12 && Self::gemv_v3_enabled() && cols % 256 == 0
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_v3(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
         }
         if ty == 12 && Self::gemv_v2_enabled() && cols % 256 == 0
             && unsafe {
@@ -2307,6 +2341,46 @@ impl MetalEngine {
         rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
         for ((ty, rows, cols), c) in rows {
             eprintln!("[gguf-hist {label}] ty={ty} rows={rows} cols={cols} calls={c}");
+        }
+    }
+
+    /// Decode GEMV v4 (x staged in threadgroup memory). SOFUU_GEMV_V4=1 arms it.
+    fn gemv_v4_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var("SOFUU_GEMV_V4")
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        v == "1" || v == "true" || v == "on"
+                    })
+                    .unwrap_or(false);
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Decode GEMV v3 (split-K: 4 warps per row). SOFUU_GEMV_V3=1 arms it.
+    fn gemv_v3_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var("SOFUU_GEMV_V3")
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        v == "1" || v == "true" || v == "on"
+                    })
+                    .unwrap_or(false);
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
         }
     }
 

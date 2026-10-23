@@ -213,6 +213,9 @@ struct Shell: View {
                     if let boot = store.state.bootError {
                         Banner(text: boot, isError: true)
                     }
+                    if let stall = store.state.enginePumpStall {
+                        Banner(text: stall, isError: true)
+                    }
                     if let preview = store.state.preview {
                         PreviewBar(label: preview.label) { store.closePreview() }
                     }

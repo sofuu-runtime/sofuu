@@ -1,5 +1,17 @@
 package com.sofuu.ui
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Environment
+import android.provider.DocumentsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import java.io.File
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -191,7 +203,8 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                 // Pills follow creation order (desktop: task || "Chat N"),
                 // newest first, capped with overflow in the history sheet.
                 val ordered = state.sessions.sortedBy { it.startedAt }
-                val pills = if (ordered.isEmpty()) listOf<String?>(null) else ordered.reversed().take(6).map { it.id }
+                val recent = ordered.reversed().take(6).map { it.id }
+                val pills = listOf<String?>(null) + recent
                 for (sid in pills) {
                     val active = sid == state.activeSessionId
                     val s = ordered.firstOrNull { it.id == sid }
@@ -213,7 +226,13 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                             .padding(start = 12.dp, end = if (active && sid != null) 6.dp else 12.dp, top = 6.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(label, fontSize = 13.sp, color = if (active) c.text else c.textMuted, maxLines = 1)
+                        Text(
+                            label,
+                            fontSize = 13.sp,
+                            fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                            color = if (active) c.text else c.textMuted,
+                            maxLines = 1,
+                        )
                         if (active && sid != null) {
                             Spacer(Modifier.width(4.dp))
                             Icon(
@@ -356,9 +375,9 @@ private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {})
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("What should we work on?", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium, color = c.text)
+        Text("What should we work on?", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = c.text)
         if (subtitle != null) {
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = c.textFaint, modifier = Modifier.padding(top = 6.dp, bottom = 24.dp))
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 6.dp, bottom = 24.dp))
         } else {
             Spacer(Modifier.height(24.dp))
         }
@@ -378,8 +397,8 @@ private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {})
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text)
-                        Text(desc, fontSize = 11.sp, color = c.textFaint)
+                        Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                        Text(desc, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                     }
                     Icon(Icons2.ChevronRight, null, tint = c.textFaint, modifier = Modifier.size(16.dp))
                 }
@@ -404,14 +423,110 @@ private fun PreviewBar(label: String, onClose: () -> Unit) {
 
 // ── Workspace drawer (the desktop sidebar, as a slide-over) ──────
 
+private fun resolveTreeUriToPath(context: Context, uri: Uri): String? {
+    try {
+        context.contentResolver.takePersistableUriPermission(
+            uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        )
+    } catch (_: Exception) {}
+
+    val docId = try {
+        DocumentsContract.getTreeDocumentId(uri)
+    } catch (_: Exception) {
+        uri.lastPathSegment
+    }
+    if (docId != null) {
+        val parts = docId.split(":")
+        if (parts.size >= 2) {
+            val type = parts[0]
+            val relativePath = parts[1]
+            if ("primary".equals(type, ignoreCase = true)) {
+                return Environment.getExternalStorageDirectory().absolutePath + "/" + relativePath
+            } else {
+                val sdDir = File("/storage/$type")
+                if (sdDir.exists()) {
+                    return File(sdDir, relativePath).absolutePath
+                }
+            }
+        } else if (docId.startsWith("/")) {
+            return docId
+        }
+    }
+    val decoded = Uri.decode(uri.toString())
+    val idx = decoded.indexOf("/storage/")
+    if (idx >= 0) {
+        return decoded.substring(idx)
+    }
+    return null
+}
+
 @Composable
 private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
     val state = store.state
     val c = LocalSofuuColors.current
+    val context = LocalContext.current
+
+    var showCustomPathDialog by remember { mutableStateOf(false) }
+    var customPathInput by remember { mutableStateOf("") }
+
+    val pickFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val resolved = resolveTreeUriToPath(context, uri)
+        if (resolved != null && resolved.isNotBlank()) {
+            onClose()
+            store.addWorkspace(resolved)
+        } else {
+            customPathInput = Environment.getExternalStorageDirectory().absolutePath
+            showCustomPathDialog = true
+        }
+    }
+
+    if (showCustomPathDialog) {
+        AlertDialog(
+            onDismissRequest = { showCustomPathDialog = false },
+            title = { Text("Open Folder", fontWeight = FontWeight.Bold, color = c.text) },
+            text = {
+                Column {
+                    Text(
+                        "Enter the directory path on your phone:",
+                        fontSize = 13.sp,
+                        color = c.textMuted,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    OutlinedTextField(
+                        value = customPathInput,
+                        onValueChange = { customPathInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        placeholder = { Text("/storage/emulated/0/Documents/...") },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val path = customPathInput.trim()
+                    if (path.isNotEmpty()) {
+                        showCustomPathDialog = false
+                        onClose()
+                        store.addWorkspace(path)
+                    }
+                }) {
+                    Text("Open", fontWeight = FontWeight.Bold, color = c.accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomPathDialog = false }) {
+                    Text("Cancel", color = c.textMuted)
+                }
+            }
+        )
+    }
+
     Box(Modifier.fillMaxSize().background(c.backdropVeil).clickable { onClose() }) {
         Column(
             Modifier
-                .fillMaxWidth(0.82f)
+                .fillMaxWidth(0.85f)
                 .fillMaxSize()
                 .background(c.bgSidebar)
                 .statusBarsPadding()
@@ -420,7 +535,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 .padding(16.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Workspaces", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f))
+                Text("Workspaces", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = c.text, modifier = Modifier.weight(1f))
                 Icon(
                     Icons2.Gear,
                     "Settings",
@@ -432,23 +547,51 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                         .padding(11.dp),
                 )
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(10.dp))
+
+            // Action 1: Create brand new workspace folder on phone
             Row(
                 Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable { onClose(); store.addDefaultWorkspace() }
-                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                    .background(c.bgRaised)
+                    .clickable { onClose(); store.createAndAddNewWorkspace() }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons2.Plus, null, tint = c.accent, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Add workspace", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = c.accent)
+                Icon(Icons2.Plus, null, tint = c.accent, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text("New workspace", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                    Text("Creates a new folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                }
             }
+
             Spacer(Modifier.height(8.dp))
+
+            // Action 2: Open existing phone folder via DocumentTree picker
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.bgRaised)
+                    .clickable { pickFolderLauncher.launch(null) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons2.Folder, null, tint = c.accent, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Open existing folder", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text)
+                    Text("Choose any folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (state.workspaces.isEmpty()) {
-                    Text("No open workspaces", color = c.textFaint, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                    Text("No open workspaces", color = c.textFaint, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(12.dp))
                 }
                 for (ws in state.workspaces) {
                     val active = ws == state.projectDir
@@ -459,13 +602,27 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (active) c.bgSidebarActive else Color.Transparent)
                             .clickable { onClose(); store.openWorkspace(ws) }
-                            .heightIn(min = 44.dp)
+                            .heightIn(min = 48.dp)
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Icons2.Folder, null, tint = if (active) c.accent else c.textFaint, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text(ws.substringAfterLast('/'), fontSize = 14.sp, color = c.text, modifier = Modifier.weight(1f))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                ws.substringAfterLast('/'),
+                                fontSize = 14.sp,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                color = c.text
+                            )
+                            Text(
+                                ws,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (active) c.textMuted else c.textFaint,
+                                maxLines = 1
+                            )
+                        }
                         if (state.workspaces.size > 1) {
                             Icon(
                                 Icons2.Close,
@@ -509,7 +666,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                 Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Chat history", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f))
+                Text("Chat history", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text, modifier = Modifier.weight(1f))
                 Icon(
                     Icons2.Close,
                     "Close",
@@ -522,7 +679,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                 )
             }
             if (state.sessions.isEmpty()) {
-                Text("No chats yet", fontSize = 13.sp, color = c.textFaint, modifier = Modifier.padding(12.dp))
+                Text("No chats yet", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(12.dp))
             }
             val ordered = state.sessions.sortedBy { it.startedAt }
             Column(
@@ -536,14 +693,18 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                         Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .clickable { onClose(); store.openPreview(s) }
+                            .clickable {
+                                onClose()
+                                store.closePreview()
+                                store.setActiveSession(s.id)
+                            }
                             .heightIn(min = 44.dp)
                             .padding(horizontal = 8.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, color = c.text, modifier = Modifier.weight(1f), maxLines = 1)
+                        Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f), maxLines = 1)
                         Spacer(Modifier.width(8.dp))
-                        Text(ageOf(s.lastSeen), fontSize = 11.sp, color = c.textFaint)
+                        Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                     }
                 }
             }
@@ -553,6 +714,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                 Text(
                     if (clearArmed) "Click again to confirm" else "Delete all chats in workspace",
                     fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
                     color = c.errStrong,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -588,8 +750,8 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
             .border(1.dp, c.border, RoundedCornerShape(16.dp))
             .padding(14.dp),
     ) {
-        Text("Tool approval", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.accent)
-        Text(approval.tool, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = c.text, modifier = Modifier.padding(top = 4.dp))
+        Text("Tool approval", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.accent)
+        Text(approval.tool, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.padding(top = 4.dp))
         // write/edit approvals get a real diff (desktop parity); anything
         // else shows the plain args.
         val args = approval.args
@@ -598,6 +760,7 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
                 Text(
                     args.optString("path"),
                     fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.textFaint,
                     modifier = Modifier.padding(top = 2.dp),
                 )
@@ -607,6 +770,7 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
                 Text(
                     args.optString("path"),
                     fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.textFaint,
                     modifier = Modifier.padding(top = 2.dp),
                 )
@@ -616,6 +780,7 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
                 Text(
                     args.toString().take(600),
                     fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
                     color = c.textMuted,
                     modifier = Modifier
                         .padding(top = 4.dp)
@@ -633,6 +798,7 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
             Text(
                 "$queued more waiting",
                 fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
                 color = c.textFaint,
                 modifier = Modifier.padding(top = 8.dp),
             )
@@ -649,6 +815,6 @@ private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit
             .clickable { onClick() }
             .padding(horizontal = 14.dp, vertical = 10.dp),
     ) {
-        Text(label, fontSize = 13.sp, color = fg)
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
     }
 }

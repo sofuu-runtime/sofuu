@@ -1,6 +1,8 @@
 package com.sofuu.store
 
 import android.app.Application
+import android.content.Context
+import android.os.Environment
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -151,7 +153,7 @@ val runtimeEnv = RuntimeEnv(app)
             cloudBg = uiPrefs.cloudBg,
             chatFontSize = uiPrefs.chatFontSize,
             workspaces = configs.workspaces(),
-            projectDir = configs.projectDir(),
+            projectDir = configs.projectDir() ?: File(app.filesDir, "workspace").absolutePath,
         )
     )
         private set
@@ -205,7 +207,12 @@ val runtimeEnv = RuntimeEnv(app)
                 onEngineReady()
             }
             is EngineEvent.BootError -> state = state.copy(engineReady = false, bootError = ev.message)
-            is EngineEvent.TurnStarted -> Unit // the assistant bubble is created on submit
+            is EngineEvent.TurnStarted -> {
+                if (ev.sid != null && ev.sid != state.activeSessionId) {
+                    state = state.copy(activeSessionId = ev.sid)
+                    saveCurrentSessionMessages()
+                }
+            }
             is EngineEvent.TurnFinished -> {
                 flushDelta()
                 val speed = finalMetricsText()
@@ -216,6 +223,8 @@ val runtimeEnv = RuntimeEnv(app)
                 } else {
                     patchAssistant { m -> m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed) }
                 }
+                saveCurrentSessionMessages()
+                refreshSessions()
             }
             is EngineEvent.Ctx -> {
                 val owner = ev.sid ?: state.activeSessionId ?: return
@@ -547,25 +556,27 @@ val runtimeEnv = RuntimeEnv(app)
             // nothing "thinks" — the model answers directly.
             phase = if (state.config?.effort.isNullOrEmpty()) "Generating" else "Thinking",
         )
+        saveCurrentSessionMessages()
         resetTurnMetrics()
         // Off-main: a first send mints a session via engine.newSession().get()
         // — bounded, but a bounded wait is still a frozen UI on Main.
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 var activeId = state.activeSessionId
-                if (activeId == null && state.sessions.isNotEmpty()) {
-                    val newest = state.sessions.first()
-                    engine.resumeSession(newest.id)
-                    setActiveSession(newest.id)
-                    activeId = newest.id
-                } else if (activeId == null) {
+                if (activeId == null) {
                     val minted = engine.newSession().get()
                     val id = minted?.optString("sessionId").orEmpty()
                     if (id.isNotEmpty()) {
-                        state = state.copy(sessions = listOf(makeSessionInfo(id)) + state.sessions)
-                        setActiveSession(id)
+                        val sessionInfo = makeSessionInfo(id)
+                        withContext(Dispatchers.Main) {
+                            state = state.copy(sessions = listOf(sessionInfo) + state.sessions, activeSessionId = id)
+                            saveCurrentSessionMessages()
+                        }
                         activeId = id
                     }
+                }
+                withContext(Dispatchers.Main) {
+                    saveCurrentSessionMessages()
                 }
                 engine.submitTurn(trimmed, noTools = state.mode == "chat", images = images)
             } catch (e: Exception) {
@@ -577,6 +588,7 @@ val runtimeEnv = RuntimeEnv(app)
 
     fun systemRow(text: String) {
         state = state.copy(messages = state.messages + ChatMessage(nextId("m"), MsgRole.SYSTEM, text))
+        saveCurrentSessionMessages()
     }
 
     private fun handleCommand(raw: String) {
@@ -796,7 +808,7 @@ val runtimeEnv = RuntimeEnv(app)
 
     private fun onEngineReady() {
         touchEngineUse()
-        refreshSessions(resumeNewest = true)
+        refreshSessions()
         engine.setPermissions(state.permissions)
         // A tuned model keeps its measured decode thread count across
         // restarts. A manual decode override in Settings wins. An untuned
@@ -845,57 +857,125 @@ val runtimeEnv = RuntimeEnv(app)
         }
     }
 
+    fun saveCurrentSessionMessages() {
+        val sid = state.activeSessionId ?: return
+        if (state.messages.isEmpty()) return
+        val cache = state.messageCache.toMutableMap()
+        cache[sid] = state.messages
+        state = state.copy(messageCache = cache)
+        val pDir = state.projectDir ?: engine.projectDir
+        SessionMessageStore.save(getApplication(), pDir, sid, state.messages)
+    }
+
+    suspend fun loadSessionMessages(sessionId: String): List<ChatMessage> {
+        val mem = state.messageCache[sessionId]
+        if (!mem.isNullOrEmpty()) return mem
+
+        val pDir = state.projectDir ?: engine.projectDir
+        val fromDisk = SessionMessageStore.load(getApplication(), pDir, sessionId)
+        if (!fromDisk.isNullOrEmpty()) {
+            val cache = state.messageCache.toMutableMap()
+            cache[sessionId] = fromDisk
+            state = state.copy(messageCache = cache)
+            return fromDisk
+        }
+
+        val turns = withContext(Dispatchers.Default) {
+            engine.sessionTurns(sessionId).get()
+        }
+        if (turns != null && turns.length() > 0) {
+            val msgs = SessionMessageStore.turnsToMessages(turns)
+            if (msgs.isNotEmpty()) {
+                SessionMessageStore.save(getApplication(), pDir, sessionId, msgs)
+                val cache = state.messageCache.toMutableMap()
+                cache[sessionId] = msgs
+                state = state.copy(messageCache = cache)
+                return msgs
+            }
+        }
+        return emptyList()
+    }
+
     fun refreshSessions(resumeNewest: Boolean = false) {
-        val ws = state.projectDir
-        // Off-main: engine queries are bounded now, but even a bounded wait
-        // is a UI freeze on Main — and one unbounded .get() here WAS the
-        // boot ANR (dropbox trace: refreshSessions → get).
+        val ws = state.projectDir ?: engine.projectDir
         viewModelScope.launch {
             val fetched = withContext(Dispatchers.Default) {
                 engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) }
-            } ?: return@launch
+            } ?: emptyList()
             // Merge, never clobber: the fetched list may be stale.
             val byId = LinkedHashMap<String, SessionInfo>()
             fetched.forEach { byId[it.id] = it }
             state.sessions.forEach { if (!byId.containsKey(it.id)) byId[it.id] = it }
+
+            // Discover any locally saved sessions on disk:
+            val localIds = SessionMessageStore.getLocalSessionIds(getApplication(), ws)
+            localIds.forEach { id ->
+                if (!byId.containsKey(id)) {
+                    val file = File(ws, ".sofuu/sessions/$id")
+                    val time = if (file.exists()) file.lastModified() / 1000 else System.currentTimeMillis() / 1000
+                    val taskName = SessionMessageStore.getSessionTask(getApplication(), ws, id)
+                    byId[id] = SessionInfo(id = id, startedAt = time, lastSeen = time, task = taskName)
+                } else if (byId[id]?.task.isNullOrBlank()) {
+                    val taskName = SessionMessageStore.getSessionTask(getApplication(), ws, id)
+                    if (!taskName.isNullOrBlank()) {
+                        byId[id] = byId[id]!!.copy(task = taskName)
+                    }
+                }
+            }
+
             val list = byId.values.sortedByDescending { it.lastSeen }
             if (state.streaming) {
                 state = state.copy(sessions = list)
                 return@launch
             }
+            val currentActive = state.activeSessionId
             val nextActive =
-                if (state.activeSessionId != null && list.any { it.id == state.activeSessionId }) state.activeSessionId
-                else list.firstOrNull()?.id
-            if (nextActive == state.activeSessionId) {
+                if (currentActive != null && list.any { it.id == currentActive }) currentActive
+                else if (resumeNewest) list.firstOrNull()?.id
+                else null
+
+            if (nextActive == null) {
+                state = state.copy(
+                    sessions = list,
+                    activeSessionId = null,
+                    messages = emptyList(),
+                )
+            } else if (nextActive == currentActive && state.messages.isNotEmpty()) {
                 state = state.copy(sessions = list)
             } else {
+                saveCurrentSessionMessages()
                 val cache = state.messageCache.toMutableMap()
-                state.activeSessionId?.let { cache[it] = state.messages }
                 val ctxCache = state.ctxCache.toMutableMap()
-                state.activeSessionId?.let { state.ctx?.let { m -> ctxCache[it] = m } }
+                currentActive?.let { state.ctx?.let { m -> ctxCache[it] = m } }
+                val memMessages = cache[nextActive]
                 state = state.copy(
                     sessions = list,
                     activeSessionId = nextActive,
-                    messages = nextActive?.let { cache[it] ?: emptyList() } ?: emptyList(),
+                    messages = memMessages ?: emptyList(),
                     approvals = emptyList(),
                     preview = null,
                     messageCache = cache,
                     ctxCache = ctxCache,
-                    ctx = nextActive?.let { ctxCache[it] },
+                    ctx = ctxCache[nextActive],
                 )
+                if (memMessages == null || memMessages.isEmpty()) {
+                    val loaded = loadSessionMessages(nextActive)
+                    if (state.activeSessionId == nextActive) {
+                        state = state.copy(messages = loaded)
+                    }
+                }
             }
-            // Resume ONLY on the boot pass: the engine attached the newest
-            // session itself, so a first send appends to it instead of
-            // minting a duplicate. Re-resuming on every refresh would
-            // hijack whatever session the user is viewing.
-            if (resumeNewest && fetched.isNotEmpty()) {
-                engine.resumeSession(fetched.first().id)
+            // Resume ONLY when explicitly asked:
+            if (resumeNewest && nextActive != null) {
+                engine.resumeSession(nextActive)
             }
         }
     }
 
     fun setActiveSession(id: String?) {
+        closePreview()
         if (id == state.activeSessionId) return
+        saveCurrentSessionMessages()
         if (state.streaming) {
             val sc = state.ctxCache.toMutableMap()
             state.activeSessionId?.let { state.ctx?.let { m -> sc[it] = m } }
@@ -903,12 +983,17 @@ val runtimeEnv = RuntimeEnv(app)
             return
         }
         val cache = state.messageCache.toMutableMap()
-        state.activeSessionId?.let { cache[it] = state.messages }
         val ctxCache = state.ctxCache.toMutableMap()
         state.activeSessionId?.let { state.ctx?.let { m -> ctxCache[it] = m } }
+
+        val pDir = state.projectDir ?: engine.projectDir
+        val memMessages = id?.let { cache[it] } ?: id?.let { SessionMessageStore.load(getApplication(), pDir, it) }
+        if (id != null && memMessages != null) {
+            cache[id] = memMessages
+        }
         state = state.copy(
             activeSessionId = id,
-            messages = id?.let { cache[it] ?: emptyList() } ?: emptyList(),
+            messages = memMessages ?: emptyList(),
             approvals = emptyList(),
             preview = null,
             messageCache = cache,
@@ -916,7 +1001,17 @@ val runtimeEnv = RuntimeEnv(app)
             ctx = id?.let { ctxCache[it] },
         )
         if (id != null) {
-            viewModelScope.launch { engine.resumeSession(id) }
+            viewModelScope.launch {
+                engine.resumeSession(id)
+                if (memMessages.isNullOrEmpty()) {
+                    val loaded = loadSessionMessages(id)
+                    withContext(Dispatchers.Main) {
+                        if (state.activeSessionId == id) {
+                            state = state.copy(messages = loaded)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -925,25 +1020,20 @@ val runtimeEnv = RuntimeEnv(app)
             systemRow("Chat limit reached ($MAX_SESSIONS per workspace) — delete a chat (the x on a pill) to add a new one.")
             return
         }
-        // Park the outgoing page and clear the active id FIRST (the
-        // desktop's new_chat dispatch) so the mint that lands afterwards
-        // activates cleanly instead of re-parking an empty page.
+        saveCurrentSessionMessages()
         val cache = state.messageCache.toMutableMap()
         state.activeSessionId?.let { cache[it] = state.messages }
         val ctxCache = state.ctxCache.toMutableMap()
         state.activeSessionId?.let { state.ctx?.let { m -> ctxCache[it] = m } }
         state = state.copy(
-            activeSessionId = null, messages = emptyList(), approvals = emptyList(),
-            preview = null, messageCache = cache, ctxCache = ctxCache, ctx = null,
+            activeSessionId = null,
+            messages = emptyList(),
+            approvals = emptyList(),
+            preview = null,
+            messageCache = cache,
+            ctxCache = ctxCache,
+            ctx = null,
         )
-        viewModelScope.launch {
-            val res = engine.newSession().get()
-            val sid = res?.optString("sessionId").orEmpty()
-            if (sid.isNotEmpty()) {
-                state = state.copy(sessions = listOf(makeSessionInfo(sid)) + state.sessions)
-                setActiveSession(sid)
-            }
-        }
     }
 
     fun deleteSession(id: String) {
@@ -961,6 +1051,7 @@ val runtimeEnv = RuntimeEnv(app)
 
     private fun applyDeleteSession(id: String) {
         val wasActive = state.activeSessionId == id
+        SessionMessageStore.delete(getApplication(), state.projectDir, id)
         val cache = state.messageCache.toMutableMap(); cache.remove(id)
         val ctxCache = state.ctxCache.toMutableMap(); ctxCache.remove(id)
         state = state.copy(
@@ -995,6 +1086,7 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     private fun applyClearSessions() {
+        SessionMessageStore.deleteAll(getApplication(), state.projectDir)
         val cache = state.messageCache.toMutableMap(); state.sessions.forEach { cache.remove(it.id) }
         val ctxCache = state.ctxCache.toMutableMap(); state.sessions.forEach { ctxCache.remove(it.id) }
         state = state.copy(sessions = emptyList(), activeSessionId = null, messages = emptyList(), approvals = emptyList(), preview = null, messageCache = cache, ctxCache = ctxCache, ctx = null)
@@ -1003,12 +1095,29 @@ val runtimeEnv = RuntimeEnv(app)
     /** Load a past session's transcript for read-only viewing. */
     fun openPreview(session: SessionInfo) {
         viewModelScope.launch {
-            val turns = engine.sessionTurns(session.id).get()?.let { arr ->
-                (0 until arr.length()).map { i ->
-                    val o = arr.optJSONObject(i) ?: return@map PreviewTurn("", "")
-                    PreviewTurn(o.optString("prompt"), o.optString("answer"))
+            val loaded = SessionMessageStore.load(getApplication(), state.projectDir, session.id)
+            val turns = if (!loaded.isNullOrEmpty()) {
+                val list = ArrayList<PreviewTurn>()
+                var curPrompt = ""
+                for (m in loaded) {
+                    if (m.role == MsgRole.USER) {
+                        curPrompt = m.content
+                    } else if (m.role == MsgRole.ASSISTANT) {
+                        list.add(PreviewTurn(curPrompt, m.content))
+                        curPrompt = ""
+                    }
                 }
-            } ?: emptyList()
+                list
+            } else {
+                withContext(Dispatchers.Default) {
+                    engine.sessionTurns(session.id).get()?.let { arr ->
+                        (0 until arr.length()).map { i ->
+                            val o = arr.optJSONObject(i) ?: return@map PreviewTurn("", "")
+                            PreviewTurn(o.optString("prompt"), o.optString("answer"))
+                        }
+                    }
+                } ?: emptyList()
+            }
             state = state.copy(preview = SessionPreview(session.id, session.labelOf(state.sessions.indexOf(session).coerceAtLeast(0)), turns))
         }
     }
@@ -1112,6 +1221,7 @@ val runtimeEnv = RuntimeEnv(app)
     // ── Workspaces ────────────────────────────────────────────────
 
     fun openWorkspace(path: String) {
+        saveCurrentSessionMessages()
         // Folder change: the strip, pills and transcripts belong to the OLD
         // workspace — reset them so another folder's sessions can never
         // merge into this view.
@@ -1239,7 +1349,7 @@ val runtimeEnv = RuntimeEnv(app)
             // endpoint, so refreshModelCache would only 404 on it.
             state = state.copy(config = configs.redacted(merged))
             refreshLocalModels()
-            refreshSessions(resumeNewest = true)
+            refreshSessions()
             // Auto-tune: apply this model's stored decode thread count, or
             // measure it once on-device. The user's manual decode override
             // takes precedence over the auto result.
@@ -1433,12 +1543,42 @@ val runtimeEnv = RuntimeEnv(app)
         }
     }
 
-    /** The drawer "+": add the default app-internal workspace (a real
-     *  folder picker can replace it later via the settings pane). */
+    /** Automatically create a dedicated directory on the phone for a new workspace. */
+    fun createAndAddNewWorkspace(): String {
+        val context = getApplication<Application>()
+        val baseDir = getWorkspacesBaseDir(context)
+        baseDir.mkdirs()
+
+        var num = 1
+        var target = File(baseDir, "Workspace $num")
+        while (target.exists()) {
+            num++
+            target = File(baseDir, "Workspace $num")
+        }
+        target.mkdirs()
+        val path = target.absolutePath
+        addWorkspace(path)
+        return path
+    }
+
+    private fun getWorkspacesBaseDir(context: Context): File {
+        return try {
+            val extDocs = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+            val sofuuDocs = File(extDocs, "Sofuu/Workspaces")
+            if (sofuuDocs.exists() || sofuuDocs.mkdirs() || extDocs.canWrite()) {
+                sofuuDocs
+            } else {
+                val extFiles = context.getExternalFilesDir(null)
+                File(extFiles ?: context.filesDir, "workspaces")
+            }
+        } catch (_: Exception) {
+            val extFiles = context.getExternalFilesDir(null)
+            File(extFiles ?: context.filesDir, "workspaces")
+        }
+    }
+
     fun addDefaultWorkspace() {
-        val dir = File(getApplication<Application>().filesDir, "workspace").absolutePath
-        File(dir).mkdirs()
-        addWorkspace(dir)
+        createAndAddNewWorkspace()
     }
 
     // ── Model cache (prefetched, never on click) ──────────────────

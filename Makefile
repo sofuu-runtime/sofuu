@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test c-only size-check cargo-build \
+.PHONY: all clean install test c-only size-check bc-check cargo-build \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -83,6 +83,13 @@ c-only:
 	@echo "    The runtime is fully Rust (crates/) over the C engine layer;"
 	@echo "    run \`make\` (cargo-first) instead."
 	@exit 1
+
+# ── Shipped .bc snapshots must match their sources ──────────────
+# Release carries bytecode only (see shipped.rs), so a stale snapshot would
+# ship stale driver code with no runtime signal. Byte comparison, not a hash
+# file: QuickJS bytecode is deterministic for a given binary.
+bc-check: $(TARGET)
+	@./scripts/check-driver-bc.sh
 
 # ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
 size-check: $(TARGET)
@@ -138,9 +145,13 @@ header-sync:
 # Builds the capi crate as staticlib + cdylib, copies artifacts to dist/.
 # Usage:  make libsofuu
 # Output: dist/libsofuu.a  dist/libsofuu.dylib  dist/sofuu_embed.h
+# The EMBEDDED dylib unwinds at the ABI boundary (panic → SOFUU_ERR_PANIC
+# via catch_unwind, never a dead host app). The `sofuu` CLI binary keeps
+# the workspace default panic=abort — this override applies to this build
+# of the capi graph only.
 libsofuu: header-sync
 	@echo "  \033[36mCARGO\033[0m  libsofuu  [arch=$(ARCH)]"
-	cargo build --release -p sofuu-capi
+	CARGO_PROFILE_RELEASE_PANIC=unwind cargo build --release -p sofuu-capi
 	@mkdir -p dist
 	@cp target/release/libsofuu_capi.a dist/libsofuu.a 2>/dev/null || \
 		cp target/release/libsofuu.a dist/libsofuu.a 2>/dev/null || true

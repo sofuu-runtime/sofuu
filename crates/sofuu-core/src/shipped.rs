@@ -19,34 +19,75 @@
 // live namespace objects instead of replacing them, so nothing clobbers
 // anything regardless of registration order.
 
+// Binary budget (Phase 6, 2026-10-23): release embeds the .bc snapshots and
+// NOT the sources. Both together cost 725,326 B of a 5 MiB binary, and the
+// sources are dead weight at runtime - eval_shipped_with_bytecode only fell
+// back to them when a snapshot failed to load. Dropping them frees 496,262 B;
+// the Phase 5 work had already eaten the budget down to 12 KB of headroom.
+//
+// What keeps this honest:
+//   * debug builds still embed every source (`cfg(debug_assertions)`), so
+//     development and `cargo test` exercise the readable path;
+//   * scripts/check-driver-bc.sh (`make bc-check`) recompiles all seven
+//     drivers and fails if a committed snapshot is not byte-identical, so a
+//     stale .bc cannot ship - it was the one failure mode with no guard
+//     (eval_shipped_with_bytecode prefers the snapshot and returns on it).
 use std::os::raw::c_void;
 
 use sofuu_ffi::bridge::JSContext;
 use sofuu_ffi::qjs;
 
 /// The agent runtime driver — single source of truth is src/js/agent.js.
+#[cfg(debug_assertions)]
 pub const AGENT_JS: &str = include_str!("../../../src/js/agent.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const AGENT_JS: &str = "";
 pub const AGENT_BC: &[u8] = include_bytes!("../../../src/js/agent.bc");
 /// The web-search driver — single source of truth is src/js/web.js.
+#[cfg(debug_assertions)]
 pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const WEB_JS: &str = "";
 pub const WEB_BC: &[u8] = include_bytes!("../../../src/js/web.bc");
 /// The coding-tools driver — single source of truth is src/js/tools.js.
+#[cfg(debug_assertions)]
 pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const TOOLS_JS: &str = "";
 pub const TOOLS_BC: &[u8] = include_bytes!("../../../src/js/tools.bc");
 /// The automated fact extractor — single source of truth is src/js/extractor.js.
+#[cfg(debug_assertions)]
 pub const EXTRACTOR_JS: &str = include_str!("../../../src/js/extractor.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const EXTRACTOR_JS: &str = "";
 pub const EXTRACTOR_BC: &[u8] = include_bytes!("../../../src/js/extractor.bc");
 /// The native structured storage driver — single source of truth is src/js/storage.js.
+#[cfg(debug_assertions)]
 pub const STORAGE_JS: &str = include_str!("../../../src/js/storage.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const STORAGE_JS: &str = "";
 pub const STORAGE_BC: &[u8] = include_bytes!("../../../src/js/storage.bc");
 /// The chat turn engine — single source of truth is src/js/chat.js
 /// (PLAN-DESKTOP C). Eval'd LAST: it builds on sofuu.agent/web/tools and
 /// exposes sofuu.chat.* for embedded hosts (the desktop app). Hosts that
 /// never call sofuu.chat.init pay nothing — the module only defines state.
+#[cfg(debug_assertions)]
 pub const CHAT_JS: &str = include_str!("../../../src/js/chat.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const CHAT_JS: &str = "";
 pub const CHAT_BC: &[u8] = include_bytes!("../../../src/js/chat.bc");
 /// The recursive language model driver — single source of truth is src/js/rlm.js.
+#[cfg(debug_assertions)]
 pub const RLM_JS: &str = include_str!("../../../src/js/rlm.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const RLM_JS: &str = "";
 pub const RLM_BC: &[u8] = include_bytes!("../../../src/js/rlm.bc");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
@@ -199,6 +240,13 @@ pub unsafe fn eval_shipped_with_bytecode(
             return;
         }
     }
+    if src.is_empty() {
+        // Release build: bytecode only. Say so loudly instead of silently
+        // starting without the driver (the old failure mode was a log line
+        // from eval_shipped that looked like a user-script error).
+        eprintln!("[sofuu] {name} unavailable: bytecode load failed and this build carries no source fallback (run `make bc-check`)");
+        return;
+    }
     eval_shipped(ctx, src, name);
 }
 
@@ -206,6 +254,8 @@ pub unsafe fn eval_shipped_with_bytecode(
 mod tests {
     use super::*;
 
+    /// Source text is embedded in debug builds only, so this runs there.
+    #[cfg(debug_assertions)]
     #[test]
     fn shipped_sources_are_nonempty_and_parseable_names() {
         assert!(AGENT_JS.contains("sofuu.agent"));

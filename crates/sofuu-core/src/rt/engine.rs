@@ -285,6 +285,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::syntax::mod_syntax_register(ctx);
     }
 
+    // Phase 6 (agent loop): AOT bytecode snapshots for ~/.sofuu/agents.
+    unsafe {
+        crate::rt::bytecode::mod_bytecode_register(ctx);
+    }
+
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };

@@ -5013,3 +5013,130 @@ kernel void gemm_q6_k_mma64(
         }
     }
 }
+
+// ── decode GEMV v3: split-K, 4 warps per row ───────────────────────────────
+// v2 (8 rows/TG, 1 warp/row) matched the coalesced kernel to within noise, so
+// the row loop is not the limit. What differs from llama.cpp is threads per
+// ROW: a 1024-wide q4_K row is 4 blocks, so gemv_q4_k_c2 hands one row to 32
+// threads that chase 4 dependent 144-byte block reads. Here a 128-thread
+// threadgroup takes ONE row and gives each warp one block (w, w+4, ...), then
+// reduces the four partials through threadgroup memory. Same bytes, 4x the
+// memory-level parallelism per row.
+kernel void gemv_q4_k_v3(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint tgid                           [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]],
+    uint wid                            [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    uint row = tgid;
+    if (row >= rows) { return; }
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    uint sub = lane >> 2;
+    uint vbase = (lane & 3) * 8;
+    uint qoff = 16 + 32 * (sub >> 1) + vbase;
+    bool high = (sub & 1) != 0;
+    uint xbase = 32 * sub + vbase;
+    uint sh = high ? 4u : 0u;
+    float acc = 0.0f;
+    for (uint b = wid; b < nb; b += 4) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        uint8_t sc, m;
+        q4k_scale_min(blk + 4, sub, &sc, &m);
+        float ds = d * (float)sc;
+        float mm = dmin * (float)m;
+        uint q0 = *(device const uint *)(blk + qoff);
+        uint q1 = *(device const uint *)(blk + qoff + 4);
+        uint xo = b * 256 + xbase;
+        device const float4 *xf = (device const float4 *)(x + xo);
+        float4 xa = xf[0];
+        float4 xb = xf[1];
+        acc += (ds * (float)((q0 >> (0u + sh)) & 0xFu) - mm) * xa.x;
+        acc += (ds * (float)((q0 >> (8u + sh)) & 0xFu) - mm) * xa.y;
+        acc += (ds * (float)((q0 >> (16u + sh)) & 0xFu) - mm) * xa.z;
+        acc += (ds * (float)((q0 >> (24u + sh)) & 0xFu) - mm) * xa.w;
+        acc += (ds * (float)((q1 >> (0u + sh)) & 0xFu) - mm) * xb.x;
+        acc += (ds * (float)((q1 >> (8u + sh)) & 0xFu) - mm) * xb.y;
+        acc += (ds * (float)((q1 >> (16u + sh)) & 0xFu) - mm) * xb.z;
+        acc += (ds * (float)((q1 >> (24u + sh)) & 0xFu) - mm) * xb.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) { partial[wid] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (wid == 0 && lane == 0) {
+        y[row] = partial[0] + partial[1] + partial[2] + partial[3];
+    }
+}
+
+// ── decode GEMV v4: stage x in threadgroup memory ───────────────────────────
+// v2 and v3 both matched the shipped kernel (+-5%), which rules out the row
+// loop and threads-per-row. What every version so far shares is that the x
+// vector is re-read from DEVICE memory once per row: for the 0.6B ffn gate
+// that is 3072 rows x 4 KB = 12 MB of x against 4.7 MB of weights. This one
+// stages x in threadgroup memory once per 8-row threadgroup, so x traffic per
+// row drops 8x. Occupancy cost: 16 KB per threadgroup.
+#define GV4_ROWS 8
+#define GV4_THREADS 256
+
+kernel void gemv_q4_k_v4(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint tgid                           [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]],
+    uint lane                           [[thread_index_in_simdgroup]],
+    uint wid                            [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float4 xs4[1024];
+    uint nq = cols / 4;
+    device const float4 *xf = (device const float4 *)x;
+    for (uint i = tid; i < nq; i += GV4_THREADS) { xs4[i] = xf[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = tgid * GV4_ROWS + wid;
+    if (row >= rows) { return; }
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    uint sub = lane >> 2;
+    uint vbase = (lane & 3) * 8;
+    uint qoff = 16 + 32 * (sub >> 1) + vbase;
+    bool high = (sub & 1) != 0;
+    uint xi = 8 * sub + (vbase >> 2);   // float4 index of the lane's 8 values
+    uint sh = high ? 4u : 0u;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        device const uchar *blk = w_base + row_byte + b * 144;
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        uint8_t sc, m;
+        q4k_scale_min(blk + 4, sub, &sc, &m);
+        float ds = d * (float)sc;
+        float mm = dmin * (float)m;
+        uint q0 = *(device const uint *)(blk + qoff);
+        uint q1 = *(device const uint *)(blk + qoff + 4);
+        uint xo = b * 64 + xi;
+        float4 xa = xs4[xo];
+        float4 xb = xs4[xo + 1];
+        acc += (ds * (float)((q0 >> (0u + sh)) & 0xFu) - mm) * xa.x;
+        acc += (ds * (float)((q0 >> (8u + sh)) & 0xFu) - mm) * xa.y;
+        acc += (ds * (float)((q0 >> (16u + sh)) & 0xFu) - mm) * xa.z;
+        acc += (ds * (float)((q0 >> (24u + sh)) & 0xFu) - mm) * xa.w;
+        acc += (ds * (float)((q1 >> (0u + sh)) & 0xFu) - mm) * xb.x;
+        acc += (ds * (float)((q1 >> (8u + sh)) & 0xFu) - mm) * xb.y;
+        acc += (ds * (float)((q1 >> (16u + sh)) & 0xFu) - mm) * xb.z;
+        acc += (ds * (float)((q1 >> (24u + sh)) & 0xFu) - mm) * xb.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) { y[row] = acc; }
+}

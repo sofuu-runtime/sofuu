@@ -58,6 +58,11 @@ class DeviceTools(private val context: Context) {
                 "Use sparingly — a vibration for every finished turn trains people to ignore it.",
             parameters = """{"type":"object","properties":{"ms":{"type":"integer","description":"Duration in milliseconds (default 200, max 1000)"}},"required":[]}""",
         ) { args -> vibrate(args) },
+        Registration(
+            name = "run_command",
+            description = "Execute a shell command on Android (/system/bin/sh -c) and return output and exit code. Allows running file inspection, process tools, and system commands.",
+            parameters = """{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute on Android"},"timeout_ms":{"type":"integer","description":"Timeout in milliseconds (default 30000)"}},"required":["command"]}""",
+        ) { args -> runPhoneShell(args) },
     )
 
     /** One tool: its schema plus the handler that answers a call. */
@@ -160,6 +165,46 @@ class DeviceTools(private val context: Context) {
         if (!vib.hasVibrator()) return err("this device has no vibrator")
         vib.vibrate(VibrationEffect.createOneShot(ms.toLong(), VibrationEffect.DEFAULT_AMPLITUDE))
         return ok("vibrated ${ms}ms")
+    }
+
+    private fun runPhoneShell(args: JSONObject): String {
+        val command = args.optString("command").trim()
+        if (command.isEmpty()) return err("command is required")
+        return try {
+            val process = ProcessBuilder("/system/bin/sh", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+
+            val reader = java.io.BufferedReader(java.io.InputStreamReader(process.inputStream))
+            val output = StringBuilder()
+            val startTime = System.currentTimeMillis()
+            val timeoutMs = args.optLong("timeout_ms", 30_000L).coerceIn(1000L, 120_000L)
+
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                if (output.length < 32_000) {
+                    output.append(line).append('\n')
+                }
+                if (System.currentTimeMillis() - startTime > timeoutMs) {
+                    process.destroy()
+                    output.append("\n[Command timed out after ${timeoutMs}ms]")
+                    break
+                }
+            }
+            val exitCode = if (process.isAlive) {
+                process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+                if (process.isAlive) { process.destroyForcibly(); -1 } else process.exitValue()
+            } else {
+                process.exitValue()
+            }
+            JSONObject()
+                .put("ok", exitCode == 0)
+                .put("exit_code", exitCode)
+                .put("output", output.toString().trim())
+                .toString()
+        } catch (e: Exception) {
+            err("failed to execute command: ${e.message}")
+        }
     }
 
     private fun ok(note: String): String = JSONObject().put("ok", true).put("note", note).toString()

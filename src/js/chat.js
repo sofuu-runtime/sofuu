@@ -1376,6 +1376,8 @@
       else if (ev.kind === 'answer' && out.length) out[out.length - 1].answer = String(ev.text || '');
       else if (ev.kind === 'tools' && out.length) {
         try { out[out.length - 1].tools = JSON.parse(ev.text || '[]'); } catch (eT) {}
+      } else if (ev.kind === 'usage' && out.length) {
+        try { out[out.length - 1].usage = JSON.parse(ev.text || '{}'); } catch (eU) {}
       } else if (ev.kind === 'served' && out.length) {
         out[out.length - 1].servedBy = String(ev.text || '');
       }

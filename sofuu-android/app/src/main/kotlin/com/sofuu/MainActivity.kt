@@ -90,6 +90,7 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         store.foreground = false
+        store.saveCurrentSessionMessages()
         // Never leave the mic hot in the background.
         store.cancelDictation()
     }

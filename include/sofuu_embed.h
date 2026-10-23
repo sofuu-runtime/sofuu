@@ -54,6 +54,12 @@ typedef void (*sofuu_event_cb)(const char *event_json, void *opaque);
 #define SOFUU_ERR_UNKNOWN_SPACE -7   /* space id not recognized            */
 #define SOFUU_ERR_MODEL_UNAVAIL -8   /* baked embedding artifact unusable  */
 #define SOFUU_ERR_NOMEM         -9   /* host-visible malloc failed         */
+/* Embedded builds unwind at the ABI boundary (the `sofuu` CLI binary keeps
+ * panic=abort): a contained Rust panic returns this, with details in
+ * out_json's error envelope — or, for sofuu_rt_call_stream, in a synthesized
+ * terminal {"kind":"done","error":{...}} so the one-terminal contract holds
+ * even through a panic. The runtime stays usable for the next call. */
+#define SOFUU_ERR_PANIC         -10  /* Rust panic contained at the ABI    */
 
 /* ── Versioning ────────────────────────────────────────────────── */
 /* Returns the ABI version this library implements (v2 = 2). The ABI is

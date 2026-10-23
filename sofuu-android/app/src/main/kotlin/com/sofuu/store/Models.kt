@@ -20,6 +20,36 @@ data class TimelineEntry(
 ) {
     companion object {
         fun raw(id: String, kind: String, title: String) = TimelineEntry(id, kind, title)
+
+        fun fromJson(o: JSONObject): TimelineEntry = TimelineEntry(
+            id = o.optString("id"),
+            kind = o.optString("kind"),
+            title = o.optString("title"),
+            tool = o.optString("tool").takeIf { it.isNotEmpty() },
+            detail = o.optString("detail").takeIf { it.isNotEmpty() },
+            badge = o.optString("badge").takeIf { it.isNotEmpty() },
+            result = o.optString("result").takeIf { it.isNotEmpty() },
+            ok = if (o.has("ok") && !o.isNull("ok")) o.optBoolean("ok") else null,
+            runId = o.optString("runId").takeIf { it.isNotEmpty() },
+            durationMs = if (o.has("durationMs") && !o.isNull("durationMs")) o.optLong("durationMs") else null,
+            live = o.optBoolean("live", false),
+            t = if (o.has("t") && !o.isNull("t")) o.optLong("t") else null,
+        )
+    }
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("kind", kind)
+        put("title", title)
+        tool?.let { put("tool", it) }
+        detail?.let { put("detail", it) }
+        badge?.let { put("badge", it) }
+        result?.let { put("result", it) }
+        ok?.let { put("ok", it) }
+        runId?.let { put("runId", it) }
+        durationMs?.let { put("durationMs", it) }
+        put("live", live)
+        t?.let { put("t", it) }
     }
 }
 
@@ -43,6 +73,24 @@ data class Usage(
     }
 
     private fun fmt(n: Long): String = "%,d".format(n)
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        promptTokens?.let { put("promptTokens", it) }
+        completionTokens?.let { put("completionTokens", it) }
+        costUsd?.let { put("costUsd", it) }
+        steps?.let { put("steps", it) }
+        servedBy?.let { put("servedBy", it) }
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): Usage = Usage(
+            promptTokens = if (o.has("promptTokens") && !o.isNull("promptTokens")) o.optLong("promptTokens") else null,
+            completionTokens = if (o.has("completionTokens") && !o.isNull("completionTokens")) o.optLong("completionTokens") else null,
+            costUsd = if (o.has("costUsd") && !o.isNull("costUsd")) o.optDouble("costUsd") else null,
+            steps = if (o.has("steps") && !o.isNull("steps")) o.optInt("steps") else null,
+            servedBy = o.optString("servedBy").takeIf { it.isNotEmpty() },
+        )
+    }
 }
 
 enum class MsgRole { USER, ASSISTANT, SYSTEM }
@@ -59,7 +107,47 @@ data class ChatMessage(
     /** Final speed line, set when the turn finishes:
      *  "22.4 tok/s · first 0.38s · 117 tok". */
     val metrics: String? = null,
-)
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("role", role.name)
+        put("content", content)
+        thinking?.let { put("thinking", it) }
+        val tlArr = JSONArray()
+        timeline.forEach { tlArr.put(it.toJson()) }
+        put("timeline", tlArr)
+        usage?.let { put("usage", it.toJson()) }
+        put("status", status)
+        error?.let { put("error", it) }
+        metrics?.let { put("metrics", it) }
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): ChatMessage {
+            val roleStr = o.optString("role", "USER")
+            val role = try { MsgRole.valueOf(roleStr) } catch (_: Exception) { MsgRole.USER }
+            val tlList = ArrayList<TimelineEntry>()
+            val tlArr = o.optJSONArray("timeline")
+            if (tlArr != null) {
+                for (i in 0 until tlArr.length()) {
+                    tlArr.optJSONObject(i)?.let { tlList.add(TimelineEntry.fromJson(it)) }
+                }
+            }
+            val usageObj = o.optJSONObject("usage")
+            return ChatMessage(
+                id = o.optString("id"),
+                role = role,
+                content = o.optString("content", ""),
+                thinking = o.optString("thinking").takeIf { it.isNotEmpty() },
+                timeline = tlList,
+                usage = usageObj?.let { Usage.fromJson(it) },
+                status = o.optString("status", "done"),
+                error = o.optString("error").takeIf { it.isNotEmpty() },
+                metrics = o.optString("metrics").takeIf { it.isNotEmpty() },
+            )
+        }
+    }
+}
 
 data class Approval(
     val id: String,

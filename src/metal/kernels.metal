@@ -5831,8 +5831,8 @@ kernel void llama_attn_wN(
     uint h                              [[threadgroup_position_in_grid]],
     uint tid                            [[thread_position_in_threadgroup]]
 ) {
-    // sacc[ATTN_WARPS][1024]: refuse a head_dim the staging array cannot hold.
-    // sacc[ATTN_WARPS][256]: 8 warps x 256 dims = 8 KB, inside the 32 KB
+    // sacc[ATTN_WARPS][256] is 8 KB at eight warps and 16 KB at sixteen, inside the
+    // 32 KB threadgroup budget, and acc[8] holds 256/32 steps:
     // threadgroup budget; anything larger is refused here and at the entry point.
     if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 256u) { return; }
     uint lane = tid & 31u;
@@ -5842,7 +5842,7 @@ kernel void llama_attn_wN(
     if (has_norm != 0u) {
         float ss = 0.0f;
         for (uint i = tid; i < head_dim; i += 32 * ATTN_WARPS) { ss += q_head[i] * q_head[i]; }
-        // reduce across the whole 128-thread group
+        // reduce the q-norm sum across every warp in the group
         threadgroup float rbuf[ATTN_WARPS];
         ss = simd_sum(ss);
         if (lane == 0u) { rbuf[warp] = ss; }
@@ -5879,8 +5879,10 @@ kernel void llama_attn_wN(
     // the output accumulator, so the V sweep stays coalesced across the warp.
     float m = -INFINITY;
     float l = 0.0f;
-    float acc[4];
-    for (uint d = 0; d < 4u; ++d) { acc[d] = 0.0f; }
+    // one slot per head_dim/32 step: head_dim is bounded by the sacc guard above,
+    // so 8 covers the 256-dim maximum (the earlier 4 only held head_dim <= 128).
+    float acc[8];
+    for (uint d = 0; d < 8u; ++d) { acc[d] = 0.0f; }
     for (uint t = warp; t < seq; t += ATTN_WARPS) {
         float partial = 0.0f;
         for (uint i = lane; i < head_dim; i += 32) {

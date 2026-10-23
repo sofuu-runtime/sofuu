@@ -229,7 +229,7 @@ struct FileTree: View {
                 composer = EntryComposer(mode: .newFile, dir: root, initial: "untitled.md")
                 composerFocused = true
             } label: {
-                Image(systemName: "doc.badge.plus").iconFrame()
+                Image(systemName: "doc.badge.plus").iconFrame(badge: true)
             }
             .buttonStyle(.plain)
             .disabled(store.state.projectDir == nil)
@@ -240,7 +240,7 @@ struct FileTree: View {
                 composer = EntryComposer(mode: .newFolder, dir: root, initial: "new-folder")
                 composerFocused = true
             } label: {
-                Image(systemName: "folder.badge.plus").iconFrame()
+                Image(systemName: "folder.badge.plus").iconFrame(badge: true)
             }
             .buttonStyle(.plain)
             .disabled(store.state.projectDir == nil)
@@ -273,9 +273,14 @@ struct FileTree: View {
 }
 
 private extension Image {
-    func iconFrame() -> some View {
-        font(.system(size: 12))
+    /// Toolbar glyphs share one optical box. The `.badge.plus` variants
+    /// carry their badge ink in the top-right of the em-box, so their
+    /// doc/folder bodies ride LOW next to plain glyphs (search, refresh)
+    /// — they get a smaller size and a small lift to line the bodies up.
+    func iconFrame(badge: Bool = false) -> some View {
+        font(.system(size: badge ? 11 : 12))
             .foregroundColor(.secondary)
+            .baselineOffset(badge ? 1 : 0)
             .frame(width: 26, height: 26)
             .contentShape(Rectangle())
     }
@@ -511,7 +516,8 @@ private extension Image {
     }
 }
 
-/// The inline naming field for create/rename. Enter commits, Esc cancels.
+/// The inline naming field for create/rename. Enter commits, Esc
+/// cancels, clicking anywhere else commits (focus-loss = save).
 private struct RowComposer: View {
     let store: AppStore
     @Binding var composer: FileTree.EntryComposer?
@@ -531,6 +537,13 @@ private struct RowComposer: View {
                 .focused(focused)
                 .onSubmit { commit() }
                 .onExitCommand { composer = nil }
+                .onChange(of: focused.wrappedValue) { active in
+                    // Click-away commits — desktop Finder/Notes behaviour.
+                    // Esc still cancels (onExitCommand nils the composer
+                    // first, so this handler sees a spent view and the
+                    // guard stops it).
+                    if !active { commit() }
+                }
             Spacer(minLength: 0)
         }
         .padding(.vertical, 3)
@@ -543,7 +556,14 @@ private struct RowComposer: View {
 
     private func commit() {
         guard let c = composer else { return }
-        let name = composer?.initial ?? c.initial
+        let name = (composer?.initial ?? c.initial).trimmingCharacters(in: .whitespaces)
+        // Never fired from a stray click on an untouched field — an
+        // empty name cancels instead of erroring (a rename with a
+        // cleared field = abandon, not an error row).
+        guard !name.isEmpty else {
+            composer = nil
+            return
+        }
         var err: String?
         switch c.mode {
         case .newFile:

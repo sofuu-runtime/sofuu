@@ -2,6 +2,42 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// Publishing the naming field's window-space frame (the click-away
+/// monitor must not treat clicks ON the field as outside clicks).
+struct ComposerFieldFrameKey: PreferenceKey {
+    static var defaultValue: CGRect = .null
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+}
+
+/// The one commit path for the inline naming field — used by Enter,
+/// focus-loss AND the window click-away monitor.
+@MainActor
+enum ComposerCommit {
+    static func commit(_ composer: Binding<FileTree.EntryComposer?>, store: AppStore) {
+        guard let c = composer.wrappedValue else { return }
+        let name = c.initial.trimmingCharacters(in: .whitespaces)
+        // An untouched (empty) field cancels silently instead of
+        // erroring; a rename whose text was cleared = abandon.
+        guard !name.isEmpty else {
+            composer.wrappedValue = nil
+            return
+        }
+        var err: String?
+        switch c.mode {
+        case .newFile:
+            err = store.createFile(at: c.dir, name: name)
+        case .newFolder:
+            err = store.createFolder(at: c.dir, name: name)
+        case .rename:
+            // The source path uses the ORIGINAL name: `initial` is the
+            // live field text, which the user is changing right now.
+            err = store.renameFile(c.dir + "/" + c.original, newName: name)
+        }
+        if let err { store.systemRow(err) }
+        composer.wrappedValue = nil
+    }
+}
+
 /// IDE left panel — the workspace file tree, with real-IDE file ops:
 ///
 /// - Working refresh: re-lists rows from disk AND reloads clean open tabs
@@ -20,6 +56,11 @@ struct FileTree: View {
     @State private var refreshTick = 0
     @State private var composer: EntryComposer?
     @FocusState private var composerFocused: Bool
+    /// Click-away commit: AppKit does NOT resign the field editor when
+    /// the user clicks a non-focusable view, so SwiftUI FocusState never
+    /// blurs — a window-level mouse monitor is the reliable detector.
+    @State private var clickAwayMonitor: Any?
+    @State private var composerFieldFrame: CGRect = .null
 
     // Project-wide search (⇧⌘F) — lives above the tree rows.
     @State private var searchVisible = false
@@ -85,6 +126,40 @@ struct FileTree: View {
                 Spacer()
             }
         }
+        .onAppear { installClickAwayMonitor() }
+        .onDisappear { removeClickAwayMonitor() }
+        .onPreferenceChange(ComposerFieldFrameKey.self) { composerFieldFrame = $0 }
+    }
+
+    // MARK: - Composer click-away
+
+    /// Any click outside the naming field commits what is typed (the
+    /// Finder/Notes click-away-save rule). Esc keeps its cancel meaning
+    /// because onExitCommand runs FIRST and nils the composer.
+    private func installClickAwayMonitor() {
+        guard clickAwayMonitor == nil else { return }
+        let composerBinding = $composer
+        clickAwayMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]) { event in
+            guard let pending = composerBinding.wrappedValue else { return event }
+            let loc = event.locationInWindow
+            if composerFieldFrame != .null, NSPointInRect(loc, composerFieldFrame) {
+                return event // clicks in the field itself are editing
+            }
+            guard let window = event.window, window.isVisible else { return event }
+            DispatchQueue.main.async {
+                // The click may have replaced the composer (e.g. pressing
+                // "New folder" mid-new-file) — retire only the SAME one.
+                guard composerBinding.wrappedValue == pending else { return }
+                ComposerCommit.commit(composerBinding, store: store)
+            }
+            return event
+        }
+    }
+
+    private func removeClickAwayMonitor() {
+        if let m = clickAwayMonitor { NSEvent.removeMonitor(m) }
+        clickAwayMonitor = nil
     }
 
     // MARK: - Project search section
@@ -229,7 +304,7 @@ struct FileTree: View {
                 composer = EntryComposer(mode: .newFile, dir: root, initial: "untitled.md")
                 composerFocused = true
             } label: {
-                Image(systemName: "doc.badge.plus").iconFrame(badge: true)
+                Image(systemName: "doc.badge.plus").iconFrame()
             }
             .buttonStyle(.plain)
             .disabled(store.state.projectDir == nil)
@@ -240,7 +315,7 @@ struct FileTree: View {
                 composer = EntryComposer(mode: .newFolder, dir: root, initial: "new-folder")
                 composerFocused = true
             } label: {
-                Image(systemName: "folder.badge.plus").iconFrame(badge: true)
+                Image(systemName: "folder.badge.plus").iconFrame()
             }
             .buttonStyle(.plain)
             .disabled(store.state.projectDir == nil)
@@ -273,14 +348,13 @@ struct FileTree: View {
 }
 
 private extension Image {
-    /// Toolbar glyphs share one optical box. The `.badge.plus` variants
-    /// carry their badge ink in the top-right of the em-box, so their
-    /// doc/folder bodies ride LOW next to plain glyphs (search, refresh)
-    /// — they get a smaller size and a small lift to line the bodies up.
-    func iconFrame(badge: Bool = false) -> some View {
-        font(.system(size: badge ? 11 : 12))
+    /// Toolbar glyphs share one optical box. (Measured: doc.badge.plus,
+    /// folder.badge.plus, magnifyingglass and arrow.clockwise all carry
+    /// the SAME optical center at equal point size — no per-glyph
+    /// correction is wanted here.)
+    func iconFrame() -> some View {
+        font(.system(size: 12))
             .foregroundColor(.secondary)
-            .baselineOffset(badge ? 1 : 0)
             .frame(width: 26, height: 26)
             .contentShape(Rectangle())
     }
@@ -547,6 +621,10 @@ private struct RowComposer: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 3)
+        .background(GeometryReader { geo in
+            Color.clear.preference(key: ComposerFieldFrameKey.self,
+                                   value: geo.frame(in: .global))
+        })
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 focused.wrappedValue = true
@@ -555,27 +633,6 @@ private struct RowComposer: View {
     }
 
     private func commit() {
-        guard let c = composer else { return }
-        let name = (composer?.initial ?? c.initial).trimmingCharacters(in: .whitespaces)
-        // Never fired from a stray click on an untouched field — an
-        // empty name cancels instead of erroring (a rename with a
-        // cleared field = abandon, not an error row).
-        guard !name.isEmpty else {
-            composer = nil
-            return
-        }
-        var err: String?
-        switch c.mode {
-        case .newFile:
-            err = store.createFile(at: c.dir, name: name)
-        case .newFolder:
-            err = store.createFolder(at: c.dir, name: name)
-        case .rename:
-            // The source path uses the ORIGINAL name: `initial` is the
-            // live field text, which the user is changing right now.
-            err = store.renameFile(c.dir + "/" + c.original, newName: name)
-        }
-        if let err { store.systemRow(err) }
-        composer = nil
+        ComposerCommit.commit($composer, store: store)
     }
 }

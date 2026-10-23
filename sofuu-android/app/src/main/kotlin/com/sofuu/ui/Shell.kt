@@ -649,6 +649,9 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
     val state = store.state
     val c = LocalSofuuColors.current
     var clearArmed by remember { mutableStateOf(false) }
+    // Per-row delete: first tap arms, second deletes. Deleting never needs the
+    // chat to be opened first, and the chat cap stays reachable at 7 chats.
+    var deleteArmed by remember { mutableStateOf<String?>(null) }
     Box(Modifier.fillMaxSize().background(c.backdropVeil).clickable { onClose() }) {
         Column(
             Modifier
@@ -693,18 +696,55 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                         Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .clickable {
-                                onClose()
-                                store.closePreview()
-                                store.setActiveSession(s.id)
-                            }
                             .heightIn(min = 44.dp)
-                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, modifier = Modifier.weight(1f), maxLines = 1)
-                        Spacer(Modifier.width(8.dp))
-                        Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                        // Tap the label = read-only preview (never touches the
+                        // active chat); "Open" resumes it.
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    onClose()
+                                    store.openPreview(s)
+                                }
+                                .padding(vertical = 4.dp),
+                        ) {
+                            Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, maxLines = 1)
+                            Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "Open",
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = c.accent,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    onClose()
+                                    store.closePreview()
+                                    store.setActiveSession(s.id)
+                                }
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        )
+                        Text(
+                            if (deleteArmed == s.id) "sure?" else "×",
+                            fontSize = if (deleteArmed == s.id) 11.5.sp else 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (deleteArmed == s.id) c.errStrong else c.textFaint,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    if (deleteArmed == s.id) {
+                                        deleteArmed = null
+                                        store.deleteSession(s.id)
+                                    } else deleteArmed = s.id
+                                }
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        )
                     }
                 }
             }

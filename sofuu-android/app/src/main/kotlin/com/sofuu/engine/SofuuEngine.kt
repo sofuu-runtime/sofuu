@@ -36,11 +36,21 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class SofuuEngine(
     val homeDir: String,
-    val projectDir: String,
+    projectDir: String,
     /** Needed to build the native host tools ([DeviceTools]); they need a
      *  Context for the vibrator, battery and share sheet. */
     private val appContext: android.content.Context,
 ) {
+    /**
+     * The engine's active workspace. Mutable on purpose: `chat.setProject`
+     * moves the engine (it chdirs), so the app-side paths that copy
+     * attachments and delete session files must move with it — a `val` here
+     * kept them pointing at the boot workspace after a switch.
+     */
+    @Volatile
+    var projectDir: String = projectDir
+        private set
+
     /** Streaming/agent events + lifecycle events for the UI. */
     private val _events = MutableSharedFlow<EngineEvent>(replay = 0, extraBufferCapacity = 512)
     val events: SharedFlow<EngineEvent> = _events
@@ -527,7 +537,14 @@ class SofuuEngine(
         query("JSON.stringify((sofuu.chat && sofuu.chat.resume) ? sofuu.chat.resume(${jsonString(id)}) : {error:'chat engine unavailable'})").thenObject()
 
     fun setProject(path: String): CompletableFuture<JSONObject?> =
-        query("JSON.stringify((sofuu.chat && sofuu.chat.setProject) ? sofuu.chat.setProject(${jsonString(path)}) : {error:'chat engine unavailable'})").thenObject()
+        query("JSON.stringify((sofuu.chat && sofuu.chat.setProject) ? sofuu.chat.setProject(${jsonString(path)}) : {error:'chat engine unavailable'})")
+            .thenCast()
+            // Follow the engine only when it accepted the switch: a rejected
+            // path must not move the app's attachment/session roots.
+            .thenApply { r ->
+                if (r?.optBoolean("ok") == true) projectDir = path
+                r
+            }
 
     fun setPermissions(profile: String): CompletableFuture<JSONObject?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.setPermissions) ? sofuu.chat.setPermissions(${jsonString(profile)}) : {error:'chat engine unavailable'})").thenObject()

@@ -490,19 +490,9 @@ val runtimeEnv = RuntimeEnv(app)
                 }
             }
             else -> {
-                if (kind == "warn" && Regex("compact", RegexOption.IGNORE_CASE).containsMatchIn(p.optString("message"))) {
-                    val pending = currentAssistant()?.timeline?.any { it.kind == "compact" && it.live } == true
-                    if (pending) {
-                        val msg = p.optString("message")
-                        patchAssistant { m ->
-                            val tl = m.timeline.toMutableList()
-                            val idx = tl.indexOfFirst { it.kind == "compact" && it.live }
-                            if (idx >= 0) tl[idx] = tl[idx].copy(detail = msg)
-                            m.copy(timeline = tl)
-                        }
-                        return
-                    }
-                }
+                // `warn` never reaches a STEP: SofuuEngine maps the event type
+                // to EngineEvent.Warn first (system row), so the old
+                // compact-notice patch here was unreachable.
                 val entry = stepToTimeline(kind, raw, p)
                 if (entry != null) {
                     patchAssistant { m -> m.copy(timeline = m.timeline + entry.copy(runId = runId)) }
@@ -568,18 +558,7 @@ val runtimeEnv = RuntimeEnv(app)
             }
             // The plan's only payload is "Step N" — dropped (desktop parity).
             "plan" -> null
-            "warn" -> {
-                val msg = p.optString("message")
-                when {
-                    msg.startsWith("ml-compaction") -> {
-                        val freed = Regex("freed ~([\\d,]+) tk").find(msg)?.groupValues?.get(1)
-                        TimelineEntry(nextId("tl"), "warn", "Context pruned", badge = freed?.let { "· ~$it tk freed" }, detail = msg, t = t)
-                    }
-                    Regex("compact", RegexOption.IGNORE_CASE).containsMatchIn(msg) ->
-                        TimelineEntry(nextId("tl"), "warn", "Context compacted", detail = msg, t = t)
-                    else -> TimelineEntry(nextId("tl"), "warn", "Warning", detail = msg.ifEmpty { null }, t = t)
-                }
-            }
+            // No "warn" row: warnings arrive as EngineEvent.Warn (system row).
             "consolidated" -> {
                 val clusters = p.optInt("clusters")
                 TimelineEntry(nextId("tl"), "consolidated", "Memory consolidated", badge = if (clusters > 0) "· $clusters ${if (clusters == 1) "cluster" else "clusters"}" else null, t = t)
@@ -1186,7 +1165,7 @@ val runtimeEnv = RuntimeEnv(app)
 
     fun newChat() {
         if (state.sessions.size >= MAX_SESSIONS) {
-            systemRow("Chat limit reached ($MAX_SESSIONS per workspace) — delete a chat (the x on a pill) to add a new one.")
+            systemRow("Chat limit reached ($MAX_SESSIONS per workspace) — delete a chat from History (tap ×) to add a new one.")
             return
         }
         saveCurrentSessionMessages()
@@ -1796,10 +1775,6 @@ val runtimeEnv = RuntimeEnv(app)
         }
     }
 
-    fun addDefaultWorkspace() {
-        createAndAddNewWorkspace()
-    }
-
     // ── Model cache (prefetched, never on click) ──────────────────
 
     fun refreshModelCache() {
@@ -1851,11 +1826,6 @@ val runtimeEnv = RuntimeEnv(app)
     fun setTheme(t: String) {
         uiPrefs.theme = t
         state = state.copy(theme = t)
-    }
-
-    /** Images chosen with the system photo picker, riding the next turn. */
-    fun consumePickedImages(urls: List<String>) {
-        state = state.copy(pickedImages = (state.pickedImages + urls).take(8))
     }
 
     fun removePickedImage(index: Int) {

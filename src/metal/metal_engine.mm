@@ -3,6 +3,8 @@
 #import <Metal/Metal.h>
 #include "metal_engine.h"
 #include <cstring>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <unistd.h>
 
@@ -27,6 +29,7 @@ struct MetalContext {
     // G2: GGUF dequant-dot GEMV kernels.
     id<MTLComputePipelineState> pso_gemv_q8_0;
     id<MTLComputePipelineState> pso_gemv_q4_0;
+    id<MTLComputePipelineState> pso_bw_probe_q4k;
     id<MTLComputePipelineState> pso_gemv_q4_k_v4;
     bool pso_gemv_q4_k_v4_live;
     id<MTLComputePipelineState> pso_gemv_q4_k_v3;
@@ -291,6 +294,7 @@ void* sofuu_metal_init(void) {
             // 107/50 GB/s compact/5G vs vec4 46/37 — but the vec4 WINS the
             // single-row shape as the 12.4 t/s serial receipt showed):
             // batched pass GEMVs = byte-lane b4c, single-row = vec4 c2.
+            ctx->pso_bw_probe_q4k = load_pso(@"bw_probe_q4k");
             ctx->pso_gemv_q4_k_v4 = load_pso(@"gemv_q4_k_v4");
             ctx->pso_gemv_q4_k_v4_live = ctx->pso_gemv_q4_k_v4 != nil;
             ctx->pso_gemv_q4_k_v3 = load_pso(@"gemv_q4_k_v3");
@@ -1486,6 +1490,7 @@ void sofuu_metal_batch_gemv_staged(
 // Returns 1 dispatched, 0 unavailable (PSO missing / bad args) — the Rust
 // side gates the GPU prefill route on a probe, never on silent zeros.
 // 8x4-tile MMQ mirror: act-quantize to per-256 TileQ8K blocks (stride 260B).
+
 int sofuu_metal_batch_quantize_q8_k(
     void* ctx_ptr,
     void* x_buf, size_t x_offset,
@@ -3239,6 +3244,39 @@ int sofuu_metal_batch_gguf(
 static NSString *g_cap_path = nil;
 static int g_cap_skip = -1, g_cap_n = 1, g_cap_cycles = 0;
 static bool g_cap_active = false;
+
+// Temporary instrumentation: measure achievable read bandwidth over nbytes of the
+// weight buffer using the same 144-byte block pattern the q4_K GEMV walks, at a
+// caller-chosen thread count and dispatch count inside ONE commit.
+extern "C" float sofuu_metal_bw_probe(void* ctx_ptr, void* w_buf_ptr, size_t nbytes,
+                                      size_t threads, size_t iters) {
+    if (!ctx_ptr || !w_buf_ptr || nbytes == 0 || iters == 0 || threads == 0) return 0.0f;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->pso_bw_probe_q4k == nil) { fprintf(stderr, "[bw-probe] pso nil\n"); return 0.0f; }
+    uint nb = (uint)(nbytes / 144);
+    id<MTLBuffer> obuf = [ctx->device newBufferWithLength:threads * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (obuf == nil) { fprintf(stderr, "[bw-probe] obuf nil\n"); return 0.0f; }
+    if (sofuu_metal_batch_open(ctx_ptr) != 0) { fprintf(stderr, "[bw-probe] open failed\n"); return 0.0f; }
+    [ctx->batch_enc setComputePipelineState:ctx->pso_bw_probe_q4k];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:obuf offset:0 atIndex:1];
+    [ctx->batch_enc setBytes:&nb length:sizeof(uint) atIndex:2];
+    size_t tpt = threads < 1024 ? threads : 1024;      // hardware max per threadgroup
+    size_t ntgs = (threads + tpt - 1) / tpt;           // round up: never launch fewer
+    MTLSize tg = MTLSizeMake(tpt, 1, 1);
+    MTLSize grid = MTLSizeMake(ntgs, 1, 1);
+    for (size_t it = 0; it < iters; ++it) {
+        [ctx->batch_enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    int ok = sofuu_metal_batch_end(ctx_ptr);
+    auto t1 = std::chrono::steady_clock::now();
+    if (!ok) { fprintf(stderr, "[bw-probe] end failed\n"); return 0.0f; }
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    if (secs <= 0.0) return 0.0f;
+    return (float)((double)nbytes * (double)iters / 1e9 / secs);
+}
 
 int sofuu_metal_batch_open(void* ctx_ptr) {
     if (!ctx_ptr) return -1;

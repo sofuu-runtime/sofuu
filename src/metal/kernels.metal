@@ -5245,3 +5245,29 @@ kernel void gemm_q8_0_mma64(
         }
     }
 }
+
+// ── bandwidth probe: stream the weight buffer as 144-byte q4_K blocks ────────
+// Temporary instrumentation. Reads exactly the bytes a GEMV reads, with two
+// 64-bit loads + one 16-byte load per block and no dequant, so whatever it gets
+// is the ceiling the matvec is working against. Xor-accumulated to keep the
+// loads live; one float per threadgroup.
+kernel void bw_probe_q4k(
+    device const uchar  *w        [[buffer(0)]],
+    device float        *out      [[buffer(1)]],
+    constant uint       &nblocks  [[buffer(2)]],
+    uint g                        [[thread_position_in_grid]],
+    uint total                    [[threads_per_grid]]
+) {
+    uint acc = 0;
+    for (uint b = g; b < nblocks; b += total) {
+        device const uint4 *p = (device const uint4 *)(w + (size_t)b * 144);
+        uint4 a = p[0], c = p[1], d = p[2], e = p[3];
+        uint4 f = p[4], h = p[5], i = p[6], j = p[7], l = p[8];
+        acc ^= a.x ^ a.y ^ a.z ^ a.w ^ c.x ^ c.y ^ c.z ^ c.w;
+        acc ^= d.x ^ d.y ^ d.z ^ d.w ^ e.x ^ e.y ^ e.z ^ e.w;
+        acc ^= f.x ^ f.y ^ f.z ^ f.w ^ h.x ^ h.y ^ h.z ^ h.w;
+        acc ^= i.x ^ i.y ^ i.z ^ i.w ^ j.x ^ j.y ^ j.z ^ j.w;
+        acc ^= l.x ^ l.y ^ l.z ^ l.w;
+    }
+    if (acc == 0xFFFFFFFFu) { out[g] = 1.0f; }   // keep the loop alive
+}

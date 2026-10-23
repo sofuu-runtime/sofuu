@@ -4779,6 +4779,21 @@ impl GgufGpu {
         let engine = crate::infer::metal::MetalEngine::new()?;
         let w_buf = engine.register_zerocopy_only(gguf.mmap.as_slice())?;
 
+        // ── temporary instrumentation: SOFUU_BW_PROBE=1 prints achievable read
+        // bandwidth over the weight buffer at several thread counts, so the next
+        // GEMV is designed against a measured ceiling instead of a guess.
+        if std::env::var_os("SOFUU_BW_PROBE").is_some() {
+            let n = gguf.mmap.as_slice().len();
+            for threads in [1024usize, 4096, 16384, 65536, 262144] {
+                let mut best = 0.0f32;
+                for _ in 0..3 {
+                    let g = engine.bw_probe(w_buf.handle, n, threads, 4);
+                    if g > best { best = g; }
+                }
+                eprintln!("[bw-probe] threads={threads:6} bytes={n} -> {best:.1} GB/s");
+            }
+        }
+
         // ── One-commit gates (GPU2.1): any miss keeps the 3-commit client ──
         let one_commit_reason = Self::one_commit_blocker(gguf, config, layers, is_gemma2);
         let one_commit = one_commit_reason.is_none();

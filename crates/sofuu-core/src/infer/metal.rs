@@ -50,6 +50,11 @@ unsafe impl Send for MetalEngine {}
 unsafe impl Sync for MetalEngine {}
 
 impl MetalEngine {
+    /// Temporary instrumentation: achievable read bandwidth over the weight buffer
+    /// at a given thread count, measured inside one commit (SOFUU_BW_PROBE).
+    pub fn bw_probe(&self, w_buf: *mut c_void, nbytes: usize, threads: usize, iters: usize) -> f32 {
+        unsafe { sofuu_metal_bw_probe(self.ctx, w_buf, nbytes, threads, iters) }
+    }
     pub fn new() -> Option<Self> {
         unsafe {
             if !sofuu_metal_available() {
@@ -853,6 +858,11 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     ) -> i32;
+    fn sofuu_metal_bw_probe(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, nbytes: usize,
+        threads: usize, iters: usize,
+    ) -> f32;
     fn sofuu_metal_batch_gguf_gemv_q4k_v2(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,

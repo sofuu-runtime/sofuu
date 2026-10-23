@@ -265,10 +265,21 @@ instead of starting silently without the driver.
 | `make bc-check` | 7/7 snapshots match their source |
 | `make size-check` | 4,818,544 B <= 5,242,880 B |
 
+**Commits**
+
+- `e5066b52c` - binding, `loadDir` AOT, release bytecode-only policy, snapshots, guard scripts.
+- `0d36151c9` - `tests/test_agent_aot_loaddir.js`, `tests/test_agent_modernization_torture.js` + wrapper.
+
+Both commits also carry a concurrent session's work (android session persistence, infer/metal,
+capi): that session runs `git commit -a` in this shared working tree and swept the Phase 6 files
+into its commits. The content is complete and verified; only the messages are not mine. Splitting
+them needs a force-push of the shared branch, which is not mine to do unasked.
+
 **Still open**
 
-- The OpenQodex review gate and the push for this phase.
-- `tests/` is gitignored; the Phase 6 suites are force-added like the Phase 3–5 ones.
+- `tests/` is gitignored; the Phase 6 suites are force-added like the Phase 3-5 ones.
+- OpenQodex flagged one `major` finding in the concurrent session's
+  `sofuu-android/.../DeviceTools.kt:184` (shell timeout can block indefinitely). Not touched here.
 - The workspace `cargo build --release` was red while this phase finished (`sofuu-capi`
   `lib.rs:5096`, a concurrent session's in-flight edit), so the binary above was built with
   `cargo build --release -p sofuu-core --bin sofuu` + `strip -x` + ad-hoc codesign, which is

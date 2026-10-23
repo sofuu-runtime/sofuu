@@ -176,3 +176,46 @@ jobs:
           name: sofuu-${{ matrix.label }}
           path: sofuu
           retention-days: 7
+
+  # Android app — OPT-IN, deliberately skipped by default.
+  #
+  # `:app:assembleDebug` needs two things this repository does not ship in a
+  # checkout:
+  #   1. the prebuilt engine `sofuu-android/app/src/main/jniLibs/<abi>/libsofuu.so`
+  #      (~77 MB, produced by the Android Makefile target) — the CMake project
+  #      imports it rather than building the Rust core;
+  #   2. an Android SDK + NDK 27 on the runner (the macOS job does not install
+  #      either, so an always-on job would sit permanently red).
+  #
+  # Set the repository variable SOFUU_ANDROID_CI=1 once the artifact is
+  # published/produced in the job to turn this on. The commands below are the
+  # exact gate used locally (unit tests, lint, APK).
+  android:
+    name: Android app (opt-in)
+    if: vars.SOFUU_ANDROID_CI == '1'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Unit tests + lint
+        working-directory: sofuu-android
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug --no-daemon
+
+      - name: Build debug APK
+        working-directory: sofuu-android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sofuu-android-debug
+          path: sofuu-android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7

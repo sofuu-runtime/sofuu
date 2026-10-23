@@ -1562,7 +1562,7 @@ val runtimeEnv = RuntimeEnv(app)
                 val maxOut = c.optLong("maxOutput", c.optLong("max_output", 0))
                 val thinking = when (val t = c.opt("thinking")) {
                     is Boolean -> t
-                    is String -> t.isNotEmpty() && t != "none" && t != "unknown"
+                    is String -> com.sofuu.engine.CapsPolicy.thinkingEnabled(t)
                     else -> false
                 }
                 patch.put("ctx_window", win)

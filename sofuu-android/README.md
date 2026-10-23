@@ -220,10 +220,26 @@ bad file reports its error instead of failing the next turn.
 - `__sofuu_gc` is exposed under Brain → Memory rather than automatically:
   one runtime lives for the whole process on a phone, so nothing else
   would run the collector at the moment a big fan-out wants it.
-- No automated tests. There is no `src/test/` and no `src/androidTest/`
-  despite the junit dependencies in `app/build.gradle.kts`, and CI only
-  runs `cc -fsyntax-only` over the *SDK's* bridge — it never compiles this
-  app.
+- Tests exist but the device half is opt-in: `src/test/` holds JVM tests
+  (provider-listing URLs, caps interpretation, the line diff) that run with
+  `./gradlew :app:testDebugUnitTest`, and `src/androidTest/` holds an engine
+  smoke test (boot → host tools → one turn) that needs a device with the
+  real `libsofuu.so`. The CI job that runs them is gated behind the
+  repository variable `SOFUU_ANDROID_CI` because the prebuilt engine
+  artifact is not committed (see `.github/workflows/ci.yml`).
+
+## Storage permission and distribution
+
+The app declares `MANAGE_EXTERNAL_STORAGE`. That is a deliberate decision, not
+an oversight: a workspace is an arbitrary folder on the phone, and the engine
+opens files by POSIX path rather than through a document provider, so a SAF
+tree grant would still have to be turned into a raw path.
+
+Consequence: this is a **sideload / internal-distribution** app. Google Play
+restricts All-Files Access to a narrow set of use cases and a chat/agent app
+is not one of them. If Play distribution ever matters, the change is to drop
+the permission, keep workspaces under app-private storage, and route import/
+export through SAF — the engine stays path-based either way.
 
 ## License
 

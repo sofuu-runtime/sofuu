@@ -773,6 +773,34 @@ unsafe extern "C" fn js_realpath(
     promise
 }
 
+// ── isSymlink — one lstat for the reader jail (S1, 2026-10-23) ───────
+// tools.js walk() must not descend into or read a symlink that leaves the
+// project. Canonicalising every entry costs a component walk per file; one
+// lstat tells the walker whether canonicalisation is needed at all. Missing
+// or unreadable paths answer false (the following read/report handles them).
+
+unsafe extern "C" fn js_is_symlink(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"isSymlink: path required".as_ptr());
+    }
+    let path_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+    if path_ptr.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let path_str = CStr::from_ptr(path_ptr).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, path_ptr);
+
+    let is_link = std::fs::symlink_metadata(&path_str)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    qjs::sofuu_js_new_bool(ctx, if is_link { 1 } else { 0 })
+}
+
 // ── Registration (C symbol replacement for mod_fs_register) ──────────
 
 /// # Safety
@@ -840,6 +868,12 @@ pub unsafe extern "C" fn mod_fs_register(ctx: *mut JSContext) {
         fs,
         c"realpath".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_realpath, c"realpath".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"isSymlink".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_is_symlink, c"isSymlink".as_ptr(), 1),
     );
 
     qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"fs".as_ptr(), fs);

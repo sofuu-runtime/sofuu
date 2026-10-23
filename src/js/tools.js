@@ -62,6 +62,14 @@
     />\s*\/dev\/(disk|rdisk|[sh]d|nvme)/,                                                // truncate a disk
   ];
   var SKIP_DIRS = { '.git': 1, 'node_modules': 1, 'target': 1, 'dist': 1, '.sofuu': 1 };
+  /* S3 (2026-10-23): SOFUU_NO_SHELL is an inventory decision, not just a
+   * call-time throw. bash stays out of GROUP (therefore out of every
+   * tools:["code"] resolution and every listing a host renders); the
+   * execute() rail below still refuses a direct call, defence in depth. */
+  var SHELL_DISABLED = false;
+  try {
+    SHELL_DISABLED = !!(typeof process !== 'undefined' && process.env && process.env.SOFUU_NO_SHELL);
+  } catch (eSh) {}
 
   function cwd() { try { return process.cwd() || '.'; } catch (e) { return '.'; } }
 
@@ -80,6 +88,53 @@
       else out.push(s);
     }
     return '/' + out.join('/');
+  }
+
+  /* S1 (2026-10-23): the canonical root, cached per cwd. On macOS /tmp is
+   * /private/tmp, so a canonical target would otherwise print as an
+   * absolute path in every result; rel() strips whichever root matches.
+   * The cache is keyed by the LEXICAL cwd because a test/host may chdir
+   * between runs (the battery does). */
+  var ROOT_REAL_CACHE = null; /* { lex, real } */
+  async function rootReal() {
+    var lex = lexNorm('.');
+    if (ROOT_REAL_CACHE && ROOT_REAL_CACHE.lex === lex) return ROOT_REAL_CACHE.real;
+    if (!sofuu.fs || typeof sofuu.fs.realpath !== 'function') return null;
+    var real = null;
+    try { real = await sofuu.fs.realpath('.'); } catch (e) { return null; }
+    if (real) ROOT_REAL_CACHE = { lex: lex, real: real };
+    return real;
+  }
+
+  /* Read-side jail (S1). The four readers used to do a lexical prefix check
+   * only, so a symlink planted INSIDE the project (cloned repo, node_modules,
+   * or one minted by a prior bash call) passed it and the native read
+   * followed the link outside the workspace — the same escape the write
+   * jail closed in P1-4. Canonicalise the target (which must exist for a
+   * read) and require canonical containment; return the canonical path so
+   * the read cannot be redirected by a swapped symlink afterwards. */
+  async function readInRoot(p, label) {
+    var who = label || 'read';
+    var abs = lexNorm(p);
+    var root = lexNorm('.');
+    if (abs !== root && abs.indexOf(root + '/') !== 0) {
+      throw new Error(who + ': path escapes the project directory (reads are jailed to cwd): ' + p);
+    }
+    var rootRealPath = await rootReal();
+    if (rootRealPath) {
+      var targetReal = null;
+      try { targetReal = await sofuu.fs.realpath(abs); } catch (e) {
+        /* Target does not exist (or is unreadable): the lexical check above
+         * already ran and the native read will report the real error. */
+        return abs;
+      }
+      if (targetReal !== rootRealPath && targetReal.indexOf(rootRealPath + '/') !== 0) {
+        throw new Error(who + ': path resolves (via symlink) outside the project directory: ' + p +
+          ' → ' + targetReal);
+      }
+      return targetReal;
+    }
+    return abs;
   }
 
   /* Jail for mutating tools: the resolved path must stay under cwd.
@@ -141,8 +196,17 @@
 
   function rel(p) {
     var abs = lexNorm(p);
-    var root = lexNorm('.');    if (abs === root) return '.';
+    var root = lexNorm('.');
+    if (abs === root) return '.';
     if (abs.indexOf(root + '/') === 0) return abs.slice(root.length + 1);
+    /* Canonical results from readInRoot/mustBeInRoot carry the realpath root
+     * (e.g. /private/tmp vs /tmp on macOS); strip it too so results stay
+     * project-relative. Only when the cache belongs to the current cwd. */
+    if (ROOT_REAL_CACHE && ROOT_REAL_CACHE.lex === root) {
+      var rr = ROOT_REAL_CACHE.real;
+      if (abs === rr) return '.';
+      if (abs.indexOf(rr + '/') === 0) return abs.slice(rr.length + 1);
+    }
     return abs;
   }
 
@@ -161,9 +225,16 @@
     try { await sofuu.fs.readdir(p); return true; } catch (e) { return false; }
   }
 
-  /* Recursive walk with caps. visit(file) is awaited per file. */
+  /* Recursive walk with caps. visit(file) is awaited per file. S1: every
+   * entry is canonical-checked before it is descended into or read, so a
+   * symlink planted INSIDE the project (to /etc, to a home directory, to a
+   * sibling repo) cannot smuggle outside content into grep/glob output.
+   * Non-symlink entries keep their path — the parent is already canonical,
+   * so the join cannot escape. Uses isSymlink when the runtime has it and
+   * falls back to canonicalising every entry otherwise. */
   async function walk(root, visit, state) {
     state = state || { files: 0, done: false };
+    var canonRoot = await rootReal();
     var queue = [lexNorm(root)];
     var depthGuard = 0;
     while (queue.length && !state.done && depthGuard < 20000) {
@@ -175,8 +246,19 @@
         var name = entries[i];
         if (SKIP_DIRS[name]) continue;
         var full = (dir === '/' ? '' : dir) + '/' + name;
-        if (await isDir(full)) queue.push(full);
-        else { state.files++; await visit(full); }
+        var real = full;
+        if (canonRoot) {
+          var isLink = true;
+          try {
+            if (typeof sofuu.fs.isSymlink === 'function') isLink = await sofuu.fs.isSymlink(full);
+          } catch (eL) { isLink = true; }
+          if (isLink) {
+            try { real = await sofuu.fs.realpath(full); } catch (eR) { continue; }
+            if (real !== canonRoot && real.indexOf(canonRoot + '/') !== 0) continue;
+          }
+        }
+        if (await isDir(real)) queue.push(real);
+        else { state.files++; await visit(real); }
         if (state.files > GREP_MAX_FILES + GLOB_MAX) { state.done = true; }
       }
     }
@@ -250,15 +332,13 @@
       required: ['path'],
     },
     execute: async function (a) {
-      /* Jailed to the project directory like grep/glob/list_dir (2026-10-15):
-       * an absolute path outside cwd — /etc/passwd, a sibling repo's config —
-       * used to stream straight into the provider transcript under every
-       * permission profile, while the sibling readers already refused it. */
-      var p = lexNorm(a && a.path);
-      var cwdRoot = lexNorm('.');
-      if (p !== cwdRoot && p.indexOf(cwdRoot + '/') !== 0) {
-        throw new Error('read_file: path escapes the project directory (reads are jailed to cwd): ' + (a && a.path));
-      }
+      /* Jailed to the project directory like grep/glob/list_dir (2026-10-15),
+       * and symlink-checked like the writers (S1, 2026-10-23): an absolute
+       * path outside cwd — /etc/passwd, a sibling repo's config — used to
+       * stream straight into the provider transcript under every permission
+       * profile, and an in-project symlink did the same after the lexical
+       * guard landed. */
+      var p = await readInRoot(a && a.path, 'read_file');
       assertNotSensitive(p);
       var text = await sofuu.fs.readFile(p, 'utf8');
       var lines = text.split('\n');
@@ -679,13 +759,7 @@
     execute: async function (a) {
       var re;
       try { re = new RegExp(a && a.pattern); } catch (e) { throw new Error('grep: invalid pattern: ' + String(e.message || e)); }
-      var root = lexNorm((a && a.path) || '.');
-      // Jail: searching outside the project (e.g. path '/') would walk the
-      // whole filesystem — reject it like writes.
-      var cwdRoot = lexNorm('.');
-      if (root !== cwdRoot && root.indexOf(cwdRoot + '/') !== 0) {
-        throw new Error('grep: path escapes the project directory (searches are jailed to cwd): ' + (a && a.path));
-      }
+      var root = await readInRoot((a && a.path) || '.', 'grep');
       var gfilter = a && a.glob ? globToRe(a.glob) : null;
       var state = { files: 0, done: false };
       var hits = [];
@@ -723,11 +797,7 @@
     execute: async function (a) {
       var re;
       try { re = globToRe((a && a.pattern) || ''); } catch (e) { throw new Error('glob: invalid pattern'); }
-      var root = lexNorm((a && a.path) || '.');
-      var cwdRoot = lexNorm('.');
-      if (root !== cwdRoot && root.indexOf(cwdRoot + '/') !== 0) {
-        throw new Error('glob: path escapes the project directory (jailed to cwd): ' + (a && a.path));
-      }
+      var root = await readInRoot((a && a.path) || '.', 'glob');
       var state = { files: 0, done: false };
       var found = [];
       await walk(root, async function (file) {
@@ -749,11 +819,7 @@
       required: [],
     },
     execute: async function (a) {
-      var p = lexNorm((a && a.path) || '.');
-      var cwdRoot = lexNorm('.');
-      if (p !== cwdRoot && p.indexOf(cwdRoot + '/') !== 0) {
-        throw new Error('list_dir: path escapes the project directory (jailed to cwd): ' + (a && a.path));
-      }
+      var p = await readInRoot((a && a.path) || '.', 'list_dir');
       var entries = await sofuu.fs.readdir(p);
       var out = [];
       for (var i = 0; i < entries.length && out.length < 500; i++) {
@@ -922,8 +988,6 @@
   sofuu.tools._loaded = true;
   sofuu.tools.VERSION = '1';
   sofuu.tools.TOOLS = TOOLS;
-  /* The "code" group — everything above. Opt out of the shell by listing
-   * individual names instead, or by exporting SOFUU_NO_SHELL. */
   /* todo_write — a living checklist the model maintains across a multi-step
    * task (P2, claude-code parity). The steps ride the chat's event stream
    * so hosts render progress; state is one JSON string on a global. */
@@ -966,5 +1030,13 @@
     },
   };
 
-  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'list_dir', 'bash', 'code_eval', 'todo_write'];
+  /* The "code" group — everything above. Opt out of the shell by listing
+   * individual names instead, or by exporting SOFUU_NO_SHELL. S3: when the
+   * shell is disabled the group (and every listing derived from it) omits
+   * bash entirely; TOOLS.bash stays present so a direct call still gets the
+   * explicit refusal at :execute instead of an opaque missing-function. */
+  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob',
+                       'list_dir', 'bash', 'code_eval', 'todo_write']
+    .filter(function (n) { return !(SHELL_DISABLED && n === 'bash'); });
+  sofuu.tools.ENABLED = { bash: !SHELL_DISABLED };
 })();

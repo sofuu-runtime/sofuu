@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test c-only size-check bc-check cargo-build \
+.PHONY: all clean install test protocol-test c-only size-check bc-check cargo-build \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -190,6 +190,15 @@ test: $(TARGET)
 	@if [ ! -f tests/run_js_tests.sh ]; then \
 		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
 	else bash tests/run_js_tests.sh; fi
+
+# ─── Workstream 6 conformance (protocols/sandbox/tooling) ─────────
+# Local-only runner (tests/ is gitignored). Not wired into CI yet: KNOWN-GAP
+# lines are the later phases' acceptance tests and stay visible until they
+# land. See docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md §5 (T5).
+protocol-test: $(TARGET)
+	@if [ ! -x tests/protocol_conformance_run.sh ]; then \
+		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
+	else SOFUU=$(TARGET) tests/protocol_conformance_run.sh; fi
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).

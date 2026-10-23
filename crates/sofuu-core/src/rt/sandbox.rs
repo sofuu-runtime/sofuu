@@ -30,13 +30,50 @@ pub struct SandboxConfig {
     pub throw_on_error: bool,
 }
 
+/* S2 (2026-10-23): the public sandbox API used to default to NO fuel and NO
+ * deadline, and trusted every caller-supplied value. `run`/`eval` are
+ * synchronous, so `sofuu.sandbox.run('while(true){}')` stopped the whole
+ * libuv loop with no way back (verified live: an external alarm was the only
+ * way to kill it). Defaults are now bounded and every value is clamped at
+ * the native boundary — the tool (tools.js code_eval) keeps its own tighter
+ * limits, but a host or inline tool cannot accidentally lift them. */
+pub const SANDBOX_DEFAULT_FUEL: u64 = 5_000_000;
+pub const SANDBOX_DEFAULT_TIMEOUT_MS: u64 = 2_000;
+pub const SANDBOX_DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+pub const SANDBOX_DEFAULT_STACK_BYTES: usize = 512 * 1024;
+pub const SANDBOX_MAX_FUEL: u64 = 50_000_000;
+pub const SANDBOX_MAX_TIMEOUT_MS: u64 = 10_000;
+pub const SANDBOX_MIN_MEMORY_BYTES: usize = 1024 * 1024;
+pub const SANDBOX_MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+pub const SANDBOX_MIN_STACK_BYTES: usize = 16 * 1024;
+pub const SANDBOX_MAX_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+impl SandboxConfig {
+    /// Enforce the native ceilings. Called by the session constructor and on
+    /// every run so no caller (JS options included) can widen the bounds.
+    pub fn clamp(&mut self) {
+        if let Some(f) = self.fuel_limit {
+            self.fuel_limit = Some(f.min(SANDBOX_MAX_FUEL));
+        }
+        if let Some(t) = self.timeout {
+            self.timeout = Some(t.min(Duration::from_millis(SANDBOX_MAX_TIMEOUT_MS)));
+        }
+        self.max_memory_bytes = self
+            .max_memory_bytes
+            .clamp(SANDBOX_MIN_MEMORY_BYTES, SANDBOX_MAX_MEMORY_BYTES);
+        self.max_stack_bytes = self
+            .max_stack_bytes
+            .clamp(SANDBOX_MIN_STACK_BYTES, SANDBOX_MAX_STACK_BYTES);
+    }
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            fuel_limit: None,
-            timeout: None,
-            max_memory_bytes: 16 * 1024 * 1024, // 16 MB default ceiling
-            max_stack_bytes: 512 * 1024,        // 512 KB default stack
+            fuel_limit: Some(SANDBOX_DEFAULT_FUEL),
+            timeout: Some(Duration::from_millis(SANDBOX_DEFAULT_TIMEOUT_MS)),
+            max_memory_bytes: SANDBOX_DEFAULT_MEMORY_BYTES,
+            max_stack_bytes: SANDBOX_DEFAULT_STACK_BYTES,
             capture_console: true,
             allow_async: true,
             throw_on_error: false,
@@ -219,7 +256,8 @@ pub struct SandboxSession {
 }
 
 impl SandboxSession {
-    pub fn new(config: SandboxConfig) -> Result<Self, String> {
+    pub fn new(mut config: SandboxConfig) -> Result<Self, String> {
+        config.clamp();
         unsafe {
             let rt = qjs::JS_NewRuntime();
             if rt.is_null() {
@@ -290,6 +328,13 @@ impl SandboxSession {
         }
 
         let start = Instant::now();
+        /* S2: per-run ceilings are enforced here too — a caller can pass a
+         * different config to every run on a stateful session. */
+        let run_config = {
+            let mut c = run_config.clone();
+            c.clamp();
+            c
+        };
 
         unsafe {
             // Re-arm interrupt state
@@ -1005,6 +1050,54 @@ pub unsafe fn mod_sandbox_register(ctx: *mut JSContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sandbox_defaults_are_bounded() {
+        let cfg = SandboxConfig::default();
+        assert_eq!(cfg.fuel_limit, Some(SANDBOX_DEFAULT_FUEL));
+        assert_eq!(
+            cfg.timeout,
+            Some(Duration::from_millis(SANDBOX_DEFAULT_TIMEOUT_MS))
+        );
+        let mut session = SandboxSession::new(cfg.clone()).expect("session");
+        let start = Instant::now();
+        let res = session.run("while(true) {}", &cfg, None);
+        assert!(!res.success, "an unbounded program must not succeed");
+        assert!(res.interrupted, "the meter must interrupt it");
+        assert!(matches!(
+            res.error_type.as_deref(),
+            Some("fuel") | Some("timeout")
+        ));
+        assert!(
+            start.elapsed() < Duration::from_millis(SANDBOX_DEFAULT_TIMEOUT_MS + 1500),
+            "bounded run took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_sandbox_config_is_clamped() {
+        let mut cfg = SandboxConfig::default();
+        cfg.fuel_limit = Some(u64::MAX);
+        cfg.timeout = Some(Duration::from_secs(3600));
+        cfg.max_memory_bytes = usize::MAX;
+        cfg.max_stack_bytes = usize::MAX;
+        cfg.clamp();
+        assert_eq!(cfg.fuel_limit, Some(SANDBOX_MAX_FUEL));
+        assert_eq!(
+            cfg.timeout,
+            Some(Duration::from_millis(SANDBOX_MAX_TIMEOUT_MS))
+        );
+        assert_eq!(cfg.max_memory_bytes, SANDBOX_MAX_MEMORY_BYTES);
+        assert_eq!(cfg.max_stack_bytes, SANDBOX_MAX_STACK_BYTES);
+
+        let mut tiny = SandboxConfig::default();
+        tiny.max_memory_bytes = 1;
+        tiny.max_stack_bytes = 1;
+        tiny.clamp();
+        assert_eq!(tiny.max_memory_bytes, SANDBOX_MIN_MEMORY_BYTES);
+        assert_eq!(tiny.max_stack_bytes, SANDBOX_MIN_STACK_BYTES);
+    }
 
     #[test]
     fn test_sandbox_basic_eval() {

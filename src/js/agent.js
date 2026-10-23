@@ -1422,11 +1422,13 @@
     var specs = [];
     var exec = {};
     var names = {};
+    var sources = {}; /* T1: name → builtin | host | mcp | inline */
     var mcpNames = [];
     function warn(payload) { emit('warn', payload); }
-    function add(spec, fn) {
+    function add(spec, fn, source) {
       if (names[spec.name]) { warn({ tool: spec.name, note: 'duplicate tool name skipped' }); return; }
       names[spec.name] = 1;
+      sources[spec.name] = source || 'builtin';
       specs.push(spec);
       exec[spec.name] = fn;
     }
@@ -1434,13 +1436,13 @@
       var t = d.inlineTools[i];
       add({ name: t.name, description: t.description || ('inline tool ' + t.name),
             parameters: t.parameters },
-          t.execute || null);
+          t.execute || null, 'inline');
     }
     for (var w = 0; w < d.webTools.length; w++) {
       var bn = d.webTools[w];
       if (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[bn]) {
         var bt = sofuu.web.TOOLS[bn];
-        add({ name: bt.name, description: bt.description, parameters: bt.parameters }, bt.execute);
+        add({ name: bt.name, description: bt.description, parameters: bt.parameters }, bt.execute, 'builtin');
       }
     }
     for (var ct = 0; ct < d.codeTools.length; ct++) {
@@ -1451,14 +1453,14 @@
          * execOneTool); every other flag stays off the LLM schema. */
         var cdSpec = { name: cd.name, description: cd.description, parameters: cd.parameters };
         if (cd.selfTimed) cdSpec.selfTimed = true;
-        add(cdSpec, cd.execute);
+        add(cdSpec, cd.execute, 'builtin');
       }
     }
     for (var ht = 0; ht < d.hostTools.length; ht++) {
       var hn = d.hostTools[ht];
       var hd = globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[hn];
       if (hd) {
-        add({ name: hd.name, description: hd.description, parameters: hd.parameters }, hd.execute);
+        add({ name: hd.name, description: hd.description, parameters: hd.parameters }, hd.execute, 'host');
       } else {
         /* Registered into the def before the host registered the tool (or
          * after a re-registration that dropped it). Say so rather than
@@ -1482,13 +1484,23 @@
         }
         names[mname] = 1;
         mcpNames.push(mname);
+        sources[mname] = 'mcp';
         specs.push({ name: mname, description: String(mt.description || ('MCP tool from ' + set.name)),
                      parameters: mt.inputSchema || { type: 'object', properties: {} } });
         exec[mname] = (function (client, toolName) {
           return async function (args) {
             var res = await client.call('tools/call', { name: toolName, arguments: args || {} });
             var text = res && res.content && res.content[0] && res.content[0].text;
-            return (typeof text === 'string') ? text : JSON.stringify(text);
+            text = (typeof text === 'string') ? text : JSON.stringify(text);
+            /* T1: a tools/call that reports isError is a FAILED tool, not a
+             * chatty success. The adapter hands the loop a typed result so
+             * the event (and the next phase's policy trace) can say so;
+             * the model still sees the server's text verbatim. */
+            if (res && res.isError === true) {
+              return { ok: false, text: text,
+                       error: { code: 'E_TOOL', message: 'MCP tool reported isError' } };
+            }
+            return { ok: true, text: text };
           };
         })(conn.client, mname);
       }
@@ -1665,7 +1677,7 @@
         return out;
       };
     }
-    return { specs: specs, exec: exec, mcpNames: mcpNames };
+    return { specs: specs, exec: exec, mcpNames: mcpNames, sources: sources };
   }
 
   function delegateSpecFor(d, chain) {
@@ -3554,6 +3566,11 @@
 
       async function execOneTool(name, args, callId) {
         own.toolCalls++; tree.toolCalls++;
+        var toolStartedAt = Date.now();
+        /* T1: which adapter owns this name (inline | builtin | host | mcp).
+         * Rides every tool_result event so host UIs and the trace can tell
+         * a local tool from an MCP server's without parsing the name. */
+        var toolSource = (toolset && toolset.sources && toolset.sources[name]) || 'builtin';
         toolHist[name] = (toolHist[name] || 0) + 1;
         emit('tool', { name: name, args: clip(JSON.stringify(args || {}), 200) });
         /* Permission profile (see permissionBlocked above): a gated tool
@@ -3563,7 +3580,9 @@
         var gateWhy = permissionBlocked(name);
         if (gateWhy) {
           var gateMsg = 'Blocked by permissions policy (' + gateWhy + '): ' + name;
-          emit('tool_result', { name: name, blocked: gateWhy, result: clip(gateMsg, 200) });
+          emit('tool_result', { name: name, blocked: gateWhy, result: clip(gateMsg, 200),
+                                ok: false, source: toolSource,
+                                duration_ms: Date.now() - toolStartedAt });
           return gateMsg;
         }
         /* ── P2.1 interactive approval (2026-10-15) ──────────────────────
@@ -3641,7 +3660,9 @@
               if (!allow) appMsg = 'denied by user';
             }
             if (appMsg) {
-              emit('tool_result', { name: name, blocked: 'approval', result: clip(appMsg, 200) });
+              emit('tool_result', { name: name, blocked: 'approval', result: clip(appMsg, 200),
+                                    ok: false, source: toolSource,
+                                    duration_ms: Date.now() - toolStartedAt });
               return appMsg;
             }
           }
@@ -3752,14 +3773,36 @@
         } catch (e) {
           result = 'tool error: ' + String((e && e.message) || e);
           errored = true;
-          emit('tool_result', { name: name, error: clip(String((e && e.message) || e), 160) });
+          emit('tool_result', { name: name, error: clip(String((e && e.message) || e), 160),
+                                ok: false, source: toolSource, error_code: 'E_TOOL',
+                                duration_ms: Date.now() - toolStartedAt });
         }
         if (result !== undefined && (typeof result.then === 'function')) {
           result = await result;
         }
+        /* T1 (2026-10-23): one result contract for every adapter. A tool may
+         * return a string (legacy) or { ok, text, error } (the MCP adapter,
+         * host tools, future inline tools). Both reach the model as text,
+         * but the event and the gates get a typed outcome; a typed failure
+         * counts as errored for the reuse ledger and the supervisor. */
+        var toolOk = !errored;
+        var toolErrorCode = errored ? 'E_TOOL' : null;
+        if (result && typeof result === 'object' && typeof result.ok === 'boolean' &&
+            typeof result.text === 'string') {
+          toolOk = result.ok;
+          if (!toolOk) {
+            toolErrorCode = (result.error && result.error.code) || 'E_TOOL';
+            result = (String(result.text).indexOf('tool error') === 0)
+              ? result.text : ('tool error: ' + result.text);
+            errored = true;
+          } else {
+            result = result.text;
+          }
+        }
         /* P3: uniform cap at the boundary (delegate answers included — the
          * child already capped its own answer; no double truncation). */
         var cappedR = capToolResult(allocToolCap(), result);
+        var toolTruncated = cappedR.text.length !== cappedR.chars;
         /* P1 token economy — reuse ledger (2026-10-15): an identical
          * re-call of the same tool on the same target enters the model
          * transcript as a marker. Strict equality (fnv1a + length) on
@@ -3827,7 +3870,11 @@
           try { globalThis.__sofuu_last_diff = null; } catch (eD2) {}
         }
         var trPayload = { name: name, result: clip(cappedR.text, 200),
-                          chars: cappedR.chars, kept: cappedR.text.length };
+                          chars: cappedR.chars, kept: cappedR.text.length,
+                          ok: toolOk, source: toolSource,
+                          duration_ms: Date.now() - toolStartedAt };
+        if (!toolOk) trPayload.error_code = toolErrorCode || 'E_TOOL';
+        if (toolTruncated) trPayload.truncated = true;
         if (stashedDiff) trPayload.diff = clip(stashedDiff, 4000);
         /* todo_write (P2): the checklist rides the result event so hosts
          * render a live checklist instead of an opaque result line. Also

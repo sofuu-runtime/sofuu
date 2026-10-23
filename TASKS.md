@@ -3742,3 +3742,52 @@ what code reading suggested:
   vs tile-GEMV fold flips near-tie argmax; SOFUU_NO_TILES=1 unifies). Doc:
   docs/PI5-SIMD-OPTIMIZATION.md §Session 10.
 - Tests: live_llama1b_prefill_logits_repeat_in_process (#[ignore], in-process bit-stability).
+
+## 2026-10-23 — workstream 6 phase 1: sandbox/tooling correctness (S1–S3, T1, T5)
+
+- **S1 — reader jail symlink escape (P0) FIXED.** `read_file`/`grep`/`glob`/
+  `list_dir` did a lexical prefix check only; a symlink planted inside the
+  project (`ln -s /etc etcdir`) passed it and the native read followed it
+  (live probe before the fix: `list_dir` returned all 77 `/etc` entries, and
+  `read_file` returned a file outside the workspace). All four now resolve
+  through one `readInRoot` (canonicalise target + root, require containment,
+  return the canonical path so a swapped link cannot redirect the read);
+  `walk()` canonical-checks symlink entries before descending/reading, using
+  the new native `sofuu.fs.isSymlink` (one lstat) and falling back to
+  realpath-per-entry when absent. In-project symlinks still work. The write
+  jail is unchanged (already symlink-aware + O_NOFOLLOW).
+- **S2 — unbounded sandbox defaults (P0) FIXED.** Defaults were fuel `None`,
+  timeout `None`; caller values were trusted. `run`/`eval` are synchronous, so
+  `sofuu.sandbox.run('while(true){}')` wedged the whole libuv loop — the live
+  receipt needed an external `alarm(3)` to kill the process (rc 142, no
+  output). Defaults are now fuel 5M / 2 s / 64 MB / 512 KB stack, and every
+  value is clamped at the native boundary (fuel ≤50M, timeout ≤10 s, memory
+  1–512 MB, stack 16 KB–4 MB) in the session constructor AND on every run, so
+  a stateful session cannot be widened per call either.
+- **S3 — `SOFUU_NO_SHELL` inventory FIXED.** The tool kept throwing at call
+  time but stayed advertised in `GROUP` (therefore in every `tools:['code']`
+  resolution and host listing). `GROUP` now omits bash at load time,
+  `tools.ENABLED.bash=false`, and a direct `execute()` still refuses.
+- **T1 — tool result contract, first cut.** `resolveTools` tags each tool with
+  its adapter (`inline`/`builtin`/`host`/`mcp`); the MCP adapter maps
+  `isError` to a typed failure; `execOneTool` normalises string-or-
+  `{ok,text,error}` results. Every `tool_result` event now carries `ok`,
+  `source`, `duration_ms` (plus `error_code` on failures and `truncated` when
+  the cap fired) while the provider transcript text stays byte-compatible.
+- **T5 — conformance harness.** `tests/protocol_conformance_run.sh` +
+  `tests/fixtures/mock_mcp_server.js` (pagination, ping, list_changed,
+  `isError`, multi-block, structuredContent) + the S3 probe, wired as
+  `make protocol-test`. Not in CI yet: `KNOWN-GAP` lines (M1 pagination
+  today) stay visible until their phase lands.
+- **Receipts:** agent battery **282 PASS / 0 FAIL** (4 new checks: T1 typed
+  events ×2, S1 symlink jail ×2); `rt::sandbox` **37/37** incl.
+  `test_sandbox_defaults_are_bounded` and `test_sandbox_config_is_clamped`;
+  conformance **0 failures / 1 known gap** (MCP tools/list pagination = M1).
+  Verified on an isolated HEAD+slice worktree because a peer's in-flight
+  infer refactor (`super::quant::env_flag`) had the shared tree red;
+  sources in that worktree were byte-identical to the commit, and
+  `agent.bc`/`tools.bc` were regenerated there (the loader prefers committed
+  bytecode even in debug builds, so stale snapshots would have masked the
+  JS changes).
+- **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` (local-only) — next:
+  T2/M1 (MCP fidelity + conformance) and S4 (one policy evaluator).

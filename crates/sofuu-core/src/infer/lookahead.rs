@@ -20,7 +20,12 @@ impl NgramNode {
 
     pub fn top_continuations(&self, max_k: usize) -> Vec<u32> {
         let mut pairs: Vec<(u32, u32)> = self.counts.iter().map(|(&t, &c)| (t, c)).collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        // Count desc, then token id asc. Without the tie-break, equal counts
+        // fall back to HashMap iteration order, whose seed is randomized per
+        // process: two identical runs would draft different trees (and so
+        // different verified text) whenever continuations tie, which is the
+        // common case for a bigram seen once.
+        pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         pairs.into_iter().take(max_k).map(|(t, _)| t).collect()
     }
 }
@@ -588,6 +593,27 @@ mod tests {
             .map(|n| n.token)
             .collect();
         assert_eq!(narrow_l1, vec![9]);
+    }
+
+    #[test]
+    fn test_top_continuations_ties_are_token_ordered() {
+        // Equal counts must not fall back to HashMap iteration order: that
+        // order is randomly seeded per process, which made the drafted tree
+        // (and the resulting greedy text) differ between identical runs.
+        let mut node = NgramNode::default();
+        for t in [77u32, 12, 300, 5, 41, 900] {
+            node.record(t); // all count 1
+        }
+        node.record(300);
+        node.record(41);
+        let mut got = node.top_continuations(4);
+        assert_eq!(got, vec![41, 300, 5, 12], "count desc, then token id asc");
+        got = node.top_continuations(2);
+        assert_eq!(got, vec![41, 300]);
+        // Repeatable across calls (no dependence on iteration order).
+        for _ in 0..8 {
+            assert_eq!(node.top_continuations(4), vec![41, 300, 5, 12]);
+        }
     }
 
     #[test]

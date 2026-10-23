@@ -226,6 +226,64 @@ impl InferModel {
         }
     }
 
+    /// Override the sliding-window size for backends that carry one.
+    pub fn set_sliding_window(&mut self, w: usize) {
+        self.sliding_window = w;
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.sliding_window = w,
+            ModelBackend::Spark(m) => m.sliding_window = w,
+            _ => {}
+        }
+    }
+
+    /// Drop any KIVI state (used when a turn does not request KIVI but an
+    /// earlier turn enabled it).
+    pub fn disable_kivi(&mut self) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.kivi = None;
+        }
+    }
+
+    /// Fill reusable scratch buffers with `v`. A debug instrument: if output
+    /// changes when the scratch is poisoned, a kernel reads a row or column
+    /// the current call never wrote, so results depend on whatever the
+    /// previous call left there. `which` is a comma-separated list of buffer
+    /// names, or "all".
+    pub fn poison_scratch(&mut self, v: f32, which: &str) {
+        let ModelBackend::Gguf(m) = &mut self.backend else {
+            return;
+        };
+        let all = which == "all";
+        for (name, buf) in [
+            ("x", &mut m.x),
+            ("x_norm", &mut m.x_norm),
+            ("q", &mut m.q),
+            ("k", &mut m.k),
+            ("v", &mut m.v),
+            ("attn_scores", &mut m.attn_scores),
+            ("head_out", &mut m.head_out),
+            ("attn_out", &mut m.attn_out),
+            ("ffn_gate_buf", &mut m.ffn_gate_buf),
+            ("ffn_up_buf", &mut m.ffn_up_buf),
+            ("ffn_out", &mut m.ffn_out),
+            ("logits", &mut m.logits),
+            ("x_batch", &mut m.x_batch),
+            ("x_norm_batch", &mut m.x_norm_batch),
+            ("q_batch", &mut m.q_batch),
+            ("k_batch", &mut m.k_batch),
+            ("v_batch", &mut m.v_batch),
+            ("head_out_batch", &mut m.head_out_batch),
+            ("attn_out_batch", &mut m.attn_out_batch),
+            ("ffn_gate_batch", &mut m.ffn_gate_batch),
+            ("ffn_up_batch", &mut m.ffn_up_batch),
+            ("ffn_out_batch", &mut m.ffn_out_batch),
+        ] {
+            if all || which.split(',').any(|w| w.trim() == name) {
+                buf.fill(v);
+            }
+        }
+    }
+
     /// Per-model speculative tree size (see TransformerModel::spec_rows_default).
     pub fn spec_rows_default(&self) -> usize {
         match &self.backend {
@@ -437,11 +495,27 @@ impl InferModel {
     }
 }
 
+/// Number of history tokens that may be reused as cached context on the next
+/// call. Zero after a KV compaction (positions no longer map onto token
+/// order), otherwise exactly the tokens that reached the KV: the decode loop
+/// pushes the last sampled token before the max-tokens break decides whether
+/// to forward it, so `history` can be one longer than the KV.
+fn reusable_history_len(compacted: bool, kv_len: usize, history_len: usize) -> usize {
+    if compacted {
+        0
+    } else {
+        kv_len.min(history_len)
+    }
+}
+
 pub struct InferEngine {
     pub model: InferModel,
     pub tokenizer: BpeTokenizer,
     pub last_prefill_tokens: usize,
     pub last_prefill_duration: std::time::Duration,
+    /// Tokenization, cache reset and SnapKV/KIVI setup for the last call.
+    /// Reported apart from prefill so it cannot be mistaken for slow decoding.
+    pub last_setup_duration: std::time::Duration,
     pub cached_tokens: Vec<u32>,
 }
 
@@ -546,6 +620,7 @@ impl InferEngine {
                         tokenizer,
                         last_prefill_tokens: 0,
                         last_prefill_duration: std::time::Duration::ZERO,
+                        last_setup_duration: std::time::Duration::ZERO,
                         cached_tokens: Vec::new(),
                     }, enable_gpu);
                 }
@@ -561,6 +636,7 @@ impl InferEngine {
                                     tokenizer,
                                     last_prefill_tokens: 0,
                                     last_prefill_duration: std::time::Duration::ZERO,
+                                    last_setup_duration: std::time::Duration::ZERO,
                                     cached_tokens: Vec::new(),
                                 }, enable_gpu);
                             }
@@ -617,6 +693,7 @@ impl InferEngine {
                             tokenizer,
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
+                            last_setup_duration: std::time::Duration::ZERO,
                             cached_tokens: Vec::new(),
                         }, enable_gpu);
                     }
@@ -628,6 +705,7 @@ impl InferEngine {
                             tokenizer,
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
+                            last_setup_duration: std::time::Duration::ZERO,
                             cached_tokens: Vec::new(),
                         }, enable_gpu);
                     }
@@ -669,6 +747,7 @@ impl InferEngine {
             tokenizer,
             last_prefill_tokens: 0,
             last_prefill_duration: std::time::Duration::ZERO,
+            last_setup_duration: std::time::Duration::ZERO,
             cached_tokens: Vec::new(),
         })
     }
@@ -732,17 +811,28 @@ impl InferEngine {
                 self::quant::set_thread_count(self.0);
             }
         }
+        // Restore the caller's thread count on every exit, not only in auto
+        // mode: an explicit --threads used to leak into later stream() calls
+        // on the same engine.
+        let prev_threads = self::quant::get_thread_count();
+        let _pool_guard = PoolRestore(prev_threads);
+        if let Some(which) = std::env::var_os("SOFUU_DEBUG_POISON") {
+            let which = which.to_string_lossy().to_string();
+            self.model.poison_scratch(1.0, &which);
+        }
         let pool_base = if options.threads == 0 {
-            Some(self::quant::get_thread_count())
+            Some(prev_threads)
         } else {
             None
         };
-        let _pool_guard = pool_base.map(PoolRestore);
         if options.threads > 0 {
             self::quant::set_thread_count(options.threads);
         }
         if options.sliding_window > 0 {
-            self.model.sliding_window = options.sliding_window;
+            // Forward into the backend: attention reads the model's own
+            // sliding_window, so writing only InferModel's field made --swa
+            // and GenerateOptions.sliding_window inert.
+            self.model.set_sliding_window(options.sliding_window);
         }
         if options.sink_tokens > 0 {
             self.model.sink_tokens = options.sink_tokens;
@@ -751,6 +841,16 @@ impl InferEngine {
         let max_seq_len = self.model.config.max_seq_len;
         let vocab_size = self.model.config.vocab_size;
         let mut logits_buf = vec![0.0f32; vocab_size];
+        // Setup work (tokenize, cache reset, SnapKV/KIVI) is reported apart
+        // from prefill so a long-prompt turn cannot look like slow decode.
+        // The bucket is filled twice: the part before prefill and the
+        // SnapKV/KIVI part after it, never the prefill itself.
+        let t_setup = std::time::Instant::now();
+        self.last_setup_duration = std::time::Duration::ZERO;
+        // Compaction rewrites KV positions, so the token order in
+        // cached_tokens no longer maps onto KV rows afterwards.
+        let mut compacted = false;
+        let pool_failures_before = self::quant::pool_failures();
 
         // 1. Tokenize prompt
         let input_tokens = self.tokenizer.encode(prompt);
@@ -774,8 +874,14 @@ impl InferEngine {
             common_prefix += 1;
         }
 
-        // If not a pure extension of cached context, reset cache
-        if common_prefix == 0 || common_prefix < self.cached_tokens.len() {
+        // If not a pure extension of cached context, reset cache. A cache at
+        // or beyond the context window is refused too: reusing it would start
+        // the new sequence past max_seq_len and compaction would run on a
+        // current_seq_len that no longer fits the buffer.
+        if common_prefix == 0
+            || common_prefix < self.cached_tokens.len()
+            || self.cached_tokens.len() > max_seq_len
+        {
             self.model.reset_cache();
             self.cached_tokens.clear();
             common_prefix = 0;
@@ -787,6 +893,7 @@ impl InferEngine {
 
         // 3. Prefill phase for new tokens
         let mut cur_pos = common_prefix;
+        self.last_setup_duration = t_setup.elapsed();
         let t_prefill = std::time::Instant::now();
 
         if common_prefix == 0 && input_tokens.len() < max_seq_len {
@@ -807,11 +914,13 @@ impl InferEngine {
             if n_new > 1 {
                 for chunk in new_tokens[..n_new - 1].chunks(chunk_size) {
                     while cur_pos + chunk.len() >= max_seq_len && cur_pos > sink + drop {
+                        compacted = true;
                         cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                     }
                     if cur_pos + chunk.len() >= max_seq_len {
                         for &tok in chunk {
                             while cur_pos >= max_seq_len && cur_pos > sink + drop {
+                                compacted = true;
                                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                             }
                             self.model.forward_prefill(tok, cur_pos);
@@ -827,24 +936,44 @@ impl InferEngine {
             // Final prompt token computes logits
             let last_tok = new_tokens[n_new - 1];
             while cur_pos >= max_seq_len && cur_pos > sink + drop {
+                compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
             let initial_logits = self.model.forward(last_tok, cur_pos);
             logits_buf.copy_from_slice(initial_logits);
             cur_pos += 1;
         } else {
-            // common_prefix == input_tokens.len() (prompt already prefilled)
+            // The prompt is already in the KV, so there are no new tokens to
+            // compute logits from. Re-run its last token: forward() rewrites
+            // that KV row and returns the logits the first turn produced.
+            // (The rewrite goes through the single-token path, which can
+            // differ from the batched row by round-off; it is the only way to
+            // get logits without a full re-prefill.) Without this the buffer
+            // stays zeroed and the sampler's argmax returns token 0.
             self.last_prefill_tokens = 0;
+            let last_tok = input_tokens[input_tokens.len() - 1];
+            if cur_pos > 0 {
+                let logits = self.model.forward(last_tok, cur_pos - 1);
+                logits_buf.copy_from_slice(logits);
+            }
         }
         self.last_prefill_duration = t_prefill.elapsed();
+        if self::quant::pool_failures() > pool_failures_before {
+            return Err(format!(
+                "a worker pool task failed during prefill ({} total); the attention/GEMM result would be incomplete",
+                self::quant::pool_failures()
+            ));
+        }
 
         // SnapKV Observation Window Compaction (Prunes inactive middle blocks after prefill)
+        let t_setup_post = std::time::Instant::now();
         if options.snapkv && cur_pos > 64 {
             let snap_sink = self.model.sink_tokens.max(16).min(cur_pos / 4);
             let keep_recent = 32.min(cur_pos - snap_sink);
             let middle = cur_pos.saturating_sub(snap_sink + keep_recent);
             if middle >= 16 {
                 let drop = (middle * 3) / 4;
+                compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, snap_sink, drop);
             }
         }
@@ -855,11 +984,17 @@ impl InferEngine {
 
         if options.kivi {
             self.model.enable_kivi(options.kivi_bits, cur_pos);
+        } else {
+            // A previous turn may have enabled KIVI. Its cache does not hold
+            // the tokens this call just prefilled, so decode would attend a
+            // truncated history; drop it and use the plain KV path.
+            self.model.disable_kivi();
         }
 
         if options.streaming_weights {
             self.model.set_streaming_weights(true);
         }
+        self.last_setup_duration += t_setup_post.elapsed();
 
         // 4. Decode Phase
         let mut sampler = Sampler::new(SamplerConfig {
@@ -914,6 +1049,16 @@ impl InferEngine {
         // be right for every model: a 5-row tree costs ~2.7 serial tokens of
         // time on the Pi (65-102 ms vs 42 ms), so acceptance has to clear
         // 2.7x, not 1.15x. Measure both rates instead of guessing.
+        //
+        // The rate comparison reads wall-clock time, so a gate that acts on it
+        // makes greedy output depend on machine noise: two identical runs can
+        // disable the tree at different steps and diverge on a near-tie.
+        // Acceptance-based switching (spec_should_disable) is a function of
+        // the token stream alone, so it is the default; set
+        // SOFUU_SPEC_RATE_GATE=1 to also let measured rates switch the tree
+        // off (faster in theory, not reproducible run to run).
+        let spec_rate_adapt =
+            std::env::var("SOFUU_SPEC_RATE_GATE").as_deref() == Ok("1");
         let mut serial_ns: u64 = 0;
         let mut serial_tokens: u32 = 0;
         let mut spec_ns: u64 = 0;
@@ -996,6 +1141,7 @@ impl InferEngine {
 
             // KV Cache auto-compaction before advancing
             while cur_pos >= max_seq_len && cur_pos > sink + drop {
+                compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
 
@@ -1167,7 +1313,8 @@ impl InferEngine {
                 spec_tokens += 1 + accepted_batch_indices.len() as u32;
                 if spec_adapt && !spec_disabled && !spec_decided {
                     let lose = spec_should_disable(spec_steps, spec_accepted, spec_min_accept)
-                        || spec_is_losing(spec_ns, spec_tokens, serial_ns, serial_tokens);
+                        || (spec_rate_adapt
+                            && spec_is_losing(spec_ns, spec_tokens, serial_ns, serial_tokens));
                     // Decide ONCE, as soon as both samples exist: the serial
                     // rate only comes from the warmup window (no serial steps
                     // run afterwards), so re-deciding later would judge fresh
@@ -1291,8 +1438,21 @@ impl InferEngine {
             );
         }
 
-        // Cache the history for multi-turn continuations
-        self.cached_tokens = history;
+        // Cache the history for multi-turn continuations. Only tokens that
+        // actually reached the KV may be reused: the loop pushes the last
+        // sampled token before the max-tokens break decides whether to
+        // forward it (so history can be one ahead of cur_pos), and a
+        // compaction shifts positions so the token order no longer maps onto
+        // KV rows at all.
+        let reusable = reusable_history_len(compacted, cur_pos, history.len());
+        self.cached_tokens = history[..reusable].to_vec();
+
+        if self::quant::pool_failures() > pool_failures_before {
+            return Err(format!(
+                "a worker pool task failed during generation ({} total); the output would be incomplete",
+                self::quant::pool_failures()
+            ));
+        }
 
         Ok(full_generated)
     }
@@ -1420,5 +1580,17 @@ mod adaptive_spec_tests {
         assert!(!spec_should_disable(16, 14, 1.15));
         // Qwen natural-text-like: ~1.2 tokens/step.
         assert!(!spec_should_disable(64, 13, 1.15));
+    }
+}
+
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    #[test]
+    fn cache_never_outlives_the_kv_rows() {
+        assert_eq!(super::reusable_history_len(false, 10, 11), 10);
+        assert_eq!(super::reusable_history_len(false, 10, 10), 10);
+        assert_eq!(super::reusable_history_len(true, 10, 20), 0);
+        assert_eq!(super::reusable_history_len(false, 3, 1), 1);
     }
 }

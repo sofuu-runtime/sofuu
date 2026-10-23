@@ -1082,7 +1082,27 @@ pub fn batched_attention(
     }
 }
 
-/// Multi-core parallel causal self-attention with Sliding Window Attention (SWA) and Attention Sinks.
+/// Read a boolean env knob consistently: unset, `0`, `false`, `off`, `no` and
+/// the empty string are off; `1`, `true`, `on`, `yes` are on. Anything else
+/// warns and counts as on (the old presence check) so a typo never silently
+/// disables a debugging or safety switch.
+pub fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "0" | "false" | "off" | "no" | "" => false,
+                "1" | "true" | "on" | "yes" => true,
+                other => {
+                    eprintln!("[infer] {name}={other} is not a boolean; treating it as on");
+                    true
+                }
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Profiling hooks (enabled with `SOFUU_PROFILE=1`): split prefill wall time
 /// into gemm / gemv / attention buckets; `report` prints and clears them.
 pub mod prof {
@@ -1108,7 +1128,7 @@ pub mod prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("SOFUU_PROFILE").is_some())
+        *ON.get_or_init(|| super::env_flag("SOFUU_PROFILE"))
     }
 
     /// RAII bucket: accumulates wall time (and one call) while on the stack.
@@ -1194,6 +1214,7 @@ pub mod prof {
     }
 }
 
+/// Multi-core parallel causal self-attention with Sliding Window Attention (SWA) and Attention Sinks.
 pub fn batched_attention_ext(
     q_batch: &[f32],
     k_cache: &[f32],

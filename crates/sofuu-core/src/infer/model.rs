@@ -45,12 +45,19 @@ pub const DEFAULT_PREFILL_BATCH: usize = 128;
 pub fn max_prefill_batch() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("SOFUU_PREFILL_BATCH")
+        let raw = std::env::var("SOFUU_PREFILL_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v >= 4)
-            .map(|v| (v / 4) * 4)
-            .unwrap_or(DEFAULT_PREFILL_BATCH)
+            .filter(|v| *v >= 4);
+        let limit = raw.map(|v| (v / 4) * 4).unwrap_or(DEFAULT_PREFILL_BATCH);
+        // The batch size multiplies into nine per-layer buffers; an unbounded
+        // value from a typo aborts the process on allocation failure.
+        if limit > 512 {
+            eprintln!("[infer] SOFUU_PREFILL_BATCH={limit} clamped to 512 (batch buffers scale linearly)");
+            512
+        } else {
+            limit
+        }
     })
 }
 
@@ -411,6 +418,29 @@ impl TransformerModel {
                     format!("missing feed_forward_length for GGUF architecture '{arch}'")
                 }
             })? as usize;
+        // Zero-valued hyperparameters divide by zero deep inside the kernels
+        // (n_rep = heads / kv_heads, pos % max_seq_len) and produce a SIGFPE
+        // instead of a load error. Reject them by name here.
+        if dim == 0 {
+            return Err(format!("invalid GGUF '{arch}': {prefix}embedding_length is 0"));
+        }
+        if n_layers == 0 {
+            return Err(format!("invalid GGUF '{arch}': {prefix}block_count is 0"));
+        }
+        if n_heads == 0 {
+            return Err(format!("invalid GGUF '{arch}': {prefix}attention.head_count is 0"));
+        }
+        if n_kv_heads == 0 {
+            return Err(format!("invalid GGUF '{arch}': {prefix}attention.head_count_kv is 0"));
+        }
+        if head_dim == 0 {
+            return Err(format!("invalid GGUF '{arch}': head_dim resolves to 0"));
+        }
+        if n_heads % n_kv_heads != 0 {
+            return Err(format!(
+                "invalid GGUF '{arch}': head_count {n_heads} is not a multiple of head_count_kv {n_kv_heads}"
+            ));
+        }
         let norm_eps = gguf
             .get_f32(&format!("{prefix}attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
@@ -446,11 +476,21 @@ impl TransformerModel {
             .map(|v| v as usize)
             .unwrap_or(0);
 
+        if detected_ctx == 0 {
+            return Err(format!("invalid GGUF '{arch}': context_length is 0"));
+        }
         let final_seq_len = if max_seq_len > 0 {
             max_seq_len.min(detected_ctx)
         } else {
             detected_ctx.min(4096)
         };
+        // Below 4 tokens sink+drop collapse to 0 and compact_kv_cache cannot
+        // make progress, so the decode loop would spin forever.
+        if final_seq_len < 4 {
+            return Err(format!(
+                "context window of {final_seq_len} tokens is too small: the decoder needs at least 4 (raise --ctx)"
+            ));
+        }
 
         let config = ModelConfig {
             dim,
@@ -654,7 +694,7 @@ impl TransformerModel {
             (None, None, false)
         };
 
-        if kv_f16 && std::env::var_os("SOFUU_PROFILE").is_some() {
+        if kv_f16 && super::quant::env_flag("SOFUU_PROFILE") {
             let feat = super::quant::simd_features();
             eprintln!(
                 "[infer] f16 KV shadows on ({} MB x2, CPU attention path, vector f16 kernels: {})",
@@ -807,7 +847,7 @@ impl TransformerModel {
     /// `SOFUU_KV_ZERO=1` restores the fill for deterministic cache dumps.
     pub fn reset_cache(&mut self) {
         static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let zero = *ZERO.get_or_init(|| std::env::var_os("SOFUU_KV_ZERO").is_some());
+        let zero = *ZERO.get_or_init(|| super::quant::env_flag("SOFUU_KV_ZERO"));
         if zero {
             self.k_cache.fill(0.0);
             self.v_cache.fill(0.0);

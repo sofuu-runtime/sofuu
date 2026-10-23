@@ -412,7 +412,7 @@ impl BpeTokenizer {
         // SOFUU_BPE_LEGACY=1 restores the O(n²) scanner (also the test oracle
         // for the fast path). Resolved once per process.
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let legacy = *LEGACY.get_or_init(|| std::env::var_os("SOFUU_BPE_LEGACY").is_some());
+        let legacy = *LEGACY.get_or_init(|| super::quant::env_flag("SOFUU_BPE_LEGACY"));
         match (&self.bpe_fast, legacy) {
             (Some(fast), false) => self.encode_segment_fast(fast, &normalized),
             _ => self.encode_segment_legacy(&normalized),
@@ -655,6 +655,11 @@ fn build_fast_tables(tok: &BpeTokenizer) -> Option<BpeFastTables> {
     }
     let mut pair_ranks = HashMap::with_capacity(tok.merges.len());
     for (key, &rank) in &tok.merges {
+        // A merge key is exactly "<left> <right>"; a key with more spaces
+        // would be silently split into the wrong pair.
+        if key.matches(' ').count() != 1 {
+            return None;
+        }
         let (a, b) = key.split_once(' ')?;
         let ia = tok.token_to_id.get(a, &tok.vocab)?;
         let ib = tok.token_to_id.get(b, &tok.vocab)?;

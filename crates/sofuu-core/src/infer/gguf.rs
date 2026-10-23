@@ -61,6 +61,12 @@ impl GgufFile {
         let path_ref = path.as_ref();
         let mmap = std::sync::Arc::new(MmapFile::open(path_ref)?);
         let resident = if std::env::var("SOFUU_RESIDENT_WEIGHTS").as_deref() == Ok("1") {
+            // Only the qwen35 backend reads this copy; every other backend
+            // loads from the mmap, so the flag doubles RSS for nothing. On an
+            // 8 GB Pi that is the difference between running and an OOM abort.
+            eprintln!(
+                "[gguf] SOFUU_RESIDENT_WEIGHTS=1: reading a second copy of the file into RAM (only the qwen35 backend uses it)"
+            );
             Some(std::fs::read(path_ref)?)
         } else {
             None
@@ -390,6 +396,20 @@ impl<'a> ByteReader<'a> {
 }
 
 fn read_value(r: &mut ByteReader<'_>, val_type: u32) -> io::Result<GgufValue> {
+    read_value_at(r, val_type, 0)
+}
+
+/// Nested metadata arrays recurse; a hand-crafted file of array headers would
+/// otherwise overflow the stack before any length check can reject it.
+const MAX_VALUE_DEPTH: usize = 8;
+
+fn read_value_at(r: &mut ByteReader<'_>, val_type: u32, depth: usize) -> io::Result<GgufValue> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("GGUF metadata nesting exceeds {MAX_VALUE_DEPTH} levels"),
+        ));
+    }
     match val_type {
         0 => Ok(GgufValue::Uint8(r.read_u8()?)),
         1 => Ok(GgufValue::Int8(r.read_u8()? as i8)),
@@ -450,7 +470,7 @@ fn read_value(r: &mut ByteReader<'_>, val_type: u32) -> io::Result<GgufValue> {
             }
             let mut arr = Vec::with_capacity(len);
             for _ in 0..len {
-                arr.push(read_value(r, item_type)?);
+                arr.push(read_value_at(r, item_type, depth + 1)?);
             }
             Ok(GgufValue::Array(arr))
         }

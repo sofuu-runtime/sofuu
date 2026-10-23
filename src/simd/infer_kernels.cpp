@@ -4295,7 +4295,14 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
                                 float scale, size_t nrows) {
 #if defined(__aarch64__) && defined(SOFUU_NEON)
     if (nrows == 0) return;
-    const size_t max_count = counts[nrows - 1];
+    // counts[] are absolute (pos + 1). Work in lengths from p_begin so the
+    // tail loop and the scalar fallback cannot index past the row when a
+    // caller passes a non-zero start offset.
+    size_t lens[8];
+    for (size_t i = 0; i < nrows; ++i) {
+        lens[i] = counts[i] > p_begin ? counts[i] - p_begin : 0;
+    }
+    const size_t max_count = lens[nrows - 1];
     const size_t npairs = max_count - (max_count & 1);
     size_t r = 0;
     for (; r + 2 <= nrows; r += 2) {
@@ -4375,18 +4382,19 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
                 td += qbj * k1[j];
             }
             const size_t p_abs = p_begin + p;
-            if (p_abs < counts[r]) outs[r][p_abs] = ta * scale;
-            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = tc * scale;
-            if (p_abs < counts[r + 1]) outs[r + 1][p_abs] = tb * scale;
-            if (p_abs + 1 < counts[r + 1]) outs[r + 1][p_abs + 1] = td * scale;
+            (void)p_abs;
+            if (p < lens[r]) outs[r][p_abs] = ta * scale;
+            if (p + 1 < lens[r]) outs[r][p_abs + 1] = tc * scale;
+            if (p < lens[r + 1]) outs[r + 1][p_abs] = tb * scale;
+            if (p + 1 < lens[r + 1]) outs[r + 1][p_abs + 1] = td * scale;
         }
     }
     if (r < nrows) {
         sofuu_attn_qk_row_f32(q_batch + r * q_stride, k_base, k_stride, head_dim, p_begin,
-                              counts[r], scale, outs[r]);
+                              lens[r], scale, outs[r]);
     }
     for (size_t rr = 0; rr < nrows; ++rr) {
-        for (size_t p = npairs; p < counts[rr]; ++p) {
+        for (size_t p = npairs; p < lens[rr]; ++p) {
             outs[rr][p_begin + p] = sofuu_vec_dot_f32(q_batch + rr * q_stride,
                                                      k_base + (p_begin + p) * k_stride, head_dim) * scale;
         }
@@ -4394,7 +4402,7 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
 #else
     for (size_t r = 0; r < nrows; ++r) {
         const float *q = q_batch + r * q_stride;
-        for (size_t p = 0; p < counts[r]; ++p) {
+        for (size_t p = 0; p < lens[r]; ++p) {
             outs[r][p_begin + p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
         }
     }
@@ -4746,7 +4754,12 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
                                     float scale, size_t nrows) {
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     if (nrows == 0) return;
-    size_t max_count = counts[nrows - 1];
+    // counts[] are absolute (pos + 1); see sofuu_attn_qk_rows8.
+    size_t lens[8];
+    for (size_t i = 0; i < nrows; ++i) {
+        lens[i] = counts[i] > p_begin ? counts[i] - p_begin : 0;
+    }
+    const size_t max_count = lens[nrows - 1];
     size_t r = 0;
     for (; r + 2 <= nrows; r += 2) {
         const float *qa = q_batch + r * q_stride;
@@ -4821,13 +4834,13 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
                 tb1 += qb[j] * sofuu_ldf16_1(k1 + j);
             }
             const size_t p_abs = p_begin + p;
-            if (p_abs < counts[r]) outs[r][p_abs] = ta0 * scale;
-            if (p_abs + 1 < counts[r]) outs[r][p_abs + 1] = ta1 * scale;
-            if (p_abs < counts[r + 1]) outs[r + 1][p_abs] = tb0 * scale;
-            if (p_abs + 1 < counts[r + 1]) outs[r + 1][p_abs + 1] = tb1 * scale;
+            if (p < lens[r]) outs[r][p_abs] = ta0 * scale;
+            if (p + 1 < lens[r]) outs[r][p_abs + 1] = ta1 * scale;
+            if (p < lens[r + 1]) outs[r + 1][p_abs] = tb0 * scale;
+            if (p + 1 < lens[r + 1]) outs[r + 1][p_abs + 1] = tb1 * scale;
         }
         for (size_t rr = r; rr < r + 2; ++rr) {
-            for (size_t p = (max_count - (max_count & 1)); p < counts[rr]; ++p) {
+            for (size_t p = (max_count - (max_count & 1)); p < lens[rr]; ++p) {
                 const uint16_t *k0 = k_base + (p_begin + p) * k_stride;
                 const float *q = q_batch + rr * q_stride;
                 outs[rr][p_begin + p] = sofuu_dot_f16_f32(q, k0, head_dim) * scale;
@@ -4836,7 +4849,7 @@ static void sofuu_attn_qk_rows8_k16(const float * __restrict q_batch, size_t q_s
     }
     if (r < nrows) {
         sofuu_attn_qk_row_k16(q_batch + r * q_stride, k_base, k_stride, head_dim, p_begin,
-                              counts[r], scale, outs[r]);
+                              lens[r], scale, outs[r]);
     }
 #else
     for (size_t r = 0; r < nrows; ++r) {

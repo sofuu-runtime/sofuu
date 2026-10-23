@@ -1890,18 +1890,41 @@ fn main() -> ExitCode {
             // edits one character inside that reply. Prints the tokens each
             // call actually prefilled plus the engine's own prefix comparison.
             if std::env::var_os("SOFUU_PREFIX_TEST").is_some() {
+                // SOFUU_PREFIX_TEST_GEN=0 runs the same turns with no decode
+                // steps, so every cached row was written by the batched
+                // prefill path. Comparing that against the default (8) says
+                // whether a warm/cold divergence comes from the prefill split
+                // or from rows the decode GEMV path wrote.
+                let gen: usize = std::env::var("SOFUU_PREFIX_TEST_GEN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8);
                 let opts = |max_tokens: usize| sofuu_core::infer::GenerateOptions {
                     max_tokens,
                     temperature: 0.0,
                     ..Default::default()
                 };
                 let mut reply = String::new();
-                let _ = engine.stream(prompt, opts(8), |t| {
+                let _ = engine.stream(prompt, opts(gen), |t| {
                     reply.push_str(&t);
                     true
                 });
                 let p1 = engine.last_prefill_tokens;
                 let cached = engine.cached_tokens.len();
+
+                // SOFUU_PREFIX_TEST_DROP=n re-prefills the last n cached
+                // tokens instead of reusing them. Rows written by the decode
+                // path are computed by a different kernel than batched
+                // prefill rows, so this says whether a warm/cold difference
+                // comes from those rows or from the reuse itself.
+                let drop_n: usize = std::env::var("SOFUU_PREFIX_TEST_DROP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if drop_n > 0 {
+                    let keep = engine.cached_tokens.len().saturating_sub(drop_n);
+                    engine.cached_tokens.truncate(keep);
+                }
 
                 let turn2 = format!("{prompt}{reply}\n\nUser: Summarize that again.\nAssistant:");
                 let t2 = engine.tokenizer.encode(&turn2);
@@ -1912,7 +1935,11 @@ fn main() -> ExitCode {
                 {
                     c2 += 1;
                 }
-                let _ = engine.stream(&turn2, opts(0), |_| true);
+                let mut prefill_skipped = String::new();
+                let _ = engine.stream(&turn2, opts(gen), |t| {
+                    prefill_skipped.push_str(&t);
+                    true
+                });
                 let p2 = engine.last_prefill_tokens;
 
                 let head: String = reply.chars().take(20).collect();
@@ -1929,12 +1956,124 @@ fn main() -> ExitCode {
                 let _ = engine.stream(&turn3, opts(0), |_| true);
                 let p3 = engine.last_prefill_tokens;
 
+                // Cold reference for the same turn: turn 3 diverged, so its
+                // cache was dropped and this call re-prefills everything.
+                let mut cold = String::new();
+                let _ = engine.stream(&turn2, opts(gen), |t| {
+                    cold.push_str(&t);
+                    true
+                });
+                let p2_cold = engine.last_prefill_tokens;
+                let same = prefill_skipped == cold;
+
                 eprintln!(
-                    "[prefix] turn1 prefill={p1} cached={cached} | turn2 tokens={} common={c2} prefill={p2} | turn3 tokens={} common={c3} prefill={p3} | reply_chars={}",
+                    "[prefix] gen={} drop={} turn1 prefill={p1} cached={cached} | turn2 tokens={} common={c2} prefill={p2} | turn3 tokens={} common={c3} prefill={p3} | cold_retry prefill={p2_cold} | warm==cold: {} | reply_chars={}",
+                    gen,
+                    drop_n,
                     t2.len(),
                     t3.len(),
+                    if same { "YES" } else { "NO" },
                     reply.chars().count()
                 );
+                if !same {
+                    eprintln!("[prefix] warm='{}'", prefill_skipped.escape_debug());
+                    eprintln!("[prefix] cold='{}'", cold.escape_debug());
+                }
+                // SOFUU_PREFIX_TEST=split: same text twice, once as a single
+                // prefill and once with the first 98% already in the KV. No
+                // decode step runs before the compared tokens, so a difference
+                // can only come from where the batched prefill was cut.
+                if std::env::var("SOFUU_PREFIX_TEST").as_deref() == Ok("split") {
+                    let a_text = format!("{prompt}\n\nUser: Summarize that again.\nAssistant:");
+                    let chars: Vec<char> = a_text.chars().collect();
+                    let at = engine.tokenizer.encode(&a_text);
+                    // A raw char cut can land mid-token, which re-tokenizes
+                    // differently and makes the cache a strict-prefix miss.
+                    // Walk the cut back until the prefix tokenizes to a strict
+                    // token prefix of the whole text so reuse really happens.
+                    let mut cut = String::new();
+                    let mut pt: Vec<u32> = Vec::new();
+                    for pct in (80..=98).rev() {
+                        let cand: String = chars[..chars.len() * pct / 100].iter().collect();
+                        let ct = engine.tokenizer.encode(&cand);
+                        if ct.len() < at.len() && at.starts_with(&ct) {
+                            cut = cand;
+                            pt = ct;
+                            break;
+                        }
+                    }
+                    if pt.is_empty() {
+                        eprintln!("[prefix-split] no strict token prefix found; skipped");
+                        return ExitCode::SUCCESS;
+                    }
+
+                    let _ = engine.stream("x", opts(0), |_| true);
+                    let mut a = String::new();
+                    let _ = engine.stream(&a_text, opts(gen), |t| {
+                        a.push_str(&t);
+                        true
+                    });
+                    let pa = engine.last_prefill_tokens;
+
+                    let _ = engine.stream("x", opts(0), |_| true);
+                    let _ = engine.stream(&cut, opts(0), |_| true);
+                    let pp = engine.last_prefill_tokens;
+                    let cached_split = engine.cached_tokens.len();
+                    let mut c = 0usize;
+                    while c < engine.cached_tokens.len()
+                        && c < at.len()
+                        && engine.cached_tokens[c] == at[c]
+                    {
+                        c += 1;
+                    }
+                    let mut b = String::new();
+                    let _ = engine.stream(&a_text, opts(gen), |t| {
+                        b.push_str(&t);
+                        true
+                    });
+                    let pb = engine.last_prefill_tokens;
+                    let same = a == b;
+                    eprintln!(
+                        "[prefix-split] gen={gen} full_tokens={} prefix_tokens={} prefix_prefill={pp} cached={cached_split} common={c} prefillA={pa} prefillB={pb} expectB={} | same: {}",
+                        at.len(),
+                        pt.len(),
+                        at.len() - pt.len(),
+                        if same { "YES" } else { "NO" }
+                    );
+                    if !same {
+                        eprintln!("[prefix-split] A='{}'", a.escape_debug());
+                        eprintln!("[prefix-split] B='{}'", b.escape_debug());
+                    }
+                }
+                // SOFUU_PREFIX_TEST=repeat: three reset+prefill cycles of the
+                // same text, each with an identical predecessor. Any
+                // difference between them is per-call nondeterminism, not a
+                // prefix-cache or compaction effect.
+                if std::env::var("SOFUU_PREFIX_TEST").as_deref() == Ok("repeat") {
+                    let mut outs: Vec<String> = Vec::new();
+                    for _ in 0..3 {
+                        let _ = engine.stream("x", opts(0), |_| true);
+                        let mut s = String::new();
+                        let _ = engine.stream(prompt, opts(gen), |t| {
+                            s.push_str(&t);
+                            true
+                        });
+                        outs.push(s);
+                    }
+                    let s01 = outs[0] == outs[1];
+                    let s12 = outs[1] == outs[2];
+                    eprintln!(
+                        "[repeat] gen={gen} run0==run1: {} | run1==run2: {}",
+                        if s01 { "YES" } else { "NO" },
+                        if s12 { "YES" } else { "NO" }
+                    );
+                    if !(s01 && s12) {
+                        for (i, o) in outs.iter().enumerate() {
+                            eprintln!("[repeat] run{i}='{}'", o.escape_debug());
+                        }
+                    }
+                    return ExitCode::SUCCESS;
+                }
                 return ExitCode::SUCCESS;
             }
 
@@ -1972,20 +2111,23 @@ fn main() -> ExitCode {
             }
             let prefill_toks = engine.last_prefill_tokens;
             let prefill_dur = engine.last_prefill_duration;
+            let setup_dur = engine.last_setup_duration;
             let prefill_rate = if prefill_dur.as_secs_f32() > 0.0 {
                 prefill_toks as f32 / prefill_dur.as_secs_f32()
             } else {
                 0.0
             };
-            let decode_dur = gen_dur.saturating_sub(prefill_dur);
+            let decode_dur = gen_dur
+                .saturating_sub(prefill_dur)
+                .saturating_sub(setup_dur);
             let decode_rate = if decode_dur.as_secs_f32() > 0.0 {
                 token_count as f32 / decode_dur.as_secs_f32()
             } else {
                 0.0
             };
             eprintln!(
-                "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
-                prefill_toks, prefill_dur, prefill_rate, token_count, decode_dur, decode_rate, gen_dur
+                "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · setup: {:.2?} · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
+                prefill_toks, prefill_dur, prefill_rate, setup_dur, token_count, decode_dur, decode_rate, gen_dur
             );
             ExitCode::SUCCESS
         }

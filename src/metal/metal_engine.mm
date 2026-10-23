@@ -3225,7 +3225,7 @@ extern "C" int sofuu_metal_batch_llama_attn_w4(
     sofuu_batch_barrier(ctx);
     uint w_rem = (uint)(qln_offset & 255ULL) / 4u;
     if (ctx->attn_noop) { p = 0xFFFFFFFFu; }
-    [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_fast];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_w4];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_ptr offset:kc_offset atIndex:1];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_ptr offset:vc_offset atIndex:2];

@@ -5852,6 +5852,12 @@ kernel void llama_attn_wN(
         float rms = rsqrt(tot / float(head_dim) + eps);
         for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
     }
+    // The q-norm scale above and this rotation BOTH write q_head, and they use
+    // different thread strides (128 vs 32*ATTN_WARPS), so a rotation can read an
+    // element before the thread that scales it has stored: that is a race, and
+    // it made greedy decode nondeterministic on every model with q-norm
+    // (Qwen3 family) while Llama-style models stayed stable. Order them.
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     for (uint j = tid; j < head_dim / 2; j += 32 * ATTN_WARPS) {
         float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
         float c = cos(theta);

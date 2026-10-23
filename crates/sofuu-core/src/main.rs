@@ -1883,6 +1883,61 @@ fn main() -> ExitCode {
                 active_threads
             );
 
+            // SOFUU_PREFIX_TEST=1: multi-turn prefix-cache receipt. The stock
+            // CLI is one-shot, so nothing else ever exercises the reuse path.
+            // Turn 1 prefills the prompt; turn 2 re-sends it with the rendered
+            // reply and a new user line (what a chat client does); turn 3
+            // edits one character inside that reply. Prints the tokens each
+            // call actually prefilled plus the engine's own prefix comparison.
+            if std::env::var_os("SOFUU_PREFIX_TEST").is_some() {
+                let opts = |max_tokens: usize| sofuu_core::infer::GenerateOptions {
+                    max_tokens,
+                    temperature: 0.0,
+                    ..Default::default()
+                };
+                let mut reply = String::new();
+                let _ = engine.stream(prompt, opts(8), |t| {
+                    reply.push_str(&t);
+                    true
+                });
+                let p1 = engine.last_prefill_tokens;
+                let cached = engine.cached_tokens.len();
+
+                let turn2 = format!("{prompt}{reply}\n\nUser: Summarize that again.\nAssistant:");
+                let t2 = engine.tokenizer.encode(&turn2);
+                let mut c2 = 0usize;
+                while c2 < engine.cached_tokens.len()
+                    && c2 < t2.len()
+                    && engine.cached_tokens[c2] == t2[c2]
+                {
+                    c2 += 1;
+                }
+                let _ = engine.stream(&turn2, opts(0), |_| true);
+                let p2 = engine.last_prefill_tokens;
+
+                let head: String = reply.chars().take(20).collect();
+                let edited = reply.replacen(&head, &format!("{head}X"), 1);
+                let turn3 = format!("{prompt}{edited}\n\nUser: Summarize that again.\nAssistant:");
+                let t3 = engine.tokenizer.encode(&turn3);
+                let mut c3 = 0usize;
+                while c3 < engine.cached_tokens.len()
+                    && c3 < t3.len()
+                    && engine.cached_tokens[c3] == t3[c3]
+                {
+                    c3 += 1;
+                }
+                let _ = engine.stream(&turn3, opts(0), |_| true);
+                let p3 = engine.last_prefill_tokens;
+
+                eprintln!(
+                    "[prefix] turn1 prefill={p1} cached={cached} | turn2 tokens={} common={c2} prefill={p2} | turn3 tokens={} common={c3} prefill={p3} | reply_chars={}",
+                    t2.len(),
+                    t3.len(),
+                    reply.chars().count()
+                );
+                return ExitCode::SUCCESS;
+            }
+
             let t_gen = std::time::Instant::now();
             let mut token_count = 0usize;
             use std::io::Write;

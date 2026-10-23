@@ -1231,6 +1231,28 @@ Per-model prefill/decode at the 1210-token prompt (t1p71): Qwen Q4_K_M
 |---|---|---|
 | `SOFUU_BPE_LEGACY=1` | off | restores the O(n²) tokenizer scanner |
 | `SOFUU_KV_ZERO=1` | off | zero-fills the KV cache on reset (old behaviour) |
+| `SOFUU_PREFIX_TEST=1` | off | multi-turn prefix-cache receipt on `sofuu infer` (prints tokens actually prefilled for turn 2/3 and the engine's own prefix comparison; the CLI is otherwise one-shot) |
+
+### Multi-turn prefix cache (measured, 2026-10-23)
+
+`stream()` keeps the last token sequence in `cached_tokens` and reuses the KV
+when the next prompt is a pure extension of it. Device receipt with
+`SOFUU_PREFIX_TEST=1`, Qwen Q4_K_M, 1210-token prompt:
+
+```
+turn1 prefill=1210 cached=1218 | turn2 tokens=1229 common=1218 prefill=11 | turn3 tokens=1231 common=1213 prefill=1231
+```
+
+An append-only turn (prompt + rendered reply + new user line) prefills **11
+tokens instead of 1210** — the second turn costs about 0.08 s of prompt work
+instead of 9.2 s. The rendered reply round-trips through the tokenizer
+exactly (`common == cached`), so a chat client that re-sends the transcript
+gets the full reuse. Editing one character inside the previous reply drops
+`common` to 1213 and the current rule throws the whole cache away
+(`prefill=1231`), because reuse is only taken when the new prompt extends the
+entire cached sequence. That is the remaining opportunity: rewind to
+`common_prefix` instead of 0 — safe only while the KV has never been
+compacted and after clearing KIVI state.
 
 Tests: `fast_bpe_matches_legacy_on_edge_cases`,
 `fast_bpe_matches_legacy_fuzz` (400 random strings),

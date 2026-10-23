@@ -56,8 +56,8 @@ A layer currently commits three times and reads results back to the host between
 each (`slot_f32(...).copy_from_slice(...)` into `self.x`), so the GPU drains and
 idles while the CPU does RMSNorm and the residual add. That is why the GEMVs run
 in the 6 GB/s regime when the same kernel reaches 29 GB/s in one commit. Work:
-keep the residual add and RMSNorm on the GPU (`batch_add`, `batch_rmsnorm_b4`
-already exist), drop the per-stage readbacks from the hot loop (they exist for
+keep the residual add and RMSNorm on the GPU (`batch_add` and
+`batch_rmsnorm_f32w_b4` already exist), drop the per-stage readbacks from the hot loop (they exist for
 the CPU sampler and the spec path - both can read once, at the end), then
 re-measure against the 29 GB/s floor. Expected: 0.6B ~250-300 tg/s, i.e. at or
 past the bar; every model scales with it since they share the structure.

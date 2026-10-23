@@ -3061,13 +3061,18 @@ impl TransformerModel {
         }
         let t0 = std::time::Instant::now();
         let positions: Vec<usize> = (0..b).map(|t| start_pos + t).collect();
+        // The core writes the last row's head logits into this slice (and then
+        // mirrors them into self.logits). Passing &mut [] made every chunk that
+        // needs logits panic with "range end index 151936 out of range for slice
+        // of length 0", so SOFUU_GPU_PREFILL never completed a prompt.
+        let mut head_logits = vec![0.0f32; if last_logits { self.config.vocab_size } else { 0 }];
         if !self.gpu_forward_chain_core(
             tokens,
             &positions,
             start_pos,
             if last_logits { Some(b - 1) } else { None },
             false,
-            &mut [],
+            &mut head_logits,
         ) {
             return false;
         }

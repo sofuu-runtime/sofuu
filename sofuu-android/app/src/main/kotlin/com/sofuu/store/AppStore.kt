@@ -275,10 +275,18 @@ val runtimeEnv = RuntimeEnv(app)
                 refreshSessions()
             }
             is EngineEvent.Ctx -> {
-                val owner = ev.sid ?: state.activeSessionId ?: return
+                // A boot event carries no sid (no session yet) and a fresh app
+                // has no active session either — the old `?: return` dropped
+                // the denominator entirely, so the ring stayed empty until the
+                // first turn. Show it on the live chat; attribute it when we
+                // know the owner.
+                val owner = ev.sid ?: state.activeSessionId
                 val meter = CtxMeter(ev.used, ev.window, ev.source, ev.model, ev.sid)
-                val cache = state.ctxCache + (owner to meter)
-                state = if (owner == state.activeSessionId) state.copy(ctx = meter, ctxCache = cache) else state.copy(ctxCache = cache)
+                state = when {
+                    owner == null -> state.copy(ctx = meter)
+                    owner == state.activeSessionId -> state.copy(ctx = meter, ctxCache = state.ctxCache + (owner to meter))
+                    else -> state.copy(ctxCache = state.ctxCache + (owner to meter))
+                }
             }
             is EngineEvent.ApprovalRequested -> {
                 state = state.copy(approvals = state.approvals + Approval(ev.id, ev.tool, ev.args, ev.risky))
@@ -927,6 +935,16 @@ val runtimeEnv = RuntimeEnv(app)
         touchEngineUse()
         refreshSessions()
         engine.setPermissions(state.permissions)
+        // Seed the ring denominator from config: the engine's boot ctx event
+        // fires inside chat.init, before this app's event sink exists, so a
+        // fresh launch with a saved model showed an empty ring until the
+        // first turn.
+        val cfgWin = state.config?.ctxWindow ?: 0
+        if (cfgWin > 0 && (state.ctx?.window ?: 0) <= 0) {
+            state = state.copy(
+                ctx = CtxMeter(0, cfgWin, "config", state.config?.model, state.activeSessionId),
+            )
+        }
         // A tuned model keeps its measured decode thread count across
         // restarts. A manual decode override in Settings wins. An untuned
         // local model gets the Part-0 protocol (probe + receipts) run
@@ -1334,7 +1352,24 @@ val runtimeEnv = RuntimeEnv(app)
      *  Fire-and-forget: the next turn and the ctx ring pick it up. */
     private fun reharvestCaps() {
         viewModelScope.launch(Dispatchers.Default) {
-            runCatching { engine.detectCaps().get(20, TimeUnit.SECONDS) }
+            val r = runCatching { engine.detectCaps().get(20, TimeUnit.SECONDS) }.getOrNull()
+            // Seed the ring denominator for the NEW model right away: the
+            // engine only emits a ctx event at boot and after a turn, so
+            // switching models used to leave the old window on screen.
+            val win = r?.optLong("window", 0) ?: 0
+            if (win > 0) {
+                withContext(Dispatchers.Main) {
+                    state = state.copy(
+                        ctx = CtxMeter(
+                            used = 0,
+                            window = win,
+                            source = r?.optString("source").orEmpty().ifEmpty { "model" },
+                            model = state.config?.model,
+                            sid = state.activeSessionId,
+                        ),
+                    )
+                }
+            }
         }
     }
 
@@ -1576,7 +1611,16 @@ val runtimeEnv = RuntimeEnv(app)
             // No provider entry to write: "local" is not a configured
             // endpoint, so refreshModelCache would only 404 on it.
             withContext(Dispatchers.Main) {
-                state = state.copy(config = configs.redacted(merged))
+                // The engine emits a ctx event only at boot and after a turn,
+                // so the ring would keep the previous model's denominator.
+                // The caps we just read ARE the new denominator.
+                val win = patch.optLong("ctx_window", 0)
+                state = state.copy(
+                    config = configs.redacted(merged),
+                    ctx = if (win > 0) {
+                        CtxMeter(0, win, "model", path, state.activeSessionId)
+                    } else state.ctx,
+                )
             }
             refreshLocalModels()
             refreshSessions()

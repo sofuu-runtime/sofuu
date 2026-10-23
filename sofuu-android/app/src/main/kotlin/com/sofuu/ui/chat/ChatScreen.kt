@@ -84,9 +84,18 @@ fun ChatScreen(
     // cancelled the previous scroll mid-flight, which read as constant
     // stutter. An instant jump when pinned, nothing when the user scrolled
     // up to read, is the standard chat-scroll contract.
-    LaunchedEffect(messages.size, messages.lastOrNull()?.content?.length) {
-        if (messages.isNotEmpty() && listState.canScrollForward == false) {
-            listState.scrollToItem((messages.size - 1).coerceAtLeast(0))
+    // A NEW row (your message, a notice, the start of an answer) always
+    // scrolls into view — sending while scrolled up used to leave the reply
+    // off-screen. Streaming *content* growth only follows when the user is
+    // already at the bottom, so reading older turns is never yanked away.
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            listState.scrollToItem(messages.size - 1)
+        }
+    }
+    LaunchedEffect(messages.lastOrNull()?.content?.length) {
+        if (messages.isNotEmpty() && !listState.canScrollForward) {
+            listState.scrollToItem(messages.size - 1)
         }
     }
 

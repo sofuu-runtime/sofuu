@@ -35,6 +35,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -108,11 +110,20 @@ fun Composer(
         }
     }
 
+    // Sending is a commitment: drop the IME so the answer is visible instead
+    // of sitting behind the keyboard (and the list can scroll to it).
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    fun dismissInput() {
+        keyboard?.hide()
+        focus.clearFocus()
+    }
     val submit = {
         val t = text.trim()
         if (!streaming && (t.isNotEmpty() || images.isNotEmpty())) {
             onSubmit(text, images)
             text = ""
+            dismissInput()
         }
     }
 
@@ -212,6 +223,7 @@ fun Composer(
                     SlashPalette(slashMatches, slashIdx) { cmd ->
                         onSubmit("/" + cmd.name, emptyList())
                         text = ""
+                        dismissInput()
                     }
                 }
 

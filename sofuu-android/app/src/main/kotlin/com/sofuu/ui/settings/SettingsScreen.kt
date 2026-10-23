@@ -1396,6 +1396,10 @@ private fun ProvidersPane(store: AppStore) {
 
 // ── Usage ───────────────────────────────────────────────────────
 
+/** A local GGUF is recorded by its on-device path; cloud ids are names. */
+private fun isLocalModelId(id: String): Boolean =
+    id.startsWith("/") || id.endsWith(".gguf", ignoreCase = true)
+
 @Composable
 private fun UsagePane(store: AppStore) {
     val c = LocalSofuuColors.current
@@ -1441,6 +1445,73 @@ private fun UsagePane(store: AppStore) {
                 Column {
                     Text("Completion tokens", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                     Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
+                }
+            }
+            // The same totals, split the way they are actually spent. A local
+            // GGUF records its model as an absolute path, so the split needs
+            // no engine change and no pricing table.
+            val models = usage?.optJSONArray("models")
+            if (models != null && models.length() > 0) {
+                var localPt = 0.0; var localCt = 0.0
+                var cloudPt = 0.0; var cloudCt = 0.0
+                for (i in 0 until models.length()) {
+                    val m = models.optJSONObject(i) ?: continue
+                    val local = isLocalModelId(m.optString("model"))
+                    if (local) {
+                        localPt += m.optDouble("pt"); localCt += m.optDouble("ct")
+                    } else {
+                        cloudPt += m.optDouble("pt"); cloudCt += m.optDouble("ct")
+                    }
+                }
+                CardDivider()
+                Text(
+                    "Local  %,.0f in · %,.0f out".format(localPt, localCt),
+                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
+                    fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 6.dp),
+                )
+                Text(
+                    "Cloud  %,.0f in · %,.0f out".format(cloudPt, cloudCt),
+                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
+                    fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+
+        Section("Per model")
+        SettingsCard {
+            val models = usage?.optJSONArray("models")
+            if (models == null || models.length() == 0) {
+                Text(
+                    "No per-model usage recorded yet. A turn records its tokens when the engine reports usage (local GGUFs and cloud providers both do).",
+                    fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                )
+            } else {
+                for (i in 0 until models.length()) {
+                    if (i > 0) CardDivider()
+                    val m = models.optJSONObject(i) ?: continue
+                    val id = m.optString("model").ifEmpty { "unknown" }
+                    val local = isLocalModelId(id)
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                id.substringAfterLast('/'),
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text,
+                                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                (if (local) "local" else "cloud") + " · ${m.optInt("turns")} turns",
+                                fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                            )
+                        }
+                        Text(
+                            "%,.0f in · %,.0f out".format(m.optDouble("pt"), m.optDouble("ct")),
+                            fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
                 }
             }
         }
@@ -1616,6 +1687,15 @@ private fun BrainPane(store: AppStore) {
 
     Column {
         Section("Stored memories", isFirst = true)
+        // Where the data actually is: one QTSQ file per workspace, written by
+        // the CMA and shared by every session of this workspace.
+        (store.state.projectDir ?: store.engine.projectDir)?.let { ws ->
+            Text(
+                "Stored in ${ws.substringAfterLast('/')}/.sofuu/brain/brain.qtsq — one file per workspace, shared by all its chats.",
+                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
         SettingsCard {
             when {
                 err != null -> Text(err!!, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.err)

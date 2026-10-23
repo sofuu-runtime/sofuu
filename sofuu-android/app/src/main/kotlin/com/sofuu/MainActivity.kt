@@ -91,6 +91,7 @@ class MainActivity : ComponentActivity() {
         super.onPause()
         store.foreground = false
         store.saveCurrentSessionMessages()
+        store.flushSessionSave()
         // Never leave the mic hot in the background.
         store.cancelDictation()
     }
@@ -119,14 +120,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun uriToDataUrl(uri: Uri, maxDim: Int): String? = try {
-        val bmp = android.graphics.ImageDecoder.decodeBitmap(
-            android.graphics.ImageDecoder.createSource(contentResolver, uri),
-        ) { decoder, info, _ ->
-            val scale = maxDim.toFloat() / maxOf(info.size.width, info.size.height).coerceAtLeast(1)
-            if (scale < 1f) {
-                decoder.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
+        val bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            android.graphics.ImageDecoder.decodeBitmap(
+                android.graphics.ImageDecoder.createSource(contentResolver, uri),
+            ) { decoder, info, _ ->
+                val scale = maxDim.toFloat() / maxOf(info.size.width, info.size.height).coerceAtLeast(1)
+                if (scale < 1f) {
+                    decoder.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
+                }
             }
-        }
+        } else {
+            // API 24–27 has no ImageDecoder: measure, then decode subsampled.
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, bounds)
+            }
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxDim && sample < 16) {
+                sample *= 2
+            }
+            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            contentResolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, opts)
+            }
+        } ?: return null
         val stream = java.io.ByteArrayOutputStream()
         bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, stream)
         "data:image/jpeg;base64," + android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)

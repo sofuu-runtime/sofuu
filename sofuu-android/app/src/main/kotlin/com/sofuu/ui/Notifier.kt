@@ -25,6 +25,14 @@ object Notifier {
     }
 
     fun post(context: Context, title: String, body: String) {
+        // POST_NOTIFICATIONS is a runtime permission on 33+; without the
+        // check the notify() call is a lint error and, when denied, a
+        // silently dropped notification on every turn.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.POST_NOTIFICATIONS,
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
         ensureChannel(context)
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_chat)

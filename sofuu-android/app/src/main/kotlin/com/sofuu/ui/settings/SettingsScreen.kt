@@ -1381,9 +1381,10 @@ private fun UsagePane(store: AppStore) {
     val c = LocalSofuuColors.current
     var usage by remember { mutableStateOf<JSONObject?>(null) }
     LaunchedEffect(Unit) {
-        usage = runCatching {
-            store.engine.usageReport().get(10, TimeUnit.SECONDS)
-        }.getOrNull()
+        // LaunchedEffect runs on Main; the engine future can take 10 s.
+        usage = withContext(Dispatchers.IO) {
+            runCatching { store.engine.usageReport().get(10, TimeUnit.SECONDS) }.getOrNull()
+        }
     }
     Column {
         Section("Workspace spend & tokens", isFirst = true)
@@ -1520,7 +1521,9 @@ private fun UsagePane(store: AppStore) {
 @Composable
 private fun BrainPane(store: AppStore) {
     val c = LocalSofuuColors.current
-    val surface = remember { com.sofuu.engine.RuntimeSurface(store.engine) }
+    val surface = remember {
+        com.sofuu.engine.RuntimeSurface(store.engine) { store.state.config?.brain != false }
+    }
 
     var info by remember { mutableStateOf<JSONObject?>(null) }
     var err by remember { mutableStateOf<String?>(null) }
@@ -1551,13 +1554,13 @@ private fun BrainPane(store: AppStore) {
                 imgNote = "Could not import that image."
             } else {
                 val r = withContext(Dispatchers.IO) {
-                    runCatching { surface.embedImage(img).get(30, TimeUnit.SECONDS) }.getOrNull()
+                    runCatching { surface.embedImageFile(img).get(30, TimeUnit.SECONDS) }.getOrNull()
                 }
                 if (r?.optBoolean("ok") == true) {
                     imgNote = "${img.substringAfterLast('/')} · ${r.optInt("dim")}-dim img1 vector"
                     imgPath = img
                 } else {
-                    imgNote = "The image projector is not in this build: ${r?.optString("error") ?: "unavailable"}"
+                    imgNote = "Image embedding failed: ${r?.optString("error") ?: "unavailable"}"
                     imgPath = null
                 }
             }
@@ -1686,18 +1689,29 @@ private fun BrainPane(store: AppStore) {
 
         Section("Embedding spaces")
         SettingsCard {
+            // embedInfo()/embedInfoV2() are two FLAT manifests (id, dimension,
+            // available, …), not one object with "hash"/"semantic" children —
+            // reading the old shape rendered 0 dims and "unavailable" against
+            // a healthy engine.
             val sp = spaces?.optJSONObject("info")
-            if (sp == null) {
+            val v2 = spaces?.optJSONObject("v2")
+            if (sp == null && v2 == null) {
                 Text("No embedding manifest yet.", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             } else {
-                SpaceLine(c.text, c.err, c.textFaint, "hash-768 (default)", sp.optJSONObject("hash")?.optInt("dimension") ?: 0, true)
-                CardDivider()
-                val sem = sp.optJSONObject("semantic")
-                SpaceLine(c.text, c.err, c.textFaint, "semantic", sem?.optInt("dimension") ?: 0, sem?.optBoolean("available", false) ?: false)
-                val v2 = spaces?.optJSONObject("v2")
+                if (sp != null) {
+                    SpaceLine(
+                        c.text, c.err, c.textFaint,
+                        sp.optString("id").ifEmpty { "hash" },
+                        sp.optInt("dimension"), sp.optBoolean("available", true),
+                    )
+                }
                 if (v2 != null) {
                     CardDivider()
-                    SpaceLine(c.text, c.err, c.textFaint, "semantic v2", v2.optInt("dimension"), v2.optBoolean("available", false))
+                    SpaceLine(
+                        c.text, c.err, c.textFaint,
+                        v2.optString("id").ifEmpty { "semantic v2" },
+                        v2.optInt("dimension"), v2.optBoolean("available", false),
+                    )
                 }
             }
         }
@@ -1716,20 +1730,23 @@ private fun BrainPane(store: AppStore) {
                     "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · ${ws?.optLong("segments") ?: 0} segments",
                     fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
                 )
-                val on = info?.optJSONObject("on")
-                if (on != null) {
+                // The gate map is `gates` (name → "on"/"off" STRINGS); the
+                // pane used to read a non-existent `on` object of booleans,
+                // so no gate row ever rendered.
+                val gates = info?.optJSONObject("gates")
+                if (gates != null) {
                     CardDivider()
-                    val keys = on.keys()
+                    val keys = gates.keys()
                     while (keys.hasNext()) {
                         val k = keys.next()
-                        val st = if (on.optBoolean(k)) "on" else "off"
+                        val st = gates.optString(k)
                         Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                             Text(
                                 k, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
                                 fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
                             )
                             Text(
-                                st, fontSize = 12.5.sp, fontWeight = FontWeight.Bold,
+                                st.ifEmpty { "off" }, fontSize = 12.5.sp, fontWeight = FontWeight.Bold,
                                 color = if (st == "on") c.accent else c.textMuted,
                             )
                         }
@@ -1918,10 +1935,20 @@ private fun AgentsPane(store: AppStore) {
     var maxSteps by remember { mutableStateOf("24") }
     var withWeb by remember { mutableStateOf(true) }
     var withCode by remember { mutableStateOf(true) }
+    // 'none' | 'sensitive' | 'all' — the runtime's def.approve. It must be
+    // set at define time; approveInteractive at run time only says HOW to
+    // ask, never WHETHER to.
+    var approveMode by remember { mutableStateOf("sensitive") }
 
     var task by remember { mutableStateOf("") }
     var answer by remember { mutableStateOf<JSONObject?>(null) }
     var running by remember { mutableStateOf(false) }
+    // Run target selected from the registry (the editable name field is a
+    // definition input, not a selection).
+    var runAgentName by remember { mutableStateOf("") }
+    var runSignal by remember { mutableStateOf<String?>(null) }
+    /** Approval parked by the headless run, if any. */
+    var pending by remember { mutableStateOf<JSONObject?>(null) }
 
     LaunchedEffect(reload) {
         list = withContext(Dispatchers.IO) { surface.agents() }
@@ -1937,25 +1964,56 @@ private fun AgentsPane(store: AppStore) {
         } else {
             for (i in 0 until l.length()) {
                 val a = l.optJSONObject(i) ?: continue
+                val agentName = a.optString("name")
                 SettingsCard(modifier = Modifier.padding(bottom = 8.dp)) {
-                    Text(
-                        a.optString("name"),
-                        fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text, fontFamily = FontFamily.Monospace,
-                    )
-                    val tools = a.optJSONArray("tools")
-                    val subs = a.optInt("agents")
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { runAgentName = agentName },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            agentName,
+                            fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text,
+                            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            if (runAgentName == agentName) "run target" else "select",
+                            fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                            color = if (runAgentName == agentName) c.accent else c.textFaint,
+                        )
+                    }
+                    // A.list() reports `tools` as a COUNT and `agents` as an
+                    // ARRAY; the old reader expected an array of tool names
+                    // and an int, so both lines rendered empty.
+                    val toolsVal = a.opt("tools")
+                    val toolsText = when (toolsVal) {
+                        is org.json.JSONArray ->
+                            (0 until toolsVal.length()).joinToString(", ") { toolsVal.optString(it) }
+                                .ifEmpty { "no tools" }
+                        is Number -> "${toolsVal.toInt()} tools"
+                        else -> null
+                    }
+                    val subsVal = a.opt("agents")
+                    val subsText = when (subsVal) {
+                        is org.json.JSONArray ->
+                            if (subsVal.length() > 0) (0 until subsVal.length()).joinToString(", ") { subsVal.optString(it) } else null
+                        is Number -> if (subsVal.toInt() > 0) "${subsVal.toInt()} sub-agent slots" else null
+                        else -> null
+                    }
                     Text(
                         buildString {
-                            tools?.let { t ->
-                                append(
-                                    (0 until t.length()).joinToString(", ") { t.optString(it) }
-                                        .ifEmpty { "no tools" }
-                                )
+                            toolsText?.let { append(it) }
+                            subsText?.let { if (isNotEmpty()) append(" · "); append("sub-agents: $it") }
+                            a.optString("provider").takeIf { it.isNotEmpty() }?.let {
+                                if (isNotEmpty()) append(" · "); append(it)
                             }
-                            if (subs > 0) append(" · $subs sub-agent slots")
-                            a.optString("provider").takeIf { it.isNotEmpty() }?.let { append(" · $it") }
-                        },
-                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp),
+                            if (a.optInt("runs24h") > 0) {
+                                if (isNotEmpty()) append(" · "); append("${a.optInt("runs24h")} runs/24h")
+                            }
+                        }.ifEmpty { "no tools" },
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                        modifier = Modifier.padding(top = 2.dp),
                     )
                 }
             }
@@ -1970,6 +2028,25 @@ private fun AgentsPane(store: AppStore) {
             CardDivider()
             ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
             Spacer(Modifier.height(10.dp))
+            Text(
+                "Approval gate — runs ask before this agent acts",
+                fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
+                modifier = Modifier.padding(bottom = 6.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("sensitive" to "Writes + shell", "all" to "Every tool", "none" to "Never").forEach { (v, label) ->
+                    SmallButton(
+                        if (approveMode == v) c.accent else c.bgCardHover,
+                        if (approveMode == v) c.accentContrast else c.textMuted,
+                        label,
+                    ) { approveMode = v }
+                }
+            }
+            Text(
+                "The answer is the card in Run headlessly below (Allow / Deny / Always).",
+                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                modifier = Modifier.padding(top = 6.dp, bottom = 10.dp),
+            )
             SmallButton(c.accent, c.accentContrast, "Register Agent") {
                 scope.launch {
                     val tools = buildList {
@@ -1978,7 +2055,7 @@ private fun AgentsPane(store: AppStore) {
                     }
                     val budget = JSONObject().put("maxSteps", maxSteps.filter { it.isDigit() }.toIntOrNull() ?: 24)
                     val r = withContext(Dispatchers.IO) {
-                        surface.defineAgent(name.trim(), system.trim(), tools, budget)
+                        surface.defineAgent(name.trim(), system.trim(), tools, budget, approve = approveMode)
                     }
                     note = if (r?.optBoolean("ok") == true) {
                         "${r.optString("name")} registered — the agent can use it by name, and /agents lists it."
@@ -1999,22 +2076,82 @@ private fun AgentsPane(store: AppStore) {
                 "Runs through the agent loop headlessly and returns the final collected answer.",
                 fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
             )
+            val target = runAgentName.ifEmpty { name.trim() }
+            Text(
+                "Agent: ${target.ifEmpty { "(none — tap one above)" }}",
+                fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                color = if (target.isEmpty()) c.warn else c.textMuted,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
             TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 8.dp))
-            SmallButton(
-                if (running) c.bgCardHover else c.accent,
-                if (running) c.textFaint else c.accentContrast,
-                if (running) "Running…" else "Run Task",
-            ) {
-                if (running || task.isBlank()) return@SmallButton
-                running = true; answer = null
-                scope.launch {
-                    val r = withContext(Dispatchers.IO) {
-                        runCatching {
-                            surface.runAgent(name.trim(), task.trim(), 300_000).get(300, TimeUnit.SECONDS)
-                        }.getOrNull()
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SmallButton(
+                    if (running) c.bgCardHover else c.accent,
+                    if (running) c.textFaint else c.accentContrast,
+                    if (running) "Running…" else "Run Task",
+                ) {
+                    if (running || task.isBlank()) return@SmallButton
+                    if (target.isEmpty()) {
+                        note = "Pick an agent above (or type a name) first."
+                        return@SmallButton
                     }
-                    answer = r ?: JSONObject().put("ok", false).put("error", "the run did not finish in 5 minutes")
-                    running = false
+                    running = true; answer = null; pending = null
+                    val signal = "android-agent-" + System.currentTimeMillis()
+                    runSignal = signal
+                    scope.launch {
+                        // approveInteractive parks an approval-gated tool
+                        // instead of denying it; drain the queue while the
+                        // run waits so the user can answer it.
+                        val poller = launch {
+                            while (true) {
+                                val now = withContext(Dispatchers.IO) {
+                                    runCatching { surface.agentPendingApprovals() }.getOrNull()
+                                }
+                                pending = if (now != null && now.length() > 0) now.optJSONObject(0) else null
+                                kotlinx.coroutines.delay(800)
+                            }
+                        }
+                        val r = withContext(Dispatchers.IO) {
+                            runCatching {
+                                surface.runAgent(target, task.trim(), 300_000, signal)
+                                    .get(300, TimeUnit.SECONDS)
+                            }.getOrNull()
+                        }
+                        poller.cancel()
+                        pending = null
+                        runSignal = null
+                        answer = r ?: JSONObject().put("ok", false).put("error", "the run did not finish in 5 minutes")
+                        running = false
+                    }
+                }
+                if (running) {
+                    SmallButton(c.bgCardHover, c.errStrong, "Cancel") {
+                        val sig = runSignal ?: return@SmallButton
+                        scope.launch(Dispatchers.IO) { runCatching { surface.cancelAgent(sig) } }
+                    }
+                }
+            }
+            pending?.let { p ->
+                val pid = p.optString("id")
+                CardDivider()
+                Text(
+                    "Approval needed · ${p.optString("tool").ifEmpty { "tool" }}",
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.warn,
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmallButton(c.bgCardHover, c.text, "Deny") {
+                        scope.launch(Dispatchers.IO) { runCatching { surface.resolveAgentApproval(pid, false, false) } }
+                        pending = null
+                    }
+                    SmallButton(c.bgCardHover, c.text, "Always") {
+                        scope.launch(Dispatchers.IO) { runCatching { surface.resolveAgentApproval(pid, true, true) } }
+                        pending = null
+                    }
+                    SmallButton(c.accent, c.accentContrast, "Allow once") {
+                        scope.launch(Dispatchers.IO) { runCatching { surface.resolveAgentApproval(pid, true, false) } }
+                        pending = null
+                    }
                 }
             }
             answer?.let { a ->

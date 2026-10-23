@@ -30,7 +30,14 @@ import org.json.JSONObject
  * permission a user might refuse are not registered rather than registered
  * and silently failing.
  */
-class DeviceTools(private val context: Context) {
+class DeviceTools(
+    private val context: Context,
+    /** Mirrors SOFUU_NO_SHELL: the engine gates its own bash on that env
+     *  var, so a host shell tool that ignored it would be a hole in the
+     *  same policy. Read per invocation, so the Settings toggle applies
+     *  without a restart. */
+    private val isShellAllowed: () -> Boolean = { true },
+) {
 
     /** The set to hand to [SofuuBridge.registerHostTool]. */
     fun all(): List<Registration> = listOf(
@@ -163,44 +170,83 @@ class DeviceTools(private val context: Context) {
             context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
         } ?: return err("this device has no vibrator")
         if (!vib.hasVibrator()) return err("this device has no vibrator")
-        vib.vibrate(VibrationEffect.createOneShot(ms.toLong(), VibrationEffect.DEFAULT_AMPLITUDE))
+        // VibrationEffect is API 26; minSdk is 24.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vib.vibrate(VibrationEffect.createOneShot(ms.toLong(), VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION")
+            vib.vibrate(ms.toLong())
+        }
         return ok("vibrated ${ms}ms")
     }
 
     private fun runPhoneShell(args: JSONObject): String {
         val command = args.optString("command").trim()
         if (command.isEmpty()) return err("command is required")
+        if (!isShellAllowed()) return err("run_command: shell is disabled (SOFUU_NO_SHELL is set)")
+        val timeoutMs = args.optLong("timeout_ms", 30_000L).coerceIn(1000L, 120_000L)
         return try {
             val process = ProcessBuilder("/system/bin/sh", "-c", command)
                 .redirectErrorStream(true)
                 .start()
 
-            val reader = java.io.BufferedReader(java.io.InputStreamReader(process.inputStream))
             val output = StringBuilder()
-            val startTime = System.currentTimeMillis()
-            val timeoutMs = args.optLong("timeout_ms", 30_000L).coerceIn(1000L, 120_000L)
+            // Read on a worker thread: readLine() blocks until a line
+            // arrives, so a child that prints a partial line and goes
+            // silent used to hold the ENGINE thread forever. The timeout
+            // is enforced on waitFor instead.
+            val reader = Thread({
+                try {
+                    java.io.BufferedReader(java.io.InputStreamReader(process.inputStream)).use { r ->
+                        var line: String?
+                        while (r.readLine().also { line = it } != null) {
+                            synchronized(output) {
+                                if (output.length < 32_000) output.append(line).append('\n')
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // Destroyed process: the stream closes under us.
+                }
+            }, "sofuu-run-command")
+            reader.isDaemon = true
+            reader.start()
 
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                if (output.length < 32_000) {
-                    output.append(line).append('\n')
-                }
-                if (System.currentTimeMillis() - startTime > timeoutMs) {
-                    process.destroy()
-                    output.append("\n[Command timed out after ${timeoutMs}ms]")
-                    break
-                }
+            // No Process.waitFor(long, TimeUnit) or destroyForcibly here:
+            // both are API 26 and minSdk is 24. A waiter thread plus a
+            // deadline loop is the same contract on every API level.
+            val exit = java.util.concurrent.atomic.AtomicInteger(Int.MIN_VALUE)
+            val waiter = Thread({
+                try { exit.set(process.waitFor()) } catch (_: Throwable) {}
+            }, "sofuu-run-command-wait")
+            waiter.isDaemon = true
+            waiter.start()
+
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (waiter.isAlive && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
             }
-            val exitCode = if (process.isAlive) {
-                process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
-                if (process.isAlive) { process.destroyForcibly(); -1 } else process.exitValue()
-            } else {
-                process.exitValue()
+            if (waiter.isAlive) {
+                process.destroy()
+                waiter.join(500)
+                reader.join(500)
+                synchronized(output) {
+                    if (output.length < 32_000) output.append("\n[Command timed out after ${timeoutMs}ms]")
+                }
+                return JSONObject()
+                    .put("ok", false)
+                    .put("exit_code", -1)
+                    .put("output", synchronized(output) { output.toString().trim() })
+                    .toString()
             }
+            // The child is gone; the reader drains the remaining bytes.
+            reader.join(1_000)
+            val code = exit.get()
+            val exitCode = if (code == Int.MIN_VALUE) -1 else code
             JSONObject()
                 .put("ok", exitCode == 0)
                 .put("exit_code", exitCode)
-                .put("output", output.toString().trim())
+                .put("output", synchronized(output) { output.toString().trim() })
                 .toString()
         } catch (e: Exception) {
             err("failed to execute command: ${e.message}")

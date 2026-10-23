@@ -67,6 +67,7 @@ fun CloudBackground(modifier: Modifier = Modifier, animate: Boolean = true) {
 
 // ── Path 1: the shader (API 33+) ────────────────────────────────
 
+@androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
 @Composable
 private fun ShaderCloud(dark: Boolean, animate: Boolean, modifier: Modifier) {
     val shader = remember(dark) {

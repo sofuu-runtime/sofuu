@@ -57,9 +57,27 @@ class SofuuEngine(
     private var thread: Thread? = null
     private var bridge: SofuuBridge? = null
 
-    /** Pending engine replies, matched by arrival order. */
-    private val pendingReplies = ArrayDeque<CompletableFuture<Any?>>()
+    /** Pending engine replies, matched by the query id the JS reply carries.
+     *  Arrival-order matching let a stray or duplicate reply resolve the
+     *  NEXT caller's future; an id makes that impossible. */
+    private val pendingReplies = HashMap<Long, CompletableFuture<Any?>>()
     private val replyLock = Any()
+    /** Monotonic id stamped into every queued query's reply. */
+    private val querySeq = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Daemon timer for query deadlines — `CompletableFuture.orTimeout` is
+     *  API 31 and this app's minSdk is 24. */
+    private val timeoutScheduler: java.util.concurrent.ScheduledExecutorService =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "sofuu-query-deadline").apply { isDaemon = true }
+        }
+
+    /** Guards engine start/shutdown so a timed-out shutdown can never hand
+     *  the runtime to a second thread. */
+    private val ownerLock = Any()
+
+    /** Mirrors SOFUU_NO_SHELL for host tools; set by AppStore.applyRuntimeEnv. */
+    @Volatile var hostShellAllowed: Boolean = true
 
     /** Commands the engine thread executes in order. */
     private val mailbox = LinkedBlockingQueue<Runnable>()
@@ -71,27 +89,41 @@ class SofuuEngine(
 
     // ── Boot ───────────────────────────────────────────────────────
 
-    fun start() {
-        if (running.getAndSet(true)) return
-        // Instance tag: two engines in one process would silently split the
-        // event pipeline (the pump drains one runtime's queues while turns
-        // push into the other's). The boot line pins each instance so a twin
-        // is impossible to miss.
-        log("start: engine#0x${Integer.toHexString(hashCode())} thread=${Thread.currentThread().name}")
-        thread = Thread({ engineMain() }, "sofuu-engine").also { it.start() }
+    /** @return false when the previous worker has not finished exiting —
+     *  starting anyway would put two threads on one runtime. */
+    fun start(): Boolean {
+        synchronized(ownerLock) {
+            if (running.get()) return true
+            val prev = thread
+            if (prev != null && prev.isAlive) {
+                log("start refused: engine thread still alive (previous shutdown in progress)")
+                return false
+            }
+            running.set(true)
+            // Instance tag: two engines in one process would silently split the
+            // event pipeline (the pump drains one runtime's queues while turns
+            // push into the other's). The boot line pins each instance so a twin
+            // is impossible to miss.
+            log("start: engine#0x${Integer.toHexString(hashCode())} thread=${Thread.currentThread().name}")
+            thread = Thread({ engineMain() }, "sofuu-engine").also { it.start() }
+            return true
+        }
     }
 
     fun shutdown() {
-        if (!running.getAndSet(false)) return
-        val t = thread
-        thread = null
+        val t = synchronized(ownerLock) {
+            if (!running.getAndSet(false)) return
+            thread
+        }
+        // JOIN OUTSIDE THE LOCK: engineMain's own finally takes ownerLock to
+        // clear `thread`, so joining while holding it would deadlock until
+        // the timeout on every single shutdown.
         t?.join(4000)
-        // A thread that did not stop in time is still holding `bridge`, and
-        // a later start() would spawn a second worker against the same
-        // runtime. Refuse rather than hand one runtime to two threads —
-        // that is the use-after-free this used to allow.
-        if (t != null && t.isAlive) {
-            log("shutdown: engine thread still alive after 4s; leaving it as the sole owner")
+        synchronized(ownerLock) {
+            if (t != null && !t.isAlive && thread === t) thread = null
+            if (t != null && t.isAlive) {
+                log("shutdown: engine thread still alive after 4s; start() refuses until it exits")
+            }
         }
     }
 
@@ -169,7 +201,7 @@ class SofuuEngine(
                 // defined), and registering after init would leave the
                 // first turn's agent without them.
                 val registered = try {
-                    DeviceTools(appContext).registerAll(rt)
+                    DeviceTools(appContext, isShellAllowed = { hostShellAllowed }).registerAll(rt)
                 } catch (e: Throwable) {
                     log("host tools failed: ${e.message ?: e.toString()}")
                     emptyList<String>()
@@ -246,9 +278,14 @@ class SofuuEngine(
                 // release its callers with null instead of leaving a future
                 // that hangs whoever is blocking on it.
                 synchronized(replyLock) {
-                    val stranded = pendingReplies.toList()
+                    val stranded = pendingReplies.values.toList()
                     pendingReplies.clear()
                     stranded.forEach { if (!it.isDone) it.complete(null) }
+                }
+                // Clear the owner slot only if this thread still owns it, so
+                // a later start() can run once the previous worker is gone.
+                synchronized(ownerLock) {
+                    if (thread === Thread.currentThread()) thread = null
                 }
             }
         } catch (e: Throwable) {
@@ -318,11 +355,17 @@ class SofuuEngine(
         }
         if (rp != null) {
             for (i in 0 until rp.length()) {
-                val d = synchronized(replyLock) {
-                    if (pendingReplies.isNotEmpty()) pendingReplies.removeFirst() else null
-                }
+                // Tagged replies are {id, json}; an untagged entry is a stray
+                // from an expression that answered itself and has no waiter.
+                val entry = rp.optJSONObject(i)
+                val id = entry?.optLong("id", -1L) ?: -1L
+                val replyJson = entry?.optString("json") ?: rp.optString(i)
+                if (replyJson.isEmpty()) continue
+                val d = if (id >= 0) synchronized(replyLock) { pendingReplies.remove(id) } else null
                 if (d != null && !d.isDone) {
-                    d.complete(parseReply(rp.optString(i)))
+                    d.complete(parseReply(replyJson))
+                } else if (d == null) {
+                    log("drain: reply id=$id has no waiter — dropped")
                 }
             }
         }
@@ -492,6 +535,12 @@ class SofuuEngine(
     fun chatState(): CompletableFuture<JSONObject?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {error:'chat engine unavailable'})").thenObject()
 
+    /** Re-harvest the active endpoint's model caps (async in JS). Called
+     *  after a provider/model switch so the context meter and the output
+     *  cap follow the NEW model instead of the one selected before. */
+    fun detectCaps(): CompletableFuture<JSONObject?> =
+        query("sofuu.chat.detectCaps()").thenObject()
+
     fun deleteSession(id: String): CompletableFuture<JSONObject?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.deleteSession) ? sofuu.chat.deleteSession(${jsonString(id)}) : {ok:false, error:'chat engine unavailable'})").thenObject()
 
@@ -500,11 +549,6 @@ class SofuuEngine(
 
     fun usageReport(): CompletableFuture<JSONObject?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.usage) ? sofuu.chat.usage() : {error:'chat engine unavailable'})").thenObject()
-
-    fun brainRemember(fact: String): CompletableFuture<JSONObject?> =        query("JSON.stringify((function(){ try { if (sofuu.memory && sofuu.memory.remember) { sofuu.memory.remember(${jsonString(fact)}); return {ok:true}; } return {ok:false, error:'brain unavailable (enable /brain)'}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())").thenObject()
-
-    fun brainWhy(): CompletableFuture<JSONObject?> =
-        query("JSON.stringify((function(){ try { var st = (sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {}; return {ok:true, lastRecall:(st && st.lastRecall) || null, recall:(st && st.lastRecallHits) || null}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())").thenObject()
 
     // ── Embeddings (stateless, NULL rt) ───────────────────────────
 
@@ -589,6 +633,11 @@ class SofuuEngine(
     fun localModelCaps(path: String): CompletableFuture<JSONObject?> =
         query(
             "JSON.stringify((function(){ try { var c = sofuu.ai.modelCaps(${jsonString(path)}); " +
+                // modelCaps returns a JSON STRING (rt/ai.rs); handing it to
+                // Kotlin unparsed made optJSONObject("caps") null, so no
+                // window/max-output was ever applied and every local model
+                // was forced to effort off.
+                "if (typeof c === 'string') { try { c = JSON.parse(c); } catch (eP) { c = null; } } " +
                 "return {ok:true, caps:c||{}}; } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })())"
         ).thenObject()
 
@@ -618,37 +667,33 @@ class SofuuEngine(
             ?: return CompletableFuture.completedFuture(JSONObject().put("ok", false).put("error", "no models URL"))
         val urlJs = jsonString(url)
         val keyJs = jsonString(key)
+        // ONE returned promise, answered exactly once by the query wrapper.
+        // The old shape started fetch(...) without returning it AND pushed
+        // its own __reply_put: the future resolved immediately with null
+        // (so the cache never populated) and the late reply could be
+        // consumed by the next query. A bare `return fetch(...)` is not
+        // enough either — the old settle() would then be a second reply.
         return query(
             """
             (function(){ var url = $urlJs; var key = $keyJs;
               var headers = key ? { 'Authorization': 'Bearer ' + key } : {};
-              /* Exactly one answer per query, whichever arrives first. This
-                 script answers ITSELF via __reply_put, and query() wraps
-                 every expression in another __reply_put — so before this
-                 guard a slow provider pushed two replies, the second of
-                 which was consumed by the NEXT query and shifted every
-                 later answer by one. That is why refreshModelCache never
-                 populated: its future was resolved by the wrapper's
-                 JSON.stringify(undefined). */
-              var done = false, timer = null;
-              function settle(o){ if (done) return; done = true; if (timer) clearTimeout(timer); __reply_put(JSON.stringify(o)); }
-              timer = setTimeout(function () { settle({ok:false, error:'timeout', models:[]}); }, 12000);
-              try {
-                fetch(url, { headers: headers }).then(function (res) {
-                  if (!res.ok) { settle({ok:false, error:'HTTP ' + res.status, models:[]}); return; }
-                  return res.json();
-                }).then(function (j) {
-                  var raw = (j && j.data && Array.isArray(j.data)) ? j.data
-                          : (j && j.models && Array.isArray(j.models)) ? j.models : [];
-                  var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; })
-                                 .filter(function (x) { return x && String(x).trim(); });
-                  settle({ok:true, models: arr, raw: JSON.stringify(j)});
-                }).catch(function (e) {
-                  settle({ok:false, error:String(e&&e.message||e), models:[]});
-                });
-              } catch (e) {
-                settle({ok:false, error:String(e&&e.message||e), models:[]});
-              } })()
+              var timeout = new Promise(function (res) {
+                setTimeout(function () { res({ok:false, error:'timeout', models:[]}); }, 12000);
+              });
+              var listing = fetch(url, { headers: headers }).then(function (res) {
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return res.json();
+              }).then(function (j) {
+                var raw = (j && j.data && Array.isArray(j.data)) ? j.data
+                        : (j && j.models && Array.isArray(j.models)) ? j.models : [];
+                var arr = raw.map(function (m) { return (m && (m.id || m.name)) || m; })
+                               .filter(function (x) { return x && String(x).trim(); });
+                return { ok: true, models: arr };
+              }).catch(function (e) {
+                return { ok: false, error: String(e && e.message || e), models: [] };
+              });
+              return Promise.race([listing, timeout]);
+            })()
             """.trimIndent()
         ).thenObject()
     }
@@ -656,23 +701,44 @@ class SofuuEngine(
     // ── Query plumbing ─────────────────────────────────────────────
 
     /** Enqueue a JS expression whose *promise or value* is answered
-     *  through `__reply_put`. Resolves with the parsed JSON value. */
-    private fun query(expr: String): CompletableFuture<Any?> {
-        val f = submit(expr, CompletableFuture<Any?>())
+     *  through `__reply_put`. Resolves with the parsed JSON value.
+     *
+     *  [timeoutMs] is the caller's real budget, NOT a fixed cap: a headless
+     *  agent run legitimately takes minutes, and the old fixed 30 s bound
+     *  silently killed every `queryFuture(…, 300_000)` caller. */
+    private fun query(expr: String, timeoutMs: Long = 30_000): CompletableFuture<Any?> {
+        val qid = querySeq.incrementAndGet()
+        val f = CompletableFuture<Any?>()
+        // Release the id whenever the future settles — reply, timeout or
+        // engine teardown. Leaving it registered let a late reply find a
+        // future nobody was waiting on any more.
+        f.whenComplete { _, _ -> synchronized(replyLock) { pendingReplies.remove(qid) } }
+        submit(expr, f, qid)
         // Bound EVERY query at the source. A caller is usually a Main-
         // dispatcher coroutine; its bare .get() froze the whole UI the
         // moment a reply once failed to land (boot-time ANR, dropbox
         // trace at AppStore.kt refreshSessions → get). Timeout completes
         // the future with null so callers degrade instead of hanging.
-        return f.orTimeout(30_000, TimeUnit.MILLISECONDS)
-            .handle { v, e ->
-                if (e != null) {
-                    log("query: bounded → null (${e.javaClass.simpleName}) expr=${expr.take(60)}")
-                    null
-                } else {
-                    v
-                }
+        armTimeout(f, timeoutMs)
+        return f.handle { v, e ->
+            if (e != null) {
+                log("query: bounded → null (${e.javaClass.simpleName}) expr=${expr.take(60)}")
+                null
+            } else {
+                v
             }
+        }
+    }
+
+    /** `CompletableFuture.orTimeout` is API 31 and minSdk is 24, so the
+     *  deadline is a scheduled completion instead. */
+    private fun armTimeout(f: CompletableFuture<Any?>, ms: Long) {
+        val timer = timeoutScheduler.schedule({
+            if (!f.isDone) {
+                f.completeExceptionally(java.util.concurrent.TimeoutException("query timeout ${ms}ms"))
+            }
+        }, ms, TimeUnit.MILLISECONDS)
+        f.whenComplete { _, _ -> timer.cancel(false) }
     }
 
     /**
@@ -683,29 +749,28 @@ class SofuuEngine(
      * cannot hang forever on an endpoint that never replies.
      */
     fun queryFuture(expr: String, timeoutMs: Long): CompletableFuture<JSONObject?> =
-        query(expr).thenApply { it as? JSONObject }.orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+        query(expr, timeoutMs).thenApply { it as? JSONObject }
 
-    private fun submit(expr: String, f: CompletableFuture<Any?>): CompletableFuture<Any?> {
+    private fun submit(expr: String, f: CompletableFuture<Any?>, qid: Long) {
         // SYNC FAST PATH: evaluate and complete the future straight from the
         // eval envelope — no promise, no reply queue, nothing that CAN be
-        // lost. (The old __rq/DRAIN_JS chain silently dropped replies on
-        // device while working on host; every app query today is a
-        // synchronous expression, so the queue is only needed for promises.)
-        // If the expression returns a promise (network fetches), fall back
-        // to the reply queue.
+        // lost. If the expression returns a promise (network fetches), fall
+        // back to the id-tagged reply queue.
         val script = "(function(){ try { var v = eval(${jsonString(expr)});" +
                 "if (v && typeof v.then === 'function') {" +
                 "  globalThis.__rq = globalThis.__rq || [];" +
                 "  globalThis.__reply_put = globalThis.__reply_put || function (j) { globalThis.__rq.push(j); };" +
-                "  Promise.resolve(v).then(function (v2) { __reply_put(JSON.stringify(v2)); }, function (e) { __reply_put(JSON.stringify({__async_error:String(e&&e.message||e)})); });" +
+                "  Promise.resolve(v).then(function (v2) { __reply_put({id:$qid, json: JSON.stringify(v2)}); }, " +
+                "function (e) { __reply_put({id:$qid, json: JSON.stringify({__async_error:String(e&&e.message||e)})}); });" +
                 "  return {ok:true, result:'__pending_promise'};" +
                 "}" +
                 "return {ok:true, result: v}; } catch(e) { return {ok:false, error:{message:String(e&&e.message||e)}}; } })()"
-        synchronized(replyLock) { pendingReplies.addLast(f) }
+        synchronized(replyLock) { pendingReplies[qid] = f }
         mailbox.put(Runnable {
             val rt = bridge
             if (rt == null) {
-                synchronized(replyLock) { if (pendingReplies.remove(f)) f.complete(null) }
+                synchronized(replyLock) { pendingReplies.remove(qid) }
+                if (!f.isDone) f.complete(null)
                 return@Runnable
             }
             try {
@@ -713,20 +778,22 @@ class SofuuEngine(
                 val raw = rt.evalNb(script)
                 if (raw == null) {
                     log("query: evalNb null — completing null")
-                    synchronized(replyLock) { if (pendingReplies.remove(f)) f.complete(null) }
+                    synchronized(replyLock) { pendingReplies.remove(qid) }
+                    if (!f.isDone) f.complete(null)
                     return@Runnable
                 }
                 val obj = JSONObject(raw)
                 if (!obj.optBoolean("ok", false)) {
                     val err = obj.optJSONObject("error")?.optString("message") ?: "engine error"
-                    synchronized(replyLock) { if (pendingReplies.remove(f)) f.complete("{\"__error\":$err}") }
+                    synchronized(replyLock) { pendingReplies.remove(qid) }
+                    if (!f.isDone) f.complete("{\"__error\":$err}")
                     log("query: sync error $err")
                     return@Runnable
                 }
                 val result = obj.opt("result")
                 if (result == "__pending_promise") {
-                    // Async expression: DRAIN_JS + the reply queue finish it
-                    // (bounded by query()'s orTimeout).
+                    // Async expression: DRAIN_JS + the tagged reply queue
+                    // finish it (bounded by query()'s orTimeout).
                     log("query: promise pending — queue path")
                     return@Runnable
                 }
@@ -734,14 +801,15 @@ class SofuuEngine(
                     null, JSONObject.NULL -> "null"
                     else -> result.toString()
                 }
-                synchronized(replyLock) { if (pendingReplies.remove(f)) f.complete(parseReply(payload)) }
+                synchronized(replyLock) { pendingReplies.remove(qid) }
+                if (!f.isDone) f.complete(parseReply(payload))
                 log("query: sync ok len=${payload.length}")
             } catch (e: Throwable) {
                 log("query: eval threw ${e.message ?: e.toString()}")
-                synchronized(replyLock) { if (pendingReplies.remove(f)) f.complete(null) }
+                synchronized(replyLock) { pendingReplies.remove(qid) }
+                if (!f.isDone) f.complete(null)
             }
         })
-        return f
     }
 
     private fun CompletableFuture<Any?>.thenObject(): CompletableFuture<JSONObject?> =
@@ -759,45 +827,25 @@ class SofuuEngine(
     private fun CompletableFuture<Any?>.thenCast(): CompletableFuture<JSONObject?> =
         thenApply { v -> v as? JSONObject }
 
-    private fun evalResult(rt: SofuuBridge, script: String): String? {
-        val raw = rt.eval(script) ?: return null
-        return try {
-            val envelope = JSONObject(raw)
-            when {
-                envelope.optBoolean("ok") -> envelope.optString("result").ifEmpty { null }
-                else -> null
-            }
-        } catch (e: Throwable) {
-            null
-        }
-    }
 
     /**
-     * Evaluate a JS expression that already evaluates to a JSON object,
-     * without the `{ok,result}` envelope the query channel wraps.
+     * Evaluate a JS expression on the engine thread and return the JSON
+     * object the script produced.
      *
-     * [RuntimeSurface] uses this because those snippets build their own
-     * `{ok:..., error:...}` object so a failure inside the brain or the
-     * ML gates is reported rather than collapsing to null — which is the
-     * whole difference between "the brain is off" and "the call threw".
+     * The ABI wraps every eval in its own `{ok, result}` transport
+     * envelope; that envelope is unwrapped here so a snippet's own
+     * `{ok:false, error:...}` is what the caller sees. Before the unwrap
+     * every [RuntimeSurface] card read `count`/`dim`/`error` off the
+     * transport object and rendered zeros or blanks.
      *
      * It MUST go through the mailbox. The runtime belongs to the engine
      * thread, and `sofuu_rt_eval` takes no lock, so calling it from a
      * caller thread while the pump is draining would run two JS contexts
      * on one QuickJS state — a native crash, not a wrong answer.
      *
-     * Synchronous, so callers must be off the main thread.
+     * Asynchronous on purpose: callers get a future and never touch the
+     * runtime from their own thread.
      */
-    @Synchronized
-    fun evalJson(script: String): JSONObject? =
-        try {
-            JSONObject(bridge?.eval(script))
-        } catch (e: Throwable) {
-            null
-        }
-
-    /** The mailbox-routed form of [evalJson]: never touches the runtime
-     *  from the caller's thread. Same contract, same returned object. */
     fun evalJsonOnEngine(script: String): CompletableFuture<JSONObject?> {
         val f = CompletableFuture<JSONObject?>()
         mailbox.put(Runnable {
@@ -807,13 +855,40 @@ class SofuuEngine(
                 return@Runnable
             }
             try {
-                val raw = rt.eval(script)
-                if (!f.isDone) f.complete(if (raw == null) null else try { JSONObject(raw) } catch (e: Throwable) { null })
+                // evalNb, not eval: every snippet on this channel is
+                // synchronous, and `rt_eval` DRAINS the loop — calling it
+                // from the pump during a streaming turn would hold the
+                // engine thread until that turn finished.
+                val raw = rt.evalNb(script)
+                if (!f.isDone) f.complete(unwrapEval(raw))
             } catch (e: Throwable) {
                 if (!f.isDone) f.complete(null)
             }
         })
         return f
+    }
+
+    /** Strip the ABI's `{ok,result}` envelope; synthesize an error object
+     *  when the eval itself failed. */
+    private fun unwrapEval(raw: String?): JSONObject? {
+        if (raw == null) return null
+        return try {
+            val env = JSONObject(raw)
+            if (!env.optBoolean("ok", false)) {
+                JSONObject()
+                    .put("ok", false)
+                    .put("error", env.optJSONObject("error")?.optString("message") ?: "engine error")
+            } else {
+                when (val payload = env.opt("result")) {
+                    is JSONObject -> payload
+                    is String -> runCatching { JSONObject(payload) }.getOrNull()
+                    null, JSONObject.NULL -> JSONObject()
+                    else -> JSONObject().put("ok", true).put("value", payload)
+                }
+            }
+        } catch (e: Throwable) {
+            null
+        }
     }
 
     companion object {

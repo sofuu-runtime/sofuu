@@ -120,7 +120,13 @@ val runtimeEnv = RuntimeEnv(app)
      * the web engine, the SSRF guard, the stall deadline. Those call
      * sites run inside the agent loop, not once at load.
      */
-    fun applyRuntimeEnv(): Map<String, String> = runtimeEnv.apply()
+    fun applyRuntimeEnv(): Map<String, String> {
+        val applied = runtimeEnv.apply()
+        // The engine gates its own bash on SOFUU_NO_SHELL; the host shell
+        // tool must honour the same policy or it is a hole in it.
+        engine.hostShellAllowed = !runtimeEnv.noShell
+        return applied
+    }
 
     /**
      * Tear the engine down and boot it again so a registration-gated knob
@@ -129,14 +135,32 @@ val runtimeEnv = RuntimeEnv(app)
      * namespace is simply absent and every gate is a silent no-op.
      */
     fun restartEngineForEnv() {
-        if (state.streaming) {
-            // Freeing the runtime mid-turn would strand the open tool
-            // round-trip. Cancel first so the agent's abort path runs.
-            engine.cancelTurn()
+        // Off-main: shutdown() joins the worker (up to 4 s) and this is
+        // called from Settings toggles on the Main dispatcher.
+        viewModelScope.launch(Dispatchers.Default) {
+            if (state.streaming) {
+                // Freeing the runtime mid-turn would strand the open tool
+                // round-trip. Cancel first so the agent's abort path runs.
+                engine.cancelTurn()
+            }
+            engine.shutdown()
+            applyRuntimeEnv()
+            var started = engine.start()
+            var attempts = 0
+            while (!started && attempts < 6) {
+                kotlinx.coroutines.delay(500)
+                started = engine.start()
+                attempts++
+            }
+            if (!started) {
+                withContext(Dispatchers.Main) {
+                    systemRow(
+                        "Engine restart deferred — the previous runtime is still " +
+                            "shutting down. The setting applies on the next restart.",
+                    )
+                }
+            }
         }
-        engine.shutdown()
-        runtimeEnv.apply()
-        engine.start()
     }
 
     val engine: SofuuEngine = SofuuEngine(
@@ -158,6 +182,12 @@ val runtimeEnv = RuntimeEnv(app)
     )
         private set
 
+    /** Direct engine surface for brain ops (/remember). The lambda reads
+     *  the live Brain toggle so /remember refuses when memory is off. */
+    private val runtimeSurface: com.sofuu.engine.RuntimeSurface by lazy {
+        com.sofuu.engine.RuntimeSurface(engine) { state.config?.brain != false }
+    }
+
     private val seq = AtomicLong(0)
 
     private fun nextId(prefix: String): String = "$prefix-${System.currentTimeMillis().toString(36)}-${seq.incrementAndGet()}"
@@ -170,10 +200,9 @@ val runtimeEnv = RuntimeEnv(app)
             // handler when a new event arrives. An event landing between the
             // two statements of TurnFinished left `streaming=false` with the
             // assistant bubble still marked streaming and no notification.
-            engine.events.collect { ev ->
-                handleEvent(ev)
-                if (ev is EngineEvent.TurnFinished) refreshSessions()
-            }
+            // handleEvent(TurnFinished) already refreshes sessions; a second
+            // call here doubled the engine round-trips per turn.
+            engine.events.collect { ev -> handleEvent(ev) }
         }
         // Load config + state immediately (cheap, no engine). Repair runs
         // first: an entry saved as a bare base URL before normalization
@@ -184,7 +213,7 @@ val runtimeEnv = RuntimeEnv(app)
         // Engine environment knobs MUST be in place before the runtime is
         // created: SOFUU_NO_ML gates module registration inside the
         // library, so setting it afterwards silently does nothing.
-        val appliedEnv = runtimeEnv.apply()
+        val appliedEnv = applyRuntimeEnv()
         engine.start()
         android.util.Log.i("sofuu-engine", "env applied: $appliedEnv")
         // The engine's curl has no built-in trust store on Android; without
@@ -206,7 +235,24 @@ val runtimeEnv = RuntimeEnv(app)
                 state = state.copy(engineReady = true, bootError = null)
                 onEngineReady()
             }
-            is EngineEvent.BootError -> state = state.copy(engineReady = false, bootError = ev.message)
+            is EngineEvent.BootError -> {
+                // A failure mid-turn must return the composer to Send and
+                // mark the bubble. The only writer of streaming=false used
+                // to be TurnFinished, so a dead engine left Stop on screen
+                // forever with no way back.
+                if (state.streaming) {
+                    patchAssistant { m ->
+                        if (m.status == "streaming") m.copy(status = "error", error = ev.message) else m
+                    }
+                }
+                state = state.copy(
+                    engineReady = false,
+                    bootError = ev.message,
+                    streaming = false,
+                    phase = null,
+                    liveMetrics = null,
+                )
+            }
             is EngineEvent.TurnStarted -> {
                 if (ev.sid != null && ev.sid != state.activeSessionId) {
                     state = state.copy(activeSessionId = ev.sid)
@@ -224,6 +270,7 @@ val runtimeEnv = RuntimeEnv(app)
                     patchAssistant { m -> m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed) }
                 }
                 saveCurrentSessionMessages()
+                flushSessionSave()
                 refreshSessions()
             }
             is EngineEvent.Ctx -> {
@@ -242,7 +289,10 @@ val runtimeEnv = RuntimeEnv(app)
                 // same surface the desktop's step reducer writes.
                 systemRow(ev.message)
             }
-            is EngineEvent.Step -> applyStep(ev.kind, ev.raw)
+            is EngineEvent.Step -> {
+                if (ev.kind == "recall") noteRecall(ev.raw)
+                applyStep(ev.kind, ev.raw)
+            }
         }
     }
 
@@ -261,6 +311,32 @@ val runtimeEnv = RuntimeEnv(app)
     private var firstTokenMs = 0L
     private var lastTokenMs = 0L
     private var tokenCount = 0
+
+    // ── Last recall (feeds /why) ──
+    // chat.state() has no lastRecall field, so the command used to print
+    // "null". These track what the recall step itself reported.
+    @Volatile private var lastRecallAt = 0L
+    @Volatile private var lastRecallCount = 0L
+    @Volatile private var lastRecallScope = ""
+    @Volatile private var lastRecallDropped = 0L
+
+    private fun noteRecall(raw: JSONObject) {
+        val p = raw.optJSONObject("payload") ?: return
+        lastRecallAt = android.os.SystemClock.elapsedRealtime()
+        lastRecallCount = p.optLong("count")
+        lastRecallScope = p.optString("scope")
+        lastRecallDropped = p.optLong("dropped")
+    }
+
+    /** What the last recall step reported, for `/why`. */
+    fun brainWhy(): JSONObject {
+        if (lastRecallAt == 0L) return JSONObject().put("ok", true).put("none", true)
+        return JSONObject()
+            .put("ok", true)
+            .put("count", lastRecallCount)
+            .put("scope", lastRecallScope)
+            .put("dropped", lastRecallDropped)
+    }
 
     private fun resetTurnMetrics() {
         turnStartMs = android.os.SystemClock.elapsedRealtime()
@@ -463,9 +539,14 @@ val runtimeEnv = RuntimeEnv(app)
                     )
                 } else {
                     val name = p.optString("tool").ifEmpty { p.optString("name") }
+                    // A policy-refused tool reports `blocked: <why>` and no
+                    // `error`, so the row used to render as a success. Surface
+                    // the refusal instead of a green result line.
+                    val blocked = p.optString("blocked")
                     val resultText = p.optString("result").takeIf { it.isNotEmpty() }?.take(400)
                         ?: p.optString("summary").takeIf { it.isNotEmpty() }
-                    val ok = !p.has("error")
+                        ?: if (blocked.isNotEmpty()) "blocked by policy: $blocked" else null
+                    val ok = !p.has("error") && blocked.isEmpty()
                     if (name == "system") {
                         TimelineEntry(nextId("tl"), "tool_result", "Notice", tool = "system", result = resultText, ok = ok, t = t)
                     } else {
@@ -598,7 +679,9 @@ val runtimeEnv = RuntimeEnv(app)
         val help = SLASH_COMMANDS.joinToString("\n") {
             it.signature.padEnd(20) + "— " + it.desc
         }
-        viewModelScope.launch {
+        // Default, not Main.immediate: every branch below blocks on an
+        // engine future (bounded at 30 s), and on Main that is an ANR.
+        viewModelScope.launch(Dispatchers.Default) {
             when (cmd) {
                 "help", "commands" -> systemRow(help)
                 "new", "clear" -> newChat()
@@ -616,10 +699,19 @@ val runtimeEnv = RuntimeEnv(app)
                         } else systemRow("Usage: /ctx [tokens] (1000–1000000). Bare /ctx shows live usage.")
                     } else {
                         val c = state.ctx
-                        systemRow(
-                            if (c != null && c.window > 0) "Context ${",".format(c.used)} / ${",".format(c.window)} tokens (${c.pct}%) — ${c.source}"
-                            else "No context meter yet — send a message first."
-                        )
+                        if (c != null && c.window > 0) {
+                            systemRow("Context ${",".format(c.used)} / ${",".format(c.window)} tokens (${c.pct}%) — ${c.source}")
+                        } else {
+                            // No live meter yet (fresh session or a model just
+                            // switched): show the selected model's window from
+                            // the config so the number is observable before the
+                            // first turn, and say the usage side is unknown.
+                            val cfgWin = state.config?.ctxWindow ?: 0
+                            systemRow(
+                                if (cfgWin > 0) "No live meter yet — window ${",".format(cfgWin)} tokens (from the selected model); the ring fills on the next turn."
+                                else "No context meter yet — send a message first."
+                            )
+                        }
                     }
                 }
                 "maxout" -> {
@@ -659,7 +751,11 @@ val runtimeEnv = RuntimeEnv(app)
                         val c = state.config
                         systemRow(if (c != null) "Provider: ${c.provider.ifEmpty { "(none)" }} · model ${c.model.ifEmpty { "(none)" }}" else "Config not loaded yet.")
                     } else {
-                        patchConfig(JSONObject().put("provider", arg).put("active", arg))
+                        patchConfig(
+                            JSONObject().put("provider", arg).put("active", arg)
+                                .put("ctx_window", 0).put("max_output", 0),
+                        )
+                        reharvestCaps()
                         systemRow("Provider → $arg. Pick a model in Settings → Models if turns fail.")
                     }
                 }
@@ -696,15 +792,36 @@ val runtimeEnv = RuntimeEnv(app)
                 "remember" -> {
                     if (arg.isEmpty()) systemRow("Usage: /remember <fact> — pin a fact to the brain.")
                     else {
-                        val r = engine.brainRemember(arg).get()
-                        systemRow(if (r?.optBoolean("ok") == true) "Remembered." else "Remember failed" + (r?.optString("error")?.let { ": $it" } ?: ""))
+                        // The old call went through sofuu.memory.remember,
+                        // which needs an OPEN handle and an options object;
+                        // it always answered "no open brain". This routes
+                        // through the same cached handle the chat uses.
+                        val r = runtimeSurface.brainRemember(arg)
+                        systemRow(
+                            if (r?.optBoolean("ok") == true) {
+                                "Remembered · ${r.optLong("count")} memories in this project's brain."
+                            } else {
+                                "Remember failed" + (r?.optString("error")?.let { ": $it" } ?: "")
+                            }
+                        )
                     }
                 }
                 "why" -> {
-                    val r = engine.brainWhy().get()
-                    if (r?.optBoolean("ok") != true) systemRow("why: ${r?.optString("error") ?: "unavailable"}")
-                    else if (!r.has("lastRecall") && !r.has("recall")) systemRow("No recalled memories shaped the last answer.")
-                    else systemRow("Last recall: ${r.opt("lastRecall") ?: r.opt("recall")}")
+                    val r = brainWhy()
+                    if (r.optBoolean("none", false)) {
+                        systemRow("No recalled memories shaped the last answer.")
+                    } else {
+                        val scope = when (r.optString("scope")) {
+                            "agent" -> "private scope"
+                            "shared" -> "shared brain"
+                            else -> "brain"
+                        }
+                        val dropped = if (r.optLong("dropped") > 0) " · ${r.optLong("dropped")} dropped" else ""
+                        systemRow(
+                            "Last recall: ${r.optLong("count")} " +
+                                "${if (r.optLong("count") == 1L) "memory" else "memories"} from the $scope$dropped."
+                        )
+                    }
                 }
                 "tools" -> {
                     val r = engine.listTools().get()
@@ -850,21 +967,68 @@ val runtimeEnv = RuntimeEnv(app)
                     systemRow("Idle ${IDLE_UNLOAD_MS / 60_000} min — unloading the model (memory back to baseline).")
                     logIdle("idle unload: restarting engine (idle=${idle / 1000}s)")
                     engine.shutdown()
-                    engine.start()
+                    var restarted = engine.start()
+                    if (!restarted) {
+                        // The old worker was still exiting; one retry is
+                        // enough (shutdown's join is 4 s, and the pump
+                        // notices running=false within 250 ms).
+                        kotlinx.coroutines.delay(1_000)
+                        restarted = engine.start()
+                    }
+                    if (!restarted) {
+                        systemRow("Idle unload deferred — the engine is still shutting down; it will retry next cycle.")
+                    }
                     lastEngineUse = android.os.SystemClock.elapsedRealtime()
                 }
             }
         }
     }
 
+    /** Coalesced transcript writes.
+     *
+     *  `systemRow` used to rewrite the whole transcript to two files on the
+     *  Main thread for EVERY warning row. Batching is keyed by session id,
+     *  so a switch still persists the old chat — only the burst within one
+     *  chat is collapsed. */
+    private val pendingSaves = LinkedHashMap<String, Pair<String?, List<ChatMessage>>>()
+    private var saveJob: kotlinx.coroutines.Job? = null
+
     fun saveCurrentSessionMessages() {
         val sid = state.activeSessionId ?: return
-        if (state.messages.isEmpty()) return
+        val msgs = state.messages
+        if (msgs.isEmpty()) return
         val cache = state.messageCache.toMutableMap()
-        cache[sid] = state.messages
+        cache[sid] = msgs
         state = state.copy(messageCache = cache)
         val pDir = state.projectDir ?: engine.projectDir
-        SessionMessageStore.save(getApplication(), pDir, sid, state.messages)
+        synchronized(pendingSaves) { pendingSaves[sid] = pDir to msgs }
+        if (saveJob?.isActive == true) return
+        saveJob = viewModelScope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(250)
+            drainPendingSaves()
+        }
+    }
+
+    /** Write whatever is queued right now (turn end, pause, session switch). */
+    fun flushSessionSave() {
+        saveJob?.cancel()
+        saveJob = null
+        if (synchronized(pendingSaves) { pendingSaves.isEmpty() }) return
+        viewModelScope.launch(Dispatchers.IO) { drainPendingSaves() }
+    }
+
+    private fun drainPendingSaves() {
+        while (true) {
+            val batch = synchronized(pendingSaves) {
+                val copy = pendingSaves.toMap()
+                pendingSaves.clear()
+                copy
+            }
+            if (batch.isEmpty()) return
+            for ((sid, v) in batch) {
+                SessionMessageStore.save(getApplication(), v.first, sid, v.second)
+            }
+        }
     }
 
     suspend fun loadSessionMessages(sessionId: String): List<ChatMessage> {
@@ -872,7 +1036,9 @@ val runtimeEnv = RuntimeEnv(app)
         if (!mem.isNullOrEmpty()) return mem
 
         val pDir = state.projectDir ?: engine.projectDir
-        val fromDisk = SessionMessageStore.load(getApplication(), pDir, sessionId)
+        val fromDisk = withContext(Dispatchers.IO) {
+            SessionMessageStore.load(getApplication(), pDir, sessionId)
+        }
         if (!fromDisk.isNullOrEmpty()) {
             val cache = state.messageCache.toMutableMap()
             cache[sessionId] = fromDisk
@@ -886,7 +1052,9 @@ val runtimeEnv = RuntimeEnv(app)
         if (turns != null && turns.length() > 0) {
             val msgs = SessionMessageStore.turnsToMessages(turns)
             if (msgs.isNotEmpty()) {
-                SessionMessageStore.save(getApplication(), pDir, sessionId, msgs)
+                withContext(Dispatchers.IO) {
+                    SessionMessageStore.save(getApplication(), pDir, sessionId, msgs)
+                }
                 val cache = state.messageCache.toMutableMap()
                 cache[sessionId] = msgs
                 state = state.copy(messageCache = cache)
@@ -907,19 +1075,20 @@ val runtimeEnv = RuntimeEnv(app)
             fetched.forEach { byId[it.id] = it }
             state.sessions.forEach { if (!byId.containsKey(it.id)) byId[it.id] = it }
 
-            // Discover any locally saved sessions on disk:
-            val localIds = SessionMessageStore.getLocalSessionIds(getApplication(), ws)
-            localIds.forEach { id ->
-                if (!byId.containsKey(id)) {
+            // Discover locally saved sessions on disk. getSessionTask parses
+            // a whole transcript per id — disk work, so off Main.
+            val local = withContext(Dispatchers.IO) {
+                SessionMessageStore.getLocalSessionIds(getApplication(), ws).map { id ->
                     val file = File(ws, ".sofuu/sessions/$id")
                     val time = if (file.exists()) file.lastModified() / 1000 else System.currentTimeMillis() / 1000
-                    val taskName = SessionMessageStore.getSessionTask(getApplication(), ws, id)
+                    Triple(id, time, SessionMessageStore.getSessionTask(getApplication(), ws, id))
+                }
+            }
+            local.forEach { (id, time, taskName) ->
+                if (!byId.containsKey(id)) {
                     byId[id] = SessionInfo(id = id, startedAt = time, lastSeen = time, task = taskName)
-                } else if (byId[id]?.task.isNullOrBlank()) {
-                    val taskName = SessionMessageStore.getSessionTask(getApplication(), ws, id)
-                    if (!taskName.isNullOrBlank()) {
-                        byId[id] = byId[id]!!.copy(task = taskName)
-                    }
+                } else if (byId[id]?.task.isNullOrBlank() && !taskName.isNullOrBlank()) {
+                    byId[id] = byId[id]!!.copy(task = taskName)
                 }
             }
 
@@ -1037,21 +1206,25 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun deleteSession(id: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.Default) {
             val r = engine.deleteSession(id).get()
             if (r?.optBoolean("ok") != true) return@launch
-            // Remove the session's files (project store) — the engine
-            // dropped the registry entry, the bytes go with it.
-            val base = File(engine.projectDir, ".sofuu/sessions")
-            File(base, id).deleteRecursively()
-            File(base, "$id.qtsq").delete()
-            applyDeleteSession(id)
+            // Remove the session's files from the ACTIVE project — the
+            // engine's boot directory is the wrong one after a switch.
+            val pDir = state.projectDir ?: engine.projectDir
+            withContext(Dispatchers.IO) {
+                val base = File(pDir, ".sofuu/sessions")
+                File(base, id).deleteRecursively()
+                File(base, "$id.qtsq").delete()
+                SessionMessageStore.delete(getApplication(), pDir, id)
+            }
+            withContext(Dispatchers.Main) { applyDeleteSession(id) }
         }
     }
 
     private fun applyDeleteSession(id: String) {
         val wasActive = state.activeSessionId == id
-        SessionMessageStore.delete(getApplication(), state.projectDir, id)
+        // The on-disk delete already ran on IO in deleteSession().
         val cache = state.messageCache.toMutableMap(); cache.remove(id)
         val ctxCache = state.ctxCache.toMutableMap(); ctxCache.remove(id)
         state = state.copy(
@@ -1066,27 +1239,31 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun clearSessions() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.Default) {
             val r = engine.clearSessions().get()
             if (r?.optBoolean("ok") != true) return@launch
             val ids = r.optJSONArray("ids")
-            val base = File(engine.projectDir, ".sofuu/sessions")
-            ids?.let { arr ->
-                for (i in 0 until arr.length()) {
-                    val sid = arr.optString(i)
-                    // Ids are engine-generated; never let a registry entry
-                    // turn into a traversal.
-                    if (sid.isEmpty() || sid.contains('/') || sid.contains('\\') || sid.startsWith('.')) continue
-                    File(base, sid).deleteRecursively()
-                    File(base, "$sid.qtsq").delete()
+            val pDir = state.projectDir ?: engine.projectDir
+            withContext(Dispatchers.IO) {
+                val base = File(pDir, ".sofuu/sessions")
+                ids?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val sid = arr.optString(i)
+                        // Ids are engine-generated; never let a registry
+                        // entry turn into a traversal.
+                        if (sid.isEmpty() || sid.contains('/') || sid.contains('\\') || sid.startsWith('.')) continue
+                        File(base, sid).deleteRecursively()
+                        File(base, "$sid.qtsq").delete()
+                    }
                 }
+                SessionMessageStore.deleteAll(getApplication(), pDir)
             }
-            applyClearSessions()
+            withContext(Dispatchers.Main) { applyClearSessions() }
         }
     }
 
     private fun applyClearSessions() {
-        SessionMessageStore.deleteAll(getApplication(), state.projectDir)
+        // The on-disk delete already ran on IO in clearSessions().
         val cache = state.messageCache.toMutableMap(); state.sessions.forEach { cache.remove(it.id) }
         val ctxCache = state.ctxCache.toMutableMap(); state.sessions.forEach { ctxCache.remove(it.id) }
         state = state.copy(sessions = emptyList(), activeSessionId = null, messages = emptyList(), approvals = emptyList(), preview = null, messageCache = cache, ctxCache = ctxCache, ctx = null)
@@ -1143,8 +1320,22 @@ val runtimeEnv = RuntimeEnv(app)
                 .put("active", name)
                 .put("provider", name)
                 .put("model", entry.model)
+                // Caps inherited from the PREVIOUS model (a local GGUF's
+                // 128k window) must not follow us here; 0 is the engine's
+                // "resolve from evidence" sentinel.
+                .put("ctx_window", 0)
+                .put("max_output", 0)
         )
         refreshModelCache()
+        reharvestCaps()
+    }
+
+    /** Re-discover the active endpoint's caps after a model/provider switch.
+     *  Fire-and-forget: the next turn and the ctx ring pick it up. */
+    private fun reharvestCaps() {
+        viewModelScope.launch(Dispatchers.Default) {
+            runCatching { engine.detectCaps().get(20, TimeUnit.SECONDS) }
+        }
     }
 
     /** Edit one provider entry in place (the desktop's patchProvider).
@@ -1297,8 +1488,13 @@ val runtimeEnv = RuntimeEnv(app)
             .put("active", provider)
             .put("provider", provider)
             .put("model", model)
+            // A cloud model must not inherit the local one's window/output
+            // override. 0 = resolve from evidence.
+            .put("ctx_window", 0)
+            .put("max_output", 0)
         patchConfig(patch)
         refreshModelCache()
+        reharvestCaps()
     }
 
     // ── Local GGUF models ───────────────────────────────────────
@@ -1322,7 +1518,9 @@ val runtimeEnv = RuntimeEnv(app)
      * turn ends in "maximum context length exceeded".
      */
     fun pickLocalModel(path: String) {
-        viewModelScope.launch {
+        // Default, not Main.immediate: the caps read is an engine round-trip
+        // bounded at 20 s and tapping a model on Main froze the UI.
+        viewModelScope.launch(Dispatchers.Default) {
             val caps = try {
                 engine.localModelCaps(path).get(20, TimeUnit.SECONDS)
             } catch (e: Exception) {
@@ -1334,32 +1532,53 @@ val runtimeEnv = RuntimeEnv(app)
                 .put("base_url", "")
                 .put("model", path)
             if (caps?.optBoolean("ok") == true) {
-                val c = caps.optJSONObject("caps") ?: JSONObject()
-                val win = c.optLong("ctx_window", 0)
-                val maxOut = c.optLong("max_output", 0)
-                if (win > 0) patch.put("ctx_window", win)
-                if (maxOut > 0) patch.put("max_output", maxOut)
+                // `caps` is the unwrapped {ok, caps} object; accept a JSON
+                // string too so an engine variant cannot silently skip the
+                // window again.
+                val c = when (val raw = caps.opt("caps")) {
+                    is JSONObject -> raw
+                    is String -> runCatching { JSONObject(raw) }.getOrNull() ?: JSONObject()
+                    else -> JSONObject()
+                }
+                // Authoritative for this model. 0 = unknown → the engine
+                // resolves it; a stale override from the previous model
+                // must not survive the switch.
+                //
+                // The payload is `modelCaps`'s shape — `ctxWindow`/`maxOutput`
+                // camelCase and `thinking` a KIND STRING ("none"|"effort"|
+                // "budget"), not a boolean. Reading the snake_case/boolean
+                // shape silently wrote 0/0 and forced effort off on every
+                // local model.
+                val win = c.optLong("ctxWindow", c.optLong("ctx_window", 0))
+                val maxOut = c.optLong("maxOutput", c.optLong("max_output", 0))
+                val thinking = when (val t = c.opt("thinking")) {
+                    is Boolean -> t
+                    is String -> t.isNotEmpty() && t != "none" && t != "unknown"
+                    else -> false
+                }
+                patch.put("ctx_window", win)
+                patch.put("max_output", maxOut)
                 // A model with a thinking channel wants effort on; one
                 // without it must not be sent "high", which some kernels
                 // reject outright.
-                patch.put("effort", if (c.optBoolean("thinking", false)) "high" else "")
+                patch.put("effort", if (thinking) "high" else "")
             }
-            val merged = configs.updateConfig(patch)
+            val merged = withContext(Dispatchers.IO) { configs.updateConfig(patch) }
             // No provider entry to write: "local" is not a configured
             // endpoint, so refreshModelCache would only 404 on it.
-            state = state.copy(config = configs.redacted(merged))
+            withContext(Dispatchers.Main) {
+                state = state.copy(config = configs.redacted(merged))
+            }
             refreshLocalModels()
             refreshSessions()
             // Auto-tune: apply this model's stored decode thread count, or
             // measure it once on-device. The user's manual decode override
             // takes precedence over the auto result.
             if (!state.streaming) {
-                viewModelScope.launch(Dispatchers.Default) {
-                    if (runtimeEnv.decodeThreads > 0) {
-                        applyTunedDecode(path)
-                    } else {
-                        calibrateDecodeThreads(path)
-                    }
+                if (runtimeEnv.decodeThreads > 0) {
+                    applyTunedDecode(path)
+                } else {
+                    calibrateDecodeThreads(path)
                 }
             }
         }

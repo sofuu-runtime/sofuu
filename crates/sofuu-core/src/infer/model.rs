@@ -2722,7 +2722,12 @@ impl TransformerModel {
             // SOFUU_GPU_ATTN=0 restores the pre-GPU3 serial kernel.
             let attn_new = std::env::var("SOFUU_GPU_ATTN")
                 .map(|v| v != "0")
-                .unwrap_or(true);
+                .unwrap_or(true)
+                // Only worth it once the context crosses one meta chunk: below that
+                // the chunked path still walks every chunk's meta, and the serial
+                // kernel is 14% cheaper per token (measured 9.1 vs 10.6 ms/token on
+                // the 0.6B at 48 positions, GPU-side timer).
+                && pos >= 128;
             if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.

@@ -883,6 +883,24 @@ extern "C" {
         dim: usize, eps: f32,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn sofuu_metal_batch_llama_attn_w16(
+        ctx: *mut c_void, q: *mut c_void, q_off: usize,
+        kc: *mut c_void, kc_off: usize, vc: *mut c_void, vc_off: usize,
+        qln: *mut c_void, qln_off: usize, out: *mut c_void, out_off: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_w8(
+        ctx: *mut c_void, q: *mut c_void, q_off: usize,
+        kc: *mut c_void, kc_off: usize, vc: *mut c_void, vc_off: usize,
+        qln: *mut c_void, qln_off: usize, out: *mut c_void, out_off: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn_w4(
         ctx: *mut c_void, q: *mut c_void, q_off: usize,
         kc: *mut c_void, kc_off: usize, vc: *mut c_void, vc_off: usize,
@@ -2483,6 +2501,23 @@ impl MetalEngine {
     }
 
     /// Warp-cooperative decode attention. SOFUU_ATTN_FAST=0 turns it off.
+    /// Warps per head for decode attention (4/8/16, default 16). Measured in one window:
+    /// serial 10177 us/token, w4 7988, w8 7659, w16 7238 - it keeps paying until the
+    /// per-warp position count gets too small to fill a warp.
+    pub fn attn_warps() -> u32 {
+        static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *N.get_or_init(|| std::env::var("SOFUU_ATTN_WARPS").ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+    }
+
+    /// Position at which the chunked attention path takes over from the warp kernel.
+    /// SOFUU_ATTN_CHUNK_MIN overrides it. The warp kernel covers everything up to the
+    /// 4096 it can stage, and at a 320-token context it is 106.8 vs 67.5 tg/s against
+    /// the chunked path, so chunked is now only the >4096 fallback.
+    pub fn attn_chunk_min() -> u32 {
+        static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *N.get_or_init(|| std::env::var("SOFUU_ATTN_CHUNK_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+    }
+
     pub fn attn_w4_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("SOFUU_ATTN_W4").map(|v| v != "0").unwrap_or(true))
@@ -2681,6 +2716,50 @@ impl MetalEngine {
     /// Decode attention, 4 warps per head. SOFUU_ATTN_W4=0 opts out. 17% faster per
     /// token than the one-warp serial kernel (8940 -> 7456 us median, 4/4 reps).
     #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_w16(
+        &self,
+        q: &MetalBuffer, q_off: usize,
+        kc: &MetalBuffer, kc_off: usize,
+        vc: &MetalBuffer, vc_off: usize,
+        qln: Option<&MetalBuffer>, qln_off: usize,
+        out: &MetalBuffer, out_off: usize,
+        has_norm: bool, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> bool {
+        let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        unsafe {
+            sofuu_metal_batch_llama_attn_w16(
+                self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
+                qln_handle, qln_off, out.handle, out_off,
+                has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
+                eps, rope_base, rope_mode,
+            ) == 1
+        }
+    }
+
+    pub fn batch_llama_attn_w8(
+        &self,
+        q: &MetalBuffer, q_off: usize,
+        kc: &MetalBuffer, kc_off: usize,
+        vc: &MetalBuffer, vc_off: usize,
+        qln: Option<&MetalBuffer>, qln_off: usize,
+        out: &MetalBuffer, out_off: usize,
+        has_norm: bool, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> bool {
+        let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        unsafe {
+            sofuu_metal_batch_llama_attn_w8(
+                self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
+                qln_handle, qln_off, out.handle, out_off,
+                has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
+                eps, rope_base, rope_mode,
+            ) == 1
+        }
+    }
+
     pub fn batch_llama_attn_w4(
         &self,
         q: &MetalBuffer, q_off: usize,

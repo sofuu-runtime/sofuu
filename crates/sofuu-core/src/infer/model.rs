@@ -2767,7 +2767,7 @@ impl TransformerModel {
                 // the chunked path still walks every chunk's meta, and the serial
                 // kernel is 14% cheaper per token (measured 9.1 vs 10.6 ms/token on
                 // the 0.6B at 48 positions, GPU-side timer).
-                && pos >= 128;
+                && pos >= crate::infer::metal::MetalEngine::attn_chunk_min() as usize;
             if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.
@@ -2801,16 +2801,42 @@ impl TransformerModel {
             } else if crate::infer::metal::MetalEngine::attn_w4_enabled() {
                 let (qln_buf, qln_off) =
                     (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
-                if !g.engine.batch_llama_attn_w4(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    qln_buf, qln_off,
-                    &g.act_buf, g.slots.ao,
-                    has_q != 0, pos as u32,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode,
-                ) {
+                let warps = crate::infer::metal::MetalEngine::attn_warps();
+                let attn_ok = if warps >= 16 {
+                    g.engine.batch_llama_attn_w16(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        qln_buf, qln_off,
+                        &g.act_buf, g.slots.ao,
+                        has_q != 0, pos as u32,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                        norm_eps, rope_freq_base, rope_mode,
+                    )
+                } else if warps >= 8 {
+                    g.engine.batch_llama_attn_w8(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        qln_buf, qln_off,
+                        &g.act_buf, g.slots.ao,
+                        has_q != 0, pos as u32,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                        norm_eps, rope_freq_base, rope_mode,
+                    )
+                } else {
+                    g.engine.batch_llama_attn_w4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        qln_buf, qln_off,
+                        &g.act_buf, g.slots.ao,
+                        has_q != 0, pos as u32,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                        norm_eps, rope_freq_base, rope_mode,
+                    )
+                };
+                if !attn_ok {
                     return false;
                 }
             } else if crate::infer::metal::MetalEngine::attn_fast_enabled() {

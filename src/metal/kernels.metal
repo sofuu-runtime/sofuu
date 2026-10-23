@@ -5811,9 +5811,8 @@ kernel void llama_attn_fast(
 // Here four warps split the positions and combine with an online softmax, so the
 // head runs with four independent load streams, and a 128-thread group still fits
 // the small decode grids.
-#define ATTN_WARPS 4
-
-kernel void llama_attn_w4(
+template <uint ATTN_WARPS>
+kernel void llama_attn_wN(
     device float       *q               [[buffer(0)]],
     device const float *k_cache_layer   [[buffer(1)]],
     device const float *v_cache_layer   [[buffer(2)]],
@@ -5833,24 +5832,27 @@ kernel void llama_attn_w4(
     uint tid                            [[thread_position_in_threadgroup]]
 ) {
     // sacc[ATTN_WARPS][1024]: refuse a head_dim the staging array cannot hold.
-    if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 1024u) { return; }
+    // sacc[ATTN_WARPS][256]: 8 warps x 256 dims = 8 KB, inside the 32 KB
+    // threadgroup budget; anything larger is refused here and at the entry point.
+    if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 256u) { return; }
     uint lane = tid & 31u;
     uint warp = tid >> 5;
     device float *q_head = q + h * head_dim;
     float scale = rsqrt(float(head_dim));
     if (has_norm != 0u) {
         float ss = 0.0f;
-        for (uint i = tid; i < head_dim; i += 128) { ss += q_head[i] * q_head[i]; }
+        for (uint i = tid; i < head_dim; i += 32 * ATTN_WARPS) { ss += q_head[i] * q_head[i]; }
         // reduce across the whole 128-thread group
         threadgroup float rbuf[ATTN_WARPS];
         ss = simd_sum(ss);
         if (lane == 0u) { rbuf[warp] = ss; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float tot = rbuf[0] + rbuf[1] + rbuf[2] + rbuf[3];
+        float tot = 0.0f;
+        for (uint w = 0; w < ATTN_WARPS; ++w) { tot += rbuf[w]; }
         float rms = rsqrt(tot / float(head_dim) + eps);
         for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
     }
-    for (uint j = tid; j < head_dim / 2; j += 128) {
+    for (uint j = tid; j < head_dim / 2; j += 32 * ATTN_WARPS) {
         float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
         float c = cos(theta);
         float s = sin(theta);
@@ -5900,19 +5902,22 @@ kernel void llama_attn_w4(
     // Combine the warps: rescale everything to the group maximum.
     threadgroup float sm[ATTN_WARPS];
     threadgroup float sl[ATTN_WARPS];
-    threadgroup float sacc[ATTN_WARPS][1024];
+    threadgroup float sacc[ATTN_WARPS][256];
     if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
     for (uint i = lane; i < head_dim; i += 32) { sacc[warp][i] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float gmax = sm[0];
     for (uint w = 1; w < ATTN_WARPS; ++w) { gmax = max(gmax, sm[w]); }
-    float r0 = exp(sm[0] - gmax), r1 = exp(sm[1] - gmax),
-          r2 = exp(sm[2] - gmax), r3 = exp(sm[3] - gmax);
-    float ltot = sl[0] * r0 + sl[1] * r1 + sl[2] * r2 + sl[3] * r3;
-    float rr[ATTN_WARPS] = { r0, r1, r2, r3 };
+    threadgroup float sr[ATTN_WARPS];
+    float ltot = 0.0f;
+    for (uint w = 0; w < ATTN_WARPS; ++w) {
+        float r = exp(sm[w] - gmax);
+        sr[w] = r;
+        ltot += sl[w] * r;
+    }
     uint di = 0;
     for (uint i = lane; i < head_dim; i += 32) {
-        sacc[warp][i] = acc[di++] * rr[warp];
+        sacc[warp][i] = acc[di++] * sr[warp];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
@@ -5922,3 +5927,22 @@ kernel void llama_attn_w4(
         head_out[h * head_dim + i] = s * inv;
     }
 }
+
+// Two instantiations from one source: four warps is the measured win over the
+// one-warp serial kernel (8940 -> 7456 us/token); eight is the next question,
+// since the cost was latency rather than arithmetic.
+template [[host_name("llama_attn_w4")]] kernel void llama_attn_wN<4>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&,
+    constant float&, constant uint&, uint, uint);
+template [[host_name("llama_attn_w8")]] kernel void llama_attn_wN<8>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&,
+    constant float&, constant uint&, uint, uint);
+template [[host_name("llama_attn_w16")]] kernel void llama_attn_wN<16>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&,
+    constant float&, constant uint&, uint, uint);

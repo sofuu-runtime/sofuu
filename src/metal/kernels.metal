@@ -5733,7 +5733,9 @@ kernel void llama_attn_fast(
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
-    if (pos == 0xFFFFFFFFu) { return; }
+    // scores[] below is a fixed 4096 entries: refuse larger contexts rather than
+    // index past it (the engine also declines, this is the in-kernel backstop).
+    if (pos == 0xFFFFFFFFu || pos >= 4096u) { return; }
     device float *q_head = q + h * head_dim;
     float scale = rsqrt(float(head_dim));
     if (has_norm != 0u) {
@@ -5830,7 +5832,8 @@ kernel void llama_attn_w4(
     uint h                              [[threadgroup_position_in_grid]],
     uint tid                            [[thread_position_in_threadgroup]]
 ) {
-    if (pos == 0xFFFFFFFFu) { return; }
+    // sacc[ATTN_WARPS][1024]: refuse a head_dim the staging array cannot hold.
+    if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 1024u) { return; }
     uint lane = tid & 31u;
     uint warp = tid >> 5;
     device float *q_head = q + h * head_dim;

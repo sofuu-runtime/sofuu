@@ -3186,6 +3186,7 @@ extern "C" int sofuu_metal_batch_llama_attn_fast(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || ctx->pso_llama_attn_fast == nil) return 0;
+    if (p >= 4096u) return 0;
     sofuu_batch_barrier(ctx);
     uint w_rem = (uint)(qln_offset & 255ULL) / 4u;
     if (ctx->attn_noop) { p = 0xFFFFFFFFu; }
@@ -3222,6 +3223,7 @@ extern "C" int sofuu_metal_batch_llama_attn_w4(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || ctx->pso_llama_attn_w4 == nil) return 0;
+    if (p >= 4096u || head_dim > 1024u) return 0;
     sofuu_batch_barrier(ctx);
     uint w_rem = (uint)(qln_offset & 255ULL) / 4u;
     if (ctx->attn_noop) { p = 0xFFFFFFFFu; }

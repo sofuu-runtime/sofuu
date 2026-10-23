@@ -5392,3 +5392,164 @@ kernel void gemv_q4_k_secs(
     sum = simd_sum(sum);
     if (lane == 0) { y[(y_off >> 2) + row] = sum; }
 }
+
+// ── 8 rows per threadgroup ──────────────────────────────────────────────────
+// The shipped c2 kernel gives one row to a 32-thread threadgroup, so a decode
+// projection launches one threadgroup per row (3072 for a gate) and each group
+// reads 576 bytes and dies. Measured in isolation: 73 us per 1.77 MB dispatch
+// (~24 GB/s) where a probe that streams the same bytes at the same granularity
+// takes 14 us. The per-threadgroup launch cost, not the arithmetic, is the
+// difference, so give each threadgroup 8 rows - one warp each - and launch 8x
+// fewer groups.
+kernel void gemv_q4_k_c2r8(
+    device const uchar  *w_base         [[buffer(0)]],
+    device const float  *x              [[buffer(1)]],
+    device float        *y              [[buffer(2)]],
+    constant uint       &cols           [[buffer(3)]],
+    constant uint       &w_rem          [[buffer(4)]],
+    constant uint       &rows           [[buffer(5)]],
+    uint tg                             [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_position_in_threadgroup]]
+) {
+    uint warpn = tid >> 5;
+    uint lane = tid & 31u;
+    uint row = tg * 8u + warpn;
+    if (row >= rows) { return; }
+
+    float4 acc = 0.0f;
+    uint nb = cols / 256;
+    uint row_byte = w_rem + row * nb * 144;
+    uint sub = lane / 8;
+    uint l8 = lane % 8;
+    uint g = l8 / 2;
+    uint k0 = (l8 % 2) * 16;
+    for (uint b0 = 0; b0 < nb; b0 += 4) {
+        uint b = b0 + sub;
+        if (b >= nb) { break; }
+        float d = float(read_f16(w_base, row_byte + b * 144));
+        float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+        device const uchar *qs = w_base + row_byte + b * 144 + 16;
+        device const uchar *scales = w_base + row_byte + b * 144 + 4;
+        uint8_t sc1, m1, sc2, m2;
+        q4k_scale_min(scales, g * 2, &sc1, &m1);
+        q4k_scale_min(scales, g * 2 + 1, &sc2, &m2);
+        float s1 = d * (float)sc1;
+        float s2 = d * (float)sc2;
+        float m1f = dmin * (float)m1;
+        float m2f = dmin * (float)m2;
+        uint4 q4 = *(device const uint4 *)&qs[l8 * 16];
+        uint xbase = b * 256 + g * 64 + k0;
+        #pragma clang loop unroll(full)
+        for (uint c = 0; c < 4; ++c) {
+            uint comp;
+            if (c == 0) { comp = q4.x; }
+            else if (c == 1) { comp = q4.y; }
+            else if (c == 2) { comp = q4.z; }
+            else { comp = q4.w; }
+            float4 lo4 = float4(float(comp & 15), float((comp >> 8) & 15),
+                                float((comp >> 16) & 15), float((comp >> 24) & 15));
+            float4 hi4 = float4(float((comp >> 4) & 15), float((comp >> 12) & 15),
+                                float((comp >> 20) & 15), float((comp >> 28) & 15));
+            float4 wlo = float4(s1) * lo4 - float4(m1f);
+            float4 whi = float4(s2) * hi4 - float4(m2f);
+            float4 xlo = *(device const float4 *)&x[xbase + 4 * c];
+            float4 xhi = *(device const float4 *)&x[xbase + 32 + 4 * c];
+            acc += wlo * xlo + whi * xhi;
+        }
+    }
+    float v = (acc.x + acc.y) + (acc.z + acc.w);
+    v = simd_sum(v);
+    if (lane == 0) { y[row] = v; }
+}
+
+// ── split-K q4_K GEMV (flat pass 1 + reduce pass 2) ─────────────────────────
+// Every row-per-threadgroup GEMV measured ~20 GB/s in isolation while a probe
+// doing the identical arithmetic in a FLAT thread->block sweep measured 111-169
+// at the same granularity. The difference is the access pattern: the flat sweep
+// has all resident threads reading one contiguous window, the row mapping has
+// thousands of groups each reading its own 576-byte row. So split the reduction:
+// pass 1 gives one thread one (row, block) pair and writes a partial, pass 2 sums
+// the nb partials of a row. Partials cost rows*nb*4 bytes, ~5% of the stream.
+kernel void gemv_q4_k_split1(
+    device const uchar  *w_base      [[buffer(0)]],
+    device const float  *x           [[buffer(1)]],
+    device float        *partial     [[buffer(2)]],
+    constant uint       &cols        [[buffer(3)]],
+    constant uint       &w_rem       [[buffer(4)]],
+    uint idx                         [[thread_position_in_grid]]
+) {
+    uint nb = cols / 256;
+    uint row = idx / nb;
+    uint b = idx - row * nb;
+    uint row_byte = w_rem + row * nb * 144;
+
+    float d = float(read_f16(w_base, row_byte + b * 144));
+    float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+    device const uchar *scales = w_base + row_byte + b * 144 + 4;
+    device const uchar *qs = w_base + row_byte + b * 144 + 16;
+    uint xb = b * 256;
+
+    float a0 = 0.0f, a1 = 0.0f;
+    uint is = 0;
+    for (uint j = 0; j < 256; j += 64) {
+        uint8_t sc1, m1, sc2, m2;
+        q4k_scale_min(scales, is + 0, &sc1, &m1);
+        q4k_scale_min(scales, is + 1, &sc2, &m2);
+        float s1 = d * (float)sc1, mf1 = dmin * (float)m1;
+        float s2 = d * (float)sc2, mf2 = dmin * (float)m2;
+        uint qb = j / 2;
+        for (uint l = 0; l < 32; ++l) {
+            float xl = x[xb + j + l];
+            float xh = x[xb + j + 32 + l];
+            a0 += s1 * (float)(qs[qb + l] & 0x0F) * xl - mf1 * xl;
+            a1 += s2 * (float)(qs[qb + l] >> 4) * xh - mf2 * xh;
+        }
+        is += 2;
+    }
+    partial[idx] = a0 + a1;
+}
+
+kernel void gemv_q4_k_split2(
+    device const float  *partial     [[buffer(0)]],
+    device float        *y           [[buffer(1)]],
+    constant uint       &nb          [[buffer(2)]],
+    uint row                         [[thread_position_in_grid]]
+) {
+    float s = 0.0f;
+    uint base = row * nb;
+    for (uint i = 0; i < nb; ++i) { s += partial[base + i]; }
+    y[row] = s;
+}
+
+// ── add + RMSNorm in one dispatch ───────────────────────────────────────────
+// Decode spends ~19% of the token in the projections and ~50% in the small
+// per-layer ops; the residual add and the norm that follows it are two
+// dispatches over the same 4 KB, so they are worth fusing before any further
+// matvec work. Writes the running residual (x + r) AND its normalised form.
+kernel void add_rmsnorm_f32w(
+    device const float *x       [[buffer(0)]],
+    device const float *r       [[buffer(1)]],
+    device float       *xs      [[buffer(2)]],
+    device float       *y       [[buffer(3)]],
+    device const float *w       [[buffer(4)]],
+    constant uint      &dim     [[buffer(5)]],
+    constant float     &eps     [[buffer(6)]],
+    constant uint      &w_rem   [[buffer(7)]],
+    uint lane                   [[thread_index_in_simdgroup]]
+) {
+    // Pass 1 only measures; pass 2 recomputes and stores. Reading back what this
+    // thread just wrote to device memory is not a guaranteed-visible pattern in
+    // Metal, and the first version of this kernel produced garbage because of it.
+    float sum_sq = 0.0f;
+    for (uint i = lane; i < dim; i += 32) {
+        float v = x[i] + r[i];
+        sum_sq += v * v;
+    }
+    sum_sq = simd_sum(sum_sq);
+    float rms = rsqrt(sum_sq / float(dim) + eps);
+    for (uint i = lane; i < dim; i += 32) {
+        float v = x[i] + r[i];
+        xs[i] = v;
+        y[i] = v * rms * w[w_rem + i];
+    }
+}

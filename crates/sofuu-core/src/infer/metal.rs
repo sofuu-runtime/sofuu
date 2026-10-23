@@ -873,6 +873,25 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     ) -> i32;
+    fn sofuu_metal_batch_add_rmsnorm_f32w(
+        ctx: *mut c_void,
+        x_buf: *mut c_void, x_off: usize,
+        r_buf: *mut c_void, r_off: usize,
+        xs_buf: *mut c_void, xs_off: usize,
+        y_buf: *mut c_void, y_off: usize,
+        w_buf: *mut c_void, w_off: usize,
+        dim: usize, eps: f32,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_split(
+        ctx: *mut c_void, w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize, y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_r8(
+        ctx: *mut c_void, w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize, y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemv_q4k_secs(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_base: usize,
@@ -1183,6 +1202,26 @@ impl MetalEngine {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
             Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
         }
+        if ty == 12 && Self::gemv_split_enabled() && cols % 256 == 0
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_split(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
+        }
+        if ty == 12 && Self::gemv_r8_enabled() && cols % 256 == 0
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_r8(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
+        }
         if ty == 12 && Self::gemv_v4_enabled() && cols % 256 == 0 && cols <= 4096
             && unsafe {
                 sofuu_metal_batch_gguf_gemv_q4k_v4(
@@ -1224,6 +1263,25 @@ impl MetalEngine {
             ) == 1 };
         self.op_tock(K_GGUF, __t);
         __r
+    }
+
+    /// Residual add + RMSNorm in one dispatch.
+    pub fn batch_add_rmsnorm_f32w(
+        &self,
+        x_buf: &MetalBuffer, x_off: usize,
+        r_buf: &MetalBuffer, r_off: usize,
+        xs_buf: &MetalBuffer, xs_off: usize,
+        y_buf: &MetalBuffer, y_off: usize,
+        w_buf: &MetalBuffer, w_off: usize,
+        dim: usize, eps: f32,
+    ) -> bool {
+        unsafe {
+            sofuu_metal_batch_add_rmsnorm_f32w(
+                self.ctx, x_buf.handle, x_off, r_buf.handle, r_off,
+                xs_buf.handle, xs_off, y_buf.handle, y_off,
+                w_buf.handle, w_off, dim, eps,
+            ) == 1
+        }
     }
 
     pub fn batch_rmsnorm(
@@ -2375,6 +2433,25 @@ impl MetalEngine {
         for ((ty, rows, cols), c) in rows {
             eprintln!("[gguf-hist {label}] ty={ty} rows={rows} cols={cols} calls={c}");
         }
+    }
+
+    /// Fused residual-add + RMSNorm. SOFUU_FUSE_NORM=1 arms it. Measured neutral
+    /// end to end (90.1 vs 90.3 tg/s), so it stays off.
+    fn fuse_norm_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_FUSE_NORM").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// Split-K q4_K GEMV (flat pass 1 + reduce). SOFUU_GEMV_SPLIT=1 arms it.
+    fn gemv_split_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_GEMV_SPLIT").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// 8 rows per threadgroup q4_K GEMV. SOFUU_GEMV_R8=1 arms it.
+    fn gemv_r8_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_GEMV_R8").map(|v| v == "1").unwrap_or(false))
     }
 
     /// Decode GEMV v4 (x staged in threadgroup memory). SOFUU_GEMV_V4=1 arms it.

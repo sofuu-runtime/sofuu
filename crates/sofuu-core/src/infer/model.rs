@@ -2464,6 +2464,11 @@ impl TransformerModel {
     /// mirrors of the CPU matvec) are now the DEFAULT, because they were
     /// gate-clean fleet-wide and are the decode-parity counterpart of the
     /// prefill tile MMQ. Opt out with SOFUU_DECODE_MMQ=0.
+    fn fuse_norm_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_FUSE_NORM").map(|v| v == "1").unwrap_or(false))
+    }
+
     fn fuse_qkv_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // measured 10% SLOWER than three separate dispatches (86 vs 96 tg/s), so off.
@@ -2587,6 +2592,8 @@ impl TransformerModel {
         let dmmq_q6 = dmmq_ops.is_empty() || dmmq_ops.contains("q6");
         macro_rules! dec_gguf {
             ($tv:expr, $w_off:expr, $src:expr, $dst:expr, $rows:expr, $cols:expr) => {{
+                // timing ablation: SOFUU_GPU_SKIP=mm drops every projection dispatch
+                if g.skip_mm { } else {
                 // q6_K only: the q6 tile GEMV is numerically the per-256
                 // batch-mmq pipeline at B=1 (probe-exact); the q4 tile GEMV
                 // uses its own blocklen-8 interleave — booked separately.
@@ -2625,6 +2632,7 @@ impl TransformerModel {
                         &g.act_buf, $src, &g.act_buf, $dst, $rows, $cols) {
                         return false;
                     }
+                }
                 }
             }};
         }
@@ -2769,16 +2777,33 @@ impl TransformerModel {
             }
             dec_gguf!(l.attn_output, gguf.data_offset + l.attn_output.offset,
                 g.slots.ao, g.slots.xo, dim, n_heads * head_dim);
-            if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim) {
-                return false;
+            // residual add + norm in ONE dispatch (SOFUU_FUSE_NORM=0 reverts)
+            if !(Self::fuse_norm_enabled()
+                && g.engine.batch_add_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x,
+                    &g.act_buf, g.slots.xo,
+                    &g.act_buf, g.slots.x,
+                    &g.act_buf, g.slots.xn,
+                    &g.w_buf, ffn_norm_off,
+                    dim, norm_eps,
+                ))
+            {
+                if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, dim) {
+                    return false;
+                }
+                if !g.engine.batch_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x,
+                    &g.w_buf, ffn_norm_off,
+                    &g.act_buf, g.slots.xn,
+                    dim, norm_eps,
+                ) {
+                    return false;
+                }
             }
-            if !g.engine.batch_rmsnorm_f32w(
-                &g.act_buf, g.slots.x,
-                &g.w_buf, ffn_norm_off,
-                &g.act_buf, g.slots.xn,
-                dim, norm_eps,
-            ) {
-                return false;
+            if layer_idx == 0 && std::env::var_os("SOFUU_FNORM_DBG").is_some() {
+                let xs = g.slot_f32(g.slots.x, dim);
+                let xn = g.slot_f32(g.slots.xn, dim);
+                eprintln!("[fnorm] x[0..4]={:?} xn[0..4]={:?}", &xs[..4], &xn[..4]);
             }
             let run_ffn = !g.skip_ffn;
             if run_ffn {
@@ -2821,6 +2846,19 @@ impl TransformerModel {
                 self.config.vocab_size, dim,
             ) {
                 return false;
+            }
+            // Experiment: dispatch the lm_head a second time. If decode grows by the
+            // head's own streaming cost (~1.3 ms) it is a normal dispatch and its
+            // 5 ms in situ is a batch-tail artifact; if it grows by 5 ms, the
+            // dispatch really costs that.
+            if std::env::var_os("SOFUU_HEAD_TWICE").is_some() {
+                let _ = g.engine.batch_gguf(
+                    self.output.tensor_type,
+                    &g.w_buf, g.w_offset(gguf2, &self.output),
+                    &g.act_buf, g.slots.xn,
+                    &g.act_buf, g.slots.xo,
+                    self.config.vocab_size, dim,
+                );
             }
             if !g.engine.batch_end() {
                 return false;
@@ -4751,6 +4789,7 @@ pub struct GgufGpu {
     skip_attn: bool,
     skip_ffn: bool,
     skip_head: bool,
+    skip_mm: bool,
     slots: GgufGpuSlots,
     /// P1 (llama.cpp parity): B-row GEMM prefill slab. All None unless
     /// SOFUU_GPU_PREFILL_GEMM=1 at engine construction (memory is not paid
@@ -4898,6 +4937,71 @@ impl GgufGpu {
         let act_slice: &[u8] =
             unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
         let act_buf = engine.register_zerocopy_only(act_slice)?;
+
+        // ── temporary instrumentation: SOFUU_GEMV_BENCH=1 times the shipped decode
+        // GEMV at real geometry inside one commit. Until now "the kernel is slow"
+        // and "the kernel is slow inside the token batch" were the same sentence.
+        if std::env::var_os("SOFUU_GEMV_BENCH").is_some() {
+            let head_only = std::env::var("SOFUU_GEMV_BENCH").map(|v| v == "head").unwrap_or(false);
+            let mut plan: Vec<(u32, usize, usize, usize)> = Vec::new();
+            if head_only {
+                for _ in 0..8 {
+                    plan.push((output.tensor_type, vocab, dim, gguf.data_offset + output.offset));
+                }
+            } else {
+                for l in layers.iter() {
+                    plan.push((l.ffn_gate.tensor_type, inter, dim, gguf.data_offset + l.ffn_gate.offset));
+                    plan.push((l.attn_q.tensor_type, q_rows, dim, gguf.data_offset + l.attn_q.offset));
+                }
+            }
+            let per = |ty: u32| -> f64 {
+                match ty { 12 => 144.0 / 256.0, 14 => 210.0 / 256.0, 8 => 34.0 / 32.0, _ => 4.0 }
+            };
+            let total_bytes: usize = plan.iter()
+                .map(|(ty, rows, cols, _)| (*rows as f64 * *cols as f64 * per(*ty)) as usize)
+                .sum();
+            // zero the activation slab: uninitialised floats include denormals and
+            // NaNs, and a denormal-bound kernel looks exactly like a slow kernel.
+            unsafe { std::ptr::write_bytes(act.as_ptr() as *mut u8, 0, act_bytes); }
+            // one dispatch, to separate per-dispatch cost from streaming cost
+            for _ in 0..3 {
+                if engine.batch_open() {
+                    let t0 = std::time::Instant::now();
+                    let (ty, rows, cols, w_off) = plan[0];
+                    let _ = engine.batch_gguf(ty, &w_buf, w_off, &act_buf, slots.x, &act_buf, slots.xo, rows, cols);
+                    let _ = engine.batch_end();
+                    let mb = rows as f64 * cols as f64 * per(ty) / 1e6;
+                    eprintln!("[gemv-bench] 1 dispatch {rows}x{cols} = {mb:.2} MB -> {:.1} us",
+                        t0.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+            let mut best = 0.0f64;
+            for rep in 0..4 {
+                if !engine.batch_open() { eprintln!("[gemv-bench] open failed"); break; }
+                let t0 = std::time::Instant::now();
+                // alternate the output slot: writing every projection into the same
+                // buffer makes each dispatch wait on the previous one's store.
+                let outs = [slots.xo, slots.gate, slots.up, slots.qa];
+                for (i, (ty, rows, cols, w_off)) in plan.iter().enumerate() {
+                    if !engine.batch_gguf(*ty, &w_buf, *w_off, &act_buf, slots.x,
+                                          &act_buf, outs[i % outs.len()], *rows, *cols) {
+                        eprintln!("[gemv-bench] gguf failed ty={ty} rows={rows} cols={cols}");
+                        break;
+                    }
+                }
+                let ok = engine.batch_end();
+                let dt = t0.elapsed().as_secs_f64();
+                if !ok { eprintln!("[gemv-bench] end failed"); break; }
+                let gbs = total_bytes as f64 / 1e9 / dt;
+                if gbs > best { best = gbs; }
+                if rep == 0 {
+                    eprintln!("[gemv-bench] {} dispatches, {:.1} MB, types q4k={} -> {:.1} GB/s",
+                        plan.len(), total_bytes as f64 / 1e6,
+                        plan.iter().filter(|(ty, _, _, _)| *ty == 12).count(), gbs);
+                }
+            }
+            eprintln!("[gemv-bench] best {best:.1} GB/s");
+        }
         // P1 (llama.cpp parity): the GEMM prefill slab, built only when the
         // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B =
         // pre_chunk rows (SOFUU_PREFILL_CHUNK, clamped 1..=128, default 32);
@@ -4998,6 +5102,7 @@ impl GgufGpu {
             skip_attn: skips.contains("attn"),
             skip_ffn: skips.contains("ffn"),
             skip_head: skips.contains("head"),
+            skip_mm: skips.contains("mm"),
             pref_buf,
             pref_act,
             pref_slots,

@@ -29,6 +29,11 @@ struct MetalContext {
     // G2: GGUF dequant-dot GEMV kernels.
     id<MTLComputePipelineState> pso_gemv_q8_0;
     id<MTLComputePipelineState> pso_gemv_q4_0;
+    id<MTLComputePipelineState> pso_gemv_q4_k_c2r8;
+    id<MTLComputePipelineState> pso_add_rmsnorm_f32w;
+    id<MTLComputePipelineState> pso_gemv_q4_k_split1;
+    id<MTLComputePipelineState> pso_gemv_q4_k_split2;
+    id<MTLBuffer> gemv_partial;
     id<MTLComputePipelineState> pso_gemv_q4_k_secs;
     id<MTLComputePipelineState> pso_bw_probe_q4k;
     id<MTLComputePipelineState> pso_gemv_q4_k_v4;
@@ -295,6 +300,10 @@ void* sofuu_metal_init(void) {
             // 107/50 GB/s compact/5G vs vec4 46/37 — but the vec4 WINS the
             // single-row shape as the 12.4 t/s serial receipt showed):
             // batched pass GEMVs = byte-lane b4c, single-row = vec4 c2.
+            ctx->pso_gemv_q4_k_c2r8 = load_pso(@"gemv_q4_k_c2r8");
+            ctx->pso_add_rmsnorm_f32w = load_pso(@"add_rmsnorm_f32w");
+            ctx->pso_gemv_q4_k_split1 = load_pso(@"gemv_q4_k_split1");
+            ctx->pso_gemv_q4_k_split2 = load_pso(@"gemv_q4_k_split2");
             ctx->pso_gemv_q4_k_secs = load_pso(@"gemv_q4_k_secs");
             ctx->pso_bw_probe_q4k = load_pso(@"bw_probe_q4k");
             ctx->pso_gemv_q4_k_v4 = load_pso(@"gemv_q4_k_v4");
@@ -3322,6 +3331,116 @@ extern "C" int sofuu_metal_batch_gguf_gemv_q4k_secs(
     unsigned long long wb = (unsigned long long)w_base;
     [ctx->batch_enc setBytes:&wb length:sizeof(unsigned long long) atIndex:5];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(max_rows, n_sec, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
+}
+
+
+// 8 rows per threadgroup q4_K GEMV: same lane mapping as the shipped c2 kernel,
+// one warp per row, so a projection launches 8x fewer threadgroups.
+extern "C" int sofuu_metal_batch_gguf_gemv_q4k_r8(
+    void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset, void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || ctx->pso_gemv_q4_k_c2r8 == nil) return 0;
+    if (!w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0 || cols % 256 != 0) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols, r = (uint)rows;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_c2r8];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&r length:sizeof(uint) atIndex:5];
+    size_t ntgs = (rows + 7) / 8;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(ntgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
+
+// Split-K q4_K GEMV: pass 1 is a flat thread->block sweep (the access pattern a
+// probe measured at 111-169 GB/s), pass 2 reduces the nb partials of each row.
+// The partial buffer grows lazily and is reused across calls.
+extern "C" int sofuu_metal_batch_gguf_gemv_q4k_split(
+    void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset, void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || ctx->pso_gemv_q4_k_split1 == nil || ctx->pso_gemv_q4_k_split2 == nil) return 0;
+    if (!w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0 || cols % 256 != 0) return 0;
+    size_t nb = cols / 256;
+    size_t need = rows * nb * sizeof(float);
+    if (ctx->gemv_partial == nil || ctx->gemv_partial.length < need) {
+        ctx->gemv_partial = [ctx->device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        if (ctx->gemv_partial == nil) return 0;
+    }
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols, r = (uint)rows, nbu = (uint)nb;
+    size_t total = rows * nb;
+
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_split1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:ctx->gemv_partial offset:0 atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    size_t tpt1 = 256;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((total + tpt1 - 1) / tpt1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tpt1, 1, 1)];
+
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_split2];
+    [ctx->batch_enc setBuffer:ctx->gemv_partial offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:1];
+    [ctx->batch_enc setBytes:&nbu length:sizeof(uint) atIndex:2];
+    size_t tpt2 = 128;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + tpt2 - 1) / tpt2, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tpt2, 1, 1)];
+    (void)r;
+    return 1;
+}
+
+
+// Residual add + RMSNorm in one dispatch: the pair runs every layer over the same
+// 4 KB, and the dispatch is most of its cost.
+extern "C" int sofuu_metal_batch_add_rmsnorm_f32w(
+    void* ctx_ptr,
+    void* x_buf, size_t x_off,
+    void* r_buf, size_t r_off,
+    void* xs_buf, size_t xs_off,
+    void* y_buf, size_t y_off,
+    void* w_buf, size_t w_off,
+    size_t dim, float eps
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || ctx->pso_add_rmsnorm_f32w == nil) return 0;
+    if (!x_buf || !r_buf || !xs_buf || !y_buf || !w_buf || dim == 0) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    size_t wal = w_off & ~255ULL;
+    uint w_rem = (uint)(w_off & 255ULL) / 4;   // element remainder (f32), like rmsnorm_f32w
+    uint d = (uint)dim;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_add_rmsnorm_f32w];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf offset:x_off atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)r_buf offset:r_off atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)xs_buf offset:xs_off atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf offset:y_off atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf offset:wal atIndex:4];
+    [ctx->batch_enc setBytes:&d length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&eps length:sizeof(float) atIndex:6];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:7];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     return 1;
 }

@@ -882,6 +882,28 @@ extern "C" {
         w_buf: *mut c_void, w_off: usize,
         dim: usize, eps: f32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn sofuu_metal_batch_llama_attn_w4(
+        ctx: *mut c_void, q: *mut c_void, q_off: usize,
+        kc: *mut c_void, kc_off: usize, vc: *mut c_void, vc_off: usize,
+        qln: *mut c_void, qln_off: usize, out: *mut c_void, out_off: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_fast(
+        ctx: *mut c_void, q: *mut c_void, q_off: usize,
+        kc: *mut c_void, kc_off: usize, vc: *mut c_void, vc_off: usize,
+        qln: *mut c_void, qln_off: usize, out: *mut c_void, out_off: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_flat(
+        ctx: *mut c_void, w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize, y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemv_q4k_split(
         ctx: *mut c_void, w_buf: *mut c_void, w_offset: usize,
         x_buf: *mut c_void, x_offset: usize, y_buf: *mut c_void, y_offset: usize,
@@ -1201,6 +1223,16 @@ impl MetalEngine {
     ) -> bool {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
             Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
+        }
+        if ty == 12 && Self::gemv_flat_enabled() && cols % 256 == 0
+            && unsafe {
+                sofuu_metal_batch_gguf_gemv_q4k_flat(
+                    self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
+                    y_buf.handle, y_offset, rows, cols,
+                ) == 1
+            }
+        {
+            return true;
         }
         if ty == 12 && Self::gemv_split_enabled() && cols % 256 == 0
             && unsafe {
@@ -2442,6 +2474,25 @@ impl MetalEngine {
         *ON.get_or_init(|| std::env::var("SOFUU_FUSE_NORM").map(|v| v == "1").unwrap_or(false))
     }
 
+    /// Flat one-dispatch q4_K GEMV. SOFUU_GEMV_FLAT=1 arms it. It is 3x faster than the
+    /// shipped kernel in isolation (149 vs 49 GB/s on the same bytes) and 2% slower
+    /// per token, so it stays off until something upstream changes.
+    fn gemv_flat_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_GEMV_FLAT").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// Warp-cooperative decode attention. SOFUU_ATTN_FAST=0 turns it off.
+    pub fn attn_w4_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_ATTN_W4").map(|v| v == "1").unwrap_or(false))
+    }
+
+    pub fn attn_fast_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_ATTN_FAST").map(|v| v != "0").unwrap_or(true))
+    }
+
     /// Split-K q4_K GEMV (flat pass 1 + reduce). SOFUU_GEMV_SPLIT=1 arms it.
     fn gemv_split_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2627,6 +2678,54 @@ impl MetalEngine {
     /// over the full cache prefix, weighted V. kln/qln buffers are only read
     /// when has_norm is set (a None binding is a placeholder there).
     #[allow(clippy::too_many_arguments)]
+    /// Decode attention, 4 warps per head. SOFUU_ATTN_W4=1 arms it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_w4(
+        &self,
+        q: &MetalBuffer, q_off: usize,
+        kc: &MetalBuffer, kc_off: usize,
+        vc: &MetalBuffer, vc_off: usize,
+        qln: Option<&MetalBuffer>, qln_off: usize,
+        out: &MetalBuffer, out_off: usize,
+        has_norm: bool, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> bool {
+        let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        unsafe {
+            sofuu_metal_batch_llama_attn_w4(
+                self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
+                qln_handle, qln_off, out.handle, out_off,
+                has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
+                eps, rope_base, rope_mode,
+            ) == 1
+        }
+    }
+
+    /// Decode attention via the warp-cooperative kernel. SOFUU_ATTN_FAST=0 opts out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_fast(
+        &self,
+        q: &MetalBuffer, q_off: usize,
+        kc: &MetalBuffer, kc_off: usize,
+        vc: &MetalBuffer, vc_off: usize,
+        qln: Option<&MetalBuffer>, qln_off: usize,
+        out: &MetalBuffer, out_off: usize,
+        has_norm: bool, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+    ) -> bool {
+        let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        unsafe {
+            sofuu_metal_batch_llama_attn_fast(
+                self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
+                qln_handle, qln_off, out.handle, out_off,
+                has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
+                eps, rope_base, rope_mode,
+            ) == 1
+        }
+    }
+
     pub fn batch_llama_attn(
         &self,
         q_buf: &MetalBuffer, q_offset: usize,

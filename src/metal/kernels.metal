@@ -1548,6 +1548,9 @@ kernel void head_rmsnorm(
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    // SOFUU_ATTN_NOOP: dispatch the kernel but do no work, to separate
+    // per-dispatch cost from the kernel body.
+    if (pos == 0xFFFFFFFFu) { return; }
     // Per-head f32 RMSNorm (q-norm, when present) + RoPE — one dispatch so
     // the chunked attention reads fully processed q with no internal race.
     if (h >= n_heads) { return; }
@@ -1773,6 +1776,9 @@ kernel void llama_kv_write(
     uint kv                             [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    // SOFUU_ATTN_NOOP: dispatch the kernel but do no work, to separate
+    // per-dispatch cost from the kernel body.
+    if (pos == 0xFFFFFFFFu) { return; }
     device float *k_head = k + kv * head_dim;
     if (has_norm != 0u) {
         float ss = 0.0f;
@@ -1833,6 +1839,9 @@ kernel void llama_attn(
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
+    // SOFUU_ATTN_NOOP: dispatch the kernel but do no work, to separate
+    // per-dispatch cost from the kernel body.
+    if (pos == 0xFFFFFFFFu) { return; }
     device float *q_head = q + h * head_dim;
     float scale = rsqrt(float(head_dim));
     if (has_norm != 0u) {
@@ -5276,7 +5285,77 @@ kernel void bw_probe_q4k(
     uint active = warp * lanes + ln;
     uint active_total = (total >> 5) * lanes;
 
-    for (uint bb = active; bb < nblk; bb += active_total) {
+    // mode 4: row-major addressing, one 32-lane group per row, the shipped c2
+    // lane mapping, striding over every row of the slice so the byte count is real.
+    if (mode == 4u) {
+        uint lanes_g = total >> 5;
+        uint rows = nblk / 4u;
+        for (uint row = g >> 5; row < rows; row += lanes_g) {
+            uint lane = g & 31u;
+            uint sub = lane / 8u;
+            uint l8 = lane % 8u;
+            size_t row_byte = (size_t)(base + row) * 576u + (size_t)sub * 144u;
+            device const uint4 *p4 = (device const uint4 *)(w + row_byte + 16u + l8 * 16u);
+            uint4 q = p4[0];
+            acc ^= q.x ^ q.y ^ q.z ^ q.w;
+            facc += float(read_f16(w, row_byte)) + float(read_f16(w, row_byte + 2u));
+            facc += float(w[row_byte + 4u + (l8 % 4u)]);
+            size_t xoff = (size_t)(row & 63u) * 256u + (size_t)l8 * 16u;
+            device const float4 *xp = (device const float4 *)(xv + xoff);
+            facc += xp[0].x + xp[1].y;
+        }
+    }
+
+    // mode 5: the shipped c2 body exactly - float4 accumulator, 8 values per word,
+    // 32 x floats per lane, warp reduction, one y store per row. Only the grid
+    // differs from the real dispatch (a striding loop instead of one group per row).
+    if (mode == 5u) {
+        uint lane = g & 31u;
+        uint sub = lane / 8u;
+        uint l8 = lane % 8u;
+        uint gq = l8 / 2u;
+        uint k0 = (l8 % 2u) * 16u;
+        uint rows = nblk / 4u;
+        uint stride = total >> 5;
+        for (uint row = g >> 5; row < rows; row += stride) {
+            float4 a4 = 0.0f;
+            size_t row_byte = (size_t)(base + row) * 576u;
+            for (uint b0 = 0; b0 < 4u; b0 += 4u) {
+                uint b = b0 + sub;
+                float d = float(read_f16(w, row_byte + b * 144));
+                float dmin = float(read_f16(w, row_byte + b * 144 + 2));
+                device const uchar *qs = w + row_byte + b * 144 + 16;
+                device const uchar *scales = w + row_byte + b * 144 + 4;
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, gq * 2, &sc1, &m1);
+                q4k_scale_min(scales, gq * 2 + 1, &sc2, &m2);
+                float s1 = d * (float)sc1, s2 = d * (float)sc2;
+                float m1f = dmin * (float)m1, m2f = dmin * (float)m2;
+                uint4 q4 = *(device const uint4 *)&qs[l8 * 16];
+                uint xbase = b * 256 + gq * 64 + k0;
+                #pragma clang loop unroll(full)
+                for (uint c = 0; c < 4; ++c) {
+                    uint comp = (c == 0) ? q4.x : (c == 1) ? q4.y : (c == 2) ? q4.z : q4.w;
+                    float4 lo4 = float4(float(comp & 15), float((comp >> 8) & 15),
+                                        float((comp >> 16) & 15), float((comp >> 24) & 15));
+                    float4 hi4 = float4(float((comp >> 4) & 15), float((comp >> 12) & 15),
+                                        float((comp >> 20) & 15), float((comp >> 28) & 15));
+                    float4 wlo = float4(s1) * lo4 - float4(m1f);
+                    float4 whi = float4(s2) * hi4 - float4(m2f);
+                    float4 xlo = *(device const float4 *)&xv[xbase + 4 * c];
+                    float4 xhi = *(device const float4 *)&xv[xbase + 32 + 4 * c];
+                    a4 += wlo * xlo + whi * xhi;
+                }
+            }
+            float v = (a4.x + a4.y) + (a4.z + a4.w);
+            v = simd_sum(v);
+            // tie the result into acc so the compiler cannot delete the loads
+            acc ^= as_type<uint>(v);
+            if (lane == 0) { facc += v; }
+        }
+    }
+
+    for (uint bb = active; bb < nblk && mode != 4u && mode != 5u; bb += active_total) {
         uint b = base + bb;
         device const uint4 *p = (device const uint4 *)(w + (size_t)b * 144);
         uint4 a = p[0], c = p[1], d4 = p[2], e = p[3];
@@ -5551,5 +5630,292 @@ kernel void add_rmsnorm_f32w(
         float v = x[i] + r[i];
         xs[i] = v;
         y[i] = v * rms * w[w_rem + i];
+    }
+}
+
+// ── flat q4_K GEMV: contiguous block runs + threadgroup reduction ────────────
+// Measured on this machine (same bytes, same block reads): a flat thread->block
+// sweep runs at 149-176 GB/s, the shipped row-per-threadgroup mapping at 81, and
+// the shipped body on the row-major mapping at 49 - while the real dispatch of
+// that body achieves 19-24. So the projection kernel is losing 2x to its
+// addressing and another 2x to something in its dispatch shape, and the flat
+// mapping is the part I can take back without a second dispatch: one threadgroup
+// owns ROWS_PER_TG contiguous rows (a contiguous 36 KB run for 64 rows at 1024
+// cols), each thread dots one 144-byte block, and the per-row reduction happens
+// in threadgroup memory.
+constant uint GEMV_FLAT_ROWS = 64;
+constant uint GEMV_FLAT_MAXNB = 12;
+
+kernel void gemv_q4_k_flat(
+    device const uchar  *w_base      [[buffer(0)]],
+    device const float  *x           [[buffer(1)]],
+    device float        *y           [[buffer(2)]],
+    constant uint       &cols        [[buffer(3)]],
+    constant uint       &w_rem       [[buffer(4)]],
+    constant uint       &rows        [[buffer(5)]],
+    uint tg                          [[threadgroup_position_in_grid]],
+    uint tid                         [[thread_position_in_threadgroup]]
+) {
+    threadgroup float part[GEMV_FLAT_ROWS * GEMV_FLAT_MAXNB];
+    uint nb = cols / 256;
+    uint row0 = tg * GEMV_FLAT_ROWS;
+    uint nblk = GEMV_FLAT_ROWS * nb;
+
+    for (uint i = tid; i < nblk; i += 256) {
+        uint r = i / nb;
+        uint b = i - r * nb;
+        uint row = row0 + r;
+        float v = 0.0f;
+        if (row < rows) {
+            size_t row_byte = (size_t)w_rem + (size_t)row * nb * 144;
+            float d = float(read_f16(w_base, row_byte + b * 144));
+            float dmin = float(read_f16(w_base, row_byte + b * 144 + 2));
+            device const uchar *scales = w_base + row_byte + b * 144 + 4;
+            device const uchar *qs = w_base + row_byte + b * 144 + 16;
+            uint xb = b * 256;
+            float a0 = 0.0f, a1 = 0.0f;
+            uint is = 0;
+            for (uint j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + 0, &sc1, &m1);
+                q4k_scale_min(scales, is + 1, &sc2, &m2);
+                float s1 = d * (float)sc1, mf1 = dmin * (float)m1;
+                float s2 = d * (float)sc2, mf2 = dmin * (float)m2;
+                uint qb = j / 2;
+                for (uint l = 0; l < 32; ++l) {
+                    float xl = x[xb + j + l];
+                    float xh = x[xb + j + 32 + l];
+                    a0 += s1 * (float)(qs[qb + l] & 0x0F) * xl - mf1 * xl;
+                    a1 += s2 * (float)(qs[qb + l] >> 4) * xh - mf2 * xh;
+                }
+                is += 2;
+            }
+            v = a0 + a1;
+        }
+        part[i] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < GEMV_FLAT_ROWS) {
+        uint row = row0 + tid;
+        if (row < rows) {
+            float s = 0.0f;
+            for (uint b = 0; b < nb; ++b) { s += part[tid * nb + b]; }
+            y[row] = s;
+        }
+    }
+}
+
+// ── decode attention, warp-cooperative ──────────────────────────────────────
+// The serial kernel gives each lane a whole position, so every step of its q.k dot
+// has the 32 lanes reading K vectors 512 bytes apart: 32 transactions per step and
+// a 32x amplification of K traffic (~12 MB per layer, measured as 86 us per layer
+// against 24 KB of actual K). Here the warp splits each dot across lanes and
+// reduces with simd_sum, so a step reads 128 contiguous bytes, and the V pass gives
+// each lane head_dim/32 dimensions so its stride runs along t without breaking
+// coalescing. Same math, same order of accumulation per lane.
+kernel void llama_attn_fast(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *head_out        [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint lane                           [[thread_index_in_simdgroup]]
+) {
+    if (pos == 0xFFFFFFFFu) { return; }
+    device float *q_head = q + h * head_dim;
+    float scale = rsqrt(float(head_dim));
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) { ss += q_head[i] * q_head[i]; }
+        ss = simd_sum(ss);
+        float rms = rsqrt(ss / float(head_dim) + eps);
+        for (uint i = lane; i < head_dim; i += 32) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
+    }
+    for (uint j = lane; j < head_dim / 2; j += 32) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float q0 = q_head[j];
+            float q1 = q_head[j + head_dim / 2];
+            q_head[j]                = q0 * c - q1 * s;
+            q_head[j + head_dim / 2] = q1 * c + q0 * s;
+        } else {
+            float q0 = q_head[2 * j];
+            float q1 = q_head[2 * j + 1];
+            q_head[2 * j]     = q0 * c - q1 * s;
+            q_head[2 * j + 1] = q1 * c + q0 * s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint seq = pos + 1u;
+    threadgroup float scores[4096];
+
+    // Pass 1: one coalesced K sweep, warp-reduced dot per position.
+    float lmax = -INFINITY;
+    for (uint t = 0; t < seq; ++t) {
+        float partial = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            partial += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        float s = simd_sum(partial) * scale;
+        if (lane == 0u) { scores[t] = s; }
+        lmax = max(lmax, s);
+    }
+    float mx = simd_max(lmax);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: exponentials and the normaliser.
+    float lsum = 0.0f;
+    for (uint t = 0; t < seq; ++t) {
+        float e = exp(scores[t] - mx);
+        if (lane == 0u) { scores[t] = e; }
+        lsum += e;
+    }
+    // every lane has already summed every t, so lsum is complete: reducing it again
+    // would scale the whole output by 32.
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 3: each lane owns head_dim/32 dimensions and sweeps t.
+    float inv = (lsum > 0.0f) ? (1.0f / lsum) : 0.0f;
+    for (uint i = lane; i < head_dim; i += 32) {
+        float acc = 0.0f;
+        for (uint t = 0; t < seq; ++t) { acc += scores[t] * vbase[(size_t)t * head_dim + i]; }
+        head_out[h * head_dim + i] = acc * inv;
+    }
+}
+
+// ── decode attention, 4 warps per head ──────────────────────────────────────
+// One warp per head (the serial kernel) gives 16 warps on a 16-core GPU: one warp
+// per core, nothing to hide a ~600 ns memory latency behind, so a 48-position
+// attention costs 82 us instead of ~2. The arithmetic was never the problem.
+// Here four warps split the positions and combine with an online softmax, so the
+// head runs with four independent load streams, and a 128-thread group still fits
+// the small decode grids.
+#define ATTN_WARPS 4
+
+kernel void llama_attn_w4(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *head_out        [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_position_in_threadgroup]]
+) {
+    if (pos == 0xFFFFFFFFu) { return; }
+    uint lane = tid & 31u;
+    uint warp = tid >> 5;
+    device float *q_head = q + h * head_dim;
+    float scale = rsqrt(float(head_dim));
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += 128) { ss += q_head[i] * q_head[i]; }
+        // reduce across the whole 128-thread group
+        threadgroup float rbuf[ATTN_WARPS];
+        ss = simd_sum(ss);
+        if (lane == 0u) { rbuf[warp] = ss; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = rbuf[0] + rbuf[1] + rbuf[2] + rbuf[3];
+        float rms = rsqrt(tot / float(head_dim) + eps);
+        for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
+    }
+    for (uint j = tid; j < head_dim / 2; j += 128) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float q0 = q_head[j];
+            float q1 = q_head[j + head_dim / 2];
+            q_head[j]                = q0 * c - q1 * s;
+            q_head[j + head_dim / 2] = q1 * c + q0 * s;
+        } else {
+            float q0 = q_head[2 * j];
+            float q1 = q_head[2 * j + 1];
+            q_head[2 * j]     = q0 * c - q1 * s;
+            q_head[2 * j + 1] = q1 * c + q0 * s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint seq = pos + 1u;
+
+    // Online softmax over this warp's positions. Each lane owns head_dim/32 dims of
+    // the output accumulator, so the V sweep stays coalesced across the warp.
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[4];
+    for (uint d = 0; d < 4u; ++d) { acc[d] = 0.0f; }
+    for (uint t = warp; t < seq; t += ATTN_WARPS) {
+        float partial = 0.0f;
+        for (uint i = lane; i < head_dim; i += 32) {
+            partial += q_head[i] * kbase[(size_t)t * head_dim + i];
+        }
+        float s = simd_sum(partial) * scale;
+        float mnew = max(m, s);
+        float corr = exp(m - mnew);
+        float w = exp(s - mnew);
+        l = l * corr + w;
+        uint di = 0;
+        for (uint i = lane; i < head_dim; i += 32) {
+            acc[di] = acc[di] * corr + w * vbase[(size_t)t * head_dim + i];
+            di++;
+        }
+        m = mnew;
+    }
+
+    // Combine the warps: rescale everything to the group maximum.
+    threadgroup float sm[ATTN_WARPS];
+    threadgroup float sl[ATTN_WARPS];
+    threadgroup float sacc[ATTN_WARPS][1024];
+    if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
+    for (uint i = lane; i < head_dim; i += 32) { sacc[warp][i] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = sm[0];
+    for (uint w = 1; w < ATTN_WARPS; ++w) { gmax = max(gmax, sm[w]); }
+    float r0 = exp(sm[0] - gmax), r1 = exp(sm[1] - gmax),
+          r2 = exp(sm[2] - gmax), r3 = exp(sm[3] - gmax);
+    float ltot = sl[0] * r0 + sl[1] * r1 + sl[2] * r2 + sl[3] * r3;
+    float rr[ATTN_WARPS] = { r0, r1, r2, r3 };
+    uint di = 0;
+    for (uint i = lane; i < head_dim; i += 32) {
+        sacc[warp][i] = acc[di++] * rr[warp];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    for (uint i = tid; i < head_dim; i += 128) {
+        float s = 0.0f;
+        for (uint w = 0; w < ATTN_WARPS; ++w) { s += sacc[w][i]; }
+        head_out[h * head_dim + i] = s * inv;
     }
 }

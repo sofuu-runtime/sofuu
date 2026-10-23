@@ -2758,6 +2758,36 @@ impl TransformerModel {
                 ) {
                     return false;
                 }
+            } else if crate::infer::metal::MetalEngine::attn_w4_enabled() {
+                let (qln_buf, qln_off) =
+                    (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
+                if !g.engine.batch_llama_attn_w4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    qln_buf, qln_off,
+                    &g.act_buf, g.slots.ao,
+                    has_q != 0, pos as u32,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                ) {
+                    return false;
+                }
+            } else if crate::infer::metal::MetalEngine::attn_fast_enabled() {
+                let (qln_buf, qln_off) =
+                    (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
+                if !g.engine.batch_llama_attn_fast(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    qln_buf, qln_off,
+                    &g.act_buf, g.slots.ao,
+                    has_q != 0, pos as u32,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode,
+                ) {
+                    return false;
+                }
             } else {
                 let (qln_buf, qln_off) =
                     (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
@@ -4875,16 +4905,18 @@ impl GgufGpu {
             // the number of resident threads no matter how many are dispatched.
             // granularity: total bytes held constant, slice size swept. A decode
             // projection is 1.7-5.3 MB; the whole buffer is 396 MB.
-            for slice_mb in [396usize, 49, 12, 5, 2, 1] {
-                let slice_blocks = (slice_mb * 1_000_000 / 144).max(1);
+            // flat vs row-major addressing, same bytes, same block count. Mode 0
+            // sweeps flat; mode 4 gives each 32-lane group one row of 4 blocks, the
+            // shipped c2 mapping, with the same 144-byte block reads.
+            for (tag, mode) in [("flat", 0usize), ("row-major", 4), ("row-major + c2 body", 5)] {
+                let slice_blocks = 12_000_000usize / 144;
                 let iters = (2_750_000usize / slice_blocks).max(1);
                 let mut best = 0.0f32;
                 for _ in 0..3 {
-                    let g = engine.bw_probe(w_buf.handle, n, 98304, iters, 32, 1024, 3, slice_blocks);
+                    let g = engine.bw_probe(w_buf.handle, n, 98304, iters, 32, 32, mode, slice_blocks);
                     if g > best { best = g; }
                 }
-                let _ = iters;
-                eprintln!("[bw-probe] slices of {slice_mb:3} MB -> {best:.1} GB/s");
+                eprintln!("[bw-probe] {tag:16} -> {best:.1} GB/s");
             }
         }
 
@@ -4948,6 +4980,10 @@ impl GgufGpu {
         // and "the kernel is slow inside the token batch" were the same sentence.
         if std::env::var_os("SOFUU_GEMV_BENCH").is_some() {
             let head_only = std::env::var("SOFUU_GEMV_BENCH").map(|v| v == "head").unwrap_or(false);
+            // SOFUU_GEMV_BENCH_N truncates the plan, so a run at K dispatches and a
+            // run at 2K separate the per-dispatch fixed cost from the stream rate.
+            let bench_n: usize = std::env::var("SOFUU_GEMV_BENCH_N")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
             let mut plan: Vec<(u32, usize, usize, usize)> = Vec::new();
             if head_only {
                 for _ in 0..8 {
@@ -4971,7 +5007,8 @@ impl GgufGpu {
             // one dispatch, to separate per-dispatch cost from streaming cost
             for _ in 0..3 {
                 if engine.batch_open() {
-                    let t0 = std::time::Instant::now();
+                    if plan.len() > bench_n { plan.truncate(bench_n); }
+            let t0 = std::time::Instant::now();
                     let (ty, rows, cols, w_off) = plan[0];
                     let _ = engine.batch_gguf(ty, &w_buf, w_off, &act_buf, slots.x, &act_buf, slots.xo, rows, cols);
                     let _ = engine.batch_end();

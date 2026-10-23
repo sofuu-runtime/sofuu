@@ -261,6 +261,22 @@ val runtimeEnv = RuntimeEnv(app)
                 }
             }
             is EngineEvent.TurnFinished -> {
+                ev.usage?.let { u ->
+                    val pt = u.promptTokens ?: 0L
+                    val ct = u.completionTokens ?: 0L
+                    if (pt > 0 || ct > 0) {
+                        val entry = UsageLedger.Entry(
+                            t = now(),
+                            model = state.config?.model.orEmpty(),
+                            provider = state.config?.provider.orEmpty(),
+                            pt = pt,
+                            ct = ct,
+                            cost = u.costUsd ?: 0.0,
+                            sid = state.activeSessionId,
+                        )
+                        viewModelScope.launch(Dispatchers.IO) { usageLedger.append(entry) }
+                    }
+                }
                 flushDelta()
                 val speed = finalMetricsText()
                 state = state.copy(streaming = false, phase = null, liveMetrics = null)
@@ -694,12 +710,12 @@ val runtimeEnv = RuntimeEnv(app)
                         val n = arg.filter { it.isDigit() }.toIntOrNull()
                         if (n != null && n in 1000..1000000) {
                             patchConfig(JSONObject().put("ctx_window", n))
-                            systemRow("Context window → ${",".format(n)} tokens.")
+                            systemRow("Context window → ${"%,d".format(n)} tokens.")
                         } else systemRow("Usage: /ctx [tokens] (1000–1000000). Bare /ctx shows live usage.")
                     } else {
                         val c = state.ctx
                         if (c != null && c.window > 0) {
-                            systemRow("Context ${",".format(c.used)} / ${",".format(c.window)} tokens (${c.pct}%) — ${c.source}")
+                            systemRow("Context ${"%,d".format(c.used)} / ${"%,d".format(c.window)} tokens (${c.pct}%) — ${c.source}")
                         } else {
                             // No live meter yet (fresh session or a model just
                             // switched): show the selected model's window from
@@ -707,7 +723,7 @@ val runtimeEnv = RuntimeEnv(app)
                             // first turn, and say the usage side is unknown.
                             val cfgWin = state.config?.ctxWindow ?: 0
                             systemRow(
-                                if (cfgWin > 0) "No live meter yet — window ${",".format(cfgWin)} tokens (from the selected model); the ring fills on the next turn."
+                                if (cfgWin > 0) "No live meter yet — window ${"%,d".format(cfgWin)} tokens (from the selected model); the ring fills on the next turn."
                                 else "No context meter yet — send a message first."
                             )
                         }
@@ -716,12 +732,12 @@ val runtimeEnv = RuntimeEnv(app)
                 "maxout" -> {
                     if (arg.isEmpty()) {
                         val v = state.config?.maxOutput ?: 0
-                        systemRow(if (v > 0) "Max output: ${",".format(v)} tokens." else "Max output: model default (set with /maxout <tokens>).")
+                        systemRow(if (v > 0) "Max output: ${"%,d".format(v)} tokens." else "Max output: model default (set with /maxout <tokens>).")
                     } else {
                         val n = arg.filter { it.isDigit() }.toIntOrNull()
                         if (n != null && n in 256..384000) {
                             patchConfig(JSONObject().put("max_output", n))
-                            systemRow("Max output → ${",".format(n)} tokens.")
+                            systemRow("Max output → ${"%,d".format(n)} tokens.")
                         } else systemRow("Usage: /maxout <tokens> (256–384000).")
                     }
                 }
@@ -877,7 +893,7 @@ val runtimeEnv = RuntimeEnv(app)
                 }
                 "cost" -> {
                     val st = engine.chatState().get()
-                    systemRow("Session: ${"%04f".format(st?.optDouble("sessionSpendUsd") ?: 0.0)} USD · ${",".format((st?.optDouble("sessionTokens") ?: 0.0).toLong())} tokens")
+                    systemRow("Session: ${"%04f".format(st?.optDouble("sessionSpendUsd") ?: 0.0)} USD · ${"%,d".format((st?.optDouble("sessionTokens") ?: 0.0).toLong())} tokens")
                 }
                 "resume" -> {
                     if (arg.isEmpty()) {
@@ -1396,6 +1412,21 @@ val runtimeEnv = RuntimeEnv(app)
 
     /** Live chat.state() for the settings engine card. Blocking-safe: it
      *  never runs on the main thread — the caller owns the coroutine. */
+    /**
+     * Usage for the pane: the engine's workspace aggregate when it has
+     * records (it also sees turns from other tools), otherwise the app-side
+     * ledger — the only source on a QTSQ-free engine build.
+     */
+    fun usageSummary(): JSONObject? {
+        val engineReport = runCatching {
+            engine.usageReport().get(10, TimeUnit.SECONDS)
+        }.getOrNull()
+        val turns = engineReport?.optJSONObject("totals")?.optLong("turns") ?: 0L
+        if (engineReport != null && turns > 0) return engineReport
+        val local = usageLedger.snapshot()
+        return if (local.optJSONObject("totals")?.optLong("turns") ?: 0L > 0) local else engineReport
+    }
+
     fun engineChatState(): JSONObject? {
         if (!engine.isReady) return null
         // A 2s deadline will expire whenever the engine is mid-turn, which
@@ -1544,6 +1575,10 @@ val runtimeEnv = RuntimeEnv(app)
     // ── Local GGUF models ───────────────────────────────────────
 
     val localModels: LocalModels by lazy { LocalModels(getApplication()) }
+
+    /** App-side token ledger — see UsageLedger for why the pane cannot rely
+     *  on the engine's QTSQ-backed history alone. */
+    val usageLedger: UsageLedger by lazy { UsageLedger(getApplication()) }
 
     /**
      * Point the runtime at an on-device GGUF.

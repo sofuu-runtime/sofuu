@@ -1409,14 +1409,20 @@ private fun UsagePane(store: AppStore) {
     // read once per composition with no way to ask again.
     LaunchedEffect(reload) {
         // LaunchedEffect runs on Main; the engine future can take 10 s.
-        usage = withContext(Dispatchers.IO) {
-            runCatching { store.engine.usageReport().get(10, TimeUnit.SECONDS) }.getOrNull()
-        }
+        usage = withContext(Dispatchers.IO) { store.usageSummary() }
     }
     Column {
         Section("Workspace spend & tokens", isFirst = true)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
             SmallButton(c.bgCardHover, c.text, "Refresh usage") { reload++ }
+        }
+        if (usage?.optString("source") == "app") {
+            Text(
+                "Recorded by the app: this engine build has no QTSQ codec, so its own per-turn usage history cannot persist. " +
+                    "Tokens are captured from each finished turn on this install.",
+                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.warn,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
         }
         val totals = usage?.optJSONObject("totals")
         SettingsCard {
@@ -1581,34 +1587,6 @@ private fun UsagePane(store: AppStore) {
             }
         }
 
-        Section("Per model")
-        val models = usage?.optJSONArray("models")
-        SettingsCard {
-            if (models == null || models.length() == 0) {
-                Text("No model records found.", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
-            } else {
-                for (i in 0 until models.length()) {
-                    if (i > 0) CardDivider()
-                    val m = models.optJSONObject(i) ?: continue
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(m.optString("model"), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
-                            Text("${m.optInt("turns")} turns", fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
-                        }
-                        Text(
-                            "$" + "%.4f".format(m.optDouble("cost")),
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = c.text,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                    }
-                }
-            }
-        }
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -1630,6 +1608,7 @@ private fun BrainPane(store: AppStore) {
     var hits by remember { mutableStateOf<org.json.JSONArray?>(null) }
     var recalled by remember { mutableStateOf("") }
     var decayArmed by remember { mutableStateOf(false) }
+    var qtsq by remember { mutableStateOf<Boolean?>(null) }
 
     var ml by remember { mutableStateOf<JSONObject?>(null) }
     var m2 by remember { mutableStateOf<Boolean?>(null) }
@@ -1668,6 +1647,11 @@ private fun BrainPane(store: AppStore) {
     var simB by remember { mutableStateOf("a feline rested") }
     var sim by remember { mutableStateOf<JSONObject?>(null) }
 
+    LaunchedEffect(Unit) {
+        qtsq = withContext(Dispatchers.IO) {
+            runCatching { store.engine.qtsqAvailable().get(5, TimeUnit.SECONDS) }.getOrNull()
+        }
+    }
     LaunchedEffect(reload) {
         val r = withContext(Dispatchers.IO) { surface.brainInfo() }
         info = r?.takeIf { it.optBoolean("ok") }
@@ -1693,6 +1677,13 @@ private fun BrainPane(store: AppStore) {
             Text(
                 "Stored in ${ws.substringAfterLast('/')}/.sofuu/brain/brain.qtsq — one file per workspace, shared by all its chats.",
                 fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+        if (qtsq == false) {
+            Text(
+                "This engine build has no QTSQ codec: memories live in RAM for this run and are lost on restart, and the engine cannot persist sessions.",
+                fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.warn,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
         }

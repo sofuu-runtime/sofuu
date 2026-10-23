@@ -552,6 +552,19 @@ class SofuuEngine(
     fun chatState(): CompletableFuture<JSONObject?> =
         query("JSON.stringify((sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {error:'chat engine unavailable'})").thenObject()
 
+    /**
+     * Whether this engine build can persist anything (QTSQ codec linked).
+     *
+     * A QTSQ-free build is allowed by the Makefile (`SOFUU_ALLOW_NO_QTSQ=1`)
+     * and is "invisibly broken": memories no-op and sessions do not persist.
+     * Both checks are function-presence probes, so they work in every build.
+     */
+    fun qtsqAvailable(): CompletableFuture<Boolean> =
+        query(
+            "JSON.stringify({ ok:true, qtsq: (typeof __qtsq_session_save === 'function' " +
+                "&& typeof __qtsq_session_load === 'function') })"
+        ).thenObject().thenApply { it?.optBoolean("qtsq") == true }
+
     /** Re-harvest the active endpoint's model caps (async in JS). Called
      *  after a provider/model switch so the context meter and the output
      *  cap follow the NEW model instead of the one selected before. */

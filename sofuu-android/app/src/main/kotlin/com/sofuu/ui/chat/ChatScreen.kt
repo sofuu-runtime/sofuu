@@ -94,7 +94,10 @@ fun ChatScreen(
         }
     }
     LaunchedEffect(messages.lastOrNull()?.content?.length) {
-        if (messages.isNotEmpty() && !listState.canScrollForward) {
+        // Follow the live answer unless the user is actively dragging: the
+        // old "only when already at the bottom" rule left a long answer
+        // growing off-screen.
+        if (messages.isNotEmpty() && !listState.isScrollInProgress) {
             listState.scrollToItem(messages.size - 1)
         }
     }

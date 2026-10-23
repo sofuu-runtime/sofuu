@@ -3791,3 +3791,46 @@ what code reading suggested:
   JS changes).
 - **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` (local-only) — next:
   T2/M1 (MCP fidelity + conformance) and S4 (one policy evaluator).
+
+## 2026-10-23 — workstream 6 phase 2: MCP fidelity + client conformance (T2, M1a–M1c)
+
+- **T2 — MCP result fidelity.** The adapters used to read `content[0].text`
+  only: later blocks, images, resource links and `structuredContent` vanished,
+  and `isError:true` read as a normal success. One mapper
+  (`sofuu.tools.mcpResult`) now joins every content block (text, image/audio
+  markers with mime+size, resource text, resource links, unknown blocks as
+  JSON), appends `structuredContent`, caps at 12k chars, and maps `isError`
+  to `{ok:false, error:{code:'E_TOOL'}}`. Both the agent loop and chat use it;
+  the tool event carries `meta` (block count, images, truncated) and
+  `data_chars`.
+- **T2 — clash namespacing.** A name collision no longer silently shadows the
+  MCP tool (the model could never reach it). The inline/builtin owner keeps
+  the bare name; each MCP copy is exposed as `<server>__<tool>` with a `warn`
+  naming both, and a second collision on the namespaced name is skipped
+  loudly. Battery A6 now proves `shared_tool`, `srv1__shared_tool` and
+  `srv2__shared_tool` all reach the wire.
+- **T2 — annotations.** MCP tool `annotations` ride the toolset:
+  `readOnlyHint:true` stops prompting under `approve:'sensitive'`;
+  `destructiveHint:true` always prompts. Unknown annotations change nothing.
+- **M1a — protocol negotiation.** The client offers `2025-06-18` (was
+  2024-11-05), records the version the server returns, and exposes it as
+  `client.protocolVersion()`.
+- **M1b — server→client traffic.** The client no longer drops requests and
+  notifications ("not for us"): `ping` is answered, `roots/list` answers an
+  empty root set, unknown/sampling/elicitation requests get `-32601`, and
+  notifications dispatch to `client.onNotification(method, paramsJson)`.
+- **M1c — pagination.** `client.listTools()`/`listResources()` follow
+  `nextCursor` (≤32 pages, repeated-cursor guard) in a shipped wrapper around
+  `sofuu.mcp.connect`, so agent, chat and plain scripts all get the full
+  inventory. (`client.call` stays a single request, as the spec intends.)
+- **Receipts:** conformance **0 failures / 0 known gaps** (was 1 known gap):
+  protocol version, 5 tools across 2 pages, answered ping, notification
+  callback, isError mapping, multi-block+structuredContent mapping. Agent
+  battery **283 PASS / 0 FAIL** (new namespacing check); `rt::mcp` **14/14**.
+  `agent.bc`/`tools.bc`/`chat.bc` regenerated and verified byte-identical to
+  fresh `compile-bc` output. Verified in an isolated HEAD+slice worktree (the
+  shared tree is still red from a peer's infer refactor).
+- **Remaining M1d:** per-call timeout + `notifications/cancelled` with native
+  pending-slot reclamation (the JS-only race would leak a slot per timeout).
+- **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: M1d, then S4
+  (one policy evaluator) and M2 (HTTP transport).

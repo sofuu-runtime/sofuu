@@ -1423,6 +1423,7 @@
     var exec = {};
     var names = {};
     var sources = {}; /* T1: name → builtin | host | mcp | inline */
+    var annotations = {}; /* T2: MCP tool annotations, name → object */
     var mcpNames = [];
     function warn(payload) { emit('warn', payload); }
     function add(spec, fn, source) {
@@ -1477,30 +1478,34 @@
         var mt = conn.tools[k];
         var mname = String(mt.name || '');
         if (!mname) continue;
+        /* T2 (2026-10-23): a clash no longer SILENTLY shadows the MCP copy
+         * (the model could never reach it). The inline/builtin owner keeps
+         * the bare name; the MCP tool is exposed as `server__tool`. */
+        var exposed = mname;
         if (names[mname]) {
-          /* A6: inline/builtin wins on a clash; the MCP copy is shadowed. */
-          warn({ tool: mname, mcp: set.name, note: 'name clash — inline tool wins, MCP tool shadowed' });
-          continue;
+          var ns = String(set.name || 'mcp').replace(/[^A-Za-z0-9_-]/g, '_');
+          exposed = ns + '__' + mname;
+          if (names[exposed]) {
+            warn({ tool: mname, mcp: set.name,
+                   note: 'name clash — namespace ' + exposed + ' also taken; tool skipped' });
+            continue;
+          }
+          warn({ tool: mname, mcp: set.name, note: 'name clash — exposed as ' + exposed });
         }
-        names[mname] = 1;
-        mcpNames.push(mname);
-        sources[mname] = 'mcp';
-        specs.push({ name: mname, description: String(mt.description || ('MCP tool from ' + set.name)),
+        names[exposed] = 1;
+        mcpNames.push(exposed);
+        sources[exposed] = 'mcp';
+        if (mt.annotations && typeof mt.annotations === 'object') {
+          annotations[exposed] = mt.annotations;
+        }
+        specs.push({ name: exposed, description: String(mt.description || ('MCP tool from ' + set.name)),
                      parameters: mt.inputSchema || { type: 'object', properties: {} } });
-        exec[mname] = (function (client, toolName) {
+        exec[exposed] = (function (client, toolName) {
           return async function (args) {
             var res = await client.call('tools/call', { name: toolName, arguments: args || {} });
-            var text = res && res.content && res.content[0] && res.content[0].text;
-            text = (typeof text === 'string') ? text : JSON.stringify(text);
-            /* T1: a tools/call that reports isError is a FAILED tool, not a
-             * chatty success. The adapter hands the loop a typed result so
-             * the event (and the next phase's policy trace) can say so;
-             * the model still sees the server's text verbatim. */
-            if (res && res.isError === true) {
-              return { ok: false, text: text,
-                       error: { code: 'E_TOOL', message: 'MCP tool reported isError' } };
-            }
-            return { ok: true, text: text };
+            /* T2: full-block mapping (text/image/resource/structuredContent)
+             * + isError as a typed failure. */
+            return sofuu.tools.mcpResult(res, { maxChars: 12000 });
           };
         })(conn.client, mname);
       }
@@ -1677,7 +1682,8 @@
         return out;
       };
     }
-    return { specs: specs, exec: exec, mcpNames: mcpNames, sources: sources };
+    return { specs: specs, exec: exec, mcpNames: mcpNames, sources: sources,
+             annotations: annotations };
   }
 
   function delegateSpecFor(d, chain) {
@@ -3602,6 +3608,15 @@
         if (d.approve && d.approve !== 'none' &&
             name !== 'delegate' && name !== 'map_context') {
           var risky = !AUTO_PASS_TOOLS[name];
+          /* T2: MCP annotations refine risk. A readOnly tool stops prompting
+           * under approve:'sensitive'; destructiveHint always prompts even
+           * when the name would otherwise pass. Unknown annotations change
+           * nothing (fail toward asking). */
+          var ann = (toolset && toolset.annotations && toolset.annotations[name]) || null;
+          if (ann) {
+            if (ann.destructiveHint === true) risky = true;
+            else if (ann.readOnlyHint === true) risky = false;
+          }
           var needAsk = d.approve === 'all' || risky;
           var askKey = name === 'bash'
             ? 'bash\u0001' + ledgerNorm(String((args && args.command) || ''))
@@ -3787,9 +3802,12 @@
          * counts as errored for the reuse ledger and the supervisor. */
         var toolOk = !errored;
         var toolErrorCode = errored ? 'E_TOOL' : null;
+        var toolData = null, toolMeta = null;
         if (result && typeof result === 'object' && typeof result.ok === 'boolean' &&
             typeof result.text === 'string') {
           toolOk = result.ok;
+          if (result.meta && typeof result.meta === 'object') toolMeta = result.meta;
+          if (result.data !== undefined) toolData = result.data;
           if (!toolOk) {
             toolErrorCode = (result.error && result.error.code) || 'E_TOOL';
             result = (String(result.text).indexOf('tool error') === 0)
@@ -3875,6 +3893,11 @@
                           duration_ms: Date.now() - toolStartedAt };
         if (!toolOk) trPayload.error_code = toolErrorCode || 'E_TOOL';
         if (toolTruncated) trPayload.truncated = true;
+        if (toolMeta) trPayload.meta = toolMeta;
+        if (toolData !== null && toolData !== undefined) {
+          try { trPayload.data_chars = JSON.stringify(toolData).length; }
+          catch (eDC) { trPayload.data_chars = 0; }
+        }
         if (stashedDiff) trPayload.diff = clip(stashedDiff, 4000);
         /* todo_write (P2): the checklist rides the result event so hosts
          * render a live checklist instead of an opaque result line. Also

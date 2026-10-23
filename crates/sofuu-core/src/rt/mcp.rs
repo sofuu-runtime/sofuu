@@ -75,6 +75,12 @@ struct McpClient {
     initialize_id: i32,   /* req id of the initialize call */
     connect_promise: *mut PromiseHandle,
 
+    /* M1 (2026-10-23): the protocol version the SERVER negotiated, stored
+     * from its initialize result so a host can inspect it. Fixed-size —
+     * protocol versions are short dates ("2025-06-18"). */
+    protocol_version: [u8; 32],
+    protocol_version_len: usize,
+
     /* Lifecycle: `done` is set in mcp_on_exit; `closing` counts the 4
      * handles (stdin/stdout/stderr pipes + process) being closed — the LAST
      * close callback frees the client + the handle storages. */
@@ -192,14 +198,84 @@ unsafe fn mcp_client_send(client: *mut McpClient, msg: &[u8]) -> c_int {
 // ── client response routing (pure Rust parse — M6 mandate) ──────────
 
 unsafe fn mcp_process_line(client: *mut McpClient, line: &[u8]) {
-    let ctx = (*client).ctx;
     let Ok(input) = std::str::from_utf8(line) else {
         return;
     };
-    let parsed = crate::mcp::jsonrpc::parse(input);
-    let Inbound::Response { id, result, error } = parsed else {
-        return; /* requests/notifications/garbage are not for us */
+    match crate::mcp::jsonrpc::parse(input) {
+        Inbound::Response { id, result, error } => mcp_handle_response(client, id, result, error),
+        /* M1 (2026-10-23): a server may send REQUESTS and NOTIFICATIONS.
+         * Dropping them (the old behavior: "not for us") violates the
+         * spec — a server's ping would never be answered and list_changed
+         * would leave every cached inventory stale. */
+        Inbound::Request { id, method, params } => {
+            mcp_answer_server_request(client, id, &method, params)
+        }
+        Inbound::Notification { method, params } => {
+            mcp_dispatch_notification(client, &method, params)
+        }
+        Inbound::Invalid(_) => {}
+    }
+}
+
+/// Answer a server→client request. We declare no sampling/elicitation
+/// capability, so those (and anything unknown) get -32601 — but a `ping`
+/// MUST be answered, and `roots/list` answers the empty root set (we
+/// declare no roots; the reply is still well-formed if a server asks).
+unsafe fn mcp_answer_server_request(
+    client: *mut McpClient,
+    id: u64,
+    method: &str,
+    _params: Option<serde_json::Value>,
+) {
+    let rid = id as i32;
+    let resp = match method {
+        "ping" => jsonrpc_response_cstr(rid, "{}"),
+        "roots/list" => jsonrpc_response_cstr(rid, "{\"roots\":[]}"),
+        _ => jsonrpc_error_cstr(rid, -32601, "Method not found"),
     };
+    mcp_client_send(client, resp.as_bytes());
+}
+
+/// Dispatch a server notification to `client.onNotification(method,
+/// paramsJson)` when the host installed one. Notifications without a
+/// listener are ignored (there is nothing to invalidate natively).
+unsafe fn mcp_dispatch_notification(
+    client: *mut McpClient,
+    method: &str,
+    params: Option<serde_json::Value>,
+) {
+    let ctx = (*client).ctx;
+    let cb = qjs::sofuu_js_get_property_str(ctx, (*client).self_val, c"onNotification".as_ptr());
+    if qjs::JS_IsFunction(ctx, cb) == 0 {
+        qjs::sofuu_js_free_value(ctx, cb);
+        return;
+    }
+    let cm = CString::new(method).unwrap_or_default();
+    let params_json = params
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
+        .unwrap_or_else(|| "null".into());
+    let cp = CString::new(params_json).unwrap_or_default();
+    let m = qjs::sofuu_js_new_string(ctx, cm.as_ptr());
+    let p = qjs::sofuu_js_new_string(ctx, cp.as_ptr());
+    let args: [JSValueConst; 2] = [m, p];
+    let ret = qjs::JS_Call(ctx, cb, qjs::sofuu_js_undefined(), 2, args.as_ptr());
+    if qjs::is_exception(ret) {
+        qjs::js_std_dump_error(ctx);
+    }
+    qjs::sofuu_js_free_value(ctx, ret);
+    qjs::sofuu_js_free_value(ctx, p);
+    qjs::sofuu_js_free_value(ctx, m);
+    qjs::sofuu_js_free_value(ctx, cb);
+}
+
+unsafe fn mcp_handle_response(
+    client: *mut McpClient,
+    id: u64,
+    result: Option<serde_json::Value>,
+    error: Option<crate::mcp::jsonrpc::RpcError>,
+) {
+    let ctx = (*client).ctx;
     let msg_id = id as i32;
 
     /* Check if this is a response to a pending call */
@@ -210,6 +286,22 @@ unsafe fn mcp_process_line(client: *mut McpClient, line: &[u8]) {
 
         let promise = (*client).pending[i].promise;
         let was_init_id = msg_id == (*client).initialize_id;
+
+        /* M1: record the version the SERVER chose before the result moves.
+         * The client offered 2025-06-18; a server may counter-offer. */
+        if was_init_id {
+            if let Some(pv) = result
+                .as_ref()
+                .and_then(|v| v.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+            {
+                let bytes = pv.as_bytes();
+                let n = bytes.len().min(31);
+                let slot: &mut [u8; 32] = &mut (*client).protocol_version;
+                slot[..n].copy_from_slice(&bytes[..n]);
+                (*client).protocol_version_len = n;
+            }
+        }
 
         if let Some(result_v) = result {
             /* Parse result into a JS value */
@@ -572,9 +664,31 @@ unsafe extern "C" fn js_mcp_disconnect(
     qjs::sofuu_js_undefined()
 }
 
+/// M1: the protocol version the server negotiated (offered 2025-06-18;
+/// "unknown" before the initialize response lands).
+unsafe extern "C" fn js_mcp_protocol_version(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let client = qjs::JS_GetOpaque(this_val, MCP_CLIENT_CLASS_ID.load(Ordering::Relaxed)) as *mut McpClient;
+    if client.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"Invalid MCPClient".as_ptr());
+    }
+    if (*client).protocol_version_len == 0 {
+        return qjs::sofuu_js_new_string(ctx, c"unknown".as_ptr());
+    }
+    let mut buf = [0u8; 33];
+    let n = (*client).protocol_version_len.min(32);
+    let src: &[u8; 32] = &(*client).protocol_version;
+    buf[..n].copy_from_slice(&src[..n]);
+    qjs::sofuu_js_new_string(ctx, buf.as_ptr() as *const c_char)
+}
+
 thread_local! {
     // JS_CFUNC_DEF(name, length, func): magic=0, u.func = { length, generic, func }.
-    static MCP_CLIENT_PROTO: [qjs::JSCFunctionListEntry; 4] = [
+    static MCP_CLIENT_PROTO: [qjs::JSCFunctionListEntry; 5] = [
         qjs::JSCFunctionListEntry {
             name: c"call".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -602,6 +716,13 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_mcp_disconnect },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"protocolVersion".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_mcp_protocol_version },
         },
     ];
 }
@@ -706,6 +827,8 @@ unsafe extern "C" fn js_mcp_connect(
         pending_count: 0,
         initialized: 0,
         initialize_id: 0,
+        protocol_version: [0u8; 32],
+        protocol_version_len: 0,
         connect_promise: ptr::null_mut(),
         done: 0,
         closing: 0,
@@ -838,7 +961,7 @@ unsafe extern "C" fn js_mcp_connect(
     let init_msg = jsonrpc_request_cstr(
         init_id,
         "initialize",
-        Some("{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sofuu\",\"version\":\"0.1.0\"}}"),
+        Some("{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sofuu\",\"version\":\"0.1.0\"}}"),
     );
 
     /* Register initialize as a pending call and remember its id */
@@ -1466,7 +1589,7 @@ pub unsafe extern "C" fn mod_mcp_register(ctx: *mut JSContext) {
     };
     let _nc1 = qjs::JS_NewClass(qjs::JS_GetRuntime(ctx), class_id, &client_class);
     let client_proto = qjs::sofuu_js_new_object(ctx);
-    MCP_CLIENT_PROTO.with(|f| qjs::JS_SetPropertyFunctionList(ctx, client_proto, f.as_ptr(), 4));
+    MCP_CLIENT_PROTO.with(|f| qjs::JS_SetPropertyFunctionList(ctx, client_proto, f.as_ptr(), 5));
     qjs::JS_SetClassProto(ctx, class_id, client_proto);
 
     /* Register MCPServer class — JS_NewClassID only ALLOCATES when
@@ -1828,6 +1951,8 @@ mod tests {
                 pending_count: 0,
                 initialized: 0,
                 initialize_id: 0,
+                protocol_version: [0u8; 32],
+                protocol_version_len: 0,
                 connect_promise: ptr::null_mut(),
                 done: 0,
                 closing: 0,

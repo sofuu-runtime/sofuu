@@ -1030,6 +1030,107 @@
     },
   };
 
+  /* ── M1 (2026-10-23): paged MCP lists ─────────────────────────────
+   * MCP list methods are cursor-based; the native client exposes one page
+   * (`client.call`). Wrapping connect() gives every consumer (agent, chat,
+   * plain scripts) the whole inventory without a native async state
+   * machine. A repeated cursor or >32 pages stops, so a hostile server
+   * cannot loop its caller forever. */
+  (function () {
+    if (!sofuu.mcp || typeof sofuu.mcp.connect !== 'function' || sofuu.mcp.__paged) return;
+    var realConnect = sofuu.mcp.connect;
+    function all(client, method, key) {
+      var out = [];
+      var cursor = null;
+      var pages = 0;
+      function step() {
+        var params = cursor ? { cursor: cursor } : {};
+        return Promise.resolve(client.call(method, params)).then(function (res) {
+          var arr = (res && res[key]) || [];
+          for (var i = 0; i < arr.length; i++) out.push(arr[i]);
+          var next = res && res.nextCursor;
+          pages++;
+          if (next && next !== cursor && pages < 32) {
+            cursor = next;
+            return step();
+          }
+          var r = {};
+          r[key] = out;
+          return r;
+        });
+      }
+      return step();
+    }
+    sofuu.mcp.connect = function (command) {
+      return Promise.resolve(realConnect(command)).then(function (client) {
+        if (!client || client.__paged) return client;
+        try {
+          client.listTools = function () { return all(client, 'tools/list', 'tools'); };
+          client.listResources = function () { return all(client, 'resources/list', 'resources'); };
+          try { Object.defineProperty(client, '__paged', { value: true, enumerable: false }); }
+          catch (eP) { client.__paged = true; }
+        } catch (eM) {}
+        return client;
+      });
+    };
+    sofuu.mcp.__paged = true;
+  })();
+
+  /* ── T2 (2026-10-23): one MCP tools/call → result mapping ────────
+   * The old adapters read content[0].text only, which silently dropped
+   * later blocks, images, resource links and structuredContent — and,
+   * worse, turned an isError:true tool failure into a chatty success.
+   * This is the single mapper both the agent and chat drivers use; the
+   * returned shape matches the T1 tool contract. */
+  sofuu.tools.mcpResult = function (res, opts) {
+    opts = opts || {};
+    var cap = (opts.maxChars | 0) || 12000;
+    var blocks = (res && res.content) || [];
+    var parts = [];
+    var images = 0;
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i] || {};
+      var t = String(b.type || '');
+      if (t === 'text') {
+        parts.push(String(b.text == null ? '' : b.text));
+      } else if (t === 'image' || t === 'audio') {
+        var bytes = 0;
+        try { bytes = Math.floor(String(b.data || '').length * 3 / 4); } catch (eB) {}
+        parts.push('[' + t + ': ' + (b.mimeType || 'unknown') + ', ~' + bytes + ' bytes]');
+        images++;
+      } else if (t === 'resource') {
+        var r = b.resource || {};
+        var line = '[resource: ' + (r.uri || '') + (r.mimeType ? ' (' + r.mimeType + ')' : '') + ']';
+        if (typeof r.text === 'string' && r.text) line += '\n' + r.text;
+        parts.push(line);
+      } else if (t === 'resource_link') {
+        parts.push('[resource: ' + (b.uri || '') + (b.name ? ' (' + b.name + ')' : '') + ']');
+      } else {
+        try { parts.push(JSON.stringify(b)); } catch (eJ) { parts.push('[' + t + ']'); }
+      }
+    }
+    var text = parts.join('\n');
+    if (res && res.structuredContent && typeof res.structuredContent === 'object') {
+      var sj = '';
+      try { sj = JSON.stringify(res.structuredContent); } catch (eS) { sj = ''; }
+      if (sj) text += (text ? '\n' : '') + '[structuredContent] ' + sj;
+    }
+    if (!text) text = '(empty tool result)';
+    var truncated = false;
+    if (cap > 0 && text.length > cap) {
+      text = text.slice(0, cap) + '\n…[MCP result truncated at ' + cap + ' chars]';
+      truncated = true;
+    }
+    var ok = !(res && res.isError === true);
+    return {
+      ok: ok,
+      text: text,
+      data: res ? res.structuredContent : undefined,
+      error: ok ? undefined : { code: 'E_TOOL', message: 'MCP tool reported isError' },
+      meta: { contentBlocks: blocks.length, images: images, truncated: truncated },
+    };
+  };
+
   /* The "code" group — everything above. Opt out of the shell by listing
    * individual names instead, or by exporting SOFUU_NO_SHELL. S3: when the
    * shell is disabled the group (and every listing derived from it) omits

@@ -668,8 +668,14 @@
       var c = S.mcpClients[j];
       if (c.name !== owner) continue;
       var res = await c.client.call('tools/call', { name: name, arguments: args || {} });
-      var text = res && res.content && res.content[0] && res.content[0].text;
-      return (typeof text === 'string') ? text : JSON.stringify(text);
+      /* T2: one mapping shared with the agent loop (all content blocks,
+       * images/resource links, structuredContent, isError). */
+      var mapped = (sofuu.tools && typeof sofuu.tools.mcpResult === 'function')
+        ? sofuu.tools.mcpResult(res, { maxChars: 12000 })
+        : { ok: !(res && res.isError === true),
+            text: String((res && res.content && res.content[0] && res.content[0].text) || '') };
+      var text = (typeof mapped.text === 'string') ? mapped.text : String(mapped.text);
+      return mapped.ok ? text : ('tool error: ' + text);
     }
     throw new Error('tool ' + name + ': owning server "' + owner + '" is not connected');
   }

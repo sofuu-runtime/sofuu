@@ -375,12 +375,13 @@ export SOFUU_QTSQ_DIR=/path/to/black-hole-disk   # the encrypted-brain codec
 make                 # cargo build --release
 make test            # JS e2e suite
 make size-check      # fails if the binary exceeds 5MB
+make bc-check        # fails if a shipped driver .bc lags its .js
 ./sofuu doctor       # confirms QTSQ linkage + a real brain round-trip
 ```
 
 `make` refuses to build without the QTSQ codec (pass `SOFUU_ALLOW_NO_QTSQ=1` for a memory-less binary) — a codec-less build silently no-ops memory, so it is opt-out, not opt-in.
 
-Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 C samples assert) · `make abi-check` · `make size-check` · `./sofuu doctor`.
+Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 C samples assert) · `make abi-check` · `make size-check` · `make bc-check` · `./sofuu doctor`.
 
 ---
 

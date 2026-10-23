@@ -16,9 +16,9 @@
 | **Phase 3** | Cooperative Scheduling & Concurrent Tool Dispatch | **COMPLETE** | `tests/test_agent_concurrency_yield.js` (5/5 passed), commit [`395509477`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/395509477) |
 | **Phase 4** | Real-Time QTSQ Agent Trace Persistence & Replay | **COMPLETE** | `tests/test_agent_qtsq_trace.js` (7/7 passed), commit [`947d855b9`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/947d855b9) |
 | **Phase 5** | Resilient File Editing (`smart_edit`) & Syntax Dry-Run | **COMPLETE** | `tests/test_agent_smart_edit.js` (37/37 checks), `tests/tools_diff_test.js` (32/32 incl. agent diff events), `tests/tools_edit_literal_e2e.sh` (7/7), commit [`8e5551824`](https://github.com/priyanshuboruah/ai-native-js-runtime/commit/8e5551824) |
-| **Phase 6** | Custom Agent AOT Bytecode & Full Integration Torture | **COMPLETE** (local) | `tests/test_agent_aot_loaddir.js` (37/37), `tests/test_agent_modernization_torture.js` (15/15, 50 concurrent runs), binary 4,818,544 B = 4.60 MiB |
+| **Phase 6** | Custom Agent AOT Bytecode & Full Integration Torture | **COMPLETE** (local) | `tests/test_agent_aot_loaddir.js` (37/37), `tests/test_agent_modernization_torture.js` (15/15, 50 concurrent runs), binary 4,818,640 B = 4.60 MiB |
 
-**Overall Progress:** 6 of 6 Phases Completed (100%) | **Stripped Binary Size:** 4,818,544 B = 4.60 MiB (cap 5,242,880 B = 5.0 MiB; **424,336 B headroom** — release now embeds driver bytecode only, see the Phase 6 note)
+**Overall Progress:** 6 of 6 Phases Completed (100%) | **Stripped Binary Size:** 4,818,640 B = 4.60 MiB (cap 5,242,880 B = 5.0 MiB; **424,240 B headroom** — release now embeds driver bytecode only, see the Phase 6 note)
 
 ---
 
@@ -231,7 +231,7 @@ flowchart TD
   and a per-run `edit_file` rewrite. 15 checks: 150 provider requests, 50 overlapping streams
   observed, 50/50 answers carrying only their own nonce (no cross-run bleed), 25/25 sandbox
   tokens, 25/25 fixtures rewritten, 50/50 traces with exactly 2 tool events, 1.9 s wall time.
-- **Binary budget: 4,818,544 B = 4.60 MiB**, 424,336 B under the 5,242,880 B cap.
+- **Binary budget: 4,818,640 B = 4.60 MiB**, 424,240 B under the 5,242,880 B cap.
 
 **The budget decision (breaking, deliberate)**
 
@@ -263,7 +263,7 @@ instead of starting silently without the driver.
 | `tests/test_bytecode_hydration.js` | 7/7 subsystems hydrated |
 | `tests/tools_diff_e2e.sh`, `tests/tools_edit_literal_e2e.sh` | 32/32, 7/7 |
 | `make bc-check` | 7/7 snapshots match their source |
-| `make size-check` | 4,818,544 B <= 5,242,880 B |
+| `make size-check` | 4,818,640 B <= 5,242,880 B |
 
 **Commits**
 

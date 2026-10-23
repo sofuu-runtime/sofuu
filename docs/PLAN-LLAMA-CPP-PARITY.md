@@ -6,6 +6,108 @@ the receipts the user sees in llama-server — NOT pure CPU: in the Homebrew ggm
 build, llama-server/llama-bench offload to Metal by default, and that is where llama.cpp's
 speed lives (0.6B prefill 3336 t/s Metal vs 243 CPU; Spark decode 40 vs 11).
 
+## CURRENT STATE — 2026-10-23 (read this first; everything below it is history)
+
+Method: every number here is best-of-N in one session on this 16-core M2 Pro at
+load 3-6. Decode drifts up to 40% run to run and prefill up to 20%, so the
+ranges below are honest and the *ratios* inside one run are the signal. The bar
+is llama.cpp's DEFAULT Metal config on this box:
+`llama-bench -m MODEL -p 128 -n 32 -ngl 99 -r 2`.
+
+| model | pp t/s | of bar | tg t/s | of bar |
+|---|---|---|---|---|
+| 0.6B Q4_K_M | 486-577 | 0.14-0.17x (3435) | 71-101 | 0.33-0.46x (217.5) |
+| 1B Q8_0 | 359 | 0.17x (2055) | 46-67 | 0.38-0.55x (121.9) |
+| Spark-4B Q4_K_M | 75 | 0.15x (490) | 21-31 | 0.41-0.59x (51.9) |
+| 8B Q4_K_M | 18-32 | 0.07-0.12x (264) | 11-12.6 | 0.35-0.40x (31.2) |
+| MiniCPM5-2B Q6_K_XL | not re-measured | (865) | not re-measured | (73) |
+
+### What changed since the 2026-10-20 scoreboard, with receipts
+
+1. **The fp32 GEMM was already at the hardware ceiling** (LEDGER #7, `68611113d`).
+   Peak measured with no memory traffic: fp32 FMA 2.05-2.14 TFLOP/s, fp16
+   `simdgroup_matrix` 18.80. llama.cpp's measured 4.0 TFLOP/s is *above* the fp32
+   pipe, so it is a matrix-pipe kernel and parity required one. Every fp32
+   scheduling hypothesis had already failed because there was no headroom to win.
+2. **The matrix pipe landed for q4_K and q6_K**, including a residual-accumulate
+   mode so the o and down projections use it at all, and it is now the default
+   (`a58fd2472`, `0681eda77`). Kernel 2.08-3.00 TFLOP/s vs 1.16-1.31 for fp32;
+   0.6B prefill 289 -> 213-253 ms. Gates: 0.6B NEAR-TIE |dtop1| 0.3150 (bound
+   1.112), Spark-4B IDENTICAL 19/19, 1B Q8_0 NEAR-TIE 0.0240 (bound 0.223).
+3. **MMQ was a 41% decode regression and I had shipped it** (LEDGER #8,
+   `d114f2c71`). Separating arm A's two defaults: coalesced-2 + MMQ 50.6 tg/s,
+   MMQ off 71.6, coalesced 0 38.1. MMQ bypasses the coalesced kernel and costs
+   21 tg/s; it is opt-in now, which also stops int8-quantizing activations.
+4. **q6_K and q8_0 were falling out of the batched route entirely** (LEDGER #10,
+   `1731b55c2`). `SOFUU_GEMM_TYPES` was q4_K-only, and the only other route is
+   `batch_gguf` - the single-token GEMV. So the o and down projections of every
+   Q4_K_M model ran once per token per layer inside a batched prefill. 8B
+   9610 -> 3820 ms (2.52x), 1B 112 -> 359 pp t/s (3.2x). All gates unchanged.
+5. **Decode's gap is the commit structure, not the matvec** (LEDGER #11,
+   `0d36151c9`). Four GEMV geometries (8 rows/TG, split-K, x staged in
+   threadgroup memory) all landed within +-10% of the shipped kernel. The bench
+   then showed why: 28 GEMVs inside ONE commit run at 29 GB/s, the same 28 GEMVs
+   each in its own commit run at 6 GB/s. **A commit costs ~240 us.**
+
+### What remains, in leverage order
+
+**1. Decode: one commit per layer instead of three (target 3x on tg).**
+A layer currently commits three times and reads results back to the host between
+each (`slot_f32(...).copy_from_slice(...)` into `self.x`), so the GPU drains and
+idles while the CPU does RMSNorm and the residual add. That is why the GEMVs run
+in the 6 GB/s regime when the same kernel reaches 29 GB/s in one commit. Work:
+keep the residual add and RMSNorm on the GPU (`batch_add`, `batch_rmsnorm_b4`
+already exist), drop the per-stage readbacks from the hot loop (they exist for
+the CPU sampler and the spec path - both can read once, at the end), then
+re-measure against the 29 GB/s floor. Expected: 0.6B ~250-300 tg/s, i.e. at or
+past the bar; every model scales with it since they share the structure.
+
+**2. Prefill: fewer, larger dispatches (target 1.5-2x on pp).**
+A 123-token pass is ~378 dispatches, 210 of them GEMMs, and the ffn bucket
+delivers 0.87 TFLOP/s against 3.00 for the same kernel measured alone (LEDGER
+#9). The shapes are small (16-48 threadgroups on 16 cores), so each dispatch
+pays launch, barrier and x-restaging on a short body. Work: fold RMSNorm and
+kv_write into the GEMM epilogues, a 128-token MMA tile so `t_tiles == 1` at
+chunk 128, and merge the per-layer commits. Regain the 3.4x that separates e2e
+ffn from the isolated kernel.
+
+**3. A matrix pipe for q8_0 (1B pp is 0.17x of bar).**
+`gemm_q8_0_*` still runs fp32; q8_0 is `1B`'s whole model and a third of the
+fleet's bytes. The dequant is the simplest of the three (f16 scale + 32 int8 per
+block), so this is a small kernel plus the same routing.
+
+**4. Close the kernel-rate gap: 2.46-3.00 vs 4.09 TFLOP/s (1.4-1.7x).**
+llama.cpp's implied rate is 2x the fp32 pipe and ~21% of the matrix pipe; ours is
+13-16%. Needs the 128-token tile, swizzled threadgroup staging, and a look at
+whether the fp16 dequant->staging step is the serialisation point. Only worth
+doing after #2, because dispatch overhead is currently the larger term.
+
+**5. Decode matvec: 29 GB/s vs llama.cpp's 86 (3x), only after #1.**
+At the 29 GB/s ceiling a 0.6B token costs 13.7 ms, so #1 alone does not reach the
+bar; this is the second half of decode. The four ruled-out geometries mean the
+next attempt should target the *bytes* rather than the loop: 144-byte blocks are
+not cache-aligned, and llama.cpp pairs q4_K weights with q8_K activations so each
+block is one wide dot instead of a dequant spread over a warp.
+
+**6. Fleet coverage and gating (not rate work, but blocks 'every model').**
+MiniCPM5-2B Q6_K_XL needs a fresh measurement on the new defaults; Phi-4-mini
+fails to load (fused attn_qkv, loader wants separate q/k/v); K2-Horizon-4B is a
+custom arch; Ternary-Bonsai PTQ1_0 is untested on the matrix pipe; the 8B text
+gate has never run against the current defaults (CPU reference is slow - use the
+GPU-vs-GPU diff plus a short prompt).
+
+**7. Conformance matrix + release gates.**
+One row per GGUF in the fleet, running the parity battery and the text gate, so a
+default flip cannot land without its receipt (that discipline is what caught the
+MMQ regression, one session too late).
+
+### Dead ends - do not rebuild these
+
+fp32 SIMT past 1.3 TFLOP/s (pipe wall); double-buffered k-slices (-20%, tgmem
+occupancy); 256-thread tiles (flat); 8x4 and 8x8 fp32 register tiles (flat);
+transposed `float4` LDS (flat); `half2` packed fp32-class loop (2.14 = no gain);
+64-row tile alone (kernel win, no e2e win); GEMV v2/v3/v4 (1.08x / 0.96x / 0.90x);
+MMQ decode (opt-in, -41%); `SOFUU_GPU_FUSE=1` on the 8B (1.19x slower than off).
 ## The bar + the scoreboard (battery #10, 2026-10-20, -p 210 -n 82, load-labeled)
 
 Sweep ran under peer load 2.4-14.6 (Sofuu half at load ~6-10 — its rows are the

@@ -2464,6 +2464,12 @@ impl TransformerModel {
     /// mirrors of the CPU matvec) are now the DEFAULT, because they were
     /// gate-clean fleet-wide and are the decode-parity counterpart of the
     /// prefill tile MMQ. Opt out with SOFUU_DECODE_MMQ=0.
+    fn fuse_qkv_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // measured 10% SLOWER than three separate dispatches (86 vs 96 tg/s), so off.
+        *ON.get_or_init(|| std::env::var("SOFUU_FUSE_QKV").map(|v| v == "1").unwrap_or(false))
+    }
+
     fn decode_mmq_enabled() -> bool {
         // Opt-in since the coalesced-2 GEMV landed: MMQ bypasses that kernel,
         // and with both armed the 0.6B decodes at 50.6 tg/s against 71.6 with
@@ -2658,12 +2664,37 @@ impl TransformerModel {
             ) {
                 return false;
             }
-            dec_gguf!(l.attn_q, gguf.data_offset + l.attn_q.offset,
-                g.slots.xn, g.slots.qa, n_heads * head_dim, dim);
-            dec_gguf!(l.attn_k, gguf.data_offset + l.attn_k.offset,
-                g.slots.xn, g.slots.ka, n_kv_heads * head_dim, dim);
-            dec_gguf!(l.attn_v, gguf.data_offset + l.attn_v.offset,
-                g.slots.xn, g.slots.va, n_kv_heads * head_dim, dim);
+            // q, k and v share x and cols and write disjoint slots, so they ride in
+            // ONE dispatch: each dispatch in a batch pays a fixed ramp that is larger
+            // than the streaming time of a decode-sized projection.
+            let qkv = [&l.attn_q, &l.attn_k, &l.attn_v];
+            let qkv_rows = [n_heads * head_dim, n_kv_heads * head_dim, n_kv_heads * head_dim];
+            let qkv_dst = [g.slots.qa, g.slots.ka, g.slots.va];
+            let qkv_fused = Self::fuse_qkv_enabled()
+                && qkv.iter().all(|tv| tv.tensor_type == GGML_TYPE_Q4_K)
+                && {
+                    let offs: Vec<usize> = qkv.iter().map(|tv| gguf.data_offset + tv.offset).collect();
+                    let base = *offs.iter().min().unwrap();
+                    let fits = offs.iter().all(|o| (*o - base) <= u32::MAX as usize);
+                    if !fits {
+                        false
+                    } else {
+                        let secs: Vec<[u32; 3]> = offs.iter().zip(qkv_dst.iter().zip(qkv_rows.iter()))
+                            .map(|(o, (dst, rows))| [(*o - base) as u32, *dst as u32, *rows as u32])
+                            .collect();
+                        g.engine.batch_gguf_gemv_q4k_secs(
+                            &g.w_buf, base, &g.act_buf, g.slots.xn, &g.act_buf, dim, &secs,
+                        )
+                    }
+                };
+            if !qkv_fused {
+                dec_gguf!(l.attn_q, gguf.data_offset + l.attn_q.offset,
+                    g.slots.xn, g.slots.qa, n_heads * head_dim, dim);
+                dec_gguf!(l.attn_k, gguf.data_offset + l.attn_k.offset,
+                    g.slots.xn, g.slots.ka, n_kv_heads * head_dim, dim);
+                dec_gguf!(l.attn_v, gguf.data_offset + l.attn_v.offset,
+                    g.slots.xn, g.slots.va, n_kv_heads * head_dim, dim);
+            }
             let run_attn = !g.skip_attn;
             if run_attn {
             if !g.engine.batch_llama_kv_write(
@@ -4787,10 +4818,29 @@ impl GgufGpu {
             for threads in [1024usize, 4096, 16384, 65536, 262144] {
                 let mut best = 0.0f32;
                 for _ in 0..3 {
-                    let g = engine.bw_probe(w_buf.handle, n, threads, 4);
+                    let g = engine.bw_probe(w_buf.handle, n, threads, 4, 32, 0, 0, 0);
                     if g > best { best = g; }
                 }
-                eprintln!("[bw-probe] threads={threads:6} bytes={n} -> {best:.1} GB/s");
+                eprintln!("[bw-probe] threads={threads:6} lanes=32 -> {best:.1} GB/s");
+            }
+            // the shipped GEMV gives a 1024-col row 4 working lanes of 32, and a
+            // 3072-col row 12; this measures what that costs
+            // thread lifetime: how many blocks each thread streams before it retires.
+            // A decode GEMV lane does ONE block (144 B) and exits.
+            // threadgroup size: a decode GEMV launches 32-thread groups, which caps
+            // the number of resident threads no matter how many are dispatched.
+            // granularity: total bytes held constant, slice size swept. A decode
+            // projection is 1.7-5.3 MB; the whole buffer is 396 MB.
+            for slice_mb in [396usize, 49, 12, 5, 2, 1] {
+                let slice_blocks = (slice_mb * 1_000_000 / 144).max(1);
+                let iters = (2_750_000usize / slice_blocks).max(1);
+                let mut best = 0.0f32;
+                for _ in 0..3 {
+                    let g = engine.bw_probe(w_buf.handle, n, 98304, iters, 32, 1024, 3, slice_blocks);
+                    if g > best { best = g; }
+                }
+                let _ = iters;
+                eprintln!("[bw-probe] slices of {slice_mb:3} MB -> {best:.1} GB/s");
             }
         }
 

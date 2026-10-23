@@ -50,10 +50,25 @@ unsafe impl Send for MetalEngine {}
 unsafe impl Sync for MetalEngine {}
 
 impl MetalEngine {
+    /// One dispatch for a group of independent q4_K projections that share x and
+    /// cols: secs is {w_off, y_off, rows} per section.
+    pub fn batch_gguf_gemv_q4k_secs(
+        &self, w_buf: &MetalBuffer, w_base: usize, x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, cols: usize, secs: &[[u32; 3]],
+    ) -> bool {
+        if secs.is_empty() { return false; }
+        unsafe {
+            sofuu_metal_batch_gguf_gemv_q4k_secs(
+                self.ctx, w_buf.handle, w_base, x_buf.handle, x_offset, y_buf.handle,
+                cols, secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        }
+    }
+
     /// Temporary instrumentation: achievable read bandwidth over the weight buffer
     /// at a given thread count, measured inside one commit (SOFUU_BW_PROBE).
-    pub fn bw_probe(&self, w_buf: *mut c_void, nbytes: usize, threads: usize, iters: usize) -> f32 {
-        unsafe { sofuu_metal_bw_probe(self.ctx, w_buf, nbytes, threads, iters) }
+    pub fn bw_probe(&self, w_buf: *mut c_void, nbytes: usize, threads: usize, iters: usize, lanes: usize, tgsz: usize, mode: usize, slice_blocks: usize) -> f32 {
+        unsafe { sofuu_metal_bw_probe(self.ctx, w_buf, nbytes, threads, iters, lanes, tgsz, mode, slice_blocks) }
     }
     pub fn new() -> Option<Self> {
         unsafe {
@@ -858,10 +873,18 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     ) -> i32;
+    fn sofuu_metal_batch_gguf_gemv_q4k_secs(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_base: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        cols: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
     fn sofuu_metal_bw_probe(
         ctx: *mut c_void,
         w_buf: *mut c_void, nbytes: usize,
-        threads: usize, iters: usize,
+        threads: usize, iters: usize, lanes: usize, tgsz: usize, mode: usize, slice_blocks: usize,
     ) -> f32;
     fn sofuu_metal_batch_gguf_gemv_q4k_v2(
         ctx: *mut c_void,

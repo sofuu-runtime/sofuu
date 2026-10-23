@@ -5255,19 +5255,140 @@ kernel void bw_probe_q4k(
     device const uchar  *w        [[buffer(0)]],
     device float        *out      [[buffer(1)]],
     constant uint       &nblocks  [[buffer(2)]],
+    constant uint       &lanes    [[buffer(3)]],
+    constant uint       &mode     [[buffer(4)]],
+    device const float  *xv       [[buffer(5)]],
+    constant uint       &slice    [[buffer(6)]],   // blocks per dispatch
+    constant uint       &dstart   [[buffer(7)]],   // first block of this dispatch
     uint g                        [[thread_position_in_grid]],
     uint total                    [[threads_per_grid]]
 ) {
     uint acc = 0;
-    for (uint b = g; b < nblocks; b += total) {
+    float facc = 0.0f;
+    // granularity sweep: restrict this dispatch to its own slice of the buffer so
+    // repeated dispatches cannot be served from cache.
+    uint nblk = slice;
+    uint base = dstart;
+    (void)nblocks;
+    uint warp = g >> 5;
+    uint ln = g & 31u;
+    if (ln >= lanes) { return; }
+    uint active = warp * lanes + ln;
+    uint active_total = (total >> 5) * lanes;
+
+    for (uint bb = active; bb < nblk; bb += active_total) {
+        uint b = base + bb;
         device const uint4 *p = (device const uint4 *)(w + (size_t)b * 144);
-        uint4 a = p[0], c = p[1], d = p[2], e = p[3];
+        uint4 a = p[0], c = p[1], d4 = p[2], e = p[3];
         uint4 f = p[4], h = p[5], i = p[6], j = p[7], l = p[8];
         acc ^= a.x ^ a.y ^ a.z ^ a.w ^ c.x ^ c.y ^ c.z ^ c.w;
-        acc ^= d.x ^ d.y ^ d.z ^ d.w ^ e.x ^ e.y ^ e.z ^ e.w;
+        acc ^= d4.x ^ d4.y ^ d4.z ^ d4.w ^ e.x ^ e.y ^ e.z ^ e.w;
         acc ^= f.x ^ f.y ^ f.z ^ f.w ^ h.x ^ h.y ^ h.z ^ h.w;
         acc ^= i.x ^ i.y ^ i.z ^ i.w ^ j.x ^ j.y ^ j.z ^ j.w;
         acc ^= l.x ^ l.y ^ l.z ^ l.w;
+
+        // mode 1: read x the way a GEMV does. mode 2: + nibble FMA on top.
+        if (mode == 1u || mode == 2u) {
+            for (uint q = 0; q < 8; ++q) {
+                float4 xa = ((device const float4 *)(xv + q * 32))[0];
+                float4 xb = ((device const float4 *)(xv + q * 32))[1];
+                float4 xc = ((device const float4 *)(xv + q * 32))[2];
+                float4 xd = ((device const float4 *)(xv + q * 32))[3];
+                if (mode == 2u) {
+                    uint u = (q & 1u) ? ((q & 2u) ? a.w : a.z) : ((q & 2u) ? a.y : a.x);
+                    facc += (float)(u & 0x0F) * xa.x + (float)((u >> 4) & 0x0F) * xa.y;
+                    facc += (float)(u & 0x0F) * xb.x + (float)((u >> 4) & 0x0F) * xb.y;
+                    facc += (float)(u & 0x0F) * xc.x + (float)((u >> 4) & 0x0F) * xc.y;
+                    facc += (float)(u & 0x0F) * xd.x + (float)((u >> 4) & 0x0F) * xd.y;
+                } else {
+                    facc += xa.x + xb.y + xc.z + xd.w;
+                }
+            }
+        }
+
+        // mode 3: the real arithmetic - 256 dequantised values dotted with 256
+        // floats, exactly what gemv_q4_k does.
+        if (mode == 3u) {
+            device const uchar *scales = w + (size_t)b * 144 + 4;
+            device const uchar *qs = w + (size_t)b * 144 + 16;
+            float dsc = float(read_f16(w, (size_t)b * 144));
+            float dmin = float(read_f16(w, (size_t)b * 144 + 2));
+            float a0 = 0.0f, a1 = 0.0f;
+            uint is = 0;
+            for (uint jj = 0; jj < 256; jj += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                q4k_scale_min(scales, is + 0, &sc1, &m1);
+                q4k_scale_min(scales, is + 1, &sc2, &m2);
+                float d1 = dsc * (float)sc1, mm1 = dmin * (float)m1;
+                float d2 = dsc * (float)sc2, mm2 = dmin * (float)m2;
+                uint qb = jj / 2;
+                for (uint ll = 0; ll < 32; ++ll) {
+                    float xl = xv[jj + ll];
+                    float xh = xv[jj + 32 + ll];
+                    a0 += d1 * (float)(qs[qb + ll] & 0x0F) * xl - mm1 * xl;
+                    a1 += d2 * (float)(qs[qb + ll] >> 4) * xh - mm2 * xh;
+                }
+                is += 2;
+            }
+            facc += a0 + a1;
+        }
     }
-    if (acc == 0xFFFFFFFFu) { out[g] = 1.0f; }   // keep the loop alive
+    if (acc == 0xFFFFFFFFu) { out[g] = 1.0f + facc * 0.0f; }
+}
+
+// ── sectioned q4_K GEMV: one dispatch for q, k and v ────────────────────────
+// Every dispatch in a batch pays a fixed ramp that is larger than the streaming
+// time of a decode-sized matvec (measured: 30 us of ramp against ~31 us of
+// streaming for a 5.3 MB projection), so the projection count per layer, not the
+// kernel body, is what decode's 39 GB/s is made of. Sections share x and cols and
+// write disjoint outputs, so they can ride in one grid: tg.x = row, tg.y = section.
+kernel void gemv_q4_k_secs(
+    device const uchar  *w_base   [[buffer(0)]],   // whole weight buffer, bound at 0
+    device const float  *x        [[buffer(1)]],
+    device float        *y        [[buffer(2)]],   // whole act buffer, bound at 0
+    constant uint       &cols     [[buffer(3)]],
+    constant uint       *secs     [[buffer(4)]],   // per section: w_off, y_off, rows
+    constant ulong      &wbase    [[buffer(5)]],   // 64-bit base, so >4 GiB models don't truncate
+    uint2 tg                          [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_index_in_simdgroup]]
+) {
+    uint s = tg.y;
+    uint w_off = secs[s * 3 + 0];
+    uint y_off = secs[s * 3 + 1];
+    uint rows  = secs[s * 3 + 2];
+    uint row   = tg.x;
+    if (row >= rows) { return; }
+
+    uint nb = cols / 256;
+    device const uchar *rowp = w_base + wbase + (size_t)w_off + (size_t)row * nb * 144;
+    float sum = 0.0f;
+    for (uint b = lane; b < nb; b += 32) {
+        float d = float(read_f16(rowp, b * 144));
+        float dmin = float(read_f16(rowp, b * 144 + 2));
+        device const uchar *scales = rowp + b * 144 + 4;
+        device const uchar *qs = rowp + b * 144 + 16;
+        float acc = 0.0f;
+        uint is = 0;
+        for (uint j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, is + 0, &sc1, &m1);
+            uint8_t sc2b, m2b;
+            q4k_scale_min(scales, is + 1, &sc2b, &m2b);
+            sc2 = sc2b; m2 = m2b;
+            float d1 = d * (float)sc1;
+            float mm1 = dmin * (float)m1;
+            float d2 = d * (float)sc2;
+            float mm2 = dmin * (float)m2;
+            uint qb = j / 2;
+            uint xb = b * 256;
+            for (uint l = 0; l < 32; ++l) {
+                acc += d1 * (float)(qs[qb + l] & 0x0F) * x[xb + j + l] - mm1 * x[xb + j + l];
+                acc += d2 * (float)(qs[qb + l] >> 4) * x[xb + j + 32 + l] - mm2 * x[xb + j + 32 + l];
+            }
+            is += 2;
+        }
+        sum += acc;
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) { y[(y_off >> 2) + row] = sum; }
 }

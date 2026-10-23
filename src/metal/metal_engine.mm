@@ -29,6 +29,7 @@ struct MetalContext {
     // G2: GGUF dequant-dot GEMV kernels.
     id<MTLComputePipelineState> pso_gemv_q8_0;
     id<MTLComputePipelineState> pso_gemv_q4_0;
+    id<MTLComputePipelineState> pso_gemv_q4_k_secs;
     id<MTLComputePipelineState> pso_bw_probe_q4k;
     id<MTLComputePipelineState> pso_gemv_q4_k_v4;
     bool pso_gemv_q4_k_v4_live;
@@ -294,6 +295,7 @@ void* sofuu_metal_init(void) {
             // 107/50 GB/s compact/5G vs vec4 46/37 — but the vec4 WINS the
             // single-row shape as the 12.4 t/s serial receipt showed):
             // batched pass GEMVs = byte-lane b4c, single-row = vec4 c2.
+            ctx->pso_gemv_q4_k_secs = load_pso(@"gemv_q4_k_secs");
             ctx->pso_bw_probe_q4k = load_pso(@"bw_probe_q4k");
             ctx->pso_gemv_q4_k_v4 = load_pso(@"gemv_q4_k_v4");
             ctx->pso_gemv_q4_k_v4_live = ctx->pso_gemv_q4_k_v4 != nil;
@@ -3249,7 +3251,7 @@ static bool g_cap_active = false;
 // weight buffer using the same 144-byte block pattern the q4_K GEMV walks, at a
 // caller-chosen thread count and dispatch count inside ONE commit.
 extern "C" float sofuu_metal_bw_probe(void* ctx_ptr, void* w_buf_ptr, size_t nbytes,
-                                      size_t threads, size_t iters) {
+                                      size_t threads, size_t iters, size_t lane_count, size_t tgsz, size_t mode, size_t slice_blocks) {
     if (!ctx_ptr || !w_buf_ptr || nbytes == 0 || iters == 0 || threads == 0) return 0.0f;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->pso_bw_probe_q4k == nil) { fprintf(stderr, "[bw-probe] pso nil\n"); return 0.0f; }
@@ -3262,11 +3264,22 @@ extern "C" float sofuu_metal_bw_probe(void* ctx_ptr, void* w_buf_ptr, size_t nby
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:0];
     [ctx->batch_enc setBuffer:obuf offset:0 atIndex:1];
     [ctx->batch_enc setBytes:&nb length:sizeof(uint) atIndex:2];
-    size_t tpt = threads < 1024 ? threads : 1024;      // hardware max per threadgroup
+    uint lanes = lane_count;
+    [ctx->batch_enc setBytes:&lanes length:sizeof(uint) atIndex:3];
+    uint sl = (uint)(slice_blocks ? slice_blocks : nb);
+    uint db = sl;   // stride must equal the slice, or dispatches overlap and hit cache
+    [ctx->batch_enc setBytes:&sl length:sizeof(uint) atIndex:6];
+    uint md = (uint)mode;
+    [ctx->batch_enc setBytes:&md length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:5];   // x stands in for w
+    size_t tpt = tgsz ? tgsz : (threads < 1024 ? threads : 1024);
+    if (tpt > 1024) tpt = 1024;
     size_t ntgs = (threads + tpt - 1) / tpt;           // round up: never launch fewer
     MTLSize tg = MTLSizeMake(tpt, 1, 1);
     MTLSize grid = MTLSizeMake(ntgs, 1, 1);
     for (size_t it = 0; it < iters; ++it) {
+        uint start = (uint)((db ? (it * db) : 0) % (nb ? nb : 1));
+        [ctx->batch_enc setBytes:&start length:sizeof(uint) atIndex:7];
         [ctx->batch_enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
     }
     auto t0 = std::chrono::steady_clock::now();
@@ -3275,7 +3288,42 @@ extern "C" float sofuu_metal_bw_probe(void* ctx_ptr, void* w_buf_ptr, size_t nby
     if (!ok) { fprintf(stderr, "[bw-probe] end failed\n"); return 0.0f; }
     double secs = std::chrono::duration<double>(t1 - t0).count();
     if (secs <= 0.0) return 0.0f;
-    return (float)((double)nbytes * (double)iters / 1e9 / secs);
+    return (float)((double)sl * 144.0 * (double)iters / 1e9 / secs);
+}
+
+
+// One dispatch per group of independent projections (q/k/v, gate/up). secs is a
+// host array of {w_off, y_off, rows} triples, passed by value.
+extern "C" int sofuu_metal_batch_gguf_gemv_q4k_secs(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_base,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr,
+    size_t cols,
+    const uint32_t* secs, size_t n_sec
+) {
+    if (!ctx_ptr || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || ctx->pso_gemv_q4_k_secs == nil) return 0;
+    if (cols == 0 || cols % 256 != 0 || !secs || n_sec == 0 || n_sec > 8) return 0;
+    uint32_t max_rows = 0;
+    for (size_t s = 0; s < n_sec; ++s) {
+        if (secs[s * 3 + 2] > max_rows) max_rows = secs[s * 3 + 2];
+    }
+    if (max_rows == 0) return 0;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_secs];
+    uint c = (uint)cols;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:secs length:3 * sizeof(uint32_t) * n_sec atIndex:4];
+    unsigned long long wb = (unsigned long long)w_base;
+    [ctx->batch_enc setBytes:&wb length:sizeof(unsigned long long) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(max_rows, n_sec, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
 }
 
 int sofuu_metal_batch_open(void* ctx_ptr) {

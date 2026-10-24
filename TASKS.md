@@ -4105,4 +4105,6 @@ what code reading suggested:
 - **Receipts:** live `sofuu tools list`, `mcp test` (rc 0 on a real server),
   `mcp add/remove`, `policy check/why`, and `doctor` / `doctor --json` all
   green on the release binary; no Rust test count changed (cli_protocols has
-  no unit surface — the commands are their own receipt).
+  no unit surface — the commands are their own receipt). Final release binary
+  **4,966,936 B** stripped (the doctor JSON fix landed after phase 6a's
+  4,966,944 B measurement); `bc-check` still 8/8.

@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test protocol-test c-only size-check bc-check cargo-build \
+.PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -199,6 +199,13 @@ protocol-test: $(TARGET)
 	@if [ ! -x tests/protocol_conformance_run.sh ]; then \
 		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
 	else SOFUU=$(TARGET) tests/protocol_conformance_run.sh; fi
+
+# H1–H3 acceptance: drives sofuu.serve.createHandler() with a fake stream
+# (no model, no sockets) plus a doc↔code route check.
+serve-test: $(TARGET)
+	@if [ ! -x tests/serve_test_run.sh ]; then \
+		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
+	else SOFUU=$(TARGET) tests/serve_test_run.sh; fi
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).

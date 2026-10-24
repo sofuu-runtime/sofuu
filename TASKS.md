@@ -3991,3 +3991,118 @@ what code reading suggested:
   checks, 8 T3 checks), battery **289 PASS / 0 FAIL** (schema-guard check
   proves execute is never reached), chat smoke 4/4, `rt::fs` suite green.
   Release binary 4,923,192 B stripped (cap 5,242,880).
+
+## 2026-10-24 — workstream 6 phase 5b: tool belt (T4) + MCP HTTP transport (M2)
+
+- **T4 — `apply_patch`.** Codex patch grammar (Add/Update/Delete File with
+  `@@` hunks) as one atomic plan-then-commit: every hunk is validated and the
+  assembled result syntax-gated before a byte is written, so a half-applied
+  patch cannot exist. It is in the inventory, the agent's edit-tool diff
+  forwarding and the ledger invalidation.
+- **T4 — stateful `code_eval`.** `session_id` (or the run's hidden scope)
+  keeps one realm across calls; `persist:true` keeps a named session after
+  the run, `reset:true` closes it. `endRunScope` tears run-scoped realms down
+  in `finish()` and on the error path.
+- **T4 — result spill.** A capped tool result spills to
+  `$TMPDIR/sofuu-tool-results/<runId>/<step>.txt` (0600, via the new
+  `sofuu.fs.chmod`); the model gets the path in-band (`spill_path` in the
+  event meta), so a 200 KB log is recoverable instead of "re-call narrower".
+- **T4 — per-run todos.** `todo_write` writes
+  `__sofuu_todos:<runId>`; a run that never calls it no longer inherits the
+  previous checklist.
+- **M2 — Streamable HTTP.** `sofuu.mcp.connect({url, transport:'http'|'auto'})`
+  POSTs JSON-RPC, carries `Mcp-Session-Id`, reads JSON or SSE bodies
+  (for-await over `Response.body`), answers server pings and `roots/list`,
+  DELETEs the session on disconnect, and refuses legacy HTTP+SSE with a typed
+  `E_TRANSPORT`. stdio stays the default.
+- **Receipts:** release battery **297 PASS / 0 FAIL**; conformance 0 failures /
+  0 known gaps; `bc-check` 7/7; release binary 4,983,664 B stripped (cap
+  5,242,880).
+
+## 2026-10-24 — workstream 6 phase 5c: MCP server conformance (M3) + funnel server (M4)
+
+- **M3 — lifecycle.** `initialize` negotiates the client's version
+  (`2025-06-18` or `2024-11-05`) and advertises only the capabilities the
+  server has; `ping` answers `{}`. The old hardcoded `2024-11-05` reply is
+  gone.
+- **M3 — inventory.** `tools/list`, `resources/list` and `prompts/list`
+  paginate (50/page, `nextCursor` round-trip); `resources/read` and
+  `prompts/get` route to their handlers. `server.resource(uri, opts, handler)`,
+  `server.prompt(name, opts, handler)` and `server.stop()` join
+  `server.tool/start`.
+- **M3 — results.** A throwing/rejecting handler answers an in-band
+  `{content, isError:true}` result instead of `-32603`; object results carry
+  `structuredContent` with the text mirror. A tool registered after the first
+  `tools/list` emits `notifications/tools/list_changed`, so clients refresh
+  instead of serving a stale inventory. Client-side `ping` is no longer
+  wrapped into `tools/call`.
+- **M4 — funnel.** `sofuu.mcp.serve()` is wrapped to stamp a handle and
+  expose `toJSON()`; `serverTool({name})` registers an already-registered
+  HOST tool by name (a JSON caller cannot pass a JS handler), with typed
+  errors for an unknown name/handle; `serverStart` / `serverStop` drive the
+  lifecycle. The documented funnel contract grows to **51** methods.
+- **Receipts:** conformance **99 PASS / 0 failures** (15 new M3 checks through
+  a real stdio child: negotiation, ping, 63-tool pagination, bare-name call,
+  in-band `isError` → typed `E_TOOL`, `structuredContent`, resources, prompts,
+  `list_changed` + 64-tool refresh); capi **54/54**; release binary
+  4,983,664 B stripped.
+
+## 2026-10-24 — workstream 6 phase 6a: the HTTP surface (H1–H3)
+
+- **H1 — `src/js/serve.js`.** The ~400-line inline handler in `main.rs` is now
+  the eighth shipped driver. `sofuu serve` boots it with a config object and
+  the tests drive `sofuu.serve.createHandler()` directly with a fake stream,
+  so the route surface is covered without a model file.
+- **H1 — real OpenAI semantics.** Chat goes through `sofuu.ai.stream`
+  (`provider:'local'`): the native ChatML template (with tools rendered in the
+  system turn via the Hermes protocol) instead of `role: content`
+  concatenation. Responses carry real `usage` (engine token counts, estimator
+  fallback), `finish_reason` `stop|length|tool_calls`, stop sequences (buffered
+  so a sequence is never split across chunks, surrogate-safe), `tool_calls` in
+  both JSON and SSE, `stream_options.include_usage`, and OpenAI error bodies
+  `{error:{message,type,param,code}}` with 400/401/403/404/500/503. A model
+  id from `/v1/models` resolves to its path; an unknown id is `404
+  model_not_found` instead of an engine error about a file named like the id.
+- **H2.** `POST /v1/embeddings` over the local embedder (brain-space aware),
+  OpenAI shape, batch cap 64 × 8192 tokens; `GET /health` is public and
+  count-free; `/v1/models` lists stable ids (`--model-id`, default basename).
+- **H3.** `POST /v1/sessions` + `GET /v1/sessions(/:id/turns)` (process-local;
+  a chat request naming `session_id` records its turn), `POST /v1/agent/runs`
+  (SSE step events by default, JSON with `stream:false`), `GET /v1/tools`,
+  `POST /v1/tools/:name/call` under `http.request` + `tool.run` policy.
+- **Policy.** `policy.http.deny` path prefixes are evaluated per authenticated
+  request (rule `R7.6/http.deny`); `policy.http.auth:"none"` is the explicit,
+  loud opt-out from bearer auth (default stays bearer).
+- **Receipts:** `tests/serve_test_run.sh` **31/31**; release conformance
+  **99 PASS / 0 failures / 0 known gaps**; release battery **297 PASS / 0
+  FAIL**; capi **54/54**; `rt::policy` **12/12**; `bc-check` 8/8; release
+  binary **4,966,944 B** stripped (cap 5,242,880).
+
+## 2026-10-24 — workstream 6 phase 6b: developer tooling & docs (D1–D3)
+
+- **D1 — CLI.** `sofuu tools list [--json] [--policy <file>]` prints the
+  inventory with policy verdicts (a denied tool shows `denied`, an approval
+  tool shows `ask`, `SOFUU_NO_SHELL` hides bash). `sofuu mcp list|test|add|
+  remove`: `test` performs a real handshake and reports protocol version +
+  tool/resource/prompt counts with an honest exit code; `add`/`remove`
+  validate before writing and replace `~/.sofuu/mcp.json` atomically
+  (tmp → rename, 0600), refusing to overwrite a corrupt file. `sofuu policy
+  check <file>` evaluates a fixed probe set and prints every decision + rule
+  id; `sofuu policy why <op> key=value…` explains one decision.
+- **D2 — doctor.** New `protocols / sandbox` section runs the same probes the
+  tests use: reader jail (inside read, symlink escape blocked, absolute escape
+  blocked), sandbox fuel bound, policy round-trip (tools.deny), MCP config
+  parse, tool inventory, serve-route registration. `doctor --json` now emits
+  the **whole** report as structured entries (the flag used to be parsed and
+  discarded), with `ok`/`failures`/`jail` and per-section messages.
+- **D3 — docs.** New `docs/MCP.md` (client/server, transports, config,
+  allowlist, result mapping, host bridge), `docs/TOOLS.md` (contract, belt,
+  validation, approval/policy, spill, writing a tool), `docs/HTTP-SERVER.md`
+  (every route, auth, OpenAI compatibility matrix, policy, sessions);
+  `OVERVIEW.md` transport/tool claims, `EMBEDDING.md` funnel + MCP server
+  surfaces, architecture §E and the driver list updated. Docs stay local-only
+  per the first-party policy.
+- **Receipts:** live `sofuu tools list`, `mcp test` (rc 0 on a real server),
+  `mcp add/remove`, `policy check/why`, and `doctor` / `doctor --json` all
+  green on the release binary; no Rust test count changed (cli_protocols has
+  no unit surface — the commands are their own receipt).

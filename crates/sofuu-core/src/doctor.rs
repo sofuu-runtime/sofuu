@@ -8,29 +8,83 @@
 // real and prints what it finds, with a non-zero exit when a hard
 // dependency (QTSQ) is missing.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use crate::chat::ChatConfig;
 use sofuu_core::ml::alloc::policy;
 
+/* D2 (workstream protocols): `--json` emits the WHOLE report as structured
+ * entries instead of dropping the flag. The text helpers are the single
+ * renderer, so the JSON and the human output can never diverge. */
+thread_local! {
+    static REPORT: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_SECTION: RefCell<String> = const { RefCell::new(String::new()) };
+    static JSON_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn emit(level: &str, msg: &str) {
+    if !JSON_MODE.with(|j| j.get()) {
+        let mark = match level {
+            "ok" => "\x1b[32m  ✓\x1b[0m",
+            "warn" => "\x1b[33m  ⚠\x1b[0m",
+            "bad" => "\x1b[31m  ✗\x1b[0m",
+            _ => "\x1b[90m  ·\x1b[0m",
+        };
+        println!("{mark} {msg}");
+    }
+    let section = CURRENT_SECTION.with(|s| s.borrow().clone());
+    REPORT.with(|r| {
+        r.borrow_mut().push(serde_json::json!({
+            "section": section,
+            "level": level,
+            "message": msg,
+        }))
+    });
+}
+
 fn ok(msg: &str) {
-    println!("\x1b[32m  ✓\x1b[0m {msg}");
+    emit("ok", msg);
 }
 
 fn warn(msg: &str) {
-    println!("\x1b[33m  ⚠\x1b[0m {msg}");
+    emit("warn", msg);
 }
 
 fn bad(msg: &str) {
-    println!("\x1b[31m  ✗\x1b[0m {msg}");
+    emit("bad", msg);
 }
 
 fn info(msg: &str) {
-    println!("\x1b[90m  ·\x1b[0m {msg}");
+    emit("info", msg);
 }
 
 fn section(title: &str) {
-    println!("\n\x1b[1m{title}\x1b[0m");
+    if !JSON_MODE.with(|j| j.get()) {
+        println!("\n\x1b[1m{title}\x1b[0m");
+    }
+    CURRENT_SECTION.with(|s| *s.borrow_mut() = title.to_string());
+}
+
+/// Strip ANSI SGR sequences (eval_repl's display colors every value).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            if it.peek() == Some(&'[') {
+                it.next();
+                while let Some(n) = it.next() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Byte size of a file, or None when it does not exist.
@@ -70,6 +124,7 @@ fn brain_path(cfg: &ChatConfig) -> PathBuf {
 /// Run the health check. Returns the process exit code.
 pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     let json = args.iter().any(|a| a == "--json");
+    JSON_MODE.with(|j| j.set(json));
     let mut cfg = ChatConfig::load();
     let mut model_override = None;
     for i in 0..args.len() {
@@ -103,7 +158,23 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     }
     let mut failures = 0usize;
 
-    println!("\x1b[1msofuu doctor\x1b[0m — v{} · {}", crate::VERSION, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()));
+    let header = format!(
+        "sofuu doctor — v{} · {}",
+        crate::VERSION,
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into())
+    );
+    if json {
+        /* The JSON document must be the only thing on stdout. */
+        REPORT.with(|r| {
+            r.borrow_mut().push(serde_json::json!({
+                "section": "",
+                "level": "header",
+                "message": header,
+            }))
+        });
+    } else {
+        println!("\x1b[1msofuu doctor\x1b[0m — v{} · {}", crate::VERSION, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()));
+    }
 
     // ── 1. QTSQ + brain (the silent-failure pair) ──────────────────
     section("QTSQ / brain");
@@ -561,13 +632,169 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     section("runtime");
     ok(&format!("engine initialized (QJS + libuv + {} embed spaces)", 4));
 
+    // ── 6. Protocols, sandbox, policy (D2) ─────────────────────────
+    section("protocols / sandbox");
+    let jail_ok = protocol_probes(rt, &mut failures);
+
     // ── verdict ─────────────────────────────────────────────────────
     section("verdict");
     if failures == 0 {
-        println!("\x1b[32m  healthy\x1b[0m — brain persistence and caps resolution both operational");
+        ok("healthy — brain persistence, caps resolution and the protocol floors are operational");
     } else {
-        println!("\x1b[31m  {failures} problem(s) found\x1b[0m — see the ⚠/✗ lines above");
+        bad(&format!("{failures} problem(s) found — see the ⚠/✗ lines above"));
     }
-    let _ = json;
+    if json {
+        let report = serde_json::json!({
+            "version": crate::VERSION,
+            "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()),
+            "ok": failures == 0,
+            "failures": failures,
+            "jail": jail_ok,
+            "entries": REPORT.with(|r| r.borrow().clone()),
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+    }
     if failures == 0 { 0 } else { 1 }
+}
+
+/// D2: the probes the protocol tests use, run in doctor so "doctor green"
+/// and "tests green" cannot diverge. Returns whether the reader jail held.
+fn protocol_probes(rt: &sofuu_ffi::SofuuRuntime, failures: &mut usize) -> bool {
+    let dir = std::env::temp_dir().join(format!("sofuu-doctor-jail-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("sofuu-doctor-outside-{}.txt", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("inside.txt"), "INSIDE-OK\n");
+    let _ = std::fs::write(&outside, "OUTSIDE-SECRET\n");
+    #[cfg(unix)]
+    let link = std::os::unix::fs::symlink(&outside, dir.join("escape"));
+    #[cfg(not(unix))]
+    let link: std::io::Result<()> =
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "no symlink support"));
+
+    let esc = |p: &Path| p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"(async function () {{
+  var out = {{}};
+  try {{ sofuu.fs.setRoot("{root}"); }} catch (e) {{ out.setRootError = String((e && e.message) || e); }}
+  try {{ var t = await sofuu.fs.readFile('inside.txt', 'utf8'); out.inside = String(t).indexOf('INSIDE-OK') >= 0; }}
+  catch (e) {{ out.insideError = String((e && e.message) || e); }}
+  try {{ await sofuu.fs.readFile('escape', 'utf8'); out.escapeRead = true; }} catch (e) {{ out.escapeBlocked = true; }}
+  try {{ await sofuu.fs.readFile("{outside}", 'utf8'); out.absRead = true; }} catch (e) {{ out.absBlocked = true; }}
+  try {{ sofuu.fs.clearRoot(); }} catch (e) {{}}
+  try {{
+    var sb = sofuu.sandbox.run('while(true){{}}', {{ fuel: 20000, timeoutMs: 2000 }});
+    out.sandboxBounded = !!(sb && sb.success === false);
+    out.sandboxErr = String((sb && (sb.errorType || sb.error)) || '');
+  }} catch (e) {{ out.sandboxError = String((e && e.message) || e); }}
+  try {{
+    sofuu.policy.set({{ tools: {{ deny: ['bash'] }} }});
+    var d = JSON.parse(sofuu.policy.evaluate({{ op: 'tool.run', tool: 'bash' }}));
+    var a = JSON.parse(sofuu.policy.evaluate({{ op: 'tool.run', tool: 'read_file' }}));
+    sofuu.policy.clear();
+    out.policyDeny = d.decision === 'deny' && d.rule === 'R7.6/tools.deny';
+    out.policyAllow = a.decision !== 'deny';
+  }} catch (e) {{ out.policyError = String((e && e.message) || e); }}
+  try {{
+    var cfg = await sofuu.mcp.loadConfig();
+    out.mcpOk = cfg.ok !== false;
+    out.mcpPath = String(cfg.path || '');
+    out.mcpServers = (cfg.servers || []).length;
+    out.mcpError = String(cfg.error || '');
+  }} catch (e) {{ out.mcpError = String((e && e.message) || e); }}
+  out.toolsList = typeof (sofuu.tools && sofuu.tools.list) === 'function';
+  out.serveRoutes = !!(sofuu.serve && typeof sofuu.serve.start === 'function' &&
+    typeof sofuu.serve.createHandler === 'function');
+  globalThis.__sofuu_doctor_proto = JSON.stringify(out);
+}})();"#,
+        root = esc(&dir),
+        outside = esc(&outside)
+    );
+
+    if rt.eval_string(&script, "<doctor-proto>") != 0 {
+        bad("protocol probe script failed to evaluate");
+        *failures += 1;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+        return false;
+    }
+    rt.run_jobs();
+    let raw = rt.eval_repl("globalThis.__sofuu_doctor_proto || ''").unwrap_or_default();
+    let clean = strip_ansi(&raw);
+    let clean = clean.trim().trim_matches('\'');
+    let v: serde_json::Value = serde_json::from_str(clean).unwrap_or_else(|_| serde_json::json!({}));
+
+    let inside = v.get("inside").and_then(|b| b.as_bool()) == Some(true);
+    let escape_blocked = v.get("escapeBlocked").and_then(|b| b.as_bool()) == Some(true);
+    let abs_blocked = v.get("absBlocked").and_then(|b| b.as_bool()) == Some(true);
+    let jail_ok = inside && escape_blocked && abs_blocked;
+    if jail_ok {
+        ok("reader jail: inside read OK · symlink escape blocked · absolute escape blocked");
+    } else {
+        let mut why = Vec::new();
+        if !inside {
+            why.push("inside.txt unreadable".to_string());
+        }
+        if !escape_blocked {
+            why.push("symlink read escaped".to_string());
+        }
+        if !abs_blocked {
+            why.push("absolute read escaped".to_string());
+        }
+        bad(&format!("reader jail FAILED: {}", why.join(", ")));
+        *failures += 1;
+    }
+    if link.is_err() {
+        info("symlink probe skipped: this platform cannot create symlinks here");
+    }
+
+    if v.get("sandboxBounded").and_then(|b| b.as_bool()) == Some(true) {
+        ok(&format!(
+            "sandbox bounded: an infinite loop stopped at its fuel (err {})",
+            v.get("sandboxErr").and_then(|s| s.as_str()).unwrap_or("?")
+        ));
+    } else {
+        bad("sandbox bounds FAILED: an infinite loop was not stopped by fuel/timeout");
+        *failures += 1;
+    }
+
+    let pol_deny = v.get("policyDeny").and_then(|b| b.as_bool()) == Some(true);
+    let pol_allow = v.get("policyAllow").and_then(|b| b.as_bool()) == Some(true);
+    if pol_deny && pol_allow {
+        ok("policy round-trip: tools.deny blocks bash and leaves read_file allowed (R7.6/tools.deny)");
+    } else {
+        bad("policy round-trip FAILED: the evaluator did not apply tools.deny");
+        *failures += 1;
+    }
+
+    if v.get("mcpOk").and_then(|b| b.as_bool()) == Some(true) {
+        ok(&format!(
+            "MCP config parsed: {} ({} server(s))",
+            v.get("mcpPath").and_then(|s| s.as_str()).unwrap_or("(no path)"),
+            v.get("mcpServers").and_then(|n| n.as_i64()).unwrap_or(0)
+        ));
+    } else {
+        bad(&format!(
+            "MCP config FAILED: {}",
+            v.get("mcpError").and_then(|s| s.as_str()).unwrap_or("unreadable")
+        ));
+        *failures += 1;
+    }
+
+    if v.get("toolsList").and_then(|b| b.as_bool()) == Some(true) {
+        ok("tool inventory reachable (sofuu.tools.list)");
+    } else {
+        bad("tool inventory MISSING (sofuu.tools.list is not a function)");
+        *failures += 1;
+    }
+    if v.get("serveRoutes").and_then(|b| b.as_bool()) == Some(true) {
+        ok("serve routes registered (sofuu.serve.start/createHandler)");
+    } else {
+        bad("serve routes MISSING (sofuu.serve.start/createHandler not registered)");
+        *failures += 1;
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&outside);
+    jail_ok
 }

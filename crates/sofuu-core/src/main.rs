@@ -42,6 +42,7 @@ macro_rules! require_qtsq {
 
 
 mod chat;
+mod cli_protocols;
 mod doctor;
 mod output_archive;
 mod session;
@@ -168,7 +169,7 @@ fn take_policy_arg(args: &[String]) -> (Option<String>, Vec<String>) {
 /// Load a policy JSON file and install it. Fail closed: an unreadable,
 /// non-JSON or rejected policy aborts the command instead of running with
 /// defaults.
-fn apply_policy_file(rt: &SofuuRuntime, path: &str) -> Result<(), String> {
+pub(crate) fn apply_policy_file(rt: &SofuuRuntime, path: &str) -> Result<(), String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("--policy {path}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("--policy {path}: not valid JSON: {e}"))?;
@@ -1348,6 +1349,23 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+        "tools" | "policy" | "mcp" => {
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rc = if cmd == "tools" {
+                cli_protocols::tools(&rt, &args)
+            } else if cmd == "policy" {
+                cli_protocols::policy(&rt, &args)
+            } else {
+                cli_protocols::mcp(&rt, &args)
+            };
+            if rc == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "infer" => {
             // Pool resilience smoke test (no model needed): drives the three

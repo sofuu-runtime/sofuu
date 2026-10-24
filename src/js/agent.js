@@ -87,7 +87,7 @@
   /* `remember` writes ONLY the sofuu-marked section of AGENTS.md — strictly
    * less reach than edit_file (any jailed file), so it rides the edit
    * profile; plan mode (no writes of any kind) still blocks it. */
-  var EDIT_TOOLS = { write_file: 1, edit_file: 1, remember: 1 };
+  var EDIT_TOOLS = { write_file: 1, edit_file: 1, apply_patch: 1, remember: 1 };
   /* Safe read-only / deterministic sandbox / child tools for concurrent execution (Phase 3). */
   var PARALLEL_TOOLS = {
     read_file: 1, grep: 1, glob: 1, list_dir: 1,
@@ -2764,6 +2764,8 @@
         catch (eMl) {}
       }
       if (opts.logs) logRun(res, task, wall);
+      /* T4: close code_eval realms and drop the per-run todo namespace. */
+      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
@@ -3627,6 +3629,18 @@
          * Rides every tool_result event so host UIs and the trace can tell
          * a local tool from an MCP server's without parsing the name. */
         var toolSource = (toolset && toolset.sources && toolset.sources[name]) || 'builtin';
+        /* T4 (2026-10-23): per-run scope for tools that must not share
+         * state across concurrent runs (todo_write, code_eval sessions).
+         * A hidden __scope arg rides the EXECUTE call only, never the wire
+         * transcript or the tool event. */
+        var execArgs = args;
+        if (name === 'todo_write' || name === 'code_eval') {
+          execArgs = {};
+          for (var ea in (args || {})) {
+            if (Object.prototype.hasOwnProperty.call(args, ea)) execArgs[ea] = args[ea];
+          }
+          execArgs.__scope = String(runId);
+        }
         toolHist[name] = (toolHist[name] || 0) + 1;
         emit('tool', { name: name, args: clip(JSON.stringify(args || {}), 200) });
         /* T3 (2026-10-23): validate against the declared schema BEFORE any
@@ -3866,7 +3880,7 @@
                     state.wallOverrun = true;
                     reject(new Error('tool ' + name + ' overrun the wall budget'));
                   }, wallLeft);
-                  Promise.resolve(fn(args)).then(
+                  Promise.resolve(fn(execArgs)).then(
                     function (v) {
                       if (settled) return;
                       settled = true;
@@ -3883,10 +3897,10 @@
               } else {
                 /* Wall already spent — run plain; the loop-top breach
                  * check stops the run before the next LLM round. */
-                result = await fn(args);
+                result = await fn(execArgs);
               }
             } else {
-              result = await withTimeout(withCancelGuard(state, Promise.resolve(fn(args))), opts.toolTimeoutMs || d.toolTimeoutMs,
+              result = await withTimeout(withCancelGuard(state, Promise.resolve(fn(execArgs))), opts.toolTimeoutMs || d.toolTimeoutMs,
                                          'tool ' + name + ' timed out');
             }
           }
@@ -3926,6 +3940,27 @@
          * child already capped its own answer; no double truncation). */
         var cappedR = capToolResult(allocToolCap(), result);
         var toolTruncated = cappedR.text.length !== cappedR.chars;
+        /* T4 (2026-10-23): a truncated result is RECOVERABLE — the full text
+         * is spilled to $TMPDIR/sofuu-tool-results/<run>/<n>.txt (0600) and
+         * the path rides both the marker the model reads and the event, so a
+         * 200 KB log can be grepped instead of forcing a re-call. */
+        if (toolTruncated && !errored && typeof cappedR.text === 'string') {
+          try {
+            var spillTmp = '';
+            try {
+              spillTmp = (typeof process !== 'undefined' && process.env &&
+                (process.env.TMPDIR || process.env.TMP || process.env.TEMP)) || '';
+            } catch (eTmp) {}
+            if (!spillTmp) spillTmp = '/tmp';
+            var spillDir = String(spillTmp).replace(/\/+$/, '') + '/sofuu-tool-results/' + String(runId);
+            await sofuu.fs.mkdir(spillDir, { recursive: true });
+            var spillPath = spillDir + '/' + stepsTotal + '.txt';
+            await sofuu.fs.writeFile(spillPath, String(result));
+            try { await sofuu.fs.chmod(spillPath, 384); } catch (eCh) {}
+            cappedR.spill_path = spillPath;
+            cappedR.text += '\n[full result saved at ' + spillPath + ']';
+          } catch (eSpill) { /* spill is best-effort; the cap still holds */ }
+        }
         /* P1 token economy — reuse ledger (2026-10-15): an identical
          * re-call of the same tool on the same target enters the model
          * transcript as a marker. Strict equality (fnv1a + length) on
@@ -3964,7 +3999,7 @@
             ledgerClearAll();
           } else if (name === 'write_file' || name === 'edit_file' || mutators[name]) {
             ledgerInvalidateTarget(mlTarget(args));
-          } else if (mutatorsAll[name]) {
+          } else if (name === 'apply_patch' || mutatorsAll[name]) {
             ledgerClearAll();
           }
         }
@@ -3983,7 +4018,7 @@
          * a stale diff can never attach to the wrong event; failures carry
          * no diff (the error line says what happened instead). */
         var stashedDiff = null;
-        if ((name === 'edit_file' || name === 'write_file') && !errored) {
+        if ((name === 'edit_file' || name === 'write_file' || name === 'apply_patch') && !errored) {
           try {
             var ld = globalThis.__sofuu_last_diff;
             if (ld && ld.name === name && typeof ld.diff === 'string' && ld.diff.length > 0) {
@@ -3998,6 +4033,7 @@
                           duration_ms: Date.now() - toolStartedAt };
         if (!toolOk) trPayload.error_code = toolErrorCode || 'E_TOOL';
         if (toolTruncated) trPayload.truncated = true;
+        if (cappedR.spill_path) trPayload.spill_path = cappedR.spill_path;
         if (toolMeta) trPayload.meta = toolMeta;
         if (toolData !== null && toolData !== undefined) {
           try { trPayload.data_chars = JSON.stringify(toolData).length; }
@@ -4011,7 +4047,8 @@
         if (name === 'todo_write') {
           sawTodo = true;
           try {
-            var todosArr = JSON.parse(String(globalThis.__sofuu_todos || '[]'));
+            var todoKey = '__sofuu_todos:' + String(runId).replace(/[^A-Za-z0-9_-]/g, '');
+            var todosArr = JSON.parse(String(globalThis[todoKey] || '[]'));
             if (Array.isArray(todosArr)) trPayload.todos = todosArr;
           } catch (eT) {}
         }
@@ -5077,6 +5114,7 @@
         } catch (e) {}
       }
     } catch (e) {
+      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;

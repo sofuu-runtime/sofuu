@@ -762,7 +762,7 @@
   /* 'edit' profile: read-only plus jailed local edits pass; everything
    * else (bash, MCP) is blocked. In 'prompt' these still ask: they are
    * NOT in AUTO_PASS_TOOLS. */
-  var EDIT_TOOLS = { write_file: 1, edit_file: 1 };
+  var EDIT_TOOLS = { write_file: 1, edit_file: 1, apply_patch: 1 };
   function blockedTool(def, why) {
     return {
       name: def.name,

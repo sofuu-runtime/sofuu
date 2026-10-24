@@ -939,10 +939,201 @@
     },
   };
 
+  /* ── T4 (2026-10-23): apply_patch — Codex-style multi-file patch ──
+   * *** Begin Patch / Add File / Update File (@@ hunks) / Delete File /
+   * *** End Patch. Every operation is parsed and applied IN MEMORY first;
+   * any bad hunk or syntax rejection aborts before the first write, so a
+   * multi-file patch is atomic on the filesystem. Context lines must match
+   * exactly one place per hunk (whitespace-insensitive, same matcher as
+   * edit_file). One diff summary rides the tool event. */
+  function parseApplyPatch(text) {
+    var lines = String(text).replace(/\r\n/g, '\n').split('\n');
+    var i = 0;
+    while (i < lines.length && lines[i].trim() === '') i++;
+    if (!/^\*\*\* Begin Patch\s*$/.test(lines[i] || '')) {
+      throw new Error('apply_patch: missing "*** Begin Patch"');
+    }
+    i++;
+    var ops = [];
+    while (i < lines.length) {
+      var l = lines[i];
+      if (/^\*\*\* End Patch\s*$/.test(l)) return ops;
+      var mAdd = /^\*\*\* Add File: (.+)$/.exec(l);
+      var mDel = /^\*\*\* Delete File: (.+)$/.exec(l);
+      var mUpd = /^\*\*\* Update File: (.+)$/.exec(l);
+      if (mAdd) {
+        i++;
+        var content = [];
+        while (i < lines.length && !/^\*\*\* /.test(lines[i])) {
+          if (lines[i].charAt(0) !== '+') {
+            throw new Error('apply_patch: add-file lines must start with "+" (got "' + lines[i].slice(0, 40) + '")');
+          }
+          content.push(lines[i].slice(1));
+          i++;
+        }
+        ops.push({ kind: 'add', path: mAdd[1].trim(),
+                   content: content.join('\n') + (content.length ? '\n' : '') });
+        continue;
+      }
+      if (mDel) { i++; ops.push({ kind: 'delete', path: mDel[1].trim() }); continue; }
+      if (mUpd) {
+        i++;
+        var hunks = [], h = null;
+        while (i < lines.length && !/^\*\*\* /.test(lines[i])) {
+          var ln = lines[i];
+          if (/^@@/.test(ln)) {
+            if (h && (h.old.length || h.new.length)) hunks.push(h);
+            h = { header: ln, old: [], new: [] };
+            i++;
+            continue;
+          }
+          if (!h) { i++; continue; } /* preamble between the header and @@ */
+          var c = ln.charAt(0);
+          if (c === '-') h.old.push(ln.slice(1));
+          else if (c === '+') h.new.push(ln.slice(1));
+          else if (c === ' ' || ln === '') { h.old.push(ln.slice(1)); h.new.push(ln.slice(1)); }
+          else throw new Error('apply_patch: unexpected hunk line "' + ln.slice(0, 40) + '"');
+          i++;
+        }
+        if (h && (h.old.length || h.new.length)) hunks.push(h);
+        if (!hunks.length) throw new Error('apply_patch: update for ' + mUpd[1].trim() + ' has no hunks');
+        ops.push({ kind: 'update', path: mUpd[1].trim(), hunks: hunks });
+        continue;
+      }
+      if (l.trim() === '') { i++; continue; }
+      throw new Error('apply_patch: unexpected line "' + l.slice(0, 60) + '"');
+    }
+    throw new Error('apply_patch: missing "*** End Patch"');
+  }
+  function applyPatchHunks(text, hunks) {
+    var lines = String(text).split('\n');
+    for (var h = 0; h < hunks.length; h++) {
+      var want = hunks[h].old;
+      if (!want.length) {
+        throw new Error('apply_patch: hunk ' + (h + 1) + ' has no context; include surrounding lines');
+      }
+      var hits = [];
+      for (var st = 0; st + want.length <= lines.length; st++) {
+        var ok = true;
+        for (var k = 0; k < want.length; k++) {
+          if (normLine(lines[st + k]) !== normLine(want[k])) { ok = false; break; }
+        }
+        if (ok) hits.push(st);
+      }
+      if (hits.length !== 1) {
+        throw new Error('apply_patch: hunk ' + (h + 1) + ' context matched ' + hits.length +
+                        ' place' + (hits.length === 1 ? '' : 's') + ' (must be unique)');
+      }
+      lines.splice.apply(lines, [hits[0], want.length].concat(hunks[h].new));
+    }
+    return lines.join('\n');
+  }
+
+  TOOLS.apply_patch = {
+    name: 'apply_patch',
+    description: 'Apply a multi-file patch atomically. Format: "*** Begin Patch" then "*** Add File: path" (+lines), "*** Update File: path" with @@ hunks (context lines start with a space, removed with "-", added with "+"), or "*** Delete File: path", then "*** End Patch". Hunk context must be unique (quote enough lines). .js/.ts/.json results are syntax-checked; any failure rejects the WHOLE patch and nothing is written. Jailed to the project directory.',
+    parameters: {
+      type: 'object',
+      properties: {
+        patch: { type: 'string', description: 'The complete *** Begin Patch … *** End Patch text' },
+      },
+      required: ['patch'],
+    },
+    execute: async function (a) {
+      var text = (a && typeof a.patch === 'string') ? a.patch : '';
+      if (!text.trim()) throw new Error('apply_patch: patch text required');
+      var ops = parseApplyPatch(text);
+      if (!ops.length) throw new Error('apply_patch: no file operations in the patch');
+      var planned = [], i;
+      /* Plan phase: resolve every path, apply every hunk in memory, gate the
+       * syntax. Nothing touches disk until the whole patch is valid. */
+      for (i = 0; i < ops.length; i++) {
+        var op = ops[i];
+        var p = await mustBeInRoot(op.path);
+        if (op.kind === 'add') {
+          if (await sofuu.fs.exists(p)) {
+            throw new Error('apply_patch: add file already exists: ' + op.path);
+          }
+          var gateA = syntaxVerdict(op.content, p);
+          if (gateA && gateA.ok === false) {
+            throw new Error('apply_patch: syntax rejected ' + rel(p) +
+              (gateA.line > 0 ? ':' + gateA.line : '') + ': ' + gateA.error + ' — nothing was written');
+          }
+          planned.push({ kind: 'add', path: p, content: op.content });
+        } else if (op.kind === 'delete') {
+          var beforeD = await sofuu.fs.readFile(p, 'utf8');
+          planned.push({ kind: 'delete', path: p, before: beforeD });
+        } else {
+          var beforeU = await sofuu.fs.readFile(p, 'utf8');
+          var afterU = applyPatchHunks(beforeU, op.hunks);
+          try { syntaxGate(beforeU, afterU, p); } catch (eG) {
+            throw new Error(String(eG.message || eG).replace(/^edit_file:/, 'apply_patch:') + ' (nothing was written)');
+          }
+          planned.push({ kind: 'update', path: p, after: afterU, hunks: op.hunks.length });
+        }
+      }
+      /* Commit phase. */
+      var out = [], diffParts = [];
+      for (i = 0; i < planned.length; i++) {
+        var pl = planned[i];
+        if (pl.kind === 'add') {
+          await mkdirp(parentDir(pl.path));
+          await sofuu.fs.writeFile(pl.path, pl.content);
+          diffParts.push('+++ ' + rel(pl.path) + ' (new file, ' + pl.content.split('\n').length + ' lines)');
+          out.push('added ' + rel(pl.path));
+        } else if (pl.kind === 'update') {
+          await sofuu.fs.writeFile(pl.path, pl.after);
+          diffParts.push(buildWritePreview(rel(pl.path), pl.after));
+          out.push('updated ' + rel(pl.path) + ' (' + pl.hunks + ' hunk' + (pl.hunks === 1 ? '' : 's') + ')');
+        } else {
+          await sofuu.fs.rm(pl.path);
+          diffParts.push('--- ' + rel(pl.path) + ' (deleted)');
+          out.push('deleted ' + rel(pl.path));
+        }
+      }
+      setLastDiff('apply_patch', diffParts.join('\n\n'));
+      var res = 'apply_patch: ' + out.join('; ');
+      /* Post-edit context for the first updated/added file (T3.1 rider). */
+      for (i = 0; i < planned.length; i++) {
+        if (planned[i].kind === 'update') {
+          try { res += anchorRider(planned[i].after, 0, 2); } catch (eR) {}
+          break;
+        }
+      }
+      return res;
+    },
+  };
+
   /* code_eval — In-process deterministic JavaScript/TypeScript sandboxed execution.
    * Powered by sofuu.sandbox. Has zero-subprocess overhead (< 1ms startup),
    * strict instruction fuel limit (500k ops), 2000ms wall-clock deadline,
    * 16MB memory ceiling, captured console logs, and hermetic host isolation. */
+  /* T4 (2026-10-23): persistent sandbox realms for code_eval. Keyed by an
+   * explicit session_id or by the run scope, so two concurrent runs never
+   * share helpers. endRunScope() closes everything a run left behind. */
+  var CODE_SESSIONS = {};
+  function codeSessionKey(a) {
+    if (a && typeof a.session_id === 'string' && a.session_id) return 'id:' + a.session_id;
+    if (a && a.persist === true) {
+      var sc = (typeof a.__scope === 'string' && a.__scope) ? a.__scope : 'default';
+      return 'run:' + sc.replace(/[^A-Za-z0-9_-]/g, '');
+    }
+    return '';
+  }
+  sofuu.tools.endRunScope = function (scope) {
+    var sc = String(scope || '');
+    var prefix = 'run:' + sc.replace(/[^A-Za-z0-9_-]/g, '');
+    Object.keys(CODE_SESSIONS).forEach(function (k) {
+      if (k === prefix) {
+        try { CODE_SESSIONS[k].close(); } catch (e) {}
+        delete CODE_SESSIONS[k];
+      }
+    });
+    try {
+      delete globalThis['__sofuu_todos:' + sc.replace(/[^A-Za-z0-9_-]/g, '')];
+    } catch (e2) {}
+  };
+
   TOOLS.code_eval = {
     name: 'code_eval',
     description: 'Execute JavaScript or TypeScript code in a secure, deterministic in-process sandbox. Use this for math, data manipulation, algorithm verification, parsing, or testing logic. Code runs in < 1ms with captured console.log output. Host OS/filesystem/network APIs are completely disabled for safety.',
@@ -960,6 +1151,18 @@
         fuel_limit: {
           type: 'number',
           description: 'Optional instruction fuel limit (default 500000, max 5000000). Traps infinite loops deterministically.',
+        },
+        session_id: {
+          type: 'string',
+          description: 'Optional session name. Calls with the same id share one sandbox realm (helpers and globals persist).',
+        },
+        persist: {
+          type: 'boolean',
+          description: 'Keep one realm for this run even without a session_id (the default is a fresh realm per call).',
+        },
+        reset: {
+          type: 'boolean',
+          description: 'Drop the session realm before running this call.',
         },
       },
       required: ['code'],
@@ -980,13 +1183,31 @@
         throw new Error('code_eval: sofuu.sandbox runtime substrate not available');
       }
 
-      var res = sofuu.sandbox.run(code, {
-        fuel: fuel,
-        timeoutMs: timeout,
-        maxMemoryMB: 16,
-        captureConsole: true,
-        throwOnError: false,
-      });
+      var key = codeSessionKey(args);
+      var res;
+      if (key) {
+        if (args && args.reset === true && CODE_SESSIONS[key]) {
+          try { CODE_SESSIONS[key].close(); } catch (eRst) {}
+          delete CODE_SESSIONS[key];
+        }
+        var sess = CODE_SESSIONS[key];
+        if (!sess) {
+          sess = sofuu.sandbox.create({
+            fuel: fuel, timeoutMs: timeout, maxMemoryMB: 16,
+            captureConsole: true, throwOnError: false,
+          });
+          CODE_SESSIONS[key] = sess;
+        }
+        res = sess.run(code, { fuel: fuel, timeoutMs: timeout, captureConsole: true, throwOnError: false });
+      } else {
+        res = sofuu.sandbox.run(code, {
+          fuel: fuel,
+          timeoutMs: timeout,
+          maxMemoryMB: 16,
+          captureConsole: true,
+          throwOnError: false,
+        });
+      }
 
       var out = [];
       if (res.logs && res.logs.length > 0) {
@@ -1059,7 +1280,11 @@
         if (c) clean.push({ content: c.slice(0, 200), status: st });
       }
       if (!clean.length) throw new Error('todo_write: at least one non-empty item');
-      try { globalThis.__sofuu_todos = JSON.stringify(clean); } catch (eG) {}
+      /* T4: state is per run (the shared loop injects __scope), so a run
+       * that never writes a checklist cannot inherit the previous one. */
+      var scope = (a && typeof a.__scope === 'string' && a.__scope)
+        ? ':' + a.__scope.replace(/[^A-Za-z0-9_-]/g, '') : '';
+      try { globalThis['__sofuu_todos' + scope] = JSON.stringify(clean); } catch (eG) {}
       return 'checklist updated (' + clean.length + ' step' + (clean.length === 1 ? '' : 's') + ')';
     },
   };
@@ -1198,32 +1423,242 @@
       } catch (e) {}
       return 0;
     }
+    /* ── M2 (2026-10-23): Streamable HTTP transport (JS) ─────────────
+     * One POST per JSON-RPC message; a response may be JSON or an SSE
+     * stream carrying the reply (and any interleaved server traffic).
+     * `Mcp-Session-Id` is echoed after initialize and DELETEd on
+     * disconnect. Legacy HTTP+SSE is an explicit typed refusal for now
+     * (the risk register's "ship Streamable HTTP first" call). */
+    function httpHostOf(url) {
+      var h = String(url || '').replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+      var slash = h.indexOf('/'); if (slash >= 0) h = h.slice(0, slash);
+      var q = h.indexOf('?'); if (q >= 0) h = h.slice(0, q);
+      var at = h.lastIndexOf('@'); if (at >= 0) h = h.slice(at + 1);
+      if (h.charAt(0) === '[') { var rb = h.indexOf(']'); if (rb > 0) return h.slice(1, rb); }
+      var colon = h.lastIndexOf(':'); if (colon > 0) h = h.slice(0, colon);
+      return h;
+    }
+    function mcpFetch(url, init) {
+      var f = (typeof fetch === 'function') ? fetch : (sofuu.fetch || null);
+      if (!f) throw new Error('mcp http: fetch is unavailable in this build');
+      return f(url, init);
+    }
+    sofuu.mcp._connectHttp = function (cfg) {
+      cfg = cfg || {};
+      var url = String(cfg.url || '');
+      if (!url) return Promise.reject(new Error('mcp.connect: url required for the HTTP transport'));
+      var host = httpHostOf(url);
+      var serverId = cfg.name ? String(cfg.name) : url;
+      var pdNet = policyDecision('net.fetch', { host: host });
+      if (pdNet && pdNet.decision === 'deny') {
+        return Promise.reject(new Error('mcp.connect: denied by policy (' + pdNet.rule + '): ' + (pdNet.reason || host)));
+      }
+      var baseHeaders = { 'content-type': 'application/json', 'accept': 'application/json, text/event-stream' };
+      if (cfg.headers && typeof cfg.headers === 'object') {
+        for (var hk in cfg.headers) {
+          if (Object.prototype.hasOwnProperty.call(cfg.headers, hk)) baseHeaders[hk.toLowerCase()] = String(cfg.headers[hk]);
+        }
+      }
+      var sessionId = '';
+      var nextId = 1;
+      var pending = {};
+      var noteCb = null;
+      var protocol = '2025-06-18';
+      var closed = false;
+
+      function wireHeaders() {
+        var h = {};
+        for (var k in baseHeaders) h[k] = baseHeaders[k];
+        if (sessionId) h['mcp-session-id'] = sessionId;
+        return h;
+      }
+      function postMessage(msg) {
+        return mcpFetch(url, { method: 'POST', headers: wireHeaders(), body: JSON.stringify(msg) });
+      }
+      function settle(id, ok, value) {
+        var p = pending[id];
+        if (!p) return;
+        delete pending[id];
+        if (p.timer) clearTimeout(p.timer);
+        if (ok) p.resolve(value); else p.reject(value);
+      }
+      function handleMessage(msg) {
+        if (!msg || msg.jsonrpc !== '2.0') return;
+        if (msg.id !== undefined && !msg.method) {
+          var v = (msg.result === undefined) ? null : msg.result;
+          if (msg.error) {
+            settle(msg.id, false, new Error(String((msg.error && msg.error.message) || ('MCP error ' + (msg.error && msg.error.code)))));
+          } else settle(msg.id, true, v);
+          return;
+        }
+        if (msg.method && msg.id !== undefined) {
+          var reply = { jsonrpc: '2.0', id: msg.id };
+          if (msg.method === 'ping') reply.result = {};
+          else if (msg.method === 'roots/list') {
+            var roots = [];
+            try {
+              var pol = JSON.parse(sofuu.policy.get());
+              if (pol && pol.fs && Array.isArray(pol.fs.roots)) roots = pol.fs.roots;
+            } catch (eR) {}
+            reply.result = { roots: roots.map(function (p) { return { uri: 'file://' + p }; }) };
+          } else reply.error = { code: -32601, message: 'Method not found' };
+          postMessage(reply).then(consumeResponse, function () {});
+          return;
+        }
+        if (msg.method && noteCb) {
+          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) {}
+        }
+      }
+      async function consumeResponse(res) {
+        try {
+          var sid = res.headers && res.headers.get ? res.headers.get('mcp-session-id') : '';
+          if (sid) sessionId = String(sid);
+        } catch (eH) {}
+        if (res.status === 202 || res.status === 204) return;
+        if (!res.ok && res.status >= 400) {
+          var bodyText = '';
+          try { bodyText = await res.text(); } catch (eT) {}
+          throw new Error('mcp http: HTTP ' + res.status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
+        }
+        var ct = '';
+        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) {}
+        if (ct.indexOf('text/event-stream') >= 0) { await readSseStream(res); return; }
+        var text = await res.text();
+        if (!text || !text.trim()) return;
+        var one;
+        try { one = JSON.parse(text); } catch (eP) { throw new Error('mcp http: response is not JSON'); }
+        if (Array.isArray(one)) { for (var i = 0; i < one.length; i++) handleMessage(one[i]); }
+        else handleMessage(one);
+      }
+      async function readSseStream(res) {
+        var it = res.body[Symbol.asyncIterator]();
+        var buf = '';
+        for (;;) {
+          var step = await it.next();
+          if (step.done) break;
+          var chunk = '';
+          var v = step.value;
+          if (typeof v === 'string') chunk = v;
+          else { for (var b = 0; b < v.length; b++) chunk += String.fromCharCode(v[b]); }
+          buf += chunk;
+          for (;;) {
+            var nl = buf.indexOf('\n');
+            if (nl < 0) break;
+            var line = buf.slice(0, nl).replace(/\r$/, '');
+            buf = buf.slice(nl + 1);
+            if (!line || line.charAt(0) === ':') continue;
+            if (line.indexOf('data:') === 0) {
+              var data = line.slice(5);
+              if (data.charAt(0) === ' ') data = data.slice(1);
+              var parsed;
+              try { parsed = JSON.parse(data); } catch (eD) { continue; }
+              if (Array.isArray(parsed)) { for (var j = 0; j < parsed.length; j++) handleMessage(parsed[j]); }
+              else handleMessage(parsed);
+            }
+          }
+          if (closed) break;
+        }
+      }
+      function rpc(method, params, timeoutMs) {
+        var id = nextId++;
+        var msg = { jsonrpc: '2.0', id: id, method: method, params: params === undefined ? {} : params };
+        return new Promise(function (resolve, reject) {
+          pending[id] = { resolve: resolve, reject: reject, timer: null };
+          if (timeoutMs > 0) {
+            pending[id].timer = setTimeout(function () {
+              if (!pending[id]) return;
+              var err = new Error('MCP call timed out after ' + timeoutMs + ' ms');
+              settle(id, false, err);
+            }, timeoutMs);
+          }
+          postMessage(msg).then(consumeResponse, function (e) { settle(id, false, e); })
+            .then(function () {}, function (e2) { settle(id, false, e2); });
+        });
+      }
+      var client = {
+        transport: 'http',
+        url: url,
+        sessionId: function () { return sessionId; },
+        protocolVersion: function () { return protocol; },
+        set onNotification(fn) { noteCb = (typeof fn === 'function') ? fn : null; },
+        get onNotification() { return noteCb; },
+        call: function (method, params, opts) {
+          if (closed) return Promise.reject(new Error('mcp: disconnected'));
+          var timeout = 0;
+          if (opts && typeof opts === 'object' && typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0) {
+            timeout = Math.min(600000, Math.floor(opts.timeoutMs));
+          }
+          var m = String(method), p = (params === undefined ? {} : params);
+          if (m.indexOf('/') < 0) { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
+          return rpc(m, p, timeout);
+        },
+        listTools: function () { return rpc('tools/list', {}); },
+        listResources: function () { return rpc('resources/list', {}); },
+        disconnect: function () {
+          if (closed) return;
+          closed = true;
+          var sids = Object.keys(pending);
+          for (var i = 0; i < sids.length; i++) settle(Number(sids[i]), false, new Error('mcp: disconnected'));
+          if (sessionId) {
+            try { mcpFetch(url, { method: 'DELETE', headers: wireHeaders() }).catch(function () {}); } catch (e) {}
+          }
+        },
+      };
+      return (async function () {
+        var init = await rpc('initialize', {
+          protocolVersion: '2025-06-18', capabilities: {},
+          clientInfo: { name: 'sofuu', version: '0.1.0' },
+        }, 30000);
+        if (init && typeof init.protocolVersion === 'string' && init.protocolVersion) protocol = init.protocolVersion;
+        try {
+          var ack = await postMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
+          await consumeResponse(ack);
+        } catch (eAck) {}
+        return client;
+      })();
+    };
+
     sofuu.mcp.connect = function (arg, opts) {
-      /* S6: normalize both call shapes into the v2 object the native
-       * connect() understands. Config entries also carry {name, tools};
-       * those are caller-side fields and stay out of the child spec. */
+      /* S6/M2: normalize both call shapes into the object the transports
+       * understand. Config entries also carry {name, tools}; those are
+       * caller-side fields and stay out of the child/HTTP spec. */
       var cfg = { command: '' };
       if (typeof arg === 'string') cfg.command = arg;
-      else if (arg && typeof arg === 'object' && arg.command) cfg.command = String(arg.command);
+      else if (arg && typeof arg === 'object') {
+        if (arg.command) cfg.command = String(arg.command);
+        if (typeof arg.url === 'string') cfg.url = arg.url;
+        if (arg.name) cfg.name = String(arg.name);
+      }
       var src = (arg && typeof arg === 'object') ? arg : opts;
       if (src && typeof src === 'object') {
         if (Array.isArray(src.args)) cfg.args = src.args.map(String);
         if (src.env && typeof src.env === 'object') cfg.env = src.env;
         if (typeof src.cwd === 'string' && src.cwd) cfg.cwd = src.cwd;
+        if (src.headers && typeof src.headers === 'object') cfg.headers = src.headers;
       }
-      var command = cfg.command || '';
+      var transport = '';
+      if (arg && typeof arg === 'object' && arg.transport) transport = String(arg.transport);
+      else if (opts && typeof opts === 'object' && opts.transport) transport = String(opts.transport);
+      if (transport === 'sse' || transport === 'http+sse') {
+        return Promise.reject(new Error("mcp.connect: legacy HTTP+SSE transport is not implemented (use transport:'http', Streamable HTTP)"));
+      }
+      if (transport === 'http' && !cfg.url) {
+        return Promise.reject(new Error("mcp.connect: transport 'http' needs a url"));
+      }
+      var useHttp = (transport === 'http') || (transport !== 'stdio' && !!cfg.url);
       var server = (opts && opts.server) ? String(opts.server)
-        : ((arg && typeof arg === 'object' && arg.server) ? String(arg.server) : command);
+        : (useHttp ? (cfg.name || cfg.url) : ((arg && typeof arg === 'object' && arg.server)
+          ? String(arg.server) : cfg.command));
       /* S6/S4: the MCP allowlist is a policy decision on the server id (or
        * the raw command for a plain-script caller). */
-      var pd = policyDecision('mcp.connect', { server: server, command: command });
+      var pd = policyDecision('mcp.connect', { server: server, command: cfg.command || '' });
       if (pd && pd.decision === 'deny') {
         return Promise.reject(new Error('mcp.connect: denied by policy (' + pd.rule + '): ' +
           (pd.reason || '')));
       }
       try { cfg.env = resolveSecretEnv(cfg.env); }
       catch (eSec) { return Promise.reject(eSec); }
-      return Promise.resolve(realConnect(cfg)).then(function (client) {
+      function finishClient(client) {
         if (!client || client.__paged) return client;
         try {
           client.listTools = function () { return all(client, 'tools/list', 'tools'); };
@@ -1251,7 +1686,21 @@
           catch (eP) { client.__paged = true; }
         } catch (eM) {}
         return client;
-      });
+      }
+      if (useHttp) {
+        return Promise.resolve(sofuu.mcp._connectHttp(cfg)).then(finishClient, function (eHttp) {
+          /* Transport 'auto' with a command: fall back to stdio. */
+          if (transport === 'auto' && cfg.command) {
+            var spec = { command: cfg.command, server: server };
+            if (cfg.args) spec.args = cfg.args;
+            if (cfg.env) spec.env = cfg.env;
+            if (cfg.cwd) spec.cwd = cfg.cwd;
+            return Promise.resolve(realConnect(spec)).then(finishClient);
+          }
+          throw eHttp;
+        });
+      }
+      return Promise.resolve(realConnect(cfg)).then(finishClient);
     };
     sofuu.mcp.__paged = true;
   })();
@@ -1323,7 +1772,7 @@
    * shell is disabled the group (and every listing derived from it) omits
    * bash entirely; TOOLS.bash stays present so a direct call still gets the
    * explicit refusal at :execute instead of an opaque missing-function. */
-  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'grep', 'glob',
+  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'apply_patch', 'grep', 'glob',
                        'list_dir', 'bash', 'code_eval', 'todo_write']
     .filter(function (n) { return !(SHELL_DISABLED && n === 'bash'); });
   sofuu.tools.ENABLED = { bash: !SHELL_DISABLED };

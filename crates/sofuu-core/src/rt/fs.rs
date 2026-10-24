@@ -312,6 +312,49 @@ unsafe extern "C" fn js_fs_set_root(
     qjs::sofuu_js_new_string(ctx, cs.as_ptr())
 }
 
+/// `fs.chmod(path, mode)` — used by the tool-result spill to keep full
+/// outputs 0600. Unix only (a no-op true elsewhere).
+unsafe extern "C" fn js_chmod(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(ctx, c"chmod: path and mode required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "chmod") { Ok(p) => p, Err(e) => return e };
+    let mv = *argv.add(1);
+    if qjs::sofuu_js_is_number(mv) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"chmod: mode must be a number".as_ptr());
+    }
+    let mut fm: f64 = 0.0;
+    if qjs::JS_ToFloat64(ctx, &mut fm, mv) != 0 {
+        return qjs::sofuu_js_exception();
+    }
+    let mode = fm as u32;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::set_permissions(
+            path.to_string_lossy().as_ref(),
+            std::fs::Permissions::from_mode(mode),
+        ) {
+            Ok(_) => qjs::sofuu_js_new_bool(ctx, 1),
+            Err(e) => {
+                let msg = format!("chmod: {e}");
+                let cm = CString::new(msg).unwrap_or_default();
+                qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), cm.as_ptr())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        qjs::sofuu_js_new_bool(ctx, 1)
+    }
+}
+
 unsafe extern "C" fn js_fs_clear_root(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -973,6 +1016,12 @@ pub unsafe extern "C" fn mod_fs_register(ctx: *mut JSContext) {
         fs,
         c"isSymlink".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_is_symlink, c"isSymlink".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"chmod".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_chmod, c"chmod".as_ptr(), 2),
     );
     qjs::sofuu_js_set_property_str(
         ctx,

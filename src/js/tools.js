@@ -1109,8 +1109,17 @@
         var env = {};
         for (var k in s.env) {
           if (Object.prototype.hasOwnProperty.call(s.env, k)) {
-            /* null removes an inherited allowlisted variable. */
-            env[k] = (s.env[k] === null) ? null : String(s.env[k]);
+            var v = s.env[k];
+            if (v === null) {
+              /* null removes an inherited allowlisted variable. */
+              env[k] = null;
+            } else if (v && typeof v === 'object' && typeof v.secret === 'string') {
+              /* S6/R7.5: configs carry only the NAME; the value is resolved
+               * at connect time by policy.secret() and never stored. */
+              env[k] = '${secret:' + v.secret + '}';
+            } else {
+              env[k] = String(v);
+            }
           }
         }
         entry.env = env;
@@ -1158,6 +1167,37 @@
       }
       return step();
     }
+    /* S6/R7.5: "${secret:NAME}" env values are resolved HERE, at connect
+     * time, through policy.secret(). Configs and loadConfig() only ever see
+     * the name; an unresolved name is a hard error (never spawn with the
+     * literal sentinel). */
+    function resolveSecretEnv(env) {
+      if (!env || typeof env !== 'object') return env;
+      var out = {};
+      for (var k in env) {
+        if (!Object.prototype.hasOwnProperty.call(env, k)) continue;
+        var v = env[k];
+        if (v === null) { out[k] = null; continue; }
+        var m = (typeof v === 'string') ? /^\$\{secret:([A-Za-z0-9_.-]+)\}$/.exec(v) : null;
+        if (!m) { out[k] = String(v); continue; }
+        if (!sofuu.policy || typeof sofuu.policy.secret !== 'function') {
+          throw new Error('mcp.connect: env ' + k + ' needs a secret but sofuu.policy.secret is unavailable');
+        }
+        out[k] = sofuu.policy.secret(m[1]);
+      }
+      return out;
+    }
+    /* S5/M1: the policy's default MCP call deadline. Applied only when the
+     * caller passed no timeout, so an explicit {timeoutMs} always wins. */
+    function policyCallTimeout() {
+      try {
+        if (!sofuu.policy || typeof sofuu.policy.get !== 'function') return 0;
+        var p = JSON.parse(sofuu.policy.get());
+        var ms = p && p.mcp && p.mcp.callTimeoutMs;
+        if (typeof ms === 'number' && ms > 0) return Math.min(600000, Math.max(50, ms));
+      } catch (e) {}
+      return 0;
+    }
     sofuu.mcp.connect = function (arg, opts) {
       /* S6: normalize both call shapes into the v2 object the native
        * connect() understands. Config entries also carry {name, tools};
@@ -1181,11 +1221,32 @@
         return Promise.reject(new Error('mcp.connect: denied by policy (' + pd.rule + '): ' +
           (pd.reason || '')));
       }
+      try { cfg.env = resolveSecretEnv(cfg.env); }
+      catch (eSec) { return Promise.reject(eSec); }
       return Promise.resolve(realConnect(cfg)).then(function (client) {
         if (!client || client.__paged) return client;
         try {
           client.listTools = function () { return all(client, 'tools/list', 'tools'); };
           client.listResources = function () { return all(client, 'resources/list', 'resources'); };
+          var defMs = policyCallTimeout();
+          if (defMs > 0 && typeof client.call === 'function') {
+            var realCall = client.call;
+            client.call = function (method, params, copts) {
+              var has = copts && typeof copts === 'object' && copts.timeoutMs !== undefined;
+              if (!has) {
+                var merged = { timeoutMs: defMs };
+                if (copts && typeof copts === 'object') {
+                  for (var ck in copts) {
+                    if (Object.prototype.hasOwnProperty.call(copts, ck)) merged[ck] = copts[ck];
+                  }
+                }
+                copts = merged;
+              }
+              return realCall.call(client, method, params, copts);
+            };
+            try { Object.defineProperty(client, '__callDefaulted', { value: true, enumerable: false }); }
+            catch (eD) { client.__callDefaulted = true; }
+          }
           try { Object.defineProperty(client, '__paged', { value: true, enumerable: false }); }
           catch (eP) { client.__paged = true; }
         } catch (eM) {}

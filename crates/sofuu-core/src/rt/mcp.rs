@@ -241,7 +241,17 @@ unsafe fn mcp_answer_server_request(
     let rid = id as i32;
     let resp = match method {
         "ping" => jsonrpc_response_cstr(rid, "{}"),
-        "roots/list" => jsonrpc_response_cstr(rid, "{\"roots\":[]}"),
+        "roots/list" => {
+            /* M1 residual (2026-10-23): advertise the policy's fs.roots so a
+             * server sees the same sandbox the tools enforce. */
+            let roots: Vec<serde_json::Value> =
+                crate::rt::policy::fs_roots((*client).ctx)
+                    .into_iter()
+                    .map(|p| serde_json::json!({ "uri": format!("file://{p}") }))
+                    .collect();
+            let body = serde_json::json!({ "roots": roots }).to_string();
+            jsonrpc_response_cstr(rid, &body)
+        }
         _ => jsonrpc_error_cstr(rid, -32601, "Method not found"),
     };
     mcp_client_send(client, resp.as_bytes());

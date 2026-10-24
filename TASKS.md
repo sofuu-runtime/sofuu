@@ -3924,3 +3924,39 @@ what code reading suggested:
   server-side resources/prompts (M3), MCP through the C funnel (M4), policy
   on the C-ABI/HTTP surfaces (S5).
 - **Plan:** `docs/PLAN-PROTOCOLS-SANDBOX-TOOLING.md` — next: S5, M2, or M3.
+
+## 2026-10-24 — workstream 6 phase 5: policy on every surface (S5) + M1/S6 residuals
+
+- **S5 — approval.mode enforced.** The evaluator now returns a decision for
+  both explicit modes: `always` → `ask` with rule `R7.4/approval.mode` for
+  every `tool.run` (a deny still wins), `never` → `allow` with the same rule.
+  The agent gate treats the policy mode as authoritative when present:
+  `always` prompts even for a def with `approve:'none'` and bypasses the
+  session always-allow cache; `never` suppresses the gate entirely. Events
+  carry `mode` and the override is recorded as a `policy` event.
+- **S5 — funnel + config + CLI.** `policy.set/get/evaluate/explain` are now
+  part of the documented funnel contract (46 methods); `explain` returns the
+  decision JSON plus a one-line reason. `sofuu_rt_new` accepts an optional
+  `policy` object. `sofuu chat|agent|serve --policy <file>` installs a policy
+  before the command runs, fails closed on unreadable/invalid JSON, and the
+  flag is stripped before the command's own argument parser sees it.
+- **S5/R7.5 — secrets at call time.** `sofuu.policy.secret(name)` resolves
+  from `policy.secrets.source` (`env`, default; or a JSON `file` re-read per
+  call). MCP config `env` values may be `{"secret":"NAME"}`: `loadConfig`
+  keeps only the name as `${secret:NAME}` and the connect wrapper resolves it
+  through `policy.secret` at spawn time — a missing secret refuses the
+  connect and the literal sentinel is never passed to a child.
+- **M1 residuals.** The policy's `mcp.callTimeoutMs` is applied by the connect
+  wrapper whenever the caller omits `timeoutMs` (explicit values win);
+  `roots/list` answers with `file://` URIs built from `policy.fs.roots`; and
+  `notifications/tools/list_changed` / `resources/list_changed` mark the
+  agent/chat inventory stale so the next turn re-lists and reports it (the
+  agent emits a `warn` naming the notification).
+- **Receipts:** conformance **0 failures / 0 known gaps** (new: policy roots,
+  policy default deadline, secret resolution + no-echo probe, missing secret
+  refusal, loader sentinel); `policy_test.js` 0 failures (explain, both
+  approval modes, env/file secrets incl. rotation); release battery
+  **288 PASS / 0 FAIL** (two new approval-mode checks); `rt::policy` 11/11,
+  `rt::mcp` 15/15. Release binary 4,923,160 B stripped (cap 5,242,880).
+- **Not in this slice:** `http.auth` as a policy check moves with the serve
+  handler rewrite (H1), where the request path is extracted and testable.

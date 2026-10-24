@@ -140,6 +140,51 @@ fn cmd_eval(rt: &SofuuRuntime, code: &str) -> i32 {
     rt.eval_string(code, "<eval>")
 }
 
+/// S5 (2026-10-23): pull `--policy <file>` / `--policy=<file>` out of a CLI
+/// argument list before the command's own parser sees it.
+fn take_policy_arg(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--policy" {
+            if i + 1 < args.len() {
+                path = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if let Some(rest) = args[i].strip_prefix("--policy=") {
+            path = Some(rest.to_string());
+            i += 1;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (path, out)
+}
+
+/// Load a policy JSON file and install it. Fail closed: an unreadable,
+/// non-JSON or rejected policy aborts the command instead of running with
+/// defaults.
+fn apply_policy_file(rt: &SofuuRuntime, path: &str) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("--policy {path}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("--policy {path}: not valid JSON: {e}"))?;
+    if !v.is_object() {
+        return Err(format!("--policy {path}: must be a JSON object"));
+    }
+    let json = serde_json::to_string(&v).map_err(|e| format!("--policy {path}: {e}"))?;
+    let code = format!(
+        "var __p = sofuu.policy.set({json}); var __o = JSON.parse(__p); if (!__o.ok) throw new Error(__o.error || 'invalid policy');"
+    );
+    if rt.eval_string(&code, "<policy-file>") != 0 {
+        return Err(format!("--policy {path}: rejected by the policy parser"));
+    }
+    Ok(())
+}
+
 /// `sofuu agent list` / `sofuu agent run <name> <task…> [--json]` —
 /// the headless agent surface (PLAN-AGENTS A8.2). Everything runs in the
 /// engine's shipped agent runtime (src/js/agent.js); this is just CLI
@@ -2196,6 +2241,7 @@ fn main() -> ExitCode {
             }
         }
         "chat" => {
+            let (policy, clean) = take_policy_arg(&args);
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
                 None => {
@@ -2203,7 +2249,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_chat(&rt, &args);
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_chat(&rt, &clean);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {
@@ -2227,6 +2279,7 @@ fn main() -> ExitCode {
             }
         }
         "agent" | "agents" => {
+            let (policy, clean) = take_policy_arg(&args);
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
                 None => {
@@ -2234,7 +2287,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_agent(&rt, &args);
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_agent(&rt, &clean);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {
@@ -2242,6 +2301,7 @@ fn main() -> ExitCode {
             }
         }
         "serve" => {
+            let (policy, clean) = take_policy_arg(&args);
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
                 None => {
@@ -2249,7 +2309,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_serve(&rt, &args);
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_serve(&rt, &clean);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

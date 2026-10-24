@@ -84,6 +84,7 @@
     mcpClients: [],           /* [{name, client}] */
     mcpTools: [],             /* [{server, name, description, schema}] */
     mcpConnecting: null,      /* in-flight connect promise (dedupe) */
+    mcpStale: false,          /* server sent list_changed - re-list next turn */
     agentsDirLoaded: false,
   };
 
@@ -622,6 +623,7 @@
       return;
     }
     S.mcpConnecting = (async function () {
+      S.mcpStale = false;
       var results = await Promise.allSettled(list.map(async function (srv) {
         var client = await sofuu.mcp.connect(srv, { server: srv.name });
         var res = await client.listTools();
@@ -635,13 +637,24 @@
             return true;
           });
         }
-        return { name: srv.name, client: client, tools: arr };
+        /* M1 residual: track the server's filter and mark the inventory
+         * stale when it announces a change; the next tool-using turn
+         * re-lists before building the model's toolset. */
+        try {
+          client.onNotification = function (method) {
+            if (method === 'notifications/tools/list_changed' ||
+                method === 'notifications/resources/list_changed') {
+              S.mcpStale = true;
+            }
+          };
+        } catch (eN) {}
+        return { name: srv.name, client: client, tools: arr, filter: t };
       }));
       var connected = 0, failed = 0;
       for (var i = 0; i < results.length; i++) {
         var r = results[i];
         if (r.status === 'fulfilled' && r.value) {
-          S.mcpClients.push({ name: r.value.name, client: r.value.client });
+          S.mcpClients.push({ name: r.value.name, client: r.value.client, filter: r.value.filter });
           for (var j = 0; j < (r.value.tools || []).length; j++) {
             var t = r.value.tools[j];
             S.mcpTools.push({ server: r.value.name, name: t.name,
@@ -666,6 +679,45 @@
     } finally {
       S.mcpConnecting = null;
     }
+  }
+  /* M1 residual: rebuild the cached MCP inventory after a list_changed.
+   * A failed re-list keeps the previous entries for that server rather than
+   * silently dropping tools mid-session. */
+  async function refreshMcpTools() {
+    S.mcpStale = false;
+    var next = [];
+    var changed = false;
+    for (var i = 0; i < S.mcpClients.length; i++) {
+      var c = S.mcpClients[i];
+      var arr = null;
+      try {
+        var res = await c.client.listTools();
+        arr = (res && res.tools) || [];
+        var t = c.filter || null;
+        if (t) {
+          arr = arr.filter(function (x) {
+            var n = String((x && x.name) || '');
+            if (t.deny && t.deny.indexOf(n) >= 0) return false;
+            if (t.allow && t.allow.length && t.allow.indexOf(n) < 0) return false;
+            return true;
+          });
+        }
+      } catch (e) {
+        for (var k = 0; k < S.mcpTools.length; k++) {
+          if (S.mcpTools[k].server === c.name) next.push(S.mcpTools[k]);
+        }
+        continue;
+      }
+      for (var j = 0; j < arr.length; j++) {
+        var tool = arr[j];
+        next.push({ server: c.name, name: tool.name,
+                    description: tool.description || '', schema: tool.inputSchema });
+      }
+    }
+    if (next.length !== S.mcpTools.length) changed = true;
+    S.mcpTools = next;
+    emit({ kind: 'warn', payload: { message: 'mcp: inventory refreshed after list_changed (' +
+           S.mcpTools.length + ' tools)' + (changed ? '' : '') } });
   }
   async function callMcpTool(name, args) {
     /* Route by name→OWNER server (A6: first-server-wins was wrong under
@@ -1477,7 +1529,12 @@
     }
     /* MCP is lazy: connect on demand only when a tool-using turn starts
      * (pure chat turns never invoke tools, so skip the handshake). The
-     * connector reads the shared v2 config and no-ops on an empty list. */
+     * connector reads the shared v2 config and no-ops on an empty list; a
+     * list_changed from a connected server refreshes the cached inventory
+     * before this turn builds its toolset. */
+    if (!noTools && S.mcpTools.length > 0 && S.mcpStale) {
+      await refreshMcpTools();
+    }
     if (!noTools && S.mcpTools.length === 0) {
       await connectMcpServers();
     }

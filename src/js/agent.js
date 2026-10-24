@@ -1444,7 +1444,20 @@
        * allowlist can match a configured id instead of a raw command. */
       var client = await sofuu.mcp.connect(spec, { server: serverName });
       var res = await client.listTools();
-      return { client: client, tools: (res && res.tools) || [] };
+      var entry = { client: client, tools: (res && res.tools) || [], stale: false, note: '' };
+      /* M1 residual (2026-10-23): a list_changed notification marks the
+       * cached inventory stale; the next resolveTools re-lists once and
+       * reports it, instead of advertising a tool the server dropped. */
+      try {
+        client.onNotification = function (method) {
+          if (method === 'notifications/tools/list_changed' ||
+              method === 'notifications/resources/list_changed') {
+            entry.stale = true;
+            entry.note = method;
+          }
+        };
+      } catch (eN) {}
+      return entry;
     })();
     MCP_POOL[key].catch(function () { delete MCP_POOL[key]; });
     return MCP_POOL[key];
@@ -1527,6 +1540,16 @@
       var conn;
       try { conn = await mcpConnect(set); }
       catch (e) { warn({ mcp: set.name, note: 'unreachable: ' + clip(String(e.message || e), 120) }); continue; }
+      if (conn.stale) {
+        try {
+          var fresh = await conn.client.listTools();
+          conn.tools = (fresh && fresh.tools) || conn.tools;
+          warn({ mcp: set.name, note: 'inventory refreshed after ' + (conn.note || 'list_changed') });
+        } catch (eR) {
+          warn({ mcp: set.name, note: 're-list failed, keeping the previous inventory: ' + clip(String(eR.message || eR), 80) });
+        }
+        conn.stale = false;
+      }
       for (var k = 0; k < conn.tools.length; k++) {
         var mt = conn.tools[k];
         var mname = String(mt.name || '');
@@ -3685,8 +3708,27 @@
          * interactive gate must never default to executing. delegate/
          * map_context are orchestration (their CHILD tools each gate) and
          * never prompt themselves. */
-        if (d.approve && d.approve !== 'none' &&
-            name !== 'delegate' && name !== 'map_context') {
+        /* S5 (2026-10-23): the policy's approval.mode, when present, is
+         * authoritative — 'always' forces a prompt for EVERY call (the
+         * session always-cache is bypassed), 'never' suppresses prompts (a
+         * deny above still wins). Without a mode the def-level `approve`
+         * behaves exactly as before. */
+        var polApproval = (polDec && polDec.rule === 'R7.4/approval.mode') ? polDec.decision : '';
+        var forceAsk = polApproval === 'ask';
+        var forceNever = polApproval === 'allow';
+        if (forceAsk) {
+          emit('policy', { decision: 'ask', rule: 'R7.4/approval.mode',
+                           op: name === 'bash' ? 'shell.run' : 'tool.run',
+                           tool: name, reason: (polDec && polDec.reason) || '',
+                           surface: 'js' });
+        } else if (forceNever && d.approve && d.approve !== 'none') {
+          emit('policy', { decision: 'allow', rule: 'R7.4/approval.mode',
+                           op: name === 'bash' ? 'shell.run' : 'tool.run',
+                           tool: name, reason: (polDec && polDec.reason) || '',
+                           surface: 'js' });
+        }
+        var gateOn = forceAsk || (!forceNever && d.approve && d.approve !== 'none');
+        if (gateOn && name !== 'delegate' && name !== 'map_context') {
           var risky = !AUTO_PASS_TOOLS[name];
           /* T2: MCP annotations refine risk. A readOnly tool stops prompting
            * under approve:'sensitive'; destructiveHint always prompts even
@@ -3697,12 +3739,15 @@
             if (ann.destructiveHint === true) risky = true;
             else if (ann.readOnlyHint === true) risky = false;
           }
-          var needAsk = d.approve === 'all' || risky;
+          var needAsk = forceAsk || d.approve === 'all' || risky;
+          var modeLabel = forceAsk ? 'always' : (d.approve || 'none');
           var askKey = name === 'bash'
             ? 'bash\u0001' + ledgerNorm(String((args && args.command) || ''))
             : name;
-          if (needAsk && alwaysApproved[askKey] === 1) {
-            emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: true, cached: true });
+          /* A policy 'always' mode must not be satisfied by the session
+           * cache — the point is to ask every time. */
+          if (needAsk && !forceAsk && alwaysApproved[askKey] === 1) {
+            emit('approval_resolved', { id: 'ap-' + runId + '-' + name, tool: name, allowed: true, cached: true, mode: modeLabel });
           } else if (needAsk) {
             var appMsg = null;
             APPROVAL_SEQ = (APPROVAL_SEQ || 0) + 1;
@@ -3732,11 +3777,11 @@
               apFn = function () { return pendingPromise; };
             }
             if (!apFn) {
-              appMsg = 'denied by policy (approve:' + d.approve + ' but the host provides neither an onApproval callback nor approveInteractive)';
+              appMsg = 'denied by policy (approve:' + modeLabel + ' but the host provides neither an onApproval callback nor approveInteractive)';
               emit('approval_resolved', { id: apId, tool: name, allowed: false, reason: 'no-callback' });
             } else {
               emit('approval_request', { id: apId, tool: name, args: clip(JSON.stringify(args || {}), 200),
-                                         risky: risky, approve: d.approve });
+                                         risky: risky, approve: modeLabel, mode: modeLabel });
               var dec = null;
               try {
                 dec = await withTimeout(withCancelGuard(state, Promise.resolve(apFn())),

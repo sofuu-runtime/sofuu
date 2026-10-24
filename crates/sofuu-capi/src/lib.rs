@@ -747,6 +747,26 @@ unsafe fn sofuu_rt_new_impl(config_json: *const c_char) -> *mut CapiRuntime {
         }
     }
 
+    // S5 (2026-10-23): an embedded host sets its R7 policy once, at create
+    // time. An invalid policy leaves the previous/default policy in place.
+    if let Some(policy) = config_val.get("policy") {
+        if policy.is_object() {
+            let policy_json = serde_json::to_string(policy).unwrap_or_else(|_| "{}".into());
+            let src = format!(
+                "try {{ if (sofuu.policy && sofuu.policy.set) sofuu.policy.set({}); }} catch(e) {{ /* invalid policy - keep defaults */ }}",
+                policy_json
+            );
+            if let Ok(csrc) = CString::new(src) {
+                unsafe {
+                    let ctx = ffi_rt.engine_ctx() as *mut qjs::JSContext;
+                    if !ctx.is_null() {
+                        eval_init_snippet(ctx, &csrc, c"<rt-policy>");
+                    }
+                }
+            }
+        }
+    }
+
     let handle = Box::new(CapiRuntime {
         ffi_rt,
     });
@@ -4655,6 +4675,10 @@ mod tests {
             "memory.rememberWorking",
             "memory.promoteWorking",
             "memory.clearWorking",
+            "policy.set",
+            "policy.get",
+            "policy.evaluate",
+            "policy.explain",
             "mcp.connect",
             "mcp.call",
             "mcp.listTools",
@@ -4680,7 +4704,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            42,
+            46,
             "the funnel contract list changed length — update it deliberately"
         );
 

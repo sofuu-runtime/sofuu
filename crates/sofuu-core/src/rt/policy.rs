@@ -242,11 +242,23 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
         }
     }
 
-    /* Approval mode is reported but not enforced here: the run/def
-     * `approve` mode is the caller-level override, and S5 owns unifying
-     * the two. A policy that wants every tool asked reports `ask`. */
-    if op == "tool.run" && str_at(policy, &["approval", "mode"]) == Some("always") {
-        return decision("ask", "R7.4/approval.mode", "approval.mode is 'always'");
+    /* Approval mode (S5, 2026-10-23): 'always' asks for every tool call;
+     * 'never' runs without prompting (denies above still win);
+     * 'per-run' is the default gate the drivers already implement. */
+    if op == "tool.run" {
+        match str_at(policy, &["approval", "mode"]) {
+            Some("always") => {
+                return decision("ask", "R7.4/approval.mode", "approval.mode is 'always'")
+            }
+            Some("never") => {
+                return decision(
+                    "allow",
+                    "R7.4/approval.mode",
+                    "approval.mode is 'never'",
+                )
+            }
+            _ => {}
+        }
     }
 
     decision("allow", "R7/default", "no policy rule denies this operation")
@@ -320,7 +332,8 @@ unsafe fn read_json_arg(ctx: *mut JSContext, v: JSValueConst) -> Option<String> 
     }
 }
 
-unsafe fn policy_json(ctx: *mut JSContext) -> serde_json::Value {
+/// The effective policy document (per runtime, stored on the global).
+pub(crate) unsafe fn policy_json(ctx: *mut JSContext) -> serde_json::Value {
     let global = qjs::sofuu_js_get_global_object(ctx);
     let v = qjs::sofuu_js_get_property_str(ctx, global, c"__sofuu_policy_json".as_ptr());
     let mut out = serde_json::json!({});
@@ -396,6 +409,110 @@ unsafe extern "C" fn js_policy_clear(
 ) -> JSValue {
     install_policy(ctx, &serde_json::json!({}));
     qjs::sofuu_js_undefined()
+}
+
+/// `policy.explain(request)` — the same decision as `evaluate`, plus a
+/// one-line human explanation. For debugging denials without guessing which
+/// rule fired.
+unsafe extern "C" fn js_policy_explain(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let result = js_policy_evaluate(ctx, _this, argc, argv);
+    if qjs::sofuu_js_is_string(result) == 0 {
+        return result;
+    }
+    let p = qjs::sofuu_js_to_cstring(ctx, result);
+    if p.is_null() {
+        return result;
+    }
+    let raw = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p);
+    qjs::sofuu_js_free_value(ctx, result);
+    let mut v: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|_| serde_json::json!({"decision":"deny","rule":"R7/invalid-request"}));
+    let decision = v.get("decision").and_then(|x| x.as_str()).unwrap_or("deny");
+    let rule = v.get("rule").and_then(|x| x.as_str()).unwrap_or("R7/unknown");
+    let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+    let explanation = format!("{decision} [{rule}] {reason}");
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "explanation".into(),
+            serde_json::Value::String(explanation),
+        );
+    }
+    let text = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+    let cs = json_str(&text);
+    qjs::sofuu_js_new_string(ctx, cs.as_ptr())
+}
+
+/// `policy.secret(name)` — resolve a secret at CALL time (R7.5).
+///
+/// Sources (`policy.secrets.source`):
+///   * `env`  (default) — the process environment
+///   * `file` — a JSON object at `policy.secrets.file`, re-read per call so a
+///              rotated file is picked up without restarting
+///
+/// The return value is a plain JS string the caller passes to the consumer
+/// (e.g. an MCP child's env). Nothing here logs it, and configs carry only
+/// the NAME, never the value.
+unsafe extern "C" fn js_policy_secret(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"policy.secret: name required".as_ptr());
+    }
+    let p = qjs::sofuu_js_to_cstring(ctx, *argv);
+    if p.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let name = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, p);
+    if name.trim().is_empty() {
+        return qjs::JS_ThrowTypeError(ctx, c"policy.secret: name is empty".as_ptr());
+    }
+    let policy = policy_json(ctx);
+    let source = str_at(&policy, &["secrets", "source"]).unwrap_or("env");
+    let value: Option<String> = match source {
+        "env" => std::env::var(&name).ok(),
+        "file" => {
+            let path = str_at(&policy, &["secrets", "file"]).unwrap_or("");
+            if path.is_empty() {
+                None
+            } else {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| {
+                        v.get(&name)
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
+            }
+        }
+        _ => None,
+    };
+    match value {
+        Some(v) => {
+            let cs = CString::new(v).unwrap_or_default();
+            qjs::sofuu_js_new_string(ctx, cs.as_ptr())
+        }
+        None => {
+            let msg = format!("policy.secret: '{name}' is not set (secrets.source={source})");
+            let cm = json_str(&msg);
+            qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), cm.as_ptr())
+        }
+    }
+}
+
+/// `fs.roots` from the active policy (used for MCP `roots/list`).
+pub(crate) unsafe fn fs_roots(ctx: *mut JSContext) -> Vec<String> {
+    list_at(&policy_json(ctx), &["fs", "roots"])
 }
 
 unsafe extern "C" fn js_policy_evaluate(
@@ -486,10 +603,12 @@ pub unsafe fn mod_policy_register(ctx: *mut JSContext) {
     }
 
     let policy = qjs::sofuu_js_new_object(ctx);
-    let funcs: [(&std::ffi::CStr, unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue); 5] = [
+    let funcs: [(&std::ffi::CStr, unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue); 7] = [
         (c"set", js_policy_set),
         (c"get", js_policy_get),
         (c"evaluate", js_policy_evaluate),
+        (c"explain", js_policy_explain),
+        (c"secret", js_policy_secret),
         (c"load", js_policy_load),
         (c"clear", js_policy_clear),
     ];
@@ -523,6 +642,34 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string()
+    }
+
+    #[test]
+    fn approval_mode_always_and_never() {
+        let always = serde_json::json!({"approval":{"mode":"always"}});
+        assert_eq!(
+            eval(serde_json::json!({"op":"tool.run","tool":"read_file"}), always.clone()),
+            "ask"
+        );
+        assert_eq!(
+            rule(serde_json::json!({"op":"tool.run","tool":"read_file"}), always),
+            "R7.4/approval.mode"
+        );
+        let never = serde_json::json!({"approval":{"mode":"never"}});
+        assert_eq!(
+            eval(serde_json::json!({"op":"tool.run","tool":"bash","command":"ls"}), never.clone()),
+            "allow"
+        );
+        assert_eq!(
+            rule(serde_json::json!({"op":"tool.run","tool":"bash"}), never),
+            "R7.4/approval.mode"
+        );
+        /* A deny still wins over 'never'. */
+        let both = serde_json::json!({"approval":{"mode":"never"},"tools":{"deny":["bash"]}});
+        assert_eq!(
+            eval(serde_json::json!({"op":"tool.run","tool":"bash"}), both),
+            "deny"
+        );
     }
 
     #[test]

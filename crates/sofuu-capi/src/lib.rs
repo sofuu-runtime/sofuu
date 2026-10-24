@@ -431,6 +431,63 @@ const MEMORY_FACADE_JS: &str = r#"
     X.__sofuu_facade = true;
   }
 
+  /* ── M4 (2026-10-23): the MCP SERVER through the funnel. A JSON caller
+   * cannot pass a JS handler, so serverTool registers a HOST tool by name
+   * (already registered via sofuu_rt_register_host_tool) and the facade
+   * wires the handler for you. ── */
+  if (X && typeof X.serve === 'function' && !X.__server_facade) {
+    var servers = [];
+    var realServe = X.serve;
+    X.serve = function () {
+      var s = realServe.apply(null, arguments);
+      var id = servers.indexOf(s);
+      if (id < 0) {
+        var emptyIdx = servers.indexOf(null);
+        if (emptyIdx >= 0) { id = emptyIdx; servers[id] = s; }
+        else { id = servers.length; servers.push(s); }
+      }
+      try {
+        Object.defineProperty(s, '__handle', { value: id, enumerable: false });
+        s.toJSON = function () { return { handle: id }; };
+      } catch (e) {}
+      return s;
+    };
+    function pickServer(a) {
+      a = a || {};
+      if (a.handle !== undefined && a.handle !== null) {
+        var got = servers[a.handle | 0];
+        if (!got) throw new TypeError('mcp: no server with handle ' + a.handle);
+        return got;
+      }
+      for (var i = servers.length - 1; i >= 0; i--) if (servers[i]) return servers[i];
+      throw new TypeError('mcp: serve() a server first');
+    }
+    X.serverTool = function (a) {
+      a = a || {};
+      var srv = pickServer(a);
+      var name = String(a.name || '');
+      if (!name) throw new TypeError('mcp.serverTool: name required');
+      var host = globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[name];
+      if (!host || typeof host.execute !== 'function') {
+        throw new TypeError('mcp.serverTool: no host tool registered as ' + name);
+      }
+      srv.tool(name, {
+        description: a.description || host.description || '',
+        schema: a.schema || host.parameters || { type: 'object', properties: {} },
+      }, function (args) { return host.execute(args || {}); });
+      return true;
+    };
+    X.serverStart = function (a) { var srv = pickServer(a); srv.start(); return true; };
+    X.serverStop = function (a) {
+      var srv = pickServer(a);
+      if (typeof srv.stop === 'function') srv.stop();
+      var id = servers.indexOf(srv);
+      if (id >= 0) servers[id] = null;
+      return true;
+    };
+    X.__server_facade = true;
+  }
+
   /* ── HTTP serving. A JSON funnel cannot pass a JS function, so the host
    * defines the handler as a global via sofuu_rt_eval and names it here:
    *   http.serve({ handler: "myHandler", port: 8080, host: "127.0.0.1" })
@@ -4637,6 +4694,88 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
+    /// M4: the MCP SERVER through the funnel. A JSON caller cannot pass a JS
+    /// handler, so `serverTool` accepts the NAME of an already-registered
+    /// host tool and wires the handler itself. This asserts the handle
+    /// round-trip (`serve().toJSON()`), the host-tool lookup, and the typed
+    /// failures — the live stdio conversation is covered by the JS
+    /// conformance suite (M3), which spawns this same binary as a child.
+    #[test]
+    fn mcp_server_facade_wires_host_tools_by_name() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        unsafe extern "C" fn m4_probe(
+            _args_json: *const c_char,
+            _call_id: u64,
+            _opaque: *mut c_void,
+        ) -> *const c_char {
+            c"{\"ok\":true}".as_ptr()
+        }
+
+        let name = CString::new("m4_probe_tool").unwrap();
+        let desc = CString::new("M4 probe tool").unwrap();
+        assert_eq!(
+            unsafe {
+                sofuu_rt_register_host_tool(
+                    rt,
+                    name.as_ptr(),
+                    desc.as_ptr(),
+                    ptr::null(),
+                    Some(m4_probe),
+                    ptr::null_mut(),
+                )
+            },
+            0,
+            "host tool registration should succeed"
+        );
+
+        let src = CString::new(
+            r#"(function () {
+                 var s = sofuu.mcp.serve();
+                 var handle = s.toJSON().handle;
+                 var wired = false;
+                 try { sofuu.mcp.serverTool({ name: 'm4_probe_tool' }); wired = true; } catch (e) {}
+                 var ghost = '';
+                 try { sofuu.mcp.serverTool({ name: 'm4_ghost_tool' }); }
+                 catch (e) { ghost = String(e.message || e); }
+                 var noHandle = '';
+                 try { sofuu.mcp.serverStart({ handle: 99 }); }
+                 catch (e) { noHandle = String(e.message || e); }
+                 return JSON.stringify({
+                   handle: handle,
+                   wired: wired,
+                   ghost: ghost.indexOf('no host tool registered') >= 0,
+                   noHandle: noHandle.indexOf('no server with handle') >= 0,
+                   start: typeof sofuu.mcp.serverStart,
+                   stop: typeof sofuu.mcp.serverStop
+                 });
+               })()"#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, src.as_ptr(), &mut out) }, 0);
+        let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        let env: JsonValue = serde_json::from_str(&json).expect("envelope is JSON");
+        let inner: JsonValue =
+            serde_json::from_str(env["result"].as_str().expect("result is a string"))
+                .expect("inner payload is JSON");
+        assert_eq!(inner["handle"], 0, "first serve() gets handle 0: {inner}");
+        assert_eq!(inner["wired"], true, "a registered host tool must wire: {inner}");
+        assert_eq!(inner["ghost"], true, "unknown host tool needs a typed error: {inner}");
+        assert_eq!(
+            inner["noHandle"], true,
+            "an unknown server handle needs a typed error: {inner}"
+        );
+        assert_eq!(inner["start"], "function", "{inner}");
+        assert_eq!(inner["stop"], "function", "{inner}");
+
+        unsafe { sofuu_rt_free(rt) };
+    }
+
     /// E0-4: the funnel-method resolution test.
     ///
     /// Every method on the headless funnel must resolve as a real function
@@ -4686,6 +4825,9 @@ mod tests {
             "mcp.listTools",
             "mcp.listResources",
             "mcp.disconnect",
+            "mcp.serverTool",
+            "mcp.serverStart",
+            "mcp.serverStop",
             "agent.define",
             "agent.run",
             "agent.list",
@@ -4706,7 +4848,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            48,
+            51,
             "the funnel contract list changed length — update it deliberately"
         );
 

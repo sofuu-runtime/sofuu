@@ -688,8 +688,10 @@ unsafe extern "C" fn js_mcp_call(
         }
     }
 
-    /* Bare tool name → wrap into tools/call. */
-    let method_is_bare = !method.contains(&b'/');
+    /* Bare tool name → wrap into tools/call. Protocol methods (ping) are
+     * called verbatim — `client.call('ping')` must reach the server's ping,
+     * not become a tool named "ping". */
+    let method_is_bare = !method.contains(&b'/') && method != b"ping";
     let wrapped_params: Option<CString>;
     if method_is_bare {
         let name_str = String::from_utf8_lossy(&method);
@@ -1219,11 +1221,29 @@ struct McpTool {
     handler: JSValue,     /* JS async function */
 }
 
+struct McpResource {
+    uri: String,
+    name: String,
+    mime: String,
+    handler: JSValue,
+}
+
+struct McpPrompt {
+    name: String,
+    description: String,
+    handler: JSValue,
+}
+
 struct McpServer {
     ctx: *mut JSContext,
     self_val: JSValue,
     tools: Vec<McpTool>,
     tool_count: usize,
+    /* M3 (2026-10-23): resources/prompts + lifecycle flags. */
+    resources: Vec<McpResource>,
+    prompts: Vec<McpPrompt>,
+    started: c_int,
+    listed_tools: c_int,
 
     stdin_pipe: *mut UvPipe,
     stdout_pipe: *mut UvPipe,
@@ -1242,6 +1262,12 @@ unsafe extern "C" fn mcp_server_finalizer(rt: *mut qjs::JSRuntime, val: JSValue)
     for tool in (*srv).tools.iter() {
         /* handlers were dup'd with JS_DupValue — free them using the runtime */
         qjs::sofuu_js_free_value_rt(rt, tool.handler);
+    }
+    for res in (*srv).resources.iter() {
+        qjs::sofuu_js_free_value_rt(rt, res.handler);
+    }
+    for pr in (*srv).prompts.iter() {
+        qjs::sofuu_js_free_value_rt(rt, pr.handler);
     }
     drop(Box::from_raw(srv));
 }
@@ -1315,12 +1341,10 @@ unsafe extern "C" fn mcp_tool_then_cb(
         }
     };
 
-    /* Heap-growable response buffer — large async results must never be
-     * truncated on a 4KB stack array. */
-    let rs_safe = rs.as_deref().unwrap_or("\"\"");
-    let rb = format!("{{\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}", rs_safe);
+    /* M3: async successes get the same body builder as sync ones. */
+    let body = mcp_success_body(ctx, *argv);
 
-    let resp = jsonrpc_response_cstr(req_id, &rb);
+    let resp = jsonrpc_response_cstr(req_id, &body);
     mcp_tool_write_response(srv, resp.as_bytes());
 
     if !qjs::is_exception(json_val) {
@@ -1337,16 +1361,76 @@ unsafe extern "C" fn mcp_tool_reject_cb(
     ctx: *mut JSContext,
     _this: JSValueConst,
     _argc: c_int,
-    _argv: *const JSValueConst,
+    argv: *const JSValueConst,
     _magic: c_int,
     data: *mut JSValue,
 ) -> JSValue {
     let mut req_id: i32 = -1;
     qjs::JS_ToInt32(ctx, &mut req_id, *data);
     let srv = mcp_tool_data_server(data);
-    let resp = jsonrpc_error_cstr(req_id, -32603, "Tool handler rejected");
+    /* M3: a rejected handler is an in-band tool failure. */
+    let body = mcp_iserror_body(ctx, *argv, "tool error");
+    let resp = jsonrpc_response_cstr(req_id, &body);
     mcp_tool_write_response(srv, resp.as_bytes());
     qjs::sofuu_js_undefined()
+}
+
+/// JSON.stringify a JS value as text (None on an exception).
+unsafe fn mcp_json_text(ctx: *mut JSContext, val: JSValue) -> Option<String> {
+    let json = qjs::JS_JSONStringify(ctx, val, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
+    if qjs::is_exception(json) {
+        return None;
+    }
+    let s = qjs::sofuu_js_to_cstring(ctx, json);
+    let out = if s.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(s).to_string_lossy().into_owned())
+    };
+    qjs::sofuu_js_free_cstring(ctx, s);
+    qjs::sofuu_js_free_value(ctx, json);
+    out
+}
+
+/// MCP tools/call result for a successful handler value. An object gain
+/// structuredContent; everything else is text (JSON-encoded).
+unsafe fn mcp_success_body(ctx: *mut JSContext, val: JSValue) -> String {
+    let js = mcp_json_text(ctx, val).unwrap_or_else(|| "\"\"".into());
+    if qjs::is_object(val) && js.trim_start().starts_with('{') {
+        return format!(
+            "{{\"content\":[{{\"type\":\"text\",\"text\":{js}}}],\"structuredContent\":{js}}}"
+        );
+    }
+    format!("{{\"content\":[{{\"type\":\"text\",\"text\":{js}}}]}}")
+}
+
+/// M3: a TOOL failure is in-band (`isError:true` with content), never a
+/// JSON-RPC error — the model must see it as a tool result.
+unsafe fn mcp_iserror_body(ctx: *mut JSContext, val: JSValue, prefix: &str) -> String {
+    let raw = mcp_json_text(ctx, val).unwrap_or_else(|| "\"\"".into());
+    let msg = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| raw.trim_matches('"').to_string());
+    let full = format!("{prefix}: {msg}");
+    let esc = serde_json::to_string(&full).unwrap_or_else(|_| "\"tool error\"".into());
+    format!("{{\"content\":[{{\"type\":\"text\",\"text\":{esc}}}],\"isError\":true}}")
+}
+
+/// Cursor is an opaque `off:<n>` string; absent = 0.
+fn mcp_cursor(params: &Option<serde_json::Value>) -> usize {
+    params
+        .as_ref()
+        .and_then(|p| p.get("cursor"))
+        .and_then(|c| c.as_str())
+        .and_then(|s| s.strip_prefix("off:"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn mcp_page_start(total: usize, cursor: usize, size: usize) -> (usize, usize) {
+    let start = cursor.min(total);
+    (start, (start + size).min(total))
 }
 
 /// Route an incoming RPC request to a registered tool.
@@ -1357,10 +1441,9 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
     };
 
     /* Parse inbound with the Rust jsonrpc::parse (safe serde). */
-    let parsed = crate::mcp::jsonrpc::parse(input);
-    let (req_id, method): (i32, Option<String>) = match parsed {
-        Inbound::Request { id, method, .. } => (id as i32, Some(method)),
-        _ => (0, None), /* notifications (and garbage) get no reply */
+    let (req_id, method, req_params) = match crate::mcp::jsonrpc::parse(input) {
+        Inbound::Request { id, method, params } => (id as i32, Some(method), params),
+        _ => (0, None, None), /* notifications (and garbage) get no reply */
     };
 
     /* JSON-RPC notifications carry no id and MUST NOT get a response. */
@@ -1368,43 +1451,263 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         return;
     };
 
-    /* --- initialize --- */
+    /* --- initialize (M3: negotiate the version) --- */
     if method == "initialize" {
-        let resp = jsonrpc_response_cstr(
-            req_id,
-            "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"sofuu-mcp\",\"version\":\"0.1.0\"}}",
+        let client_v = req_params
+            .as_ref()
+            .and_then(|p| p.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let chosen = if client_v == "2025-06-18" || client_v == "2024-11-05" {
+            client_v
+        } else {
+            "2025-06-18"
+        };
+        let result = format!(
+            "{{\"protocolVersion\":\"{chosen}\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"sofuu-mcp\",\"version\":\"0.1.0\"}}}}"
         );
-        mcp_server_write_str(srv, resp.as_bytes());
-
-    /* --- tools/list --- */
-    } else if method == "tools/list" {
-        let mut tools_json = String::from("[");
-        for (i, tool) in (*srv).tools.iter().enumerate() {
-            if i > 0 {
-                tools_json.push(',');
-            }
-            let n = String::from_utf8_lossy(&tool.name);
-            let d = tool.description.to_string_lossy();
-            let s = tool.schema_json.to_string_lossy();
-            tools_json.push_str(&format!(
-                "{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{}}}",
-                json_escape(&n),
-                json_escape(&d),
-                s
-            ));
-        }
-        tools_json.push(']');
-        let result = format!("{{\"tools\":{}}}", tools_json);
         let resp = jsonrpc_response_cstr(req_id, &result);
         mcp_server_write_str(srv, resp.as_bytes());
 
-    /* --- tools/call --- */
+    /* --- ping (M3) --- */
+    } else if method == "ping" {
+        let resp = jsonrpc_response_cstr(req_id, "{}");
+        mcp_server_write_str(srv, resp.as_bytes());
+
+    /* --- tools/list (paginated) --- */
+    } else if method == "tools/list" {
+        (*srv).listed_tools = 1;
+        let tool_list: &Vec<McpTool> = &(*srv).tools;
+        let total = tool_list.len();
+        let (start, end) = mcp_page_start(total, mcp_cursor(&req_params), 50);
+        let mut tools_json = String::from("[");
+        for (n, i) in (start..end).enumerate() {
+            if n > 0 {
+                tools_json.push(',');
+            }
+            let tool = &tool_list[i];
+            let name = String::from_utf8_lossy(&tool.name);
+            let d = tool.description.to_string_lossy();
+            let sc = tool.schema_json.to_string_lossy();
+            tools_json.push_str(&format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{}}}",
+                json_escape(&name),
+                json_escape(&d),
+                sc
+            ));
+        }
+        tools_json.push(']');
+        let next = if end < total {
+            format!(",\"nextCursor\":\"off:{end}\"")
+        } else {
+            String::new()
+        };
+        let result = format!("{{\"tools\":{tools_json}{next}}}");
+        let resp = jsonrpc_response_cstr(req_id, &result);
+        mcp_server_write_str(srv, resp.as_bytes());
+
+    /* --- resources/list + resources/read (M3; sync handlers) --- */
+    } else if method == "resources/list" {
+        let res_list: &Vec<McpResource> = &(*srv).resources;
+        let total = res_list.len();
+        let (start, end) = mcp_page_start(total, mcp_cursor(&req_params), 50);
+        let mut arr = String::from("[");
+        for (n, i) in (start..end).enumerate() {
+            if n > 0 {
+                arr.push(',');
+            }
+            let r = &res_list[i];
+            arr.push_str(&format!(
+                "{{\"uri\":\"{}\",\"name\":\"{}\",\"mimeType\":\"{}\"}}",
+                json_escape(&r.uri),
+                json_escape(&r.name),
+                json_escape(&r.mime)
+            ));
+        }
+        arr.push(']');
+        let next = if end < total {
+            format!(",\"nextCursor\":\"off:{end}\"")
+        } else {
+            String::new()
+        };
+        let result = format!("{{\"resources\":{arr}{next}}}");
+        let resp = jsonrpc_response_cstr(req_id, &result);
+        mcp_server_write_str(srv, resp.as_bytes());
+
+    } else if method == "resources/read" {
+        let uri = req_params
+            .as_ref()
+            .and_then(|p| p.get("uri"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let res_list: &Vec<McpResource> = &(*srv).resources;
+        let found = res_list.iter().position(|r| r.uri == uri);
+        match found {
+            None => {
+                let err = jsonrpc_error_cstr(req_id, -32602, "Resource not found");
+                mcp_server_write_str(srv, err.as_bytes());
+            }
+            Some(i) => {
+                let handler = res_list[i].handler;
+                let mime = res_list[i].mime.clone();
+                let cs = CString::new(uri.clone()).unwrap_or_default();
+                let arg = qjs::sofuu_js_new_string(ctx, cs.as_ptr());
+                let ret = qjs::JS_Call(ctx, handler, qjs::sofuu_js_undefined(), 1, &arg);
+                qjs::sofuu_js_free_value(ctx, arg);
+                if qjs::is_exception(ret) {
+                    qjs::js_std_dump_error(ctx);
+                    let err = jsonrpc_error_cstr(req_id, -32603, "Resource handler threw");
+                    mcp_server_write_str(srv, err.as_bytes());
+                } else {
+                    let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
+                    if qjs::JS_IsFunction(ctx, then_fn) != 0 {
+                        /* Sync-only in this slice: say so instead of hanging. */
+                        let err = jsonrpc_error_cstr(
+                            req_id,
+                            -32603,
+                            "Async resource handlers are not supported yet",
+                        );
+                        mcp_server_write_str(srv, err.as_bytes());
+                    } else if qjs::sofuu_js_is_string(ret) != 0 {
+                        let sp = qjs::sofuu_js_to_cstring(ctx, ret);
+                        let text = if sp.is_null() {
+                            String::new()
+                        } else {
+                            let v = CStr::from_ptr(sp).to_string_lossy().into_owned();
+                            qjs::sofuu_js_free_cstring(ctx, sp);
+                            v
+                        };
+                        let body = format!(
+                            "{{\"contents\":[{{\"uri\":\"{}\",\"mimeType\":\"{}\",\"text\":{}}}]}}",
+                            json_escape(&uri),
+                            json_escape(&mime),
+                            serde_json::to_string(&text)
+                                .unwrap_or_else(|_| "\"\"".into())
+                        );
+                        let resp = jsonrpc_response_cstr(req_id, &body);
+                        mcp_server_write_str(srv, resp.as_bytes());
+                    } else {
+                        let body = mcp_json_text(ctx, ret)
+                            .map(|j| format!("{{\"contents\":{j}}}"))
+                            .unwrap_or_else(|| "{\"contents\":[]}".into());
+                        let resp = jsonrpc_response_cstr(req_id, &body);
+                        mcp_server_write_str(srv, resp.as_bytes());
+                    }
+                    qjs::sofuu_js_free_value(ctx, then_fn);
+                }
+                qjs::sofuu_js_free_value(ctx, ret);
+            }
+        }
+
+    /* --- prompts/list + prompts/get (M3; sync handlers) --- */
+    } else if method == "prompts/list" {
+        let prompt_list: &Vec<McpPrompt> = &(*srv).prompts;
+        let total = prompt_list.len();
+        let (start, end) = mcp_page_start(total, mcp_cursor(&req_params), 50);
+        let mut arr = String::from("[");
+        for (n, i) in (start..end).enumerate() {
+            if n > 0 {
+                arr.push(',');
+            }
+            let p = &prompt_list[i];
+            arr.push_str(&format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\"}}",
+                json_escape(&p.name),
+                json_escape(&p.description)
+            ));
+        }
+        arr.push(']');
+        let next = if end < total {
+            format!(",\"nextCursor\":\"off:{end}\"")
+        } else {
+            String::new()
+        };
+        let result = format!("{{\"prompts\":{arr}{next}}}");
+        let resp = jsonrpc_response_cstr(req_id, &result);
+        mcp_server_write_str(srv, resp.as_bytes());
+
+    } else if method == "prompts/get" {
+        let pname = req_params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let prompt_list: &Vec<McpPrompt> = &(*srv).prompts;
+        let found = prompt_list.iter().position(|p| p.name == pname);
+        match found {
+            None => {
+                let err = jsonrpc_error_cstr(req_id, -32602, "Prompt not found");
+                mcp_server_write_str(srv, err.as_bytes());
+            }
+            Some(i) => {
+                let handler = prompt_list[i].handler;
+                let desc = prompt_list[i].description.clone();
+                let args_val = req_params
+                    .as_ref()
+                    .and_then(|p| p.get("arguments"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let ac = cstr_json(&args_val.to_string());
+                let mut arg = qjs::JS_ParseJSON(
+                    ctx,
+                    ac.as_ptr(),
+                    ac.as_bytes().len(),
+                    c"<prompt-args>".as_ptr(),
+                );
+                if qjs::is_exception(arg) {
+                    qjs::sofuu_js_get_exception(ctx);
+                    arg = qjs::sofuu_js_new_object(ctx);
+                }
+                let ret = qjs::JS_Call(ctx, handler, qjs::sofuu_js_undefined(), 1, &arg);
+                qjs::sofuu_js_free_value(ctx, arg);
+                if qjs::is_exception(ret) {
+                    qjs::js_std_dump_error(ctx);
+                    let err = jsonrpc_error_cstr(req_id, -32603, "Prompt handler threw");
+                    mcp_server_write_str(srv, err.as_bytes());
+                } else {
+                    let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
+                    if qjs::JS_IsFunction(ctx, then_fn) != 0 {
+                        let err = jsonrpc_error_cstr(
+                            req_id,
+                            -32603,
+                            "Async prompt handlers are not supported yet",
+                        );
+                        mcp_server_write_str(srv, err.as_bytes());
+                    } else {
+                        let text = if qjs::sofuu_js_is_string(ret) != 0 {
+                            let sp = qjs::sofuu_js_to_cstring(ctx, ret);
+                            let v = if sp.is_null() {
+                                String::new()
+                            } else {
+                                let out = CStr::from_ptr(sp).to_string_lossy().into_owned();
+                                qjs::sofuu_js_free_cstring(ctx, sp);
+                                out
+                            };
+                            v
+                        } else {
+                            mcp_json_text(ctx, ret).unwrap_or_else(|| "".into())
+                        };
+                        let body = format!(
+                            "{{\"description\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]}}",
+                            json_escape(&desc),
+                            serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
+                        );
+                        let resp = jsonrpc_response_cstr(req_id, &body);
+                        mcp_server_write_str(srv, resp.as_bytes());
+                    }
+                    qjs::sofuu_js_free_value(ctx, then_fn);
+                }
+                qjs::sofuu_js_free_value(ctx, ret);
+            }
+        }
+
+    /* --- tools/call (M3: tool failures are in-band isError) --- */
     } else if method == "tools/call" {
-        /* Extract params from the parsed request. */
         let mut toolname: Option<String> = None;
         let mut args_str: Option<CString> = None;
-        let params = crate::mcp::jsonrpc::parse(input);
-        if let Inbound::Request { params: Some(p), .. } = params {
+        if let Some(p) = req_params.as_ref() {
             if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
                 toolname = Some(name.to_string());
             }
@@ -1451,8 +1754,13 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
 
                 if qjs::is_exception(ret) {
                     qjs::js_std_dump_error(ctx);
-                    let err = jsonrpc_error_cstr(req_id, -32603, "Tool handler threw");
-                    mcp_server_write_str(srv, err.as_bytes());
+                    /* M3: a thrown handler is a TOOL failure, not a protocol
+                     * error — answer isError:true with content. */
+                    let threw = qjs::sofuu_js_new_string(ctx, c"handler threw".as_ptr());
+                    let body = mcp_iserror_body(ctx, threw, "tool error");
+                    qjs::sofuu_js_free_value(ctx, threw);
+                    let resp = jsonrpc_response_cstr(req_id, &body);
+                    mcp_server_write_str(srv, resp.as_bytes());
                 } else {
                     /* Check if the return value is a Promise by testing for
                      * a callable .then property. */
@@ -1461,27 +1769,15 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                     qjs::sofuu_js_free_value(ctx, then_fn);
 
                     if is_promise {
-                        /* P1-7: capture req_id + the server's JSValue (NOT
-                         * a raw pointer — the old int64 encoding let the
-                         * finalizer free the Box while a tool promise was
-                         * pending = UAF). QuickJS GC-marks C-function data
-                         * (quickjs.c:1485), so this dup pins the object
-                         * until the promise settles; the callbacks recover
-                         * it via mcp_tool_data_server. */
                         let js_id = qjs::sofuu_js_new_int32(ctx, req_id);
                         let js_srv = qjs::sofuu_js_dup_value(ctx, (*srv).self_val);
                         let mut data_arr: [JSValue; 2] = [js_id, js_srv];
 
-                        /* .then(on_ok, on_err) — P1-8: the rejection handler
-                         * answers the request with a JSON-RPC error so the
-                         * caller's pending slot frees even when the tool
-                         * handler rejects. */
                         let then_ok =
                             qjs::JS_NewCFunctionData(ctx, mcp_tool_then_cb, 1, 0, 2, data_arr.as_mut_ptr());
                         let then_err =
                             qjs::JS_NewCFunctionData(ctx, mcp_tool_reject_cb, 1, 0, 2, data_arr.as_mut_ptr());
 
-                        /* Handle resolution + rejection */
                         let handlers: [JSValueConst; 2] = [then_ok, then_err];
                         let ret2 = qjs::JS_Call(ctx, then_fn, ret, 2, handlers.as_ptr());
                         if qjs::is_exception(ret2) {
@@ -1496,36 +1792,11 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                         qjs::sofuu_js_free_value(ctx, data_arr[1]);
                         qjs::sofuu_js_free_value(ctx, data_arr[0]);
 
-                        /* Pump microtasks once to settle synchronous promises */
                         sofuu_flush_jobs(ctx);
-
-                        /* If still unresolved, the async response arrives
-                         * when the promise settles (mcp_tool_then_cb). */
                     } else {
-                        /* Sync path (or settled promise after flush) */
-                        let json_val = qjs::JS_JSONStringify(ctx, ret, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
-                        let result_str = if qjs::is_exception(json_val) {
-                            None
-                        } else {
-                            let s = qjs::sofuu_js_to_cstring(ctx, json_val);
-                            if s.is_null() {
-                                None
-                            } else {
-                                let out = Some(CStr::from_ptr(s).to_string_lossy().into_owned());
-                                qjs::sofuu_js_free_cstring(ctx, s);
-                                out
-                            }
-                        };
-
-                        /* Heap-growable — large sync results must not truncate. */
-                        let rs_safe = result_str.as_deref().unwrap_or("\"\"");
-                        let result_buf = format!("{{\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}", rs_safe);
-                        let resp = jsonrpc_response_cstr(req_id, &result_buf);
+                        let body = mcp_success_body(ctx, ret);
+                        let resp = jsonrpc_response_cstr(req_id, &body);
                         mcp_server_write_str(srv, resp.as_bytes());
-
-                        if !qjs::is_exception(json_val) {
-                            qjs::sofuu_js_free_value(ctx, json_val);
-                        }
                     }
 
                     qjs::sofuu_js_free_value(ctx, ret);
@@ -1673,7 +1944,111 @@ unsafe extern "C" fn js_server_tool(
         handler,
     });
     (*srv).tool_count += 1;
+    /* M3: a tool registered after the client listed the inventory is
+     * announced instead of silently appearing. */
+    if (*srv).started != 0 && (*srv).listed_tools != 0 {
+        let note = jsonrpc_notify_cstr("notifications/tools/list_changed", None);
+        mcp_server_write_str(srv, note.as_bytes());
+    }
 
+    qjs::sofuu_js_undefined()
+}
+
+// ── JS: server.resource(uri, { name, mimeType }, handler) ───────────
+
+unsafe extern "C" fn js_server_resource(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, MCP_SERVER_CLASS_ID.load(Ordering::Relaxed)) as *mut McpServer;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"Invalid MCPServer".as_ptr());
+    }
+    if argc < 3 {
+        return qjs::JS_ThrowTypeError(ctx, c"resource: uri, opts, handler required".as_ptr());
+    }
+    if (*srv).resources.len() >= 512 {
+        return qjs::JS_ThrowRangeError(ctx, c"Too many resources".as_ptr());
+    }
+    let uri_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+    if uri_ptr.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let uri = CStr::from_ptr(uri_ptr).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, uri_ptr);
+    let mut name = uri.clone();
+    let mut mime = String::from("text/plain");
+    if qjs::is_object(*argv.add(1)) {
+        let nv = qjs::sofuu_js_get_property_str(ctx, *argv.add(1), c"name".as_ptr());
+        if qjs::sofuu_js_is_string(nv) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, nv);
+            if !p.is_null() {
+                name = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, nv);
+        let mv = qjs::sofuu_js_get_property_str(ctx, *argv.add(1), c"mimeType".as_ptr());
+        if qjs::sofuu_js_is_string(mv) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, mv);
+            if !p.is_null() {
+                mime = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, mv);
+    }
+    if qjs::JS_IsFunction(ctx, *argv.add(2)) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"resource: handler must be a function".as_ptr());
+    }
+    let handler = qjs::sofuu_js_dup_value(ctx, *argv.add(2));
+    (*srv).resources.push(McpResource { uri, name, mime, handler });
+    qjs::sofuu_js_undefined()
+}
+
+// ── JS: server.prompt(name, { description }, handler) ───────────────
+
+unsafe extern "C" fn js_server_prompt(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, MCP_SERVER_CLASS_ID.load(Ordering::Relaxed)) as *mut McpServer;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"Invalid MCPServer".as_ptr());
+    }
+    if argc < 3 {
+        return qjs::JS_ThrowTypeError(ctx, c"prompt: name, opts, handler required".as_ptr());
+    }
+    if (*srv).prompts.len() >= 512 {
+        return qjs::JS_ThrowRangeError(ctx, c"Too many prompts".as_ptr());
+    }
+    let name_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
+    if name_ptr.is_null() {
+        return qjs::sofuu_js_exception();
+    }
+    let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, name_ptr);
+    let mut description = String::new();
+    if qjs::is_object(*argv.add(1)) {
+        let dv = qjs::sofuu_js_get_property_str(ctx, *argv.add(1), c"description".as_ptr());
+        if qjs::sofuu_js_is_string(dv) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, dv);
+            if !p.is_null() {
+                description = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, dv);
+    }
+    if qjs::JS_IsFunction(ctx, *argv.add(2)) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"prompt: handler must be a function".as_ptr());
+    }
+    let handler = qjs::sofuu_js_dup_value(ctx, *argv.add(2));
+    (*srv).prompts.push(McpPrompt { name, description, handler });
     qjs::sofuu_js_undefined()
 }
 
@@ -1711,6 +2086,7 @@ unsafe extern "C" fn js_server_start(
         crate::rt::event_loop::track_handle((*srv).ctx, stdout_pipe as *mut UvHandle, Some(free_pipe_cb));
     }
 
+    (*srv).started = 1;
     eprintln!(
         "[sofuu mcp] server started ({} tools registered)",
         (*srv).tool_count
@@ -1719,8 +2095,27 @@ unsafe extern "C" fn js_server_start(
     qjs::sofuu_js_undefined()
 }
 
+// ── JS: server.stop() — detach from stdio (idempotent) ──────────────
+
+unsafe extern "C" fn js_server_stop(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, MCP_SERVER_CLASS_ID.load(Ordering::Relaxed)) as *mut McpServer;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"Invalid MCPServer".as_ptr());
+    }
+    if !(*srv).stdin_pipe.is_null() {
+        uv::uv_read_stop((*srv).stdin_pipe as *mut UvStream);
+    }
+    (*srv).started = 0;
+    qjs::sofuu_js_undefined()
+}
+
 thread_local! {
-    static MCP_SERVER_PROTO: [qjs::JSCFunctionListEntry; 2] = [
+    static MCP_SERVER_PROTO: [qjs::JSCFunctionListEntry; 5] = [
         qjs::JSCFunctionListEntry {
             name: c"tool".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -1734,6 +2129,27 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_server_start },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"resource".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_server_resource },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"prompt".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_server_prompt },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"stop".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_server_stop },
         },
     ];
 }
@@ -1751,6 +2167,10 @@ unsafe extern "C" fn js_mcp_serve(
         self_val: qjs::sofuu_js_undefined(),
         tools: Vec::new(),
         tool_count: 0,
+        resources: Vec::new(),
+        prompts: Vec::new(),
+        started: 0,
+        listed_tools: 0,
         stdin_pipe: ptr::null_mut(),
         stdout_pipe: ptr::null_mut(),
         read_buf: [0u8; MCP_READ_BUF],
@@ -1821,7 +2241,9 @@ pub unsafe extern "C" fn mod_mcp_register(ctx: *mut JSContext) {
     };
     let _nc2 = qjs::JS_NewClass(qjs::JS_GetRuntime(ctx), class_id, &server_class);
     let server_proto = qjs::sofuu_js_new_object(ctx);
-    MCP_SERVER_PROTO.with(|f| qjs::JS_SetPropertyFunctionList(ctx, server_proto, f.as_ptr(), 2));
+    MCP_SERVER_PROTO.with(|f| {
+        qjs::JS_SetPropertyFunctionList(ctx, server_proto, f.as_ptr(), f.len() as i32)
+    });
     qjs::JS_SetClassProto(ctx, class_id, server_proto);
 
     /* Attach mcp object to sofuu global */

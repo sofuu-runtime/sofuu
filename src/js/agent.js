@@ -1770,7 +1770,15 @@
       };
     }
     return { specs: specs, exec: exec, mcpNames: mcpNames, sources: sources,
-             annotations: annotations };
+             annotations: annotations,
+             /* T3: name → declared parameters, for pre-execute validation. */
+             schemas: (function () {
+               var m = {};
+               for (var si = 0; si < specs.length; si++) {
+                 if (specs[si] && specs[si].name) m[specs[si].name] = specs[si];
+               }
+               return m;
+             })() };
   }
 
   function delegateSpecFor(d, chain) {
@@ -2087,58 +2095,13 @@
     }
   }
   function validateSchemaLight(obj, schema) {
+    /* T3 (2026-10-23): ONE validation semantics — the tool-argument
+     * validator in tools.js also judges structured answers. */
     try {
-      if (!schema || typeof schema !== 'object') return { ok: true, why: '' };
-      var t = schema.type;
-      if (t && !schemaTypeCheck(obj, t)) {
-        return { ok: false, why: 'root is not ' + t };
-      }
-      var wantObj = (!t && (schema.properties || schema.required)) || t === 'object';
-      if (wantObj && (!obj || typeof obj !== 'object' || Array.isArray(obj))) {
-        return { ok: false, why: 'root must be a JSON object' };
-      }
-      var req, pr;
-      if (wantObj) {
-        req = Array.isArray(schema.required) ? schema.required : [];
-        pr = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {};
-        for (var ri = 0; ri < req.length; ri++) {
-          if (!(req[ri] in obj)) return { ok: false, why: 'missing required key "' + req[ri] + '"' };
-        }
-        for (var k in pr) {
-          if (!(k in obj)) continue;
-          var spec = pr[k];
-          if (spec && spec.type && !schemaTypeCheck(obj[k], spec.type)) {
-            return { ok: false, why: 'key "' + k + '" is not ' + spec.type };
-          }
-          /* one nested level: required AND declared types of the
-           * sub-object's keys (the first cut checked required only —
-           * review 2026-10-16) */
-          if (spec && spec.type === 'object' && obj[k] && typeof obj[k] === 'object' &&
-              !Array.isArray(obj[k])) {
-            var nreq = Array.isArray(spec.required) ? spec.required : [];
-            for (var nj = 0; nj < nreq.length; nj++) {
-              if (!(nreq[nj] in obj[k])) {
-                return { ok: false, why: 'missing "' + k + '.' + nreq[nj] + '"' };
-              }
-            }
-            var npr = (spec.properties && typeof spec.properties === 'object') ? spec.properties : null;
-            if (npr) {
-              for (var nk in npr) {
-                if (!(nk in obj[k])) continue;
-                if (npr[nk] && npr[nk].type && !schemaTypeCheck(obj[k][nk], npr[nk].type)) {
-                  return { ok: false, why: '"' + k + '.' + nk + '" is not ' + npr[nk].type };
-                }
-              }
-            }
-          }
-        }
-      }
-      if (t === 'array' && Array.isArray(obj) && schema.items && schema.items.type) {
-        for (var ai2 = 0; ai2 < Math.min(obj.length, 50); ai2++) {
-          if (!schemaTypeCheck(obj[ai2], schema.items.type)) {
-            return { ok: false, why: 'items[' + ai2 + '] is not ' + schema.items.type };
-          }
-        }
+      if (sofuu.tools && typeof sofuu.tools.validateArgs === 'function') {
+        var r = sofuu.tools.validateArgs(schema, obj);
+        if (r.ok) return { ok: true, why: '' };
+        return { ok: false, why: (r.path ? r.path + ' ' : '') + (r.error || 'invalid') };
       }
       return { ok: true, why: '' };
     } catch (e) {
@@ -3666,6 +3629,23 @@
         var toolSource = (toolset && toolset.sources && toolset.sources[name]) || 'builtin';
         toolHist[name] = (toolHist[name] || 0) + 1;
         emit('tool', { name: name, args: clip(JSON.stringify(args || {}), 200) });
+        /* T3 (2026-10-23): validate against the declared schema BEFORE any
+         * side effect. A bad call gets a path-precise E_SCHEMA result and
+         * the tool never runs (no partial writes, no spawned shell). */
+        var specForTool = (toolset && toolset.schemas) ? toolset.schemas[name] : null;
+        if (specForTool && specForTool.parameters &&
+            sofuu.tools && typeof sofuu.tools.validateArgs === 'function') {
+          var vArgs = sofuu.tools.validateArgs(specForTool.parameters, args || {});
+          if (!vArgs.ok) {
+            var vMsg = 'tool error: invalid arguments at ' + (vArgs.path || '$') +
+                       ': ' + (vArgs.error || 'invalid');
+            emit('tool_result', { name: name, ok: false, source: toolSource,
+                                  error_code: 'E_SCHEMA', invalid_path: vArgs.path || '$',
+                                  result: clip(vMsg, 200),
+                                  duration_ms: Date.now() - toolStartedAt });
+            return vMsg;
+          }
+        }
         /* Permission profile (see permissionBlocked above): a gated tool
          * never executes — the model gets the same explanatory string the
          * desktop gate returns (chat.js blockedTool), so it can react

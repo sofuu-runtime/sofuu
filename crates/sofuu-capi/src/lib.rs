@@ -4679,6 +4679,8 @@ mod tests {
             "policy.get",
             "policy.evaluate",
             "policy.explain",
+            "tools.list",
+            "tools.describe",
             "mcp.connect",
             "mcp.call",
             "mcp.listTools",
@@ -4704,7 +4706,7 @@ mod tests {
         methods.dedup();
         assert_eq!(
             methods.len(),
-            46,
+            48,
             "the funnel contract list changed length — update it deliberately"
         );
 

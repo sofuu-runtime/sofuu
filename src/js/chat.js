@@ -737,8 +737,11 @@
         ? sofuu.tools.mcpResult(res, { maxChars: 12000 })
         : { ok: !(res && res.isError === true),
             text: String((res && res.content && res.content[0] && res.content[0].text) || '') };
-      var text = (typeof mapped.text === 'string') ? mapped.text : String(mapped.text);
-      return mapped.ok ? text : ('tool error: ' + text);
+      /* T1b (2026-10-23): return the TYPED result, not unwrapped prose — the
+       * shared loop renders `.text` into the transcript and carries ok/
+       * data/meta/error into the event, exactly as it does for the agent's
+       * own MCP adapter. */
+      return mapped;
     }
     throw new Error('tool ' + name + ': owning server "' + owner + '" is not connected');
   }

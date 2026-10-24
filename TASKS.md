@@ -3960,3 +3960,34 @@ what code reading suggested:
   `rt::mcp` 15/15. Release binary 4,923,160 B stripped (cap 5,242,880).
 - **Not in this slice:** `http.auth` as a policy check moves with the serve
   handler rewrite (H1), where the request path is extracted and testable.
+
+## 2026-10-24 — workstream 6 phase 6: native fs root (S1b), validation/inventory (T3), typed chat results (T1b)
+
+- **S1b — opt-in native fs root.** `sofuu.fs.setRoot(path)` canonicalises and
+  installs one root for the runtime; `clearRoot()` removes it and `root()`
+  reports it. With a root installed, every fs entry point (readFile,
+  writeFile/appendFile, exists, readdir, mkdir, rm, readFileBytes, realpath,
+  isSymlink) resolves relative paths under it and refuses anything that
+  escapes, lexically and after realpath (so an in-root symlink pointing out is
+  refused, but an in-root symlink stays readable). A path outside the root
+  answers `false` for `exists`/`isSymlink` rather than throwing. No root = the
+  previous behaviour exactly, so hosts reading HOME/model paths are unaffected
+  unless they opt in.
+- **T3 — one validator, one inventory.** `sofuu.tools.validateArgs(schema,
+  value)` (type incl. unions/integer, required, properties, items, enum,
+  recursive) now backs BOTH pre-execute tool-argument validation and the
+  agent's `responseSchema` check. A bad call returns a typed `E_SCHEMA`
+  `tool_result` with the offending `invalid_path` and the tool never runs.
+  `sofuu.tools.list({enabledOnly})` / `describe(name)` return
+  `{name, source, description, schema, policy:{allowed, requiresApproval}}`
+  for builtin/web/host tools, with the ACTIVE policy's verdicts (a denied
+  bash reports `allowed:false`; `approval.mode:'always'` reports
+  `requiresApproval:true`). Both are part of the 48-method funnel contract.
+- **T1b — chat runs on the typed contract.** Chat's MCP adapter returns the
+  mapped `{ok,text,data,error,meta}` result instead of unwrapped prose, so
+  the shared loop emits typed `tool_result` events (source/ok/meta/data) for
+  chat turns too; the chat smoke asserts it.
+- **Receipts:** conformance **0 failures / 0 known gaps** (7 S1b native-root
+  checks, 8 T3 checks), battery **289 PASS / 0 FAIL** (schema-guard check
+  proves execute is never reached), chat smoke 4/4, `rt::fs` suite green.
+  Release binary 4,923,192 B stripped (cap 5,242,880).

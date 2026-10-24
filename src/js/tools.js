@@ -1327,4 +1327,122 @@
                        'list_dir', 'bash', 'code_eval', 'todo_write']
     .filter(function (n) { return !(SHELL_DISABLED && n === 'bash'); });
   sofuu.tools.ENABLED = { bash: !SHELL_DISABLED };
+
+  /* ── T3 (2026-10-23): one lightweight schema validator ───────────
+   * No external dependency. Covers type (incl. unions and integer),
+   * required, properties (recursive), items (recursive) and enum.
+   * `sofuu.tools.validateArgs` also backs the agent's responseSchema
+   * check, so tool arguments and structured answers share one semantics. */
+  function schemaTypeOk(v, t) {
+    if (t === 'string') return typeof v === 'string';
+    if (t === 'number') return typeof v === 'number' && isFinite(v);
+    if (t === 'integer') return typeof v === 'number' && isFinite(v) && Math.floor(v) === v;
+    if (t === 'boolean') return typeof v === 'boolean';
+    if (t === 'array') return Array.isArray(v);
+    if (t === 'object') return !!v && typeof v === 'object' && !Array.isArray(v);
+    if (t === 'null') return v === null;
+    return true;
+  }
+  function schemaWalk(v, schema, path) {
+    if (!schema || typeof schema !== 'object') return null;
+    if (Array.isArray(schema.enum) && schema.enum.length) {
+      var found = false;
+      for (var i = 0; i < schema.enum.length; i++) {
+        if (schema.enum[i] === v) { found = true; break; }
+      }
+      if (!found) {
+        return { path: path || '$', error: 'must be one of ' + JSON.stringify(schema.enum) };
+      }
+    }
+    if (schema.type) {
+      var types = Array.isArray(schema.type) ? schema.type : [schema.type];
+      var okT = false;
+      for (var ti = 0; ti < types.length; ti++) {
+        if (schemaTypeOk(v, types[ti])) { okT = true; break; }
+      }
+      if (!okT) return { path: path || '$', error: 'must be ' + types.join('|') };
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      var req = Array.isArray(schema.required) ? schema.required : [];
+      for (var r = 0; r < req.length; r++) {
+        if (!(req[r] in v)) {
+          return { path: (path ? path + '.' : '') + req[r], error: 'is required' };
+        }
+      }
+      var props = (schema.properties && typeof schema.properties === 'object')
+        ? schema.properties : null;
+      if (props) {
+        for (var k in props) {
+          if (!Object.prototype.hasOwnProperty.call(v, k) || v[k] === undefined) continue;
+          var sub = schemaWalk(v[k], props[k], (path ? path + '.' : '') + k);
+          if (sub) return sub;
+        }
+      }
+    }
+    if (Array.isArray(v) && schema.items) {
+      var lim = Math.min(v.length, 200);
+      for (var ai = 0; ai < lim; ai++) {
+        var subI = schemaWalk(v[ai], schema.items, (path || '$') + '[' + ai + ']');
+        if (subI) return subI;
+      }
+    }
+    return null;
+  }
+  sofuu.tools.validateArgs = function (schema, value) {
+    if (!schema || typeof schema !== 'object') return { ok: true };
+    var bad = schemaWalk(value, schema, '$');
+    return bad ? { ok: false, path: bad.path, error: bad.error } : { ok: true };
+  };
+
+  /* T3: tool inventory. Builtin + web + host tools; MCP/inline tools are
+   * per-run (they only exist after a def connects), so they are not in the
+   * global list. `allowed`/`requiresApproval` are the ACTIVE policy's
+   * verdicts, so a picker and the loop cannot disagree. */
+  sofuu.tools.list = function (opts) {
+    opts = opts || {};
+    var enabledOnly = opts.enabledOnly !== false;
+    var out = [];
+    function push(name, source, spec) {
+      if (enabledOnly && sofuu.tools.ENABLED && sofuu.tools.ENABLED[name] === false) return;
+      var allowed = true, requiresApproval = false;
+      try {
+        if (sofuu.policy && typeof sofuu.policy.evaluate === 'function') {
+          /* tool.run on bash carries the shell checks too (deny wins). */
+          var d = JSON.parse(sofuu.policy.evaluate({ op: 'tool.run', tool: name }));
+          allowed = d.decision !== 'deny';
+          requiresApproval = d.decision === 'ask';
+        }
+      } catch (ePol) {}
+      out.push({
+        name: name,
+        source: source,
+        description: String((spec && (spec.description || spec.summary)) || ''),
+        schema: (spec && (spec.parameters || spec.schema)) || null,
+        policy: { allowed: allowed, requiresApproval: requiresApproval },
+      });
+    }
+    var i, keys, n;
+    for (i = 0; i < sofuu.tools.GROUP.length; i++) {
+      n = sofuu.tools.GROUP[i];
+      if (sofuu.tools.TOOLS[n]) push(n, 'builtin', sofuu.tools.TOOLS[n]);
+    }
+    if (sofuu.web && sofuu.web.TOOLS) {
+      keys = Object.keys(sofuu.web.TOOLS);
+      for (i = 0; i < keys.length; i++) push(keys[i], 'web', sofuu.web.TOOLS[keys[i]]);
+    }
+    var host = globalThis.__sofuu_host_tools;
+    if (host && typeof host === 'object') {
+      keys = Object.keys(host);
+      for (i = 0; i < keys.length; i++) push(keys[i], 'host', host[keys[i]]);
+    }
+    return out;
+  };
+  sofuu.tools.describe = function (name) {
+    var wanted = String(name || '');
+    var all = sofuu.tools.list({ enabledOnly: false });
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].name === wanted) return all[i];
+    }
+    return null;
+  };
 })();

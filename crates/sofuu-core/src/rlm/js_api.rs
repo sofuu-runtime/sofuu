@@ -535,6 +535,15 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::CHAT_BC),
             "<chat-driver>",
         );
+        // Workstream H1: the HTTP edge server. Last — its agent/tool routes
+        // call into every namespace above; the module only defines
+        // sofuu.serve.*, nothing runs until start().
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::SERVE_JS,
+            Some(crate::shipped::SERVE_BC),
+            "<serve-driver>",
+        );
     }
 }
 

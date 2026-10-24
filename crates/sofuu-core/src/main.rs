@@ -899,6 +899,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
     let mut brain_path = String::new();
     let mut model_path = String::new();
+    let mut model_id = String::new();
     let mut port: u16 = 7707;
     let mut host = "127.0.0.1".to_string();
     // Prefer env over argv: --token is visible via `ps`. SOFUU_SERVE_TOKEN
@@ -928,6 +929,16 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
             "--model" | "-m" => match value_arg(args, i) {
                 Some(v) => {
                     model_path = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]);
+                    return 1;
+                }
+            },
+            "--model-id" => match value_arg(args, i) {
+                Some(v) => {
+                    model_id = v;
                     i += 2;
                 }
                 None => {
@@ -1068,10 +1079,15 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         eprintln!("\x1b[2m  token: (from --token / SOFUU_SERVE_TOKEN)\x1b[0m");
     }
     eprintln!("\x1b[2m  endpoints:\x1b[0m");
-    eprintln!("\x1b[2m    GET  /health\x1b[0m");
+    eprintln!("\x1b[2m    GET  /health               (liveness, no auth)\x1b[0m");
     eprintln!("\x1b[2m    GET  /v1/models\x1b[0m");
     eprintln!("\x1b[2m    POST /v1/chat/completions  (OpenAI SSE stream & json)\x1b[0m");
     eprintln!("\x1b[2m    POST /v1/completions       (text completions)\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/embeddings        (OpenAI embeddings)\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/sessions          (process-local session history)\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/agent/runs        (agent loop, SSE events)\x1b[0m");
+    eprintln!("\x1b[2m    GET  /v1/tools             (inventory + policy verdict)\x1b[0m");
+    eprintln!("\x1b[2m    POST /v1/tools/:name/call  (execute under policy)\x1b[0m");
     eprintln!("\x1b[2m    POST /infer                (direct local infer)\x1b[0m");
     eprintln!("\x1b[2m    POST /remember             {{text, role?, source?}}\x1b[0m");
     eprintln!("\x1b[2m    GET  /recall?q=…&k=…\x1b[0m");
@@ -1080,411 +1096,19 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     eprintln!("\x1b[2m    POST /share                (export card: records + vectors + manifest)\x1b[0m");
     eprintln!();
 
-    let brain_path_js = serde_json::to_string(&brain_path).unwrap_or_else(|_| "\"\"".into());
-    let model_path_js = serde_json::to_string(&model_path).unwrap_or_else(|_| "\"\"".into());
-    let token_js = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".into());
-    let host_js = serde_json::to_string(&host).unwrap_or_else(|_| "\"\"".into());
-
-    let serve_js = format!(r#"
-(async function () {{
-  var g = globalThis;
-  if (!g.sofuu) g.sofuu = {{}};
-  var brainPath = {brain_path_js};
-  var modelPath = {model_path_js};
-  var token = {token_js};
-  var host = {host_js};
-  var port = {port};
-  var brain = null;
-  /* B1.5: open the file by ITS OWN manifest, not a hardcoded 768 — this
-   * server used to be able to serve hash brains only. `inspect` reads the
-   * manifest without opening; `embed` then follows the space so /remember
-   * and /recall produce vectors the store actually holds. */
-  var embed = function (t) {{ return sofuu.ai.embedLocal(String(t)); }};
-  if (sofuu.memory && typeof sofuu.memory.open === 'function') {{
-    var dim = 768;
-    var space = undefined;
-    try {{
-      if (typeof sofuu.memory.inspect === 'function') {{
-        var info = JSON.parse(sofuu.memory.inspect(brainPath));
-        if (info && info.ok) {{
-          if (info.dimension) dim = info.dimension;
-          if (info.id) space = info.id;
-        }}
-      }}
-    }} catch (e0) {{}}
-    try {{
-      brain = space === undefined
-        ? sofuu.memory.open(brainPath, dim)
-        : sofuu.memory.open(brainPath, dim, space);
-    }} catch (e) {{ console.error('brain open: ' + e); }}
-    if (space === 'semantic-projector-v1' && typeof sofuu.ai.embedLocalSemantic === 'function') {{
-      embed = function (t) {{ return sofuu.ai.embedLocalSemantic(String(t)); }};
-    }} else if (space === 'semantic-table-v2' && typeof sofuu.ai.embedLocalSemanticV2 === 'function') {{
-      embed = function (t) {{ return sofuu.ai.embedLocalSemanticV2(String(t)); }};
-    }}
-    /* P2 (audit 2026-10-14): a manifest space this server cannot embed
-     * LOCALLY (a remote provider space, a custom agent space) used to fall
-     * through to the default hash embedder — hash-768 vectors stored under
-     * a foreign-space manifest, mislabeled in /share cards and useless at
-     * recall. Refuse instead: the store simply stays unavailable (503s
-     * below) with the reason on stderr. hash-v1 needs no switch. */
-    if (brain && space && space !== 'hash-v1' &&
-        space !== 'semantic-projector-v1' && space !== 'semantic-table-v2') {{
-      console.error("brain space '" + space + "' has no local embedder in this server — refusing to serve (hash vectors would be mislabeled in a '" + space + "' store)");
-      brain = null;
-    }}
-  }}
-  /* Pin the brain + server to globals: their JS objects' reachability
-   * controls native lifetime (the finalizer closes the handle) — locals
-   * inside this async IIFE die at resolution and would kill the server. */
-  g.__sofuu_serve_brain = brain;
-  g.__sofuu_serve_server = null;
-  var server = sofuu.http.createServer(async function (req, res) {{
-    /* Constant-time comparison — a plain !== compare leaks the matching
-     * prefix length to a local timing attacker. */
-    function ctEq(a, b) {{
-      if (typeof a !== 'string' || a.length !== b.length) return false;
-      var d = 0;
-      for (var i = 0; i < b.length; i++) d |= (a.charCodeAt(i) ^ b.charCodeAt(i));
-      return d === 0;
-    }}
-    var auth = (req.headers && req.headers.authorization) || '';
-    if (!ctEq(auth, 'Bearer ' + token)) {{
-      res.writeHead(401, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{ ok: false, error: 'unauthorized' }}));
-      return;
-    }}
-    var url = req.url || '/';
-    var path = url.split('?')[0];
-    if (req.method === 'GET' && path === '/health') {{
-      var count = brain ? brain.count() : 0;
-      res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{ ok: true, memories: count, model: modelPath || null }}));
-      return;
-    }}
-    if (req.method === 'GET' && path === '/v1/models') {{
-      var mId = modelPath ? modelPath.split('/').pop() : 'sofuu-default';
-      res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-      res.end(JSON.stringify({{
-        object: 'list',
-        data: [{{
-          id: mId,
-          object: 'model',
-          created: Math.floor(Date.now() / 1000),
-          owned_by: 'sofuu'
-        }}]
-      }}));
-      return;
-    }}
-    if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {{
-      var body = typeof req.body === 'string' ? req.body : '';
-      try {{
-        var data = JSON.parse(body || '{{}}');
-        var targetModel = data.model || modelPath;
-        if (!targetModel) {{
-          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'no model loaded; specify --model <path> or pass model in body' }}));
-          return;
-        }}
-        var prompt = '';
-        if (Array.isArray(data.messages)) {{
-          for (var mi = 0; mi < data.messages.length; mi++) {{
-            var m = data.messages[mi];
-            prompt += (m.role || 'user') + ': ' + (m.content || '') + '\n';
-          }}
-          prompt += 'assistant:';
-        }} else {{
-          prompt = String(data.prompt || '');
-        }}
-        var maxTokens = data.max_tokens || 512;
-        var temp = typeof data.temperature === 'number' ? data.temperature : 0.7;
-        var reqId = 'chatcmpl-' + Math.random().toString(36).substring(2, 12);
-        var created = Math.floor(Date.now() / 1000);
-
-        if (data.stream) {{
-          res.writeHead(200, {{
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-          }});
-          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
-          while (true) {{
-            var n = await it.next();
-            if (n.done) break;
-            var chunk = n.value;
-            if (chunk && chunk.text) {{
-              var payload = {{
-                id: reqId,
-                object: 'chat.completion.chunk',
-                created: created,
-                model: targetModel,
-                choices: [{{ index: 0, delta: {{ content: chunk.text }}, finish_reason: null }}]
-              }};
-              res.write('data: ' + JSON.stringify(payload) + '\n\n');
-            }}
-          }}
-          var stopPayload = {{
-            id: reqId,
-            object: 'chat.completion.chunk',
-            created: created,
-            model: targetModel,
-            choices: [{{ index: 0, delta: {{}}, finish_reason: 'stop' }}]
-          }};
-          res.write('data: ' + JSON.stringify(stopPayload) + '\n\n');
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }} else {{
-          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
-          var fullText = '';
-          while (true) {{
-            var n = await it.next();
-            if (n.done) break;
-            if (n.value && n.value.text) fullText += n.value.text;
-          }}
-          res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{
-            id: reqId,
-            object: 'chat.completion',
-            created: created,
-            model: targetModel,
-            choices: [{{
-              index: 0,
-              message: {{ role: 'assistant', content: fullText }},
-              finish_reason: 'stop'
-            }}]
-          }}));
-        }}
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'POST' && (path === '/v1/completions' || path === '/infer')) {{
-      var body = typeof req.body === 'string' ? req.body : '';
-      try {{
-        var data = JSON.parse(body || '{{}}');
-        var targetModel = data.model || modelPath;
-        if (!targetModel) {{
-          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'no model loaded; specify --model <path> or pass model in body' }}));
-          return;
-        }}
-        var prompt = String(data.prompt || '');
-        var maxTokens = data.max_tokens || 512;
-        var temp = typeof data.temperature === 'number' ? data.temperature : 0.7;
-        var reqId = 'cmpl-' + Math.random().toString(36).substring(2, 12);
-        var created = Math.floor(Date.now() / 1000);
-
-        if (data.stream) {{
-          res.writeHead(200, {{
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-          }});
-          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
-          while (true) {{
-            var n = await it.next();
-            if (n.done) break;
-            if (n.value && n.value.text) {{
-              res.write('data: ' + JSON.stringify({{
-                id: reqId,
-                object: 'text_completion',
-                created: created,
-                choices: [{{ text: n.value.text, index: 0, finish_reason: null }}]
-              }}) + '\n\n');
-            }}
-          }}
-          res.write('data: ' + JSON.stringify({{
-            id: reqId,
-            object: 'text_completion',
-            created: created,
-            choices: [{{ text: '', index: 0, finish_reason: 'stop' }}]
-          }}) + '\n\n');
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }} else {{
-          var it = sofuu.ai.streamLocal(targetModel, prompt, {{ maxTokens: maxTokens, temperature: temp }});
-          var fullText = '';
-          while (true) {{
-            var n = await it.next();
-            if (n.done) break;
-            if (n.value && n.value.text) fullText += n.value.text;
-          }}
-          res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{
-            id: reqId,
-            object: 'text_completion',
-            created: created,
-            model: targetModel,
-            choices: [{{ text: fullText, index: 0, finish_reason: 'stop' }}]
-          }}));
-        }}
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'POST' && path === '/remember') {{
-      /* req.body is a fully-buffered string — iterating it as chunks would
-       * concatenate one character per round (O(n^2)). */
-      var body = typeof req.body === 'string' ? req.body : '';
-      try {{
-        var data = JSON.parse(body || '{{}}');
-        if (!data.text) {{
-          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'text required' }}));
-          return;
-        }}
-        if (!brain) {{
-          res.writeHead(503, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
-          return;
-        }}
-        var vec = embed(data.text);
-        var role = data.role || 'user';
-        brain.remember(new Float32Array(vec), data.text, role, 0, data.source || 'server');
-        brain.flush();
-        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: true, memories: brain.count() }}));
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'GET' && path === '/recall') {{
-      var qs = {{}};
-      try {{
-        var q = (url.split('?')[1] || '').split('&');
-        for (var i = 0; i < q.length; i++) {{
-          if (!q[i]) continue;
-          /* P2 (audit): split on the FIRST '=' only — a value containing
-           * '=' (base64, predicates) used to be silently dropped — and
-           * '+' means space before percent-decoding. */
-          var eq = q[i].indexOf('=');
-          if (eq < 0) continue;
-          qs[decodeURIComponent(q[i].slice(0, eq))] =
-            decodeURIComponent(q[i].slice(eq + 1).replace(/\+/g, ' '));
-        }}
-      }} catch (eQ) {{
-        /* P1 (audit 2026-10-14): a malformed %sequence used to throw
-         * outside any handler → the promise rejected → no bytes written
-         * and serve runs without deadlines → the socket hung forever. */
-        res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'bad query encoding' }}));
-        return;
-      }}
-      if (!qs.q) {{
-        res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'q parameter required' }}));
-        return;
-      }}
-      if (!brain) {{
-        res.writeHead(503, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
-        return;
-      }}
-      try {{
-        var vec = embed(qs.q);
-        var k = parseInt(qs.k || '5', 10);
-        var results = brain.recall(new Float32Array(vec), k);
-        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: true, results: results }}));
-      }} catch (eR) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(eR.message || eR) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'GET' && path === '/memories') {{
-      if (!brain) {{
-        res.writeHead(503, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
-        return;
-      }}
-      var mqs = {{}};
-      try {{
-        var mq = (url.split('?')[1] || '').split('&');
-        for (var mi = 0; mi < mq.length; mi++) {{
-          if (!mq[mi]) continue;
-          var meq = mq[mi].indexOf('=');
-          if (meq < 0) continue;
-          mqs[decodeURIComponent(mq[mi].slice(0, meq))] =
-            decodeURIComponent(mq[mi].slice(meq + 1).replace(/\+/g, ' '));
-        }}
-      }} catch (eM) {{
-        res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'bad query encoding' }}));
-        return;
-      }}
-      var lopts = {{}};
-      if (mqs.tier !== undefined) lopts.tier = parseInt(mqs.tier, 10) || 0;
-      if (mqs.role) lopts.role = mqs.role;
-      if (mqs.entity) lopts.entity = mqs.entity;
-      if (mqs.text) lopts.text = mqs.text;
-      if (mqs.offset) lopts.offset = parseInt(mqs.offset, 10) || 0;
-      lopts.limit = mqs.limit ? (parseInt(mqs.limit, 10) || 20) : 20;
-      try {{
-        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-        res.end(brain.list(lopts));
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'POST' && path === '/forget') {{
-      var fbody = typeof req.body === 'string' ? req.body : '';
-      try {{
-        var fdata = JSON.parse(fbody || '{{}}');
-        if (!brain) {{
-          res.writeHead(503, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
-          return;
-        }}
-        var fid = parseInt(fdata.id, 10);
-        if (!(fid >= 0)) {{
-          res.writeHead(400, {{ 'Content-Type': 'application/json' }});
-          res.end(JSON.stringify({{ ok: false, error: 'id required' }}));
-          return;
-        }}
-        var forgot = brain.forget(fid);
-        brain.flush();
-        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: true, forgot: forgot, id: fid }}));
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    if (req.method === 'POST' && path === '/share') {{
-      /* B2.1: a real card — records + vectors + manifest. */
-      if (!brain) {{
-        res.writeHead(503, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: 'brain not available' }}));
-        return;
-      }}
-      try {{
-        res.writeHead(200, {{ 'Content-Type': 'application/json' }});
-        res.end(brain.export());
-      }} catch (e) {{
-        res.writeHead(500, {{ 'Content-Type': 'application/json' }});
-        res.end(JSON.stringify({{ ok: false, error: String(e.message || e) }}));
-      }}
-      return;
-    }}
-    res.writeHead(404, {{ 'Content-Type': 'application/json' }});
-    res.end(JSON.stringify({{ ok: false, error: 'not found' }}));
-  }});
-  g.__sofuu_serve_server = server;
-  server.listen(port, host);
-  console.log('brain server listening on http://' + host + ':' + port);
-}})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});
-"#);
-
+    /* Workstream H1: the handler lives in src/js/serve.js (a shipped
+     * driver). This boot call passes the resolved config; everything else —
+     * routes, templates, usage, stop sequences, policy — is testable JS. */
+    let cfg = serde_json::json!({
+        "brainPath": brain_path,
+        "modelPath": model_path,
+        "modelId": model_id,
+        "token": token,
+        "host": host,
+        "port": port,
+        "version": VERSION,
+    });
+    let serve_js = format!("sofuu.serve.start({});", cfg);
     rt.eval_string(&serve_js, "<serve>")
 }
 
@@ -1935,41 +1559,18 @@ fn main() -> ExitCode {
             // edits one character inside that reply. Prints the tokens each
             // call actually prefilled plus the engine's own prefix comparison.
             if std::env::var_os("SOFUU_PREFIX_TEST").is_some() {
-                // SOFUU_PREFIX_TEST_GEN=0 runs the same turns with no decode
-                // steps, so every cached row was written by the batched
-                // prefill path. Comparing that against the default (8) says
-                // whether a warm/cold divergence comes from the prefill split
-                // or from rows the decode GEMV path wrote.
-                let gen: usize = std::env::var("SOFUU_PREFIX_TEST_GEN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8);
                 let opts = |max_tokens: usize| sofuu_core::infer::GenerateOptions {
                     max_tokens,
                     temperature: 0.0,
                     ..Default::default()
                 };
                 let mut reply = String::new();
-                let _ = engine.stream(prompt, opts(gen), |t| {
+                let _ = engine.stream(prompt, opts(8), |t| {
                     reply.push_str(&t);
                     true
                 });
                 let p1 = engine.last_prefill_tokens;
                 let cached = engine.cached_tokens.len();
-
-                // SOFUU_PREFIX_TEST_DROP=n re-prefills the last n cached
-                // tokens instead of reusing them. Rows written by the decode
-                // path are computed by a different kernel than batched
-                // prefill rows, so this says whether a warm/cold difference
-                // comes from those rows or from the reuse itself.
-                let drop_n: usize = std::env::var("SOFUU_PREFIX_TEST_DROP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                if drop_n > 0 {
-                    let keep = engine.cached_tokens.len().saturating_sub(drop_n);
-                    engine.cached_tokens.truncate(keep);
-                }
 
                 let turn2 = format!("{prompt}{reply}\n\nUser: Summarize that again.\nAssistant:");
                 let t2 = engine.tokenizer.encode(&turn2);
@@ -1980,11 +1581,7 @@ fn main() -> ExitCode {
                 {
                     c2 += 1;
                 }
-                let mut prefill_skipped = String::new();
-                let _ = engine.stream(&turn2, opts(gen), |t| {
-                    prefill_skipped.push_str(&t);
-                    true
-                });
+                let _ = engine.stream(&turn2, opts(0), |_| true);
                 let p2 = engine.last_prefill_tokens;
 
                 let head: String = reply.chars().take(20).collect();
@@ -2001,124 +1598,12 @@ fn main() -> ExitCode {
                 let _ = engine.stream(&turn3, opts(0), |_| true);
                 let p3 = engine.last_prefill_tokens;
 
-                // Cold reference for the same turn: turn 3 diverged, so its
-                // cache was dropped and this call re-prefills everything.
-                let mut cold = String::new();
-                let _ = engine.stream(&turn2, opts(gen), |t| {
-                    cold.push_str(&t);
-                    true
-                });
-                let p2_cold = engine.last_prefill_tokens;
-                let same = prefill_skipped == cold;
-
                 eprintln!(
-                    "[prefix] gen={} drop={} turn1 prefill={p1} cached={cached} | turn2 tokens={} common={c2} prefill={p2} | turn3 tokens={} common={c3} prefill={p3} | cold_retry prefill={p2_cold} | warm==cold: {} | reply_chars={}",
-                    gen,
-                    drop_n,
+                    "[prefix] turn1 prefill={p1} cached={cached} | turn2 tokens={} common={c2} prefill={p2} | turn3 tokens={} common={c3} prefill={p3} | reply_chars={}",
                     t2.len(),
                     t3.len(),
-                    if same { "YES" } else { "NO" },
                     reply.chars().count()
                 );
-                if !same {
-                    eprintln!("[prefix] warm='{}'", prefill_skipped.escape_debug());
-                    eprintln!("[prefix] cold='{}'", cold.escape_debug());
-                }
-                // SOFUU_PREFIX_TEST=split: same text twice, once as a single
-                // prefill and once with the first 98% already in the KV. No
-                // decode step runs before the compared tokens, so a difference
-                // can only come from where the batched prefill was cut.
-                if std::env::var("SOFUU_PREFIX_TEST").as_deref() == Ok("split") {
-                    let a_text = format!("{prompt}\n\nUser: Summarize that again.\nAssistant:");
-                    let chars: Vec<char> = a_text.chars().collect();
-                    let at = engine.tokenizer.encode(&a_text);
-                    // A raw char cut can land mid-token, which re-tokenizes
-                    // differently and makes the cache a strict-prefix miss.
-                    // Walk the cut back until the prefix tokenizes to a strict
-                    // token prefix of the whole text so reuse really happens.
-                    let mut cut = String::new();
-                    let mut pt: Vec<u32> = Vec::new();
-                    for pct in (80..=98).rev() {
-                        let cand: String = chars[..chars.len() * pct / 100].iter().collect();
-                        let ct = engine.tokenizer.encode(&cand);
-                        if ct.len() < at.len() && at.starts_with(&ct) {
-                            cut = cand;
-                            pt = ct;
-                            break;
-                        }
-                    }
-                    if pt.is_empty() {
-                        eprintln!("[prefix-split] no strict token prefix found; skipped");
-                        return ExitCode::SUCCESS;
-                    }
-
-                    let _ = engine.stream("x", opts(0), |_| true);
-                    let mut a = String::new();
-                    let _ = engine.stream(&a_text, opts(gen), |t| {
-                        a.push_str(&t);
-                        true
-                    });
-                    let pa = engine.last_prefill_tokens;
-
-                    let _ = engine.stream("x", opts(0), |_| true);
-                    let _ = engine.stream(&cut, opts(0), |_| true);
-                    let pp = engine.last_prefill_tokens;
-                    let cached_split = engine.cached_tokens.len();
-                    let mut c = 0usize;
-                    while c < engine.cached_tokens.len()
-                        && c < at.len()
-                        && engine.cached_tokens[c] == at[c]
-                    {
-                        c += 1;
-                    }
-                    let mut b = String::new();
-                    let _ = engine.stream(&a_text, opts(gen), |t| {
-                        b.push_str(&t);
-                        true
-                    });
-                    let pb = engine.last_prefill_tokens;
-                    let same = a == b;
-                    eprintln!(
-                        "[prefix-split] gen={gen} full_tokens={} prefix_tokens={} prefix_prefill={pp} cached={cached_split} common={c} prefillA={pa} prefillB={pb} expectB={} | same: {}",
-                        at.len(),
-                        pt.len(),
-                        at.len() - pt.len(),
-                        if same { "YES" } else { "NO" }
-                    );
-                    if !same {
-                        eprintln!("[prefix-split] A='{}'", a.escape_debug());
-                        eprintln!("[prefix-split] B='{}'", b.escape_debug());
-                    }
-                }
-                // SOFUU_PREFIX_TEST=repeat: three reset+prefill cycles of the
-                // same text, each with an identical predecessor. Any
-                // difference between them is per-call nondeterminism, not a
-                // prefix-cache or compaction effect.
-                if std::env::var("SOFUU_PREFIX_TEST").as_deref() == Ok("repeat") {
-                    let mut outs: Vec<String> = Vec::new();
-                    for _ in 0..3 {
-                        let _ = engine.stream("x", opts(0), |_| true);
-                        let mut s = String::new();
-                        let _ = engine.stream(prompt, opts(gen), |t| {
-                            s.push_str(&t);
-                            true
-                        });
-                        outs.push(s);
-                    }
-                    let s01 = outs[0] == outs[1];
-                    let s12 = outs[1] == outs[2];
-                    eprintln!(
-                        "[repeat] gen={gen} run0==run1: {} | run1==run2: {}",
-                        if s01 { "YES" } else { "NO" },
-                        if s12 { "YES" } else { "NO" }
-                    );
-                    if !(s01 && s12) {
-                        for (i, o) in outs.iter().enumerate() {
-                            eprintln!("[repeat] run{i}='{}'", o.escape_debug());
-                        }
-                    }
-                    return ExitCode::SUCCESS;
-                }
                 return ExitCode::SUCCESS;
             }
 
@@ -2156,23 +1641,20 @@ fn main() -> ExitCode {
             }
             let prefill_toks = engine.last_prefill_tokens;
             let prefill_dur = engine.last_prefill_duration;
-            let setup_dur = engine.last_setup_duration;
             let prefill_rate = if prefill_dur.as_secs_f32() > 0.0 {
                 prefill_toks as f32 / prefill_dur.as_secs_f32()
             } else {
                 0.0
             };
-            let decode_dur = gen_dur
-                .saturating_sub(prefill_dur)
-                .saturating_sub(setup_dur);
+            let decode_dur = gen_dur.saturating_sub(prefill_dur);
             let decode_rate = if decode_dur.as_secs_f32() > 0.0 {
                 token_count as f32 / decode_dur.as_secs_f32()
             } else {
                 0.0
             };
             eprintln!(
-                "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · setup: {:.2?} · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
-                prefill_toks, prefill_dur, prefill_rate, setup_dur, token_count, decode_dur, decode_rate, gen_dur
+                "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
+                prefill_toks, prefill_dur, prefill_rate, token_count, decode_dur, decode_rate, gen_dur
             );
             ExitCode::SUCCESS
         }

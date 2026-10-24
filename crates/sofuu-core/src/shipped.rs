@@ -82,6 +82,16 @@ pub const CHAT_JS: &str = include_str!("../../../src/js/chat.js");
 #[cfg(not(debug_assertions))]
 pub const CHAT_JS: &str = "";
 pub const CHAT_BC: &[u8] = include_bytes!("../../../src/js/chat.bc");
+/// The HTTP edge server — single source of truth is src/js/serve.js
+/// (workstream H1). `sofuu serve` boots it; the module itself only defines
+/// state and functions, so a process that never serves pays nothing.
+/// Eval'd after chat: its agent/tool routes use the driver namespaces.
+#[cfg(debug_assertions)]
+pub const SERVE_JS: &str = include_str!("../../../src/js/serve.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const SERVE_JS: &str = "";
+pub const SERVE_BC: &[u8] = include_bytes!("../../../src/js/serve.bc");
 /// The recursive language model driver — single source of truth is src/js/rlm.js.
 #[cfg(debug_assertions)]
 pub const RLM_JS: &str = include_str!("../../../src/js/rlm.js");

@@ -202,6 +202,18 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
         }
     }
 
+    /* ── inbound HTTP (serve routes; H1) ───────────────────────── */
+    if op == "http.request" && !path.is_empty() {
+        let deny = list_at(policy, &["http", "deny"]);
+        if deny.iter().any(|p| path.starts_with(p.as_str())) {
+            return decision(
+                "deny",
+                "R7.6/http.deny",
+                &format!("route '{path}' is denied by policy"),
+            );
+        }
+    }
+
     /* ── network ───────────────────────────────────────────────── */
     if op == "net.fetch" && !host.is_empty() {
         let deny = list_at(policy, &["net", "deny"]);
@@ -673,8 +685,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_policy_allows() {
-        assert_eq!(eval(serde_json::json!({"op":"tool.run","tool":"read_file"}), serde_json::json!({})), "allow");
+    fn http_route_deny_prefix() {
+        let p = serde_json::json!({"http":{"deny":["/v1/tools"]}});
+        assert_eq!(
+            eval(serde_json::json!({"op":"http.request","path":"/v1/tools/read_file/call"}), p.clone()),
+            "deny"
+        );
+        assert_eq!(
+            rule(serde_json::json!({"op":"http.request","path":"/v1/tools"}), p.clone()),
+            "R7.6/http.deny"
+        );
+        assert_eq!(
+            eval(serde_json::json!({"op":"http.request","path":"/v1/chat/completions"}), p),
+            "allow"
+        );
+    }
+
+    #[test]
+    fn empty_policy_allows() {        assert_eq!(eval(serde_json::json!({"op":"tool.run","tool":"read_file"}), serde_json::json!({})), "allow");
     }
 
     #[test]

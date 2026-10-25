@@ -122,7 +122,11 @@ def run_infer(sofuu, model, prompt, args, extra, ctx=None):
     return {
         "rc": rc,
         "stdout": out,
-        "error_hint": "" if rc == 0 else err.strip().splitlines()[-1] if err.strip() else "",
+        "error_hint": "" if rc == 0 else next(
+            (l for l in reversed(err.strip().splitlines())
+             if ("error" in l.lower() or "warning" in l.lower())),
+            err.strip().splitlines()[-1] if err.strip() else "",
+        ),
         "wall_s": round(wall, 2),
         "prefill_tokens": prefill_toks,
         "prefill_ms": prefill_ms,

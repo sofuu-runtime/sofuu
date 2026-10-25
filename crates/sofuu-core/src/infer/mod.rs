@@ -899,6 +899,21 @@ impl InferEngine {
         let drop = ((max_seq_len - sink) / 4).max(1).min((max_seq_len - sink).saturating_sub(1));
         let chunk_size = self::model::max_prefill_batch().min((max_seq_len - sink).saturating_sub(drop).max(1));
 
+        // F-LC1 (PLAN-LONG-CONTEXT-PERSISTENCE §8 P2): a FRESH prompt that
+        // fills the window used to trigger mid-PREFILL compaction — the loop
+        // below silently dropped middle KV rows (a 50%-depth needle in an 8k
+        // haystack vanished; the run still printed a normal stats line).
+        // Refuse instead: the caller must raise --ctx or shorten the prompt.
+        // Continuations (common_prefix > 0) keep the compaction path — chat
+        // legitimately extends past the window — but it now warns loudly.
+        if common_prefix == 0 && input_tokens.len() >= max_seq_len {
+            return Err(format!(
+                "prompt is {} tokens but the context window is only {} — mid-prompt compaction would silently drop content; raise --ctx or shorten the prompt",
+                input_tokens.len(),
+                max_seq_len
+            ));
+        }
+
         // 3. Prefill phase for new tokens
         let mut cur_pos = common_prefix;
         self.last_setup_duration = t_setup.elapsed();
@@ -950,6 +965,14 @@ impl InferEngine {
             let initial_logits = self.model.forward(last_tok, cur_pos);
             logits_buf.copy_from_slice(initial_logits);
             cur_pos += 1;
+            if compacted {
+                eprintln!(
+                    "[sofuu infer] WARNING: the context window filled during prefill — KV compaction dropped middle tokens (prompt {} + prefix {} vs window {}); raise --ctx to keep the whole prompt",
+                    input_tokens.len(),
+                    common_prefix,
+                    max_seq_len
+                );
+            }
         } else {
             // The prompt is already in the KV, so there are no new tokens to
             // compute logits from. Re-run its last token: forward() rewrites

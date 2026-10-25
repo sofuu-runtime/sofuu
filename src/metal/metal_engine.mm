@@ -375,6 +375,21 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_f16  = load_pso(@"gemv_f16");
         ctx->pso_gemv_f32  = load_pso(@"gemv_f32");
         ctx->pso_gemm_q4_k_mma8 = load_pso(@"gemm_q4_k_mma8");
+        // Same maxTotalThreadsPerThreadgroup discipline as llama_attn_pre_w32
+        // (see the 1024-thread guard below): the mma8 GEMM dispatches 128
+        // threads (4 simdgroups) per threadgroup and Metal DROPS an oversized
+        // threadgroup silently in release builds - the output would read back
+        // as untouched scratch (all-zero heads), not as an error. Check the
+        // limit at init and disable the pipeline rather than dispatching it;
+        // sofuu_metal_batch_gguf_mma8 returns 0 on a nil PSO and every caller
+        // falls back to the per-tensor path.
+        if (ctx->pso_gemm_q4_k_mma8 != nil &&
+            ctx->pso_gemm_q4_k_mma8.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q4_k_mma8 needs 128 threads/group, pipeline allows %lu - mma8 disabled\n",
+                    (unsigned long)ctx->pso_gemm_q4_k_mma8.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q4_k_mma8 = nil;
+        }
         ctx->pso_gemv_mlx4_f16  = load_pso(@"gemv_mlx4_affine_f16");
         ctx->pso_gemv_mlx4_bf16 = load_pso(@"gemv_mlx4_affine_bf16");
         ctx->pso_rmsnorm   = load_pso(@"rmsnorm");

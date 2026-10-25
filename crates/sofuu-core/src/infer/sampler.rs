@@ -1,6 +1,16 @@
 // crates/sofuu-core/src/infer/sampler.rs — Fast logit sampling strategies.
 //
-// Supports greedy argmax, temperature scaling, top-p (nucleus), top-k, and repetition penalty.
+// Supports greedy argmax, temperature scaling, top-p (nucleus), top-k, and
+// repetition penalty, plus the entropy-adaptive presence penalty of
+// PLAN-LONG-CONTEXT-PERSISTENCE §4.3: long contexts drift into repetition
+// loops, and a static repetition_penalty over the last 64 tokens is too
+// myopic to notice. The adaptive penalty watches the unigram entropy of a
+// 1,024-token window; only when it collapses below the 2.4-bit threshold
+// does it penalise every token already seen in the window (λ = 1.15,
+// same sign convention as the repetition penalty). Healthy prose sits at
+// 6-8 bits, so normal sampling is bit-for-bit unchanged — including greedy
+// runs, where the penalty is applied BEFORE argmax so a locked loop can
+// actually break. SOFUU_ENTROPY_PENALTY=0 disables it.
 
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -9,6 +19,13 @@ pub struct SamplerConfig {
     pub top_k: usize,
     pub repetition_penalty: f32,
 }
+
+/// §4.3 constants: window, entropy floor (bits), presence-penalty λ.
+pub const ENTROPY_WINDOW: usize = 1024;
+pub const ENTROPY_THRESHOLD_BITS: f32 = 2.4;
+pub const ENTROPY_PRESENCE_LAMBDA: f32 = 1.15;
+/// The judge needs this many GENERATED tokens before it may penalise.
+pub const MIN_GENERATED_BEFORE_PENALTY: usize = 64;
 
 impl Default for SamplerConfig {
     fn default() -> Self {
@@ -24,6 +41,12 @@ impl Default for SamplerConfig {
 pub struct Sampler {
     config: SamplerConfig,
     rng_state: u64,
+    /// History length at the FIRST sample() call = the prompt. The entropy
+    /// window must watch only what the model itself generated: a code-heavy
+    /// PROMPT tail has sub-2.4-bit unigram entropy by nature, and penalising
+    /// over it flipped healthy greedy runs to immediate EOS (caught live by
+    /// scripts/bench_niah.py — every 8k depth returned zero tokens).
+    prompt_len: Option<usize>,
 }
 
 impl Sampler {
@@ -36,6 +59,7 @@ impl Sampler {
         Self {
             config,
             rng_state: seed ^ 0x9e3779b97f4a7c15,
+            prompt_len: None,
         }
     }
 
@@ -85,6 +109,12 @@ impl Sampler {
         if logits.is_empty() {
             return 0;
         }
+
+        // 0. Entropy-adaptive presence penalty (§4.3). Runs before the greedy
+        // short-circuit so a temp-0 repetition loop can be broken; with a
+        // healthy window entropy it is a no-op.
+        let prompt_len = *self.prompt_len.get_or_insert(history.len());
+        Self::apply_entropy_penalty(logits, history, prompt_len);
 
         // Greedy decoding if temperature is near zero
         if self.config.temperature <= 0.01 {
@@ -182,6 +212,68 @@ impl Sampler {
         }
         max_idx as u32
     }
+
+    /// Shannon entropy (bits) of the unigram distribution over the last
+    /// `ENTROPY_WINDOW` GENERATED tokens (everything after `prompt_len`).
+    /// Public so tests and harnesses can assert the exact quantity the gate
+    /// uses.
+    pub fn window_entropy(history: &[u32], prompt_len: usize) -> f32 {
+        let gen = &history[prompt_len.min(history.len())..];
+        let window = &gen[gen.len().saturating_sub(ENTROPY_WINDOW)..];
+        if window.is_empty() {
+            return f32::INFINITY;
+        }
+        let mut counts: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::with_capacity(256);
+        for &t in window {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+        let n = window.len() as f32;
+        let mut h = 0.0f32;
+        for &c in counts.values() {
+            let p = c as f32 / n;
+            h -= p * p.log2();
+        }
+        h
+    }
+
+    /// §4.3: if the window entropy has collapsed below the threshold,
+    /// divide/multiply the logits of every token seen in the window by
+    /// λ = 1.15 (the presence-penalty sign convention). A no-op when the
+    /// window is healthy or the kill switch is set.
+    fn apply_entropy_penalty(logits: &mut [f32], history: &[u32], prompt_len: usize) {
+        if history.is_empty() || logits.is_empty() {
+            return;
+        }
+        if let Ok(v) = std::env::var("SOFUU_ENTROPY_PENALTY") {
+            if v == "0" {
+                return;
+            }
+        }
+        let gen = &history[prompt_len.min(history.len())..];
+        // Too little generated text to judge — never penalise off the prompt.
+        if gen.len() < MIN_GENERATED_BEFORE_PENALTY {
+            return;
+        }
+        if Self::window_entropy(history, prompt_len) >= ENTROPY_THRESHOLD_BITS {
+            return;
+        }
+        let window = &gen[gen.len().saturating_sub(ENTROPY_WINDOW)..];
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(256);
+        for &t in window {
+            if t as usize >= logits.len() {
+                continue;
+            }
+            if seen.insert(t) {
+                let l = &mut logits[t as usize];
+                if *l < 0.0 {
+                    *l *= ENTROPY_PRESENCE_LAMBDA;
+                } else {
+                    *l /= ENTROPY_PRESENCE_LAMBDA;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,4 +302,104 @@ mod tests {
         let chosen = sampler.sample(&mut logits, &[]);
         assert!(chosen == 1 || chosen == 3);
     }
+
+    /// §4.3: known entropies (prompt_len = 0 here).
+    #[test]
+    fn test_window_entropy_known_values() {
+        let hist = vec![7u32; 512];
+        assert!(Sampler::window_entropy(&hist, 0) <= 1e-4, "constant window → 0 bits");
+        let mut two = vec![7u32; 512];
+        two.extend(std::iter::repeat(9u32).take(512));
+        let h = Sampler::window_entropy(&two, 0);
+        assert!((h - 1.0).abs() < 1e-3, "50/50 window → 1 bit, got {h}");
+        // Only the last ENTROPY_WINDOW generated tokens count.
+        let mut padded = vec![1u32; ENTROPY_WINDOW];
+        padded.extend(std::iter::repeat(7u32).take(64));
+        assert!(Sampler::window_entropy(&padded, 0) < 0.35,
+            "window is the tail, got {}", Sampler::window_entropy(&padded, 0));
+        // The prompt is excluded: same tail, huge prompt prefix, same answer.
+        let mut with_prompt = vec![3u32; 4096];
+        with_prompt.extend_from_slice(&padded);
+        assert!((Sampler::window_entropy(&with_prompt, 4096)
+                 - Sampler::window_entropy(&padded, 0)).abs() < 1e-4);
+        // Healthy varied text sits well above the 2.4-bit threshold.
+        let varied: Vec<u32> = (0..600u32).collect();
+        assert!(Sampler::window_entropy(&varied, 0) > 8.0);
+    }
+
+    /// The live failure that forced this design: a low-entropy (code-heavy)
+    /// PROMPT tail must never trigger the penalty — only generated text is
+    /// judged, and a fresh generation has nothing to judge yet.
+    #[test]
+    fn test_entropy_penalty_ignores_prompt_tail() {
+        let code_tail: Vec<u32> = std::iter::repeat(5u32).take(1024).collect(); // H = 0 bits
+        let mut sampler = Sampler::new(SamplerConfig { temperature: 0.0, ..Default::default() });
+        let mut logits = vec![4.5f32, 5.0, 3.0];
+        assert_eq!(sampler.sample(&mut logits, &code_tail), 1,
+            "prompt-only history → argmax untouched");
+        assert_eq!(logits, vec![4.5, 5.0, 3.0], "prompt-only history → logits untouched");
+    }
+
+    /// Under MIN_GENERATED_BEFORE_PENALTY generated tokens the judge stays
+    /// silent even if those few tokens repeat.
+    #[test]
+    fn test_entropy_penalty_needs_minimum_generated() {
+        let hist: Vec<u32> = std::iter::repeat(1u32).take(200).collect(); // 200-token prompt…
+        let mut sampler = Sampler::new(SamplerConfig { temperature: 0.0, ..Default::default() });
+        let mut logits = vec![4.5f32, 5.0, 3.0];
+        // …first sample() pins prompt_len=200; a loop of <64 generated tokens
+        // cannot trigger yet.
+        let short: Vec<u32> = hist.iter().cloned().chain(std::iter::repeat(1u32).take(32)).collect();
+        assert_eq!(sampler.sample(&mut logits, &short), 1);
+        assert_eq!(logits, vec![4.5, 5.0, 3.0]);
+    }
+
+    /// §4.3: a collapsed window breaks even a GREEDY loop — the penalty runs
+    /// before argmax, and the looped token loses to an equal-logit rival.
+    /// The kill switch is exercised in the SAME test (env is process-global;
+    /// two parallel #[test]s racing set_var would flake).
+    #[test]
+    fn test_entropy_penalty_breaks_greedy_loop_and_kill_switch() {
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        });
+        // The first call pins prompt_len = 1 (a one-token prompt); the model
+        // has then generated a 511-token loop of token 1.
+        let mut pin = vec![0.0f32, 0.0, 0.0];
+        let _ = sampler.sample(&mut pin, &[9u32]);
+        let mut looping: Vec<u32> = vec![9u32];
+        looping.extend(std::iter::repeat(1u32).take(511));
+
+        std::env::set_var("SOFUU_ENTROPY_PENALTY", "1");
+        let mut logits = vec![4.5f32, 5.0, 3.0];
+        let tok = sampler.sample(&mut logits, &looping);
+        // Token 1's positive logit was divided by λ (5.0 → 4.35); the unseen
+        // token 0 (4.5) stays put and wins.
+        assert_eq!(tok, 0);
+        assert!(logits[1] < logits[0]);
+
+        // SOFUU_ENTROPY_PENALTY=0 restores pre-§4.3 behavior exactly: the
+        // un-penalized argmax (token 1) wins again.
+        std::env::set_var("SOFUU_ENTROPY_PENALTY", "0");
+        let mut logits2 = vec![4.5f32, 5.0, 3.0];
+        assert_eq!(sampler.sample(&mut logits2, &looping), 1, "kill switch → argmax unchanged");
+        std::env::remove_var("SOFUU_ENTROPY_PENALTY");
+    }
+
+    /// A healthy window is untouched: same argmax AND same logit values.
+    #[test]
+    fn test_entropy_penalty_is_noop_on_healthy_windows() {
+        let varied: Vec<u32> = (0..600u32).collect();
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        });
+        let mut logits = vec![1.0f32, 5.0, 2.0, 4.0];
+        let before = logits.clone();
+        let tok = sampler.sample(&mut logits, &varied);
+        assert_eq!(tok, 1);
+        assert_eq!(logits, before, "healthy entropy must not perturb logits");
+    }
+
 }

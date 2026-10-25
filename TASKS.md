@@ -4108,3 +4108,52 @@ what code reading suggested:
   no unit surface — the commands are their own receipt). Final release binary
   **4,966,936 B** stripped (the doctor JSON fix landed after phase 6a's
   4,966,944 B measurement); `bc-check` still 8/8.
+
+## 2026-10-25 — long-context persistence: gate harness + §4.3 entropy penalty (first slice)
+
+Plan: `docs/PLAN-LONG-CONTEXT-PERSISTENCE.md` (§7 now carries the full status
+board + first receipt matrix). Ownership: this slice touches ONLY
+`infer/sampler.rs` (verified clean of peer edits), the new harness script and
+docs — every other row is recorded for the infer owners, not edited.
+
+- **§4.3 entropy-adaptive presence penalty — DONE.** `infer/sampler.rs`
+  tracks the unigram entropy of the last 1,024 GENERATED tokens (prompt
+  excluded — the first version penalised over a code-heavy prompt tail and
+  flipped healthy greedy runs to immediate EOS; caught live by the NIAH
+  harness and fixed with `prompt_len` pinning + a 64-generated-token minimum
+  before the judge may fire). Below 2.4 bits, every window-seen token gets
+  λ=1.15 (same sign convention as `repetition_penalty`); the penalty runs
+  BEFORE argmax so even temp-0 loops break. Healthy windows are
+  bit-for-bit unchanged; `SOFUU_ENTROPY_PENALTY=0` restores pre-§4.3
+  behavior exactly. 7 unit tests (known entropies, greedy-loop break,
+  prompt-tail immunity, minimum-generated guard, kill switch, no-op on
+  healthy windows).
+- **Gate harness — DONE (`scripts/bench_niah.py`).** Drives the shipped
+  `sofuu infer` CLI (zero engine edits): per-model chars/token calibration
+  (one even sample across the corpus tiling cycle — a head-of-list sample
+  biased 3× and made 8k targets prefill 23k tokens), EXACT-length haystacks
+  (repo prose+code corpus, deterministic), a random 6-digit vault at
+  10/25/50/75/90% depth, greedy `--temp 0 --no-lookahead`, explicit
+  `--ctx = target + 1024`, peak RSS via `/usr/bin/time -l`, TTFT from the
+  stats line, digit-normalised exact-match scoring, Gate 4 decode probe
+  (ctx = probe + 2048 so the probe never meets compaction), one JSON line
+  per run appended to `docs/bench/long-context.jsonl`.
+- **First matrix (16 GB Mac14,9, release CPU):** Llama-1B 8k 2/5 f16 · 3/5
+  kivi4; 16k 0/3+0/3; 32k 0/2+0/2 — TTFT 209 s (16k) → 728 s (32k).
+  Qwen-0.6B 8k 1/3+1/3, 16k 0/1+0/1. Qwen3-8B 16k **1/1 + 1/1 PASS** at
+  9.3–9.5 GB RSS. Reads: the §1 guarantee is not met on ≤1B models (the
+  NTK/YaRN gap, §4.2, is the prime suspect — peer lane); **KIVI is
+  accuracy-clean on retrieval (kivi4 ≥ f16 in every cell)** but its RAM
+  saving is invisible at prefill (FP32 peak first, ingest after — row 6);
+  Gate 4 aggregate decode ratio 0.41–0.46 (FAIL — and the ≥90% gate as
+  written needs per-position timing, which needs the logprob surface).
+- **Engine findings recorded for the infer owners (not fixed here):**
+  F-LC1 (P1) a prompt longer than `--ctx` silently compacts MID-PREFILL —
+  an 8k-target haystack that overshot to 23k tokens ran to completion,
+  dropped the 50%-depth needle and still printed a normal stats line;
+  F-LC2 (P2) instruct models emit EOS immediately on raw-QA prompts without
+  an `Answer:` completion cue; F-LC3 KIVI ↔ `compact_kv_cache` incoherence
+  and the `kivi.is_none()` GPU-fallback gate (`model.rs:2158`).
+- **Blocked:** Gate 2 perplexity ratio (no per-token logprobs), Gate 3's
+  official 32k/8B point (needs ~14.4 GB — prefill-side quantized KV),
+  per-position Gate 4 timing (same surface as Gate 2).

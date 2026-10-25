@@ -4221,3 +4221,16 @@ from the isolated worktree, one commit each, all pushed to main:
 - Plan doc §9 "Progress 2026-10-26" carries the per-item table; P7
   (prefill-side quantized KV, the 32k/8B peak-RSS cure) and the per-token
   logprob API (real Gate-4 timing) remain open, W4 stays blocked on hardware.
+
+- **P10 receipt (later same day, `6281e2c6e`+worktree):** 16k prefill
+  SOFUU_PREFILL_BATCH sweep on a fixed 17,488-token prompt, --ctx 18432:
+  128 → 49.8 tk/s, **256 → 61.7 tk/s (+24%)**, 512 → 52.3 tk/s. The plan's
+  256/512 PRE_CHUNK claim holds for 256 only; a calm-machine confirmation
+  precedes any default flip. 16k kivi4 NIAH re-ran post-fix: still FAIL
+  (wrong code, RSS healthy) — P8 default-on stays declined. Root mechanism
+  identified for the ledger (P1b): this GGUF carries NO
+  llama.rope.scaling.* keys (the quant dropped llama3's rope table, factor
+  32 / orig ctx 8192 / freq factors 1,4) — the file claims 128k ctx with
+  8k-style rope; remedies = re-quant with scaling metadata and support the
+  llama3 frequency table, or an explicit SOFUU_ROPE_LLAMA3 knob. NOT done
+  here: the rope kernel is peer-lane and needs its own NIAH matrix.

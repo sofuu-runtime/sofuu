@@ -1442,7 +1442,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let model_path = &args[2];
-            let prompt = &args[3];
+            let prompt = args[3].clone();
 
             let mut max_tokens = 256;
             let mut temperature = 0.7f32;
@@ -1462,6 +1462,7 @@ fn main() -> ExitCode {
             let mut kivi = false;
             let mut kivi_bits = 4usize;
             let mut streaming_weights = false;
+            let mut chat = false;
 
             let mut i = 4;
             while i < args.len() {
@@ -1525,6 +1526,9 @@ fn main() -> ExitCode {
                 } else if args[i] == "--streaming-weights" || args[i] == "--cache-bypass" {
                     streaming_weights = true;
                     i += 1;
+                } else if args[i] == "--chat" {
+                    chat = true;
+                    i += 1;
                 } else if args[i].starts_with('-') && args[i] != "-" {
                     // A silently-dropped flag is a correctness hazard: e.g.
                     // "--temperature 0" would leave the sampler at the 0.7
@@ -1555,6 +1559,34 @@ fn main() -> ExitCode {
             engine.model.set_gpu_layers(gpu_layers);
 
             let load_dur = t0.elapsed();
+
+            // F-LC2 (PLAN-LONG-CONTEXT-PERSISTENCE §8 P9): a raw prompt on an
+            // instruct model ignores the format it was trained on — the
+            // distilled Qwen emits immediate EOS on some raw-QA prompts and
+            // decodes zero tokens. `--chat` wraps the prompt with the model's
+            // OWN template family, detected from the GGUF
+            // `tokenizer.chat_template` (ChatML im_start / Llama-3
+            // start_header_id); unknown templates pass the prompt raw with a
+            // note instead of guessing.
+            let mut prompt = prompt.clone();
+            if chat {
+                let tmpl = sofuu_core::infer::gguf::GgufFile::open(model_path)
+                    .ok()
+                    .and_then(|g| g.get_str("tokenizer.chat_template").map(|s| s.to_string()))
+                    .unwrap_or_default();
+                prompt = if tmpl.contains("im_start") {
+                    format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
+                } else if tmpl.contains("start_header_id") {
+                    format!(
+                        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    )
+                } else {
+                    eprintln!(
+                        "[sofuu infer] --chat: no known chat template in this GGUF; passing the prompt raw"
+                    );
+                    prompt
+                };
+            }
             let active_threads = if threads > 0 {
                 threads
             } else {
@@ -1583,7 +1615,7 @@ fn main() -> ExitCode {
                     ..Default::default()
                 };
                 let mut reply = String::new();
-                let _ = engine.stream(prompt, opts(8), |t| {
+                let _ = engine.stream(&prompt, opts(8), |t| {
                     reply.push_str(&t);
                     true
                 });
@@ -1629,7 +1661,7 @@ fn main() -> ExitCode {
             let mut token_count = 0usize;
             use std::io::Write;
             let res = engine.stream(
-                prompt,
+                &prompt,
                 sofuu_core::infer::GenerateOptions {
                     max_tokens,
                     temperature,

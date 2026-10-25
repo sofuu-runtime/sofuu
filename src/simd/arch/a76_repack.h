@@ -3379,9 +3379,92 @@ static inline int sofuu_repack_q4k_8bl_apply2(uint8_t * dst, const uint8_t * src
     return sofuu_repack_q4k_8bl_apply2_range(dst, src, nblocks, 0, nrow / 8, interleave);
 }
 
+// ══════════ Lean q4_K 8x4 tile (SOFUU_Q4K_LEAN) ══════════
+// Same idea as the apply2 tile — hoist the 6-bit scale/min decode to repack
+// time — but trade instructions back for bytes: the nibbles stay PACKED (one
+// 16 B load + vand + vshr per (k group, weight-row half) instead of two 16 B
+// loads of pre-split planes) and the pre-decoded scales/mins are stored as
+// int8 (64 B + 64 B) instead of int32/int16 (256 B + 128 B):
+//
+//   d + dmin                     32 B   (as in every other q4_K tile)
+//   sc[8][8]  int8 scales        64 B   6-bit field, 0..63, int8 holds it
+//   mn[8][8]  uint8 mins         64 B   6-bit field, 0..63
+//   qs[4][8][2][16] packed     1024 B   the stock 8-row tile's qs bytes
+//   ---------------------------------------------------
+//   total                      1184 B   vs 2464 B for apply2 (-52%),
+//                               0.578 B/elem vs 1.203 (plane tile 2176 = 1.063)
+//
+// Range check for the int8 scales/mins: decode_q_Kx8_6bit_scales masks each
+// scale byte with 0x3f and each min field with 0x3f, so both are 0..63 for any
+// input — including this model's Q4_K_M tensors, whose 6-bit scale/min fields
+// are produced by the quantizer with the same 0..63 range. The kernel widens
+// them back to int32 (scales) and int16 (mins) with vmovl before use, so the
+// per-output int32 multiply chain is unchanged and the output is bit-identical.
+struct tile_block_q4_Kx8l {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    int8_t   sc[8][8];                    // [(sb*2+half)][row]: 6-bit scale, decoded
+    uint8_t  mn[8][8];                    // [(sb*2+half)][row]: 6-bit min, decoded
+    uint8_t  qs[4][8][2][16];             // [sb][k-group][weight-row half][16 packed]
+};
+static_assert(sizeof(tile_block_q4_Kx8l) == 1184, "q4_K lean tile layout drift");
+
+static inline void sofuu_fill_q4k_lean_block(tile_block_q4_Kx8l * __restrict out,
+                                             const tile_block_q4_Kx8 * __restrict in) {
+    memcpy(out->d, in->d, sizeof(out->d));
+    memcpy(out->dmin, in->dmin, sizeof(out->dmin));
+    for (int g = 0; g < (QK_K / 64) * 2; g++) {          // g = sb*2 + half
+        int8_t    aux[8];
+        int16_t   mn[8];
+        int16x8_t mins;
+        decode_q_Kx8_6bit_scales(&in->scales[g * 12], &mins, aux);
+        vst1q_s16(mn, mins);
+        for (int r = 0; r < 8; r++) {
+            out->sc[g][r] = aux[r];
+            out->mn[g][r] = (uint8_t) mn[r];
+        }
+    }
+    memcpy(out->qs, in->qs, sizeof(out->qs));
+}
+
+static inline int sofuu_repack_q4k_8bl_lean_range(uint8_t * dst, const uint8_t * src, int64_t nblocks,
+                                                  int64_t r8_begin, int64_t r8_end, unsigned interleave = 4) {
+    tile_block_q4_Kx8l * d = (tile_block_q4_Kx8l *) dst + r8_begin * nblocks;
+    const tile_block_q4_K * s = (const tile_block_q4_K *) src + r8_begin * 8 * nblocks;
+    tile_block_q4_K tmp[8];
+    for (int64_t b = r8_begin; b < r8_end; b++) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < 8; i++) tmp[i] = s[x + i * nblocks];
+            tile_block_q4_Kx8 blk = make_block_q4_Kx8(tmp, interleave);
+            sofuu_fill_q4k_lean_block(d, &blk);
+            d++;
+        }
+        s += 8 * nblocks;
+    }
+    return 0;
+}
+
+static inline int sofuu_repack_q4k_8bl_lean(uint8_t * dst, const uint8_t * src, int64_t nrow,
+                                            int64_t nblocks, unsigned interleave = 4) {
+    return sofuu_repack_q4k_8bl_lean_range(dst, src, nblocks, 0, nrow / 8, interleave);
+}
+
 // Shape/gate for the variant: the kernel keeps the 8x4 tile, so the caller
 // gates are the same as the _p kernel's.
-void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
+// PF is a measurement hook (see ggml_gemm_q4_K_8x4_q8_K_p2pf): PF > 0
+// software-prefetches the weight block PF iterations ahead at the top of the b
+// loop. The shipped kernel is PF = 0, which leaves the code unchanged.
+// MEASURED (interleaved bench, min GMAC/s, 4 threads): PF=1 531.5, PF=2 517.4,
+// PF=4 532.0 vs 529.7 at PF=0 -- no gain, so the shipped kernel does not
+// prefetch. Nothing for it to hide: the same kernel runs at 543 GMAC/s (min)
+// over an 18.9 MB tile that cannot stay cached, i.e. the block stream costs it
+// nothing, and its end-to-end rate equals the cache-resident one within noise.
+// LEAN selects the 1184 B packed-nibble + int8-scale tile (tile_block_q4_Kx8l)
+// instead of the 2464 B apply2 tile; the int8 operands, the per-sub-block int32
+// dot order and the per-output apply sequence are identical, so the output is
+// bit-identical to both.
+template <int PF, bool LEAN>
+static void ggml_gemm_q4_K_8x4_q8_K_p2_impl(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     constexpr int qk = QK_K;
     const int     nb = n / qk;
@@ -3402,12 +3485,22 @@ void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const vo
 
         for (int x = 0; x < nc / 8; x++) {
             const tile_block_q4_Kx8q * __restrict q4_ptr = (const tile_block_q4_Kx8q *) vx + ((size_t) x * nb);
+            const tile_block_q4_Kx8l * __restrict q4l_ptr = (const tile_block_q4_Kx8l *) vx + ((size_t) x * nb);
+            UNUSED(q4_ptr); UNUSED(q4l_ptr);
 
             for (int i = 0; i < acc_size; i++) acc_f32[i] = vdupq_n_f32(0);
 
             for (int b = 0; b < nb; b++) {
-                const float16x8_t d8    = vld1q_f16((const __fp16 *) q4_ptr[b].d);
-                const float16x8_t dm8   = vld1q_f16((const __fp16 *) q4_ptr[b].dmin);
+                if (PF > 0 && b + PF < nb) {
+                    const char * q = (const char *) (q4_ptr + b + PF);
+                    __builtin_prefetch(q, 0, 0);
+                    __builtin_prefetch(q + 1024, 0, 0);
+                    __builtin_prefetch(q + 2048, 0, 0);
+                }
+                const uint16_t * __restrict dptr    = LEAN ? q4l_ptr[b].d    : q4_ptr[b].d;
+                const uint16_t * __restrict dminptr = LEAN ? q4l_ptr[b].dmin : q4_ptr[b].dmin;
+                const float16x8_t d8    = vld1q_f16((const __fp16 *) dptr);
+                const float16x8_t dm8   = vld1q_f16((const __fp16 *) dminptr);
                 const float32x4_t q4_d_0123 = vcvt_f32_f16(vget_low_f16(d8));
                 const float32x4_t q4_d_4567 = vcvt_f32_f16(vget_high_f16(d8));
                 const float32x4_t q4_m_0123 = vcvt_f32_f16(vget_low_f16(dm8));
@@ -3438,27 +3531,60 @@ void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const vo
                         acc_hi[i] = vdupq_n_s32(0);
                     }
                     // Pre-decoded scales/mins: 2 + 2 loads, no bit extraction.
-                    const int32x4x2_t scl = vld1q_s32_x2(q4_ptr[b].sc[sb * 2]);
-                    const int32x4x2_t sch = vld1q_s32_x2(q4_ptr[b].sc[sb * 2 + 1]);
-                    const int16x8_t   mnl = vld1q_s16(q4_ptr[b].mn[sb * 2]);
-                    const int16x8_t   mnh = vld1q_s16(q4_ptr[b].mn[sb * 2 + 1]);
+                    // LEAN stores them as int8/uint8 (the 6-bit fields are 0..63)
+                    // and widens with vmovl instead: 2 + 2 loads of 8 B and 6
+                    // vmovl vs 2 + 2 loads of 32 B.
+                    int32x4x2_t scl, sch;
+                    int16x8_t   mnl, mnh;
+                    if constexpr (LEAN) {
+                        const int16x8_t s16l = vmovl_s8(vld1_s8(q4l_ptr[b].sc[sb * 2]));
+                        const int16x8_t s16h = vmovl_s8(vld1_s8(q4l_ptr[b].sc[sb * 2 + 1]));
+                        scl.val[0] = vmovl_s16(vget_low_s16(s16l));
+                        scl.val[1] = vmovl_s16(vget_high_s16(s16l));
+                        sch.val[0] = vmovl_s16(vget_low_s16(s16h));
+                        sch.val[1] = vmovl_s16(vget_high_s16(s16h));
+                        mnl = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q4l_ptr[b].mn[sb * 2])));
+                        mnh = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q4l_ptr[b].mn[sb * 2 + 1])));
+                    } else {
+                        scl = vld1q_s32_x2(q4_ptr[b].sc[sb * 2]);
+                        sch = vld1q_s32_x2(q4_ptr[b].sc[sb * 2 + 1]);
+                        mnl = vld1q_s16(q4_ptr[b].mn[sb * 2]);
+                        mnh = vld1q_s16(q4_ptr[b].mn[sb * 2 + 1]);
+                    }
 
                     const int8_t * __restrict q8lo = q8_ptr[b].qs + sb * 256;
                     // Plane bytes are walked linearly (32 B per weight-row half,
                     // lo then hi) so the compiler can use post-increment loads
                     // instead of materialising 16 addresses per sub-block.
                     const int8_t * __restrict plp = (const int8_t *) q4_ptr[b].pl[sb][0][0];
+                    UNUSED(plp);
+                    const uint8x16_t m4b = vdupq_n_u8(0x0F);
 
                     for (int k = 0; k < 8; k++) {
                         const int8x16_t q8_blk0 = vld1q_s8(q8lo + 16 * k);
                         const int8x16_t q8_blk1 = vld1q_s8(q8lo + 16 * k + 128);
                         for (int hw = 0; hw < 2; hw++) {
-                            // lo plane (4 rows) then hi plane (4 rows); two
-                            // plain loads so both use the base register with an
-                            // immediate offset (an ld1 pair cannot).
-                            const int8x16_t w_lo = vld1q_s8(plp);
-                            const int8x16_t w_hi = vld1q_s8(plp + 16);
-                            plp += 32;
+                            int8x16_t w_lo, w_hi;
+                            if constexpr (LEAN) {
+                                // Packed nibbles: the same 16 B feed both halves
+                                // (vand + vshr), so the stream is half the plane
+                                // bytes at two extra ops per 32 nibbles.
+                                const uint8x16_t p = vld1q_u8(&q4l_ptr[b].qs[sb][k][hw][0]);
+                                w_lo = vreinterpretq_s8_u8(vandq_u8(p, m4b));
+                                w_hi = vreinterpretq_s8_u8(vshrq_n_u8(p, 4));
+                            } else {
+                                // lo plane (4 rows) then hi plane (4 rows); two
+                                // plain loads so both use the base register with an
+                                // immediate offset. A single ld1 pair over the same
+                                // 32 B chunk (vld1q_s8_x2 + post-increment) was
+                                // tried and is worse: clang re-materialises the
+                                // base, 263 instructions per sub-block instead of
+                                // 244 (arm64 census of this build) for identical
+                                // int8 operands. Keep the two loads.
+                                w_lo = vld1q_s8(plp);
+                                w_hi = vld1q_s8(plp + 16);
+                                plp += 32;
+                            }
                             const int b0 = 4 * hw;
                             acc_lo[b0 + 0] = vdotq_laneq_s32(acc_lo[b0 + 0], w_lo, q8_blk0, 0);
                             acc_lo[b0 + 1] = vdotq_laneq_s32(acc_lo[b0 + 1], w_lo, q8_blk0, 1);
@@ -3535,6 +3661,38 @@ void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const vo
     return;
 #endif
     ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
+    ggml_gemm_q4_K_8x4_q8_K_p2_impl<0, false>(n, s, bs, vx, vy, nr, nc, in_acc);
+}
+
+// Lean tile (tile_block_q4_Kx8l, 1184 B/block): packed nibbles + int8 scales.
+// MEASURED (min GMAC/s, interleaved bench, 4 threads; apply2 in parens):
+//   1024x3072 441.7 (529.7) | 3072x1024 452.3 (517.7)
+//   2048x7680, 18.9 MB tile that cannot stay cached: 459.0 (543.2)
+// so -16% to -20% kernel level; end to end +15% median per-chunk gemm (5 of 7
+// interleaved pairs; the other two ran into a load-10 machine). Cause, from the
+// arm64 census of this build: 269 instructions per 64-k sub-block instead of
+// 244 (128 sdot + 141 non-sdot vs 128 sdot + 116 non-sdot) -- halving the bytes
+// adds vand/vshr per 16 B nibble load plus the vmovl widening of the int8
+// scales/mins, and the bytes it saves are not what limits this kernel (see the
+// PF note above). What it does buy is footprint: 459 MB -> 220 MB of q4_K tile
+// for this model, which is why it is kept as an opt-in.
+// Output bit-identical to the packed kernel (bench parity 0/131072 floats and
+// 0/262144 at the uncached shape, plus the end-to-end logits gate).
+void ggml_gemm_q4_K_8x4_q8_K_p3(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
+    ggml_gemm_q4_K_8x4_q8_K_p2_impl<0, true>(n, s, bs, vx, vy, nr, nc, in_acc);
+}
+
+// Prefetch-distance sweep entry point, used only by sofuu_bench_gemm_plane to
+// keep the "prefetching does not help" measurement reproducible (numbers above).
+// pf = 0 runs the shipped code.
+void ggml_gemm_q4_K_8x4_q8_K_p2pf(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc, int pf) {
+    if (pf == 1)      ggml_gemm_q4_K_8x4_q8_K_p2_impl<1, false>(n, s, bs, vx, vy, nr, nc, in_acc);
+    else if (pf == 2) ggml_gemm_q4_K_8x4_q8_K_p2_impl<2, false>(n, s, bs, vx, vy, nr, nc, in_acc);
+    else if (pf == 4) ggml_gemm_q4_K_8x4_q8_K_p2_impl<4, false>(n, s, bs, vx, vy, nr, nc, in_acc);
+    else              ggml_gemm_q4_K_8x4_q8_K_p2_impl<0, false>(n, s, bs, vx, vy, nr, nc, in_acc);
 }
 
 // ══════════ Wider batch tile: 8 activation rows per weight load ══════════
@@ -3632,10 +3790,14 @@ static inline void ggml_quantize_mat_q8_K_8rows_neon(const float * __restrict x,
     }
 }
 
-// Shared body for both weight-tile flavours: PLANE = pre-expanded nibble-plane
-// tile (tile_block_q4_Kx8p, self-contained scales), !PLANE = stock packed tile
-// with the T1 pre-decoded scale section (tile_ss_q4_Kx8s).
-template <bool PLANE>
+// Shared body for the weight-tile flavours: MODE 0 = stock packed tile with the
+// T1 pre-decoded scale section (tile_ss_q4_Kx8s), MODE 1 = pre-expanded
+// nibble-plane tile (tile_block_q4_Kx8p, self-contained scales), MODE 2 = the
+// apply-phase tile (tile_block_q4_Kx8q: same planes plus the scale/min decode
+// hoisted to repack time, see ggml_gemm_q4_K_8x4_q8_K_p2). MODE 2 reuses this
+// kernel's 4-weight-row x 8-activation-row accumulator shape unchanged; only
+// the scale/min loads and the weight-load addressing differ.
+template <int MODE>
 static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs, const void * __restrict vx,
                                          const void * __restrict ss, const void * __restrict vy, int nr, int nc,
                                          const float * in_acc) {
@@ -3655,8 +3817,9 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
         for (int x = 0; x < nc / 8; x++) {
             const tile_block_q4_Kx8p * __restrict q4p = (const tile_block_q4_Kx8p *) vx + (size_t) x * nb;
             const tile_block_q4_Kx8  * __restrict q4s = (const tile_block_q4_Kx8 *)  vx + (size_t) x * nb;
+            const tile_block_q4_Kx8q * __restrict q4q = (const tile_block_q4_Kx8q *) vx + (size_t) x * nb;
             const tile_ss_q4_Kx8s    * __restrict ssp = (const tile_ss_q4_Kx8s *)    ss + (size_t) x * nb;
-            UNUSED(q4p); UNUSED(q4s); UNUSED(ssp);
+            UNUSED(q4p); UNUSED(q4s); UNUSED(q4q); UNUSED(ssp);
 
             for (int hw = 0; hw < 2; hw++) {  // 4-weight-row half of the 8-row block
                 float32x4_t acc_f32[8];
@@ -3665,8 +3828,9 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
                 for (int b = 0; b < nb; b++) {
                     const uint16_t *dptr    = nullptr;
                     const uint16_t *dminptr = nullptr;
-                    if constexpr (PLANE) { dptr = q4p[b].d;    dminptr = q4p[b].dmin; }
-                    else                 { dptr = q4s[b].d;    dminptr = q4s[b].dmin; }
+                    if constexpr (MODE == 1)      { dptr = q4p[b].d; dminptr = q4p[b].dmin; }
+                    else if constexpr (MODE == 2) { dptr = q4q[b].d; dminptr = q4q[b].dmin; }
+                    else                          { dptr = q4s[b].d; dminptr = q4s[b].dmin; }
 
                     const float32x4_t q4_d    = vcvt_f32_f16(vld1_f16((const __fp16 *) dptr + 4 * hw));
                     const float32x4_t q4_dmin = vcvt_f32_f16(vld1_f16((const __fp16 *) dminptr + 4 * hw));
@@ -3686,7 +3850,18 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
                         int16x4_t isc_lo = vdup_n_s16(0), isc_hi = vdup_n_s16(0);
                         float32x4_t fsc_lo = vdupq_n_f32(0), fsc_hi = vdupq_n_f32(0);
                         int16x4_t mins_lo = vdup_n_s16(0), mins_hi = vdup_n_s16(0);
-                        if constexpr (PLANE) {
+                        // MODE 2 only: the apply2 tile's pre-decoded int32 scales
+                        // for these 4 weight rows (same values the 8x4 apply2
+                        // kernel multiplies, so the int32 apply is identical).
+                        int32x4_t isc32_lo = vdupq_n_s32(0), isc32_hi = vdupq_n_s32(0);
+                        if constexpr (MODE == 2) {
+                            isc32_lo  = vld1q_s32(q4q[b].sc[sb * 2] + 4 * hw);
+                            isc32_hi  = vld1q_s32(q4q[b].sc[sb * 2 + 1] + 4 * hw);
+                            const int16x8_t mnl8 = vld1q_s16(q4q[b].mn[sb * 2]);
+                            const int16x8_t mnh8 = vld1q_s16(q4q[b].mn[sb * 2 + 1]);
+                            mins_lo = hw ? vget_high_s16(mnl8) : vget_low_s16(mnl8);
+                            mins_hi = hw ? vget_high_s16(mnh8) : vget_low_s16(mnh8);
+                        } else if constexpr (MODE == 1) {
                             int8_t    aux[2][8];
                             int16x8_t mins[2];
                             decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24], &mins[0], aux[0]);
@@ -3717,7 +3892,15 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
                             const int8x16x2_t a_hi = vld1q_s8_x2(q8hi + 32 * kg);
 
                             int8x16_t w_lo, w_hi;
-                            if constexpr (PLANE) {
+                            if constexpr (MODE == 2) {
+                                // apply2 tile: one 32 B chunk per (sub-block, k
+                                // group, weight-row half) holds 16 B of lo nibbles
+                                // then 16 B of hi, so both loads share a base
+                                // register with an immediate offset.
+                                const int8_t * __restrict pl = (const int8_t *) q4q[b].pl[sb][kg][hw];
+                                w_lo = vld1q_s8(pl);
+                                w_hi = vld1q_s8(pl + 16);
+                            } else if constexpr (MODE == 1) {
                                 // Pre-expanded nibble planes: identical int8 vectors
                                 // to the packed tile's vand/vshr outputs.
                                 const uint32_t poff = (uint32_t) ((sb * 8 + kg) * 32 + 16 * hw);
@@ -3755,7 +3938,10 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
 #define SOFUU_Q4K_8X8_SCALE_ROW(R, Q8D)                                                          \
     do {                                                                                         \
         float32x4_t sumf;                                                                        \
-        if constexpr (PLANE) {                                                                    \
+        if constexpr (MODE == 2) {                                                                \
+            sumf = vcvtq_f32_s32(vmlaq_s32(vmulq_s32(isc32_lo, acc_lo[R]),                        \
+                                           isc32_hi, acc_hi[R]));                                \
+        } else if constexpr (MODE == 1) {                                                         \
             sumf = vcvtq_f32_s32(vaddq_s32(vmulq_s32(vmovl_s16(isc_lo), acc_lo[R]),              \
                                            vmulq_s32(vmovl_s16(isc_hi), acc_hi[R])));            \
         } else {                                                                                 \
@@ -3781,7 +3967,12 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
                     for (int r = 0; r < 8; r++) bias_acc[r] = vdupq_n_s32(0);
                     for (int sb = 0; sb < QK_K / 64; sb++) {
                         int16x4_t mins_lo, mins_hi;
-                        if constexpr (PLANE) {
+                        if constexpr (MODE == 2) {
+                            const int16x8_t mnl8 = vld1q_s16(q4q[b].mn[sb * 2]);
+                            const int16x8_t mnh8 = vld1q_s16(q4q[b].mn[sb * 2 + 1]);
+                            mins_lo = hw ? vget_high_s16(mnl8) : vget_low_s16(mnl8);
+                            mins_hi = hw ? vget_high_s16(mnh8) : vget_low_s16(mnh8);
+                        } else if constexpr (MODE == 1) {
                             int8_t    aux[8];
                             int16x8_t mins;
                             decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24], &mins, aux);
@@ -3830,14 +4021,53 @@ static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs,
 // Nibble-plane weight tile (tile_block_q4_Kx8p), 8 weight rows x 8 act rows.
 void ggml_gemm_q4_K_8x8_q8_K_p(int n, float * __restrict s, size_t bs, const void * __restrict vx,
                                const void * __restrict vy, int nr, int nc, const float * in_acc) {
-    ggml_gemm_q4_K_8x8_q8_K_impl<true>(n, s, bs, vx, nullptr, vy, nr, nc, in_acc);
+    ggml_gemm_q4_K_8x8_q8_K_impl<1>(n, s, bs, vx, nullptr, vy, nr, nc, in_acc);
 }
 
 // Stock packed weight tile (tile_block_q4_Kx8) + T1 scale section, 8x8.
 void ggml_gemm_q4_K_8x8_q8_K_s(int n, float * __restrict s, size_t bs, const void * __restrict vx,
                                const void * __restrict ss, const void * __restrict vy, int nr, int nc,
                                const float * in_acc) {
-    ggml_gemm_q4_K_8x8_q8_K_impl<false>(n, s, bs, vx, ss, vy, nr, nc, in_acc);
+    ggml_gemm_q4_K_8x8_q8_K_impl<0>(n, s, bs, vx, ss, vy, nr, nc, in_acc);
+}
+
+// ── Apply-phase tile, 8 activation rows per weight load ──────────────────────
+// The 8x4 apply2 kernel (ggml_gemm_q4_K_8x4_q8_K_p2) streams its 2464 B weight
+// block once per 4 activation rows; at 128-token prefill chunks that stream is
+// what limits it end to end (see the apply2 note above: ~60 GB/s of the ~118
+// GB/s this machine sustains, +32% kernel GMAC/s but only -7.5% GEMM time). This
+// wrapper runs the SAME tile through the 8x8 body, so the weight block is read
+// once per 8 activation rows: half the weight bytes per MAC, same instruction
+// count per MAC (the 8x8 body does the identical per-sub-block work, split into
+// two 4-weight-row passes of the same 2464 B block, which stays in L1 between
+// them).
+//
+// MEASURED (interleaved bench, min GMAC/s, 4 threads; 8x4 apply2 in parens):
+// 1024x3072 502.1 (529.7), 3072x1024 496.1 (517.7), 2048x7680 uncached 489.5
+// (543.2) -- -5% to -10% at kernel level, and no end-to-end win: 8 interleaved
+// pairs at 1454 prefill tokens gave +1.1% median per-chunk gemm (min -8.0%,
+// max +7.0%), i.e. the halved weight stream (7.35 GB vs 14.7 GB per 128-token
+// chunk) buys nothing while the extra 4-weight-row pass costs instructions: the
+// arm64 census of this build puts the 8-row body's inner loop at 226
+// instructions per (64-k sub-block, weight-row half), i.e. 452 for the same
+// 4096 MAC that cost the 8x4 kernel 244, plus it runs the bias sum in a second
+// pass over the block. Consistent with the
+// 8x4 apply2 kernel reaching the same GMAC/s over an uncacheable tile as
+// cache-resident: this GEMM is not byte-limited at 4 threads. OPT-IN via
+// SOFUU_GEMM_BATCH_TILE=8.
+//
+// Bit-identity: the int8 operands are the same bytes, every int32 accumulator
+// sums exactly the same products, and the per-output apply is the same op
+// sequence as the 8x4 apply2 kernel
+//   sumf = f32( sc_lo*acc_lo + sc_hi*acc_hi )     (int32 mul + mla, exact)
+//   acc  = vfma(acc, d*q8_d, sumf)
+//   acc  = vmls(acc, f32(sum(min*bsum)), dmin*q8_d)
+// with the bias sum formed in int32 over all four sub-blocks (exact, so order
+// does not matter). Checked live by sofuu_bench_gemm_plane (0 float diffs vs the
+// packed kernel) and by the end-to-end logits gate.
+void ggml_gemm_q4_K_8x8_q8_K_p2(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                                const void * __restrict vy, int nr, int nc, const float * in_acc) {
+    ggml_gemm_q4_K_8x8_q8_K_impl<2>(n, s, bs, vx, nullptr, vy, nr, nc, in_acc);
 }
 
 #endif  // __aarch64__ && __ARM_NEON && __ARM_FEATURE_DOTPROD

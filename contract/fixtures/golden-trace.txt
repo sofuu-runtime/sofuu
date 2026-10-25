@@ -1,0 +1,6 @@
+0001 delta          s_harness/t1 text="Hel"
+0002 delta          s_harness/t1 text="lo"
+0003 tool           s_harness/t1 id=c1 name=grep
+0004 tool_result    s_harness/t1 id=c1 ok=true ms=5
+0005 usage          s_harness/t1 in=3 out=2 model=m provider=local
+0006 stop           s_harness/t1 reason=done

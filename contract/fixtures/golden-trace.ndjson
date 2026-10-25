@@ -1,0 +1,6 @@
+{"kind": "delta", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 1, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"text": "Hel"}}
+{"kind": "delta", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 2, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"text": "lo"}}
+{"kind": "tool", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 3, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"id": "c1", "name": "grep"}}
+{"kind": "tool_result", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 4, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"id": "c1", "name": "grep", "ok": true, "ms": 5}}
+{"kind": "usage", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 5, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"in": 3, "out": 2, "model": "m", "provider": "local"}}
+{"kind": "stop", "schema_version": 1, "sid": "s_harness", "turn_id": "t1", "seq": 6, "ts": "2026-10-25T12:00:00Z", "surface": "js", "payload": {"reason": "done"}}

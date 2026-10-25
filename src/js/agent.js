@@ -3881,6 +3881,13 @@
                * blocked tool (bench S4: cancel left a child's `sleep 4`
                * blocking for its full duration — cancel propagation is
                * via the shared state object). */
+              /* R2.3 (SPEC T2.3): register the tool-kill abort BEFORE the
+               * wall race so a cancel kills the in-flight child on either
+               * branch; deregistered right after the tool settles. */
+              var toolAbort = function () {
+                try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eKa) {}
+              };
+              state.aborts.push(toolAbort);
               var wallLeft = d.budget.maxWallMs - (Date.now() - started);
               if (wallLeft > 0) {
                 if (wallLeft > 2147483000) wallLeft = 2147483000; /* setTimeout range */
@@ -3920,9 +3927,20 @@
                 result = await fn(execArgs);
               }
             } else {
-              result = await withTimeout(withCancelGuard(state, Promise.resolve(fn(execArgs))), opts.toolTimeoutMs || d.toolTimeoutMs,
-                                         'tool ' + name + ' timed out');
+              /* Only selfTimed tools opt out of the ceiling (they police
+               * their own timeout internally) — a plain tool keeps the
+               * withTimeout tool-ceiling, or a hanging execute() parks the
+               * whole run forever with no pending timers. */
+              result = await withTimeout(withCancelGuard(state, Promise.resolve(fn(execArgs))),
+                opts.toolTimeoutMs || d.toolTimeoutMs, 'tool ' + name + ' timed out');
             }
+            /* R2.3 (SPEC T2.3): a cancelled run kills the in-flight tool's
+             * subprocess. withCancelGuard stops the loop; killActive stops
+             * the child — the wall-race branch leaves the child untouched
+             * by design (bash polices its own timeout), so the cancel path
+             * needs this explicit kill. Deregistered once the tool settles. */
+            var ai = state.aborts.indexOf(toolAbort);
+            if (ai >= 0) state.aborts.splice(ai, 1);
           }
         } catch (e) {
           result = 'tool error: ' + String((e && e.message) || e);

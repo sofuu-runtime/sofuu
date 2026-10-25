@@ -975,7 +975,29 @@ fn extract_json_field(body: &[u8], key: &str) -> Vec<u8> {
     while p < body.len() && (body[p] == b' ' || body[p] == b'\n') {
         p += 1;
     }
-    if p >= body.len() || body[p] != b'"' {
+    if p >= body.len() {
+        return Vec::new();
+    }
+    /* Bare non-string JSON values: numbers, true/false/null (`"usage":
+     * {"prompt_tokens":5}` — string-only parsing silently dropped every
+     * numeric field and the usage shape never surfaced). */
+    if body[p] == b'-' || body[p].is_ascii_digit() {
+        let mut out: Vec<u8> = Vec::with_capacity(24);
+        while p < body.len() && (body[p].is_ascii_digit() || matches!(body[p], b'-' | b'+' | b'.' | b'e' | b'E')) {
+            out.push(body[p]);
+            p += 1;
+        }
+        return out;
+    }
+    if matches!(body[p], b't' | b'f' | b'n') {
+        let mut out: Vec<u8> = Vec::with_capacity(8);
+        while p < body.len() && body[p].is_ascii_alphabetic() {
+            out.push(body[p]);
+            p += 1;
+        }
+        return out;
+    }
+    if body[p] != b'"' {
         return Vec::new();
     }
     p += 1;
@@ -2916,6 +2938,27 @@ unsafe fn ai_check_multi() {
                     );
                     qjs::sofuu_js_set_property_str(ctx, result, c"text".as_ptr(), text_js);
 
+                    /* R6.4/T6.7: complete() reports the usage the provider
+                     * returned in the response body — the last surface
+                     * without a usage shape. Absent/zero -> no usage field
+                     * (local providers report 0 tokens; cost is 0). */
+                    let u_in = std::str::from_utf8(&extract_json_field(raw, "prompt_tokens"))
+                        .unwrap_or("").trim().parse::<i64>().unwrap_or(0);
+                    let u_out = std::str::from_utf8(&extract_json_field(raw, "completion_tokens"))
+                        .unwrap_or("").trim().parse::<i64>().unwrap_or(0);
+                    if u_in > 0 || u_out > 0 {
+                        let usage = qjs::sofuu_js_new_object(ctx);
+                        qjs::sofuu_js_set_property_str(
+                            ctx, usage, c"promptTokens".as_ptr(),
+                            qjs::sofuu_js_new_int64(ctx, u_in),
+                        );
+                        qjs::sofuu_js_set_property_str(
+                            ctx, usage, c"completionTokens".as_ptr(),
+                            qjs::sofuu_js_new_int64(ctx, u_out),
+                        );
+                        qjs::sofuu_js_set_property_str(ctx, result, c"usage".as_ptr(), usage);
+                    }
+
                     /* native_think: Anthropic extended-thinking field */
                     let native_think = extract_json_field(raw, "thinking");
                     if !native_think.is_empty() {
@@ -4434,6 +4477,7 @@ unsafe extern "C" fn js_ai_complete(
 
 const STREAM_FACTORY: &str = r#"(function() {
   var queue = [];
+  var MAX_QUEUE = 1024; /* R2.4 (SPEC §3.2): bounded chunk queue */
   var _resolve = null, _done = false, _error = null, _aborted = false;
   var _usage = { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   var iterator = {
@@ -4448,11 +4492,13 @@ const STREAM_FACTORY: &str = r#"(function() {
       if (typeof __ai_abort === 'function') __ai_abort(iterator._sid);
     },
     next: function() {
+      /* A failed stream reports failure, not stale data: _error preempts
+       * whatever is still queued (R2: once errored, the stream is dead). */
+      if (_error) return Promise.reject(_error);
       if (queue.length > 0) {
         return Promise.resolve({ value: queue.shift(), done: false });
       }
       if (_done)  return Promise.resolve({ value: undefined, done: true });
-      if (_error) return Promise.reject(_error);
       return new Promise(function(res, rej) {
         _resolve = { res: res, rej: rej };
       });
@@ -4466,6 +4512,22 @@ const STREAM_FACTORY: &str = r#"(function() {
     const value = { text: text, think: _think, done: false };
     _think = '';
     if (_resolve) { var r = _resolve; _resolve = null; r.res({ value: value }); }
+    else if (queue.length >= MAX_QUEUE) {
+      /* R2.4: a non-draining consumer gets a typed E_BACKPRESSURE and the
+       * provider request is aborted — the queue never grows without bound.
+       * The abort MUST be deferred to a timer tick: push() runs inside the
+       * curl write callback, and stream_abort_one tearing the easy handle
+       * down from within its own callback spins the multi loop (libcurl
+       * forbids remove/cleanup in-callback); from a JS tick it is the
+       * documented-safe path. */
+      _aborted = true;
+      error('E_BACKPRESSURE: ' + MAX_QUEUE + ' undelivered chunks; slow consumer');
+      if (typeof setTimeout === 'function' && iterator._sid != null) {
+        setTimeout(function () {
+          if (typeof __ai_abort === 'function') __ai_abort(iterator._sid);
+        }, 0);
+      }
+    }
     else { queue.push(value); }
   }
   function done(stats) {

@@ -17,9 +17,9 @@ T1.6|R1|R1.4|file|-|contract/matrix.json|hasnot:"status": "unknown"|P0 artifact 
 T1.7|R1|R1.6|js|-|JSON.stringify(Object.keys(JSON.parse(sofuu.capabilities()).engine.paths))|["cpu-tiles","metal-mma","mmq"]|engine.paths carries a tier per path
 T2.1|R2|R2.2|cli|-|./sofuu run scripts/contract/harness/t21_timeout.js|exit:0|deadline kill + orphan check
 T2.2|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t22_cancel_stream.js|exit:0|mock-provider cancel + usage accounting
-T2.3|R2|R2.3|manual|-|-|-|needs a subprocess tool fixture
-T2.4|R2|R2.3|manual|-|-|-|needs a client-disconnect harness
-T2.5|R2|R2.4|manual|-|-|-|needs a non-draining consumer harness
+T2.3|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t23_cancel_tool.js|exit:0|cancel mid-tool kills the subprocess (mock provider, no orphan)
+T2.4|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t24_disconnect.js|exit:0|server-side disconnect is visible to the handler (peer_closed)
+T2.5|R2|R2.4|cli|-|./sofuu run scripts/contract/harness/t25_backpressure.js|exit:0|non-draining consumer: typed E_BACKPRESSURE + provider abort
 T2.6|R2|R2.6|manual|-|-|-|needs failure injection
 T2.7|R2|R2.2|cli|-|./sofuu run scripts/contract/harness/t27_deadline.js|exit:0|nested deadline inheritance
 T2.8|R2|R2.5|cli|-|./sofuu run scripts/contract/harness/t28_error_shape.js|exit:0|error taxonomy + §1.4 shape
@@ -46,11 +46,11 @@ T5.7|R5|R5.5|file|-|.github/workflows/ci.yml|has:abi-check|gate exists
 T5.8|R5|R5.1|manual|-|-|-|needs a four-surface failure harness
 T6.1|R6|R6.1|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|envelope on real agent+chat events
 T6.2|R6|R6.2|cli|-|./sofuu run scripts/contract/harness/t62_eventlog.js|exit:0|event-log round-trip, seq order, backpressure bound
-T6.3|R6|R6.7|manual|-|-|-|needs golden files
+T6.3|R6|R6.7|cli|-|./sofuu run scripts/contract/harness/t63_golden.js|exit:0|deterministic renderer == committed golden bytes
 T6.4|R6|R6.4|manual|-|-|-|needs cloud+local fixtures
 T6.5|R6|R6.3|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|terminal-once + total order on a real run
 T6.6|R6|R6.6|cli|-|./sofuu run scripts/contract/harness/t66_redaction.js|exit:0|redaction choke point
-T6.7|R6|R6.4|manual|-|-|-|needs a local model
+T6.7|R6|R6.4|cli|-|./sofuu run scripts/contract/harness/t67_usage.js|exit:0|usage reconciles across complete/stream/agent; cost semantics
 T7.1|R7|R7.1|manual|-|-|-|needs a policy evaluator
 T7.2|R7|R7.2|manual|-|-|-|needs a four-surface harness
 T7.3|R7|R7.4|manual|-|-|-|needs an approval harness

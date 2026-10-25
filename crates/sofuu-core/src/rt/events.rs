@@ -36,10 +36,11 @@ pub const KINDS: [&str; 10] = [
 /// Kinds the shipped drivers additionally emit, recognized with envelope-only
 /// validation (identity fields required, no payload rules). The required ten
 /// are a subset; a driver may not invent kinds outside this registry.
-pub const KNOWN_KINDS: [&str; 21] = [
+pub const KNOWN_KINDS: [&str; 23] = [
     "start", "plan", "think", "answer", "answer_delta", "llm", "delegate", "recall",
     "consolidated", "stored", "learned", "evidence", "schema", "verify", "warn", "mlgate",
     "allocgate", "compact", "done", "approval_request", "approval_resolved",
+    "prompt", "tools",
 ];
 
 pub const SURFACES: [&str; 6] = ["js", "cli", "http", "cabi", "swift", "kotlin"];
@@ -397,6 +398,89 @@ pub fn reconstruct(args: &Value) -> Value {
     json!({"ok": res["ok"].clone(), "turns": turns, "count": turns.len()})
 }
 
+/// T6.7: normalize the three producer usage shapes into the §7.2 payload.
+/// Accepts `{in,out}` (canonical), `{pt,ct}` (chat persisted log), and
+/// `{promptTokens,completionTokens}` (agent/ai) — plus model/provider/cost
+/// under any of their aliases. Cost defaults to 0 (local semantics).
+pub fn canonical_usage(args: &Value) -> Value {
+    let pick = |names: &[&str]| -> Value {
+        for n in names {
+            if let Some(v) = args.get(*n) {
+                if v.is_number() {
+                    return v.clone();
+                }
+            }
+        }
+        json!(0)
+    };
+    let str_pick = |names: &[&str]| -> String {
+        for n in names {
+            if let Some(v) = args.get(*n) {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+        "unknown".into()
+    };
+    json!({
+        "in": pick(&["in", "in_tokens", "pt", "promptTokens", "prompt_tokens"]),
+        "out": pick(&["out", "out_tokens", "ct", "completionTokens", "completion_tokens"]),
+        "model": str_pick(&["model"]),
+        "provider": str_pick(&["provider", "served_by", "servedBy"]),
+        "cost_usd": pick(&["cost_usd", "costUsd", "cost"]),
+    })
+}
+
+/// T6.3: the deterministic text trace renderer — one line per event, seq
+/// order, stable field order. This is the render contract every client
+/// shares; a golden fixture (contract/fixtures/golden-trace.*) pins it.
+pub fn render(events: &[Value]) -> String {
+    let mut sorted: Vec<&Value> = events.iter().collect();
+    sorted.sort_by_key(|e| e.get("seq").and_then(Value::as_u64).unwrap_or(0));
+    let mut out = String::new();
+    for e in sorted {
+        let seq = e.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        let kind = e.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let sid = e.get("sid").and_then(Value::as_str).unwrap_or("?");
+        let turn = e.get("turn_id").and_then(Value::as_str).unwrap_or("?");
+        let payload = e.get("payload").cloned().unwrap_or_else(|| e.clone());
+        let detail = match kind {
+            "delta" => format!("text={:?}", payload.get("text").and_then(Value::as_str).unwrap_or("")),
+            "tool" => format!("id={} name={}", fs(&payload, "id"), fs(&payload, "name")),
+            "tool_result" => format!(
+                "id={} ok={} ms={}",
+                fs(&payload, "id"),
+                payload.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                payload.get("ms").and_then(Value::as_u64).unwrap_or(0)
+            ),
+            "usage" => format!(
+                "in={} out={} model={} provider={}",
+                payload.get("in").and_then(Value::as_u64).unwrap_or(0),
+                payload.get("out").and_then(Value::as_u64).unwrap_or(0),
+                fs(&payload, "model"),
+                fs(&payload, "provider")
+            ),
+            "stop" => format!("reason={}", fs(&payload, "reason")),
+            "served" => format!("by={}", fs(&payload, "by")),
+            "ctx" => format!("used={} limit={}", payload.get("used").and_then(Value::as_u64).unwrap_or(0), payload.get("limit").and_then(Value::as_u64).unwrap_or(0)),
+            _ => {
+                // Deterministic JSON (serde_json maps sort keys by default).
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+            }
+        };
+        out.push_str(&format!("{:04} {:<14} {}/{} {}
+", seq, kind, sid, turn, detail));
+    }
+    out
+}
+
+fn fs(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("?").to_string()
+}
+
 /// The §7.2 definition itself, for hosts and the conformance suite.
 pub fn schema() -> Value {
     let mut payload = Map::new();
@@ -504,6 +588,37 @@ unsafe extern "C" fn js_events_reconstruct(
     qjs::sofuu_js_new_string(ctx, cs.as_ptr())
 }
 
+unsafe extern "C" fn js_events_render(
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
+) -> JSValue {
+    let events: Vec<Value> = read_json_arg(ctx, *argv)
+        .filter(|a| !a.is_null())
+        .and_then(|a| {
+            if a.is_array() {
+                Some(a.as_array().cloned().unwrap_or_default())
+            } else {
+                a.get("events").and_then(Value::as_array).cloned()
+            }
+        })
+        .unwrap_or_default();
+    let cs = json_str(&render(&events));
+    qjs::sofuu_js_new_string(ctx, cs.as_ptr())
+}
+
+unsafe extern "C" fn js_events_canonical_usage(
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
+) -> JSValue {
+    let out = if argc < 1 {
+        canonical_usage(&json!({}))
+    } else {
+        read_json_arg(ctx, *argv)
+            .map(|a| canonical_usage(&a))
+            .unwrap_or_else(|| json!({"in": 0, "out": 0, "model": "unknown", "provider": "unknown", "cost_usd": 0}))
+    };
+    let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
+    qjs::sofuu_js_new_string(ctx, cs.as_ptr())
+}
+
 /// Register `sofuu.events.*`. Called from `engine_register_builtins`.
 pub unsafe fn mod_events_register(ctx: *mut JSContext) {
     let global = qjs::sofuu_js_get_global_object(ctx);
@@ -518,13 +633,15 @@ pub unsafe fn mod_events_register(ctx: *mut JSContext) {
         );
     }
     let obj = qjs::sofuu_js_new_object(ctx);
-    let funcs: [(&std::ffi::CStr, unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue); 6] = [
+    let funcs: [(&std::ffi::CStr, unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue); 8] = [
         (c"schema", js_events_schema),
         (c"validate", js_events_validate),
         (c"redact", js_events_redact),
         (c"append", js_events_append),
         (c"read", js_events_read),
         (c"reconstruct", js_events_reconstruct),
+        (c"render", js_events_render),
+        (c"canonicalUsage", js_events_canonical_usage),
     ];
     for (name, f) in funcs {
         qjs::sofuu_js_set_property_str(
@@ -625,6 +742,36 @@ mod tests {
         assert_eq!(rec["turns"][0]["usage"]["out"], 2);
         assert_eq!(rec["turns"][0]["stop_reason"], "done");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_is_deterministic_and_seq_ordered() {
+        let events = vec![
+            ev("usage", "t1", 5, json!({"in": 3, "out": 2, "model": "m", "provider": "local"})),
+            ev("delta", "t1", 1, json!({"text": "Hel"})),
+            ev("stop", "t1", 6, json!({"reason": "done"})),
+        ];
+        let r1 = render(&events);
+        let r2 = render(&events);
+        assert_eq!(r1, r2, "render must be deterministic");
+        let lines: Vec<&str> = r1.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("0001 delta"), "seq order: {}", lines[0]);
+        assert!(lines[1].starts_with("0005 usage"));
+        assert!(lines[2].starts_with("0006 stop"));
+        assert!(lines[2].contains("reason=done"));
+    }
+
+    #[test]
+    fn canonical_usage_unifies_the_three_producer_shapes() {
+        let a = canonical_usage(&json!({"in": 3, "out": 4, "model": "m", "provider": "local"}));
+        let b = canonical_usage(&json!({"pt": 3, "ct": 4, "model": "m"}));
+        let c = canonical_usage(&json!({"promptTokens": 3, "completionTokens": 4}));
+        assert_eq!(a["in"], b["in"]);
+        assert_eq!(a["out"], c["out"]);
+        assert_eq!(a["cost_usd"], 0, "local cost semantics");
+        let cloud = canonical_usage(&json!({"promptTokens": 5, "completionTokens": 7, "costUsd": 0.0135}));
+        assert_eq!(cloud["cost_usd"], 0.0135);
     }
 
     #[test]

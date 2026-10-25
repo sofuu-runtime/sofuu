@@ -71,6 +71,20 @@
     SHELL_DISABLED = !!(typeof process !== 'undefined' && process.env && process.env.SOFUU_NO_SHELL);
   } catch (eSh) {}
 
+  /* R2.3 (SPEC T2.3): live tool subprocess registry. bash/code_eval register
+   * their spawn handle here so a run cancel can kill an in-flight tool —
+   * withCancelGuard stops the loop, this stops the child. */
+  var LIVE_PROCS = [];
+  function trackProc(handle) {
+    if (!handle) return handle;
+    LIVE_PROCS.push(handle);
+    return handle;
+  }
+  function untrackProc(handle) {
+    var i = LIVE_PROCS.indexOf(handle);
+    if (i >= 0) LIVE_PROCS.splice(i, 1);
+  }
+
   /* S4 (2026-10-23): the shared policy floor (SPEC R7). Every executor in
    * this driver consults the same evaluator the agent loop uses, so a host
    * calling a tool directly cannot bypass a project/user deny. */
@@ -920,13 +934,13 @@
         } catch (_) {}
         var proc;
         try {
-          proc = sofuu.spawn({
+          proc = trackProc(sofuu.spawn({
             command: shCmd,
             args: shArgs,
             onStdout: function (chunk) { capAdd(String(chunk)); },
             onStderr: function (chunk) { capErr(String(chunk)); },
-            onExit: function (c) { code = c; finish(''); },
-          });
+            onExit: function (c) { untrackProc(proc); code = c; finish(''); },
+          }));
         } catch (e) {
           resolve('$ ' + cmd + '\nbash: spawn failed: ' + String(e.message || e));
           return;
@@ -1893,5 +1907,16 @@
       if (all[i].name === wanted) return all[i];
     }
     return null;
+  };
+
+  /* R2.3: kill every live tool subprocess (the cancel path calls this so a
+   * cancelled run leaves no orphan child behind). Returns the kill count. */
+  sofuu.tools.killActive = function () {
+    var n = 0;
+    while (LIVE_PROCS.length) {
+      var h = LIVE_PROCS.pop();
+      try { h.kill(); n++; } catch (eK) {}
+    }
+    return n;
   };
 })();

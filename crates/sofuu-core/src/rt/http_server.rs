@@ -81,6 +81,7 @@ struct Client {
     finished: c_int,  /* response ended — further res calls are no-ops */
     refcount: c_int,  /* connection (1) + live res JS object (1) */
     closing: c_int,   /* uv_close already requested — no double close */
+    peer_closed: c_int, /* R2 (T2.4): the client went away (read EOF/error) */
     /* JS objects */
     req_val: Cell<JSValue>,
     res_val: Cell<JSValue>,
@@ -122,6 +123,7 @@ impl Client {
             streaming: 0,
             finished: 0,
             refcount: 1,
+            peer_closed: 0,
             closing: 0,
             req_val: Cell::new(zero_jsvalue()),
             res_val: Cell::new(zero_jsvalue()),
@@ -458,6 +460,20 @@ unsafe extern "C" fn js_res_write(
     qjs::sofuu_js_new_bool(ctx, 1)
 }
 
+/// R2 (T2.4): has the peer gone away? Read EOF/error, or the server already
+/// tore the connection down. Lets a streaming handler stop writing into a
+/// dead socket instead of buffering forever.
+unsafe extern "C" fn js_res_closed(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let c = qjs::JS_GetOpaque(this_val, RES_CLASS_ID.load(Ordering::Relaxed)) as *mut Client;
+    let closed = !c.is_null() && ((*c).peer_closed != 0 || (*c).closing != 0);
+    qjs::sofuu_js_new_bool(ctx, if closed { 1 } else { 0 })
+}
+
 unsafe extern "C" fn js_res_end(
     ctx: *mut JSContext,
     this_val: JSValueConst,
@@ -693,6 +709,12 @@ unsafe extern "C" fn cb_message_complete(p: *mut HttpParser) -> c_int {
         c"send".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_res_send, c"send".as_ptr(), 1),
     );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        (*c).res_val.get(),
+        c"closed".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_res_closed, c"closed".as_ptr(), 0),
+    );
 
     let mut args: [JSValueConst; 2] = [(*c).req_val.get(), (*c).res_val.get()];
     let ret = qjs::JS_Call(ctx, (*(*c).srv).handler, qjs::sofuu_js_undefined(), 2, args.as_mut_ptr());
@@ -748,6 +770,10 @@ unsafe extern "C" fn on_read(s: *mut UvStream, n: isize, b: *const uv::UvBuf) {
             }
         }
     } else if n < 0 {
+        /* R2 (T2.4): read EOF/error = the peer went away. Recorded so the
+         * handler can observe the disconnect instead of writing into a
+         * dead socket forever. */
+        (*c).peer_closed = 1;
         if (*c).closing == 0 {
             (*c).closing = 1;
             uv::uv_close(s as *mut UvHandle, Some(client_free));

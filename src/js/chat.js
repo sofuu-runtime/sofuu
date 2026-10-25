@@ -1260,6 +1260,43 @@
         }), sessionPassword(S.project));
       }
     } catch (e) {}
+
+    /* 3. R6 (SPEC §7.2): the session's events.ndjson — the substrate the
+     * conformance suite reconstructs turns from. Additive to the QTSQ
+     * logging; any failure here never breaks the turn. */
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.events && typeof sofuu.events.append === 'function') {
+        var sid6 = String(S.info ? S.info.id : 'chat');
+        var payload6 = { text: String(text == null ? '' : text) };
+        if (kind === 'usage') {
+          try {
+            var u6 = JSON.parse(String(text || '{}'));
+            payload6 = {
+              in: u6.pt || u6.in || 0, out: u6.ct || u6.out || 0,
+              model: String(u6.model || (S.info ? S.info.model : 'unknown') || 'unknown'),
+              provider: String(u6.provider || 'local'),
+              cost_usd: u6.cost || u6.costUsd || u6.cost_usd || 0,
+            };
+          } catch (eU6) {
+            payload6 = { in: 0, out: 0, model: 'unknown', provider: 'local' };
+          }
+        } else if (kind === 'served') {
+          payload6 = { by: String(text) === 'cloud' ? 'cloud' : 'local' };
+        } else if (kind === 'tools') {
+          payload6 = { name: 'tools' };
+        }
+        sofuu.events.append(JSON.stringify({
+          project: String(S.project || '.'),
+          sid: sid6,
+          events: [{
+            kind: kind, schema_version: 1, sid: sid6, turn_id: sid6,
+            seq: 1000 + (ev.seq | 0),
+            ts: new Date(t).toISOString(),
+            surface: 'js', payload: payload6,
+          }],
+        }));
+      }
+    } catch (eEv6) {}
     sessionPersist();
   }
   /* Per-workspace chat cap (user rule): the strip holds at most 7 — a new

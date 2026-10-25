@@ -1,0 +1,289 @@
+{
+  "schema": 1,
+  "audit_date": "2026-10-23",
+  "rule": "R1.6 / SPEC 1.5 — every public symbol carries exactly one stability tier",
+  "tier_legend": {
+    "T1": "guaranteed: conformance-tested, semver-protected",
+    "T2": "supported: documented, may change with a minor bump and a deprecation note",
+    "T3": "experimental: may change or vanish; never required by a guide or an app"
+  },
+  "surfaces": {
+    "cabi": {
+      "symbols": {
+        "sofuu_destroy": "T1",
+        "sofuu_embed_abi_version": "T1",
+        "sofuu_embed_batch": "T1",
+        "sofuu_embed_image": "T1",
+        "sofuu_embed_info": "T1",
+        "sofuu_embed_local": "T1",
+        "sofuu_embed_set_log_cb": "T2",
+        "sofuu_engine_ctx": "T1",
+        "sofuu_eval_file": "T1",
+        "sofuu_eval_string": "T1",
+        "sofuu_flush_jobs": "T2",
+        "sofuu_flush_jobs_bounded": "T2",
+        "sofuu_free": "T1",
+        "sofuu_get_engine": "T2",
+        "sofuu_init": "T1",
+        "sofuu_loop_close": "T2",
+        "sofuu_loop_get": "T2",
+        "sofuu_loop_init": "T2",
+        "sofuu_loop_run": "T2",
+        "sofuu_loop_shutdown_engine": "T2",
+        "sofuu_rt_call": "T1",
+        "sofuu_rt_call_stream": "T1",
+        "sofuu_rt_cancel": "T1",
+        "sofuu_rt_eval": "T2",
+        "sofuu_rt_eval_nb": "T2",
+        "sofuu_rt_free": "T1",
+        "sofuu_rt_host_tool_resolve": "T2",
+        "sofuu_rt_install_rejection_tracker": "T2",
+        "sofuu_rt_new": "T1",
+        "sofuu_rt_register_host_tool": "T2",
+        "sofuu_rt_report_pending_rejections": "T2",
+        "sofuu_run_jobs": "T2",
+        "sofuu_voice_speak": "T1",
+        "sofuu_voice_transcribe": "T1"
+      }
+    },
+    "cli": {
+      "commands": {
+        "chat": "T1",
+        "infer": "T1",
+        "serve": "T1",
+        "agent": "T1",
+        "agents": "T1",
+        "session": "T1",
+        "sessions": "T1",
+        "doctor": "T1",
+        "run": "T1",
+        "eval": "T1",
+        "repl": "T1",
+        "version": "T1",
+        "help": "T1",
+        "bundle": "T2",
+        "install": "T2",
+        "add": "T2",
+        "compile-bc": "T2",
+        "swarm": "T2",
+        "outputs": "T2",
+        "output": "T2",
+        "licenses": "T2"
+      }
+    },
+    "http": {
+      "routes": {
+        "GET /v1/models": "T1",
+        "POST /v1/chat/completions": "T1",
+        "POST /v1/completions": "T1",
+        "POST /remember": "T1",
+        "GET /recall": "T1",
+        "POST /forget": "T1",
+        "GET /health": "T2",
+        "GET /memories": "T2",
+        "POST /share": "T2",
+        "POST /chat/completions": "T2",
+        "POST /infer": "T2"
+      }
+    },
+    "js": {
+      "namespaces": {
+        "sofuu.capabilities": {
+          "tier": "T1",
+          "members": { "capabilities": "T1" }
+        },
+        "sofuu.ai": {
+          "tier": "T1",
+          "members": {
+            "complete": "T1", "stream": "T1", "inferLocal": "T1", "streamLocal": "T1",
+            "applyChatTemplate": "T2", "embed": "T1", "embedBatch": "T1", "embedImage": "T1",
+            "transcribe": "T1", "speak": "T1", "embedLocal": "T1", "embedLocalSemantic": "T2",
+            "embedInfo": "T2", "embedLocalSemanticV2": "T2", "embedInfoV2": "T2",
+            "similarity": "T1", "dot": "T1", "l2": "T1", "estimateTokens": "T2",
+            "modelCaps": "T2", "resolveCaps": "T2"
+          }
+        },
+        "sofuu.agent": {
+          "tier": "T1",
+          "members": {
+            "define": "T1", "run": "T1", "runMany": "T1", "mapContext": "T2",
+            "cancel": "T1", "list": "T1", "loadDir": "T1", "getTrace": "T1",
+            "resume": "T2", "current": "T2", "pinProjectFact": "T2", "renderTrace": "T1",
+            "contextWindow": "T2", "modelCaps": "T2", "maxOutputFor": "T2",
+            "isTransientProviderError": "T3", "brainFor": "T3", "rememberGist": "T2",
+            "resolveApproval": "T1", "pendingApprovals": "T1", "setPermissions": "T1",
+            "getPermissions": "T1", "CORE_PROMPT": "T2", "VERSION": "T2",
+            "create": "T3"
+          }
+        },
+        "sofuu.chat": {
+          "tier": "T1",
+          "members": {
+            "init": "T1", "submit": "T1", "cancel": "T1", "compact": "T1", "clear": "T1",
+            "resume": "T1", "sessionTurns": "T1", "newSession": "T1", "setProject": "T1",
+            "setPermissions": "T1", "state": "T1", "sessions": "T1", "usage": "T1",
+            "deleteSession": "T1", "clearSessions": "T1", "resolveApproval": "T1",
+            "detectCaps": "T2", "resolveCaps": "T2"
+          }
+        },
+        "sofuu.tools": {
+          "tier": "T1",
+          "members": {
+            "TOOLS": "T1", "GROUP": "T1", "ENABLED": "T2", "VERSION": "T2",
+            "read_file": "T1", "write_file": "T1", "edit_file": "T1", "grep": "T1",
+            "glob": "T1", "list_dir": "T1", "bash": "T1", "code_eval": "T1", "todo_write": "T1"
+          }
+        },
+        "sofuu.policy": {
+          "tier": "T2",
+          "members": {
+            "evaluate": "T2", "load": "T2", "get": "T2", "set": "T2", "clear": "T2"
+          }
+        },
+        "sofuu.rlm": {
+          "tier": "T2",
+          "members": { "query": "T2", "route": "T2", "logRoute": "T3", "VERSION": "T2" }
+        },
+        "sofuu.storage": {
+          "tier": "T2",
+          "members": {
+            "open": "T2", "Database": "T2", "TableHandle": "T2",
+            "MessagesCollection": "T2", "TracesCollection": "T2", "KeyValueStore": "T2"
+          }
+        },
+        "sofuu.web": {
+          "tier": "T1",
+          "members": { "search": "T1", "open": "T1", "TOOLS": "T1", "VERSION": "T2", "ENGINES": "T3" }
+        },
+        "sofuu.memory": {
+          "tier": "T1",
+          "members": {
+            "open": "T1", "migrate": "T2", "embeddingInfo": "T2", "inspect": "T2",
+            "remember": "T1", "learn": "T1", "recall": "T1", "search": "T1",
+            "count": "T1", "flush": "T1", "forget": "T1", "close": "T1",
+            "list": "T1", "export": "T1", "importRecords": "T1",
+            "stats": "T2", "retain": "T2", "consolidate": "T2", "compact": "T2",
+            "markPositive": "T2", "rememberWorking": "T2", "promoteWorking": "T2",
+            "clearWorking": "T2", "rememberEntity": "T2", "rememberEntityTurn": "T3",
+            "retainAgainst": "T2", "decayTick": "T2", "kvHints": "T2"
+          }
+        },
+        "sofuu.kv": {
+          "tier": "T2",
+          "members": { "open": "T2", "save": "T2", "search": "T2", "flush": "T2" }
+        },
+        "sofuu.fs": {
+          "tier": "T1",
+          "members": {
+            "readFile": "T1", "writeFile": "T1", "appendFile": "T1", "exists": "T1",
+            "readdir": "T1", "mkdir": "T1", "rm": "T1", "readFileBytes": "T1", "realpath": "T2"
+          }
+        },
+        "sofuu.http": {
+          "tier": "T1",
+          "members": { "createServer": "T1", "fetch": "T1", "SSEParser": "T2" }
+        },
+        "sofuu.mcp": {
+          "tier": "T1",
+          "members": {
+            "connect": "T1", "serve": "T1", "MCPClient": "T1", "MCPServer": "T1"
+          }
+        },
+        "sofuu.ml": {
+          "tier": "T2",
+          "members": {
+            "track": "T3", "workset": "T3", "info": "T2", "feedback": "T3",
+            "supervisor": "T2", "freshness": "T2", "compaction": "T2",
+            "relevance": "T2", "alloc": "T2"
+          }
+        },
+        "sofuu.spawn": {
+          "tier": "T1",
+          "members": { "spawn": "T1", "exec": "T1" }
+        },
+        "sofuu.process": {
+          "tier": "T1",
+          "members": {
+            "version": "T1", "runtime": "T1", "platform": "T1", "pid": "T1",
+            "argv": "T1", "env": "T1", "exit": "T1", "cwd": "T1", "chdir": "T1",
+            "on": "T1", "off": "T1"
+          }
+        },
+        "sofuu.sandbox": {
+          "tier": "T2",
+          "members": { "run": "T2", "eval": "T2", "create": "T2" }
+        },
+        "sofuu.context": {
+          "tier": "T2",
+          "members": { "AsyncLocalStorage": "T2" }
+        },
+        "sofuu.parse": { "tier": "T3", "members": { "default": "T3" } },
+        "sofuu.aotEval": { "tier": "T3", "members": { "default": "T3" } },
+        "sofuu.buffer": { "tier": "T3", "members": { "default": "T3" } },
+        "sofuu.extractor": {
+          "tier": "T3",
+          "members": {
+            "shouldExtract": "T3", "cleanJsonText": "T3", "parseFactsJson": "T3",
+            "extract": "T3", "applyFacts": "T3", "processTurn": "T3", "processTurnAsync": "T3"
+          }
+        }
+      }
+    },
+    "config": {
+      "keys": {
+        "providers[]": "T1",
+        "active": "T1",
+        "model": "T1",
+        "effort": "T1",
+        "brain": "T1",
+        "brain_path": "T1",
+        "permissions": "T1",
+        "pricing": "T1",
+        "budget_usd": "T1",
+        "ctx_window": "T1",
+        "memory_backend": "T1",
+        "api_key": "T2",
+        "base_url": "T2",
+        "profile": "T2",
+        "ml": "T2",
+        "sync": "T2",
+        "rlm": "T2",
+        "theme": "T2",
+        "embed_provider": "T2",
+        "embed_model": "T2",
+        "ctx_window_explicit": "T2",
+        "max_output": "T2",
+        "spend_total_usd": "T2",
+        "ghost": "T2",
+        "rss_warn_mb": "T2",
+        "recall_min": "T2",
+        "recall_budget": "T2",
+        "no_think_models": "T2",
+        "archive_enabled": "T2",
+        "archive_retain_final": "T2",
+        "archive_retain_tool_results": "T2",
+        "archive_retain_partial": "T2",
+        "archive_redact": "T2",
+        "archive_max_bytes": "T2",
+        "archive_max_count": "T2",
+        "archive_max_age_secs": "T2",
+        "archive_auto_recover": "T2",
+        "archive_recovery_budget_chars": "T2",
+        "provider(legacy flat)": "T3",
+        "model(legacy flat)": "T3",
+        "api_key(legacy flat)": "T3",
+        "base_url(legacy flat)": "T3",
+        "profile(legacy flat)": "T3"
+      }
+    }
+  },
+  "gaps": [
+    {"symbol": "sofuu_capabilities_json()", "surface": "cabi", "target_tier": "T1", "phase": "P1"},
+    {"symbol": "sofuu.model.describe()", "surface": "js", "target_tier": "T1", "phase": "P1"},
+    {"symbol": "sofuu.model.list()", "surface": "js", "target_tier": "T1", "phase": "P1"},
+    {"symbol": "sofuu.session (namespace)", "surface": "js", "target_tier": "T1", "phase": "P3"},
+    {"symbol": "GET /capabilities", "surface": "http", "target_tier": "T1", "phase": "P1"},
+    {"symbol": "POST /v1/embeddings", "surface": "http", "target_tier": "T2", "phase": "P3"},
+    {"symbol": "session export/import (CLI + JS + HTTP)", "surface": "all", "target_tier": "T1", "phase": "P3"}
+  ]
+}

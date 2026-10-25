@@ -116,6 +116,24 @@ jobs:
       - name: Run JS test suite
         run: make test
 
+      # ── R3: determinism gate (SPEC-RUNTIME-CONTRACT §4) ──────────
+      # The receipt schema is validated on every push, then the committed
+      # 77 KB fixture model runs the full two-route gate: the default CPU
+      # route must equal the SOFUU_NO_TILES reference exactly. FORK — or any
+      # non-identical exact-tier verdict — fails the job and blocks a default
+      # flip (R3.2/R3.6). Regenerating the fixture in CI also proves the
+      # committed bytes still match the generator.
+      - name: Determinism gate (R3)
+        run: |
+          python3 scripts/text_gate.py --self-check
+          python3 scripts/contract/make_fixture_gguf.py contract/fixtures/sofuu-fixture.gguf
+          git diff --exit-code -- contract/fixtures/sofuu-fixture.gguf
+          python3 scripts/text_gate.py contract/fixtures/sofuu-fixture.gguf \
+            "Write three sentences about Paris." \
+            --max-tokens 8 --tier exact --require-identical \
+            --cpu-env "" --gpu-env "SOFUU_NO_TILES=1" \
+            --prompt-id paris8 --label ci --receipt gate-receipt.json
+
       - name: ABI symbol guard
         run: make abi-check
 

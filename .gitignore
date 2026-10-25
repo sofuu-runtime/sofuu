@@ -148,3 +148,9 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 /docs/
 /crates/sofuu-core/tests/
 /sofuu-ios/docs/
+
+# P1 verification: a second build tree for the QTSQ-free binary (T1.3)
+/target-noqts/
+
+# ...but the runtime contract's live status is tracked:
+!contract/PROGRESS.md

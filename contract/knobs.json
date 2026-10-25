@@ -1,0 +1,1346 @@
+{
+  "schema": 1,
+  "generated_from": "scan of src/, crates/*/src/, bindings/ (getenv | env::var | process.env)",
+  "count": 125,
+  "counts_by_class": {
+    "tuning": 61,
+    "test": 33,
+    "public": 19,
+    "debug": 11,
+    "build": 1
+  },
+  "unclassified_numeric_effect": [],
+  "unsure_determinism_tier": [
+    "SOFUU_ATTN_CHUNK_MIN",
+    "SOFUU_ATTN_FAST",
+    "SOFUU_ATTN_NOOP",
+    "SOFUU_ATTN_W4",
+    "SOFUU_ATTN_WARPS",
+    "SOFUU_DECODE_MMQ",
+    "SOFUU_DECODE_MMQ_OPS",
+    "SOFUU_FA2",
+    "SOFUU_FUSE_GUP",
+    "SOFUU_FUSE_MULTI",
+    "SOFUU_FUSE_NORM",
+    "SOFUU_FUSE_QKV",
+    "SOFUU_GEMM_ACC",
+    "SOFUU_GEMM_TILE",
+    "SOFUU_GEMM_TYPES",
+    "SOFUU_GEMV_BENCH",
+    "SOFUU_GEMV_BENCH_N",
+    "SOFUU_GEMV_FLAT",
+    "SOFUU_GEMV_R8",
+    "SOFUU_GEMV_SPLIT",
+    "SOFUU_GEMV_V2",
+    "SOFUU_GEMV_V3",
+    "SOFUU_GEMV_V4",
+    "SOFUU_GPU_ATTN",
+    "SOFUU_GPU_ATTN_FLASH",
+    "SOFUU_GPU_FUSE",
+    "SOFUU_GPU_GEMM_TILED",
+    "SOFUU_GPU_GEMM_WIDE",
+    "SOFUU_GPU_PREFILL",
+    "SOFUU_GPU_PREFILL_GEMM",
+    "SOFUU_GPU_SKIP",
+    "SOFUU_GPU_SPEC",
+    "SOFUU_GPU_TILE_MMQ",
+    "SOFUU_GQA4",
+    "SOFUU_GQA_ATTN",
+    "SOFUU_KIVI",
+    "SOFUU_KIVI_BITS",
+    "SOFUU_KV_F16",
+    "SOFUU_NIBBLE_PLANES",
+    "SOFUU_NIBBLE_PLANES_MB",
+    "SOFUU_NO_BARRIER",
+    "SOFUU_NO_ROPE_TABLE",
+    "SOFUU_PRE8",
+    "SOFUU_PREFILL_BATCH",
+    "SOFUU_PREFILL_BLAS",
+    "SOFUU_PREFILL_CHUNK",
+    "SOFUU_Q3K_TILE_MB",
+    "SOFUU_Q4_SS",
+    "SOFUU_Q4_SS_MB",
+    "SOFUU_RESIDENT_WEIGHTS",
+    "SOFUU_SCALE_SIDECAR",
+    "SOFUU_T143_DIRECT",
+    "SOFUU_TILE_MB",
+    "SOFUU_TILE_RESERVE_MB"
+  ],
+  "knobs": [
+    {
+      "name": "SOFUU_AFFINITY",
+      "class": "tuning",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/simd/platform/platform_affinity.h:94"
+      ]
+    },
+    {
+      "name": "SOFUU_ATTN_CHUNK_MIN",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2521"
+      ]
+    },
+    {
+      "name": "SOFUU_ATTN_FAST",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2534"
+      ]
+    },
+    {
+      "name": "SOFUU_ATTN_NOOP",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/metal/metal_engine.mm:503"
+      ]
+    },
+    {
+      "name": "SOFUU_ATTN_W4",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2529"
+      ]
+    },
+    {
+      "name": "SOFUU_ATTN_WARPS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2509"
+      ]
+    },
+    {
+      "name": "SOFUU_BENCH_ATTN",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/main.rs:1401"
+      ]
+    },
+    {
+      "name": "SOFUU_BENCH_DIR",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_bench.rs:87"
+      ]
+    },
+    {
+      "name": "SOFUU_BENCH_GEMM",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/main.rs:1418"
+      ]
+    },
+    {
+      "name": "SOFUU_BENCH_GEMV",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/main.rs:1386"
+      ]
+    },
+    {
+      "name": "SOFUU_BENCH_JSON",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_bench.rs:683"
+      ]
+    },
+    {
+      "name": "SOFUU_BRAIN_EF_SEARCH",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/memory/cma.rs:134"
+      ]
+    },
+    {
+      "name": "SOFUU_BRAIN_KEY",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/doctor.rs:272"
+      ]
+    },
+    {
+      "name": "SOFUU_BRAIN_MAX_RECORDS",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/chat.rs:4174",
+        "crates/sofuu-core/src/doctor.rs:526",
+        "crates/sofuu-core/src/rt/memory.rs:709"
+      ]
+    },
+    {
+      "name": "SOFUU_DECODE_MMQ",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:2526"
+      ]
+    },
+    {
+      "name": "SOFUU_DECODE_MMQ_OPS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:2630"
+      ]
+    },
+    {
+      "name": "SOFUU_DYNAMIC_FFN",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/dynamic_ffn.rs:40"
+      ]
+    },
+    {
+      "name": "SOFUU_EMBED_EVAL_ARTIFACT",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_eval.rs:755",
+        "crates/ml-train/src/embedding_eval.rs:965",
+        "crates/ml-train/src/embedding_probe.rs:112"
+      ]
+    },
+    {
+      "name": "SOFUU_EMBED_EVAL_DEBUG",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_eval.rs:1128"
+      ]
+    },
+    {
+      "name": "SOFUU_EMBED_EVAL_MODE",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_eval.rs:964",
+        "crates/ml-train/src/embedding_stress.rs:292",
+        "crates/ml-train/src/embedding_verify.rs:202"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_ANCHOR",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_anchor.rs:33"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_ANCHOR_KIND",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_anchor.rs:222"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_ANCHOR_W",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_anchor.rs:38"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_BUDGET_KIB",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_eval.rs:53",
+        "crates/ml-train/src/embedding_eval.rs:1213"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_CORPUS",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1064",
+        "crates/ml-train/src/embedding_train.rs:1067"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_CORPUS_SEED",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/data_embedding_gen.rs:48"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_EPOCHS",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1078"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_LOSS",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1089",
+        "crates/ml-train/src/embedding_train.rs:1343"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_MINING",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:963"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_OUT",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:988"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_QAT",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1092"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_QAT_WARMUP",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1093"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_SEEDS",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1069"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_SOUP",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1088"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_SPARSE_K",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1083",
+        "crates/ml-train/src/embedding_train.rs:1350"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_TAU",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1097"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_TEACHER",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1109"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_TEACHER_W",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:557"
+      ]
+    },
+    {
+      "name": "SOFUU_EMB_V2",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_train.rs:1339"
+      ]
+    },
+    {
+      "name": "SOFUU_ENTROPY_PENALTY",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "best-effort",
+      "evidence": [
+        "crates/sofuu-core/src/infer/sampler.rs:248"
+      ]
+    },
+    {
+      "name": "SOFUU_FA2",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:5165"
+      ]
+    },
+    {
+      "name": "SOFUU_FUSE_GUP",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:4063"
+      ]
+    },
+    {
+      "name": "SOFUU_FUSE_MULTI",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3185"
+      ]
+    },
+    {
+      "name": "SOFUU_FUSE_NORM",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2492",
+        "crates/sofuu-core/src/infer/model.rs:2509"
+      ]
+    },
+    {
+      "name": "SOFUU_FUSE_QKV",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:2515",
+        "crates/sofuu-core/src/infer/model.rs:3877"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMM_ACC",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3732"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMM_TILE",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/metal/metal_engine.mm:433"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMM_TYPES",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3666"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_BENCH",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:5035"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_BENCH_N",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:5038"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_FLAT",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2500"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_R8",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2546"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_SPLIT",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2540"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_V2",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2598"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_V3",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2577"
+      ]
+    },
+    {
+      "name": "SOFUU_GEMV_V4",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2557"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_ATTN",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:2763"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_ATTN_FLASH",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2682"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_FUSE",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3123"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_GEMM_MMA",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "tolerant",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2624"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_GEMM_TILED",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:1633"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_GEMM_WIDE",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/metal.rs:2385"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_PREFILL",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3052"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_PREFILL_GEMM",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:1573",
+        "crates/sofuu-core/src/infer/model.rs:5109"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_SKIP",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:5190"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_SPEC",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3010",
+        "crates/sofuu-core/src/infer/model.rs:4902"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_TILE_MMQ",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:3678"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_TIMING",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/metal/metal_engine.mm:605",
+        "crates/sofuu-core/src/infer/metal.rs:97",
+        "crates/sofuu-core/src/infer/model.rs:3499"
+      ]
+    },
+    {
+      "name": "SOFUU_GQA4",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:5294"
+      ]
+    },
+    {
+      "name": "SOFUU_GQA_ATTN",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:5147"
+      ]
+    },
+    {
+      "name": "SOFUU_HAZARD",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/metal/metal_engine.mm:504"
+      ]
+    },
+    {
+      "name": "SOFUU_HTTP_HEADERS_MS",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/rt/http_server.rs:911"
+      ]
+    },
+    {
+      "name": "SOFUU_HTTP_IDLE_MS",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/rt/http_server.rs:916"
+      ]
+    },
+    {
+      "name": "SOFUU_IMG_HOLDTAGS",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_img_eval.rs:63",
+        "crates/ml-train/src/embedding_img_train.rs:156"
+      ]
+    },
+    {
+      "name": "SOFUU_IMG_OUT",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_img_train.rs:129"
+      ]
+    },
+    {
+      "name": "SOFUU_IMG_SEED",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/ml-train/src/embedding_img_train.rs:120"
+      ]
+    },
+    {
+      "name": "SOFUU_KIVI",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/kivi.rs:48"
+      ]
+    },
+    {
+      "name": "SOFUU_KIVI_BITS",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/kivi.rs:51"
+      ]
+    },
+    {
+      "name": "SOFUU_KV_F16",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:674"
+      ]
+    },
+    {
+      "name": "SOFUU_LFM2_PROF",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/lfm2.rs:1990",
+        "crates/sofuu-core/src/infer/lfm2.rs:2076"
+      ]
+    },
+    {
+      "name": "SOFUU_MCP_CONFIG",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "src/js/tools.js:1303",
+        "crates/sofuu-core/src/cli_protocols.rs:15"
+      ]
+    },
+    {
+      "name": "SOFUU_METAL_CAPTURE",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/metal/metal_engine.mm:3679"
+      ]
+    },
+    {
+      "name": "SOFUU_METAL_CAPTURE_N",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/metal/metal_engine.mm:3681"
+      ]
+    },
+    {
+      "name": "SOFUU_METAL_CAPTURE_SKIP",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/metal/metal_engine.mm:3680"
+      ]
+    },
+    {
+      "name": "SOFUU_NIBBLE_PLANES",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:515"
+      ]
+    },
+    {
+      "name": "SOFUU_NIBBLE_PLANES_MB",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:522"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_BARRIER",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/metal/metal_engine.mm:502"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_ML",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/ml/mod.rs:441"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_ROPE_TABLE",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:3979"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_SHELL",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "src/js/tools.js:71",
+        "src/js/tools.js:882"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_TILES",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "exact",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:705"
+      ]
+    },
+    {
+      "name": "SOFUU_NO_TOOLS",
+      "class": "tuning",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/chat.rs:3765"
+      ]
+    },
+    {
+      "name": "SOFUU_NUM_THREADS",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "src/simd/infer_kernels.cpp:96"
+      ]
+    },
+    {
+      "name": "SOFUU_PHASE_METRICS",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/continuous.rs:88"
+      ]
+    },
+    {
+      "name": "SOFUU_POLICY",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/cli_protocols.rs:319"
+      ]
+    },
+    {
+      "name": "SOFUU_PRE8",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/lfm2.rs:2312",
+        "crates/sofuu-core/src/infer/lfm2.rs:3831",
+        "crates/sofuu-core/src/infer/lfm2.rs:3833"
+      ]
+    },
+    {
+      "name": "SOFUU_PREFILL_BATCH",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:48"
+      ]
+    },
+    {
+      "name": "SOFUU_PREFILL_BLAS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/lfm2.rs:2458"
+      ]
+    },
+    {
+      "name": "SOFUU_PREFILL_CHUNK",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:5113"
+      ]
+    },
+    {
+      "name": "SOFUU_PROFILE_LOAD",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:663"
+      ]
+    },
+    {
+      "name": "SOFUU_PROJECT",
+      "class": "build",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/rt/session_js.rs:159",
+        "crates/sofuu-core/src/session.rs:239"
+      ]
+    },
+    {
+      "name": "SOFUU_Q3K_TILE_MB",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:586"
+      ]
+    },
+    {
+      "name": "SOFUU_Q4K_COALESCED",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "src/metal/metal_engine.mm:289"
+      ]
+    },
+    {
+      "name": "SOFUU_Q4_SS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:551"
+      ]
+    },
+    {
+      "name": "SOFUU_Q4_SS_MB",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:565"
+      ]
+    },
+    {
+      "name": "SOFUU_QKV_SNAP_LAYER",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:1179",
+        "crates/sofuu-core/src/infer/model.rs:3671"
+      ]
+    },
+    {
+      "name": "SOFUU_RESIDENT_WEIGHTS",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/gguf.rs:63"
+      ]
+    },
+    {
+      "name": "SOFUU_ROPE_DEBUG",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "src/simd/infer_kernels.cpp:3908"
+      ]
+    },
+    {
+      "name": "SOFUU_SCALE_SIDECAR",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:490"
+      ]
+    },
+    {
+      "name": "SOFUU_SEL_DEBUG",
+      "class": "debug",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/modules/process.rs:2066"
+      ]
+    },
+    {
+      "name": "SOFUU_SERVE_TOKEN",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/main.rs:908"
+      ]
+    },
+    {
+      "name": "SOFUU_SPARKTEST_VARIANT",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/quant.rs:2958"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_ADAPT",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:901"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_DEPTH",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:1015"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_MIN_ACCEPT",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:906"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_ROWS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:1028"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_WARMUP",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:902"
+      ]
+    },
+    {
+      "name": "SOFUU_SPEC_WIDTHS",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "exact",
+      "evidence": [
+        "crates/sofuu-core/src/infer/mod.rs:1033"
+      ]
+    },
+    {
+      "name": "SOFUU_STALL_TIMEOUT_SECS",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/rt/ai.rs:1670"
+      ]
+    },
+    {
+      "name": "SOFUU_STORAGE",
+      "class": "public",
+      "numeric_effect": "no",
+      "stability_tier": "T2",
+      "determinism_tier": null,
+      "evidence": [
+        "src/js/agent.js:2280",
+        "src/js/agent.js:5136"
+      ]
+    },
+    {
+      "name": "SOFUU_T143_DIRECT",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/qwen35.rs:1217"
+      ]
+    },
+    {
+      "name": "SOFUU_TEST_CONFIG_DIR",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/chat.rs:280"
+      ]
+    },
+    {
+      "name": "SOFUU_TEST_LFM2_DIR",
+      "class": "test",
+      "numeric_effect": "no",
+      "stability_tier": "T3",
+      "determinism_tier": null,
+      "evidence": [
+        "crates/sofuu-core/src/infer/lfm2.rs:3729"
+      ]
+    },
+    {
+      "name": "SOFUU_TILE_MB",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:635"
+      ]
+    },
+    {
+      "name": "SOFUU_TILE_RESERVE_MB",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "src/simd/infer_kernels.cpp:608"
+      ]
+    }
+  ]
+}

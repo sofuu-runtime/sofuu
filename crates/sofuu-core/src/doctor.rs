@@ -636,6 +636,56 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     section("protocols / sandbox");
     let jail_ok = protocol_probes(rt, &mut failures);
 
+    // ── 7. Capability manifest (R1, T1.4) ──────────────────────────
+    // Doctor asserts the build's own claims: a declared feature that fails
+    // its probe, or a build compiled without a core feature, is a failure —
+    // "healthy" must never describe a degraded build.
+    section("capabilities");
+    // NOTE: doctor.rs is compiled into both the lib and the bin crate, so the
+    // manifest must be reached through the lib crate name, not `crate::`.
+    let caps = sofuu_core::capabilities::manifest();
+    let missing: Vec<String> = caps
+        .pointer("/build/missing")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if missing.is_empty() {
+        ok("all declared build features present");
+    } else {
+        for m in &missing {
+            bad(&format!(
+                "capability missing: {m} — this binary was built without it and refuses the matching APIs loudly (rebuild with the feature enabled; see the Makefile guard)"
+            ));
+        }
+        failures += 1;
+    }
+    let metal_declared = caps
+        .pointer("/build/features")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().any(|x| x.as_str() == Some("metal")))
+        .unwrap_or(false);
+    let gpu_available = caps
+        .pointer("/runtime/gpu/available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if metal_declared && !gpu_available {
+        bad("metal is compiled in but no Metal device is available at runtime");
+        failures += 1;
+    }
+    info(&format!(
+        "determinism paths: {}",
+        caps.pointer("/engine/paths")
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "{}".into())
+    ));
+    info(&format!(
+        "runtime: {} {} · {} threads · gpu available: {}",
+        caps.pointer("/runtime/os").and_then(|v| v.as_str()).unwrap_or("?"),
+        caps.pointer("/runtime/arch").and_then(|v| v.as_str()).unwrap_or("?"),
+        caps.pointer("/runtime/threads").and_then(|v| v.as_u64()).unwrap_or(0),
+        gpu_available
+    ));
+
     // ── verdict ─────────────────────────────────────────────────────
     section("verdict");
     if failures == 0 {
@@ -650,6 +700,7 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             "ok": failures == 0,
             "failures": failures,
             "jail": jail_ok,
+            "capabilities": caps,
             "entries": REPORT.with(|r| r.borrow().clone()),
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));

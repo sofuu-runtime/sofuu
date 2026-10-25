@@ -236,6 +236,9 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // PLAN-DESKTOP C: sync session-mesh primitives for the shipped
         // chat.js turn engine (qtsq codec + sync registry file I/O).
         crate::rt::session_js::mod_session_js_register(ctx);
+        // R1 (SPEC §2): the capability manifest, after every module so the
+        // `sofuu` object exists and its surface matrix is complete.
+        crate::capabilities::mod_capabilities_register(ctx);
     }
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the
@@ -262,6 +265,12 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         mod_kv_register(ctx);
         mod_agent_register(ctx);
         crate::rt::storage::mod_storage_register(ctx);
+    }
+    #[cfg(not(has_qtsq))]
+    unsafe {
+        // R1.2 (SPEC T1.3): a QTSQ-free build must refuse memory loudly, not
+        // silently no-op it — the guard the brain-less 2026-09-22 tarball lacked.
+        crate::capabilities::mod_memory_unavailable_register(ctx);
     }
 
     // Phase 3: Zero-Copy TypedArray & Native Memory Bridge (sofuu.memory.* / sofuu.buffer.*)

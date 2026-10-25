@@ -1608,7 +1608,7 @@ private fun BrainPane(store: AppStore) {
     var hits by remember { mutableStateOf<org.json.JSONArray?>(null) }
     var recalled by remember { mutableStateOf("") }
     var decayArmed by remember { mutableStateOf(false) }
-    var qtsq by remember { mutableStateOf<Boolean?>(null) }
+    var qtsqState by remember { mutableStateOf<JSONObject?>(null) }
 
     var ml by remember { mutableStateOf<JSONObject?>(null) }
     var m2 by remember { mutableStateOf<Boolean?>(null) }
@@ -1648,8 +1648,8 @@ private fun BrainPane(store: AppStore) {
     var sim by remember { mutableStateOf<JSONObject?>(null) }
 
     LaunchedEffect(Unit) {
-        qtsq = withContext(Dispatchers.IO) {
-            runCatching { store.engine.qtsqAvailable().get(5, TimeUnit.SECONDS) }.getOrNull()
+        qtsqState = withContext(Dispatchers.IO) {
+            runCatching { surface.qtsqState() }.getOrNull()
         }
     }
     LaunchedEffect(reload) {
@@ -1680,9 +1680,10 @@ private fun BrainPane(store: AppStore) {
                 modifier = Modifier.padding(bottom = 8.dp),
             )
         }
-        if (qtsq == false) {
+        if (qtsqState?.optBoolean("canPersist") == false) {
             Text(
-                "This engine build has no QTSQ codec: memories live in RAM for this run and are lost on restart, and the engine cannot persist sessions.",
+                "This engine build cannot persist memory (probe: ${qtsqState?.optString("reason").orEmpty().ifEmpty { "write failed" }}). " +
+                    "Memories live in RAM for this run and the engine cannot store sessions.",
                 fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.warn,
                 modifier = Modifier.padding(bottom = 8.dp),
             )

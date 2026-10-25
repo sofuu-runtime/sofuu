@@ -274,6 +274,32 @@ class RuntimeSurface(
             "catch(e){ return { ok:false, error:String(e&&e.message||e) }; } })()"
     ).get(30, java.util.concurrent.TimeUnit.SECONDS)
 
+    /**
+     * Functional QTSQ persistence probe.
+     *
+     * `typeof __qtsq_session_save === 'function'` is useless here: the
+     * session primitives are registered unconditionally and their bodies
+     * degrade to `-1` when the binary was built without the codec
+     * (`#[cfg(not(has_qtsq))]`). The only honest test is to write and read
+     * a tiny file and look at the return code.
+     */
+    fun qtsqState(): JSONObject? = engine.evalJsonOnEngine(
+        """
+        (function(){ try {
+          var st = (sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {};
+          var p = (st && st.project) ? String(st.project) : '';
+          if (!p) return { ok:true, canPersist:false, write:-2, reason:'no project open' };
+          var f = p + '/.sofuu/qtsq-probe.qtsq';
+          var w = __qtsq_session_save(f, '{"probe":1}', 'sofuu-probe');
+          var r = __qtsq_session_load(f, 'sofuu-probe');
+          var hit = String(r) === '{"probe":1}';
+          try { __qtsq_session_save(f, '{}', 'sofuu-probe'); } catch (e2) {}
+          return { ok:true, canPersist: (w === 0 && hit), write: w, read: hit,
+                   reason: (w === 0 && hit) ? '' : ('save returned ' + w) };
+        } catch(e){ return { ok:false, canPersist:false, write:-3, reason:String(e&&e.message||e) }; } })()
+        """.trimIndent()
+    ).get(15, java.util.concurrent.TimeUnit.SECONDS)
+
     // ── Agents ─────────────────────────────────────────────────────
 
     /** Registered agents with their tools, budgets and sub-agent fan-out. */

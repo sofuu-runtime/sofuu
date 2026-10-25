@@ -226,6 +226,16 @@ impl InferModel {
         }
     }
 
+    /// Rebuild the KIVI stream from the (post-compaction) f32 cache —
+    /// F-LC3: after compact_kv_cache re-anchors positions, the quantized
+    /// store must describe the same history or decode attends a ghost.
+    /// No-op on backends without KIVI.
+    pub fn rebuild_kivi_after_compact(&mut self, seq_len: usize) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.rebuild_kivi_after_compact(seq_len);
+        }
+    }
+
     /// Override the sliding-window size for backends that carry one.
     pub fn set_sliding_window(&mut self, w: usize) {
         self.sliding_window = w;
@@ -1285,6 +1295,14 @@ impl InferEngine {
             while cur_pos >= max_seq_len && cur_pos > sink + drop {
                 compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
+                // F-LC3: the compaction dropped middle tokens, shifted the
+                // survivors and re-roped them — the KIVI stream built before
+                // this point would keep attending the dropped history under
+                // positions that no longer exist. Re-ingest from the
+                // compacted cache.
+                if options.kivi {
+                    self.model.rebuild_kivi_after_compact(cur_pos);
+                }
             }
 
             // Propose multi-path speculative candidate tree from n-gram cache

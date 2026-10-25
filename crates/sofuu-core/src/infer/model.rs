@@ -970,27 +970,56 @@ impl TransformerModel {
             config,
         );
 
+        // Ingest prefilled tokens from k_cache & v_cache
+        if cur_pos > 0 {
+            self.ingest_rows_into_kivi(&mut kivi, 0, cur_pos);
+        }
+
+        self.kivi = Some(kivi);
+    }
+
+    /// Append cache rows [pos .. seq_len) of every layer/head into `kivi`
+    /// (shared by enable_kivi and the post-compaction rebuild).
+    fn ingest_rows_into_kivi(&self, kivi: &mut super::kivi::KiviCache, pos: usize, seq_len: usize) {
         let n_layers = self.config.n_layers;
         let n_kv_heads = self.config.n_kv_heads;
         let head_dim = self.config.head_dim;
         let max_seq_len = self.config.max_seq_len;
-
-        // Ingest prefilled tokens from k_cache & v_cache
-        if cur_pos > 0 {
-            for layer_idx in 0..n_layers {
-                for p in 0..cur_pos {
-                    let cache_pos = p % max_seq_len;
-                    for kv_h in 0..n_kv_heads {
-                        let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
-                        let k_slice = &self.k_cache[slot..slot + head_dim];
-                        let v_slice = &self.v_cache[slot..slot + head_dim];
-                        let head_idx = layer_idx * n_kv_heads + kv_h;
-                        kivi.heads[head_idx].append(k_slice, v_slice);
-                    }
+        for layer_idx in 0..n_layers {
+            for p in pos..seq_len {
+                let cache_pos = p % max_seq_len;
+                for kv_h in 0..n_kv_heads {
+                    let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim + cache_pos * head_dim;
+                    let k_slice = &self.k_cache[slot..slot + head_dim];
+                    let v_slice = &self.v_cache[slot..slot + head_dim];
+                    let head_idx = layer_idx * n_kv_heads + kv_h;
+                    kivi.heads[head_idx].append(k_slice, v_slice);
                 }
             }
         }
+    }
 
+    /// F-LC3 (long-context §8 P5): compact_kv_cache() drops middle tokens,
+    /// shifts the survivors left and re-ropes them to their new positions —
+    /// a KIVI stream built before the compaction would keep attending the
+    /// dropped history under positions that no longer exist. Rebuild the
+    /// stream from the compacted cache so the quantized store and the f32
+    /// store describe the same (sinks + survivors) history. No-op when KIVI
+    /// is not armed.
+    pub fn rebuild_kivi_after_compact(&mut self, seq_len: usize) {
+        let old = match self.kivi.take() {
+            Some(k) => k.config,
+            None => return,
+        };
+        let mut kivi = super::kivi::KiviCache::new(
+            self.config.n_layers,
+            self.config.n_kv_heads,
+            self.config.head_dim,
+            old,
+        );
+        if seq_len > 0 {
+            self.ingest_rows_into_kivi(&mut kivi, 0, seq_len);
+        }
         self.kivi = Some(kivi);
     }
 
@@ -4886,7 +4915,7 @@ mod tests {
 
     /// Build a synthetic 1-layer llama GGUF over a temp mmap so the loader's
     /// type gate and tied-output handling can be tested without a real model.
-    fn synth_gguf(output_type: Option<u32>) -> GgufFile {
+    pub(super) fn synth_gguf(output_type: Option<u32>) -> GgufFile {
         use std::collections::HashMap;
         let path = std::env::temp_dir().join(format!(
             "sofuu_synth_gguf_{}_{}.bin",
@@ -5641,3 +5670,88 @@ const SPEC_B: usize = 128;
     }
 }
 
+
+#[cfg(test)]
+mod kivi_compact_tests {
+    use super::tests::synth_gguf;
+    use super::*;
+
+    /// F-LC3 (§8 P5): compact_kv_cache() drops middle tokens, shifts survivors
+    /// left and re-ropes them; the KIVI stream must describe the SAME
+    /// (sinks + survivors) history afterwards, row for row.
+    #[test]
+    fn kivi_rebuild_after_compact_matches_compacted_cache() {
+        let gguf = synth_gguf(None);
+        let mut m = TransformerModel::from_gguf(gguf, 64, 256).expect("synth load");
+        let (layers, kvh, hd, seq) = (
+            m.config.n_layers,
+            m.config.n_kv_heads,
+            m.config.head_dim,
+            m.config.max_seq_len,
+        );
+        let n_heads = m.config.n_heads;
+        // Rows 0..11 of every layer/head hold distinct values.
+        for layer in 0..layers {
+            for p in 0..11 {
+                for h in 0..kvh {
+                    let base = (layer * kvh + h) * seq * hd + p * hd;
+                    for c in 0..hd {
+                        let t = ((base + c) % 251) as f32;
+                        m.k_cache[base + c] = 0.01 + t * 0.003;
+                        m.v_cache[base + c] = 0.02 + t * 0.002;
+                    }
+                }
+            }
+        }
+        m.enable_kivi(4, 11);
+        assert!(m.kivi.is_some());
+        let pre_total = m.kivi.as_ref().unwrap().heads[0].total_tokens();
+        assert_eq!(pre_total, 11);
+
+        // Compact like the decode loop: keep 4 sinks, drop 4 middle tokens.
+        let new_len = m.compact_kv_cache(11, 4, 4);
+        assert_eq!(new_len, 7);
+
+        // Snapshot the post-compaction f32 rows (sinks 0..4, survivors 4..7)
+        // — these are the ground truth the rebuilt stream must match.
+        let mut k_expected = vec![vec![0.0f32; hd]; layers * kvh * new_len];
+        let mut v_expected = vec![vec![0.0f32; hd]; layers * kvh * new_len];
+        for head in 0..layers * kvh {
+            for p in 0..new_len {
+                let slot = head * seq * hd + p * hd;
+                k_expected[head * new_len + p].copy_from_slice(&m.k_cache[slot..slot + hd]);
+                v_expected[head * new_len + p].copy_from_slice(&m.v_cache[slot..slot + hd]);
+            }
+        }
+
+        m.rebuild_kivi_after_compact(new_len);
+        let kivi = m.kivi.as_mut().expect("kivi must still be armed");
+        for head in 0..layers * kvh {
+            let st = &kivi.heads[head];
+            assert_eq!(st.sink_len, 4, "sinks preserved");
+            assert_eq!(st.recent_tokens, new_len - 4, "survivors re-ingested");
+            assert_eq!(st.total_tokens(), new_len);
+            assert!(st.num_quantized_tokens >= 0);
+            for t in 0..4 {
+                assert_eq!(&st.sink_k[t * hd..(t + 1) * hd], &k_expected[head * new_len + t][..]);
+                assert_eq!(&st.sink_v[t * hd..(t + 1) * hd], &v_expected[head * new_len + t][..]);
+            }
+            for t in 4..new_len {
+                assert_eq!(
+                    &st.recent_k[(t - 4) * hd..(t - 3) * hd],
+                    &k_expected[head * new_len + t][..]
+                );
+                assert_eq!(
+                    &st.recent_v[(t - 4) * hd..(t - 3) * hd],
+                    &v_expected[head * new_len + t][..]
+                );
+            }
+        }
+
+        // Attention over the rebuilt stream computes.
+        let q = vec![0.3f32; n_heads * hd];
+        let mut out = vec![0.0f32; n_heads * hd];
+        kivi.compute_layer_attention(0, n_heads, &q, &mut out);
+        assert!(out.iter().any(|&v| v != 0.0));
+    }
+}

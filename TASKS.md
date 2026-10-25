@@ -4157,3 +4157,13 @@ docs — every other row is recorded for the infer owners, not edited.
 - **Blocked:** Gate 2 perplexity ratio (no per-token logprobs), Gate 3's
   official 32k/8B point (needs ~14.4 GB — prefill-side quantized KV),
   per-position Gate 4 timing (same surface as Gate 2).
+- **Pushed as `5c1edb76f`** (rebased over the peers' `f4ac47615` contract-P1
+  and `9a479e245` q4_K GPU decode; sampler tests 7/7 on the new base;
+  OpenQodex receipt `.openqodex/reviews/20261025-172152-9b9ab3eed2ec`,
+  reviewer again incomplete/zero findings). Gate 4 fixed-ctx re-run recorded:
+  aggregate ratio 0.41 (f16) / 0.46 (kivi4) — the ≥90% gate as written needs
+  per-position timing. Plan §8 now carries the full remaining-work ledger:
+  P1–P10 peer-lane engine items (NTK/YaRN, F-LC1 mid-prefill compaction,
+  logprob/timing surface, KIVI sinks/coherence/GPU-gate/prefill-side KV/
+  default flip, F-LC2 EOS prompting, 16k TTFT) and W1–W4 this-workstream
+  candidates (Gate 2 accuracy proxy, NTK A/B hooks, KIVI timing cells).

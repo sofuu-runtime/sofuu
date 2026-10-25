@@ -292,6 +292,14 @@ impl InferModel {
         }
     }
 
+    /// Per-model spec-gate break-even (see TransformerModel::spec_min_accept_default).
+    pub fn spec_min_accept_default(&self) -> f32 {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.spec_min_accept_default(),
+            _ => 1.15,
+        }
+    }
+
     /// Per-model decode thread count (see TransformerModel::decode_threads_auto).
     pub fn decode_threads_auto(&self, max_threads: usize) -> usize {
         match &self.backend {
@@ -1041,7 +1049,7 @@ impl InferEngine {
         let spec_min_accept = std::env::var("SOFUU_SPEC_MIN_ACCEPT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(1.15);
+            .unwrap_or(self.model.spec_min_accept_default());
         let mut spec_steps: u32 = 0;
         let mut spec_accepted: u32 = 0;
         let mut spec_disabled = false;

@@ -797,6 +797,20 @@ impl TransformerModel {
         if self.dominant_proj_type == GGML_TYPE_Q6_K { 3 } else { 5 }
     }
 
+    /// Default break-even for the adaptive spec gate, in tokens per
+    /// speculative step. The verify rows ride the batched GEMM path, whose
+    /// cost per serial token depends on the weight format: tiled q4_K/q8_0
+    /// verify near prefill-class rates (q4_K break-even ~2.2 — the default
+    /// tree earns its keep at 2.4 accepted/step), but q3_K verify batches hit
+    /// the ~3x-fatter native unpack and break even at ~2.8. Battery #12
+    /// (Pi 5, 2.8 GHz+ovd): Qwen3-0.6B Q3_K_S at acceptance 2.400 ran 26.0
+    /// tk/s with the tree vs 30.0 serial (llama.cpp 28.4), so q3_K defaults
+    /// above 2.8 and the gate disables the tree after warmup.
+    #[inline]
+    pub fn spec_min_accept_default(&self) -> f32 {
+        if self.dominant_proj_type == GGML_TYPE_Q3_K { 2.9 } else { 1.15 }
+    }
+
     /// Decode-phase thread count (auto mode, Pi lane). q8_0's GEMV is a pure
     /// DRAM stream: two streams already saturate the Pi 5 memory controller
     /// and four streams thrash it (SmolLM2 26.5→31.5 t/s, 1B 16.2→18.3).

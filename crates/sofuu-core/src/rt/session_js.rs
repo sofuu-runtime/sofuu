@@ -49,6 +49,13 @@ unsafe extern "C" fn js_qtsq_session_save(
     let (Some(path), Some(data)) = (path, data) else {
         return qjs::sofuu_js_new_int32(ctx, -1);
     };
+    // The QTSQ writer opens the target directly and does NOT mkdir, so a
+    // first save into a fresh `.sofuu/` tree failed with -1 and looked like
+    // "QTSQ is not linked" (an app-side probe produced exactly that false
+    // negative). Create the parent here, like js_session_write_file does.
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let rc = sofuu_ffi::qtsq_session_save(&path, data.as_bytes());
     qjs::sofuu_js_new_int32(ctx, if rc == 0 { 0 } else { -1 })
 }
@@ -324,6 +331,27 @@ mod tests {
              }}"
         );
         assert_eq!(rt.eval_string(&script, "<session-qtsq-test>"), 0);
+
+        // A first save into a directory tree that does not exist yet must
+        // succeed: the primitive creates parents itself, so a fresh project
+        // does not read as "QTSQ not linked" (report 2026-10-25).
+        let fresh_path = dir.join("fresh/deeper/first.qtsq");
+        let fresh_js = serde_json::to_string(&fresh_path.to_string_lossy()).unwrap();
+        let script = format!(
+            "var rc = __qtsq_session_save({fresh_js}, '{{\"schema\":1}}', 'pw'); \
+             if (rc !== 0 && rc !== -1) throw new Error('unexpected rc: ' + rc); \
+             if (rc === 0) {{ \
+               var back = __qtsq_session_load({fresh_js}, 'pw'); \
+               if (back !== '{{\"schema\":1}}') throw new Error('fresh-dir roundtrip failed: ' + back); \
+             }}"
+        );
+        assert_eq!(rt.eval_string(&script, "<session-qtsq-mkdir-test>"), 0);
+        if sofuu_ffi::qtsq_linked() {
+            assert!(
+                fresh_path.is_file(),
+                "QTSQ-linked build must create missing parent dirs before saving"
+            );
+        }
         if let Ok(meta) = std::fs::metadata(&qtsq_path) {
             let raw = std::fs::read(&qtsq_path).expect("read qtsq test record");
             assert!(meta.len() < 1000, "plaintext session record unexpectedly large: {} bytes", meta.len());

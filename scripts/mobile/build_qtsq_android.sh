@@ -50,13 +50,19 @@ build_one() {
     local abi="$1"
     mobile_abi_env "$abi"
     local out="$REPO_ROOT/dist/qtsq-android-$MOBILE_ABI_NAME"
+    # Headers are staged on every run, cache or not: build.rs compiles
+    # sofuu_qtsq_table.c with -I <dist>/include and -I
+    # <dist>/compressor/include, and an archive hit must not skip them
+    # (a cached archive with unstaged headers died on qtc.h).
+    mkdir -p "$out/include" "$out/compressor/include"
+    cp "$QTSQ_DIR/include/"*.h "$out/include/"
+    cp "$QTSQ_DIR/compressor/include/"*.h "$out/compressor/include/"
     if [ -f "$out/libqtsq.a" ] && [ -f "$out/compressor/libqtc.a" ] && [ -f "$out/libz.a" ]; then
         echo "✓ qtsq $MOBILE_ABI_NAME already built"
         return 0
     fi
     echo "── qtsq → $MOBILE_ABI_NAME ($MOBILE_NDK_PREFIX)"
-    mkdir -p "$out/obj" "$out/compressor" "$out/include"
-    cp "$QTSQ_DIR/include/"*.h "$out/include/"
+    mkdir -p "$out/obj" "$out/compressor"
 
     local inc=(-I"$QTSQ_DIR/include" -I"$QTSQ_DIR/compressor/include" \
                -I"$QTSQ_DIR/crypto/common" -I"$QTSQ_DIR/crypto/ml-kem-768" \

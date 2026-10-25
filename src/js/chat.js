@@ -1096,8 +1096,8 @@
     while (str.length < w) str = '0' + str;
     return str;
   }
-  /* The QTSQ codec does not mkdir — a touched file in the target dir is
-   * the mkdir (its writer creates parent directories). */
+  /* The QTSQ codec does not mkdir; __session_write_file does, so touching
+   * a .keep file in the target dir creates the whole tree. */
   function ensureDir(dir) {
     try {
       if (typeof __session_write_file === 'function') __session_write_file(dir + '/.keep', '');

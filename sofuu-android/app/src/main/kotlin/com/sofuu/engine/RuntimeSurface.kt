@@ -290,6 +290,9 @@ class RuntimeSurface(
           var p = (st && st.project) ? String(st.project) : '';
           if (!p) return { ok:true, canPersist:false, write:-2, reason:'no project open' };
           var f = p + '/.sofuu/qtsq-probe.qtsq';
+          // The codec does not mkdir; touch a file through the primitive that
+          // does, so a fresh project tree does not read as "no QTSQ".
+          try { if (typeof __session_write_file === 'function') __session_write_file(p + '/.sofuu/.keep', ''); } catch (e0) {}
           var w = __qtsq_session_save(f, '{"probe":1}', 'sofuu-probe');
           var r = __qtsq_session_load(f, 'sofuu-probe');
           var hit = String(r) === '{"probe":1}';

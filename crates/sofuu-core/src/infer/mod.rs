@@ -558,6 +558,16 @@ pub fn clean_model_path(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// Teacher-forced scoring result ([`InferEngine::score_text`]).
+#[derive(Debug, Clone)]
+pub struct ScoreStats {
+    pub tokens_total: usize,
+    pub scored: usize,
+    pub windows: usize,
+    pub nll_total: f64,
+    pub ppl: f64,
+}
+
 impl InferEngine {
     /// Load a model and its tokenizer from disk (auto-detects context length).
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self, String> {
@@ -792,6 +802,96 @@ impl InferEngine {
 
     pub fn forward_head(&mut self, in_hidden: &[f32], out_logits: &mut [f32]) {
         self.model.forward_head(in_hidden, out_logits);
+    }
+
+    /// Teacher-forced NLL scoring (PLAN-LONG-CONTEXT-PERSISTENCE §8 P3): run
+    /// the text through the model and accumulate the NLL of every next token
+    /// given its left context, in sliding windows of `window` tokens
+    /// (1-token overlap; each window's first token is context, not scored).
+    /// This is the surface Gate 2 needs (PPL ratio f16 vs KIVI) and the only
+    /// honest perplexity measurement available without touching the prefill
+    /// kernels: the batched prefill keeps only the LAST token's logits, so
+    /// every other scored position costs one single-token `forward` (decode
+    /// speed — a 4k-token slice is minutes, not seconds).
+    ///
+    /// Per window: one batched prefill of the first `batch` tokens (the fast
+    /// GEMM path), then per-token forwards for the rest, scoring from the
+    /// returned logits before each step. With `options.kivi`, KIVI is armed
+    /// after every window's prefill (the same prefill-FP32 → decode-quantized
+    /// flow as `stream`), so f16-vs-KIVI ratios measure exactly the shipped
+    /// decode path. The multi-turn prefix cache is cleared and left cleared.
+    pub fn score_text(
+        &mut self,
+        text: &str,
+        options: GenerateOptions,
+        window: usize,
+    ) -> Result<ScoreStats, String> {
+        let tokens = self.tokenizer.encode(text);
+        if tokens.len() < 8 {
+            return Err(format!("score_text needs >= 8 tokens, got {}", tokens.len()));
+        }
+        let vocab = self.model.config.vocab_size;
+        let max_seq = self.model.config.max_seq_len;
+        let window = window.max(64).min(max_seq);
+        let batch = self::model::max_prefill_batch().min(window / 2).max(1);
+
+        let mut stats = ScoreStats {
+            tokens_total: tokens.len(),
+            scored: 0,
+            windows: 0,
+            nll_total: 0.0,
+            ppl: f64::NAN,
+        };
+        let mut logits = vec![0.0f32; vocab];
+        let mut start = 0usize;
+        while start + 2 < tokens.len() {
+            let end = (start + window).min(tokens.len());
+            let prefill_n = (end - 1 - start).min(batch);
+            self.model.reset_cache();
+            self.cached_tokens.clear();
+            let lg = self.model.forward_prefill_all_with_logits(&tokens[start..start + prefill_n], 0);
+            logits.copy_from_slice(lg);
+            let mut kvpos = prefill_n;
+            if options.kivi {
+                self.model.enable_kivi(options.kivi_bits, kvpos);
+            }
+            let mut i = start + prefill_n;
+            loop {
+                /* logits currently predict tokens[i] — score it. */
+                let t = tokens[i] as usize;
+                if t < vocab {
+                    let mut lse = f32::NEG_INFINITY;
+                    for &l in logits.iter() {
+                        if l > lse {
+                            lse = l;
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for &l in logits.iter() {
+                        sum += (l - lse).exp();
+                    }
+                    let nll = -((logits[t] - lse) - sum.ln()) as f64;
+                    stats.nll_total += nll;
+                    stats.scored += 1;
+                }
+                i += 1;
+                if i >= end || kvpos + 1 >= window {
+                    break;
+                }
+                let out = self.model.forward(tokens[i - 1], kvpos);
+                logits.copy_from_slice(&out[..vocab]);
+                kvpos += 1;
+            }
+            stats.windows += 1;
+            /* 1-token overlap: the next window re-prefills this token as
+             * context, so every token is scored with full in-window left
+             * context and scored exactly once. */
+            start = end - 1;
+        }
+        if stats.scored > 0 {
+            stats.ppl = (stats.nll_total / stats.scored as f64).exp();
+        }
+        Ok(stats)
     }
 
     /// Generate text for a prompt, returning the complete generated string.

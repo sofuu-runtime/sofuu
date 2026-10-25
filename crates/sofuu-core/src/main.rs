@@ -1463,9 +1463,12 @@ fn main() -> ExitCode {
             let mut kivi_bits = 4usize;
             let mut streaming_weights = false;
             let mut chat = false;
+            let mut score_path: Option<String> = None;
+            let mut score_window = 0usize;
 
             let mut i = 4;
             while i < args.len() {
+                /* (the --score-after-model form is handled before the loop) */
                 if (args[i] == "--max-tokens" || args[i] == "-n") && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
                         max_tokens = v;
@@ -1529,6 +1532,14 @@ fn main() -> ExitCode {
                 } else if args[i] == "--chat" {
                     chat = true;
                     i += 1;
+                } else if args[i] == "--score" && i + 1 < args.len() {
+                    score_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--score-window" && i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<usize>() {
+                        score_window = v;
+                    }
+                    i += 2;
                 } else if args[i].starts_with('-') && args[i] != "-" {
                     // A silently-dropped flag is a correctness hazard: e.g.
                     // "--temperature 0" would leave the sampler at the 0.7
@@ -1538,6 +1549,25 @@ fn main() -> ExitCode {
                 } else {
                     i += 1;
                 }
+            }
+
+            // KIVI × speculation: two independent hazards, so a --kivi run
+            // decodes serially.
+            //   1. The speculative tree commits accepted draft tokens through
+            //      commit_speculative_candidates(), which writes the KV cache
+            //      but never appends to the KIVI stream — the quantized cache
+            //      would silently attend a truncated history (its recent
+            //      window lags the accepted positions).
+            //   2. The frozen-logits class that produced F-LC4 ("Berlin Berlin
+            //      Berlin…" from the step after prefill) lived in
+            //      forward_impl's GPU-head early-return; fixed by gating that
+            //      return on execute_layers_checked(). Until the tree path
+            //      learns to feed the KIVI stream, speculation stays off here.
+            if kivi && lookahead {
+                lookahead = false;
+                eprintln!(
+                    "[sofuu infer] --kivi: speculative lookahead does not feed the quantized KV cache (its tree commit bypasses the KIVI stream) — running serial decode"
+                );
             }
 
             let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
@@ -1568,7 +1598,15 @@ fn main() -> ExitCode {
             // `tokenizer.chat_template` (ChatML im_start / Llama-3
             // start_header_id); unknown templates pass the prompt raw with a
             // note instead of guessing.
+            // `--score` may directly follow the model — the prompt is unused
+            // when scoring: `sofuu infer <model> --score <file>`.
             let mut prompt = prompt.clone();
+            let mut i = i; // shadowed below; keep parse-loop position mutable
+            if args.len() > 4 && args[3] == "--score" {
+                score_path = Some(args[4].clone());
+                prompt = String::new();
+                i = 5;
+            }
             if chat {
                 let tmpl = sofuu_core::infer::gguf::GgufFile::open(model_path)
                     .ok()
@@ -1601,6 +1639,46 @@ fn main() -> ExitCode {
                 engine.model.config.vocab_size,
                 active_threads
             );
+
+            // --score <file> (PLAN-LONG-CONTEXT-PERSISTENCE §8 P3): teacher-
+            // forced NLL over the file — the Gate 2 surface (PPL ratio f16 vs
+            // KIVI) without touching the prefill kernels. Prints one JSON
+            // line on stdout.
+            if let Some(path) = &score_path {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read {}: {e}", path))
+                    .unwrap_or_else(|e| {
+                        eprintln!("\x1b[31mError:\x1b[0m {e}");
+                        std::process::exit(1);
+                    });
+                let stats = engine
+                    .score_text(
+                        &text,
+                        sofuu_core::infer::GenerateOptions {
+                            kivi,
+                            kivi_bits,
+                            threads,
+                            ..Default::default()
+                        },
+                        score_window,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("\x1b[31mScoring error:\x1b[0m {e}");
+                        std::process::exit(1);
+                    });
+                println!(
+                    "{{\"kind\":\"score\",\"model\":{},\"kv\":\"{}\",\"window\":{},\"tokens_total\":{},\"scored\":{},\"windows\":{},\"nll_total\":{:.4},\"ppl\":{:.4}}}",
+                    serde_json::to_string(&model_path).unwrap_or_else(|_| "\"\"".into()),
+                    if kivi { format!("kivi{}", kivi_bits) } else { "f16".to_string() },
+                    score_window,
+                    stats.tokens_total,
+                    stats.scored,
+                    stats.windows,
+                    stats.nll_total,
+                    stats.ppl
+                );
+                return ExitCode::SUCCESS;
+            }
 
             // SOFUU_PREFIX_TEST=1: multi-turn prefix-cache receipt. The stock
             // CLI is one-shot, so nothing else ever exercises the reuse path.

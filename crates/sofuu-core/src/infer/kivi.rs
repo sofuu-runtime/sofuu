@@ -869,3 +869,68 @@ mod tests {
         assert!(out.iter().any(|&v| v > 0.0));
     }
 }
+
+/// F-LC4 regression: kivi attention must match an exact FP32 reference on
+/// the SAME data (golden: softmax(q·kᵀ/√d)·v) across the quantization
+/// turnover. When this failed to hold, decode degenerated into repetition
+/// ("Berlin Berlin Berlin…", receipt in docs/PLAN-LONG-CONTEXT-PERSISTENCE.md
+/// §8); it passes, which exonerates the kivi math and pinned F-LC4 on the
+/// lookahead replay over the quantized cache instead.
+#[cfg(test)]
+mod f_lc4_tests {
+    use super::*;
+
+    #[test]
+    fn kivi_attention_matches_fp32_reference() {
+        let hd = 64usize;
+        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32);
+        // Deterministic pseudo-data: ropes-ish rotations, magnitudes ~1.
+        let mut state: f32 = 0.123456;
+        let mut next = || {
+            state = (state * 1103515245.0 + 12345.0) % 97.0;
+            state / 97.0 - 0.5
+        };
+        let mut k_all: Vec<Vec<f32>> = Vec::new();
+        let mut v_all: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..100 {
+            let k: Vec<f32> = (0..hd).map(|_| next()).collect();
+            let v: Vec<f32> = (0..hd).map(|_| next()).collect();
+            st.append(&k, &v);
+            k_all.push(k);
+            v_all.push(v);
+        }
+        // Turnover fires whenever recent reaches 2× the residual window:
+        // at appends 64 and 96 (64→32, then 32+36... ) leaving 64 quantized.
+        assert_eq!(st.num_quantized_tokens, 64, "two blocks should have quantized");
+        assert_eq!(st.recent_tokens, 36);
+        assert_eq!(st.total_tokens(), 100);
+
+        let q: Vec<f32> = (0..hd).map(|_| next()).collect();
+
+        // Exact FP32 reference.
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut scores = vec![0.0f32; 100];
+        for t in 0..100 {
+            let dot: f32 = q.iter().zip(&k_all[t]).map(|(a, b)| a * b).sum();
+            scores[t] = dot * scale;
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let mut ref_out = vec![0.0f32; hd];
+        for t in 0..100 {
+            for c in 0..hd {
+                ref_out[c] += exp[t] / sum * v_all[t][c];
+            }
+        }
+
+        let mut out = vec![0.0f32; hd];
+        st.compute_attention(&q, &mut out);
+        let max_diff = out.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 0.05,
+            "kivi attention diverged from fp32 reference: max_diff={max_diff}"
+        );
+    }
+}
+

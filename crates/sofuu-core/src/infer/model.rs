@@ -2322,26 +2322,43 @@ impl TransformerModel {
     }
 
     pub fn execute_layers(&mut self, pos: usize, start_layer: usize, end_layer: usize) {
+        self.execute_layers_checked(pos, start_layer, end_layer);
+    }
+
+    /// Runs the transformer layers for one token. Returns `true` only when the
+    /// GPU whole-layer path ran to completion — its in-batch head has then
+    /// already written `self.logits`, and `forward_impl` may skip the CPU
+    /// head. Returns `false` when the CPU layer loop ran (KIVI,
+    /// streaming-weights, dynamic-FFN and rejected Metal command buffers all
+    /// fall back this way), in which case the CPU head MUST run.
+    /// F-LC4: the early-return in `forward_impl` used to fire on
+    /// `token_commit` alone, so with KIVI armed the CPU layer loop ran but the
+    /// head was skipped and `self.logits` stayed frozen at the prefill
+    /// values — the sampler then re-picked the prefill argmax every step
+    /// ("Berlin Berlin Berlin…").
+    pub fn execute_layers_checked(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         // GPU2: whole-layer Metal batches when armed and the CPU-side
         // special paths are all off (streaming/dynamic-FFN/KIVI fall back).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.gpu.is_some()
-            && !self.streaming_weights
-            && !self.dynamic_ffn.enabled
-            && self.kivi.is_none()
         {
-            if self.execute_layers_gpu(pos, start_layer, end_layer) {
-                return;
+            if self.gpu.is_some()
+                && !self.streaming_weights
+                && !self.dynamic_ffn.enabled
+                && self.kivi.is_none()
+            {
+                if self.execute_layers_gpu(pos, start_layer, end_layer) {
+                    return true;
+                }
+                // A rejected command buffer tears (partial writes, later ops
+                // killed). Falling through to the full CPU layer loop from
+                // start_layer is still coherent: every layer's KV write for the
+                // token's positions is overwritten (GPU and CPU KV are
+                // bit-identical per the parity receipts, so the rerun is
+                // idempotent), and self.x here is the token's layer INPUT — the
+                // GPU paths only sync x back to the host at their successful
+                // tails, never on a failure return.
+                // layers 0..(start_layer) were never touched by this call.
             }
-            // A rejected command buffer tears (partial writes, later ops
-            // killed). Falling through to the full CPU layer loop from
-            // start_layer is still coherent: every layer's KV write for the
-            // token's positions is overwritten (GPU and CPU KV are
-            // bit-identical per the parity receipts, so the rerun is
-            // idempotent), and self.x here is the token's layer INPUT — the
-            // GPU paths only sync x back to the host at their successful
-            // tails, never on a failure return.
-            // layers 0..(start_layer) were never touched by this call.
         }
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
@@ -2604,6 +2621,7 @@ impl TransformerModel {
             // ── Residual Connection 2 ───────────────────────
             inline_mad(&mut self.x, &self.ffn_out, 1.0);
         }
+        false
     }
 
     pub fn forward_layer_range(
@@ -4798,7 +4816,7 @@ impl TransformerModel {
         } else {
             None
         };
-        self.execute_layers(pos, 0, self.config.n_layers);
+        let gpu_did_layers = self.execute_layers_checked(pos, 0, self.config.n_layers);
         if let Some(t) = __lt {
             let gpu = self.gpu.as_ref().map(|g| g.token_commit).unwrap_or(false);
             eprintln!(
@@ -4817,9 +4835,13 @@ impl TransformerModel {
             .unwrap_or(false);
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let token_head = false;
-
+        // The head is only pre-paid when the GPU whole-layer path ACTUALLY
+        // ran this token (execute_layers_checked): with KIVI /
+        // streaming-weights / dynamic-FFN / a rejected command buffer the CPU
+        // layer loop ran instead, and skipping the head would leave
+        // `self.logits` frozen at the previous forward's values (F-LC4).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if token_head && compute_logits {
+        if token_head && gpu_did_layers && compute_logits {
             // Head ran in-batch inside layers_one_commit; logits already home.
             let trace = std::env::var_os("SOFUU_GPU_TRACE").is_some();
             if trace {

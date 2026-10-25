@@ -225,8 +225,16 @@ static inline int sofuu_attn_w32_on(void) {
 // Prefill chunk attention: llama_attn_pre_w32 computes whole rows with an online
 // softmax over the K/V cache instead of llama_attn_part_b4's one-warp-per-
 // (row, head, key-chunk) three-pass sweep. SOFUU_PRE_ATTN=0 restores the old
-// pair; SOFUU_PRE_ATTN_RPT (1..4) sets how many consecutive rows share one K/V
-// stream.
+// pair.
+//
+// SOFUU_PRE_ATTN_RPT (1..4) is accepted and forwarded to the kernel but no
+// longer changes anything: the shipped kernel is one threadgroup per (row, head)
+// and takes no row grouping, so the value only reaches the kernel's (void)rpt.
+// It stays bound because the kernel signature is shared with the earlier
+// row-grouped variants; a row-grouped kernel (R rows sharing one K/V load)
+// needs ~93 registers/thread here, which drops the pipeline to 704 threads per
+// threadgroup and makes the 1024-thread dispatch silently vanish - see the
+// register-pressure note in sofuu_metal_init before trying it again.
 static inline int sofuu_pre_attn_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -237,14 +245,16 @@ static inline int sofuu_pre_attn_on(void) {
 }
 
 // Highest max-position a chunk may contain for the whole-row fast path to run.
-// Default 128 = only the single-window range that is validated end to end; raise
-// it with SOFUU_PREW_MAXPOS once a wider sweep passes, and it doubles as the
-// rollback knob back to the shipped part/fin pair.
+// Default 0xFFFFFFFF = no bound, i.e. the fast path runs for every position in
+// the prompt (validated 39..1454 tokens; the per-token-count deltas are in the
+// gate comment in sofuu_metal_batch_llama_attn_part_b4). It also doubles as the
+// rollback knob: SOFUU_PREW_MAXPOS=128 restores the old one-128-key-window
+// behaviour and hands every longer chunk back to the shipped part/fin pair.
 static inline uint32_t sofuu_prew_maxpos(void) {
-    static long mp = -1;
+    static long mp = -2;
     if (mp < 0) {
         const char* v = getenv("SOFUU_PREW_MAXPOS");
-        mp = v ? atol(v) : 128;
+        mp = v ? atol(v) : 0xFFFFFFFFL;
     }
     return (uint32_t)mp;
 }
@@ -406,6 +416,21 @@ void* sofuu_metal_init(void) {
         ctx->pso_llama_attn_part_b4  = load_pso(@"llama_attn_part_b4");
         ctx->pso_llama_attn_fin_b4   = load_pso(@"llama_attn_fin_b4");
         ctx->pso_llama_attn_pre_w32  = load_pso(@"llama_attn_pre_w32");
+        // The whole-row fast path dispatches 1024 threads per threadgroup (32
+        // warps) and keeps its per-warp softmax state in registers. A kernel
+        // whose register footprint pushes maxTotalThreadsPerThreadgroup below
+        // 1024 does NOT fail loudly: the oversized threadgroup is dropped, the
+        // meta scratch keeps whatever it held, and the result reads as "one head
+        // correct, the rest zero". Disable the path here - the gate in
+        // sofuu_metal_batch_llama_attn_part_b4 then runs the shipped pair -
+        // rather than dispatching a threadgroup the pipeline cannot host.
+        if (ctx->pso_llama_attn_pre_w32 != nil &&
+            ctx->pso_llama_attn_pre_w32.maxTotalThreadsPerThreadgroup < 1024ul) {
+            fprintf(stderr,
+                    "[metal] llama_attn_pre_w32 needs 1024 threads/group, pipeline allows %lu - fast path disabled\n",
+                    (unsigned long)ctx->pso_llama_attn_pre_w32.maxTotalThreadsPerThreadgroup);
+            ctx->pso_llama_attn_pre_w32 = nil;
+        }
         ctx->pso_llama_attn_copy_b4  = load_pso(@"llama_attn_copy_b4");
         ctx->pso_llama_attn_1c_b4    = load_pso(@"llama_attn_1c_b4");
         ctx->pso_gemv_q4_k_b4c2r     = load_pso(@"gemv_q4_k_b4c2r");
@@ -3162,16 +3187,37 @@ void sofuu_metal_batch_llama_attn_part_b4(
     if (ctx->batch_enc == nil || !q_buf_ptr || !kc_buf_ptr || !vc_buf_ptr || !meta_buf_ptr) return;
     if (ctx->pso_llama_attn_part_b4 == nil) return;
     sofuu_batch_barrier(ctx);
-    // VALIDITY GATE (round 78): llama_attn_pre_w32 is only correct while the
-    // chunk's causal window is a SINGLE 128-key window (max position < 128).
-    // Measured on a 1-token-per-word prompt, max|delta| vs the CPU prefill:
-    //   tokens 126/127/128/129 -> 0.43/0.39/0.41/0.33   (correct)
-    //   tokens 130/136/150/200 -> 9.11/9.02/8.96/8.83   (wrong)
-    // and it is wrong for every row group size (rpt 1/2/4 identical), while the
-    // shipped part_b4+fin_b4 pair is correct at ALL positions (0.281 at 1454
-    // tokens). So the fast path is taken only where it is validated; beyond one
-    // window the pair runs. positions is a zero-copy buffer, so the bound is
-    // read on the host here instead of adding a kernel argument.
+    // VALIDITY GATE for llama_attn_pre_w32, the whole-row fast attention. The
+    // gate used to stop at one 128-key window because the kernel that shipped
+    // then was only right below that (it wrote dead rows above it: max|delta|
+    // 9.11/9.02/8.96/8.83 at 130/136/150/200 tokens, one head correct and the
+    // other 15 zero - "attention contributed nothing"). The kernel in the tree
+    // now is the per-(row,head) transplant, which has none of that machinery,
+    // and it is correct at every position measured, so the gate opens for the
+    // whole prompt. SOFUU_PREW_MAXPOS still bounds it and is the rollback knob
+    // to the shipped part_b4+fin_b4 pair (SOFUU_PREW_MAXPOS=128 restores the
+    // old one-window behaviour).
+    //
+    // Evidence (M2 Pro 16-core GPU, Qwen3-0.6B i1-Q4_K_M, route
+    // SOFUU_GPU_PREFILL=1, CPU default prefill as the reference; max|delta| on
+    // prefill_logits[..8], all three numbers from the same prompt prefix):
+    //   tokens  fast vs CPU  pair vs CPU  fast vs pair
+    //       39     0.341        0.341        0     (below one window the fused
+    //      148     0.130        0.130        3e-6  1c kernel runs, both settings
+    //      176     0.403        0.403        8e-6  agree bit for bit)
+    //      286     0.218        0.218        6e-6
+    //      637     0.222        0.222        3e-6
+    //     1454     0.281        0.281        3e-6
+    // The fast path IS the pair numerically (<=8e-6 apart); the 0.13-0.40 band
+    // against the CPU is the bf16 rounding of this route, which is why 176 reads
+    // 0.403 for both - parity with the pair, not a new tolerance (0.281 at 1454
+    // is the established number).
+    // Second sweep, one-token-per-word prompt, gate wide open, tokens
+    // 126/127/128/129/130/136/150/200 -> 0.427/0.385/0.407/0.333/0.288/0.282/
+    // 0.327/0.387, i.e. the same band straight through the 128-key boundary.
+    //
+    // positions is a zero-copy buffer, so the bound is read on the host here
+    // instead of adding a kernel argument.
     int pre_window_ok = 0;
     if (sofuu_pre_attn_on() != 0 && ctx->pso_llama_attn_pre_w32 != nil && rows > 0u && pos_buf_ptr) {
         id<MTLBuffer> pb = (__bridge id<MTLBuffer>)pos_buf_ptr;
@@ -3187,8 +3233,8 @@ void sofuu_metal_batch_llama_attn_part_b4(
     ctx->pre_window_active = fast_ok;
     if (fast_ok) {
         uint rpt = sofuu_pre_attn_rpt();
-        // One threadgroup per (row, head) after the decode-kernel transplant:
-        // rpt is still passed (the kernel ignores it) but no longer shapes the grid.
+        // One threadgroup per (row, head): the kernel takes a whole row, so rpt
+        // does not shape the grid (it stays bound for ABI stability).
         uint groups = rows * n_heads;
         uint r_n = rows;
         [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_pre_w32];

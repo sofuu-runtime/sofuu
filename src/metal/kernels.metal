@@ -6309,10 +6309,11 @@ kernel void llama_attn_w32(
 // bytes and is correct at all positions, so the fault was in the added layers,
 // not in the data path. This kernel has none of them.
 //
-// NOTE for future debugging: host readback of the engine-registered meta buffer
-// via .contents returns zeros (even for bytes the shipped pair had just written),
-// so it is NOT a valid observation channel. Allocate a Shared debug buffer if you
-// need to see a kernel's intermediate values.
+// NOTE: this kernel needs 1024 threads per threadgroup (32 warps). Register
+// pressure can push maxTotalThreadsPerThreadgroup below that, and a dispatch
+// larger than the limit is DROPPED (not an error the release build reports) -
+// which reads exactly like "attention contributed nothing". The host therefore
+// checks the limit before choosing this path (see sofuu_metal_init).
 #define PREW_WARPS 32
 #define PREW_DMAX  8
 
@@ -6349,7 +6350,7 @@ kernel void llama_attn_pre_w32(
     threadgroup float sacc[PREW_WARPS][128];
 
     uint lane = lid.x & 31u;
-    uint warp = lid.x >> 5;
+    uint warp = lid.x >> 5u;
     uint kv = h / (n_heads / n_kv_heads);
     device const float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
     device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;

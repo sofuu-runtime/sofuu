@@ -3459,6 +3459,36 @@ impl TransformerModel {
                         &g.act_buf, $y_off,
                         $rows, $cols,
                     );
+                } else if $tv.tensor_type == GGML_TYPE_Q6_K
+                    && crate::infer::metal::MetalEngine::mma8_enabled()
+                    && {
+                        // The q6_K half of the chain's projections (attn_v on
+                        // the i1 Q4_K_M quants; ffn_down below uses the same
+                        // class with a resid epilogue) used to walk the per-row
+                        // batch_gguf loop: one dispatch per row, each
+                        // re-streaming the whole weight matrix - 128x traffic
+                        // and 128 encoder round-trips per projection per
+                        // 128-row chunk. The tiled fused GEMM is the same f32
+                        // dequant (block constants first, no f16 staging) with
+                        // the chunk's tokens as its second tile dimension, so
+                        // one typed section over the whole grid is ONE
+                        // dispatch. Sections are [base-relative off, 256-byte
+                        // remainder, rows_end, y_off, y_stride]; padded slots
+                        // carry rows_end 0 and are skipped by the host.
+                        let woff = gguf.data_offset + $tv.offset;
+                        let mut blob = [[0u32; 5]; 4];
+                        blob[0] = [0, (woff & 255) as u32, $rows as u32, 0, $rows as u32];
+                        g.engine.batch_gguf_gemm_tiled_multi_chain(
+                            GGML_TYPE_Q6_K, &g.w_buf, woff & !255usize,
+                            &g.act_buf, $x_off,
+                            &g.act_buf, $y_off,
+                            $rows, $cols, b, &blob,
+                        )
+                    }
+                {
+                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                        eprintln!("[gemv] Q6TILED rows={} cols={} b={}", $rows, $cols, b);
+                    }
                 } else {
                     for t in 0..b {
                         g.engine.batch_gguf(
@@ -3729,8 +3759,13 @@ impl TransformerModel {
                 }
             }
 
-            // o projection + resid-add fused (rows == dim == acc width)
+            // o projection + resid-add fused (rows == dim == acc width).
+            // gemv_q4_k_b4c2r is a FOUR-TOKEN kernel (no B argument): on the
+            // wide-chain route (mma8, chunk 128) it would compute rows 0..3 and
+            // leave the other 124 rows of xo stale. Only the narrow b4 walk can
+            // use it; wider chunks fall through to gemv_b!, which is batched.
             if !(fuse_on
+                && b <= 4
                 && l.attn_output.tensor_type == GGML_TYPE_Q4_K
                 && g.engine.batch_gguf_b4r(
                     &g.w_buf, gguf.data_offset + l.attn_output.offset,
@@ -3789,7 +3824,8 @@ impl TransformerModel {
                 return false;
             }
             // down projection + resid-add fused
-            if !(fuse_on
+            let down_fused = (fuse_on
+                && b <= 4 // gemv_q4_k_b4c2r is 4 tokens wide (see o above)
                 && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
                 && g.engine.batch_gguf_b4r(
                     &g.w_buf, gguf.data_offset + l.ffn_down.offset,
@@ -3798,7 +3834,24 @@ impl TransformerModel {
                     &g.act_buf, g.slots.x,
                     dim, hidden_dim, dim,
                 ))
-            {
+                // q6_K down (the i1 Q4_K_M class — half the layers): the tiled
+                // fused kernel's resid epilogue is the same f32 dequant as
+                // above with the residual add folded in, so the 128 per-row
+                // dispatches AND the separate batch_add collapse into ONE
+                // dispatch. Every output element is read and written by the
+                // same thread, so binding y and res to the same slot region is
+                // not a race.
+                || (l.ffn_down.tensor_type == GGML_TYPE_Q6_K
+                    && crate::infer::metal::MetalEngine::mma8_enabled()
+                    && g.engine.batch_gguf_gemm_tiled_acc_chain(
+                        GGML_TYPE_Q6_K,
+                        &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                        &g.act_buf, g.slots.gate,
+                        &g.act_buf, g.slots.x, dim,
+                        &g.act_buf, g.slots.x,
+                        dim, hidden_dim, b,
+                    ));
+            if !down_fused {
                 gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
                 if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
                     return false;

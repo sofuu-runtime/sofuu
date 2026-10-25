@@ -557,10 +557,31 @@ void* sofuu_metal_init(void) {
         ctx->pso_peak_fma = load_pso(@"peak_fma");
         ctx->pso_peak_mma = load_pso(@"peak_mma");
         ctx->pso_gemm_q8_0_mma64 = load_pso(@"gemm_q8_0_mma64");
-        ctx->pso_gemm_q8_0_mma64_live = ctx->pso_gemm_q8_0_mma64 != nil;
         ctx->pso_gemm_q6_k_mma64 = load_pso(@"gemm_q6_k_mma64");
-        ctx->pso_gemm_q6_k_mma64_live = ctx->pso_gemm_q6_k_mma64 != nil;
         ctx->pso_gemm_q4_k_mma64 = load_pso(@"gemm_q4_k_mma64");
+        // Same maxTotalThreadsPerThreadgroup discipline as gemm_q4_k_mma8
+        // above: the 64x64 matrix-pipe GEMMs dispatch 128 threads (4
+        // simdgroups) per threadgroup, and an oversized threadgroup is DROPPED
+        // silently in release builds - the y slab would read back as stale
+        // scratch instead of failing. Nil the PSO out so the typed entry
+        // points (the chain's q6_K attn_v/ffn_down batching) return 0 and the
+        // caller keeps its per-row fallback.
+        if (ctx->pso_gemm_q6_k_mma64 != nil &&
+            ctx->pso_gemm_q6_k_mma64.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q6_k_mma64 needs 128 threads/group, pipeline allows %lu - q6_K mma64 disabled\n",
+                    (unsigned long)ctx->pso_gemm_q6_k_mma64.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q6_k_mma64 = nil;
+        }
+        if (ctx->pso_gemm_q8_0_mma64 != nil &&
+            ctx->pso_gemm_q8_0_mma64.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q8_0_mma64 needs 128 threads/group, pipeline allows %lu - q8_0 mma64 disabled\n",
+                    (unsigned long)ctx->pso_gemm_q8_0_mma64.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q8_0_mma64 = nil;
+        }
+        ctx->pso_gemm_q8_0_mma64_live = ctx->pso_gemm_q8_0_mma64 != nil;
+        ctx->pso_gemm_q6_k_mma64_live = ctx->pso_gemm_q6_k_mma64 != nil;
         ctx->pso_gemm_q4_k_mma64_live = ctx->pso_gemm_q4_k_mma64 != nil;
         ctx->pso_gemm_q4_k_tiled_r88 = load_pso(@"gemm_q4_k_tiled_r88");
         ctx->pso_gemm_q4_k_tiled_r88_live = ctx->pso_gemm_q4_k_tiled_r88 != nil;
@@ -577,6 +598,17 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q4_k_tiled_fused = load_pso(@"gemm_q4_k_tiled_fused");
         ctx->pso_gemm_q4_k_tiled_fused_live = ctx->pso_gemm_q4_k_tiled_fused != nil;
         ctx->pso_gemm_q6_k_tiled_fused = load_pso(@"gemm_q6_k_tiled_fused");
+        // Same 128-thread discipline as the mma64 PSOs above: the 32x64 tile
+        // dispatches 128 threads and an oversized threadgroup is dropped
+        // silently, leaving y stale. Nil it so the typed entry points return 0
+        // and the chain keeps its per-row q6_K fallback.
+        if (ctx->pso_gemm_q6_k_tiled_fused != nil &&
+            ctx->pso_gemm_q6_k_tiled_fused.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q6_k_tiled_fused needs 128 threads/group, pipeline allows %lu - q6_K tiled disabled\n",
+                    (unsigned long)ctx->pso_gemm_q6_k_tiled_fused.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q6_k_tiled_fused = nil;
+        }
         ctx->pso_gemm_q6_k_tiled_fused_live = ctx->pso_gemm_q6_k_tiled_fused != nil;
         ctx->pso_gemm_q8_0_tiled_fused = load_pso(@"gemm_q8_0_tiled_fused");
         ctx->pso_gemm_q8_0_tiled_fused_live = ctx->pso_gemm_q8_0_tiled_fused != nil;
@@ -3899,6 +3931,7 @@ int sofuu_metal_batch_gguf(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     return 1;
 }
+
 
 // ── G0: real multi-op batching ─────────────────────────────────────────────
 // batch_open retains ONE uncommitted command buffer with a LIVE encoder;

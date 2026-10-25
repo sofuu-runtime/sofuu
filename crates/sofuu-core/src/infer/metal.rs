@@ -1280,6 +1280,7 @@ impl MetalEngine {
 
     /// GGUF dequant-dot GEMV op in the live batch (ty: 2=q4_0 8=q8_0
     /// 12=q4_K 14=q6_K).
+
     pub fn batch_gguf(
         &self,
         ty: u32,
@@ -1772,6 +1773,75 @@ impl MetalEngine {
         }
         if std::env::var_os("SOFUU_TILED_DEBUG").is_some() {
             eprintln!("[tiled-dbg] acc ty={ty} rows={rows} cols={cols} B={b}");
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_tiled_acc(
+                self.ctx,
+                ty,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                res_buf.handle, res_offset, res_stride,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+
+    /// Chain-route batching for the NON-q4_K projections (q6_K on the i1
+    /// Q4_K_M class, q8_0 on the 8B): the tiled fused GEMM class with the
+    /// typed single-tensor section table. Same weight layout as the per-row
+    /// gemv_q6_k it replaces and the same f32 dequant, so batching a
+    /// projection does not change its arithmetic class - only the summation
+    /// order across k-blocks. Deliberately NOT behind SOFUU_GPU_GEMM_TILED:
+    /// that switch belongs to the PREFILL_GEMM arm's kernel choice, and the
+    /// chain's q6_K projections have no other batched route.
+    pub fn batch_gguf_gemm_tiled_multi_chain(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_base_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows_total: usize, cols: usize, b: usize,
+        secs: &[[u32; 5]],
+    ) -> bool {
+        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || b < 2 || cols % 256 != 0 {
+            return false;
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_gemm_tiled_multi(
+                self.ctx,
+                ty,
+                w_buf.handle, w_base_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows_total, cols, b,
+                secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF_GEMM, __t);
+        __r
+    }
+
+    /// Chain-route resid-epilogue form of the above (ffn_down, and any o
+    /// projection that is not q4_K): one dispatch computes y = res + W x.
+    /// Every output element is read and written by the same thread, so
+    /// passing the residual slot itself as y is not a race.
+    pub fn batch_gguf_gemm_tiled_acc_chain(
+        &self,
+        ty: u32,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        res_buf: &MetalBuffer, res_offset: usize, res_stride: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        if !matches!(ty, 8 | 12 | 14) || b < 2 || cols % 256 != 0 || res_stride != rows {
+            return false;
         }
         let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
@@ -8750,3 +8820,5 @@ extern "C" {
 pub unsafe fn buffer_contents_raw(buf: &MetalBuffer) -> *mut u8 {
     sofuu_metal_buffer_contents(buf.handle) as *mut u8
 }
+
+

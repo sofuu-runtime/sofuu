@@ -680,6 +680,7 @@ kernel void gemv_q6_k(
     }
 }
 
+
 // ── GPU3: q4_K batched GEMV, B=4 tokens per weight pass ───────────────────
 // Same mapping and dispatch family as gemv_q4_k_v2 (1 row per 32-lane
 // simdgroup, 16-byte-aligned uint4 group loads, static unrolls, algebraic
@@ -5065,10 +5066,23 @@ kernel void gemm_q6_k_mma64(
                 device const uchar *blk = w_base + row_byte + b * 210;
                 float d = float(read_f16(w_base, row_byte + b * 210 + 208));
                 float s = d * (float)((int)((device const char *)(blk + 192))[scidx]);
-                uint4 ql4 = *(device const uint4 *)(blk + n * 64 + ((part & 1) ? 32 : 0) + (sk & ~3u));
-                uint4 qh4 = *(device const uint4 *)(blk + 128 + n * 32 + (sk & ~3u));
-                uint qlw[4] = { ql4.x, ql4.y, ql4.z, ql4.w };
-                uint qhw[4] = { qh4.x, qh4.y, qh4.z, qh4.w };
+                // A q6_K block is 210 bytes, so the 16-byte k-slice lives at an
+                // arbitrary 2-byte-aligned address (odd blocks sit at 2 mod 16).
+                // A uint4 load there is UB on Metal and returned garbage on the
+                // M2 Pro (parity harness: 6e0 relative at b=1). Load the same
+                // 32 bytes as scalar uchars and pack them by hand; the byte
+                // offsets stay inside one block, so the addressing is exact.
+                uint qlo = n * 64 + ((part & 1) ? 32u : 0u) + sk;
+                uint qho = 128 + n * 32 + sk;
+                uint qlw[4];
+                uint qhw[4];
+                for (uint w = 0; w < 4; ++w) {
+                    uint j = 4 * w;
+                    qlw[w] = (uint)blk[qlo + j + 0] | ((uint)blk[qlo + j + 1] << 8)
+                           | ((uint)blk[qlo + j + 2] << 16) | ((uint)blk[qlo + j + 3] << 24);
+                    qhw[w] = (uint)blk[qho + j + 0] | ((uint)blk[qho + j + 1] << 8)
+                           | ((uint)blk[qho + j + 2] << 16) | ((uint)blk[qho + j + 3] << 24);
+                }
                 uint sh = 2 * part;
                 uint nib = (part < 2) ? 0u : 4u;
                 for (uint u = 0; u < 16; ++u) {

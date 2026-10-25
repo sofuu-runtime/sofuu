@@ -1310,6 +1310,116 @@ kernel void gemv_q4_k_b4c2(
     y[2 * rows + row] = v2;
     y[3 * rows + row] = v3;
 }
+// q4_K x f32 GEMM on the simdgroup matrix units: 32 rows x 32 tokens per
+// 128-thread threadgroup. Each simdgroup owns a 16x16 output block as 2x2
+// fragments, so four independent 8x8x8 MMAs are in flight per k-step.
+//
+// PRECISION: a 3-term hi/lo split was tried and did NOT change the divergence from
+// the CPU path (LEDGER #51), so the single-term form is kept for speed.
+// Former note: staging operands as plain half quantises every product to fp16
+// (~11 bits), which flips greedy near-ties against the f32 CPU path (LEDGER
+// #50). Each operand is therefore split into hi + lo halves (the "3xhalf"
+// trick, analogous to 3xTF32) and three MMAs are accumulated:
+//   A_hi*B_hi + A_hi*B_lo + A_lo*B_hi  =  ~22 bits of product precision
+// at 3x the MMA count, which this kernel can afford.
+kernel void gemm_q4_k_mma8(
+    device const uchar  *w_base    [[buffer(0)]],
+    device const float  *x         [[buffer(1)]],
+    device float        *y         [[buffer(2)]],
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       &w_rem     [[buffer(4)]],
+    constant uint       &rows      [[buffer(5)]],
+    constant uint       &ntok      [[buffer(6)]],
+    uint2               tg         [[threadgroup_position_in_grid]],
+    uint2               tp         [[thread_position_in_threadgroup]]
+) {
+    uint tid = tp.x;
+    uint lane = tid & 31u;
+    uint sgi = tid >> 5u;
+    uint row_off = (sgi & 1u) * 16u;
+    uint tok_off = (sgi >> 1u) * 16u;
+    threadgroup half  whi[32 * 32];
+    threadgroup half  wlo[32 * 32];
+    threadgroup half  xhi[32 * 32];
+    threadgroup half  xlo[32 * 32];
+    threadgroup float obuf[4][16 * 16];
+    uint r0 = tg.x * 32u;
+    uint t0 = tg.y * 32u;
+    uint nb = cols / 256u;
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
+    for (uint kt = 0; kt < cols; kt += 32u) {
+        uint blk = kt >> 8u;
+        uint kbase = kt & 255u;
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint row = r0 + (idx >> 5u);
+            uint j = kbase + (idx & 31u);
+            float wv = 0.0f;
+            if (row < rows) {
+                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
+                float d = float(read_f16(w_base, row_byte));
+                float dmin = float(read_f16(w_base, row_byte + 2u));
+                device const uchar *scales = w_base + row_byte + 4u;
+                device const uchar *qs = w_base + row_byte + 16u;
+                uint8_t sc, mn;
+                q4k_scale_min(scales, j >> 5u, &sc, &mn);
+                uint off = j & 31u;
+                uint l8 = 2u * (j >> 6u) + (off >> 4u);
+                uint by = qs[l8 * 16u + (off & 15u)];
+                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            half h = (half)wv;
+            whi[idx] = h;
+            wlo[idx] = (half)(wv - (float)h);
+            uint tt = t0 + (idx & 31u);
+            float xv = 0.0f;
+            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
+            half xh = (half)xv;
+            xhi[idx] = xh;
+            xlo[idx] = (half)(xv - (float)xh);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+        for (uint kq = 0; kq < 4u; ++kq) {
+            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1, Al0, Al1, Bl0, Bl1;
+            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
+            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
+            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
+            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
+            // LEDGER #131: the lo halves carry the rounding residue of the half split; without these
+            // three extra products per fragment the dot is hi*hi only (~1e-3 relative error) and the
+            // logits flip near-ties depending on how close the top two entries are.
+            simdgroup_load(Al0, wlo + row_off * 32u + kq * 8u, 32);
+            simdgroup_load(Al1, wlo + (row_off + 8u) * 32u + kq * 8u, 32);
+            simdgroup_load(Bl0, xlo + kq * 8u * 32u + tok_off, 32);
+            simdgroup_load(Bl1, xlo + kq * 8u * 32u + tok_off + 8u, 32);
+            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
+            // LEDGER #183: the 12 lo-term products are DISABLED again. Round 77 restored them
+            // (improving b=8 max|delta| from 16.03 to 2.54) but that tripled the MMA work and cost
+            // ~3.8x on GPU prefill (4.18 s -> 15.8 s, measured with all prefill-attention code
+            // bypassed). Since mma8 remains numerically wrong for b >= 6 EITHER WAY, it is kept on
+            // no default path, and the fast variant is restored. mma8 must not be enabled until a
+            // real correctness fix lands - see PLAN-TARGET-1200-1500.md section 18 (D1).
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 2u; ++j) {
+            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lane; idx < 256u; idx += 32u) {
+        uint row = r0 + row_off + (idx >> 4u);
+        uint tt = t0 + tok_off + (idx & 15u);
+        if (row < rows && tt < ntok) { y[(size_t)tt * rows + row] = obuf[sgi][idx]; }
+    }
+}
+
 // RESID-ADD EPILOGUE variant: after the GEMV, x_acc[t*acc_dim + row] +=
 // y[t*rows + row] for t in 0..4 — one writer per element (threadgroup row),
 // removing the separate batch_add dispatch (and its barrier) per layer.
@@ -5706,6 +5816,96 @@ kernel void gemv_q4_k_flat(
     }
 }
 
+static inline uint u4_comp(uint4 v, uint c) {
+    return (c == 0u) ? v.x : (c == 1u) ? v.y : (c == 2u) ? v.z : v.w;
+}
+
+// ── b=1 q4_K GEMV: one whole 144-byte block per thread ──────────────────────
+// The measured shape of the problem (SOFUU_BW_PROBE + the per-shape ablation):
+// the q4_K projection class costs 3722 us of a 14640 us decode batch, and its
+// cost tracks the ROW COUNT at ~10-12 ns/row rather than the byte count — the
+// gate+up shapes (3072 rows x 1024 cols, 1.77 MB) cost 1826 us while ffn_down
+// (1024 rows x 3072 cols, the same 1.77 MB) costs 406 us. The engine probe
+// streams the same buffer at 137-165 GB/s when a thread holds a WHOLE 144-byte
+// block (nine uint4 loads in flight, 4.6 KB per warp) against 52-64 GB/s for the
+// row-major mapping. So this kernel gives every thread exactly one block, laid
+// out flat: thread i of the grid owns block i, so a warp covers 32 consecutive
+// blocks (4.6 KB) and the threadgroup covers a contiguous GB6_ROWS*576-byte run.
+// Every row's blocks therefore sit in nb consecutive threads of one warp, and
+// the row reduction is one threadgroup-memory pass.
+//
+// The body is vector-wide (the scalar per-block body in gemv_q4_k_flat is why
+// that kernel loses): each 16-byte qs word carries four low/high nibble pairs,
+// so it feeds four float4 dots against x, and d/dmin/scales are read once per
+// block. Values are the shipped d*sc*nib - dmin*m with the shipped mapping.
+#define GB6_THREADS 256
+
+kernel void gemv_q4_k_b1blk(
+    device const uchar  *w_base      [[buffer(0)]],
+    device const float  *x           [[buffer(1)]],
+    device float        *y           [[buffer(2)]],
+    constant uint       &cols        [[buffer(3)]],
+    constant uint       &w_rem       [[buffer(4)]],
+    constant uint       &rows        [[buffer(5)]],
+    uint tg                          [[threadgroup_position_in_grid]],
+    uint tid                         [[thread_position_in_threadgroup]]
+) {
+    threadgroup float part[GB6_THREADS];
+    uint nb = cols >> 8;                       // 256-value blocks per row
+    uint rpt = GB6_THREADS / nb;               // whole rows this threadgroup covers
+    uint njobs = rpt * nb;                     // blocks this threadgroup covers
+    uint job = tg * njobs + tid;
+    uint r = job / nb;
+    uint b = job - r * nb;
+    uint row0 = tg * rpt;
+    float4 acc = 0.0f;
+    if (tid < njobs && r < rows) {
+        size_t off = (size_t)w_rem + (size_t)r * nb * 144u + (size_t)b * 144u;
+        float d = float(read_f16(w_base, (uint)off));
+        float dmin = float(read_f16(w_base, (uint)off + 2u));
+        device const uchar *scales = w_base + off + 4;
+        uint xb = b * 256u;
+        // 8 x 16-byte qs words: one header-less span of the block, loaded flat
+        device const uint4 *qs = (device const uint4 *)(w_base + off + 16u);
+        uint4 q[8];
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; ++j) { q[j] = qs[j]; }
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; ++j) {          // 32 values each: sub-blocks 2g, 2g+1
+            uint g = j >> 1;
+            uint h = j & 1u;
+            uint8_t sc1, m1, sc2, m2;
+            q4k_scale_min(scales, 2u * g, &sc1, &m1);
+            q4k_scale_min(scales, 2u * g + 1u, &sc2, &m2);
+            float s1 = d * (float)sc1, f1 = dmin * (float)m1;
+            float s2 = d * (float)sc2, f2 = dmin * (float)m2;
+            uint xo = xb + g * 64u + h * 16u;
+#pragma clang loop unroll(full)
+            for (uint c = 0; c < 4; ++c) {
+                uint comp = u4_comp(q[j], c);
+                float4 lo4 = float4(float(comp & 15u), float((comp >> 8) & 15u),
+                                    float((comp >> 16) & 15u), float((comp >> 24) & 15u));
+                float4 hi4 = float4(float((comp >> 4) & 15u), float((comp >> 12) & 15u),
+                                    float((comp >> 20) & 15u), float((comp >> 28) & 15u));
+                float4 xl = *(device const float4 *)(x + xo + 4u * c);
+                float4 xh = *(device const float4 *)(x + xo + 32u + 4u * c);
+                acc += (float4(s1) * lo4 - float4(f1)) * xl
+                     + (float4(s2) * hi4 - float4(f2)) * xh;
+            }
+        }
+    }
+    part[tid] = (acc.x + acc.y) + (acc.z + acc.w);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < rpt) {
+        uint row = row0 + tid;
+        if (row < rows) {
+            float s = 0.0f;
+            for (uint k = 0; k < nb; ++k) { s += part[tid * nb + k]; }
+            y[row] = s;
+        }
+    }
+}
+
 // ── decode attention, warp-cooperative ──────────────────────────────────────
 // The serial kernel gives each lane a whole position, so every step of its q.k dot
 // has the 32 lanes reading K vectors 512 bytes apart: 32 transactions per step and
@@ -5954,3 +6154,273 @@ template [[host_name("llama_attn_w16")]] kernel void llama_attn_wN<16>(
     device float*, constant uint&, constant uint&, constant uint&, constant uint&,
     constant uint&, constant uint&, constant uint&, constant float&,
     constant float&, constant uint&, uint, uint);
+
+// ── decode attention, 32 warps per head ─────────────────────────────────────
+// The GQA-fused kernel above halves K/V traffic but launches one threadgroup per
+// K/V head, i.e. 8 of this machine's 16 cores, and it came out 1.8x SLOWER (14.2
+// -> 20.8 ms whole batch): decode attention here is bound by resident warps and
+// the per-position dependency chain, not by bandwidth (85 GB/s against a measured
+// 165 GB/s probe ceiling). So keep one threadgroup per query head — all 16 cores —
+// and give each head 32 warps instead of 16, i.e. 1024 threads per core.
+// sacc is sized [32][128]: head_dim <= 128 keeps the rescale tile at 16 KB, and the
+// engine falls back to the 16-warp kernel for wider heads.
+#define AW32_WARPS 32
+
+kernel void llama_attn_w32(
+    device float       *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *head_out        [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_position_in_threadgroup]]
+) {
+    if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 128u) { return; }
+    threadgroup float rbuf[AW32_WARPS];
+    threadgroup float sm[AW32_WARPS];
+    threadgroup float sl[AW32_WARPS];
+    threadgroup float sr[AW32_WARPS];
+    threadgroup float sacc[AW32_WARPS][128];
+
+    uint lane = tid & 31u;
+    uint warp = tid >> 5;
+    device float *q_head = q + h * head_dim;
+    float scale = rsqrt(float(head_dim));
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += 32 * AW32_WARPS) { ss += q_head[i] * q_head[i]; }
+        ss = simd_sum(ss);
+        if (lane == 0u) { rbuf[warp] = ss; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (uint w = 0; w < AW32_WARPS; ++w) { tot += rbuf[w]; }
+        float rms = rsqrt(tot / float(head_dim) + eps);
+        for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (uint j = tid; j < head_dim / 2; j += 32 * AW32_WARPS) {
+        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        if (rope_mode == 0u) {
+            float q0 = q_head[j];
+            float q1 = q_head[j + head_dim / 2];
+            q_head[j]                = q0 * c - q1 * s;
+            q_head[j + head_dim / 2] = q1 * c + q0 * s;
+        } else {
+            float q0 = q_head[2 * j];
+            float q1 = q_head[2 * j + 1];
+            q_head[2 * j]     = q0 * c - q1 * s;
+            q_head[2 * j + 1] = q1 * c + q0 * s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint seq = pos + 1u;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[8];
+    for (uint d = 0; d < 8u; ++d) { acc[d] = 0.0f; }
+    // 32 warps split the positions; K and V of a step are both loaded before the
+    // score is used, so the V load does not wait behind the dot's reduction.
+    for (uint t = warp; t < seq; t += AW32_WARPS) {
+        float part = 0.0f;
+        float vv[8];
+        uint di = 0;
+        for (uint i = lane; i < head_dim; i += 32) {
+            part += q_head[i] * kbase[(size_t)t * head_dim + i];
+            vv[di] = vbase[(size_t)t * head_dim + i];
+            di++;
+        }
+        float s = simd_sum(part) * scale;
+        float mnew = max(m, s);
+        float corr = exp(m - mnew);
+        float w = exp(s - mnew);
+        l = l * corr + w;
+        uint dj = 0;
+        for (uint i = lane; i < head_dim; i += 32) {
+            acc[dj] = acc[dj] * corr + w * vv[dj];
+            dj++;
+        }
+        m = mnew;
+    }
+
+    if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = sm[0];
+    for (uint w = 1; w < AW32_WARPS; ++w) { gmax = max(gmax, sm[w]); }
+    float ltot = 0.0f;
+    for (uint w = 0; w < AW32_WARPS; ++w) {
+        float r = exp(sm[w] - gmax);
+        sr[w] = r;
+        ltot += sl[w] * r;
+    }
+    uint di = 0;
+    for (uint i = lane; i < head_dim; i += 32) { sacc[warp][i] = acc[di++] * sr[warp]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    for (uint i = tid; i < head_dim; i += 128) {
+        float s = 0.0f;
+        for (uint w = 0; w < AW32_WARPS; ++w) { s += sacc[w][i]; }
+        head_out[h * head_dim + i] = s * inv;
+    }
+}// ── batched prefill attention (row chunk, online softmax) ───────────────────
+// The b4 chunk pass used llama_attn_part_b4: one 32-thread threadgroup per
+// (row, head, 64-key chunk), the QK dot recomputed THREE times per key (max
+// pass, sum pass, weight pass) with q_head[i] reloaded from device memory in
+// the innermost loop. 128 rows x 16 heads x 12 chunks of a single warp each was
+// ~1.8 s of a 4.2 s GPU prefill (43%, measured by skip-subtraction) for 2.1 GB
+// of K/V that should stream in ~13 ms.
+//
+// This is the decode kernel's structure applied to a whole chunk: one
+// threadgroup of 32 warps per (head, group of rpt consecutive rows), one K read
+// and one V read per key, weights in registers via online softmax, and the rows
+// of a group sharing the K/V stream (their causal masks differ only in the last
+// rpt keys, which the per-row bound checks handle). It writes the FINAL rows
+// into the per-row meta scratch, and llama_attn_copy_b4 moves them out, so the
+// part/finish pair keeps the signatures its caller already uses.
+// ── chunk prefill attention: one threadgroup per (row, head) ────────────────
+// Straight transplant of the accepted decode kernel llama_attn_w32 to a whole
+// row chunk: the same 32-warp online softmax and the same sacc reduce, with the
+// row's position taken from the chunk positions buffer and the result landing in
+// the meta row so the copy finish can move it to head_out (one threadgroup per
+// (row, head) is rows*n_heads threadgroups of 1024 threads).
+//
+// Why the rewrite: the previous variant packed 4 rows per threadgroup and
+// reduced over row-indexed sm[r][w]/sl[r][w]. It was exact for causal windows of
+// <=128 keys and wrote byte-zero rows above that (the normaliser went dead:
+// ltot<=0 or NaN, so inv=0), for every rpt in {1,2,4} and every row-group size.
+// Two prompts 70 tokens apart produced logits equal to 5 decimals, i.e. attention
+// contributed exactly nothing. The shipped part_b4+fin_b4 pair reads the same K/V
+// bytes and is correct at all positions, so the fault was in the added layers,
+// not in the data path. This kernel has none of them.
+//
+// NOTE for future debugging: host readback of the engine-registered meta buffer
+// via .contents returns zeros (even for bytes the shipped pair had just written),
+// so it is NOT a valid observation channel. Allocate a Shared debug buffer if you
+// need to see a kernel's intermediate values.
+#define PREW_WARPS 32
+#define PREW_DMAX  8
+
+kernel void llama_attn_pre_w32(
+    device const float *q               [[buffer(0)]],
+    device const float *k_cache_layer   [[buffer(1)]],
+    device const float *v_cache_layer   [[buffer(2)]],
+    device float       *q_unused        [[buffer(3)]],
+    device float       *meta            [[buffer(4)]],
+    device const uint  *positions       [[buffer(5)]],
+    constant uint      &head_dim        [[buffer(6)]],
+    constant uint      &n_heads         [[buffer(7)]],
+    constant uint      &n_kv_heads      [[buffer(8)]],
+    constant uint      &max_seq         [[buffer(9)]],
+    constant uint      &n_chunks_max    [[buffer(10)]],
+    constant uint      &meta_stride     [[buffer(11)]],
+    constant uint      &rows            [[buffer(12)]],
+    constant uint      &rpt             [[buffer(13)]],
+    uint3 gid                           [[threadgroup_position_in_grid]],
+    uint3 lid                           [[thread_position_in_threadgroup]]
+) {
+    if (head_dim == 0u || head_dim > 128u || n_kv_heads == 0u || n_heads % n_kv_heads != 0u) { return; }
+    uint g = gid.y * 1024u + gid.x;
+    uint row = g / n_heads;
+    uint h = g % n_heads;
+    if (row >= rows) { return; }
+    uint pos = positions[row];
+    if (pos == 0xFFFFFFFFu || pos >= max_seq) { return; }
+    (void)rpt; (void)n_chunks_max; (void)q_unused;
+
+    threadgroup float sm[PREW_WARPS];
+    threadgroup float sl[PREW_WARPS];
+    threadgroup float sr[PREW_WARPS];
+    threadgroup float sacc[PREW_WARPS][128];
+
+    uint lane = lid.x & 31u;
+    uint warp = lid.x >> 5;
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    float scale = rsqrt(float(head_dim));
+    uint seq = pos + 1u;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[PREW_DMAX];
+    for (uint d = 0; d < PREW_DMAX; ++d) { acc[d] = 0.0f; }
+    for (uint t = warp; t < seq; t += PREW_WARPS) {
+        float part = 0.0f;
+        float vv[PREW_DMAX];
+        uint di = 0;
+        for (uint i = lane; i < head_dim; i += 32u) {
+            part += q_head[i] * kbase[(size_t)t * head_dim + i];
+            vv[di] = vbase[(size_t)t * head_dim + i];
+            di++;
+        }
+        float s = simd_sum(part) * scale;
+        float mnew = max(m, s);
+        float corr = exp(m - mnew);
+        float w = exp(s - mnew);
+        l = l * corr + w;
+        uint dj = 0;
+        for (uint i = lane; i < head_dim; i += 32u) {
+            acc[dj] = acc[dj] * corr + w * vv[dj];
+            dj++;
+        }
+        m = mnew;
+    }
+
+    if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = sm[0];
+    for (uint w = 1; w < PREW_WARPS; ++w) { gmax = max(gmax, sm[w]); }
+    float ltot = 0.0f;
+    for (uint w = 0; w < PREW_WARPS; ++w) {
+        float r = exp(sm[w] - gmax);
+        sr[w] = r;
+        ltot += sl[w] * r;
+    }
+    uint di2 = 0;
+    for (uint i = lane; i < head_dim; i += 32u) { sacc[warp][i] = acc[di2++] * sr[warp]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    device float *dst = meta + (size_t)row * meta_stride + (size_t)h * head_dim;
+    for (uint i = lid.x; i < head_dim; i += 128u) {
+        float s = 0.0f;
+        for (uint w = 0; w < PREW_WARPS; ++w) { s += sacc[w][i]; }
+        dst[i] = s * inv;
+    }
+}
+// Moves the per-row attention result out of the meta scratch (finish is a copy
+// now that part computes whole rows).
+kernel void llama_attn_copy_b4(
+    device const float *meta        [[buffer(0)]],
+    device float       *head_out    [[buffer(1)]],
+    device const uint  *positions   [[buffer(2)]],
+    constant uint      &n_heads     [[buffer(3)]],
+    constant uint      &head_dim    [[buffer(4)]],
+    constant uint      &n_chunks_max[[buffer(5)]],
+    constant uint      &meta_stride [[buffer(6)]],
+    uint3 gid                       [[threadgroup_position_in_grid]],
+    uint3 lid                       [[thread_position_in_threadgroup]]
+) {
+    uint g = gid.y * 1024u + gid.x;
+    uint row = g / n_heads;
+    uint h   = g % n_heads;
+    device const float *src = meta + (size_t)row * meta_stride + (size_t)h * head_dim;
+    device float *dst = head_out + ((size_t)row * n_heads + h) * head_dim;
+    for (uint d = lid.x; d < head_dim; d += 32u) { dst[d] = src[d]; }
+}

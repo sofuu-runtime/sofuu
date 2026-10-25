@@ -28,6 +28,9 @@
 #if defined(__linux__)
 #include <sys/auxv.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #endif
 
 #if defined(__linux__)
@@ -469,12 +472,16 @@ struct sofuu_tile_entry {
     std::vector<uint8_t> sc;   // q4_K decoded-scale sidecar (tile_sc_q4_Kx8 per block)
     std::vector<uint8_t> data_p;  // q4_K nibble-plane tile (tile_block_q4_Kx8p per block)
     std::vector<uint8_t> data_s;  // q4_K pre-decoded scale section (tile_ss_q4_Kx8s per block)
+    std::vector<uint8_t> data_i;  // q4_K i8mm/SMMLA tile (tile_block_q4_Kx8i per block)
+    std::vector<uint8_t> data_q;  // q4_K apply-phase tile (tile_block_q4_Kx8q per block)
     unsigned type;
     size_t rows, cols;
     uint64_t fp;
     bool has_sc = false;
     bool has_p = false;
     bool has_s = false;
+    bool has_i = false;
+    bool has_q = false;
 };
 static std::mutex g_tile_mutex;
 static std::unordered_map<const void *, sofuu_tile_entry> g_tile_map;
@@ -525,6 +532,53 @@ static size_t nibble_planes_budget_bytes() {
     }();
     return v;
 }
+// q4_K apply-phase GEMM tile + kernel (ggml_gemm_q4_K_8x4_q8_K_p2 in
+// arch/a76_repack.h). OPT-IN via SOFUU_Q4K_APPLY2=1; the default path is
+// untouched. Why: at 4 pooled threads the q4_K prefill GEMM is limited by
+// total instruction issue (~4.1 instr/cycle over the pooled cores), not by
+// bytes — the plane kernel's own cache-resident rate is within 2% of its
+// streamed rate and halving the weight stream (SOFUU_GEMM_BATCH_TILE=8) does
+// not move it. 175 of the 303 instructions per sub-block in the plane kernel
+// are not sdot, and ~36 of those are the per-(sub-block, half) 6-bit scale/min
+// decode, so this tile pre-decodes it at repack time and pairs the two nibble
+// plane loads. Same int8 operands, same int32 dot order, same per-output
+// multiply-then-add sequence => bit-identical output. Measured numbers are in
+// the comment above the kernel.
+static bool q4k_apply2_enabled() {
+    // DEFAULT ON since round 78: bit-identical (prefill_logits exact at 1454/637/286/176/148/39 tok,
+    // 0/393216 float diffs in the kernel bench) and faster in 10/10 interleaved pairs - gemm
+    // -7.5% median end to end (+32% kernel level with cache-resident weights). The tile costs
+    // +434 MB RSS at 0.6B, admitted under the SOFUU_Q4K_APPLY2_MB budget, so larger models silently
+    // fall back per tensor. SOFUU_Q4K_APPLY2=0 is the kill switch.
+    static const bool v = [] {
+        const char * e = getenv("SOFUU_Q4K_APPLY2");
+        return e == nullptr || e[0] != '0';
+    }();
+    return v;
+}
+// Admission mirrors the plane-tile gate (per-tensor element cap + a global
+// budget, SOFUU_Q4K_APPLY2_MB, default 768 MB): the apply-phase tile is 2464 B
+// per 8-row block versus 2176 for the plane tile.
+static bool q4k_apply2_auto(size_t rows, size_t cols) {
+    if (!q4k_apply2_enabled()) return false;
+    if (rows % 8 != 0 || cols % 256 != 0) return false;
+    const size_t elems = rows * cols;
+    if (elems > (size_t)16 << 20) return false;
+    static std::atomic<size_t> used{0};
+    // One tile block covers 8 weight rows x 256 k = 2048 elements.
+    const size_t need = elems / 2048 * sizeof(tile_block_q4_Kx8q);
+    if (need > optional_headroom()) return false;
+    static const size_t budget = [] {
+        const char * e = getenv("SOFUU_Q4K_APPLY2_MB");
+        return e ? (size_t) strtoull(e, nullptr, 10) << 20 : (size_t) 768 << 20;
+    }();
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
+}
+
 static bool nibble_planes_auto(size_t rows, size_t cols) {
     if (!nibble_planes_enabled()) return false;
     const size_t elems = rows * cols;
@@ -538,6 +592,97 @@ static bool nibble_planes_auto(size_t rows, size_t cols) {
         if (budget != 0 && u + need > budget) return false;
         if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
     }
+}
+
+// i8mm (FEAT_I8MM / SMMLA) q4_K prefill tile. OPT-IN via SOFUU_GEMM_I8MM=1 AND
+// only on a cpu that reports FEAT_I8MM at runtime (sofuu_cpu_has_i8mm).
+//
+// Measured on M2 Pro (2026-10-25, 4 pooled threads, real Qwen prefill shapes):
+// this path is *slower* than the nibble-plane SDOT kernel and is kept as
+// bit-exact infrastructure + the harness for SIMD-issue work. Reason: SMMLA and
+// SDOT have the same int8 MAC peak per core (single-stream microbenchmark:
+// 136-139 GMAC/s SMMLA vs 136-137 GMAC/s SDOT) and the plane kernel already
+// runs at ~131 GMAC/s = 38 of the 40 MAC/cycle SDOT peak, while SMMLA reuses
+// only 2 weight rows per 16 B operand load where SDOT reuses 4 — so the SMMLA
+// kernel pays ~2x the load instructions for the same MAC count and lands at
+// 121-123 GMAC/s (0.93x). A 50/50 SMMLA+SDOT instruction mix does reach
+// 206-210 GMAC/s in a pure MAC-loop microbenchmark (the two run on different
+// execution resources), but no real kernel is instruction-free enough to
+// reach that rate: the scale-apply chain alone is ~45% of the instructions.
+//
+// Output is bit-identical to the SDOT kernel (int32 MACs are exact; the scale
+// apply runs the same per-element op sequence, only lane-permuted) — gated by
+// sofuu_test_gemm_q4_K_i8mm. Same size/budget shape as the plane tiles.
+static bool sofuu_cpu_has_i8mm(void);
+
+static bool nibble_i8mm_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("SOFUU_GEMM_I8MM");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+static size_t nibble_i8mm_budget_bytes() {
+    static const size_t v = [] {
+        const char * e = getenv("SOFUU_GEMM_I8MM_MB");
+        if (!e) return (size_t)768 << 20;
+        return (size_t)strtoull(e, nullptr, 10) << 20;
+    }();
+    return v;
+}
+static bool nibble_i8mm_auto(size_t rows, size_t cols) {
+    if (!nibble_i8mm_enabled()) return false;
+    const size_t elems = rows * cols;
+    if (elems > (size_t)16 << 20) return false;
+    static std::atomic<size_t> used{0};
+    const size_t need = elems / 2;  // one extra byte per element (lo+hi vs packed nibble)
+    if (need > optional_headroom()) return false;
+    const size_t budget = nibble_i8mm_budget_bytes();
+    size_t u = used.load(std::memory_order_relaxed);
+    while (true) {
+        if (budget != 0 && u + need > budget) return false;
+        if (used.compare_exchange_weak(u, u + need, std::memory_order_relaxed)) return true;
+    }
+}
+
+// Wider batch tile for the q4_K prefill GEMM (8 weight rows x 8 activation
+// rows; kernels ggml_gemm_q4_K_8x8_q8_K_p / _s in arch/a76_repack.h). OPT-IN
+// via SOFUU_GEMM_BATCH_TILE=8; default OFF leaves every existing path untouched.
+//
+// Why: the 8x4 tile reloads each 8-row weight block once per 4 activation rows,
+// so a prefill over N activation rows streams the whole q4_K tile set N/4 times
+// (212 MB of tile + T1-sidecar bytes for this 0.6B model: 6.8 GB per 128-token
+// chunk, 77 GB over a 1454-token prefill). The wider tile halves that stream.
+//
+// MEASURED, and the reason this is opt-in rather than default: halving the bytes
+// does not buy wall time. At 128-token chunks the q4_K GEMM is issue-bound, not
+// byte-bound — it runs at ~420 GMAC/s, ~98% of what the same kernel reaches in a
+// pure 4-thread loop over cache-resident weights, while streaming only ~58 of the
+// ~85 GB/s this machine sustains. The wider tile halves the stream (58 -> 29
+// GB/s) and then waits on the dot-product issue rate, which it does not improve:
+// it executes the same vdots plus the extra scale/bias work of walking each
+// weight block in two 4-row halves. Measured on interleaved same-run pairs at
+// 1454 prefilled tokens: 569.0 vs 571.2 median tk/s (parity, +0.4%), sum of
+// per-chunk gemm time 1356 vs 1379 ms (+1.7%), and 2% *worse* with a competing
+// streaming load. So: bit-identical and half the DRAM stream, but not faster.
+// Delete the branch below plus the kernel block added at the end of
+// arch/a76_repack.h to drop it; nothing else refers to it.
+//
+// The math is unchanged — every int32 dot sum is exact and order-independent and
+// the scale/bias apply runs the same per-element op sequence — so the output is
+// bit-identical: verified offline by memcmp of this kernel's whole output against
+// ggml_gemm_q4_K_8x4_q8_K_p/_s over 9 shapes (8..56 activation rows, 8..3072
+// weight rows, with and without in_acc) and by checking that the 8-row
+// quantizer reproduces the 4-row one's d/qs/bsums exactly. Uses the same weight
+// tiles (plane or T1), so it needs no extra weight memory; only the activation
+// tile doubles, into the same per-8-activation-rows scratch bytes as two 4-row
+// tiles.
+static bool gemm_batch8_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("SOFUU_GEMM_BATCH_TILE");
+        return e != nullptr && atoi(e) == 8;
+    }();
+    return v;
 }
 
 // T1 (2026-10-15): repack-time pre-decoded sub-block scales for q4_K, as a
@@ -753,6 +898,39 @@ static int sofuu_tile_warm_impl(const void *w, size_t rows, size_t cols, unsigne
             }
             e.has_p = true;
         }
+        // i8mm/SMMLA prefill tile (bit-identical math, 8-k operand grouping
+        // for vmmlaq_s32). Opt-in + runtime feature gated, see
+        // nibble_i8mm_enabled.
+        if (nibble_i8mm_auto(rows, cols) && sofuu_cpu_has_i8mm()) {
+            static_assert(sizeof(tile_block_q4_Kx8i) == 2176, "q4_K i8mm tile layout drift");
+            const size_t ni = (size_t)r8 * nb;
+            e.data_i.resize(ni * sizeof(tile_block_q4_Kx8i));
+            uint8_t * dsti = e.data_i.data();
+            if (r8 >= 16) {
+                g_pool.parallel_for(0, (size_t)r8, [=](size_t g0, size_t g1) {
+                    sofuu_repack_q4k_8bl_i8mm_range(dsti, src, nb, g0, g1);
+                });
+            } else {
+                sofuu_repack_q4k_8bl_i8mm(dsti, src, rows, nb);
+            }
+            e.has_i = true;
+        }
+        // Apply-phase tile (SOFUU_Q4K_APPLY2): the plane tile's nibbles with
+        // the sub-block scales/mins pre-decoded into weight-row lanes.
+        if (q4k_apply2_auto(rows, cols)) {
+            static_assert(sizeof(tile_block_q4_Kx8q) == 2464, "q4_K apply2 tile layout drift");
+            const size_t nq = (size_t)r8 * nb;
+            e.data_q.resize(nq * sizeof(tile_block_q4_Kx8q));
+            uint8_t * dstq = e.data_q.data();
+            if (r8 >= 16) {
+                g_pool.parallel_for(0, (size_t)r8, [=](size_t g0, size_t g1) {
+                    sofuu_repack_q4k_8bl_apply2_range(dstq, src, nb, g0, g1, 4);
+                });
+            } else {
+                sofuu_repack_q4k_8bl_apply2(dstq, src, rows, nb, 4);
+            }
+            e.has_q = true;
+        }
 #if defined(__ARM_FEATURE_DOTPROD)
         if (want_s && q4_ss_admit(rows, cols)) {
             static_assert(sizeof(tile_ss_q4_Kx8s) == 192, "q4_K ss-region layout drift");
@@ -898,6 +1076,31 @@ static const uint8_t * sofuu_tile_lookup_p(const void *w, size_t rows, size_t co
     if (it == g_tile_map.end()) return nullptr;
     const sofuu_tile_entry &e = it->second;
     if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_p) return e.data_p.data();
+    return nullptr;
+}
+
+// i8mm/SMMLA tile for the q4_K prefill GEMM (same keying; only present when
+// warm built one under the opt-in env gate + runtime FEAT_I8MM check).
+static const uint8_t * sofuu_tile_lookup_i(const void *w, size_t rows, size_t cols) {
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    auto it = g_tile_map.find(w);
+    if (it == g_tile_map.end()) return nullptr;
+    const sofuu_tile_entry &e = it->second;
+    if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_i) return e.data_i.data();
+    return nullptr;
+}
+
+// Apply-phase tile (tile_block_q4_Kx8q region) for ggml_gemm_q4_K_8x4_q8_K_p2.
+// Same keying; only present when the SOFUU_Q4K_APPLY2 opt-in admitted this
+// tensor at warm time.
+static const uint8_t * sofuu_tile_lookup_q(const void *w, size_t rows, size_t cols) {
+    const uint64_t fp = sofuu_tile_fingerprint(w);
+    std::lock_guard<std::mutex> lk(g_tile_mutex);
+    auto it = g_tile_map.find(w);
+    if (it == g_tile_map.end()) return nullptr;
+    const sofuu_tile_entry &e = it->second;
+    if (e.type == 12 && e.rows == rows && e.cols == cols && e.fp == fp && e.has_q) return e.data_q.data();
     return nullptr;
 }
 
@@ -1884,6 +2087,32 @@ static bool sofuu_cpu_has_dotprod() {
     // every non-Linux aarch64 target we build (Apple silicon) has sdot.
     return true;
 #endif
+#else
+    return false;
+#endif
+}
+
+// Does THIS cpu implement FEAT_I8MM (vmmlaq_s32 / SMMLA)?
+//
+// __ARM_FEATURE_I8MM is not defined in this build (-march=armv8.2-a+fp16+dotprod,
+// crates/sofuu-ffi/build.rs FP16_MARCH), so the i8mm kernel carries a
+// per-function target("i8mm") attribute and reaching it without asking the cpu
+// would SIGILL on pre-8.6 cores. Cached in a function-local static.
+static bool sofuu_cpu_has_i8mm() {
+#if defined(__aarch64__)
+    static const bool has = [] {
+#if defined(__APPLE__)
+        int have = 0;
+        size_t len = sizeof(have);
+        if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &have, &len, nullptr, 0) != 0) return false;
+        return have != 0;
+#elif defined(__linux__)
+        return (getauxval(AT_HWCAP2) & (1ul << 13)) != 0;  // HWCAP2_I8MM
+#else
+        return false;
+#endif
+    }();
+    return has;
 #else
     return false;
 #endif
@@ -2896,8 +3125,159 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
     // Packed-tile prefill: repacked 8-row weight tiles + q8_K batch
     // activations, extended to small speculative batches by padding
     // activations to a 4-multiple inside the call.
-    const size_t tile_batch = batch_size % 4 == 0 ? batch_size : gemm_tile_pad_batch(batch_size);
+    const size_t tile_batch0 = batch_size % 4 == 0 ? batch_size : gemm_tile_pad_batch(batch_size);
+    // The wider-batch kernel's tile spans 8 activation rows, so round the tail
+    // up to an 8-multiple when it is enabled (the zero rows quantize to d = 0
+    // and are copied back away); off => the 4-row rounding above is unchanged.
+    const size_t tile_batch =
+        (gemm_batch8_enabled() && tile_batch0 >= 8) ? ((tile_batch0 + 7) & ~(size_t) 7) : tile_batch0;
     if (tile_batch >= 4 && tile_batch % 4 == 0 && rows % 8 == 0 && cols % 256 == 0 && SOFUU_TILE_TYPES_OK(12)) {
+        // Wider batch tile (SOFUU_GEMM_BATCH_TILE=8, default OFF): same weight
+        // tiles, but 8 activation rows per weight load, so the weight stream is
+        // read half as many times. Bit-identical to the 8x4 kernels below — see
+        // the kernel note in arch/a76_repack.h.
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        if (gemm_batch8_enabled() && tile_batch % 8 == 0) {
+            const uint8_t *ss8    = nullptr;
+            const uint8_t *stile8 = sofuu_tile_lookup_s(weight_bytes, rows, cols, &ss8);
+            const uint8_t *ptile8 = sofuu_tile_lookup_p(weight_bytes, rows, cols);
+            if (ptile8 != nullptr || (stile8 != nullptr && ss8 != nullptr)) {
+                const size_t nb = cols / 256;
+                const size_t g8n = tile_batch / 8;
+                tile_block_q8_Kx8 *qa_ptr = tile_scratch<tile_block_q8_Kx8>(g8n * nb);
+                const float *gr = x;
+                if (tile_batch != batch_size) {
+                    float *p = tile_scratch_pad<float>(tile_batch * cols);
+                    std::memset(p, 0, tile_batch * cols * sizeof(float));
+                    std::memcpy(p, x, batch_size * cols * sizeof(float));
+                    gr = p;
+                }
+                if (g8n >= 2) {
+                    g_pool.parallel_for(0, g8n, [=](size_t a, size_t b) {
+                        for (size_t g8 = a; g8 < b; ++g8) {
+                            ggml_quantize_mat_q8_K_8rows_neon(gr + g8 * 8 * cols, qa_ptr + g8 * nb, cols);
+                        }
+                    });
+                } else {
+                    ggml_quantize_mat_q8_K_8rows_neon(gr, qa_ptr, cols);
+                }
+                float *out_dst = out;
+                if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+                const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
+                if (ptile8 != nullptr) {
+                    g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                        for (size_t g = g0; g < g1; ++g) {
+                            const uint8_t *t = ptile8 + g * nb * sizeof(tile_block_q4_Kx8p);
+                            ggml_gemm_q4_K_8x8_q8_K_p(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8, acc_k);
+                        }
+                    });
+                } else {
+                    g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                        for (size_t g = g0; g < g1; ++g) {
+                            const uint8_t *t   = stile8 + g * nb * sizeof(tile_block_q4_Kx8);
+                            const uint8_t *ssg = ss8 + g * nb * sizeof(tile_ss_q4_Kx8s);
+                            ggml_gemm_q4_K_8x8_q8_K_s(cols, out_dst + g * 8, rows, t, ssg, qa_ptr, tile_batch, 8, acc_k);
+                        }
+                    });
+                }
+                if (tile_batch != batch_size) {
+                    if (in_acc) {
+                        sofuu_f32_add_inplace(out, out_dst, batch_size * rows);  // out still holds the residual
+                    } else {
+                        std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                    }
+                }
+                return 0;
+            }
+        }
+#endif
+        // i8mm/SMMLA tile when the runtime opted in and the cpu has FEAT_I8MM
+        // (bit-identical to the plane kernel; see nibble_i8mm_enabled).
+#if defined(SOFUU_HAVE_GEMM_I8MM)
+        if (nibble_i8mm_enabled() && sofuu_cpu_has_i8mm()) {
+            if (const uint8_t *itile = sofuu_tile_lookup_i(weight_bytes, rows, cols)) {
+                const size_t nb = cols / 256;
+                const size_t g4n = tile_batch / 4;
+                static_assert(sizeof(tile_block_q8_Kx4i) == sizeof(tile_block_q8_Kx4),
+                    "i8mm act tile must not grow the scratch unit");
+                tile_block_q8_Kx4i *qa_ptr = tile_scratch<tile_block_q8_Kx4i>(g4n * nb);
+                const float *gr = x;
+                if (tile_batch != batch_size) {
+                    float *p = tile_scratch_pad<float>(tile_batch * cols);
+                    std::memset(p, 0, tile_batch * cols * sizeof(float));
+                    std::memcpy(p, x, batch_size * cols * sizeof(float));
+                    gr = p;
+                }
+                if (g4n >= 2) {
+                    g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                        for (size_t g4 = a; g4 < b; ++g4) {
+                            ggml_quantize_mat_q8_K_4x4_i8mm_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                        }
+                    });
+                } else {
+                    ggml_quantize_mat_q8_K_4x4_i8mm_neon(gr, qa_ptr, cols);
+                }
+                float *out_dst = out;
+                if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+                const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
+                g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                    for (size_t g = g0; g < g1; ++g) {
+                        const uint8_t *t = itile + g * nb * sizeof(tile_block_q4_Kx8i);
+                        ggml_gemm_q4_K_8x4_q8_K_i8mm(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8, acc_k);
+                    }
+                });
+                if (tile_batch != batch_size) {
+                    if (in_acc) {
+                        sofuu_f32_add_inplace(out, out_dst, batch_size * rows);
+                    } else {
+                        std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                    }
+                }
+                return 0;
+            }
+        }
+#endif
+        // Apply-phase tile (SOFUU_Q4K_APPLY2, default OFF): plane nibbles with
+        // the 6-bit scale/min decode hoisted to repack time. Bit-identical to
+        // the plane kernel below.
+        if (const uint8_t *qtile = sofuu_tile_lookup_q(weight_bytes, rows, cols)) {
+            const size_t nb = cols / 256;
+            const size_t g4n = tile_batch / 4;
+            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
+            const float *gr = x;
+            if (tile_batch != batch_size) {
+                float *p = tile_scratch_pad<float>(tile_batch * cols);
+                std::memset(p, 0, tile_batch * cols * sizeof(float));
+                std::memcpy(p, x, batch_size * cols * sizeof(float));
+                gr = p;
+            }
+            if (g4n >= 2) {
+                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+                    for (size_t g4 = a; g4 < b; ++g4) {
+                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
+                    }
+                });
+            } else {
+                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
+            }
+            float *out_dst = out;
+            if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
+            const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
+            g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    const uint8_t *t = qtile + g * nb * sizeof(tile_block_q4_Kx8q);
+                    ggml_gemm_q4_K_8x4_q8_K_p2(cols, out_dst + g * 8, rows, t, qa_ptr, tile_batch, 8, acc_k);
+                }
+            });
+            if (tile_batch != batch_size) {
+                if (in_acc) {
+                    sofuu_f32_add_inplace(out, out_dst, batch_size * rows);
+                } else {
+                    std::memcpy(out, out_dst, batch_size * rows * sizeof(float));
+                }
+            }
+            return 0;
+        }
         // Nibble-plane tiles first: same act-quant prologue, aux-op-free kernel.
         if (const uint8_t *ptile = sofuu_tile_lookup_p(weight_bytes, rows, cols)) {
             const size_t nb = cols / 256;
@@ -4540,6 +4920,109 @@ static void sofuu_attn_vacc_pair(float * __restrict out_a, float * __restrict ou
 #endif
 }
 
+
+// 4-row V accumulation for the prefill's 8-row groups: each V row load feeds
+// FOUR rows' accumulators (sofuu_attn_vacc_pair feeds two), which halves V
+// traffic. Per-row accumulation order is identical to vacc_pair/vacc_range
+// (16-wide strips, then 4-wide, then scalar tail), so the output is
+// bit-identical to the pair path.
+static void sofuu_attn_vacc_quad(float * __restrict out_a, float * __restrict out_b,
+                                 float * __restrict out_c, float * __restrict out_d,
+                                 const float * __restrict v_base, size_t v_stride,
+                                 size_t head_dim, size_t p_begin, size_t count,
+                                 const float * __restrict s_a, const float * __restrict s_b,
+                                 const float * __restrict s_c, const float * __restrict s_d) {
+#if defined(SOFUU_NEON)
+    size_t p = 0;
+    for (; p + 4 <= count; p += 4) {
+        const size_t i16 = head_dim - (head_dim & 15);
+        for (size_t i = 0; i + 16 <= head_dim; i += 16) {
+            float32x4_t a0 = vld1q_f32(out_a + i), a1 = vld1q_f32(out_a + i + 4);
+            float32x4_t a2 = vld1q_f32(out_a + i + 8), a3 = vld1q_f32(out_a + i + 12);
+            float32x4_t b0 = vld1q_f32(out_b + i), b1 = vld1q_f32(out_b + i + 4);
+            float32x4_t b2 = vld1q_f32(out_b + i + 8), b3 = vld1q_f32(out_b + i + 12);
+            float32x4_t c0 = vld1q_f32(out_c + i), c1 = vld1q_f32(out_c + i + 4);
+            float32x4_t c2 = vld1q_f32(out_c + i + 8), c3 = vld1q_f32(out_c + i + 12);
+            float32x4_t d0 = vld1q_f32(out_d + i), d1 = vld1q_f32(out_d + i + 4);
+            float32x4_t d2 = vld1q_f32(out_d + i + 8), d3 = vld1q_f32(out_d + i + 12);
+            for (int q = 0; q < 4; ++q) {
+                const float *vrow = v_base + (p_begin + p + q) * v_stride;
+                const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+                const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+                const float32x4_t sc = vdupq_n_f32(s_c[p + q]);
+                const float32x4_t sd = vdupq_n_f32(s_d[p + q]);
+                const float32x4_t v0 = vld1q_f32(vrow + i);
+                const float32x4_t v1 = vld1q_f32(vrow + i + 4);
+                const float32x4_t v2 = vld1q_f32(vrow + i + 8);
+                const float32x4_t v3 = vld1q_f32(vrow + i + 12);
+                a0 = vfmaq_f32(a0, v0, sa); a1 = vfmaq_f32(a1, v1, sa);
+                a2 = vfmaq_f32(a2, v2, sa); a3 = vfmaq_f32(a3, v3, sa);
+                b0 = vfmaq_f32(b0, v0, sb); b1 = vfmaq_f32(b1, v1, sb);
+                b2 = vfmaq_f32(b2, v2, sb); b3 = vfmaq_f32(b3, v3, sb);
+                c0 = vfmaq_f32(c0, v0, sc); c1 = vfmaq_f32(c1, v1, sc);
+                c2 = vfmaq_f32(c2, v2, sc); c3 = vfmaq_f32(c3, v3, sc);
+                d0 = vfmaq_f32(d0, v0, sd); d1 = vfmaq_f32(d1, v1, sd);
+                d2 = vfmaq_f32(d2, v2, sd); d3 = vfmaq_f32(d3, v3, sd);
+            }
+            vst1q_f32(out_a + i, a0); vst1q_f32(out_a + i + 4, a1);
+            vst1q_f32(out_a + i + 8, a2); vst1q_f32(out_a + i + 12, a3);
+            vst1q_f32(out_b + i, b0); vst1q_f32(out_b + i + 4, b1);
+            vst1q_f32(out_b + i + 8, b2); vst1q_f32(out_b + i + 12, b3);
+            vst1q_f32(out_c + i, c0); vst1q_f32(out_c + i + 4, c1);
+            vst1q_f32(out_c + i + 8, c2); vst1q_f32(out_c + i + 12, c3);
+            vst1q_f32(out_d + i, d0); vst1q_f32(out_d + i + 4, d1);
+            vst1q_f32(out_d + i + 8, d2); vst1q_f32(out_d + i + 12, d3);
+        }
+        for (int q = 0; q < 4; ++q) {
+            const float *vrow = v_base + (p_begin + p + q) * v_stride;
+            const float32x4_t sa = vdupq_n_f32(s_a[p + q]);
+            const float32x4_t sb = vdupq_n_f32(s_b[p + q]);
+            const float32x4_t sc = vdupq_n_f32(s_c[p + q]);
+            const float32x4_t sd = vdupq_n_f32(s_d[p + q]);
+            size_t it = i16;
+            for (; it + 4 <= head_dim; it += 4) {
+                const float32x4_t v = vld1q_f32(vrow + it);
+                float32x4_t da = vld1q_f32(out_a + it);
+                float32x4_t db = vld1q_f32(out_b + it);
+                float32x4_t dc = vld1q_f32(out_c + it);
+                float32x4_t dd = vld1q_f32(out_d + it);
+                da = vfmaq_f32(da, v, sa);
+                db = vfmaq_f32(db, v, sb);
+                dc = vfmaq_f32(dc, v, sc);
+                dd = vfmaq_f32(dd, v, sd);
+                vst1q_f32(out_a + it, da);
+                vst1q_f32(out_b + it, db);
+                vst1q_f32(out_c + it, dc);
+                vst1q_f32(out_d + it, dd);
+            }
+            for (; it < head_dim; ++it) {
+                const float v = vrow[it];
+                out_a[it] += v * s_a[p + q];
+                out_b[it] += v * s_b[p + q];
+                out_c[it] += v * s_c[p + q];
+                out_d[it] += v * s_d[p + q];
+            }
+        }
+    }
+    for (; p < count; ++p) {
+        const float *vrow = v_base + (p_begin + p) * v_stride;
+        const float wa = s_a[p], wb = s_b[p], wc = s_c[p], wd = s_d[p];
+        for (size_t it = 0; it < head_dim; ++it) {
+            const float v = vrow[it];
+            out_a[it] += v * wa;
+            out_b[it] += v * wb;
+            out_c[it] += v * wc;
+            out_d[it] += v * wd;
+        }
+    }
+#else
+    sofuu_attn_vacc_range(out_a, v_base, v_stride, head_dim, p_begin, count, s_a);
+    sofuu_attn_vacc_range(out_b, v_base, v_stride, head_dim, p_begin, count, s_b);
+    sofuu_attn_vacc_range(out_c, v_base, v_stride, head_dim, p_begin, count, s_c);
+    sofuu_attn_vacc_range(out_d, v_base, v_stride, head_dim, p_begin, count, s_d);
+#endif
+}
+
 // ── f16 KV attention inner kernels ────────────────────────────────────
 // Same loop shapes as the f32 kernels above; every KV load is converted
 // from the halved f16 shadow, so DRAM traffic on the score/AV passes drops
@@ -5537,6 +6020,23 @@ void sofuu_batched_attention_ext(
                 // once for two rows; longer rows finish their tail through the
                 // single-row kernel.
                 size_t rp = 0;
+                for (; rp + 4 <= nr; rp += 4) {
+                    float *o0 = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
+                    float *o1 = head_out_batch + (b0 + rp + 1) * q_dim + h * head_dim;
+                    float *o2 = head_out_batch + (b0 + rp + 2) * q_dim + h * head_dim;
+                    float *o3 = head_out_batch + (b0 + rp + 3) * q_dim + h * head_dim;
+                    size_t cm = counts[rp];
+                    for (size_t t = 1; t < 4; ++t) if (counts[rp + t] < cm) cm = counts[rp + t];
+                    sofuu_attn_vacc_quad(o0, o1, o2, o3, v_past, head_dim, head_dim, 0, cm,
+                                         outs_p[rp], outs_p[rp + 1], outs_p[rp + 2], outs_p[rp + 3]);
+                    float *oo[4] = {o0, o1, o2, o3};
+                    for (size_t t = 0; t < 4; ++t) {
+                        if (counts[rp + t] > cm) {
+                            sofuu_attn_vacc_range(oo[t], v_past, head_dim, head_dim, cm,
+                                                  counts[rp + t] - cm, outs_p[rp + t] + cm);
+                        }
+                    }
+                }
                 for (; rp + 2 <= nr; rp += 2) {
                     float *oa = head_out_batch + (b0 + rp) * q_dim + h * head_dim;
                     float *ob = head_out_batch + (b0 + rp + 1) * q_dim + h * head_dim;
@@ -6368,9 +6868,17 @@ extern "C" int sofuu_test_quant_q8_K_parity(int cols, int iters) {
 #endif
 }
 
-// ── R3 bench: q4_K nibble-plane kernel vs packed kernel, kernel-only on
-// identical synthetic weights/activations. rows*cols must satisfy the auto
-// plane gate (<= 16M elems) so warm builds the plane tile.
+// ── R3 bench: q4_K prefill kernels, kernel-only on identical synthetic
+// weights/activations, INTERLEAVED inside one process (per-iteration round
+// robin over the variants) so every variant sees the same clock/thermal state
+// — cross-run comparisons on this box are noise. Variants: packed 8x4, T1
+// decoded-scale 8x4, nibble-plane 8x4, and (when built) the pre-decoded
+// plane variant used by the apply-phase work. Prints min and median GMAC/s
+// per variant plus the number of output floats that differ from the packed
+// kernel (0 = bit-identical).
+// rows*cols must satisfy the auto plane gate (<= 16M elems) so the warm builds
+// the plane tile; the plane variants only appear with SOFUU_NIBBLE_PLANES=1,
+// and the apply2 variant only with SOFUU_Q4K_APPLY2=1.
 extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters) {
 #if defined(__aarch64__)
     if (batch < 4 || batch % 4 != 0 || iters < 1) return;
@@ -6378,6 +6886,8 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
     std::vector<uint8_t> w((size_t)rows * row_size);
     std::vector<float> x((size_t)batch * cols);
     std::vector<float> out((size_t)batch * rows);
+    std::vector<float> out_p((size_t)batch * rows), out_s((size_t)batch * rows);
+    std::vector<float> out_q((size_t)batch * rows);
     uint32_t rng = 12345;
     for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
     for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
@@ -6388,8 +6898,11 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
     }
     const uint8_t *ptile = sofuu_tile_lookup_p(w.data(), rows, cols);
     const uint8_t *ktile = sofuu_tile_lookup(w.data(), 12, rows, cols);
-    if (!ptile || !ktile) {
-        fprintf(stderr, "[bench-p] missing tiles (plane gate: rows*cols <= 16M elems)\n");
+    const uint8_t *ss = nullptr;
+    const uint8_t *stile = sofuu_tile_lookup_s(w.data(), rows, cols, &ss);
+    const uint8_t *qtile = sofuu_tile_lookup_q(w.data(), rows, cols);
+    if (!ktile) {
+        fprintf(stderr, "[bench-p] missing packed tile\n");
         return;
     }
     const size_t nb = cols / 256;
@@ -6397,34 +6910,183 @@ extern "C" void sofuu_bench_gemm_plane(int rows, int cols, int batch, int iters)
     for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
         ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
     }
-    double t_k = 0, t_p = 0;
-    for (int it = 0; it < iters; ++it) {
-        auto t0 = std::chrono::steady_clock::now();
-        g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
-            for (size_t g = g0; g < g1; ++g) {
-                ggml_gemm_q4_K_8x4_q8_K(cols, out.data() + g * 8, rows,
-                    ktile + g * nb * sizeof(tile_block_q4_Kx8), qa, batch, 8, nullptr);
-            }
-        });
-        auto t1 = std::chrono::steady_clock::now();
-        t_k += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    enum { NV = 4 };
+    struct Var { const char * name; bool ok; float * dst; double t[64]; double best; };
+    Var vr[NV] = {
+        { "packed",  true,                                    out.data(),   {}, 1e30 },
+        { "T1(_s)",  stile != nullptr && ss != nullptr,        out_s.data(), {}, 1e30 },
+        { "planes",  ptile != nullptr,                        out_p.data(), {}, 1e30 },
+        { "apply2",  qtile != nullptr,                        out_q.data(), {}, 1e30 },
+    };
+    const int ni = iters < 64 ? iters : 64;
+    for (int it = 0; it < ni; ++it) {
+        for (int v = 0; v < NV; ++v) {
+            if (!vr[v].ok) continue;
+            auto t0 = std::chrono::steady_clock::now();
+            g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+                for (size_t g = g0; g < g1; ++g) {
+                    const void *wt = ktile + g * nb * sizeof(tile_block_q4_Kx8);
+                    if (v == 0) ggml_gemm_q4_K_8x4_q8_K(cols, vr[0].dst + g * 8, rows, wt, qa, batch, 8, nullptr);
+                    if (v == 1) ggml_gemm_q4_K_8x4_q8_K_s(cols, vr[1].dst + g * 8, rows, wt,
+                                     ss + g * nb * sizeof(tile_ss_q4_Kx8s), qa, batch, 8, nullptr);
+                    if (v == 2) ggml_gemm_q4_K_8x4_q8_K_p(cols, vr[2].dst + g * 8, rows,
+                                     ptile + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8, nullptr);
+                    if (v == 3) ggml_gemm_q4_K_8x4_q8_K_p2(cols, vr[3].dst + g * 8, rows,
+                                     qtile + g * nb * sizeof(tile_block_q4_Kx8q), qa, batch, 8, nullptr);
+                }
+            });
+            vr[v].t[it] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
     }
+    const double macs = (double)batch * rows * cols;
+    fprintf(stderr, "[bench-p] q4_K %dx%d batch=%d iters=%d:", rows, cols, batch, ni);
+    for (int v = 0; v < NV; ++v) {
+        if (!vr[v].ok) continue;
+        std::vector<double> tv(vr[v].t, vr[v].t + ni);
+        std::sort(tv.begin(), tv.end());
+        const double mn = tv.front(), md = tv[ni / 2];
+        fprintf(stderr, " %s %.1f/%.1f GMAC/s(min/med)", vr[v].name, macs / (mn * 1e6), macs / (md * 1e6));
+    }
+    fprintf(stderr, "\n");
+    // Live bit-parity check against the packed kernel (same tiles, same q8 tile).
+    for (int v = 1; v < NV; ++v) {
+        if (!vr[v].ok) continue;
+        size_t diff = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            uint32_t a, b;
+            memcpy(&a, &out[i], 4);
+            memcpy(&b, &vr[v].dst[i], 4);
+            if (a != b) ++diff;
+        }
+        fprintf(stderr, "[bench-p] parity %s vs packed: %zu/%zu floats differ\n", vr[v].name, diff, out.size());
+    }
+#else
+    (void) rows; (void) cols; (void) batch; (void) iters;
+#endif
+}
+
+// ── i8mm (SMMLA) q4_K tile bench + parity hooks ──────────────────────────
+// Kernel-only A/B on identical synthetic weights/activations; both kernels run
+// on their own tile layouts. The i8mm kernel is bit-identical to the plane
+// kernel by construction (int32 MACs are exact and order-independent; the
+// per-element scale-apply sequence is unchanged), which the parity hook below
+// asserts with memcmp over the whole output.
+extern "C" void sofuu_bench_gemm_i8mm(int rows, int cols, int batch, int iters) {
+#if defined(SOFUU_HAVE_GEMM_I8MM)
+    if (batch < 4 || batch % 4 != 0 || iters < 1) return;
+    if (!sofuu_cpu_has_i8mm()) {
+        fprintf(stderr, "[bench-i8mm] cpu has no FEAT_I8MM\n");
+        return;
+    }
+    const size_t nb = cols / 256;
+    const size_t r8 = rows / 8;
+    const size_t row_size = nb * 144;
+    std::vector<uint8_t> w((size_t)rows * row_size);
+    std::vector<float> x((size_t)batch * cols);
+    std::vector<float> out((size_t)batch * rows);
+    uint32_t rng = 12345;
+    for (auto &b : w) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    for (auto &v : x) { rng = rng * 1664525u + 1013904223u; v = ((int)(rng >> 16) % 2000 - 1000) / 700.0f; }
+    sanitize_block_scale_headers(w.data(), (size_t)rows * nb, 144, 4);
+    std::vector<uint8_t> tplane(r8 * nb * sizeof(tile_block_q4_Kx8p));
+    std::vector<uint8_t> ti8mm(r8 * nb * sizeof(tile_block_q4_Kx8i));
+    sofuu_repack_q4k_8bl_planes(tplane.data(), w.data(), rows, nb, 4);
+    sofuu_repack_q4k_8bl_i8mm(ti8mm.data(), w.data(), rows, nb);
+    tile_block_q8_Kx4 *qa = tile_scratch<tile_block_q8_Kx4>((batch / 4) * nb);
+    for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+        ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa + g4 * nb, cols);
+    }
+    tile_block_q8_Kx4i *qai = tile_scratch<tile_block_q8_Kx4i>((batch / 4) * nb);
+    for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+        ggml_quantize_mat_q8_K_4x4_i8mm_neon(x.data() + g4 * 4 * cols, qai + g4 * nb, cols);
+    }
+    double t_p = 0, t_i = 0;
     for (int it = 0; it < iters; ++it) {
         auto t0 = std::chrono::steady_clock::now();
         g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
             for (size_t g = g0; g < g1; ++g) {
                 ggml_gemm_q4_K_8x4_q8_K_p(cols, out.data() + g * 8, rows,
-                    ptile + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8, nullptr);
+                    tplane.data() + g * nb * sizeof(tile_block_q4_Kx8p), qa, batch, 8, nullptr);
             }
         });
         auto t1 = std::chrono::steady_clock::now();
         t_p += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
+    for (int it = 0; it < iters; ++it) {
+        auto t0 = std::chrono::steady_clock::now();
+        g_pool.parallel_for(0, rows / 8, [&](size_t g0, size_t g1) {
+            for (size_t g = g0; g < g1; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K_i8mm(cols, out.data() + g * 8, rows,
+                    ti8mm.data() + g * nb * sizeof(tile_block_q4_Kx8i), qai, batch, 8, nullptr);
+            }
+        });
+        auto t1 = std::chrono::steady_clock::now();
+        t_i += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
     const double macs = (double)batch * rows * cols * iters;
-    fprintf(stderr, "[bench-p] q4_K %dx%d batch=%d iters=%d: packed %.1f GMAC/s | planes %.1f GMAC/s (%+.1f%%)\n",
-        rows, cols, batch, iters, macs / (t_k * 1e6), macs / (t_p * 1e6), 100.0 * (t_k - t_p) / t_k);
+    fprintf(stderr, "[bench-i8mm] q4_K %dx%d batch=%d iters=%d: planes(SDOT) %.1f GMAC/s | i8mm(SMMLA) %.1f GMAC/s (%+.1f%%)\n",
+        rows, cols, batch, iters, macs / (t_p * 1e6), macs / (t_i * 1e6), 100.0 * (t_p - t_i) / t_p);
 #else
     (void) rows; (void) cols; (void) batch; (void) iters;
+#endif
+}
+
+// Number of output floats that differ between the SMMLA kernel and the SDOT
+// plane kernel (0 = bit-identical). Covers a plain pass and an accumulate-in-
+// place pass, three activation rounds (incl. an all-zero row and mixed
+// magnitudes), and several column counts.
+extern "C" int sofuu_test_gemm_q4_K_i8mm(int rows, int cols, int batch) {
+#if defined(SOFUU_HAVE_GEMM_I8MM)
+    if (rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;
+    if (!sofuu_cpu_has_i8mm()) return -2;
+    const size_t nb = cols / 256;
+    const size_t r8 = rows / 8;
+    std::vector<uint8_t> wsrc((size_t)rows * nb * 144);
+    std::vector<uint8_t> tplane(r8 * nb * sizeof(tile_block_q4_Kx8p));
+    std::vector<uint8_t> ti8mm(r8 * nb * sizeof(tile_block_q4_Kx8i));
+    uint32_t rng = 20261025;
+    for (auto &b : wsrc) { rng = rng * 1664525u + 1013904223u; b = (uint8_t)(rng >> 24); }
+    sanitize_block_scale_headers(wsrc.data(), (size_t)rows * nb, 144, 4);
+    sofuu_repack_q4k_8bl_planes(tplane.data(), wsrc.data(), rows, nb, 4);
+    sofuu_repack_q4k_8bl_i8mm(ti8mm.data(), wsrc.data(), rows, nb);
+    std::vector<float> x((size_t)batch * cols);
+    std::vector<float> oa((size_t)batch * rows), ob((size_t)batch * rows);
+    int diff = 0;
+    for (int round = 0; round < 3; ++round) {
+        for (size_t i = 0; i < x.size(); ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            const float mag = round == 0 ? 1.0f : (round == 1 ? 8.0f : 0.05f);
+            x[i] = ((int)(rng >> 16) % 2001 - 1000) / 1000.0f * mag;
+        }
+        if (round == 1) {
+            for (size_t i = 0; i < (size_t)cols; ++i) x[i] = 0.0f;  // zero activation row
+        }
+        std::vector<tile_block_q8_Kx4>  qa((batch / 4) * nb);
+        std::vector<tile_block_q8_Kx4i> qai((batch / 4) * nb);
+        for (size_t g4 = 0; g4 < (size_t)batch / 4; ++g4) {
+            ggml_quantize_mat_q8_K_4x4_neon(x.data() + g4 * 4 * cols, qa.data() + g4 * nb, cols);
+            ggml_quantize_mat_q8_K_4x4_i8mm_neon(x.data() + g4 * 4 * cols, qai.data() + g4 * nb, cols);
+        }
+        for (int mode = 0; mode < 2; ++mode) {
+            std::fill(oa.begin(), oa.end(), -1e30f);
+            std::fill(ob.begin(), ob.end(), -1e30f);
+            for (size_t g = 0; g < r8; ++g) {
+                ggml_gemm_q4_K_8x4_q8_K_p(cols, oa.data() + g * 8, rows,
+                    tplane.data() + g * nb * sizeof(tile_block_q4_Kx8p), qa.data(), batch, 8,
+                    mode ? oa.data() : nullptr);
+                ggml_gemm_q4_K_8x4_q8_K_i8mm(cols, ob.data() + g * 8, rows,
+                    ti8mm.data() + g * nb * sizeof(tile_block_q4_Kx8i), qai.data(), batch, 8,
+                    mode ? ob.data() : nullptr);
+            }
+            for (size_t i = 0; i < oa.size(); ++i) {
+                if (std::memcmp(&oa[i], &ob[i], sizeof(float)) != 0) ++diff;
+            }
+        }
+    }
+    return diff;
+#else
+    (void) rows; (void) cols; (void) batch;
+    return -2;  // kernel not compiled in (no i8mm-capable toolchain)
 #endif
 }
 

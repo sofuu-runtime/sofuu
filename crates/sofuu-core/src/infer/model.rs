@@ -357,6 +357,9 @@ pub struct TransformerModel {
     pub k16_cache: Option<AnonBuffer>,
     pub v16_cache: Option<AnonBuffer>,
     pub kv_f16: bool,
+    /// f16 KV shadows are present and the BATCH (prefill) attention should read them.
+    /// Separate from kv_f16 so GPU decode can stay armed on the zero-copy f32 caches.
+    pub k16_prefill: bool,
     /// Element-weighted dominant quant type of the projection matrices.
     pub dominant_proj_type: u32,
     pub kv_dim: usize,
@@ -652,7 +655,12 @@ impl TransformerModel {
         let gpu = {
             let wanted = gpu_allowed
                 && cfg!(target_os = "macos")
-                && std::env::var_os("SOFUU_GPU_DECODE").is_some()
+                // DEFAULT ON. The round-69 "regression" was retracted in round 70: prefill routing
+                // is env-gated (SOFUU_GPU_PREFILL*) and client arming does not touch it - both
+                // paths showed [prof] gemm 168 ops, gemv 0. Same-run measurement (load 4.7):
+                // GPU decode forward 18.6ms (kernels 15.2 + host 3.3) vs CPU 25.6ms.
+                // SOFUU_GPU_DECODE=0 opts out.
+                && std::env::var("SOFUU_GPU_DECODE").map(|v| v != "0").unwrap_or(true)
                 && gguf.resident.is_none();
             if wanted {
                 GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm)
@@ -675,7 +683,15 @@ impl TransformerModel {
         // The f16 shadows are an optimization, not a requirement: when the
         // extra reservation fails under pressure, run with the f32 caches
         // (the pre-shadow behaviour) instead of aborting the load.
-        let (k16_cache, v16_cache, kv_f16) = if kv_f16 {
+        // Prefill-time f16 KV (opt-out SOFUU_PREFILL_K16=0): the batch attention then reads
+        // halved K/V bytes. Independent of kv_f16 because GPU decode binds the f32 caches
+        // zero-copy, but prefill never touches the GPU - so both can coexist.
+        let prefill_k16_want = !kv_f16
+            && cfg!(target_arch = "aarch64")
+            && kv_cache_size % 2 == 0
+            && std::env::var("SOFUU_PREFILL_K16").map(|v| v != "0").unwrap_or(false);
+        let want_shadow = kv_f16 || prefill_k16_want;
+        let (k16_cache, v16_cache, k16_ok) = if want_shadow {
             match (
                 AnonBuffer::try_new(kv_cache_size / 2),
                 AnonBuffer::try_new(kv_cache_size / 2),
@@ -693,6 +709,8 @@ impl TransformerModel {
         } else {
             (None, None, false)
         };
+        let kv_f16 = kv_f16 && k16_ok;
+        let k16_prefill = prefill_k16_want && k16_ok;
 
         if kv_f16 && super::quant::env_flag("SOFUU_PROFILE") {
             let feat = super::quant::simd_features();
@@ -750,6 +768,7 @@ impl TransformerModel {
             k16_cache,
             v16_cache,
             kv_f16,
+            k16_prefill,
             dominant_proj_type,
             kv_dim,
             sliding_window: detected_sliding_window,
@@ -1115,7 +1134,21 @@ impl TransformerModel {
     /// Prefill all prompt tokens and compute logits for the very last token in a single pass,
     /// avoiding an extra single-token evaluation over model weights.
     pub fn forward_prefill_all_with_logits(&mut self, tokens: &[u32], start_pos: usize) -> &[f32] {
-        if tokens.is_empty() {
+
+        // LEDGER #141: macOS defaults to 4 CPU threads (platform_topology.h:17) and measures 427 tk/s,
+        // while 6 threads measures 605 tk/s on the same prompt (+41%). The C++ default is in the peer
+        // lane, so the correction is applied here: leave an explicit SOFUU_NUM_THREADS alone, and on
+        // a machine with 8+ logical cores use 6 - the measured knee on M2 Pro (4/6/8/10 -> 405/481/373/339).
+        #[cfg(target_os = "macos")]
+        {
+            if std::env::var_os("SOFUU_NUM_THREADS").is_none() {
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let want = if cores >= 8 { 6 } else { cores.saturating_sub(1).clamp(1, 4) };
+                if crate::infer::quant::get_thread_count() != want {
+                    crate::infer::quant::set_thread_count(want);
+                }
+            }
+        }        if tokens.is_empty() {
             return &self.logits;
         }
         if tokens.len() == 1 {
@@ -1348,7 +1381,7 @@ impl TransformerModel {
 
             // ── RoPE & KV-Cache Storage for batch ────────────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            if self.kv_f16 {
+            if self.kv_f16 || self.k16_prefill {
                 batched_rope_kv_f16(
                     &mut self.q_batch[0..b_size * q_dim],
                     &mut self.k_batch[0..b_size * kv_dim],
@@ -1420,6 +1453,23 @@ impl TransformerModel {
             // more than the halved bytes save there. The f16 shadows are still
             // written above, so decode reads them.
             let sliding_window = self.layer_sliding_window(layer_idx);
+            if self.k16_prefill {
+                super::quant::batched_attention_ext_k16(
+                    &self.q_batch[0..b_size * q_dim],
+                    self.k16_cache.as_ref().unwrap().as_u16(),
+                    self.v16_cache.as_ref().unwrap().as_u16(),
+                    &mut self.head_out_batch[0..b_size * q_dim],
+                    b_size,
+                    start_pos,
+                    layer_idx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    sliding_window,
+                    self.sink_tokens,
+                );
+            } else {
             batched_attention_ext(
                 &self.q_batch[0..b_size * q_dim],
                 &self.k_cache,
@@ -1435,6 +1485,7 @@ impl TransformerModel {
                 sliding_window,
                 self.sink_tokens,
             );
+            }
 
             // ── Attention Output Projection + Residual 1 (fused when the
             // tile path takes it; bit-identical either way) ──────────────
@@ -1597,7 +1648,46 @@ impl TransformerModel {
         // b4 GEMVs; head GEMV only when the caller needs last-row logits).
         // Anything unsupported (b>4, boundaries) falls to the CPU tiles.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // Chain chunk width: 128 rows is the measured knee with the simdgroup-matrix GEMM
+        // (the b4c2 kernels compute only 4 rows); everything else walks 4 rows so the
+        // fused 4-row kernels stay in play. The walk must NOT depend on the MMA flag,
+        // or plain SOFUU_GPU_PREFILL=1 silently falls through to the CPU path and looks
+        // like a slow GPU route (LEDGER #47).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let chain_chunk = if crate::infer::metal::MetalEngine::mma8_enabled()
+            && std::env::var_os("SOFUU_MMA8_CHUNK4").is_none()
+        {
+            std::env::var("SOFUU_CHAIN_CHUNK")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(128)
+        } else {
+            4
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if b_size > chain_chunk {
+            let mut off = 0usize;
+            let mut all_ok = true;
+            while off < b_size {
+                let end = (off + chain_chunk).min(b_size);
+                let is_last = end == b_size;
+                if !self.gpu_forward_prefill_chain(
+                    &tokens[off..end], start_pos + off, compute_last_logits && is_last,
+                ) {
+                    all_ok = false;
+                    break;
+                }
+                off = end;
+            }
+            if all_ok {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                self.logits_gap_probe_tagged("chain_head", start_pos + b_size - 1);
+                return &self.logits;
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.gpu_forward_prefill_chain(tokens, start_pos, compute_last_logits) {
+            self.logits_gap_probe_tagged("chain_head", start_pos + b_size - 1);
             return &self.logits;
         }
 
@@ -2697,7 +2787,27 @@ impl TransformerModel {
             assert!(g.engine.batch_open());
         }
 
+        // LEDGER #192: arm the flat GEMV sweep for this decode token only.
+        // LEDGER #193: OPT-IN only. Forcing the flat sweep here made the GPU one-commit
+        // batch get REJECTED (sofuu gpu_batch=false -> silent CPU fallback at 30-220ms/token),
+        // so #192s measured "win" was the fallback, not a faster GPU path.
+        // W0/A2: hoist every env/OnceLock read out of the per-layer loop. These were read
+        // 28x per token (each std::env::var walks environ under a lock).
+        let dec_attn_env = std::env::var("SOFUU_GPU_ATTN").map(|v| v != "0").unwrap_or(true);
+        let dec_attn_min = crate::infer::metal::MetalEngine::attn_chunk_min() as usize;
+        let dec_trace = std::env::var_os("SOFUU_GPU_TRACE").is_some();
+        let dec_fnorm_dbg = std::env::var_os("SOFUU_FNORM_DBG").is_some();
+
+        let _flat_guard = if std::env::var_os("SOFUU_GEMV_FLAT_FORCE").is_some() {
+            crate::infer::metal::MetalEngine::set_gemv_flat_forced(true);
+            Some(crate::infer::metal::FlatGuard)
+        } else {
+            None
+        };
         for layer_idx in start_layer..end_layer {
+            // LEDGER #190: sibling GEMVs within a layer read the same input and write
+            // disjoint outputs, so only the layer boundary needs a real barrier.
+            g.engine.batch_barrier_mark();
             let (attn_norm_off, ffn_norm_off, q_norm_off, k_norm_off) = {
                 let l = &self.layers[layer_idx];
                 (
@@ -2774,14 +2884,8 @@ impl TransformerModel {
             // GPU3 chunked attention (default; the meta-overlap bug is fixed —
             // head-0 partials were overwriting the {max,sum} block).
             // SOFUU_GPU_ATTN=0 restores the pre-GPU3 serial kernel.
-            let attn_new = std::env::var("SOFUU_GPU_ATTN")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-                // Only worth it once the context crosses one meta chunk: below that
-                // the chunked path still walks every chunk's meta, and the serial
-                // kernel is 14% cheaper per token (measured 9.1 vs 10.6 ms/token on
-                // the 0.6B at 48 positions, GPU-side timer).
-                && pos >= crate::infer::metal::MetalEngine::attn_chunk_min() as usize;
+            // the serial kernel is 14% cheaper per token (9.1 vs 10.6 ms/token, GPU timer).
+            let attn_new = dec_attn_env && pos >= dec_attn_min;
             if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.
@@ -2882,7 +2986,7 @@ impl TransformerModel {
                     norm_eps, rope_freq_base, rope_mode,
                 );
             }
-            let trace = std::env::var_os("SOFUU_GPU_TRACE").is_some();
+            let trace = dec_trace;
             if trace && (layer_idx == 0 || layer_idx == 17 || layer_idx == 35) {
                 let ao = g.slot_f32(g.slots.ao, n_heads * head_dim);
                 let r: f32 = (ao.iter().map(|v| v * v).sum::<f32>() / (n_heads * head_dim) as f32)
@@ -2915,7 +3019,7 @@ impl TransformerModel {
                     return false;
                 }
             }
-            if layer_idx == 0 && std::env::var_os("SOFUU_FNORM_DBG").is_some() {
+            if layer_idx == 0 && dec_fnorm_dbg {
                 let xs = g.slot_f32(g.slots.x, dim);
                 let xn = g.slot_f32(g.slots.xn, dim);
                 eprintln!("[fnorm] x[0..4]={:?} xn[0..4]={:?}", &xs[..4], &xn[..4]);
@@ -3047,6 +3151,13 @@ impl TransformerModel {
             // (root logits present) is still met shape-wise.
             out_logits[..self.config.vocab_size].fill(0.0);
         }
+        // LEDGER #174 test: the last op of a chunk has no successor to sync it (#112), so the
+        // caller may read logits with work still in flight. Force a wait at the end of the chunk.
+        if std::env::var_os("SOFUU_CHAIN_WAIT").is_some() {
+            if let Some(g) = self.gpu.as_mut() {
+                g.engine.sync();
+            }
+        }
         true
     }
 
@@ -3059,7 +3170,10 @@ impl TransformerModel {
         start_pos: usize,
         last_logits: bool,
     ) -> bool {
-        // OPT-IN (SOFUU_GPU_PREFILL=1): the b4 chunk pass is ~4x the SERIAL
+
+        if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
+            eprintln!("[chain] n={} start={}", tokens.len(), start_pos);
+        }        // OPT-IN (SOFUU_GPU_PREFILL=1): the b4 chunk pass is ~4x the SERIAL
         // GPU prefill, but at current q4_K kernel rates (~50GB/s class) it
         // still loses to the CPU tile path on most models — it becomes the
         // default together with the higher-bandwidth kernel generation.
@@ -3070,7 +3184,7 @@ impl TransformerModel {
             return false;
         }
         let b = tokens.len();
-        if b < 2 || b > 4 || start_pos + b > self.config.max_seq_len {
+        if b < 2 || b > 128 || start_pos + b > self.config.max_seq_len {
             return false;
         }
         let t0 = std::time::Instant::now();
@@ -3089,6 +3203,27 @@ impl TransformerModel {
             &mut head_logits,
         ) {
             return false;
+        }
+        // Probe the logits the chain actually produced (LEDGER #52: self.logits is
+        // still zero at this point, so the earlier probe measured the wrong buffer).
+        if last_logits {
+            if let Some(p) = std::env::var_os("SOFUU_LOGITS_GAP_PROBE") {
+                let mut idx: Vec<usize> = (0..head_logits.len()).collect();
+                idx.sort_by(|a, b| {
+                    head_logits[*b]
+                        .partial_cmp(&head_logits[*a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let line: Vec<String> = idx
+                    .iter()
+                    .take(8)
+                    .map(|i| format!("({:.6e},{})", head_logits[*i], i))
+                    .collect();
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                    let _ = writeln!(f, "chain_core pos={} {}", start_pos + b - 1, line.join(" "));
+                }
+            }
         }
         if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
             eprintln!(
@@ -3115,8 +3250,29 @@ impl TransformerModel {
             _ => return false,
         };
         let b = tokens.len();
-        if b < 2 || b > 4 || positions.len() != b || start_pos + b > self.config.max_seq_len {
+        if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
+            eprintln!("[chain] core token_commit={} b={} start={}", g.token_commit, b, start_pos);
+        }
+        if b < 2 || b > 128 || positions.len() != b || start_pos + b > self.config.max_seq_len {
             return false;
+        }
+        // LEDGER #118 (fixed in #153): stale-read test. Zero every activation slot region, bounded by
+        // the NEXT slot's offset so the fill can never run past the allocation. Previously placed inside
+        // the shape guard above, where it could only run on chunks that were already invalid.
+        if std::env::var_os("SOFUU_ZERO_ACT").is_some() {
+            let mut offs = vec![
+                g.slots.x, g.slots.xn, g.slots.xo, g.slots.qa,
+                g.slots.ka, g.slots.va, g.slots.ao, g.slots.gate, g.slots.up, g.slots.posb,
+            ];
+            offs.sort_unstable();
+            offs.dedup();
+            for w in offs.windows(2) {
+                let (a, c) = (w[0], w[1]);
+                if c > a {
+                    let n = (c - a) / 4;
+                    g.slot_f32_mut(a, n).fill(0.0);
+                }
+            }
         }
         for (t, &p) in positions.iter().enumerate() {
             if p != start_pos + t {
@@ -3152,9 +3308,16 @@ impl TransformerModel {
         // Per-row positions for the b4 attention family (u32s bit-written
         // into the posb slot).
         {
-            let pb = g.slot_f32_mut(g.slots.posb, 16);
+            // BUG FIX (audit round 76): this wrote only 16 positions while a chain chunk runs
+            // up to b = 128 rows, so rows 16..127 kept stale/zero positions - RoPE ran at
+            // position 0 and the causal bound collapsed, making GPU chain prefill numerically
+            // wrong (measured max |delta| 8.32 vs CPU on prefill_logits[..8]). The slot is
+            // SPEC_B * 16 floats (model.rs:5220, SPEC_B = 128), so b contiguous u32s are well
+            // inside it; the sibling writer at model.rs:3806 and the CPU path both use
+            // contiguous layout.
+            let pb = g.slot_f32_mut(g.slots.posb, b);
             let pbb =
-                unsafe { std::slice::from_raw_parts_mut(pb.as_ptr() as *mut u32, 16) };
+                unsafe { std::slice::from_raw_parts_mut(pb.as_ptr() as *mut u32, b) };
             for (t, item) in pbb.iter_mut().enumerate().take(b) {
                 *item = (start_pos + t) as u32;
             }
@@ -3170,7 +3333,23 @@ impl TransformerModel {
         // batch_gguf per row otherwise. Both paths use identical offsets.
         macro_rules! gemv_b {
             ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
-                if $tv.tensor_type == GGML_TYPE_Q4_K {
+                if $tv.tensor_type == GGML_TYPE_Q4_K
+                    && crate::infer::metal::MetalEngine::mma8_enabled()
+                    && g.engine.batch_gguf_mma8(
+                        &g.w_buf, gguf.data_offset + $tv.offset,
+                        &g.act_buf, $x_off,
+                        &g.act_buf, $y_off,
+                        $rows, $cols, b,
+                    )
+                {
+                    // simdgroup-matrix GEMM (SOFUU_GEMM_MMA8=1)
+                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                        eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
+                    }
+                } else if $tv.tensor_type == GGML_TYPE_Q4_K {
+                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                        eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
+                    }
                     g.engine.batch_gguf_b4(
                         &g.w_buf, gguf.data_offset + $tv.offset,
                         &g.act_buf, $x_off,
@@ -3331,7 +3510,7 @@ impl TransformerModel {
                 &g.act_buf, g.slots.xn,
                 dim, norm_eps, b,
             );
-            let qkv_ok = gemm_fused_dec!(
+            let qkv_ok = b <= 4 && gemm_fused_dec!(
                 [
                     (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
                     (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
@@ -3385,7 +3564,12 @@ impl TransformerModel {
                     head_dim as u32, n_heads as u32, n_kv_heads as u32,
                     max_seq_len as u32,
                 );
+                // `llama_attn_1c_b4` is WRONG for pos >= 128 (LEDGER #64/#65: it agrees with
+                // the split pair only below one 128-position chunk). Gate it to the range it
+                // is actually valid for rather than letting it corrupt long prompts.
+                let one_chunk_pos = start_pos + b - 1 < 128;
                 let fused = flashed || (fuse_on
+                    && one_chunk_pos
                     && g.engine.batch_llama_attn_1c_b4(
                         &g.act_buf, g.slots.qa,
                         &g.k_buf, kc_layer,
@@ -3448,7 +3632,7 @@ impl TransformerModel {
             }
             if !g.skip_ffn {
             ffn_ops += 1;
-            let gu_ok = gemm_fused_dec!(
+            let gu_ok = b <= 4 && gemm_fused_dec!(
                 [
                     (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
                     (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
@@ -3598,6 +3782,51 @@ impl TransformerModel {
         };
 
         let pref_bytes = g.pref_bytes;
+        if std::env::var_os("SOFUU_SLAB_DUMP").is_some() {
+            let n = 8.min(self.x.len());
+            eprintln!("[slab] x_cpu[0..{n}] = {:?}", &self.x[..n]);
+            eprintln!("[slab] slab[0..{n}]  = {:?} (off={})", &g.pref_f32(pslots.x, n), pslots.x);
+        }
+        // LEDGER #176: the act-slot zeroing lived inside gpu_forward_chain_core, which these
+        // wide-tile routes never call - so every earlier SOFUU_ZERO_ACT negative was meaningless
+        // here. Zero the act_buf slots HERE, next to the slab, and cover all 12 fields
+        // (including logits and xq8e, which the previous list missed).
+        if std::env::var_os("SOFUU_ZERO_ACT").is_some() {
+            let mut offs = vec![
+                g.slots.x, g.slots.posb, g.slots.xn, g.slots.qa, g.slots.ka, g.slots.va,
+                g.slots.ao, g.slots.xo, g.slots.gate, g.slots.up, g.slots.logits, g.slots.xq8e,
+            ];
+            offs.sort_unstable();
+            offs.dedup();
+            for w in offs.windows(2) {
+                if w[1] > w[0] {
+                    let n = (w[1] - w[0]) / 4;
+                    g.slot_f32_mut(w[0], n).fill(0.0);
+                }
+            }
+        }
+        // LEDGER #173 test: the MMA/GEMM slab is a DIFFERENT buffer from act_buf, so zeroing
+        // g.slots.* (SOFUU_ZERO_ACT) can never affect it. Zero the slab regions themselves,
+        // bounded by the next slot offset exactly like the act version.
+        if std::env::var_os("SOFUU_ZERO_SLAB").is_some() {
+            let mut offs = vec![
+                pslots.x, pslots.posb, pslots.xn, pslots.qa, pslots.ka,
+                pslots.va, pslots.ao, pslots.xo, pslots.gate, pslots.up, pslots.rope,
+            ];
+            offs.sort_unstable();
+            offs.dedup();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for w in offs.windows(2) {
+                if w[1] > w[0] {
+                    spans.push((w[0], (w[1] - w[0]) / 4));
+                }
+            }
+            for (a, n) in spans {
+                if n > 0 {
+                    g.pref_f32_mut(a, n).fill(0.0);
+                }
+            }
+        }
         let pbuf = match g.pref_buf.as_ref() {
             Some(pb) => pb,
             None => return false,
@@ -4473,7 +4702,21 @@ impl TransformerModel {
         Self::lookup_embedding(&self.gguf, &self.token_embd, token_id, dim, &mut self.x);
 
         // 2. Transformer layers
+        let __lt = if std::env::var_os("SOFUU_DEC_PROFILE").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.execute_layers(pos, 0, self.config.n_layers);
+        if let Some(t) = __lt {
+            let gpu = self.gpu.as_ref().map(|g| g.token_commit).unwrap_or(false);
+            eprintln!(
+                "[dp] pos={} layers={:.2}ms gpu_batch={}",
+                pos,
+                t.elapsed().as_secs_f64() * 1000.0,
+                gpu
+            );
+        }
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let token_head = self
@@ -5023,7 +5266,8 @@ impl GgufGpu {
         // GPU route) feeds q/k/v/o/ffn GEMVs through batch_gguf_b4 with
         // token-major [4][cols] x and [4][rows] y. The single-token client
         // uses row 0 of each region. ~3MB extra slab on 8B-sized models.
-        const SPEC_B: usize = 4;
+        // 16 rows per chain chunk: every activation slot below is sized from this.
+const SPEC_B: usize = 128;
         let slots = GgufGpuSlots {
             x: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
             posb: gguf_gpu_slot(&mut cursor, SPEC_B * 16),
@@ -5296,6 +5540,27 @@ impl GgufGpu {
         }
     }
 
+    /// LEDGER #173: mutable slab view, mirror of slot_f32_mut for pref_buf.
+    #[inline]
+    fn pref_f32_mut(&mut self, off: usize, n: usize) -> &mut [f32] {
+        unsafe {
+            let b = self.pref_buf.as_ref().expect("pref_f32_mut: no slab");
+            let base = crate::infer::metal::buffer_contents_raw(b);
+            std::slice::from_raw_parts_mut(base.add(off) as *mut f32, n)
+        }
+    }
+
+    /// LEDGER #164: read the PREFILL SLAB (pref_buf) from the CPU. Mirrors slot_f32_mut, which is
+    /// hard-wired to act_buf; the slab lives in its own buffer and needs the contents FFI.
+    #[inline]
+    fn pref_f32(&self, off: usize, n: usize) -> &[f32] {
+        unsafe {
+            let b = self.pref_buf.as_ref().expect("pref_f32: no slab");
+            let base = crate::infer::metal::buffer_contents_raw(b);
+            std::slice::from_raw_parts(base.add(off) as *const f32, n)
+        }
+    }
+
     #[inline]
     fn slot_f32(&self, off: usize, n: usize) -> &[f32] {
         unsafe {
@@ -5310,3 +5575,4 @@ impl GgufGpu {
         gguf.data_offset + tv.offset
     }
 }
+

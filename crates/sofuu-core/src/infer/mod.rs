@@ -1020,7 +1020,14 @@ impl InferEngine {
         // stream only on the Gguf backend's batched tile path; every other
         // backend falls back to a serial per-token speculative loop that
         // multiplies weight streams, so the flag is ignored there.
-        let mut ngram_cache = if options.lookahead && matches!(self.model.backend, ModelBackend::Gguf(_)) {
+        // See PLAN-TARGET-1200-1500.md 12c: speculation measured 2x SLOWER than serial decode on
+        // this machine (13.1 vs 28.0 tk/s, 3 runs each, identical greedy output), and the
+        // adaptive gate cannot see it because a spec step here costs ~2 serial forwards while
+        // its threshold is 1.15 tokens/step. Timing-based switching is forbidden (it would make
+        // greedy output depend on machine noise), so the default is OFF and constant.
+        // SOFUU_SPEC=1 re-enables the tree.
+        let spec_wanted = std::env::var("SOFUU_SPEC").map(|v| v == "1").unwrap_or(false);
+        let mut ngram_cache = if spec_wanted && options.lookahead && matches!(self.model.backend, ModelBackend::Gguf(_)) {
             let mut cache = lookahead::NgramCache::new(2048);
             cache.ingest_sequence(&input_tokens);
             Some(cache)
@@ -1050,6 +1057,10 @@ impl InferEngine {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(self.model.spec_min_accept_default());
+        // A2/W4: hoisted out of the generation loop (these were read once PER TOKEN).
+        let dec_profile = std::env::var_os("SOFUU_DEC_PROFILE").is_some();
+        let det_debug = std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some();
+        let gpu_profile_spec = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
         let mut spec_steps: u32 = 0;
         let mut spec_accepted: u32 = 0;
         let mut spec_disabled = false;
@@ -1244,7 +1255,7 @@ impl InferEngine {
 
                 let positions = tree.build_positions(cur_pos);
                 let ancestry_mask = tree.build_full_batch_ancestry_mask();
-                let prof_spec = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
+                let prof_spec = gpu_profile_spec;
                 let t_verify = std::time::Instant::now();
 
                 self.model.forward_speculative_tree(
@@ -1415,8 +1426,16 @@ impl InferEngine {
             } else {
                 // Standard baseline forward pass (1 token)
                 let t_serial = std::time::Instant::now();
-                let next_logits = self.model.forward(next_token, cur_pos);
-                if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() && step <= 2 {
+                let __dt = if dec_profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let next_logits = self.model.forward(next_token, cur_pos);
+        if let Some(t) = __dt {
+            eprintln!("[dp] pos={} forward={:.2}ms", cur_pos, t.elapsed().as_secs_f64() * 1000.0);
+        }
+                if det_debug && step <= 2 {
                     eprintln!(
                         "[determ] step {} tok {} pos {} logits[0..8] = {:?}",
                         step,
@@ -1425,10 +1444,28 @@ impl InferEngine {
                         &next_logits[..8.min(next_logits.len())]
                     );
                 }
+                // W3 probe: time everything AFTER forward returns (logits copy + sampler +
+                // token probe). If this carries the bulk of the wall time, the [dp] forward
+                // figure is encode-time only and the real wait is a late GPU sync.
+                let __rd = if dec_profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 logits_buf.copy_from_slice(next_logits);
+                let __cp = __rd.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 cur_pos += 1;
                 cur_token = sampler.sample(&mut logits_buf, &history);
+                let __sm = __rd.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 decode_step_probe(&logits_buf, "gen_serial", cur_pos, cur_token);
+                if let (Some(_), Some(cp), Some(sm)) = (__rd, __cp, __sm) {
+                    eprintln!(
+                        "[dp] tail copy={:.2}ms sampler={:.2}ms probe={:.2}ms",
+                        cp,
+                        sm - cp,
+                        __rd.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0) - sm
+                    );
+                }
                 serial_ns += t_serial.elapsed().as_nanos() as u64;
                 serial_tokens += 1;
             }

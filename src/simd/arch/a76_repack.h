@@ -97,6 +97,21 @@ struct tile_block_q8_Kx4 {
     int16_t bsums[QK_K / 4];
 };
 
+// 8-activation-row q8_K tile for the wider-batch q4_K prefill GEMM
+// (SOFUU_GEMM_BATCH_TILE=8, see the kernel section further down). Two 4-row
+// row groups in one block, with the per-(sb, half, kg) 16-byte row groups of
+// the upper 4 rows stored directly after the lower 4 — one 32-byte load then
+// fetches all 8 activation rows of a k group. Same bytes, same int8 values,
+// same d/bsums as two tile_block_q8_Kx4 blocks; bsums are stored as the
+// 32-k-half sums the kernels consume ([sb][row][half]).
+struct tile_block_q8_Kx8 {
+    float   d[8];
+    int8_t  qs[QK_K * 8];
+    int16_t bsums[QK_K / 4 * 2];
+};
+static_assert(sizeof(tile_block_q8_Kx8) == 2 * sizeof(tile_block_q8_Kx4),
+              "8-row act tile must not change the scratch unit");
+
 using tile_block_q4_K   = tile_block_q4_K;
 using tile_block_q6_K   = tile_block_q6_K;
 using tile_block_q8_0   = tile_block_q8_0;
@@ -3247,5 +3262,910 @@ void ggml_gemm_q4_K_8x4_q8_K_p(int n, float * __restrict s, size_t bs, const voi
 #endif
     ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }
+
+// ══════════ Apply-phase q4_K 8x4 GEMM (SOFUU_Q4K_APPLY2) ══════════
+// Same int8 operands, same int32 dot order and the same per-output arithmetic
+// as the nibble-plane kernel ggml_gemm_q4_K_8x4_q8_K_p, with the scale/bias
+// apply's instruction count cut down. It is bit-identical to it.
+//
+// What was removed (arm64 instruction census of the shipped build, per 64-k
+// sub-block of the 8x4 tile, i.e. per 128 sdot: packed 311, plane (_p) 303,
+// this kernel 244):
+//   * 36 instructions of per-(sub-block, half) 6-bit scale/min decode (two
+//     packed-word loads, ~16 and/orr bit extracts, 8 fmov/mov.s lane builds,
+//     6 sshll widenings). Those values are fixed per weight row and block, so
+//     they are decoded once at repack time into int32 sub-block scales and
+//     int16 mins, already in the 8-weight-row lane order the apply wants
+//     (2 ldr + 2 ldr per sub-block, no bit twiddling).
+//   * the load address arithmetic: the two nibble planes are re-laid so a
+//     (sub-block, k-group, weight-row half) pair is one 32 B chunk (lo plane
+//     in [0..15], hi in [16..31]) instead of two 16 B loads 1024 B apart, and
+//     the bsums come from the q8 registers by lane instead of a stack array
+//     read back with ld1r.
+//   * 8 registers of sbd_scale/sbd_min hoisting: they are rebuilt per
+//     sub-block, which keeps the 16 accumulators + 8 f32 accumulators in
+//     registers instead of spilling ~16 vectors per sub-block.
+//
+// Byte layout per 8-weight-row block: 16+16 d/dmin (f16, as in _p) + 256
+// int32 scales + 128 int16 mins + 2048 nibble planes = 2464 B, versus 2176
+// for the plane tile and 1344 for the default packed + T1-sidecar stream.
+//
+// Measured (M2 Pro, 4 pooled threads, sofuu_bench_gemm_plane = interleaved
+// variants in one run, batch 128, 21 iters, min GMAC/s):
+//     shape              packed   T1(_s)  planes  apply2
+//     1024x3072           435.8    416.8   494.8   551.1
+//     3072x1024           432.9    413.5   490.3   544.0
+//     1024x1024           431.7    412.5   488.8   545.4
+// i.e. +32% over the default T1 path and +11% over the plane tile, and the
+// outputs match the packed kernel float for float (0/393216 differ).
+//
+// End to end on a 1454-token prefill of a 0.6B Q4_K_M model this is much
+// smaller (interleaved, medians of the summed per-chunk gemm time: 1651 ms
+// default, 1590 ms plane tile, 1543 ms apply2 = -6.5%), because streaming the
+// bigger tile dominates: the kernel only reaches ~60 GB/s of the ~118 GB/s
+// this machine streams with 4 threads, so the extra bytes of a 2464 B block
+// eat most of the instruction win. Shrinking the block (packed nibbles +
+// int8 scales, ~1440 B) or doubling the activation tile is the next lever,
+// not more instruction cuts.
+//
+// Nothing about the int8 operands or the int32 dot order changes, and the
+// per-output arithmetic keeps the _p kernel's exact sequence
+//   sumf = f32( sc_lo*acc_lo + sc_hi*acc_hi )        (int32, exact)
+//   acc  = vfma(acc, d*q8_d, sumf)
+//   acc  = vmls(acc, f32(sum(b_min*bsums)), dmin*q8_d)
+// so the output is bit-identical (int32 mul+mla is exact, hence equal to the
+// _p kernel's mul+mul+add; verified live by sofuu_bench_gemm_plane and by the
+// end-to-end logits gate).
+struct tile_block_q4_Kx8q {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    int32_t  sc[8][8];         // [(sb*2+half)][row]: 6-bit scale, decoded
+    int16_t  mn[8][8];         // [(sb*2+half)][row]: 6-bit min, decoded
+    uint8_t  pl[4][8][2][32];  // [sb][k-group][weight-row half][0..15]=lo, [16..31]=hi
+};
+
+// Build the apply-phase tile from the stock packed 8-row tile. The scale/min
+// values come from the same decode_q_Kx8_6bit_scales the hot kernels call, so
+// they are bit-equal to what those kernels would compute; the plane bytes are
+// the same nibbles the _p repack writes (identical int8 operands).
+static inline void sofuu_fill_q4k_apply2_block(tile_block_q4_Kx8q * __restrict out,
+                                               const tile_block_q4_Kx8 * __restrict in) {
+    memcpy(out->d, in->d, sizeof(out->d));
+    memcpy(out->dmin, in->dmin, sizeof(out->dmin));
+    for (int g = 0; g < (QK_K / 64) * 2; g++) {          // g = sb*2 + half
+        int8_t    aux[8];
+        int16x8_t mins;
+        decode_q_Kx8_6bit_scales(&in->scales[g * 12], &mins, aux);
+        for (int r = 0; r < 8; r++) out->sc[g][r] = (int32_t) aux[r];
+        vst1q_s16(out->mn[g], mins);
+    }
+    for (int sb = 0; sb < QK_K / 64; sb++) {
+        for (int kg = 0; kg < 8; kg++) {
+            // 32 B hold rows 0..3 then rows 4..7, four k values per row; byte
+            // j carries both nibbles, so lo/hi come from the same byte.
+            const uint8_t * q = in->qs + sb * QK_K + 32 * kg;
+            for (int hw = 0; hw < 2; hw++) {
+                for (int j = 0; j < 16; j++) {
+                    out->pl[sb][kg][hw][j]      = (uint8_t) (q[16 * hw + j] & 0x0F);
+                    out->pl[sb][kg][hw][j + 16] = (uint8_t) (q[16 * hw + j] >> 4);
+                }
+            }
+        }
+    }
+}
+
+// Written as a whole-tile pass so the warm path can split it by 8-row group
+// (the repack is a pure per-group shuffle, same as the other q4_K tiles).
+static inline int sofuu_repack_q4k_8bl_apply2_range(uint8_t * dst, const uint8_t * src,
+                                                    int64_t nblocks, int64_t r8_begin,
+                                                    int64_t r8_end, unsigned interleave = 4) {
+    tile_block_q4_Kx8q * d = (tile_block_q4_Kx8q *) dst + r8_begin * nblocks;
+    const tile_block_q4_K * s = (const tile_block_q4_K *) src + r8_begin * 8 * nblocks;
+    tile_block_q4_K tmp[8];
+    for (int64_t b = r8_begin; b < r8_end; b++) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < 8; i++) tmp[i] = s[x + i * nblocks];
+            tile_block_q4_Kx8 blk = make_block_q4_Kx8(tmp, interleave);
+            sofuu_fill_q4k_apply2_block(d, &blk);
+            d++;
+        }
+        s += 8 * nblocks;
+    }
+    return 0;
+}
+
+static inline int sofuu_repack_q4k_8bl_apply2(uint8_t * dst, const uint8_t * src, int64_t nrow,
+                                              int64_t nblocks, unsigned interleave = 4) {
+    return sofuu_repack_q4k_8bl_apply2_range(dst, src, nblocks, 0, nrow / 8, interleave);
+}
+
+// Shape/gate for the variant: the kernel keeps the 8x4 tile, so the caller
+// gates are the same as the _p kernel's.
+void ggml_gemm_q4_K_8x4_q8_K_p2(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    constexpr int qk = QK_K;
+    const int     nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+    UNUSED(nb);
+
+    constexpr int q8_k_blocklen = 4;
+    constexpr int acc_size      = 2 * 4;   // 2 weight-row quads x 4 activation rows
+    constexpr int nsub          = QK_K / 64;
+
+    float32x4_t acc_f32[acc_size];
+
+    for (int y = 0; y < nr / q8_k_blocklen; y++) {
+        const tile_block_q8_Kx4 * __restrict q8_ptr = (const tile_block_q8_Kx4 *) vy + (y * nb);
+
+        for (int x = 0; x < nc / 8; x++) {
+            const tile_block_q4_Kx8q * __restrict q4_ptr = (const tile_block_q4_Kx8q *) vx + ((size_t) x * nb);
+
+            for (int i = 0; i < acc_size; i++) acc_f32[i] = vdupq_n_f32(0);
+
+            for (int b = 0; b < nb; b++) {
+                const float16x8_t d8    = vld1q_f16((const __fp16 *) q4_ptr[b].d);
+                const float16x8_t dm8   = vld1q_f16((const __fp16 *) q4_ptr[b].dmin);
+                const float32x4_t q4_d_0123 = vcvt_f32_f16(vget_low_f16(d8));
+                const float32x4_t q4_d_4567 = vcvt_f32_f16(vget_high_f16(d8));
+                const float32x4_t q4_m_0123 = vcvt_f32_f16(vget_low_f16(dm8));
+                const float32x4_t q4_m_4567 = vcvt_f32_f16(vget_high_f16(dm8));
+                const float32x4_t q8_d0 = vld1q_f32(q8_ptr[b].d);
+
+                // The per-(activation row, weight-row quad) scale products
+                // (the _p kernel's sbd_scale) are rebuilt in the apply instead
+                // of being hoisted: 8 extra vmul per sub-block buys back the 8
+                // registers that otherwise spill the accumulators.
+
+                // Per-activation-row bsums (8 int16 = 4 sub-blocks x 2 halves),
+                // kept in registers and read with lane dups instead of being
+                // stored to a stack array and reloaded with ld1r.
+                int16x8_t bs[q8_k_blocklen];
+                for (int r = 0; r < q8_k_blocklen; r++) {
+                    bs[r] = vpaddq_s16(vld1q_s16(q8_ptr[b].bsums + 16 * r),
+                                       vld1q_s16(q8_ptr[b].bsums + 16 * r + 8));
+                }
+
+                int32x4_t bias_acc[acc_size];
+                for (int i = 0; i < acc_size; i++) bias_acc[i] = vdupq_n_s32(0);
+
+                for (int sb = 0; sb < nsub; sb++) {
+                    int32x4_t acc_lo[acc_size], acc_hi[acc_size];
+                    for (int i = 0; i < acc_size; i++) {
+                        acc_lo[i] = vdupq_n_s32(0);
+                        acc_hi[i] = vdupq_n_s32(0);
+                    }
+                    // Pre-decoded scales/mins: 2 + 2 loads, no bit extraction.
+                    const int32x4x2_t scl = vld1q_s32_x2(q4_ptr[b].sc[sb * 2]);
+                    const int32x4x2_t sch = vld1q_s32_x2(q4_ptr[b].sc[sb * 2 + 1]);
+                    const int16x8_t   mnl = vld1q_s16(q4_ptr[b].mn[sb * 2]);
+                    const int16x8_t   mnh = vld1q_s16(q4_ptr[b].mn[sb * 2 + 1]);
+
+                    const int8_t * __restrict q8lo = q8_ptr[b].qs + sb * 256;
+                    // Plane bytes are walked linearly (32 B per weight-row half,
+                    // lo then hi) so the compiler can use post-increment loads
+                    // instead of materialising 16 addresses per sub-block.
+                    const int8_t * __restrict plp = (const int8_t *) q4_ptr[b].pl[sb][0][0];
+
+                    for (int k = 0; k < 8; k++) {
+                        const int8x16_t q8_blk0 = vld1q_s8(q8lo + 16 * k);
+                        const int8x16_t q8_blk1 = vld1q_s8(q8lo + 16 * k + 128);
+                        for (int hw = 0; hw < 2; hw++) {
+                            // lo plane (4 rows) then hi plane (4 rows); two
+                            // plain loads so both use the base register with an
+                            // immediate offset (an ld1 pair cannot).
+                            const int8x16_t w_lo = vld1q_s8(plp);
+                            const int8x16_t w_hi = vld1q_s8(plp + 16);
+                            plp += 32;
+                            const int b0 = 4 * hw;
+                            acc_lo[b0 + 0] = vdotq_laneq_s32(acc_lo[b0 + 0], w_lo, q8_blk0, 0);
+                            acc_lo[b0 + 1] = vdotq_laneq_s32(acc_lo[b0 + 1], w_lo, q8_blk0, 1);
+                            acc_lo[b0 + 2] = vdotq_laneq_s32(acc_lo[b0 + 2], w_lo, q8_blk0, 2);
+                            acc_lo[b0 + 3] = vdotq_laneq_s32(acc_lo[b0 + 3], w_lo, q8_blk0, 3);
+                            acc_hi[b0 + 0] = vdotq_laneq_s32(acc_hi[b0 + 0], w_hi, q8_blk1, 0);
+                            acc_hi[b0 + 1] = vdotq_laneq_s32(acc_hi[b0 + 1], w_hi, q8_blk1, 1);
+                            acc_hi[b0 + 2] = vdotq_laneq_s32(acc_hi[b0 + 2], w_hi, q8_blk1, 2);
+                            acc_hi[b0 + 3] = vdotq_laneq_s32(acc_hi[b0 + 3], w_hi, q8_blk1, 3);
+                        }
+                    }
+
+                    // Scale apply + bias accumulation, same op order as _p
+                    // (int32 scale products are exact; vmla == mul+mul+add).
+                    // Unrolled over the 4 activation rows because the bsums
+                    // lane dups need constant lane indices.
+#define SOFUU_Q4K_APPLY2_ROW(R)                                                                 \
+    do {                                                                                        \
+        const int16x4_t b_lo = vdup_n_s16(vgetq_lane_s16(bs[sb], 2 * (R)));                       \
+        const int16x4_t b_hi = vdup_n_s16(vgetq_lane_s16(bs[sb], 2 * (R) + 1));                   \
+        const float32x4_t sumf_0123 = vcvtq_f32_s32(                                             \
+            vmlaq_s32(vmulq_s32(scl.val[0], acc_lo[(R)]), sch.val[0], acc_hi[(R)]));             \
+        acc_f32[2 * (R)] = vfmaq_f32(acc_f32[2 * (R)],                                           \
+            vmulq_laneq_f32(q4_d_0123, q8_d0, (R)), sumf_0123);                                  \
+        const float32x4_t sumf_4567 = vcvtq_f32_s32(                                             \
+            vmlaq_s32(vmulq_s32(scl.val[1], acc_lo[(R) + 4]), sch.val[1], acc_hi[(R) + 4]));     \
+        acc_f32[2 * (R) + 1] = vfmaq_f32(acc_f32[2 * (R) + 1],                                   \
+            vmulq_laneq_f32(q4_d_4567, q8_d0, (R)), sumf_4567);                                  \
+        bias_acc[2 * (R)]     = vmlal_s16(bias_acc[2 * (R)], b_lo, vget_low_s16(mnl));            \
+        bias_acc[2 * (R)]     = vmlal_s16(bias_acc[2 * (R)], b_hi, vget_low_s16(mnh));            \
+        bias_acc[2 * (R) + 1] = vmlal_s16(bias_acc[2 * (R) + 1], b_lo, vget_high_s16(mnl));       \
+        bias_acc[2 * (R) + 1] = vmlal_s16(bias_acc[2 * (R) + 1], b_hi, vget_high_s16(mnh));       \
+    } while (0)
+                    SOFUU_Q4K_APPLY2_ROW(0);
+                    SOFUU_Q4K_APPLY2_ROW(1);
+                    SOFUU_Q4K_APPLY2_ROW(2);
+                    SOFUU_Q4K_APPLY2_ROW(3);
+#undef SOFUU_Q4K_APPLY2_ROW
+                }  // for sb
+
+                // Bias step, same op order as _p: f32(exact int32 sum) times
+                // (dmin * q8_d), subtracted once per 256-element block.
+                const float32x4_t sm0 = vmulq_laneq_f32(q4_m_0123, q8_d0, 0);
+                const float32x4_t sm1 = vmulq_laneq_f32(q4_m_4567, q8_d0, 0);
+                const float32x4_t sm2 = vmulq_laneq_f32(q4_m_0123, q8_d0, 1);
+                const float32x4_t sm3 = vmulq_laneq_f32(q4_m_4567, q8_d0, 1);
+                const float32x4_t sm4 = vmulq_laneq_f32(q4_m_0123, q8_d0, 2);
+                const float32x4_t sm5 = vmulq_laneq_f32(q4_m_4567, q8_d0, 2);
+                const float32x4_t sm6 = vmulq_laneq_f32(q4_m_0123, q8_d0, 3);
+                const float32x4_t sm7 = vmulq_laneq_f32(q4_m_4567, q8_d0, 3);
+                acc_f32[0] = vmlsq_f32(acc_f32[0], vcvtq_f32_s32(bias_acc[0]), sm0);
+                acc_f32[1] = vmlsq_f32(acc_f32[1], vcvtq_f32_s32(bias_acc[1]), sm1);
+                acc_f32[2] = vmlsq_f32(acc_f32[2], vcvtq_f32_s32(bias_acc[2]), sm2);
+                acc_f32[3] = vmlsq_f32(acc_f32[3], vcvtq_f32_s32(bias_acc[3]), sm3);
+                acc_f32[4] = vmlsq_f32(acc_f32[4], vcvtq_f32_s32(bias_acc[4]), sm4);
+                acc_f32[5] = vmlsq_f32(acc_f32[5], vcvtq_f32_s32(bias_acc[5]), sm5);
+                acc_f32[6] = vmlsq_f32(acc_f32[6], vcvtq_f32_s32(bias_acc[6]), sm6);
+                acc_f32[7] = vmlsq_f32(acc_f32[7], vcvtq_f32_s32(bias_acc[7]), sm7);
+            }  // for b
+
+            for (int i = 0; i < q8_k_blocklen; i++) {
+                const int row = y * q8_k_blocklen + i;
+                for (int j = 0; j < 2; j++) {
+                    const size_t offset = (size_t) row * bs + (size_t) x * 8 + j * 4;
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[2 * i + j]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                    }
+                }
+            }
+        }  // for x
+    }  // for y
+    return;
+#endif
+    ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// ══════════ Wider batch tile: 8 activation rows per weight load ══════════
+// The 8x4 tile loads each 8-weight-row block once per 4 activation rows, so a
+// prefill over N activation rows streams the whole weight tile set N/4 times
+// (0.6B model: 212 MB of tile + sidecar bytes -> 6.8 GB per 128-token chunk),
+// and the obvious lever is the activation dimension of the tile: 8 activation
+// rows per weight load halves it.
+//
+// Measured caveat, see gemm_batch8_enabled() in infer_kernels.cpp: at 4 threads
+// the 8x4 kernel already runs at ~420 GMAC/s, ~98% of the issue rate this code
+// reaches over cache-resident weights, and only ~58 of the ~85 GB/s the machine
+// sustains, so halving the stream does not shorten the GEMM — interleaved pairs
+// measure parity (569 vs 571 tk/s end to end). This is a bandwidth reduction,
+// not a speedup. The sections below document what it took to keep it
+// bit-identical; they are dead code unless SOFUU_GEMM_BATCH_TILE=8.
+//
+// Register budget is what caps the tile shape. One int32x4 accumulator holds a
+// (4 weight rows x 1 activation row) int32 dot sum, and the low/high nibble
+// halves need separate accumulators (different 6-bit sub-block scales), so a
+// tile needs 2 * (weight_rows/4) * activation_rows int32x4 accumulators: 8x4
+// already uses 16, and a full 8x8 tile would need 32 — the whole register file,
+// before the 8 f32 accumulators. This kernel therefore keeps 4 weight rows per
+// pass (16 int32x4 accumulators, the same count as 8x4) and walks the two
+// 4-row halves of the SAME 8-row weight block. Bytes per output element are
+// unchanged by that split (one 2176 B plane block feeds both halves and stays
+// in L1 between them: nb * 2176 B), while the activation rows per weight load
+// double.
+//
+// The bias term (weight mins x activation bsums) is accumulated after the dot
+// loops instead of inside them so its 8 int32x4 accumulators do not compete
+// with the 16 dot accumulators; int32 sums are exact and order-independent, so
+// the value is the one the 8x4 kernel forms inside its sub-block loop.
+//
+// Bit-identity: every int32 accumulator sums exactly the same int8 products as
+// the 8x4 kernel, and the per-output-element scale/bias apply below is the same
+// op sequence on the same f32 values with 8 activation lanes instead of 4, so
+// no output bit changes. OPT-IN via SOFUU_GEMM_BATCH_TILE=8 (see
+// gemm_batch8_enabled in infer_kernels.cpp); default OFF. Verified offline by
+// memcmp against both 8x4 kernels over 9 shapes, with and without in_acc.
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+
+// 8-row activation quantizer: identical per-row amax/iscale/rounding/bsums math
+// to ggml_quantize_mat_q8_K_4x4_neon (see its design notes above), stored into
+// the interleaved 8-row layout. bsums are summed straight into the 32-k halves
+// the kernels consume with int16 adds only (|sum| <= 32*127), which is the same
+// value the 4-row path derives inside the kernel with vpaddq_s16.
+static inline void ggml_quantize_mat_q8_K_8rows_neon(const float * __restrict x, void * __restrict vy, int64_t k) {
+    assert(QK_K == 256);
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    tile_block_q8_Kx8 * __restrict y = (tile_block_q8_Kx8 *) vy;
+    const float32x4_t f32_magic = vdupq_n_f32(12582912.0f);
+    const int32x4_t i32_magic = vreinterpretq_s32_f32(f32_magic); // 0x4B400000 bit pattern
+
+    for (int i = 0; i < nb; i++) {
+        float iscale[8];
+        for (int row_iter = 0; row_iter < 8; row_iter++) {
+            const float *row = x + row_iter * k + i * QK_K;
+            float32x4_t va = vabsq_f32(vld1q_f32(row));
+            for (int j = 4; j < QK_K; j += 4) {
+                va = vmaxq_f32(va, vabsq_f32(vld1q_f32(row + j)));
+            }
+            const float amax = vmaxvq_f32(va);
+
+            float max = 0.0f;
+            if (amax > 0.0f) {
+                for (int j = 0; j < QK_K; j++) {
+                    if (fabsf(row[j]) == amax) { max = row[j]; break; }
+                }
+            }
+            iscale[row_iter] = amax ? -127.f / max : 0;
+            y[i].d[row_iter] = amax ? 1 / iscale[row_iter] : 0;
+        }
+
+        memset(y[i].bsums, 0, sizeof(y[i].bsums));
+
+        for (int t = 0; t < QK_K / 4; t++) {
+            int16x4_t qs16[8];
+            for (int s = 0; s < 8; s++) {
+                const float32x4_t q = vmulq_n_f32(vld1q_f32(x + s * k + i * QK_K + 4 * t), iscale[s]);
+                const int32x4_t val = vsubq_s32(vreinterpretq_s32_f32(vaddq_f32(q, f32_magic)), i32_magic);
+                qs16[s] = vmovn_s32(val);
+                // bsums slot: sub-block (t>>4), row s, 32-k half ((t>>2)&3)>>1 —
+                // both 16-k groups of a half accumulate into the same int16 slot.
+                y[i].bsums[16 * (t >> 4) + 2 * s + (((t >> 2) & 3) >> 1)] += (int16_t) vaddvq_s32(val);
+            }
+            vst1q_s8(y[i].qs + 32 * t,
+                     vcombine_s8(vmovn_s16(vcombine_s16(qs16[0], qs16[1])),
+                                 vmovn_s16(vcombine_s16(qs16[2], qs16[3]))));
+            vst1q_s8(y[i].qs + 32 * t + 16,
+                     vcombine_s8(vmovn_s16(vcombine_s16(qs16[4], qs16[5])),
+                                 vmovn_s16(vcombine_s16(qs16[6], qs16[7]))));
+        }
+    }
+}
+
+// Shared body for both weight-tile flavours: PLANE = pre-expanded nibble-plane
+// tile (tile_block_q4_Kx8p, self-contained scales), !PLANE = stock packed tile
+// with the T1 pre-decoded scale section (tile_ss_q4_Kx8s).
+template <bool PLANE>
+static void ggml_gemm_q4_K_8x8_q8_K_impl(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                                         const void * __restrict ss, const void * __restrict vy, int nr, int nc,
+                                         const float * in_acc) {
+    constexpr int qk = QK_K;
+    const int     nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nr % 8 == 0);
+    assert(nc % 8 == 0);
+    UNUSED(nb);
+
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+
+    for (int y = 0; y < nr / 8; y++) {
+        const tile_block_q8_Kx8 * __restrict q8_ptr = (const tile_block_q8_Kx8 *) vy + (size_t) y * nb;
+
+        for (int x = 0; x < nc / 8; x++) {
+            const tile_block_q4_Kx8p * __restrict q4p = (const tile_block_q4_Kx8p *) vx + (size_t) x * nb;
+            const tile_block_q4_Kx8  * __restrict q4s = (const tile_block_q4_Kx8 *)  vx + (size_t) x * nb;
+            const tile_ss_q4_Kx8s    * __restrict ssp = (const tile_ss_q4_Kx8s *)    ss + (size_t) x * nb;
+            UNUSED(q4p); UNUSED(q4s); UNUSED(ssp);
+
+            for (int hw = 0; hw < 2; hw++) {  // 4-weight-row half of the 8-row block
+                float32x4_t acc_f32[8];
+                for (int r = 0; r < 8; r++) acc_f32[r] = vdupq_n_f32(0);
+
+                for (int b = 0; b < nb; b++) {
+                    const uint16_t *dptr    = nullptr;
+                    const uint16_t *dminptr = nullptr;
+                    if constexpr (PLANE) { dptr = q4p[b].d;    dminptr = q4p[b].dmin; }
+                    else                 { dptr = q4s[b].d;    dminptr = q4s[b].dmin; }
+
+                    const float32x4_t q4_d    = vcvt_f32_f16(vld1_f16((const __fp16 *) dptr + 4 * hw));
+                    const float32x4_t q4_dmin = vcvt_f32_f16(vld1_f16((const __fp16 *) dminptr + 4 * hw));
+                    const float32x4_t q8_d0   = vld1q_f32(q8_ptr[b].d);
+                    const float32x4_t q8_d1   = vld1q_f32(q8_ptr[b].d + 4);
+
+                    for (int sb = 0; sb < QK_K / 64; sb++) {
+                        // Int accumulators for the qs vecdot (4 weight rows x 8 act rows)
+                        int32x4_t acc_lo[8], acc_hi[8];
+                        for (int r = 0; r < 8; r++) {
+                            acc_lo[r] = vdupq_n_s32(0);
+                            acc_hi[r] = vdupq_n_s32(0);
+                        }
+
+                        // Per-(sub-block, 32-k half) scales/mins for these 4 weight rows
+                        // (8-lane decode split by the weight-row half, as in 8x4).
+                        int16x4_t isc_lo = vdup_n_s16(0), isc_hi = vdup_n_s16(0);
+                        float32x4_t fsc_lo = vdupq_n_f32(0), fsc_hi = vdupq_n_f32(0);
+                        int16x4_t mins_lo = vdup_n_s16(0), mins_hi = vdup_n_s16(0);
+                        if constexpr (PLANE) {
+                            int8_t    aux[2][8];
+                            int16x8_t mins[2];
+                            decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24], &mins[0], aux[0]);
+                            decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24 + 12], &mins[1], aux[1]);
+                            const int16x8_t sc8_lo = vmovl_s8(vld1_s8(aux[0]));
+                            const int16x8_t sc8_hi = vmovl_s8(vld1_s8(aux[1]));
+                            isc_lo  = hw ? vget_high_s16(sc8_lo) : vget_low_s16(sc8_lo);
+                            isc_hi  = hw ? vget_high_s16(sc8_hi) : vget_low_s16(sc8_hi);
+                            mins_lo = hw ? vget_high_s16(mins[0]) : vget_low_s16(mins[0]);
+                            mins_hi = hw ? vget_high_s16(mins[1]) : vget_low_s16(mins[1]);
+                        } else {
+                            const __fp16 * sbp = ssp[b].sb_scale + (size_t) sb * 16 + 4 * hw;
+                            fsc_lo  = vcvt_f32_f16(vld1_f16(sbp));
+                            fsc_hi  = vcvt_f32_f16(vld1_f16(sbp + 8));
+                            const int16x8_t m8_lo = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ssp[b].sb_min + (size_t) sb * 16)));
+                            const int16x8_t m8_hi = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ssp[b].sb_min + (size_t) sb * 16 + 8)));
+                            mins_lo = hw ? vget_high_s16(m8_lo) : vget_low_s16(m8_lo);
+                            mins_hi = hw ? vget_high_s16(m8_hi) : vget_low_s16(m8_hi);
+                        }
+
+                        const int8_t * __restrict q8lo = q8_ptr[b].qs + (size_t) sb * 512;
+                        const int8_t * __restrict q8hi = q8lo + 256;
+
+                        constexpr int reads_per_sb = 8;
+                        for (int kg = 0; kg < reads_per_sb; kg++) {
+                            // 32 B = both 4-activation-row groups of this k group.
+                            const int8x16x2_t a_lo = vld1q_s8_x2(q8lo + 32 * kg);
+                            const int8x16x2_t a_hi = vld1q_s8_x2(q8hi + 32 * kg);
+
+                            int8x16_t w_lo, w_hi;
+                            if constexpr (PLANE) {
+                                // Pre-expanded nibble planes: identical int8 vectors
+                                // to the packed tile's vand/vshr outputs.
+                                const uint32_t poff = (uint32_t) ((sb * 8 + kg) * 32 + 16 * hw);
+                                w_lo = vld1q_s8((const int8_t *) (q4p[b].qs_lo + poff));
+                                w_hi = vld1q_s8((const int8_t *) (q4p[b].qs_hi + poff));
+                            } else {
+                                const uint8x16_t p = vld1q_u8(q4s[b].qs + sb * QK_K + 32 * kg + 16 * hw);
+                                w_lo = vreinterpretq_s8_u8(vandq_u8(p, m4b));
+                                w_hi = vreinterpretq_s8_u8(vshrq_n_u8(p, 4));
+                            }
+
+                            acc_lo[0] = vdotq_laneq_s32(acc_lo[0], w_lo, a_lo.val[0], 0);
+                            acc_lo[1] = vdotq_laneq_s32(acc_lo[1], w_lo, a_lo.val[0], 1);
+                            acc_lo[2] = vdotq_laneq_s32(acc_lo[2], w_lo, a_lo.val[0], 2);
+                            acc_lo[3] = vdotq_laneq_s32(acc_lo[3], w_lo, a_lo.val[0], 3);
+                            acc_lo[4] = vdotq_laneq_s32(acc_lo[4], w_lo, a_lo.val[1], 0);
+                            acc_lo[5] = vdotq_laneq_s32(acc_lo[5], w_lo, a_lo.val[1], 1);
+                            acc_lo[6] = vdotq_laneq_s32(acc_lo[6], w_lo, a_lo.val[1], 2);
+                            acc_lo[7] = vdotq_laneq_s32(acc_lo[7], w_lo, a_lo.val[1], 3);
+
+                            acc_hi[0] = vdotq_laneq_s32(acc_hi[0], w_hi, a_hi.val[0], 0);
+                            acc_hi[1] = vdotq_laneq_s32(acc_hi[1], w_hi, a_hi.val[0], 1);
+                            acc_hi[2] = vdotq_laneq_s32(acc_hi[2], w_hi, a_hi.val[0], 2);
+                            acc_hi[3] = vdotq_laneq_s32(acc_hi[3], w_hi, a_hi.val[0], 3);
+                            acc_hi[4] = vdotq_laneq_s32(acc_hi[4], w_hi, a_hi.val[1], 0);
+                            acc_hi[5] = vdotq_laneq_s32(acc_hi[5], w_hi, a_hi.val[1], 1);
+                            acc_hi[6] = vdotq_laneq_s32(acc_hi[6], w_hi, a_hi.val[1], 2);
+                            acc_hi[7] = vdotq_laneq_s32(acc_hi[7], w_hi, a_hi.val[1], 3);
+                        }
+
+                        // Scale apply — same op sequence as the matching 8x4 kernel.
+                        // Unrolled because the vmul/vdot lane forms need constant
+                        // lane indices (activation row R uses lane R & 3 of its
+                        // 4-row q8 d vector).
+#define SOFUU_Q4K_8X8_SCALE_ROW(R, Q8D)                                                          \
+    do {                                                                                         \
+        float32x4_t sumf;                                                                        \
+        if constexpr (PLANE) {                                                                    \
+            sumf = vcvtq_f32_s32(vaddq_s32(vmulq_s32(vmovl_s16(isc_lo), acc_lo[R]),              \
+                                           vmulq_s32(vmovl_s16(isc_hi), acc_hi[R])));            \
+        } else {                                                                                 \
+            sumf = vaddq_f32(vmulq_f32(fsc_lo, vcvtq_f32_s32(acc_lo[R])),                        \
+                             vmulq_f32(fsc_hi, vcvtq_f32_s32(acc_hi[R])));                       \
+        }                                                                                        \
+        acc_f32[R] = vfmaq_f32(acc_f32[R], vmulq_laneq_f32(q4_d, Q8D, (R) & 3), sumf);          \
+    } while (0)
+                        SOFUU_Q4K_8X8_SCALE_ROW(0, q8_d0);
+                        SOFUU_Q4K_8X8_SCALE_ROW(1, q8_d0);
+                        SOFUU_Q4K_8X8_SCALE_ROW(2, q8_d0);
+                        SOFUU_Q4K_8X8_SCALE_ROW(3, q8_d0);
+                        SOFUU_Q4K_8X8_SCALE_ROW(4, q8_d1);
+                        SOFUU_Q4K_8X8_SCALE_ROW(5, q8_d1);
+                        SOFUU_Q4K_8X8_SCALE_ROW(6, q8_d1);
+                        SOFUU_Q4K_8X8_SCALE_ROW(7, q8_d1);
+#undef SOFUU_Q4K_8X8_SCALE_ROW
+                    }  // for sb
+
+                    // Bias term (exact int32 accumulation of mins x bsums), then
+                    // the same vmlsq the 8x4 kernel runs at the end of each block.
+                    int32x4_t bias_acc[8];
+                    for (int r = 0; r < 8; r++) bias_acc[r] = vdupq_n_s32(0);
+                    for (int sb = 0; sb < QK_K / 64; sb++) {
+                        int16x4_t mins_lo, mins_hi;
+                        if constexpr (PLANE) {
+                            int8_t    aux[8];
+                            int16x8_t mins;
+                            decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24], &mins, aux);
+                            mins_lo = hw ? vget_high_s16(mins) : vget_low_s16(mins);
+                            decode_q_Kx8_6bit_scales(&q4p[b].scales[sb * 24 + 12], &mins, aux);
+                            mins_hi = hw ? vget_high_s16(mins) : vget_low_s16(mins);
+                        } else {
+                            const int16x8_t m8_lo = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ssp[b].sb_min + (size_t) sb * 16)));
+                            const int16x8_t m8_hi = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(ssp[b].sb_min + (size_t) sb * 16 + 8)));
+                            mins_lo = hw ? vget_high_s16(m8_lo) : vget_low_s16(m8_lo);
+                            mins_hi = hw ? vget_high_s16(m8_hi) : vget_low_s16(m8_hi);
+                        }
+                        for (int r = 0; r < 8; r++) {
+                            const int16x4_t bsums_lo = vdup_n_s16(q8_ptr[b].bsums[16 * sb + 2 * r]);
+                            const int16x4_t bsums_hi = vdup_n_s16(q8_ptr[b].bsums[16 * sb + 2 * r + 1]);
+                            bias_acc[r] = vmlal_s16(bias_acc[r], bsums_lo, mins_lo);
+                            bias_acc[r] = vmlal_s16(bias_acc[r], bsums_hi, mins_hi);
+                        }
+                    }
+#define SOFUU_Q4K_8X8_MIN_ROW(R, Q8D) \
+    acc_f32[R] = vmlsq_f32(acc_f32[R], vcvtq_f32_s32(bias_acc[R]), vmulq_laneq_f32(q4_dmin, Q8D, (R) & 3))
+                    SOFUU_Q4K_8X8_MIN_ROW(0, q8_d0);
+                    SOFUU_Q4K_8X8_MIN_ROW(1, q8_d0);
+                    SOFUU_Q4K_8X8_MIN_ROW(2, q8_d0);
+                    SOFUU_Q4K_8X8_MIN_ROW(3, q8_d0);
+                    SOFUU_Q4K_8X8_MIN_ROW(4, q8_d1);
+                    SOFUU_Q4K_8X8_MIN_ROW(5, q8_d1);
+                    SOFUU_Q4K_8X8_MIN_ROW(6, q8_d1);
+                    SOFUU_Q4K_8X8_MIN_ROW(7, q8_d1);
+#undef SOFUU_Q4K_8X8_MIN_ROW
+                }  // for b
+
+                for (int r = 0; r < 8; r++) {
+                    const size_t offset = (size_t) (y * 8 + r) * bs + (size_t) x * 8 + 4 * hw;
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), acc_f32[r]));
+                    } else {
+                        vst1q_f32(s + offset, acc_f32[r]);
+                    }
+                }
+            }  // for hw
+        }  // for x
+    }  // for y
+}
+
+// Nibble-plane weight tile (tile_block_q4_Kx8p), 8 weight rows x 8 act rows.
+void ggml_gemm_q4_K_8x8_q8_K_p(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                               const void * __restrict vy, int nr, int nc, const float * in_acc) {
+    ggml_gemm_q4_K_8x8_q8_K_impl<true>(n, s, bs, vx, nullptr, vy, nr, nc, in_acc);
+}
+
+// Stock packed weight tile (tile_block_q4_Kx8) + T1 scale section, 8x8.
+void ggml_gemm_q4_K_8x8_q8_K_s(int n, float * __restrict s, size_t bs, const void * __restrict vx,
+                               const void * __restrict ss, const void * __restrict vy, int nr, int nc,
+                               const float * in_acc) {
+    ggml_gemm_q4_K_8x8_q8_K_impl<false>(n, s, bs, vx, ss, vy, nr, nc, in_acc);
+}
+
+#endif  // __aarch64__ && __ARM_NEON && __ARM_FEATURE_DOTPROD
+
+// ══════════ i8mm (FEAT_I8MM / SMMLA) q4_K prefill GEMM ══════════
+// SMMLA (vmmlaq_s32) computes a 2-wt x 2-act block of 8-element int8 dots per
+// instruction (32 MACs) from operands laid out as two 8-byte rows:
+//   w[16] = [wt row 2p, k0..k7][wt row 2p+1, k0..k7]
+//   a[16] = [act row 2q, k0..k7][act row 2q+1, k0..k7]
+//   lanes = (w2p,a2q) (w2p,a2q+1) (w2p+1,a2q) (w2p+1,a2q+1)
+// so both tiles need an 8-k-grouped layout: the SDOT plane tile groups 4 k per
+// byte lane and the q8_Kx4 tile groups 4 k per row, hence the two new tile
+// types below. The int32 partial sums are exact and order-independent, so the
+// i8mm kernel is bit-identical to the SDOT plane kernel provided every int32
+// product / f32 fma per output element is unchanged — the scale apply is the
+// same elementwise op sequence, only the lanes are permuted (gated by
+// sofuu_test_gemm_q4_K_i8mm in infer_kernels.cpp).
+//
+// Weight tile: same d/dmin/scales header as tile_block_q4_Kx8p; plane byte x of
+// the 16B group (sb, kg, p) is the nibble of (row 2p+(x>>3), k = sb*64 +
+// half*32 + kg*8 + (x&7)) — byte-identical values to the SDOT planes, regrouped.
+struct tile_block_q4_Kx8i {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    uint8_t  scales[96];
+    uint8_t  qs_lo[1024];  // SMMLA form, 16B = rows 2p,2p+1 x 8 k
+    uint8_t  qs_hi[1024];
+};
+
+// Activation tile: qs holds 16B = rows 2q,2q+1 x 8 k per (sb, kg); bsums holds
+// the per-(sb, batch-pair, half) sums already broadcast to the SMMLA lane
+// pattern, so the bias path needs no scalar shuffling in the hot loop.
+struct tile_block_q8_Kx4i {
+    float   d[4];
+    int8_t  qs[1024];
+    int16_t bsums[64];  // [((sb*2+q)*2+half)*4 + lane] = [b(2q),b(2q+1),b(2q),b(2q+1)]
+};
+
+static inline int sofuu_repack_q4k_8bl_i8mm_range(uint8_t * dst, const uint8_t * src, int64_t nblocks, int64_t r8_begin, int64_t r8_end) {
+    tile_block_q4_Kx8i * d = (tile_block_q4_Kx8i *) dst + r8_begin * nblocks;
+    const tile_block_q4_K * s = (const tile_block_q4_K *) src + r8_begin * 8 * nblocks;
+    tile_block_q4_K tmp[8];
+    for (int64_t b = r8_begin; b < r8_end; b++) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < 8; i++) tmp[i] = s[x + i * nblocks];
+            // Reuse the stock repacker for d/dmin/scales (bit-identical 6-bit
+            // group packing to every other q4_K tile).
+            tile_block_q4_Kx8 blk = make_block_q4_Kx8(tmp, 4);
+            memcpy(d->d, blk.d, sizeof(d->d));
+            memcpy(d->dmin, blk.dmin, sizeof(d->dmin));
+            memcpy(d->scales, blk.scales, sizeof(d->scales));
+            for (int sb = 0; sb < QK_K / 64; sb++) {
+                for (int half = 0; half < 2; half++) {
+                    for (int kg = 0; kg < 4; kg++) {
+                        for (int p = 0; p < 4; p++) {
+                            uint8_t * o = (half ? d->qs_hi : d->qs_lo) + (((sb * 4 + kg) * 4 + p) * 16);
+                            for (int x = 0; x < 16; x++) {
+                                const int r = 2 * p + (x >> 3);
+                                // k = sb*64 + half*32 + kg*8 + (x&7)  ->  the q4_K
+                                // row byte e = (k/64)*32 + (k%32), nibble by half.
+                                const int e = sb * 32 + kg * 8 + (x & 7);
+                                const uint8_t byte = tmp[r].qs[e];
+                                o[x] = (uint8_t)(half ? (byte >> 4) : (byte & 0x0F));
+                            }
+                        }
+                    }
+                }
+            }
+            d++;
+        }
+        s += 8 * nblocks;
+    }
+    return 0;
+}
+
+static inline int sofuu_repack_q4k_8bl_i8mm(uint8_t * dst, const uint8_t * src, int64_t nrow, int64_t nblocks) {
+    return sofuu_repack_q4k_8bl_i8mm_range(dst, src, nblocks, 0, nrow / 8);
+}
+
+// NEON activation quantizer for the SMMLA q8_K tile: the same per-256 block
+// quantization as ggml_quantize_mat_q8_K_4x4_neon (identical d, identical int8
+// values and bsums — only the store offsets differ), so the int8 operands are
+// the same bytes the SDOT path uses.
+static inline void ggml_quantize_mat_q8_K_4x4_i8mm_neon(const float * __restrict x, void * __restrict vy, int64_t k) {
+#if defined(__ARM_NEON)
+    assert(QK_K == 256);
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    tile_block_q8_Kx4i * __restrict y = (tile_block_q8_Kx4i *) vy;
+    const float32x4_t f32_magic = vdupq_n_f32(12582912.0f);
+    const int32x4_t i32_magic = vreinterpretq_s32_f32(f32_magic);
+
+    for (int i = 0; i < nb; i++) {
+        float iscale[4];
+        for (int row_iter = 0; row_iter < 4; row_iter++) {
+            const float *row = x + row_iter * k + i * QK_K;
+            float32x4_t va = vabsq_f32(vld1q_f32(row));
+            for (int j = 4; j < QK_K; j += 4) {
+                va = vmaxq_f32(va, vabsq_f32(vld1q_f32(row + j)));
+            }
+            const float amax = vmaxvq_f32(va);
+
+            float max = 0.0f;
+            if (amax > 0.0f) {
+                for (int j = 0; j < QK_K; j++) {
+                    if (fabsf(row[j]) == amax) { max = row[j]; break; }
+                }
+            }
+            iscale[row_iter] = amax ? -127.f / max : 0;
+            y[i].d[row_iter] = amax ? 1 / iscale[row_iter] : 0;
+        }
+
+        int16_t raw[QK_K / 4];
+        memset(raw, 0, sizeof(raw));
+
+        // 8-k group G: qs[G/8*256 + (G%8)*32 + row*8 + x] = row's k = G*8+x.
+        // Rows are 8-byte strides apart inside the 16B SMMLA operand pair.
+        for (int G = 0; G < QK_K / 8; G++) {
+            int16x4_t qs16[4][2];
+            for (int h = 0; h < 2; h++) {
+                const int t = 2 * G + h;
+                for (int s = 0; s < 4; s++) {
+                    const float32x4_t q = vmulq_n_f32(vld1q_f32(x + s * k + i * QK_K + 4 * t), iscale[s]);
+                    const int32x4_t val = vsubq_s32(vreinterpretq_s32_f32(vaddq_f32(q, f32_magic)), i32_magic);
+                    qs16[s][h] = vmovn_s32(val);
+                    const int idx = 4 * s + (t >> 4) * 16 + ((t >> 2) & 3);  // identical to the SDOT tile
+                    raw[idx] = (int16_t)(raw[idx] + (int16_t)vaddvq_s32(val));
+                }
+            }
+            uint8_t * o = (uint8_t *) (y[i].qs + ((G >> 3) * 256 + (G & 7) * 32));
+            for (int s = 0; s < 4; s++)
+                vst1_s8((int8_t *) (o + s * 8), vmovn_s16(vcombine_s16(qs16[s][0], qs16[s][1])));
+        }
+        // bsums: the SDOT kernels' bsums_arr[sb][l] = raw[sb*16+l] + raw[sb*16+l+8]
+        // (a vpaddq_s16 of the two halves), indexed [2*batch_row + half]; store
+        // that value pre-broadcast to the SMMLA accumulator lane pattern.
+        for (int sb = 0; sb < QK_K / 64; sb++) {
+            int16_t a8[8];
+            // vpaddq_s16 is a PAIRWISE add over the concatenated halves:
+            //   l < 4: raw[2l]     + raw[2l+1]        (row l, its two 16-groups)
+            //   l >= 4: raw[8+2(l-4)] + raw[8+2(l-4)+1]  (rows 2,3)
+            for (int l = 0; l < 4; l++) a8[l]     = (int16_t)(raw[sb * 16 + 2 * l] + raw[sb * 16 + 2 * l + 1]);
+            for (int l = 4; l < 8; l++) a8[l]     = (int16_t)(raw[sb * 16 + 8 + 2 * (l - 4)] + raw[sb * 16 + 9 + 2 * (l - 4)]);
+            for (int q = 0; q < 2; q++) {
+                for (int half = 0; half < 2; half++) {
+                    const int16_t v0 = a8[4 * q + half];
+                    const int16_t v1 = a8[4 * q + 2 + half];
+                    int16_t * o = y[i].bsums + ((sb * 2 + q) * 2 + half) * 4;
+                    o[0] = v0; o[1] = v1; o[2] = v0; o[3] = v1;
+                }
+            }
+        }
+    }
+#else
+    (void) x; (void) vy; (void) k;
+#endif
+}
+
+// ── i8mm q4_K 8x4 x q8_K GEMM ───────────────────────────────────────────────
+// Tile shape: 8 weight rows x 4 batch rows per call (nc=8, nr%4==0), 16 int32
+// accumulators (4 weight pairs x 2 batch pairs x lo/hi nibble plane) — the same
+// footprint as the SDOT plane kernel, so the loop structure and the per-b/per-sb
+// float apply are unchanged. Compiled with a per-function i8mm target attribute
+// (this build's -march is armv8.2-a+fp16+dotprod, which does not define
+// __ARM_FEATURE_I8MM); the dispatcher takes it only when the CPU implements
+// FEAT_I8MM, otherwise the SDOT plane kernel below runs unchanged.
+// Per-function target attribute: this build's -march is armv8.2-a+fp16+dotprod
+// (crates/sofuu-ffi/build.rs FP16_MARCH), which does not define
+// __ARM_FEATURE_I8MM, so the kernel body needs the feature added locally. Only
+// clang accepts this spelling here, so builds without __ARM_FEATURE_I8MM *and*
+// without clang compile the declaration only (SOFUU_HAVE_GEMM_I8MM stays
+// undefined) and the dispatcher never selects the path.
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) &&     (defined(__ARM_FEATURE_I8MM) || defined(__clang__))
+#define SOFUU_HAVE_GEMM_I8MM 1
+#endif
+
+#if defined(SOFUU_HAVE_GEMM_I8MM)
+#if !defined(__ARM_FEATURE_I8MM)
+__attribute__((target("i8mm")))
+#endif
+void ggml_gemm_q4_K_8x4_q8_K_i8mm(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc) {
+    constexpr int qk = QK_K;
+    const int     nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    constexpr int q8_k_blocklen = 4;
+
+    for (int y = 0; y < nr / q8_k_blocklen; y++) {
+        const tile_block_q8_Kx4i * __restrict q8_ptr = (const tile_block_q8_Kx4i *) vy + (y * nb);
+
+        for (int x = 0; x < nc / 8; x++) {
+            const tile_block_q4_Kx8i * __restrict q4_ptr = (const tile_block_q4_Kx8i *) vx + (x * nb);
+
+            // acc[q][p] lanes: (w2p,a2q) (w2p,a2q+1) (w2p+1,a2q) (w2p+1,a2q+1)
+            float32x4_t acc_f32[2][4];
+            for (int q = 0; q < 2; q++)
+                for (int p = 0; p < 4; p++) acc_f32[q][p] = vdupq_n_f32(0);
+
+            for (int b = 0; b < nb; b++) {
+                const float32x4_t q4_d_0123    = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].d));
+                const float32x4_t q4_d_4567    = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].d + 4));
+                const float32x4_t q8_d         = vld1q_f32(q8_ptr[b].d);
+                const float32x4_t q4_dmin_0123 = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].dmin));
+                const float32x4_t q4_dmin_4567 = vcvt_f32_f16(vld1_f16((const __fp16 *) q4_ptr[b].dmin + 4));
+
+                // Lane-shaped scale factors: dwp[p] = [dw2p,dw2p,dw2p+1,dw2p+1],
+                // dq[q] = [dq2q,dq2q+1,dq2q,dq2q+1]; the products are the same
+                // per-element f32 values the SDOT kernel forms with vmulq_laneq.
+                float32x4_t dwp[4], dminp[4], dq[2];
+                dwp[0]   = vzip1q_f32(q4_d_0123, q4_d_0123);
+                dwp[1]   = vzip2q_f32(q4_d_0123, q4_d_0123);
+                dwp[2]   = vzip1q_f32(q4_d_4567, q4_d_4567);
+                dwp[3]   = vzip2q_f32(q4_d_4567, q4_d_4567);
+                dminp[0] = vzip1q_f32(q4_dmin_0123, q4_dmin_0123);
+                dminp[1] = vzip2q_f32(q4_dmin_0123, q4_dmin_0123);
+                dminp[2] = vzip1q_f32(q4_dmin_4567, q4_dmin_4567);
+                dminp[3] = vzip2q_f32(q4_dmin_4567, q4_dmin_4567);
+                dq[0]    = vcombine_f32(vget_low_f32(q8_d), vget_low_f32(q8_d));
+                dq[1]    = vcombine_f32(vget_high_f32(q8_d), vget_high_f32(q8_d));
+
+                float32x4_t sbd_min[2][4];
+                for (int q = 0; q < 2; q++)
+                    for (int p = 0; p < 4; p++) sbd_min[q][p] = vmulq_f32(dminp[p], dq[q]);
+
+                int32x4_t bias_acc[2][4];
+                for (int q = 0; q < 2; q++)
+                    for (int p = 0; p < 4; p++) bias_acc[q][p] = vdupq_n_s32(0);
+
+                for (int sb = 0; sb < QK_K / 64; sb++) {
+                    int32x4_t acc_lo[2][4], acc_hi[2][4];
+                    for (int q = 0; q < 2; q++)
+                        for (int p = 0; p < 4; p++) {
+                            acc_lo[q][p] = vdupq_n_s32(0);
+                            acc_hi[q][p] = vdupq_n_s32(0);
+                        }
+
+                    const int8_t * __restrict ab = q8_ptr[b].qs + sb * 256;
+                    const int8_t * __restrict wlo = (const int8_t *) (q4_ptr[b].qs_lo + sb * 256);
+                    const int8_t * __restrict whi = (const int8_t *) (q4_ptr[b].qs_hi + sb * 256);
+
+                    for (int kg = 0; kg < 4; kg++) {
+                        const int8x16_t a_lo0 = vld1q_s8(ab + kg * 32);
+                        const int8x16_t a_lo1 = vld1q_s8(ab + kg * 32 + 16);
+                        const int8x16_t a_hi0 = vld1q_s8(ab + kg * 32 + 128);
+                        const int8x16_t a_hi1 = vld1q_s8(ab + kg * 32 + 144);
+                        const int8_t * w = wlo + kg * 64;
+                        const int8_t * v = whi + kg * 64;
+                        for (int p = 0; p < 4; p++) {
+                            const int8x16_t w_lo = vld1q_s8(w + p * 16);
+                            const int8x16_t w_hi = vld1q_s8(v + p * 16);
+                            acc_lo[0][p] = vmmlaq_s32(acc_lo[0][p], w_lo, a_lo0);
+                            acc_lo[1][p] = vmmlaq_s32(acc_lo[1][p], w_lo, a_lo1);
+                            acc_hi[0][p] = vmmlaq_s32(acc_hi[0][p], w_hi, a_hi0);
+                            acc_hi[1][p] = vmmlaq_s32(acc_hi[1][p], w_hi, a_hi1);
+                        }
+                    }
+
+                    // 6-bit group decode + lane-shaped int16/int32 scales/mins
+                    int16x8_t q4sb_mins[2];
+                    int16x4_t scl[2][4];   // [half][p] int16 = [s2p,s2p,s2p+1,s2p+1]
+                    int16x4_t mnb[2][4];
+                    for (int h = 0; h < 2; h++) {
+                        int8_t aux_q4sb[8];
+                        decode_q_Kx8_6bit_scales(&q4_ptr[b].scales[sb * 24 + h * 12], &q4sb_mins[h], aux_q4sb);
+                        const int8x8_t sv = vld1_s8(aux_q4sb);
+                        const int16x8_t s16 = vmovl_s8(sv);
+                        const int16x4_t sl = vzip1_s16(vget_low_s16(s16), vget_low_s16(s16));
+                        const int16x4_t sh = vzip2_s16(vget_low_s16(s16), vget_low_s16(s16));
+                        const int16x4_t tl = vzip1_s16(vget_high_s16(s16), vget_high_s16(s16));
+                        const int16x4_t th = vzip2_s16(vget_high_s16(s16), vget_high_s16(s16));
+                        scl[h][0] = sl; scl[h][1] = sh; scl[h][2] = tl; scl[h][3] = th;
+                        const int16x4_t m0 = vget_low_s16(q4sb_mins[h]);
+                        const int16x4_t m1 = vget_high_s16(q4sb_mins[h]);
+                        mnb[h][0] = vzip1_s16(m0, m0);
+                        mnb[h][1] = vzip2_s16(m0, m0);
+                        mnb[h][2] = vzip1_s16(m1, m1);
+                        mnb[h][3] = vzip2_s16(m1, m1);
+                    }
+
+                    for (int q = 0; q < 2; q++) {
+                        const int16x4_t bs_lo = vld1_s16(q8_ptr[b].bsums + ((sb * 2 + q) * 2 + 0) * 4);
+                        const int16x4_t bs_hi = vld1_s16(q8_ptr[b].bsums + ((sb * 2 + q) * 2 + 1) * 4);
+                        for (int p = 0; p < 4; p++) {
+                            const int32x4_t isum =
+                                vaddq_s32(vmulq_s32(vmovl_s16(scl[0][p]), acc_lo[q][p]),
+                                          vmulq_s32(vmovl_s16(scl[1][p]), acc_hi[q][p]));
+                            const float32x4_t sumf = vcvtq_f32_s32(isum);
+                            acc_f32[q][p] = vfmaq_f32(acc_f32[q][p], vmulq_f32(dwp[p], dq[q]), sumf);
+                            bias_acc[q][p] = vmlal_s16(bias_acc[q][p], bs_lo, mnb[0][p]);
+                            bias_acc[q][p] = vmlal_s16(bias_acc[q][p], bs_hi, mnb[1][p]);
+                        }
+                    }
+                }  // for sb
+
+                for (int q = 0; q < 2; q++)
+                    for (int p = 0; p < 4; p++)
+                        acc_f32[q][p] = vmlsq_f32(acc_f32[q][p], vcvtq_f32_s32(bias_acc[q][p]), sbd_min[q][p]);
+            }  // for b
+
+            // lanes -> (batch row, 4 weight cols): vuzp1 = even lanes (batch 2q),
+            // vuzp2 = odd lanes (batch 2q+1).
+            float32x4_t rowv[4][2];
+            for (int q = 0; q < 2; q++) {
+                rowv[2 * q][0]     = vuzp1q_f32(acc_f32[q][0], acc_f32[q][1]);
+                rowv[2 * q][1]     = vuzp1q_f32(acc_f32[q][2], acc_f32[q][3]);
+                rowv[2 * q + 1][0] = vuzp2q_f32(acc_f32[q][0], acc_f32[q][1]);
+                rowv[2 * q + 1][1] = vuzp2q_f32(acc_f32[q][2], acc_f32[q][3]);
+            }
+            for (int i = 0; i < q8_k_blocklen; i++) {
+                const int row = y * q8_k_blocklen + i;
+                for (int j = 0; j < 2; j++) {
+                    const int col    = x * 8 + j * 4;
+                    const int offset = row * bs + col;
+                    if (in_acc) {
+                        vst1q_f32(s + offset, vaddq_f32(vld1q_f32(s + offset), rowv[i][j]));
+                    } else {
+                        vst1q_f32(s + offset, rowv[i][j]);
+                    }
+                }
+            }
+        }  // for x
+    }  // for y
+}
+#else
+void ggml_gemm_q4_K_8x4_q8_K_i8mm(int n, float * __restrict s, size_t bs, const void * __restrict vx, const void * __restrict vy, int nr, int nc, const float * in_acc);
+#endif
 
 #endif // SOFUU_ARCH_A76_REPACK_H

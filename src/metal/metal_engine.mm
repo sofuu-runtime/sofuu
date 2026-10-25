@@ -36,6 +36,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_llama_attn_w4;
     id<MTLComputePipelineState> pso_llama_attn_w8;
     id<MTLComputePipelineState> pso_llama_attn_w16;
+    id<MTLComputePipelineState> pso_llama_attn_w32;
     id<MTLComputePipelineState> pso_llama_attn_fast;
     id<MTLComputePipelineState> pso_gemv_q4_k_flat;
     id<MTLComputePipelineState> pso_add_rmsnorm_f32w;
@@ -50,9 +51,11 @@ struct MetalContext {
     bool pso_gemv_q4_k_v3_live;
     id<MTLComputePipelineState> pso_gemv_q4_k_v2;
     bool pso_gemv_q4_k_v2_live;
+    id<MTLComputePipelineState> pso_gemv_q4_k_b1blk;
     id<MTLComputePipelineState> pso_gemv_q4_k;
     id<MTLComputePipelineState> pso_gemv_q6_k;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4;
+    id<MTLComputePipelineState> pso_gemm_q4_k_mma8;
 
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
@@ -66,6 +69,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_head_rmsnorm_b4;
     id<MTLComputePipelineState> pso_llama_attn_part_b4;
     id<MTLComputePipelineState> pso_llama_attn_fin_b4;
+    id<MTLComputePipelineState> pso_llama_attn_pre_w32;
+    id<MTLComputePipelineState> pso_llama_attn_copy_b4;
     id<MTLComputePipelineState> pso_llama_attn_1c_b4;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4c2r;
     id<MTLComputePipelineState> pso_gemm_q4_k;
@@ -161,6 +166,24 @@ struct MetalContext {
 // barriers cost, because the decode chain has a real dependency at every step.
 static inline void sofuu_batch_barrier(MetalContext* ctx) {
     if (ctx->no_barrier) return;
+    // LEDGER #190: layer mode gets its barrier from sofuu_metal_batch_barrier_mark.
+    static int layer_mode = -1;
+    if (layer_mode < 0) {
+        const char* m = getenv("SOFUU_BARRIER_MODE");
+        layer_mode = (m && strcmp(m, "layer") == 0) ? 1 : 0;
+    }
+    if (layer_mode == 1) return;
+    // LEDGER #189 probe: emit the buffer barrier only every Nth call, to measure how many
+    // of the 168 per decode token are actually required. SOFUU_BARRIER_EVERY=1 is the
+    // shipped behaviour.
+    static int every = -2;
+    static unsigned long bcnt = 0;
+    if (every == -2) {
+        const char* e = getenv("SOFUU_BARRIER_EVERY");
+        every = e ? atoi(e) : 1;
+        if (every < 1) every = 1;
+    }
+    if (every > 1 && (bcnt++ % (unsigned long)every) != 0) return;
     [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
@@ -169,6 +192,76 @@ static inline void sofuu_batch_barrier(MetalContext* ctx) {
 // default.metallib (scripts/dist/ios.sh) can never disagree about which
 // kernels exist. See the note in crates/sofuu-ffi/build.rs.
 #include "kernels_metal.h"
+
+
+// Decode (b=1) q4_K GEMV kernel choice: gemv_q4_k_b1blk by default, SOFUU_GEMV_B1=0
+// restores the shipped per-row kernel for an A/B on one binary.
+static inline int sofuu_gemv_b1_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = getenv("SOFUU_GEMV_B1");
+        on = v ? atoi(v) : 4;
+    }
+    return on;
+}
+
+// Decode attention warps per query head: 32 (llama_attn_w32) by default, 16 (the
+// shipped llama_attn_w16) with SOFUU_ATTN_W32=0 for an A/B on one binary.
+static inline int sofuu_attn_w32_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = getenv("SOFUU_ATTN_W32");
+        on = v ? atoi(v) : 1;
+    }
+    return on;
+}
+
+// Prefill chunk attention: llama_attn_pre_w32 computes whole rows with an online
+// softmax over the K/V cache instead of llama_attn_part_b4's one-warp-per-
+// (row, head, key-chunk) three-pass sweep. SOFUU_PRE_ATTN=0 restores the old
+// pair; SOFUU_PRE_ATTN_RPT (1..4) sets how many consecutive rows share one K/V
+// stream.
+static inline int sofuu_pre_attn_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = getenv("SOFUU_PRE_ATTN");
+        on = v ? atoi(v) : 1;
+    }
+    return on;
+}
+
+// Highest max-position a chunk may contain for the whole-row fast path to run.
+// Default 128 = only the single-window range that is validated end to end; raise
+// it with SOFUU_PREW_MAXPOS once a wider sweep passes, and it doubles as the
+// rollback knob back to the shipped part/fin pair.
+static inline uint32_t sofuu_prew_maxpos(void) {
+    static long mp = -1;
+    if (mp < 0) {
+        const char* v = getenv("SOFUU_PREW_MAXPOS");
+        mp = v ? atol(v) : 128;
+    }
+    return (uint32_t)mp;
+}
+
+static inline uint sofuu_pre_attn_rpt(void) {
+    static long rpt = -1;
+    if (rpt < 0) {
+        const char* v = getenv("SOFUU_PRE_ATTN_RPT");
+        rpt = v ? atol(v) : 4;
+        if (rpt < 1) rpt = 1;
+        if (rpt > 4) rpt = 4;
+    }
+    return (uint)rpt;
+}
+
+
+extern "C" void sofuu_metal_batch_barrier_mark(void* ctx_ptr) {
+    if (!ctx_ptr) return;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil) return;
+    if (ctx->no_barrier) return;
+    [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
 
 bool sofuu_metal_available(void) {
     @autoreleasepool {
@@ -265,6 +358,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_bf16 = load_pso(@"gemv_bf16");
         ctx->pso_gemv_f16  = load_pso(@"gemv_f16");
         ctx->pso_gemv_f32  = load_pso(@"gemv_f32");
+        ctx->pso_gemm_q4_k_mma8 = load_pso(@"gemm_q4_k_mma8");
         ctx->pso_gemv_mlx4_f16  = load_pso(@"gemv_mlx4_affine_f16");
         ctx->pso_gemv_mlx4_bf16 = load_pso(@"gemv_mlx4_affine_bf16");
         ctx->pso_rmsnorm   = load_pso(@"rmsnorm");
@@ -277,6 +371,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_q8_0 = load_pso(@"gemv_q8_0");
         ctx->pso_gemv_q4_0 = load_pso(@"gemv_q4_0");
         ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
+        ctx->pso_gemv_q4_k_b1blk = load_pso(@"gemv_q4_k_b1blk");
         // SOFUU_Q4K_COALESCED=1 flips BOTH q4_K PSOs to the coalesced-lane
         // kernels — one kernel class per engine instance so serial, spec and
         // b4 GEMVs all share the same f32 summation order (text parity holds
@@ -304,6 +399,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_head_rmsnorm_b4     = load_pso(@"head_rmsnorm_b4");
         ctx->pso_llama_attn_part_b4  = load_pso(@"llama_attn_part_b4");
         ctx->pso_llama_attn_fin_b4   = load_pso(@"llama_attn_fin_b4");
+        ctx->pso_llama_attn_pre_w32  = load_pso(@"llama_attn_pre_w32");
+        ctx->pso_llama_attn_copy_b4  = load_pso(@"llama_attn_copy_b4");
         ctx->pso_llama_attn_1c_b4    = load_pso(@"llama_attn_1c_b4");
         ctx->pso_gemv_q4_k_b4c2r     = load_pso(@"gemv_q4_k_b4c2r");
         // class 1 = byte-lane coalesced; class 2 = 16B-span vec4 coalesced
@@ -320,6 +417,7 @@ void* sofuu_metal_init(void) {
             ctx->pso_llama_attn_w4 = load_pso(@"llama_attn_w4");
             ctx->pso_llama_attn_w8 = load_pso(@"llama_attn_w8");
             ctx->pso_llama_attn_w16 = load_pso(@"llama_attn_w16");
+            ctx->pso_llama_attn_w32 = load_pso(@"llama_attn_w32");
             ctx->pso_llama_attn_fast = load_pso(@"llama_attn_fast");
             ctx->pso_gemv_q4_k_flat = load_pso(@"gemv_q4_k_flat");
             ctx->pso_add_rmsnorm_f32w = load_pso(@"add_rmsnorm_f32w");
@@ -594,6 +692,8 @@ void sofuu_metal_buffer_free(void* buf_ptr) {
  * MTLCommandBufferErrorInternal, while f16/f32 kernels complete.) */
 static inline bool wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel) {
     [cmd waitUntilCompleted];
+    // LEDGER #154 probe: count waits per process (SOFUU_COMMIT_TRACE=1).
+    { static long g_waits = 0; g_waits++; if (getenv("SOFUU_COMMIT_TRACE") && (g_waits % 250 == 0)) fprintf(stderr, "[commit] waits=%ld kern=%s\n", g_waits, kernel); }
     if (cmd.status == MTLCommandBufferStatusError) {
         NSLog(@"Sofuu Metal: %s command buffer failed: %@", kernel, cmd.error);
         return false;
@@ -2425,6 +2525,33 @@ extern "C" int sofuu_metal_batch_gguf_b4multi(
     return 1;
 }
 
+int sofuu_metal_batch_gguf_mma8(void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset, void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t B) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    if (ctx->pso_gemm_q4_k_mma8 == nil) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mma8];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    uint bn = (uint)B;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 31) / 32, (B + 31) / 32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
 // P1 completion: multi-section q6_K b4 GEMV (same table as the q4_K one).
 extern "C" int sofuu_metal_batch_gguf6_b4multi(
     void* ctx_ptr,
@@ -3029,6 +3156,51 @@ void sofuu_metal_batch_llama_attn_part_b4(
     if (ctx->batch_enc == nil || !q_buf_ptr || !kc_buf_ptr || !vc_buf_ptr || !meta_buf_ptr) return;
     if (ctx->pso_llama_attn_part_b4 == nil) return;
     sofuu_batch_barrier(ctx);
+    // VALIDITY GATE (round 78): llama_attn_pre_w32 is only correct while the
+    // chunk's causal window is a SINGLE 128-key window (max position < 128).
+    // Measured on a 1-token-per-word prompt, max|delta| vs the CPU prefill:
+    //   tokens 126/127/128/129 -> 0.43/0.39/0.41/0.33   (correct)
+    //   tokens 130/136/150/200 -> 9.11/9.02/8.96/8.83   (wrong)
+    // and it is wrong for every row group size (rpt 1/2/4 identical), while the
+    // shipped part_b4+fin_b4 pair is correct at ALL positions (0.281 at 1454
+    // tokens). So the fast path is taken only where it is validated; beyond one
+    // window the pair runs. positions is a zero-copy buffer, so the bound is
+    // read on the host here instead of adding a kernel argument.
+    int pre_window_ok = 0;
+    if (sofuu_pre_attn_on() != 0 && ctx->pso_llama_attn_pre_w32 != nil && rows > 0u && pos_buf_ptr) {
+        id<MTLBuffer> pb = (__bridge id<MTLBuffer>)pos_buf_ptr;
+        if (pb.contents != NULL) {
+            const uint32_t* pp = (const uint32_t*)((const char*)pb.contents + pos_offset);
+            uint32_t maxpos = sofuu_prew_maxpos();
+            pre_window_ok = (pp[rows - 1u] < maxpos) ? 1 : 0;
+        }
+    }
+    if (pre_window_ok != 0
+        && head_dim <= 128u && n_kv_heads != 0u && n_heads % n_kv_heads == 0u && rows > 0u) {
+        uint rpt = sofuu_pre_attn_rpt();
+        // One threadgroup per (row, head) after the decode-kernel transplant:
+        // rpt is still passed (the kernel ignores it) but no longer shapes the grid.
+        uint groups = rows * n_heads;
+        uint r_n = rows;
+        [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_pre_w32];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:1];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_buf_ptr offset:vc_layer_offset atIndex:2];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:3];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)meta_buf_ptr offset:meta_offset atIndex:4];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:5];
+        [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:6];
+        [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:7];
+        [ctx->batch_enc setBytes:&n_kv_heads length:sizeof(uint) atIndex:8];
+        [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:9];
+        [ctx->batch_enc setBytes:&n_chunks_max length:sizeof(uint) atIndex:10];
+        [ctx->batch_enc setBytes:&meta_stride length:sizeof(uint) atIndex:11];
+        [ctx->batch_enc setBytes:&r_n length:sizeof(uint) atIndex:12];
+        [ctx->batch_enc setBytes:&rpt length:sizeof(uint) atIndex:13];
+        [ctx->batch_enc dispatchThreadgroups:sf_grid2d(groups)
+                        threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        return;
+    }
     [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_part_b4];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:1];
@@ -3062,6 +3234,29 @@ void sofuu_metal_batch_llama_attn_fin_b4(
     if (ctx->batch_enc == nil || !meta_buf_ptr || !out_buf_ptr) return;
     if (ctx->pso_llama_attn_fin_b4 == nil) return;
     sofuu_batch_barrier(ctx);
+    // Same validity gate as the part pass: the copy only matches when part took
+    // the whole-row fast path (single 128-key window).
+    int fin_window_ok = 0;
+    if (sofuu_pre_attn_on() != 0 && ctx->pso_llama_attn_copy_b4 != nil && rows > 0u && pos_buf_ptr) {
+        id<MTLBuffer> pb2 = (__bridge id<MTLBuffer>)pos_buf_ptr;
+        if (pb2.contents != NULL) {
+            const uint32_t* pp2 = (const uint32_t*)((const char*)pb2.contents + pos_offset);
+            fin_window_ok = (pp2[rows - 1u] < 128u) ? 1 : 0;
+        }
+    }
+    if (fin_window_ok != 0) {
+        [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_copy_b4];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)meta_buf_ptr offset:meta_offset atIndex:0];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:2];
+        [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:3];
+        [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:4];
+        [ctx->batch_enc setBytes:&n_chunks_max length:sizeof(uint) atIndex:5];
+        [ctx->batch_enc setBytes:&meta_stride length:sizeof(uint) atIndex:6];
+        [ctx->batch_enc dispatchThreadgroups:sf_grid2d(rows * n_heads)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        return;
+    }
     [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_fin_b4];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)meta_buf_ptr offset:meta_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
@@ -3307,6 +3502,35 @@ extern "C" int sofuu_metal_batch_llama_attn_w16(
     sofuu_batch_barrier(ctx);
     uint w_rem = (uint)(qln_offset & 255ULL) / 4u;
     if (ctx->attn_noop) { p = 0xFFFFFFFFu; }
+    // One threadgroup per query head, 32 warps deep (1024 threads). Decode attention
+    // here is bound by resident warps, not by K/V bandwidth: the 16-warp kernel ran
+    // the batch at 14.2 ms and this one at 10.3 ms, which puts the K/V stream at
+    // ~171 GB/s — this machine's measured streaming ceiling — so the remaining lever
+    // there is gone. Wider heads fall through to the shipped 16-warp kernel
+    // ("SOFUU_ATTN_W32=0" forces it back).
+    if (sofuu_attn_w32_on() != 0 && ctx->pso_llama_attn_w32 != nil
+        && head_dim <= 128u && n_kv != 0u && n_heads % n_kv == 0u) {
+        uint w_rem = (uint)(qln_offset & 255ULL) / 4u;
+        [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_w32];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:0];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_ptr offset:kc_offset atIndex:1];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_ptr offset:vc_offset atIndex:2];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qln_ptr offset:(qln_offset & ~255ULL) atIndex:3];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_ptr offset:out_offset atIndex:4];
+        [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:5];
+        [ctx->batch_enc setBytes:&has_norm length:sizeof(uint) atIndex:6];
+        [ctx->batch_enc setBytes:&p length:sizeof(uint) atIndex:7];
+        [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:8];
+        [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:9];
+        [ctx->batch_enc setBytes:&n_kv length:sizeof(uint) atIndex:10];
+        [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:11];
+        [ctx->batch_enc setBytes:&eps length:sizeof(float) atIndex:12];
+        [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:13];
+        [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:14];
+        [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        return 1;
+    }
     [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_w16];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_ptr offset:kc_offset atIndex:1];
@@ -3411,6 +3635,28 @@ int sofuu_metal_batch_gguf(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows == 0 || cols == 0) return 0;
+    // Decode (b=1) q4_K GEMV: one whole 144-byte block per thread. This is the
+    // measured winner over the shipped per-row kernel ("SOFUU_GEMV_B1=0" restores
+    // that one, which is also the fallback for any shape this branch declines).
+    if (ty == 12 && sofuu_gemv_b1_on() != 0 && ctx->pso_gemv_q4_k_b1blk != nil
+        && cols % 256 == 0 && cols <= 4096 && (w_offset & 15) == 0) {
+        uint nb = (uint)(cols >> 8);
+        uint rpt = 256u / nb;               // whole rows this threadgroup covers
+        sofuu_batch_barrier(ctx);
+        size_t aligned = w_offset & ~255ULL;
+        uint w_rem = (uint)(w_offset & 255ULL);
+        uint c = (uint)cols, r = (uint)rows;
+        [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_b1blk];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+        [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+        [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+        [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+        [ctx->batch_enc setBytes:&r length:sizeof(uint) atIndex:5];
+        [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + rpt - 1) / rpt, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return 1;
+    }
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
         case 8:  pso = ctx->pso_gemv_q8_0; break;
@@ -3876,4 +4122,10 @@ extern "C" int sofuu_metal_peak_mma(void* ctx_ptr, void* out_buf, size_t n_block
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1)
                                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
+}
+
+// LEDGER #164 probe: CPU-visible contents pointer of a Metal buffer (shared storage).
+extern "C" void* sofuu_metal_buffer_contents(void* buf) {
+    if (!buf) return NULL;
+    return [(id<MTLBuffer>)buf contents];
 }

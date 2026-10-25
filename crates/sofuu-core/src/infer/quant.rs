@@ -374,6 +374,23 @@ pub fn gemm_plane_parity(rows: usize, cols: usize, batch: usize) -> i32 {
     unsafe { sofuu_test_gemm_q4_k_plane_parity(rows as i32, cols as i32, batch as i32) }
 }
 
+/// Device micro-bench for the i8mm/SMMLA q4_K prefill kernel vs the SDOT
+/// nibble-plane kernel (kernel-only, identical synthetic tensors).
+/// Opt-in path: needs a FEAT_I8MM cpu and SOFUU_GEMM_I8MM=1 for the engine to
+/// build/use the tile (this bench builds its own tiles and checks the cpu).
+pub fn gemm_bench_i8mm(rows: usize, cols: usize, batch: usize, iters: usize) {
+    unsafe {
+        sofuu_bench_gemm_i8mm(rows as i32, cols as i32, batch as i32, iters as i32);
+    }
+}
+
+/// Bit-parity gate for the i8mm/SMMLA q4_K GEMM vs the SDOT nibble-plane
+/// kernel. Returns 0 when outputs are bit-identical, -2 when the cpu has no
+/// FEAT_I8MM (nothing to test), -1 on a bad shape.
+pub fn gemm_i8mm_parity(rows: usize, cols: usize, batch: usize) -> i32 {
+    unsafe { sofuu_test_gemm_q4_K_i8mm(rows as i32, cols as i32, batch as i32) }
+}
+
 /// Bit-parity gate for the T1 pre-decoded-scale tiles (gemm_s) vs the
 /// stock packed-tile kernel. Returns 0 when outputs are bit-identical.
 pub fn gemm_q4_s_parity(rows: usize, cols: usize, batch: usize) -> i32 {
@@ -576,7 +593,9 @@ extern "C" {
     fn sofuu_bench_gemm(ty: u32, rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_bench_gemv(ty: u32, rows: i32, cols: i32, iters: i32);
     fn sofuu_bench_gemm_plane(rows: i32, cols: i32, batch: i32, iters: i32);
+    fn sofuu_bench_gemm_i8mm(rows: i32, cols: i32, batch: i32, iters: i32);
     fn sofuu_test_gemm_q4_k_plane_parity(rows: i32, cols: i32, batch: i32) -> i32;
+    fn sofuu_test_gemm_q4_K_i8mm(rows: i32, cols: i32, batch: i32) -> i32;
     fn sofuu_test_q4_k_s_bit_exact(rows: i32, cols: i32, batch: i32) -> i32;
     // (sofuu_dequantize_row_q4_0 / _q8_0 are called from C++ only —
     // infer_kernels.cpp:2159/2329 — no Rust extern decl needed.)
@@ -2267,6 +2286,26 @@ mod tests {
         for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
             let r = gemm_plane_parity(rows, cols, 8);
             assert_eq!(r, 0, "nibble-plane q4_K GEMM diverged at {rows}x{cols}");
+        }
+    }
+
+    /// The i8mm/SMMLA q4_K GEMM must be bit-identical to the SDOT
+    /// nibble-plane kernel: vmmlaq_s32 only regroups the same int8 products
+    /// into different accumulator lanes (int32 MACs are exact and
+    /// order-independent) and the per-element scale/bias apply keeps the same
+    /// op sequence, so this guards the regrouping end to end.
+    #[test]
+    fn test_gemm_q4_k_i8mm_bit_exact() {
+        let _guard = tile_test_guard();
+        for (rows, cols) in [(64usize, 256usize), (64, 1024), (128, 3072)] {
+            let r = gemm_i8mm_parity(rows, cols, 8);
+            if r == -2 {
+                // No FEAT_I8MM on this host (or a non-aarch64 build): the
+                // kernel is runtime-gated and never dispatched here.
+                eprintln!("skipping i8mm parity: cpu reports no FEAT_I8MM");
+                return;
+            }
+            assert_eq!(r, 0, "i8mm q4_K GEMM diverged at {rows}x{cols}");
         }
     }
 

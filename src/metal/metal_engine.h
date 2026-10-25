@@ -254,6 +254,7 @@ int sofuu_metal_batch_llama_attn_1c_b4(void* ctx, void* q_buf, size_t q_offset, 
 int sofuu_metal_batch_gguf_b4r(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, void* acc_buf, size_t acc_offset, size_t rows, size_t cols, size_t acc_dim);
 // G2: GGUF dequant-dot GEMV in the live batch. ty: 2=q4_0 8=q8_0 12=q4_K 14=q6_K.
 int sofuu_metal_batch_gguf(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
+int sofuu_metal_batch_gguf_mma8(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t rows, size_t cols, size_t B);
 void sofuu_metal_batch_gguf_b4(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 int sofuu_metal_batch_gguf_gemm(void* ctx, uint32_t ty, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_peak_fma16(void* ctx, void* out_buf, size_t n_blocks);

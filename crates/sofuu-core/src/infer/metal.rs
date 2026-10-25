@@ -49,6 +49,16 @@ pub struct MetalEngine {
 unsafe impl Send for MetalEngine {}
 unsafe impl Sync for MetalEngine {}
 
+/// LEDGER #192: clears the decode-scoped flat-GEMV force on drop, so every return path
+/// (including the rejected-command-buffer ones) restores prefill behaviour.
+pub struct FlatGuard;
+
+impl Drop for FlatGuard {
+    fn drop(&mut self) {
+        MetalEngine::set_gemv_flat_forced(false);
+    }
+}
+
 impl MetalEngine {
     /// One dispatch for a group of independent q4_K projections that share x and
     /// cols: secs is {w_off, y_off, rows} per section.
@@ -597,6 +607,8 @@ impl Drop for MetalBuffer {
 // of op count. Ops chain y→x with zero CPU staging (caller-owned MTLBuffers).
 
 extern "C" {
+
+    fn sofuu_metal_batch_barrier_mark(ctx: *mut c_void);
     fn sofuu_metal_batch_open(ctx: *mut c_void) -> i32;
     fn sofuu_metal_batch_gemv(
         ctx: *mut c_void,
@@ -667,6 +679,13 @@ extern "C" {
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize,
     );
+    fn sofuu_metal_batch_gguf_mma8(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_gemm(
         ctx: *mut c_void,
         ty: u32,
@@ -1113,6 +1132,14 @@ extern "C" {
 
 impl MetalEngine {
     /// Open a batch: subsequent enqueue calls append to ONE command buffer.
+
+    /// LEDGER #190: emit the per-layer buffer barrier (one per layer, not per op).
+    pub fn batch_barrier_mark(&self) {
+        unsafe {
+            sofuu_metal_batch_barrier_mark(self.ctx);
+        }
+    }
+
     pub fn batch_open(&self) -> bool {
         unsafe { sofuu_metal_batch_open(self.ctx) == 0 }
     }
@@ -1242,7 +1269,7 @@ impl MetalEngine {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
             Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
         }
-        if ty == 12 && Self::gemv_flat_enabled() && cols % 256 == 0
+        if ty == 12 && (Self::gemv_flat_enabled() || Self::gemv_flat_forced()) && cols % 256 == 0
             && unsafe {
                 sofuu_metal_batch_gguf_gemv_q4k_flat(
                     self.ctx, w_buf.handle, w_offset, x_buf.handle, x_offset,
@@ -1424,6 +1451,37 @@ impl MetalEngine {
 
     /// GPU3: batched (B=4) q4_K GEMV. Token-major layouts match the
     /// engine's x_batch/y_batch slices: x[4][cols] -> y[4][rows].
+    pub fn mma8_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOFUU_GEMM_MMA8").map(|v| v == "1").unwrap_or(false))
+    }
+
+    pub fn batch_gguf_mma8(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer, y_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_GGUF_B4);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_mma8(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                y_buf.handle, y_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_B4, __t);
+        // LEDGER #179 test: serialise every MMA dispatch to test for a WAR hazard
+        // between the host's slab writes and the GPU's reads inside one deferred batch.
+        if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
+            self.sync();
+        }
+        __r
+    }
+
     pub fn batch_gguf_b4(
         &self,
         w_buf: &MetalBuffer, w_offset: usize,
@@ -2495,6 +2553,22 @@ impl MetalEngine {
     /// Flat one-dispatch q4_K GEMV. SOFUU_GEMV_FLAT=1 arms it. It is 3x faster than the
     /// shipped kernel in isolation (149 vs 49 GB/s on the same bytes) and 2% slower
     /// per token, so it stays off until something upstream changes.
+    /// LEDGER #192: the flat single-thread-per-(row,block) sweep measured 6->30+ GB/s
+    /// effective for decode (3/3 interleaved wins, +35% median) but 7-13% WORSE for
+    /// prefill, so it is armed only around a decode token, never globally.
+    fn flat_flag() -> &'static std::sync::atomic::AtomicBool {
+        static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        &F
+    }
+
+    fn gemv_flat_forced() -> bool {
+        Self::flat_flag().load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_gemv_flat_forced(on: bool) {
+        Self::flat_flag().store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn gemv_flat_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("SOFUU_GEMV_FLAT").map(|v| v == "1").unwrap_or(false))
@@ -8569,4 +8643,12 @@ fn attn_1c_values_micro_shape() {
     for (p, sz) in &ptrs {
         unsafe { libc::munmap(*p as *mut libc::c_void, *sz) };
     }
+}
+
+extern "C" {
+    fn sofuu_metal_buffer_contents(buf: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+pub unsafe fn buffer_contents_raw(buf: &MetalBuffer) -> *mut u8 {
+    sofuu_metal_buffer_contents(buf.handle) as *mut u8
 }

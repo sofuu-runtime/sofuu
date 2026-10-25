@@ -2596,8 +2596,17 @@
                savedChars: dropped, totalChars: total };
     }
 
+    var EV_SEQ = 0;
     function emit(kind, payload) {
       var e = { t: Date.now() - started, kind: kind };
+      /* R6 envelope (SPEC §7.2): identity + total order on every event,
+       * additive — existing consumers keep reading their inline fields. */
+      e.schema_version = 1;
+      e.seq = ++EV_SEQ;
+      e.ts = new Date().toISOString();
+      e.surface = 'js';
+      e.sid = 'agent';
+      e.turn_id = (typeof runId !== 'undefined' && runId) ? String(runId) : 'run';
       if (payload !== undefined) e.payload = payload;
       trace.push(e);
       if (traceStorage) {
@@ -2695,6 +2704,17 @@
       if (answer && answer.length > ANSWER_CAP_CHARS) answer = answer.slice(0, ANSWER_CAP_CHARS);
       var wall = Date.now() - started;
       own.wallMs = wall;
+      /* R2.6 (SPEC §7.2): every run terminates with exactly one terminal
+       * event — `stop`, carrying the resolution reason. The guard keeps it
+       * exactly-once if a cancel/error path already closed the run. */
+      if (!trace.some(function (e) { return e.kind === 'stop'; })) {
+        emit('stop', {
+          reason: stopped
+            ? (String(stopped).indexOf('budget_') === 0 ? 'budget'
+              : String(stopped) === 'cancelled' ? 'cancelled' : 'done')
+            : 'done',
+        });
+      }
       var res = {
         runId: runId, name: d.name, answer: answer || '',
         steps: stepsTotal, subRuns: subRuns,

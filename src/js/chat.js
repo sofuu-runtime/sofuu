@@ -99,7 +99,24 @@
   }
   function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
+  var EV_SEQ = 0;
   function emit(ev) {
+    /* R6 envelope (SPEC §7.2): additive identity on every chat event —
+     * hosts that only read inline fields keep working unchanged. */
+    if (ev && typeof ev === 'object') {
+      if (ev.schema_version === undefined) ev.schema_version = 1;
+      if (ev.seq === undefined) ev.seq = ++EV_SEQ;
+      if (ev.ts === undefined) {
+        try { ev.ts = new Date().toISOString(); } catch (eTs) { ev.ts = '1970-01-01T00:00:00Z'; }
+      }
+      if (ev.surface === undefined) ev.surface = 'js';
+      if (ev.sid === undefined) {
+        ev.sid = String(S.sid || S.sessionId || S.activeSessionId || S.project || 'chat');
+      }
+      if (ev.turn_id === undefined) {
+        ev.turn_id = String(ev.sid);
+      }
+    }
     if (typeof S.onEvent === 'function') {
       try { S.onEvent(ev); } catch (e) {} /* a dead sink never kills a turn */
     }

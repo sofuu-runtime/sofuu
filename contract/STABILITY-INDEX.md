@@ -141,10 +141,12 @@ Every public symbol carries exactly one tier. Do not edit by hand.
 | `sofuu.agent` | T1 | 25 | 12 |
 | `sofuu.ai` | T1 | 21 | 13 |
 | `sofuu.aotEval` | T3 | 1 | 0 |
+| `sofuu.async` | T2 | 4 | 0 |
 | `sofuu.buffer` | T3 | 1 | 0 |
 | `sofuu.capabilities` | T1 | 1 | 1 |
 | `sofuu.chat` | T1 | 18 | 16 |
 | `sofuu.context` | T2 | 1 | 0 |
+| `sofuu.events` | T2 | 6 | 0 |
 | `sofuu.extractor` | T3 | 7 | 0 |
 | `sofuu.fs` | T1 | 9 | 8 |
 | `sofuu.http` | T1 | 3 | 2 |
@@ -218,6 +220,15 @@ Every public symbol carries exactly one tier. Do not edit by hand.
 | `streamLocal` | T1 |
 | `transcribe` | T1 |
 
+### `sofuu.async` members
+
+| member | tier |
+|---|---|
+| `childDeadline` | T2 |
+| `codes` | T2 |
+| `limits` | T2 |
+| `makeError` | T2 |
+
 ### `sofuu.chat` members
 
 | member | tier |
@@ -240,6 +251,17 @@ Every public symbol carries exactly one tier. Do not edit by hand.
 | `state` | T1 |
 | `submit` | T1 |
 | `usage` | T1 |
+
+### `sofuu.events` members
+
+| member | tier |
+|---|---|
+| `append` | T2 |
+| `read` | T2 |
+| `reconstruct` | T2 |
+| `redact` | T2 |
+| `schema` | T2 |
+| `validate` | T2 |
 
 ### `sofuu.extractor` members
 

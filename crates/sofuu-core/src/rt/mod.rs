@@ -39,6 +39,8 @@ pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod async_context; // Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP
+pub mod events; // P2 (R6): the unified event envelope + session event log
+pub mod async_contract; // P2 (R2): one error taxonomy, nested deadlines, queue bounds
 pub mod syntax; // Phase 5 (agent plan): sofuu.parse - parse-only gate for file edits
 pub mod bytecode; // Phase 6 (agent plan): sofuu.aotEval - AOT bytecode snapshots for agent scripts
 pub mod engine; // M10: engine.c + sofuu.c + repl.c (boot, loader, Sofuu aliases, eval, destroy)

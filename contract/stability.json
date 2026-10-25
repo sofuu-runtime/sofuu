@@ -134,6 +134,19 @@
             "glob": "T1", "list_dir": "T1", "bash": "T1", "code_eval": "T1", "todo_write": "T1"
           }
         },
+        "sofuu.events": {
+          "tier": "T2",
+          "members": {
+            "schema": "T2", "validate": "T2", "redact": "T2",
+            "append": "T2", "read": "T2", "reconstruct": "T2"
+          }
+        },
+        "sofuu.async": {
+          "tier": "T2",
+          "members": {
+            "makeError": "T2", "childDeadline": "T2", "limits": "T2", "codes": "T2"
+          }
+        },
         "sofuu.policy": {
           "tier": "T2",
           "members": {

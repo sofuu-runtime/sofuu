@@ -239,6 +239,10 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // R1 (SPEC §2): the capability manifest, after every module so the
         // `sofuu` object exists and its surface matrix is complete.
         crate::capabilities::mod_capabilities_register(ctx);
+        // P2 (SPEC §7/§3): the event envelope + the async contract, so every
+        // driver and host can validate events and speak one error shape.
+        crate::rt::events::mod_events_register(ctx);
+        crate::rt::async_contract::mod_async_contract_register(ctx);
     }
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the

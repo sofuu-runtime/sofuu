@@ -11,7 +11,7 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 |---|---|---|
 | P0 — inventory + spec verification | ✅ **complete** (2026-10-23, refreshed 2026-10-25) | 48/48 matrix cells resolved, zero unknowns; 132 tiered symbols; 125 knobs with determinism tiers (54 `unsure` open items); 52 conformance cases stubbed |
 | P1 — R1 capability model + R3 tiers | ✅ **complete** (2026-10-25) | `sofuu.capabilities()`, `sofuu.model.describe()`, doctor assertion, typed memory refusal on QTSQ-free builds, `text_gate` receipts + `--require-identical`, the R3 CI gate, and the committed fixture model (T3.3) — all landed and verified; suite 12 PASS / 4 FAIL / 36 BLOCKED, and the FORK enforcement demonstrated (exit 3, `|dtop1|=0.2770`) |
-| P2 — R2 async contract + R6 observability | ⬜ not started | peers landed per-call MCP deadlines (`665302375`); no chaos suite yet; `T6.1` failing |
+| P2 — R2 async contract + R6 observability | 🟡 **substantially complete** (2026-10-25) | `sofuu.async.*` + `sofuu.events.*` substrates, envelope stamped at both emit choke points, exactly-one-terminal stop, chaos harnesses T2.1/T2.2/T2.7/T2.8, event log + redaction T6.2/T6.6, envelope-on-real-events T6.1/T6.5; suite 21 PASS / 2 FAIL / 29 BLOCKED. Open: golden renders in 3 clients, T2.3/T2.4/T2.5 live-path harnesses, usage reconcile (T6.7), chat adopting the ndjson log |
 | P3 — R4 portability + R5 surface parity | ⬜ not started | `T4.1`/`T4.5`/`T4.7` failing; 21 remaining `partial` cells |
 | P4 — R7 security + install integrity | ⬜ not started | policy evaluator + approval modes landed by peers (`0b753686c`, `cdd16835b`); four-surface denial matrix still missing |
 | P5 — platform matrix + conformance + benchmark | ⬜ not started | CI is macOS-only; suite is local |
@@ -19,7 +19,7 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 
 ## Conformance suite
 
-**52 cases — PASS 12 · FAIL 4 · BLOCKED 36.**
+**52 cases — PASS 21 · FAIL 2 · BLOCKED 29.**
 (`CONTRACT_NOQTSQ_BIN=target-noqts/release/sofuu` enables T1.3.)
 
 Passing:
@@ -38,9 +38,38 @@ Passing:
 | T5.1 | the generated surface matrix has no unknowns |
 | T5.7 | the ABI gate (`abi-check`) is wired in CI |
 | T7.6 | `SOFUU_NO_SHELL=1` removes `bash` from the advertised tool group |
+| T2.1 | a silent child is killed at its deadline (±2 s) with no orphan |
+| T2.2 | cancel terminates a real SSE stream promptly; usage accounted |
+| T2.7 | nested deadlines inherit (parent − margin) and refuse exhausted parents |
+| T2.8 | one error shape + the ten-code taxonomy, defaults per code |
+| T6.1 | the §7.2 identity fields ride on every real agent AND chat event; the runtime validator reports zero violations |
+| T6.2 | the session event log round-trips: append → read → reconstruct (answer, tools, usage, terminal) |
+| T6.5 | seq strictly increasing; exactly one terminal `stop` per run |
+| T6.6 | redaction strips secret-bearing fields recursively before any log/write |
 
-Failing (later-phase backlog): `T4.1` session export, `T4.5` `sofuu.session`,
-`T4.7` `schema_version`, `T6.1` event `seq`.
+Failing (P3 backlog): `T4.1` session export, `T4.5` `sofuu.session`.
+(`T4.7` schema_version passes since the chat emit stamps it; `T6.1`'s old
+file-grep form was replaced by the live-event harness.)
+
+## What landed in P2 (2026-10-25)
+
+- **`sofuu.async.*`** (`rt/async_contract.rs`) — the §1.4 error taxonomy with
+  per-code retryability, `makeError` (unknown codes wrap as `E_INTERNAL`),
+  `childDeadline` (parent − margin inheritance; exhausted parents report
+  `E_TIMEOUT`), and `limits()` (bounded queues + the §3.2 default timeouts).
+- **`sofuu.events.*`** (`rt/events.rs`) — the §7.2 envelope: schema (10
+  required kinds with payload rules + 21 known driver kinds), a validator,
+  recursive redaction, and the per-session `events.ndjson` log with seq-order
+  enforcement and an `E_BACKPRESSURE` overflow bound.
+- **Envelope stamped at both emit choke points** — `agent.js` and `chat.js`
+  additively carry `schema_version/seq/ts/surface/sid/turn_id` on every event;
+  existing consumers are unaffected (JS suite 59/1, the 1 pre-existing).
+- **Exactly-one-terminal** — `agent.js finish()` emits `stop {reason:
+  done|budget|cancelled}` once; a real run's trace shows the total order.
+- **Chaos harnesses** (tracked, `scripts/contract/harness/`) — real
+  subprocess kill + orphan check, a real SSE stream cancelled mid-flight with
+  usage accounting, contract math, the event log round-trip, redaction, and
+  envelope-on-live-events; CI runs the suite in report mode.
 
 ## The fixture model and the FORK demonstration (T3.3)
 
@@ -114,11 +143,14 @@ merged registration — not done here to avoid crossing lanes.
 
 ## Next actions
 
-1. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
+1. **P2 remainder** — golden trace renders in CLI/macOS/Android (app lanes);
+   live-path harnesses for T2.3 (cancel mid-tool), T2.4 (server-side
+   disconnect visibility), T2.5 (stream-pump backpressure); usage reconcile
+   (T6.7); chat adopting the ndjson event log over its private third shape.
+2. **P3** — session primitive v1 (`T4.1`/`T4.5` — the two remaining FAILs)
+   and the parity matrix in CI.
+3. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
    namespace collision; then matrix memory × js returns to `full`.
-2. **P2** — the async contract and event envelope (`T6.1` and the chaos suite).
-3. **P3** — session primitive v1 (`T4.1`/`T4.5`/`T4.7`) and the parity matrix
-   in CI.
 4. Refresh the matrix cells affected by the Oct-24 protocol commits (tool,
    transport, policy) — several `partial`/`unavailable` cells are likely stale
    in the good direction.

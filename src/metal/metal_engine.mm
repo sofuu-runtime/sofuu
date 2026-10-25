@@ -71,6 +71,12 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_llama_attn_fin_b4;
     id<MTLComputePipelineState> pso_llama_attn_pre_w32;
     id<MTLComputePipelineState> pso_llama_attn_copy_b4;
+    // Single source of truth for the llama_attn_pre_w32 whole-row fast path,
+    // written by the part pass and read by the fin pass. They used to gate
+    // independently (fin hardcoded 128 and skipped the head_dim / n_kv_heads
+    // checks), so raising SOFUU_PREW_MAXPOS or a head_dim > 128 made them
+    // disagree about who owns head_out - silent corruption (OpenQodex finding 1).
+    int pre_window_active;
     id<MTLComputePipelineState> pso_llama_attn_1c_b4;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4c2r;
     id<MTLComputePipelineState> pso_gemm_q4_k;
@@ -3175,8 +3181,11 @@ void sofuu_metal_batch_llama_attn_part_b4(
             pre_window_ok = (pp[rows - 1u] < maxpos) ? 1 : 0;
         }
     }
-    if (pre_window_ok != 0
-        && head_dim <= 128u && n_kv_heads != 0u && n_heads % n_kv_heads == 0u && rows > 0u) {
+    // Decide ONCE and publish it for the fin pass (see the field comment).
+    const int fast_ok = pre_window_ok != 0
+        && head_dim <= 128u && n_kv_heads != 0u && n_heads % n_kv_heads == 0u && rows > 0u;
+    ctx->pre_window_active = fast_ok;
+    if (fast_ok) {
         uint rpt = sofuu_pre_attn_rpt();
         // One threadgroup per (row, head) after the decode-kernel transplant:
         // rpt is still passed (the kernel ignores it) but no longer shapes the grid.
@@ -3234,16 +3243,11 @@ void sofuu_metal_batch_llama_attn_fin_b4(
     if (ctx->batch_enc == nil || !meta_buf_ptr || !out_buf_ptr) return;
     if (ctx->pso_llama_attn_fin_b4 == nil) return;
     sofuu_batch_barrier(ctx);
-    // Same validity gate as the part pass: the copy only matches when part took
-    // the whole-row fast path (single 128-key window).
-    int fin_window_ok = 0;
-    if (sofuu_pre_attn_on() != 0 && ctx->pso_llama_attn_copy_b4 != nil && rows > 0u && pos_buf_ptr) {
-        id<MTLBuffer> pb2 = (__bridge id<MTLBuffer>)pos_buf_ptr;
-        if (pb2.contents != NULL) {
-            const uint32_t* pp2 = (const uint32_t*)((const char*)pb2.contents + pos_offset);
-            fin_window_ok = (pp2[rows - 1u] < 128u) ? 1 : 0;
-        }
-    }
+    // The copy only matches when the part pass took the whole-row fast path, so
+    // ask it rather than re-deriving the gate here (it cannot be re-derived
+    // faithfully: n_kv_heads is not a parameter of this function).
+    const int fin_window_ok =
+        (ctx->pre_window_active != 0 && ctx->pso_llama_attn_copy_b4 != nil && rows > 0u) ? 1 : 0;
     if (fin_window_ok != 0) {
         [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_copy_b4];
         [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)meta_buf_ptr offset:meta_offset atIndex:0];

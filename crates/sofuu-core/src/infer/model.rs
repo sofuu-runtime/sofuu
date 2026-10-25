@@ -3335,6 +3335,13 @@ impl TransformerModel {
             ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
                 if $tv.tensor_type == GGML_TYPE_Q4_K
                     && crate::infer::metal::MetalEngine::mma8_enabled()
+                    // The simdgroup-matrix path is numerically wrong for b >= 6: measured
+                    // max|delta| vs the CPU reference 2.4 at b=6, 16.0 at b=8, 8.4 at b=16,
+                    // against 0.27-0.35 for the b4 GEMV it replaces. It stays in the tree for
+                    // the correctness work but must never run on a batch it was not proven
+                    // on, so the dispatch is gated to the validated range instead of trusting
+                    // the env flag alone.
+                    && b < 6
                     && g.engine.batch_gguf_mma8(
                         &g.w_buf, gguf.data_offset + $tv.offset,
                         &g.act_buf, $x_off,

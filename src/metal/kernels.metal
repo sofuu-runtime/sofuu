@@ -6405,6 +6405,93 @@ kernel void llama_attn_pre_w32(
         dst[i] = s * inv;
     }
 }
+// ── 128-row chunk attention: PAR_ROWS rows share ONE K/V stream ─────────────
+// llama_attn_pre_w32 above is one threadgroup per (row, head) with 32 warps
+// splitting the key range. It is correct at every position, but on the chain
+// pass (whole 128-row prefill chunks) every row re-streams the K/V this layer
+// just wrote, so the cache is read rows x n_heads times: at 1454 tokens the
+// biggest chunk moves ~8x the bytes of the 4-row flash kernel below for the
+// same arithmetic, and the 2048-threadgroup grid runs 128 cores'-worth of
+// threadgroups one after another.
+//
+// This variant keeps the same online-softmax math but changes the mapping:
+// PAR_ROWS consecutive rows (one warp each, 32 warps = 1024 threads) ride ONE
+// threadgroup and walk the key range IN LOCKSTEP, so the 32 warps' K/V loads
+// hit the same cache line and the DRAM traffic per chunk falls by the row-group
+// width. Each warp owns a whole row, so there is no cross-warp softmax reduce:
+// no sacc slab, no threadgroup barrier, and the row lands in `out` directly in
+// [row][head][head_dim] layout (no meta scratch, no copy finish).
+//
+// Causality: kv_write_b4 publishes every row of the chunk with its own position
+// before this runs, so the loop bound is the row GROUP's last position and a
+// row with a smaller position masks its tail (t > pos -> -INFINITY) — the same
+// bound llama_attn_flash_b4 uses. The wasted tail is < PAR_ROWS keys.
+//
+// head_dim <= 128 (host-gated) so one float4 per lane covers a head; lanes past
+// head_dim/4 load zeros so narrower heads (64) stay exact. Registers are
+// q4/acc4/v4 + the softmax scalars, which keeps a 1024-thread threadgroup
+// inside the pipeline limit — the host still checks
+// maxTotalThreadsPerThreadgroup before dispatching, because an oversized
+// threadgroup is silently DROPPED in release and reads back as dead attention.
+#define PAR_ROWS 32
+
+kernel void llama_attn_pre_row(
+    device const float *q               [[buffer(0)]],
+    device float       *out             [[buffer(1)]],
+    device const float *k_cache_layer   [[buffer(2)]],
+    device const float *v_cache_layer   [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    constant uint      &out_stride      [[buffer(9)]],
+    constant uint      &rows            [[buffer(10)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint  tid                           [[thread_index_in_threadgroup]]
+) {
+    uint h = tg.x;
+    uint row0 = tg.y * PAR_ROWS;
+    uint row = row0 + (tid >> 5u);
+    uint lane = tid & 31u;
+    if (h >= n_heads || row >= rows) { return; }
+    uint pos = positions[row];
+    if (pos == 0xFFFFFFFFu || pos >= max_seq) { return; }
+    uint last = min(row0 + PAR_ROWS - 1u, rows - 1u);
+    uint tmax = positions[last] + 1u;
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    bool act = (lane * 4u) < head_dim;
+    float4 q4 = act ? *(device const float4 *)&q_head[lane * 4u] : float4(0.0f);
+    float4 acc = float4(0.0f);
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (uint t = 0; t < tmax; ++t) {
+        float4 k4 = float4(0.0f);
+        float4 v4 = float4(0.0f);
+        if (act) {
+            k4 = *(device const float4 *)&kbase[(size_t)t * head_dim + lane * 4u];
+            v4 = *(device const float4 *)&vbase[(size_t)t * head_dim + lane * 4u];
+        }
+        float part = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+        float s = simd_sum(part) * scale;
+        if (t > pos) { s = -INFINITY; }
+        float mnew = max(m, s);
+        float corr = exp(m - mnew);
+        float w = exp(s - mnew);
+        l = l * corr + w;
+        acc = acc * corr + v4 * w;
+        m = mnew;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    if (act) {
+        device float *dst = out + (size_t)row * out_stride + (size_t)h * head_dim;
+        *(device float4 *)&dst[lane * 4u] = acc * inv;
+    }
+}
 // Moves the per-row attention result out of the meta scratch (finish is a copy
 // now that part computes whole rows).
 kernel void llama_attn_copy_b4(

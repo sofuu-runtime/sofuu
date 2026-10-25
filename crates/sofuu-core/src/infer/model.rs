@@ -3655,9 +3655,29 @@ impl TransformerModel {
                     has_q, norm_eps, rope_freq_base, rope_mode,
                     None,
                 );
+                // Whole-row attention first (ONE dispatch for the whole chunk,
+                // every row's full softmax): llama_attn_pre_row on the 128-row
+                // chain — 32 rows share one K/V stream per threadgroup — and
+                // llama_attn_pre_w32 as the A/B arm. It took 55% of the route
+                // (3.18 s of 5.76 s at 1454 tokens) because the b4 family below
+                // walks 4 rows per threadgroup over a grid of
+                // rows*n_heads*n_chunks one-warp threadgroups. A false return
+                // means nothing was dispatched (pipeline missing, unsupported
+                // geometry, SOFUU_PRE_ATTN=0, or SOFUU_PREW_MAXPOS below this
+                // chunk), so the b4 family still owns attention in that case.
+                let row_attn = g.engine.batch_llama_attn_row(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                );
                 // pos < 128 (one softmax chunk): part+fin fuse into one
                 // dispatch — one barrier drain instead of two
-                let flashed = g.engine.batch_llama_attn_flash_b4(
+                let flashed = !row_attn && g.engine.batch_llama_attn_flash_b4(
                     &g.act_buf, g.slots.qa,
                     &g.k_buf, kc_layer,
                     &g.v_buf, kc_layer,
@@ -3671,7 +3691,9 @@ impl TransformerModel {
                 // the split pair only below one 128-position chunk). Gate it to the range it
                 // is actually valid for rather than letting it corrupt long prompts.
                 let one_chunk_pos = start_pos + b - 1 < 128;
-                let fused = flashed || (fuse_on
+                // row_attn already wrote slots.ao: nothing below may run for
+                // this layer, or it would overwrite a finished chunk.
+                let fused = row_attn || flashed || (fuse_on
                     && one_chunk_pos
                     && g.engine.batch_llama_attn_1c_b4(
                         &g.act_buf, g.slots.qa,
@@ -3723,14 +3745,28 @@ impl TransformerModel {
                     return false;
                 }
             }
-            for t in 0..b {
-                if !g.engine.batch_rmsnorm_f32w(
-                    &g.act_buf, g.slots.x + t * dim * 4,
-                    &g.w_buf, ffn_norm_off,
-                    &g.act_buf, g.slots.xn + t * dim * 4,
-                    dim, norm_eps,
-                ) {
-                    return false;
+            // ONE dispatch for the whole chunk's ffn_norm, not b of them: the
+            // b-row kernel is one 32-thread threadgroup per row off a single
+            // grid, so 128 per-row dispatches (+128 memoryBarrier-ordered
+            // encoder steps) collapse into one with identical math. That loop
+            // was ~1.27 s of the 5.76 s route. Falls back to the per-row
+            // dispatch only when the pipeline/rows ceiling makes the batched
+            // form unavailable — never silently skips the norm.
+            if !g.engine.batch_rmsnorm_f32w_b4(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, ffn_norm_off,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps, b,
+            ) {
+                for t in 0..b {
+                    if !g.engine.batch_rmsnorm_f32w(
+                        &g.act_buf, g.slots.x + t * dim * 4,
+                        &g.w_buf, ffn_norm_off,
+                        &g.act_buf, g.slots.xn + t * dim * 4,
+                        dim, norm_eps,
+                    ) {
+                        return false;
+                    }
                 }
             }
             if !g.skip_ffn {
@@ -3778,14 +3814,22 @@ impl TransformerModel {
         // usually never samples; accepted rows get a lazy GPU head commit
         // (gpu_spec_head_row, ~13ms each) and CPU matvec as the fallback.
         if let Some(hr) = head_row {
-            for t in 0..b {
-                if !g.engine.batch_rmsnorm_f32w(
-                    &g.act_buf, g.slots.x + t * dim * 4,
-                    &g.w_buf, gguf.data_offset + self.output_norm.offset,
-                    &g.act_buf, g.slots.xn + t * dim * 4,
-                    dim, norm_eps,
-                ) {
-                    return false;
+            // Same batching as the ffn_norm above: one dispatch for the chunk.
+            if !g.engine.batch_rmsnorm_f32w_b4(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, gguf.data_offset + self.output_norm.offset,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps, b,
+            ) {
+                for t in 0..b {
+                    if !g.engine.batch_rmsnorm_f32w(
+                        &g.act_buf, g.slots.x + t * dim * 4,
+                        &g.w_buf, gguf.data_offset + self.output_norm.offset,
+                        &g.act_buf, g.slots.xn + t * dim * 4,
+                        dim, norm_eps,
+                    ) {
+                        return false;
+                    }
                 }
             }
             if !g.engine.batch_gguf(

@@ -240,7 +240,8 @@ void sofuu_metal_batch_conv_gate(void* ctx, void* bcx_buf, size_t bcx_offset, vo
 void sofuu_metal_batch_kv_write(void* ctx, void* k_buf, size_t k_offset, void* v_buf, size_t v_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* kln_buf, size_t kln_offset, uint32_t pos, uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base);
 void sofuu_metal_batch_attn(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* qln_buf, size_t qln_offset, void* out_buf, size_t out_offset, uint32_t pos, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base);
 int sofuu_metal_batch_rmsnorm_f32w(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, void* y_buf, size_t y_offset, size_t dim, float eps);
-void sofuu_metal_batch_rmsnorm_f32w_b4(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, void* y_buf, size_t y_offset, size_t dim, float eps, size_t rows);
+// 1 = dispatched (one threadgroup per row), 0 = pipeline missing / rows > 1024.
+int sofuu_metal_batch_rmsnorm_f32w_b4(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, void* y_buf, size_t y_offset, size_t dim, float eps, size_t rows);
 int sofuu_metal_batch_llama_kv_write(void* ctx, void* k_buf, size_t k_offset, void* v_buf, size_t v_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* kln_buf, size_t kln_offset, uint32_t has_norm, uint32_t pos, uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base, uint32_t rope_mode);
 void sofuu_metal_batch_llama_attn(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* qln_buf, size_t qln_offset, void* out_buf, size_t out_offset, uint32_t has_norm, uint32_t pos, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base, uint32_t rope_mode);
 int sofuu_metal_batch_head_rmsnorm(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, uint32_t head_dim, uint32_t n_heads, uint32_t has_norm, uint32_t pos, float eps, float rope_base, uint32_t rope_mode);
@@ -266,6 +267,15 @@ int sofuu_metal_batch_gguf_gemm_tiled_wide_multi(void* ctx, uint32_t ty, void* w
 int sofuu_metal_batch_gguf_gemm_tiled_wide(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemm_mma(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t has_table);
+// Whole-row chunk attention for the 128-row chain pass. Both compute every row's
+// full softmax in ONE dispatch and write [row][head][head_dim] straight into
+// out_buf (no meta scratch, no copy finish). Return 1 when the dispatch was
+// enqueued (attention for this layer is DONE - the caller must skip the b4
+// family) and 0 when the pipeline/geometry cannot host it, so the caller falls
+// back. row: PAR_ROWS rows x 1 head per 1024-thread threadgroup; w32_out: the
+// shipped llama_attn_pre_w32 (one threadgroup per (row, head)).
+int sofuu_metal_batch_llama_attn_row(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
+int sofuu_metal_batch_llama_attn_w32_out(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
 int sofuu_metal_batch_gguf_gemv_q4k_v4(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 int sofuu_metal_batch_gguf_gemv_q4k_v3(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);

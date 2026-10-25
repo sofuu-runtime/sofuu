@@ -1042,6 +1042,28 @@ extern "C" {
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         has_table: u32,
     ) -> i32;
+    fn sofuu_metal_batch_llama_attn_row(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        out_stride: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_w32_out(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        kc_buf: *mut c_void, kc_layer_offset: usize,
+        vc_buf: *mut c_void, vc_layer_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        out_stride: u32,
+    ) -> i32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1081,7 +1103,7 @@ extern "C" {
         w_buf: *mut c_void, w_offset: usize,
         y_buf: *mut c_void, y_offset: usize,
         dim: usize, eps: f32, rows: usize,
-    );
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1982,7 +2004,9 @@ impl MetalEngine {
     }
 
     /// B-row f32-weight RMSNorm for the spec chain: rows are contiguous
-    /// [B][dim]; one dispatch instead of B.
+    /// [B][dim]; one dispatch instead of B. Returns false when the pipeline is
+    /// missing (a bundled metallib predating it) so the caller can fall back to
+    /// the per-row dispatch instead of silently skipping the norm.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_rmsnorm_f32w_b4(
         &self,
@@ -1990,17 +2014,18 @@ impl MetalEngine {
         w_buf: &MetalBuffer, w_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         dim: usize, eps: f32, rows: usize,
-    ) {        let __t = self.op_tick(K_RMSNORM_B4);
-        unsafe {
+    ) -> bool {        let __t = self.op_tick(K_RMSNORM_B4);
+        let __r = unsafe {
             sofuu_metal_batch_rmsnorm_f32w_b4(
                 self.ctx,
                 x_buf.handle, x_offset,
                 w_buf.handle, w_offset,
                 y_buf.handle, y_offset,
                 dim, eps, rows,
-            );
-        }
+            ) == 1
+        };
         self.op_tock(K_RMSNORM_B4, __t);
+        __r
     }
 
     /// Llama-shape KV append: optional f32 head-norm + RoPE (either mode),
@@ -2705,6 +2730,79 @@ impl MetalEngine {
                 on
             }
         }
+    }
+
+    /// Whole-row chunk attention (chain 128-row pass). ONE dispatch computes
+    /// every row's full softmax and writes [row][head][head_dim] straight into
+    /// out_buf — no meta scratch, no copy finish, no per-4-rows grid.
+    ///
+    /// SOFUU_CHAIN_ATTN picks the arm: "row" (default, kernels.metal
+    /// llama_attn_pre_row — 32 rows per 1024-thread threadgroup, one warp per
+    /// row, so the group shares one K/V stream), "w32" (the shipped
+    /// llama_attn_pre_w32, one threadgroup per (row, head)) and "b4" (returns
+    /// false so the caller keeps the flash/1c/part-fin family). Returns false
+    /// with no dispatch at all when the arm cannot run, so the caller falls back
+    /// instead of leaving attention undone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_row(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+    ) -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static ARM: AtomicU8 = AtomicU8::new(0);
+        let mut arm = ARM.load(Ordering::Relaxed);
+        if arm == 0 {
+            arm = match std::env::var("SOFUU_CHAIN_ATTN") {
+                Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                    "b4" | "0" | "off" => 3u8,
+                    "w32" | "prew" => 2u8,
+                    _ => 1u8,
+                },
+                Err(_) => 1u8,
+            };
+            ARM.store(arm, Ordering::Relaxed);
+        }
+        if rows == 0 || arm == 3 {
+            return false;
+        }
+        let out_stride = (n_heads as usize * head_dim as usize) as u32;
+        let __t = self.op_tick(K_ATTN_1C);
+        let __r = unsafe {
+            let r = if arm == 2 {
+                sofuu_metal_batch_llama_attn_w32_out(
+                    self.ctx,
+                    q_buf.handle, q_offset,
+                    kc_buf.handle, kc_layer_offset,
+                    vc_buf.handle, vc_layer_offset,
+                    out_buf.handle, out_offset,
+                    pos_buf.handle, pos_offset,
+                    rows as u32,
+                    head_dim, n_heads, n_kv_heads, max_seq,
+                    out_stride,
+                )
+            } else {
+                sofuu_metal_batch_llama_attn_row(
+                    self.ctx,
+                    q_buf.handle, q_offset,
+                    kc_buf.handle, kc_layer_offset,
+                    vc_buf.handle, vc_layer_offset,
+                    out_buf.handle, out_offset,
+                    pos_buf.handle, pos_offset,
+                    rows as u32,
+                    head_dim, n_heads, n_kv_heads, max_seq,
+                    out_stride,
+                )
+            };
+            r == 1
+        };
+        self.op_tock(K_ATTN_1C, __t);
+        __r
     }
 
     /// P5 arm-b: flash-style batched prefill attention. Same math and ABI as

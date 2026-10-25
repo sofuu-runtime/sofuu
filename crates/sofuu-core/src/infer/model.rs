@@ -24,6 +24,24 @@ use super::quant::{
     GGML_TYPE_Q8_0,
 };
 
+// ── Activation-quantize reuse window ────────────────────────────────
+// A transformer layer feeds ONE activation buffer to several q4_K/q6_K
+// projections: attn q/k/v all read the attn-norm output, ffn gate/up both read
+// the ffn-norm output (the latter is already fused by matmat_pair). Between
+// begin/end the C++ prefill GEMMs reuse a single q8_K quantize of that exact
+// buffer instead of re-running the prologue per tensor. Bit-exact: a reuse hit
+// hands the kernel the same bytes a fresh prologue would produce, and
+// SOFUU_ACTQ_VERIFY=1 re-quantizes + memcmp's every hit to prove it.
+// Off by default: SOFUU_ACTQ_CACHE=1 enables the window (begin is otherwise a
+// no-op and every GEMM quantizes on its own, exactly as before) — the measured
+// end-to-end gain is ~1.5% of prefill, below this host's noise floor, while the
+// prologue itself drops ~20% (see the note on sofuu_actq_begin in
+// src/simd/infer_kernels.cpp).
+extern "C" {
+    fn sofuu_actq_begin(x: *const f32, cols: usize, batch: usize);
+    fn sofuu_actq_end();
+}
+
 /// Mirror a freshly written f32 KV row into the f16 shadow. Both stores stay
 /// on every write path, so the shadow can never describe a stale cache.
 #[inline]
@@ -1277,6 +1295,10 @@ impl TransformerModel {
             }
 
             // ── Batched Q, K, V Projections via matmat ──────────
+            // q/k/v all consume the attn-norm output: quantize it to q8_K once
+            // and let all three GEMMs share the tile (bit-exact — see the
+            // reuse-window note at the top of this file).
+            unsafe { sofuu_actq_begin(self.x_norm_batch.as_ptr(), dim, b_size) };
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
             matmat(
                 q_bytes,
@@ -1330,6 +1352,7 @@ impl TransformerModel {
                 };
                 batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
+            unsafe { sofuu_actq_end() };
 
             // ── Per-token QK-Norm ────────────────────────────────
             if layer_idx == snap_layer {
@@ -1966,6 +1989,9 @@ impl TransformerModel {
             );
 
             // ── Batched Q, K, V Projections via matmat ──────────────
+            // Same activation q8_K reuse as the prefill path above: q/k/v read
+            // one attn-norm buffer, so one quantize serves all three.
+            unsafe { sofuu_actq_begin(self.x_norm_batch.as_ptr(), dim, b_size) };
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
             matmat(
                 q_bytes,
@@ -2019,6 +2045,7 @@ impl TransformerModel {
                 };
                 batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
+            unsafe { sofuu_actq_end() };
 
             // ── Per-token QK-Norm ───────────────────────────────────
             if let Some(ref q_norm) = layer.attn_q_norm {

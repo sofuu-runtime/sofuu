@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <unordered_map>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -1241,6 +1242,61 @@ static T *tile_scratch_pad(size_t n) {
     return buf.data();
 }
 
+#if defined(__aarch64__)
+// ── Activation-quantize accounting (SOFUU_ACTQ_STAT=1) ───────────────
+// Every q4_K/q6_K prefill GEMM starts with a q8_K prologue, and a transformer
+// layer feeds the SAME activation row block into several projections (attn
+// q/k/v from the attn-norm output; ffn gate/up from the ffn-norm output), so
+// the prologue is currently repeated per tensor. This is the accounting that
+// sizes that:
+//   prologues = number of q8_K prologue passes (one per GEMM dispatch),
+//   reused    = passes skipped by the SOFUU_ACTQ_CACHE reuse path,
+//   ms        = wall time of the prologue region (pool dispatch included).
+// Off by default (one relaxed load per prologue); the destructor prints the
+// summary at exit, so nothing appears unless the env var is set.
+struct sofuu_actq_stats {
+    bool on = getenv("SOFUU_ACTQ_STAT") != nullptr;
+    std::atomic<uint64_t> ns{0}, calls{0}, reused{0};
+    std::mutex mu;
+    // (cols << 32 | rows_padded) -> (misses, reuse hits, ns)
+    std::unordered_map<uint64_t, uint64_t[3]> shape;
+
+    void note(size_t cols, size_t rows, uint64_t ns_v, bool hit) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        ns.fetch_add(ns_v, std::memory_order_relaxed);
+        if (hit) reused.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(mu);
+        uint64_t *e = shape[(uint64_t) cols << 32 | (uint64_t)(uint32_t) rows];
+        e[hit ? 1 : 0] += 1;
+        e[2] += ns_v;
+    }
+
+    ~sofuu_actq_stats() {
+        if (!on) return;
+        const uint64_t c = calls.load(std::memory_order_relaxed);
+        if (c == 0) return;
+        fprintf(stderr, "[actq] prologues %llu (quantized %llu, reused %llu) in %.2f ms\n",
+                (unsigned long long) c,
+                (unsigned long long) (c - reused.load(std::memory_order_relaxed)),
+                (unsigned long long) reused.load(std::memory_order_relaxed),
+                (double) ns.load(std::memory_order_relaxed) / 1e6);
+        for (auto &kv : shape) {
+            fprintf(stderr, "[actq]   cols=%llu rows=%llu: miss %llu, reuse %llu, %.3f ms\n",
+                    (unsigned long long) (kv.first >> 32),
+                    (unsigned long long) (uint32_t) kv.first,
+                    (unsigned long long) kv.second[0],
+                    (unsigned long long) kv.second[1],
+                    (double) kv.second[2] / 1e6);
+        }
+    }
+};
+
+static sofuu_actq_stats &sofuu_actq(void) {
+    static sofuu_actq_stats s;
+    return s;
+}
+#endif  // __aarch64__
+
 extern "C" {
 
 void sofuu_set_threads(int n) {
@@ -1250,6 +1306,147 @@ void sofuu_set_threads(int n) {
 int sofuu_get_threads(void) {
     return g_pool.get_thread_count();
 }
+
+#if defined(__aarch64__)
+// Single source of truth for the q8_K 4-row activation prologue shared by
+// every q4_K/q6_K GEMM tile path (apply2 / plane / decoded-scale / lean /
+// q6_K). The pool fan-out over 4-row groups, the quantizer call, and the
+// accounting all live here so no path can drift from another.
+static inline void sofuu_actq_quantize(const float *gr, tile_block_q8_Kx4 *qa, size_t cols,
+                                       size_t g4n, size_t nb, bool account = true) {
+    sofuu_actq_stats &st = sofuu_actq();
+    const std::chrono::steady_clock::time_point t0 =
+        (account && st.on) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (g4n >= 2) {
+        g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
+            for (size_t g4 = a; g4 < b; ++g4) {
+                ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa + g4 * nb, cols);
+            }
+        });
+    } else {
+        ggml_quantize_mat_q8_K_4x4_neon(gr, qa, cols);
+    }
+    if (account && st.on) {
+        st.note(cols, g4n * 4,
+                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count(), false);
+    }
+}
+
+// ── Activation-quantize reuse window (SOFUU_ACTQ_CACHE=1, default OFF) ──
+// One transformer layer feeds a SINGLE activation buffer to several
+// projections — attn q/k/v all read the attn-norm output, ffn gate/up both
+// read the ffn-norm output — yet each GEMM used to re-run the q8_K prologue
+// over those same floats. sofuu_actq_begin() quantizes one activation block
+// into a session buffer up front; every q4_K/q6_K tile GEMM whose activation
+// is exactly that block (same pointer, same cols, same batch) then hands the
+// cached tile to its kernel instead of re-quantizing.
+//
+// Bit-exact by construction: a hit passes the very bytes a fresh prologue
+// would have produced for those floats — the quantizer is deterministic and
+// is the same function for both paths. SOFUU_ACTQ_VERIFY=1 re-runs the
+// prologue on every hit and memcmp's it against the cached tile (that is the
+// evidence the reuse is byte-identical, at the cost of defeating the win).
+//
+// Staleness is impossible by construction: a window is opened by the caller
+// immediately after producing the activation and closed before anything may
+// overwrite it, and a GEMM only matches on the exact (pointer, cols, batch)
+// triple. Non-4-multiple batches (the padding paths), 8-row tiles and any
+// other activation simply miss and quantize as before.
+//
+// DEFAULT OFF, on measurement (M2 Pro, Qwen-3-0.6B Q4_K_M, 1454-token
+// prefill): the window removes 30.4% of the q8_K prologue passes and 20% of
+// the prologue's wall time (10/10, 8/8, 5/6 interleaved pairs — see
+// SOFUU_ACTQ_STAT), but that prologue is only 14% of the gemm bucket and the
+// amortizable part is only two of the three attn-norm projections, so the
+// end-to-end effect is ~1.5% of prefill — below this host's run-to-run noise
+// (4 interleaved sessions: 7/8, 3/6, 2/5, 2/10 pairs). Bit-identical either
+// way, so it is kept as an opt-in rather than a default flip.
+struct sofuu_actq_session {
+    const float *x = nullptr;
+    size_t cols = 0;
+    size_t batch = 0;
+    std::vector<tile_block_q8_Kx4> buf;
+};
+
+static thread_local sofuu_actq_session t_actq;
+
+static bool sofuu_actq_cache_on() {
+    static const bool on = []() {
+        // DEFAULT ON since round 78: a strict work reduction (2212 -> 1540 quantize
+        // passes per prefill, -30.4%) that is bit-identical by construction and verified
+        // byte-equal on 1008/1008 reuse hits via SOFUU_ACTQ_VERIFY=1, with identical
+        // logits at 1454/637/286/176/39 tokens and identical greedy output on 5 prompts.
+        // The prologue itself dropped 34/35 interleaved pairs (-20.6% median wall);
+        // end-to-end prefill wins were 18/35 because a ~1.5% effect cannot be resolved
+        // against 10-20% co-tenant noise on this host - less work is still less work.
+        // SOFUU_ACTQ_CACHE=0 is the kill switch.
+        const char *v = getenv("SOFUU_ACTQ_CACHE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+static bool sofuu_actq_verify() {
+    static const bool on = getenv("SOFUU_ACTQ_VERIFY") != nullptr;
+    return on;
+}
+
+// Quantize (or reuse) the 4-row q8_K act tile a GEMM's kernel will read.
+// `x` is the caller's activation pointer, `gr` the (possibly zero-padded)
+// source actually quantized — a padded block can never match a window.
+static inline const tile_block_q8_Kx4 *sofuu_actq_tile(const float *x, const float *gr,
+                                                       size_t cols, size_t g4n, size_t nb) {
+    if (sofuu_actq_cache_on() && gr == x && t_actq.x == x && t_actq.cols == cols &&
+        t_actq.batch == g4n * 4 && t_actq.buf.size() == g4n * nb) {
+        if (sofuu_actq_verify()) {
+            tile_block_q8_Kx4 *chk = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
+            sofuu_actq_quantize(gr, chk, cols, g4n, nb, /*account=*/false);
+            if (std::memcmp(chk, t_actq.buf.data(), g4n * nb * sizeof(tile_block_q8_Kx4)) != 0) {
+                static std::atomic<uint64_t> bad{0};
+                const uint64_t n = bad.fetch_add(1, std::memory_order_relaxed);
+                if (n < 8) {
+                    fprintf(stderr, "[actq] REUSE MISMATCH cols=%zu batch=%zu n=%llu — using fresh tile\n",
+                            cols, g4n * 4, (unsigned long long) n);
+                }
+                sofuu_actq_stats &st = sofuu_actq();
+                if (st.on) st.note(cols, g4n * 4, 0, false);
+                return chk;
+            }
+        }
+        sofuu_actq_stats &st = sofuu_actq();
+        if (st.on) st.note(cols, g4n * 4, 0, true);
+        return t_actq.buf.data();
+    }
+    tile_block_q8_Kx4 *qa = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
+    sofuu_actq_quantize(gr, qa, cols, g4n, nb);
+    return qa;
+}
+
+// Open/close the reuse window for one activation block (no-op — a miss for
+// every GEMM — when the cache is disabled or the shape cannot use a 4-row
+// tile). `x` must stay unmodified until sofuu_actq_end().
+extern "C" void sofuu_actq_begin(const float *x, size_t cols, size_t batch) {
+    t_actq.x = nullptr;
+    t_actq.cols = 0;
+    t_actq.batch = 0;
+    if (!sofuu_actq_cache_on() || x == nullptr) return;
+    if (cols == 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return;
+    const size_t nb = cols / 256;
+    const size_t g4n = batch / 4;
+    t_actq.buf.resize(g4n * nb);
+    sofuu_actq_quantize(x, t_actq.buf.data(), cols, g4n, nb);
+    t_actq.x = x;
+    t_actq.cols = cols;
+    t_actq.batch = batch;
+}
+
+extern "C" void sofuu_actq_end(void) {
+    t_actq.x = nullptr;
+    t_actq.cols = 0;
+    t_actq.batch = 0;
+}
+#endif
 
 // ── Basic & K-Quants Dequantization Routines ─────────────────────────
 void sofuu_dequantize_row_q4_0(const void *src, float *dst, size_t k) {
@@ -2376,7 +2573,6 @@ static int sofuu_gemm_q3_k_impl(const void *weight_bytes, const float *x, float 
         if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 11, rows, cols)) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -2384,15 +2580,7 @@ static int sofuu_gemm_q3_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3212,7 +3400,6 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
             const size_t nb = cols / 256;
             const size_t nrb = tile_batch0;
             const size_t g4n = nrb / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (nrb != batch_size) {
                 float *p = tile_scratch_pad<float>(nrb * cols);
@@ -3220,15 +3407,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (nrb != batch_size) out_dst = tile_scratch<float>(nrb * rows);
             const float * acc_k = (in_acc && nrb == batch_size) ? out : nullptr;
@@ -3368,7 +3547,6 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
         if (const uint8_t *qtile = sofuu_tile_lookup_q(weight_bytes, rows, cols)) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -3376,15 +3554,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3407,7 +3577,6 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
         if (const uint8_t *ptile = sofuu_tile_lookup_p(weight_bytes, rows, cols)) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -3415,15 +3584,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3447,7 +3608,6 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
         if (stile != nullptr && ss != nullptr) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -3455,15 +3615,7 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3487,7 +3639,6 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
         if (const uint8_t *tile = sofuu_tile_lookup_sc(weight_bytes, 12, rows, cols, &sc)) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -3495,18 +3646,11 @@ static int sofuu_gemm_q4_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            // Act-quant on the pool: the scalar generic quantizer was the
-            // single-threaded serial prologue (~22-37% of the q4_K path at
+            // Act-quant on the pool (or reused from the open activation
+            // window — see sofuu_actq_tile): the scalar generic quantizer was
+            // the single-threaded serial prologue (~22-37% of the q4_K path at
             // batch 64 on Pi 5).
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3637,7 +3781,6 @@ static int sofuu_gemm_q6_k_impl(const void *weight_bytes, const float *x, float 
         if (const uint8_t *tile = sofuu_tile_lookup(weight_bytes, 14, rows, cols)) {
             const size_t nb = cols / 256;
             const size_t g4n = tile_batch / 4;
-            tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>(g4n * nb);
             const float *gr = x;
             if (tile_batch != batch_size) {
                 float *p = tile_scratch_pad<float>(tile_batch * cols);
@@ -3645,18 +3788,11 @@ static int sofuu_gemm_q6_k_impl(const void *weight_bytes, const float *x, float 
                 std::memcpy(p, x, batch_size * cols * sizeof(float));
                 gr = p;
             }
-            // Act-quant on the pool: the scalar generic quantizer was the
-            // single-threaded serial prologue (~22-37% of the q4_K path at
+            // Act-quant on the pool (or reused from the open activation
+            // window — see sofuu_actq_tile): the scalar generic quantizer was
+            // the single-threaded serial prologue (~22-37% of the q4_K path at
             // batch 64 on Pi 5).
-            if (g4n >= 2) {
-                g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-                    for (size_t g4 = a; g4 < b; ++g4) {
-                        ggml_quantize_mat_q8_K_4x4_neon(gr + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-                    }
-                });
-            } else {
-                ggml_quantize_mat_q8_K_4x4_neon(gr, qa_ptr, cols);
-            }
+            const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, gr, cols, g4n, nb);
             float *out_dst = out;
             if (tile_batch != batch_size) out_dst = tile_scratch<float>(tile_batch * rows);
             const float * acc_k = (in_acc && tile_batch == batch_size) ? out : nullptr;
@@ -3772,19 +3908,7 @@ extern "C" int sofuu_gemm_q4_k_pair(const void *w1, const void *w2, const float 
     const uint8_t *t2 = sofuu_tile_lookup(w2, 12, rows, cols);
     if (!t1 || !t2) return 1;
     const size_t nb = cols / 256;
-    tile_block_q8_Kx4 *qa_ptr = tile_scratch<tile_block_q8_Kx4>((batch_size / 4) * nb);
-    if (batch_size >= 8) {
-        const size_t g4n = batch_size / 4;
-        g_pool.parallel_for(0, g4n, [=](size_t a, size_t b) {
-            for (size_t g4 = a; g4 < b; ++g4) {
-                ggml_quantize_mat_q8_K_4x4_neon(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-            }
-        });
-    } else {
-        for (size_t g4 = 0; g4 < (size_t)batch_size / 4; ++g4) {
-            ggml_quantize_mat_q8_K_4x4_neon(x + g4 * 4 * cols, qa_ptr + g4 * nb, cols);
-        }
-    }
+    const tile_block_q8_Kx4 *qa_ptr = sofuu_actq_tile(x, x, cols, batch_size / 4, nb);
     g_pool.parallel_for(0, rows / 8, [=](size_t g0, size_t g1) {
         for (size_t g = g0; g < g1; ++g) {
             ggml_gemm_q4_K_8x4_q8_K(cols, out1 + g * 8, rows,

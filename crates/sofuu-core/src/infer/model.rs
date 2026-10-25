@@ -500,8 +500,50 @@ impl TransformerModel {
         if detected_ctx == 0 {
             return Err(format!("invalid GGUF '{arch}': context_length is 0"));
         }
+        // NTK-aware rope scaling (PLAN-LONG-CONTEXT-PERSISTENCE §4.2 / §8 P1).
+        // A request past the model's TRAINED context drifts rotary angles
+        // out of distribution; scaling the base by α^(d/(d-2)) with
+        // α = requested/trained restores sharp token-distance perception
+        // without retraining. Static α chosen once at load from the REQUESTED
+        // window (the standard llama.cpp-style formulation): every position
+        // is roped with the SAME base, so the cache stays phase-consistent —
+        // the per-position dynamic variant would need a full cache re-rope
+        // on every base change. Engages only when requested > trained, so
+        // every in-window run is bit-identical to before;
+        // SOFUU_ROPE_NTK=0 restores the hard clamp, SOFUU_NTK_ALPHA forces a
+        // factor for A/B receipts.
+        let ntk_requested = if max_seq_len > 0 { max_seq_len } else { detected_ctx };
+        let ntk_forced = std::env::var("SOFUU_NTK_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|a| *a >= 1.0);
+        let ntk_disabled = std::env::var("SOFUU_ROPE_NTK").map(|v| v == "0").unwrap_or(false);
+        let ntk_alpha = if let Some(a) = ntk_forced {
+            a
+        } else if ntk_disabled || ntk_requested <= detected_ctx {
+            1.0
+        } else {
+            ntk_requested as f32 / detected_ctx as f32
+        };
+        let rope_freq_base = if ntk_alpha > 1.0 {
+            let d = head_dim as f32;
+            let scaled = rope_freq_base * ntk_alpha.powf(d / (d - 2.0));
+            eprintln!(
+                "[sofuu] NTK rope scaling: requested ctx {ntk_requested} > trained {detected_ctx} → α={ntk_alpha:.3}, base {rope_freq_base:.0} → {scaled:.0}"
+            );
+            scaled
+        } else {
+            rope_freq_base
+        };
+
         let final_seq_len = if max_seq_len > 0 {
-            max_seq_len.min(detected_ctx)
+            if ntk_alpha > 1.0 {
+                // Scaling IS the mechanism that makes the larger window
+                // valid — clamping here would silently ignore --ctx again.
+                max_seq_len
+            } else {
+                max_seq_len.min(detected_ctx)
+            }
         } else {
             detected_ctx.min(4096)
         };

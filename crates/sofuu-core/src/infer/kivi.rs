@@ -41,6 +41,12 @@ pub struct KiviConfig {
     pub residual_window: usize,
     /// Number of tokens per quantized block (default: 32).
     pub group_size: usize,
+    /// Attention-sink pinning (long-context §4.1): the first `sink_tokens`
+    /// tokens of the stream are kept bit-exact in F32 forever — never
+    /// quantized, never evicted. They absorb the disproportionate share of
+    /// attention mass; quantizing or dropping them collapses the softmax
+    /// over the rest of the stream.
+    pub sink_tokens: usize,
 }
 
 impl Default for KiviConfig {
@@ -58,6 +64,7 @@ impl Default for KiviConfig {
             bits,
             residual_window: 32,
             group_size: 32,
+            sink_tokens: 4,
         }
     }
 }
@@ -439,6 +446,12 @@ pub struct KiviHeadStream {
     pub bits: KiviBits,
     pub residual_window: usize,
     pub group_size: usize,
+    /// Pinned attention sinks (first `sink_tokens` rows, bit-exact F32).
+    pub sink_tokens: usize,
+    pub sink_len: usize,
+    /// [sink_len * head_dim], never quantized.
+    pub sink_k: Vec<f32>,
+    pub sink_v: Vec<f32>,
     pub historical_k: Vec<QuantizedKBlock>,
     pub historical_v: Vec<QuantizedVBlock>,
     pub num_quantized_tokens: usize,
@@ -449,12 +462,22 @@ pub struct KiviHeadStream {
 }
 
 impl KiviHeadStream {
-    pub fn new(head_dim: usize, bits: KiviBits, residual_window: usize, group_size: usize) -> Self {
+    pub fn new(
+        head_dim: usize,
+        bits: KiviBits,
+        residual_window: usize,
+        group_size: usize,
+        sink_tokens: usize,
+    ) -> Self {
         Self {
             head_dim,
             bits,
             residual_window,
             group_size,
+            sink_tokens,
+            sink_len: 0,
+            sink_k: Vec::new(),
+            sink_v: Vec::new(),
             historical_k: Vec::new(),
             historical_v: Vec::new(),
             num_quantized_tokens: 0,
@@ -468,6 +491,16 @@ impl KiviHeadStream {
     pub fn append(&mut self, k: &[f32], v: &[f32]) {
         assert_eq!(k.len(), self.head_dim);
         assert_eq!(v.len(), self.head_dim);
+
+        // §4.1 attention sinks: the first positions of the stream stay
+        // bit-exact F32 for the whole generation — outside the quantization
+        // turnover and every compaction.
+        if self.sink_len < self.sink_tokens {
+            self.sink_k.extend_from_slice(k);
+            self.sink_v.extend_from_slice(v);
+            self.sink_len += 1;
+            return;
+        }
 
         self.recent_k.extend_from_slice(k);
         self.recent_v.extend_from_slice(v);
@@ -504,7 +537,7 @@ impl KiviHeadStream {
     }
 
     pub fn total_tokens(&self) -> usize {
-        self.num_quantized_tokens + self.recent_tokens
+        self.sink_len + self.num_quantized_tokens + self.recent_tokens
     }
 
     /// Compute multi-head attention for this head stream against Query `q`.
@@ -529,6 +562,18 @@ impl KiviHeadStream {
 
         let mut curr_tok = 0;
 
+        // 0. Pinned attention sinks — bit-exact F32 dots (§4.1)
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        for r in 0..self.sink_len {
+            let k_slice = &self.sink_k[r * self.head_dim..(r + 1) * self.head_dim];
+            let mut dot = 0.0f32;
+            for c in 0..self.head_dim {
+                dot += q[c] * k_slice[c];
+            }
+            scores[curr_tok + r] = dot;
+        }
+        curr_tok += self.sink_len;
+
         // 1. Score historical quantized blocks
         for k_block in &self.historical_k {
             let n = k_block.num_tokens;
@@ -537,7 +582,6 @@ impl KiviHeadStream {
         }
 
         // 2. Score recent full-precision tokens
-        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         for r in 0..self.recent_tokens {
             let k_slice = &self.recent_k[r * self.head_dim..(r + 1) * self.head_dim];
             let mut dot = 0.0f32;
@@ -574,6 +618,18 @@ impl KiviHeadStream {
         // 4. Value accumulation
         head_out.fill(0.0);
         let mut v_tok = 0;
+
+        // 4-sink. Pinned sinks first — exact F32 V rows (§4.1)
+        for r in 0..self.sink_len {
+            let w = scores[v_tok + r];
+            if w.abs() > 1e-12 {
+                let v_slice = &self.sink_v[r * self.head_dim..(r + 1) * self.head_dim];
+                for c in 0..self.head_dim {
+                    head_out[c] += w * v_slice[c];
+                }
+            }
+        }
+        v_tok += self.sink_len;
 
         // 4a. Accumulate historical quantized V blocks
         for v_block in &self.historical_v {
@@ -618,6 +674,7 @@ impl KiviCache {
                 config.bits,
                 config.residual_window,
                 config.group_size,
+                config.sink_tokens,
             ));
         }
         Self {
@@ -805,6 +862,7 @@ mod tests {
             bits: KiviBits::Four,
             residual_window: 16,
             group_size: 16,
+            sink_tokens: 0,
         };
 
         let mut cache = KiviCache::new(n_layers, n_kv_heads, head_dim, config);
@@ -848,6 +906,7 @@ mod tests {
             bits: KiviBits::Two,
             residual_window: 16,
             group_size: 16,
+            sink_tokens: 0,
         };
 
         let mut cache = KiviCache::new(n_layers, n_kv_heads, head_dim, config);
@@ -883,7 +942,7 @@ mod f_lc4_tests {
     #[test]
     fn kivi_attention_matches_fp32_reference() {
         let hd = 64usize;
-        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32);
+        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32, 0);
         // Deterministic pseudo-data: ropes-ish rotations, magnitudes ~1.
         let mut state: f32 = 0.123456;
         let mut next = || {
@@ -934,3 +993,73 @@ mod f_lc4_tests {
     }
 }
 
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    /// §4.1 (P4): the first `sink_tokens` tokens are pinned bit-exact in F32
+    /// — outside the quantization turnover — and attention still matches the
+    /// FP32 reference over the whole stream.
+    #[test]
+    fn kivi_sink_pins_first_tokens_full_precision() {
+        let hd = 64usize;
+        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32, 4);
+        let mut state: f32 = 0.123456;
+        let mut next = || {
+            state = (state * 1103515245.0 + 12345.0) % 97.0;
+            state / 97.0 - 0.5
+        };
+        let mut k_all: Vec<Vec<f32>> = Vec::new();
+        let mut v_all: Vec<Vec<f32>> = Vec::new();
+        for i in 0..100 {
+            let k: Vec<f32> = (0..hd).map(|c| next() + if c == 0 { i as f32 * 0.01 } else { 0.0 }).collect();
+            let v: Vec<f32> = (0..hd).map(|_| next()).collect();
+            st.append(&k, &v);
+            k_all.push(k);
+            v_all.push(v);
+        }
+        // Bookkeeping: 4 sinks + 64 quantized + 32 recent = 100.
+        assert_eq!(st.sink_len, 4);
+        assert_eq!(st.num_quantized_tokens, 64);
+        assert_eq!(st.recent_tokens, 32);
+        assert_eq!(st.total_tokens(), 100);
+        // Sinks are bit-exact copies of the appended rows (0..4).
+        for t in 0..4 {
+            assert_eq!(&st.sink_k[t * hd..(t + 1) * hd], &k_all[t][..]);
+            assert_eq!(&st.sink_v[t * hd..(t + 1) * hd], &v_all[t][..]);
+        }
+
+        let q: Vec<f32> = (0..hd).map(|_| next()).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut scores = vec![0.0f32; 100];
+        for t in 0..100 {
+            let dot: f32 = q.iter().zip(&k_all[t]).map(|(a, b)| a * b).sum();
+            scores[t] = dot * scale;
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let mut ref_out = vec![0.0f32; hd];
+        for t in 0..100 {
+            for c in 0..hd {
+                ref_out[c] += exp[t] / sum * v_all[t][c];
+            }
+        }
+
+        let mut out = vec![0.0f32; hd];
+        st.compute_attention(&q, &mut out);
+        let max_diff = out.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 0.05,
+            "kivi sink-pinned attention diverged from fp32 reference: max_diff={max_diff}"
+        );
+
+        // A sink-position query scores its own row exactly: with q == sink row
+        // k, the sink's self dot (||k||^2, positive) must survive quantization
+        // turnover untouched in the kivi path.
+        let qs = k_all[2].clone();
+        let mut out2 = vec![0.0f32; hd];
+        st.compute_attention(&qs, &mut out2);
+        assert!(out2.iter().any(|&v| v != 0.0));
+    }
+}

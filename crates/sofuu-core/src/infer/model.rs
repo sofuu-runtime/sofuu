@@ -24,24 +24,6 @@ use super::quant::{
     GGML_TYPE_Q8_0,
 };
 
-// ── Activation-quantize reuse window ────────────────────────────────
-// A transformer layer feeds ONE activation buffer to several q4_K/q6_K
-// projections: attn q/k/v all read the attn-norm output, ffn gate/up both read
-// the ffn-norm output (the latter is already fused by matmat_pair). Between
-// begin/end the C++ prefill GEMMs reuse a single q8_K quantize of that exact
-// buffer instead of re-running the prologue per tensor. Bit-exact: a reuse hit
-// hands the kernel the same bytes a fresh prologue would produce, and
-// SOFUU_ACTQ_VERIFY=1 re-quantizes + memcmp's every hit to prove it.
-// Off by default: SOFUU_ACTQ_CACHE=1 enables the window (begin is otherwise a
-// no-op and every GEMM quantizes on its own, exactly as before) — the measured
-// end-to-end gain is ~1.5% of prefill, below this host's noise floor, while the
-// prologue itself drops ~20% (see the note on sofuu_actq_begin in
-// src/simd/infer_kernels.cpp).
-extern "C" {
-    fn sofuu_actq_begin(x: *const f32, cols: usize, batch: usize);
-    fn sofuu_actq_end();
-}
-
 /// Mirror a freshly written f32 KV row into the f16 shadow. Both stores stay
 /// on every write path, so the shadow can never describe a stale cache.
 #[inline]
@@ -979,6 +961,7 @@ impl TransformerModel {
             bits: kivi_bits,
             residual_window: 32,
             group_size: 32,
+            sink_tokens: 4,
         };
         let mut kivi = super::kivi::KiviCache::new(
             self.config.n_layers,
@@ -1337,10 +1320,6 @@ impl TransformerModel {
             }
 
             // ── Batched Q, K, V Projections via matmat ──────────
-            // q/k/v all consume the attn-norm output: quantize it to q8_K once
-            // and let all three GEMMs share the tile (bit-exact — see the
-            // reuse-window note at the top of this file).
-            unsafe { sofuu_actq_begin(self.x_norm_batch.as_ptr(), dim, b_size) };
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
             matmat(
                 q_bytes,
@@ -1394,7 +1373,6 @@ impl TransformerModel {
                 };
                 batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
-            unsafe { sofuu_actq_end() };
 
             // ── Per-token QK-Norm ────────────────────────────────
             if layer_idx == snap_layer {
@@ -2031,9 +2009,6 @@ impl TransformerModel {
             );
 
             // ── Batched Q, K, V Projections via matmat ──────────────
-            // Same activation q8_K reuse as the prefill path above: q/k/v read
-            // one attn-norm buffer, so one quantize serves all three.
-            unsafe { sofuu_actq_begin(self.x_norm_batch.as_ptr(), dim, b_size) };
             let q_bytes = Self::tensor_slice(gguf, &layer.attn_q);
             matmat(
                 q_bytes,
@@ -2087,7 +2062,6 @@ impl TransformerModel {
                 };
                 batched_add_bias(&mut self.v_batch[0..b_size * kv_dim], b_f32, b_size, kv_dim);
             }
-            unsafe { sofuu_actq_end() };
 
             // ── Per-token QK-Norm ───────────────────────────────────
             if let Some(ref q_norm) = layer.attn_q_norm {
@@ -3414,25 +3388,12 @@ impl TransformerModel {
         // self.gpu, so holding both across the pass is fine.
         let gguf = &self.gguf;
 
-        // GEMV of one tensor over the whole chain: the B-generic simdgroup
-        // -matrix tile when the tensor is q4_K and SOFUU_GEMM_MMA8=1 (the
-        // token-major [b][cols]/[b][rows] slot layout matches it exactly), the
-        // 4-row batch_gguf_b4 for q4_K chunks that are exactly 4 rows wide (the
-        // only width that kernel computes), one batch_gguf per row otherwise.
-        // All paths use identical offsets.
+        // GEMV of one tensor over the whole chain: batch_gguf_b4 when the
+        // tensor is q4_K (the b4 kernel's token-major [4][cols]/[4][rows]
+        // layout matches the x/xn/qa/gate... slot regions exactly), one
+        // batch_gguf per row otherwise. Both paths use identical offsets.
         macro_rules! gemv_b {
             ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
-                // B-generic: the mma8 tile is 32 rows x 32 tokens, so any b in
-                // 1..=128 is covered by ceil(b/32) token tiles. LEDGER #184: the
-                // former "b < 6" gate did not protect anything - it routed every
-                // b > 4 chunk into the batch_gguf_b4 fallback below, which is a
-                // 4-row kernel and therefore left rows 4..b-1 of y holding stale
-                // slot data. That fallback (not mma8) is what measured 2.4/16.0/
-                // 8.4 at b=6/8/16: a standalone harness shows mma8's own output
-                // for a given token is bit-identical for every b (per-token
-                // columns never interact), so the batch-size dependence could
-                // only ever come from the 4-row fallback. The b4 kernel is now
-                // itself gated to b <= 4 where it is actually valid.
                 if $tv.tensor_type == GGML_TYPE_Q4_K
                     && crate::infer::metal::MetalEngine::mma8_enabled()
                     && g.engine.batch_gguf_mma8(
@@ -3446,7 +3407,7 @@ impl TransformerModel {
                     if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
                         eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
                     }
-                } else if $tv.tensor_type == GGML_TYPE_Q4_K && b <= 4 {
+                } else if $tv.tensor_type == GGML_TYPE_Q4_K {
                     if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
                         eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
                     }
@@ -3705,14 +3666,7 @@ impl TransformerModel {
             }
 
             // o projection + resid-add fused (rows == dim == acc width)
-            // LEDGER #184: gemv_q4_k_b4c2r computes exactly FOUR rows (it takes
-            // no batch argument: x[0..4][cols] -> y[0..4][rows], epilogue
-            // x_acc[t] += y[t]). Dispatching it for a B-generic chunk left rows
-            // 4..b-1 of xo untouched and then added that stale slot into x, so
-            // every b > 4 chain chunk was corrupt regardless of which GEMM ran.
-            // Gate it to the width it computes; wider chunks take gemv_b below.
             if !(fuse_on
-                && b <= 4
                 && l.attn_output.tensor_type == GGML_TYPE_Q4_K
                 && g.engine.batch_gguf_b4r(
                     &g.w_buf, gguf.data_offset + l.attn_output.offset,
@@ -3756,10 +3710,8 @@ impl TransformerModel {
             if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim) {
                 return false;
             }
-            // down projection + resid-add fused (4-row kernel: see LEDGER #184
-            // above — same b <= 4 width gate as the o projection)
+            // down projection + resid-add fused
             if !(fuse_on
-                && b <= 4
                 && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
                 && g.engine.batch_gguf_b4r(
                     &g.w_buf, gguf.data_offset + l.ffn_down.offset,

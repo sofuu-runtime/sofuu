@@ -4167,3 +4167,57 @@ docs — every other row is recorded for the infer owners, not edited.
   logprob/timing surface, KIVI sinks/coherence/GPU-gate/prefill-side KV/
   default flip, F-LC2 EOS prompting, 16k TTFT) and W1–W4 this-workstream
   candidates (Gate 2 accuracy proxy, NTK A/B hooks, KIVI timing cells).
+
+## 2026-10-26 — long-context persistence: §8 ledger implemented one by one (P1–P6, P9 landed)
+
+The user delegated the whole remaining ledger ("now implement all this one
+by one"); every engine item previously reserved for the peer lane landed
+from the isolated worktree, one commit each, all pushed to main:
+
+- **P1 NTK rope scaling (`7112e3ca0`)** — static α = requested_ctx/trained_ctx
+  engaged only above the GGUF `{arch}context_length`, base′ = base·α^(d/(d−2));
+  `--ctx` used to be silently clamped to the trained length by
+  `final_seq_len` (the real 16k+ collapse cause on 1B). Kill switch
+  `SOFUU_ROPE_NTK=0`; `SOFUU_NTK_ALPHA` forces α for A/B.
+- **P2 F-LC1 (`34166b8f6`)** — overlong fresh prompts refused with a loud
+  error instead of silent mid-prefill compaction; continuation paths warn.
+- **P9 F-LC2 (`f67cf2a03`)** — `sofuu infer --chat` wraps the prompt with the
+  model's own template family (ChatML / Llama-3 start_header) read from the
+  GGUF itself; unknown templates pass raw with a note.
+- **P3 + F-LC4 (`652289fa8`)** — teacher-forced scoring:
+  `InferEngine::score_text()` + `sofuu infer M --score <file>
+  [--score-window n]` → one JSON receipt (kv/window/tokens/scored/windows/
+  nll_total/ppl). This flushed out **F-LC4**: every `--kivi` generation
+  degenerated to the prefill argmax repeated forever (kivi4 PPL ~970k)
+  because `forward_impl` skipped the LM head whenever `token_commit` was set,
+  while `execute_layers` had silently rerouted to the CPU layer loop under
+  KIVI/streaming-weights/dynamic-FFN/rejected command buffers — `self.logits`
+  stayed frozen at prefill values. Fixed via `execute_layers_checked()`;
+  new regression test pins kivi attention to an exact FP32 reference across
+  the quantization turnover. `--kivi` additionally forces serial decode:
+  the speculative tree commit (`commit_speculative_candidates`) never feeds
+  the KIVI stream. **Gate 2 PASS**: on the 8252-token repo corpus (3×4096
+  windows), f16 PPL 18.5507 vs kivi4 18.7519 = 1.011 ratio (plan bound ≤ 1.04).
+- **P4 sink pinning (`e6743f6ad`)** — `KiviConfig.sink_tokens` (default 4):
+  the first tokens live in a bit-exact F32 slab outside the quantization
+  turnover and every compaction; attention scores/accumulates them first.
+  Unit test: 4 pinned + 64 quantized + 32 recent accounting, byte-exact sink
+  rows, FP32-reference attention match.
+- **P5/F-LC3 (`ce279d8f9`)** — `rebuild_kivi_after_compact()` re-ingests the
+  compacted cache (sinks + shifted, re-roped survivors) after
+  `compact_kv_cache`; unit test row-compares every head against the
+  post-compaction f32 rows; end-to-end: 34-token prompt @ `--ctx 48` chains
+  capitals coherently through mid-decode compactions.
+- **P6 + P8 (in worktree commit)** — once-per-process contract notice that
+  KIVI runs the CPU layer loop only when a Metal context is present; the
+  P8 default-on flip **declined with receipts**: E+F are green but the
+  ≥16k NIAH matrix (0/3+0/3, 0/2+0/2) that P8's own gate requires is not;
+  a post-fix 16k kivi4 cell is appended to `docs/bench/long-context.jsonl`.
+- **Recorded, not fixed (metal lane):** six `sofuu infer` runs wedged at 0%
+  CPU in uninterruptible wait under heavy peer load, with the Metal context
+  armed (kernels compiled, decode client armed) even under `--cpu`.
+- KIVI tests: **7/7** (FP32-reference, sink pinning, compaction-rebuild) on
+  the final base; release probes coherent both KV modes.
+- Plan doc §9 "Progress 2026-10-26" carries the per-item table; P7
+  (prefill-side quantized KV, the 32k/8B peak-RSS cure) and the per-token
+  logprob API (real Gate-4 timing) remain open, W4 stays blocked on hardware.

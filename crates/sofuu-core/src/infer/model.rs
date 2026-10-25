@@ -952,6 +952,19 @@ impl TransformerModel {
     /// Enable KIVI 2-bit or 4-bit Asymmetric Quantized KV Cache.
     /// Ingests any prefilled tokens from `k_cache` and `v_cache` into historical quantized blocks.
     pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
+        // P6 contract (long-context §8): the quantized-KV decode path runs
+        // the CPU layer loop only — execute_layers_checked bypasses the GPU
+        // whole-layer batch while KIVI is armed (`kivi.is_none()` gate), so a
+        // --kivi run on a GPU-visible load still computes on the CPU. Say so
+        // once per process instead of silently dropping the GPU.
+        static KIVI_CONTRACT_NOTICE: std::sync::Once = std::sync::Once::new();
+        KIVI_CONTRACT_NOTICE.call_once(|| {
+            if self.gpu.is_some() {
+                eprintln!(
+                    "[kivi] quantized-KV path: CPU layer loop only — the GPU whole-layer batch is bypassed while KIVI is armed (long-context contract, P6)"
+                );
+            }
+        });
         let kivi_bits = match bits {
             2 => super::kivi::KiviBits::Two,
             _ => super::kivi::KiviBits::Four,

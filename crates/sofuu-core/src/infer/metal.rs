@@ -46,7 +46,35 @@ pub struct MetalEngine {
     op_ct: [std::sync::atomic::AtomicU64; OP_KINDS],
     tgate: std::sync::atomic::AtomicU8,
 
+    /// fp16 materialisation of the chain GEMM weights (SOFUU_GPU_F16W=1):
+    /// set once at load, read-only afterwards. A OnceLock keeps the dispatch
+    /// path a single atomic load and keeps MetalEngine Sync (it is a process
+    /// global on some routes).
+    pub f16w: std::sync::OnceLock<F16Weights>,
+
     ctx: *mut c_void,
+}
+
+/// The dequantised-weights arena. `map` keys a tensor by the byte offset the
+/// chain passes (data_offset + tensor offset) and holds the slot inside `buf`
+/// plus the shape it was built for, so a shape mismatch falls back instead of
+/// reading the wrong rows.
+pub struct F16Weights {
+    pub buf: MetalBuffer,
+    map: std::collections::HashMap<usize, (usize, usize, usize)>,
+    pub bytes: usize,
+}
+
+impl F16Weights {
+    /// Arena slot (byte offset) for one tensor, or None when it was never
+    /// materialised or the shape differs.
+    #[inline]
+    pub fn slot(&self, w_offset: usize, rows: usize, cols: usize) -> Option<usize> {
+        match self.map.get(&w_offset) {
+            Some(&(off, r, c)) if r == rows && c == cols => Some(off),
+            _ => None,
+        }
+    }
 }
 
 unsafe impl Send for MetalEngine {}
@@ -97,6 +125,7 @@ impl MetalEngine {
                 op_ns: Default::default(),
                 op_ct: Default::default(),
                 tgate: std::sync::atomic::AtomicU8::new(0),
+                f16w: std::sync::OnceLock::new(),
             })
         }
     }
@@ -730,6 +759,37 @@ extern "C" {
         cols: usize, B: usize,
         secs: *const u32, n_sec: usize,
     ) -> i32;
+    // fp16-input forms of the same tile (SOFUU_GPU_F16W): buffer 0 is the
+    // materialised arena and the weight address is a plain half offset.
+    fn sofuu_metal_batch_gguf_f16_mma8(
+        ctx: *mut c_void,
+        w16_buf: *mut c_void, w16_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void, y_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_f16_mma8_acc(
+        ctx: *mut c_void,
+        w16_buf: *mut c_void, w16_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        acc_buf: *mut c_void, acc_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_f16_mma8_secs(
+        ctx: *mut c_void,
+        w16_buf: *mut c_void,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        cols: usize, B: usize,
+        secs: *const u32, n_sec: usize,
+    ) -> i32;
+    fn sofuu_metal_dequant_q4k_f16(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        rows: usize, cols: usize,
+    ) -> i32;
+    fn sofuu_metal_buffer_alloc(ctx: *mut c_void, size_bytes: usize) -> *mut c_void;
     fn sofuu_metal_batch_gguf_gemm(
         ctx: *mut c_void,
         ty: u32,
@@ -1596,15 +1656,29 @@ impl MetalEngine {
         rows: usize, cols: usize, b: usize,
     ) -> bool {
         let __t = self.op_tick(K_GGUF_B4);
-        let __r = unsafe {
-            sofuu_metal_batch_gguf_mma8(
-                self.ctx,
-                w_buf.handle, w_offset,
-                x_buf.handle, x_offset,
-                y_buf.handle, y_offset,
-                rows, cols, b,
-            ) == 1
-        };
+        let mut __r = false;
+        if let Some((wh, off)) = self.f16_slot(w_offset, rows, cols, b) {
+            __r = unsafe {
+                sofuu_metal_batch_gguf_f16_mma8(
+                    self.ctx,
+                    wh, off,
+                    x_buf.handle, x_offset,
+                    y_buf.handle, y_offset,
+                    rows, cols, b,
+                ) == 1
+            };
+        }
+        if !__r {
+            __r = unsafe {
+                sofuu_metal_batch_gguf_mma8(
+                    self.ctx,
+                    w_buf.handle, w_offset,
+                    x_buf.handle, x_offset,
+                    y_buf.handle, y_offset,
+                    rows, cols, b,
+                ) == 1
+            };
+        }
         self.op_tock(K_GGUF_B4, __t);
         // LEDGER #179 test: serialise every MMA dispatch to test for a WAR hazard
         // between the host's slab writes and the GPU's reads inside one deferred batch.
@@ -1625,15 +1699,29 @@ impl MetalEngine {
         rows: usize, cols: usize, b: usize,
     ) -> bool {
         let __t = self.op_tick(K_GGUF_B4);
-        let __r = unsafe {
-            sofuu_metal_batch_gguf_mma8_acc(
-                self.ctx,
-                w_buf.handle, w_offset,
-                x_buf.handle, x_offset,
-                acc_buf.handle, acc_offset,
-                rows, cols, b,
-            ) == 1
-        };
+        let mut __r = false;
+        if let Some((wh, off)) = self.f16_slot(w_offset, rows, cols, b) {
+            __r = unsafe {
+                sofuu_metal_batch_gguf_f16_mma8_acc(
+                    self.ctx,
+                    wh, off,
+                    x_buf.handle, x_offset,
+                    acc_buf.handle, acc_offset,
+                    rows, cols, b,
+                ) == 1
+            };
+        }
+        if !__r {
+            __r = unsafe {
+                sofuu_metal_batch_gguf_mma8_acc(
+                    self.ctx,
+                    w_buf.handle, w_offset,
+                    x_buf.handle, x_offset,
+                    acc_buf.handle, acc_offset,
+                    rows, cols, b,
+                ) == 1
+            };
+        }
         self.op_tock(K_GGUF_B4, __t);
         if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
             self.sync();
@@ -1657,21 +1745,157 @@ impl MetalEngine {
     ) -> bool {
         if secs.is_empty() { return false; }
         let __t = self.op_tick(K_GGUF_B4_SECS);
-        let __r = unsafe {
-            sofuu_metal_batch_gguf_mma8_secs(
-                self.ctx,
-                w_buf.handle, w_base,
-                x_buf.handle, x_offset,
-                y_buf.handle,
-                cols, b,
-                secs.as_ptr() as *const u32, secs.len(),
-            ) == 1
-        };
+        let mut __r = false;
+        // fp16 arm: every section must be materialised (the tile reads one
+        // arena), so the translation is all-or-nothing. secs[0] becomes the
+        // arena byte offset, secs[1] (the q4_K 256-byte remainder) is unused.
+        if let Some((wh, _)) = self.f16_slot(
+            w_base + secs[0][0] as usize + secs[0][1] as usize,
+            secs[0][2] as usize, cols, b,
+        ) {
+            if let Some(w) = self.f16w.get() {
+                let mut fsecs: Vec<[u32; 4]> = Vec::with_capacity(secs.len());
+                let mut all = true;
+                for s in secs {
+                    let raw = w_base + s[0] as usize + s[1] as usize;
+                    match w.slot(raw, s[2] as usize, cols) {
+                        Some(off) if off <= u32::MAX as usize => {
+                            fsecs.push([off as u32, 0u32, s[2], s[3]]);
+                        }
+                        _ => { all = false; break; }
+                    }
+                }
+                if all {
+                    __r = unsafe {
+                        sofuu_metal_batch_gguf_f16_mma8_secs(
+                            self.ctx,
+                            wh,
+                            x_buf.handle, x_offset,
+                            y_buf.handle,
+                            cols, b,
+                            fsecs.as_ptr() as *const u32, fsecs.len(),
+                        ) == 1
+                    };
+                }
+            }
+        }
+        if !__r {
+            __r = unsafe {
+                sofuu_metal_batch_gguf_mma8_secs(
+                    self.ctx,
+                    w_buf.handle, w_base,
+                    x_buf.handle, x_offset,
+                    y_buf.handle,
+                    cols, b,
+                    secs.as_ptr() as *const u32, secs.len(),
+                ) == 1
+            };
+        }
         self.op_tock(K_GGUF_B4_SECS, __t);
         if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
             self.sync();
         }
         __r
+    }
+
+    /// SOFUU_GPU_F16W=1 opts into the fp16 materialisation. Shipped default is
+    /// unset (q4_K unpack per tile) until a bit-identical, faster arm is
+    /// measured; see the arm table in TASKS.md.
+    pub fn f16_weights_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("SOFUU_GPU_F16W").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    /// Arena slot for one tensor in the chain GEMM form, or None to stay on the
+    /// q4_K path. `ntok` gates the diversion: below a 16-token chunk the chain
+    /// walks the b4 GEMV class, and an fp16 buffer would only double the bytes
+    /// that class streams.
+    #[inline]
+    fn f16_slot(
+        &self, w_offset: usize, rows: usize, cols: usize, ntok: usize,
+    ) -> Option<(*mut c_void, usize)> {
+        if ntok < 16 { return None; }
+        let w = self.f16w.get()?;
+        w.slot(w_offset, rows, cols).map(|off| (w.buf.handle, off))
+    }
+
+    /// Materialise every (weight byte offset, rows, cols) q4_K matrix into ONE
+    /// fp16 arena. One dispatch per tensor, one commit for all of them.
+    /// Returns the arena bytes on success. Any refusal (flag off, over the cap,
+    /// allocation failure, rejected dispatch) returns None and leaves the q4_K
+    /// path in charge — never a half-materialised table.
+    pub fn materialize_f16(
+        &self,
+        w_buf: &MetalBuffer,
+        tensors: &[(usize, usize, usize)],
+    ) -> Option<usize> {
+        if !Self::f16_weights_enabled() { return None; }
+        if tensors.is_empty() { return None; }
+        // 2 KiB per-tensor alignment: 16 B is all the tile needs, the slack
+        // keeps every slot on a page-ish boundary for the bind offsets.
+        const SLOT_ALIGN: usize = 2048;
+        let mut total = 0usize;
+        for &(_, rows, cols) in tensors {
+            if rows == 0 || cols == 0 || cols % 256 != 0 { return None; }
+            total += ((rows * cols * 2 + SLOT_ALIGN - 1) / SLOT_ALIGN) * SLOT_ALIGN;
+        }
+        let cap_mb: usize = std::env::var("SOFUU_GPU_F16W_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        // The section table carries arena offsets as u32, so 4 GiB is a hard
+        // ceiling on top of the memory cap.
+        let cap = (cap_mb * 1024 * 1024).min(u32::MAX as usize);
+        if total > cap {
+            eprintln!(
+                "[f16w] refused: {} MB of fp16 weights exceeds the {cap_mb} MB cap (SOFUU_GPU_F16W_MAX_MB); staying on the q4_K path",
+                total / (1024 * 1024)
+            );
+            return None;
+        }
+        let handle = unsafe { sofuu_metal_buffer_alloc(self.ctx, total) };
+        if handle.is_null() {
+            eprintln!("[f16w] refused: {} MB arena allocation failed; staying on the q4_K path",
+                total / (1024 * 1024));
+            return None;
+        }
+        let buf = MetalBuffer { handle };
+        let t0 = std::time::Instant::now();
+        let mut map = std::collections::HashMap::with_capacity(tensors.len());
+        let mut off = 0usize;
+        let mut ok = self.batch_open();
+        if ok {
+            for &(w_off, rows, cols) in tensors {
+                if !unsafe {
+                    sofuu_metal_dequant_q4k_f16(
+                        self.ctx, w_buf.handle, w_off, buf.handle, off, rows, cols,
+                    ) == 1
+                } {
+                    eprintln!("[f16w] refused: materialisation dispatch rejected at {}x{}; staying on the q4_K path", rows, cols);
+                    ok = false;
+                    break;
+                }
+                map.insert(w_off, (off, rows, cols));
+                off += ((rows * cols * 2 + SLOT_ALIGN - 1) / SLOT_ALIGN) * SLOT_ALIGN;
+            }
+        }
+        let committed = ok && self.batch_end();
+        if !ok || !committed {
+            eprintln!("[f16w] refused: materialisation batch failed; staying on the q4_K path");
+            return None;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let gbs = if ms > 0.0 { (total + total / 2) as f64 / 1e9 / (ms / 1e3) } else { 0.0 };
+        let _ = self.f16w.set(F16Weights { buf, map, bytes: total });
+        eprintln!(
+            "[f16w] materialised {} q4_K matrices -> {} MB fp16 arena in {ms:.1} ms ({} GB/s effective, cap {cap_mb} MB)",
+            tensors.len(),
+            total / (1024 * 1024),
+            gbs as u64
+        );
+        Some(total)
     }
 
     pub fn batch_gguf_b4(

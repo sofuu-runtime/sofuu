@@ -65,6 +65,13 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemm_q4_k_mma8_secs;
     // Same kernel with the residual add folded into the store (o, down).
     id<MTLComputePipelineState> pso_gemm_q4_k_mma8_acc;
+    // fp16-input forms of the same tile (SOFUU_GPU_F16W=1): the weight k-slice
+    // is read from a matrix materialised once at load instead of unpacked from
+    // q4_K per tile. Same 128-thread geometry, same guard.
+    id<MTLComputePipelineState> pso_gemm_f16_mma8;
+    id<MTLComputePipelineState> pso_gemm_f16_mma8_secs;
+    id<MTLComputePipelineState> pso_gemm_f16_mma8_acc;
+    id<MTLComputePipelineState> pso_dequant_q4k_f16;
 
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
@@ -428,6 +435,36 @@ void* sofuu_metal_init(void) {
                     "[metal] gemm_q4_k_mma8_secs needs 128 threads/group, pipeline allows %lu - sectioned mma8 disabled\n",
                     (unsigned long)ctx->pso_gemm_q4_k_mma8_secs.maxTotalThreadsPerThreadgroup);
             ctx->pso_gemm_q4_k_mma8_secs = nil;
+        }
+        ctx->pso_gemm_f16_mma8 = load_pso(@"gemm_f16_mma8");
+        if (ctx->pso_gemm_f16_mma8 != nil &&
+            ctx->pso_gemm_f16_mma8.maxTotalThreadsPerThreadgroup < 128ul) {
+            NSLog(@"[metal] gemm_f16_mma8 needs 128 threads/group, pipeline allows %lu - fp16 chain GEMM disabled",
+                  (unsigned long)ctx->pso_gemm_f16_mma8.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_f16_mma8 = nil;
+        }
+        ctx->pso_gemm_f16_mma8_secs = load_pso(@"gemm_f16_mma8_secs");
+        if (ctx->pso_gemm_f16_mma8_secs != nil &&
+            ctx->pso_gemm_f16_mma8_secs.maxTotalThreadsPerThreadgroup < 128ul) {
+            NSLog(@"[metal] gemm_f16_mma8_secs needs 128 threads/group, pipeline allows %lu - fp16 sectioned GEMM disabled",
+                  (unsigned long)ctx->pso_gemm_f16_mma8_secs.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_f16_mma8_secs = nil;
+        }
+        ctx->pso_gemm_f16_mma8_acc = load_pso(@"gemm_f16_mma8_acc");
+        if (ctx->pso_gemm_f16_mma8_acc != nil &&
+            ctx->pso_gemm_f16_mma8_acc.maxTotalThreadsPerThreadgroup < 128ul) {
+            NSLog(@"[metal] gemm_f16_mma8_acc needs 128 threads/group, pipeline allows %lu - fp16 residual GEMM disabled",
+                  (unsigned long)ctx->pso_gemm_f16_mma8_acc.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_f16_mma8_acc = nil;
+        }
+        // 128-thread flat grid, same floor: a >max dispatch is dropped silently
+        // in release, which here would leave the arena half-written.
+        ctx->pso_dequant_q4k_f16 = load_pso(@"dequant_q4k_f16");
+        if (ctx->pso_dequant_q4k_f16 != nil &&
+            ctx->pso_dequant_q4k_f16.maxTotalThreadsPerThreadgroup < 128ul) {
+            NSLog(@"[metal] dequant_q4k_f16 needs 128 threads/group, pipeline allows %lu - fp16 weight staging disabled",
+                  (unsigned long)ctx->pso_dequant_q4k_f16.maxTotalThreadsPerThreadgroup);
+            ctx->pso_dequant_q4k_f16 = nil;
         }
         ctx->pso_gemm_q4_k_mma8_acc = load_pso(@"gemm_q4_k_mma8_acc");
         if (ctx->pso_gemm_q4_k_mma8_acc != nil &&
@@ -850,6 +887,28 @@ void* sofuu_metal_buffer_create(void* ctx_ptr, const void* ptr, size_t size_byte
     }
 }
 
+
+/* Driver-owned buffer of `size_bytes`, contents undefined. The fp16 weight
+ * arena (SOFUU_GPU_F16W) needs ~0.8 GB that no host slice exists for: the
+ * weights are dequantised by the GPU straight out of the mapped file, so a
+ * copying buffer built from a caller slice would double the peak RSS for no
+ * reason. Shared storage keeps the host able to inspect the result (the
+ * bit-identity receipt) and is what every other buffer in the engine uses.
+ * Returns NULL on allocation failure, which the caller treats as "fall back to
+ * the q4_K path" — a 0.9 GB request on a full device is an expected miss. */
+extern "C" void* sofuu_metal_buffer_alloc(void* ctx_ptr, size_t size_bytes) {
+    if (!ctx_ptr || size_bytes == 0) return NULL;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    @autoreleasepool {
+        size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        if (page_size == 0) page_size = 16384;
+        size_t aligned_len = ((size_bytes + page_size - 1) / page_size) * page_size;
+        id<MTLBuffer> buf = [ctx->device newBufferWithLength:aligned_len
+                                                    options:MTLResourceStorageModeShared];
+        if (buf == nil) return NULL;
+        return (__bridge_retained void*)buf;
+    }
+}
 
 void* sofuu_metal_buffer_create_copy(void* ctx_ptr, const void* ptr, size_t size_bytes) {
     if (!ctx_ptr || !ptr || size_bytes == 0) return NULL;
@@ -2817,6 +2876,136 @@ int sofuu_metal_batch_gguf_mma8(void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
     [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:6];
     // 64x64 tile (see gemm_q4_k_mma8): grid = (rows/64, tokens/64), 128 threads.
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 63) / 64, (B + 63) / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+// ── fp16-input chain GEMM forms (SOFUU_GPU_F16W=1) ───────────────────────
+// Same tile, grid and 128-thread threadgroup as the q4_K forms above; the only
+// difference is that buffer 0 is the materialised fp16 arena and the weight
+// address is a plain half offset (no 256-byte remainder trick: arena slots are
+// 2 KiB aligned). ntok < 16 never comes here — the diversion is gated on the
+// token count so the decode GEMV class keeps its q4_K stream.
+extern "C" int sofuu_metal_batch_gguf_f16_mma8(void* ctx_ptr, void* w16_ptr, size_t w16_offset,
+    void* x_buf_ptr, size_t x_offset, void* y_buf_ptr, size_t y_offset,
+    size_t rows, size_t cols, size_t B) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w16_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (ctx->pso_gemm_f16_mma8 == nil) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    if (cols > 0xFFFFFFFFull || rows > 0xFFFFFFFFull || B > 0xFFFFFFFFull) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_f16_mma8];
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    uint bn = (uint)B;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w16_ptr offset:w16_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 63) / 64, (B + 63) / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+extern "C" int sofuu_metal_batch_gguf_f16_mma8_acc(
+    void* ctx_ptr, void* w16_ptr, size_t w16_offset,
+    void* x_buf_ptr, size_t x_offset, void* acc_buf_ptr, size_t acc_offset,
+    size_t rows, size_t cols, size_t B) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w16_ptr || !x_buf_ptr || !acc_buf_ptr) return 0;
+    if (ctx->pso_gemm_f16_mma8_acc == nil) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_f16_mma8_acc];
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    uint bn = (uint)B;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w16_ptr offset:w16_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)acc_buf_ptr offset:acc_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 63) / 64, (B + 63) / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+// secs: [n][4] = {arena byte offset, unused, rows, y_off bytes} — the fp16
+// twin of the q4_K section table, so one dispatch still covers q/k/v and
+// gate/up.
+extern "C" int sofuu_metal_batch_gguf_f16_mma8_secs(
+    void* ctx_ptr,
+    void* w16_ptr,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr,
+    size_t cols, size_t B,
+    const uint32_t* secs, size_t n_sec
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w16_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (ctx->pso_gemm_f16_mma8_secs == nil) return 0;
+    if (cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    if (!secs || n_sec == 0 || n_sec > 4) return 0;
+    uint32_t max_rows = 0;
+    for (size_t s = 0; s < n_sec; ++s) {
+        if (secs[s * 4 + 2] > max_rows) max_rows = secs[s * 4 + 2];
+    }
+    if (max_rows == 0) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_f16_mma8_secs];
+    uint c = (uint)cols;
+    uint bn = (uint)B;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w16_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:secs length:4 * sizeof(uint32_t) * n_sec atIndex:4];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((max_rows + 63u) / 64u, (B + 63u) / 64u, n_sec)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+// One-shot q4_K → fp16 for ONE tensor: source = the mapped weights (bound at
+// w_offset & ~255 with the remainder passed as w_rem), destination = the
+// arena slot at out_offset bytes. Encoded into the live batch; the caller
+// commits once for the whole materialisation.
+extern "C" int sofuu_metal_dequant_q4k_f16(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_offset,
+    void* out_buf_ptr, size_t out_offset,
+    size_t rows, size_t cols
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->pso_dequant_q4k_f16 == nil) return 0;
+    if (!w_buf_ptr || !out_buf_ptr) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0) return 0;
+    if (out_offset % 2048 != 0) return 0;
+    if (ctx->batch_enc == nil) return 0;      // the caller owns the batch
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_dequant_q4k_f16];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    uint oh = (uint)(out_offset / 2);
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:0 atIndex:1];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:2];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&oh length:sizeof(uint) atIndex:5];
+    size_t total = rows * (cols / 16);
+    size_t tgs = (total + 127) / 128;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }

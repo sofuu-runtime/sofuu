@@ -1391,8 +1391,23 @@ kernel void gemv_q4_k_b4c2(
 // their per-section y stride, so the chain's dispatch collapse (q/k/v and
 // gate/up in one dispatch, the o/down residual add folded into the store) is
 // unchanged - only the tile geometry differs.
-static inline void q4k_mma64_tile(
-    device const uchar *w_base, device const float *x, device float *y,
+// The staged weight value, in ONE place: the q4_K tile below and the
+// pre-materialisation kernel (dequant_q4k_f16) must produce the same fp16 bit
+// for the same input, so both evaluate this exact f32 expression and round once.
+static inline half q4k_f16_val(float ds, uint nib, float mm) {
+    return (half)(ds * (float)nib - mm);
+}
+
+// Shared 64x64 tile body. Exactly one of w_base (q4_K, unpacked per k-slice)
+// and w16 (an fp16 [rows][cols] matrix materialised once at load,
+// SOFUU_GPU_F16W) is non-null; the branch is threadgroup-uniform and the
+// wrapper below folds it away for the q4_K form, so the shipped path compiles
+// to the same code it did before. The MMA loop, the k-slice order, the
+// staging layout and the epilogue are shared verbatim: an fp16 matrix whose
+// entries are the same fp16 bits therefore produces a BIT-IDENTICAL y.
+static inline void mma64_tile_core(
+    device const uchar *w_base, device const half *w16,
+    device const float *x, device float *y,
     uint cols, uint w_rem, uint rows, uint ntok, uint r0, uint t0,
     uint tid, uint sgid, uint lane, bool do_acc,
     threadgroup half *ws, threadgroup half *xs, threadgroup float *oc
@@ -1414,20 +1429,31 @@ static inline void q4k_mma64_tile(
             uint grow = r0 + srow;
             threadgroup half *wrow = ws + srow * PADK + sk;
             if (grow < rows) {
-                uint row_byte = w_rem + grow * nb * 144u + b * 144u;
-                device const uchar *blk = w_base + row_byte;
-                float d = float(read_f16(w_base, row_byte));
-                float dmin = float(read_f16(w_base, row_byte + 2u));
-                uint8_t sc, m;
-                q4k_scale_min(blk + 4u, sub, &sc, &m);
-                float ds = d * (float)sc;
-                float mm = dmin * (float)m;
-                device const uchar *qrow = blk + 16u + 32u * (sub >> 1u);
-                bool hi = (sub & 1u) != 0u;
-                for (uint u = 0; u < 16u; ++u) {
-                    uint byte = (uint)qrow[sk + u];
-                    uint nib = hi ? (byte >> 4u) : (byte & 0x0Fu);
-                    wrow[u] = (half)(ds * (float)nib - mm);
+                if (w16 != nullptr) {
+                    // Materialised fp16 row (SOFUU_GPU_F16W): 32 B of halves
+                    // that are already the exact fp16 values the q4_K branch
+                    // below computes, so no unpack and no scale decode. 16 B
+                    // aligned on both sides (arena slots are 2 KiB aligned,
+                    // cols % 256 == 0, k0 % 32 == 0, sk in {0, 16}).
+                    device const half *src = w16 + (size_t)grow * cols + k0 + sk;
+                    *(threadgroup uint4 *)(wrow + 0u) = *(device const uint4 *)(src + 0u);
+                    *(threadgroup uint4 *)(wrow + 8u) = *(device const uint4 *)(src + 8u);
+                } else {
+                    uint row_byte = w_rem + grow * nb * 144u + b * 144u;
+                    device const uchar *blk = w_base + row_byte;
+                    float d = float(read_f16(w_base, row_byte));
+                    float dmin = float(read_f16(w_base, row_byte + 2u));
+                    uint8_t sc, m;
+                    q4k_scale_min(blk + 4u, sub, &sc, &m);
+                    float ds = d * (float)sc;
+                    float mm = dmin * (float)m;
+                    device const uchar *qrow = blk + 16u + 32u * (sub >> 1u);
+                    bool hi = (sub & 1u) != 0u;
+                    for (uint u = 0; u < 16u; ++u) {
+                        uint byte = (uint)qrow[sk + u];
+                        uint nib = hi ? (byte >> 4u) : (byte & 0x0Fu);
+                        wrow[u] = q4k_f16_val(ds, nib, mm);
+                    }
                 }
             } else {
                 for (uint u = 0; u < 16u; ++u) { wrow[u] = (half)0.0f; }
@@ -1486,6 +1512,29 @@ static inline void q4k_mma64_tile(
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+}
+
+// Call-site wrappers: the q4_K form keeps the signature every shipped kernel
+// already uses (the inlined core with w16 == nullptr), the fp16 form passes the
+// materialised matrix instead. Both inline into the same body above.
+static inline void q4k_mma64_tile(
+    device const uchar *w_base, device const float *x, device float *y,
+    uint cols, uint w_rem, uint rows, uint ntok, uint r0, uint t0,
+    uint tid, uint sgid, uint lane, bool do_acc,
+    threadgroup half *ws, threadgroup half *xs, threadgroup float *oc
+) {
+    mma64_tile_core(w_base, nullptr, x, y, cols, w_rem, rows, ntok, r0, t0,
+                    tid, sgid, lane, do_acc, ws, xs, oc);
+}
+
+static inline void f16_mma64_tile(
+    device const half *w16, device const float *x, device float *y,
+    uint cols, uint rows, uint ntok, uint r0, uint t0,
+    uint tid, uint sgid, uint lane, bool do_acc,
+    threadgroup half *ws, threadgroup half *xs, threadgroup float *oc
+) {
+    mma64_tile_core(nullptr, w16, x, y, cols, 0u, rows, ntok, r0, t0,
+                    tid, sgid, lane, do_acc, ws, xs, oc);
 }
 
 // Plain form: y[t][row] = sum_k W[row][k] * x[t][k] for one projection.
@@ -1567,6 +1616,123 @@ kernel void gemm_q4_k_mma8_acc(
     q4k_mma64_tile(w_base, x, x_acc, cols, w_rem, rows, ntok,
                    tg.x * 64u, tg.y * 64u, tid, tid >> 5u, tid & 31u, true,
                    ws, xs, oc);
+}
+
+// ── fp16-input forms (SOFUU_GPU_F16W=1) ────────────────────────────────────
+// Same tile, same MMA loop, same accumulation order as the q4_K forms above;
+// the only difference is that the weight k-slice is a plain fp16 read from a
+// matrix materialised ONCE at load instead of a q4_K unpack per tile. Each
+// reads w16 as a [rows][cols] half matrix (row stride == cols) whose slot is
+// 2 KiB aligned inside one arena buffer, so an offset is all the host passes.
+kernel void gemm_f16_mma8(
+    device const half   *w16       [[buffer(0)]],
+    device const float  *x         [[buffer(1)]],
+    device float        *y         [[buffer(2)]],
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       &rows      [[buffer(4)]],
+    constant uint       &ntok      [[buffer(5)]],
+    uint2               tg         [[threadgroup_position_in_grid]],
+    uint2               tp         [[thread_position_in_threadgroup]]
+) {
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
+    uint tid = tp.x;
+    f16_mma64_tile(w16, x, y, cols, rows, ntok,
+                   tg.x * 64u, tg.y * 64u, tid, tid >> 5u, tid & 31u, false,
+                   ws, xs, oc);
+}
+
+// Sectioned fp16 form: secs[i] = {arena byte offset, unused (0), rows, y_off}.
+kernel void gemm_f16_mma8_secs(
+    device const half   *w16_base  [[buffer(0)]],
+    device const float  *x         [[buffer(1)]],
+    device float        *y         [[buffer(2)]],
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       *secs      [[buffer(4)]],
+    constant uint       &ntok      [[buffer(5)]],
+    uint3               tg         [[threadgroup_position_in_grid]],
+    uint3               tp         [[thread_position_in_threadgroup]]
+) {
+    uint s = tg.z;
+    uint rows = secs[s * 4u + 2u];
+    uint r0 = tg.x * 64u;
+    if (r0 >= rows) { return; }
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
+    uint tid = tp.x;
+    device const half *w_sec =
+        (device const half *)((device const char *)w16_base + (size_t)secs[s * 4u + 0u]);
+    device float *y_sec = y + (size_t)(secs[s * 4u + 3u] >> 2u);
+    f16_mma64_tile(w_sec, x, y_sec, cols, rows, ntok,
+                   r0, tg.y * 64u, tid, tid >> 5u, tid & 31u, false, ws, xs, oc);
+}
+
+// Residual-epilogue fp16 form (o / down: output width == residual width).
+kernel void gemm_f16_mma8_acc(
+    device const half   *w16       [[buffer(0)]],
+    device const float  *x         [[buffer(1)]],
+    device float        *x_acc     [[buffer(2)]],
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       &rows      [[buffer(4)]],
+    constant uint       &ntok      [[buffer(5)]],
+    uint2               tg         [[threadgroup_position_in_grid]],
+    uint2               tp         [[thread_position_in_threadgroup]]
+) {
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
+    uint tid = tp.x;
+    f16_mma64_tile(w16, x, x_acc, cols, rows, ntok,
+                   tg.x * 64u, tg.y * 64u, tid, tid >> 5u, tid & 31u, true,
+                   ws, xs, oc);
+}
+
+// ── ONE-SHOT q4_K → fp16 materialisation ──────────────────────────────────
+// Measured: the q4_K unpack + scale decode is ~38% of the chain tile's time,
+// and it recomputes the same fp16 values in every tile and for every token
+// tile. This kernel does it once into a plain fp16 matrix. One thread = 16
+// values: the 8 low-nibble values of an 8-byte qs span (one 16 B store) and
+// the 8 high-nibble values that live 32 values later in the same 64-value
+// group, both through q4k_f16_val so the bits match the tile bit for bit.
+kernel void dequant_q4k_f16(
+    device const uchar *w_base     [[buffer(0)]],
+    device half        *out        [[buffer(1)]],
+    constant uint      &cols       [[buffer(2)]],
+    constant uint      &w_rem      [[buffer(3)]],
+    constant uint      &rows       [[buffer(4)]],
+    constant uint      &out_h      [[buffer(5)]],   // arena slot, in halves
+    uint gid                       [[thread_position_in_grid]]
+) {
+    uint spans = cols / 16u;                 // 16 values per span of 8 qs bytes
+    uint total = rows * spans;
+    if (gid >= total) { return; }
+    uint row = gid / spans;
+    uint ri  = gid - row * spans;
+    uint nb  = cols / 256u;
+    uint b   = ri / 16u;                     // 256-value block
+    uint s   = ri - b * 16u;                 // 16 spans per block
+    uint g   = s >> 2u;                      // 64-value group inside the block
+    uint m   = s & 3u;                       // 8-byte span inside the group
+    uint row_byte = w_rem + row * nb * 144u + b * 144u;
+    device const uchar *blk = w_base + row_byte;
+    float d    = float(read_f16(w_base, row_byte));
+    float dmin = float(read_f16(w_base, row_byte + 2u));
+    uint8_t sc1, m1, sc2, m2;
+    q4k_scale_min(blk + 4u, 2u * g, &sc1, &m1);
+    q4k_scale_min(blk + 4u, 2u * g + 1u, &sc2, &m2);
+    float ds1 = d * (float)sc1;
+    float ds2 = d * (float)sc2;
+    float mm1 = dmin * (float)m1;
+    float mm2 = dmin * (float)m2;
+    device const uchar *qs = blk + 16u + 32u * g + 8u * m;
+    uint base = out_h + row * cols + b * 256u + g * 64u + 8u * m;
+    for (uint u = 0; u < 8u; ++u) {
+        uint byte = (uint)qs[u];
+        out[base + u]      = q4k_f16_val(ds1, byte & 0x0Fu, mm1);
+        out[base + 32u + u] = q4k_f16_val(ds2, byte >> 4u, mm2);
+    }
 }
 
 // RESID-ADD EPILOGUE variant: after the GEMV, x_acc[t*acc_dim + row] +=

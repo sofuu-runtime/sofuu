@@ -3459,6 +3459,27 @@ impl TransformerModel {
                 }
             }
         }
+        // Bit-identity receipt for the fp16 weight arm (SOFUU_LOGITS_HASH=1):
+        // FNV-1a over the whole f32 logit row the GPU chain produced. Two runs
+        // that differ only in how the q4_K weights were staged must print the
+        // same 64-bit hash.
+        if last_logits {
+            if std::env::var_os("SOFUU_LOGITS_HASH").is_some() {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for v in head_logits.iter() {
+                    for &byte in v.to_le_bytes().iter() {
+                        h = (h ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+                eprintln!(
+                    "[logits-hash] pos={} n={} fnv={h:016x} l0={:.9} l1={:.9}",
+                    start_pos + b - 1,
+                    head_logits.len(),
+                    head_logits.first().copied().unwrap_or(0.0),
+                    head_logits.get(1).copied().unwrap_or(0.0),
+                );
+            }
+        }
         if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
             eprintln!(
                 "[gpu-profile] prefill-chunk: n={b} start_pos={start_pos} wall={}{}",
@@ -7254,6 +7275,31 @@ impl GgufGpu {
         let engine = crate::infer::metal::MetalEngine::new()?;
         let w_buf = engine.register_zerocopy_only(gguf.mmap.as_slice())?;
 
+        // ── fp16 weight materialisation (SOFUU_GPU_F16W=1) ────────────────
+        // The chain GEMM tile unpacks q4_K -> fp16 in every 32-value k-slice of
+        // every tile, and measured staging is ~38% of tile time. The values it
+        // stages are exactly q4k_f16_val(ds, nib, mm), so one dequantisation at
+        // load into a plain fp16 matrix is BIT-IDENTICAL and deletes the unpack
+        // from the inner loop. Only the q4_K chain projections qualify: the q6_K
+        // ones (attn_v / ffn_down on the i1 class) run the f32-FMA tiled kernel,
+        // whose arithmetic is a different class and would NOT be bit-identical.
+        if crate::infer::metal::MetalEngine::f16_weights_enabled() {
+            let mut want: Vec<(usize, usize, usize)> = Vec::new();
+            for l in layers.iter() {
+                for tv in [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output,
+                           &l.ffn_gate, &l.ffn_up, &l.ffn_down] {
+                    if tv.tensor_type != GGML_TYPE_Q4_K { continue; }
+                    if tv.shape.len() != 2 { continue; }
+                    let (cols, rows) = (tv.shape[0], tv.shape[1]);
+                    if cols % 256 != 0 || rows == 0 { continue; }
+                    want.push((gguf.data_offset + tv.offset, rows, cols));
+                }
+            }
+            want.sort_unstable();
+            want.dedup();
+            engine.materialize_f16(&w_buf, &want);
+        }
+
         // ── temporary instrumentation: SOFUU_BW_PROBE=1 prints achievable read
         // bandwidth over the weight buffer at several thread counts, so the next
         // GEMV is designed against a measured ceiling instead of a guess.
@@ -7348,6 +7394,115 @@ const SPEC_B: usize = 128;
         let act_slice: &[u8] =
             unsafe { std::slice::from_raw_parts(act.as_ptr() as *const u8, act_bytes) };
         let act_buf = engine.register_zerocopy_only(act_slice)?;
+
+        // ── instrumentation: SOFUU_BENCH_PROJ=1 times the chain GEMM per real
+        // projection in ONE commit (the production encoder path, not a synthetic
+        // kernel loop) and prints a byte hash of every y region it wrote, so the
+        // same plan run with SOFUU_GPU_F16W=0 and =1 is a per-projection
+        // BIT-IDENTITY receipt as well as an A/B.
+        if std::env::var_os("SOFUU_BENCH_PROJ").is_some() {
+            let iters: usize = std::env::var("SOFUU_BENCH_PROJ_ITERS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let b: usize = std::env::var("SOFUU_BENCH_PROJ_B")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+            let l0 = &layers[0];
+            let l3 = &layers[3.min(layers.len() - 1)];
+            let off = |tv: &TensorView| gguf.data_offset + tv.offset;
+            // form: 0 = plain mma8, 1 = sectioned, 2 = resid acc.
+            let mut plan: Vec<(&str, u8, Vec<(usize, usize, usize, usize)>)> = Vec::new();
+            plan.push(("attn_q", 0, vec![(off(&l0.attn_q), q_rows, dim, slots.qa)]));
+            plan.push(("attn_k", 0, vec![(off(&l0.attn_k), kv_rows, dim, slots.ka)]));
+            plan.push(("attn_o", 2, vec![(off(&l0.attn_output), dim, q_rows, slots.x)]));
+            plan.push(("ffn_gate", 0, vec![(off(&l0.ffn_gate), inter, dim, slots.gate)]));
+            plan.push(("ffn_up", 0, vec![(off(&l0.ffn_up), inter, dim, slots.up)]));
+            plan.push(("ffn_down", 2, vec![(off(&l3.ffn_down), dim, inter, slots.x)]));
+            plan.push(("qkv_secs3", 1, vec![
+                (off(&l0.attn_q), q_rows, dim, slots.qa),
+                (off(&l0.attn_k), kv_rows, dim, slots.ka),
+                (off(&l3.attn_v), kv_rows, dim, slots.va),
+            ]));
+            plan.push(("qk_secs2", 1, vec![
+                (off(&l0.attn_q), q_rows, dim, slots.qa),
+                (off(&l0.attn_k), kv_rows, dim, slots.ka),
+            ]));
+            plan.push(("gu_secs2", 1, vec![
+                (off(&l0.ffn_gate), inter, dim, slots.gate),
+                (off(&l0.ffn_up), inter, dim, slots.up),
+            ]));
+            let keep: usize = std::env::var("SOFUU_BENCH_PROJ_N")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+            plan.truncate(keep);
+            for (label, form, secs) in plan {
+                let macs: f64 = secs.iter().map(|(_, r, c, _)| (*r * *c) as f64).sum();
+                let bytes_per: f64 = secs.iter().map(|(wo, rows, cols, _)| {
+                    // streamed weight bytes per token tile: q4_K is 144 B per 256
+                    // values, or fp16 when this tensor has a materialised slot.
+                    let use16 = b >= 16
+                        && engine.f16w.get().and_then(|w| w.slot(*wo, *rows, *cols)).is_some();
+                    (rows * cols) as f64 * if use16 { 2.0 } else { 144.0 / 256.0 }
+                }).sum();
+                let base = secs.iter().map(|(wo, _, _, _)| wo & !255usize).min().unwrap_or(0);
+                let sb: Vec<[u32; 4]> = secs.iter().map(|(wo, rows, _, y_off)| {
+                    [((wo & !255usize) - base) as u32, (wo & 255) as u32,
+                     *rows as u32, *y_off as u32]
+                }).collect();
+                let mut ok = true;
+                // one untimed pass through the same plan: the first dispatch of
+                // a kernel in a process pays driver setup that is not the kernel
+                if ok && engine.batch_open() {
+                    for (wo, rows, cols, y_off) in secs.iter() {
+                        let r = match form {
+                            0 => engine.batch_gguf_mma8(&w_buf, *wo, &act_buf, slots.xn, &act_buf, *y_off, *rows, *cols, b),
+                            1 => engine.batch_gguf_mma8_secs(&w_buf, base, &act_buf, slots.xn, &act_buf, dim, b, &sb),
+                            _ => engine.batch_gguf_mma8_acc(&w_buf, *wo, &act_buf, slots.xn, &act_buf, *y_off, *rows, *cols, b),
+                        };
+                        if !r { ok = false; break; }
+                    }
+                    ok = ok && engine.batch_end();
+                } else { ok = false; }
+                let t0 = std::time::Instant::now();
+                ok = ok && engine.batch_open();
+                let ys = [slots.qa];
+                for it in 0..iters {
+                    if !ok { break; }
+                    for (k, (wo, rows, cols, y_off)) in secs.iter().enumerate() {
+                        // fan single-projection arms across y slots so the timing
+                        // does not measure a write-after-write chain on one slot
+                        let y = if form == 2 { *y_off }
+                                else if secs.len() == 1 { ys[0] }
+                                else { *y_off };
+                        let r = match form {
+                            0 => engine.batch_gguf_mma8(
+                                &w_buf, *wo, &act_buf, slots.xn, &act_buf, y,
+                                *rows, *cols, b),
+                            1 => engine.batch_gguf_mma8_secs(
+                                &w_buf, base, &act_buf, slots.xn, &act_buf,
+                                dim, b, &sb),
+                            _ => engine.batch_gguf_mma8_acc(
+                                &w_buf, *wo, &act_buf, slots.xn, &act_buf, y,
+                                *rows, *cols, b),
+                        };
+                        if !r { ok = false; break; }
+                    }
+                }
+                ok = ok && engine.batch_end();
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                let gbs = bytes_per * ((b + 63) / 64) as f64 / 1e9 / (ms / 1e3);
+                let tf = 2.0 * macs * b as f64 / 1e12 / (ms / 1e3);
+                let mut h: u64 = 0xcbf29ce484222325;
+                for (_, rows, _, y_off) in secs.iter() {
+                    let y = if form == 2 { *y_off } else if secs.len() == 1 { ys[0] } else { *y_off };
+                    let p = unsafe { (act.as_ptr() as *const u8).add(y) };
+                    for &byte in unsafe { std::slice::from_raw_parts(p, rows * b * 4) } {
+                        h = (h ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+                eprintln!(
+                    "[proj-bench] {label:10} form={form} b={b} iters={iters} ok={} {ms:.3} ms/dispatch {tf:.3} TFLOPS {gbs:.1} GB/s yhash={h:016x}",
+                    ok as u8
+                );
+            }
+        }
 
         // ── temporary instrumentation: SOFUU_GEMV_BENCH=1 times the shipped decode
         // GEMV at real geometry inside one commit. Until now "the kernel is slow"

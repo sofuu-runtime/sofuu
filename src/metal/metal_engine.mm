@@ -2685,7 +2685,9 @@ int sofuu_metal_batch_gguf_mma8_acc(void* ctx_ptr, void* w_buf_ptr, size_t w_off
     [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
     [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
     [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:6];
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 31) / 32, (B + 31) / 32, 1)
+    // 64x64 tile: one threadgroup per (64 rows, 64 tokens). Still 128 threads,
+    // so the maxTotalThreadsPerThreadgroup >= 128 guard above is the right one.
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 63) / 64, (B + 63) / 64, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }
@@ -2727,7 +2729,7 @@ extern "C" int sofuu_metal_batch_gguf_mma8_secs(
     [ctx->batch_enc setBytes:secs length:4 * sizeof(uint32_t) * n_sec atIndex:4];
     [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:5];
     [ctx->batch_enc setBytes:&wb length:sizeof(unsigned long long) atIndex:6];
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((max_rows + 31u) / 32u, (B + 31u) / 32u, n_sec)
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((max_rows + 63u) / 64u, (B + 63u) / 64u, n_sec)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }
@@ -2754,7 +2756,8 @@ int sofuu_metal_batch_gguf_mma8(void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
     [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
     [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
     [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:6];
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 31) / 32, (B + 31) / 32, 1)
+    // 64x64 tile (see gemm_q4_k_mma8): grid = (rows/64, tokens/64), 128 threads.
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 63) / 64, (B + 63) / 64, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }

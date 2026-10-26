@@ -1362,18 +1362,133 @@ kernel void gemv_q4_k_b4c2(
     y[2 * rows + row] = v2;
     y[3 * rows + row] = v3;
 }
-// q4_K x f32 GEMM on the simdgroup matrix units: 32 rows x 32 tokens per
-// 128-thread threadgroup. Each simdgroup owns a 16x16 output block as 2x2
-// fragments, so four independent 8x8x8 MMAs are in flight per k-step.
+// ── simdgroup-matrix q4_K GEMM: 64 rows x 64 tokens per 128-thread group ────
+// LEDGER: the three chain GEMM kernels below used a 32x32 tile. Measured in
+// isolation on the real projections at the real chunk width (b=128, production
+// dispatch), that tile reached 0.74-1.03 TFLOPS (attn_q 2048x1024 1.172 ms ->
+// 0.724 ms after the GPU clock settled, ffn_gate 3072x1024 0.914 ms), while the
+// 64x64 tile already used by gemm_q4_k_mma64 reached 2.77-2.85 TFLOPS on the
+// SAME weights, the SAME arithmetic class and a BIT-IDENTICAL y (identical f32
+// dequant, identical fp16 hi-only staging, identical k order, identical f32
+// accumulate - verified element-wise, see the harness table in the round
+// report). Four times the area with twice the staged operands per k-slice
+// doubles the MMA work per dequantised element (R*T/(R+T): 16 -> 32 MAC per
+// staged value); x flows through 2 threads/row x 16 contiguous floats instead
+// of one strided float per lane (the old x stage issued a 32-token-strided load
+// per lane, 8x sector amplification); and wlo/xlo staging, dead since LEDGER
+// #183, is gone. Measured after: attn_q 0.189 ms / 2.848 TFLOPS, ffn_gate
+// 0.290 ms / 2.774 TFLOPS, o 1024x2048 0.19 ms class.
 //
-// PRECISION: a 3-term hi/lo split was tried and did NOT change the divergence from
-// the CPU path (LEDGER #51), so the single-term form is kept for speed.
-// Former note: staging operands as plain half quantises every product to fp16
-// (~11 bits), which flips greedy near-ties against the f32 CPU path (LEDGER
-// #50). Each operand is therefore split into hi + lo halves (the "3xhalf"
-// trick, analogous to 3xTF32) and three MMAs are accumulated:
-//   A_hi*B_hi + A_hi*B_lo + A_lo*B_hi  =  ~22 bits of product precision
-// at 3x the MMA count, which this kernel can afford.
+// Geometry: 64 rows x 64 tokens, 128 threads = 4 simdgroups, one per 16-row
+// band, 2x8 = 16 accumulator fragments each (32 registers/lane). Both operands
+// are staged [row][k] with k contiguous and a padded stride of 40 halves
+// (80 B, a distinct bank group per row); A loads non-transposed, B transposed
+// so it reads as (k, token), and the accumulator reaches y through threadgroup
+// scratch instead of a transposed simdgroup_store.
+//
+// The tile is shared by the plain, sectioned and residual-epilogue forms: the
+// section forms keep their per-threadgroup z slice, their 256-aligned w_rem and
+// their per-section y stride, so the chain's dispatch collapse (q/k/v and
+// gate/up in one dispatch, the o/down residual add folded into the store) is
+// unchanged - only the tile geometry differs.
+static inline void q4k_mma64_tile(
+    device const uchar *w_base, device const float *x, device float *y,
+    uint cols, uint w_rem, uint rows, uint ntok, uint r0, uint t0,
+    uint tid, uint sgid, uint lane, bool do_acc,
+    threadgroup half *ws, threadgroup half *xs, threadgroup float *oc
+) {
+    const uint PADK = 40u;
+    uint nb = cols / 256u;
+    uint nbk = cols / 32u;
+    uint srow = tid >> 1u;          // 64 rows, 2 threads each
+    uint sk = (tid & 1u) * 16u;     // 16 of the 32 k values
+    simdgroup_matrix<float, 8, 8> acc[2][8];
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 8u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); }
+    }
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * 32u;
+        uint b = k0 / 256u;
+        uint sub = (k0 % 256u) / 32u;
+        {
+            uint grow = r0 + srow;
+            threadgroup half *wrow = ws + srow * PADK + sk;
+            if (grow < rows) {
+                uint row_byte = w_rem + grow * nb * 144u + b * 144u;
+                device const uchar *blk = w_base + row_byte;
+                float d = float(read_f16(w_base, row_byte));
+                float dmin = float(read_f16(w_base, row_byte + 2u));
+                uint8_t sc, m;
+                q4k_scale_min(blk + 4u, sub, &sc, &m);
+                float ds = d * (float)sc;
+                float mm = dmin * (float)m;
+                device const uchar *qrow = blk + 16u + 32u * (sub >> 1u);
+                bool hi = (sub & 1u) != 0u;
+                for (uint u = 0; u < 16u; ++u) {
+                    uint byte = (uint)qrow[sk + u];
+                    uint nib = hi ? (byte >> 4u) : (byte & 0x0Fu);
+                    wrow[u] = (half)(ds * (float)nib - mm);
+                }
+            } else {
+                for (uint u = 0; u < 16u; ++u) { wrow[u] = (half)0.0f; }
+            }
+        }
+        {
+            uint gt = t0 + srow;
+            threadgroup half *xrow = xs + srow * PADK + sk;
+            if (gt < ntok) {
+                device const float *xt = x + (size_t)gt * cols + k0 + sk;
+                for (uint u = 0; u < 16u; ++u) { xrow[u] = (half)xt[u]; }
+            } else {
+                for (uint u = 0; u < 16u; ++u) { xrow[u] = (half)0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint rl = sgid * 16u;
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_matrix<half, 8, 8> afr[2];
+            simdgroup_matrix<half, 8, 8> bfr[8];
+            simdgroup_load(afr[0], ws + (rl + 0u) * PADK + kk, PADK, ulong2(0, 0), false);
+            simdgroup_load(afr[1], ws + (rl + 8u) * PADK + kk, PADK, ulong2(0, 0), false);
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < 8u; ++j) {
+                simdgroup_load(bfr[j], xs + (j * 8u) * PADK + kk, PADK, ulong2(0, 0), true);
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 2u; ++i) {
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < 8u; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], afr[i], bfr[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // epilogue: acc is (rows x tokens), y is token-major [ntok][rows]. Threadgroup
+    // scratch turns the layout change into plain stores; each element is read and
+    // written by the same thread, so do_acc on the live residual slot is not a race.
+    threadgroup float *oband = oc + sgid * 64u;
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 8u; ++j) {
+            simdgroup_store(acc[i][j], oband, 8, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            uint grow = r0 + sgid * 16u + i * 8u + (lane >> 3u);
+            uint gt = t0 + j * 8u + (lane & 7u);
+            if (grow < rows && gt < ntok) {
+                size_t at = (size_t)gt * rows + grow;
+                y[at] = (do_acc ? y[at] : 0.0f) + oband[lane];
+            }
+            uint grow2 = grow + 4u;
+            if (grow2 < rows && gt < ntok) {
+                size_t at = (size_t)gt * rows + grow2;
+                y[at] = (do_acc ? y[at] : 0.0f) + oband[lane + 32u];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Plain form: y[t][row] = sum_k W[row][k] * x[t][k] for one projection.
 kernel void gemm_q4_k_mma8(
     device const uchar  *w_base    [[buffer(0)]],
     device const float  *x         [[buffer(1)]],
@@ -1385,107 +1500,23 @@ kernel void gemm_q4_k_mma8(
     uint2               tg         [[threadgroup_position_in_grid]],
     uint2               tp         [[thread_position_in_threadgroup]]
 ) {
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
     uint tid = tp.x;
-    uint lane = tid & 31u;
-    uint sgi = tid >> 5u;
-    uint row_off = (sgi & 1u) * 16u;
-    uint tok_off = (sgi >> 1u) * 16u;
-    threadgroup half  whi[32 * 32];
-    threadgroup half  wlo[32 * 32];
-    threadgroup half  xhi[32 * 32];
-    threadgroup half  xlo[32 * 32];
-    threadgroup float obuf[4][16 * 16];
-    uint r0 = tg.x * 32u;
-    uint t0 = tg.y * 32u;
-    uint nb = cols / 256u;
-    simdgroup_matrix<float, 8, 8> acc[2][2];
-    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
-    for (uint kt = 0; kt < cols; kt += 32u) {
-        uint blk = kt >> 8u;
-        uint kbase = kt & 255u;
-        for (uint idx = tid; idx < 1024u; idx += 128u) {
-            uint row = r0 + (idx >> 5u);
-            uint j = kbase + (idx & 31u);
-            float wv = 0.0f;
-            if (row < rows) {
-                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
-                float d = float(read_f16(w_base, row_byte));
-                float dmin = float(read_f16(w_base, row_byte + 2u));
-                device const uchar *scales = w_base + row_byte + 4u;
-                device const uchar *qs = w_base + row_byte + 16u;
-                uint8_t sc, mn;
-                q4k_scale_min(scales, j >> 5u, &sc, &mn);
-                uint off = j & 31u;
-                uint l8 = 2u * (j >> 6u) + (off >> 4u);
-                uint by = qs[l8 * 16u + (off & 15u)];
-                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
-                wv = d * (float)sc * (float)nib - dmin * (float)mn;
-            }
-            half h = (half)wv;
-            whi[idx] = h;
-            wlo[idx] = (half)(wv - (float)h);
-            uint tt = t0 + (idx & 31u);
-            float xv = 0.0f;
-            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
-            half xh = (half)xv;
-            xhi[idx] = xh;
-            xlo[idx] = (half)(xv - (float)xh);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma clang loop unroll(full)
-        for (uint kq = 0; kq < 4u; ++kq) {
-            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1, Al0, Al1, Bl0, Bl1;
-            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
-            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
-            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
-            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
-            // LEDGER #131: the lo halves carry the rounding residue of the half split; without these
-            // three extra products per fragment the dot is hi*hi only (~1e-3 relative error) and the
-            // logits flip near-ties depending on how close the top two entries are.
-            simdgroup_load(Al0, wlo + row_off * 32u + kq * 8u, 32);
-            simdgroup_load(Al1, wlo + (row_off + 8u) * 32u + kq * 8u, 32);
-            simdgroup_load(Bl0, xlo + kq * 8u * 32u + tok_off, 32);
-            simdgroup_load(Bl1, xlo + kq * 8u * 32u + tok_off + 8u, 32);
-            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
-            // LEDGER #183: the 12 lo-term products are DISABLED again. Round 77 restored them
-            // (improving b=8 max|delta| from 16.03 to 2.54) but that tripled the MMA work and cost
-            // ~3.8x on GPU prefill (4.18 s -> 15.8 s, measured with all prefill-attention code
-            // bypassed). Since mma8 remains numerically wrong for b >= 6 EITHER WAY, it is kept on
-            // no default path, and the fast variant is restored. mma8 must not be enabled until a
-            // real correctness fix lands - see PLAN-TARGET-1200-1500.md section 18 (D1).
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint i = 0; i < 2u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
-            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lane; idx < 256u; idx += 32u) {
-        uint row = r0 + row_off + (idx >> 4u);
-        uint tt = t0 + tok_off + (idx & 15u);
-        if (row < rows && tt < ntok) { y[(size_t)tt * rows + row] = obuf[sgi][idx]; }
-    }
+    q4k_mma64_tile(w_base, x, y, cols, w_rem, rows, ntok,
+                   tg.x * 64u, tg.y * 64u, tid, tid >> 5u, tid & 31u, false,
+                   ws, xs, oc);
 }
 
-// ── sectioned mma8 GEMM: ONE dispatch for a group of q4_K projections ───────
-// The body below is gemm_q4_k_mma8 verbatim — same 32-row x 32-token tile, same
-// 128-thread threadgroup, same k-loop, same hi/lo staging, same accumulation
-// order — with the (weights, out) pair chosen by threadgroup z instead of by the
-// buffer offsets. Every output element is therefore computed by the same
-// arithmetic as in the three-dispatches form, so the result is bit-identical;
-// only the dispatch count changes.
-//
-// The sections a layer can share are exactly the projections that read the SAME
-// activation rows and write disjoint output slots: q/k/v off the normed input,
-// gate/up off the ffn-normed one. Sections carry {w_off (256-aligned,
-// base-relative), w_rem (<256), rows, y_off (bytes)} and may have different
-// rows; a tile beyond a section's row count returns before touching memory.
-// wbase is a 64-bit base so a >4 GiB model never truncates an offset.
+// ── sectioned form: ONE dispatch for a group of q4_K projections ────────────
+// Same tile and body as gemm_q4_k_mma8; the (weights, out) pair is chosen by
+// threadgroup z instead of by the buffer offsets, so one dispatch covers the
+// projections that read the same activation rows and write disjoint y slots
+// (q/k/v off the normed input, gate/up off the ffn-normed one). Sections carry
+// {w_off (256-aligned, base-relative), w_rem (<256), rows, y_off (bytes)} and
+// may have different rows; a tile beyond a section's row count returns before
+// touching memory. wbase is a 64-bit base so a >4 GiB model never truncates.
 kernel void gemm_q4_k_mma8_secs(
     device const uchar  *w_base    [[buffer(0)]],   // whole weight buffer, bound at 0
     device const float  *x         [[buffer(1)]],
@@ -1498,93 +1529,26 @@ kernel void gemm_q4_k_mma8_secs(
     uint3               tp         [[thread_position_in_threadgroup]]
 ) {
     uint s = tg.z;
-    uint w_rem = secs[s * 4u + 1u];
-    uint rows  = secs[s * 4u + 2u];
-    uint y_off = secs[s * 4u + 3u];
-    uint r0 = tg.x * 32u;
+    uint rows = secs[s * 4u + 2u];
+    uint r0 = tg.x * 64u;
     if (r0 >= rows) { return; }
-    device const uchar *w_sec = w_base + wbase + (size_t)secs[s * 4u + 0u];
-    device float       *y_sec = y + (size_t)(y_off >> 2u);
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
     uint tid = tp.x;
-    uint lane = tid & 31u;
-    uint sgi = tid >> 5u;
-    uint row_off = (sgi & 1u) * 16u;
-    uint tok_off = (sgi >> 1u) * 16u;
-    threadgroup half  whi[32 * 32];
-    threadgroup half  wlo[32 * 32];
-    threadgroup half  xhi[32 * 32];
-    threadgroup half  xlo[32 * 32];
-    threadgroup float obuf[4][16 * 16];
-    uint t0 = tg.y * 32u;
-    uint nb = cols / 256u;
-    simdgroup_matrix<float, 8, 8> acc[2][2];
-    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
-    for (uint kt = 0; kt < cols; kt += 32u) {
-        uint blk = kt >> 8u;
-        uint kbase = kt & 255u;
-        for (uint idx = tid; idx < 1024u; idx += 128u) {
-            uint row = r0 + (idx >> 5u);
-            uint j = kbase + (idx & 31u);
-            float wv = 0.0f;
-            if (row < rows) {
-                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
-                float d = float(read_f16(w_sec, row_byte));
-                float dmin = float(read_f16(w_sec, row_byte + 2u));
-                device const uchar *scales = w_sec + row_byte + 4u;
-                device const uchar *qs = w_sec + row_byte + 16u;
-                uint8_t sc, mn;
-                q4k_scale_min(scales, j >> 5u, &sc, &mn);
-                uint off = j & 31u;
-                uint l8 = 2u * (j >> 6u) + (off >> 4u);
-                uint by = qs[l8 * 16u + (off & 15u)];
-                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
-                wv = d * (float)sc * (float)nib - dmin * (float)mn;
-            }
-            half h = (half)wv;
-            whi[idx] = h;
-            wlo[idx] = (half)(wv - (float)h);
-            uint tt = t0 + (idx & 31u);
-            float xv = 0.0f;
-            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
-            half xh = (half)xv;
-            xhi[idx] = xh;
-            xlo[idx] = (half)(xv - (float)xh);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma clang loop unroll(full)
-        for (uint kq = 0; kq < 4u; ++kq) {
-            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1;
-            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
-            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
-            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
-            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
-            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint i = 0; i < 2u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
-            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lane; idx < 256u; idx += 32u) {
-        uint row = r0 + row_off + (idx >> 4u);
-        uint tt = t0 + tok_off + (idx & 15u);
-        if (row < rows && tt < ntok) { y_sec[(size_t)tt * rows + row] = obuf[sgi][idx]; }
-    }
+    device const uchar *w_sec = w_base + wbase + (size_t)secs[s * 4u + 0u];
+    device float       *y_sec = y + (size_t)(secs[s * 4u + 3u] >> 2u);
+    q4k_mma64_tile(w_sec, x, y_sec, cols, secs[s * 4u + 1u], rows, ntok,
+                   r0, tg.y * 64u, tid, tid >> 5u, tid & 31u, false, ws, xs, oc);
 }
 
-// ── mma8 with a RESIDUAL-ADD epilogue ──────────────────────────────────────
-// Same tile/k-loop/accumulation as gemm_q4_k_mma8; the store adds into the
-// residual slab instead of writing a fresh y slot. Valid only when the output
-// width equals the residual width (the o and down projections: both == dim),
-// which the host enforces. One thread writes each element, and the add is the
-// SAME f32 addition the separate batch_add performs on the same two operands,
-// so x[t][row] is bit-identical while the y-slot write and its dispatch go away.
+// ── residual-add epilogue form ─────────────────────────────────────────────
+// Same tile/k-loop/accumulation; the store adds into the residual slab instead
+// of writing a fresh y slot. Valid only when the output width equals the
+// residual width (the o and down projections: both == dim), which the host
+// enforces. One thread reads and writes each element, and the add is the SAME
+// f32 addition the separate batch_add performs on the same two operands, so
+// x[t][row] is bit-identical while the y-slot write and its dispatch go away.
 kernel void gemm_q4_k_mma8_acc(
     device const uchar  *w_base    [[buffer(0)]],
     device const float  *x         [[buffer(1)]],
@@ -1596,78 +1560,13 @@ kernel void gemm_q4_k_mma8_acc(
     uint2               tg         [[threadgroup_position_in_grid]],
     uint2               tp         [[thread_position_in_threadgroup]]
 ) {
+    threadgroup half  ws[64 * 40];
+    threadgroup half  xs[64 * 40];
+    threadgroup float oc[4 * 64];
     uint tid = tp.x;
-    uint lane = tid & 31u;
-    uint sgi = tid >> 5u;
-    uint row_off = (sgi & 1u) * 16u;
-    uint tok_off = (sgi >> 1u) * 16u;
-    threadgroup half  whi[32 * 32];
-    threadgroup half  wlo[32 * 32];
-    threadgroup half  xhi[32 * 32];
-    threadgroup half  xlo[32 * 32];
-    threadgroup float obuf[4][16 * 16];
-    uint r0 = tg.x * 32u;
-    uint t0 = tg.y * 32u;
-    uint nb = cols / 256u;
-    simdgroup_matrix<float, 8, 8> acc[2][2];
-    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
-    for (uint kt = 0; kt < cols; kt += 32u) {
-        uint blk = kt >> 8u;
-        uint kbase = kt & 255u;
-        for (uint idx = tid; idx < 1024u; idx += 128u) {
-            uint row = r0 + (idx >> 5u);
-            uint j = kbase + (idx & 31u);
-            float wv = 0.0f;
-            if (row < rows) {
-                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
-                float d = float(read_f16(w_base, row_byte));
-                float dmin = float(read_f16(w_base, row_byte + 2u));
-                device const uchar *scales = w_base + row_byte + 4u;
-                device const uchar *qs = w_base + row_byte + 16u;
-                uint8_t sc, mn;
-                q4k_scale_min(scales, j >> 5u, &sc, &mn);
-                uint off = j & 31u;
-                uint l8 = 2u * (j >> 6u) + (off >> 4u);
-                uint by = qs[l8 * 16u + (off & 15u)];
-                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
-                wv = d * (float)sc * (float)nib - dmin * (float)mn;
-            }
-            half h = (half)wv;
-            whi[idx] = h;
-            wlo[idx] = (half)(wv - (float)h);
-            uint tt = t0 + (idx & 31u);
-            float xv = 0.0f;
-            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
-            half xh = (half)xv;
-            xhi[idx] = xh;
-            xlo[idx] = (half)(xv - (float)xh);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma clang loop unroll(full)
-        for (uint kq = 0; kq < 4u; ++kq) {
-            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1;
-            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
-            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
-            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
-            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
-            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint i = 0; i < 2u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
-            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lane; idx < 256u; idx += 32u) {
-        uint row = r0 + row_off + (idx >> 4u);
-        uint tt = t0 + tok_off + (idx & 15u);
-        if (row < rows && tt < ntok) { x_acc[(size_t)tt * rows + row] += obuf[sgi][idx]; }
-    }
+    q4k_mma64_tile(w_base, x, x_acc, cols, w_rem, rows, ntok,
+                   tg.x * 64u, tg.y * 64u, tid, tid >> 5u, tid & 31u, true,
+                   ws, xs, oc);
 }
 
 // RESID-ADD EPILOGUE variant: after the GEMV, x_acc[t*acc_dim + row] +=

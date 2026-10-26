@@ -201,6 +201,8 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_conv1d_3;
     // GPU1: in-batch glue kernels (whole-decode-step batches).
     id<MTLComputePipelineState> pso_add_inplace;
+    // Qwen2/2.5 q/k/v bias epilogue over a [b][rows] slot (one dispatch).
+    id<MTLComputePipelineState> pso_add_chan_bias4;
     // W2 CPU+GPU feature split: compact-range placement + two-owner residual.
     id<MTLComputePipelineState> pso_strided_copy_f32;
     id<MTLComputePipelineState> pso_resid_split_add_f32;
@@ -568,7 +570,7 @@ void* sofuu_metal_init(void) {
             @"gemv_bf16", @"gemv_f16", @"gemv_f32",
             @"gemv_mlx4_affine_f16", @"gemv_mlx4_affine_bf16",
             @"rmsnorm", @"swiglu", @"conv1d_3",
-            @"add_inplace", @"lfm2_conv_gate", @"lfm2_kv_write", @"lfm2_attn",
+            @"add_inplace", @"add_chan_bias4", @"lfm2_conv_gate", @"lfm2_kv_write", @"lfm2_attn",
             @"gemv_q8_0", @"gemv_q4_0", @"gemv_q4_k", @"gemv_q6_k",
             @"rmsnorm_f32w", @"llama_kv_write", @"llama_attn",
             @"head_rmsnorm", @"llama_attn_part", @"llama_attn_fin",
@@ -688,6 +690,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_swiglu    = load_pso(@"swiglu");
         ctx->pso_conv1d_3  = load_pso(@"conv1d_3");
         ctx->pso_add_inplace     = load_pso(@"add_inplace");
+        ctx->pso_add_chan_bias4  = load_pso(@"add_chan_bias4");
         ctx->pso_strided_copy_f32    = load_pso(@"strided_copy_f32");
         ctx->pso_resid_split_add_f32 = load_pso(@"resid_split_add_f32");
         ctx->pso_lfm2_conv_gate  = load_pso(@"lfm2_conv_gate");
@@ -3470,6 +3473,41 @@ int sofuu_metal_batch_add(
     return 1;
 }
 
+// Qwen2/2.5 attention bias: y[t][j] += bias[j] for t in 0..b over up to four
+// sections. Every offset is an f32 ELEMENT index into the bound buffer. One
+// dispatch for the layer's whole q/k/v bias; returns 0 (caller refuses the
+// commit) when the pipeline is missing, so a missing kernel degrades to "no
+// bias support" instead of a silently unbiased projection.
+int sofuu_metal_batch_add_chan_bias(
+    void* ctx_ptr,
+    void* y_buf_ptr,
+    void* bias_buf_ptr,
+    const uint32_t* secs,
+    size_t nsec,
+    size_t b
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !y_buf_ptr || !bias_buf_ptr || secs == NULL) return 0;
+    if (ctx->pso_add_chan_bias4 == nil || nsec == 0 || nsec > 4 || b == 0) return 0;
+    size_t total = 0;
+    for (size_t s = 0; s < nsec; ++s) total += (size_t)secs[s * 4 + 2];
+    total *= b;
+    if (total == 0) return 1;
+    sofuu_batch_barrier(ctx);
+    uint unsec = (uint)nsec;
+    uint ub = (uint)b;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_add_chan_bias4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)bias_buf_ptr offset:0 atIndex:1];
+    [ctx->batch_enc setBytes:secs length:sizeof(uint32_t) * 4 * nsec atIndex:2];
+    [ctx->batch_enc setBytes:&unsec length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&ub length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((total + 255) / 256))
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
 int sofuu_metal_batch_swiglu(
     void* ctx_ptr,
     void* g_buf_ptr, size_t g_offset,
@@ -5352,6 +5390,7 @@ int sofuu_metal_batch_wait_all(void* ctx) { (void)ctx; return 0; }
 void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 int sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; return 0; }
+int sofuu_metal_batch_add_chan_bias(void* ctx, void* y, void* bias, const uint32_t* secs, size_t nsec, size_t b) { (void)ctx;(void)y;(void)bias;(void)secs;(void)nsec;(void)b; return 0; }
 int sofuu_metal_batch_strided_copy_f32(void* ctx, void* d, size_t dob, size_t ds, void* s, size_t sob, size_t ss, size_t n, size_t r) { (void)ctx;(void)d;(void)dob;(void)ds;(void)s;(void)sob;(void)ss;(void)n;(void)r; return 0; }
 int sofuu_metal_batch_resid_split_add_f32(void* ctx, void* y, size_t yo, void* pa, size_t pao, size_t na, void* pb, size_t pbo, size_t nb, size_t c, size_t r) { (void)ctx;(void)y;(void)yo;(void)pa;(void)pao;(void)na;(void)pb;(void)pbo;(void)nb;(void)c;(void)r; return 0; }
 int sofuu_metal_batch_swiglu(void* ctx, void* g, size_t go, void* u, size_t uo, size_t n) { (void)ctx;(void)g;(void)go;(void)u;(void)uo;(void)n; return 0; }

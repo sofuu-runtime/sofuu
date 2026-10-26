@@ -15,6 +15,48 @@ pub const GGML_TYPE_Q6_K: u32 = 14;
 /// Prism-private ternary at group size 128 (ggml type 143).
 pub const GGML_TYPE_PTQ1_0: u32 = 143;
 
+/// GGML type id -> the name a user can look up (and the name a quantizer
+/// takes). Used by the load-time refusal so a rejection says "Q5_K (13)",
+/// never a bare number: the whole point of the gate is that the reader knows
+/// what to re-quantize away from.
+pub fn ggml_type_name(type_id: u32) -> &'static str {
+    match type_id {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        24 => "I8",
+        25 => "I16",
+        26 => "I32",
+        27 => "I64",
+        28 => "F64",
+        29 => "IQ1_M",
+        30 => "BF16",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        143 => "PTQ1_0",
+        _ => "unknown",
+    }
+}
+
 pub const QK4_0: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
@@ -1769,6 +1811,13 @@ pub fn batched_mad(dst: &mut [f32], src: &[f32], alpha: f32, rows: usize, cols: 
 /// Batched per-row bias add: `x[r][c] += bias[c]`.
 #[inline]
 pub fn batched_add_bias(x: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
+    // CPU half of the SOFUU_NO_CHAN_BIAS bisect arm (see
+    // TransformerModel::chan_bias_secs). Dropping the bias on BOTH engines is
+    // what separates "the route's own numeric class" from "the bias add" in a
+    // GPU-vs-CPU dump comparison, so the knob has to reach the CPU glue too.
+    if std::env::var_os("SOFUU_NO_CHAN_BIAS").is_some() {
+        return;
+    }
     let _p = prof::Scope::new(&prof::GLUE_NS, &prof::GLUE_CALLS);
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(bias.len(), cols);

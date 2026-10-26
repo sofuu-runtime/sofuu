@@ -488,6 +488,21 @@ impl TransformerModel {
         let arch = gguf.get_str("general.architecture").unwrap_or("llama");
         let prefix = format!("{arch}.");
         let is_gemma2 = arch == "gemma2" || arch.contains("gemma2");
+        if is_gemma2 {
+            // Loud, at load, because the alternative is a silent wrong answer:
+            // this backend implements gemma2's sliding-window layer schedule
+            // (calc_layer_sliding_window) and its q/k norms, but NOT the arch's
+            // post_attention_norm / post_ffw_norm residuals, its two logit
+            // soft-caps (attn 50, final 30) nor the sqrt(dim) embedding scale.
+            // A gemma2 checkpoint therefore loads and produces logits that must
+            // not be used as a reference until those three land.
+            eprintln!(
+                "[gguf] WARNING: arch {} is only partially implemented: post_attention_norm / post_ffw_norm not applied, attn_logit_softcapping ({:.1}) and final_logit_softcapping ({:.1}) not applied, sqrt(dim) embedding scale not applied. Expect WRONG logits from this checkpoint.",
+                arch,
+                gguf.get_f32(&format!("{prefix}attn_logit_softcapping")).unwrap_or(50.0),
+                gguf.get_f32(&format!("{prefix}final_logit_softcapping")).unwrap_or(30.0),
+            );
+        }
 
         // 2. Read model hyperparameters
         let dim = gguf
@@ -719,6 +734,15 @@ impl TransformerModel {
             );
         }
 
+        // ── Whole-file quant gate: refuse ONCE, naming every unsupported type
+        // and tensor. The per-tensor gate below fires on the first offender
+        // mid-load, which told a Q5_K user only about blk.0.attn_v and never
+        // how many tensors or which type they were hitting; the refusal itself
+        // is the product here, so it has to be complete and actionable.
+        {
+            Self::check_quant_types(&gguf)?;
+        }
+
         // Helper to find tensor
         let find_tensor = |name: &str| -> Result<TensorView, String> {
             let info = gguf
@@ -728,20 +752,15 @@ impl TransformerModel {
             // Gate unsupported quant types at load with a loud, actionable
             // error instead of a mid-forward panic (type_row_size's fallback
             // sizes IQ* as f32 and corrupts the slice math). The llama
-            // matvec path handles exactly these types.
-            const SUPPORTED: [u32; 7] = [
-                crate::infer::quant::GGML_TYPE_F32,
-                crate::infer::quant::GGML_TYPE_F16,
-                crate::infer::quant::GGML_TYPE_Q4_0,
-                crate::infer::quant::GGML_TYPE_Q8_0,
-                crate::infer::quant::GGML_TYPE_Q4_K,
-                crate::infer::quant::GGML_TYPE_Q6_K,
-                crate::infer::quant::GGML_TYPE_Q3_K,
-            ];
+            // matvec path handles exactly these types. The whole-file pre-scan
+            // (check_quant_types) has already refused a file with offenders,
+            // so this is the backstop for a name that appears mid-load.
+            const SUPPORTED: [u32; 7] = TransformerModel::SUPPORTED_QUANT_TYPES;
             if !SUPPORTED.contains(&info.tensor_type) {
                 return Err(format!(
-                    "tensor `{name}` uses GGML type {} — not supported by the CPU GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k, q3_k). Re-quantize the model to one of these, e.g. `llama-quantize` to Q4_K_M.",
-                    info.tensor_type
+                    "tensor `{name}` uses GGML type {} ({}) — not supported by the GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k, q3_k). Re-quantize to a mix inside that set: `llama-quantize <src.gguf> <dst.gguf> q4_k_m` is the closest 4-bit mix (q4_K + q6_K) and stays inside it; q6_k or q8_0 also work.",
+                    info.tensor_type,
+                    crate::infer::quant::ggml_type_name(info.tensor_type)
                 ));
             }
             Ok(TensorView {
@@ -3107,6 +3126,108 @@ impl TransformerModel {
     /// the CPU) are all command-buffer-resident between layers; x syncs back
     /// to Vec once per token.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
+    /// Every quant type this backend implements end to end: the CPU dequant /
+    /// dot / matvec / matmat dispatch, the GGUF loader's row-size table and the
+    /// Metal GEMV + GEMM kernels all cover exactly this set. Q5_K (13), Q4_1,
+    /// Q5_0/Q5_1, Q2_K, Q8_K and the IQ family are NOT here — a file that uses
+    /// them is refused at load rather than half-computed.
+    pub const SUPPORTED_QUANT_TYPES: [u32; 7] = [
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q6_K,
+        GGML_TYPE_Q3_K,
+    ];
+
+    /// Whole-file quant gate. Returns ONE error naming every unsupported type
+    /// (with id and count) and the first few offending tensors, plus the
+    /// remedy, instead of failing on whichever tensor the loader happens to
+    /// reach first. Pure over the parsed header so it is testable without a
+    /// forward pass.
+    pub fn check_quant_types(gguf: &GgufFile) -> Result<(), String> {
+        let mut bad: Vec<(&str, u32)> = gguf
+            .tensors
+            .iter()
+            .filter(|(_, ti)| !Self::SUPPORTED_QUANT_TYPES.contains(&ti.tensor_type))
+            .map(|(n, ti)| (n.as_str(), ti.tensor_type))
+            .collect();
+        if bad.is_empty() {
+            return Ok(());
+        }
+        bad.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut by_type: std::collections::BTreeMap<u32, usize> = Default::default();
+        for (_, ty) in &bad {
+            *by_type.entry(*ty).or_insert(0) += 1;
+        }
+        let types: Vec<String> = by_type
+            .iter()
+            .map(|(ty, n)| format!("{} ({ty}) x{n}", crate::infer::quant::ggml_type_name(*ty)))
+            .collect();
+        let shown = 8.min(bad.len());
+        let first: Vec<String> = bad[..shown]
+            .iter()
+            .map(|(n, ty)| format!("{n} [{}]", crate::infer::quant::ggml_type_name(*ty)))
+            .collect();
+        let more = if bad.len() > shown {
+            format!(" (+{} more)", bad.len() - shown)
+        } else {
+            String::new()
+        };
+        Err(format!(
+            "cannot load this GGUF: {} tensor(s) use quant types that are not supported by this backend: {}. \
+             Supported: f32, f16, q4_0, q8_0, q4_K, q6_K, q3_K. Offenders: {first}{more}. \
+             Re-quantize to a mix inside the supported set: \
+             `llama-quantize <src.gguf> <dst.gguf> q4_k_m` (q4_K + q6_K) is the closest 4-bit mix \
+             that stays inside it; q6_k and q8_0 also work. Q5_K in particular has no CPU dot and \
+             no GPU kernel in this build, so it is refused rather than half-supported.",
+            bad.len(),
+            types.join(", "),
+            first = first.join(", "),
+        ))
+    }
+
+    /// Bias section list for ONE layer's q/k/v slots:
+    /// (y_off, bias_off, rows, 0) per present bias, f32 ELEMENT units into the
+    /// activation slab / weight buffer. Pure on purpose: the slot-to-bias
+    /// mapping is the one thing a bias epilogue can get wrong silently (right
+    /// values on the wrong slot is a plausible-looking logit row), so it is
+    /// testable without a GPU.
+    #[allow(dead_code)]
+    fn chan_bias_secs(
+        gguf: &GgufFile,
+        layer: &LayerWeights,
+        q_rows: usize,
+        kv_rows: usize,
+        qa: usize,
+        ka: usize,
+        va: usize,
+    ) -> Vec<[u32; 4]> {
+        // Bisect / A-B arm: SOFUU_NO_CHAN_BIAS=1 drops the bias epilogue, so a
+        // run can price the bias itself (and prove the dispatch is doing the
+        // work) without a second binary. Unset is the shipped behaviour.
+        if std::env::var_os("SOFUU_NO_CHAN_BIAS").is_some() {
+            return Vec::new();
+        }
+        let mut secs = Vec::with_capacity(3);
+        for (bias, rows, slot) in [
+            (&layer.attn_q_bias, q_rows, qa),
+            (&layer.attn_k_bias, kv_rows, ka),
+            (&layer.attn_v_bias, kv_rows, va),
+        ] {
+            if let Some(tv) = bias {
+                secs.push([
+                    (slot / 4) as u32,
+                    ((gguf.data_offset + tv.offset) / 4) as u32,
+                    rows as u32,
+                    0,
+                ]);
+            }
+        }
+        secs
+    }
+
     fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
@@ -3262,6 +3383,21 @@ impl TransformerModel {
                     g.slots.xn, g.slots.ka, n_kv_heads * head_dim, dim);
                 dec_gguf!(l.attn_v, gguf.data_offset + l.attn_v.offset,
                     g.slots.xn, g.slots.va, n_kv_heads * head_dim, dim);
+            }
+            // Qwen2/2.5 bias (one token = one row here), BEFORE the kv_write
+            // and head_rmsnorm dispatches below: both apply k/q-norm and rope,
+            // and the CPU glue adds the bias first. Same single additive
+            // dispatch as the chain route, b = 1.
+            {
+                let secs = Self::chan_bias_secs(
+                    gguf, l, n_heads * head_dim, n_kv_heads * head_dim,
+                    g.slots.qa, g.slots.ka, g.slots.va,
+                );
+                if !secs.is_empty()
+                    && !g.engine.batch_add_chan_bias(&g.act_buf, &g.w_buf, &secs, 1)
+                {
+                    return false;
+                }
             }
             let run_attn = !g.skip_attn;
             if run_attn {
@@ -5635,6 +5771,21 @@ impl TransformerModel {
             gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
             gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
         }
+        // Qwen2/2.5 q/k/v bias: additive per output channel, so it lands on
+        // the projected [b][rows] slots before k-norm/rope and the KV write —
+        // the CPU glue's order. ONE dispatch for q+k+v over the activation
+        // slab; a refused dispatch fails the layer, because a bias-free
+        // projection is a wrong answer, not a slow one.
+        {
+            let secs = Self::chan_bias_secs(
+                gguf, l, q_rows, kv_rows, g.slots.qa, g.slots.ka, g.slots.va,
+            );
+            if !secs.is_empty()
+                && !g.engine.batch_add_chan_bias(&g.act_buf, &g.w_buf, &secs, b)
+            {
+                return false;
+            }
+        }
 
         // Attention in four b4 dispatches (rows × heads × chunks grid):
         // kv_write_b4 lands every row's KV first; attn_part_b4 bounds
@@ -6412,6 +6563,19 @@ impl TransformerModel {
                 gemm!(l.attn_q, pslots.xn, pslots.qa, q_rows, dim);
                 gemm!(l.attn_k, pslots.xn, pslots.ka, kv_rows, dim);
                 gemm!(l.attn_v, pslots.xn, pslots.va, kv_rows, dim);
+            }
+            // Qwen2/2.5 bias on the GEMM route (SOFUU_GPU_PREFILL_GEMM=1):
+            // same additive dispatch as the chain, on the prefill slab, before
+            // kv_write/head_rmsnorm apply k/q-norm and rope.
+            {
+                let secs = Self::chan_bias_secs(
+                    gguf, l, q_rows, kv_rows, pslots.qa, pslots.ka, pslots.va,
+                );
+                if !secs.is_empty()
+                    && !g.engine.batch_add_chan_bias(pbuf, &g.w_buf, &secs, b)
+                {
+                    return false;
+                }
             }
             if layer_idx == snap_layer {
                 if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
@@ -7270,6 +7434,43 @@ mod tests {
         assert!(err.contains("token_embd.weight"), "error must name the tensor: {err}");
     }
 
+    /// The Q5_K refusal (gemma-2-2b-it-Q4_K_S and every other Q5_K mix): the
+    /// error must name the TYPE (not just the id), count the offenders, list
+    /// them, and say what to re-quantize to. A refusal is the product here.
+    #[test]
+    fn q5_k_refusal_names_type_count_and_remedy() {
+        let mut gguf = synth_gguf(Some(GGML_TYPE_Q8_0));
+        let mut offenders = Vec::new();
+        for name in ["blk.0.attn_v.weight", "blk.0.ffn_down.weight"] {
+            let bad = gguf.tensors.get(name).unwrap().clone();
+            gguf.tensors.insert(
+                name.into(),
+                TensorInfo { tensor_type: 13, ..bad },
+            );
+            offenders.push(name);
+        }
+        let err = TransformerModel::check_quant_types(&gguf)
+            .expect_err("Q5_K must be refused");
+        assert!(err.contains("Q5_K (13)"), "must name the type: {err}");
+        assert!(err.contains("2 tensor(s)"), "must count the offenders: {err}");
+        for name in offenders {
+            assert!(err.contains(name), "must list {name}: {err}");
+        }
+        assert!(err.contains("q4_k_m"), "must give the remedy: {err}");
+        // A file entirely inside the supported set passes the gate.
+        let ok = synth_gguf(Some(GGML_TYPE_Q8_0));
+        assert!(TransformerModel::check_quant_types(&ok).is_ok());
+    }
+
+    #[test]
+    fn ggml_type_names_cover_the_refusal_set() {
+        use crate::infer::quant::ggml_type_name;
+        assert_eq!(ggml_type_name(13), "Q5_K");
+        assert_eq!(ggml_type_name(GGML_TYPE_Q4_K), "Q4_K");
+        assert_eq!(ggml_type_name(3), "Q4_1");
+        assert_eq!(ggml_type_name(999), "unknown");
+    }
+
     #[test]
     fn present_but_unsupported_output_weight_is_not_treated_as_tied() {
         // output.weight EXISTS in an unsupported type: the load must fail —
@@ -7999,7 +8200,7 @@ const SPEC_B: usize = 128;
         })
     }
 
-    /// One-commit eligibility: every layer full-attention, no biases, f32
+    /// One-commit eligibility: every layer full-attention, f32 biases and f32
     /// norms 4-byte aligned, head geometry the kernels support. Any miss
     /// names itself so the arm log is self-explanatory.
     fn one_commit_blocker(
@@ -8014,13 +8215,44 @@ const SPEC_B: usize = 128;
         if config.n_kv_heads == 0 || config.n_heads % config.n_kv_heads != 0 {
             return Some("n_heads not divisible by n_kv_heads");
         }
+        let q_rows = config.n_heads * config.head_dim;
+        let kv_rows = config.n_kv_heads * config.head_dim;
         for i in 0..layers.len() {
             if TransformerModel::calc_layer_sliding_window(is_gemma2, config.sliding_window, i) != 0 {
                 return Some("sliding-window layers present");
             }
             let l = &layers[i];
-            if l.attn_q_bias.is_some() || l.attn_k_bias.is_some() || l.attn_v_bias.is_some() {
-                return Some("attention biases present");
+            // Qwen2/2.5 carry a per-output-channel q/k/v bias. It no longer
+            // costs the client its one-commit status: the chain and decode
+            // paths apply it with ONE additive bias dispatch per layer
+            // (add_chan_bias4) over the projection's [b][rows] slot — the
+            // same f32 add the CPU glue does, and never a second pass over a
+            // weight. What the kernel does need is a plain f32 bias vector at
+            // a 4-byte-aligned offset and the projection's own row count, so
+            // anything else still blocks here and names itself.
+            let bias_ok = |tv: &Option<TensorView>, want: usize, what: &'static str| -> Option<&'static str> {
+                if let Some(tv) = tv {
+                    if tv.tensor_type != GGML_TYPE_F32 {
+                        return Some(what);
+                    }
+                    let n = tv.shape.first().copied().unwrap_or(0);
+                    if n != want {
+                        return Some(what);
+                    }
+                    if (gguf.data_offset + tv.offset) % 4 != 0 {
+                        return Some("attention bias not 4-byte aligned");
+                    }
+                }
+                None
+            };
+            if let Some(why) = bias_ok(&l.attn_q_bias, q_rows, "attn_q bias not f32") {
+                return Some(why);
+            }
+            if let Some(why) = bias_ok(&l.attn_k_bias, kv_rows, "attn_k bias not f32") {
+                return Some(why);
+            }
+            if let Some(why) = bias_ok(&l.attn_v_bias, kv_rows, "attn_v bias not f32") {
+                return Some(why);
             }
             let f32_4b = |tv: &Option<TensorView>, what: &'static str| -> Option<&'static str> {
                 if let Some(tv) = tv {

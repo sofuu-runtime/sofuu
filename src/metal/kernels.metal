@@ -206,6 +206,41 @@ kernel void add_inplace(
     acc[id] += add[id];
 }
 
+// ── Qwen2/2.5 attention bias: per-output-channel add over a [b][rows] slot ─
+// After a projection has written y[t][j] for t in 0..b (token-major rows, the
+// chain/one-commit slot layout), the model's q/k/v bias is a constant per
+// output channel, so the epilogue is y[t][j] += bias[j] for every row. Up to
+// four sections (q, k, v and one spare) ride ONE dispatch: each section names
+// its own output slot and its own bias vector, both f32 ELEMENT offsets into
+// the bound buffers. This is O(b*rows) work on the activation slab and never
+// re-reads a weight byte - the bias is not part of the GEMM.
+kernel void add_chan_bias4(
+    device float       *y               [[buffer(0)]],
+    device const float *bias            [[buffer(1)]],
+    constant uint4     *secs            [[buffer(2)]],
+    constant uint      &nsec            [[buffer(3)]],
+    constant uint      &b               [[buffer(4)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint ti                             [[thread_index_in_threadgroup]]
+) {
+    uint gid = (tg.y * 1024u + tg.x) * 256u + ti;
+    uint acc = 0u;
+    for (uint s = 0; s < nsec; ++s) {
+        uint4 sc = secs[s];
+        uint rows = sc.z;
+        if (rows == 0u) { continue; }
+        uint cnt = rows * b;
+        if (gid < acc + cnt) {
+            uint k = gid - acc;
+            uint t = k / rows;
+            uint j = k - t * rows;
+            y[sc.x + t * rows + j] += bias[sc.y + j];
+            return;
+        }
+        acc += cnt;
+    }
+}
+
 // ── W2 feature split: place a compact [rows][n] block into a column slice ──
 // The output-feature split has each engine compute a CONTIGUOUS range of
 // output features, which every GEMM writes compact ([rows][n]); the consumer

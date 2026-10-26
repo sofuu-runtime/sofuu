@@ -242,6 +242,12 @@ void sofuu_metal_batch_mlx4(void* ctx, void* w_buf, size_t w_offset, void* s_buf
 // slot-to-slot inside one encoder, one commit per batch (see infer/metal.rs).
 int sofuu_metal_batch_add(void* ctx, void* acc_buf, size_t acc_offset, void* add_buf, size_t add_offset, size_t n);
 int sofuu_metal_batch_swiglu(void* ctx, void* g_buf, size_t g_offset, void* u_buf, size_t u_offset, size_t n);
+// Qwen2/2.5 attention bias (SOFUU qwen2 family): y[t][j] += bias[j] over b
+// token-major rows, up to four sections (q, k, v) in ONE dispatch. secs = 4
+// u32 per section (y_off, bias_off, rows, unused), f32 ELEMENT units into
+// act_buf / w_buf. Cost is O(b*rows) on the activation slab; the bias is never
+// folded into a weight pass.
+int sofuu_metal_batch_add_chan_bias(void* ctx, void* y_buf, void* bias_buf, const uint32_t* secs, size_t nsec, size_t b);
 // W2 CPU+GPU feature split glue (SOFUU_SPLIT_AXIS=feat): place a compact
 // [rows][n] block into a column slice of a canonical [rows][stride] block, and
 // fold a two-owner residual partial pair into y. Offsets and strides are f32

@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use super::quant::*;
 
-pub const OP_KINDS: usize = 16;
+pub const OP_KINDS: usize = 17;
 pub const K_GGUF: usize = 0;
 pub const K_GGUF_B4: usize = 1;
 pub const K_GGUF_GEMM: usize = 2;
@@ -33,10 +33,14 @@ pub const K_HEAD: usize = 14;
 /// The sectioned mma8 form (one dispatch for q/k/v or gate/up): counted apart
 /// from K_GGUF_B4 so a SOFUU_GPU_TIMING=2 census shows exactly what merged.
 pub const K_GGUF_B4_SECS: usize = 15;
+/// Qwen2/2.5 q/k/v bias epilogue (one dispatch per layer, activation slab
+/// only). Booked apart so a SOFUU_GPU_TIMING=2 census shows what bias support
+/// actually costs instead of hiding it inside "add".
+pub const K_BIAS: usize = 16;
 pub const OP_NAMES: [&str; OP_KINDS] = [
     "gguf", "gguf_b4", "gemm", "rmsnorm", "rmsnorm_b4", "kv_write", "kv_write_b4",
     "head_rmsnorm", "attn", "attn_part", "attn_fin", "attn_1c", "add", "swiglu",
-    "head", "gguf_b4s",
+    "head", "gguf_b4s", "chan_bias",
 ];
 
 /// Column granularity a BATCHED GEMM actually needs, per weight type, read off
@@ -739,6 +743,16 @@ extern "C" {
         g_buf: *mut c_void, g_offset: usize,
         u_buf: *mut c_void, u_offset: usize,
         n: usize,
+    ) -> i32;
+    /// Qwen2/2.5 bias epilogue: y[t][j] += bias[j] over b token-major rows,
+    /// up to four sections in one dispatch (f32 ELEMENT offsets).
+    fn sofuu_metal_batch_add_chan_bias(
+        ctx: *mut c_void,
+        y_buf: *mut c_void,
+        bias_buf: *mut c_void,
+        secs: *const u32,
+        nsec: usize,
+        b: usize,
     ) -> i32;
     // W2 feature split: compact [rows][n] block -> column slice of the
     // canonical [rows][dst_stride] layout.
@@ -1450,6 +1464,42 @@ impl MetalEngine {
                 n,
             ) == 1 };
         self.op_tock(K_ADD, __t);
+        __r
+    }
+
+    /// Qwen2/2.5 attention bias: after the sectioned q/k/v GEMM has written
+    /// [b][rows] into each slot, add the per-output-channel bias. ONE dispatch
+    /// covers q, k and v (the section list); it reads only the activation slab
+    /// and the f32 bias vectors and never touches a weight byte. It is the
+    /// cheap shape of the change as well as the safe one: folding it into the
+    /// GEMM epilogue would have meant teaching every chain arm
+    /// (mma8 / sectioned / tiled / b4 / per-row) a new parameter, while the
+    /// additive pass performs the CPU's own y[i] += b[i] in the same f32
+    /// order, so the result is bit-identical to the CPU glue.
+    /// secs = (y_off, bias_off, rows, 0) per section, f32 ELEMENT units.
+    pub fn batch_add_chan_bias(
+        &self,
+        y_buf: &MetalBuffer,
+        bias_buf: &MetalBuffer,
+        secs: &[[u32; 4]],
+        b: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_BIAS);
+        let mut flat: [u32; 16] = [0; 16];
+        for (i, s) in secs.iter().take(4).enumerate() {
+            flat[i * 4..i * 4 + 4].copy_from_slice(s);
+        }
+        let __r = unsafe {
+            sofuu_metal_batch_add_chan_bias(
+                self.ctx,
+                y_buf.handle,
+                bias_buf.handle,
+                flat.as_ptr(),
+                secs.len(),
+                b,
+            ) == 1
+        };
+        self.op_tock(K_BIAS, __t);
         __r
     }
 
@@ -3396,6 +3446,28 @@ impl MetalEngine {
             r == 1
         };
         self.op_tock(K_ATTN_1C, __t);
+        // One-shot coverage trace (SOFUU_CHAIN_TRACE=1): the GQA form the
+        // picker chose for THIS model's ratio. -1 means the table has no form
+        // for the ratio and the per-head arm owns it — qwen2/Qwen2.5's 14:2
+        // (7:1) is exactly such a ratio, so a Qwen2.5 run prints -1 and pays
+        // the per-head k/v re-read; -2 means forms exist but none is live on
+        // this GPU (a real configuration loss, not a table gap).
+        if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static TRACED: AtomicBool = AtomicBool::new(false);
+            if !TRACED.swap(true, Ordering::Relaxed) {
+                let ratio = if n_kv_heads > 0 { n_heads / n_kv_heads } else { 0 };
+                let idx = unsafe { sofuu_metal_attn_gqa_last() };
+                let why = match idx {
+                    -1 => " (no form for this ratio: per-head arm)",
+                    -2 => " (forms exist, none live here: per-head arm)",
+                    _ => " (paired k/v arm)",
+                };
+                eprintln!(
+                    "[chain] attn: {n_heads}q/{n_kv_heads}kv heads = ratio {ratio}, hd {head_dim} -> table form {idx}{why}",
+                );
+            }
+        }
         __r
     }
 
@@ -10462,4 +10534,323 @@ fn q8_0_tiled_fused_strides_rows_by_32_value_blocks() {
     );
 }
 
+
+
+// ─── Qwen2/2.5 bias epilogue: value + organisation gates ───────────────────
+#[cfg(all(test, target_os = "macos"))]
+mod chan_bias_tests {
+    use super::*;
+
+    struct Buf {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl Buf {
+        fn new(bytes: usize) -> Self {
+            let page = 16384usize;
+            let len = ((bytes + page - 1) / page) * page;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED, "arena mmap");
+            Self { ptr: p as *mut u8, len }
+        }
+        fn f32s(&self) -> &[f32] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const f32, self.len / 4) }
+        }
+        fn f32s_mut(&mut self) -> &mut [f32] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
+        }
+        fn bytes(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+        }
+    }
+
+    /// T1 (bias kernel, 0 tolerance): the one-dispatch three-section bias
+    /// epilogue is BIT-IDENTICAL to the CPU glue's f32 y[i] += bias[i], and a
+    /// single-section dispatch produces exactly the same bytes for its
+    /// section — the merge of q/k/v into one dispatch is an organisation
+    /// change, not an arithmetic one.
+    #[test]
+    fn chan_bias_kernel_matches_cpu_loop() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let b = 8usize;
+        // q/k/v slot geometry of a small qwen2 layer (q 64 rows, k/v 16).
+        let qa = 0usize; // bytes
+        let ka = b * 64 * 4;
+        let va = ka + b * 16 * 4;
+        let total = va + b * 16 * 4;
+        let mut act = Buf::new(total);
+        for (i, v) in act.f32s_mut()[..total / 4].iter_mut().enumerate() {
+            *v = (i % 37) as f32 * 0.125 - 2.0;
+        }
+        let sect: [(usize, usize, usize); 3] = [
+            (0, qa, 64),
+            (64, ka, 16),
+            (80, va, 16),
+        ];
+        let mut wbuf = Buf::new(256);
+        let bias_vals: Vec<f32> = (0..96).map(|i| (i % 11) as f32 * 0.25 - 1.0).collect();
+        wbuf.f32s_mut()[..96].copy_from_slice(&bias_vals);
+        let act_buf = engine.register_zerocopy_only(act.bytes()).expect("act reg");
+        let w_buf = engine.register_zerocopy_only(wbuf.bytes()).expect("w reg");
+
+        // CPU reference on a copy.
+        let mut want = act.f32s()[..total / 4].to_vec();
+        for (boff, yoff, rows) in sect {
+            for t in 0..b {
+                for j in 0..rows {
+                    want[yoff / 4 + t * rows + j] += bias_vals[boff + j];
+                }
+            }
+        }
+
+        let secs: Vec<[u32; 4]> = sect
+            .iter()
+            .map(|(boff, yoff, rows)| [(*yoff / 4) as u32, *boff as u32, *rows as u32, 0])
+            .collect();
+        assert!(engine.batch_open());
+        assert!(
+            engine.batch_add_chan_bias(&act_buf, &w_buf, &secs, b),
+            "three-section bias dispatch refused"
+        );
+        assert!(engine.batch_end(), "bias batch rejected");
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(
+                act.f32s()[i].to_bits(),
+                w.to_bits(),
+                "chan_bias idx {i}: gpu {} cpu {}",
+                act.f32s()[i],
+                w
+            );
+        }
+
+        // Organisation equivalence: one dispatch per section, same bytes.
+        for (s, (_boff, _yoff, _rows)) in sect.iter().enumerate() {
+            let mut solo = Buf::new(total);
+            solo.f32s_mut()[..total / 4].copy_from_slice(&want); // start from the SUM
+            let reg = engine.register_zerocopy_only(solo.bytes()).expect("solo reg");
+            // subtract the section's bias first so one dispatch re-adds it.
+            for t in 0..b {
+                for j in 0..sect[s].2 {
+                    let idx = sect[s].1 / 4 + t * sect[s].2 + j;
+                    solo.f32s_mut()[idx] -= bias_vals[sect[s].0 + j];
+                }
+            }
+            assert!(engine.batch_open());
+            assert!(engine.batch_add_chan_bias(&reg, &w_buf, &secs[s..s + 1], b));
+            assert!(engine.batch_end());
+            for i in 0..total / 4 {
+                assert_eq!(
+                    solo.f32s()[i].to_bits(),
+                    want[i].to_bits(),
+                    "section {s} solo dispatch differs at {i}"
+                );
+            }
+        }
+        println!("[chan_bias] b={b} sections=3 — BIT-EXACT vs CPU glue (0 delta)");
+    }
+
+    /// The regression the arm was asked for: a BIASED sectioned GEMM (q, k, v in
+    /// ONE dispatch) equals per-tensor GEMM + bias, bit for bit, and equals the
+    /// CPU dequant dot + bias to the fp16-staging tolerance. Folding the bias
+    /// into a sectioned epilogue is only correct if the section merge itself
+    /// changes nothing — this pins both halves.
+    #[test]
+    fn biased_sectioned_gemm_equals_per_tensor_plus_bias() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let cols = 256usize;
+        let b = 8usize;
+        let row_bytes = 144usize; // one q4_K super-block per row
+        let (q_rows, k_rows, v_rows) = (64usize, 16usize, 32usize);
+
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rand = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let bits = v.to_bits();
+            let sign = ((bits >> 16) & 0x8000) as u16;
+            let exp = ((((bits >> 23) & 0xFF) as i32) - 127 + 15).clamp(1, 30) as u16;
+            let man = ((bits >> 13) & 0x3FF) as u16;
+            (sign | (exp << 10) | man).to_le_bytes()
+        };
+        let sec_rows = [q_rows, k_rows, v_rows];
+        let rows_total: usize = sec_rows.iter().sum();
+        let mut w = Buf::new(rows_total * row_bytes);
+        {
+            let wb = w.f32s_mut();
+            let _ = wb;
+        }
+        // write the q4_K blocks through the raw byte view
+        let wbytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(w.ptr, rows_total * row_bytes)
+        };
+        for r in 0..rows_total {
+            let off = r * row_bytes;
+            wbytes[off..off + 2].copy_from_slice(&f16_bytes(0.0625f32));
+            wbytes[off + 2..off + 4].copy_from_slice(&f16_bytes(0.0005f32));
+            for j in 0..12 {
+                wbytes[off + 4 + j] = ((rand() & 0x3F) as u8) | (((rand() & 3) as u8) << 6);
+            }
+            for j in 0..128 {
+                wbytes[off + 16 + j] = (rand() % 255) as u8;
+            }
+        }
+
+        let x: Vec<f32> = (0..b * cols)
+            .map(|i| ((i % 23) as f32) * 0.125 - 1.5)
+            .collect();
+        let mut xb = Buf::new(b * cols * 4);
+        xb.f32s_mut()[..b * cols].copy_from_slice(&x);
+
+        // y slab: one compact [b][rows] region per section, laid out like the
+        // qa/ka/va slots (byte offsets are what the mma8 sections take).
+        let y_off: Vec<usize> = {
+            let mut v = Vec::new();
+            let mut cur = 0usize;
+            for r in sec_rows {
+                v.push(cur);
+                cur += b * r * 4;
+            }
+            v
+        };
+        let y_bytes = y_off[2] + b * v_rows * 4;
+        let mut y = Buf::new(y_bytes);
+
+        // bias vectors for the three sections, contiguous f32 slots.
+        let bias: Vec<f32> = (0..rows_total).map(|i| (i % 13) as f32 * 0.125 - 0.75).collect();
+        let mut bbuf = Buf::new(rows_total * 4);
+        bbuf.f32s_mut()[..rows_total].copy_from_slice(&bias);
+
+        let w_buf = engine.register_zerocopy_only(w.bytes()).expect("w reg");
+        let x_buf = engine.register_zerocopy_only(xb.bytes()).expect("x reg");
+        let y_buf = engine.register_zerocopy_only(y.bytes()).expect("y reg");
+        let bias_buf = engine.register_zerocopy_only(bbuf.bytes()).expect("bias reg");
+
+        // base = min section offset (all 256-aligned here), secs[0] = delta.
+        let mut wsecs: Vec<[u32; 4]> = Vec::new();
+        let mut bsecs: Vec<[u32; 4]> = Vec::new();
+        let mut cur = 0usize;
+        let mut bias_off = 0usize;
+        for (i, r) in sec_rows.iter().enumerate() {
+            wsecs.push([cur as u32, 0, *r as u32, y_off[i] as u32]);
+            bsecs.push([(y_off[i] / 4) as u32, bias_off as u32, *r as u32, 0]);
+            cur += r * row_bytes;
+            bias_off += r;
+        }
+
+        // (a) sectioned GEMM + one bias dispatch
+        assert!(engine.batch_open());
+        assert!(
+            engine.batch_gguf_mma8_secs(&w_buf, 0, &x_buf, 0, &y_buf, cols, b, &wsecs),
+            "sectioned mma8 refused (pipeline missing?)"
+        );
+        assert!(engine.batch_add_chan_bias(&y_buf, &bias_buf, &bsecs, b));
+        assert!(engine.batch_end());
+        let gemm_sectioned_bias: Vec<f32> = y.f32s()[..y_bytes / 4].to_vec();
+
+        // (b) per-tensor GEMM (three dispatches) + bias added on the HOST
+        let mut y2 = Buf::new(y_bytes);
+        let y2_buf = engine.register_zerocopy_only(y2.bytes()).expect("y2 reg");
+        assert!(engine.batch_open());
+        for (i, r) in sec_rows.iter().enumerate() {
+            assert!(engine.batch_gguf_mma8(
+                &w_buf,
+                cur_base_hack(i, &sec_rows, row_bytes),
+                &x_buf,
+                0,
+                &y2_buf,
+                y_off[i],
+                *r,
+                cols,
+                b,
+            ));
+        }
+        assert!(engine.batch_end());
+        let mut want = y2.f32s()[..y_bytes / 4].to_vec();
+        let mut bias_off = 0usize;
+        for (i, r) in sec_rows.iter().enumerate() {
+            for t in 0..b {
+                for j in 0..*r {
+                    want[y_off[i] / 4 + t * r + j] += bias[bias_off + j];
+                }
+            }
+            bias_off += r;
+        }
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(
+                gemm_sectioned_bias[i].to_bits(),
+                w.to_bits(),
+                "bit mismatch at {i}: sectioned+bias {} per-tensor+bias {}",
+                gemm_sectioned_bias[i],
+                w
+            );
+        }
+
+        // (c) CPU dequant dot + bias. The mma8 tile stages BOTH sides in fp16,
+        // so the bound is the fp16 epsilon class measured against the sum of
+        // |w*x| terms (this synthetic matrix cancels hard: |dot| ~ 0.2 over
+        // terms ~ 3, so a bound relative to the RESULT would be meaningless and
+        // a bound relative to the terms is the one that actually tests the
+        // kernel).
+        let mut bias_off = 0usize;
+        let mut worst_rel = 0f32;
+        let mut deq = vec![0f32; cols];
+        for (i, r) in sec_rows.iter().enumerate() {
+            for t in 0..b {
+                for row in 0..*r {
+                    let woff = cur_base_hack(i, &sec_rows, row_bytes) + row * row_bytes;
+                    crate::infer::quant::dequantize_q4_k_row(
+                        &wbytes[woff..woff + row_bytes],
+                        &mut deq,
+                    );
+                    let mut term_abs = 0f32;
+                    for j in 0..cols {
+                        term_abs += (deq[j] * x[t * cols + j]).abs();
+                    }
+                    let cpu = unsafe {
+                        crate::infer::quant::vec_dot_raw_q4_k(
+                            wbytes[woff..].as_ptr(),
+                            x[t * cols..].as_ptr(),
+                            cols / 256,
+                        )
+                    } + bias[bias_off + row];
+                    let gpu = gemm_sectioned_bias[y_off[i] / 4 + t * r + row];
+                    let d = (gpu - cpu).abs();
+                    let rel = d / term_abs.max(1e-6);
+                    if rel > worst_rel {
+                        worst_rel = rel;
+                    }
+                    assert!(
+                        rel <= 2e-3,
+                        "vs CPU: sec {i} t {t} row {row}: gpu {gpu:.7} cpu {cpu:.7} d {d:.3e} terms {term_abs:.4}"
+                    );
+                }
+            }
+            bias_off += r;
+        }
+        println!(
+            "[bias_gemm] b={b} cols={cols} sections=q{}k{}v{} — sectioned+bias == per-tensor+bias BIT-EXACT, worst|d|/sum|w*x| vs CPU = {worst_rel:.3e} (fp16 class)",
+            q_rows, k_rows, v_rows
+        );
+    }
+
+    /// Byte offset of section i's weights in the synthetic arena (sections are
+    /// packed in q,k,v order, each rows*144 bytes).
+    fn cur_base_hack(i: usize, sec_rows: &[usize], row_bytes: usize) -> usize {
+        sec_rows[..i].iter().map(|r| r * row_bytes).sum()
+    }
+}
 

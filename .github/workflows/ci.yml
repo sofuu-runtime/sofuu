@@ -313,10 +313,11 @@ jobs:
           sudo apt-get install -y cmake libcurl4-openssl-dev python3 bash xz-utils
 
       - name: Build via the proven cross path (Linux)
-        # The native-Linux cargo build currently breaks in the SIMD lane's
-        # infer_kernels.cpp under g++ (tracked for that lane); the repo's
-        # proven Linux path is the zig cross build (scripts/cross — the same
-        # path every release artifact uses).
+        # Release artifacts for Linux are zig static-musl builds, so the
+        # matrix runs the same scripts/cross path a release does — not a
+        # native g++ build. x86_64 was the first real exercise of it (the
+        # engine's SIMD lane had grown ARM-only tile/GQA helpers without
+        # non-ARM guards); those are fixed and this job is their gate.
         if: runner.os == 'Linux'
         run: |
           bash scripts/cross/install_zig.sh

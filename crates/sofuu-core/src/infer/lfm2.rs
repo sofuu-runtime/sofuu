@@ -1740,10 +1740,13 @@ unsafe fn dot_f32_neon(a: *const f32, b: *const f32, n: usize) -> f32 {
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
-fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+unsafe fn dot_f32_neon(a: *const f32, b: *const f32, n: usize) -> f32 {
     let mut acc = 0.0f32;
-    for (&va, &vb) in a.iter().zip(b.iter()) {
-        acc += va * vb;
+    for i in 0..n {
+        // SAFETY: callers pass live row slices of at least `n` floats. The
+        // pointer signature mirrors the ARM kernel so both cfg branches read
+        // the same at the call sites.
+        acc += unsafe { *a.add(i) } * unsafe { *b.add(i) };
     }
     acc
 }
@@ -1893,6 +1896,22 @@ unsafe fn gemm_tile4x4_neon(w: *const f32, x: *const f32, n: usize, out: &mut [f
                 out[ri * 4 + 3] += wv * *x3.add(i);
             }
             i += 1;
+        }
+    }
+}
+
+/// Portable twin of the NEON 4×4 tile so the fused dual-panel path compiles
+/// and runs everywhere (the panel kernel calls it unconditionally).
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+unsafe fn gemm_tile4x4_neon(w: *const f32, x: *const f32, n: usize, out: &mut [f32; 16]) {
+    for r in 0..4 {
+        for c in 0..4 {
+            let mut acc = 0.0f32;
+            for k in 0..n {
+                acc += unsafe { *w.add(r * n + k) } * unsafe { *x.add(c * n + k) };
+            }
+            out[r * 4 + c] = acc;
         }
     }
 }
@@ -2155,7 +2174,7 @@ unsafe fn run_gemm_panels(
                     #[cfg(target_arch = "aarch64")]
                     let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
                     #[cfg(not(target_arch = "aarch64"))]
-                    let acc = dot_f32_neon(&buf[ri * cols..(ri + 1) * cols], xr);
+                    let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
                     y[t * rows + row0 + ri] = acc;
                 }
                 t += 1;
@@ -3418,14 +3437,16 @@ fn gemm_pair_batched(
                             #[cfg(target_arch = "aarch64")]
                             let acca = unsafe { dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols) };
                             #[cfg(not(target_arch = "aarch64"))]
-                            let acca = dot_f32_neon(&buf[r1 * cols..(r1 + 1) * cols], xr);
+                            let acca = unsafe { dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols) };
                             ya[(t + tk) * rows + row0 + r1] = acca;
                             #[cfg(target_arch = "aarch64")]
                             let accb = unsafe {
                                 dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols)
                             };
                             #[cfg(not(target_arch = "aarch64"))]
-                            let accb = dot_f32_neon(&buf[(ROW_PANEL + r1) * cols..(ROW_PANEL + r1 + 1) * cols], xr);
+                            let accb = unsafe {
+                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols)
+                            };
                             yb[(t + tk) * rows + row0 + r1] = accb;
                         }
                     }
@@ -3437,14 +3458,16 @@ fn gemm_pair_batched(
                         #[cfg(target_arch = "aarch64")]
                         let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
                         #[cfg(not(target_arch = "aarch64"))]
-                        let acc = dot_f32_neon(&buf[ri * cols..(ri + 1) * cols], xr);
+                        let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
                         ya[t * rows + row0 + ri] = acc;
                         #[cfg(target_arch = "aarch64")]
                         let accb = unsafe {
                             dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols)
                         };
                         #[cfg(not(target_arch = "aarch64"))]
-                        let accb = dot_f32_neon(&buf[(ROW_PANEL + ri) * cols..(ROW_PANEL + ri + 1) * cols], xr);
+                        let accb = unsafe {
+                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols)
+                        };
                         yb[t * rows + row0 + ri] = accb;
                     }
                     t += 1;

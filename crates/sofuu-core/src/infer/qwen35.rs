@@ -1055,6 +1055,10 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
         }
     }
     if threads <= 1 {
+        // File-direct packed dots exist only on aarch64 (SDOT + the codec
+        // popcount kernels); elsewhere `use_sdot` is false at runtime, and
+        // the generic dequant path below is the whole implementation.
+        #[cfg(target_arch = "aarch64")]
         if use_sdot {
             for (r, o) in out.iter_mut().enumerate() {
                 *o = unsafe { packed_row_dot(m, m.row_slice(data, r), &aq, 0, n_in) };
@@ -1082,6 +1086,7 @@ fn gemv_t143(data: &[u8], m: &RawMat, act: &[f32], out: &mut [f32]) {
             let rows = r0;
             let aq_ref = &aq;
             scope.spawn(move || {
+                #[cfg(target_arch = "aarch64")]
                 if use_sdot {
                     for (i, o) in chunk.iter_mut().enumerate() {
                         *o = unsafe { packed_row_dot(m, m.row_slice(data, rows + i), aq_ref, 0, n_in) };

@@ -464,6 +464,26 @@ static inline uint16_t f32_to_f16_val(float val) {
 #endif
 #include "arch/arm_cortex_a76.h"
 
+// a76_repack.h (ARM-only include above) owns ggml_cpu_fp32_to_fp16, but the
+// generic fixtures below need it on every arch. Mirror its portable body.
+#if !defined(__aarch64__)
+static inline uint16_t ggml_cpu_fp32_to_fp16(float val) {
+    uint32_t x; std::memcpy(&x, &val, 4);
+    uint32_t sign = (x >> 31) & 1;
+    int32_t e = ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = (x >> 13) & 0x3ff;
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)(sign << 15);
+        m = ((x & 0x7fffff) | 0x800000) >> (1 - e + 13);
+        if ((x & 0x7fffff) & ((1u << (1 - e + 13)) - 1)) m = (m + 1) & 0x3ff;
+        return (uint16_t)((sign << 15) | m);
+    }
+    if (e >= 31) return (uint16_t)((sign << 15) | 0x7c00);
+    if ((x & 0xffff) > 0x8000) m = m + 1;
+    return (uint16_t)((sign << 15) | ((uint32_t)e << 10) | m);
+}
+#endif
+
 #if defined(__aarch64__)
 #include <mutex>
 #include <unordered_map>
@@ -5030,8 +5050,9 @@ static void sofuu_attn_qk_rows8(const float * __restrict q_batch, size_t q_strid
     }
 #else
     for (size_t r = 0; r < nrows; ++r) {
+        const size_t len = counts[r] > p_begin ? counts[r] - p_begin : 0;
         const float *q = q_batch + r * q_stride;
-        for (size_t p = 0; p < lens[r]; ++p) {
+        for (size_t p = 0; p < len; ++p) {
             outs[r][p_begin + p] = sofuu_vec_dot_f32(q, k_base + (p_begin + p) * k_stride, head_dim) * scale;
         }
     }
@@ -7778,6 +7799,7 @@ extern "C" int sofuu_test_attention_fa2_parity(int n_heads, int n_kv_heads, int 
 
 // ── Parity: residual-fused and dual-pair GEMM paths must be bit-identical to
 // the unfused equivalents on the same inputs (q4_K + q8_0). ──
+#if defined(__aarch64__)
 extern "C" int sofuu_test_gemm_resid_pair_parity(int rows, int cols, int batch) {
     if (rows < 8 || rows % 8 != 0 || cols % 256 != 0 || batch < 4 || batch % 4 != 0) return -1;
     const size_t nb4 = cols / 256, nb8 = cols / 32;
@@ -7934,6 +7956,19 @@ extern "C" int sofuu_test_gemm_resid_pair_parity(int rows, int cols, int batch) 
     if (memcmp(ref6.data(), aug6.data(), ref6.size() * sizeof(float)) != 0) { fprintf(stderr, "[parity-resid] q4_K pad batch mismatch\n"); return 16; }
     return 0;
 }
+#else
+// The fused epilogues this compares are ARM tile paths; on other arches there
+// is nothing to compare, so the Rust test treats -1 as "skipped".
+extern "C" int sofuu_test_gemm_resid_pair_parity(int, int, int) { return -1; }
+
+// Tile kernels (sofuu_tile_warm) and the GQA-fused fp16 decode path are ARM
+// implementations; the non-ARM build routes to the generic GEMM/GEMV kernels
+// and the per-head attention path, so these entry points are inert.
+extern "C" int sofuu_tile_warm(const void *, size_t, size_t, unsigned) { return -1; }
+extern "C" void sofuu_tile_scale_sidecar_mode(int) {}
+extern "C" void sofuu_set_gqa_attn(int) {}
+extern "C" uint64_t sofuu_gqa_attn_calls(void) { return 0; }
+#endif
 
 } // extern "C"
 

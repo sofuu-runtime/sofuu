@@ -2658,12 +2658,11 @@ mod tests {
     /// A method that exists but throws must keep the generic `js_exception`
     /// code — the `unknown_method` marker must not leak onto real failures.
     ///
-    /// On a QTSQ-free build `memory.*` genuinely does not exist, so the
-    /// correct answer there IS `unknown_method`. Asserting the wrong code
-    /// for the build would be a test that only ever runs on one machine, so
-    /// this asserts the honest answer for whichever build is under test —
-    /// and that is itself the contract: the code distinguishes "this build
-    /// lacks it" from "it exists and failed".
+    /// `memory.*` resolves on EVERY build since P1: a QTSQ-free build
+    /// registers typed-refusal stubs (E_CAPABILITY) instead of leaving the
+    /// namespace absent, so apps can feature-detect by calling. Both a real
+    /// backend failure (bad handle) and the refusal are real throws, which is
+    /// exactly what `js_exception` is for.
     #[test]
     fn a_throwing_method_is_not_reported_as_unknown_method() {
         let _g = lock();
@@ -2672,17 +2671,12 @@ mod tests {
 
         // memory.count with a handle that was never opened:
         //  - QTSQ build  → the method exists and throws inside → js_exception
-        //  - QTSQ-free   → the method does not exist          → unknown_method
+        //  - QTSQ-free   → the stub exists and throws E_CAPABILITY → js_exception
         let code = call_err(rt, "memory.count", r#"{"handle":99}"#);
-        let expected = if sofuu_core::HAS_QTSQ {
-            "js_exception"
-        } else {
-            "unknown_method"
-        };
         assert_eq!(
-            code, expected,
-            "a method that exists but throws must report js_exception, and a \
-             method absent from this build must report unknown_method"
+            code, "js_exception",
+            "a method that exists but throws must report js_exception — \
+             unknown_method would wrongly claim the method is absent"
         );
 
         unsafe { sofuu_rt_free(rt) };
@@ -4523,18 +4517,15 @@ mod tests {
 
         // No memory.open on this runtime → the facade's "call open first"
         // error must surface as a normal error envelope, not a crash. The
-        // code differs by build for the reason above (absent vs throwing).
+        // method resolves in every build (P1 typed-refusal stubs on a
+        // QTSQ-free one), and the facade answers before the engine stub is
+        // reached, so the code is js_exception in both.
         let code = call_err(
             rt,
             "memory.count",
             r#"{"handle":99}"#,
         );
-        let expected = if sofuu_core::HAS_QTSQ {
-            "js_exception"
-        } else {
-            "unknown_method"
-        };
-        assert_eq!(code, expected, "expected a clean error envelope");
+        assert_eq!(code, "js_exception", "expected a clean error envelope");
         unsafe { sofuu_rt_free(rt) };
     }
 
@@ -4669,8 +4660,9 @@ mod tests {
             serde_json::from_str(env["result"].as_str().expect("result is a string"))
                 .expect("inner payload is JSON");
         // mcp + http are pure JS facades and must exist in every build. The
-        // memory methods come from sofuu-core's QTSQ-gated registration, so
-        // they are only required where the codec is actually linked.
+        // memory namespace is QTSQ-gated on the engine side, but since P1 a
+        // QTSQ-free build exposes typed-refusal stubs, so the facade's
+        // handle methods exist in every build too.
         for m in ["mcpCall", "mcpList", "httpServe"] {
             assert_eq!(
                 inner[m], "function",
@@ -4678,18 +4670,14 @@ mod tests {
             );
         }
         for m in ["memRemember", "memRecall", "memCount"] {
-            if sofuu_core::HAS_QTSQ {
-                assert_eq!(
-                    inner[m], "function",
-                    "{m} should be registered as a function by the facade"
-                );
-            } else {
-                assert_eq!(
-                    inner[m], "undefined",
-                    "without QTSQ the memory surface is compiled out entirely, \
-                     so the facade must not invent it"
-                );
-            }
+            // Since P1 a QTSQ-free build still exposes `sofuu.memory` as
+            // typed-refusal stubs, so the facade's handle methods exist in
+            // every build. The refusal surfaces at memory.open (E_CAPABILITY)
+            // and at these methods as the facade's "no open brain" error.
+            assert_eq!(
+                inner[m], "function",
+                "{m} should be registered as a function by the facade"
+            );
         }
         unsafe { sofuu_rt_free(rt) };
     }
@@ -4890,47 +4878,49 @@ mod tests {
 
         assert_eq!(flags.len(), methods.len(), "one flag per method");
 
-        // Partition on the QTSQ boundary. `memory.*` is registered by
-        // sofuu-core under `#[cfg(has_qtsq)]`, so a QTSQ-free build (what CI
-        // runs) legitimately has none of it. Rather than skipping the test or
-        // weakening it, each build asserts the contract that is true for it:
-        //
-        //   QTSQ build  → every documented method resolves.
-        //   QTSQ-free   → every NON-memory method resolves, and the memory
-        //                 methods are uniformly ABSENT (catching a partial or
-        //                 half-registered facade, which a blanket "skip the
-        //                 memory rows" would hide).
-        //
-        // Drift in the memory rows is still caught on any QTSQ build, and
-        // the length assertion above keeps the list itself honest in
-        // every build.
-        let mut broken: Vec<&String> = Vec::new();
-        let mut memory_resolved: Vec<&String> = Vec::new();
-        for (m, ok) in methods.iter().zip(flags.iter()) {
-            let is_memory = m.starts_with("memory.");
-            if !*ok {
-                if sofuu_core::HAS_QTSQ || !is_memory {
-                    broken.push(m);
-                }
-            } else if is_memory {
-                memory_resolved.push(m);
-            }
-        }
+        // The QTSQ boundary. Since P1 a QTSQ-free build (what CI runs)
+        // registers `memory.*` as typed-refusal stubs (E_CAPABILITY) instead
+        // of leaving the namespace absent, so every documented method must
+        // resolve on EVERY build. What differs is behavior: the stubs must
+        // refuse loudly, never silently no-op — that silent no-op is the
+        // exact brain-less-tarball failure the stubs exist to prevent. A
+        // partial registration is caught by the resolution flags as well.
+        let broken: Vec<&String> = methods
+            .iter()
+            .zip(flags.iter())
+            .filter(|(_, ok)| !**ok)
+            .map(|(m, _)| m)
+            .collect();
         assert!(
             broken.is_empty(),
             "funnel methods that do not resolve: {broken:?}"
         );
-        if sofuu_core::HAS_QTSQ {
-            assert!(
-                !memory_resolved.is_empty(),
-                "a QTSQ build must resolve the memory funnel"
+
+        if !sofuu_core::HAS_QTSQ {
+            // The entry point an app actually calls first is memory.open:
+            // the C-ABI handle facade forwards it to the engine stub, so the
+            // typed refusal must surface there. (Handle-taking methods like
+            // memory.count stop earlier, at the facade's own "no open brain"
+            // TypeError — also a real throw, but a layer-local message.)
+            let m = CString::new("memory.open").unwrap();
+            let a = CString::new(r#"{"path":"/tmp/sofuu-ci-noqtsq","dim":4}"#).unwrap();
+            let mut out: *mut c_char = ptr::null_mut();
+            let _ = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+            assert!(!out.is_null(), "memory.open: out_json must not be NULL");
+            let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+            unsafe { sofuu_free(out as *mut c_void) };
+            let v: JsonValue =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("envelope is not JSON: {e}: {json}"));
+            assert_eq!(
+                v.get("ok").and_then(|o| o.as_bool()),
+                Some(false),
+                "a QTSQ-free build must refuse memory.open, got {json}"
             );
-        } else {
+            let msg = v["error"]["message"].as_str().unwrap_or("");
             assert!(
-                memory_resolved.is_empty(),
-                "a QTSQ-free build must expose NO memory methods (found {:?}) — \
-                 a partial registration means the no-QTSQ path is broken",
-                memory_resolved
+                msg.contains("E_CAPABILITY"),
+                "a QTSQ-free build must refuse memory.open with a typed \
+                 E_CAPABILITY error, got: {json}"
             );
         }
 

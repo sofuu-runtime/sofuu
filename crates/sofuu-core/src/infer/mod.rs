@@ -19,6 +19,8 @@ pub mod npy;
 pub mod paged_kv;
 pub mod pytorch;
 pub mod quant;
+#[cfg(test)]
+mod quant_oracle;
 pub mod safetensors;
 pub mod sampler;
 pub mod spark;

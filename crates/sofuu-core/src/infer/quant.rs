@@ -2189,15 +2189,16 @@ pub fn rope_style(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Tile-cache entries are keyed by (weight pointer, rows, cols, type);
     /// tests running in parallel can hand the allocator the same address for
     /// a different fixture, so every tile-warming test takes this lock.
-    static TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Shared with quant_oracle.rs, which warms tiles too.
+    pub(crate) static TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn tile_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn tile_test_guard() -> std::sync::MutexGuard<'static, ()> {
         TILE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 

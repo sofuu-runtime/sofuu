@@ -559,30 +559,81 @@ impl KiviHeadStream {
             return;
         }
         assert!(scores.len() >= total);
+        self.compute_attention_causal_upto(q, head_out, scores, total);
+    }
 
-        let mut curr_tok = 0;
+    /// P7: causal truncation of the stream — attend only rows [0 .. upto).
+    /// Rows are stored in ascending position order (sinks first), so the
+    /// stream index equals the token position; a prefill query at position
+    /// p therefore caps at p + 1 rows.
+    pub fn compute_attention_causal_upto(
+        &self,
+        q: &[f32],
+        head_out: &mut [f32],
+        scores: &mut [f32],
+        upto: usize,
+    ) {
+        let avail = self.total_tokens().min(upto);
+        if avail == 0 {
+            head_out.fill(0.0);
+            return;
+        }
+        assert!(scores.len() >= avail);
 
-        // 0. Pinned attention sinks — bit-exact F32 dots (§4.1)
+        // Section widths under the causal cutoff. Rows are stored in
+        // ascending position order (sinks, then quantized groups, then
+        // recent), so the kept prefix [0 .. avail) is exactly positions
+        // [0 .. avail). When the cutoff lands inside `recent`, the OLDEST
+        // recent rows survive and the newest (the chunk rows after this
+        // query) drop.
+        let w_sink = self.sink_len.min(avail);
+        let mut rem = avail - w_sink;
+        let mut w_hist = 0usize;
+        for block in &self.historical_k {
+            if rem == 0 {
+                break;
+            }
+            let n = block.num_tokens.min(rem);
+            w_hist += n;
+            rem -= n;
+        }
+        let w_recent = rem.min(self.recent_tokens);
+
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        for r in 0..self.sink_len {
+
+        // 1. Pinned attention sinks — bit-exact F32 dots (§4.1)
+        for r in 0..w_sink {
             let k_slice = &self.sink_k[r * self.head_dim..(r + 1) * self.head_dim];
             let mut dot = 0.0f32;
             for c in 0..self.head_dim {
                 dot += q[c] * k_slice[c];
             }
-            scores[curr_tok + r] = dot;
+            scores[r] = dot;
         }
-        curr_tok += self.sink_len;
+        let mut curr_tok = w_sink;
 
-        // 1. Score historical quantized blocks
+        // 2. Historical quantized blocks (full blocks until the cutoff)
+        let mut hist_left = w_hist;
         for k_block in &self.historical_k {
-            let n = k_block.num_tokens;
-            k_block.compute_q_dot_k(q, &mut scores[curr_tok..curr_tok + n]);
+            if hist_left == 0 {
+                break;
+            }
+            let n = k_block.num_tokens.min(hist_left);
+            if n == k_block.num_tokens {
+                k_block.compute_q_dot_k(q, &mut scores[curr_tok..curr_tok + n]);
+            } else {
+                // Partial group at the causal boundary: the primitive
+                // asserts a full-block slice, so fill a temp and cut.
+                let mut tmp = vec![0.0f32; k_block.num_tokens];
+                k_block.compute_q_dot_k(q, &mut tmp);
+                scores[curr_tok..curr_tok + n].copy_from_slice(&tmp[..n]);
+            }
             curr_tok += n;
+            hist_left -= n;
         }
 
-        // 2. Score recent full-precision tokens
-        for r in 0..self.recent_tokens {
+        // 3. Recent full-precision rows (oldest first under the cutoff)
+        for r in 0..w_recent {
             let k_slice = &self.recent_k[r * self.head_dim..(r + 1) * self.head_dim];
             let mut dot = 0.0f32;
             for c in 0..self.head_dim {
@@ -591,9 +642,9 @@ impl KiviHeadStream {
             scores[curr_tok + r] = dot;
         }
 
-        // 3. Fused Softmax with numerical stabilization
+        // 4. Fused Softmax with numerical stabilization
         let mut max_score = f32::NEG_INFINITY;
-        for s in &mut scores[..total] {
+        for s in &mut scores[..avail] {
             *s *= scale;
             if *s > max_score {
                 max_score = *s;
@@ -601,7 +652,7 @@ impl KiviHeadStream {
         }
 
         let mut sum_exp = 0.0f32;
-        for s in &mut scores[..total] {
+        for s in &mut scores[..avail] {
             *s = (*s - max_score).exp();
             sum_exp += *s;
         }
@@ -611,17 +662,16 @@ impl KiviHeadStream {
         } else {
             0.0
         };
-        for s in &mut scores[..total] {
+        for s in &mut scores[..avail] {
             *s *= inv_sum;
         }
 
-        // 4. Value accumulation
+        // 5. Value accumulation with the same section widths
         head_out.fill(0.0);
-        let mut v_tok = 0;
 
-        // 4-sink. Pinned sinks first — exact F32 V rows (§4.1)
-        for r in 0..self.sink_len {
-            let w = scores[v_tok + r];
+        // 5-sink. Pinned sinks first — exact F32 V rows (§4.1)
+        for r in 0..w_sink {
+            let w = scores[r];
             if w.abs() > 1e-12 {
                 let v_slice = &self.sink_v[r * self.head_dim..(r + 1) * self.head_dim];
                 for c in 0..self.head_dim {
@@ -629,17 +679,29 @@ impl KiviHeadStream {
                 }
             }
         }
-        v_tok += self.sink_len;
+        let mut v_tok = w_sink;
 
-        // 4a. Accumulate historical quantized V blocks
+        // 5a. Historical quantized V blocks
+        let mut v_left = w_hist;
         for v_block in &self.historical_v {
-            let n = v_block.num_tokens;
-            v_block.accumulate_v(&scores[v_tok..v_tok + n], head_out);
+            if v_left == 0 {
+                break;
+            }
+            let n = v_block.num_tokens.min(v_left);
+            if n == v_block.num_tokens {
+                v_block.accumulate_v(&scores[v_tok..v_tok + n], head_out);
+            } else {
+                // Partial group at the causal boundary — full-slice temp.
+                let mut tmp = vec![0.0f32; v_block.num_tokens];
+                tmp[..n].copy_from_slice(&scores[v_tok..v_tok + n]);
+                v_block.accumulate_v(&tmp, head_out);
+            }
             v_tok += n;
+            v_left -= n;
         }
 
-        // 4b. Accumulate recent full-precision V tokens
-        for r in 0..self.recent_tokens {
+        // 5b. Recent full-precision V rows
+        for r in 0..w_recent {
             let w = scores[v_tok + r];
             if w.abs() <= 1e-12 {
                 continue;
@@ -702,6 +764,63 @@ impl KiviCache {
             let k_slice = &k[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
             let v_slice = &v[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
             self.heads[idx].append(k_slice, v_slice);
+        }
+    }
+
+    /// P7 streaming prefill: append `b` prefill rows (post-rope) of one
+    /// layer. Row layout: [b * n_kv_heads * head_dim], kv-head-major per row
+    /// — the same layout k_batch/v_batch carry.
+    pub fn append_rows(&mut self, layer: usize, k_rows: &[f32], v_rows: &[f32], b: usize) {
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        assert!(k_rows.len() >= b * kv_dim);
+        assert!(v_rows.len() >= b * kv_dim);
+        for r in 0..b {
+            self.append_token(
+                layer,
+                &k_rows[r * kv_dim..(r + 1) * kv_dim],
+                &v_rows[r * kv_dim..(r + 1) * kv_dim],
+            );
+        }
+    }
+
+    /// P7 streaming prefill: causal GQA attention for ONE chunk query row.
+    /// `q`: [n_heads * head_dim] at global position `upto - 1`; the head
+    /// streams hold sinks + quantized history + the current chunk (all
+    /// appended in row order), so causality is simply "attend rows
+    /// [0 .. upto)" — the stream index equals the position.
+    pub fn compute_layer_attention_causal(
+        &mut self,
+        layer: usize,
+        n_heads: usize,
+        q: &[f32],
+        head_out: &mut [f32],
+        upto: usize,
+    ) {
+        assert_eq!(q.len(), n_heads * self.head_dim);
+        assert_eq!(head_out.len(), n_heads * self.head_dim);
+
+        let group_ratio = n_heads / self.n_kv_heads;
+
+        for h in 0..n_heads {
+            let kv_h = h / group_ratio;
+            let idx = self.head_index(layer, kv_h);
+            let total = self.heads[idx].total_tokens().min(upto);
+            if total == 0 {
+                let hslice = &mut head_out[h * self.head_dim..(h + 1) * self.head_dim];
+                hslice.fill(0.0);
+                continue;
+            }
+            if self.scratch_scores.len() < total {
+                self.scratch_scores.resize(total.max(64), 0.0);
+            }
+            let q_slice = &q[h * self.head_dim..(h + 1) * self.head_dim];
+            let out_slice = &mut head_out[h * self.head_dim..(h + 1) * self.head_dim];
+            self.heads[idx].compute_attention_causal_upto(
+                q_slice,
+                out_slice,
+                &mut self.scratch_scores[..total],
+                total,
+            );
         }
     }
 
@@ -1061,5 +1180,78 @@ mod sink_tests {
         let mut out2 = vec![0.0f32; hd];
         st.compute_attention(&qs, &mut out2);
         assert!(out2.iter().any(|&v| v != 0.0));
+    }
+}
+
+#[cfg(test)]
+mod causal_tests {
+    use super::*;
+
+    #[test]
+    fn kivi_causal_upto_full_equals_full_attention() {
+        let hd = 64usize;
+        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32, 4);
+        let mut state: f32 = 0.31;
+        let mut next = || {
+            state = (state * 1103515245.0 + 12345.0) % 97.0;
+            state / 97.0 - 0.5
+        };
+        for _ in 0..100 {
+            let k: Vec<f32> = (0..hd).map(|_| next()).collect();
+            let v: Vec<f32> = (0..hd).map(|_| next()).collect();
+            st.append(&k, &v);
+        }
+        let q: Vec<f32> = (0..hd).map(|_| next()).collect();
+        let mut a = vec![0.0f32; hd];
+        let mut b = vec![0.0f32; hd];
+        st.compute_attention(&q, &mut a);
+        st.compute_attention_causal_upto(&q, &mut b, &mut vec![0.0f32; 100], 100);
+        let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(d < 1e-6, "causal-upto(total) diverges from full attention: {d}");
+    }
+
+    #[test]
+    fn kivi_causal_upto_truncates_to_prefix() {
+        let hd = 64usize;
+        let mut st = KiviHeadStream::new(hd, KiviBits::Four, 32, 32, 4);
+        let mut state: f32 = 0.77;
+        let mut next = || {
+            state = (state * 1103515245.0 + 12345.0) % 97.0;
+            state / 97.0 - 0.5
+        };
+        let mut rows_k: Vec<Vec<f32>> = Vec::new();
+        let mut rows_v: Vec<Vec<f32>> = Vec::new();
+        for i in 0..100 {
+            let k: Vec<f32> = (0..hd).map(|c| next() + if c == 0 { i as f32 * 0.01 } else { 0.0 }).collect();
+            let v: Vec<f32> = (0..hd).map(|_| next()).collect();
+            st.append(&k, &v);
+            rows_k.push(k);
+            rows_v.push(v);
+        }
+        let q: Vec<f32> = (0..hd).map(|_| next()).collect();
+
+        // Reference: exact softmax over rows [0 .. 40) only.
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut scores = vec![0.0f32; 40];
+        for t in 0..40 {
+            let dot: f32 = q.iter().zip(&rows_k[t]).map(|(a, b)| a * b).sum();
+            scores[t] = dot * scale;
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        let mut ref_out = vec![0.0f32; hd];
+        for t in 0..40 {
+            for c in 0..hd {
+                ref_out[c] += exp[t] / sum * rows_v[t][c];
+            }
+        }
+        let mut out = vec![0.0f32; hd];
+        st.compute_attention_causal_upto(&q, &mut out, &mut vec![0.0f32; 100], 40);
+        // rows 0..36 are quantized (4 sinks + 32... at 100 rows: turnover at
+        // 64 -> 64 quantized; rows 0..40 = 4 sinks + 36 quantized) so the
+        // quant error of the 36 quantized rows dominates the diff.
+        let d = out.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(d < 0.06, "causal truncation diverges from prefix reference: {d}");
     }
 }

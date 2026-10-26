@@ -272,6 +272,15 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     pub rope_freq_base: f32,
     pub max_seq_len: usize,
+    /// F-LC/P7 ring-KV mode: the LOGICAL conversation window the caller
+    /// asked for (F-LC1 refusals and compaction triggers use this), while
+    /// `max_seq_len` — which sizes and strides the f32 KV arrays — may be
+    /// the smaller ring when the KIVI streaming prefill carries history in
+    /// the quantized slab. Equals max_seq_len when ring mode is off.
+    pub logical_max_seq_len: usize,
+    /// 0 = off. Otherwise rows f32 KV cache holds (the ring); positions past
+    /// it live only in the KIVI quantized store.
+    pub kv_ring: usize,
     pub sliding_window: usize,
     /// GGUF has two common RoPE pairings. Llama-family uses consecutive pairs;
     /// Qwen/Gemma-family uses split-half pairs.
@@ -378,7 +387,21 @@ pub struct TransformerModel {
 
 impl TransformerModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
-        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true)
+        Self::from_gguf_with_kv_ring(gguf, max_seq_len, vocab_size, 0)
+    }
+
+    /// P7 (long-context §8): load with a RINGED f32 KV cache — the arrays
+    /// hold only `kv_ring_req` rows while the logical window stays
+    /// `max_seq_len`; prompt/decode positions past the ring are carried by
+    /// the KIVI quantized streams, which the streaming prefill ingests
+    /// chunk-by-chunk and attends causally.
+    pub fn from_gguf_with_kv_ring(
+        gguf: GgufFile,
+        max_seq_len: usize,
+        vocab_size: usize,
+        kv_ring_req: usize,
+    ) -> Result<Self, String> {
+        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true, kv_ring_req)
     }
 
     /// `gpu_allowed = false` (engine --cpu / CPU-load contract) keeps the
@@ -388,6 +411,7 @@ impl TransformerModel {
         max_seq_len: usize,
         vocab_size: usize,
         gpu_allowed: bool,
+        kv_ring_req: usize,
     ) -> Result<Self, String> {
         // 1. Detect architecture prefix
         let arch = gguf.get_str("general.architecture").unwrap_or("llama");
@@ -537,6 +561,17 @@ impl TransformerModel {
             ));
         }
 
+        // P7 ring-KV: the f32 arrays shrink to the ring; everything cache-
+        // indexed reads config.max_seq_len (= the ring) so every kernel call
+        // site stays stride-correct, while compaction triggers / F-LC1
+        // refusals consult logical_max_seq_len.
+        let logical_max_seq_len = final_seq_len;
+        let kv_ring = if kv_ring_req > 0 && kv_ring_req < final_seq_len {
+            kv_ring_req
+        } else {
+            0
+        };
+        let cache_seq_len = if kv_ring > 0 { kv_ring } else { final_seq_len };
         let config = ModelConfig {
             dim,
             n_layers,
@@ -547,10 +582,17 @@ impl TransformerModel {
             vocab_size,
             norm_eps,
             rope_freq_base,
-            max_seq_len: final_seq_len,
+            max_seq_len: cache_seq_len,
+            logical_max_seq_len,
+            kv_ring,
             sliding_window: detected_sliding_window,
             rope_interleaved,
         };
+        if kv_ring > 0 {
+            eprintln!(
+                "[sofuu] KIVI ring KV cache: logical window {logical_max_seq_len}, f32 ring {kv_ring} rows — history past the ring lives in the quantized streams (P7)"
+            );
+        }
 
         // Helper to find tensor
         let find_tensor = |name: &str| -> Result<TensorView, String> {
@@ -668,7 +710,7 @@ impl TransformerModel {
 
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
-        let kv_cache_size = n_layers * final_seq_len * kv_dim;
+        let kv_cache_size = n_layers * cache_seq_len * kv_dim;
 
         for l in &layers {
             for tv in [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down] {
@@ -785,7 +827,7 @@ impl TransformerModel {
             q: vec![0.0f32; q_dim],
             k: vec![0.0f32; kv_dim],
             v: vec![0.0f32; kv_dim],
-            attn_scores: vec![0.0f32; final_seq_len],
+            attn_scores: vec![0.0f32; cache_seq_len.max(4)],
             head_out: vec![0.0f32; q_dim],
             attn_out: vec![0.0f32; dim],
             ffn_gate_buf: vec![0.0f32; hidden_dim],
@@ -969,6 +1011,33 @@ impl TransformerModel {
             2 => super::kivi::KiviBits::Two,
             _ => super::kivi::KiviBits::Four,
         };
+        if cur_pos > 0 {
+            let mut kivi = self.build_kivi_cache(kivi_bits);
+            self.ingest_rows_into_kivi(&mut kivi, 0, cur_pos);
+            self.kivi = Some(kivi);
+        } else {
+            self.kivi = Some(self.build_kivi_cache(kivi_bits));
+        }
+    }
+
+    /// P7: arm EMPTY KIVI streams before the streaming prefill — each
+    /// prefill chunk ingests itself right after its rope (ring mode);
+    /// no f32 re-ingest ever runs.
+    pub fn enable_kivi_streaming(&mut self, bits: usize) {
+        let kivi_bits = match bits {
+            2 => super::kivi::KiviBits::Two,
+            _ => super::kivi::KiviBits::Four,
+        };
+        self.kivi = Some(self.build_kivi_cache(kivi_bits));
+        if self.config.kv_ring == 0 {
+            eprintln!(
+                "[kivi] streaming arm requested without a ring cache (SOFUU_KV_RING / --kv-ring): history past the f32 window cannot be carried — falling back to post-prefill ingest semantics"
+            );
+        }
+    }
+
+    /// Shared KIVI construction (sink-pinned config, P4).
+    fn build_kivi_cache(&self, kivi_bits: super::kivi::KiviBits) -> super::kivi::KiviCache {
         let config = super::kivi::KiviConfig {
             enabled: true,
             bits: kivi_bits,
@@ -976,19 +1045,12 @@ impl TransformerModel {
             group_size: 32,
             sink_tokens: 4,
         };
-        let mut kivi = super::kivi::KiviCache::new(
+        super::kivi::KiviCache::new(
             self.config.n_layers,
             self.config.n_kv_heads,
             self.config.head_dim,
             config,
-        );
-
-        // Ingest prefilled tokens from k_cache & v_cache
-        if cur_pos > 0 {
-            self.ingest_rows_into_kivi(&mut kivi, 0, cur_pos);
-        }
-
-        self.kivi = Some(kivi);
+        )
     }
 
     /// Append cache rows [pos .. seq_len) of every layer/head into `kivi`
@@ -1561,7 +1623,28 @@ impl TransformerModel {
             // more than the halved bytes save there. The f16 shadows are still
             // written above, so decode reads them.
             let sliding_window = self.layer_sliding_window(layer_idx);
-            if self.k16_prefill {
+            if let Some(mut kivi) = self.kivi.take() {
+                // P7 streaming quantized prefill: this chunk's rows were just
+                // roped (k_batch/v_batch) — ingest them per head, then causal
+                // softmax-attend over sinks + quantized history + this chunk
+                // (stream index = position, so causality is a row cap).
+                for kv_h in 0..n_kv_heads {
+                    for r in 0..b_size {
+                        let base = r * kv_dim + kv_h * head_dim;
+                        let idx = layer_idx * n_kv_heads + kv_h;
+                        kivi.heads[idx].append(
+                            &self.k_batch[base..base + head_dim],
+                            &self.v_batch[base..base + head_dim],
+                        );
+                    }
+                }
+                for i in 0..b_size {
+                    let qrow = &self.q_batch[i * q_dim..(i + 1) * q_dim];
+                    let outrow = &mut self.head_out_batch[i * q_dim..(i + 1) * q_dim];
+                    kivi.compute_layer_attention_causal(layer_idx, n_heads, qrow, outrow, start_pos + i + 1);
+                }
+                self.kivi = Some(kivi);
+            } else if self.k16_prefill {
                 super::quant::batched_attention_ext_k16(
                     &self.q_batch[0..b_size * q_dim],
                     self.k16_cache.as_ref().unwrap().as_u16(),
@@ -7626,5 +7709,60 @@ mod kivi_compact_tests {
         let mut out = vec![0.0f32; n_heads * hd];
         kivi.compute_layer_attention(0, n_heads, &q, &mut out);
         assert!(out.iter().any(|&v| v != 0.0));
+    }
+}
+
+#[cfg(test)]
+mod kivi_ring_tests {
+    use super::*;
+
+    /// P7: the streaming ring prefill (quantized causal attention over the
+    /// KIVI streams) must produce the same next-token distribution class as
+    /// the plain f32 prefill on a short prompt — same argmax, close logits.
+    /// Env-gated on a real checkpoint: SOFUU_LC_RING_GGUF=<small llama gguf>.
+    #[test]
+    fn kivi_ring_prefill_matches_f32_argmax() {
+        let path = match std::env::var_os("SOFUU_LC_RING_GGUF") {
+            Some(p) => p,
+            None => {
+                println!("SOFUU_LC_RING_GGUF not set; skipping");
+                return;
+            }
+        };
+        if !std::path::Path::new(&path).exists() {
+            println!("model file missing; skipping");
+            return;
+        }
+        let gguf = GgufFile::open(&path).expect("open gguf");
+        let vocab = gguf
+            .metadata
+            .get("llama.vocab_size")
+            .and_then(|v| match v {
+                GgufValue::Uint32(n) => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(128256);
+
+        // Plain f32 reference.
+        let mut plain = TransformerModel::from_gguf_with_gpu(GgufFile::open(&path).unwrap(), 4096, vocab, false, 0)
+            .expect("plain load");
+        let toks: Vec<u32> = vec![128000, 791, 6864, 315, 9822, 374, 12366, 13, 578, 6864, 315, 10057, 374];
+        let logits_plain: Vec<f32> = plain.forward_prefill_all_with_logits(&toks, 0).to_vec();
+
+        // Ring-KIVI streaming prefill (ring 32 forces multiple causal groups).
+        let mut ring = TransformerModel::from_gguf_with_gpu(GgufFile::open(&path).unwrap(), 4096, vocab, false, 32)
+            .expect("ring load");
+        ring.enable_kivi_streaming(4);
+        let logits_ring: Vec<f32> = ring.forward_prefill_all_with_logits(&toks, 0).to_vec();
+
+        let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        let (ap, ar) = (argmax(&logits_plain), argmax(&logits_ring));
+        let dot: f32 = logits_plain.iter().zip(&logits_ring).map(|(a, b)| a * b).sum();
+        let np = (logits_plain.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        let nr = (logits_ring.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        let cos = dot / (np * nr);
+        println!("[ring-parity] argmax plain={ap} ring={ar} cosine={cos:.5}");
+        assert_eq!(ap, ar, "ring-KIVI streaming prefill changed the argmax");
+        assert!(cos > 0.95, "ring-KIVI logits diverge from f32 (cosine {cos:.5})");
     }
 }

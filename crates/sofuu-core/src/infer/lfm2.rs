@@ -566,6 +566,8 @@ impl Lfm2Model {
             norm_eps,
             rope_freq_base,
             max_seq_len: effective_max_seq_len,
+            logical_max_seq_len: effective_max_seq_len,
+            kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: false,
         };

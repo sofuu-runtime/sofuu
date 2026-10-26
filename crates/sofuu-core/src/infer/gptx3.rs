@@ -236,6 +236,8 @@ impl Gptx3Model {
             norm_eps,
             rope_freq_base: rope_base,
             max_seq_len: effective_seq,
+            logical_max_seq_len: effective_seq,
+            kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: true,
         };

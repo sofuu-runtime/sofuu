@@ -1658,7 +1658,19 @@ fn main() -> ExitCode {
             let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
             eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
             let t0 = std::time::Instant::now();
-            let load_result = if gpu_layers == 0 {
+            // P7 ring-KV (long-context §8): --kivi loads the CPU engine with
+            // a ringed f32 KV cache — the quantized streams carry positions
+            // past the ring via the streaming prefill. KIVI is a CPU-path
+            // contract (P6), so the GPU whole-layer client is disarmed.
+            let load_result = if kivi {
+                let ring = std::env::var("SOFUU_KV_RING")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v >= 256)
+                    .unwrap_or(4096);
+                gpu_layers = 0;
+                sofuu_core::infer::InferEngine::load_with_seq_len_kv_ring_cpu(model_path, custom_ctx, ring)
+            } else if gpu_layers == 0 {
                 sofuu_core::infer::InferEngine::load_with_seq_len_cpu(model_path, custom_ctx)
             } else {
                 sofuu_core::infer::InferEngine::load_with_seq_len(model_path, custom_ctx)

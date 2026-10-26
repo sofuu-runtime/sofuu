@@ -1439,6 +1439,8 @@ impl BlockGraphModel {
             norm_eps,
             rope_freq_base: hf_cfg.as_ref().and_then(|c| c.rope_theta).unwrap_or(10000.0),
             max_seq_len: seq_len,
+            logical_max_seq_len: seq_len,
+            kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: false,
         };

@@ -221,6 +221,8 @@ impl Spark25Model {
             norm_eps,
             rope_freq_base: rope_base_full,
             max_seq_len: final_seq_len,
+            logical_max_seq_len: final_seq_len,
+            kv_ring: 0,
             sliding_window: swa_window,
             rope_interleaved: false, // NeoX split-half pairing
         };

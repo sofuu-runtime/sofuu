@@ -1785,6 +1785,8 @@ impl Qwen35Model {
             norm_eps,
             rope_freq_base: rope_base,
             max_seq_len: seq_cap,
+            logical_max_seq_len: seq_cap,
+            kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: true,
         };

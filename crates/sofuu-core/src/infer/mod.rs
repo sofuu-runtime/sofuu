@@ -124,7 +124,7 @@ pub struct InferModel {
 
 impl InferModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
-        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true)
+        Self::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, true, 0)
     }
 
     pub fn from_gguf_with_gpu(
@@ -132,6 +132,7 @@ impl InferModel {
         max_seq_len: usize,
         vocab_size: usize,
         gpu_allowed: bool,
+        kv_ring_req: usize,
     ) -> Result<Self, String> {
         let arch = gguf.get_str("general.architecture").unwrap_or("llama").to_string();
         if arch == "spark2_5" {
@@ -154,7 +155,7 @@ impl InferModel {
                 sink_tokens: 4,
             });
         }
-        let m = TransformerModel::from_gguf(gguf, max_seq_len, vocab_size)?;
+        let m = TransformerModel::from_gguf_with_kv_ring(gguf, max_seq_len, vocab_size, kv_ring_req)?;
         let config = m.config.clone();
         Ok(Self {
             config,
@@ -243,6 +244,31 @@ impl InferModel {
     pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
         if let ModelBackend::Gguf(m) = &mut self.backend {
             m.enable_kivi(bits, cur_pos);
+        }
+    }
+
+    /// P7: arm EMPTY KIVI streams before the streaming prefill — the chunks
+    /// ingest themselves as they are computed (ring mode).
+    pub fn enable_kivi_streaming(&mut self, bits: usize) {
+        if let ModelBackend::Gguf(m) = &mut self.backend {
+            m.enable_kivi_streaming(bits);
+        }
+    }
+
+    /// P7: true when the f32 KV arrays are ring-strided and the quantized
+    /// streams carry the history of record.
+    pub fn kv_ring_mode(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.config.kv_ring > 0,
+            _ => false,
+        }
+    }
+
+    /// The LOGICAL window (may exceed the ring-sized f32 arrays).
+    pub fn logical_seq_len(&self) -> usize {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.config.logical_max_seq_len,
+            _ => self.config.max_seq_len,
         }
     }
 
@@ -610,16 +636,33 @@ impl InferEngine {
     /// Load a model with custom context length (0 = auto-detect from metadata).
     /// Auto-detects model format: GGUF, SafeTensors directory, or direct .safetensors file.
     pub fn load_with_seq_len<P: AsRef<Path>>(model_path: P, max_seq_len: usize) -> Result<Self, String> {
-        Self::load_inner(model_path, max_seq_len, true)
+        Self::load_inner(model_path, max_seq_len, true, 0)
+    }
+
+    /// P7 (long-context §8): KIVI ring load for the CPU engine — the f32 KV
+    /// arrays shrink to `kv_ring` rows; the logical window stays
+    /// `max_seq_len`. History past the ring lives in the KIVI quantized
+    /// streams (prefill ingests chunk-by-chunk; decode appends).
+    pub fn load_with_seq_len_kv_ring_cpu<P: AsRef<Path>>(
+        model_path: P,
+        max_seq_len: usize,
+        kv_ring: usize,
+    ) -> Result<Self, String> {
+        Self::load_inner(model_path, max_seq_len, false, kv_ring)
     }
 
     /// Load a model without creating or using GPU resources. Useful for explicit
     /// CPU-only requests, especially for large SafeTensors models.
     pub fn load_with_seq_len_cpu<P: AsRef<Path>>(model_path: P, max_seq_len: usize) -> Result<Self, String> {
-        Self::load_inner(model_path, max_seq_len, false)
+        Self::load_inner(model_path, max_seq_len, false, 0)
     }
 
-    fn load_inner<P: AsRef<Path>>(model_path: P, max_seq_len: usize, enable_gpu: bool) -> Result<Self, String> {
+    fn load_inner<P: AsRef<Path>>(
+        model_path: P,
+        max_seq_len: usize,
+        enable_gpu: bool,
+        kv_ring: usize,
+    ) -> Result<Self, String> {
         let raw_str = model_path.as_ref().to_str().unwrap_or("");
         let clean_path = clean_model_path(raw_str);
 
@@ -790,7 +833,7 @@ impl InferEngine {
             tokenizer.bos_token_id = None;
         }
         let vocab_size = tokenizer.vocab.len();
-        let model = InferModel::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, enable_gpu)?;
+        let model = InferModel::from_gguf_with_gpu(gguf, max_seq_len, vocab_size, enable_gpu, kv_ring)?;
         let t_model = t2.elapsed();
 
         if std::env::var("SOFUU_PROFILE_LOAD").is_ok() {
@@ -987,6 +1030,11 @@ impl InferEngine {
         }
 
         let max_seq_len = self.model.config.max_seq_len;
+        // P7 ring-KV: the f32 arrays are ring-strided (config.max_seq_len is
+        // the ring); the LOGICAL window governs refusals and compaction
+        // triggers. Equal to max_seq_len when ring mode is off.
+        let logical_max_seq_len = self.model.logical_seq_len();
+        let ring_mode = options.kivi && self.model.kv_ring_mode();
         let vocab_size = self.model.config.vocab_size;
         let mut logits_buf = vec![0.0f32; vocab_size];
         // Setup work (tokenize, cache reset, SnapKV/KIVI) is reported apart
@@ -1039,6 +1087,14 @@ impl InferEngine {
         let drop = ((max_seq_len - sink) / 4).max(1).min((max_seq_len - sink).saturating_sub(1));
         let chunk_size = self::model::max_prefill_batch().min((max_seq_len - sink).saturating_sub(drop).max(1));
 
+        // P7 ring-KV: resumed prompts are unsupported — the quantized
+        // streams carry history and expect a from-zero prefill.
+        if ring_mode && common_prefix > 0 {
+            return Err(
+                "--kivi ring mode carries history in the quantized streams and does not support resumed prompts (common_prefix > 0) — start the session fresh".to_string(),
+            );
+        }
+
         // F-LC1 (PLAN-LONG-CONTEXT-PERSISTENCE §8 P2): a FRESH prompt that
         // fills the window used to trigger mid-PREFILL compaction — the loop
         // below silently dropped middle KV rows (a 50%-depth needle in an 8k
@@ -1046,11 +1102,11 @@ impl InferEngine {
         // Refuse instead: the caller must raise --ctx or shorten the prompt.
         // Continuations (common_prefix > 0) keep the compaction path — chat
         // legitimately extends past the window — but it now warns loudly.
-        if common_prefix == 0 && input_tokens.len() >= max_seq_len {
+        if common_prefix == 0 && input_tokens.len() >= logical_max_seq_len {
             return Err(format!(
                 "prompt is {} tokens but the context window is only {} — mid-prompt compaction would silently drop content; raise --ctx or shorten the prompt",
                 input_tokens.len(),
-                max_seq_len
+                logical_max_seq_len
             ));
         }
 
@@ -1059,7 +1115,14 @@ impl InferEngine {
         self.last_setup_duration = t_setup.elapsed();
         let t_prefill = std::time::Instant::now();
 
-        if common_prefix == 0 && input_tokens.len() < max_seq_len {
+        if common_prefix == 0 && input_tokens.len() < logical_max_seq_len {
+            // Ring mode arms the KIVI streams FIRST so the streaming prefill
+            // ingests every chunk as it is computed (history past the f32
+            // ring lives only in the quantized store; decode appends join
+            // the same streams).
+            if ring_mode {
+                self.model.enable_kivi_streaming(options.kivi_bits);
+            }
             // Fast-path: unified prefill with last-token logits projection
             let initial_logits = self.model.forward_prefill_all_with_logits(&input_tokens, 0);
             if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
@@ -1138,7 +1201,7 @@ impl InferEngine {
 
         // SnapKV Observation Window Compaction (Prunes inactive middle blocks after prefill)
         let t_setup_post = std::time::Instant::now();
-        if options.snapkv && cur_pos > 64 {
+        if options.snapkv && !ring_mode && cur_pos > 64 {
             let snap_sink = self.model.sink_tokens.max(16).min(cur_pos / 4);
             let keep_recent = 32.min(cur_pos - snap_sink);
             let middle = cur_pos.saturating_sub(snap_sink + keep_recent);
@@ -1153,8 +1216,12 @@ impl InferEngine {
             self.model.set_dynamic_ffn(true);
         }
 
-        if options.kivi {
+        if options.kivi && !ring_mode {
             self.model.enable_kivi(options.kivi_bits, cur_pos);
+        } else if ring_mode {
+            // P7 streaming arm: KIVI was armed before the prefill and holds
+            // every chunk already — the post-hoc f32 re-ingest would read a
+            // wrapped ring and must not run.
         } else {
             // A previous turn may have enabled KIVI. Its cache does not hold
             // the tokens this call just prefilled, so decode would attend a
@@ -1321,8 +1388,10 @@ impl InferEngine {
                 break;
             }
 
-            // KV Cache auto-compaction before advancing
-            while cur_pos >= max_seq_len && cur_pos > sink + drop {
+            // KV Cache auto-compaction before advancing. Ring mode skips it
+            // entirely: the KIVI streams are the history of record, positions
+            // never shift, and the ring's wrapped f32 rows are dead weight.
+            while !ring_mode && cur_pos >= max_seq_len && cur_pos > sink + drop {
                 compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                 // F-LC3: the compaction dropped middle tokens, shifted the

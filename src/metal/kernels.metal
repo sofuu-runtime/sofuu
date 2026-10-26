@@ -3149,16 +3149,22 @@ kernel void gemm_q8_0_multi(
     }
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
     acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    // The subtile token offset (t0 = tg.y * GEMM_TS) MUST be in the store
+    // index. It is the GEMM_TS grouping, not a per-token dispatch: every
+    // subtile > 0 wrote its accumulators over subtile 0's slots, so tokens
+    // 8..B-1 were never written at all (stale scratch read back as logits)
+    // and tokens 0..7 held whichever subtile won the race. gemm_q4_k_multi
+    // always had the term; the q8_0/q6_K copies dropped it.
     device float *yr = y + sec_yoff / 4 + local_row;
     if (lane == 0) {
-        if (v0) yr[0] = acc0;
-        if (v1) yr[sec_ystr] = acc1;
-        if (v2) yr[2 * sec_ystr] = acc2;
-        if (v3) yr[3 * sec_ystr] = acc3;
-        if (v4) yr[4 * sec_ystr] = acc4;
-        if (v5) yr[5 * sec_ystr] = acc5;
-        if (v6) yr[6 * sec_ystr] = acc6;
-        if (v7) yr[7 * sec_ystr] = acc7;
+        if (v0) yr[(size_t)(t0 + 0) * sec_ystr] = acc0;
+        if (v1) yr[(size_t)(t0 + 1) * sec_ystr] = acc1;
+        if (v2) yr[(size_t)(t0 + 2) * sec_ystr] = acc2;
+        if (v3) yr[(size_t)(t0 + 3) * sec_ystr] = acc3;
+        if (v4) yr[(size_t)(t0 + 4) * sec_ystr] = acc4;
+        if (v5) yr[(size_t)(t0 + 5) * sec_ystr] = acc5;
+        if (v6) yr[(size_t)(t0 + 6) * sec_ystr] = acc6;
+        if (v7) yr[(size_t)(t0 + 7) * sec_ystr] = acc7;
     }
 }
 
@@ -3236,14 +3242,16 @@ kernel void gemm_q6_k_multi(
     acc4 = simd_sum(acc4); acc5 = simd_sum(acc5); acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
     device float *yr = y + sec_yoff / 4 + local_row;
     if (lane == 0) {
-        if (v0) yr[0] = acc0;
-        if (v1) yr[sec_ystr] = acc1;
-        if (v2) yr[2 * sec_ystr] = acc2;
-        if (v3) yr[3 * sec_ystr] = acc3;
-        if (v4) yr[4 * sec_ystr] = acc4;
-        if (v5) yr[5 * sec_ystr] = acc5;
-        if (v6) yr[6 * sec_ystr] = acc6;
-        if (v7) yr[7 * sec_ystr] = acc7;
+        // t0 in the store: same defect as gemm_q8_0_multi (q6_K prefill
+        // would clobber subtile 0 and leave tokens 8..B-1 stale).
+        if (v0) yr[(size_t)(t0 + 0) * sec_ystr] = acc0;
+        if (v1) yr[(size_t)(t0 + 1) * sec_ystr] = acc1;
+        if (v2) yr[(size_t)(t0 + 2) * sec_ystr] = acc2;
+        if (v3) yr[(size_t)(t0 + 3) * sec_ystr] = acc3;
+        if (v4) yr[(size_t)(t0 + 4) * sec_ystr] = acc4;
+        if (v5) yr[(size_t)(t0 + 5) * sec_ystr] = acc5;
+        if (v6) yr[(size_t)(t0 + 6) * sec_ystr] = acc6;
+        if (v7) yr[(size_t)(t0 + 7) * sec_ystr] = acc7;
     }
 }
 

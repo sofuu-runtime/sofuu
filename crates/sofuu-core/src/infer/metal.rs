@@ -2391,30 +2391,21 @@ impl MetalEngine {
             note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_multi");
             return false;
         }
-        // Held at the SUPER-BLOCK floor for q8_0 — measured, not inherited.
-        // gemm_q8_0_multi answers WRONG for a column count that is not a
-        // multiple of 256, which is exactly the shape the previous round's
-        // 256 -> 32 relaxation let in. SmolLM2 (cols 960, 30 eight-float
-        // blocks) on the prefill-GEMM route, one fused section table at a
-        // time, same binary, 39 tokens, max|dlogit| against the per-tensor
-        // walk: fused q/k/v through THIS entry only 10.98 (argmax 21745 vs
-        // 2067), fused gate/up only 15.94 (argmax 365), both-refused 0.0.
-        // The 64-row matrix-tile twin (batch_gguf_gemm_mma64_multi) reads the
-        // same 30 blocks and lands 0.0085 from that reference, so the block
-        // arithmetic is fine and this kernel is not. Until its row/section
-        // cursor is root-caused, refuse the shape LOUDLY: the caller then
-        // walks one dispatch per tensor (correct; one extra dispatch per
-        // layer) instead of returning a 10-16-logit-wrong answer in silence.
-        if ty == GGML_TYPE_Q8_0 && cols % 256 != 0 {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static ONCE: AtomicBool = AtomicBool::new(false);
-            if !ONCE.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[gemm-floor] batch_gguf_gemm_multi refused: ty={ty} cols={cols} (gemm_q8_0_multi is wrong off the 256-value super-block grid); that section group now walks one dispatch per tensor"
-                );
-            }
-            return false;
-        }
+        // The retired 256-value hold on q8_0 lived here. It was a SYMPTOM
+        // refusal with the wrong root cause: gemm_q8_0_multi stored its
+        // accumulators at yr[k * y_stride] instead of yr[(t0 + k) * y_stride],
+        // so the GEMM_TS=8 subtile grouping (not the column count) was wrong:
+        // every subtile >= 1 clobbered subtile 0's slots and tokens 8..B-1
+        // were NEVER written (stale scratch read back as logits). It is wrong
+        // for every B > 8 at EVERY width, 256-divisible or not - which is why
+        // the hold "fixed" 960 and never showed at 1024 (cols 1024 was measured
+        // on the mma64 twin, which always had the term).
+        // Fixed in kernels.metal (q8_0 + the identical q6_K copy) and pinned
+        // both ways: gemm_q8_0_multi_matches_dequant_oracle (numeric, 960/992/
+        // 1024/2080/3200 x b_tok 9/17 vs a host f64 dequant reference) and
+        // gemm_multi_kernels_store_the_subtile_token_offset (source). The only
+        // column requirement left is the REAL one from gemm_cols_ok above:
+        // whole q8_0 blocks (cols % 32 == 0), already checked at entry.
         let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gguf_gemm_multi(
@@ -3847,6 +3838,600 @@ mod batch_gguf_parity_tests {
                 y_gpu[0]
             );
         }
+    }
+
+    /// JOB A oracle: gemm_q8_0_multi against a plain f64 dequant reference
+    /// computed ON THE HOST from the same quantised bytes.
+    ///
+    /// It runs the multi dispatch DIRECTLY (below the model route's shape
+    /// guards) at the widths the fleet uses plus the remainders that break
+    /// 256, at TWO batch shapes, and it is the permanent regression gate for
+    /// this kernel. It earned its keep immediately: the first defect it found
+    /// was not the weight cursor everybody suspected but the STORE index -
+    /// `yr[k * sec_ystr]` with the GEMM_TS subtile offset `t0` missing, so
+    /// every subtile > 0 clobbered subtile 0 and tokens 8..B-1 were never
+    /// written at all. A B <= 8 oracle cannot see that, hence b_tok 9 AND 17.
+    ///
+    /// Data design: the quant bytes are f16 scales of `k/32` and the x values
+    /// are multiples of 1/4, so every dot product is an exact dyadic multiple
+    /// of 1/128 below 2^24/128 - the GPU's f32 accumulate and the host f64
+    /// reference agree BITWISE. That is why a healthy run reports 0.000e0 and
+    /// why the bound below is a formality: any non-zero error is structural.
+    /// (The 1e-4 relative bound is kept so the test stays honest if the data
+    /// pattern is ever changed to a non-dyadic one.)
+    ///
+    /// Failure modes are separated instead of lumped: an element still
+    /// holding the poison sentinel means the kernel never wrote it (dropped
+    /// subtile / dropped dispatch), a wrong value with the right magnitude
+    /// means a cursor problem. SOFUU_ORACLE_DIAG=1 inverts a bad cell across
+    /// ALL (section, token, row) candidates - not just the same token - which
+    /// is what names a store-index defect, and prints a per-token census of
+    /// never-written cells. SOFUU_ORACLE_DUMP=<dir> writes gpu/ref/x/w bytes
+    /// so a failure can be re-analysed offline without re-running the GPU.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gemm_q8_0_multi_matches_dequant_oracle() {
+        let engine = match MetalEngine::new() {
+            Some(e) => e,
+            None => {
+                eprintln!("[oracle] no Metal device - skipped");
+                return;
+            }
+        };
+        let diag = std::env::var_os("SOFUU_ORACLE_DIAG").is_some();
+
+        // 9 = one full subtile + a 1-token tail; 17 = two full subtiles + a
+        // 1-token tail, i.e. the shape that exposed the missing subtile token
+        // offset (a single-subtile B <= 8 dispatch is correct either way, so a
+        // b_tok <= 8 oracle would have blessed the broken kernel forever).
+        let b_toks = [9usize, 17usize];
+        let sec_rows = [640usize, 320usize, 320usize]; // q/k/v-like spans
+        let total: usize = sec_rows.iter().sum();
+        // fleet widths + remainders: 960/2080/3200 are NOT multiples of 256
+        // (192, 32, 128 left over); 992 and 1024 bracket 1000.
+        let widths = [960usize, 992, 1024, 2080, 3200];
+
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        let f16_read = |lo: u8, hi: u8| -> f64 {
+            let h = u16::from_le_bytes([lo, hi]);
+            let sign = if h & 0x8000 != 0 { -1.0f64 } else { 1.0f64 };
+            let exp = ((h >> 10) & 0x1F) as i32;
+            let man = (h & 0x3FF) as f64;
+            if exp == 0 {
+                sign * man * 2f64.powi(-24)
+            } else {
+                sign * (1.0 + man / 1024.0) * 2f64.powi(exp - 15)
+            }
+        };
+
+        let mut rows: Vec<(usize, usize, f64, f64)> = Vec::new(); // cols, b_tok, max|d|, rel
+
+        for &b_tok in b_toks.iter() {
+        for &cols in widths.iter() {
+            let nb = cols / 32; // q8_0 block = 32 values / 34 bytes
+            let row_bytes = nb * 34;
+
+            // -- weights: three tensors at RAW offsets with a non-zero byte
+            // remainder, so the section cursor's off+rem split is exercised
+            let mut sec_raw = [0usize; 3];
+            let mut cur = 96usize;
+            let mut w_len = 0usize;
+            for s in 0..3 {
+                sec_raw[s] = cur;
+                cur += row_bytes * sec_rows[s];
+                w_len = cur;
+                cur += 64 + 128 * s; // inter-section pad (not 256-aligned)
+            }
+            let w_arena = Arena::new(w_len.max(4096));
+            {
+                let w = unsafe { std::slice::from_raw_parts_mut(w_arena.ptr, w_arena.len) };
+                for s in 0..3 {
+                    for r in 0..sec_rows[s] {
+                        let base = sec_raw[s] + r * row_bytes;
+                        for b in 0..nb {
+                            let off = base + b * 34;
+                            w[off..off + 2]
+                                .copy_from_slice(&f16_bytes(0.03125f32 * ((rand() % 32) + 1) as f32));
+                            for j in 0..32 {
+                                // full int8 range: as_type<int8_t> must sign-extend
+                                w[off + 2 + j] = (rand() % 256) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            let w_buf = engine.register_zerocopy_only(w_arena.as_slice()).expect("w buf");
+
+            // -- slab: x[b_tok][cols] then the three output regions
+            let x_f32 = b_tok * cols;
+            let region = b_tok * total;
+            let out_off = x_f32 * 4;
+            let slab_arena = Arena::new(out_off + region * 4);
+            let slab = unsafe { std::slice::from_raw_parts_mut(slab_arena.ptr, slab_arena.len) };
+            for t in 0..b_tok {
+                for i in 0..cols {
+                    let v = ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5;
+                    slab[(t * cols + i) * 4..(t * cols + i) * 4 + 4]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            // poison the output region: a silently dropped dispatch would
+            // otherwise read back as zeros and look like a clean tensor
+            for byte in slab[out_off..].iter_mut() {
+                *byte = 0x7F;
+            }
+            let slab_buf = engine.register_zerocopy_only(slab_arena.as_slice()).expect("slab");
+
+            // -- y layout: the sections are CONTIGUOUS regions in the slab
+            // (prefix sum of b_tok*rows), which is exactly what the table's
+            // y_off encodes. Every index below MUST use this prefix base: the
+            // first cut of this test used s*b_tok*sec_rows[s], which makes
+            // section 1 start at 2880 instead of 5760 and silently compares
+            // (and references) across sections - an unsound oracle that
+            // "failed" a correct kernel and could have hidden a real one.
+            let mut sec_ybase = [0usize; 3];
+            {
+                let mut acc = 0usize;
+                for s in 0..3 {
+                    sec_ybase[s] = acc;
+                    acc += b_tok * sec_rows[s];
+                }
+            }
+
+            // -- host reference: dequant from the SAME bytes, f64 dot
+            let reference = {
+                let mut v = vec![0f64; region];
+                let w = w_arena.as_slice();
+                for s in 0..3 {
+                    for t in 0..b_tok {
+                        for r in 0..sec_rows[s] {
+                            let base = sec_raw[s] + r * row_bytes;
+                            let mut acc = 0f64;
+                            for b in 0..nb {
+                                let off = base + b * 34;
+                                let d = f16_read(w[off], w[off + 1]);
+                                for j in 0..32 {
+                                    let q = w[off + 2 + j] as i8 as f64;
+                                    let xb = (t * cols + b * 32 + j) * 4;
+                                    let xv = f32::from_le_bytes(
+                                        slab[xb..xb + 4].try_into().unwrap(),
+                                    ) as f64;
+                                    acc += d * q * xv;
+                                }
+                            }
+                            v[sec_ybase[s] + t * sec_rows[s] + r] = acc;
+                        }
+                    }
+                }
+                v
+            };
+
+            // -- section table exactly as the model route builds it
+            let mut blob = [[0u32; 5]; 4];
+            let base = (0..3).map(|s| sec_raw[s] & !255usize).min().unwrap();
+            let mut end = 0u32;
+            let mut y_acc = out_off;
+            for s in 0..3 {
+                blob[s][0] = ((sec_raw[s] & !255usize) - base) as u32;
+                blob[s][1] = (sec_raw[s] & 255usize) as u32;
+                end += sec_rows[s] as u32;
+                blob[s][2] = end;
+                blob[s][3] = y_acc as u32;
+                blob[s][4] = sec_rows[s] as u32;
+                y_acc += b_tok * sec_rows[s] * 4;
+            }
+
+            assert!(engine.batch_open());
+            let ok = unsafe {
+                sofuu_metal_batch_gguf_gemm_multi(
+                    engine.ctx,
+                    8u32, // GGML_TYPE_Q8_0
+                    w_buf.handle,
+                    base,
+                    slab_buf.handle,
+                    0,
+                    slab_buf.handle,
+                    0,
+                    total,
+                    cols,
+                    b_tok,
+                    blob.as_ptr() as *const u32,
+                    3,
+                ) == 1
+            };
+            assert!(engine.batch_end(), "[oracle] batch_end failed cols={cols}");
+            assert!(ok, "[oracle] gemm_q8_0_multi unavailable at cols={cols}");
+
+            // -- compare every element
+            let read = |s: usize, t: usize, r: usize| -> f32 {
+                let byte = out_off + (sec_ybase[s] + t * sec_rows[s] + r) * 4;
+                f32::from_le_bytes(slab[byte..byte + 4].try_into().unwrap())
+            };
+            let mut max_d = 0f64;
+            let mut max_ref = 0f64;
+            let mut worst = (0usize, 0usize, 0usize);
+            let mut nbad = 0usize;
+            for s in 0..3 {
+                for t in 0..b_tok {
+                    for r in 0..sec_rows[s] {
+                        let g = read(s, t, r) as f64;
+                        let e = reference[sec_ybase[s] + t * sec_rows[s] + r];
+                        max_ref = max_ref.max(e.abs());
+                        let d = (g - e).abs();
+                        if d > max_d {
+                            max_d = d;
+                            worst = (s, t, r);
+                        }
+                        if d > 4e-3 * e.abs().max(1.0) {
+                            nbad += 1;
+                        }
+                    }
+                }
+            }
+            // A cell that still holds the poison sentinel was never written:
+            // report it apart from "wrote the wrong number" (a dropped
+            // subtile/threadgroup vs a cursor defect), and fail on it even if
+            // some reference value happened to be huge enough to absorb it.
+            let poison = f32::from_bits(0x7F7F_7F7F);
+            let mut n_untouched = 0usize;
+            for s in 0..3 {
+                for t in 0..b_tok {
+                    for r in 0..sec_rows[s] {
+                        if read(s, t, r) == poison {
+                            n_untouched += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                n_untouched == 0,
+                "[oracle] cols={cols} b_tok={b_tok}: {n_untouched}/{} output cells were NEVER \
+                 written (still the 0x7F poison sentinel) - a subtile/threadgroup was dropped \
+                 or its store index is wrong",
+                region
+            );
+            let max_rel = if max_ref > 0.0 { max_d / max_ref } else { max_d };
+            println!(
+                "[oracle] cols={cols:4} b_tok={b_tok:2} nb={nb} row_bytes={row_bytes} \
+                 max_d={max_d:.3e} rel={max_rel:.3e} max_ref={max_ref:.3e} bad={nbad}/{} \
+                 worst=(s={} t={} r={})",
+                region, worst.0, worst.1, worst.2
+            );
+            if diag && nbad > 0 {
+                let (s, t, r) = worst;
+                let g = read(s, t, r) as f64;
+                // Full inversion, not same-token only: a store that drops the
+                // subtile token offset (t0) puts token T's value in token
+                // T-t0's slot, and a same-token search cannot name that. The
+                // reference values here are exact dyadics (< 2^24/128), so an
+                // equality hit is a genuine provenance match, not rounding.
+                let mut best = (f64::INFINITY, 0usize, 0usize, 0usize);
+                for s2 in 0..3 {
+                    for t2 in 0..b_tok {
+                        for r2 in 0..sec_rows[s2] {
+                            let e = reference[sec_ybase[s2] + t2 * sec_rows[s2] + r2];
+                            let d = (g - e).abs();
+                            if d < best.0 {
+                                best = (d, s2, t2, r2);
+                            }
+                        }
+                    }
+                }
+                // poison marker (0x7F7F7F7F) => the element was NEVER written
+                let unwritten = read(s, t, r) == f32::from_bits(0x7F7F_7F7F);
+                println!(
+                    "[oracle]   diag: gpu={g:.6e} expected=(s={s} t={t} r={r})                      unwritten={unwritten} looked_like=(s={} t={} r={} d={:.3e})",
+                    best.1, best.2, best.3, best.0
+                );
+                // per-token write census: a missing subtile leaves whole
+                // token planes untouched -> that is the signature to report.
+                let poison = f32::from_bits(0x7F7F_7F7F);
+                let mut census = String::new();
+                for t2 in 0..b_tok {
+                    let mut n_untouched = 0usize;
+                    for s2 in 0..3 {
+                        for r2 in 0..sec_rows[s2] {
+                            if read(s2, t2, r2) == poison {
+                                n_untouched += 1;
+                            }
+                        }
+                    }
+                    census.push_str(&format!(" {t2}:{n_untouched}"));
+                }
+                println!("[oracle]   diag: untouched-cells per token (of {total}) ->{census}");
+            }
+            // SOFUU_ORACLE_DUMP=<dir>: write gpu/ref/reference metadata so the
+            // failure pattern can be analysed without re-running the binary.
+            if let Some(dir) = std::env::var_os("SOFUU_ORACLE_DUMP") {
+                let dir = std::path::PathBuf::from(dir);
+                let mut meta = String::new();
+                meta.push_str(&format!("cols {cols}\nb_tok {b_tok}\ntotal {total}\n"));
+                for s in 0..3 {
+                    meta.push_str(&format!("sec {s} rows {} raw {}\n", sec_rows[s], sec_raw[s]));
+                }
+                let tag = format!("{cols}x{b_tok}");
+                std::fs::write(dir.join(format!("meta_{tag}.txt")), meta).unwrap();
+                let gpu: Vec<u8> = slab[out_off..out_off + region * 4].to_vec();
+                std::fs::write(dir.join(format!("gpu_{tag}.bin")), &gpu).unwrap();
+                let rf: Vec<u8> = reference.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect();
+                std::fs::write(dir.join(format!("ref_{tag}.bin")), &rf).unwrap();
+                let xr: Vec<u8> = slab[..out_off].to_vec();
+                std::fs::write(dir.join(format!("x_{tag}.bin")), &xr).unwrap();
+                // the weight arena too: a wrong (section,row) inversion is only
+                // provable against the bytes the kernel actually read
+                std::fs::write(dir.join(format!("w_{tag}.bin")), w_arena.as_slice()).unwrap();
+            }
+            rows.push((cols, b_tok, max_d, max_rel));
+        }
+        }
+
+        let bad: Vec<_> = rows.iter().filter(|(_, _, _, rel)| *rel > 1e-4).collect();
+        assert!(
+            bad.is_empty(),
+            "[oracle] gemm_q8_0_multi is NOT the dequant reference at these shapes: {:?} \
+             (width, b_tok, max_abs_delta, rel)",
+            bad
+        );
+    }
+
+
+    /// Same oracle for the q6_K twin (\`gemm_q6_k_multi\`), which carried the
+    /// identical store-index defect and had no numeric test of its own.
+    ///
+    /// q6_K moves 256 values per 210-byte block (ql[128], qh[64], sc[16]i8,
+    /// d f16 at +208), so this arm is limited to the widths where the host
+    /// floor actually admits q6_K (cols % 256 == 0): 1024 and 3072. The
+    /// reference is the GGML dequant order (dequantize_row_q6_K) in f64 -
+    /// NOT a transcription of the kernel's lane mapping, so the two agree only
+    /// if the kernel's mapping is right.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gemm_q6_k_multi_matches_dequant_oracle() {
+        let engine = match MetalEngine::new() {
+            Some(e) => e,
+            None => {
+                eprintln!("[oracle-q6] no Metal device - skipped");
+                return;
+            }
+        };
+        let b_toks = [9usize, 17usize];
+        let sec_rows = [512usize, 256usize, 256usize];
+        let total: usize = sec_rows.iter().sum();
+        let widths = [1024usize, 3072];
+
+        let mut state = 0xC2B2AE3D27D4EB4Fu64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        let f16_read = |lo: u8, hi: u8| -> f64 {
+            let h = u16::from_le_bytes([lo, hi]);
+            let sign = if h & 0x8000 != 0 { -1.0f64 } else { 1.0f64 };
+            let exp = ((h >> 10) & 0x1F) as i32;
+            let man = (h & 0x3FF) as f64;
+            if exp == 0 {
+                sign * man * 2f64.powi(-24)
+            } else {
+                sign * (1.0 + man / 1024.0) * 2f64.powi(exp - 15)
+            }
+        };
+
+        let mut rows: Vec<(usize, usize, f64, f64)> = Vec::new();
+
+        for &b_tok in b_toks.iter() {
+            for &cols in widths.iter() {
+                let nb = cols / 256; // q6_K super-block = 256 values / 210 bytes
+                let row_bytes = nb * 210;
+
+                let mut sec_raw = [0usize; 3];
+                let mut cur = 192usize; // non-zero byte remainder on section 0
+                let mut w_len = 0usize;
+                for s in 0..3 {
+                    sec_raw[s] = cur;
+                    cur += row_bytes * sec_rows[s];
+                    w_len = cur;
+                    cur += 96 + 64 * s; // pad, deliberately not 256-aligned
+                }
+                let w_arena = Arena::new(w_len.max(4096));
+                {
+                    let w = unsafe { std::slice::from_raw_parts_mut(w_arena.ptr, w_arena.len) };
+                    for s in 0..3 {
+                        for r in 0..sec_rows[s] {
+                            let base = sec_raw[s] + r * row_bytes;
+                            for b in 0..nb {
+                                let off = base + b * 210;
+                                for j in 0..128 {
+                                    w[off + j] = (rand() % 256) as u8; // ql
+                                }
+                                for j in 0..64 {
+                                    w[off + 128 + j] = (rand() % 256) as u8; // qh
+                                }
+                                for j in 0..16 {
+                                    w[off + 192 + j] = (rand() % 256) as u8; // i8 scales
+                                }
+                                w[off + 208..off + 210]
+                                    .copy_from_slice(&f16_bytes(0.03125 * ((rand() % 8) + 1) as f32));
+                            }
+                        }
+                    }
+                }
+                let w_buf = engine.register_zerocopy_only(w_arena.as_slice()).expect("q6 w buf");
+
+                let x_f32 = b_tok * cols;
+                let region = b_tok * total;
+                let out_off = x_f32 * 4;
+                let slab_arena = Arena::new(out_off + region * 4);
+                let slab = unsafe { std::slice::from_raw_parts_mut(slab_arena.ptr, slab_arena.len) };
+                for t in 0..b_tok {
+                    for i in 0..cols {
+                        let v = ((i * 5 + t * 7) % 19) as f32 * 0.25 - 2.25;
+                        slab[(t * cols + i) * 4..(t * cols + i) * 4 + 4]
+                            .copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                for byte in slab[out_off..].iter_mut() {
+                    *byte = 0x7F;
+                }
+                let slab_buf = engine.register_zerocopy_only(slab_arena.as_slice()).expect("slab");
+
+                let mut sec_ybase = [0usize; 3];
+                {
+                    let mut acc = 0usize;
+                    for s in 0..3 {
+                        sec_ybase[s] = acc;
+                        acc += b_tok * sec_rows[s];
+                    }
+                }
+
+                // -- host reference: GGML q6_K dequant order, f64 dots
+                let reference = {
+                    let mut v = vec![0f64; region];
+                    let w = w_arena.as_slice();
+                    for s in 0..3 {
+                        for t in 0..b_tok {
+                            for r in 0..sec_rows[s] {
+                                let base = sec_raw[s] + r * row_bytes;
+                                let mut acc = 0f64;
+                                for b in 0..nb {
+                                    let off = base + b * 210;
+                                    let d = f16_read(w[off + 208], w[off + 209]);
+                                    for n in 0..2 {
+                                        for l in 0..32 {
+                                            let qh = w[off + 128 + n * 32 + l];
+                                            let isn = 8 * n + l / 16;
+                                            let q1 = (w[off + n * 64 + l] & 0x0F)
+                                                | (((qh >> 0) & 3) << 4);
+                                            let q2 = (w[off + n * 64 + l + 32] & 0x0F)
+                                                | (((qh >> 2) & 3) << 4);
+                                            let q3 = (w[off + n * 64 + l] >> 4)
+                                                | (((qh >> 4) & 3) << 4);
+                                            let q4 = (w[off + n * 64 + l + 32] >> 4)
+                                                | (((qh >> 6) & 3) << 4);
+                                            let sc = |o: usize| w[off + 192 + isn + o] as i8 as f64;
+                                            let k0 = b * 256 + n * 128 + l;
+                                            let xs = |k: usize| -> f64 {
+                                                let xb = (t * cols + k) * 4;
+                                                f32::from_le_bytes(
+                                                    slab[xb..xb + 4].try_into().unwrap(),
+                                                ) as f64
+                                            };
+                                            acc += d * sc(0) * (q1 as f64 - 32.0) * xs(k0);
+                                            acc += d * sc(2) * (q2 as f64 - 32.0) * xs(k0 + 32);
+                                            acc += d * sc(4) * (q3 as f64 - 32.0) * xs(k0 + 64);
+                                            acc += d * sc(6) * (q4 as f64 - 32.0) * xs(k0 + 96);
+                                        }
+                                    }
+                                }
+                                v[sec_ybase[s] + t * sec_rows[s] + r] = acc;
+                            }
+                        }
+                    }
+                    v
+                };
+
+                let mut blob = [[0u32; 5]; 4];
+                let base = (0..3).map(|s| sec_raw[s] & !255usize).min().unwrap();
+                let mut end = 0u32;
+                let mut y_acc = out_off;
+                for s in 0..3 {
+                    blob[s][0] = ((sec_raw[s] & !255usize) - base) as u32;
+                    blob[s][1] = (sec_raw[s] & 255usize) as u32;
+                    end += sec_rows[s] as u32;
+                    blob[s][2] = end;
+                    blob[s][3] = y_acc as u32;
+                    blob[s][4] = sec_rows[s] as u32;
+                    y_acc += b_tok * sec_rows[s] * 4;
+                }
+
+                assert!(engine.batch_open());
+                let ok = unsafe {
+                    sofuu_metal_batch_gguf_gemm_multi(
+                        engine.ctx,
+                        14u32, // GGML_TYPE_Q6_K
+                        w_buf.handle,
+                        base,
+                        slab_buf.handle,
+                        0,
+                        slab_buf.handle,
+                        0,
+                        total,
+                        cols,
+                        b_tok,
+                        blob.as_ptr() as *const u32,
+                        3,
+                    ) == 1
+                };
+                assert!(engine.batch_end(), "[oracle-q6] batch_end failed cols={cols}");
+                assert!(ok, "[oracle-q6] gemm_q6_k_multi unavailable at cols={cols}");
+
+                let read = |s: usize, t: usize, r: usize| -> f32 {
+                    let byte = out_off + (sec_ybase[s] + t * sec_rows[s] + r) * 4;
+                    f32::from_le_bytes(slab[byte..byte + 4].try_into().unwrap())
+                };
+                let poison = f32::from_bits(0x7F7F_7F7F);
+                let mut max_d = 0f64;
+                let mut max_ref = 0f64;
+                let mut n_untouched = 0usize;
+                let mut worst = (0usize, 0usize, 0usize);
+                for s in 0..3 {
+                    for t in 0..b_tok {
+                        for r in 0..sec_rows[s] {
+                            let g = read(s, t, r);
+                            if g == poison {
+                                n_untouched += 1;
+                            }
+                            let g = g as f64;
+                            let e = reference[sec_ybase[s] + t * sec_rows[s] + r];
+                            max_ref = max_ref.max(e.abs());
+                            let dd = (g - e).abs();
+                            if dd > max_d {
+                                max_d = dd;
+                                worst = (s, t, r);
+                            }
+                        }
+                    }
+                }
+                let max_rel = if max_ref > 0.0 { max_d / max_ref } else { max_d };
+                println!(
+                    "[oracle-q6] cols={cols:4} b_tok={b_tok:2} nb={nb} row_bytes={row_bytes} \
+                     max_d={max_d:.3e} rel={max_rel:.3e} max_ref={max_ref:.3e} \
+                     untouched={n_untouched}/{} worst=(s={} t={} r={})",
+                    region, worst.0, worst.1, worst.2
+                );
+                assert!(
+                    n_untouched == 0,
+                    "[oracle-q6] cols={cols} b_tok={b_tok}: {n_untouched}/{} cells never written",
+                    region
+                );
+                rows.push((cols, b_tok, max_d, max_rel));
+            }
+        }
+
+        let bad: Vec<_> = rows.iter().filter(|(_, _, _, rel)| *rel > 1e-4).collect();
+        assert!(
+            bad.is_empty(),
+            "[oracle-q6] gemm_q6_k_multi is NOT the dequant reference: {:?} \
+             (width, b_tok, max_abs_delta, rel)",
+            bad
+        );
     }
 }
 
@@ -9662,18 +10247,56 @@ fn gemm_cols_ok_accepts_the_fleet_widths_and_refuses_every_tail() {
     assert!(!gemm_cols_ok(GGML_TYPE_F16, 2048));
 }
 
-/// The multi-section q8_0 GEMM (`gemm_q8_0_multi`) is held at the 256-value
-/// super-block floor even though the shared table says q8_0 needs only 32: it
-/// was measured WRONG at cols=960 (SmolLM2), the one fleet width where the two
-/// floors differ. On the prefill-GEMM route, 39 tokens, same binary, against the
-/// per-tensor walk that the hold falls back to: fused q/k/v through this entry
-/// only -> 10.98 max|dlogit| (argmax 21745 vs 2067), fused gate/up only -> 15.94
-/// (argmax 365), both refused -> 0.00. The mma64 twin reads the same 30 blocks
-/// and lands 0.0085 from that reference, so the block arithmetic is fine and
-/// this kernel is not. Relaxing this hold again REQUIRES a numeric receipt at a
-/// cols%256 != 0 width; the pin below fails the moment it is dropped in silence.
+/// The multi-section kernels must put the SUBTILE token offset into the store
+/// index: `yr[(t0 + k) * y_stride]`, not `yr[k * y_stride]`.
+///
+/// This is pinned at the source because the defect it guards is invisible to
+/// every per-call test that dispatches fewer than GEMM_TS+1 tokens, and it is
+/// invisible on paper too - the weight/section cursor is correct either way.
+/// What it does: with GEMM_TS = 8 every subtile > 0 wrote its 8 accumulators
+/// over subtile 0's slots, so slots 0..7 held whichever subtile won the race
+/// and slots 8..B-1 were never written at all (stale slab read back as
+/// logits). That is a 10-17 max|dlogit| error on a 39-token prefill at ANY
+/// column count, which is what the retired "q8_0 is wrong off the 256 grid"
+/// hold was really seeing (cols 1024 was only ever measured on the mma64
+/// twin, which always had the term). Numeric receipt:
+/// gemm_q8_0_multi_matches_dequant_oracle below.
 #[test]
-fn gemm_q8_0_multi_entry_is_held_at_the_super_block_floor() {
+fn gemm_multi_kernels_store_the_subtile_token_offset() {
+    fn kernel_body<'a>(all: &'a str, name: &str) -> &'a str {
+        let start = match all.find(name) {
+            Some(s) => s,
+            None => panic!("{name} missing from kernels.metal"),
+        };
+        let rest = &all[start..];
+        let end = match rest[1..].find("\nkernel void ") {
+            Some(i) => i + 1,
+            None => rest.len(),
+        };
+        &rest[..end]
+    }
+    const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+    for name in ["kernel void gemm_q8_0_multi(", "kernel void gemm_q6_k_multi("] {
+        let body = kernel_body(KERNELS, name);
+        assert!(
+            body.contains("uint t0 = tg.y * GEMM_TS;"),
+            "{name} must keep the GEMM_TS subtile grouping"
+        );
+        for k in 0..8 {
+            let want = format!("yr[(size_t)(t0 + {k}) * sec_ystr]");
+            assert!(
+                body.contains(&want),
+                "{name} must store acc{k} at {want} - a store without t0 \
+                 clobbers subtile 0 and never writes tokens 8..B-1"
+            );
+        }
+        assert!(
+            !body.contains("yr[0] = acc0"),
+            "{name} stores acc0 without the subtile token offset again"
+        );
+    }
+    // the entry must no longer refuse q8_0 off the 256-value grid: the real
+    // column requirement is whole 32-value q8_0 blocks (gemm_cols_ok).
     const SRC: &str = include_str!("metal.rs");
     let start = SRC
         .find("pub fn batch_gguf_gemm_multi(")
@@ -9685,12 +10308,9 @@ fn gemm_q8_0_multi_entry_is_held_at_the_super_block_floor() {
         .unwrap_or(rest.len());
     let body = &rest[..end];
     assert!(
-        body.contains("ty == GGML_TYPE_Q8_0 && cols % 256 != 0"),
-        "batch_gguf_gemm_multi must refuse q8_0 off the 256-value super-block grid"
-    );
-    assert!(
-        body.contains("[gemm-floor] batch_gguf_gemm_multi refused"),
-        "the hold must print, not fall through silently"
+        !body.contains("cols % 256 != 0"),
+        "batch_gguf_gemm_multi must not re-impose a 256-value hold on q8_0: \
+         gemm_q8_0_multi is exact at 960/992/2080/3200 (oracle) and at any B"
     );
 }
 

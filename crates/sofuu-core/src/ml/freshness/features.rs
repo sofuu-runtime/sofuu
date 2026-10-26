@@ -18,6 +18,8 @@ use std::sync::LazyLock;
 use crate::rt::ai::sofuu_tfidf_embed;
 
 pub const FRESHNESS_FEATURES: usize = 28;
+pub const FRESHNESS_FEATURES_V1: usize = 28;
+pub const FRESHNESS_FEATURES_V2: usize = 34;
 const EMBED_DIM: usize = 768;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -394,6 +396,62 @@ pub fn extract(inp: &FreshnessInput) -> [f32; FRESHNESS_FEATURES] {
     f[25] = if inp.age_days.is_finite() { (inp.age_days.max(0.0) / 730.0).min(1.0) } else { 0.0 };
     f[26] = sentence_max_cosine(text, &STALE_VEC);
     f[27] = sentence_max_cosine(text, &HEDGING_VEC);
+    f
+}
+
+const BREAKING_KEYWORDS: &[&str] = &[
+    "breaking change", "breaking changes", "deprecated since", "removed in",
+    "migration guide", "no longer works", "upgrade guide", "incompatible with",
+    "signature changed", "dropped support for",
+];
+
+const RELATIVE_DATE_KEYWORDS: &[&str] = &[
+    "last month", "last year", "several months ago", "few months ago",
+    "recently updated", "months ago", "weeks ago", "days ago",
+];
+
+const SIGNATURE_MISMATCH_KEYWORDS: &[&str] = &[
+    "renamed parameter", "renamed to", "argument count", "signature mismatch",
+    "wrong number of arguments", "type mismatch", "deprecated parameter",
+];
+
+const CHANGELOG_KEYWORDS: &[&str] = &[
+    "changelog", "release notes", "what's new", "whats new", "migrating from",
+    "version history", "history.md", "releases",
+];
+
+/// v2 Feature extractor (34 scalar f32 features).
+/// Retains all 28 v1 features bit-identically in slots 0..28, and adds:
+///   28: breaking change keyword density
+///   29: SemVer major difference / legacy version indicator
+///   30: lockfile drift flag
+///   31: relative date keyword density
+///   32: signature / argument mismatch keyword density
+///   33: changelog / release notes marker density
+pub fn extract_v2(inp: &FreshnessInput) -> [f32; FRESHNESS_FEATURES_V2] {
+    let f1 = extract(inp);
+    let mut f = [0.0f32; FRESHNESS_FEATURES_V2];
+    f[..FRESHNESS_FEATURES_V1].copy_from_slice(&f1);
+
+    let text = inp.text;
+    f[28] = keyword_density(text, BREAKING_KEYWORDS);
+    // 29: SemVer major leap indicator (v0.x vs v1+ vs v2+)
+    f[29] = if text.contains("v0.") || text.contains("0.") {
+        0.5
+    } else if text.contains("v1.") || text.contains("v2.") {
+        1.0
+    } else {
+        0.0
+    };
+    // 30: Lockfile drift / package format presence
+    f[30] = if text.contains("package.json") || text.contains("Cargo.lock") || text.contains("yarn.lock") {
+        1.0
+    } else {
+        0.0
+    };
+    f[31] = keyword_density(text, RELATIVE_DATE_KEYWORDS);
+    f[32] = keyword_density(text, SIGNATURE_MISMATCH_KEYWORDS);
+    f[33] = keyword_density(text, CHANGELOG_KEYWORDS);
     f
 }
 

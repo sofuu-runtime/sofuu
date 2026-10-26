@@ -20,6 +20,12 @@ pub const H1: u32 = 112;
 pub const H2: u32 = 48;
 pub const PARAMS: u32 = 8721; // §5 arch: 28 → 112 → 48 → 1
 
+pub const V2_IN_DIM: u32 = features::FRESHNESS_FEATURES_V2 as u32; // 34
+pub const V2_H1: u32 = 128;
+pub const V2_H2: u32 = 64;
+pub const V2_PARAMS: u32 = 12801;
+pub const V2_THRESHOLD: f32 = 0.95;
+
 /// Decision threshold, baked from the ml-train run that emitted
 /// weights_v1.f32. Chosen on the VALIDATION fold only (§10 bar 3) at the
 /// 0.95 recall-selection floor; the held-out test fold held recall 0.990
@@ -27,11 +33,16 @@ pub const PARAMS: u32 = 8721; // §5 arch: 28 → 112 → 48 → 1
 pub const THRESHOLD: f32 = 0.95;
 
 static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
+pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
 
 static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
     TinyMlp::from_blob(WEIGHTS).expect("committed freshness weights must load")
+});
+
+pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
+    TinyMlp::from_blob(WEIGHTS_V2).expect("committed freshness v2 weights must load")
 });
 
 pub struct FreshnessVerdict {

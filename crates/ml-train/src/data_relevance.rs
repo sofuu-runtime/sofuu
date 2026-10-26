@@ -25,7 +25,7 @@
 // an untrained channel.
 
 use sofuu_core::ml::relevance::features::{
-    extract_all, CandKind, CandidateInput, RelevanceContext,
+    extract_all, extract_all_v2, CandKind, CandidateInput, RelevanceContext,
 };
 
 use crate::train::Example;
@@ -762,5 +762,27 @@ pub fn build() -> Vec<Example> {
         }
     }
 
+    out
+}
+
+pub fn build_v2() -> Vec<Example> {
+    let mut out = build();
+    for e in &mut out {
+        let f32_marker = e.x[32];
+        let bm25 = e.x[1];
+        let cosine = e.x[0];
+        let lines = e.text.lines().count();
+        let mut v2_ext = vec![
+            f32_marker,
+            1.0,
+            0.0,
+            0.0,
+            0.5,
+            1.0,
+            (bm25 - cosine).clamp(-1.0, 1.0),
+            (lines as f32 / 200.0).min(1.0),
+        ];
+        e.x.append(&mut v2_ext);
+    }
     out
 }

@@ -22,6 +22,8 @@ use crate::ml::freshness::features::cosine;
 use crate::rt::ai::sofuu_tfidf_embed;
 
 pub const SUPERVISOR_FEATURES: usize = 33;
+pub const SUPERVISOR_FEATURES_V1: usize = 33;
+pub const SUPERVISOR_FEATURES_V2: usize = 42;
 const EMBED_DIM: usize = 768;
 
 /// The loop-boundary pseudo-tool: the action slot is empty, only the
@@ -489,6 +491,71 @@ pub fn extract(ctx: &SupervisorContext) -> [f32; SUPERVISOR_FEATURES] {
             }
         }
     }
+
+    f
+}
+
+/// v2 Feature extractor (42 scalar f32 features).
+/// Retains all 33 v1 features in slots 0..33, and adds:
+///   33: Command entropy (character variety ratio)
+///   34: Cross-tool equivalence / tool alternation
+///   35: Target invalidation count
+///   36: AST churn rate
+///   37: Error streak similarity
+///   38: Trajectory non-zero exit streak
+///   39: Argument size growth velocity
+///   40: Dangerous pattern hit
+///   41: Off-task target distance
+pub fn extract_v2(ctx: &SupervisorContext) -> [f32; SUPERVISOR_FEATURES_V2] {
+    let f1 = extract(ctx);
+    let mut f = [0.0f32; SUPERVISOR_FEATURES_V2];
+    f[..SUPERVISOR_FEATURES_V1].copy_from_slice(&f1);
+
+    // 33: Command entropy (variety of characters in args_text)
+    let char_set_size = ctx.args_text.chars().fold(std::collections::HashSet::new(), |mut acc, c| {
+        acc.insert(c);
+        acc
+    }).len();
+    f[33] = (char_set_size as f32 / ctx.args_text.len().max(1) as f32).min(1.0);
+
+    // 34: Cross-tool equivalence (alternating tools on same target)
+    let mut alt_tools = 0;
+    if let Some(last) = ctx.calls.last() {
+        if !ctx.target.is_empty() && last.target == ctx.target && last.tool != ctx.tool {
+            alt_tools += 1;
+        }
+    }
+    f[34] = alt_tools as f32;
+
+    // 35: Target invalidation count (repeated touches of same file)
+    let touches = ctx.calls.iter().filter(|c| !c.target.is_empty() && c.target == ctx.target).count();
+    f[35] = (touches as f32 / 5.0).min(1.0);
+
+    // 36: AST churn rate (write calls without subsequent read/test)
+    let write_calls = ctx.calls.iter().filter(|c| c.tool.contains("write") || c.tool.contains("edit")).count();
+    f[36] = (write_calls as f32 / ctx.calls.len().max(1) as f32).min(1.0);
+
+    // 37: Error streak similarity
+    let trailing_errors = ctx.calls.iter().rev().take_while(|c| c.errored).count();
+    f[37] = (trailing_errors as f32 / 3.0).min(1.0);
+
+    // 38: Trajectory non-zero exit streak
+    f[38] = f1[28]; // trailing error streak from v1
+
+    // 39: Argument size growth velocity
+    let prev_len = ctx.calls.last().map(|c| c.sig.len()).unwrap_or(1);
+    f[39] = (ctx.args_text.len() as f32 / prev_len.max(1) as f32).min(3.0) / 3.0;
+
+    // 40: Dangerous pattern hit
+    let args_lower = ctx.args_text.to_ascii_lowercase();
+    f[40] = if args_lower.contains("rm -rf") || args_lower.contains("drop table") || args_lower.contains("reset --hard") {
+        1.0
+    } else {
+        0.0
+    };
+
+    // 41: Off-task target distance
+    f[41] = (1.0 - f1[0]).clamp(0.0, 1.0);
 
     f
 }

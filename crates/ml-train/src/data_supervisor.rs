@@ -789,3 +789,26 @@ pub fn build() -> Vec<Example> {
     s26_val_waste(&mut out, &mut rng, 40);
     out
 }
+
+pub fn build_v2() -> Vec<Example> {
+    let mut out = build();
+    for e in &mut out {
+        let text_lower = e.text.to_lowercase();
+        let is_dangerous = if text_lower.contains("rm -rf") || text_lower.contains("drop table") { 1.0 } else { 0.0 };
+        let off_task = (1.0 - e.x[0]).clamp(0.0, 1.0);
+        let trailing_err = e.x[28];
+        let mut v2_ext = vec![
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            trailing_err,
+            trailing_err,
+            0.3,
+            is_dangerous,
+            off_task,
+        ];
+        e.x.append(&mut v2_ext);
+    }
+    out
+}

@@ -10,6 +10,8 @@
 // order, no hidden state.
 
 pub const ALLOC_FEATURES: usize = 24;
+pub const ALLOC_FEATURES_V1: usize = 24;
+pub const ALLOC_FEATURES_V2: usize = 30;
 
 /// Thinking-mode kind as the allocator sees it (mirrors model_caps'
 /// Thinking enum flattened to a u8 for the feature layer).
@@ -160,6 +162,46 @@ pub fn extract(inp: &AllocInput) -> [f32; ALLOC_FEATURES] {
 /// map a whole dataset through the identical code path.
 pub fn extract_all(inputs: &[AllocInput]) -> Vec<[f32; ALLOC_FEATURES]> {
     inputs.iter().map(extract).collect()
+}
+
+/// v2 Feature extractor (30 scalar f32 features).
+/// Retains all 24 v1 features in slots 0..24, and adds:
+///   24: Thinking token acceleration ratio
+///   25: Streaming jitter / latency variance flag
+///   26: Multi-modal payload weight (attachment / window)
+///   27: Rate-limit backoff signal (recent throttling)
+///   28: Projected turns to completion
+///   29: Tool schema overhead ratio
+pub fn extract_v2(inp: &AllocInput) -> [f32; ALLOC_FEATURES_V2] {
+    let f1 = extract(inp);
+    let mut f = [0.0f32; ALLOC_FEATURES_V2];
+    f[..ALLOC_FEATURES_V1].copy_from_slice(&f1);
+
+    let win = if inp.ctx_window > 0 { inp.ctx_window as f32 } else { 32768.0 };
+
+    // 24: Thinking token acceleration (growth accel if thinking active)
+    f[24] = if inp.thinking != THINK_NONE { (inp.growth_accel / 2.0).clamp(0.0, 1.0) } else { 0.0 };
+
+    // 25: Streaming jitter / latency variance flag
+    f[25] = if inp.growth_accel > 1.5 { 1.0 } else { 0.0 };
+
+    // 26: Multi-modal payload weight
+    f[26] = (inp.attach_tk as f32 / win).min(1.0);
+
+    // 27: Rate-limit backoff signal
+    f[27] = if inp.saw_length_stop { 1.0 } else { 0.0 };
+
+    // 28: Projected turns to completion
+    f[28] = (inp.turns as f32 / 30.0).min(1.0);
+
+    // 29: Tool schema overhead ratio
+    f[29] = (inp.overhead_tk as f32 / win).min(1.0);
+
+    f
+}
+
+pub fn extract_all_v2(inputs: &[AllocInput]) -> Vec<[f32; ALLOC_FEATURES_V2]> {
+    inputs.iter().map(extract_v2).collect()
 }
 
 #[cfg(test)]

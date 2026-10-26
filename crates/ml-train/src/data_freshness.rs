@@ -32,7 +32,7 @@
 // the SHARED signal — years, staleness semantics, task interaction —
 // predicts the label).
 
-use sofuu_core::ml::freshness::features::{extract, FreshnessInput, SourceKind};
+use sofuu_core::ml::freshness::features::{extract, extract_v2, FreshnessInput, SourceKind};
 
 use crate::train::Example;
 
@@ -498,6 +498,22 @@ pub fn build() -> Vec<Example> {
                 });
             }
         }
+    }
+    out
+}
+
+pub fn build_v2() -> Vec<Example> {
+    let mut out = build();
+    for e in &mut out {
+        let inp = FreshnessInput {
+            text: &e.text,
+            task: &e.task,
+            kind: SourceKind::Web,
+            strength: 0.0,
+            age_days: 0.0,
+            now_year: NOW_YEAR,
+        };
+        e.x = extract_v2(&inp).to_vec();
     }
     out
 }

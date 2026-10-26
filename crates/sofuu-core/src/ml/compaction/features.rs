@@ -13,6 +13,8 @@ use crate::ml::freshness::features::cosine;
 use crate::rt::ai::sofuu_tfidf_embed;
 
 pub const COMPACTION_FEATURES: usize = 33;
+pub const COMPACTION_FEATURES_V1: usize = 33;
+pub const COMPACTION_FEATURES_V2: usize = 41;
 const EMBED_DIM: usize = 768;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -322,6 +324,94 @@ pub fn extract_all(ctx: &CompactionContext) -> Vec<[f32; COMPACTION_FEATURES]> {
     (0..ctx.segments.len())
         .map(|i| {
             extract(
+                ctx,
+                i,
+                &emb,
+                recent_emb.as_deref(),
+                task_emb.as_deref(),
+                summary_emb.as_deref(),
+            )
+        })
+        .collect()
+}
+
+const CONFIG_WORDS: &[&str] = &[
+    "config", "environment", "env", "port", "host", "token", "api_key", "password",
+    "secret", "database_url", "settings", "schema",
+];
+
+const CONSTRAINT_WORDS: &[&str] = &[
+    "never", "do not", "don't", "must not", "without", "require", "mandatory",
+    "always", "strictly", "critical",
+];
+
+/// v2 Feature extractor (41 scalar f32 features).
+/// Retains all 33 v1 features in slots 0..33, and adds:
+///   33: Forward citation count (symbols referenced in subsequent segments)
+///   34: Unresolved error flag
+///   35: Configuration state marker
+///   36: User constraint echo
+///   37: Turn duration seconds norm
+///   38: Patch application target (contains diff markers)
+///   39: Consecutive assistant monologue depth
+///   40: Semantic density ratio (distinct tokens / length)
+pub fn extract_v2(
+    ctx: &CompactionContext,
+    idx: usize,
+    emb: &[Vec<f32>],
+    recent_emb: Option<&[f32]>,
+    task_emb: Option<&[f32]>,
+    summary_emb: Option<&[f32]>,
+) -> [f32; COMPACTION_FEATURES_V2] {
+    let f1 = extract(ctx, idx, emb, recent_emb, task_emb, summary_emb);
+    let mut f = [0.0f32; COMPACTION_FEATURES_V2];
+    f[..COMPACTION_FEATURES_V1].copy_from_slice(&f1);
+
+    let seg = &ctx.segments[idx];
+    let lower = seg.text.to_lowercase();
+
+    // 33: Forward citation count (overlap with later segments)
+    let mut fwd_hits = 0.0f32;
+    for later in &ctx.segments[idx + 1..] {
+        fwd_hits += lexical_overlap(seg.text, later.text);
+    }
+    f[33] = (fwd_hits / 5.0).min(1.0);
+
+    // 34: Unresolved error flag
+    let has_error = f1[24] > 0.0 || f1[26] > 0.0;
+    let later_fixed = ctx.segments[idx + 1..].iter().any(|s| s.text.contains("PASS") || s.text.contains("success") || s.text.contains("fixed"));
+    f[34] = if has_error && !later_fixed { 1.0 } else { 0.0 };
+
+    // 35: Configuration state marker
+    f[35] = word_hits(seg.text, CONFIG_WORDS);
+
+    // 36: User constraint echo
+    f[36] = word_hits(seg.text, CONSTRAINT_WORDS);
+
+    // 37: Turn duration seconds norm (approximated from size)
+    f[37] = (seg.tokens as f32 / 2000.0).min(1.0);
+
+    // 38: Patch application target (contains git diff markers)
+    f[38] = if lower.contains("diff --git") || lower.contains("@@ -") || lower.contains("+++ b/") { 1.0 } else { 0.0 };
+
+    // 39: Consecutive assistant monologue depth
+    let assistant_streak = ctx.segments[..=idx].iter().rev().take_while(|s| s.kind == SegKind::Assistant).count();
+    f[39] = (assistant_streak as f32 / 4.0).min(1.0);
+
+    // 40: Semantic density ratio
+    f[40] = distinct_token_ratio(seg.text);
+
+    f
+}
+
+pub fn extract_all_v2(ctx: &CompactionContext) -> Vec<[f32; COMPACTION_FEATURES_V2]> {
+    let emb: Vec<Vec<f32>> = ctx.segments.iter().map(|s| embed_text(s.text)).collect();
+    let recent_emb = (!ctx.recent.is_empty()).then(|| embed_text(ctx.recent));
+    let task_emb = (!ctx.task.is_empty()).then(|| embed_text(ctx.task));
+    let summary_emb = (!ctx.summary.is_empty()).then(|| embed_text(ctx.summary));
+    (0..ctx.segments.len())
+        .map(|i| {
+            extract_v2(
                 ctx,
                 i,
                 &emb,

@@ -282,3 +282,20 @@ pub fn build() -> Vec<Example> {
     }
     out
 }
+
+pub fn build_v2() -> Vec<Example> {
+    let mut out = build();
+    for e in &mut out {
+        let saw_length = e.x[20];
+        let mut v2_ext = vec![
+            0.0,        // 24: thinking
+            0.0,        // 25: jitter
+            0.05,       // 26: multimodal
+            saw_length, // 27: rate-limit backoff
+            0.3,        // 28: projected turns
+            0.02,       // 29: tool schema
+        ];
+        e.x.append(&mut v2_ext);
+    }
+    out
+}

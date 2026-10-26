@@ -27,6 +27,12 @@ pub const H1: u32 = 96;
 pub const H2: u32 = 40;
 pub const PARAMS: u32 = 6321; // 24 → 96 → 40 → 1
 
+pub const V2_IN_DIM: u32 = features::ALLOC_FEATURES_V2 as u32; // 30
+pub const V2_H1: u32 = 128;
+pub const V2_H2: u32 = 64;
+pub const V2_PARAMS: u32 = 12289;
+pub const V2_THRESHOLD: f32 = 0.51;
+
 /// Decision threshold baked from the ml-train run that emitted
 /// weights_v1.f32 — selected on the VALIDATION fold only, at the
 /// recall floor (a missed pressure event is exactly the provider-400
@@ -74,9 +80,14 @@ const WRITING_OUTPUT_BOOST: f32 = 1.25;
 const UNKNOWN_PRESSURE_FLOOR: f32 = 0.50;
 
 static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
+pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
 
 static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     TinyMlp::from_blob(WEIGHTS).expect("committed alloc weights must load")
+});
+
+pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
+    TinyMlp::from_blob(WEIGHTS_V2).expect("committed alloc v2 weights must load")
 });
 
 /// One turn's allocation. Every number is clamped to the selected

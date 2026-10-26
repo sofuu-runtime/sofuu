@@ -21,6 +21,12 @@ pub const H1: u32 = 104;
 pub const H2: u32 = 44;
 pub const PARAMS: u32 = 8201; // §12 arch: 33 → 104 → 44 → 1
 
+pub const V2_IN_DIM: u32 = features::COMPACTION_FEATURES_V2 as u32; // 41
+pub const V2_H1: u32 = 128;
+pub const V2_H2: u32 = 64;
+pub const V2_PARAMS: u32 = 13697;
+pub const V2_THRESHOLD: f32 = 0.45;
+
 /// Decision threshold, baked from the ml-train run that emitted
 /// weights_v1.f32. Selected on the VALIDATION fold only (§10 bar 3): the
 /// fold (off-task musings, held-out decision phrasings, held-out
@@ -53,11 +59,16 @@ pub const KEEP_WINDOW_AGE: u32 = 1;
 pub const MECHANICAL_DUP_COSINE: f32 = 0.95;
 
 static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
+pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
 
 static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
     TinyMlp::from_blob(WEIGHTS).expect("committed compaction weights must load")
+});
+
+pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
+    TinyMlp::from_blob(WEIGHTS_V2).expect("committed compaction v2 weights must load")
 });
 
 /// How a flagged segment can be compacted. The free tiers need no LLM

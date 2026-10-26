@@ -195,6 +195,69 @@ fn push_example(st: &mut OnlineState, ex: Example) {
     st.examples.push(ex);
 }
 
+/* ── Multi-Gate Online Learning (Pillar 4: Relevance & Compaction) ─── */
+
+/// Bounded observation buffer for relevance candidates.
+pub fn observe_relevance(run: &str, cand_id: u32, feats: &[f32; 37], chosen: bool, score: f32) {
+    with_online(|st| {
+        if st.obs.len() >= MAX_OBS {
+            st.obs.pop_front();
+        }
+        let mut f33 = [0.0f32; 33];
+        f33.copy_from_slice(&feats[..33]);
+        st.obs.push_back(Obs {
+            run: format!("rel:{run}"),
+            step: cand_id,
+            feats: f33,
+            flagged: chosen,
+            score,
+        });
+    });
+}
+
+/// Attach an outcome label for relevance (useful vs noise).
+pub fn label_relevance(run: &str, cand_id: u32, useful: bool, conf: f32) -> bool {
+    let key = format!("rel:{run}");
+    let w = conf.clamp(0.0, MAX_WEIGHT);
+    with_online(|st| {
+        let idx = st.obs.iter().position(|o| o.run == key && o.step == cand_id);
+        let Some(idx) = idx else { return false };
+        let o = st.obs.remove(idx).unwrap();
+        push_example(st, Example { feats: o.feats, y: if useful { 1.0 } else { 0.0 }, w });
+        true
+    })
+}
+
+/// Bounded observation buffer for compaction segments.
+pub fn observe_compaction(run: &str, seg_idx: u32, feats: &[f32; 33], compacted: bool, score: f32) {
+    with_online(|st| {
+        if st.obs.len() >= MAX_OBS {
+            st.obs.pop_front();
+        }
+        st.obs.push_back(Obs {
+            run: format!("cmp:{run}"),
+            step: seg_idx,
+            feats: *feats,
+            flagged: compacted,
+            score,
+        });
+    });
+}
+
+/// Attach an outcome label for compaction (needed vs scrap).
+pub fn label_compaction(run: &str, seg_idx: u32, needed: bool, conf: f32) -> bool {
+    let key = format!("cmp:{run}");
+    let w = conf.clamp(0.0, MAX_WEIGHT);
+    with_online(|st| {
+        let idx = st.obs.iter().position(|o| o.run == key && o.step == seg_idx);
+        let Some(idx) = idx else { return false };
+        let o = st.obs.remove(idx).unwrap();
+        // needed = 0 (keep), disposable = 1 (compact)
+        push_example(st, Example { feats: o.feats, y: if needed { 0.0 } else { 1.0 }, w });
+        true
+    })
+}
+
 /* ── Runtime fixtures: replay anchors + adoption gate ───────────────── */
 
 /// Canonical cases in a domain no training family touches (wind-turbine

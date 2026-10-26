@@ -31,6 +31,9 @@ mod embedding_verify;
 mod embedding_diag;
 mod embedding_anchor;
 mod embedding_probe;
+mod data_trajectories;
+mod preprocess;
+mod trainer_v2;
 mod train;
 
 use std::path::PathBuf;
@@ -1439,11 +1442,18 @@ fn diagnose_supervisor() {
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
+        "preprocess" => preprocess::run_preprocessing(),
         "freshness" => train_freshness(),
         "compaction" => train_compaction(),
         "relevance" => train_relevance(),
         "supervisor" => train_supervisor(),
         "alloc" => train_alloc(),
+        "freshness-v2" => trainer_v2::train_freshness_v2(),
+        "compaction-v2" => trainer_v2::train_compaction_v2(),
+        "relevance-v2" => trainer_v2::train_relevance_v2(),
+        "supervisor-v2" => trainer_v2::train_supervisor_v2(),
+        "alloc-v2" => trainer_v2::train_alloc_v2(),
+        "train-all-v2" => trainer_v2::train_all_v2(),
         "embedding" => embedding_train::train_embedding(),
         "embed-eval" => std::process::exit(embedding_eval::run_eval()),
         "embed-stress" => std::process::exit(embedding_stress::run_stress()),

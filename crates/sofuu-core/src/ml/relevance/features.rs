@@ -19,6 +19,8 @@ use crate::ml::freshness::features::cosine;
 use crate::rt::ai::sofuu_tfidf_embed;
 
 pub const RELEVANCE_FEATURES: usize = 37;
+pub const RELEVANCE_FEATURES_V1: usize = 37;
+pub const RELEVANCE_FEATURES_V2: usize = 45;
 const EMBED_DIM: usize = 768;
 
 /// BM25 parameters — the standard retrieval defaults. Deterministic
@@ -590,6 +592,66 @@ fn definition_site(task: &str, text: &str) -> f32 {
 pub fn extract_all(ctx: &RelevanceContext) -> Vec<[f32; RELEVANCE_FEATURES]> {
     let st = compute_stats(ctx);
     (0..ctx.candidates.len()).map(|i| extract(ctx, i, &st)).collect()
+}
+
+/// Syntax validity estimation: checks for balanced braces, parens, brackets.
+fn syntax_balance(text: &str) -> f32 {
+    let mut b = 0i32;
+    let mut p = 0i32;
+    let mut k = 0i32;
+    for c in text.chars() {
+        match c {
+            '{' => b += 1,
+            '}' => b -= 1,
+            '(' => p += 1,
+            ')' => p -= 1,
+            '[' => k += 1,
+            ']' => k -= 1,
+            _ => {}
+        }
+    }
+    if b.abs() <= 1 && p.abs() <= 1 && k.abs() <= 1 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// v2 Feature extractor (45 scalar f32 features).
+/// Retains all 37 v1 features in slots 0..37, and adds:
+///   37: AST symbol proximity
+///   38: File recency / project source indicator
+///   39: Import graph / recent context proximity
+///   40: Test-to-implementation pairing
+///   41: Chunk offset norm
+///   42: Syntax validity flag
+///   43: Lexical x Semantic contrast (BM25 - Cosine)
+///   44: Candidate line count norm
+pub fn extract_v2(ctx: &RelevanceContext, idx: usize, st: &SetStats) -> [f32; RELEVANCE_FEATURES_V2] {
+    let f1 = extract(ctx, idx, st);
+    let mut f = [0.0f32; RELEVANCE_FEATURES_V2];
+    f[..RELEVANCE_FEATURES_V1].copy_from_slice(&f1);
+
+    let c = &ctx.candidates[idx];
+    let path_lower = c.path.to_ascii_lowercase();
+    let is_test = path_lower.contains("test") || path_lower.contains("spec");
+    let task_mentions_test = ctx.task.to_ascii_lowercase().contains("test");
+
+    f[37] = f1[32];
+    f[38] = if path_lower.starts_with("src/") || path_lower.starts_with("crates/") || path_lower.starts_with("lib/") { 1.0 } else { 0.0 };
+    f[39] = if ctx.recent.contains(&c.path) { 1.0 } else { 0.0 };
+    f[40] = if (is_test && task_mentions_test) || (!is_test && !task_mentions_test) { 1.0 } else { 0.0 };
+    f[41] = (idx as f32 / ctx.candidates.len().max(1) as f32).min(1.0);
+    f[42] = syntax_balance(c.text);
+    f[43] = (f1[1] - f1[0]).clamp(-1.0, 1.0);
+    let lines = c.text.lines().count();
+    f[44] = (lines as f32 / 200.0).min(1.0);
+    f
+}
+
+pub fn extract_all_v2(ctx: &RelevanceContext) -> Vec<[f32; RELEVANCE_FEATURES_V2]> {
+    let st = compute_stats(ctx);
+    (0..ctx.candidates.len()).map(|i| extract_v2(ctx, i, &st)).collect()
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */

@@ -39,19 +39,32 @@ fi
 if [ ! -x "$BIN" ]; then
     fail "binary not executable: $BIN"
 else
-    mem=$("$BIN" eval 'console.log(typeof sofuu.memory.remember)' 2>/dev/null | tail -1)
-    case "$mem" in
-        function)
-            say "OK  live capabilities: memory available (QTSQ build)"
+    # Classify from the build's own manifest, not typeof: since P1 a
+    # QTSQ-free build exposes typed-refusal stubs, so `remember` is a
+    # function there too and typeof cannot tell the two apart.
+    has_qtsq=$("$BIN" eval 'console.log(sofuu.capabilities())' 2>/dev/null | tail -1 | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2>/dev/null)
+    [ -n "$has_qtsq" ] || has_qtsq=unknown
+    case "$has_qtsq" in
+        yes)
+            mem=$("$BIN" eval 'console.log(typeof sofuu.memory.remember)' 2>/dev/null | tail -1)
+            [ "$mem" = "function" ] \
+                && say "OK  live capabilities: memory available (QTSQ build)" \
+                || fail "a QTSQ build must expose sofuu.memory.remember, got '${mem:-no output}' — engine-lane namespace clobber (sofuu.memory holds the ZeroCopy bridge; finding tracked in contract/PROGRESS.md)"
+            ;;
+        no)
+            cls=$("$BIN" eval 'var c="silent-noop"; try { sofuu.memory.remember("x") } catch (e) { c = String(e && e.message || e).indexOf("E_CAPABILITY") >= 0 ? "typed-refusal" : "other-error" } console.log(c)' 2>/dev/null | tail -1)
+            [ "$cls" = "typed-refusal" ] \
+                && say "OK  live capabilities: memory is a typed E_CAPABILITY refusal (capability-gated build)" \
+                || fail "a QTSQ-free build must refuse memory with E_CAPABILITY, got: ${cls:-no output}"
             ;;
         *)
-            # A QTSQ-free build must refuse TYPE, not pretend: the documented
-            # capability is the typed refusal, and that is what we require.
-            if "$BIN" eval 'sofuu.memory.remember("x")' >/dev/null 2>&1; then
-                fail "memory is absent AND not a typed refusal — silent degradation"
-            else
-                say "OK  live capabilities: memory absent but a typed refusal (capability-gated build)"
-            fi
+            fail "cannot read the build manifest (sofuu capabilities)"
             ;;
     esac
     sess=$("$BIN" eval 'console.log(typeof sofuu.session.export)' 2>/dev/null | tail -1)
@@ -62,10 +75,23 @@ else
         || fail "event surface missing (P2 regression)"
 
     # ── 3. doctor ─────────────────────────────────────────────────────────
+    # A capability-gated (QTSQ-free) build exits non-zero BY DESIGN: the
+    # missing codec is a declared gap. That is the documented posture only
+    # when EVERY failing line is the qtsq gap; anything else is a defect.
     if "$BIN" doctor >/dev/null 2>&1; then
         say "OK  doctor exits 0 on this build"
     else
-        fail "doctor exits non-zero — the build's declared features are not all present"
+        doc_bad=$("$BIN" doctor 2>&1 \
+            | sed $'s/\033\\[[0-9;]*m//g' \
+            | grep -E '^[[:space:]]*✗' \
+            | grep -vE 'problem\(s\) found')
+        if [ "$has_qtsq" = "no" ] && [ "${SOFUU_ALLOW_NO_QTSQ:-0}" = "1" ] \
+           && [ -n "$doc_bad" ] \
+           && [ -z "$(printf '%s\n' "$doc_bad" | grep -viE 'qtsq')" ]; then
+            say "OK  doctor: QTSQ-free capability-gated build (every ✗ is the declared qtsq gap)"
+        else
+            fail "doctor exits non-zero — the build's declared features are not all present"
+        fi
     fi
 
     # ── 4. version parity (Cargo ↔ npm ↔ CLI) ─────────────────────────────

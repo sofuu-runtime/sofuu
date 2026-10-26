@@ -170,6 +170,12 @@ struct MetalContext {
     id<MTLComputeCommandEncoder> batch_enc;
     size_t pending_y_bytes;
     float* pending_y_dst;
+    // W1 CPU+GPU row split: command buffers committed with
+    // sofuu_metal_batch_commit_async are kept alive here until
+    // sofuu_metal_batch_wait_all drains them. The queue is serial, so waiting
+    // on the last one implies every earlier one completed.
+    void* inflight[64];
+    int inflight_n = 0;
 };
 
 // Batch barrier. SOFUU_NO_BARRIER=1 drops every inter-dispatch barrier: only valid
@@ -661,6 +667,8 @@ void* sofuu_metal_init(void) {
 }
 
 void sofuu_metal_sync(void* ctx_ptr);
+// W1 row split: drains the committed-but-unwaited buffers (defined below).
+int sofuu_metal_batch_wait_all(void* ctx_ptr);
 
 void sofuu_metal_free(void* ctx_ptr) {
     if (!ctx_ptr) return;
@@ -1617,6 +1625,9 @@ void sofuu_metal_gemv_gate_up_multi(
 void sofuu_metal_sync(void* ctx_ptr) {
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
+    // W1: a previous split pass may have left committed-but-unwaited
+    // buffers; sync means "everything the GPU was given is done".
+    sofuu_metal_batch_wait_all(ctx_ptr);
     if (ctx->batch_enc != nil) {
         [ctx->batch_enc endEncoding];
         CFRelease((__bridge CFTypeRef)ctx->batch_enc);
@@ -4280,6 +4291,75 @@ int sofuu_metal_batch_end(void* ctx_ptr) {
     return 1;
 }
 
+// W1 (CPU+GPU row split): commit the open batch WITHOUT waiting for it. This
+// is the producer/consumer half of the split: the host commits the GPU's rows
+// for a layer group and immediately goes back to running the CPU's rows on the
+// host, so the two arms share one wall-clock window instead of serialising.
+// The command buffer is retained in ctx->inflight until
+// sofuu_metal_batch_wait_all (or sofuu_metal_sync) drains it. Returns 1 when a
+// buffer was committed, 0 when there was nothing open.
+int sofuu_metal_batch_commit_async(void* ctx_ptr) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil) return 0;
+    [ctx->batch_enc endEncoding];
+    CFRelease((__bridge CFTypeRef)ctx->batch_enc);
+    ctx->batch_enc = nil;
+    id<MTLCommandBuffer> cmd = ctx->pending_cmd;
+    ctx->pending_cmd = nil;
+    ctx->pending_y_dst = nullptr;
+    ctx->pending_y_bytes = 0;
+    if (cmd == nil) return 0;
+    const int cap = (int)(sizeof(ctx->inflight) / sizeof(ctx->inflight[0]));
+    if (ctx->inflight_n >= cap) {
+        // Safety valve: never grow the in-flight set without bound. Draining is
+        // always safe here - the caller has already encoded everything it needs.
+        sofuu_metal_batch_wait_all(ctx_ptr);
+    }
+    [cmd commit];
+    ctx->inflight[ctx->inflight_n++] = (void*)CFBridgingRetain(cmd);
+    CFRelease((__bridge CFTypeRef)cmd);
+    return 1;
+}
+
+// W1: open the next batch encoder on a NEW command buffer while the buffers
+// committed above are still executing. The queue is serial, so the new batch
+// simply executes after them - no wait, no ordering surprise.
+int sofuu_metal_batch_open_async(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc != nil) return -1;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        ctx->batch_enc = (__bridge id<MTLComputeCommandEncoder>)(void*)CFBridgingRetain([cmd computeCommandEncoder]);
+        ctx->pending_cmd = (__bridge id<MTLCommandBuffer>)(void*)CFBridgingRetain(cmd);
+        ctx->pending_y_dst = nullptr;
+        ctx->pending_y_bytes = 0;
+        if (ctx->batch_enc == nil) return -1;
+    }
+    return 0;
+}
+
+// W1: drain every command buffer committed through
+// sofuu_metal_batch_commit_async. Returns the number that did NOT complete
+// successfully (a rejected buffer leaves its outputs untouched, so the caller
+// must treat the whole split pass as not-happened and fall back to one arm).
+int sofuu_metal_batch_wait_all(void* ctx_ptr) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    int bad = 0;
+    for (int i = 0; i < ctx->inflight_n; ++i) {
+        id<MTLCommandBuffer> c = (__bridge id<MTLCommandBuffer>)ctx->inflight[i];
+        if (c != nil) {
+            if (!wait_and_report(c, "split layer group")) bad++;
+            CFRelease(ctx->inflight[i]);
+        }
+        ctx->inflight[i] = nullptr;
+    }
+    ctx->inflight_n = 0;
+    return bad;
+}
+
 #else
 
 // Stubs for non-macOS platforms (Linux, Android, Windows)
@@ -4287,6 +4367,9 @@ bool sofuu_metal_available(void) { return false; }
 int sofuu_metal_batch_open(void* ctx) { (void)ctx; return -1; }
 void sofuu_metal_batch_gemv(void* ctx, void* w, size_t wo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 int sofuu_metal_batch_end(void* ctx) { (void)ctx; return 0; }
+int sofuu_metal_batch_commit_async(void* ctx) { (void)ctx; return 0; }
+int sofuu_metal_batch_open_async(void* ctx) { (void)ctx; return -1; }
+int sofuu_metal_batch_wait_all(void* ctx) { (void)ctx; return 0; }
 void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 int sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; return 0; }

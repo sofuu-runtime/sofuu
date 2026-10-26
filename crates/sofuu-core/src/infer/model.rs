@@ -1282,15 +1282,6 @@ impl TransformerModel {
         }
 
         let dim = self.config.dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
-        let head_dim = self.config.head_dim;
-        let hidden_dim = self.config.hidden_dim;
-        let norm_eps = self.config.norm_eps;
-        let rope_freq_base = self.config.rope_freq_base;
-        let max_seq_len = self.config.max_seq_len;
-        let kv_dim = self.kv_dim;
-        let q_dim = n_heads * head_dim;
 
         let gguf = &self.gguf;
 
@@ -1313,6 +1304,37 @@ impl TransformerModel {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         for layer_idx in 0..self.config.n_layers {
+            self.forward_batch_layer_rows(layer_idx, b_size, start_pos, snap_layer);
+        }
+    }
+
+    /// W1 row split: ONE layer of the batched prefill tile path over rows
+    /// [0, b_size) of the *_batch buffers, at positions
+    /// [start_pos, start_pos + b_size). This is the loop body of
+    /// forward_batch_layers_chunk moved verbatim into its own function so the
+    /// CPU+GPU split driver can interleave the CPU's rows with the GPU's rows
+    /// one layer at a time (the CPU's rows are the FIRST rows of the chunk, so
+    /// they never need the GPU's same-chunk K/V: their attention covers
+    /// positions <= start_pos + i). Behaviour is unchanged: the batching loop
+    /// calls it once per layer exactly as before.
+    fn forward_batch_layer_rows(
+        &mut self,
+        layer_idx: usize,
+        b_size: usize,
+        start_pos: usize,
+        snap_layer: usize,
+    ) {
+        let dim = self.config.dim;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_dim = self.config.hidden_dim;
+        let norm_eps = self.config.norm_eps;
+        let rope_freq_base = self.config.rope_freq_base;
+        let max_seq_len = self.config.max_seq_len;
+        let kv_dim = self.kv_dim;
+        let q_dim = n_heads * head_dim;
+        let gguf = &self.gguf;
             let layer = &self.layers[layer_idx];
 
             // ── Attention Norm for batch ────────────────────────
@@ -1696,7 +1718,6 @@ impl TransformerModel {
                     dim,
                 );
             }
-        }
     }
 
     fn forward_prefill_batch_chunk_internal(&mut self, tokens: &[u32], start_pos: usize, compute_last_logits: bool) -> &[f32] {
@@ -1714,6 +1735,20 @@ impl TransformerModel {
         }
 
         let chunk_t0 = prof::enabled().then(std::time::Instant::now);
+
+        // W1: CPU+GPU ROW SPLIT (SOFUU_SPLIT=1, default OFF - shipped config
+        // unchanged). Rows [0,kc) of the chunk run through the CPU tile path
+        // while rows [kc,b) run on the GPU in the same wall-clock window; see
+        // gpu_forward_prefill_split for the ordering argument. A false return
+        // means "not taken" and the chunk falls through to the whole-chunk
+        // routes below, so the split can never be why a chunk fails.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(kg) = self.prefill_split_gpu_rows(b_size) {
+            if self.gpu_forward_prefill_split(tokens, start_pos, kg, compute_last_logits) {
+                self.logits_gap_probe_tagged("split_head", start_pos + b_size - 1);
+                return &self.logits;
+            }
+        }
 
         // P1 (llama.cpp parity): B<=pre_chunk chunks through the prefill
         // GEMM class (SOFUU_GPU_PREFILL_GEMM=1; cap = SOFUU_PREFILL_CHUNK,
@@ -3338,6 +3373,856 @@ impl TransformerModel {
         true
     }
 
+    /// W1 row split: the slab prologue shared by the whole-chunk chain pass
+    /// and the CPU+GPU split driver - embedding lookup for the pass tokens plus
+    /// the per-row position table. Slab row t is token t (position
+    /// start_pos + t).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn chain_embed_posb(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        embd: &TensorView,
+        tokens: &[u32],
+        start_pos: usize,
+        dim: usize,
+        b: usize,
+    ) {
+        // Embedding lookup stays on CPU by design (GPU-first directive:
+        // embedding/sampler are CPU work; q-row staging is a host copy).
+        for (t, &tok) in tokens.iter().enumerate() {
+            let dst = g.slot_f32_mut(g.slots.x + t * dim * 4, dim);
+            Self::lookup_embedding(gguf, embd, tok, dim, dst);
+        }
+        // Per-row positions for the b4 attention family (u32s bit-written
+        // into the posb slot).
+        {
+            // BUG FIX (audit round 76): this wrote only 16 positions while a chain chunk runs
+            // up to b = 128 rows, so rows 16..127 kept stale/zero positions - RoPE ran at
+            // position 0 and the causal bound collapsed, making GPU chain prefill numerically
+            // wrong (measured max |delta| 8.32 vs CPU on prefill_logits[..8]). The slot is
+            // SPEC_B * 16 floats (model.rs:5220, SPEC_B = 128), so b contiguous u32s are well
+            // inside it; the sibling writer at model.rs:3806 and the CPU path both use
+            // contiguous layout.
+            let pb = g.slot_f32_mut(g.slots.posb, b);
+            let pbb =
+                unsafe { std::slice::from_raw_parts_mut(pb.as_ptr() as *mut u32, b) };
+            for (t, item) in pbb.iter_mut().enumerate().take(b) {
+                *item = (start_pos + t) as u32;
+            }
+        }
+    }
+
+    /// W1 row split: output-norm the pass rows and run ONE lm_head GEMV for
+    /// head_row. Shared by the whole-chunk chain pass and the split driver.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn chain_head_into(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        output: &TensorView,
+        output_norm: &TensorView,
+        cfg: &ModelConfig,
+        b: usize,
+        head_row: Option<usize>,
+    ) -> bool {
+        let dim = cfg.dim;
+        let norm_eps = cfg.norm_eps;
+        let vocab_size = cfg.vocab_size;
+        if head_row.is_none() {
+            return true;
+        }
+        // Head: output-norm every row (cheap; feeds lazy per-row logits),
+        // then ONE lm_head GEMV — row 0 (the root logits the tree contract
+        // needs eagerly). The lm_head is ~514MB of q6_K for the 8B vocab:
+        // committing it for all B rows streams 2GB per pass for rows verify
+        // usually never samples; accepted rows get a lazy GPU head commit
+        // (gpu_spec_head_row, ~13ms each) and CPU matvec as the fallback.
+        if let Some(hr) = head_row {
+            // Same batching as the ffn_norm above: one dispatch for the chunk.
+            if !g.engine.batch_rmsnorm_f32w_b4(
+                &g.act_buf, g.slots.x,
+                &g.w_buf, gguf.data_offset + output_norm.offset,
+                &g.act_buf, g.slots.xn,
+                dim, norm_eps, b,
+            ) {
+                for t in 0..b {
+                    if !g.engine.batch_rmsnorm_f32w(
+                        &g.act_buf, g.slots.x + t * dim * 4,
+                        &g.w_buf, gguf.data_offset + output_norm.offset,
+                        &g.act_buf, g.slots.xn + t * dim * 4,
+                        dim, norm_eps,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            if !g.engine.batch_gguf(
+                output.tensor_type,
+                &g.w_buf, g.w_offset(gguf, output),
+                &g.act_buf, g.slots.xn + hr * dim * 4,
+                &g.act_buf, g.slots.logits,
+                vocab_size, dim,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // ─── W1: CPU+GPU prefill ROW SPLIT (SOFUU_SPLIT=1, default OFF) ───────────
+    //
+    // Split each prefill chunk's ROWS between the two engines and run them in
+    // the SAME wall-clock window: rows [0, kc) through the CPU tile path
+    // (forward_batch_layer_rows) and rows [kc, b) through the GPU chain
+    // (chain_layer_into), with the host encoding one GPU layer group per
+    // command buffer and draining only at the end of the chunk.
+    //
+    // Why this shape and not "two independent passes per chunk":
+    //   * The CPU arm owns the FIRST rows, so row i's attention covers
+    //     positions <= start_pos + i - all of them written by the CPU arm
+    //     itself (or by an earlier, already-drained chunk). It never reads the
+    //     GPU arm's same-chunk K/V, so the CPU arm needs NO wait at all.
+    //   * The GPU arm owns the LATER rows, whose attention does need the CPU
+    //     arm's rows' K/V of the SAME layer. The per-layer order is therefore
+    //     CPU layer L -> encode GPU layer L -> commit the group, i.e. a group is
+    //     committed only after the CPU finished every layer in it. The CPU's
+    //     next layer then runs on the host while the GPU executes the group
+    //     just committed - that overlap is the whole split.
+    //   * KV: both arms write the same f32 cache (g.k_buf/g.v_buf are the
+    //     zero-copy wrappers of self.k_cache/self.v_cache). Each arm writes
+    //     only its own rows, only in its own layer's region, so the concurrent
+    //     host and GPU writes never share a cache line, and the end-of-chunk
+    //     drain is the barrier that makes chunk t+1 see all of chunk t.
+    //   * The chunk's LAST row is a GPU row, so the head GEMV (and therefore
+    //     the numerics class of the returned logits) is the GPU route's.
+    //
+    // Every unsupported shape returns false and the caller falls through to a
+    // whole-chunk route: a split is never the reason a chunk fails.
+
+    /// Per-chunk row target for the GPU arm.
+    ///
+    /// Default: the measured BALANCE point between the two arms. Each arm pays a
+    /// per-chunk FIXED cost that does not shrink with its row count - the CPU
+    /// arm re-streams every weight once per chunk (~85ms of the 196-359ms a
+    /// 128-row chunk costs) and the GPU arm pays ~37ms of dispatch overhead -
+    /// while the per-row costs are the same order (~0.9ms CPU, ~0.95ms GPU at
+    /// 128 rows). Equalising the two arms,
+    ///     CPU_FIX + kc*c_cpu = GPU_FIX + (b-kc)*c_gpu
+    /// gives kc = (GPU_FIX - CPU_FIX + c_gpu*b)/(c_cpu + c_gpu) ~= 0.51*b - 26,
+    /// i.e. 40 CPU rows of 128 (kg=88) - which is where the 128-row chunks
+    /// measured fastest - and only 8 CPU rows of a 44-row chunk, where the CPU
+    /// arm's fixed cost is all it could ever contribute.
+    ///
+    /// SOFUU_SPLIT_GPU_ROWS=<n> pins the absolute GPU row count;
+    /// SOFUU_SPLIT_GPU_FRAC=<pct> pins the GPU share instead. Both are clamped so
+    /// each arm keeps rows, and the CPU count is rounded down to a multiple of 4.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn split_gpu_row_target(b: usize) -> Option<usize> {
+        static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        static FRAC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let pinned = *ROWS.get_or_init(|| {
+            std::env::var("SOFUU_SPLIT_GPU_ROWS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        let frac = *FRAC.get_or_init(|| {
+            std::env::var("SOFUU_SPLIT_GPU_FRAC")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0 && *v < 100)
+                .unwrap_or(0)
+        });
+        let want = if pinned > 0 {
+            pinned
+        } else if frac > 0 {
+            (b * frac) / 100
+        } else {
+            // balance point: kc ~= 0.514*b - 26 rows to the CPU (see above)
+            let kc = ((b as f64) * 0.514 - 26.0).round().max(8.0) as usize;
+            b.saturating_sub(kc.min(b.saturating_sub(8).max(8)))
+        };
+        let kg = want.clamp(4, b.saturating_sub(4).max(4));
+        // The CPU arm's row count must stay a multiple of 4: the tile path
+        // walks its rows in b4 kernels and its non-multiple-of-4 tail is
+        // measured FOUR times slower (a 128-row chunk at kc=57 costs 460ms of
+        // CPU arm against 120ms at kc=60), which would swamp the split. The
+        // leftover rows go to the GPU arm, whose kernels are row-generic.
+        let kc = (b - kg) & !3usize;
+        let kg = b.saturating_sub(kc);
+        if kc < 4 || kg < 4 {
+            return None;
+        }
+        Some(kg)
+    }
+
+    /// Layers per split command buffer (SOFUU_SPLIT_GROUP, default 2). 1 is the
+    /// finest interleave; larger groups trade GPU idle time for fewer commits
+    /// (measured on 128-row chunks: G=2 < G=4 < G=7).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn split_layer_group() -> usize {
+        static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *G.get_or_init(|| {
+            std::env::var("SOFUU_SPLIT_GROUP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v >= 1)
+                .unwrap_or(2)
+        })
+    }
+
+    /// SOFUU_SPLIT=1 arms the row split (default OFF - the shipped
+    /// configuration is exactly the whole-chunk routes).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn split_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("SOFUU_SPLIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        })
+    }
+
+    /// Some(gpu_rows) when this chunk can be split; None means "use a whole-chunk
+    /// route". The GPU side is the b4/chain client, whose only wide-chunk GEMV
+    /// class is mma8 (the plain q4_K path is a FOUR-row kernel), so mma8 is part
+    /// of the contract; the CPU arm's attention reads the f32 cache, so the f16
+    /// KV shadows (decode-only on this target) must be off.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn prefill_split_gpu_rows(&self, b: usize) -> Option<usize> {
+        if !Self::split_enabled() || b < 8 {
+            return None;
+        }
+        let g = self.gpu.as_ref()?;
+        if !g.token_commit || !crate::infer::metal::MetalEngine::mma8_enabled() {
+            return None;
+        }
+        if self.k16_prefill || self.kv_f16 {
+            return None;
+        }
+        if self.kivi.is_some() || self.streaming_weights || self.dynamic_ffn.enabled {
+            return None;
+        }
+        if self.config.n_layers == 0 || b > 128 {
+            return None;
+        }
+        Self::split_gpu_row_target(b)
+    }
+
+    /// W1: split one prefill chunk's rows across the CPU and the GPU. See the
+    /// block comment above for the ordering argument. Returns false when the
+    /// pass could not be run to completion (the caller then falls through).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[inline(never)]
+    fn gpu_forward_prefill_split(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        gpu_rows: usize,
+        want_logits: bool,
+    ) -> bool {
+        if start_pos + tokens.len() > self.config.max_seq_len {
+            return false;
+        }
+        // The CPU arm holds &mut self (the tile path's batch buffers), so the
+        // GPU client has to be an independent local for the duration.
+        let mut gpu = match self.gpu.take() {
+            Some(g) => g,
+            None => return false,
+        };
+        let ok = self.prefill_split_inner(&mut gpu, tokens, start_pos, gpu_rows, want_logits);
+        if !ok {
+            // A rejected/aborted pass must not leave a command buffer in flight
+            // for the next chunk to trip over.
+            gpu.engine.batch_wait_all();
+        }
+        self.gpu = Some(gpu);
+        ok
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[inline(never)]
+    fn prefill_split_inner(
+        &mut self,
+        g: &mut GgufGpu,
+        tokens: &[u32],
+        start_pos: usize,
+        gpu_rows: usize,
+        want_logits: bool,
+    ) -> bool {
+        let b = tokens.len();
+        if gpu_rows < 4 || gpu_rows > b.saturating_sub(4) {
+            return false;
+        }
+        let kc = b - gpu_rows; // CPU rows [0, kc)
+        let kg = gpu_rows; // GPU rows [kc, b), slab rows 0..kg
+        let dim = self.config.dim;
+        let n_layers = self.config.n_layers;
+        let vocab_size = self.config.vocab_size;
+        let gpu_start = start_pos + kc;
+        let t_pass = std::time::Instant::now();
+
+        // CPU arm: embeddings for its own rows (the GPU arm stages its rows in
+        // the slab via the shared prologue below).
+        for (i, &tok) in tokens[..kc].iter().enumerate() {
+            let dst = &mut self.x_batch[i * dim..(i + 1) * dim];
+            Self::lookup_embedding(&self.gguf, &self.token_embd, tok, dim, dst);
+        }
+        Self::chain_embed_posb(
+            g,
+            &self.gguf,
+            &self.token_embd,
+            &tokens[kc..],
+            gpu_start,
+            dim,
+            kg,
+        );
+
+        let fuse_on = std::env::var("SOFUU_GPU_FUSE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let group = Self::split_layer_group().min(n_layers.max(1));
+        let snap_layer: usize = std::env::var("SOFUU_QKV_SNAP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut ffn_ops = 0usize;
+        let mut cpu_us = 0u64;
+
+        if !g.engine.batch_open() {
+            return false;
+        }
+        for layer_idx in 0..n_layers {
+            // ---- CPU arm: its rows, this layer. No wait: its attention never
+            //      looks past its own last position.
+            let t_cpu = std::time::Instant::now();
+            self.forward_batch_layer_rows(layer_idx, kc, start_pos, snap_layer);
+            cpu_us += t_cpu.elapsed().as_micros() as u64;
+            // ---- GPU arm: its rows, same layer, into the OPEN command buffer.
+            if !Self::chain_layer_into(
+                g,
+                &self.layers[layer_idx],
+                &self.gguf,
+                &self.config,
+                layer_idx,
+                kg,
+                gpu_start,
+                fuse_on,
+                &mut ffn_ops,
+            ) {
+                return false;
+            }
+            let done = layer_idx + 1;
+            if done % group == 0 || done == n_layers {
+                // Commit only now: the CPU arm's K/V for EVERY layer in this
+                // group is in the shared cache, so the group's attention may
+                // read those rows. Then keep encoding while the GPU runs.
+                if !g.engine.batch_commit_async() {
+                    return false;
+                }
+                if done < n_layers && !g.engine.batch_open_async() {
+                    return false;
+                }
+            }
+        }
+
+        if want_logits {
+            if !g.engine.batch_open_async() {
+                return false;
+            }
+            if !Self::chain_head_into(
+                g,
+                &self.gguf,
+                &self.output,
+                &self.output_norm,
+                &self.config,
+                kg,
+                Some(kg - 1),
+            ) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+        }
+        // One drain per chunk: the queue is serial, so waiting here waits for
+        // every group - the end-of-chunk barrier the KV handoff needs.
+        if !g.engine.batch_wait_all() {
+            return false;
+        }
+        let wall_us = t_pass.elapsed().as_micros() as u64;
+
+        if want_logits {
+            self.logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
+            // The slab xn rows are the GPU arm's chunk rows, not rows 0..kg of
+            // the chunk, so the GPU-only route's xn copy does not apply here.
+            self.spec_rows_valid = false;
+        }
+        if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
+            eprintln!(
+                "[gpu-profile] split-chunk: start={start_pos} b={b} cpu_rows={kc} gpu_rows={kg} wall={}us cpu_arm={}us groups={}",
+                wall_us,
+                cpu_us,
+                (n_layers + group - 1) / group.max(1)
+            );
+        }
+        true
+    }
+
+    /// W1 CPU+GPU row split: ONE chain layer over b contiguous slab rows
+    /// (slab row t = token t of this pass, its position start_pos + t). This is
+    /// the body of gpu_forward_chain_core's layer loop moved verbatim into its
+    /// own function, so the split driver can interleave it with the CPU arm and
+    /// commit one layer group per command buffer AFTER the CPU arm has written
+    /// its rows' K/V for the same layers. Returns false when a dispatch was
+    /// rejected, exactly like the in-loop returns did.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    fn chain_layer_into(
+        g: &mut GgufGpu,
+        l: &LayerWeights,
+        gguf: &GgufFile,
+        cfg: &ModelConfig,
+        layer_idx: usize,
+        b: usize,
+        start_pos: usize,
+        fuse_on: bool,
+        ffn_ops: &mut usize,
+    ) -> bool {
+        let dim = cfg.dim;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let hidden_dim = cfg.hidden_dim;
+        let norm_eps = cfg.norm_eps;
+        let rope_freq_base = cfg.rope_freq_base;
+        let max_seq_len = cfg.max_seq_len;
+        let rope_mode: u32 = if cfg.rope_interleaved { 1 } else { 0 };
+        let q_rows = n_heads * head_dim;
+        let kv_rows = n_kv_heads * head_dim;
+    // GEMV of one tensor over the whole chain: batch_gguf_b4 when the
+    // tensor is q4_K (the b4 kernel's token-major [4][cols]/[4][rows]
+    // layout matches the x/xn/qa/gate... slot regions exactly), one
+    // batch_gguf per row otherwise. Both paths use identical offsets.
+    macro_rules! gemv_b {
+        ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
+            if $tv.tensor_type == GGML_TYPE_Q4_K
+                && crate::infer::metal::MetalEngine::mma8_enabled()
+                && g.engine.batch_gguf_mma8(
+                    &g.w_buf, gguf.data_offset + $tv.offset,
+                    &g.act_buf, $x_off,
+                    &g.act_buf, $y_off,
+                    $rows, $cols, b,
+                )
+            {
+                // simdgroup-matrix GEMM (SOFUU_GEMM_MMA8=1)
+                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                    eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
+                }
+            } else if $tv.tensor_type == GGML_TYPE_Q4_K {
+                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                    eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
+                }
+                g.engine.batch_gguf_b4(
+                    &g.w_buf, gguf.data_offset + $tv.offset,
+                    &g.act_buf, $x_off,
+                    &g.act_buf, $y_off,
+                    $rows, $cols,
+                );
+            } else if $tv.tensor_type == GGML_TYPE_Q6_K
+                && crate::infer::metal::MetalEngine::mma8_enabled()
+                && {
+                    // The q6_K half of the chain's projections (attn_v on
+                    // the i1 Q4_K_M quants; ffn_down below uses the same
+                    // class with a resid epilogue) used to walk the per-row
+                    // batch_gguf loop: one dispatch per row, each
+                    // re-streaming the whole weight matrix - 128x traffic
+                    // and 128 encoder round-trips per projection per
+                    // 128-row chunk. The tiled fused GEMM is the same f32
+                    // dequant (block constants first, no f16 staging) with
+                    // the chunk's tokens as its second tile dimension, so
+                    // one typed section over the whole grid is ONE
+                    // dispatch. Sections are [base-relative off, 256-byte
+                    // remainder, rows_end, y_off, y_stride]; padded slots
+                    // carry rows_end 0 and are skipped by the host.
+                    let woff = gguf.data_offset + $tv.offset;
+                    let mut blob = [[0u32; 5]; 4];
+                    blob[0] = [0, (woff & 255) as u32, $rows as u32, 0, $rows as u32];
+                    g.engine.batch_gguf_gemm_tiled_multi_chain(
+                        GGML_TYPE_Q6_K, &g.w_buf, woff & !255usize,
+                        &g.act_buf, $x_off,
+                        &g.act_buf, $y_off,
+                        $rows, $cols, b, &blob,
+                    )
+                }
+            {
+                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
+                    eprintln!("[gemv] Q6TILED rows={} cols={} b={}", $rows, $cols, b);
+                }
+            } else {
+                for t in 0..b {
+                    g.engine.batch_gguf(
+                        $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
+                        // offsets are BYTES; slot sizes are element counts
+                        &g.act_buf, $x_off + t * $cols * 4,
+                        &g.act_buf, $y_off + t * $rows * 4,
+                        $rows, $cols,
+                    );
+                }
+            }
+        };
+    }
+
+    // P2 decode diet: the SAME fused multi-section GEMM kernel as the
+    // prefill route — B-generic (mask subtiles), sections land in the
+    // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
+    // SHIPPED ON (SOFUU_FUSE_MULTI=0 disables): the in-model divergence
+    // was the section blob's base — base was taken from the FIRST
+    // section's aligned offset, but sections are not monotonic in file
+    // order (1B attn_k < attn_q) so the k delta underflowed u32 → the
+    // kernel read base+u32::MAX+rem = garbage ~1e-1-off activations.
+    // base = MIN aligned offset across the run fixes it: 1B + MiniCPM +
+    // 0.6B FULL-TEXT == CPU with the type-grouped mixed dispatch.
+    let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    #[inline]
+    fn f16_bits_to_f32(h: u16) -> f32 {
+        let sign = ((h >> 15) as u32) << 31;
+        let exp = ((h >> 10) & 0x1F) as u32;
+        let man = (h & 0x3FF) as u32;
+        if exp == 0 {
+            f32::from_bits(sign | (man << 13))
+        } else if exp == 31 {
+            f32::from_bits(sign | 0x7F80_0000 | (man << 13))
+        } else {
+            f32::from_bits(sign | ((exp + 112) << 23) | (man << 13))
+        }
+    }
+    let multi_dbg_dec = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
+    let multi_dbg_dec_done = std::cell::Cell::new(false);
+    let multi_dbg_dec_dumped = std::cell::Cell::new(false);
+    macro_rules! gemm_fused_dec {
+        ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
+            // P1/P2: type-grouped section runs — consecutive sections of
+            // one type ride ONE dispatch. base = MIN aligned weight offset
+            // across the run (sections may not be monotonic in file order —
+            // the 1B's attn_k sits BELOW attn_q; a first-section base made
+            // the k delta underflow u32 = the b4blob OOB receipt).
+            let mut all_ok = fuse_multi && !$secs.is_empty();
+            let mut fast = false;
+            let mut groups: Vec<(u32, Vec<(usize, u32, u32, u32)>)> = Vec::new(); // (type, [(secs idx, rows, y_off, y_stride)])
+            for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
+                let ty = tv.tensor_type;
+                if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K && ty != GGML_TYPE_Q8_0 {
+                    all_ok = false;
+                    break;
+                }
+                match groups.last_mut() {
+                    Some(g) if g.0 == ty => g.1.push((i, *rows, *y_off as u32, *y_stride)),
+                    _ => groups.push((ty, vec![(i, *rows, *y_off as u32, *y_stride)])),
+                }
+            }
+            let mut flushed_fast = true;
+            let mut first_dumped = !multi_dbg_dec;
+            for (run_type, run) in groups.iter() {
+                let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
+                let mut base = usize::MAX;
+                for (idx, _rr, _yo, _ys) in run {
+                    let raw = gguf.data_offset + $secs[*idx].0.offset;
+                    base = base.min(raw & !255usize);
+                }
+                let mut end = 0u32;
+                let mut rt = 0u32;
+                for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
+                    let raw = gguf.data_offset + $secs[*idx].0.offset;
+                    blob[j][0] = ((raw & !255usize) - base) as u32;
+                    blob[j][1] = (raw & 255usize) as u32;
+                    end += *rr;
+                    blob[j][2] = end;
+                    blob[j][3] = *yo;
+                    blob[j][4] = *ys;
+                    rt = end;
+                }
+                if multi_dbg_dec && !first_dumped {
+                    first_dumped = true;
+                    let fb8 = gguf.as_bytes();
+                    for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
+                        let raw = gguf.data_offset + $secs[*idx].0.offset;
+                        let slot = base + blob[j][0] as usize + blob[j][1] as usize;
+                        if slot + 2 > fb8.len() || raw + 2 > fb8.len() {
+                            eprintln!("[b4blob] sec{j} OOB base={base} off={} rem={} raw={raw} file_len={}",
+                                blob[j][0], blob[j][1], fb8.len());
+                            continue;
+                        }
+                        let bits = u16::from_le_bytes([fb8[raw], fb8[raw + 1]]);
+                        let d_file = f16_bits_to_f32(bits);
+                        let bits2 = u16::from_le_bytes([fb8[slot], fb8[slot + 1]]);
+                        let d_slot = f16_bits_to_f32(bits2);
+                        eprintln!(
+                            "[b4blob] sec{j} ty={} raw={raw} base={base} off={} rem={} rows_end={} y_off={} stride={} d_file={d_file:.6e} d_slot={d_slot:.6e} match={}",
+                            *run_type, blob[j][0], blob[j][1], blob[j][2], blob[j][3], blob[j][4],
+                            (bits == bits2) as u8
+                        );
+                    }
+                }
+                let ok = match *run_type {
+                    GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
+                        14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                        rt as usize, $cols, &blob,
+                    ),
+                    GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4r4(
+                        8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                        rt as usize, $cols, &blob,
+                    ),
+                    _ => g.engine.batch_gguf_b4multi(
+                        12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
+                        rt as usize, $cols, &blob,
+                    ),
+                };
+                flushed_fast &= ok;
+            }
+            fast = all_ok && flushed_fast;
+            fast
+        }};
+    }
+
+        let attn_norm_off = gguf.data_offset + l.attn_norm.offset;
+        let ffn_norm_off = gguf.data_offset + l.ffn_norm.offset;
+        let q_norm_off = l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+        let k_norm_off = l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+        let has_q = u32::from(q_norm_off.is_some());
+        let has_k = u32::from(k_norm_off.is_some());
+        let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
+        let kc_layer = layer_idx * kv_head_bytes;
+        let meta_chunks = (max_seq_len + 127) / 128;
+        let meta_per_layer = n_heads * meta_chunks * 2 + n_heads * meta_chunks * head_dim;
+        let meta_layer_off = layer_idx * meta_per_layer * 4;
+        let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
+
+        g.engine.batch_rmsnorm_f32w_b4(
+            &g.act_buf, g.slots.x,
+            &g.w_buf, attn_norm_off,
+            &g.act_buf, g.slots.xn,
+            dim, norm_eps, b,
+        );
+        let qkv_ok = b <= 4 && gemm_fused_dec!(
+            [
+                (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
+                (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
+                (&l.attn_v, kv_rows as u32, g.slots.va, kv_rows as u32),
+            ],
+            q_rows + 2 * kv_rows, dim, g.slots.xn
+        );
+        if !qkv_ok {
+            gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
+            gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
+            gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
+        }
+
+        // Attention in four b4 dispatches (rows × heads × chunks grid):
+        // kv_write_b4 lands every row's KV first; attn_part_b4 bounds
+        // row r's softmax to positions[r], so later rows' fresh cache
+        // content is excluded — chain causality without per-row
+        // dispatches. (SOFUU_GPU_SKIP=attn timing ablation skips it.)
+        if !g.skip_attn {
+            g.engine.batch_llama_kv_write_b4(
+                &g.act_buf, g.slots.ka,
+                &g.act_buf, g.slots.va,
+                &g.k_buf, kc_layer,
+                &g.v_buf, kc_layer,
+                kln_buf, kln_off,
+                has_k,
+                &g.act_buf, g.slots.posb,
+                b,
+                head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
+                norm_eps, rope_freq_base, rope_mode,
+                None,
+            );
+            g.engine.batch_head_rmsnorm_b4(
+                &g.act_buf, g.slots.qa,
+                q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
+                &g.act_buf, g.slots.posb,
+                b,
+                head_dim as u32, n_heads as u32,
+                has_q, norm_eps, rope_freq_base, rope_mode,
+                None,
+            );
+            // Whole-row attention first (ONE dispatch for the whole chunk,
+            // every row's full softmax): llama_attn_pre_row on the 128-row
+            // chain — 32 rows share one K/V stream per threadgroup — and
+            // llama_attn_pre_w32 as the A/B arm. It took 55% of the route
+            // (3.18 s of 5.76 s at 1454 tokens) because the b4 family below
+            // walks 4 rows per threadgroup over a grid of
+            // rows*n_heads*n_chunks one-warp threadgroups. A false return
+            // means nothing was dispatched (pipeline missing, unsupported
+            // geometry, SOFUU_PRE_ATTN=0, or SOFUU_PREW_MAXPOS below this
+            // chunk), so the b4 family still owns attention in that case.
+            let row_attn = g.engine.batch_llama_attn_row(
+                &g.act_buf, g.slots.qa,
+                &g.k_buf, kc_layer,
+                &g.v_buf, kc_layer,
+                &g.act_buf, g.slots.ao,
+                &g.act_buf, g.slots.posb,
+                b,
+                head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                max_seq_len as u32,
+            );
+            // pos < 128 (one softmax chunk): part+fin fuse into one
+            // dispatch — one barrier drain instead of two
+            let flashed = !row_attn && g.engine.batch_llama_attn_flash_b4(
+                &g.act_buf, g.slots.qa,
+                &g.k_buf, kc_layer,
+                &g.v_buf, kc_layer,
+                &g.act_buf, g.slots.ao,
+                &g.act_buf, g.slots.posb,
+                b,
+                head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                max_seq_len as u32,
+            );
+            // `llama_attn_1c_b4` is WRONG for pos >= 128 (LEDGER #64/#65: it agrees with
+            // the split pair only below one 128-position chunk). Gate it to the range it
+            // is actually valid for rather than letting it corrupt long prompts.
+            let one_chunk_pos = start_pos + b - 1 < 128;
+            // row_attn already wrote slots.ao: nothing below may run for
+            // this layer, or it would overwrite a finished chunk.
+            let fused = row_attn || flashed || (fuse_on
+                && one_chunk_pos
+                && g.engine.batch_llama_attn_1c_b4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                    None,
+                ));
+            if !fused {
+                g.engine.batch_llama_attn_part_b4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.meta_buf, meta_layer_off,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                    meta_chunks as u32, meta_per_layer as u32,
+                );
+                g.engine.batch_llama_attn_fin_b4(
+                    &g.meta_buf, meta_layer_off,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    n_heads as u32, head_dim as u32,
+                    meta_chunks as u32, meta_per_layer as u32,
+                );
+            }
+        }
+
+        // o projection + resid-add fused (rows == dim == acc width).
+        // gemv_q4_k_b4c2r is a FOUR-TOKEN kernel (no B argument): on the
+        // wide-chain route (mma8, chunk 128) it would compute rows 0..3 and
+        // leave the other 124 rows of xo stale. Only the narrow b4 walk can
+        // use it; wider chunks fall through to gemv_b!, which is batched.
+        if !(fuse_on
+            && b <= 4
+            && l.attn_output.tensor_type == GGML_TYPE_Q4_K
+            && g.engine.batch_gguf_b4r(
+                &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                &g.act_buf, g.slots.ao,
+                &g.act_buf, g.slots.xo,
+                &g.act_buf, g.slots.x,
+                dim, q_rows, dim,
+            ))
+        {
+            gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
+            if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
+                return false;
+            }
+        }
+        // ONE dispatch for the whole chunk's ffn_norm, not b of them: the
+        // b-row kernel is one 32-thread threadgroup per row off a single
+        // grid, so 128 per-row dispatches (+128 memoryBarrier-ordered
+        // encoder steps) collapse into one with identical math. That loop
+        // was ~1.27 s of the 5.76 s route. Falls back to the per-row
+        // dispatch only when the pipeline/rows ceiling makes the batched
+        // form unavailable — never silently skips the norm.
+        if !g.engine.batch_rmsnorm_f32w_b4(
+            &g.act_buf, g.slots.x,
+            &g.w_buf, ffn_norm_off,
+            &g.act_buf, g.slots.xn,
+            dim, norm_eps, b,
+        ) {
+            for t in 0..b {
+                if !g.engine.batch_rmsnorm_f32w(
+                    &g.act_buf, g.slots.x + t * dim * 4,
+                    &g.w_buf, ffn_norm_off,
+                    &g.act_buf, g.slots.xn + t * dim * 4,
+                    dim, norm_eps,
+                ) {
+                    return false;
+                }
+            }
+        }
+        if !g.skip_ffn {
+        *ffn_ops += 1;
+        let gu_ok = b <= 4 && gemm_fused_dec!(
+            [
+                (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
+                (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
+            ],
+            2 * hidden_dim, dim, g.slots.xn
+        );
+        if !gu_ok {
+            gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
+            gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
+        }
+        if !g.skip_ffn {
+            *ffn_ops += 3;
+        }
+        if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim) {
+            return false;
+        }
+        // down projection + resid-add fused
+        let down_fused = (fuse_on
+            && b <= 4 // gemv_q4_k_b4c2r is 4 tokens wide (see o above)
+            && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+            && g.engine.batch_gguf_b4r(
+                &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                &g.act_buf, g.slots.gate,
+                &g.act_buf, g.slots.xo,
+                &g.act_buf, g.slots.x,
+                dim, hidden_dim, dim,
+            ))
+            // q6_K down (the i1 Q4_K_M class — half the layers): the tiled
+            // fused kernel's resid epilogue is the same f32 dequant as
+            // above with the residual add folded in, so the 128 per-row
+            // dispatches AND the separate batch_add collapse into ONE
+            // dispatch. Every output element is read and written by the
+            // same thread, so binding y and res to the same slot region is
+            // not a race.
+            || (l.ffn_down.tensor_type == GGML_TYPE_Q6_K
+                && crate::infer::metal::MetalEngine::mma8_enabled()
+                && g.engine.batch_gguf_gemm_tiled_acc_chain(
+                    GGML_TYPE_Q6_K,
+                    &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                    &g.act_buf, g.slots.gate,
+                    &g.act_buf, g.slots.x, dim,
+                    &g.act_buf, g.slots.x,
+                    dim, hidden_dim, b,
+                ));
+        if !down_fused {
+            gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
+            if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
+                return false;
+            }
+        }
+        }
+        true
+    }
+
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn gpu_forward_chain_core(
         &mut self,
@@ -3384,238 +4269,22 @@ impl TransformerModel {
         }
 
         let dim = self.config.dim;
-        let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
         let head_dim = self.config.head_dim;
-        let hidden_dim = self.config.hidden_dim;
-        let norm_eps = self.config.norm_eps;
-        let rope_freq_base = self.config.rope_freq_base;
         let max_seq_len = self.config.max_seq_len;
-        let rope_mode: u32 = if self.config.rope_interleaved { 1 } else { 0 };
-        let q_rows = n_heads * head_dim;
         let kv_rows = n_kv_heads * head_dim;
         let vocab_size = self.config.vocab_size;
         let pass_t = std::time::Instant::now();
         let mut ffn_ops = 0usize;
-        let pos_of_last = start_pos + b - 1;
         let fuse_on = std::env::var("SOFUU_GPU_FUSE")
             .map(|v| v != "0")
             .unwrap_or(true);
 
-        // Embedding lookup stays on CPU by design (GPU-first directive:
-        // embedding/sampler are CPU work; q-row staging is a host copy).
-        for (t, &tok) in tokens.iter().enumerate() {
-            let dst = g.slot_f32_mut(g.slots.x + t * dim * 4, dim);
-            Self::lookup_embedding(&self.gguf, &self.token_embd, tok, dim, dst);
-        }
-        // Per-row positions for the b4 attention family (u32s bit-written
-        // into the posb slot).
-        {
-            // BUG FIX (audit round 76): this wrote only 16 positions while a chain chunk runs
-            // up to b = 128 rows, so rows 16..127 kept stale/zero positions - RoPE ran at
-            // position 0 and the causal bound collapsed, making GPU chain prefill numerically
-            // wrong (measured max |delta| 8.32 vs CPU on prefill_logits[..8]). The slot is
-            // SPEC_B * 16 floats (model.rs:5220, SPEC_B = 128), so b contiguous u32s are well
-            // inside it; the sibling writer at model.rs:3806 and the CPU path both use
-            // contiguous layout.
-            let pb = g.slot_f32_mut(g.slots.posb, b);
-            let pbb =
-                unsafe { std::slice::from_raw_parts_mut(pb.as_ptr() as *mut u32, b) };
-            for (t, item) in pbb.iter_mut().enumerate().take(b) {
-                *item = (start_pos + t) as u32;
-            }
-        }
+        Self::chain_embed_posb(g, &self.gguf, &self.token_embd, tokens, start_pos, dim, b);
         // Bound above the macro so macro hygiene can see it (the macro body
         // expands it at def-site scope); a field borrow is disjoint from
         // self.gpu, so holding both across the pass is fine.
         let gguf = &self.gguf;
-
-        // GEMV of one tensor over the whole chain: batch_gguf_b4 when the
-        // tensor is q4_K (the b4 kernel's token-major [4][cols]/[4][rows]
-        // layout matches the x/xn/qa/gate... slot regions exactly), one
-        // batch_gguf per row otherwise. Both paths use identical offsets.
-        macro_rules! gemv_b {
-            ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
-                if $tv.tensor_type == GGML_TYPE_Q4_K
-                    && crate::infer::metal::MetalEngine::mma8_enabled()
-                    && g.engine.batch_gguf_mma8(
-                        &g.w_buf, gguf.data_offset + $tv.offset,
-                        &g.act_buf, $x_off,
-                        &g.act_buf, $y_off,
-                        $rows, $cols, b,
-                    )
-                {
-                    // simdgroup-matrix GEMM (SOFUU_GEMM_MMA8=1)
-                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                        eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
-                    }
-                } else if $tv.tensor_type == GGML_TYPE_Q4_K {
-                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                        eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
-                    }
-                    g.engine.batch_gguf_b4(
-                        &g.w_buf, gguf.data_offset + $tv.offset,
-                        &g.act_buf, $x_off,
-                        &g.act_buf, $y_off,
-                        $rows, $cols,
-                    );
-                } else if $tv.tensor_type == GGML_TYPE_Q6_K
-                    && crate::infer::metal::MetalEngine::mma8_enabled()
-                    && {
-                        // The q6_K half of the chain's projections (attn_v on
-                        // the i1 Q4_K_M quants; ffn_down below uses the same
-                        // class with a resid epilogue) used to walk the per-row
-                        // batch_gguf loop: one dispatch per row, each
-                        // re-streaming the whole weight matrix - 128x traffic
-                        // and 128 encoder round-trips per projection per
-                        // 128-row chunk. The tiled fused GEMM is the same f32
-                        // dequant (block constants first, no f16 staging) with
-                        // the chunk's tokens as its second tile dimension, so
-                        // one typed section over the whole grid is ONE
-                        // dispatch. Sections are [base-relative off, 256-byte
-                        // remainder, rows_end, y_off, y_stride]; padded slots
-                        // carry rows_end 0 and are skipped by the host.
-                        let woff = gguf.data_offset + $tv.offset;
-                        let mut blob = [[0u32; 5]; 4];
-                        blob[0] = [0, (woff & 255) as u32, $rows as u32, 0, $rows as u32];
-                        g.engine.batch_gguf_gemm_tiled_multi_chain(
-                            GGML_TYPE_Q6_K, &g.w_buf, woff & !255usize,
-                            &g.act_buf, $x_off,
-                            &g.act_buf, $y_off,
-                            $rows, $cols, b, &blob,
-                        )
-                    }
-                {
-                    if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                        eprintln!("[gemv] Q6TILED rows={} cols={} b={}", $rows, $cols, b);
-                    }
-                } else {
-                    for t in 0..b {
-                        g.engine.batch_gguf(
-                            $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
-                            // offsets are BYTES; slot sizes are element counts
-                            &g.act_buf, $x_off + t * $cols * 4,
-                            &g.act_buf, $y_off + t * $rows * 4,
-                            $rows, $cols,
-                        );
-                    }
-                }
-            };
-        }
-
-        // P2 decode diet: the SAME fused multi-section GEMM kernel as the
-        // prefill route — B-generic (mask subtiles), sections land in the
-        // pre-existing qa/ka/va (gate/up) slots, per-tensor b4 GEMV fallback.
-        // SHIPPED ON (SOFUU_FUSE_MULTI=0 disables): the in-model divergence
-        // was the section blob's base — base was taken from the FIRST
-        // section's aligned offset, but sections are not monotonic in file
-        // order (1B attn_k < attn_q) so the k delta underflowed u32 → the
-        // kernel read base+u32::MAX+rem = garbage ~1e-1-off activations.
-        // base = MIN aligned offset across the run fixes it: 1B + MiniCPM +
-        // 0.6B FULL-TEXT == CPU with the type-grouped mixed dispatch.
-        let fuse_multi = std::env::var("SOFUU_FUSE_MULTI")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        #[inline]
-        fn f16_bits_to_f32(h: u16) -> f32 {
-            let sign = ((h >> 15) as u32) << 31;
-            let exp = ((h >> 10) & 0x1F) as u32;
-            let man = (h & 0x3FF) as u32;
-            if exp == 0 {
-                f32::from_bits(sign | (man << 13))
-            } else if exp == 31 {
-                f32::from_bits(sign | 0x7F80_0000 | (man << 13))
-            } else {
-                f32::from_bits(sign | ((exp + 112) << 23) | (man << 13))
-            }
-        }
-        let multi_dbg_dec = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
-        let multi_dbg_dec_done = std::cell::Cell::new(false);
-        let multi_dbg_dec_dumped = std::cell::Cell::new(false);
-        macro_rules! gemm_fused_dec {
-            ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
-                // P1/P2: type-grouped section runs — consecutive sections of
-                // one type ride ONE dispatch. base = MIN aligned weight offset
-                // across the run (sections may not be monotonic in file order —
-                // the 1B's attn_k sits BELOW attn_q; a first-section base made
-                // the k delta underflow u32 = the b4blob OOB receipt).
-                let mut all_ok = fuse_multi && !$secs.is_empty();
-                let mut fast = false;
-                let mut groups: Vec<(u32, Vec<(usize, u32, u32, u32)>)> = Vec::new(); // (type, [(secs idx, rows, y_off, y_stride)])
-                for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
-                    let ty = tv.tensor_type;
-                    if ty != GGML_TYPE_Q4_K && ty != GGML_TYPE_Q6_K && ty != GGML_TYPE_Q8_0 {
-                        all_ok = false;
-                        break;
-                    }
-                    match groups.last_mut() {
-                        Some(g) if g.0 == ty => g.1.push((i, *rows, *y_off as u32, *y_stride)),
-                        _ => groups.push((ty, vec![(i, *rows, *y_off as u32, *y_stride)])),
-                    }
-                }
-                let mut flushed_fast = true;
-                let mut first_dumped = !multi_dbg_dec;
-                for (run_type, run) in groups.iter() {
-                    let mut blob: [[u32; 5]; 4] = [[0u32; 5]; 4];
-                    let mut base = usize::MAX;
-                    for (idx, _rr, _yo, _ys) in run {
-                        let raw = gguf.data_offset + $secs[*idx].0.offset;
-                        base = base.min(raw & !255usize);
-                    }
-                    let mut end = 0u32;
-                    let mut rt = 0u32;
-                    for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
-                        let raw = gguf.data_offset + $secs[*idx].0.offset;
-                        blob[j][0] = ((raw & !255usize) - base) as u32;
-                        blob[j][1] = (raw & 255usize) as u32;
-                        end += *rr;
-                        blob[j][2] = end;
-                        blob[j][3] = *yo;
-                        blob[j][4] = *ys;
-                        rt = end;
-                    }
-                    if multi_dbg_dec && !first_dumped {
-                        first_dumped = true;
-                        let fb8 = gguf.as_bytes();
-                        for (j, (idx, rr, yo, ys)) in run.iter().enumerate() {
-                            let raw = gguf.data_offset + $secs[*idx].0.offset;
-                            let slot = base + blob[j][0] as usize + blob[j][1] as usize;
-                            if slot + 2 > fb8.len() || raw + 2 > fb8.len() {
-                                eprintln!("[b4blob] sec{j} OOB base={base} off={} rem={} raw={raw} file_len={}",
-                                    blob[j][0], blob[j][1], fb8.len());
-                                continue;
-                            }
-                            let bits = u16::from_le_bytes([fb8[raw], fb8[raw + 1]]);
-                            let d_file = f16_bits_to_f32(bits);
-                            let bits2 = u16::from_le_bytes([fb8[slot], fb8[slot + 1]]);
-                            let d_slot = f16_bits_to_f32(bits2);
-                            eprintln!(
-                                "[b4blob] sec{j} ty={} raw={raw} base={base} off={} rem={} rows_end={} y_off={} stride={} d_file={d_file:.6e} d_slot={d_slot:.6e} match={}",
-                                *run_type, blob[j][0], blob[j][1], blob[j][2], blob[j][3], blob[j][4],
-                                (bits == bits2) as u8
-                            );
-                        }
-                    }
-                    let ok = match *run_type {
-                        GGML_TYPE_Q6_K => g.engine.batch_gguf6_b4multi(
-                            14, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                            rt as usize, $cols, &blob,
-                        ),
-                        GGML_TYPE_Q8_0 => g.engine.batch_gguf8_b4r4(
-                            8, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                            rt as usize, $cols, &blob,
-                        ),
-                        _ => g.engine.batch_gguf_b4multi(
-                            12, &g.w_buf, base, &g.act_buf, $x_off, &g.act_buf,
-                            rt as usize, $cols, &blob,
-                        ),
-                    };
-                    flushed_fast &= ok;
-                }
-                fast = all_ok && flushed_fast;
-                fast
-            }};
-        }
 
         // SOFUU_LAYER_SNAP: split the chunk into one command buffer PER
         // LAYER and dump xn/x after each — the L-granularity divergence pin
@@ -3623,277 +4292,31 @@ impl TransformerModel {
         // mid-buffer otherwise).
         assert!(g.engine.batch_open());
         for layer_idx in 0..self.config.n_layers {
-            let l = &self.layers[layer_idx];
-            let attn_norm_off = gguf.data_offset + l.attn_norm.offset;
-            let ffn_norm_off = gguf.data_offset + l.ffn_norm.offset;
-            let q_norm_off = l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
-            let k_norm_off = l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
-            let has_q = u32::from(q_norm_off.is_some());
-            let has_k = u32::from(k_norm_off.is_some());
-            let kv_head_bytes = n_kv_heads * max_seq_len * head_dim * 4;
-            let kc_layer = layer_idx * kv_head_bytes;
-            let meta_chunks = (max_seq_len + 127) / 128;
-            let meta_per_layer = n_heads * meta_chunks * 2 + n_heads * meta_chunks * head_dim;
-            let meta_layer_off = layer_idx * meta_per_layer * 4;
-            let (kln_buf, kln_off) = (k_norm_off.map(|off| &g.w_buf), k_norm_off.unwrap_or(0));
-
-            g.engine.batch_rmsnorm_f32w_b4(
-                &g.act_buf, g.slots.x,
-                &g.w_buf, attn_norm_off,
-                &g.act_buf, g.slots.xn,
-                dim, norm_eps, b,
-            );
-            let qkv_ok = b <= 4 && gemm_fused_dec!(
-                [
-                    (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
-                    (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
-                    (&l.attn_v, kv_rows as u32, g.slots.va, kv_rows as u32),
-                ],
-                q_rows + 2 * kv_rows, dim, g.slots.xn
-            );
-            if !qkv_ok {
-                gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
-                gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
-                gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
-            }
-
-            // Attention in four b4 dispatches (rows × heads × chunks grid):
-            // kv_write_b4 lands every row's KV first; attn_part_b4 bounds
-            // row r's softmax to positions[r], so later rows' fresh cache
-            // content is excluded — chain causality without per-row
-            // dispatches. (SOFUU_GPU_SKIP=attn timing ablation skips it.)
-            if !g.skip_attn {
-                g.engine.batch_llama_kv_write_b4(
-                    &g.act_buf, g.slots.ka,
-                    &g.act_buf, g.slots.va,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    kln_buf, kln_off,
-                    has_k,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode,
-                    None,
-                );
-                g.engine.batch_head_rmsnorm_b4(
-                    &g.act_buf, g.slots.qa,
-                    q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_heads as u32,
-                    has_q, norm_eps, rope_freq_base, rope_mode,
-                    None,
-                );
-                // Whole-row attention first (ONE dispatch for the whole chunk,
-                // every row's full softmax): llama_attn_pre_row on the 128-row
-                // chain — 32 rows share one K/V stream per threadgroup — and
-                // llama_attn_pre_w32 as the A/B arm. It took 55% of the route
-                // (3.18 s of 5.76 s at 1454 tokens) because the b4 family below
-                // walks 4 rows per threadgroup over a grid of
-                // rows*n_heads*n_chunks one-warp threadgroups. A false return
-                // means nothing was dispatched (pipeline missing, unsupported
-                // geometry, SOFUU_PRE_ATTN=0, or SOFUU_PREW_MAXPOS below this
-                // chunk), so the b4 family still owns attention in that case.
-                let row_attn = g.engine.batch_llama_attn_row(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    &g.act_buf, g.slots.ao,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                    max_seq_len as u32,
-                );
-                // pos < 128 (one softmax chunk): part+fin fuse into one
-                // dispatch — one barrier drain instead of two
-                let flashed = !row_attn && g.engine.batch_llama_attn_flash_b4(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    &g.act_buf, g.slots.ao,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                    max_seq_len as u32,
-                );
-                // `llama_attn_1c_b4` is WRONG for pos >= 128 (LEDGER #64/#65: it agrees with
-                // the split pair only below one 128-position chunk). Gate it to the range it
-                // is actually valid for rather than letting it corrupt long prompts.
-                let one_chunk_pos = start_pos + b - 1 < 128;
-                // row_attn already wrote slots.ao: nothing below may run for
-                // this layer, or it would overwrite a finished chunk.
-                let fused = row_attn || flashed || (fuse_on
-                    && one_chunk_pos
-                    && g.engine.batch_llama_attn_1c_b4(
-                        &g.act_buf, g.slots.qa,
-                        &g.k_buf, kc_layer,
-                        &g.v_buf, kc_layer,
-                        &g.act_buf, g.slots.ao,
-                        &g.act_buf, g.slots.posb,
-                        b,
-                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                        max_seq_len as u32,
-                        None,
-                    ));
-                if !fused {
-                    g.engine.batch_llama_attn_part_b4(
-                        &g.act_buf, g.slots.qa,
-                        &g.k_buf, kc_layer,
-                        &g.v_buf, kc_layer,
-                        &g.meta_buf, meta_layer_off,
-                        &g.act_buf, g.slots.posb,
-                        b,
-                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                        max_seq_len as u32,
-                        meta_chunks as u32, meta_per_layer as u32,
-                    );
-                    g.engine.batch_llama_attn_fin_b4(
-                        &g.meta_buf, meta_layer_off,
-                        &g.act_buf, g.slots.ao,
-                        &g.act_buf, g.slots.posb,
-                        b,
-                        n_heads as u32, head_dim as u32,
-                        meta_chunks as u32, meta_per_layer as u32,
-                    );
-                }
-            }
-
-            // o projection + resid-add fused (rows == dim == acc width).
-            // gemv_q4_k_b4c2r is a FOUR-TOKEN kernel (no B argument): on the
-            // wide-chain route (mma8, chunk 128) it would compute rows 0..3 and
-            // leave the other 124 rows of xo stale. Only the narrow b4 walk can
-            // use it; wider chunks fall through to gemv_b!, which is batched.
-            if !(fuse_on
-                && b <= 4
-                && l.attn_output.tensor_type == GGML_TYPE_Q4_K
-                && g.engine.batch_gguf_b4r(
-                    &g.w_buf, gguf.data_offset + l.attn_output.offset,
-                    &g.act_buf, g.slots.ao,
-                    &g.act_buf, g.slots.xo,
-                    &g.act_buf, g.slots.x,
-                    dim, q_rows, dim,
-                ))
-            {
-                gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
-                if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
-                    return false;
-                }
-            }
-            // ONE dispatch for the whole chunk's ffn_norm, not b of them: the
-            // b-row kernel is one 32-thread threadgroup per row off a single
-            // grid, so 128 per-row dispatches (+128 memoryBarrier-ordered
-            // encoder steps) collapse into one with identical math. That loop
-            // was ~1.27 s of the 5.76 s route. Falls back to the per-row
-            // dispatch only when the pipeline/rows ceiling makes the batched
-            // form unavailable — never silently skips the norm.
-            if !g.engine.batch_rmsnorm_f32w_b4(
-                &g.act_buf, g.slots.x,
-                &g.w_buf, ffn_norm_off,
-                &g.act_buf, g.slots.xn,
-                dim, norm_eps, b,
+            if !Self::chain_layer_into(
+                g,
+                &self.layers[layer_idx],
+                gguf,
+                &self.config,
+                layer_idx,
+                b,
+                start_pos,
+                fuse_on,
+                &mut ffn_ops,
             ) {
-                for t in 0..b {
-                    if !g.engine.batch_rmsnorm_f32w(
-                        &g.act_buf, g.slots.x + t * dim * 4,
-                        &g.w_buf, ffn_norm_off,
-                        &g.act_buf, g.slots.xn + t * dim * 4,
-                        dim, norm_eps,
-                    ) {
-                        return false;
-                    }
-                }
-            }
-            if !g.skip_ffn {
-            ffn_ops += 1;
-            let gu_ok = b <= 4 && gemm_fused_dec!(
-                [
-                    (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
-                    (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
-                ],
-                2 * hidden_dim, dim, g.slots.xn
-            );
-            if !gu_ok {
-                gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
-                gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
-            }
-            if !g.skip_ffn {
-                ffn_ops += 3;
-            }
-            if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * hidden_dim) {
                 return false;
-            }
-            // down projection + resid-add fused
-            let down_fused = (fuse_on
-                && b <= 4 // gemv_q4_k_b4c2r is 4 tokens wide (see o above)
-                && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
-                && g.engine.batch_gguf_b4r(
-                    &g.w_buf, gguf.data_offset + l.ffn_down.offset,
-                    &g.act_buf, g.slots.gate,
-                    &g.act_buf, g.slots.xo,
-                    &g.act_buf, g.slots.x,
-                    dim, hidden_dim, dim,
-                ))
-                // q6_K down (the i1 Q4_K_M class — half the layers): the tiled
-                // fused kernel's resid epilogue is the same f32 dequant as
-                // above with the residual add folded in, so the 128 per-row
-                // dispatches AND the separate batch_add collapse into ONE
-                // dispatch. Every output element is read and written by the
-                // same thread, so binding y and res to the same slot region is
-                // not a race.
-                || (l.ffn_down.tensor_type == GGML_TYPE_Q6_K
-                    && crate::infer::metal::MetalEngine::mma8_enabled()
-                    && g.engine.batch_gguf_gemm_tiled_acc_chain(
-                        GGML_TYPE_Q6_K,
-                        &g.w_buf, gguf.data_offset + l.ffn_down.offset,
-                        &g.act_buf, g.slots.gate,
-                        &g.act_buf, g.slots.x, dim,
-                        &g.act_buf, g.slots.x,
-                        dim, hidden_dim, b,
-                    ));
-            if !down_fused {
-                gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
-                if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
-                    return false;
-                }
-            }
             }
         }
 
-        // Head: output-norm every row (cheap; feeds lazy per-row logits),
-        // then ONE lm_head GEMV — row 0 (the root logits the tree contract
-        // needs eagerly). The lm_head is ~514MB of q6_K for the 8B vocab:
-        // committing it for all B rows streams 2GB per pass for rows verify
-        // usually never samples; accepted rows get a lazy GPU head commit
-        // (gpu_spec_head_row, ~13ms each) and CPU matvec as the fallback.
-        if let Some(hr) = head_row {
-            // Same batching as the ffn_norm above: one dispatch for the chunk.
-            if !g.engine.batch_rmsnorm_f32w_b4(
-                &g.act_buf, g.slots.x,
-                &g.w_buf, gguf.data_offset + self.output_norm.offset,
-                &g.act_buf, g.slots.xn,
-                dim, norm_eps, b,
-            ) {
-                for t in 0..b {
-                    if !g.engine.batch_rmsnorm_f32w(
-                        &g.act_buf, g.slots.x + t * dim * 4,
-                        &g.w_buf, gguf.data_offset + self.output_norm.offset,
-                        &g.act_buf, g.slots.xn + t * dim * 4,
-                        dim, norm_eps,
-                    ) {
-                        return false;
-                    }
-                }
-            }
-            if !g.engine.batch_gguf(
-                self.output.tensor_type,
-                &g.w_buf, g.w_offset(gguf, &self.output),
-                &g.act_buf, g.slots.xn + hr * dim * 4,
-                &g.act_buf, g.slots.logits,
-                vocab_size, dim,
-            ) {
-                return false;
-            }
+        if !Self::chain_head_into(
+            g,
+            gguf,
+            &self.output,
+            &self.output_norm,
+            &self.config,
+            b,
+            head_row,
+        ) {
+            return false;
         }
         if !g.engine.batch_end() {
             return false;

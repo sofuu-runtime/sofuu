@@ -618,6 +618,12 @@ extern "C" {
         rows: usize, cols: usize, dtype: i32,
     );
     fn sofuu_metal_batch_end(ctx: *mut c_void) -> i32;
+    // W1 CPU+GPU row split (the only consumers are the split driver in
+    // infer/model.rs): commit the open batch without waiting, open the next
+    // batch on a fresh command buffer, drain everything committed so far.
+    fn sofuu_metal_batch_commit_async(ctx: *mut c_void) -> i32;
+    fn sofuu_metal_batch_open_async(ctx: *mut c_void) -> i32;
+    fn sofuu_metal_batch_wait_all(ctx: *mut c_void) -> i32;
     fn sofuu_metal_batch_mlx4(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1194,6 +1200,26 @@ impl MetalEngine {
     /// KV/logits reached the CPU repack under load).
     pub fn batch_end(&self) -> bool {
         unsafe { sofuu_metal_batch_end(self.ctx) != 0 }
+    }
+
+    /// W1 row split: commit the open batch and RETURN without waiting. The
+    /// host keeps running (the CPU's rows) while this command buffer executes;
+    /// the queue is serial, so the next batch_open_async batch runs after it.
+    pub fn batch_commit_async(&self) -> bool {
+        unsafe { sofuu_metal_batch_commit_async(self.ctx) != 0 }
+    }
+
+    /// W1 row split: open the next batch on a NEW command buffer without
+    /// draining the ones already committed.
+    pub fn batch_open_async(&self) -> bool {
+        unsafe { sofuu_metal_batch_open_async(self.ctx) == 0 }
+    }
+
+    /// W1 row split: drain every committed-but-unwaited command buffer.
+    /// Returns false when any of them failed to complete (outputs untouched ->
+    /// the caller must treat the pass as not-happened).
+    pub fn batch_wait_all(&self) -> bool {
+        unsafe { sofuu_metal_batch_wait_all(self.ctx) == 0 }
     }
 
     /// Batched mlx4 GEMV op (binds mirror the per-op kernel exactly).

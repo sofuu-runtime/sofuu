@@ -227,6 +227,13 @@ void sofuu_metal_sync(void* ctx);
 int sofuu_metal_batch_open(void* ctx);
 void sofuu_metal_batch_gemv(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, int dtype);
 int sofuu_metal_batch_end(void* ctx);
+// W1 CPU+GPU row split: commit without waiting / open the next batch on a new
+// command buffer / drain every committed-but-unwaited buffer. Returns 1 on a
+// successful commit, 0 when nothing was open; wait_all returns the number of
+// buffers that failed to complete.
+int sofuu_metal_batch_commit_async(void* ctx);
+int sofuu_metal_batch_open_async(void* ctx);
+int sofuu_metal_batch_wait_all(void* ctx);
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w_buf, size_t w_offset, const float* x, void* y_buf, size_t y_offset, size_t rows, size_t cols, int dtype);
 void sofuu_metal_batch_mlx4(void* ctx, void* w_buf, size_t w_offset, void* s_buf, size_t s_offset, void* b_buf, size_t b_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t group_size, int is_bf16);
 

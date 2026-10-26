@@ -1125,12 +1125,19 @@ mod tests {
         let mut session = SandboxSession::new(SandboxConfig::default()).expect("session");
         let mut config = SandboxConfig::default();
         config.timeout = Some(Duration::from_millis(10));
+        // The default fuel budget (5M) can run out before a 10 ms deadline is
+        // observed on a loaded runner — the interrupt then reports "fuel" and
+        // the assertion below fails on a healthy engine (seen in the P5
+        // matrix run). Raise fuel to the clamp ceiling so only the deadline
+        // can stop this loop.
+        config.fuel_limit = Some(SANDBOX_MAX_FUEL);
         let start = Instant::now();
         let res = session.run("while(true) {}", &config, None);
         assert!(!res.success);
         assert!(res.interrupted);
         assert_eq!(res.error_type.as_deref(), Some("timeout"));
-        assert!(start.elapsed() < Duration::from_millis(100));
+        // Promptness, not a benchmark: a busy runner can delay the poll.
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

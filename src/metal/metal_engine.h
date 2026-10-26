@@ -290,6 +290,31 @@ int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q_buf, size_t q_offse
 // family) and 0 when the pipeline/geometry cannot host it, so the caller falls
 // back. row: PAR_ROWS rows x 1 head per 1024-thread threadgroup; w32_out: the
 // shipped llama_attn_pre_w32 (one threadgroup per (row, head)).
+//
+// sofuu_metal_batch_llama_attn_row additionally honors two env knobs, both read
+// once per process and both inert by default:
+//   SOFUU_ATTN_SPLIT_K=S  flash-decoding split-K over the KEY range. S>0 cuts
+//     the row group's window into min(S, tmax/32) contiguous slices, one
+//     threadgroup each (grid z, kernels.metal llama_attn_pre_row_gqa_sk), then
+//     runs the one-warp llama_attn_sk_combine over the S partials in device
+//     scratch: m = max m_s, acc = sum acc_s*exp(m_s - m), l = sum l_s*exp(...),
+//     y = acc/l. S=1 routes the shipped shape through the split plumbing with a
+//     single slice, which reproduces the shipped kernel EXACTLY and is the
+//     bit-identity receipt for the path. Only the r2/nr2/rg32 shape (table
+//     entry 1, the default) has a split twin; every other shape - and S=0/unset,
+//     the shipped default - takes the single-dispatch kernel below untouched.
+//     MEASURED (M2 Pro, 1454-token prompt, order-balanced ABBA): the attention
+//     cost per 128-row chunk is 35.8 ms at S=0 and 35.0/36.7/35.8 ms at
+//     S=8/4/2 - i.e. flat in S, because slicing keys multiplies the warp count
+//     and divides the keys per warp, leaving the (warp, key) instruction count
+//     that this kernel is bound by unchanged. It is opt-in, not a win; the
+//     numerics cost is up to +0.0025 max|dlogit| vs CPU (length 148).
+//   SOFUU_ATTN_DUP=N  re-issues the whole (idempotent) attention dispatch N
+//     extra times in the same encoder. Every kernel here overwrites out/scratch
+//     unconditionally, so the total-time delta between N=0 and N=1 is the
+//     marginal cost of one attention dispatch measured in situ with the real
+//     grid and cache state - the receipt that stays stable under machine load,
+//     where wall-clock section subtraction does not. Default 0 (inert).
 int sofuu_metal_batch_llama_attn_row(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_llama_attn_w32_out(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);

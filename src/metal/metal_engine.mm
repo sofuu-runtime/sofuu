@@ -102,6 +102,18 @@ struct MetalContext {
     int attn_gqa_mode;    // SOFUU_ATTN_GQA: 0 = per-head kernel, 1..5 = GQA shapes
     uint attn_gqa_rg[6];      // rows per threadgroup of each entry
     uint attn_gqa_threads[6]; // threads per threadgroup of each entry
+    // Split-K (flash-decoding) twin of table entry 1 (r2/nr2/rg32): the same
+    // 512-thread threadgroup, one key slice per threadgroup via grid z, so the
+    // per-thread register footprint and the maxTotalThreadsPerThreadgroup guard
+    // are the shipped ones. pso_attn_sk_combine is the one-warp reduction that
+    // turns the S partials in attn_sk_scratch into the output row. Both nil =>
+    // SOFUU_ATTN_SPLIT_K is ignored and the shipped kernel owns the chunk.
+    id<MTLComputePipelineState> pso_attn_gqa_sk;
+    id<MTLComputePipelineState> pso_attn_sk_combine;
+    // Device scratch for the S partials: S*rows*n_heads*(head_dim+4) floats,
+    // grown on demand (GPU-private: nothing on the host ever reads it).
+    id<MTLBuffer> attn_sk_scratch;
+    size_t attn_sk_cap;
     id<MTLComputePipelineState> pso_llama_attn_copy_b4;
     // Single source of truth for the llama_attn_pre_w32 whole-row fast path,
     // written by the part pass and read by the fin pass. They used to gate
@@ -582,6 +594,28 @@ void* sofuu_metal_init(void) {
                 }
                 ctx->pso_attn_gqa[gi] = p;
             }
+        }
+        // Split-K (flash-decoding) chunk attention: the shipped r2/nr2/rg32
+        // threadgroup with the key range cut into grid z slices, and the
+        // one-warp combine that reduces the partials. Same silent-drop rule as
+        // the rest of this file: a pipeline that cannot host its threadgroup
+        // is nil'd here rather than dispatched into the void.
+        ctx->pso_attn_gqa_sk     = load_pso(@"attn_gqa_sk_r2_nr2_rg32");
+        ctx->pso_attn_sk_combine = load_pso(@"llama_attn_sk_combine");
+        if (ctx->pso_attn_gqa_sk != nil &&
+            ctx->pso_attn_gqa_sk.maxTotalThreadsPerThreadgroup < 512ul) {
+            fprintf(stderr,
+                    "[metal] attn_gqa_sk_r2_nr2_rg32 needs 512 threads/group, pipeline allows %lu - split-K disabled\n",
+                    (unsigned long)ctx->pso_attn_gqa_sk.maxTotalThreadsPerThreadgroup);
+            ctx->pso_attn_gqa_sk = nil;
+        }
+        if (ctx->pso_attn_sk_combine != nil &&
+            ctx->pso_attn_sk_combine.maxTotalThreadsPerThreadgroup < 32ul) {
+            ctx->pso_attn_sk_combine = nil;
+        }
+        if (ctx->pso_attn_gqa_sk == nil || ctx->pso_attn_sk_combine == nil) {
+            ctx->pso_attn_gqa_sk = nil;
+            ctx->pso_attn_sk_combine = nil;
         }
         // SOFUU_ATTN_GQA selects the shape: 0 = the per-head
         // llama_attn_pre_row, 1 = r2/nr1/rg32 (pairing only), 2 = r2/nr2/rg32,
@@ -3871,21 +3905,130 @@ int sofuu_metal_batch_llama_attn_row(
         }
     }
     if (pso == nil) return 0;
-    [ctx->batch_enc setComputePipelineState:pso];
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:2];
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_buf_ptr offset:vc_layer_offset atIndex:3];
-    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:4];
-    [ctx->batch_enc setBytes:&hd length:sizeof(uint) atIndex:5];
-    [ctx->batch_enc setBytes:&nh length:sizeof(uint) atIndex:6];
-    [ctx->batch_enc setBytes:&nkv length:sizeof(uint) atIndex:7];
-    [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
-    [ctx->batch_enc setBytes:&stride length:sizeof(uint) atIndex:9];
-    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:10];
     uint row_groups = (rows + rg - 1u) / rg;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid_x, row_groups, 1)
-                    threadsPerThreadgroup:MTLSizeMake(nthr, 1, 1)];
+    // ── split-K (flash-decoding) selection ──────────────────────────────────
+    // SOFUU_ATTN_SPLIT_K=S cuts the key range into up to S slices, one
+    // threadgroup each (grid z), when the chunk is long enough to pay for the
+    // partial scratch and the combine pass. 0/unset keeps the shipped kernel
+    // bit-for-bit (the default until this arm is proven faster); 1 routes the
+    // shipped shape through the split path with a single slice, which the
+    // combine reproduces EXACTLY (w = exp(0) = 1, one term) and is therefore
+    // the bit-identity receipt for the whole split plumbing.
+    //
+    // The slice index rides grid z so the threadgroup keeps the shipped
+    // 512-thread shape: the hardware 1024-thread limit is never approached and
+    // each entry's own maxTotalThreadsPerThreadgroup was checked at init.
+    static int sk_max_env = -2;
+    if (sk_max_env == -2) {
+        sk_max_env = 0;
+        if (const char *e = getenv("SOFUU_ATTN_SPLIT_K")) {
+            int m = atoi(e);
+            if (m < 0) m = 0;
+            if (m > 8) m = 8;          // scratch stays <= 8.7 MB at 128 rows
+            sk_max_env = m;
+        }
+    }
+    uint nsplit = 1u;
+    // Entry 1 is the shipped r2/nr2/rg32 shape; the split kernel is its twin.
+    const bool sk_shape = (ctx->attn_gqa_mode == 2 && ratio == 2u);
+    if (sk_max_env > 0 && sk_shape && ctx->pso_attn_gqa_sk != nil) {
+        id<MTLBuffer> pb = (__bridge id<MTLBuffer>)pos_buf_ptr;
+        const uint32_t* pp = (const uint32_t*)((const char*)pb.contents + pos_offset);
+        // The chunk's own length bounds the useful split count: a slice must
+        // still carry >= 32 keys, which is also the widest causal overhang a
+        // row group of RG keys can waste on the mask.
+        uint32_t tmax_chunk = pp[rows - 1u] + 1u;
+        uint32_t want = tmax_chunk / 32u;
+        if (want > (uint32_t)sk_max_env) want = (uint32_t)sk_max_env;
+        if (want > 8u) want = 8u;
+        if (want < 1u) want = 1u;
+        nsplit = want;
+    }
+    uint rec = hd + 4u;
+    if (nsplit > 1u) {
+        size_t need = (size_t)nsplit * (size_t)rn * (size_t)nh * (size_t)rec * sizeof(float);
+        if (ctx->attn_sk_scratch == nil || ctx->attn_sk_cap < need) {
+            id<MTLBuffer> nb = [ctx->device newBufferWithLength:(need + need / 2)
+                                                       options:MTLResourceStorageModePrivate];
+            if (nb == nil) {
+                nsplit = 1u;           // no scratch -> the shipped kernel
+            } else {
+                ctx->attn_sk_scratch = nb;
+                ctx->attn_sk_cap = need + need / 2;
+            }
+        }
+    }
+    // SOFUU_ATTN_DUP=N re-issues the (idempotent) attention dispatch N extra
+    // times inside the same encoder. Nothing this function produces depends on
+    // how many times it ran - both variants overwrite out/scratch
+    // unconditionally - so the total-time delta between N=0 and N=1 is the
+    // marginal cost of ONE attention dispatch measured in situ, with the real
+    // grid, cache state and neighbouring dispatches. That receipt stays inside
+    // +/-2% under machine load where wall-clock section subtraction does not.
+    static int attn_dup = -2;
+    if (attn_dup == -2) {
+        attn_dup = 0;
+        if (const char *d = getenv("SOFUU_ATTN_DUP")) {
+            int v = atoi(d);
+            if (v > 0) attn_dup = (v > 8) ? 8 : v;
+        }
+    }
+    for (int rep = 0; rep <= attn_dup; ++rep) {
+        if (nsplit > 1u) {
+            uint nsp = nsplit;
+            [ctx->batch_enc setComputePipelineState:ctx->pso_attn_gqa_sk];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:2];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_buf_ptr offset:vc_layer_offset atIndex:3];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:4];
+            [ctx->batch_enc setBytes:&hd length:sizeof(uint) atIndex:5];
+            [ctx->batch_enc setBytes:&nh length:sizeof(uint) atIndex:6];
+            [ctx->batch_enc setBytes:&nkv length:sizeof(uint) atIndex:7];
+            [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
+            [ctx->batch_enc setBytes:&stride length:sizeof(uint) atIndex:9];
+            [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:10];
+            [ctx->batch_enc setBuffer:ctx->attn_sk_scratch offset:0 atIndex:11];
+            [ctx->batch_enc setBytes:&nsp length:sizeof(uint) atIndex:12];
+            [ctx->batch_enc setBytes:&rec length:sizeof(uint) atIndex:13];
+            [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid_x, row_groups, nsplit)
+                            threadsPerThreadgroup:MTLSizeMake(nthr, 1, 1)];
+            // Split -> combine is a hard producer/consumer dependency, so it
+            // gets an unconditional buffer barrier (sofuu_batch_barrier honors
+            // the SOFUU_NO_BARRIER / SOFUU_BARRIER_EVERY ablation knobs, and a
+            // skipped barrier here reads as "attention returned zeros").
+            [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [ctx->batch_enc setComputePipelineState:ctx->pso_attn_sk_combine];
+            [ctx->batch_enc setBuffer:ctx->attn_sk_scratch offset:0 atIndex:0];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:2];
+            [ctx->batch_enc setBytes:&hd length:sizeof(uint) atIndex:3];
+            [ctx->batch_enc setBytes:&nh length:sizeof(uint) atIndex:4];
+            [ctx->batch_enc setBytes:&stride length:sizeof(uint) atIndex:5];
+            [ctx->batch_enc setBytes:&nsp length:sizeof(uint) atIndex:6];
+            [ctx->batch_enc setBytes:&rec length:sizeof(uint) atIndex:7];
+            [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
+            [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:9];
+            [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rn, nh, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            [ctx->batch_enc setComputePipelineState:pso];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:2];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)vc_buf_ptr offset:vc_layer_offset atIndex:3];
+            [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:4];
+            [ctx->batch_enc setBytes:&hd length:sizeof(uint) atIndex:5];
+            [ctx->batch_enc setBytes:&nh length:sizeof(uint) atIndex:6];
+            [ctx->batch_enc setBytes:&nkv length:sizeof(uint) atIndex:7];
+            [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
+            [ctx->batch_enc setBytes:&stride length:sizeof(uint) atIndex:9];
+            [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:10];
+            [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid_x, row_groups, 1)
+                            threadsPerThreadgroup:MTLSizeMake(nthr, 1, 1)];
+        }
+        if (rep != attn_dup) { [ctx->batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+    }
     return 1;
 }
 

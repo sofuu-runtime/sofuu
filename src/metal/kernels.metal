@@ -6976,6 +6976,219 @@ kernel void llama_attn_pre_row_gqa(
     }
 }
 
+// ── split-K (flash-decoding style) chunk attention ──────────────────────────
+// llama_attn_pre_row_gqa above walks the WHOLE causal window in one serial
+// online-softmax chain per warp. On a 128-row chunk at 1454 tokens that is a
+// ~1400-step chain per warp and 512 warps in total; measured, the chunk does
+// 805 MFLOP in 33.7 ms = 24 GFLOPS (0.4% of this GPU's fp32 peak) while
+// streaming only 25 MB (21 GB/s). Neither the FLOP nor the byte roofline is
+// the binding resource - PARALLELISM OVER KEYS is: cost tracks (warp, key)
+// pairs, and the warp count is fixed by the row-group shape.
+//
+// This kernel cuts the row group's key range into n_splits contiguous slices
+// and gives each slice its own threadgroup (grid z), which multiplies the
+// resident warp count by n_splits at CONSTANT total (warp, key) work: every
+// slice keeps its own local online-softmax state (m_s, l_s, acc_s) - the
+// standard flash-decoding partial - and llama_attn_sk_combine below reduces
+// them:
+//     m = max_s m_s,  acc = sum_s acc_s*exp(m_s - m),
+//     l = sum_s l_s*exp(m_s - m),  y = acc / l.
+// Only the reduction ORDER changes; the fp32 expression inside a slice is the
+// shipped one, in the shipped key order.
+//
+// Causality: the shipped kernel bounds its window by the row GROUP's last
+// position and masks t > pos. A slice is therefore wholly past a row's
+// position only for the last slice of a group whose rows sit within RG keys of
+// tmax, which is why the host sizes n_splits from the chunk length (>= 32 keys
+// per slice) instead of using a fixed split count.
+//
+// Scratch: one record per (slice, row, head) of rec_stride = head_dim + 4
+// floats - acc in [0, head_dim), m at [head_dim], l at [head_dim+1]. The +4
+// pad keeps every float4 access 16-byte aligned (head_dim % 4 == 0 is
+// host-gated). A slice with no keys (k0 >= k1) or a parked row still writes
+// its record as (m = -inf, l = 0, acc = 0) so the combine can never read a
+// previous layer's partial.
+template <uint R, uint NR, uint RG>
+kernel void llama_attn_pre_row_gqa_sk(
+    device const float *q               [[buffer(0)]],
+    device float       *out             [[buffer(1)]],
+    device const float *k_cache_layer   [[buffer(2)]],
+    device const float *v_cache_layer   [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    constant uint      &out_stride      [[buffer(9)]],
+    constant uint      &rows            [[buffer(10)]],
+    device float       *scratch         [[buffer(11)]],
+    constant uint      &n_splits        [[buffer(12)]],
+    constant uint      &rec_stride      [[buffer(13)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint  tid                           [[thread_index_in_threadgroup]]
+) {
+    (void)out;                      // the combine pass owns the output row
+    uint kv = tg.x;
+    uint row0 = tg.y * RG;
+    uint split = tg.z;
+    uint warp = tid >> 5u;
+    uint row = row0 + warp * NR;
+    uint lane = tid & 31u;
+    if (kv >= n_kv_heads || row >= rows || split >= n_splits) { return; }
+    uint last = min(row0 + RG - 1u, rows - 1u);
+    uint tmax = positions[last] + 1u;
+    // This slice's key range: kt = ceil(tmax/n_splits) so the slices tile
+    // [0, tmax) and every key is visited exactly once.
+    uint kt = (tmax + n_splits - 1u) / n_splits;
+    uint k0 = min(split * kt, tmax);
+    uint k1 = min(tmax, k0 + kt);
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint h0 = kv * R;
+    float scale = rsqrt(float(head_dim));
+    bool act = (lane * 4u) < head_dim;
+    uint o = lane * 4u;
+
+    // pos[] doubles as the live/parked flag exactly as in the shipped kernel.
+    uint pos[NR];
+    float4 q4[R][NR];
+    float4 acc[R][NR];
+    float m[R][NR];
+    float l[R][NR];
+    for (uint qq = 0; qq < NR; ++qq) {
+        uint rq = row + qq;
+        pos[qq] = (rq < rows) ? positions[rq] : 0xFFFFFFFFu;
+        bool live = (rq < rows && pos[qq] != 0xFFFFFFFFu && pos[qq] < max_seq);
+        device const float *q_row = q + ((size_t)min(rq, rows - 1u) * n_heads
+                                        + (size_t)h0) * head_dim;
+        for (uint j = 0; j < R; ++j) {
+            q4[j][qq] = (live && act)
+                ? *(device const float4 *)&q_row[(size_t)j * head_dim + o]
+                : float4(0.0f);
+            acc[j][qq] = float4(0.0f);
+            m[j][qq] = -INFINITY;
+            l[j][qq] = 0.0f;
+        }
+        if (!live) { pos[qq] = 0xFFFFFFFFu; }
+    }
+
+    for (uint t = k0; t < k1; ++t) {
+        float4 k4 = float4(0.0f);
+        float4 v4 = float4(0.0f);
+        if (act) {
+            k4 = *(device const float4 *)&kbase[(size_t)t * head_dim + o];
+            v4 = *(device const float4 *)&vbase[(size_t)t * head_dim + o];
+        }
+        for (uint qq = 0; qq < NR; ++qq) {
+            for (uint j = 0; j < R; ++j) {
+                float part = q4[j][qq].x * k4.x + q4[j][qq].y * k4.y
+                           + q4[j][qq].z * k4.z + q4[j][qq].w * k4.w;
+                float s = simd_sum(part) * scale;
+                if (t > pos[qq]) { s = -INFINITY; }
+                // A masked key is skipped outright instead of being folded in
+                // as w = exp(-inf - m) = 0: the two operations would be the
+                // shipped kernel's (and bit-exact no-ops) while m is finite,
+                // but a slice can consist ENTIRELY of keys past a row's
+                // position - then m is still -inf and exp(-inf - -inf) is NaN,
+                // which would poison l and the accumulator. Skipping also
+                // drops the exp and the two vector FMAs for the masked tail.
+                if (s == -INFINITY) { continue; }
+                // Same half-transcendental trick as the shipped kernel: s is
+                // warp-uniform, so exactly one of the two exps is exp(0) = 1.
+                float mold = m[j][qq];
+                float corr;
+                float w;
+                if (s > mold) {
+                    m[j][qq] = s;
+                    corr = exp(mold - s);
+                    w = 1.0f;
+                } else {
+                    corr = 1.0f;
+                    w = exp(s - mold);
+                }
+                l[j][qq] = l[j][qq] * corr + w;
+                acc[j][qq] = acc[j][qq] * corr + v4 * w;
+            }
+        }
+    }
+
+    // Publish the partial. Rows past the chunk end have no record (the
+    // combine grid never reads them either).
+    for (uint qq = 0; qq < NR; ++qq) {
+        uint rq = row + qq;
+        if (rq >= rows) { continue; }
+        bool valid = (pos[qq] != 0xFFFFFFFFu);
+        for (uint j = 0; j < R; ++j) {
+            device float *rec = scratch
+                + (((size_t)split * (size_t)rows + (size_t)rq) * (size_t)n_heads
+                   + (size_t)(h0 + j)) * (size_t)rec_stride;
+            if (lane == 0u) {
+                rec[head_dim]      = valid ? m[j][qq] : -INFINITY;
+                rec[head_dim + 1u] = valid ? l[j][qq] : 0.0f;
+            }
+            if (act) {
+                *(device float4 *)&rec[o] = valid ? acc[j][qq] : float4(0.0f);
+            }
+        }
+    }
+}
+
+// Reduces the n_splits partials of one (row, head) into the output row: one
+// 32-lane warp per (row, head) - the grid shape llama_attn_copy_b4 already
+// uses for whole rows - with the lanes striding head_dim in float4 steps.
+// exp(m_s - m) is exactly 0 for an empty slice (m_s = -inf); the all-empty
+// case (a parked row, or every slice past the row) is short-circuited before
+// the max subtraction could produce (-inf) - (-inf) = NaN. acc and l are
+// summed slice by slice in ascending slice order, so the reduction is
+// deterministic and independent of how the slices were scheduled.
+kernel void llama_attn_sk_combine(
+    device const float *scratch     [[buffer(0)]],
+    device float       *out         [[buffer(1)]],
+    device const uint  *positions   [[buffer(2)]],
+    constant uint      &head_dim    [[buffer(3)]],
+    constant uint      &n_heads     [[buffer(4)]],
+    constant uint      &out_stride  [[buffer(5)]],
+    constant uint      &n_splits    [[buffer(6)]],
+    constant uint      &rec_stride  [[buffer(7)]],
+    constant uint      &max_seq     [[buffer(8)]],
+    constant uint      &rows        [[buffer(9)]],
+    uint3 tg                        [[threadgroup_position_in_grid]],
+    uint3 lid                       [[thread_position_in_threadgroup]]
+) {
+    uint row = tg.x;
+    uint h = tg.y;
+    uint tid = lid.x;
+    if (tid >= 32u) { return; }
+    uint pos = positions[row];
+    if (pos == 0xFFFFFFFFu || pos >= max_seq) { return; }
+    uint o = tid * 4u;
+    bool act = o < head_dim;
+    size_t slice_hop = (size_t)rows * (size_t)n_heads * (size_t)rec_stride;
+    device const float *base = scratch + ((size_t)row * n_heads + h) * (size_t)rec_stride;
+    float mmax = -INFINITY;
+    for (uint s = 0; s < n_splits; ++s) {
+        mmax = max(mmax, base[(size_t)s * slice_hop + head_dim]);
+    }
+    float4 acc = float4(0.0f);
+    float ltot = 0.0f;
+    if (mmax > -INFINITY) {
+        for (uint s = 0; s < n_splits; ++s) {
+            device const float *rec = base + (size_t)s * slice_hop;
+            float w = exp(rec[head_dim] - mmax);      // 0 when m_s = -inf
+            ltot += rec[head_dim + 1u] * w;
+            if (act) {
+                float4 a = *(device const float4 *)&rec[o];
+                acc = acc + a * w;
+            }
+        }
+    }
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    if (act) {
+        device float *dst = out + (size_t)row * out_stride + (size_t)h * head_dim;
+        *(device float4 *)&dst[o] = acc * inv;
+    }
+}
+
 #define PRE_GQA_ARGS device const float*, device float*, device const float*, \
     device const float*, device const uint*, constant uint&, constant uint&, \
     constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint
@@ -6986,6 +7199,17 @@ template [[host_name("attn_gqa_r2_nr2_rg16")]]    kernel void llama_attn_pre_row
 template [[host_name("attn_gqa_r2_nr4_rg32")]]    kernel void llama_attn_pre_row_gqa<2, 4, 32, 0>(PRE_GQA_ARGS); //  256
 template [[host_name("attn_gqa_r2_nr1_rg32_pf")]] kernel void llama_attn_pre_row_gqa<2, 1, 32, 1>(PRE_GQA_ARGS); // 1024
 template [[host_name("attn_gqa_r4_nr1_rg16")]]    kernel void llama_attn_pre_row_gqa<4, 1, 16, 0>(PRE_GQA_ARGS); //  512
+
+// Split-K twins of the shipped r2/nr2/rg32 shape (512 threads, same register
+// footprint as attn_gqa_r2_nr2_rg32: the slice index rides grid z, not the
+// threadgroup), plus the one-warp combine pass.
+#define PRE_GQA_SK_ARGS device const float*, device float*, device const float*, \
+    device const float*, device const uint*, constant uint&, constant uint&, \
+    constant uint&, constant uint&, constant uint&, constant uint&, device float*, \
+    constant uint&, constant uint&, uint3, uint
+template [[host_name("attn_gqa_sk_r2_nr2_rg32")]] kernel void llama_attn_pre_row_gqa_sk<2, 2, 32>(PRE_GQA_SK_ARGS); // 512
+// llama_attn_sk_combine is a plain kernel (not a template): it keeps its own
+// name, so the host loads "llama_attn_sk_combine" directly.
 
 // Moves the per-row attention result out of the meta scratch (finish is a copy
 // now that part computes whole rows).

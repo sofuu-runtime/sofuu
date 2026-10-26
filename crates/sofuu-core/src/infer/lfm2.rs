@@ -570,6 +570,9 @@ impl Lfm2Model {
             kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: false,
+            rope_n_rot: 0,
+            rope_mscale: 1.0,
+            rope_custom: false,
         };
 
         // Helper to load linear tensor (supports BF16 or MLX 4-bit)

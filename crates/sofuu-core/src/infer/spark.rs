@@ -225,6 +225,9 @@ impl Spark25Model {
             kv_ring: 0,
             sliding_window: swa_window,
             rope_interleaved: false, // NeoX split-half pairing
+            rope_n_rot: 0,
+            rope_mscale: 1.0,
+            rope_custom: false,
         };
 
         // Per-layer SWA pattern from the GGUF bool array (raw byte array).

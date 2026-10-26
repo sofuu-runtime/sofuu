@@ -305,6 +305,21 @@ pub struct ModelConfig {
     /// GGUF has two common RoPE pairings. Llama-family uses consecutive pairs;
     /// Qwen/Gemma-family uses split-half pairs.
     pub rope_interleaved: bool,
+    /// Dims per head that RoPE actually rotates. 0 = the whole head
+    /// (`head_dim`), which is every arch in this engine except phi3-style
+    /// PARTIAL rotary: Phi-4-mini stores `phi3.rope.dimension_count = 96`
+    /// against head_dim 128, so dims 96..127 of every head are not rotated.
+    pub rope_n_rot: usize,
+    /// cos/sin amplitude ("mscale"): HF's longrope scaling factor, carried in
+    /// GGUF as `{arch}.rope.scaling.attn_factor`. 1.0 = unscaled, which is
+    /// every arch that does not declare it.
+    pub rope_mscale: f32,
+    /// A non-default rope profile is armed (partial rotary, per-pair frequency
+    /// factors, or mscale). The Metal decode/prefill kernels, the batched C
+    /// rope kernels and the speculative tree implement plain full-width rope
+    /// only, so they MUST stay off for such a model: running phi3 through them
+    /// is a silently wrong model, not a slow one.
+    pub rope_custom: bool,
 }
 
 #[derive(Clone)]
@@ -712,6 +727,133 @@ impl TransformerModel {
             }
         }
 
+        // ── phi3 longrope: PARTIAL rotary + per-pair factors + mscale ──
+        // Phi-4-mini (arch phi3) declares three rope parameters that the
+        // plain C rope kernel cannot express, and silently ignoring any of
+        // them yields a fluent-looking but WRONG model:
+        //   {arch}rope.dimension_count            = 96  (n_rot; head_dim is 128,
+        //                                                so dims 96..127 of every
+        //                                                head must NOT rotate and
+        //                                                the frequency ladder is
+        //                                                built over 96, not 128)
+        //   {arch}rope.scaling.attn_factor        = 1.190238118171692 (HF's
+        //                                                longrope mscale: cos/sin
+        //                                                amplitude, i.e. attention
+        //                                                logits scaled by 1.4167)
+        //   rope_factors_short/long.weight        = [n_rot/2] f32 per-pair
+        //                                                frequency DIVISORS
+        //                                                (ggml: theta/factor)
+        // Reading them is the whole point: a refuse-loudly is the fallback,
+        // never a load with the default angles.
+        let mut rope_n_rot = head_dim;
+        let mut rope_mscale = 1.0f32;
+        let mut rope_profile_source = "default (full-width, unscaled)".to_string();
+        if let Some(n_rot_meta) = gguf.get_u32(&format!("{prefix}rope.dimension_count")) {
+            let n_rot = n_rot_meta as usize;
+            if n_rot > 0 && n_rot < head_dim {
+                rope_n_rot = n_rot;
+                if n_rot % 2 != 0 {
+                    return Err(format!(
+                        "invalid GGUF '{arch}': {prefix}rope.dimension_count is {n_rot} (odd — rope rotates PAIRS of dims)"
+                    ));
+                }
+            }
+        }
+        if let Some(m) = gguf.get_f32(&format!("{prefix}rope.scaling.attn_factor")) {
+            if m.is_finite() && m > 0.0 {
+                rope_mscale = m;
+            } else {
+                return Err(format!(
+                    "invalid GGUF '{arch}': {prefix}rope.scaling.attn_factor is {m} — refusing to rope with a non-positive/non-finite amplitude"
+                ));
+            }
+        }
+        if rope_n_rot < head_dim || rope_mscale != 1.0 {
+            // HF's Phi3SuScaledRotaryEmbedding swaps to the LONG table once the
+            // sequence passes the trained window; llama.cpp selects on the
+            // configured context the same way. Both tables in the Phi-4-mini
+            // file are byte-identical, so the receipt prints the chosen table's
+            // fingerprint instead of assuming they agree.
+            let orig_ctx = gguf
+                .get_u32(&format!("{prefix}rope.scaling.original_context_length"))
+                .unwrap_or(0) as usize;
+            let want_long = orig_ctx > 0 && final_seq_len > orig_ctx;
+            let table = if want_long { "rope_factors_long.weight" } else { "rope_factors_short.weight" };
+            let candidates = [
+                table.to_string(),
+                format!("blk.0.{table}"),
+                // A file carrying only one of the two tables is still usable:
+                // they encode the same interpolation, so fall back loudly.
+                if want_long { "rope_factors_short.weight".to_string() } else { "rope_factors_long.weight".to_string() },
+            ];
+            let found = candidates.iter().find_map(|n| {
+                gguf.tensors.get(n).map(|info| (n.clone(), info.clone()))
+            });
+            match found {
+                Some((name, info)) => {
+                    let pairs = rope_n_rot / 2;
+                    if info.shape != vec![pairs] {
+                        return Err(format!(
+                            "'{arch}' longrope: '{name}' is {:?} but {prefix}rope.dimension_count={rope_n_rot} needs {pairs} pairs",
+                            info.shape
+                        ));
+                    }
+                    if info.tensor_type != GGML_TYPE_F32 {
+                        return Err(format!(
+                            "'{arch}' longrope: '{name}' is GGML type {} — rope factors must be f32",
+                            crate::infer::quant::ggml_type_name(info.tensor_type)
+                        ));
+                    }
+                    let start = gguf.data_offset + info.offset;
+                    let bytes = gguf
+                        .as_bytes()
+                        .get(start..start + pairs * 4)
+                        .ok_or_else(|| format!("'{name}' runs past the end of the file"))?;
+                    let factors: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    if let Some(bad) = factors.iter().position(|f| !f.is_finite() || *f <= 0.0) {
+                        return Err(format!(
+                            "'{arch}' longrope: '{name}' pair {bad} is {} — factors divide theta and must be finite and positive",
+                            factors[bad]
+                        ));
+                    }
+                    if !rope_freq_adjust.is_empty() {
+                        return Err(format!(
+                            "'{arch}' declares BOTH llama3 rope scaling ({prefix}rope.scaling.type=llama3) and a longrope factor table ('{name}'); the engine applies one frequency table per model and will not guess which wins"
+                        ));
+                    }
+                    // ggml divides theta by the factor, so the engine's
+                    // inverse-frequency multiplier is 1/factor.
+                    rope_freq_adjust = factors.iter().map(|f| 1.0f32 / *f).collect();
+                    rope_profile_source = format!(
+                        "'{name}' [{} pairs, {:.4}..{:.4}] {}",
+                        pairs,
+                        factors.first().copied().unwrap_or(1.0),
+                        factors.iter().copied().fold(0.0f32, f32::max),
+                        if want_long { format!("long table: requested ctx {final_seq_len} > trained {orig_ctx}") } else { format!("short table: requested ctx {final_seq_len} <= trained {orig_ctx}") },
+                    );
+                }
+                None => {
+                    return Err(format!(
+                        "'{arch}' is a PARTIAL-ROTARY / longrope checkpoint ({prefix}rope.dimension_count={rope_n_rot} of head_dim {head_dim}, {prefix}rope.scaling.attn_factor={rope_mscale}) but carries no '{}' tensor (looked for {candidates:?}). Rope factors are part of the weights' semantics — refuse to load rather than rope with plain angles and emit silently wrong text.",
+                        if want_long { "rope_factors_long.weight" } else { "rope_factors_short.weight" }
+                    ));
+                }
+            }
+        }
+        let rope_custom = !rope_freq_adjust.is_empty() || rope_n_rot != head_dim || rope_mscale != 1.0;
+        if rope_custom {
+            eprintln!(
+                "[rope] {arch}: custom profile — n_rot {rope_n_rot}/{head_dim} dims{}, mscale {rope_mscale:.6}, source {rope_profile_source}",
+                if rope_n_rot < head_dim { " (partial rotary: the remaining dims pass through)" } else { "" },
+            );
+            eprintln!(
+                "[rope] {arch}: the Metal decode/prefill kernels, the batched rope+KV kernels and the speculative tree implement plain full-width rope only — they are DISABLED for this model (this becomes a CPU-route model, not a silently-wrong GPU one)"
+            );
+        }
+
         let config = ModelConfig {
             dim,
             n_layers,
@@ -727,6 +869,9 @@ impl TransformerModel {
             kv_ring,
             sliding_window: detected_sliding_window,
             rope_interleaved,
+            rope_n_rot,
+            rope_mscale,
+            rope_custom,
         };
         if kv_ring > 0 {
             eprintln!(
@@ -755,14 +900,7 @@ impl TransformerModel {
             // matvec path handles exactly these types. The whole-file pre-scan
             // (check_quant_types) has already refused a file with offenders,
             // so this is the backstop for a name that appears mid-load.
-            const SUPPORTED: [u32; 7] = TransformerModel::SUPPORTED_QUANT_TYPES;
-            if !SUPPORTED.contains(&info.tensor_type) {
-                return Err(format!(
-                    "tensor `{name}` uses GGML type {} ({}) — not supported by the GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k, q3_k). Re-quantize to a mix inside that set: `llama-quantize <src.gguf> <dst.gguf> q4_k_m` is the closest 4-bit mix (q4_K + q6_K) and stays inside it; q6_k or q8_0 also work.",
-                    info.tensor_type,
-                    crate::infer::quant::ggml_type_name(info.tensor_type)
-                ));
-            }
+            Self::gate_quant_type(name, info.tensor_type)?;
             Ok(TensorView {
                 offset: info.offset,
                 size_bytes: info.size_bytes,
@@ -815,23 +953,75 @@ impl TransformerModel {
         note_type(token_embd.tensor_type, &token_embd.shape);
         note_type(output.tensor_type, &output.shape);
 
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        // FUSED projections (phi3): one attn_qkv instead of attn_q/_k/_v, and
+        // an ffn_up that holds gate+up. See `fused_row_views` for why the
+        // split is a row RANGE and not a de-interleave. Split views keep
+        // every kernel, the GPU weight offsets and the streaming prefetcher
+        // untouched — they only ever see a smaller tensor that starts later
+        // in the same mmap.
+        let mut fused_qkv_layers = 0usize;
+        let mut fused_ffn_layers = 0usize;
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let attn_norm = find_tensor(&format!("blk.{i}.attn_norm.weight"))?;
-            let attn_q = find_tensor(&format!("blk.{i}.attn_q.weight"))?;
-            let attn_k = find_tensor(&format!("blk.{i}.attn_k.weight"))?;
-            let attn_v = find_tensor(&format!("blk.{i}.attn_v.weight"))?;
+            let qkv_name = format!("blk.{i}.attn_qkv.weight");
+            let (attn_q, attn_k, attn_v) = match find_opt_tensor(&qkv_name) {
+                Some(fused) if !gguf.tensors.contains_key(&format!("blk.{i}.attn_q.weight")) => {
+                    Self::gate_quant_type(&qkv_name, fused.tensor_type)?;
+                    let v = Self::fused_row_views(&fused, dim, &[q_dim, kv_dim, kv_dim])
+                        .map_err(|e| format!("{qkv_name}: {e}"))?;
+                    fused_qkv_layers += 1;
+                    (v[0].clone(), v[1].clone(), v[2].clone())
+                }
+                _ => (
+                    find_tensor(&format!("blk.{i}.attn_q.weight"))?,
+                    find_tensor(&format!("blk.{i}.attn_k.weight"))?,
+                    find_tensor(&format!("blk.{i}.attn_v.weight"))?,
+                ),
+            };
             let attn_output = find_tensor(&format!("blk.{i}.attn_output.weight"))?;
 
-            let attn_q_bias = find_opt_tensor(&format!("blk.{i}.attn_q.bias"));
-            let attn_k_bias = find_opt_tensor(&format!("blk.{i}.attn_k.bias"));
-            let attn_v_bias = find_opt_tensor(&format!("blk.{i}.attn_v.bias"));
+            // phi3 ships no attention biases at all; a fused qkv BIAS, when a
+            // checkpoint has one, is the same row stack over f32 and splits
+            // the same way.
+            let (attn_q_bias, attn_k_bias, attn_v_bias) = match find_opt_tensor(&format!("blk.{i}.attn_qkv.bias")) {
+                Some(fused) if !gguf.tensors.contains_key(&format!("blk.{i}.attn_q.bias")) => {
+                    let v = Self::fused_row_views(&fused, 1, &[q_dim, kv_dim, kv_dim])
+                        .map_err(|e| format!("blk.{i}.attn_qkv.bias: {e}"))?;
+                    (Some(v[0].clone()), Some(v[1].clone()), Some(v[2].clone()))
+                }
+                _ => (
+                    find_opt_tensor(&format!("blk.{i}.attn_q.bias")),
+                    find_opt_tensor(&format!("blk.{i}.attn_k.bias")),
+                    find_opt_tensor(&format!("blk.{i}.attn_v.bias")),
+                ),
+            };
             let attn_q_norm = find_opt_tensor(&format!("blk.{i}.attn_q_norm.weight"));
             let attn_k_norm = find_opt_tensor(&format!("blk.{i}.attn_k_norm.weight"));
 
             let ffn_norm = find_tensor(&format!("blk.{i}.ffn_norm.weight"))?;
-            let ffn_gate = find_tensor(&format!("blk.{i}.ffn_gate.weight"))?;
-            let ffn_up = find_tensor(&format!("blk.{i}.ffn_up.weight"))?;
+            let ffn_gate_name = format!("blk.{i}.ffn_gate.weight");
+            let ffn_up_name = format!("blk.{i}.ffn_up.weight");
+            let (ffn_gate, ffn_up) = match find_opt_tensor(&ffn_up_name) {
+                // Fused gate+up: gate is the FIRST half of the rows, up the
+                // second (HF chunks gate_up_proj that way; ggml_swiglu reads
+                // the first half as the silu input). Detected by the double-
+                // wide row count, not by the name alone, so a genuinely
+                // separate-gate file can never be mis-split.
+                Some(up) if !gguf.tensors.contains_key(&ffn_gate_name)
+                    && up.shape.len() == 2
+                    && up.shape[1] == 2 * hidden_dim =>
+                {
+                    Self::gate_quant_type(&ffn_up_name, up.tensor_type)?;
+                    let v = Self::fused_row_views(&up, dim, &[hidden_dim, hidden_dim])
+                        .map_err(|e| format!("{ffn_up_name} (fused gate|up): {e}"))?;
+                    fused_ffn_layers += 1;
+                    (v[0].clone(), v[1].clone())
+                }
+                _ => (find_tensor(&ffn_gate_name)?, find_tensor(&ffn_up_name)?),
+            };
             let ffn_down = find_tensor(&format!("blk.{i}.ffn_down.weight"))?;
 
             layers.push(LayerWeights {
@@ -852,9 +1042,16 @@ impl TransformerModel {
             });
         }
 
-        let q_dim = n_heads * head_dim;
-        let kv_dim = n_kv_heads * head_dim;
         let kv_cache_size = n_layers * cache_seq_len * kv_dim;
+
+        if fused_qkv_layers > 0 || fused_ffn_layers > 0 {
+            eprintln!(
+                "[gguf] {arch}: FUSED tensors split by row range — attn_qkv → Q[{q_dim}] K[{kv_dim}] V[{kv_dim}] rows on {fused_qkv_layers}/{n_layers} layers, ffn_up → gate[{hidden_dim}] up[{hidden_dim}] rows on {fused_ffn_layers}/{n_layers} layers{}",
+                if fused_qkv_layers == 0 || fused_ffn_layers == 0 {
+                    " (only the fused sites the file actually carries)"
+                } else { "" }
+            );
+        }
 
         for l in &layers {
             for tv in [&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output, &l.ffn_gate, &l.ffn_up, &l.ffn_down] {
@@ -889,7 +1086,14 @@ impl TransformerModel {
                 // GPU decode forward 18.6ms (kernels 15.2 + host 3.3) vs CPU 25.6ms.
                 // SOFUU_GPU_DECODE=0 opts out.
                 && std::env::var("SOFUU_GPU_DECODE").map(|v| v != "0").unwrap_or(true)
-                && gguf.resident.is_none();
+                && gguf.resident.is_none()
+                // A custom rope profile (phi3 partial rotary / longrope, llama3
+                // frequency scaling) is not implemented in the Metal rope
+                // dispatch or the batched C rope+KV kernels. Arming the client
+                // would run this model's angles through a full-width plain rope
+                // and produce fluent, wrong text — so the whole GPU route stays
+                // off and the model runs on the CPU reference path.
+                && !config.rope_custom;
             if wanted {
                 GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm)
             } else {
@@ -1035,11 +1239,21 @@ impl TransformerModel {
     /// Gemma 2 alternates: even layers (0, 2, 4...) use local sliding window (4096),
     /// while odd layers (1, 3, 5...) use full global attention (sliding_window = 0).
     /// Mistral and other models apply uniform sliding window across all layers.
+    /// The speculative tree ropes its verify batch with the plain C kernel
+    /// (tree_rope: full-width, no factors, no mscale). A custom rope profile
+    /// makes that a silently different model at verify time, which would leak
+    /// into greedy output through draft acceptance — so the tree is refused.
+    #[inline]
+    pub fn spec_decode_supported(&self) -> bool {
+        !self.config.rope_custom
+    }
+
     #[inline]
     /// Default speculative tree size for this model. q6_K projections have no
     /// 8-act panel GEMM, so a rows=5 draft (batch 8) is compute-bound; device
     /// sweeps on the Pi put rows=3 (batch 4) ~7% ahead there, while q4_K and
     /// q8_0 models prefer the rows=5 tree.
+
     #[inline]
     pub fn spec_rows_default(&self) -> usize {
         if self.dominant_proj_type == GGML_TYPE_Q6_K { 3 } else { 5 }
@@ -1095,6 +1309,77 @@ impl TransformerModel {
         gguf.mmap
             .slice(start, tv.size_bytes)
             .expect("valid tensor slice")
+    }
+
+    /// The quant-type gate every projection tensor must pass at load.
+    /// Split out of `find_tensor` so a FUSED tensor (phi3's attn_qkv /
+    /// ffn_up) is gated before it is split into views — the split itself
+    /// would otherwise hand the forward path a type it cannot decode.
+    fn gate_quant_type(name: &str, tensor_type: u32) -> Result<(), String> {
+        const SUPPORTED: [u32; 7] = TransformerModel::SUPPORTED_QUANT_TYPES;
+        if !SUPPORTED.contains(&tensor_type) {
+            return Err(format!(
+                "tensor `{name}` uses GGML type {} ({}) — not supported by the GGUF backend (supported: f32, f16, q4_0, q8_0, q4_k, q6_k, q3_k). Re-quantize to a mix inside that set: `llama-quantize <src.gguf> <dst.gguf> q4_k_m` is the closest 4-bit mix (q4_K + q6_K) and stays inside it; q6_k or q8_0 also work.",
+                tensor_type,
+                crate::infer::quant::ggml_type_name(tensor_type)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Split a FUSED projection tensor into contiguous row-block views.
+    ///
+    /// phi3 checkpoints store one `attn_qkv` instead of `attn_q/_k/_v` and one
+    /// `ffn_up` holding gate+up. Both are plain row stacks of the same
+    /// quantized rows — output channel `r` of the fused tensor is output
+    /// channel `r` of whichever projection owns that row — so the three (or
+    /// two) logical tensors are `[start_row, start_row + rows)` RANGES of the
+    /// file bytes with no re-quantization and no per-element work. That is
+    /// exactly how llama.cpp reads the same files (build_qkv slices the fused
+    /// qkv output into Q | K | V in that order; ggml_swiglu takes the FIRST
+    /// half as the gate and the second as the up branch), and how HF chunks
+    /// Phi-3's `gate_up_proj` (`chunk(2, dim=-1)`).
+    ///
+    /// `groups` are the row counts in that reference order. The split is
+    /// REFUSED unless the arithmetic closes exactly: `sum(groups)` rows of
+    /// `cols` values must equal the tensor's declared byte count at this
+    /// quant type's row size. A fused tensor whose layout does not close is a
+    /// different packing (per-channel interleave, per-head interleave, …) and
+    /// guessing it would silently corrupt every projection.
+    pub(crate) fn fused_row_views(
+        base: &TensorView,
+        cols: usize,
+        groups: &[usize],
+    ) -> Result<Vec<TensorView>, String> {
+        let rows: usize = groups.iter().copied().sum();
+        // GGUF dims are [ne0 = row length, ne1 = rows].
+        if base.shape.len() == 2 && (base.shape[0] != cols || base.shape[1] != rows) {
+            return Err(format!(
+                "fused tensor is {:?} but the split wants [{cols}, {rows}] = {groups:?} rows of {cols} values",
+                base.shape
+            ));
+        }
+        let row_bytes = type_row_size(base.tensor_type, cols);
+        let want = row_bytes.saturating_mul(rows);
+        if row_bytes == 0 || want != base.size_bytes {
+            return Err(format!(
+                "{rows} rows x {row_bytes} B/row ({}, {cols} values per row) = {want} B, file declares {} B — refusing to guess the row split",
+                crate::infer::quant::ggml_type_name(base.tensor_type),
+                base.size_bytes
+            ));
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        let mut off = base.offset;
+        for &g in groups {
+            out.push(TensorView {
+                offset: off,
+                size_bytes: row_bytes * g,
+                tensor_type: base.tensor_type,
+                shape: vec![cols, g],
+            });
+            off += row_bytes * g;
+        }
+        Ok(out)
     }
 
     /// Reset KV cache for a fresh conversation/prompt.
@@ -1698,19 +1983,21 @@ impl TransformerModel {
 
             // ── RoPE & KV-Cache Storage for batch ────────────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            if !self.rope_freq_adjust.is_empty() {
-                // P1b: llama3-scaled rope — the batched C kernel takes only a
-                // scalar base, so rope each row here (rope is ~1% of a prefill
-                // step) and store the rows to the cache ourselves.
+            if self.config.rope_custom {
+                // P1b: llama3-scaled rope, and phi3 longrope — the batched C
+                // kernel takes only a scalar base and rotates whole heads, so
+                // rope each row here (rope is ~1% of a prefill step) and store
+                // the rows to the cache ourselves.
+                let (n_rot, mscale) = (self.config.rope_n_rot, self.config.rope_mscale);
                 for b in 0..b_size {
                     let p = start_pos + b;
-                    super::quant::rope_style_adjust(
+                    super::quant::rope_style_ex(
                         &mut self.q_batch[b * q_dim..(b + 1) * q_dim],
-                        n_heads, head_dim, p, rope_freq_base, rope_mode, &self.rope_freq_adjust,
+                        n_heads, head_dim, n_rot, p, rope_freq_base, rope_mode, &self.rope_freq_adjust, mscale,
                     );
-                    super::quant::rope_style_adjust(
+                    super::quant::rope_style_ex(
                         &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim],
-                        n_kv_heads, head_dim, p, rope_freq_base, rope_mode, &self.rope_freq_adjust,
+                        n_kv_heads, head_dim, n_rot, p, rope_freq_base, rope_mode, &self.rope_freq_adjust, mscale,
                     );
                     let cache_pos = p % max_seq_len;
                     for kv_h in 0..n_kv_heads {
@@ -2668,6 +2955,7 @@ impl TransformerModel {
                 && !self.dynamic_ffn.enabled
                 && self.kivi.is_none()
                 && self.rope_freq_adjust.is_empty()
+                && !self.config.rope_custom
             {
                 if self.execute_layers_gpu(pos, start_layer, end_layer) {
                     return true;
@@ -2804,9 +3092,13 @@ impl TransformerModel {
 
             // ── RoPE (Rotary Position Embeddings) ───────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            if !self.rope_freq_adjust.is_empty() {
-                super::quant::rope_style_adjust(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust);
-                super::quant::rope_style_adjust(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust);
+            if self.config.rope_custom {
+                // phi3 longrope (partial rotary + per-pair factors + mscale) and
+                // llama3 frequency scaling both land here; the C kernel below
+                // takes only a scalar base and rotates whole heads.
+                let (n_rot, mscale) = (self.config.rope_n_rot, self.config.rope_mscale);
+                super::quant::rope_style_ex(&mut self.q, n_heads, head_dim, n_rot, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust, mscale);
+                super::quant::rope_style_ex(&mut self.k, n_kv_heads, head_dim, n_rot, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust, mscale);
             } else {
                 rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
                 rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
@@ -7413,6 +7705,96 @@ mod tests {
             tensors,
             data_offset: 0,
         }
+    }
+
+    /// Fused-tensor split: the ROW RANGE rule, pinned on a synthetic q8_0
+    /// stack so a future "cleanup" cannot reorder or interleave Q/K/V (or
+    /// gate/up) into a silently wrong model. Row r of the fused tensor is
+    /// output channel r of whichever projection owns it; every view must
+    /// start at exactly `rows_before * type_row_size` bytes in and be
+    /// exactly its own rows long.
+    #[test]
+    fn fused_row_views_split_qkv_and_gate_up_by_row_blocks() {
+        // 32-value rows => one q8_0 block (2-byte f16 scale + 32 i8) = 34 B.
+        let cols = 32usize;
+        let row_bytes = super::super::quant::type_row_size(GGML_TYPE_Q8_0, cols);
+        assert_eq!(row_bytes, 34);
+        let (q_rows, kv_rows) = (6usize, 2usize);
+        let total_rows = q_rows + 2 * kv_rows;
+        // Distinct f16 scale per row: the scale word IS the row's identity.
+        // bias 15 => exponent field 15 + r, i.e. the exact power of two 2^r.
+        let mut buf = vec![0u8; total_rows * row_bytes];
+        for r in 0..total_rows {
+            let d_bits: u16 = ((15 + r) as u16) << 10; // f16 1.0, 2.0, 4.0, …
+            buf[r * row_bytes] = (d_bits & 0xff) as u8;
+            buf[r * row_bytes + 1] = (d_bits >> 8) as u8;
+        }
+        let fused = TensorView {
+            offset: 4096,
+            size_bytes: buf.len(),
+            tensor_type: GGML_TYPE_Q8_0,
+            shape: vec![cols, total_rows],
+        };
+        let views = TransformerModel::fused_row_views(&fused, cols, &[q_rows, kv_rows, kv_rows]).unwrap();
+        assert_eq!(views.len(), 3);
+        for (v, &rows) in views.iter().zip([q_rows, kv_rows, kv_rows].iter()) {
+            assert_eq!(v.tensor_type, GGML_TYPE_Q8_0);
+            assert_eq!(v.shape, vec![cols, rows]);
+            assert_eq!(v.size_bytes, row_bytes * rows);
+        }
+        // Contiguous, in order, starting at the fused tensor's own offset.
+        assert_eq!(views[0].offset, 4096);
+        assert_eq!(views[1].offset, 4096 + row_bytes * q_rows);
+        assert_eq!(views[2].offset, 4096 + row_bytes * (q_rows + kv_rows));
+        assert_eq!(views[2].offset + views[2].size_bytes - 4096, fused.size_bytes);
+        // And the views really land on the right rows: row 0 of each view
+        // carries the scale of fused row 0 / q_rows / q_rows + kv_rows.
+        let scale_at = |off: usize| -> f32 {
+            let bits = u16::from_le_bytes([buf[off - 4096], buf[off - 4096 + 1]]);
+            super::super::quant::f16_to_f32(bits)
+        };
+        let pow2 = |r: usize| 2f32.powi(r as i32);
+        assert_eq!(scale_at(views[0].offset), pow2(0));
+        assert_eq!(scale_at(views[1].offset), pow2(q_rows));
+        assert_eq!(scale_at(views[2].offset), pow2(q_rows + kv_rows));
+
+        // Fused gate+up: gate is the first half, up the second.
+        let (gate_rows, up_rows) = (4usize, 4usize);
+        let mut buf2 = vec![0u8; (gate_rows + up_rows) * row_bytes];
+        for r in 0..gate_rows + up_rows {
+            let d_bits: u16 = ((15 + r) as u16) << 10;
+            buf2[r * row_bytes] = (d_bits & 0xff) as u8;
+            buf2[r * row_bytes + 1] = (d_bits >> 8) as u8;
+        }
+        let fused2 = TensorView {
+            offset: 0,
+            size_bytes: buf2.len(),
+            tensor_type: GGML_TYPE_Q8_0,
+            shape: vec![cols, gate_rows + up_rows],
+        };
+        let ffn = TransformerModel::fused_row_views(&fused2, cols, &[gate_rows, up_rows]).unwrap();
+        assert_eq!(ffn[0].size_bytes, row_bytes * gate_rows);
+        assert_eq!(ffn[1].offset, row_bytes * gate_rows);
+        let scale2 = |v: &TensorView| -> f32 {
+            let b = u16::from_le_bytes([buf2[v.offset], buf2[v.offset + 1]]);
+            super::super::quant::f16_to_f32(b)
+        };
+        assert_eq!(scale2(&ffn[0]), pow2(0), "gate starts at row 0");
+        assert_eq!(scale2(&ffn[1]), pow2(gate_rows), "up starts right after the gate rows");
+
+        // A layout that does NOT close must be refused, never guessed: here the
+        // tensor holds one row less than the split claims.
+        let short = TensorView {
+            size_bytes: fused.size_bytes - row_bytes,
+            ..fused.clone()
+        };
+        let err = TransformerModel::fused_row_views(&short, cols, &[q_rows, kv_rows, kv_rows])
+            .err()
+            .expect("a byte count that does not close must be refused");
+        assert!(err.contains("refusing to guess the row split"), "unexpected error: {err}");
+        // …and a shape that disagrees with the row arithmetic is refused too.
+        let wrong_shape = TensorView { shape: vec![cols, total_rows + 1], ..fused.clone() };
+        assert!(TransformerModel::fused_row_views(&wrong_shape, cols, &[q_rows, kv_rows, kv_rows]).is_err());
     }
 
     #[test]

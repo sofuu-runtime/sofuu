@@ -1443,6 +1443,9 @@ impl BlockGraphModel {
             kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: false,
+            rope_n_rot: 0,
+            rope_mscale: 1.0,
+            rope_custom: false,
         };
 
         let graph_config = BlockGraphConfig {

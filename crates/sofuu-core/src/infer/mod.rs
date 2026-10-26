@@ -340,6 +340,18 @@ impl InferModel {
         }
     }
 
+    /// Whether the speculative TREE may run on this model. It ropes the whole
+    /// verify batch with the plain C kernel (tree_rope), so a model with a
+    /// custom rope profile (phi3 partial rotary / longrope, llama3 scaling)
+    /// would verify its drafts at wrong angles — greedy output would then
+    /// depend on drafts instead of being the serial answer.
+    pub fn spec_decode_supported(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.spec_decode_supported(),
+            _ => true,
+        }
+    }
+
     /// Per-model speculative tree size (see TransformerModel::spec_rows_default).
     pub fn spec_rows_default(&self) -> usize {
         match &self.backend {
@@ -1297,7 +1309,11 @@ impl InferEngine {
         // its threshold is 1.15 tokens/step. Timing-based switching is forbidden (it would make
         // greedy output depend on machine noise), so the default is OFF and constant.
         // SOFUU_SPEC=1 re-enables the tree.
-        let spec_wanted = std::env::var("SOFUU_SPEC").map(|v| v == "1").unwrap_or(false);
+        // A custom rope profile (phi3 longrope / llama3 scaling) is not
+        // implemented in the tree verify pass, so the tree is off for those
+        // models whatever SOFUU_SPEC says.
+        let spec_wanted = std::env::var("SOFUU_SPEC").map(|v| v == "1").unwrap_or(false)
+            && self.model.spec_decode_supported();
         let mut ngram_cache = if spec_wanted && options.lookahead && matches!(self.model.backend, ModelBackend::Gguf(_)) {
             let mut cache = lookahead::NgramCache::new(2048);
             cache.ingest_sequence(&input_tokens);

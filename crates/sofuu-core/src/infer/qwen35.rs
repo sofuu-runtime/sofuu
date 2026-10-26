@@ -1794,6 +1794,9 @@ impl Qwen35Model {
             kv_ring: 0,
             sliding_window: 0,
             rope_interleaved: true,
+            rope_n_rot: 0,
+            rope_mscale: 1.0,
+            rope_custom: false,
         };
 
         let kv_elems = n_attn * n_kv_heads * seq_cap * head_dim;

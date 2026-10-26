@@ -2101,18 +2101,56 @@ pub fn rope_style_adjust(
     rope_mode: i32,
     adjust: &[f32],
 ) {
-    if head_dim < 2 || adjust.is_empty() {
+    rope_style_ex(vec, n_heads, head_dim, head_dim, pos, freq_base, rope_mode, adjust, 1.0);
+}
+
+/// Generalized rope: PARTIAL rotary width + per-pair frequency factors +
+/// cos/sin amplitude scale, all in one scalar kernel so the phi3 (longrope)
+/// and llama3 (freq-scaling) profiles cannot drift apart in pairing or sign
+/// convention. Reduces to `rope_style_adjust` exactly when
+/// `n_rot == head_dim && mscale == 1.0`.
+///
+/// * `n_rot` — dims per head actually rotated. 0 or > head_dim means the
+///   whole head. phi3 stores `rope.dimension_count = 96` with head_dim 128,
+///   so the top 32 dims of every head pass through unrotated (llama.cpp's
+///   `rotate_pairs(n_dims, n_dims/2, ...)` skips them the same way) and the
+///   frequency ladder is built over 96 dims, NOT 128.
+/// * `adjust[i]` — multiplier on pair i's inverse frequency, i.e. exactly
+///   ggml's `theta / freq_factors[i0/2]` for a GGUF rope_factors table, so
+///   GGUF factors are passed as `1.0 / factor`. Missing entries are 1.0.
+/// * `mscale` — multiplies cos and sin (HF longrope `mscale`, carried in
+///   GGUF as `{arch}.rope.scaling.attn_factor`; 1.1902381 for Phi-4-mini).
+///   This scales Q and K by `mscale` through the rotation, i.e. attention
+///   logits by `mscale^2`, so ignoring it is a different model, not a
+///   rounding difference.
+pub fn rope_style_ex(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    n_rot: usize,
+    pos: usize,
+    freq_base: f32,
+    rope_mode: i32,
+    adjust: &[f32],
+    mscale: f32,
+) {
+    // 0 is the "whole head" sentinel every other backend uses (it has no
+    // partial-rotary archs); an n_rot past head_dim would read out of bounds.
+    let n_rot = if n_rot == 0 || n_rot > head_dim { head_dim } else { n_rot };
+    if head_dim < 2 || n_rot < 2 || vec.len() < n_heads * head_dim {
         return;
     }
-    let half_dim = head_dim / 2;
+    let half_dim = n_rot / 2;
     for h in 0..n_heads {
         let head = &mut vec[h * head_dim..(h + 1) * head_dim];
         for i in 0..half_dim {
-            let freq = 1.0f32 / freq_base.powf((2 * i) as f32 / head_dim as f32)
-                * adjust[i];
+            let adj = if adjust.is_empty() { 1.0f32 } else { *adjust.get(i).unwrap_or(&1.0) };
+            // Ladder over n_rot (not head_dim): ggml's
+            // powf(freq_base, -2.0f/n_dims) with n_dims = n_rot.
+            let freq = 1.0f32 / freq_base.powf((2 * i) as f32 / n_rot as f32) * adj;
             let theta = pos as f32 * freq;
-            let c = theta.cos();
-            let s = theta.sin();
+            let c = theta.cos() * mscale;
+            let s = theta.sin() * mscale;
             if rope_mode == 1 {
                 let even = 2 * i;
                 let odd = even + 1;
@@ -4062,5 +4100,54 @@ mod llama3_rope_tests {
         }
         let d = v.iter().zip(&refv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(d < 1e-6, "scaled rope diverges from reference: {d}");
+    }
+
+    /// phi3 longrope, pinned against values computed OUTSIDE this crate
+    /// (float64 reference): partial rotary (n_rot 4 of head_dim 8), per-pair
+    /// frequency factors and the cos/sin amplitude mscale all at once. If any
+    /// of the three is dropped or re-ordered this test moves.
+    #[test]
+    fn rope_style_ex_matches_partial_rotary_longrope_reference() {
+        let head_dim = 8usize;
+        let n_rot = 4usize;
+        let pos = 3usize;
+        let base = 10_000.0f32;
+        let adjust = [1.0f32, 0.25];
+        let mscale = 1.190238118171692f32;
+        let head = [0.5f32, -1.25, 2.0, 0.75, 3.0, -0.5, 1.5, -2.25];
+        let mut v = head.to_vec();
+        let mut v2 = head.to_vec();
+
+        rope_style_ex(&mut v, 1, head_dim, n_rot, pos, base, 0, &adjust, mscale);
+        rope_style_ex(&mut v2, 1, head_dim, n_rot, pos, base, 0, &adjust, mscale);
+
+        // float64 reference (kern/python/ropecalc.py, copied verbatim)
+        let want = [
+            -0.925096229f32,
+            -1.494450830,
+            -2.272670406,
+            0.881495104,
+            3.0,   // dims >= n_rot are NOT rotated
+            -0.5,
+            1.5,
+            -2.25,
+        ];
+        let d = v.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(d < 6e-6, "longrope diverges from the float64 reference: {d} ({v:?})");
+
+        // Determinism: a second call on identical input must be bit-identical.
+        assert_eq!(v, v2, "rope_style_ex is not deterministic");
+
+        // Default profile == the existing llama3 entry point, and close to the
+        // C kernel's own output (same pairing, same signs).
+        let mut a = head.to_vec();
+        let mut b = head.to_vec();
+        let mut c = head.to_vec();
+        rope_style_adjust(&mut a, 1, head_dim, pos, base, 0, &[]);
+        rope_style_ex(&mut b, 1, head_dim, head_dim, pos, base, 0, &[], 1.0);
+        rope_style(&mut c, 1, head_dim, pos, base, 0);
+        assert_eq!(a, b, "rope_style_ex(half-width default) must equal rope_style_adjust");
+        let dc = b.iter().zip(&c).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(dc < 1e-6, "custom-path rope diverges from the C kernel: {dc}");
     }
 }

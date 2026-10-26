@@ -170,7 +170,7 @@ jobs:
         run: make abi-check
 
       - name: Reference apps are public-API-only (P5)
-        run: bash scripts/check_public_api.py
+        run: python3 scripts/check_public_api.py
 
       - name: Install integrity (checksums + capabilities-vs-claim + version parity)
         run: |

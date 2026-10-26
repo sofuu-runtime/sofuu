@@ -365,21 +365,26 @@ merged registration — not done here to avoid crossing lanes.
    the machine is saturated by concurrent builds (seen once each locally;
    green on CI and when re-run alone). They are report-mode cases, but a
    future blocking flip should give them load-aware bounds.
-3. **Residual harness families** — failure injection (T2.6), the v0.2
+3. **Flip the suite to blocking** — the board is 42/0/10 and the FAIL list
+   is empty, but the runner exits 1 when cases are BLOCKED, so every CI
+   step still runs it in report mode. The flip needs a FAIL-only exit code
+   (0 with blocked>0) before `|| echo` can be removed.
+4. **Residual harness families** — failure injection (T2.6), the v0.2
    migration fixture (T4.4), an MCP fixture server (T5.6), the four-surface
    error-parity harness (T5.8), cloud+local fixtures (T6.4), and a
    behavioral C-ABI policy sample (examples/ is local-only — the S5
    create-config policy path and the capi suite carry it behaviorally).
-2. **App-lane residue from P3** — the device round-trip (T4.2) on
+5. **App-lane residue from P3** — the device round-trip (T4.2) on
    macOS+Android runners, the v0.2 migration fixture (T4.4), an MCP fixture
    server (T5.6), the four-surface error-parity harness (T5.8), the app
    stores becoming caches of `session.json` (Android `SessionMessageStore`,
    macOS), and the `/v1/*` README section.
-3. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
-   namespace collision; then matrix memory × js returns to `full`.
-4. Refresh the remaining `partial` cells (tool/usage on the app lanes) as the
+6. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
+   namespace collision; then matrix memory × js returns to `full`, and
+   verify-dist's memory row stops failing on QTSQ-bearing builds.
+7. Refresh the remaining `partial` cells (tool/usage on the app lanes) as the
    protocol work lands; several are stale in the good direction.
-5. Investigate the live FORK the gate caught (0.6B q4_K default pair, depth 32,
+8. Investigate the live FORK the gate caught (0.6B q4_K default pair, depth 32,
    `|dtop1|=0.2770`): it matches the parity ledger's known class, and the gate
    will keep it out of defaults automatically.
 

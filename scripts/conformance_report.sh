@@ -13,8 +13,26 @@ BIN="${SOFUU_BIN:-$ROOT/sofuu}"
 mkdir -p "$(dirname "$OUT")"
 
 SUITE_LOG="$(mktemp)"
-CONTRACT_LIBSOFUU="${CONTRACT_LIBSOFUU:-$ROOT/dist/libsofuu.dylib}" \
-    bash "$ROOT/scripts/contract/run_contract_tests.sh" > "$SUITE_LOG" 2>&1
+# Two case families execute only when their targets exist: T5.5 (C-ABI
+# parity — a built libsofuu) and T1.3 (the typed memory refusal — a
+# QTSQ-free binary). A release report should carry the strongest board the
+# artifact set can support, so detect both instead of leaving them BLOCKED.
+if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
+    # The runner resolves this against the repo root, so hand it the
+    # relative form.
+    for cand in dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a; do
+        if [ -f "$ROOT/$cand" ]; then CONTRACT_LIBSOFUU="$cand"; break; fi
+    done
+fi
+if [ -z "${CONTRACT_NOQTSQ_BIN:-}" ]; then
+    miss=$("$BIN" eval 'console.log((JSON.parse(sofuu.capabilities()).build.missing||[]).join(","))' 2>/dev/null | tail -1)
+    case ",$miss," in
+        *,qtsq,*) CONTRACT_NOQTSQ_BIN="$BIN" ;;
+    esac
+fi
+[ -n "${CONTRACT_LIBSOFUU:-}" ] && export CONTRACT_LIBSOFUU
+[ -n "${CONTRACT_NOQTSQ_BIN:-}" ] && export CONTRACT_NOQTSQ_BIN
+bash "$ROOT/scripts/contract/run_contract_tests.sh" > "$SUITE_LOG" 2>&1
 suite_rc=$?
 
 python3 - "$SUITE_LOG" "${SUITE_LOG}.json" "$suite_rc" <<'PY'

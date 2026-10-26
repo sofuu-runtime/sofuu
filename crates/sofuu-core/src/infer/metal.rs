@@ -69,7 +69,7 @@ impl F16Weights {
     /// Arena slot (byte offset) for one tensor, or None when it was never
     /// materialised or the shape differs.
     #[inline]
-    pub fn slot(&self, w_offset: usize, rows: usize, cols: usize) -> Option<usize> {
+    fn slot(&self, w_offset: usize, rows: usize, cols: usize) -> Option<usize> {
         match self.map.get(&w_offset) {
             Some(&(off, r, c)) if r == rows && c == cols => Some(off),
             _ => None,
@@ -1888,6 +1888,13 @@ impl MetalEngine {
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let gbs = if ms > 0.0 { (total + total / 2) as f64 / 1e9 / (ms / 1e3) } else { 0.0 };
+        // SOFUU_GPU_F16W_DRY=1 keeps the arena and its 728 MB resident but does
+        // not install the table, so every dispatch stays on q4_K. That isolates
+        // "the memory cost of the arena" from "the fp16 kernels" in one binary.
+        if std::env::var_os("SOFUU_GPU_F16W_DRY").is_some() {
+            eprintln!("[f16w] DRY run: arena built, table not installed (q4_K path in charge)");
+            return Some(total);
+        }
         let _ = self.f16w.set(F16Weights { buf, map, bytes: total });
         eprintln!(
             "[f16w] materialised {} q4_K matrices -> {} MB fp16 arena in {ms:.1} ms ({} GB/s effective, cap {cap_mb} MB)",

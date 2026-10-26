@@ -3930,6 +3930,10 @@ mod lfm2_batched_prefill_tests {
     }
 
     #[test]
+    // Same local-checkpoint class as the mlx4 sibling below: the reference
+    // path is a developer Downloads directory, so it can never pass on a CI
+    // runner. It was the only red test in the P5 matrix run.
+    #[ignore = "needs the local liquid-350 reference model; run explicitly"]
     fn batched_prefill_matches_per_token_bf16() {
         compare_paths("/Users/priyanshuboruah/Downloads/liqiud-350", 8);
     }

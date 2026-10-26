@@ -2391,6 +2391,30 @@ impl MetalEngine {
             note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_multi");
             return false;
         }
+        // Held at the SUPER-BLOCK floor for q8_0 — measured, not inherited.
+        // gemm_q8_0_multi answers WRONG for a column count that is not a
+        // multiple of 256, which is exactly the shape the previous round's
+        // 256 -> 32 relaxation let in. SmolLM2 (cols 960, 30 eight-float
+        // blocks) on the prefill-GEMM route, one fused section table at a
+        // time, same binary, 39 tokens, max|dlogit| against the per-tensor
+        // walk: fused q/k/v through THIS entry only 10.98 (argmax 21745 vs
+        // 2067), fused gate/up only 15.94 (argmax 365), both-refused 0.0.
+        // The 64-row matrix-tile twin (batch_gguf_gemm_mma64_multi) reads the
+        // same 30 blocks and lands 0.0085 from that reference, so the block
+        // arithmetic is fine and this kernel is not. Until its row/section
+        // cursor is root-caused, refuse the shape LOUDLY: the caller then
+        // walks one dispatch per tensor (correct; one extra dispatch per
+        // layer) instead of returning a 10-16-logit-wrong answer in silence.
+        if ty == GGML_TYPE_Q8_0 && cols % 256 != 0 {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[gemm-floor] batch_gguf_gemm_multi refused: ty={ty} cols={cols} (gemm_q8_0_multi is wrong off the 256-value super-block grid); that section group now walks one dispatch per tensor"
+                );
+            }
+            return false;
+        }
         let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gguf_gemm_multi(
@@ -9636,6 +9660,38 @@ fn gemm_cols_ok_accepts_the_fleet_widths_and_refuses_every_tail() {
     assert!(!gemm_cols_ok(GGML_TYPE_Q4_K, 3200));
     assert!(!gemm_cols_ok(GGML_TYPE_Q6_K, 2080));
     assert!(!gemm_cols_ok(GGML_TYPE_F16, 2048));
+}
+
+/// The multi-section q8_0 GEMM (`gemm_q8_0_multi`) is held at the 256-value
+/// super-block floor even though the shared table says q8_0 needs only 32: it
+/// was measured WRONG at cols=960 (SmolLM2), the one fleet width where the two
+/// floors differ. On the prefill-GEMM route, 39 tokens, same binary, against the
+/// per-tensor walk that the hold falls back to: fused q/k/v through this entry
+/// only -> 10.98 max|dlogit| (argmax 21745 vs 2067), fused gate/up only -> 15.94
+/// (argmax 365), both refused -> 0.00. The mma64 twin reads the same 30 blocks
+/// and lands 0.0085 from that reference, so the block arithmetic is fine and
+/// this kernel is not. Relaxing this hold again REQUIRES a numeric receipt at a
+/// cols%256 != 0 width; the pin below fails the moment it is dropped in silence.
+#[test]
+fn gemm_q8_0_multi_entry_is_held_at_the_super_block_floor() {
+    const SRC: &str = include_str!("metal.rs");
+    let start = SRC
+        .find("pub fn batch_gguf_gemm_multi(")
+        .expect("batch_gguf_gemm_multi missing");
+    let rest = &SRC[start..];
+    let end = rest[1..]
+        .find("\n    pub fn ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("ty == GGML_TYPE_Q8_0 && cols % 256 != 0"),
+        "batch_gguf_gemm_multi must refuse q8_0 off the 256-value super-block grid"
+    );
+    assert!(
+        body.contains("[gemm-floor] batch_gguf_gemm_multi refused"),
+        "the hold must print, not fall through silently"
+    );
 }
 
 /// The kernel that carries a non-q4_K chain projection must stride a weight

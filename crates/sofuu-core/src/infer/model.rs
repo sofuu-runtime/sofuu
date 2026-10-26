@@ -39,6 +39,26 @@ fn kv16_store(shadow: Option<&mut AnonBuffer>, slot: usize, src: &[f32]) {
 /// Spark/Llama-1B neutral). Mostly GEMM-bucket time — attention is untouched.
 pub const DEFAULT_PREFILL_BATCH: usize = 128;
 
+/// One softmax chunk of the b4 prefill attention family — `ATTN_CHUNK` in
+/// src/metal/kernels.metal. `llama_attn_1c_b4` keeps its softmax weight table
+/// in a threadgroup `float tw[ATTN_CHUNK]` addressed by the row's ABSOLUTE
+/// position, so it computes the right answer only while every row of the pass
+/// sits inside the first chunk (max position <= 127). Past that the writes walk
+/// off the table and the reads come back as something else: a silently wrong
+/// softmax, not a slow one.
+pub const ATTN_SOFTMAX_CHUNK: usize = 128;
+
+/// True when a prefill pass of `rows` rows starting at `start_pos` may use the
+/// fused one-chunk attention (`llama_attn_1c_b4`). `false` means the split
+/// part+fin pair (which walks `ceil((pos+1)/ATTN_CHUNK)` chunks through meta)
+/// owns the pass. EVERY `batch_llama_attn_1c_b4` call site must go through this
+/// gate — the kernel itself cannot see the positions, and the .mm dispatch has
+/// no way to refuse.
+#[inline]
+pub fn attn_1c_valid(start_pos: usize, rows: usize) -> bool {
+    rows > 0 && start_pos + rows <= ATTN_SOFTMAX_CHUNK
+}
+
 /// Cap on tokens per prefill batch chunk. Overridable at process start with
 /// `SOFUU_PREFILL_BATCH` (snapped to a multiple of 4 so the tiled GEMM path
 /// stays eligible); read once per process.
@@ -5679,7 +5699,7 @@ impl TransformerModel {
             // `llama_attn_1c_b4` is WRONG for pos >= 128 (LEDGER #64/#65: it agrees with
             // the split pair only below one 128-position chunk). Gate it to the range it
             // is actually valid for rather than letting it corrupt long prompts.
-            let one_chunk_pos = start_pos + b - 1 < 128;
+            let one_chunk_pos = attn_1c_valid(start_pos, b);
             // row_attn already wrote slots.ao: nothing below may run for
             // this layer, or it would overwrite a finished chunk.
             let fused = row_attn || flashed || (fuse_on
@@ -6490,17 +6510,29 @@ impl TransformerModel {
                     head_dim as u32, n_heads as u32, n_kv_heads as u32,
                     max_seq_len as u32,
                 );
-                let fused = flashed || (g.engine.batch_llama_attn_1c_b4(
-                        pbuf, pslots.qa,
-                        &g.k_buf, kc_layer,
-                        &g.v_buf, kc_layer,
-                        pbuf, pslots.ao,
-                        pbuf, pslots.posb,
-                        b,
-                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                        max_seq_len as u32,
-                        Some((pbuf, pslots.rope)),
-                    ));
+                // SGate: `llama_attn_1c_b4` is valid for ONE 128-position softmax
+                // chunk only (its threadgroup weight table is tw[ATTN_CHUNK] indexed
+                // by the ABSOLUTE position; kernels.metal llama_attn_1c_b4). This
+                // route used to dispatch it unconditionally, so EVERY pass past
+                // position 127 — the second 128-row chunk of a long prompt, or a
+                // tail chunk that starts at 128 — read its softmax weights from
+                // off the end of that table and returned 10-25-logit-wrong logits
+                // with a changed argmax and no warning. Same gate the chain route
+                // has carried since LEDGER #64/#65.
+                let one_chunk_pos = attn_1c_valid(start_pos, b);
+                let fused = flashed
+                    || (one_chunk_pos
+                        && g.engine.batch_llama_attn_1c_b4(
+                            pbuf, pslots.qa,
+                            &g.k_buf, kc_layer,
+                            &g.v_buf, kc_layer,
+                            pbuf, pslots.ao,
+                            pbuf, pslots.posb,
+                            b,
+                            head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                            max_seq_len as u32,
+                            Some((pbuf, pslots.rope)),
+                        ));
                 if !fused {
                     g.engine.batch_llama_attn_part_b4(
                         pbuf, pslots.qa,
@@ -7378,6 +7410,110 @@ mod tests {
         assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 1), 4096);
         assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 2), 4096);
         assert_eq!(TransformerModel::calc_layer_sliding_window(false, 4096, 3), 4096);
+    }
+
+    /// SGate (TASK 1): the fused one-chunk attention `llama_attn_1c_b4` is valid
+    /// for exactly ONE 128-position softmax chunk. Its softmax table is a
+    /// threadgroup `float tw[ATTN_CHUNK]` addressed by the row's ABSOLUTE
+    /// position, so a pass whose rows reach past position 127 writes off the end
+    /// of that table and reads the weights back from somewhere else. Nothing
+    /// prints: the answer is simply 10-25 logits (and an argmax) wrong.
+    ///
+    /// The prefill-GEMM route used to dispatch it unconditionally — one
+    /// `flashed || 1c(...)` with no range gate — so EVERY pass past position
+    /// 127 (the second 128-row chunk of a long prompt, or a tail chunk that
+    /// starts at 128) was silently wrong. Boundaries below are the lengths that
+    /// were measured: 128 tokens (one chunk) fine; 137/148/160/255/256/257/383/
+    /// 384/385/637/1454 wrong until the gate went in.
+    #[test]
+    fn attn_1c_gate_is_exactly_one_softmax_chunk() {
+        // Inside the first chunk: dispatched.
+        assert!(attn_1c_valid(0, 1));
+        assert!(attn_1c_valid(0, DEFAULT_PREFILL_BATCH));
+        assert!(attn_1c_valid(96, 32));
+        assert!(attn_1c_valid(127, 1));
+        // Reaching position 128 or beyond: the split part+fin pair owns the pass.
+        assert!(!attn_1c_valid(0, 129));
+        assert!(!attn_1c_valid(96, 33));
+        assert!(!attn_1c_valid(128, 1));
+        assert!(!attn_1c_valid(128, DEFAULT_PREFILL_BATCH));
+        assert!(!attn_1c_valid(256, 1));
+        assert!(!attn_1c_valid(384, 1));
+        // Every pass the 128-row top-level prefill walk produces at the lengths
+        // that were measured, including the tails (few rows, start_pos >= 128).
+        for &(start, rows) in &[
+            (0usize, 128usize),
+            (128, 128),
+            (256, 128),
+            (384, 128),
+            (1280, 128),
+            (128, 9),   // 137 tokens
+            (128, 32),  // 160 tokens
+            (256, 127), // 383 tokens
+            (0, 33),
+            (0, 96),
+        ] {
+            assert_eq!(
+                attn_1c_valid(start, rows),
+                start + rows <= ATTN_SOFTMAX_CHUNK,
+                "start={start} rows={rows}"
+            );
+        }
+        // rows == 0 never happens and must never dispatch attention.
+        assert!(!attn_1c_valid(0, 0));
+    }
+
+    /// SGate (TASK 1): the gate constant is the KERNEL's chunk, not a number
+    /// that happens to agree today — and no prefill route may dispatch
+    /// `batch_llama_attn_1c_b4` without it above the call. The kernel cannot see
+    /// the positions and the .mm dispatch cannot refuse, so this Rust-side gate
+    /// is the only thing between a long prompt and a silently wrong softmax.
+    /// Reads the source (repo precedent: the kernels.metal guards in
+    /// infer/metal.rs) so a NEW call site cannot be added ungated.
+    #[test]
+    fn every_prefill_attn_1c_dispatch_sits_behind_the_position_gate() {
+        const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+        assert_eq!(ATTN_SOFTMAX_CHUNK, 128);
+        let start = KERNELS
+            .find("kernel void llama_attn_1c_b4(")
+            .expect("llama_attn_1c_b4 missing from kernels.metal");
+        let rest = &KERNELS[start..];
+        let end = rest[1..]
+            .find("\nkernel void ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("threadgroup float tw[128]") && body.contains("tw[t] = exp("),
+            "llama_attn_1c_b4 no longer carries the absolute-position tw[128] table this gate exists for"
+        );
+        let src = include_str!("model.rs");
+        // Only the prefill code, never this test's own needle (the string below
+        // occurs in here too): everything from the first test module on is out.
+        let src = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let calls: Vec<usize> = src
+            .match_indices("g.engine.batch_llama_attn_1c_b4(")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            calls.len() >= 2,
+            "expected the chain route and the prefill-GEMM route, found {}",
+            calls.len()
+        );
+        for at in calls {
+            let fn_start = src[..at]
+                .rfind("\n    fn ")
+                .expect("a 1c dispatch outside any fn");
+            let body = &src[fn_start..at];
+            assert!(
+                body.contains("attn_1c_valid(start_pos"),
+                "ungated batch_llama_attn_1c_b4 dispatch at byte {at}: the kernel is valid for one 128-position chunk only"
+            );
+            assert!(
+                body.contains("one_chunk_pos"),
+                "the gate above the 1c dispatch at byte {at} is computed but not used"
+            );
+        }
     }
 }
 

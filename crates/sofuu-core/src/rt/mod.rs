@@ -41,6 +41,7 @@ pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP
 pub mod events; // P2 (R6): the unified event envelope + session event log
 pub mod async_contract; // P2 (R2): one error taxonomy, nested deadlines, queue bounds
+pub mod crypto; // sofuu.crypto: SHA-256/base64url + RS256 JWT verification
 pub mod session_doc; // P3 (R4): the §5.2 session document — one export/import format
 pub mod syntax; // Phase 5 (agent plan): sofuu.parse - parse-only gate for file edits
 pub mod bytecode; // Phase 6 (agent plan): sofuu.aotEval - AOT bytecode snapshots for agent scripts

@@ -23,3 +23,6 @@ libc = "0.2"
 # default-features off to keep the 5MB cap: no rayon, no extra format glue.
 png = { version = "0.17", default-features = false }
 jpeg-decoder = { version = "0.3", default-features = false }
+# sofuu.crypto: RS256 JWT verification (public-key modular exponentiation).
+# num-bigint is pure Rust and keeps the no-OpenSSL posture.
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }

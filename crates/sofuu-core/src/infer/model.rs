@@ -6759,7 +6759,12 @@ impl TransformerModel {
         };
         let gpu_did_layers = self.execute_layers_checked(pos, 0, self.config.n_layers);
         if let Some(t) = __lt {
+            // `gpu` is macOS/iOS-only (see the field); Linux/CI builds have
+            // no field to read, so the profiler reports false there.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let gpu = self.gpu.as_ref().map(|g| g.token_commit).unwrap_or(false);
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let gpu = false;
             eprintln!(
                 "[dp] pos={} layers={:.2}ms gpu_batch={}",
                 pos,

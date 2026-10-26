@@ -7199,6 +7199,25 @@ template [[host_name("attn_gqa_r2_nr2_rg16")]]    kernel void llama_attn_pre_row
 template [[host_name("attn_gqa_r2_nr4_rg32")]]    kernel void llama_attn_pre_row_gqa<2, 4, 32, 0>(PRE_GQA_ARGS); //  256
 template [[host_name("attn_gqa_r2_nr1_rg32_pf")]] kernel void llama_attn_pre_row_gqa<2, 1, 32, 1>(PRE_GQA_ARGS); // 1024
 template [[host_name("attn_gqa_r4_nr1_rg16")]]    kernel void llama_attn_pre_row_gqa<4, 1, 16, 0>(PRE_GQA_ARGS); //  512
+// ── generalised shapes: every other ratio the fleet actually ships ─────────
+// The kernel body is ratio- and NR-generic; only the (R, NR, RG) triple is
+// compile-time. These entries are what let a NON-2:1 model use the paired
+// K/V stream at all - before them a 4:1 / 3:1 / 8:1 model fell through to the
+// per-head kernel and streamed one K/V pair per (row, head).
+//   r4_nr2_rg16: 4:1 at 256 threads, 16 rows/threadgroup, 8 warps of 2 rows -
+//                the shape that fits a 384-thread maxTotalThreadsPerThreadgroup
+//                ceiling, where the 512-thread r4_nr1_rg16 cannot be dispatched.
+//   r4_nr4_rg32: 4:1 with 4 rows per warp (4 rows x 4 heads per K/V load).
+//   r3_*:        3:1 (SmolLM2 15/5, Phi-4-mini 24/8).
+//   r8_nr1_rg8:  8:1 (Sharp-MiniCPM 16/2) - 8 q heads per warp-key.
+//   r1_nr2_rg32: 1:1 (no K/V sharing, row-grouped only); OFF by default, see
+//                the shape table in metal_engine.mm.
+template [[host_name("attn_gqa_r4_nr2_rg16")]]    kernel void llama_attn_pre_row_gqa<4, 2, 16, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r4_nr4_rg32")]]    kernel void llama_attn_pre_row_gqa<4, 4, 32, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r3_nr1_rg16")]]    kernel void llama_attn_pre_row_gqa<3, 1, 16, 0>(PRE_GQA_ARGS); //  512
+template [[host_name("attn_gqa_r3_nr2_rg16")]]    kernel void llama_attn_pre_row_gqa<3, 2, 16, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r8_nr1_rg8")]]     kernel void llama_attn_pre_row_gqa<8, 1,  8, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r1_nr2_rg32")]]    kernel void llama_attn_pre_row_gqa<1, 2, 32, 0>(PRE_GQA_ARGS); //  512
 
 // Split-K twins of the shipped r2/nr2/rg32 shape (512 threads, same register
 // footprint as attn_gqa_r2_nr2_rg32: the slice index rides grid z, not the

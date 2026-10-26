@@ -318,6 +318,20 @@ int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q_buf, size_t q_offse
 int sofuu_metal_batch_llama_attn_row(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_llama_attn_w32_out(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
+
+// GQA attention shape table, GPU-free views (kernels.metal llama_attn_pre_row_gqa).
+// sofuu_metal_attn_gqa_pick is the SAME rule the dispatcher uses to choose a
+// (R, rows-per-threadgroup) form for n_heads/n_kv_heads == ratio: bit i of
+// avail_mask is set when shape i has a live pipeline, and -1 means the per-head
+// kernel owns the chunk. The accessors expose the table so a test can assert
+// every selectable shape fits a given maxTotalThreadsPerThreadgroup ceiling and
+// that a ratio with no form is never dispatched.
+int sofuu_metal_attn_gqa_pick(uint32_t ratio, uint32_t avail_mask, int allow_opt_in);
+uint32_t sofuu_metal_attn_gqa_count(void);
+uint32_t sofuu_metal_attn_gqa_threads(int idx);
+uint32_t sofuu_metal_attn_gqa_rg(int idx);
+uint32_t sofuu_metal_attn_gqa_ratio(int idx);
+int sofuu_metal_attn_gqa_last(void);
 int sofuu_metal_batch_gguf_gemv_q4k_v4(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 int sofuu_metal_batch_gguf_gemv_q4k_v3(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);
 int sofuu_metal_batch_gguf_gemv_q4k_v2(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols);

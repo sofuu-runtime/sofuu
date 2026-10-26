@@ -9,6 +9,94 @@
 #include <iostream>
 #include <unistd.h>
 
+// ── GQA attention shape table ───────────────────────────────────────────────
+// One entry per compile-time (R, NR, RG) instantiation of
+// llama_attn_pre_row_gqa. R is the q-heads-per-kv-head ratio the kernel
+// hard-codes, rg the rows per threadgroup and threads = (rg/nr)*32 after the
+// kernel rows-per-warp. Entries 0..4 are the shipped 2:1 shapes and keep the
+// SOFUU_ATTN_GQA=1..5 meaning they always had; entries 5.. are the other
+// ratios the model fleet actually ships, so a 4:1 / 3:1 / 8:1 model can use
+// the paired K/V stream instead of the per-head kernel.
+//
+// sofuu_attn_gqa_pick is the single selection rule and it is pure, so the
+// shape table is testable without a GPU (see the Rust tests).
+#define SOFUU_GQA_N 12
+struct SofuuGqaShape {
+    const char *name;
+    uint32_t ratio;    // n_heads / n_kv_heads the kernel R must equal
+    uint32_t rg;       // rows per threadgroup
+    uint32_t threads;  // threads per threadgroup (checked against the pipeline)
+    uint32_t opt_in;   // 1 => only under SOFUU_ATTN_GQA_ALL=1 (unmeasured shape)
+};
+static const SofuuGqaShape k_sofuu_gqa[SOFUU_GQA_N] = {
+    { "attn_gqa_r2_nr1_rg32",    2u, 32u, 1024u, 0u },  // 0  mode 1
+    { "attn_gqa_r2_nr2_rg32",    2u, 32u,  512u, 0u },  // 1  mode 2 (default)
+    { "attn_gqa_r2_nr2_rg16",    2u, 16u,  256u, 0u },  // 2  mode 3
+    { "attn_gqa_r2_nr4_rg32",    2u, 32u,  256u, 0u },  // 3  mode 4
+    { "attn_gqa_r2_nr1_rg32_pf", 2u, 32u, 1024u, 0u },  // 4  mode 5
+    { "attn_gqa_r4_nr1_rg16",    4u, 16u,  512u, 0u },  // 5  4:1, 512
+    { "attn_gqa_r4_nr2_rg16",    4u, 16u,  256u, 0u },  // 6  4:1, 256: fits a 384-thread ceiling
+    { "attn_gqa_r4_nr4_rg32",    4u, 32u,  256u, 0u },  // 7  4:1, 4 rows per warp
+    { "attn_gqa_r3_nr1_rg16",    3u, 16u,  512u, 0u },  // 8  3:1
+    { "attn_gqa_r3_nr2_rg16",    3u, 16u,  256u, 0u },  // 9  3:1, 256
+    { "attn_gqa_r8_nr1_rg8",     8u,  8u,  256u, 0u },  // 10 8:1
+    { "attn_gqa_r1_nr2_rg32",    1u, 32u,  512u, 1u },  // 11 1:1 - no K/V sharing and
+                                                        //    no 1:1 model in the fleet
+                                                        //    to measure it on => opt-in
+};
+// avail bit i set <=> k_sofuu_gqa[i] has a live pipeline. Returns the index
+// of the shape to dispatch for this ratio, or -1 (the per-head kernel owns
+// the chunk). Preference is table order within a ratio, which keeps the
+// shipped 2:1 default (index 1) and picks the 512-thread 4:1 form on a GPU
+// that allows it, falling to the 256-thread one on a GPU that does not.
+static int sofuu_attn_gqa_pick(uint32_t ratio, uint32_t avail, int allow_opt_in) {
+    if (ratio < 1u || ratio > 64u) return -1;
+    // 2:1 keeps its historical preference list (entries 1,2,3,0,4) so the
+    // default dispatch stays index 1, the shape the shipped receipts used.
+    static const int pref2[5] = { 1, 2, 3, 0, 4 };
+    if (ratio == 2u) {
+        for (int i = 0; i < 5; ++i) {
+            int idx = pref2[i];
+            if (avail & (1u << idx)) return idx;
+        }
+        return -1;
+    }
+    for (int idx = 5; idx < SOFUU_GQA_N; ++idx) {
+        const SofuuGqaShape &s = k_sofuu_gqa[idx];
+        if (s.ratio != ratio) continue;
+        if (s.opt_in && !allow_opt_in) continue;
+        if (!(avail & (1u << idx))) continue;
+        return idx;
+    }
+    return -1;
+}
+
+// Public, GPU-free views of the table so the shape choice is testable from
+// the Rust side (tests/generalization): pick() is the shipped rule, and the
+// per-index accessors let a test assert the table invariants.
+int sofuu_metal_attn_gqa_pick(uint32_t ratio, uint32_t avail_mask, int allow_opt_in) {
+    return sofuu_attn_gqa_pick(ratio, avail_mask, allow_opt_in);
+}
+uint32_t sofuu_metal_attn_gqa_count(void) { return (uint32_t)SOFUU_GQA_N; }
+uint32_t sofuu_metal_attn_gqa_threads(int idx) {
+    if (idx < 0 || idx >= SOFUU_GQA_N) return 0u;
+    return k_sofuu_gqa[idx].threads;
+}
+uint32_t sofuu_metal_attn_gqa_rg(int idx) {
+    if (idx < 0 || idx >= SOFUU_GQA_N) return 0u;
+    return k_sofuu_gqa[idx].rg;
+}
+uint32_t sofuu_metal_attn_gqa_ratio(int idx) {
+    if (idx < 0 || idx >= SOFUU_GQA_N) return 0u;
+    return k_sofuu_gqa[idx].ratio;
+}
+// Diagnostic: the shape index the LAST chunk-attention dispatch selected, or -1
+// when it went to the per-head kernel. The parity test uses it to prove a shape
+// was really dispatched (batch_llama_attn_row also falls back to the per-head
+// kernel, so a true return value alone would not). Never read on a model path.
+static int g_sofuu_gqa_last = -1;
+int sofuu_metal_attn_gqa_last(void) { return g_sofuu_gqa_last; }
+
 #if defined(__APPLE__)
 
 struct MetalContext {
@@ -98,10 +186,15 @@ struct MetalContext {
     // the per-head kernel above owns the chunk.
     // One entry per (heads-per-kv, prefetch, rows-per-threadgroup) shape of
     // llama_attn_pre_row_gqa; see the table in sofuu_metal_init.
-    id<MTLComputePipelineState> pso_attn_gqa[6];
-    int attn_gqa_mode;    // SOFUU_ATTN_GQA: 0 = per-head kernel, 1..5 = GQA shapes
-    uint attn_gqa_rg[6];      // rows per threadgroup of each entry
-    uint attn_gqa_threads[6]; // threads per threadgroup of each entry
+    id<MTLComputePipelineState> pso_attn_gqa[SOFUU_GQA_N];
+    int attn_gqa_mode;    // SOFUU_ATTN_GQA: 0 = per-head kernel, 1..5 = 2:1 shapes
+    uint attn_gqa_rg[SOFUU_GQA_N];      // rows per threadgroup of each entry
+    uint attn_gqa_threads[SOFUU_GQA_N]; // threads per threadgroup of each entry
+    // bit i set <=> pso_attn_gqa[i] survived the maxTotalThreadsPerThreadgroup
+    // guard; sofuu_attn_gqa_pick turns it into a shape index per ratio.
+    uint32_t attn_gqa_mask;
+    int attn_gqa_all;     // SOFUU_ATTN_GQA_ALL=1 admits the opt-in shapes
+    int attn_gqa_only;    // SOFUU_ATTN_GQA_ONLY=<idx>: pin the shape under test
     // Split-K (flash-decoding) twin of table entry 1 (r2/nr2/rg32): the same
     // 512-thread threadgroup, one key slice per threadgroup via grid z, so the
     // per-thread register footprint and the maxTotalThreadsPerThreadgroup guard
@@ -569,30 +662,45 @@ void* sofuu_metal_init(void) {
             // rows-per-warp. Entry 0 is the 2:1 GQA pairing at the per-head
             // kernel's own shape; entries 2..4 also pack rows into each warp,
             // which is what cuts the K/V bytes per (row, head, key).
-            struct { const char *name; uint rg; uint threads; } gqa[6] = {
-                { "attn_gqa_r2_nr1_rg32",    32u, 1024u },  // mode 1
-                { "attn_gqa_r2_nr2_rg32",    32u,  512u },  // mode 2
-                { "attn_gqa_r2_nr2_rg16",    16u,  256u },  // mode 3
-                { "attn_gqa_r2_nr4_rg32",    32u,  256u },  // mode 4
-                { "attn_gqa_r2_nr1_rg32_pf", 32u, 1024u },  // mode 5
-                { "attn_gqa_r4_nr1_rg16",    16u,  512u },  // ratio-4 models
-            };
-            for (int gi = 0; gi < 6; ++gi) {
-                ctx->attn_gqa_rg[gi] = gqa[gi].rg;
-                ctx->attn_gqa_threads[gi] = gqa[gi].threads;
-                id<MTLComputePipelineState> p = load_pso(@(gqa[gi].name));
-                // Same silent-drop rule as pre_row/pre_w32: a pipeline whose
-                // register footprint cannot host rg*32 threads must never be
-                // dispatched, so nil it here and let the per-head kernel (or the
-                // b4 family) take the chunk.
-                if (p != nil && p.maxTotalThreadsPerThreadgroup < (NSUInteger)gqa[gi].threads) {
+            // The table itself is file-scope (k_sofuu_gqa) so the same
+            // entries feed the pure selector; this loop only loads and guards
+            // them. Every entry carries its own thread count, and a pipeline
+            // that cannot host it is nil'd here: an oversized threadgroup is
+            // silently DROPPED by Metal in release, which reads back as dead
+            // attention, so the guard is the only thing between a new shape and
+            // a wrong answer.
+            ctx->attn_gqa_mask = 0u;
+            ctx->attn_gqa_all = getenv("SOFUU_ATTN_GQA_ALL") != nullptr;
+            // SOFUU_ATTN_GQA_ONLY=<idx> keeps exactly one shape selectable. It
+            // exists so a shape the auto-rule would not pick on THIS GPU (e.g.
+            // the 256-thread 4:1 form on a box that allows 512) can still be
+            // dispatched and checked against the per-head kernel - a shape that
+            // has never been run must never be selectable by the default rule.
+            int only_idx = -1;
+            if (const char *only_env = getenv("SOFUU_ATTN_GQA_ONLY")) {
+                only_idx = atoi(only_env);
+                if (only_idx < 0 || only_idx >= SOFUU_GQA_N) only_idx = -1;
+            }
+            ctx->attn_gqa_only = only_idx;
+            for (int gi = 0; gi < SOFUU_GQA_N; ++gi) {
+                ctx->attn_gqa_rg[gi] = k_sofuu_gqa[gi].rg;
+                ctx->attn_gqa_threads[gi] = k_sofuu_gqa[gi].threads;
+                if (k_sofuu_gqa[gi].opt_in && !ctx->attn_gqa_all) {
+                    ctx->pso_attn_gqa[gi] = nil;
+                    continue;
+                }
+                id<MTLComputePipelineState> p = load_pso(@(k_sofuu_gqa[gi].name));
+                if (p != nil && p.maxTotalThreadsPerThreadgroup < (NSUInteger)k_sofuu_gqa[gi].threads) {
                     fprintf(stderr,
                             "[metal] %s needs %u threads/group, pipeline allows %lu - GQA shape disabled\n",
-                            gqa[gi].name, gqa[gi].threads,
+                            k_sofuu_gqa[gi].name, k_sofuu_gqa[gi].threads,
                             (unsigned long)p.maxTotalThreadsPerThreadgroup);
                     p = nil;
                 }
                 ctx->pso_attn_gqa[gi] = p;
+                if (p != nil && (only_idx < 0 || only_idx == gi)) {
+                    ctx->attn_gqa_mask |= (1u << gi);
+                }
             }
         }
         // Split-K (flash-decoding) chunk attention: the shipped r2/nr2/rg32
@@ -3868,8 +3976,7 @@ int sofuu_metal_batch_llama_attn_row(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     {
-        bool any = (ctx->pso_llama_attn_pre_row != nil);
-        for (int gi = 0; gi < 6 && !any; ++gi) { any = (ctx->pso_attn_gqa[gi] != nil); }
+        bool any = (ctx->pso_llama_attn_pre_row != nil) || (ctx->attn_gqa_mask != 0u);
         if (!any) return 0;
     }
     if (!q_buf_ptr || !kc_buf_ptr || !vc_buf_ptr || !out_buf_ptr || !pos_buf_ptr) return 0;
@@ -3890,14 +3997,26 @@ int sofuu_metal_batch_llama_attn_row(
     uint rg = 32u;
     uint nthr = 1024u;
     uint ratio = (nkv > 0u) ? (nh / nkv) : 0u;
-    if (ctx->attn_gqa_mode != 0 && ratio > 1u) {
-        int idx = -1;
-        if (ratio == 2u) {
-            idx = ctx->attn_gqa_mode - 1;   // modes 1..5 are table entries 0..4
-        } else if (ratio == 4u) {
-            idx = 5;
-        }
-        if (idx >= 0 && idx < 6 && ctx->pso_attn_gqa[idx] != nil) {
+    g_sofuu_gqa_last = -1;   // reset per dispatch: the diagnostic must not
+                             // report a previous chunk's shape
+    if (ctx->attn_gqa_mode != 0 && ratio >= 1u && nh % nkv == 0u) {
+        // The 2:1 ratio keeps the SOFUU_ATTN_GQA=1..5 meaning it always had
+        // (mode m -> table entry m-1) so the shipped receipts stay on the
+        // shape they were measured on; every other ratio asks the shape table
+        // which of its forms is live on this GPU. -1 (or a ratio the table has
+        // no form for, e.g. 5:1) leaves the per-head kernel in charge - a
+        // ratio the kernel's compile-time R does not equal must never be
+        // dispatched, because R fixes how many q heads read one kv head and a
+        // mismatch silently writes another head's rows.
+        // A pinned shape (SOFUU_ATTN_GQA_ONLY) wins over the 2:1 mode
+        // mapping so a test can dispatch the 256-thread 2:1 form that the
+        // default rule would never pick on a GPU that allows 1024 threads.
+        int idx = (ratio == 2u && ctx->attn_gqa_only < 0)
+                      ? (ctx->attn_gqa_mode - 1)
+                      : sofuu_attn_gqa_pick(ratio, ctx->attn_gqa_mask, ctx->attn_gqa_all);
+        if (idx >= 0 && idx < SOFUU_GQA_N && ctx->pso_attn_gqa[idx] != nil
+            && k_sofuu_gqa[idx].ratio == ratio) {
+            g_sofuu_gqa_last = idx;
             pso = ctx->pso_attn_gqa[idx];
             grid_x = nkv;
             rg = ctx->attn_gqa_rg[idx];

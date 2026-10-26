@@ -390,6 +390,52 @@ pub struct TransformerModel {
     pub tree_max_nodes: usize,
 }
 
+/// Which kernel carries one chain projection. Pure so the rule can be tested
+/// without a GPU - and because the failure mode of getting it wrong is silent:
+/// batch_gguf_b4 is a FOUR-TOKEN kernel with no row-count argument, so handing
+/// it a 128-row chunk leaves 124 rows holding stale activations and nothing
+/// in the log says a word.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChainGemvArm {
+    /// q4_K simdgroup-matrix GEMM over the whole chunk (SOFUU_GEMM_MMA8).
+    Mma8,
+    /// q6_K typed tiled GEMM over the whole chunk, B-generic.
+    Q6Tiled,
+    /// Any of q4_K/q6_K/q8_0 over a WIDE chunk through the typed tiled GEMM.
+    Tiled,
+    /// The four-token fused GEMV - only valid for a chunk of <= 4 rows.
+    B4,
+    /// One batch_gguf dispatch per row: the correct catch-all.
+    PerRow,
+}
+
+/// The arm rule. Every dispatched arm reports whether it really enqueued, so
+/// "false" here means "that kernel could not take this shape"; the fallbacks
+/// are then chosen by shape alone. A four-row kernel is never returned for a
+/// chunk wider than four rows, whatever the other arms did.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) fn chain_gemv_arm(
+    ty: u32,
+    b: usize,
+    mma8_ok: bool,
+    q6_tiled_ok: bool,
+    tiled_ok: bool,
+) -> ChainGemvArm {
+    if mma8_ok {
+        return ChainGemvArm::Mma8;
+    }
+    if q6_tiled_ok {
+        return ChainGemvArm::Q6Tiled;
+    }
+    if tiled_ok {
+        return ChainGemvArm::Tiled;
+    }
+    if ty == GGML_TYPE_Q4_K && b <= 4 {
+        return ChainGemvArm::B4;
+    }
+    ChainGemvArm::PerRow
+}
 impl TransformerModel {
     pub fn from_gguf(gguf: GgufFile, max_seq_len: usize, vocab_size: usize) -> Result<Self, String> {
         Self::from_gguf_with_kv_ring(gguf, max_seq_len, vocab_size, 0)
@@ -3517,6 +3563,18 @@ impl TransformerModel {
         if b < 2 || b > 128 || start_pos + b > self.config.max_seq_len {
             return false;
         }
+        // A rope-frequency table (llama3 scaling: factor/orig-ctx/low/high) is
+        // applied by the CPU rope path and by nothing on the GPU side, so the
+        // whole GPU chain pass would silently use plain rope for a scaled
+        // model. The decode client already refuses this case; the prefill chain
+        // did not, which made SOFUU_GPU_PREFILL=1 on a llama3-scaled model a
+        // quiet wrong-answer switch rather than a slow one.
+        if !self.rope_freq_adjust.is_empty() {
+            if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
+                eprintln!("[chain] refused: rope frequency table (llama3 scaling) is CPU-only");
+            }
+            return false;
+        }
         let t0 = std::time::Instant::now();
         let positions: Vec<usize> = (0..b).map(|t| start_pos + t).collect();
         // The core writes the last row's head logits into this slice (and then
@@ -5244,31 +5302,23 @@ impl TransformerModel {
     // layout matches the x/xn/qa/gate... slot regions exactly), one
     // batch_gguf per row otherwise. Both paths use identical offsets.
     macro_rules! gemv_b {
-        ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {
-            if $tv.tensor_type == GGML_TYPE_Q4_K
+        ($tv:expr, $x_off:expr, $y_off:expr, $rows:expr, $cols:expr) => {{
+            // One dispatch attempt per arm, then chain_gemv_arm decides. The
+            // decision is a pure function (and is tested as one) so "which
+            // kernel carries a chunk" cannot drift back into a shape that
+            // silently computes only part of it.
+            let __ty = $tv.tensor_type;
+            let __woff = gguf.data_offset + $tv.offset;
+            let __mma8_ok = __ty == GGML_TYPE_Q4_K
                 && crate::infer::metal::MetalEngine::mma8_enabled()
                 && g.engine.batch_gguf_mma8(
-                    &g.w_buf, gguf.data_offset + $tv.offset,
+                    &g.w_buf, __woff,
                     &g.act_buf, $x_off,
                     &g.act_buf, $y_off,
                     $rows, $cols, b,
-                )
-            {
-                // simdgroup-matrix GEMM (SOFUU_GEMM_MMA8=1)
-                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                    eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
-                }
-            } else if $tv.tensor_type == GGML_TYPE_Q4_K {
-                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                    eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
-                }
-                g.engine.batch_gguf_b4(
-                    &g.w_buf, gguf.data_offset + $tv.offset,
-                    &g.act_buf, $x_off,
-                    &g.act_buf, $y_off,
-                    $rows, $cols,
                 );
-            } else if $tv.tensor_type == GGML_TYPE_Q6_K
+            let __q6_ok = !__mma8_ok
+                && __ty == GGML_TYPE_Q6_K
                 && crate::infer::metal::MetalEngine::mma8_enabled()
                 && {
                     // The q6_K half of the chain's projections (attn_v on
@@ -5284,32 +5334,97 @@ impl TransformerModel {
                     // dispatch. Sections are [base-relative off, 256-byte
                     // remainder, rows_end, y_off, y_stride]; padded slots
                     // carry rows_end 0 and are skipped by the host.
-                    let woff = gguf.data_offset + $tv.offset;
                     let mut blob = [[0u32; 5]; 4];
-                    blob[0] = [0, (woff & 255) as u32, $rows as u32, 0, $rows as u32];
+                    blob[0] = [0, (__woff & 255) as u32, $rows as u32, 0, $rows as u32];
                     g.engine.batch_gguf_gemm_tiled_multi_chain(
-                        GGML_TYPE_Q6_K, &g.w_buf, woff & !255usize,
+                        GGML_TYPE_Q6_K, &g.w_buf, __woff & !255usize,
                         &g.act_buf, $x_off,
                         &g.act_buf, $y_off,
                         $rows, $cols, b, &blob,
                     )
+                };
+            let __tiled_ok = !__mma8_ok && !__q6_ok && b > 4
+                && matches!(__ty, 8u32 | 12u32 | 14u32)
+                // SOFUU_CHAIN_NO_TILED=1 restores the per-row walk for the
+                // whole chunk, which is the A/B arm for this route's
+                // numeric receipt (same chunk width, different GEMM).
+                && std::env::var_os("SOFUU_CHAIN_NO_TILED").is_none()
+                && {
+                    // WIDE chunk (b > 4) on a tensor class with no mma8
+                    // section of its own: q8_0 always (the Llama-3.2-1B /
+                    // SmolLM2 / K2-Horizon class is pure q8_0), and q4_K /
+                    // q6_K when their own forms above refused. Before this
+                    // arm the remaining routes were both wrong for a wide
+                    // chunk: the b4 GEMV computes FOUR rows (124 of 128
+                    // would stay stale) and the per-row loop costs b
+                    // dispatches per projection, each re-streaming the whole
+                    // matrix - measured 4x SLOWER than the CPU tile path on
+                    // a Q8_0 1B (117 vs 532 tk/s), which made
+                    // SOFUU_GPU_PREFILL=1 a regression rather than a route.
+                    // This is the same typed tiled GEMM the q6_K arm above
+                    // already ships (f32 dequant, token-major y, B-generic
+                    // second tile dimension), so a whole projection is ONE
+                    // dispatch. cols % 256 != 0 or a missing pipeline makes
+                    // it refuse, and the per-row loop still owns the tensor.
+                    let mut blob = [[0u32; 5]; 4];
+                    blob[0] = [0, (__woff & 255) as u32, $rows as u32, 0, $rows as u32];
+                    g.engine.batch_gguf_gemm_tiled_multi_chain(
+                        __ty, &g.w_buf, __woff & !255usize,
+                        &g.act_buf, $x_off,
+                        &g.act_buf, $y_off,
+                        $rows, $cols, b, &blob,
+                    )
+                };
+            let __trace = std::env::var_os("SOFUU_MMA8_TRACE").is_some();
+            match chain_gemv_arm(__ty, b, __mma8_ok, __q6_ok, __tiled_ok) {
+                ChainGemvArm::Mma8 => {
+                    // simdgroup-matrix GEMM (SOFUU_GEMM_MMA8=1)
+                    if __trace {
+                        eprintln!("[gemv] MMA8 rows={} cols={} b={}", $rows, $cols, b);
+                    }
                 }
-            {
-                if std::env::var_os("SOFUU_MMA8_TRACE").is_some() {
-                    eprintln!("[gemv] Q6TILED rows={} cols={} b={}", $rows, $cols, b);
+                ChainGemvArm::Q6Tiled => {
+                    if __trace {
+                        eprintln!("[gemv] Q6TILED rows={} cols={} b={}", $rows, $cols, b);
+                    }
                 }
-            } else {
-                for t in 0..b {
-                    g.engine.batch_gguf(
-                        $tv.tensor_type, &g.w_buf, gguf.data_offset + $tv.offset,
-                        // offsets are BYTES; slot sizes are element counts
-                        &g.act_buf, $x_off + t * $cols * 4,
-                        &g.act_buf, $y_off + t * $rows * 4,
-                        $rows, $cols,
-                    );
+                ChainGemvArm::Tiled => {
+                    if __trace {
+                        eprintln!("[gemv] TILED rows={} cols={} b={}", $rows, $cols, b);
+                    }
+                }
+                ChainGemvArm::B4 => {
+                // batch_gguf_b4 is a FOUR-TOKEN kernel (no B argument): it
+                // writes rows 0..3 of x/y and nothing else. It is only
+                // reachable for a chunk the chain actually walks four rows
+                // at a time (b <= 4); a wider chunk whose mma8 form refused
+                // (cols % 256 != 0, missing pipeline) must take the
+                // B-generic arms below or the per-row loop, never this one -
+                // that mismatch is what kept two wide-chunk corruption bugs
+                // alive.
+                if __trace {
+                    eprintln!("[gemv] B4   rows={} cols={} b={}", $rows, $cols, b);
+                }
+                g.engine.batch_gguf_b4(
+                    &g.w_buf, __woff,
+                    &g.act_buf, $x_off,
+                    &g.act_buf, $y_off,
+                    $rows, $cols,
+                );
+                }
+                ChainGemvArm::PerRow => {
+                    for t in 0..b {
+                        g.engine.batch_gguf(
+                            __ty, &g.w_buf, __woff,
+                            // offsets are BYTES; slot sizes are element counts
+                            &g.act_buf, $x_off + t * $cols * 4,
+                            &g.act_buf, $y_off + t * $rows * 4,
+                            $rows, $cols,
+                        );
+                    }
                 }
             }
-        };
+        }};
     }
 
     // P2 decode diet: the SAME fused multi-section GEMM kernel as the
@@ -6977,6 +7092,70 @@ impl TransformerModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chain's projection kernels are chosen by shape, and one of them
+    /// (batch_gguf_b4) computes FOUR rows with no row-count argument. Sending
+    /// it a wider chunk loses every row past the fourth while every dispatch
+    /// still returns success, so the rule that keeps it on <=4-row chunks is a
+    /// test rather than a comment.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn chain_gemv_arm_never_gives_the_four_row_kernel_a_wide_chunk() {
+        // q4_K on a 128-row chunk whose mma8 form could not take the shape
+        // (cols % 256 != 0, or the pipeline is not on this GPU): not b4.
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q4_K, 128, false, false, false),
+            ChainGemvArm::PerRow
+        );
+        // Every chunk width the four-token kernel really sees.
+        for b in 1..=4usize {
+            assert_eq!(
+                chain_gemv_arm(GGML_TYPE_Q4_K, b, false, false, false),
+                ChainGemvArm::B4,
+                "b={b} must keep the fused four-token GEMV"
+            );
+        }
+        // q8_0 has no mma8 section at all: wide chunks belong to the typed
+        // tile, and a refused tile falls back to one dispatch per row.
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q8_0, 128, false, false, true),
+            ChainGemvArm::Tiled
+        );
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q8_0, 128, false, false, false),
+            ChainGemvArm::PerRow
+        );
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q8_0, 4, false, false, false),
+            ChainGemvArm::PerRow
+        );
+        // The routes the shipped model was measured on stay first in line.
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q4_K, 128, true, false, false),
+            ChainGemvArm::Mma8
+        );
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q4_K, 128, true, false, true),
+            ChainGemvArm::Mma8,
+            "an enrolled mma8 dispatch must not be second-guessed"
+        );
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q6_K, 128, false, true, false),
+            ChainGemvArm::Q6Tiled
+        );
+        assert_eq!(
+            chain_gemv_arm(GGML_TYPE_Q6_K, 128, false, true, true),
+            ChainGemvArm::Q6Tiled
+        );
+        // A type no tile knows about never leaves the catch-all.
+        for ty in [0u32, 1, 2, GGML_TYPE_Q3_K] {
+            assert_eq!(
+                chain_gemv_arm(ty, 128, false, false, false),
+                ChainGemvArm::PerRow,
+                "type {ty}"
+            );
+        }
+    }
 
     /// Build a synthetic 1-layer llama GGUF over a temp mmap so the loader's
     /// type gate and tied-output handling can be tested without a real model.

@@ -1169,6 +1169,15 @@ extern "C" {
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         out_stride: u32,
     ) -> i32;
+    // GQA shape table (see metal_engine.h): the shipped selection rule and the
+    // table itself, exposed so the generalized shapes are testable without a
+    // GPU and without duplicating the table in Rust.
+    fn sofuu_metal_attn_gqa_pick(ratio: u32, avail_mask: u32, allow_opt_in: i32) -> i32;
+    fn sofuu_metal_attn_gqa_count() -> u32;
+    fn sofuu_metal_attn_gqa_threads(idx: i32) -> u32;
+    fn sofuu_metal_attn_gqa_rg(idx: i32) -> u32;
+    fn sofuu_metal_attn_gqa_ratio(idx: i32) -> u32;
+    fn sofuu_metal_attn_gqa_last() -> i32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -9261,4 +9270,235 @@ pub unsafe fn buffer_contents_raw(buf: &MetalBuffer) -> *mut u8 {
     sofuu_metal_buffer_contents(buf.handle) as *mut u8
 }
 
+
+
+
+// ── generalised GQA shapes: table + refusal regression ─────────────────────
+// The shape a chunk's attention runs on is chosen by sofuu_attn_gqa_pick from
+// the table in metal_engine.mm. Both are read here through the C ABI, so these
+// tests exercise the SHIPPED rule rather than a Rust copy of it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn gqa_shape_table_covers_every_supported_ratio() {
+    let n = unsafe { sofuu_metal_attn_gqa_count() } as i32;
+    assert!(n >= 12, "shape table shrank to {n} entries");
+    let all: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    for i in 0..n {
+        let th = unsafe { sofuu_metal_attn_gqa_threads(i) };
+        let rg = unsafe { sofuu_metal_attn_gqa_rg(i) };
+        let ra = unsafe { sofuu_metal_attn_gqa_ratio(i) };
+        assert!((32..=1024).contains(&th) && th % 32 == 0, "entry {i}: {th} threads");
+        assert!((1..=64).contains(&rg), "entry {i}: {rg} rows/threadgroup");
+        assert!(ra >= 1, "entry {i}: ratio {ra}");
+        // rows per threadgroup must be at least the warps available for them
+        assert!(rg * 32 >= th, "entry {i}: rg {rg} cannot host {th} threads");
+    }
+    // the shipped 2:1 default must stay on the shape it was measured on
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick(2, all, 1) }, 1);
+    // every ratio the fleet ships has a form, and the form's compile-time R
+    // equals the ratio (a mismatch would read another head's K/V)
+    for ratio in [1u32, 2, 3, 4, 8] {
+        let idx = unsafe { sofuu_metal_attn_gqa_pick(ratio, all, 1) };
+        assert!(idx >= 0, "ratio {ratio} has no GQA shape");
+        assert_eq!(unsafe { sofuu_metal_attn_gqa_ratio(idx) }, ratio);
+    }
+    // a ratio with no form must fall back to the per-head kernel, never to a
+    // near-miss shape
+    for ratio in [0u32, 5, 6, 7, 9, 16, 64, 65] {
+        assert_eq!(
+            unsafe { sofuu_metal_attn_gqa_pick(ratio, all, 1) },
+            -1,
+            "ratio {ratio} must not dispatch a GQA shape"
+        );
+    }
+    // 1:1 shares no K/V between heads, so it is opt-in until a 1:1 model has
+    // been measured: the default rule must not select it.
+    let one = (0..n)
+        .find(|i| unsafe { sofuu_metal_attn_gqa_ratio(*i) } == 1)
+        .expect("1:1 shape missing from the table");
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick(1, all, 0) }, -1);
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick(1, all, 1) }, one);
+    // a 384-thread ceiling (the reason the 256-thread 4:1 form exists): the
+    // rule may only pick shapes that fit, and 4:1 must still get one.
+    let mut small: u32 = 0;
+    for i in 0..n {
+        if unsafe { sofuu_metal_attn_gqa_threads(i) } <= 384 {
+            small |= 1u32 << i;
+        }
+    }
+    for ratio in [1u32, 2, 3, 4, 8] {
+        let idx = unsafe { sofuu_metal_attn_gqa_pick(ratio, small, 1) };
+        if idx >= 0 {
+            assert!(
+                unsafe { sofuu_metal_attn_gqa_threads(idx) } <= 384,
+                "ratio {ratio} picked entry {idx} above the ceiling"
+            );
+        }
+    }
+    let r4 = unsafe { sofuu_metal_attn_gqa_pick(4, small, 1) };
+    assert!(r4 >= 0, "4:1 lost its <=384-thread form");
+    assert!(unsafe { sofuu_metal_attn_gqa_threads(r4) } <= 384);
+}
+
+
+// ── every generalised shape against the per-head kernel, on real hardware ──
+// The paired-K/V kernel exists in one instantiation per (R, NR, RG) triple and
+// nothing in the model fleet exercises most of them, so each one is dispatched
+// here at several head_dims and compared against the shape the whole engine was
+// built on. The GQA form computes the same per-(row, head) softmax chain as
+// llama_attn_pre_row, so the outputs must match to f32 noise; any difference
+// means the pairing changed the math for a (ratio, head_dim) that no model in
+// the fleet would have caught.
+//   SOFUU_ATTN_GQA_ONLY pins the shape under test, because the auto rule picks
+//   the widest live form and a 256-thread entry never wins on a GPU that allows
+//   1024. Run: cargo test --release -p sofuu-core --lib -- --ignored --test-threads=1
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+#[ignore]
+fn gqa_each_shape_matches_per_head_kernel() {
+    // (table index, n_kv_heads, head_dim). Covers every new entry at a head_dim
+    // from each divisibility class: 64 and 96 are not multiples of 128, the only
+    // value the shipped model was ever measured at.
+    let cases: [(i32, usize, usize); 14] = [
+        (1, 4, 128),  // shipped 2:1 default, the reference shape
+        (2, 4, 96),   // 2:1, 256 threads, hd 96
+        (5, 4, 128),  // 4:1 512
+        (6, 4, 64),   // 4:1 256  <- the <=384-thread form, hd 64
+        (6, 4, 96),   // 4:1 256, hd 96
+        (7, 4, 128),  // 4:1, 4 rows per warp
+        (8, 4, 64),   // 3:1 512
+        (9, 4, 96),   // 3:1 256
+        (10, 4, 128), // 8:1
+        (10, 4, 64),  // 8:1, hd 64
+        (0, 4, 128),  // 2:1 pairing-only shape
+        (3, 4, 96),   // 2:1, 4 rows per warp
+        (11, 4, 128), // 1:1 opt-in form: it shares no K/V, so it is correct to
+        (11, 4, 64),  //   prove here but never auto-selected without a 1:1 model
+    ];
+    let rows = 32usize;
+    let max_seq = 64usize;
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut rand = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) % 2003) as f32 / 1000.0f32 - 1.0f32
+    };
+    let page = 16384usize;
+    let alloc = |bytes: usize| bytes.div_ceil(page) * page;
+    let mk = |bytes: usize| -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    };
+    let mut checked = 0usize;
+    let mut skipped: Vec<i32> = Vec::new();
+    for &(idx, nkv, hd) in &cases {
+        let ratio = unsafe { sofuu_metal_attn_gqa_ratio(idx) } as usize;
+        if ratio == 0 {
+            skipped.push(idx);
+            continue;
+        }
+        let nh = nkv * ratio;
+        let q: Vec<f32> = (0..rows * nh * hd).map(|_| rand()).collect();
+        let kc: Vec<f32> = (0..nkv * max_seq * hd).map(|_| rand()).collect();
+        let vc: Vec<f32> = (0..nkv * max_seq * hd).map(|_| rand()).collect();
+        let posb: Vec<u32> = (0..rows).map(|t| (max_seq - rows + t) as u32).collect();
+        // one engine per arm: the shape pin is read once, at init
+        let run = |pin: Option<i32>| -> (Vec<f32>, i32) {
+            match pin {
+                Some(i) => {
+                    std::env::set_var("SOFUU_ATTN_GQA_ONLY", i.to_string());
+                    std::env::set_var("SOFUU_ATTN_GQA_ALL", "1");
+                    std::env::remove_var("SOFUU_ATTN_GQA");
+                }
+                None => {
+                    std::env::set_var("SOFUU_ATTN_GQA", "0");
+                    std::env::remove_var("SOFUU_ATTN_GQA_ONLY");
+                }
+            }
+            let engine = MetalEngine::new().expect("engine");
+            let mut ptrs: Vec<(*mut u8, usize)> = Vec::new();
+            let mut bufs: Vec<MetalBuffer> = Vec::new();
+            for f in [&q, &kc, &vc] {
+                let sz = alloc(f.len() * 4);
+                let p = mk(sz);
+                ptrs.push((p, sz));
+                unsafe { std::ptr::copy_nonoverlapping(f.as_ptr() as *const u8, p, f.len() * 4) };
+                bufs.push(engine
+                    .register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(p, sz) })
+                    .expect("reg"));
+            }
+            let out_sz = alloc(rows * nh * hd * 4);
+            let outp = mk(out_sz);
+            ptrs.push((outp, out_sz));
+            let out_buf = engine
+                .register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(outp, out_sz) })
+                .expect("reg out");
+            let pos_sz = alloc(rows * 4);
+            let posptr = mk(pos_sz);
+            ptrs.push((posptr, pos_sz));
+            for (t, v) in posb.iter().enumerate() {
+                unsafe { (posptr as *mut u32).add(t).write_unaligned(*v) };
+            }
+            let pos_buf = engine
+                .register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(posptr, pos_sz) })
+                .expect("reg pos");
+            assert!(engine.batch_open());
+            let ok = engine.batch_llama_attn_row(
+                &bufs[0], 0, &bufs[1], 0, &bufs[2], 0, &out_buf, 0, &pos_buf, 0,
+                rows, hd as u32, nh as u32, nkv as u32, max_seq as u32,
+            );
+            engine.batch_end();
+            assert!(ok, "shape {idx} (ratio {ratio}, hd {hd}): dispatch refused");
+            let last = unsafe { sofuu_metal_attn_gqa_last() };
+            let mut got = vec![0f32; rows * nh * hd];
+            unsafe {
+                std::ptr::copy_nonoverlapping(outp as *const f32, got.as_mut_ptr(), got.len())
+            };
+            for (p, sz) in &ptrs {
+                unsafe { libc::munmap(*p as *mut libc::c_void, *sz) };
+            }
+            (got, last)
+        };
+        let (ref_out, ref_last) = run(None);
+        assert_eq!(ref_last, -1, "per-head arm dispatched GQA shape {ref_last}");
+        let (got, last) = run(Some(idx));
+        std::env::remove_var("SOFUU_ATTN_GQA_ONLY");
+        std::env::remove_var("SOFUU_ATTN_GQA_ALL");
+        std::env::remove_var("SOFUU_ATTN_GQA");
+        if last != idx {
+            // the threadgroup guard refused this pipeline on this GPU: a real
+            // outcome, but it leaves the shape unverified here.
+            println!("[gqa-parity] shape {idx} (ratio {ratio}, hd {hd}): pipeline unavailable on this GPU - skipped");
+            skipped.push(idx);
+            continue;
+        }
+        let mut worst = 0f32;
+        let mut wi = 0usize;
+        let mut nbad = 0usize;
+        for i in 0..got.len() {
+            let d = (got[i] - ref_out[i]).abs();
+            if got[i].to_bits() != ref_out[i].to_bits() {
+                nbad += 1;
+            }
+            if d > worst {
+                worst = d;
+                wi = i;
+            }
+        }
+        println!(
+            "[gqa-parity] shape {idx} ratio {ratio} hd {hd} nh {nh}: worst|d|={worst:.3e} at {wi} ({nbad}/{} lanes differ)",
+            got.len()
+        );
+        assert!(
+            worst <= 1.2e-7,
+            "shape {idx} (ratio {ratio}, hd {hd}) diverges from the per-head kernel: worst|d|={worst:.3e} at {wi}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} shapes verified (skipped {skipped:?})");
+    println!("[gqa-parity] {checked} shapes match the per-head kernel; skipped {skipped:?}");
+}
 

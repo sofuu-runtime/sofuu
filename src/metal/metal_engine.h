@@ -315,6 +315,27 @@ int sofuu_metal_batch_llama_attn_flash_b4(void* ctx, void* q_buf, size_t q_offse
 //     marginal cost of one attention dispatch measured in situ with the real
 //     grid and cache state - the receipt that stays stable under machine load,
 //     where wall-clock section subtraction does not. Default 0 (inert).
+//
+// The GQA-paired shape (sofuu_metal_attn_gqa_pick) is chosen automatically from
+// the model's n_heads/n_kv_heads ratio, among the shapes whose pipeline loaded
+// AND reports a big enough maxTotalThreadsPerThreadgroup - the per-pipeline
+// ceiling, not a device constant, is what makes the 1024-thread _pf form nil on
+// a pipeline that reports 896. Knobs, all read once at init:
+//   SOFUU_ATTN_GQA=0        per-head kernel (no pairing) - the A/B arm
+//   SOFUU_ATTN_GQA=1..5     pin 2:1 table entry 0..4. A pin is a REQUEST: when
+//     that shape's pipeline is not live the rule falls through to the fastest
+//     live form of the same ratio and says so on stderr, instead of silently
+//     running the per-head kernel.
+//   SOFUU_ATTN_GQA_ONLY=<i> make table entry i the only selectable shape (the
+//     shape-under-test arm; a nil entry i is reported, then per-head)
+//   SOFUU_ATTN_GQA_ALL=1    admit the opt-in (never measured) shapes
+//   SOFUU_ATTN_GQA_TRACE=1  name every (ratio, shape) dispatched, once each.
+//     This is the external receipt that a paired shape ran: the logits cannot
+//     show it, the paired kernel is bit-identical to the per-head one by
+//     construction (same reduction order, only the K/V loads are shared).
+// When a ratio has table forms and NONE is usable the dispatcher prints one
+// line naming the ratio and each form's real cause (nil pipeline, or the
+// threads/group the pipeline allows) and then runs the per-head kernel.
 int sofuu_metal_batch_llama_attn_row(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_llama_attn_w32_out(void* ctx, void* q_buf, size_t q_offset, void* kc_buf, size_t kc_offset, void* vc_buf, size_t vc_offset, void* out_buf, size_t out_offset, void* pos_buf, size_t pos_offset, uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq, uint32_t out_stride);
 int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, void* x_buf, size_t x_offset, void* y_buf, size_t y_offset, size_t rows, size_t cols, size_t B);
@@ -322,11 +343,21 @@ int sofuu_metal_batch_gguf_gemm_tiled(void* ctx, void* w_buf, size_t w_offset, v
 // GQA attention shape table, GPU-free views (kernels.metal llama_attn_pre_row_gqa).
 // sofuu_metal_attn_gqa_pick is the SAME rule the dispatcher uses to choose a
 // (R, rows-per-threadgroup) form for n_heads/n_kv_heads == ratio: bit i of
-// avail_mask is set when shape i has a live pipeline, and -1 means the per-head
-// kernel owns the chunk. The accessors expose the table so a test can assert
-// every selectable shape fits a given maxTotalThreadsPerThreadgroup ceiling and
-// that a ratio with no form is never dispatched.
+// avail_mask is set when shape i has a live pipeline whose OWN
+// maxTotalThreadsPerThreadgroup covers its threadgroup (so a 1024-thread form
+// is in the mask only on a pipeline that reports >= 1024). Within a ratio the
+// rule walks a measured cost order and takes the first mask-live entry.
+// The accessors expose the table so a test can assert every selectable shape
+// fits a given threadgroup ceiling and that a ratio with no form is never
+// dispatched.
+//
+// pick() returns the table index, or -1 for "the per-head kernel owns this
+// chunk". pick_ex() splits that -1 into the two cases the caller must not
+// conflate: -1 = the table has no form for the ratio (design), -2 = the table
+// HAS forms for the ratio and none is usable (a configuration failure the
+// dispatcher reports on stderr exactly once per ratio).
 int sofuu_metal_attn_gqa_pick(uint32_t ratio, uint32_t avail_mask, int allow_opt_in);
+int sofuu_metal_attn_gqa_pick_ex(uint32_t ratio, uint32_t avail_mask, int allow_opt_in);
 uint32_t sofuu_metal_attn_gqa_count(void);
 uint32_t sofuu_metal_attn_gqa_threads(int idx);
 uint32_t sofuu_metal_attn_gqa_rg(int idx);

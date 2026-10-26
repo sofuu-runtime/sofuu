@@ -1227,6 +1227,9 @@ extern "C" {
     // table itself, exposed so the generalized shapes are testable without a
     // GPU and without duplicating the table in Rust.
     fn sofuu_metal_attn_gqa_pick(ratio: u32, avail_mask: u32, allow_opt_in: i32) -> i32;
+    // Same rule, but tells "no form for this ratio" (-1) from "the table has
+    // forms and none of them is usable" (-2), which the dispatcher reports.
+    fn sofuu_metal_attn_gqa_pick_ex(ratio: u32, avail_mask: u32, allow_opt_in: i32) -> i32;
     fn sofuu_metal_attn_gqa_count() -> u32;
     fn sofuu_metal_attn_gqa_threads(idx: i32) -> u32;
     fn sofuu_metal_attn_gqa_rg(idx: i32) -> u32;
@@ -10042,6 +10045,114 @@ fn gqa_shape_table_covers_every_supported_ratio() {
     let r4 = unsafe { sofuu_metal_attn_gqa_pick(4, small, 1) };
     assert!(r4 >= 0, "4:1 lost its <=384-thread form");
     assert!(unsafe { sofuu_metal_attn_gqa_threads(r4) } <= 384);
+}
+
+// ── the two failure modes this table exists to stop ─────────────────────────
+// 1. A threadgroup wider than the pipeline's own reported ceiling is SILENTLY
+//    DROPPED by Metal in release (stale scratch, no error). The rule must only
+//    ever return a form the dispatch can actually host: on this box the
+//    pipelines report 896 for the 1024-thread _pf form, so it is not in the
+//    live mask and must never come back - not even as a fallback.
+// 2. A ratio whose forms are all unusable must be REPORTED, not folded into the
+//    "-1" that means "this ratio has no form at all" (per-head is the design
+//    only in that second case). That conflation is exactly what let a dead
+//    shape table hide behind the per-head kernel.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn gqa_picker_never_leaves_the_live_mask() {
+    let n = unsafe { sofuu_metal_attn_gqa_count() } as i32;
+    assert!(n > 0 && n < 32, "shape table grew past the 32-bit mask: {n}");
+    let all: u32 = (1u32 << n) - 1;
+    // The rule is mask-driven: a one-shape mask selects that shape and nothing
+    // else, so a pinned-but-dead shape can never be dispatched.
+    for i in 0..n {
+        let ratio = unsafe { sofuu_metal_attn_gqa_ratio(i) };
+        assert!(ratio >= 1, "entry {i} has no ratio");
+        assert_eq!(
+            unsafe { sofuu_metal_attn_gqa_pick(ratio, 1u32 << i, 1) },
+            i,
+            "a mask holding only entry {i} (ratio {ratio}) must select entry {i}"
+        );
+    }
+    // A GPU that reports 896 threads/group (this one) puts only the sub-1024
+    // shapes in the mask. Every ratio must still get a form, it must be in the
+    // mask, and it must not be a 1024-thread one.
+    let mut m896: u32 = 0;
+    for i in 0..n {
+        if unsafe { sofuu_metal_attn_gqa_threads(i) } <= 896 {
+            m896 |= 1u32 << i;
+        }
+    }
+    for ratio in [1u32, 2, 3, 4, 8] {
+        let idx = unsafe { sofuu_metal_attn_gqa_pick(ratio, m896, 1) };
+        assert!(idx >= 0, "ratio {ratio} lost its <=896-thread form");
+        assert!(
+            m896 & (1u32 << idx) != 0,
+            "ratio {ratio} picked entry {idx}, which is not in the 896-thread mask"
+        );
+        let th = unsafe { sofuu_metal_attn_gqa_threads(idx) };
+        assert!(
+            th <= 896,
+            "ratio {ratio} picked a {th}-thread form under an 896-thread mask"
+        );
+    }
+    // Every (ratio, mask) pair returns an in-mask entry or -1; never an
+    // out-of-mask one (the mode-pin path this rule replaced could do that by
+    // mapping the env number straight to a table index).
+    let mut state = 0x2545f4914f6cdd1du64;
+    for _ in 0..256 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mask = (state >> 33) as u32 & all;
+        for ratio in [1u32, 2, 3, 4, 8] {
+            let idx = unsafe { sofuu_metal_attn_gqa_pick(ratio, mask, 1) };
+            if idx >= 0 {
+                assert!(idx < n, "mask {mask:#x} ratio {ratio}: out-of-table {idx}");
+                assert!(
+                    mask & (1u32 << idx) != 0,
+                    "mask {mask:#x} ratio {ratio}: picked dead entry {idx}"
+                );
+                assert_eq!(unsafe { sofuu_metal_attn_gqa_ratio(idx) }, ratio);
+            }
+        }
+    }
+    // A dead preferred form falls THROUGH to the next live form of the ratio -
+    // it must not become a per-head dispatch while a paired form is live.
+    let nr1_rg32_and_nr4 = (1u32 << 0) | (1u32 << 3);
+    let fell = unsafe { sofuu_metal_attn_gqa_pick_ex(2, nr1_rg32_and_nr4, 1) };
+    assert_eq!(fell, 0, "2:1 must fall through to its live form, got {fell}");
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn gqa_picker_reports_a_ratio_whose_shapes_are_all_dead() {
+    let n = unsafe { sofuu_metal_attn_gqa_count() } as i32;
+    let all: u32 = (1u32 << n) - 1;
+    // Every ratio the fleet ships has forms in the table. An empty live mask
+    // therefore means "none usable" (-2): a configuration failure the
+    // dispatcher prints, not the silent per-head of the "-1" path.
+    for ratio in [1u32, 2, 3, 4, 8] {
+        assert_eq!(
+            unsafe { sofuu_metal_attn_gqa_pick_ex(ratio, 0, 1) },
+            -2,
+            "ratio {ratio}: forms exist but none is live - must be reported, not silent"
+        );
+    }
+    // The 1:1 form is opt-in: with SOFUU_ATTN_GQA_ALL off it is unreachable, so
+    // the ratio has forms and none usable -> reported, not "no such ratio".
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick_ex(1, all, 0) }, -2);
+    assert!(unsafe { sofuu_metal_attn_gqa_pick_ex(1, all, 1) } >= 0);
+    // A ratio the table genuinely has no form for is NOT a failure: the
+    // per-head kernel is the correct owner and nothing is printed.
+    for ratio in [5u32, 6, 7, 9, 16, 32] {
+        assert_eq!(
+            unsafe { sofuu_metal_attn_gqa_pick_ex(ratio, all, 1) },
+            -1,
+            "ratio {ratio} has no table form - per-head is the design"
+        );
+    }
+    // pick() keeps the historical index-or--1 contract for both cases.
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick(2, 0, 1) }, -1);
+    assert_eq!(unsafe { sofuu_metal_attn_gqa_pick(5, all, 1) }, -1);
 }
 
 

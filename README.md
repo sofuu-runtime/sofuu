@@ -33,7 +33,7 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 ## Features
 
 - **JS/TS runtime** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3 ms startup, TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
-- **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), mmap load in 17–38 ms, up to 150 tok/s prefill, up to 68.7 tok/s decode, in-place KV cache compaction & sliding-window attention past context limits
+- **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + sub-agents** — `sofuu.agent.define/run`, built-in `code` + `web` tools, budgets, cancel, trace rendering; the same loop powers chat
 - **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving
@@ -183,7 +183,14 @@ for await (const chunk of stream) {
 | **Apple Silicon Mac** (M2 Pro) | `liqiud-350` (BF16 SafeTensors) | **127.9 ms** | — | **68.7 tk/s** | 19.1× speedup via NEON bit-extension |
 | **Apple Silicon Mac** (M2 Pro) | `liquid` (MLX 4-bit SafeTensors) | **119.2 ms** | — | **8.1 tk/s** | 20.25× speedup via group scale/bias broadcast |
 | **Apple Silicon Mac** (M2 Pro) | `Qwen-3-0.6B` (Q4_K_M GGUF) | **17.7 ms** | **138–150 tk/s** | **30.0–33.5 tk/s** | 4-way unrolled vector accumulators |
-| **Raspberry Pi 5** (ARM64 musl) | `Qwen-3-0.6B` (Q4_K_M GGUF) | **38.15 ms** | **49.3–49.8 tk/s** | **15.6–15.7 tk/s** | Zero futex storms, core-pinned, LPDDR4X prefetch |
+| **Raspberry Pi 5** (ARM64 musl) | `Qwen-3-0.6B` (Q4_K_M GGUF) | **880 ms** | **195–196 tk/s** | **26.0–26.1 tk/s** | Ahead of llama.cpp-11041 CPU on the same prompt (+11% prefill / +9% decode); q4_K tile GEMM |
+| **Raspberry Pi 5** (ARM64 musl) | `Qwen-3-0.6B` (Q3_K_S GGUF) | **560 ms** | **145 tk/s** | **30.3 tk/s** | ~2× llama.cpp prefill, decode +7% (cost-aware speculative gate, serial after warmup) |
+| **Raspberry Pi 5** (ARM64 musl) | `Llama-3.2-1B-Instruct` (Q8_0 GGUF) | **1.1 s** | **141–142 tk/s** | **10.1 tk/s** | Prefill 2.4× llama.cpp, decode +15%; speculative tree on longer generations (20+ tk/s) |
+| **Raspberry Pi 5** (ARM64 musl) | `Sharp-MiniCPM5-2B` (Q6_K_XL GGUF) | **1.4 s** | **38.4–39.2 tk/s** | **5.8–5.9 tk/s** | Ahead of llama.cpp (+9% prefill / +6% decode, sampled — its greedy first token is EOS on the raw prompt) |
+| **Raspberry Pi 5** (ARM64 musl) | `Spark-X2.5-4B` (Q4_K_M GGUF) | **2.1 s** | **25.3–25.4 tk/s** | **4.4 tk/s** | Ahead of llama.cpp (+11% prefill / +5% decode), matched prompt & context |
+| **Raspberry Pi 5** (ARM64 musl) | `Ternary-Bonsai-2-9B` (PQ2_0 GGUF) | **440 ms** | **1.4 tk/s** | **0.7 tk/s** | Loadable only here (ternary-weight format); v1 dequant path, not yet optimized |
+
+Pi 5 receipts: 2026-10-26 battery, current main, 4× Cortex-A76 with NEON+dotprod at the adopted `arm_freq=2800` + 25 mV boot config, `performance` governor, 4 threads, temp 0, 234–252-token prompt, fresh llama.cpp build 11041 references from the same session. Load times are warm page-cache.
 
 ---
 

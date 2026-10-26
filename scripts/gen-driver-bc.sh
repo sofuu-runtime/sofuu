@@ -19,6 +19,7 @@ cd "$ROOT" || exit 1
 for js in src/js/*.js; do
     name="$(basename "$js" .js)"
     "$SOFUU" compile-bc "$js" "src/js/$name.bc" >/dev/null
-    echo "  compiled $name.js -> src/js/$name.bc ($(wc -c < "src/js/$name.bc" | tr -d ' ') B)"
+    gzip -9 -n -k -f "src/js/$name.bc"
+    echo "  compiled $name.js -> src/js/$name.bc ($(wc -c < "src/js/$name.bc" | tr -d ' ') B, gz: $(wc -c < "src/js/$name.bc.gz" | tr -d ' ') B)"
 done
 echo "GEN-DRIVER-BC: done - now run 'make' so the binary embeds them"

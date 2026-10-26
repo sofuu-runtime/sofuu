@@ -2542,8 +2542,8 @@ mod tests {
 
         let line = unsafe { read_response_line(resp_rd) };
         assert!(
-            line.contains("\"id\":9") && line.contains("\"error\"") && line.contains("-32603"),
-            "rejected handler must answer with a JSON-RPC error, got: {line}"
+            line.contains("\"id\":9") && line.contains("\"isError\":true"),
+            "rejected handler must answer with in-band isError, got: {line}"
         );
 
         unsafe { p1_server_teardown(rt, ctx, stdout_pipe, resp_rd) };

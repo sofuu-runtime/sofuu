@@ -601,6 +601,31 @@ pub unsafe extern "C" fn sofuu_module_loader(
         }
         return unsafe { qjs::sofuu_js_value_get_ptr(func) };
     }
+
+    // Built-in sofuu plugin & extensibility module support
+    let builtin_code = if name == "sofuu" {
+        Some(c"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,sofuu=globalThis.sofuu;export default globalThis.sofuu;")
+    } else if name == "zod" {
+        Some(c"export const z=globalThis.sofuu?.plugins?.z;export default{z};")
+    } else {
+        None
+    };
+    if let Some(code) = builtin_code {
+        let func = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                code.as_ptr(),
+                code.to_bytes().len(),
+                module_name,
+                qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+            )
+        };
+        if unsafe { qjs::is_exception(func) } {
+            unsafe { qjs::js_std_dump_error(ctx) };
+            return ptr::null_mut();
+        }
+        return unsafe { qjs::sofuu_js_value_get_ptr(func) };
+    }
     // SAFETY: opaque is our g_loader_base CString or NULL.
     let base: String = if opaque.is_null() {
         "./".to_string()

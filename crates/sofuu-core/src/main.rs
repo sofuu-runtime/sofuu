@@ -81,6 +81,10 @@ fn print_help() {
     println!("  sofuu agent list         List agent definitions (~/.sofuu/agents/*.js)");
     println!("  sofuu agent run <name> \"task\"  Run one agent headless");
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
+    println!("  sofuu plugin list        List plugins in ./plugins/ and ~/.sofuu/plugins/");
+    println!("  sofuu plugin validate <f> Validate plugin syntax, export, and schema");
+    println!("  sofuu plugin run <tool>  Execute a plugin tool with 5-shield safety");
+    println!("  sofuu plugin init <name> Scaffold a plugin (--category=tool|service|...)");
     println!("  sofuu dev [dir]          Start AI-native full-stack dev server (--port, --host, --model)");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
@@ -430,6 +434,75 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
         }
         other => {
             eprintln!("\x1b[31mError:\x1b[0m unknown agent subcommand '{other}' (list | run)");
+            1
+        }
+    }
+}
+
+/// `sofuu plugin list` / `validate` / `run` / `init` —
+/// the extensibility standard CLI surface (PLAN-PLUGIN-AND-EXTENSIBILITY-STANDARD).
+fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    if args.len() < 3 {
+        eprintln!("\x1b[1mUsage:\x1b[0m");
+        eprintln!("  sofuu plugin list [--json]");
+        eprintln!("  sofuu plugin validate <file.js|file.ts>");
+        eprintln!("  sofuu plugin run <tool_name> [args_json]");
+        eprintln!("  sofuu plugin init <name> [--category=tool|service|provider|store]");
+        return 1;
+    }
+    match args[2].as_str() {
+        "list" | "ls" => {
+            let json = if args.iter().any(|a| a == "--json") { "true" } else { "false" };
+            let code = format!("sofuu.plugins.cliList({json})");
+            rt.eval_string(&code, "<plugin-list>")
+        }
+        "validate" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin validate' requires a file argument");
+                return 1;
+            }
+            let file = &args[3];
+            if !std::path::Path::new(file).exists() {
+                eprintln!("\x1b[31mError:\x1b[0m file '{}' does not exist", file);
+                return 1;
+            }
+            let fjs = serde_json::to_string(file).unwrap_or_else(|_| "\"\"".into());
+            let code = format!("sofuu.plugins.cliValidate({fjs})");
+            rt.eval_string(&code, "<plugin-validate>")
+        }
+        "run" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin run' requires a tool name");
+                eprintln!("Usage: sofuu plugin run <tool_name> [args_json]");
+                return 1;
+            }
+            let tool_name = &args[3];
+            let raw_args = if args.len() >= 5 { args[4..].join(" ") } else { "{}".to_string() };
+            let tool_js = serde_json::to_string(tool_name).unwrap_or_else(|_| "\"\"".into());
+            let args_js = serde_json::to_string(&raw_args).unwrap_or_else(|_| "\"{}\"".into());
+            let code = format!("sofuu.plugins.cliRun({tool_js}, {args_js})");
+            rt.eval_string(&code, "<plugin-run>")
+        }
+        "init" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin init' requires a plugin name");
+                eprintln!("Usage: sofuu plugin init <name> [--category=tool|service|provider|store]");
+                return 1;
+            }
+            let name = &args[3];
+            let mut category = "tool";
+            for a in &args[4..] {
+                if let Some(c) = a.strip_prefix("--category=") {
+                    category = c;
+                }
+            }
+            let name_js = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
+            let cat_js = serde_json::to_string(category).unwrap_or_else(|_| "\"tool\"".into());
+            let code = format!("sofuu.plugins.cliInit({name_js}, {cat_js})");
+            rt.eval_string(&code, "<plugin-init>")
+        }
+        other => {
+            eprintln!("\x1b[31mError:\x1b[0m unknown plugin subcommand '{other}' (list | validate | run | init)");
             1
         }
     }
@@ -2037,6 +2110,28 @@ fn main() -> ExitCode {
                 }
             }
             let rc = cmd_agent(&rt, &clean);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "plugin" | "plugins" => {
+            let (policy, clean) = take_policy_arg(&args);
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_plugin(&rt, &clean);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

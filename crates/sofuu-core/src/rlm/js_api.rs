@@ -544,6 +544,14 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::SERVE_BC),
             "<serve-driver>",
         );
+        // PLAN-PLUGIN-AND-EXTENSIBILITY-STANDARD: the extensibility standard driver
+        // (sofuu.plugins.*, defineTool, defineProvider, defineService, defineStorage, useOpenAPI).
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::PLUGINS_JS,
+            Some(crate::shipped::PLUGINS_BC),
+            "<plugins-driver>",
+        );
     }
 }
 

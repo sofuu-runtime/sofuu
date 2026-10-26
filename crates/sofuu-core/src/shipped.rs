@@ -43,35 +43,35 @@ pub const AGENT_JS: &str = include_str!("../../../src/js/agent.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const AGENT_JS: &str = "";
-pub const AGENT_BC: &[u8] = include_bytes!("../../../src/js/agent.bc");
+pub const AGENT_BC: &[u8] = include_bytes!("../../../src/js/agent.bc.gz");
 /// The web-search driver — single source of truth is src/js/web.js.
 #[cfg(debug_assertions)]
 pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const WEB_JS: &str = "";
-pub const WEB_BC: &[u8] = include_bytes!("../../../src/js/web.bc");
+pub const WEB_BC: &[u8] = include_bytes!("../../../src/js/web.bc.gz");
 /// The coding-tools driver — single source of truth is src/js/tools.js.
 #[cfg(debug_assertions)]
 pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const TOOLS_JS: &str = "";
-pub const TOOLS_BC: &[u8] = include_bytes!("../../../src/js/tools.bc");
+pub const TOOLS_BC: &[u8] = include_bytes!("../../../src/js/tools.bc.gz");
 /// The automated fact extractor — single source of truth is src/js/extractor.js.
 #[cfg(debug_assertions)]
 pub const EXTRACTOR_JS: &str = include_str!("../../../src/js/extractor.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const EXTRACTOR_JS: &str = "";
-pub const EXTRACTOR_BC: &[u8] = include_bytes!("../../../src/js/extractor.bc");
+pub const EXTRACTOR_BC: &[u8] = include_bytes!("../../../src/js/extractor.bc.gz");
 /// The native structured storage driver — single source of truth is src/js/storage.js.
 #[cfg(debug_assertions)]
 pub const STORAGE_JS: &str = include_str!("../../../src/js/storage.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const STORAGE_JS: &str = "";
-pub const STORAGE_BC: &[u8] = include_bytes!("../../../src/js/storage.bc");
+pub const STORAGE_BC: &[u8] = include_bytes!("../../../src/js/storage.bc.gz");
 /// The chat turn engine — single source of truth is src/js/chat.js
 /// (PLAN-DESKTOP C). Eval'd LAST: it builds on sofuu.agent/web/tools and
 /// exposes sofuu.chat.* for embedded hosts (the desktop app). Hosts that
@@ -81,7 +81,7 @@ pub const CHAT_JS: &str = include_str!("../../../src/js/chat.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const CHAT_JS: &str = "";
-pub const CHAT_BC: &[u8] = include_bytes!("../../../src/js/chat.bc");
+pub const CHAT_BC: &[u8] = include_bytes!("../../../src/js/chat.bc.gz");
 /// The HTTP edge server — single source of truth is src/js/serve.js
 /// (workstream H1). `sofuu serve` boots it; the module itself only defines
 /// state and functions, so a process that never serves pays nothing.
@@ -91,14 +91,21 @@ pub const SERVE_JS: &str = include_str!("../../../src/js/serve.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const SERVE_JS: &str = "";
-pub const SERVE_BC: &[u8] = include_bytes!("../../../src/js/serve.bc");
+pub const SERVE_BC: &[u8] = include_bytes!("../../../src/js/serve.bc.gz");
 /// The recursive language model driver — single source of truth is src/js/rlm.js.
 #[cfg(debug_assertions)]
 pub const RLM_JS: &str = include_str!("../../../src/js/rlm.js");
 /// Release builds carry bytecode only - see the file header.
 #[cfg(not(debug_assertions))]
 pub const RLM_JS: &str = "";
-pub const RLM_BC: &[u8] = include_bytes!("../../../src/js/rlm.bc");
+pub const RLM_BC: &[u8] = include_bytes!("../../../src/js/rlm.bc.gz");
+/// The plugins and extensibility standard driver — single source of truth is src/js/plugins.js.
+#[cfg(debug_assertions)]
+pub const PLUGINS_JS: &str = include_str!("../../../src/js/plugins.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const PLUGINS_JS: &str = "";
+pub const PLUGINS_BC: &[u8] = include_bytes!("../../../src/js/plugins.bc.gz");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —
@@ -150,12 +157,24 @@ pub unsafe fn eval_bytecode(ctx: *mut c_void, bytecode: &[u8], name: &str) -> bo
     if ctx.is_null() || bytecode.is_empty() {
         return false;
     }
+    let mut decompressed = Vec::new();
+    let bc = if bytecode.len() >= 2 && bytecode[0] == 0x1f && bytecode[1] == 0x8b {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(bytecode);
+        if decoder.read_to_end(&mut decompressed).is_ok() {
+            &decompressed[..]
+        } else {
+            bytecode
+        }
+    } else {
+        bytecode
+    };
     let ctx = ctx as *mut JSContext;
 
     let fun_obj = qjs::JS_ReadObject(
         ctx,
-        bytecode.as_ptr(),
-        bytecode.len(),
+        bc.as_ptr(),
+        bc.len(),
         qjs::JS_READ_OBJ_BYTECODE | qjs::JS_READ_OBJ_ROM_DATA,
     );
 
@@ -291,6 +310,7 @@ mod tests {
             ("extractor.js", EXTRACTOR_JS),
             ("storage.js", STORAGE_JS),
             ("chat.js", CHAT_JS),
+            ("plugins.js", PLUGINS_JS),
         ] {
             let bc = unsafe { compile_to_bytecode(ctx, src, name) };
             assert!(bc.is_some(), "{name}: failed to compile to bytecode");

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use super::runtime::{HTML_SHELL, UI_JS};
+use super::runtime::{HTML_SHELL, UI_JS_GZ};
 use super::transpile::transpile;
 
 static RELOAD_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -144,7 +144,12 @@ fn handle_connection(mut stream: TcpStream, cfg: &DevServerConfig) -> Result<(),
 
     // 1. Embedded Micro-Runtime: `/_sofuu/ui.js`, `/_sofuu/router.js`, `/_sofuu/ai.js`, `/_sofuu/store.js`
     if path == "/_sofuu/ui.js" || path == "/_sofuu/router.js" || path == "/_sofuu/ai.js" || path == "/_sofuu/store.js" {
-        return send_response(&mut stream, 200, "application/javascript; charset=utf-8", UI_JS.as_bytes());
+        return send_response(
+            &mut stream,
+            200,
+            "application/javascript; charset=utf-8\r\nContent-Encoding: gzip",
+            UI_JS_GZ,
+        );
     }
 
     // 1b. Dev Live Reload Stream: `/_sofuu/live`

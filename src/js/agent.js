@@ -681,6 +681,16 @@
       var t = tools[i];
       if (t === 'web') { d.webTools = ['web_search', 'web_open']; continue; }
       if (t === 'code' && sofuu.tools && sofuu.tools.GROUP) { d.codeTools = sofuu.tools.GROUP.slice(); continue; }
+      if (typeof t === 'string') {
+        if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[t]) {
+          if (d.codeTools.indexOf(t) < 0) d.codeTools.push(t);
+          continue;
+        }
+        if (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[t]) {
+          if (d.codeTools.indexOf(t) < 0) d.codeTools.push(t);
+          continue;
+        }
+      }
       if (t && typeof t === 'object' && Array.isArray(t.mcp)) {
         for (var j = 0; j < t.mcp.length; j++) {
           var s = t.mcp[j];
@@ -2786,6 +2796,17 @@
       if (opts.logs) logRun(res, task, wall);
       /* T4: close code_eval realms and drop the per-run todo namespace. */
       try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
+      try {
+        if (typeof sofuu !== 'undefined' && sofuu.plugins && typeof sofuu.plugins.emitTurnEnd === 'function') {
+          sofuu.plugins.emitTurnEnd({
+            turnId: runId,
+            durationMs: wall,
+            tokensUsed: (res.usage && res.usage.completionTokens) || 0,
+            error: res.stopped ? new Error(res.stopped) : null,
+            agent: d.name
+          });
+        }
+      } catch (eEndHook) {}
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
@@ -2797,6 +2818,11 @@
     }
 
     emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.plugins && typeof sofuu.plugins.emitTurnStart === 'function') {
+        sofuu.plugins.emitTurnStart({ turnId: runId, prompt: task, agent: d.name, depth: depth });
+      }
+    } catch (eStartHook) {}
     /* PLAN-ML-GATES §8: open this run's trajectory in the working set.
      * Sub-agents run under their own runId, so trajectories stay separate. */
     if (mlEnabled(d)) {

@@ -4234,3 +4234,30 @@ from the isolated worktree, one commit each, all pushed to main:
   8k-style rope; remedies = re-quant with scaling metadata and support the
   llama3 frequency table, or an explicit SOFUU_ROPE_LLAMA3 knob. NOT done
   here: the rope kernel is peer-lane and needs its own NIAH matrix.
+
+## 2026-10-26 (second pass) — §8 ledger closed out: P3 trace surface + P7 ring-KV landed
+
+- **P3 surface complete (`8de0b44be` after rebase):** per-token timing +
+  logprobs — `GenerateOptions.trace_tokens` fills
+  `InferEngine.last_token_trace` (pos, token, forward_ns, full-vocab top
+  logprob); `sofuu infer --trace <file>` emits one JSONL row per decode-
+  step token. First Gate-4-as-written fold from a real trace (Qwen-0.6B,
+  pos 533-2068, 256-token windows): first 107.2 tk/s, worst 40.3 at
+  1813-2068 → **ratio 0.375 vs the 90% bar — FAIL, now with named
+  windows** (record appended to docs/bench/long-context.jsonl).
+- **P7 ring-KV streaming prefill (`026c041ca`):** `--kivi` loads the CPU
+  engine with a ringed f32 KV cache (SOFUU_KV_RING, default 4096; --ctx
+  stays logical) — prefill chunks ingest themselves post-rope and attend
+  causally over sinks + quantized history + chunk
+  (`compute_attention_causal_upto`, section-width walks for partial
+  groups). ModelConfig gains `logical_max_seq_len` + `kv_ring`. Receipts:
+  parity vs f32 prefill argmax-identical cosine 0.99912 (env-gated test);
+  ring score PPL 18.5874 vs f16 18.5507 = 1.002; **beyond-ring NIAH PASS**
+  (8192tk @75%, needle ~6.4k past the 4096 ring, RSS 2,683 MiB vs 3.08 GB
+  f16); **the Gate-3 config receipt — Qwen3-8B Q4_K_M @ --ctx 33024 peaks
+  at 5.64 GB RSS (bar 7.5)** with "logical 33024 / ring 4096", the 9.66 GB
+  full-cache no longer exists. Recorded costs: scalar causal reader →
+  ring prefill TTFT slower until the SIMD dequant-batch follow-up (block
+  layouts pinned in kivi.rs); 8B kivi CPU decode on this loaded box ~0.1
+  tk/s on the OLD path too (pre-existing, not ring-specific). KIVI suite
+  9/9 after the causal tests.

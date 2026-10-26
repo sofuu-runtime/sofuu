@@ -2550,6 +2550,21 @@ extern "C" int sofuu_metal_batch_gguf_gemv_q4k_v2(
 // Matrix-pipe GEMM that ADDS into the residual (the o/down projections).
 // res_stride must equal rows: the kernel indexes res with the same (gt*rows+grow)
 // mapping it writes y with, which is what the fused-acc route already requires.
+// Per-type column granularity of the batched GEMM kernels. MUST match
+// MetalEngine::gemm_cols_floor in crates/sofuu-core/src/infer/metal.rs:
+// q8_0 walks 32-value blocks, q4_K/q6_K a 256-value super-block. Every one
+// of those kernels truncates to whole blocks, so a shape below the floor is
+// a silent partial dot product - refuse it here as well as on the Rust side
+// (defence in depth: the FFI is callable directly).
+static inline bool sf_gemm_cols_ok(uint32_t ty, size_t cols) {
+    if (cols == 0) return false;
+    switch (ty) {
+        case 8:  return (cols % 32u) == 0;
+        case 12: return (cols % 256u) == 0;
+        case 14: return (cols % 256u) == 0;
+        default: return false;
+    }
+}
 int sofuu_metal_batch_gguf_gemm_mma64_acc(
     void* ctx_ptr,
     uint32_t ty,
@@ -2562,7 +2577,8 @@ int sofuu_metal_batch_gguf_gemm_mma64_acc(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || !res_buf_ptr) return 0;
-    if (rows == 0 || cols == 0 || B == 0 || cols % 256 != 0 || B < 16) return 0;
+    if (rows == 0 || cols == 0 || B == 0 || B < 16) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     if (res_stride != rows) return 0;
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
@@ -2608,7 +2624,8 @@ int sofuu_metal_batch_gguf_gemm_mma64_multi(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
-    if (rows_total == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (rows_total == 0 || cols == 0 || B == 0) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     if (!secs || n_sec == 0 || n_sec > 4) return 0;
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
@@ -2665,7 +2682,8 @@ int sofuu_metal_batch_gguf_gemm_tiled_multi(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
-    if (rows_total == 0 || cols == 0 || B == 0 || cols % 256 != 0) return 0;
+    if (rows_total == 0 || cols == 0 || B == 0) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     if (!secs || n_sec == 0 || n_sec > 4) return 0;
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
@@ -2752,7 +2770,8 @@ int sofuu_metal_batch_gguf_gemm_tiled_acc(
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || !res_buf_ptr) return 0;
-    if (rows == 0 || cols == 0 || B == 0 || cols % 256 != 0 || res_stride == 0) return 0;
+    if (rows == 0 || cols == 0 || B == 0 || res_stride == 0) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     id<MTLComputePipelineState> pso = nil;
     switch (ty) {
         case 12: pso = ctx->pso_gemm_q4_k_tiled_fused; break;
@@ -2902,6 +2921,7 @@ extern "C" int sofuu_metal_batch_gguf_b4multi(
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
     if (!ctx->pso_gpu_q4_k_b4multi_live) return 0;
     if (ty != 12) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     sofuu_batch_barrier(ctx);
     uint c = (uint)cols;
     uint rn = (uint)rows_total;
@@ -3167,6 +3187,7 @@ extern "C" int sofuu_metal_batch_gguf6_b4multi(
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
     if (!ctx->pso_gpu_q6_k_b4multi_live) return 0;
     if (ty != 14) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     sofuu_batch_barrier(ctx);
     uint c = (uint)cols;
     uint rn = (uint)rows_total;
@@ -3199,6 +3220,7 @@ extern "C" int sofuu_metal_batch_gguf8_b4multi(
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
     if (!ctx->pso_gpu_q8_0_b4multi_live) return 0;
     if (ty != 8) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     sofuu_batch_barrier(ctx);
     uint c = (uint)cols;
     uint rn = (uint)rows_total;
@@ -3231,6 +3253,7 @@ extern "C" int sofuu_metal_batch_gguf8_b4r4(
     if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr || rows_total == 0 || cols == 0 || !secs || n_sec == 0 || n_sec > 4) return 0;
     if (!ctx->pso_gpu_q8_0_b4r4_live) return 0;
     if (ty != 8) return 0;
+    if (!sf_gemm_cols_ok(ty, cols)) return 0;
     sofuu_batch_barrier(ctx);
     uint c = (uint)cols;
     uint rn = (uint)rows_total;

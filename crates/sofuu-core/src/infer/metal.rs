@@ -39,6 +39,60 @@ pub const OP_NAMES: [&str; OP_KINDS] = [
     "head", "gguf_b4s",
 ];
 
+/// Column granularity a BATCHED GEMM actually needs, per weight type, read off
+/// the kernels rather than assumed (src/metal/kernels.metal):
+///
+///   * q8_0 (ty 8) - every q8_0 GEMM body walks `nb = cols / 32` 34-byte
+///     blocks, 32 values per block: gemm_q8_0, gemm_q8_0_multi, gemm_q8_0_acc,
+///     gemm_q8_0_t32, gemm_q8_0_mma64 (`nb = cols / 32`, `nbk = cols / MM_BK`
+///     with MM_BK = 32) and gemm_q8_0_tiled_fused (`nbk = cols / TILED_BK`
+///     with TILED_BK = 32; its ROW stride is (cols/32)*34 bytes). => 32.
+///   * q4_K (ty 12) - a 256-value super-block in a 144-byte block
+///     (gemm_q4_k `nb = cols / 256`, gemm_q4_k_tiled*/mma*/mmq likewise,
+///     f16_mma64_tile's q4_K branch `nb = cols / 256`). => 256.
+///   * q6_K (ty 14) - 256 values in a 210-byte block (gemm_q6_k,
+///     gemm_q6_k_multi, gemm_q6_k_acc, gemm_q6_k_t32, gemm_q6_k_tiled_fused
+///     `nb = cols / 256`). => 256.
+///
+/// A type not in this list has no batched GEMM at all: refuse rather than
+/// dispatch something that computes a partial dot product. The floor is a
+/// HARD requirement - every kernel drops a `cols % block` tail, so a shape
+/// below the floor is a silent wrong answer, not a slow one.
+pub fn gemm_cols_floor(ty: u32) -> Option<usize> {
+    match ty {
+        GGML_TYPE_Q8_0 => Some(32),
+        GGML_TYPE_Q4_K => Some(256),
+        GGML_TYPE_Q6_K => Some(256),
+        _ => None,
+    }
+}
+
+/// True when one batched GEMM dispatch can cover `cols` columns exactly for
+/// this weight type. `false` is always safe (the caller keeps the per-row
+/// GEMV walk, which covers arbitrary columns one row at a time).
+pub fn gemm_cols_ok(ty: u32, cols: usize) -> bool {
+    match gemm_cols_floor(ty) {
+        Some(f) => cols != 0 && cols % f == 0,
+        None => false,
+    }
+}
+
+/// Loud, once-per-process note when a batched GEMM refuses a shape. The
+/// fallback (one dispatch per token) is CORRECT but 3x slower than the CPU
+/// tile path on a 960-wide q8_0 model, so a shape change must never silently
+/// land there.
+pub fn note_gemm_shape_refusal(ty: u32, cols: usize, entry: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if let Some(want) = gemm_cols_floor(ty) {
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[gemm-floor] {entry} refused: ty={ty} cols={cols} (needs cols % {want} == 0         for this quant block); that projection now walks one dispatch per token"
+            );
+        }
+    }
+}
+
 
 pub struct MetalEngine {
     /// P0.2 per-op HOST enqueue timing (SOFUU_GPU_TIMING=2): nanos + count
@@ -1948,7 +2002,16 @@ impl MetalEngine {
         x_buf: &MetalBuffer, x_offset: usize,
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
-    ) -> bool {        let __t = self.op_tick(K_GGUF_GEMM);
+    ) -> bool {
+        // Per-type floor, not a blanket 256: q8_0 tiles 32 values, q4_K/q6_K a
+        // 256-value super-block (see gemm_cols_floor). The .mm dispatch itself
+        // has no column guard, so without this a cols % 32 != 0 q8_0 shape
+        // would dispatch a kernel that silently drops its tail.
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm");
+            return false;
+        }
+        let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gguf_gemm(
                 self.ctx,
@@ -2151,6 +2214,10 @@ impl MetalEngine {
         {
             return false;
         }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_tiled_multi");
+            return false;
+        }
         if std::env::var_os("SOFUU_TILED_DEBUG").is_some() {
             eprintln!("[tiled-dbg] multi ty={ty} rows={rows_total} cols={cols} B={b}");
         }
@@ -2181,6 +2248,10 @@ impl MetalEngine {
         rows: usize, cols: usize, b: usize,
     ) -> bool {
         if !matches!(ty, 8 | 12 | 14) || !Self::gemm_tiled_enabled() || b < 16 {
+            return false;
+        }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_tiled_acc");
             return false;
         }
         if std::env::var_os("SOFUU_TILED_DEBUG").is_some() {
@@ -2220,7 +2291,11 @@ impl MetalEngine {
         rows_total: usize, cols: usize, b: usize,
         secs: &[[u32; 5]],
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || b < 2 || cols % 256 != 0 {
+        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || b < 2 {
+            return false;
+        }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_tiled_multi_chain");
             return false;
         }
         let __t = self.op_tick(K_GGUF_GEMM);
@@ -2252,7 +2327,11 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || b < 2 || cols % 256 != 0 || res_stride != rows {
+        if !matches!(ty, 8 | 12 | 14) || b < 2 || res_stride != rows {
+            return false;
+        }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_tiled_acc_chain");
             return false;
         }
         let __t = self.op_tick(K_GGUF_GEMM);
@@ -2308,6 +2387,10 @@ impl MetalEngine {
         secs: &[[u32; 5]], // host-padded to 4 entries
     ) -> bool {
         debug_assert!(secs.len() <= 4);
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_multi");
+            return false;
+        }
         let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gguf_gemm_multi(
@@ -2336,6 +2419,10 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_acc");
+            return false;
+        }
         let __t = self.op_tick(K_GGUF_GEMM);
         let __r = unsafe {
             sofuu_metal_batch_gguf_gemm_acc(
@@ -2805,7 +2892,11 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 {
+        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 {
+            return false;
+        }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_mma64_acc");
             return false;
         }
         let __t = self.op_tick(K_GGUF_GEMM);
@@ -2834,7 +2925,11 @@ impl MetalEngine {
         secs: &[[u32; 5]; 4],
     ) -> bool {
         let secs: &[[u32; 5]] = &secs[..];
-        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || cols % 256 != 0 || secs.is_empty() {
+        if !matches!(ty, 8 | 12 | 14) || !Self::gemm_mma_enabled() || b < 16 || secs.is_empty() {
+            return false;
+        }
+        if !gemm_cols_ok(ty, cols) {
+            note_gemm_shape_refusal(ty, cols, "batch_gguf_gemm_mma64_multi");
             return false;
         }
         let n_sec = secs.len();
@@ -9501,4 +9596,83 @@ fn gqa_each_shape_matches_per_head_kernel() {
     assert!(checked >= 8, "only {checked} shapes verified (skipped {skipped:?})");
     println!("[gqa-parity] {checked} shapes match the per-head kernel; skipped {skipped:?}");
 }
+
+// ── batched-GEMM column floor - regression gate ─────────────────────────────
+// The floor is the contract between the host dispatch guard and the kernels'
+// block arithmetic. Too coarse and a whole model class falls back to one
+// dispatch per token (SmolLM2 q8_0 at cols=960 ran 3x slower than the CPU
+// tile path); too fine and a kernel silently drops the tail of every row.
+// Both directions are wrong answers, so both are pinned here.
+#[test]
+fn gemm_cols_floor_matches_the_kernel_block_size() {
+    assert_eq!(gemm_cols_floor(GGML_TYPE_Q8_0), Some(32));
+    assert_eq!(gemm_cols_floor(GGML_TYPE_Q4_K), Some(256));
+    assert_eq!(gemm_cols_floor(GGML_TYPE_Q6_K), Some(256));
+    // No batched GEMM exists for anything else: refuse, never fall through
+    // to a kernel that would compute a partial dot product.
+    assert_eq!(gemm_cols_floor(GGML_TYPE_F32), None);
+    assert_eq!(gemm_cols_floor(GGML_TYPE_F16), None);
+    assert_eq!(gemm_cols_floor(GGML_TYPE_Q4_0), None);
+    assert_eq!(gemm_cols_floor(99), None);
+}
+
+#[test]
+fn gemm_cols_ok_accepts_the_fleet_widths_and_refuses_every_tail() {
+    // every projection width in the model fleet (960 is SmolLM2's hidden
+    // size: below the retired 256 floor but exactly 30 q8_0 blocks)
+    for &cols in &[960usize, 1024, 2048, 2560, 3072, 6144, 8192, 10240] {
+        assert!(gemm_cols_ok(GGML_TYPE_Q8_0, cols), "q8_0 must cover cols={cols}");
+    }
+    assert!(gemm_cols_ok(GGML_TYPE_Q8_0, 960));
+    // ...and the same width is STILL refused for the 256-value super-block
+    // types: relaxing q8_0 must not relax them.
+    assert!(!gemm_cols_ok(GGML_TYPE_Q6_K, 960));
+    assert!(!gemm_cols_ok(GGML_TYPE_Q4_K, 960));
+    // non-multiple-of-32 stays refused (the kernel would drop the tail)
+    for &cols in &[0usize, 1, 31, 1000, 2047, 4095] {
+        assert!(!gemm_cols_ok(GGML_TYPE_Q8_0, cols), "q8_0 must refuse cols={cols}");
+    }
+    assert!(gemm_cols_ok(GGML_TYPE_Q4_K, 3072));
+    assert!(!gemm_cols_ok(GGML_TYPE_Q4_K, 3200));
+    assert!(!gemm_cols_ok(GGML_TYPE_Q6_K, 2080));
+    assert!(!gemm_cols_ok(GGML_TYPE_F16, 2048));
+}
+
+/// The kernel that carries a non-q4_K chain projection must stride a weight
+/// ROW by whole 32-value q8_0 blocks, which is exactly what the 32 floor
+/// promises. The retired `(cols/256)*8*34` form agrees only on 256-divisible
+/// widths, so pin the source text to the 32-block form (and pin the q6_K twin
+/// to its 256-value blocks): an edit that changes the tile granularity without
+/// changing the host floor fails here instead of on a 960-wide model.
+#[test]
+fn q8_0_tiled_fused_strides_rows_by_32_value_blocks() {
+    fn kernel_body<'a>(all: &'a str, name: &str) -> &'a str {
+        let start = match all.find(name) {
+            Some(s) => s,
+            None => panic!("{name} missing from kernels.metal"),
+        };
+        let rest = &all[start..];
+        let end = match rest[1..].find("\nkernel void ") {
+            Some(i) => i + 1,
+            None => rest.len(),
+        };
+        &rest[..end]
+    }
+    const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+    let q8 = kernel_body(KERNELS, "kernel void gemm_q8_0_tiled_fused(");
+    assert!(
+        q8.contains("cols / 32u") && q8.contains("nb32 * 34u"),
+        "gemm_q8_0_tiled_fused must stride rows by (cols/32)*34 bytes"
+    );
+    assert!(
+        !q8.contains("cols / 256"),
+        "gemm_q8_0_tiled_fused still assumes 256-divisible cols"
+    );
+    let q6 = kernel_body(KERNELS, "kernel void gemm_q6_k_tiled_fused(");
+    assert!(
+        q6.contains("cols / 256"),
+        "gemm_q6_k_tiled_fused must keep 256-value super-blocks"
+    );
+}
+
 

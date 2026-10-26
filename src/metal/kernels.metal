@@ -4278,7 +4278,14 @@ kernel void gemm_q8_0_tiled_fused(
 
     uint r0 = tg.x * TILED_R;
     uint t0 = tg.y * TILED_T;
-    uint nb = cols / 256;
+    // q8_0 packs one 34-byte block per 32 values, so a weight ROW is
+    // (cols/32)*34 bytes. The retired form computed it as eight 34-byte
+    // blocks per 256-value super-block, which is the same number only when
+    // 256 divides cols: at the 960-wide SmolLM2 the host floor kept this
+    // kernel away, so the arithmetic error was latent. With the floor at 32
+    // (MetalEngine::gemm_cols_floor) this formula has to be the 32-block one,
+    // or every row past the first reads the wrong weights.
+    uint nb32 = cols / 32u;
 
     float acc[4][4];
     for (uint i = 0; i < 4; ++i) {
@@ -4286,8 +4293,8 @@ kernel void gemm_q8_0_tiled_fused(
     }
 
     // staging cursor for this thread's row — resolved ONCE (it is
-    // section-dependent and k-independent). d/dmin are per 256-value block,
-    // so they stay inside the k loop below.
+    // section-dependent and k-independent). The block scale d is per
+    // 32-value block, so it stays inside the k loop below.
     uint srow = r0 + (tid >> 2);
     device const uchar *s_blk = w_base;
     bool s_live = false;
@@ -4303,7 +4310,7 @@ kernel void gemm_q8_0_tiled_fused(
             prev_end = end_i;
         }
         if (srow < rows_tot) {
-            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb * 8 * 34;
+            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb32 * 34u;
             s_live = true;
         }
     }
@@ -4312,8 +4319,8 @@ kernel void gemm_q8_0_tiled_fused(
     uint nbk = cols / TILED_BK;
     for (uint kb = 0; kb < nbk; ++kb) {
         uint k0 = kb * TILED_BK;
-        uint b = k0 / 256;
-        uint sub = (k0 % 256) / 32;
+        // q8_0 has one scale per 32 values, so the k-slice index IS the block
+        // index: no super-block split here (that is the q6_K twin's job).
 
         // ── stage 32 rows x 32 values ──
         {

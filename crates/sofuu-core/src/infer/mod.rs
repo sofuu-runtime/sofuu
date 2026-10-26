@@ -1049,7 +1049,18 @@ impl InferEngine {
         let pool_failures_before = self::quant::pool_failures();
 
         // 1. Tokenize prompt
-        let input_tokens = self.tokenizer.encode(prompt);
+        let mut input_tokens = self.tokenizer.encode(prompt);
+        // DIAGNOSTIC ONLY (never set in shipped runs): truncate the token
+        // stream so a numerics/speed sweep can compare two arms at an
+        // identical token prefix, including lengths that no text cut hits.
+        if let Some(lim) = std::env::var("SOFUU_PREFILL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if lim > 0 && lim < input_tokens.len() {
+                input_tokens.truncate(lim);
+            }
+        }
         if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
             eprintln!(
                 "[determ] input_tokens.len {} = {:?}",
@@ -1127,6 +1138,36 @@ impl InferEngine {
             let initial_logits = self.model.forward_prefill_all_with_logits(&input_tokens, 0);
             if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
                 eprintln!("[determ] prefill_logits[..8] = {:?}", &initial_logits[..8]);
+            }
+            // DIAGNOSTIC ONLY: dump the WHOLE last-row logit vector so a
+            // GPU-vs-CPU numeric comparison covers every vocabulary entry
+            // instead of the 8 printed above. Raw little-endian f32.
+            if let Some(p) = std::env::var_os("SOFUU_DUMP_LOGITS") {
+                let mut bytes = Vec::with_capacity(initial_logits.len() * 4 + 64);
+                bytes.extend_from_slice(b"SFLOG01\0");
+                bytes.extend_from_slice(&(initial_logits.len() as u64).to_le_bytes());
+                for v in initial_logits.iter() {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                if let Err(e) = std::fs::write(&p, &bytes) {
+                    eprintln!("[logits-dump] write {} failed: {e}", p.to_string_lossy());
+                } else {
+                    let mut amax = 0.0f32;
+                    let mut argmax = 0usize;
+                    for (i, v) in initial_logits.iter().enumerate() {
+                        let a = v.abs();
+                        if a > amax { amax = a; }
+                        if *v > initial_logits[argmax] { argmax = i; }
+                    }
+                    eprintln!(
+                        "[logits-dump] {} n={} maxabs={:.6} argmax={} top={:.6}",
+                        p.to_string_lossy(),
+                        initial_logits.len(),
+                        amax,
+                        argmax,
+                        initial_logits[argmax]
+                    );
+                }
             }
             logits_buf.copy_from_slice(initial_logits);
             cur_pos = input_tokens.len();

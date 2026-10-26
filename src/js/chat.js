@@ -1267,6 +1267,10 @@
     try {
       if (typeof sofuu !== 'undefined' && sofuu.events && typeof sofuu.events.append === 'function') {
         var sid6 = String(S.info ? S.info.id : 'chat');
+        /* R4.3: each turn keeps a stable id (`<sid>-t<N>`) so the §5.2
+         * session document folds into the same turns after a restart. */
+        if (kind === 'prompt') S._promptCount = (S._promptCount | 0) + 1;
+        var turnId6 = sid6 + '-t' + (S._promptCount | 0);
         var payload6 = { text: String(text == null ? '' : text) };
         if (kind === 'usage') {
           try {
@@ -1289,12 +1293,29 @@
           project: String(S.project || '.'),
           sid: sid6,
           events: [{
-            kind: kind, schema_version: 1, sid: sid6, turn_id: sid6,
+            kind: kind, schema_version: 1, sid: sid6, turn_id: turnId6,
             seq: 1000 + (ev.seq | 0),
             ts: new Date(t).toISOString(),
             surface: 'js', payload: payload6,
           }],
         }));
+        /* P3 (R4.1): the canonical session document at the R4.3 canonical
+         * location — rebuilt from the log at each turn-terminal event so
+         * `.sofuu/sessions/<id>/session.json` is the portable truth the
+         * CLI exports. The fold is small (per-event, not per-token) and a
+         * failure here never breaks the turn. */
+        if (kind === 'usage' || kind === 'answer') {
+          try {
+            sofuu.session.sync(JSON.stringify({
+              project: String(S.project || '.'),
+              sid: sid6,
+              meta: {
+                model: String((S.info && S.info.model) || ''),
+                provider: String((S.info && S.info.provider) || ''),
+              },
+            }));
+          } catch (eSync6) {}
+        }
       }
     } catch (eEv6) {}
     sessionPersist();
@@ -1322,6 +1343,7 @@
       task: null, notes: [], events: [],
     };
     S.eventSeq = 0;
+    S._promptCount = 0; /* R4.3: per-turn ids `<sid>-t<N>`, restart-stable */
     /* The project store skeleton — generated for every session, so the
      * structure exists even before the first record lands. */
     ensureDir(sessionDir(project, id));
@@ -2343,6 +2365,10 @@
     var data = loadSessionData(S.project, String(id || ''), S.pastTurns);
     if (!data) return { ok: false, error: 'session not found (or QTSQ unavailable)' };
     var turns = turnsFromData(data, S.pastTurns);
+    /* R4.3: the session doc's turn ids stay stable across restarts — seed
+     * the per-turn counter from the restored turns so a resumed session's
+     * Nth turn is the same `<sid>-t<N>` it would have been without one. */
+    S._promptCount = turns.length;
     /* A minted-but-unused session (zero turns) MUST still attach: refusing
      * it leaves the host sessionless next to an existing pill, and the next
      * turn then mints a duplicate (the desktop "session-2" bug). */

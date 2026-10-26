@@ -142,9 +142,12 @@ jobs:
       # so the same binary doubles as the T1.3 memory-refusal target.
       - name: Contract conformance suite (report mode)
         run: |
+          # P3 (R5.3): the C ABI is now a checked surface — the libsofuu step
+          # above already built dist/, so the cabi parity cases run too.
           CONTRACT_NOQTSQ_BIN=target/release/sofuu \
+            CONTRACT_LIBSOFUU=dist/libsofuu.dylib \
             bash scripts/contract/run_contract_tests.sh \
-            || echo "contract suite: non-blocking while P2/P3 are in progress"
+            || echo "contract suite: non-blocking while P3 is in progress"
 
       - name: ABI symbol guard
         run: make abi-check

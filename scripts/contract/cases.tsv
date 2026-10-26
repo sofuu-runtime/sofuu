@@ -29,18 +29,18 @@ T3.3|R3|R3.6|cli|-|python3 scripts/text_gate.py contract/fixtures/sofuu-fixture.
 T3.4|R3|R3.4|file|-|scripts/text_gate.py|has:tier|receipt schema fields missing
 T3.5|R3|R3.2|manual|-|-|-|needs fixture + reference route
 T3.6|R3|R3.3|manual|-|-|-|needs default introspection
-T4.1|R4|R4.2|cli|-|./sofuu session export|stdout_absent:unknown session command|no export command exists
+T4.1|R4|R4.2|cli|-|./sofuu run scripts/contract/harness/t41_session_roundtrip.js|exit:0|session document round-trips JS⇄CLI: turns/tools/usage/ids identical
 T4.2|R4|R4.2|manual|-|-|-|needs macOS+Android runners
-T4.3|R4|R4.3|manual|-|-|-|needs stable ids in the schema
+T4.3|R4|R4.3|cli|-|./sofuu run scripts/contract/harness/t41_session_roundtrip.js|exit:0|ids stable: turn ids are stable shapes; re-import is idempotent
 T4.4|R4|R4.4|manual|-|-|-|needs a committed v0.2 fixture
-T4.5|R4|R4.5|js|-|typeof sofuu.session|object|session lives under chat.*
-T4.6|R4|R4.6|manual|-|-|-|needs export implementation
+T4.5|R4|R4.5|js|-|typeof sofuu.session|object|the session primitive is a first-class namespace (list/export/import/sync)
+T4.6|R4|R4.6|cli|-|./sofuu run scripts/contract/harness/t46_export_redaction.js|exit:0|an export carrying secrets ships none; fields survive redaction
 T4.7|R4|R4.1|file|-|src/js/chat.js|has:schema_version|no version field today
 T5.1|R5|R5.3|file|-|contract/SURFACE-MATRIX.md|hasnot:unknown|generated matrix has no unknowns
-T5.2|R5|R5.4|http|GET /v1/models|200|needs serve+model
-T5.3|R5|R5.4|http|POST /v1/chat/completions|sse|needs serve+model
-T5.4|R5|R5.4|http|POST /v1/chat/completions|json|needs serve+model
-T5.5|R5|R5.5|cabi|sofuu_rt_call|present|needs make libsofuu
+T5.2|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|GET /v1/models returns the OpenAI list shape for the loaded model
+T5.3|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions stream:true yields SSE delta frames + [DONE]
+T5.4|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions JSON matches the OpenAI completion shape
+T5.5|R5|R5.5|cabi|-|sofuu_rt_call|present|the C ABI keeps the versioned symbol contract (make libsofuu + CONTRACT_LIBSOFUU)
 T5.6|R5|R5.6|manual|-|-|-|needs an MCP fixture server
 T5.7|R5|R5.5|file|-|.github/workflows/ci.yml|has:abi-check|gate exists
 T5.8|R5|R5.1|manual|-|-|-|needs a four-surface failure harness

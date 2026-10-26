@@ -494,6 +494,10 @@ impl ChatConfig {
             let dir = Self::config_dir();
             let _ = std::fs::create_dir_all(&dir);
             let json = serde_json::json!({
+                /* P3 (R4.1): the config is a persisted artifact, so it carries
+                 * the §5 schema_version; the reader treats absence as v0 and
+                 * migrates by normalizing on the next save (R4.4: forward-only). */
+                "schema_version": 1,
                 "providers": self.providers,
                 "active": self.active,
                 "provider": flat_provider,

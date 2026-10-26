@@ -1,331 +1,770 @@
 {
-  "schema": 1,
-  "audit_date": "2026-10-23 (refreshed 2026-10-25)",
-  "rules": ["R1", "R2", "R3", "R4", "R5", "R6", "R7"],
-  "surfaces": ["js", "cli", "http", "cabi", "swift_kotlin", "mcp"],
-  "primitives": ["session", "stream", "tool", "usage", "memory", "model", "agent", "transport"],
-  "status_legend": {
-    "full": "the surface's documented API exposes the primitive's main operations with correct result shapes",
-    "partial": "some operations are missing, or only reachable through a generic escape hatch; every missing item is listed",
-    "unavailable": "the primitive cannot be used on this surface; the reason is listed",
-    "n/a": "the primitive is not a concept on this surface"
+ "schema": 1,
+ "audit_date": "2026-10-23 (refreshed 2026-10-26)",
+ "rules": [
+  "R1",
+  "R2",
+  "R3",
+  "R4",
+  "R5",
+  "R6",
+  "R7"
+ ],
+ "surfaces": [
+  "js",
+  "cli",
+  "http",
+  "cabi",
+  "swift_kotlin",
+  "mcp"
+ ],
+ "primitives": [
+  "session",
+  "stream",
+  "tool",
+  "usage",
+  "memory",
+  "model",
+  "agent",
+  "transport"
+ ],
+ "status_legend": {
+  "full": "the surface's documented API exposes the primitive's main operations with correct result shapes",
+  "partial": "some operations are missing, or only reachable through a generic escape hatch; every missing item is listed",
+  "unavailable": "the primitive cannot be used on this surface; the reason is listed",
+  "n/a": "the primitive is not a concept on this surface"
+ },
+ "cells": [
+  {
+   "primitive": "session",
+   "surface": "js",
+   "status": "full",
+   "missing": [
+    "tool_use/tool_result pairing fidelity"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/rt/session_doc.rs",
+    "src/js/chat.js"
+   ],
+   "tests": [
+    "T4.1",
+    "T4.3",
+    "T4.5",
+    "T4.6"
+   ],
+   "note": "sofuu.session (list/export/import/sync, schemaVersion 1) + the session.json document at the canonical location; export/import round-trips with the CLI (T4.1); pairing fidelity rides the cross-surface harness (T4.2)"
   },
-  "cells": [
-    {
-      "primitive": "session", "surface": "js", "status": "partial",
-      "missing": ["export/import", "event-level read", "metadata update", "tool_use/tool_result pairing fidelity"],
-      "evidence": ["src/js/chat.js:2549-2569", "src/js/chat.js:2258", "src/js/chat.js:1369-1386"],
-      "tests": ["T4.1", "T4.2", "T4.3"]
-    },
-    {
-      "primitive": "session", "surface": "cli", "status": "full",
-      "missing": [],
-      "note": "session list/show/inspect/repair/migrate/storage-stats/prune plus chat /sessions /resume /context; no export subcommand",
-      "evidence": ["crates/sofuu-core/src/main.rs:771-816", "crates/sofuu-core/src/chat.rs:887-918"],
-      "tests": ["T4.1"]
-    },
-    {
-      "primitive": "session", "surface": "http", "status": "unavailable",
-      "missing": [],
-      "reason": "no session routes; unmatched paths fall through to 404",
-      "evidence": ["crates/sofuu-core/src/main.rs:1434-1435"],
-      "tests": ["T5.1"]
-    },
-    {
-      "primitive": "session", "surface": "cabi", "status": "full",
-      "missing": [],
-      "note": "reachable through the documented sofuu_rt_call funnel (chat.init/resume/sessions/newSession/sessionTurns/deleteSession); deleteSession removes only the registry entry, not files",
-      "evidence": ["crates/sofuu-capi/src/lib.rs:894-911", "src/js/chat.js:2258", "src/js/chat.js:2349"],
-      "tests": ["T4.2", "T4.3"]
-    },
-    {
-      "primitive": "session", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["typed session API"],
-      "note": "reachable only through the generic call/callStream bridge; no Swift or Kotlin session wrapper",
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"],
-      "tests": ["T4.2"]
-    },
-    {
-      "primitive": "session", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "MCP has no session concept",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "stream", "surface": "js", "status": "partial",
-      "missing": ["uniform backpressure", "cancel token for every stream", "structured per-chunk tool-call events"],
-      "evidence": ["crates/sofuu-core/src/rt/ai.rs:6383", "crates/sofuu-core/src/rt/ai.rs:6397", "crates/sofuu-core/src/rt/ai.rs:4435-4478"],
-      "tests": ["T2.2", "T2.5", "T6.1"]
-    },
-    {
-      "primitive": "stream", "surface": "cli", "status": "full",
-      "missing": [],
-      "evidence": ["crates/sofuu-core/src/main.rs:1944-1965", "crates/sofuu-core/src/main.rs:1159-1190", "crates/sofuu-core/src/main.rs:2471-2485"],
-      "tests": ["T2.2"]
-    },
-    {
-      "primitive": "stream", "surface": "http", "status": "full",
-      "missing": [],
-      "note": "SSE chat/completions and completions; chat template is bypassed (messages flattened to text)",
-      "evidence": ["crates/sofuu-core/src/main.rs:1134-1217", "crates/sofuu-core/src/main.rs:1218-1283"],
-      "tests": ["T2.4", "T5.3", "T5.4"]
-    },
-    {
-      "primitive": "stream", "surface": "cabi", "status": "full",
-      "missing": [],
-      "note": "cancel is thread-local; a C host cannot cancel from another thread",
-      "evidence": ["crates/sofuu-capi/src/lib.rs:1235", "crates/sofuu-capi/src/lib.rs:1465", "crates/sofuu-capi/src/lib.rs:1491"],
-      "tests": ["T2.2", "T2.3"]
-    },
-    {
-      "primitive": "stream", "surface": "swift_kotlin", "status": "full",
-      "missing": [],
-      "note": "Swift StreamHandle.cancel is same-thread only; Kotlin cancels via the listener return value",
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:258-281", "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:485", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:131-150"],
-      "tests": ["T2.2"]
-    },
-    {
-      "primitive": "stream", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "MCP tools are request/response; no streaming primitive",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "tool", "surface": "js", "status": "partial",
-      "missing": ["uniform tool result shape"],
-      "note": "policy floor shared via sofuu.policy.evaluate (tools.js + agent.js); SOFUU_NO_SHELL now filters GROUP (landed 2026-10-23, 0b753686c); approval UX still differs between chat and agent",
-      "evidence": ["src/js/tools.js:65-94", "src/js/tools.js:1265-1271", "src/js/agent.js:3660", "crates/sofuu-core/src/rt/policy.rs:137"],
-      "tests": ["T7.1", "T7.6", "T5.6"]
-    },
-    {
-      "primitive": "tool", "surface": "cli", "status": "partial",
-      "missing": ["standalone tool management", "approval control from the CLI"],
-      "note": "agent run resolves tools from the definition; chat /tools is list-only",
-      "evidence": ["crates/sofuu-core/src/main.rs:205-207", "crates/sofuu-core/src/chat.rs:750"],
-      "tests": ["T7.6"]
-    },
-    {
-      "primitive": "tool", "surface": "http", "status": "unavailable",
-      "missing": [],
-      "reason": "no tool routes; tools cannot be inspected, registered, or approved over HTTP",
-      "evidence": ["crates/sofuu-core/src/main.rs:1434-1435"],
-      "tests": ["T5.1"]
-    },
-    {
-      "primitive": "tool", "surface": "cabi", "status": "partial",
-      "missing": ["tool inspection/list", "in-run approval from the host thread"],
-      "note": "host tool register/resolve exist; built-ins are reachable only through agent.run or undocumented tools.TOOLS.execute",
-      "evidence": ["crates/sofuu-capi/src/lib.rs:1741", "crates/sofuu-capi/src/lib.rs:1823", "src/js/tools.js:924"],
-      "tests": ["T7.2", "T7.4"]
-    },
-    {
-      "primitive": "tool", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["tool inspection", "approval resolution"],
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:311", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:199", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:213"],
-      "tests": ["T7.2"]
-    },
-    {
-      "primitive": "tool", "surface": "mcp", "status": "full",
-      "missing": [],
-      "note": "mcp.connect/call/listTools/listResources and mcp.serve tool/start; mcp.servers.allow is enforced by sofuu.policy.evaluate",
-      "evidence": ["crates/sofuu-core/src/rt/mcp.rs:1434-1500", "crates/sofuu-core/src/rt/mcp.rs:579-600"],
-      "tests": ["T5.6", "T7.9"]
-    },
-
-    {
-      "primitive": "usage", "surface": "js", "status": "partial",
-      "missing": ["usage from ai.complete", "cost from agent results", "one usage shape across chat/agent/ai"],
-      "evidence": ["crates/sofuu-core/src/rt/ai.rs:6376", "crates/sofuu-core/src/rt/ai.rs:2906-2963", "src/js/chat.js:2131-2145", "src/js/chat.js:2481", "src/js/agent.js:2275"],
-      "tests": ["T6.4", "T6.7"]
-    },
-    {
-      "primitive": "usage", "surface": "cli", "status": "partial",
-      "missing": ["uniform usage output across commands"],
-      "note": "chat /cost, agent run usage line, outputs stats; each has its own shape",
-      "evidence": ["crates/sofuu-core/src/main.rs:337-347", "crates/sofuu-core/src/chat.rs:2736-2787", "crates/sofuu-core/src/output_archive.rs:1832"],
-      "tests": ["T6.4"]
-    },
-    {
-      "primitive": "usage", "surface": "http", "status": "unavailable",
-      "missing": [],
-      "reason": "completion responses carry no usage object",
-      "evidence": ["crates/sofuu-core/src/main.rs:1200-1210", "crates/sofuu-core/src/main.rs:1270-1276"],
-      "tests": ["T5.4"]
-    },
-    {
-      "primitive": "usage", "surface": "cabi", "status": "partial",
-      "missing": ["ai.complete usage"],
-      "evidence": ["src/js/chat.js:2481", "src/js/chat.js:2258", "crates/sofuu-core/src/rt/ai.rs:3898"],
-      "tests": ["T6.4"]
-    },
-    {
-      "primitive": "usage", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["typed usage model", "stream usage"],
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"],
-      "tests": ["T6.4"]
-    },
-    {
-      "primitive": "usage", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "MCP has no usage concept",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "memory", "surface": "js", "status": "partial",
-      "missing": ["remember/recall reachable from JS"],
-      "note": "P1 finding (2026-10-25): the zerocopy bridge registers sofuu.memory/sofuu.brain AFTER the CMA memory module, clobbering both — on the release build sofuu.memory is the buffer bridge (allocAligned/viewFloat32/…) and typeof sofuu.memory.remember is undefined. Chat's brain works via internal __qtsq_* globals, so the loss is silent.",
-      "evidence": ["crates/sofuu-core/src/rt/memory.rs:4216-4217", "crates/sofuu-core/src/rt/zerocopy.rs:274-470", "crates/sofuu-core/src/rt/engine.rs:270-273"],
-      "tests": ["T1.3", "T4.6"]
-    },
-    {
-      "primitive": "memory", "surface": "cli", "status": "partial",
-      "missing": ["dedicated `sofuu memory` command"],
-      "note": "available only through chat slash commands and doctor probes",
-      "evidence": ["crates/sofuu-core/src/chat.rs:1109-1131", "crates/sofuu-core/src/chat.rs:1391-1447", "crates/sofuu-core/src/doctor.rs:109-190"],
-      "tests": ["T1.4"]
-    },
-    {
-      "primitive": "memory", "surface": "http", "status": "partial",
-      "missing": ["import"],
-      "note": "remember/recall/memories/forget/share exist; serve defaults to a different brain file than chat",
-      "evidence": ["crates/sofuu-core/src/main.rs:1284-1433", "crates/sofuu-core/src/main.rs:951-954"],
-      "tests": ["T4.6"]
-    },
-    {
-      "primitive": "memory", "surface": "cabi", "status": "full",
-      "missing": [],
-      "evidence": ["crates/sofuu-capi/src/lib.rs:193-374"],
-      "tests": ["T1.3"]
-    },
-    {
-      "primitive": "memory", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["Swift: forget/export/import/list/stats", "Kotlin: typed memory API"],
-      "note": "the generic call bridge reaches the rest",
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:544-632", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"],
-      "tests": ["T1.3"]
-    },
-    {
-      "primitive": "memory", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "memory is not exposed as MCP tools",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "model", "surface": "js", "status": "partial",
-      "missing": ["model.describe", "model.list", "persistent model selection", "pricing in the runtime"],
-      "evidence": ["crates/sofuu-core/src/rt/ai.rs:6509", "crates/sofuu-core/src/rt/ai.rs:6520", "src/js/agent.js:5384-5387", "src/js/chat.js:1900"],
-      "tests": ["T1.5"]
-    },
-    {
-      "primitive": "model", "surface": "cli", "status": "full",
-      "missing": [],
-      "evidence": ["crates/sofuu-core/src/main.rs:1683-1991", "crates/sofuu-core/src/main.rs:565-589", "crates/sofuu-core/src/main.rs:883-892", "crates/sofuu-core/src/doctor.rs:74-102"],
-      "tests": ["T5.2"]
-    },
-    {
-      "primitive": "model", "surface": "http", "status": "partial",
-      "missing": ["model.describe/caps", "stable usable model ids", "selection"],
-      "note": "/v1/models returns a basename or sofuu-default; completions 400 when no path is set",
-      "evidence": ["crates/sofuu-core/src/main.rs:1120-1133", "crates/sofuu-core/src/main.rs:1138-1143"],
-      "tests": ["T5.2"]
-    },
-    {
-      "primitive": "model", "surface": "cabi", "status": "partial",
-      "missing": ["model.list", "persistent selection"],
-      "evidence": ["crates/sofuu-core/src/rt/ai.rs:6509", "crates/sofuu-core/src/rt/ai.rs:6520", "crates/sofuu-capi/src/lib.rs:894-911"],
-      "tests": ["T1.5"]
-    },
-    {
-      "primitive": "model", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["model list/describe/select"],
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:281", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:150"],
-      "tests": ["T1.5"]
-    },
-    {
-      "primitive": "model", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "MCP has no model concept",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "agent", "surface": "js", "status": "full",
-      "missing": [],
-      "note": "define/run/runMany/mapContext/cancel/list/loadDir/getTrace/resume/current plus approvals; no update/delete, no durable run store beyond traces",
-      "evidence": ["src/js/agent.js:5358-5479", "src/js/agent.js:2633"],
-      "tests": ["T2.7", "T7.4"]
-    },
-    {
-      "primitive": "agent", "surface": "cli", "status": "partial",
-      "missing": ["update/delete", "durable run management"],
-      "evidence": ["crates/sofuu-core/src/main.rs:147-383", "crates/sofuu-core/src/chat.rs:1291"],
-      "tests": ["T2.7"]
-    },
-    {
-      "primitive": "agent", "surface": "http", "status": "unavailable",
-      "missing": [],
-      "reason": "no agent routes",
-      "evidence": ["crates/sofuu-core/src/main.rs:1434-1435"],
-      "tests": ["T5.1"]
-    },
-    {
-      "primitive": "agent", "surface": "cabi", "status": "full",
-      "missing": [],
-      "note": "agent.run is special-cased in the funnel; approvals cannot be settled from a C host mid-run",
-      "evidence": ["crates/sofuu-capi/src/lib.rs:889-890", "crates/sofuu-capi/src/lib.rs:1235", "crates/sofuu-capi/src/lib.rs:5199-5205"],
-      "tests": ["T2.7", "T7.2"]
-    },
-    {
-      "primitive": "agent", "surface": "swift_kotlin", "status": "full",
-      "missing": [],
-      "note": "reachable through the generic call/callStream bridge; no typed agent wrapper",
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240-269", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92-131"],
-      "tests": ["T2.7"]
-    },
-    {
-      "primitive": "agent", "surface": "mcp", "status": "n/a",
-      "missing": [], "reason": "MCP has no agent concept",
-      "evidence": [], "tests": []
-    },
-
-    {
-      "primitive": "transport", "surface": "js", "status": "partial",
-      "missing": ["WebSocket", "HTTP/2", "explicit connection lifecycle"],
-      "note": "fetch, createServer/serve, SSEParser, MCP client+server",
-      "evidence": ["crates/sofuu-core/src/rt/http_client.rs:1854", "crates/sofuu-core/src/rt/http_server.rs:1061-1084", "crates/sofuu-core/src/rt/mcp.rs:1434-1500"],
-      "tests": ["T5.6"]
-    },
-    {
-      "primitive": "transport", "surface": "cli", "status": "full",
-      "missing": [],
-      "evidence": ["crates/sofuu-core/src/main.rs:840-1444", "crates/sofuu-core/src/main.rs:2145-2504"],
-      "tests": ["T5.2", "T5.3"]
-    },
-    {
-      "primitive": "transport", "surface": "http", "status": "full",
-      "missing": [],
-      "note": "server with bearer auth and SSE; MCP is not exposed over HTTP",
-      "evidence": ["crates/sofuu-core/src/main.rs:1000-1444"],
-      "tests": ["T5.2", "T5.3"]
-    },
-    {
-      "primitive": "transport", "surface": "cabi", "status": "partial",
-      "missing": ["mcp.serve through the funnel", "OpenAI-compatible /v1 routes"],
-      "note": "mcp.serve returns {} through sofuu_rt_call; HTTP server only via an eval-defined handler",
-      "evidence": ["crates/sofuu-capi/src/lib.rs:420-447", "crates/sofuu-core/src/rt/mcp.rs:1440-1460"],
-      "tests": ["T5.5", "T5.6"]
-    },
-    {
-      "primitive": "transport", "surface": "swift_kotlin", "status": "partial",
-      "missing": ["typed MCP client", "HTTP server helper"],
-      "evidence": ["bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240", "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"],
-      "tests": ["T5.6"]
-    },
-    {
-      "primitive": "transport", "surface": "mcp", "status": "full",
-      "missing": [],
-      "note": "client and server; per-call deadlines (665302375) and mcp.servers.allow (0b753686c) landed",
-      "evidence": ["crates/sofuu-core/src/rt/mcp.rs:1434", "crates/sofuu-core/src/rt/mcp.rs:1441"],
-      "tests": ["T5.6", "T7.9"]
-    }
-  ]
+  {
+   "primitive": "session",
+   "surface": "cli",
+   "status": "full",
+   "missing": [],
+   "note": "session list/show/inspect/repair/migrate/storage-stats/prune + export/import (R4.2, one builder with the JS surface)",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs",
+    "crates/sofuu-core/src/rt/session_doc.rs"
+   ],
+   "tests": [
+    "T4.1"
+   ]
+  },
+  {
+   "primitive": "session",
+   "surface": "http",
+   "status": "unavailable",
+   "missing": [],
+   "reason": "no session routes; unmatched paths fall through to 404",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1434-1435"
+   ],
+   "tests": [
+    "T5.1"
+   ]
+  },
+  {
+   "primitive": "session",
+   "surface": "cabi",
+   "status": "full",
+   "missing": [],
+   "note": "reachable through the documented sofuu_rt_call funnel (chat.init/resume/sessions/newSession/sessionTurns/deleteSession); deleteSession removes only the registry entry, not files",
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:894-911",
+    "src/js/chat.js:2258",
+    "src/js/chat.js:2349"
+   ],
+   "tests": [
+    "T4.2",
+    "T4.3"
+   ]
+  },
+  {
+   "primitive": "session",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "typed session API"
+   ],
+   "note": "reachable only through the generic call/callStream bridge; no Swift or Kotlin session wrapper",
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"
+   ],
+   "tests": [
+    "T4.2"
+   ]
+  },
+  {
+   "primitive": "session",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "MCP has no session concept",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "stream",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "uniform backpressure",
+    "cancel token for every stream",
+    "structured per-chunk tool-call events"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/rt/ai.rs:6383",
+    "crates/sofuu-core/src/rt/ai.rs:6397",
+    "crates/sofuu-core/src/rt/ai.rs:4435-4478"
+   ],
+   "tests": [
+    "T2.2",
+    "T2.5",
+    "T6.1"
+   ]
+  },
+  {
+   "primitive": "stream",
+   "surface": "cli",
+   "status": "full",
+   "missing": [],
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1944-1965",
+    "crates/sofuu-core/src/main.rs:1159-1190",
+    "crates/sofuu-core/src/main.rs:2471-2485"
+   ],
+   "tests": [
+    "T2.2"
+   ]
+  },
+  {
+   "primitive": "stream",
+   "surface": "http",
+   "status": "full",
+   "missing": [],
+   "note": "SSE chat/completions and completions; chat template is bypassed (messages flattened to text)",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1134-1217",
+    "crates/sofuu-core/src/main.rs:1218-1283"
+   ],
+   "tests": [
+    "T2.4",
+    "T5.3",
+    "T5.4"
+   ]
+  },
+  {
+   "primitive": "stream",
+   "surface": "cabi",
+   "status": "full",
+   "missing": [],
+   "note": "cancel is thread-local; a C host cannot cancel from another thread",
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:1235",
+    "crates/sofuu-capi/src/lib.rs:1465",
+    "crates/sofuu-capi/src/lib.rs:1491"
+   ],
+   "tests": [
+    "T2.2",
+    "T2.3"
+   ]
+  },
+  {
+   "primitive": "stream",
+   "surface": "swift_kotlin",
+   "status": "full",
+   "missing": [],
+   "note": "Swift StreamHandle.cancel is same-thread only; Kotlin cancels via the listener return value",
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:258-281",
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:485",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:131-150"
+   ],
+   "tests": [
+    "T2.2"
+   ]
+  },
+  {
+   "primitive": "stream",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "MCP tools are request/response; no streaming primitive",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "tool",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "uniform tool result shape"
+   ],
+   "note": "policy floor shared via sofuu.policy.evaluate (tools.js + agent.js); SOFUU_NO_SHELL now filters GROUP (landed 2026-10-23, 0b753686c); approval UX still differs between chat and agent",
+   "evidence": [
+    "src/js/tools.js:65-94",
+    "src/js/tools.js:1265-1271",
+    "src/js/agent.js:3660",
+    "crates/sofuu-core/src/rt/policy.rs:137"
+   ],
+   "tests": [
+    "T7.1",
+    "T7.6",
+    "T5.6"
+   ]
+  },
+  {
+   "primitive": "tool",
+   "surface": "cli",
+   "status": "partial",
+   "missing": [
+    "standalone tool management",
+    "approval control from the CLI"
+   ],
+   "note": "agent run resolves tools from the definition; chat /tools is list-only",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:205-207",
+    "crates/sofuu-core/src/chat.rs:750"
+   ],
+   "tests": [
+    "T7.6"
+   ]
+  },
+  {
+   "primitive": "tool",
+   "surface": "http",
+   "status": "unavailable",
+   "missing": [],
+   "reason": "no tool routes; tools cannot be inspected, registered, or approved over HTTP",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1434-1435"
+   ],
+   "tests": [
+    "T5.1"
+   ]
+  },
+  {
+   "primitive": "tool",
+   "surface": "cabi",
+   "status": "partial",
+   "missing": [
+    "tool inspection/list",
+    "in-run approval from the host thread"
+   ],
+   "note": "host tool register/resolve exist; built-ins are reachable only through agent.run or undocumented tools.TOOLS.execute",
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:1741",
+    "crates/sofuu-capi/src/lib.rs:1823",
+    "src/js/tools.js:924"
+   ],
+   "tests": [
+    "T7.2",
+    "T7.4"
+   ]
+  },
+  {
+   "primitive": "tool",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "tool inspection",
+    "approval resolution"
+   ],
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:311",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:199",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:213"
+   ],
+   "tests": [
+    "T7.2"
+   ]
+  },
+  {
+   "primitive": "tool",
+   "surface": "mcp",
+   "status": "full",
+   "missing": [],
+   "note": "mcp.connect/call/listTools/listResources and mcp.serve tool/start; mcp.servers.allow is enforced by sofuu.policy.evaluate",
+   "evidence": [
+    "crates/sofuu-core/src/rt/mcp.rs:1434-1500",
+    "crates/sofuu-core/src/rt/mcp.rs:579-600"
+   ],
+   "tests": [
+    "T5.6",
+    "T7.9"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "usage from ai.complete",
+    "cost from agent results",
+    "one usage shape across chat/agent/ai"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/rt/ai.rs:6376",
+    "crates/sofuu-core/src/rt/ai.rs:2906-2963",
+    "src/js/chat.js:2131-2145",
+    "src/js/chat.js:2481",
+    "src/js/agent.js:2275"
+   ],
+   "tests": [
+    "T6.4",
+    "T6.7"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "cli",
+   "status": "partial",
+   "missing": [
+    "uniform usage output across commands"
+   ],
+   "note": "chat /cost, agent run usage line, outputs stats; each has its own shape",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:337-347",
+    "crates/sofuu-core/src/chat.rs:2736-2787",
+    "crates/sofuu-core/src/output_archive.rs:1832"
+   ],
+   "tests": [
+    "T6.4"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "http",
+   "status": "unavailable",
+   "missing": [],
+   "reason": "completion responses carry no usage object",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1200-1210",
+    "crates/sofuu-core/src/main.rs:1270-1276"
+   ],
+   "tests": [
+    "T5.4"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "cabi",
+   "status": "partial",
+   "missing": [
+    "ai.complete usage"
+   ],
+   "evidence": [
+    "src/js/chat.js:2481",
+    "src/js/chat.js:2258",
+    "crates/sofuu-core/src/rt/ai.rs:3898"
+   ],
+   "tests": [
+    "T6.4"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "typed usage model",
+    "stream usage"
+   ],
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"
+   ],
+   "tests": [
+    "T6.4"
+   ]
+  },
+  {
+   "primitive": "usage",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "MCP has no usage concept",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "memory",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "remember/recall reachable from JS"
+   ],
+   "note": "P1 finding (2026-10-25): the zerocopy bridge registers sofuu.memory/sofuu.brain AFTER the CMA memory module, clobbering both \u2014 on the release build sofuu.memory is the buffer bridge (allocAligned/viewFloat32/\u2026) and typeof sofuu.memory.remember is undefined. Chat's brain works via internal __qtsq_* globals, so the loss is silent.",
+   "evidence": [
+    "crates/sofuu-core/src/rt/memory.rs:4216-4217",
+    "crates/sofuu-core/src/rt/zerocopy.rs:274-470",
+    "crates/sofuu-core/src/rt/engine.rs:270-273"
+   ],
+   "tests": [
+    "T1.3",
+    "T4.6"
+   ]
+  },
+  {
+   "primitive": "memory",
+   "surface": "cli",
+   "status": "partial",
+   "missing": [
+    "dedicated `sofuu memory` command"
+   ],
+   "note": "available only through chat slash commands and doctor probes",
+   "evidence": [
+    "crates/sofuu-core/src/chat.rs:1109-1131",
+    "crates/sofuu-core/src/chat.rs:1391-1447",
+    "crates/sofuu-core/src/doctor.rs:109-190"
+   ],
+   "tests": [
+    "T1.4"
+   ]
+  },
+  {
+   "primitive": "memory",
+   "surface": "http",
+   "status": "partial",
+   "missing": [
+    "import"
+   ],
+   "note": "remember/recall/memories/forget/share exist; serve defaults to a different brain file than chat",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1284-1433",
+    "crates/sofuu-core/src/main.rs:951-954"
+   ],
+   "tests": [
+    "T4.6"
+   ]
+  },
+  {
+   "primitive": "memory",
+   "surface": "cabi",
+   "status": "full",
+   "missing": [],
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:193-374"
+   ],
+   "tests": [
+    "T1.3"
+   ]
+  },
+  {
+   "primitive": "memory",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "Swift: forget/export/import/list/stats",
+    "Kotlin: typed memory API"
+   ],
+   "note": "the generic call bridge reaches the rest",
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:544-632",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"
+   ],
+   "tests": [
+    "T1.3"
+   ]
+  },
+  {
+   "primitive": "memory",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "memory is not exposed as MCP tools",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "model",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "model.describe",
+    "model.list",
+    "persistent model selection",
+    "pricing in the runtime"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/rt/ai.rs:6509",
+    "crates/sofuu-core/src/rt/ai.rs:6520",
+    "src/js/agent.js:5384-5387",
+    "src/js/chat.js:1900"
+   ],
+   "tests": [
+    "T1.5"
+   ]
+  },
+  {
+   "primitive": "model",
+   "surface": "cli",
+   "status": "full",
+   "missing": [],
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1683-1991",
+    "crates/sofuu-core/src/main.rs:565-589",
+    "crates/sofuu-core/src/main.rs:883-892",
+    "crates/sofuu-core/src/doctor.rs:74-102"
+   ],
+   "tests": [
+    "T5.2"
+   ]
+  },
+  {
+   "primitive": "model",
+   "surface": "http",
+   "status": "full",
+   "missing": [],
+   "note": "/v1/models returns a basename or sofuu-default; completions 400 when no path is set",
+   "evidence": [
+    "src/js/serve.js",
+    "scripts/contract/harness/t52_serve_v1.js"
+   ],
+   "tests": [
+    "T5.2",
+    "T5.3",
+    "T5.4"
+   ]
+  },
+  {
+   "primitive": "model",
+   "surface": "cabi",
+   "status": "partial",
+   "missing": [
+    "model.list",
+    "persistent selection"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/rt/ai.rs:6509",
+    "crates/sofuu-core/src/rt/ai.rs:6520",
+    "crates/sofuu-capi/src/lib.rs:894-911"
+   ],
+   "tests": [
+    "T1.5"
+   ]
+  },
+  {
+   "primitive": "model",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "model list/describe/select"
+   ],
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:281",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:150"
+   ],
+   "tests": [
+    "T1.5"
+   ]
+  },
+  {
+   "primitive": "model",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "MCP has no model concept",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "agent",
+   "surface": "js",
+   "status": "full",
+   "missing": [],
+   "note": "define/run/runMany/mapContext/cancel/list/loadDir/getTrace/resume/current plus approvals; no update/delete, no durable run store beyond traces",
+   "evidence": [
+    "src/js/agent.js:5358-5479",
+    "src/js/agent.js:2633"
+   ],
+   "tests": [
+    "T2.7",
+    "T7.4"
+   ]
+  },
+  {
+   "primitive": "agent",
+   "surface": "cli",
+   "status": "partial",
+   "missing": [
+    "update/delete",
+    "durable run management"
+   ],
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:147-383",
+    "crates/sofuu-core/src/chat.rs:1291"
+   ],
+   "tests": [
+    "T2.7"
+   ]
+  },
+  {
+   "primitive": "agent",
+   "surface": "http",
+   "status": "unavailable",
+   "missing": [],
+   "reason": "no agent routes",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1434-1435"
+   ],
+   "tests": [
+    "T5.1"
+   ]
+  },
+  {
+   "primitive": "agent",
+   "surface": "cabi",
+   "status": "full",
+   "missing": [],
+   "note": "agent.run is special-cased in the funnel; approvals cannot be settled from a C host mid-run",
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:889-890",
+    "crates/sofuu-capi/src/lib.rs:1235",
+    "crates/sofuu-capi/src/lib.rs:5199-5205"
+   ],
+   "tests": [
+    "T2.7",
+    "T7.2"
+   ]
+  },
+  {
+   "primitive": "agent",
+   "surface": "swift_kotlin",
+   "status": "full",
+   "missing": [],
+   "note": "reachable through the generic call/callStream bridge; no typed agent wrapper",
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240-269",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92-131"
+   ],
+   "tests": [
+    "T2.7"
+   ]
+  },
+  {
+   "primitive": "agent",
+   "surface": "mcp",
+   "status": "n/a",
+   "missing": [],
+   "reason": "MCP has no agent concept",
+   "evidence": [],
+   "tests": []
+  },
+  {
+   "primitive": "transport",
+   "surface": "js",
+   "status": "partial",
+   "missing": [
+    "WebSocket",
+    "HTTP/2",
+    "explicit connection lifecycle"
+   ],
+   "note": "fetch, createServer/serve, SSEParser, MCP client+server",
+   "evidence": [
+    "crates/sofuu-core/src/rt/http_client.rs:1854",
+    "crates/sofuu-core/src/rt/http_server.rs:1061-1084",
+    "crates/sofuu-core/src/rt/mcp.rs:1434-1500"
+   ],
+   "tests": [
+    "T5.6"
+   ]
+  },
+  {
+   "primitive": "transport",
+   "surface": "cli",
+   "status": "full",
+   "missing": [],
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:840-1444",
+    "crates/sofuu-core/src/main.rs:2145-2504"
+   ],
+   "tests": [
+    "T5.2",
+    "T5.3"
+   ]
+  },
+  {
+   "primitive": "transport",
+   "surface": "http",
+   "status": "full",
+   "missing": [],
+   "note": "server with bearer auth and SSE; MCP is not exposed over HTTP",
+   "evidence": [
+    "crates/sofuu-core/src/main.rs:1000-1444"
+   ],
+   "tests": [
+    "T5.2",
+    "T5.3"
+   ]
+  },
+  {
+   "primitive": "transport",
+   "surface": "cabi",
+   "status": "partial",
+   "missing": [
+    "mcp.serve through the funnel",
+    "OpenAI-compatible /v1 routes"
+   ],
+   "note": "mcp.serve returns {} through sofuu_rt_call; HTTP server only via an eval-defined handler",
+   "evidence": [
+    "crates/sofuu-capi/src/lib.rs:420-447",
+    "crates/sofuu-core/src/rt/mcp.rs:1440-1460"
+   ],
+   "tests": [
+    "T5.5",
+    "T5.6"
+   ]
+  },
+  {
+   "primitive": "transport",
+   "surface": "swift_kotlin",
+   "status": "partial",
+   "missing": [
+    "typed MCP client",
+    "HTTP server helper"
+   ],
+   "evidence": [
+    "bindings/swift/Sources/SofuuBridge/SofuuBridge.swift:240",
+    "bindings/android/sofuu/src/main/java/com/sofuu/runtime/SofuuBridge.kt:92"
+   ],
+   "tests": [
+    "T5.6"
+   ]
+  },
+  {
+   "primitive": "transport",
+   "surface": "mcp",
+   "status": "full",
+   "missing": [],
+   "note": "client and server; per-call deadlines (665302375) and mcp.servers.allow (0b753686c) landed",
+   "evidence": [
+    "crates/sofuu-core/src/rt/mcp.rs:1434",
+    "crates/sofuu-core/src/rt/mcp.rs:1441"
+   ],
+   "tests": [
+    "T5.6",
+    "T7.9"
+   ]
+  }
+ ]
 }

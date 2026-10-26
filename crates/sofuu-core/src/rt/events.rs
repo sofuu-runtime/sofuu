@@ -208,14 +208,14 @@ pub fn redact(ev: &Value) -> Value {
     out
 }
 
-fn sessions_dir(project: &str, sid: &str) -> PathBuf {
+pub(crate) fn sessions_dir(project: &str, sid: &str) -> PathBuf {
     PathBuf::from(project)
         .join(".sofuu")
         .join("sessions")
         .join(sid)
 }
 
-fn log_path(project: &str, sid: &str) -> PathBuf {
+pub(crate) fn log_path(project: &str, sid: &str) -> PathBuf {
     sessions_dir(project, sid).join("events.ndjson")
 }
 
@@ -366,6 +366,26 @@ pub fn reconstruct(args: &Value) -> Value {
                 let text = p.get("text").and_then(Value::as_str).unwrap_or("");
                 let cur = obj.get("answer").and_then(Value::as_str).unwrap_or("").to_string();
                 obj.insert("answer".into(), json!(format!("{cur}{text}")));
+            }
+            "answer" => {
+                /* The chat driver emits one terminal `answer` event carrying
+                 * the full turn text alongside the deltas (P2). Idempotent:
+                 * a turn that already folded its deltas would double the
+                 * text, so only use it when the turn has no folded text. */
+                let text = p.get("answer").and_then(Value::as_str)
+                    .or_else(|| p.get("text").and_then(Value::as_str)).unwrap_or("");
+                let cur = obj.get("answer").and_then(Value::as_str).unwrap_or("");
+                if cur.is_empty() && !text.is_empty() {
+                    obj.insert("answer".into(), json!(text));
+                }
+            }
+            "prompt" => {
+                if !obj.get("prompt").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                    obj.insert("prompt".into(), p.get("text").cloned().unwrap_or(json!("")));
+                }
+            }
+            "served" => {
+                obj.insert("served_by".into(), p.get("by").cloned().unwrap_or(json!("")));
             }
             "tool" | "tool_result" => {
                 let name = p.get("name").and_then(Value::as_str).unwrap_or("?");

@@ -861,8 +861,29 @@ fn cmd_session(args: &[String]) -> i32 {
             session::cmd_storage_stats(&project, id)
         }
         "prune" | "clean" => session::cmd_prune(&project),
+        "export" => {
+            // P3 (R4.2): the portable session document (SPEC §5.2). Secrets
+            // are stripped before anything leaves the process (R4.6).
+            let Some(id) = args.get(3) else {
+                println!("  Usage: sofuu session export <id> [--out <file>]\n");
+                return 1;
+            };
+            let out = (4..args.len())
+                .find(|&i| args[i] == "--out")
+                .and_then(|i| args.get(i + 1).map(|s| s.as_str()));
+            sofuu_core::rt::session_doc::cli_export(&project.to_string_lossy(), id, out)
+        }
+        "import" => {
+            // P3 (R4.2/R4.4): validate + persist a session document; `-` is
+            // stdin. Import is idempotent and reports anything it refuses.
+            let Some(src) = args.get(3) else {
+                println!("  Usage: sofuu session import <file|->\n");
+                return 1;
+            };
+            sofuu_core::rt::session_doc::cli_import(&project.to_string_lossy(), src)
+        }
         other => {
-            eprintln!("\x1b[31mError:\x1b[0m unknown session command '{other}' (list|show|inspect|repair|migrate|storage-stats|prune)");
+            eprintln!("\x1b[31mError:\x1b[0m unknown session command '{other}' (list|show|inspect|repair|migrate|storage-stats|prune|export|import)");
             1
         }
     }

@@ -263,7 +263,7 @@
       "stability_tier": "T2",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/chat.rs:4174",
+        "crates/sofuu-core/src/chat.rs:4178",
         "crates/sofuu-core/src/doctor.rs:526",
         "crates/sofuu-core/src/rt/memory.rs:709"
       ]
@@ -1143,7 +1143,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/chat.rs:3765"
+        "crates/sofuu-core/src/chat.rs:3769"
       ]
     },
     {
@@ -1528,7 +1528,7 @@
       "determinism_tier": null,
       "evidence": [
         "src/js/agent.js:2280",
-        "src/js/agent.js:5171"
+        "src/js/agent.js:5174"
       ]
     },
     {

@@ -12,14 +12,15 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 | P0 — inventory + spec verification | ✅ **complete** (2026-10-23, refreshed 2026-10-25) | 48/48 matrix cells resolved, zero unknowns; 132 tiered symbols; 125 knobs with determinism tiers (54 `unsure` open items); 52 conformance cases stubbed |
 | P1 — R1 capability model + R3 tiers | ✅ **complete** (2026-10-25) | `sofuu.capabilities()`, `sofuu.model.describe()`, doctor assertion, typed memory refusal on QTSQ-free builds, `text_gate` receipts + `--require-identical`, the R3 CI gate, and the committed fixture model (T3.3) — all landed and verified; suite 12 PASS / 4 FAIL / 36 BLOCKED, and the FORK enforcement demonstrated (exit 3, `|dtop1|=0.2770`) |
 | P2 — R2 async contract + R6 observability | ✅ **complete** (2026-10-26) | `sofuu.async.*` + `sofuu.events.*` substrates; envelope stamped at both emit choke points; exactly-one-terminal stop; chaos harnesses T2.1–T2.5 + T2.7/T2.8 all live (mid-tool cancel kills the subprocess — no orphan; server-side disconnect visible; pump backpressure is typed); usage reconciled through `sofuu.events.canonicalUsage` (T6.7, `ai.complete` now reports provider usage); chat appends the turn's envelopes to `events.ndjson`; deterministic renderer pinned byte-for-byte by the committed golden fixtures (T6.3); suite 26 PASS / 2 FAIL / 24 BLOCKED |
-| P3 — R4 portability + R5 surface parity | ⬜ not started | `T4.1`/`T4.5` failing; 21 remaining `partial` cells |
+| P3 — R4 portability + R5 surface parity | ✅ **complete (2026-10-26)** | the §5.2 session document written once in the engine (`rt/session_doc.rs`) behind `sofuu.session.{list,export,import,sync}` AND `sofuu session export|import` — **T4.1/T4.3 round-trip + idempotence, T4.5 namespace, T4.6 redaction, T4.7 version stamp all executable and green**; chat persists `session.json` with restart-stable `<sid>-t<N>` turn ids; config carries `schema_version` (v0 accepted, forward-only); serve `/v1/*` conformance **T5.2/T5.3/T5.4 executable** against the committed fixture model; **T5.5 C-ABI symbol check executable** (suite + CI via CONTRACT_LIBSOFUU); matrix regenerated (session×js, model×http → full, 0 unknowns). Residue by design: device round-trip (T4.2, needs runners), v0.2 migration fixture (T4.4), MCP fixture server (T5.6), four-surface error parity (T5.8), CHANGELOG/semver (P4), app stores as caches (app lanes) |
 | P4 — R7 security + install integrity | ⬜ not started | policy evaluator + approval modes landed by peers (`0b753686c`, `cdd16835b`); four-surface denial matrix still missing |
 | P5 — platform matrix + conformance + benchmark | ⬜ not started | CI is macOS-only; suite is local |
 | P6 — external adoption | ⬜ not started | no external deployment yet |
 
 ## Conformance suite
 
-**52 cases — PASS 26 · FAIL 2 · BLOCKED 24.**
+**52 cases — PASS 33 · FAIL 0 · BLOCKED 19.**
+(`CONTRACT_LIBSOFUU=dist/libsofuu.dylib` now enables the C-ABI parity check.)
 (`CONTRACT_NOQTSQ_BIN=target-noqts/release/sofuu` enables T1.3.)
 
 Passing:
@@ -51,8 +52,16 @@ Passing:
 | T6.5 | seq strictly increasing; exactly one terminal `stop` per run |
 | T6.6 | redaction strips secret-bearing fields recursively before any log/write |
 | T6.7 | usage reconciles: `ai.complete` reports `{promptTokens, completionTokens}`, stream matches the same provider totals, agent shape normalizes identically, local cost 0 / cloud cost carried |
+| T4.1 | the §5.2 session document round-trips CLI⇄JS: same turns, tools, usage, ids; one builder serves both surfaces |
+| T4.3 | turn ids are stable shapes and re-import is idempotent (`overwritten_existing` false on a same-content re-import) |
+| T4.5 | `sofuu.session` is a first-class namespace (`schemaVersion/list/export/import/sync`); an app-private top-level section is rejected, not tolerated |
+| T4.6 | an export carrying secrets ships none (`api_key`/`Authorization`/tool tokens stripped), while lossless fields survive |
+| T5.2 | `GET /v1/models` returns the OpenAI `{object:'list', data:[…id, object:'model'…]}` shape for the loaded fixture model |
+| T5.3 | `POST /v1/chat/completions` `stream:true` yields OpenAI delta-frame SSE chunks terminated by `[DONE]` |
+| T5.4 | `POST /v1/chat/completions` JSON matches the OpenAI completion shape (choices[].message.{role,content}, usage) |
+| T5.5 | the C ABI keeps the versioned symbol contract: `sofuu_rt_call` exported from the built library (suite + CI) |
 
-Failing (P3 backlog): `T4.1` session export, `T4.5` `sofuu.session`.
+No failing cases. Previously failing `T4.1`/`T4.5` (and `T4.3`/`T4.6`) are executable and green as of P3.
 
 ## What landed in P2 (2026-10-25/26)
 
@@ -90,6 +99,42 @@ Failing (P3 backlog): `T4.1` session export, `T4.5` `sofuu.session`.
 - **Chat adopts the ndjson log** — `chat.js sessionLog` additionally appends
   the turn's envelopes to `<project>/.sofuu/sessions/<sid>/events.ndjson`
   (usage normalized to the canonical shape; additive, never breaks the turn).
+
+## What landed in P3 (2026-10-26)
+
+- **The §5.2 session document, written once** (`rt/session_doc.rs`) —
+  build, validate, redact, persist, import, list. The CLI and the JS
+  namespace call the SAME functions, so the two surfaces cannot drift.
+  `session.json` lives at the canonical location next to `events.ndjson`.
+- **`sofuu.session`** (`schemaVersion/list/export/import/sync`) — the
+  session primitive on the JS surface (T4.5). Import enforces the format's
+  top-level allowlist (R4.5: an app-private section is a typed refusal).
+- **`sofuu session export|import`** — the CLI arm (T4.1): export prints or
+  `--out`s the document (secrets stripped first, R4.6); import validates
+  (typed `E_SCHEMA` refusal, R4.4), persists under its own id, and reports
+  whether it replaced an existing, different doc.
+- **Chat writes the canonical document** — `sessionLog` now emits
+  restart-stable per-turn ids (`<sid>-t<N>`, seeded from the restored turn
+  count, R4.3) and regenerates `session.json` at each turn terminal via
+  `sofuu.session.sync`; the fold reconstructs turns, tools, and usage from
+  the event log alone.
+- **Config carries `schema_version: 1`** — every save stamps it; the
+  reader accepts absent (v0) and normalizes on the next save; the field
+  set is identical, so v0→v1 is lossless by construction (R4.1/R4.4).
+- **serve `/v1/*` conformance (T5.2–T5.4)** — a harness boots `sofuu
+  serve` with the committed 77 KB fixture model and asserts the OpenAI
+  wire shapes: models list, SSE delta frames + `[DONE]`, and the JSON
+  completion. Requires the bearing token — the harness sets one.
+- **C-ABI parity gate executable (T5.5)** — the suite (and CI) pass
+  `CONTRACT_LIBSOFUU=dist/libsofuu.dylib`; the symbol contract check
+  replaced a manual-blocked case.
+- **Matrix regenerated** — session×js and model×http moved to `full` with
+  evidence + test ids; 17 `full` cells, 0 unknowns.
+
+Harness notes of record: `t61`'s chat leg is raced with a dead-local
+`base_url` (a host's active real provider must never leak a network call
+into a contract harness) and kills its tool children so later orphan
+checks see a clean process table.
 
 ## The fixture model and the FORK demonstration (T3.3)
 
@@ -162,15 +207,20 @@ merged registration — not done here to avoid crossing lanes.
 
 ## Next actions
 
-1. **P3** — session primitive v1 (`T4.1`/`T4.5` — the two remaining suite
-   FAILs) and the parity matrix in CI. Golden renders on the macOS/Android
-   lanes (T6.3's cross-surface half) ride with those app-lane phases.
-2. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
+1. **P4** — R7 security + install integrity: the four-surface deny matrix
+   (`T7.1–T5.8` harness family), policy evaluator conformance, install
+   integrity (checksummed installs, manifest-true capabilities), CHANGELOG +
+   version alignment (also an R4/R5 implementation step). P4's successor work.
+2. **App-lane residue from P3** — the device round-trip (T4.2) on
+   macOS+Android runners, the v0.2 migration fixture (T4.4), an MCP fixture
+   server (T5.6), the four-surface error-parity harness (T5.8), the app
+   stores becoming caches of `session.json` (Android `SessionMessageStore`,
+   macOS), and the `/v1/*` README section.
+3. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
    namespace collision; then matrix memory × js returns to `full`.
-3. Refresh the matrix cells affected by the Oct-24 protocol commits (tool,
-   transport, policy) — several `partial`/`unavailable` cells are likely stale
-   in the good direction.
-4. Investigate the live FORK the gate caught (0.6B q4_K default pair, depth 32,
+4. Refresh the remaining `partial` cells (tool/usage on the app lanes) as the
+   protocol work lands; several are stale in the good direction.
+5. Investigate the live FORK the gate caught (0.6B q4_K default pair, depth 32,
    `|dtop1|=0.2770`): it matches the parity ledger's known class, and the gate
    will keep it out of defaults automatically.
 

@@ -28,7 +28,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_BENCH_JSON` | test | no | — | T3 | `crates/ml-train/src/embedding_bench.rs:683` |
 | `SOFUU_BRAIN_EF_SEARCH` | public | no | — | T2 | `crates/sofuu-core/src/memory/cma.rs:134` |
 | `SOFUU_BRAIN_KEY` | public | no | — | T2 | `crates/sofuu-core/src/doctor.rs:272` |
-| `SOFUU_BRAIN_MAX_RECORDS` | public | no | — | T2 | `crates/sofuu-core/src/chat.rs:4174` |
+| `SOFUU_BRAIN_MAX_RECORDS` | public | no | — | T2 | `crates/sofuu-core/src/chat.rs:4178` |
 | `SOFUU_CHAIN_CHUNK` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:1660` |
 | `SOFUU_COMMIT_TRACE` | debug | no | — | T3 | `src/metal/metal_engine.mm:702` |
 | `SOFUU_DECODE_MMQ` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:2630` |
@@ -114,7 +114,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_NO_ROPE_TABLE` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:4484` |
 | `SOFUU_NO_SHELL` | public | no | — | T2 | `src/js/tools.js:71` |
 | `SOFUU_NO_TILES` | public | yes | exact | T2 | `src/simd/infer_kernels.cpp:894` |
-| `SOFUU_NO_TOOLS` | tuning | no | — | T3 | `crates/sofuu-core/src/chat.rs:3765` |
+| `SOFUU_NO_TOOLS` | tuning | no | — | T3 | `crates/sofuu-core/src/chat.rs:3769` |
 | `SOFUU_NUM_THREADS` | public | no | — | T2 | `src/simd/infer_kernels.cpp:99` |
 | `SOFUU_PHASE_METRICS` | debug | no | — | T3 | `crates/sofuu-core/src/infer/continuous.rs:88` |
 | `SOFUU_POLICY` | public | no | — | T2 | `crates/sofuu-core/src/cli_protocols.rs:319` |

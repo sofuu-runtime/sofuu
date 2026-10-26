@@ -83,7 +83,26 @@ async function main() {
     const chatEvents = [];
     try { sofuu.chat.init({}); } catch (e) { console.log("  ℹ chat.init:", (e && e.message) || e); }
     try {
-        await sofuu.chat.submit("envelope probe", { onEvent: (ev) => { if (ev && ev.kind) chatEvents.push(ev); } });
+        // Deliberately offline: a dead local base_url makes the failure
+        // instant and deterministic — the error path's events must still
+        // ride the §7.2 envelope regardless of the host's real config
+        // (an active ~/.sofuu/config.json provider must never leak a real
+        // network call into a contract harness). The submit is raced, not
+        // awaited: a failing provider's retry/window legs may run long; the
+        // envelope contract is about the events on the sink, not the settle.
+        await Promise.race([
+            sofuu.chat.submit("envelope probe", {
+                provider: "openai", model: "dead-mock", api_key: "x",
+                base_url: "http://127.0.0.1:9/v1/chat/completions",
+                onEvent: (ev) => { if (ev && ev.kind) chatEvents.push(ev); },
+            }).catch(() => {}),
+            new Promise((r) => setTimeout(r, 6000)),
+        ]);
+        /* The raced submit may still run a retry/tool leg — its children are
+         * killed here so the suite's later orphan checks (T2.1/T2.3) see a
+         * clean process table. */
+        try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eK) {}
+        await new Promise((r) => setTimeout(r, 300));
     } catch (e) { /* the error path is fine — the events matter */ }
     await new Promise((r2) => setTimeout(r2, 300));
     assert("chat driver emitted events through the sink", chatEvents.length >= 1);

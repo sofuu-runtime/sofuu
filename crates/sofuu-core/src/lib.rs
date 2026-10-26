@@ -18,6 +18,7 @@ pub mod capabilities; // R1: the capability manifest (sofuu.capabilities)
 pub mod embedding; // compact learned semantic projector for memory recall
 pub mod embed_config; // H2: process-global embedded-mode config (is_embedded, config_root, signals)
 pub mod ffi_exports; // C-ABI exports consumed by the remaining C core (Track D3)
+pub mod frontend; // AI-Native Frontend Engine (JSX/TSX transpiler + micro-runtime + dev server)
 
 // M10: the runtime + bridge end-to-end test lives HERE (not in sofuu-ffi)
 // to keep sofuu-ffi free of a dev-dependency on this crate — with the

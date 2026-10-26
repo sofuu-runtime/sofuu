@@ -81,6 +81,7 @@ fn print_help() {
     println!("  sofuu agent list         List agent definitions (~/.sofuu/agents/*.js)");
     println!("  sofuu agent run <name> \"task\"  Run one agent headless");
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
+    println!("  sofuu dev [dir]          Start AI-native full-stack dev server (--port, --host, --model)");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
     println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
@@ -1298,6 +1299,63 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            }
+        }
+        "dev" | "web" => {
+            let mut port = 3000u16;
+            let mut host = "127.0.0.1".to_string();
+            let mut root_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let mut model_path = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--port" | "-p" => {
+                        if i + 1 < args.len() {
+                            port = args[i + 1].parse().unwrap_or(3000);
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--host" | "-h" => {
+                        if i + 1 < args.len() {
+                            host = args[i + 1].clone();
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--model" | "-m" => {
+                        if i + 1 < args.len() {
+                            model_path = Some(std::path::PathBuf::from(&args[i + 1]));
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    dir if !dir.starts_with('-') => {
+                        root_dir = std::path::PathBuf::from(dir);
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+
+            let cfg = sofuu_core::frontend::DevServerConfig {
+                root_dir,
+                host,
+                port,
+                model_path,
+            };
+
+            if let Err(e) = sofuu_core::frontend::start_dev_server(cfg) {
+                eprintln!("\x1b[31mServer error:\x1b[0m {e}");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
             }
         }
         "compile-bc" => {

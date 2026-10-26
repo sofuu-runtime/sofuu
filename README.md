@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *The vLLM of Edge & Mobile — a fast, private JavaScript runtime with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), agents, and encrypted memory in a single < 5 MB binary (4.8 MB stripped release). Zero daemons, zero external deps.*
+> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single < 5 MB binary (4.8 MB stripped release). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
@@ -14,9 +14,19 @@
 
 ## What is Sofuu?
 
-Sofuu is a **server-side JavaScript/TypeScript runtime** — run your AI backend, API server, or edge automation script. No browser API, no DOM, no renderer.
+Sofuu is **the AI-specific general-purpose JavaScript/TypeScript runtime** — the unified execution environment for the AI era.
 
-Everything AI workloads need is built into the binary — no npm packages required: LLM streaming, local CPU inference, agents, MCP client/server, HTTP, SIMD vector math, offline embeddings, speech in/out, and an encrypted local brain. It runs **unchanged** on a phone, a Raspberry Pi, a laptop, or a cloud server.
+Sofuu is **not just a terminal coding agent or a local model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational operating substrate built to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process runtime.
+
+Everything AI workloads need is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
+- **In-process local LLM inference** (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
+- **Autonomous agent loops** with native tools and sandboxed execution
+- **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers
+- **Model Context Protocol (MCP)** — first-class client and server support
+- **Unified R7 Security Policy** — deterministic firewall for tools, shell, filesystem, network, and MCP
+- **Async HTTP server & SIMD vector mathematics**
+
+Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsofuu` for iOS/Android), an edge agent on a Raspberry Pi, an API microservice in the cloud, or an interactive terminal workspace on your laptop.
 
 ---
 
@@ -182,6 +192,7 @@ for await (const chunk of stream) {
 ```bash
 sofuu                        # Interactive AI chat
 sofuu chat [-m <model.gguf>] # Chat (cloud API or local model)
+sofuu dev [dir]              # AI-native full-stack dev server (--port, --host, --model)
 sofuu infer <model> "<p>"    # Pure CPU LLM inference (GGUF, zero deps)
 sofuu repl                   # JavaScript evaluation REPL
 sofuu run <file.js|ts>       # Run a JavaScript/TypeScript file
@@ -194,6 +205,27 @@ sofuu serve --brain <path>   # Serve the brain over HTTP
 sofuu doctor                 # Health check: QTSQ link, brain round-trip, ctx
 sofuu version / help
 ```
+
+---
+
+## Native Frontend & Full-Stack Engine (`sofuu dev`)
+
+Sofuu embeds a streaming JSX/TSX transpiler, file-based router, and React-compatible reactive micro-runtime directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
+
+```bash
+sofuu dev [dir] --port 3000 --host 127.0.0.1
+```
+
+* **Zero-AST On-the-Fly Transpilation**: Converts JSX and strips TypeScript types in RAM with sub-millisecond latency.
+* **Drop-In React Compatibility**: Write standard React code (`import React, { useState, useEffect } from "react"`, `import ReactDOM from "react-dom"`) with zero `npm install`.
+* **Complete Primitives Suite (38 primitives)**:
+  - **Hooks & Lifecycle**: `useState`, `useReducer`, `useEffect`, `useLayoutEffect`, `useCallback`, `useMemo`, `useRef`, `useId`, `createContext`, `useContext`, `forwardRef`, `memo`, `useSyncExternalStore`, `useTransition`, `useDeferredValue`, `createPortal`, `Children`.
+  - **Client-Side SPA Routing (`sofuu/router`)**: `<Link>`, `useRouter`, `usePathname`, `useSearchParams`.
+  - **Data Fetching & Cache**: `useQuery`, `useMutation` with automatic SWR revalidation and caching.
+  - **Global Reactive Store (`sofuu/store`)**: `createStore`, `useStore` without external state libraries.
+  - **AI UI Streaming (`sofuu/ai`)**: `useChat()`, `useCompletion()`, `<ThinkingBlock />`, `<Markdown />`, `<CodeBlock />`.
+* **Zero-Dependency Live Reload**: Built-in file watcher streams instant reloads on save via `/_sofuu/live` SSE.
+
 
 **Chat slash commands** (`sofuu` / `sofuu chat`):
 

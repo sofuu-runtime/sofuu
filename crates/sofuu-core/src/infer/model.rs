@@ -1001,6 +1001,9 @@ impl TransformerModel {
         // once per process instead of silently dropping the GPU.
         static KIVI_CONTRACT_NOTICE: std::sync::Once = std::sync::Once::new();
         KIVI_CONTRACT_NOTICE.call_once(|| {
+            // gpu is macOS/iOS-only (see the field); no GPU layer batch
+            // exists on Linux/CI, so there is nothing to announce there.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             if self.gpu.is_some() {
                 eprintln!(
                     "[kivi] quantized-KV path: CPU layer loop only — the GPU whole-layer batch is bypassed while KIVI is armed (long-context contract, P6)"
@@ -4208,6 +4211,10 @@ impl TransformerModel {
         super::quant::tile_warm(bytes.as_ptr(), rows, cols, tv.tensor_type);
     }
 
+    /// One GQA-paired prefill-attention stage through the GPU chain.
+    /// macOS/iOS only: the types in the signature (GgufGpu, FeatSplit) and
+    /// the callees exist behind the same gate.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn feat_gpu_attn(
         g: &mut GgufGpu,
         gguf: &GgufFile,

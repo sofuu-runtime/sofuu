@@ -4261,3 +4261,25 @@ from the isolated worktree, one commit each, all pushed to main:
   layouts pinned in kivi.rs); 8B kivi CPU decode on this loaded box ~0.1
   tk/s on the OLD path too (pre-existing, not ring-specific). KIVI suite
   9/9 after the causal tests.
+
+## 2026-10-26 (third pass) — GATE 1 GREEN, GATE 4 attributed
+
+- **Gate 1 GREEN (`548bf5f67`):** llama3 rope-frequency table —
+  `quant::llama3_rope_adjust` + scalar `rope_style_adjust` mirror; loaded
+  from `{arch}rope.scaling.*` metadata or the explicit
+  `SOFUU_ROPE_LLAMA3=factor/orig[/lo/hi]` knob; unscaled models keep the
+  untouched C kernel; Metal batches + batched prefill rope are bypassed
+  while the table is armed. **Llama-1B NIAH goes 0/3→2/2 at 16k (f16),
+  0/2→1/1 at 32k, and 16k kivi4-ring 2/2** — needle codes exact every
+  cell, RSS 2.4-3.4 GB. P1b is now receipts, not theory.
+- **Gate 4 attributed (`--trace` + `SOFUU_DEC_PROFILE`):** engine forward
+  10.99→11.84 ms (+7.7%) over pos 533→2068 (near-flat; ratio 0.935
+  wall-clock on re-run); entropy penalty exonerated; the literal
+  100→16000 decode ratio is ~0.06 by O(n) attention physics (no SWA
+  metadata in either checkpoint) — the 90% bar is a hardware/SWA claim;
+  engine levers = KIVI 4-bit rows (4×/row bytes) + the SIMD quantized
+  reader follow-up + sliding-window honoring when declared.
+- Metal-lane environment tally grows to 11: a kivi-16k run killed by the
+  wedge, a second died silently mid-prefill (jetsam-suspected) — both
+  after clean load, empty stderr; 15k+ prompt length is the common
+  factor in silent deaths. KIVI@16k lever cell recorded wedge-blocked.

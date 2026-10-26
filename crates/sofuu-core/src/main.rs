@@ -1465,6 +1465,7 @@ fn main() -> ExitCode {
             let mut chat = false;
             let mut score_path: Option<String> = None;
             let mut score_window = 0usize;
+            let mut trace_path: Option<String> = None;
 
             let mut i = 4;
             while i < args.len() {
@@ -1539,6 +1540,11 @@ fn main() -> ExitCode {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
                         score_window = v;
                     }
+                    i += 2;
+                } else if args[i] == "--trace" && i + 1 < args.len() {
+                    // §8 P3 surface: per-token forward timing + top logprob
+                    // as JSONL (one line per generated token).
+                    trace_path = Some(args[i + 1].clone());
                     i += 2;
                 } else if args[i].starts_with('-') && args[i] != "-" {
                     // A silently-dropped flag is a correctness hazard: e.g.
@@ -1751,6 +1757,7 @@ fn main() -> ExitCode {
                     kivi,
                     kivi_bits,
                     streaming_weights,
+                    trace_tokens: trace_path.is_some(),
                     ..Default::default()
                 },
                 |tok| {
@@ -1784,6 +1791,41 @@ fn main() -> ExitCode {
                 "\n\x1b[90m── prefill: {} tk in {:.2?} ({:.1} tk/s) · decode: {} tk in {:.2?} ({:.1} tk/s) · total: {:.2?} ──\x1b[0m",
                 prefill_toks, prefill_dur, prefill_rate, token_count, decode_dur, decode_rate, gen_dur
             );
+            if let Some(tp) = trace_path {
+                match std::fs::File::create(&tp) {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        for t in &engine.last_token_trace {
+                            let piece = engine.tokenizer.decode_piece(t.token);
+                            let piece_json: String = piece
+                                .chars()
+                                .map(|c| {
+                                    if c == '"' || c == '\\' {
+                                        format!("\\{}", c)
+                                    } else if c.is_control() {
+                                        format!("\\u{:04x}", c as u32)
+                                    } else {
+                                        c.to_string()
+                                    }
+                                })
+                                .collect();
+                            let _ = writeln!(
+                                f,
+                                "{{\"i\":{},\"pos\":{},\"tok\":{},\"piece\":\"{}\",\"forward_ns\":{},\"logprob\":{:.6}}}",
+                                t.step, t.pos, t.token, piece_json, t.forward_ns, t.logprob
+                            );
+                        }
+                        eprintln!(
+                            "[sofuu] token trace: {} rows -> {}",
+                            engine.last_token_trace.len(),
+                            tp
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[sofuu] --trace: cannot write {}: {}", tp, e);
+                    }
+                }
+            }
             ExitCode::SUCCESS
         }
         "run" => {

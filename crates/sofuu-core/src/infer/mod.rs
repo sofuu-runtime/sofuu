@@ -57,6 +57,7 @@ pub struct GenerateOptions {
     pub kivi: bool,
     pub kivi_bits: usize,
     pub streaming_weights: bool,
+    pub trace_tokens: bool,
 }
 
 impl Default for GenerateOptions {
@@ -82,8 +83,27 @@ impl Default for GenerateOptions {
             kivi: false,       // KIVI / TurboKV asymmetric 2-bit & 4-bit KV cache
             kivi_bits: 4,      // 4-bit (Four) or 2-bit (Two)
             streaming_weights: false, // Non-temporal streaming weights (cache-bypass)
+            trace_tokens: false, // record per-token timing + top logprobs (§8 P3)
         }
     }
+}
+
+/// One generated token's timing + logprob, recorded when
+/// `GenerateOptions::trace_tokens` is set and readable afterwards from
+/// [`InferEngine::last_token_trace`]. Long-context plan §8 P3: the surface
+/// Gate 4 needs (per-position decode timing) and the logprobs Gate 2 wants.
+#[derive(Debug, Clone)]
+pub struct TokenTiming {
+    /// Index within this generation (0 = first generated token).
+    pub step: usize,
+    /// KV position the token was fed back at.
+    pub pos: usize,
+    /// The sampled token id.
+    pub token: u32,
+    /// Wall-clock cost of the forward that produced this token's logits.
+    pub forward_ns: u64,
+    /// log P(this token was sampled) — full-vocab logsumexp over logits.
+    pub logprob: f32,
 }
 
 pub enum ModelBackend {
@@ -535,6 +555,9 @@ pub struct InferEngine {
     /// Reported apart from prefill so it cannot be mistaken for slow decoding.
     pub last_setup_duration: std::time::Duration,
     pub cached_tokens: Vec<u32>,
+    /// Per-token per-token timing + top logprobs from the last stream call,
+    /// filled only when [`GenerateOptions::trace_tokens`] is set (§8 P3).
+    pub last_token_trace: Vec<TokenTiming>,
 }
 
 /// Normalize and sanitize a model path string:
@@ -649,6 +672,7 @@ impl InferEngine {
                         last_prefill_tokens: 0,
                         last_prefill_duration: std::time::Duration::ZERO,
                         last_setup_duration: std::time::Duration::ZERO,
+                        last_token_trace: Vec::new(),
                         cached_tokens: Vec::new(),
                     }, enable_gpu);
                 }
@@ -665,6 +689,7 @@ impl InferEngine {
                                     last_prefill_tokens: 0,
                                     last_prefill_duration: std::time::Duration::ZERO,
                                     last_setup_duration: std::time::Duration::ZERO,
+                        last_token_trace: Vec::new(),
                                     cached_tokens: Vec::new(),
                                 }, enable_gpu);
                             }
@@ -722,6 +747,7 @@ impl InferEngine {
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
                             last_setup_duration: std::time::Duration::ZERO,
+                        last_token_trace: Vec::new(),
                             cached_tokens: Vec::new(),
                         }, enable_gpu);
                     }
@@ -734,6 +760,7 @@ impl InferEngine {
                             last_prefill_tokens: 0,
                             last_prefill_duration: std::time::Duration::ZERO,
                             last_setup_duration: std::time::Duration::ZERO,
+                        last_token_trace: Vec::new(),
                             cached_tokens: Vec::new(),
                         }, enable_gpu);
                     }
@@ -776,6 +803,7 @@ impl InferEngine {
             last_prefill_tokens: 0,
             last_prefill_duration: std::time::Duration::ZERO,
             last_setup_duration: std::time::Duration::ZERO,
+                        last_token_trace: Vec::new(),
             cached_tokens: Vec::new(),
         })
     }
@@ -920,6 +948,8 @@ impl InferEngine {
     where
         F: FnMut(&str) -> bool,
     {
+        // A fresh trace per call — callers read it after stream returns.
+        self.last_token_trace.clear();
         // Auto mode adjusts the pool per phase; restore the caller's count on
         // every exit path so a stream() call never leaks its decode
         // configuration to other users of the global pool.
@@ -1597,6 +1627,31 @@ impl InferEngine {
                 let __cp = __rd.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 cur_pos += 1;
                 cur_token = sampler.sample(&mut logits_buf, &history);
+                // §8 P3: per-token timing + top logprob when tracing is on.
+                // logsumexp over the full vocab costs ~1 vocab pass — only
+                // paid when a trace surface actually asked for it.
+                if options.trace_tokens {
+                    let forward_ns = t_serial.elapsed().as_nanos() as u64;
+                    let mut max_v = f32::NEG_INFINITY;
+                    for &v in logits_buf.iter() {
+                        if v > max_v {
+                            max_v = v;
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for &v in logits_buf.iter() {
+                        sum += (v - max_v).exp();
+                    }
+                    let lse = max_v + sum.ln();
+                    let lp = logits_buf[cur_token as usize] - lse;
+                    self.last_token_trace.push(TokenTiming {
+                        step,
+                        pos: cur_pos - 1,
+                        token: cur_token,
+                        forward_ns,
+                        logprob: lp,
+                    });
+                }
                 let __sm = __rd.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 decode_step_probe(&logits_buf, "gen_serial", cur_pos, cur_token);
                 if let (Some(_), Some(cp), Some(sm)) = (__rd, __cp, __sm) {

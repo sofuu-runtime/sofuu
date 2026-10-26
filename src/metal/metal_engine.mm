@@ -84,6 +84,17 @@ struct MetalContext {
     // same maxTotalThreadsPerThreadgroup guard in sofuu_metal_init: nil here
     // means "the b4 family owns attention", never a silent no-op dispatch.
     id<MTLComputePipelineState> pso_llama_attn_pre_row;
+    // GQA-paired form of the same pass (kernels.metal llama_attn_pre_row_gqa):
+    // one warp owns a row and EVERY q head that shares its kv head, so the K/V
+    // pair is loaded once for R heads instead of once per head. Same 1024-thread
+    // threadgroup and the same maxTotalThreadsPerThreadgroup guard; nil means
+    // the per-head kernel above owns the chunk.
+    // One entry per (heads-per-kv, prefetch, rows-per-threadgroup) shape of
+    // llama_attn_pre_row_gqa; see the table in sofuu_metal_init.
+    id<MTLComputePipelineState> pso_attn_gqa[6];
+    int attn_gqa_mode;    // SOFUU_ATTN_GQA: 0 = per-head kernel, 1..5 = GQA shapes
+    uint attn_gqa_rg[6];      // rows per threadgroup of each entry
+    uint attn_gqa_threads[6]; // threads per threadgroup of each entry
     id<MTLComputePipelineState> pso_llama_attn_copy_b4;
     // Single source of truth for the llama_attn_pre_w32 whole-row fast path,
     // written by the part pass and read by the fin pass. They used to gate
@@ -496,6 +507,54 @@ void* sofuu_metal_init(void) {
                     "[metal] llama_attn_pre_row needs 1024 threads/group, pipeline allows %lu - row fast path disabled\n",
                     (unsigned long)ctx->pso_llama_attn_pre_row.maxTotalThreadsPerThreadgroup);
             ctx->pso_llama_attn_pre_row = nil;
+        }
+        // GQA-paired whole-row chunk attention: one table, one guard loop.
+        // Index -> (kernel, rows per threadgroup). Entry 0 is the shape this
+        // model wants (2 q heads per kv head, 32 rows = 1024 threads); entries
+        // 1..3 keep the paired loads but shrink the row group so more
+        // threadgroups are independently schedulable; entry 4 is the
+        // prefetched K/V form; entry 5 is the 4:1 GQA shape (16 rows = 512
+        // threads, the 1024 shape exceeds its register budget and cannot run).
+        {
+            // rg = rows per threadgroup, threads = (rg/nr)*32 after the kernel's
+            // rows-per-warp. Entry 0 is the 2:1 GQA pairing at the per-head
+            // kernel's own shape; entries 2..4 also pack rows into each warp,
+            // which is what cuts the K/V bytes per (row, head, key).
+            struct { const char *name; uint rg; uint threads; } gqa[6] = {
+                { "attn_gqa_r2_nr1_rg32",    32u, 1024u },  // mode 1
+                { "attn_gqa_r2_nr2_rg32",    32u,  512u },  // mode 2
+                { "attn_gqa_r2_nr2_rg16",    16u,  256u },  // mode 3
+                { "attn_gqa_r2_nr4_rg32",    32u,  256u },  // mode 4
+                { "attn_gqa_r2_nr1_rg32_pf", 32u, 1024u },  // mode 5
+                { "attn_gqa_r4_nr1_rg16",    16u,  512u },  // ratio-4 models
+            };
+            for (int gi = 0; gi < 6; ++gi) {
+                ctx->attn_gqa_rg[gi] = gqa[gi].rg;
+                ctx->attn_gqa_threads[gi] = gqa[gi].threads;
+                id<MTLComputePipelineState> p = load_pso(@(gqa[gi].name));
+                // Same silent-drop rule as pre_row/pre_w32: a pipeline whose
+                // register footprint cannot host rg*32 threads must never be
+                // dispatched, so nil it here and let the per-head kernel (or the
+                // b4 family) take the chunk.
+                if (p != nil && p.maxTotalThreadsPerThreadgroup < (NSUInteger)gqa[gi].threads) {
+                    fprintf(stderr,
+                            "[metal] %s needs %u threads/group, pipeline allows %lu - GQA shape disabled\n",
+                            gqa[gi].name, gqa[gi].threads,
+                            (unsigned long)p.maxTotalThreadsPerThreadgroup);
+                    p = nil;
+                }
+                ctx->pso_attn_gqa[gi] = p;
+            }
+        }
+        // SOFUU_ATTN_GQA selects the shape: 0 = the per-head
+        // llama_attn_pre_row, 1 = r2/nr1/rg32 (pairing only), 2 = r2/nr2/rg32,
+        // 3 = r2/nr2/rg64, 4 = r2/nr4/rg64, 5 = r2/nr1/rg32 with the prefetched
+        // K/V. A shape whose pipeline is nil falls back to the per-head kernel
+        // for that chunk, never to a skipped dispatch.
+        ctx->attn_gqa_mode = 2;
+        if (const char *gqa_env = getenv("SOFUU_ATTN_GQA")) {
+            int m = atoi(gqa_env);
+            if (m >= 0 && m <= 5) { ctx->attn_gqa_mode = m; }
         }
         ctx->pso_llama_attn_copy_b4  = load_pso(@"llama_attn_copy_b4");
         ctx->pso_llama_attn_1c_b4    = load_pso(@"llama_attn_1c_b4");
@@ -3585,14 +3644,45 @@ int sofuu_metal_batch_llama_attn_row(
 ) {
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
-    if (ctx->pso_llama_attn_pre_row == nil) return 0;
+    {
+        bool any = (ctx->pso_llama_attn_pre_row != nil);
+        for (int gi = 0; gi < 6 && !any; ++gi) { any = (ctx->pso_attn_gqa[gi] != nil); }
+        if (!any) return 0;
+    }
     if (!q_buf_ptr || !kc_buf_ptr || !vc_buf_ptr || !out_buf_ptr || !pos_buf_ptr) return 0;
     if (!sofuu_chain_attn_gate(ctx, pos_buf_ptr, pos_offset, rows, head_dim, n_heads,
                                n_kv_heads, max_seq, out_stride)) return 0;
     sofuu_batch_barrier(ctx);
     uint hd = head_dim, nh = n_heads, nkv = n_kv_heads, ms = max_seq;
     uint stride = out_stride, rn = rows;
-    [ctx->batch_enc setComputePipelineState:ctx->pso_llama_attn_pre_row];
+    // GQA pairing: the n_heads/n_kv_heads q heads of one kv head read the same
+    // K/V, so the paired kernel (kernels.metal llama_attn_pre_row_gqa) loads it
+    // once for the whole group: grid x becomes the KV head count and each warp
+    // computes R heads of NR rows. The row group and the threadgroup width come
+    // from the shape table (rg rows, (rg/nr)*32 threads); each shape's own
+    // maxTotalThreadsPerThreadgroup was checked in sofuu_metal_init, so this
+    // dispatch can never exceed it.
+    id<MTLComputePipelineState> pso = ctx->pso_llama_attn_pre_row;
+    uint grid_x = n_heads;
+    uint rg = 32u;
+    uint nthr = 1024u;
+    uint ratio = (nkv > 0u) ? (nh / nkv) : 0u;
+    if (ctx->attn_gqa_mode != 0 && ratio > 1u) {
+        int idx = -1;
+        if (ratio == 2u) {
+            idx = ctx->attn_gqa_mode - 1;   // modes 1..5 are table entries 0..4
+        } else if (ratio == 4u) {
+            idx = 5;
+        }
+        if (idx >= 0 && idx < 6 && ctx->pso_attn_gqa[idx] != nil) {
+            pso = ctx->pso_attn_gqa[idx];
+            grid_x = nkv;
+            rg = ctx->attn_gqa_rg[idx];
+            nthr = ctx->attn_gqa_threads[idx];
+        }
+    }
+    if (pso == nil) return 0;
+    [ctx->batch_enc setComputePipelineState:pso];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_buf_ptr offset:q_offset atIndex:0];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_buf_ptr offset:out_offset atIndex:1];
     [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)kc_buf_ptr offset:kc_layer_offset atIndex:2];
@@ -3604,9 +3694,9 @@ int sofuu_metal_batch_llama_attn_row(
     [ctx->batch_enc setBytes:&ms length:sizeof(uint) atIndex:8];
     [ctx->batch_enc setBytes:&stride length:sizeof(uint) atIndex:9];
     [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:10];
-    uint row_groups = (rows + 31u) / 32u;
-    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads, row_groups, 1)
-                    threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    uint row_groups = (rows + rg - 1u) / rg;
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(grid_x, row_groups, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nthr, 1, 1)];
     return 1;
 }
 

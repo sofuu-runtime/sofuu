@@ -6654,6 +6654,173 @@ kernel void llama_attn_pre_row(
         *(device float4 *)&dst[lane * 4u] = acc * inv;
     }
 }
+// ── GQA/row-grouped chunk attention: K/V loaded once per warp-key ───────────
+// llama_attn_pre_row above walks the key range once per (row, HEAD): with GQA
+// the n_heads/n_kv_heads heads that map to the same kv head read the SAME K/V
+// bytes, and the per-row online softmax makes that walk the unit of cost, so a
+// row group fetches n_heads streams where only n_kv_heads distinct ones exist.
+//
+// This kernel makes the fetch per WARP, not per (row, head): a warp owns NR
+// consecutive rows of the threadgroup row window and computes ALL R =
+// n_heads/n_kv_heads heads those rows use, so ONE K/V load feeds R*NR online
+// softmaxes. Threadgroup = RG rows, RG/NR warps (RG/NR*32 threads), grid =
+// (n_kv_heads, ceil(rows/RG)): on 16 q / 8 kv with RG=32, NR=2 that is 8x4
+// threadgroups of 512 threads, and the K/V bytes per (row, head, key) fall
+// from 1 KB (per-head kernel) to 1 KB/(R*NR).
+//
+// The arithmetic is UNCHANGED per (row, head): for every (j, qq) the chain is
+// the per-head kernel expression - the same four-multiply dot, the same
+// simd_sum over the same 32 lanes, the same exp/max/rescale sequence in the
+// same key order - so every head fp32 accumulation order, and therefore the
+// bits, are the per-head kernel bits. Loads are only hoisted across heads and
+// rows, which are independent chains.
+//
+// PF=1 double-buffers the load one key ahead. It also moves no arithmetic; it
+// measured SLOWER (register pressure costs more occupancy than the latency it
+// hides), so the shipped shapes use PF=0.
+//
+// Register budget: the host checks maxTotalThreadsPerThreadgroup for the exact
+// (RG/NR)*32 it is about to dispatch and falls back to the per-head kernel
+// otherwise - an oversized threadgroup is DROPPED in release and reads back as
+// dead attention.
+template <uint R, uint NR, uint RG, uint PF>
+kernel void llama_attn_pre_row_gqa(
+    device const float *q               [[buffer(0)]],
+    device float       *out             [[buffer(1)]],
+    device const float *k_cache_layer   [[buffer(2)]],
+    device const float *v_cache_layer   [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    constant uint      &out_stride      [[buffer(9)]],
+    constant uint      &rows            [[buffer(10)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint  tid                           [[thread_index_in_threadgroup]]
+) {
+    uint kv = tg.x;
+    uint row0 = tg.y * RG;
+    uint warp = tid >> 5u;
+    uint row = row0 + warp * NR;
+    uint lane = tid & 31u;
+    if (kv >= n_kv_heads || row >= rows) { return; }
+    // The key loop runs to the row window last row so the warps of a
+    // threadgroup stay on one t; each row keeps its own causal bound.
+    uint last = min(row0 + RG - 1u, rows - 1u);
+    uint tmax = positions[last] + 1u;
+    device const float *kbase = k_cache_layer + (size_t)kv * max_seq * head_dim;
+    device const float *vbase = v_cache_layer + (size_t)kv * max_seq * head_dim;
+    uint h0 = kv * R;
+    float scale = rsqrt(float(head_dim));
+    bool act = (lane * 4u) < head_dim;
+    uint o = lane * 4u;
+
+    // pos[] doubles as the live/parked flag: 0xFFFFFFFF parks a row past the
+    // chunk end (it joins the key loop for its live warp-mates but is never
+    // read back and never masks anything).
+    uint pos[NR];
+    float4 q4[R][NR];
+    float4 acc[R][NR];
+    float m[R][NR];
+    float l[R][NR];
+    for (uint qq = 0; qq < NR; ++qq) {
+        uint rq = row + qq;
+        pos[qq] = (rq < rows) ? positions[rq] : 0xFFFFFFFFu;
+        bool live = (rq < rows && pos[qq] != 0xFFFFFFFFu && pos[qq] < max_seq);
+        device const float *q_row = q + ((size_t)min(rq, rows - 1u) * n_heads
+                                        + (size_t)h0) * head_dim;
+        for (uint j = 0; j < R; ++j) {
+            q4[j][qq] = (live && act)
+                ? *(device const float4 *)&q_row[(size_t)j * head_dim + o]
+                : float4(0.0f);
+            acc[j][qq] = float4(0.0f);
+            m[j][qq] = -INFINITY;
+            l[j][qq] = 0.0f;
+        }
+        if (!live) { pos[qq] = 0xFFFFFFFFu; }
+    }
+
+    float4 kcur = float4(0.0f);
+    float4 vcur = float4(0.0f);
+    if (PF != 0u && act) {
+        kcur = *(device const float4 *)&kbase[o];
+        vcur = *(device const float4 *)&vbase[o];
+    }
+    for (uint t = 0; t < tmax; ++t) {
+        float4 k4;
+        float4 v4;
+        if (PF != 0u) {
+            k4 = kcur;
+            v4 = vcur;
+            uint tn = min(t + 1u, tmax - 1u);
+            if (act) {
+                kcur = *(device const float4 *)&kbase[(size_t)tn * head_dim + o];
+                vcur = *(device const float4 *)&vbase[(size_t)tn * head_dim + o];
+            }
+        } else {
+            k4 = float4(0.0f);
+            v4 = float4(0.0f);
+            if (act) {
+                k4 = *(device const float4 *)&kbase[(size_t)t * head_dim + o];
+                v4 = *(device const float4 *)&vbase[(size_t)t * head_dim + o];
+            }
+        }
+        for (uint qq = 0; qq < NR; ++qq) {
+            for (uint j = 0; j < R; ++j) {
+                float part = q4[j][qq].x * k4.x + q4[j][qq].y * k4.y
+                           + q4[j][qq].z * k4.z + q4[j][qq].w * k4.w;
+                float s = simd_sum(part) * scale;
+                if (t > pos[qq]) { s = -INFINITY; }
+                // One of the two exponentials of the online-softmax update is
+                // exp(0) in EVERY key step and exactly one is: if s > m then
+                // w = exp(0) = 1, else corr = exp(0) = 1. s comes out of a
+                // simd_sum, so it is uniform across the warp and this branch is
+                // warp-uniform (no divergence). Skipping the exp and its
+                // multiply by 1.0f is bit-exact - exp(0.0f) is exactly 1.0f and
+                // x * 1.0f is exactly x - so this is the same arithmetic, minus
+                // half the transcendentals.
+                float mold = m[j][qq];
+                float corr;
+                float w;
+                if (s > mold) {
+                    m[j][qq] = s;               // mnew = s
+                    corr = exp(mold - s);
+                    w = 1.0f;
+                } else {
+                    corr = 1.0f;
+                    w = exp(s - mold);
+                }
+                l[j][qq] = l[j][qq] * corr + w;
+                acc[j][qq] = acc[j][qq] * corr + v4 * w;
+            }
+        }
+    }
+    if (act) {
+        for (uint qq = 0; qq < NR; ++qq) {
+            uint rq = row + qq;
+            if (rq >= rows || pos[qq] == 0xFFFFFFFFu) { continue; }
+            for (uint j = 0; j < R; ++j) {
+                float inv = (l[j][qq] > 0.0f) ? (1.0f / l[j][qq]) : 0.0f;
+                device float *dst = out + (size_t)rq * out_stride
+                                        + (size_t)(h0 + j) * head_dim;
+                *(device float4 *)&dst[o] = acc[j][qq] * inv;
+            }
+        }
+    }
+}
+
+#define PRE_GQA_ARGS device const float*, device float*, device const float*, \
+    device const float*, device const uint*, constant uint&, constant uint&, \
+    constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint
+//                      R  NR  RG  PF      threads = (RG/NR)*32
+template [[host_name("attn_gqa_r2_nr1_rg32")]]    kernel void llama_attn_pre_row_gqa<2, 1, 32, 0>(PRE_GQA_ARGS); // 1024
+template [[host_name("attn_gqa_r2_nr2_rg32")]]    kernel void llama_attn_pre_row_gqa<2, 2, 32, 0>(PRE_GQA_ARGS); //  512
+template [[host_name("attn_gqa_r2_nr2_rg16")]]    kernel void llama_attn_pre_row_gqa<2, 2, 16, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r2_nr4_rg32")]]    kernel void llama_attn_pre_row_gqa<2, 4, 32, 0>(PRE_GQA_ARGS); //  256
+template [[host_name("attn_gqa_r2_nr1_rg32_pf")]] kernel void llama_attn_pre_row_gqa<2, 1, 32, 1>(PRE_GQA_ARGS); // 1024
+template [[host_name("attn_gqa_r4_nr1_rg16")]]    kernel void llama_attn_pre_row_gqa<4, 1, 16, 0>(PRE_GQA_ARGS); //  512
+
 // Moves the per-row attention result out of the meta scratch (finish is a copy
 // now that part computes whole rows).
 kernel void llama_attn_copy_b4(

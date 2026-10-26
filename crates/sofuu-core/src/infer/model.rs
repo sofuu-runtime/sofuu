@@ -3594,19 +3594,27 @@ impl TransformerModel {
     // Every unsupported shape returns false and the caller falls through to a
     // whole-chunk route: a split is never the reason a chunk fails.
 
-    /// Per-chunk row target for the GPU arm.
+    /// Per-chunk row target for the GPU arm - FITTED, not guessed.
     ///
-    /// Default: the measured BALANCE point between the two arms. Each arm pays a
-    /// per-chunk FIXED cost that does not shrink with its row count - the CPU
-    /// arm re-streams every weight once per chunk (~85ms of the 196-359ms a
-    /// 128-row chunk costs) and the GPU arm pays ~37ms of dispatch overhead -
-    /// while the per-row costs are the same order (~0.9ms CPU, ~0.95ms GPU at
-    /// 128 rows). Equalising the two arms,
-    ///     CPU_FIX + kc*c_cpu = GPU_FIX + (b-kc)*c_gpu
-    /// gives kc = (GPU_FIX - CPU_FIX + c_gpu*b)/(c_cpu + c_gpu) ~= 0.51*b - 26,
-    /// i.e. 40 CPU rows of 128 (kg=88) - which is where the 128-row chunks
-    /// measured fastest - and only 8 CPU rows of a 44-row chunk, where the CPU
-    /// arm's fixed cost is all it could ever contribute.
+    /// Each arm costs a per-chunk FIXED part (both re-stream every weight once
+    /// per chunk) plus a per-row slope, and the arms run concurrently, so a
+    /// chunk costs max(CPU_FIX + kc*c_cpu, GPU_FIX + kg*c_gpu). Measured on
+    /// 128-row chunks at start_pos=128 over interleaved rounds (M2 Pro):
+    ///     CPU arm: 18.9ms at kc=4 .. 183.5ms at kc=124  -> c_cpu ~= 1.4ms/row
+    ///     GPU arm: 65.0ms at kg=124, 68.3ms at kg=112   -> c_gpu ~= 0.3ms/row
+    ///     whole-chunk GPU route, same b and start       = 64.5-67.7ms
+    /// c_cpu is ~5x c_gpu, so the equalising row count
+    ///     kc* = (GPU_FIX - CPU_FIX + c_gpu*b) / (c_cpu + c_gpu)
+    /// has NO interior solution: every row handed to the CPU lengthens the
+    /// critical path by c_cpu - c_gpu ~= 1.1ms. The fitted target is therefore
+    /// the smallest CPU share the tile path can take - 4 rows, its b4
+    /// granularity - and kg = b - 4. A full SOFUU_SPLIT_GPU_ROWS sweep agrees:
+    /// on 128-row chunks kg=124 measured 1.036s of steady chunks against 1.60s
+    /// at the old kc=40 (kg=88) formula, and the curve is monotonic in kg.
+    /// Even at kg=124 the split only TIES the whole-chunk GPU route (1.036s vs
+    /// 1.012s; GPU-only faster in 5 of 5 interleaved rounds), because a
+    /// layer-group commit costs more than the 4 GPU rows it saves. That is why
+    /// SOFUU_SPLIT stays opt-in and the GPU route is the fast arm.
     ///
     /// SOFUU_SPLIT_GPU_ROWS=<n> pins the absolute GPU row count;
     /// SOFUU_SPLIT_GPU_FRAC=<pct> pins the GPU share instead. Both are clamped so
@@ -3633,9 +3641,9 @@ impl TransformerModel {
         } else if frac > 0 {
             (b * frac) / 100
         } else {
-            // balance point: kc ~= 0.514*b - 26 rows to the CPU (see above)
-            let kc = ((b as f64) * 0.514 - 26.0).round().max(8.0) as usize;
-            b.saturating_sub(kc.min(b.saturating_sub(8).max(8)))
+            // Fitted balance (see above): the CPU arm's marginal row is ~5x the
+            // GPU arm's, so it keeps only the 4-row tile-granularity floor.
+            b.saturating_sub(4).max(4)
         };
         let kg = want.clamp(4, b.saturating_sub(4).max(4));
         // The CPU arm's row count must stay a multiple of 4: the tile path

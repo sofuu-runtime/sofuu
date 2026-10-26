@@ -2001,6 +2001,86 @@ pub fn softmax(scores: &mut [f32]) {
     }
 }
 
+/// P1b (long-context §8): llama3-style per-pair rope frequency scaling.
+/// HF "llama3" rope_type: pair i's frequency is kept when its wavelength is
+/// shorter than orig_ctx/high_freq_factor, divided by `factor` when longer
+/// than orig_ctx/low_freq_factor, and smoothly interpolated in between.
+/// Returned multipliers index the PAIR (head_dim/2 entries), 1.0 = untouched.
+pub fn llama3_rope_adjust(
+    head_dim: usize,
+    freq_base: f32,
+    factor: f32,
+    orig_ctx: usize,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut adj = vec![1.0f32; half.max(1)];
+    if half == 0 || orig_ctx == 0 || factor <= 1.0 {
+        return adj;
+    }
+    let high_wavelen = orig_ctx as f32 / high_freq_factor;
+    let low_wavelen = orig_ctx as f32 / low_freq_factor;
+    for i in 0..half {
+        let freq = 1.0f32 / freq_base.powf((2 * i) as f32 / head_dim as f32);
+        let wavelen = std::f32::consts::TAU / freq;
+        adj[i] = if wavelen < high_wavelen {
+            1.0
+        } else if wavelen > low_wavelen {
+            1.0 / factor
+        } else {
+            let smooth = (orig_ctx as f32 / wavelen - low_freq_factor)
+                / (high_freq_factor - low_freq_factor);
+            (1.0 - smooth) / factor + smooth
+        };
+    }
+    adj
+}
+
+/// rope_style with per-pair frequency multipliers (P1b). A scalar mirror of
+/// the sofuu_rope C kernel (same pairing, same rotation signs — mode 1 =
+/// GGUF normal consecutive pairs, mode 0 = NeoX half pairs; the two modes'
+/// second-element forms are algebraically identical). Used only when a
+/// llama3 frequency table is armed; the default path stays the C kernel
+/// untouched.
+pub fn rope_style_adjust(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    rope_mode: i32,
+    adjust: &[f32],
+) {
+    if head_dim < 2 || adjust.is_empty() {
+        return;
+    }
+    let half_dim = head_dim / 2;
+    for h in 0..n_heads {
+        let head = &mut vec[h * head_dim..(h + 1) * head_dim];
+        for i in 0..half_dim {
+            let freq = 1.0f32 / freq_base.powf((2 * i) as f32 / head_dim as f32)
+                * adjust[i];
+            let theta = pos as f32 * freq;
+            let c = theta.cos();
+            let s = theta.sin();
+            if rope_mode == 1 {
+                let even = 2 * i;
+                let odd = even + 1;
+                let v0 = head[even];
+                let v1 = head[odd];
+                head[even] = v0 * c - v1 * s;
+                head[odd] = v1 * c + v0 * s;
+            } else {
+                let v0 = head[i];
+                let v1 = head[i + half_dim];
+                head[i] = v0 * c - v1 * s;
+                head[i + half_dim] = v0 * s + v1 * c;
+            }
+        }
+    }
+}
+
 /// Rotary Position Embedding (RoPE) via C++ SIMD.
 #[inline]
 pub fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, freq_base: f32) {
@@ -3882,5 +3962,56 @@ pub(crate) fn gemm_batched_f16(
 ) {
     unsafe {
         sofuu_gemm_f16(w.as_ptr() as *const u16, x.as_ptr(), out.as_mut_ptr(), rows, cols, batch);
+    }
+}
+
+#[cfg(test)]
+mod llama3_rope_tests {
+    use super::*;
+
+    #[test]
+    fn llama3_adjust_shapes_and_bounds() {
+        // Llama-3.2-1B parameters: factor 32, orig ctx 8192, lo 1, hi 4.
+        let adj = llama3_rope_adjust(64, 500_000.0, 32.0, 8192, 1.0, 4.0);
+        assert_eq!(adj.len(), 32);
+        // Highest-frequency pair keeps its trained frequency.
+        assert_eq!(adj[0], 1.0);
+        // Lowest-frequency pair takes the full factor.
+        assert!((adj[31] - 1.0 / 32.0).abs() < 1e-6, "adj[31]={}", adj[31]);
+        // Monotone non-increasing across pairs.
+        for w in adj.windows(2) {
+            assert!(w[0] >= w[1] - 1e-7);
+        }
+        // No-construction guards.
+        let off = llama3_rope_adjust(64, 500_000.0, 1.0, 8192, 1.0, 4.0);
+        assert!(off.iter().all(|&a| a == 1.0));
+    }
+
+    #[test]
+    fn rope_style_adjust_matches_inline_reference() {
+        // Independent hard-coded reference for a small case, NeoX mode.
+        let head_dim = 8usize;
+        let pos = 7usize;
+        let base = 10_000.0f32;
+        let mut adj = vec![1.0f32; 4];
+        adj[1] = 2.0; // scale one pair's frequency
+        let mut v: Vec<f32> = (0..16).map(|i| (i as f32 * 0.3).sin()).collect();
+        rope_style_adjust(&mut v, 2, head_dim, pos, base, 0, &adj);
+
+        let mut refv: Vec<f32> = (0..16).map(|i| (i as f32 * 0.3).sin()).collect();
+        for h in 0..2usize {
+            let hb = h * head_dim; // head base
+            for (i, &a) in adj.iter().enumerate() {
+                let freq = 1.0f32 / base.powf((2 * i) as f32 / head_dim as f32) * a;
+                let theta = pos as f32 * freq;
+                let (c, s) = (theta.cos(), theta.sin());
+                let v0 = refv[hb + i];
+                let v1 = refv[hb + 4 + i];
+                refv[hb + i] = v0 * c - v1 * s;
+                refv[hb + 4 + i] = v0 * s + v1 * c;
+            }
+        }
+        let d = v.iter().zip(&refv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(d < 1e-6, "scaled rope diverges from reference: {d}");
     }
 }

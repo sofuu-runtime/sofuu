@@ -315,6 +315,11 @@ pub struct LayerWeights {
 
 pub struct TransformerModel {
     pub config: ModelConfig,
+    /// P1b: llama3 per-pair rope frequency multipliers (head_dim/2 entries).
+    /// Empty = the C kernel path unchanged. Filled from GGUF
+    /// `{arch}rope.scaling.*` or the explicit SOFUU_ROPE_LLAMA3 knob for
+    /// checkpoints whose quant dropped the metadata.
+    pub rope_freq_adjust: Vec<f32>,
     pub gguf: GgufFile,
     pub token_embd: TensorView,
     pub output_norm: TensorView,
@@ -572,6 +577,60 @@ impl TransformerModel {
             0
         };
         let cache_seq_len = if kv_ring > 0 { kv_ring } else { final_seq_len };
+        // P1b llama3 rope-frequency table: HF-trained models (Llama-3.x)
+        // were trained WITH this per-pair scaling — it is part of the
+        // weights' semantics, so it applies at every position once present,
+        // not only past the trained window. Source 1: the GGUF's own
+        // `{arch}rope.scaling.*` keys. Source 2 (for checkpoints whose quant
+        // dropped the keys, e.g. our Llama-3.2-1B Q8_0): the explicit knob
+        // SOFUU_ROPE_LLAMA3="factor/orig_ctx[/low/high]" e.g. "32/8192".
+        let mut rope_freq_adjust: Vec<f32> = Vec::new();
+        let gguf_scaling = gguf.get_str(&format!("{prefix}rope.scaling.type"))
+            .map(|t| t.to_string());
+        let knob = std::env::var("SOFUU_ROPE_LLAMA3").ok();
+        let llama3_spec: Option<(f32, usize, f32, f32, &'static str)> = if let Some(k) = knob {
+            let parts: Vec<&str> = k.split('/').map(|x| x.trim()).collect();
+            let parse = |x: &str| x.parse::<f64>().ok();
+            match (parts.first().and_then(|v| parse(v)), parts.get(1).and_then(|v| parse(v))) {
+                (Some(factor), Some(orig)) if factor > 1.0 && orig > 0.0 => {
+                    let low = parts.get(2).and_then(|v| parse(v)).unwrap_or(1.0);
+                    let high = parts.get(3).and_then(|v| parse(v)).unwrap_or(4.0);
+                    Some((factor as f32, orig as usize, low as f32, high as f32, "SOFUU_ROPE_LLAMA3"))
+                }
+                _ => {
+                    eprintln!("[sofuu] SOFUU_ROPE_LLAMA3: expected factor/orig_ctx[/low/high], got '{k}' — ignored");
+                    None
+                }
+            }
+        } else if gguf_scaling.as_deref() == Some("llama3") {
+            let factor = gguf.get_f32(&format!("{prefix}rope.scaling.factor"))
+                .or_else(|| gguf.metadata.get(&format!("{prefix}rope.scaling.factor")).and_then(|v| match v {
+                    GgufValue::Float32(f) => Some(*f),
+                    GgufValue::Uint32(u) => Some(*u as f32),
+                    GgufValue::Float64(f) => Some(*f as f32),
+                    _ => None,
+                }))
+                .unwrap_or(0.0);
+            let orig = gguf.get_u32(&format!("{prefix}rope.scaling.original_context_length")).unwrap_or(0) as usize;
+            let low = gguf.get_f32(&format!("{prefix}rope.scaling.low_freq_factor")).unwrap_or(1.0);
+            let high = gguf.get_f32(&format!("{prefix}rope.scaling.high_freq_factor")).unwrap_or(4.0);
+            if factor > 1.0 && orig > 0 {
+                Some((factor, orig, low, high, "gguf metadata"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((factor, orig, low, high, source)) = llama3_spec {
+            if head_dim >= 2 {
+                rope_freq_adjust = super::quant::llama3_rope_adjust(head_dim, rope_freq_base, factor, orig, low, high);
+                eprintln!(
+                    "[rope] llama3 scaling armed ({source}): factor {factor}, orig ctx {orig}, low/high freq factors {low}/{high} — applies at every position (trained semantics)"
+                );
+            }
+        }
+
         let config = ModelConfig {
             dim,
             n_layers,
@@ -814,6 +873,7 @@ impl TransformerModel {
 
         let model = Self {
             config,
+            rope_freq_adjust,
             gguf,
             token_embd,
             output_norm,
@@ -1553,7 +1613,34 @@ impl TransformerModel {
 
             // ── RoPE & KV-Cache Storage for batch ────────────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            if self.kv_f16 || self.k16_prefill {
+            if !self.rope_freq_adjust.is_empty() {
+                // P1b: llama3-scaled rope — the batched C kernel takes only a
+                // scalar base, so rope each row here (rope is ~1% of a prefill
+                // step) and store the rows to the cache ourselves.
+                for b in 0..b_size {
+                    let p = start_pos + b;
+                    super::quant::rope_style_adjust(
+                        &mut self.q_batch[b * q_dim..(b + 1) * q_dim],
+                        n_heads, head_dim, p, rope_freq_base, rope_mode, &self.rope_freq_adjust,
+                    );
+                    super::quant::rope_style_adjust(
+                        &mut self.k_batch[b * kv_dim..(b + 1) * kv_dim],
+                        n_kv_heads, head_dim, p, rope_freq_base, rope_mode, &self.rope_freq_adjust,
+                    );
+                    let cache_pos = p % max_seq_len;
+                    for kv_h in 0..n_kv_heads {
+                        let src = b * kv_dim + kv_h * head_dim;
+                        let slot = (layer_idx * n_kv_heads + kv_h) * max_seq_len * head_dim
+                            + cache_pos * head_dim;
+                        let krow: Vec<f32> = self.k_batch[src..src + head_dim].to_vec();
+                        let vrow: Vec<f32> = self.v_batch[src..src + head_dim].to_vec();
+                        self.k_cache[slot..slot + head_dim].copy_from_slice(&krow);
+                        self.v_cache[slot..slot + head_dim].copy_from_slice(&vrow);
+                        kv16_store(self.k16_cache.as_mut(), slot, &krow);
+                        kv16_store(self.v16_cache.as_mut(), slot, &vrow);
+                    }
+                }
+            } else if self.kv_f16 || self.k16_prefill {
                 batched_rope_kv_f16(
                     &mut self.q_batch[0..b_size * q_dim],
                     &mut self.k_batch[0..b_size * kv_dim],
@@ -2495,6 +2582,7 @@ impl TransformerModel {
                 && !self.streaming_weights
                 && !self.dynamic_ffn.enabled
                 && self.kivi.is_none()
+                && self.rope_freq_adjust.is_empty()
             {
                 if self.execute_layers_gpu(pos, start_layer, end_layer) {
                     return true;
@@ -2631,8 +2719,13 @@ impl TransformerModel {
 
             // ── RoPE (Rotary Position Embeddings) ───────────
             let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-            rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
-            rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
+            if !self.rope_freq_adjust.is_empty() {
+                super::quant::rope_style_adjust(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust);
+                super::quant::rope_style_adjust(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode, &self.rope_freq_adjust);
+            } else {
+                rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
+                rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
+            }
 
             // ── Store to KV-Cache at slot pos ───────────────
             let cache_pos = pos % max_seq_len;

@@ -3768,6 +3768,41 @@ impl TransformerModel {
         true
     }
 
+    /// Section blob for a group of q4_K projections that read the SAME activation
+    /// rows (q/k/v off the normed input; gate/up off the ffn-normed one) so they
+    /// can ride ONE sectioned mma8 dispatch instead of one dispatch each.
+    /// Returns (w_base, secs) where secs[i] = {w_off - w_base, w_rem, rows,
+    /// y_off bytes}, or None when the group cannot be expressed: fewer than two
+    /// members (nothing to merge), more than the kernel's four sections, any
+    /// member that is not q4_K, or an aligned delta that does not fit the u32
+    /// the kernel reads (a >4 GiB weight buffer would truncate).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn mma8_secs_blob(
+        gguf: &GgufFile,
+        members: &[(&TensorView, u32, u32)],
+    ) -> Option<(usize, Vec<[u32; 4]>)> {
+        if members.len() < 2 || members.len() > 4 {
+            return None;
+        }
+        if members.iter().any(|(tv, _, _)| tv.tensor_type != GGML_TYPE_Q4_K) {
+            return None;
+        }
+        let mut base = usize::MAX;
+        for (tv, _, _) in members {
+            base = base.min((gguf.data_offset + tv.offset) & !255usize);
+        }
+        let mut secs = Vec::with_capacity(members.len());
+        for (tv, rows, y_off) in members {
+            let raw = gguf.data_offset + tv.offset;
+            let aligned = raw & !255usize;
+            if aligned < base || aligned - base > u32::MAX as usize {
+                return None;
+            }
+            secs.push([(aligned - base) as u32, (raw & 255) as u32, *rows, *y_off]);
+        }
+        Some((base, secs))
+    }
+
     /// W1 CPU+GPU row split: ONE chain layer over b contiguous slab rows
     /// (slab row t = token t of this pass, its position start_pos + t). This is
     /// the body of gpu_forward_chain_core's layer loop moved verbatim into its
@@ -4005,14 +4040,56 @@ impl TransformerModel {
             &g.act_buf, g.slots.xn,
             dim, norm_eps, b,
         );
-        let qkv_ok = b <= 4 && gemm_fused_dec!(
-            [
-                (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
-                (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
-                (&l.attn_v, kv_rows as u32, g.slots.va, kv_rows as u32),
-            ],
-            q_rows + 2 * kv_rows, dim, g.slots.xn
-        );
+        // WIDE chunks (b > 4): q, k and v read the SAME normed rows and write
+        // disjoint slots, so one sectioned mma8 dispatch replaces three - two
+        // dispatch ramps and two barriers per layer less, with the same tile,
+        // the same accumulation order and therefore the same bits in qa/ka/va.
+        // Narrow chunks keep the b<=4 fused path (which also handles mixed
+        // tensor types); a false return anywhere falls through to the
+        // per-tensor walk, never to a skipped projection.
+        // v is q6_K on the Q4_K_M layer class, so the three-way merge fires only
+        // on the layers whose v is q4_K; the two-way q+k merge covers the rest
+        // (q and k are q4_K in both classes), leaving v to its own dispatch as
+        // before. Both are the SAME kernel with a shorter section list, so no
+        // output bit changes either way.
+        let qkv_secs = b > 4
+            && crate::infer::metal::MetalEngine::mma8_enabled()
+            && {
+                let q3 = [
+                    (&l.attn_q, q_rows as u32, g.slots.qa as u32),
+                    (&l.attn_k, kv_rows as u32, g.slots.ka as u32),
+                    (&l.attn_v, kv_rows as u32, g.slots.va as u32),
+                ];
+                let secs_run = |base: usize, secs: &[[u32; 4]]| {
+                    g.engine.batch_gguf_mma8_secs(
+                        &g.w_buf, base, &g.act_buf, g.slots.xn, &g.act_buf, dim, b, secs,
+                    )
+                };
+                match Self::mma8_secs_blob(gguf, &q3) {
+                    Some((base, secs)) => secs_run(base, &secs),
+                    None => match Self::mma8_secs_blob(gguf, &q3[..2]) {
+                        Some((base, secs)) => {
+                            if secs_run(base, &secs) {
+                                gemv_b!(l.attn_v, g.slots.xn, g.slots.va, kv_rows, dim);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    },
+                }
+            };
+        let qkv_ok = qkv_secs
+            || (b <= 4
+                && gemm_fused_dec!(
+                    [
+                        (&l.attn_q, q_rows as u32, g.slots.qa, q_rows as u32),
+                        (&l.attn_k, kv_rows as u32, g.slots.ka, kv_rows as u32),
+                        (&l.attn_v, kv_rows as u32, g.slots.va, kv_rows as u32),
+                    ],
+                    q_rows + 2 * kv_rows, dim, g.slots.xn
+                ));
         if !qkv_ok {
             gemv_b!(l.attn_q, g.slots.xn, g.slots.qa, q_rows, dim);
             gemv_b!(l.attn_k, g.slots.xn, g.slots.ka, kv_rows, dim);
@@ -4126,16 +4203,29 @@ impl TransformerModel {
         // wide-chain route (mma8, chunk 128) it would compute rows 0..3 and
         // leave the other 124 rows of xo stale. Only the narrow b4 walk can
         // use it; wider chunks fall through to gemv_b!, which is batched.
-        if !(fuse_on
-            && b <= 4
+        // Wide chunks: the mma8 residual epilogue writes x directly, so the
+        // separate batch_add dispatch and the xo round trip are gone. Same f32
+        // add of the same two operands, so x is bit-identical.
+        let o_acc = b > 4
+            && crate::infer::metal::MetalEngine::mma8_enabled()
             && l.attn_output.tensor_type == GGML_TYPE_Q4_K
-            && g.engine.batch_gguf_b4r(
+            && g.engine.batch_gguf_mma8_acc(
                 &g.w_buf, gguf.data_offset + l.attn_output.offset,
                 &g.act_buf, g.slots.ao,
-                &g.act_buf, g.slots.xo,
                 &g.act_buf, g.slots.x,
-                dim, q_rows, dim,
-            ))
+                dim, q_rows, b,
+            );
+        if !o_acc
+            && !(fuse_on
+                && b <= 4
+                && l.attn_output.tensor_type == GGML_TYPE_Q4_K
+                && g.engine.batch_gguf_b4r(
+                    &g.w_buf, gguf.data_offset + l.attn_output.offset,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.xo,
+                    &g.act_buf, g.slots.x,
+                    dim, q_rows, dim,
+                ))
         {
             gemv_b!(l.attn_output, g.slots.ao, g.slots.xo, dim, q_rows);
             if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
@@ -4168,13 +4258,34 @@ impl TransformerModel {
         }
         if !g.skip_ffn {
         *ffn_ops += 1;
-        let gu_ok = b <= 4 && gemm_fused_dec!(
-            [
-                (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
-                (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
-            ],
-            2 * hidden_dim, dim, g.slots.xn
-        );
+        // gate/up share the ffn-normed rows: ONE sectioned mma8 dispatch on the
+        // wide chunks (same argument as q/k/v above), b<=4 fused path otherwise.
+        // (A two-GEMM-per-threadgroup variant that also applied the SwiGLU in
+        // the epilogue was measured: it halves the in-flight threadgroup count
+        // and cost +16 ms per 128-row chunk, so the three dispatches stay.)
+        let gu_secs = b > 4
+            && crate::infer::metal::MetalEngine::mma8_enabled()
+            && Self::mma8_secs_blob(
+                gguf,
+                &[
+                    (&l.ffn_gate, hidden_dim as u32, g.slots.gate as u32),
+                    (&l.ffn_up, hidden_dim as u32, g.slots.up as u32),
+                ],
+            )
+            .is_some_and(|(base, secs)| {
+                g.engine.batch_gguf_mma8_secs(
+                    &g.w_buf, base, &g.act_buf, g.slots.xn, &g.act_buf, dim, b, &secs,
+                )
+            });
+        let gu_ok = gu_secs
+            || (b <= 4
+                && gemm_fused_dec!(
+                    [
+                        (&l.ffn_gate, hidden_dim as u32, g.slots.gate, hidden_dim as u32),
+                        (&l.ffn_up, hidden_dim as u32, g.slots.up, hidden_dim as u32),
+                    ],
+                    2 * hidden_dim, dim, g.slots.xn
+                ));
         if !gu_ok {
             gemv_b!(l.ffn_gate, g.slots.xn, g.slots.gate, hidden_dim, dim);
             gemv_b!(l.ffn_up, g.slots.xn, g.slots.up, hidden_dim, dim);
@@ -4213,7 +4324,18 @@ impl TransformerModel {
                     &g.act_buf, g.slots.x,
                     dim, hidden_dim, b,
                 ));
-        if !down_fused {
+        // Wide chunks whose down is q4_K: same residual epilogue as o above.
+        let down_acc = !down_fused
+            && b > 4
+            && crate::infer::metal::MetalEngine::mma8_enabled()
+            && l.ffn_down.tensor_type == GGML_TYPE_Q4_K
+            && g.engine.batch_gguf_mma8_acc(
+                &g.w_buf, gguf.data_offset + l.ffn_down.offset,
+                &g.act_buf, g.slots.gate,
+                &g.act_buf, g.slots.x,
+                dim, hidden_dim, b,
+            );
+        if !down_fused && !down_acc {
             gemv_b!(l.ffn_down, g.slots.gate, g.slots.xo, dim, hidden_dim);
             if !g.engine.batch_add(&g.act_buf, g.slots.x, &g.act_buf, g.slots.xo, b * dim) {
                 return false;

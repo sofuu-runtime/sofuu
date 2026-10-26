@@ -1421,6 +1421,204 @@ kernel void gemm_q4_k_mma8(
     }
 }
 
+// ── sectioned mma8 GEMM: ONE dispatch for a group of q4_K projections ───────
+// The body below is gemm_q4_k_mma8 verbatim — same 32-row x 32-token tile, same
+// 128-thread threadgroup, same k-loop, same hi/lo staging, same accumulation
+// order — with the (weights, out) pair chosen by threadgroup z instead of by the
+// buffer offsets. Every output element is therefore computed by the same
+// arithmetic as in the three-dispatches form, so the result is bit-identical;
+// only the dispatch count changes.
+//
+// The sections a layer can share are exactly the projections that read the SAME
+// activation rows and write disjoint output slots: q/k/v off the normed input,
+// gate/up off the ffn-normed one. Sections carry {w_off (256-aligned,
+// base-relative), w_rem (<256), rows, y_off (bytes)} and may have different
+// rows; a tile beyond a section's row count returns before touching memory.
+// wbase is a 64-bit base so a >4 GiB model never truncates an offset.
+kernel void gemm_q4_k_mma8_secs(
+    device const uchar  *w_base    [[buffer(0)]],   // whole weight buffer, bound at 0
+    device const float  *x         [[buffer(1)]],
+    device float        *y         [[buffer(2)]],   // whole activation slab, bound at 0
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       *secs      [[buffer(4)]],   // [n][4]: w_off, w_rem, rows, y_off
+    constant uint       &ntok      [[buffer(5)]],
+    constant ulong      &wbase     [[buffer(6)]],
+    uint3               tg         [[threadgroup_position_in_grid]],
+    uint3               tp         [[thread_position_in_threadgroup]]
+) {
+    uint s = tg.z;
+    uint w_rem = secs[s * 4u + 1u];
+    uint rows  = secs[s * 4u + 2u];
+    uint y_off = secs[s * 4u + 3u];
+    uint r0 = tg.x * 32u;
+    if (r0 >= rows) { return; }
+    device const uchar *w_sec = w_base + wbase + (size_t)secs[s * 4u + 0u];
+    device float       *y_sec = y + (size_t)(y_off >> 2u);
+    uint tid = tp.x;
+    uint lane = tid & 31u;
+    uint sgi = tid >> 5u;
+    uint row_off = (sgi & 1u) * 16u;
+    uint tok_off = (sgi >> 1u) * 16u;
+    threadgroup half  whi[32 * 32];
+    threadgroup half  wlo[32 * 32];
+    threadgroup half  xhi[32 * 32];
+    threadgroup half  xlo[32 * 32];
+    threadgroup float obuf[4][16 * 16];
+    uint t0 = tg.y * 32u;
+    uint nb = cols / 256u;
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
+    for (uint kt = 0; kt < cols; kt += 32u) {
+        uint blk = kt >> 8u;
+        uint kbase = kt & 255u;
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint row = r0 + (idx >> 5u);
+            uint j = kbase + (idx & 31u);
+            float wv = 0.0f;
+            if (row < rows) {
+                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
+                float d = float(read_f16(w_sec, row_byte));
+                float dmin = float(read_f16(w_sec, row_byte + 2u));
+                device const uchar *scales = w_sec + row_byte + 4u;
+                device const uchar *qs = w_sec + row_byte + 16u;
+                uint8_t sc, mn;
+                q4k_scale_min(scales, j >> 5u, &sc, &mn);
+                uint off = j & 31u;
+                uint l8 = 2u * (j >> 6u) + (off >> 4u);
+                uint by = qs[l8 * 16u + (off & 15u)];
+                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            half h = (half)wv;
+            whi[idx] = h;
+            wlo[idx] = (half)(wv - (float)h);
+            uint tt = t0 + (idx & 31u);
+            float xv = 0.0f;
+            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
+            half xh = (half)xv;
+            xhi[idx] = xh;
+            xlo[idx] = (half)(xv - (float)xh);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+        for (uint kq = 0; kq < 4u; ++kq) {
+            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1;
+            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
+            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
+            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
+            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
+            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 2u; ++j) {
+            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lane; idx < 256u; idx += 32u) {
+        uint row = r0 + row_off + (idx >> 4u);
+        uint tt = t0 + tok_off + (idx & 15u);
+        if (row < rows && tt < ntok) { y_sec[(size_t)tt * rows + row] = obuf[sgi][idx]; }
+    }
+}
+
+// ── mma8 with a RESIDUAL-ADD epilogue ──────────────────────────────────────
+// Same tile/k-loop/accumulation as gemm_q4_k_mma8; the store adds into the
+// residual slab instead of writing a fresh y slot. Valid only when the output
+// width equals the residual width (the o and down projections: both == dim),
+// which the host enforces. One thread writes each element, and the add is the
+// SAME f32 addition the separate batch_add performs on the same two operands,
+// so x[t][row] is bit-identical while the y-slot write and its dispatch go away.
+kernel void gemm_q4_k_mma8_acc(
+    device const uchar  *w_base    [[buffer(0)]],
+    device const float  *x         [[buffer(1)]],
+    device float        *x_acc     [[buffer(2)]],   // bound at the residual slot
+    constant uint       &cols      [[buffer(3)]],
+    constant uint       &w_rem     [[buffer(4)]],
+    constant uint       &rows      [[buffer(5)]],
+    constant uint       &ntok      [[buffer(6)]],
+    uint2               tg         [[threadgroup_position_in_grid]],
+    uint2               tp         [[thread_position_in_threadgroup]]
+) {
+    uint tid = tp.x;
+    uint lane = tid & 31u;
+    uint sgi = tid >> 5u;
+    uint row_off = (sgi & 1u) * 16u;
+    uint tok_off = (sgi >> 1u) * 16u;
+    threadgroup half  whi[32 * 32];
+    threadgroup half  wlo[32 * 32];
+    threadgroup half  xhi[32 * 32];
+    threadgroup half  xlo[32 * 32];
+    threadgroup float obuf[4][16 * 16];
+    uint r0 = tg.x * 32u;
+    uint t0 = tg.y * 32u;
+    uint nb = cols / 256u;
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i) { for (uint j = 0; j < 2u; ++j) { acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f); } }
+    for (uint kt = 0; kt < cols; kt += 32u) {
+        uint blk = kt >> 8u;
+        uint kbase = kt & 255u;
+        for (uint idx = tid; idx < 1024u; idx += 128u) {
+            uint row = r0 + (idx >> 5u);
+            uint j = kbase + (idx & 31u);
+            float wv = 0.0f;
+            if (row < rows) {
+                uint row_byte = w_rem + row * nb * 144u + blk * 144u;
+                float d = float(read_f16(w_base, row_byte));
+                float dmin = float(read_f16(w_base, row_byte + 2u));
+                device const uchar *scales = w_base + row_byte + 4u;
+                device const uchar *qs = w_base + row_byte + 16u;
+                uint8_t sc, mn;
+                q4k_scale_min(scales, j >> 5u, &sc, &mn);
+                uint off = j & 31u;
+                uint l8 = 2u * (j >> 6u) + (off >> 4u);
+                uint by = qs[l8 * 16u + (off & 15u)];
+                uint nib = ((j & 63u) >> 5u) ? (by >> 4u) : (by & 15u);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            half h = (half)wv;
+            whi[idx] = h;
+            wlo[idx] = (half)(wv - (float)h);
+            uint tt = t0 + (idx & 31u);
+            float xv = 0.0f;
+            if (tt < ntok) { xv = x[(size_t)tt * cols + kt + (idx >> 5u)]; }
+            half xh = (half)xv;
+            xhi[idx] = xh;
+            xlo[idx] = (half)(xv - (float)xh);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+        for (uint kq = 0; kq < 4u; ++kq) {
+            simdgroup_matrix<half, 8, 8> Ah0, Ah1, Bh0, Bh1;
+            simdgroup_load(Ah0, whi + row_off * 32u + kq * 8u, 32);
+            simdgroup_load(Ah1, whi + (row_off + 8u) * 32u + kq * 8u, 32);
+            simdgroup_load(Bh0, xhi + kq * 8u * 32u + tok_off, 32);
+            simdgroup_load(Bh1, xhi + kq * 8u * 32u + tok_off + 8u, 32);
+            simdgroup_multiply_accumulate(acc[0][0], Ah0, Bh0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], Ah0, Bh1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], Ah1, Bh0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], Ah1, Bh1, acc[1][1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 2u; ++i) {
+        for (uint j = 0; j < 2u; ++j) {
+            simdgroup_store(acc[i][j], obuf[sgi] + i * 8u * 16u + j * 8u, 16);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lane; idx < 256u; idx += 32u) {
+        uint row = r0 + row_off + (idx >> 4u);
+        uint tt = t0 + tok_off + (idx & 15u);
+        if (row < rows && tt < ntok) { x_acc[(size_t)tt * rows + row] += obuf[sgi][idx]; }
+    }
+}
+
 // RESID-ADD EPILOGUE variant: after the GEMV, x_acc[t*acc_dim + row] +=
 // y[t*rows + row] for t in 0..4 — one writer per element (threadgroup row),
 // removing the separate batch_add dispatch (and its barrier) per layer.

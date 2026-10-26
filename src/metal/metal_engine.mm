@@ -56,6 +56,12 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemv_q6_k;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4;
     id<MTLComputePipelineState> pso_gemm_q4_k_mma8;
+    // Sectioned form of the same kernel: one dispatch for the projections that
+    // share an activation row (q/k/v, gate/up). Same threadgroup geometry, so
+    // it carries the same 128-thread maxTotalThreadsPerThreadgroup floor.
+    id<MTLComputePipelineState> pso_gemm_q4_k_mma8_secs;
+    // Same kernel with the residual add folded into the store (o, down).
+    id<MTLComputePipelineState> pso_gemm_q4_k_mma8_acc;
 
     // GPU2.1: one-commit-per-layer llama kernels.
     id<MTLComputePipelineState> pso_rmsnorm_f32w;
@@ -400,6 +406,22 @@ void* sofuu_metal_init(void) {
                     "[metal] gemm_q4_k_mma8 needs 128 threads/group, pipeline allows %lu - mma8 disabled\n",
                     (unsigned long)ctx->pso_gemm_q4_k_mma8.maxTotalThreadsPerThreadgroup);
             ctx->pso_gemm_q4_k_mma8 = nil;
+        }
+        ctx->pso_gemm_q4_k_mma8_secs = load_pso(@"gemm_q4_k_mma8_secs");
+        if (ctx->pso_gemm_q4_k_mma8_secs != nil &&
+            ctx->pso_gemm_q4_k_mma8_secs.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q4_k_mma8_secs needs 128 threads/group, pipeline allows %lu - sectioned mma8 disabled\n",
+                    (unsigned long)ctx->pso_gemm_q4_k_mma8_secs.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q4_k_mma8_secs = nil;
+        }
+        ctx->pso_gemm_q4_k_mma8_acc = load_pso(@"gemm_q4_k_mma8_acc");
+        if (ctx->pso_gemm_q4_k_mma8_acc != nil &&
+            ctx->pso_gemm_q4_k_mma8_acc.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q4_k_mma8_acc needs 128 threads/group, pipeline allows %lu - mma8 acc epilogue disabled\n",
+                    (unsigned long)ctx->pso_gemm_q4_k_mma8_acc.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q4_k_mma8_acc = nil;
         }
         ctx->pso_gemv_mlx4_f16  = load_pso(@"gemv_mlx4_affine_f16");
         ctx->pso_gemv_mlx4_bf16 = load_pso(@"gemv_mlx4_affine_bf16");
@@ -2629,6 +2651,79 @@ extern "C" int sofuu_metal_batch_gguf_b4multi(
     [ctx->batch_enc setBytes:sblob length:sizeof(sblob) atIndex:5];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(rows_total, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    return 1;
+}
+
+// mma8 with the residual add in the epilogue: o and down project onto the
+// residual width, so the separate batch_add (and its dispatch + its y-slot
+// round trip) folds into the store. rows must equal acc_dim; the caller checks
+// the shape and falls back to mma8 + batch_add otherwise.
+int sofuu_metal_batch_gguf_mma8_acc(void* ctx_ptr, void* w_buf_ptr, size_t w_offset,
+    void* x_buf_ptr, size_t x_offset, void* acc_buf_ptr, size_t acc_offset,
+    size_t rows, size_t cols, size_t B) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !acc_buf_ptr) return 0;
+    if (ctx->pso_gemm_q4_k_mma8_acc == nil) return 0;
+    if (rows == 0 || cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mma8_acc];
+    size_t aligned = w_offset & ~255ULL;
+    uint w_rem = (uint)(w_offset & 255ULL);
+    uint c = (uint)cols;
+    uint rn = (uint)rows;
+    uint bn = (uint)B;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)acc_buf_ptr offset:acc_offset atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((rows + 31) / 32, (B + 31) / 32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+// Sectioned mma8: ONE dispatch for a group of q4_K projections that share x and
+// cols and write disjoint y slots (q/k/v off the normed input, gate/up off the
+// ffn-normed one). secs is [n][4]: {w_off - w_base (256-aligned), w_rem, rows,
+// y_off in BYTES}; w_base is the smallest aligned weight offset of the group, so
+// the per-section deltas stay 32-bit on a >4 GiB model. Geometry is chosen from
+// the WIDEST section; narrower sections return early from their spare tiles.
+extern "C" int sofuu_metal_batch_gguf_mma8_secs(
+    void* ctx_ptr,
+    void* w_buf_ptr, size_t w_base,
+    void* x_buf_ptr, size_t x_offset,
+    void* y_buf_ptr,
+    size_t cols, size_t B,
+    const uint32_t* secs, size_t n_sec
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !w_buf_ptr || !x_buf_ptr || !y_buf_ptr) return 0;
+    if (ctx->pso_gemm_q4_k_mma8_secs == nil) return 0;
+    if (cols == 0 || cols % 256 != 0 || B == 0) return 0;
+    if (!secs || n_sec == 0 || n_sec > 4) return 0;
+    uint32_t max_rows = 0;
+    for (size_t s = 0; s < n_sec; ++s) {
+        if (secs[s * 4 + 2] > max_rows) max_rows = secs[s * 4 + 2];
+    }
+    if (max_rows == 0) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:ctx->pso_gemm_q4_k_mma8_secs];
+    uint c = (uint)cols;
+    uint bn = (uint)B;
+    unsigned long long wb = (unsigned long long)w_base;
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:0 atIndex:2];
+    [ctx->batch_enc setBytes:&c length:sizeof(uint) atIndex:3];
+    [ctx->batch_enc setBytes:secs length:4 * sizeof(uint32_t) * n_sec atIndex:4];
+    [ctx->batch_enc setBytes:&bn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&wb length:sizeof(unsigned long long) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake((max_rows + 31u) / 32u, (B + 31u) / 32u, n_sec)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     return 1;
 }
 

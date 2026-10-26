@@ -30,10 +30,13 @@ pub const K_ATTN_1C: usize = 11;
 pub const K_ADD: usize = 12;
 pub const K_SWIGLU: usize = 13;
 pub const K_HEAD: usize = 14;
+/// The sectioned mma8 form (one dispatch for q/k/v or gate/up): counted apart
+/// from K_GGUF_B4 so a SOFUU_GPU_TIMING=2 census shows exactly what merged.
+pub const K_GGUF_B4_SECS: usize = 15;
 pub const OP_NAMES: [&str; OP_KINDS] = [
     "gguf", "gguf_b4", "gemm", "rmsnorm", "rmsnorm_b4", "kv_write", "kv_write_b4",
     "head_rmsnorm", "attn", "attn_part", "attn_fin", "attn_1c", "add", "swiglu",
-    "head", "unused",
+    "head", "gguf_b4s",
 ];
 
 pub struct MetalEngine {
@@ -691,6 +694,21 @@ extern "C" {
         x_buf: *mut c_void, x_offset: usize,
         y_buf: *mut c_void, y_offset: usize,
         rows: usize, cols: usize, B: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_mma8_acc(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_offset: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        acc_buf: *mut c_void, acc_offset: usize,
+        rows: usize, cols: usize, B: usize,
+    ) -> i32;
+    fn sofuu_metal_batch_gguf_mma8_secs(
+        ctx: *mut c_void,
+        w_buf: *mut c_void, w_base: usize,
+        x_buf: *mut c_void, x_offset: usize,
+        y_buf: *mut c_void,
+        cols: usize, B: usize,
+        secs: *const u32, n_sec: usize,
     ) -> i32;
     fn sofuu_metal_batch_gguf_gemm(
         ctx: *mut c_void,
@@ -1525,6 +1543,66 @@ impl MetalEngine {
         self.op_tock(K_GGUF_B4, __t);
         // LEDGER #179 test: serialise every MMA dispatch to test for a WAR hazard
         // between the host's slab writes and the GPU's reads inside one deferred batch.
+        if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
+            self.sync();
+        }
+        __r
+    }
+
+    /// mma8 with the residual add folded into the store: same arithmetic as
+    /// batch_gguf_mma8 followed by batch_add, one dispatch shorter and without
+    /// the y-slot round trip. Only for rows == the residual width (o, down).
+    pub fn batch_gguf_mma8_acc(
+        &self,
+        w_buf: &MetalBuffer, w_offset: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        acc_buf: &MetalBuffer, acc_offset: usize,
+        rows: usize, cols: usize, b: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_GGUF_B4);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_mma8_acc(
+                self.ctx,
+                w_buf.handle, w_offset,
+                x_buf.handle, x_offset,
+                acc_buf.handle, acc_offset,
+                rows, cols, b,
+            ) == 1
+        };
+        self.op_tock(K_GGUF_B4, __t);
+        if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
+            self.sync();
+        }
+        __r
+    }
+
+    /// ONE dispatch for a group of q4_K projections that share x and cols and
+    /// write disjoint y slots: q/k/v off the normed input, gate/up off the
+    /// ffn-normed one. Same kernel body, tile and accumulation order as
+    /// batch_gguf_mma8, so each section's result is bit-identical to the
+    /// three-dispatches form; it only removes dispatch ramps and barriers.
+    /// secs: {w_off - w_base (256-aligned), w_rem, rows, y_off bytes} per section.
+    pub fn batch_gguf_mma8_secs(
+        &self,
+        w_buf: &MetalBuffer, w_base: usize,
+        x_buf: &MetalBuffer, x_offset: usize,
+        y_buf: &MetalBuffer,
+        cols: usize, b: usize,
+        secs: &[[u32; 4]],
+    ) -> bool {
+        if secs.is_empty() { return false; }
+        let __t = self.op_tick(K_GGUF_B4_SECS);
+        let __r = unsafe {
+            sofuu_metal_batch_gguf_mma8_secs(
+                self.ctx,
+                w_buf.handle, w_base,
+                x_buf.handle, x_offset,
+                y_buf.handle,
+                cols, b,
+                secs.as_ptr() as *const u32, secs.len(),
+            ) == 1
+        };
+        self.op_tock(K_GGUF_B4_SECS, __t);
         if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
             self.sync();
         }

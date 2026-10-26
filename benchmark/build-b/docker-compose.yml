@@ -1,0 +1,11 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+  chroma:
+    image: chromadb/chroma:latest
+    ports: ["8000:8000"]
+  app:
+    build: .
+    ports: ["8080:8080"]
+    depends_on: [ollama, chroma]

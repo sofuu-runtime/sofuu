@@ -1,0 +1,28 @@
+{
+ "schema_version": 1,
+ "kind": "sofuu-benchmark-build-a",
+ "app_lines": 49,
+ "dependencies": {
+  "direct": 0,
+  "transitive": 0,
+  "note": "the runtime IS the dependency (single binary)"
+ },
+ "processes": 1,
+ "daemons": 0,
+ "ports_app_extra": 0,
+ "binary_mb": 6.3,
+ "cold_start_boot_ms": 24,
+ "peak_rss_kb_phase": 1744,
+ "works_offline": {
+  "answer": "yes",
+  "features": [
+   "chat",
+   "tools",
+   "session document",
+   "resume",
+   "serve"
+  ]
+ },
+ "model_swap_lines": 0,
+ "resume_after_kill": "session.json + events.ndjson at the canonical location (T4.1/T6.x)"
+}

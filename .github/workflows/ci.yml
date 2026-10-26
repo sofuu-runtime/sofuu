@@ -149,8 +149,28 @@ jobs:
             bash scripts/contract/run_contract_tests.sh \
             || echo "contract suite: non-blocking while P3 is in progress"
 
+      - name: 32-token tiny-model smoke (P5)
+        run: bash scripts/smoke32.sh ./sofuu contract/fixtures/sofuu-fixture.gguf
+
+      - name: Conformance report (P5)
+        run: |
+          ./sofuu conformance > conformance-macos-arm64.json || true
+          bash scripts/conformance_report.sh dist/conformance-report.json || true
+      - name: Upload conformance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-macos-arm64
+          path: |
+            conformance-macos-arm64.json
+            dist/conformance-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: ABI symbol guard
         run: make abi-check
+
+      - name: Reference apps are public-API-only (P5)
+        run: bash scripts/check_public_api.py
 
       - name: Install integrity (checksums + capabilities-vs-claim + version parity)
         run: |
@@ -257,3 +277,122 @@ jobs:
           name: sofuu-android-debug
           path: sofuu-android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 7
+
+  # ── P5: the platform matrix — Linux x86_64 + arm64 + Windows x86_64 ──────
+  # Build + the 32-token fixture-model smoke + the contract suite (report
+  # mode) + the runtime's own conformance report, on every OS the runtime
+  # targets. QTSQ stays capability-gated (see the qtsq job below).
+  platform:
+    name: Platform (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: Linux-arm64
+          - os: windows-latest
+            label: Windows-x86_64
+    env:
+      SOFUU_ALLOW_NO_QTSQ: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libcurl4-openssl-dev python3 bash
+
+      - name: Build libuv for Windows (cmake uv_a.lib per the build.rs Windows path)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -S deps/libuv -B deps/libuv/build-win -DBUILD_SHARED_LIBS=OFF -DLIBUV_BUILD_TESTS=OFF
+          cmake --build deps/libuv/build-win --config Release
+
+      - name: Build (QTSQ-free, capability-gated)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            export SOFUU_UV_DIR="$PWD/deps/libuv/build-win/Release"
+            cargo build --release -p sofuu-core
+            cp target/release/sofuu.exe ./sofuu.exe
+          else
+            cargo build --release -p sofuu-core
+            cp target/release/sofuu ./sofuu
+            chmod +x ./sofuu
+          fi
+
+      - name: Contract suite (report mode)
+        shell: bash
+        run: |
+          ls target/release/ | grep -E "^sofuu" | head -3
+          SOFUU_BIN="$(ls target/release/sofuu* | grep -vE '\.(d|rlib|pdb)$' | head -1)" \
+            bash scripts/contract/run_contract_tests.sh \
+            || echo "contract suite: report recorded (non-blocking on a new platform)"
+
+      - name: 32-token tiny-model smoke
+        shell: bash
+        run: |
+          BIN="$(ls target/release/sofuu* | grep -vE '\.(d|rlib|pdb)$' | head -1)"
+          bash scripts/smoke32.sh "$BIN" contract/fixtures/sofuu-fixture.gguf
+
+      - name: Conformance report
+        shell: bash
+        run: |
+          BIN="$(ls target/release/sofuu* | grep -vE '\.(d|rlib|pdb)$' | head -1)"
+          "$BIN" conformance > conformance-${{ matrix.label }}.json || true
+      - name: Upload conformance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.label }}
+          path: conformance-${{ matrix.label }}.json
+          retention-days: 7
+
+  # ── P5: iOS SDK compile gate (Swift typecheck on a macOS runner) ─────────
+  ios:
+    name: iOS SDK typecheck
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Swift typecheck (the iOS embedding surface)
+        run: |
+          make ios-typecheck || echo "ios-typecheck: gate recorded (non-blocking until the sim lane lands)"
+
+  # ── P5: the QTSQ-enabled job (opt-in, like the Android lane) ─────────────
+  # QTSQ is a proprietary local checkout; the job runs only when the
+  # repository variable SOFUU_QTSQ_CI=1 is set AND the secret provides the
+  # checkout (SOFUU_QTSQ_CI_URL). Absent either, the platform matrix's
+  # capability-gated jobs are the documented posture.
+  qtsq:
+    name: QTSQ-enabled build (opt-in)
+    if: vars.SOFUU_QTSQ_CI == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: QTSQ checkout (from the provided secret)
+        run: |
+          if [ -n "${{ secrets.SOFUU_QTSQ_CI_URL }}" ]; then
+            git clone "${{ secrets.SOFUU_QTSQ_CI_URL }}" /tmp/qtsq
+            echo "SOFUU_QTSQ_DIR=/tmp/qtsq" >> "$GITHUB_ENV"
+          else
+            echo "SOFUU_ALLOW_NO_QTSQ=1" >> "$GITHUB_ENV"
+            echo "No QTSQ checkout provided — recording the capability-gated posture."
+          fi
+      - name: Build + capabilities claim check
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+          cargo build --release -p sofuu-core
+          bash scripts/verify-dist.sh dist ./target/release/sofuu

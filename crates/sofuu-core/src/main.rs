@@ -43,6 +43,7 @@ macro_rules! require_qtsq {
 
 mod chat;
 mod cli_protocols;
+mod conformance;
 mod doctor;
 mod output_archive;
 mod session;
@@ -2077,6 +2078,17 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+        "conformance" => {
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rc = conformance::cmd_conformance(&rt, VERSION, &args);
+            if rc == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         "session" | "sessions" => {
             let rc = cmd_session(&args);

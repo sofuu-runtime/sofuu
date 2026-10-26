@@ -9,10 +9,10 @@
 //   - useOpenAPI(spec, opts)   — Zero-code OpenAPI 3.x REST auto-bridging
 //
 // The 5-Shield Safety Boundary:
-//   Shield 1: Input/output schema validation (E_SCHEMA)
-//   Shield 2: Security & network jailing (E_DENIED per R7 policy and SSRF egress guard)
+//   Shield 1: Input/output schema validation (E_SCHEMA, micro-Zod + JSON Schema)
+//   Shield 2: Security & network jailing (E_DENIED per R7 policy and private IP / SSRF egress guard)
 //   Shield 3: Automated circuit breakers (CLOSED / OPEN / HALF_OPEN, E_CIRCUIT_OPEN)
-//   Shield 4: Hardware timer watchdog (timeoutMs, E_TIMEOUT)
+//   Shield 4: Hardware timer watchdog with signal abort (timeoutMs, E_TIMEOUT)
 //   Shield 5: Isolated JS execution / panic guard (E_TOOL, host process never crashes)
 //
 // Conforms to normative Sofuu error taxonomy:
@@ -32,7 +32,7 @@
   var P = {};
   sofuu.plugins = P;
   P._loaded = true;
-  P.VERSION = '0.1.0';
+  P.VERSION = '0.2.0';
 
   // Registries
   P.TOOLS = {};
@@ -50,162 +50,111 @@
     return err;
   }
 
-  /* ── Minimal Schema & Zod Compatibility (Shield 1) ───────────────── */
+  /* ── Built-in Robust URL Parser (zero-dependency for QuickJS) ────── */
 
-  function isZodSchema(s) {
-    return !!(s && (typeof s.parse === 'function' || typeof s.safeParse === 'function' || s._def));
-  }
+  function parseURL(urlStr) {
+    if (!urlStr || typeof urlStr !== 'string') return null;
+    var s = urlStr.trim();
+    var match = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):(?:\/\/([^\/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/);
+    if (!match) return null;
 
-  function zodToJSONSchema(zObj) {
-    if (!zObj || typeof zObj !== 'object') return { type: 'object', properties: {} };
-    if (zObj._isJSONSchema) return zObj;
-    if (zObj.type && typeof zObj.type === 'string') return zObj;
+    var protocol = match[1].toLowerCase();
+    var authority = match[2] || '';
+    var pathname = match[3] || '/';
+    var search = match[4] ? ('?' + match[4]) : '';
+    var hash = match[5] ? ('#' + match[5]) : '';
 
-    if (zObj._def) {
-      var def = zObj._def;
-      var typeName = def.typeName || (def.type && def.type.name) || '';
-      if (typeName === 'ZodObject' || typeName === 'object' || def.shape) {
-        var shape = (typeof def.shape === 'function') ? def.shape() : (def.shape || {});
-        var props = {};
-        var required = [];
-        for (var k in shape) {
-          if (Object.prototype.hasOwnProperty.call(shape, k)) {
-            var field = shape[k];
-            var fDef = field._def || {};
-            var fType = fDef.typeName || '';
-            var isOpt = fType === 'ZodOptional' || field.isOptional === true;
-            props[k] = zodToJSONSchema(field);
-            if (!isOpt) required.push(k);
-          }
-        }
-        var res = { type: 'object', properties: props };
-        if (required.length) res.required = required;
-        if (zObj.description) res.description = zObj.description;
-        return res;
+    var host = authority;
+    var atIdx = host.indexOf('@');
+    if (atIdx >= 0) host = host.slice(atIdx + 1);
+
+    var hostname = host;
+    var port = '';
+    if (host.charAt(0) === '[') {
+      var closeBracket = host.indexOf(']');
+      if (closeBracket > 0) {
+        hostname = host.slice(1, closeBracket);
+        if (host.charAt(closeBracket + 1) === ':') port = host.slice(closeBracket + 2);
       }
-      if (typeName === 'ZodString' || typeName === 'string') return { type: 'string', description: zObj.description || '' };
-      if (typeName === 'ZodNumber' || typeName === 'number') return { type: 'number', description: zObj.description || '' };
-      if (typeName === 'ZodBoolean' || typeName === 'boolean') return { type: 'boolean', description: zObj.description || '' };
-      if (typeName === 'ZodArray' || typeName === 'array') return { type: 'array', items: zodToJSONSchema(def.type), description: zObj.description || '' };
+    } else {
+      var colonIdx = host.indexOf(':');
+      if (colonIdx >= 0) {
+        hostname = host.slice(0, colonIdx);
+        port = host.slice(colonIdx + 1);
+      }
     }
 
-    if (zObj.properties && typeof zObj.properties === 'object') return zObj;
-    return { type: 'object', properties: {} };
+    return {
+      protocol: protocol + ':',
+      authority: authority,
+      hostname: hostname.toLowerCase(),
+      port: port,
+      pathname: pathname,
+      search: search,
+      hash: hash,
+      href: s,
+      origin: protocol + '://' + (port ? (hostname + ':' + port) : hostname)
+    };
   }
 
-  var microZod = {
-    string: function () {
-      return {
-        _isJSONSchema: true,
-        type: 'string',
-        describe: function (d) { this.description = d; return this; },
-        optional: function () { this.isOptional = true; return this; }
-      };
-    },
-    number: function () {
-      return {
-        _isJSONSchema: true,
-        type: 'number',
-        int: function () { this.type = 'integer'; return this; },
-        positive: function () { this.minimum = 1; return this; },
-        describe: function (d) { this.description = d; return this; },
-        optional: function () { this.isOptional = true; return this; }
-      };
-    },
-    boolean: function () {
-      return {
-        _isJSONSchema: true,
-        type: 'boolean',
-        describe: function (d) { this.description = d; return this; },
-        optional: function () { this.isOptional = true; return this; }
-      };
-    },
-    array: function (item) {
-      return {
-        _isJSONSchema: true,
-        type: 'array',
-        items: zodToJSONSchema(item),
-        describe: function (d) { this.description = d; return this; },
-        optional: function () { this.isOptional = true; return this; }
-      };
-    },
-    enum: function (values) {
-      return {
-        _isJSONSchema: true,
-        type: 'string',
-        enum: Array.isArray(values) ? values : [],
-        describe: function (d) { this.description = d; return this; },
-        optional: function () { this.isOptional = true; return this; }
-      };
-    },
-    object: function (shape) {
-      var props = {};
-      var required = [];
-      shape = shape || {};
-      for (var k in shape) {
-        if (Object.prototype.hasOwnProperty.call(shape, k)) {
-          var item = shape[k];
-          props[k] = zodToJSONSchema(item);
-          if (!item.isOptional) required.push(k);
-        }
-      }
-      return {
-        _isJSONSchema: true,
-        type: 'object',
-        properties: props,
-        required: required,
-        describe: function (d) { this.description = d; return this; },
-        safeParse: function (val) {
-          if (!val || typeof val !== 'object' || Array.isArray(val)) {
-            return { success: false, error: { message: 'Expected object, received ' + typeof val, path: [] } };
-          }
-          for (var r = 0; r < required.length; r++) {
-            var reqKey = required[r];
-            if (!(reqKey in val) || val[reqKey] === undefined) {
-              return { success: false, error: { message: reqKey + ' is required', path: [reqKey] } };
-            }
-          }
-          return { success: true, data: val };
-        },
-        parse: function (val) {
-          var r = this.safeParse(val);
-          if (!r.success) throw makeError('E_SCHEMA', r.error.message, r.error);
-          return r.data;
-        }
-      };
-    }
-  };
-  P.z = microZod;
-  g.z = g.z || microZod;
-
-  /* ── SSRF & Network Security Rails (Shield 2) ────────────────────── */
+  /* ── Hardened SSRF & Network Security Rails (Shield 2) ───────────── */
 
   function isPrivateHost(host) {
     if (!host) return true;
-    var h = String(host).toLowerCase().trim();
-    if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
-    if (h === '169.254.169.254' || h.indexOf('169.254.') === 0) return true;
-    var m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (m) {
-      var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
-      if (a === 10) return true;
-      if (a === 172 && b >= 16 && b <= 31) return true;
-      if (a === 192 && b === 168) return true;
-      if (a === 127) return true;
+    var h = String(host).toLowerCase().trim().replace(/^\[|\]$/g, '');
+    if (!h || h === 'localhost' || h === '0.0.0.0' || h === '::' || h === '::1') return true;
+    if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+    if (h === 'metadata.google.internal' || h.indexOf('169.254.') === 0) return true;
+    if (h.indexOf('fe80:') === 0 || h.indexOf('fc00:') === 0 || h.indexOf('fd00:') === 0) return true;
+    if (h.indexOf('::ffff:') === 0) h = h.slice(7);
+
+    // Decimal or hex integer IP (e.g. 2130706433 or 0x7f000001)
+    if (/^\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h)) {
+      var n = parseInt(h, h.startsWith('0x') ? 16 : 10);
+      if (!isNaN(n) && n >= 0 && n <= 0xffffffff) {
+        h = [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+      }
+    }
+
+    // IPv4 dotted notation (including octal/hex segments)
+    var parts = h.split('.');
+    if (parts.length >= 1 && parts.length <= 4) {
+      var nums = [];
+      var valid = true;
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        var num;
+        if (/^0x[0-9a-f]+$/i.test(p)) num = parseInt(p, 16);
+        else if (/^0[0-7]+$/.test(p)) num = parseInt(p, 8);
+        else if (/^\d+$/.test(p)) num = parseInt(p, 10);
+        else { valid = false; break; }
+        nums.push(num);
+      }
+      if (valid && nums.length > 0) {
+        var a = nums[0];
+        var b = nums[1] || 0;
+        if (a === 127 || a === 10 || a === 0) return true;
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        if (a === 192 && b === 168) return true;
+        if (a === 169 && b === 254) return true;
+        if (a === 100 && b >= 64 && b <= 127) return true;
+      }
     }
     return false;
   }
 
-  function createSandboxedFetch(toolName, permissions) {
+  function createSandboxedFetch(toolName, permissions, defaultSignal) {
     var baseFetch = (typeof g.fetch === 'function') ? g.fetch : null;
     if (!baseFetch) return null;
     var allowedNets = (permissions && Array.isArray(permissions.net)) ? permissions.net : null;
 
     return function sandboxedFetch(url, init) {
-      var parsedUrl;
-      try {
-        parsedUrl = new URL(url);
-      } catch (eUrl) {
+      init = init || {};
+      if (!init.signal && defaultSignal) {
+        init.signal = defaultSignal;
+      }
+      var parsedUrl = parseURL(url);
+      if (!parsedUrl) {
         return Promise.reject(makeError('E_DENIED', 'Invalid URL in tool ' + toolName + ': ' + url));
       }
       var host = parsedUrl.hostname;
@@ -223,6 +172,40 @@
         }
       }
       return baseFetch(url, init);
+    };
+  }
+
+  /* ── Jailed Filesystem Rails (Shield 2) ──────────────────────────── */
+
+  function createJailedFs(toolName, cwd) {
+    if (!sofuu.fs) return null;
+    cwd = (cwd || '.').replace(/\\/g, '/');
+
+    function resolvePath(p) {
+      if (!p || typeof p !== 'string') throw makeError('E_DENIED', 'Invalid path in tool ' + toolName);
+      var norm = p.replace(/\\/g, '/');
+      if (norm.indexOf('..') >= 0 || norm.indexOf('/.') >= 0) {
+        throw makeError('E_DENIED', 'Path traversal outside project root is blocked for ' + toolName);
+      }
+      var lower = norm.toLowerCase();
+      if (lower.indexOf('.env') >= 0 || lower.indexOf('.ssh') >= 0 || lower.indexOf('.aws') >= 0 || lower.indexOf('.git') >= 0) {
+        throw makeError('E_DENIED', 'Access to sensitive file ' + p + ' is blocked for ' + toolName);
+      }
+      if (norm.charAt(0) === '/') {
+        if (!norm.startsWith(cwd)) {
+          throw makeError('E_DENIED', 'Access outside working directory is blocked for ' + toolName);
+        }
+        return norm;
+      }
+      return cwd.replace(/\/+$/, '') + '/' + norm.replace(/^\/+/, '');
+    }
+
+    return {
+      readFile: function (p, opt) { return sofuu.fs.readFile(resolvePath(p), opt); },
+      writeFile: function (p, data, opt) { return sofuu.fs.writeFile(resolvePath(p), data, opt); },
+      exists: function (p) { return sofuu.fs.exists(resolvePath(p)); },
+      readdir: function (p) { return (sofuu.fs.readdir || sofuu.fs.listDir)(resolvePath(p)); },
+      listDir: function (p) { return (sofuu.fs.readdir || sofuu.fs.listDir)(resolvePath(p)); }
     };
   }
 
@@ -277,7 +260,264 @@
     }
   }
 
-  /* ── Category 1: defineTool (Action Plugins) ─────────────────────── */
+  /* ── Schema Validation & Micro-Zod (Shield 1) ────────────────────── */
+
+  function isZodSchema(s) {
+    return !!(s && (typeof s.parse === 'function' || typeof s.safeParse === 'function' || s._def));
+  }
+
+  function zodToJSONSchema(zObj) {
+    if (!zObj || typeof zObj !== 'object') return { type: 'object', properties: {} };
+    if (zObj._isJSONSchema) return zObj;
+    if (zObj.type && typeof zObj.type === 'string') return zObj;
+
+    if (zObj._def) {
+      var def = zObj._def;
+      var typeName = def.typeName || (def.type && def.type.name) || '';
+      if (typeName === 'ZodObject' || typeName === 'object' || def.shape) {
+        var shape = (typeof def.shape === 'function') ? def.shape() : (def.shape || {});
+        var props = {};
+        var required = [];
+        for (var k in shape) {
+          if (Object.prototype.hasOwnProperty.call(shape, k)) {
+            var field = shape[k];
+            var fDef = field._def || {};
+            var fType = fDef.typeName || '';
+            var isOpt = fType === 'ZodOptional' || field.isOptional === true;
+            props[k] = zodToJSONSchema(field);
+            if (!isOpt) required.push(k);
+          }
+        }
+        var res = { type: 'object', properties: props };
+        if (required.length) res.required = required;
+        if (zObj.description) res.description = zObj.description;
+        return res;
+      }
+      if (typeName === 'ZodString' || typeName === 'string') return { type: 'string', description: zObj.description || '' };
+      if (typeName === 'ZodNumber' || typeName === 'number') return { type: 'number', description: zObj.description || '' };
+      if (typeName === 'ZodBoolean' || typeName === 'boolean') return { type: 'boolean', description: zObj.description || '' };
+      if (typeName === 'ZodArray' || typeName === 'array') return { type: 'array', items: zodToJSONSchema(def.type), description: zObj.description || '' };
+    }
+
+    if (zObj.properties && typeof zObj.properties === 'object') return zObj;
+    return { type: 'object', properties: {} };
+  }
+
+  function validateJSONSchema(schema, data) {
+    if (!schema || typeof schema !== 'object') return { ok: true };
+    if (schema.type === 'object') {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { ok: false, path: '$', error: 'Expected object, received ' + typeof data };
+      }
+      var required = schema.required || [];
+      for (var i = 0; i < required.length; i++) {
+        var req = required[i];
+        if (!(req in data) || data[req] === undefined) {
+          return { ok: false, path: req, error: req + ' is required' };
+        }
+      }
+      var props = schema.properties || {};
+      for (var k in props) {
+        if (k in data && data[k] !== undefined) {
+          var pSchema = props[k];
+          var expectedType = pSchema.type;
+          var actualType = typeof data[k];
+          if (expectedType === 'string' && actualType !== 'string') {
+            return { ok: false, path: k, error: 'Expected string, received ' + actualType };
+          }
+          if (expectedType === 'number' && (actualType !== 'number' || isNaN(data[k]))) {
+            return { ok: false, path: k, error: 'Expected number, received ' + actualType };
+          }
+          if (expectedType === 'integer' && !Number.isInteger(data[k])) {
+            return { ok: false, path: k, error: 'Expected integer, received ' + actualType };
+          }
+          if (expectedType === 'boolean' && actualType !== 'boolean') {
+            return { ok: false, path: k, error: 'Expected boolean, received ' + actualType };
+          }
+          if (expectedType === 'array' && !Array.isArray(data[k])) {
+            return { ok: false, path: k, error: 'Expected array, received ' + actualType };
+          }
+          if (Array.isArray(pSchema.enum) && pSchema.enum.indexOf(data[k]) < 0) {
+            return { ok: false, path: k, error: 'Value must be one of ' + JSON.stringify(pSchema.enum) };
+          }
+        }
+      }
+    }
+    return { ok: true };
+  }
+
+  var microZod = {
+    string: function () {
+      return {
+        _isJSONSchema: true,
+        type: 'string',
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (typeof val !== 'string') return { success: false, error: { message: 'Expected string, received ' + typeof val } };
+          return { success: true, data: val };
+        }
+      };
+    },
+    number: function () {
+      return {
+        _isJSONSchema: true,
+        type: 'number',
+        int: function () { this.type = 'integer'; this.isInt = true; return this; },
+        positive: function () { this.minimum = 1; this.isPositive = true; return this; },
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (typeof val !== 'number' || isNaN(val)) return { success: false, error: { message: 'Expected number, received ' + typeof val } };
+          if (this.isInt && !Number.isInteger(val)) return { success: false, error: { message: 'Expected integer, received float' } };
+          if (this.isPositive && val <= 0) return { success: false, error: { message: 'Number must be positive' } };
+          return { success: true, data: val };
+        }
+      };
+    },
+    boolean: function () {
+      return {
+        _isJSONSchema: true,
+        type: 'boolean',
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (typeof val !== 'boolean') return { success: false, error: { message: 'Expected boolean, received ' + typeof val } };
+          return { success: true, data: val };
+        }
+      };
+    },
+    array: function (item) {
+      return {
+        _isJSONSchema: true,
+        type: 'array',
+        items: zodToJSONSchema(item),
+        itemSchema: item,
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (!Array.isArray(val)) return { success: false, error: { message: 'Expected array, received ' + typeof val } };
+          if (this.itemSchema && typeof this.itemSchema.safeParse === 'function') {
+            for (var i = 0; i < val.length; i++) {
+              var r = this.itemSchema.safeParse(val[i]);
+              if (!r.success) return { success: false, error: { message: r.error.message, path: [i].concat(r.error.path || []) } };
+            }
+          }
+          return { success: true, data: val };
+        }
+      };
+    },
+    enum: function (values) {
+      return {
+        _isJSONSchema: true,
+        type: 'string',
+        enum: Array.isArray(values) ? values : [],
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (typeof val !== 'string' || this.enum.indexOf(val) < 0) {
+            return { success: false, error: { message: 'Expected one of ' + JSON.stringify(this.enum) + ', received ' + JSON.stringify(val) } };
+          }
+          return { success: true, data: val };
+        }
+      };
+    },
+    any: function () {
+      return {
+        _isJSONSchema: true,
+        type: 'any',
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) { return { success: true, data: val }; }
+      };
+    },
+    record: function () {
+      return {
+        _isJSONSchema: true,
+        type: 'object',
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (!val || typeof val !== 'object' || Array.isArray(val)) return { success: false, error: { message: 'Expected record object' } };
+          return { success: true, data: val };
+        }
+      };
+    },
+    literal: function (expected) {
+      return {
+        _isJSONSchema: true,
+        type: typeof expected,
+        describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (val !== expected) return { success: false, error: { message: 'Expected literal ' + JSON.stringify(expected) } };
+          return { success: true, data: val };
+        }
+      };
+    },
+    object: function (shape) {
+      var props = {};
+      var required = [];
+      shape = shape || {};
+      for (var k in shape) {
+        if (Object.prototype.hasOwnProperty.call(shape, k)) {
+          var item = shape[k];
+          props[k] = zodToJSONSchema(item);
+          if (!item.isOptional) required.push(k);
+        }
+      }
+      return {
+        _isJSONSchema: true,
+        type: 'object',
+        properties: props,
+        required: required,
+        shape: shape,
+        describe: function (d) { this.description = d; return this; },
+        safeParse: function (val) {
+          if (!val || typeof val !== 'object' || Array.isArray(val)) {
+            return { success: false, error: { message: 'Expected object, received ' + typeof val, path: [] } };
+          }
+          for (var r = 0; r < required.length; r++) {
+            var reqKey = required[r];
+            if (!(reqKey in val) || val[reqKey] === undefined) {
+              return { success: false, error: { message: reqKey + ' is required', path: [reqKey] } };
+            }
+          }
+          for (var propKey in shape) {
+            if (Object.prototype.hasOwnProperty.call(shape, propKey)) {
+              if (propKey in val && val[propKey] !== undefined) {
+                var fieldValidator = shape[propKey];
+                if (fieldValidator && typeof fieldValidator.safeParse === 'function') {
+                  var res = fieldValidator.safeParse(val[propKey]);
+                  if (!res.success) {
+                    var innerPath = [propKey].concat(res.error.path || []);
+                    return { success: false, error: { message: 'Invalid value for ' + propKey + ': ' + res.error.message, path: innerPath } };
+                  }
+                }
+              }
+            }
+          }
+          return { success: true, data: val };
+        },
+        parse: function (val) {
+          var r = this.safeParse(val);
+          if (!r.success) throw makeError('E_SCHEMA', r.error.message, r.error);
+          return r.data;
+        }
+      };
+    }
+  };
+  P.z = microZod;
+  g.z = g.z || microZod;
+
+  /* ── Category 1: defineTool (Action Plugins with 5-Shields) ──────── */
 
   P.defineTool = function defineTool(spec) {
     if (!spec || typeof spec !== 'object') throw makeError('E_SCHEMA', 'defineTool requires a spec object');
@@ -318,18 +558,14 @@
             };
           }
           args = zRes.data;
-        } else if (sofuu.tools && typeof sofuu.tools.validateArgs === 'function') {
-          var vCheck = sofuu.tools.validateArgs(jsonSchema, args);
+        } else {
+          var vCheck = validateJSONSchema(jsonSchema, args);
           if (!vCheck.ok) {
             return {
               ok: false,
               source: 'plugin',
-              error: {
-                code: 'E_SCHEMA',
-                message: 'Invalid argument for ' + vCheck.path + ': ' + vCheck.error,
-                path: vCheck.path
-              },
-              text: 'tool error [E_SCHEMA]: Invalid argument for ' + vCheck.path + ': ' + vCheck.error
+              error: { code: 'E_SCHEMA', message: vCheck.error, path: vCheck.path },
+              text: 'tool error [E_SCHEMA]: ' + vCheck.error + ' at ' + vCheck.path
             };
           }
         }
@@ -361,15 +597,26 @@
           };
         }
 
-        // Build Isolated Context
+        // Build Isolated Context & Watchdog
         var ctx = customCtx || {};
-        var sandboxedFetch = createSandboxedFetch(name, spec.permissions);
+        var abortCtrl = (typeof AbortController === 'function') ? new AbortController() : null;
+        var signal = abortCtrl ? abortCtrl.signal : null;
+
+        var procCwd = (typeof process !== 'undefined' && typeof process.cwd === 'function') ? process.cwd() : '.';
+        var sandboxedFetch = createSandboxedFetch(name, spec.permissions, signal);
+        var jailedFs = createJailedFs(name, procCwd);
+
         var toolCtx = {
           name: name,
           fetch: sandboxedFetch || g.fetch,
+          fs: jailedFs,
+          signal: signal,
+          abortSignal: signal,
           secrets: (typeof process !== 'undefined' && process.env) || {},
           env: (typeof process !== 'undefined' && process.env) || {},
-          cwd: (typeof process !== 'undefined' && typeof process.cwd === 'function') ? process.cwd() : '.',
+          cwd: procCwd,
+          model: ctx.model || '',
+          state: ctx.state || {},
           log: function () {
             var msg = Array.prototype.slice.call(arguments).join(' ');
             if (ctx.log) ctx.log(msg);
@@ -385,6 +632,9 @@
         var timer = null;
         var timeoutPromise = new Promise(function (_, reject) {
           timer = setTimeout(function () {
+            if (abortCtrl) {
+              try { abortCtrl.abort(); } catch (eAb) {}
+            }
             reject(makeError('E_TIMEOUT', 'Tool ' + name + ' exceeded deadline of ' + timeoutMs + 'ms'));
           }, timeoutMs);
         });
@@ -417,6 +667,9 @@
           };
         } catch (err) {
           clearTimeout(timer);
+          if (abortCtrl) {
+            try { abortCtrl.abort(); } catch (eAb2) {}
+          }
           recordCircuitFailure(name, cbConfig);
 
           var eCode = (err && err.code) || 'E_TOOL';
@@ -557,7 +810,10 @@
         if (!resp.ok) throw makeError('E_TOOL', 'Failed to fetch OpenAPI spec from ' + urlOrSpec + ': ' + resp.status);
         specObj = await resp.json();
         if (!baseEndpoint) {
-          try { baseEndpoint = new URL(urlOrSpec).origin; } catch (e) {}
+          try {
+            var pu = parseURL(urlOrSpec);
+            if (pu) baseEndpoint = pu.origin;
+          } catch (e) {}
         }
       } else {
         if (!sofuu.fs || !sofuu.fs.readFile) throw makeError('E_CAPABILITY', 'sofuu.fs unavailable to read local OpenAPI spec');
@@ -598,8 +854,10 @@
           var param = params[pi];
           var pName = param.name;
           var pSchema = param.schema || { type: 'string' };
-          props[pName] = { type: pSchema.type || 'string', description: param.description || (param.in + ' parameter') };
-          if (pSchema.enum) props[pName].enum = pSchema.enum;
+          props[pName] = {
+            type: pSchema.type || 'string',
+            description: param.description || ''
+          };
           if (param.required) requiredList.push(pName);
         }
 
@@ -628,7 +886,7 @@
         var schema = { type: 'object', properties: props, required: requiredList };
 
         (function (optM, optP, optName, optDesc, optSchema, optHasBody) {
-          P.defineTool({
+          var t = P.defineTool({
             name: optName,
             description: optDesc || (optM.toUpperCase() + ' ' + optP),
             schema: optSchema,
@@ -658,40 +916,75 @@
               var headers = Object.assign({}, customHeaders);
               if (bodyPayload) headers['Content-Type'] = 'application/json';
 
-              var fetchFn = (ctx && ctx.fetch) || g.fetch;
-              var res = await fetchFn(fullUrl, {
+              var res = await ctx.fetch(fullUrl, {
                 method: optM.toUpperCase(),
                 headers: headers,
                 body: bodyPayload ? JSON.stringify(bodyPayload) : undefined
               });
 
-              var contentType = res.headers ? (res.headers.get('content-type') || '') : '';
-              var resData = (contentType.indexOf('application/json') >= 0) ? (await res.json()) : (await res.text());
+              if (!res.ok) {
+                throw makeError('E_TOOL', 'HTTP ' + res.status + ' from ' + fullUrl);
+              }
 
-              if (!res.ok) throw makeError('E_TOOL', 'HTTP ' + res.status + ': ' + (typeof resData === 'string' ? resData : JSON.stringify(resData)));
-              return resData;
+              var cType = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+              if (cType.indexOf('application/json') >= 0) return await res.json();
+              return await res.text();
             }
           });
-        })(m, p, toolName, op.summary || op.description, schema, hasBody);
-
-        generatedTools.push(toolName);
+          generatedTools.push(t);
+        })(m, p, toolName, op.description || op.summary, schema, hasBody);
       }
     }
+
     return generatedTools;
   };
 
-  /* ── Workflow 1 & 2: Folder Discovery & Manifest Loading ─────────── */
+  /* ── Dynamic Discovery & Manifest Loading ────────────────────────── */
+
+  /* ── Built-in TypeScript Type Stripper for Plugins ───────────────── */
+
+  function stripTs(src) {
+    if (!src || typeof src !== 'string') return '';
+    var s = src;
+    // 1. Strip multi-line and single-line interfaces
+    s = s.replace(/(?:export\s+)?interface\s+[A-Za-z_$][\w$]*(?:<[^>]*>)?(?:\s+extends\s+[^{]+)?\s*\{[\s\S]*?\}/g, '');
+
+    // 2. Strip type aliases
+    s = s.replace(/(?:export\s+)?type\s+[A-Za-z_$][\w$]*(?:<[^>]*>)?\s*=\s*[^;]+;/g, '');
+
+    // 3. Strip "as Type" assertions
+    s = s.replace(/\s+as\s+[A-Za-z_$][\w$]*(?:<[^>]*>)?(?:\[\])?/g, '');
+
+    // 4. Strip return type annotations before block or arrow: ): ReturnType { or ): ReturnType =>
+    s = s.replace(/\)\s*:\s*(?:Promise<[\s\S]*?>|[A-Za-z_$][\w$]*(?:<[^>]*>)?(?:\[\])?|\{[\s\S]*?\})\s*(?=\{|=>)/g, ') ');
+
+    // 5. Strip destructuring type annotations: } : { ... }
+    s = s.replace(/\}\s*:\s*\{[\s\S]*?\}(?=\s*[,)])/g, '}');
+
+    // 6. Strip variable type annotations: (const|let|var) name: Type =
+    s = s.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*[^=;]+(?=\s*=|\s*;)/g, '$1 $2');
+
+    // 7. Strip parameter type annotations in function signatures: (name: Type)
+    s = s.replace(/([,(]\s*[A-Za-z_$][\w$]*)\s*:\s*(?:string|number|boolean|any|void|unknown|never|object|Record<[^>]+>|Array<[^>]+>|[A-Za-z_$][\w$]*(?:<[^>]*>)?(?:\[\])?)(?=\s*[,)=])/g, '$1');
+
+    return s;
+  }
 
   P.discover = async function discover(dir) {
-    var out = { loaded: [], broken: [] };
-    if (!sofuu.fs || !sofuu.fs.readdir || !sofuu.fs.readFile) return out;
-
     dir = dir || './plugins';
-    var files = [];
-    try { files = await sofuu.fs.readdir(dir); } catch (e) { return out; }
+    var out = { loaded: [], broken: [] };
+    var readDirFn = sofuu.fs.readdir || sofuu.fs.listDir;
+    if (!sofuu.fs || !readDirFn) return out;
 
-    var pluginFiles = files.filter(function (f) {
-      return /\.(js|ts|mjs)$/.test(String(f)) && !/\.d\.ts$/.test(String(f));
+    var exists = false;
+    try { exists = await sofuu.fs.exists(dir); } catch (e) { return out; }
+    if (!exists) return out;
+
+    var entries = [];
+    try { entries = await readDirFn.call(sofuu.fs, dir); } catch (e2) { return out; }
+
+    var pluginFiles = entries.filter(function (e) {
+      return (e.endsWith('.js') || e.endsWith('.ts')) && !e.startsWith('.') && !e.endsWith('.d.ts');
     }).sort();
 
     for (var i = 0; i < pluginFiles.length; i++) {
@@ -700,9 +993,15 @@
       try {
         var content = await sofuu.fs.readFile(fpath);
         var src = String(content);
-        var execSrc = src.replace(/import\s+[^;]+;?/g, '')
+
+        // Robust import removal (handles single/multi-line, with or without semicolon)
+        var execSrc = src.replace(/import(?:\s+[\s\S]*?\s+from)?\s+['"][^'"]+['"]\s*;?/g, '')
                          .replace(/export\s+default\s+/g, 'globalThis.__sofuu_last_export = ')
                          .replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
+
+        if (fname.endsWith('.ts')) {
+          execSrc = stripTs(execSrc);
+        }
 
         var toolsBefore = Object.keys(P.TOOLS);
         var servicesBefore = Object.keys(P.SERVICES);
@@ -824,6 +1123,7 @@
     if (!tool) {
       return {
         ok: false,
+        source: 'plugin',
         error: { code: 'E_CAPABILITY', message: 'Plugin tool "' + name + '" not found' },
         text: 'tool error [E_CAPABILITY]: plugin tool not found'
       };
@@ -868,9 +1168,14 @@
     try {
       var content = await sofuu.fs.readFile(file);
       var src = String(content);
-      var execSrc = src.replace(/import\s+[^;]+;?/g, '')
+
+      var execSrc = src.replace(/import(?:\s+[\s\S]*?\s+from)?\s+['"][^'"]+['"]\s*;?/g, '')
                        .replace(/export\s+default\s+/g, 'globalThis.__sofuu_last_export = ')
                        .replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
+
+      if (file.endsWith('.ts')) {
+        execSrc = stripTs(execSrc);
+      }
 
       var beforeTools = Object.keys(P.TOOLS);
       var beforeServices = Object.keys(P.SERVICES);

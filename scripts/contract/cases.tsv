@@ -51,12 +51,12 @@ T6.4|R6|R6.4|manual|-|-|-|needs cloud+local fixtures
 T6.5|R6|R6.3|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|terminal-once + total order on a real run
 T6.6|R6|R6.6|cli|-|./sofuu run scripts/contract/harness/t66_redaction.js|exit:0|redaction choke point
 T6.7|R6|R6.4|cli|-|./sofuu run scripts/contract/harness/t67_usage.js|exit:0|usage reconciles across complete/stream/agent; cost semantics
-T7.1|R7|R7.1|manual|-|-|-|needs a policy evaluator
-T7.2|R7|R7.2|manual|-|-|-|needs a four-surface harness
-T7.3|R7|R7.4|manual|-|-|-|needs an approval harness
-T7.4|R7|R7.4|manual|-|-|-|needs an approval harness
-T7.5|R7|R7.6|manual|-|-|-|needs a shared error shape
+T7.1|R7|R7.1|cli|-|./sofuu run scripts/contract/harness/t72_policy_matrix.js|exit:0|one policy object, evaluated identically on every surface (same decision + rule id)
+T7.2|R7|R7.2|cli|-|./sofuu run scripts/contract/harness/t72_policy_matrix.js|exit:0|no bypass by entry point: JS/CLI/HTTP/C ABI all answer to the same deny
+T7.3|R7|R7.4|cli|-|./sofuu run scripts/contract/harness/t73_approval_harness.js|exit:0|approval deadline resolves to a typed deny, recorded in the trace
+T7.4|R7|R7.4|cli|-|./sofuu run scripts/contract/harness/t73_approval_harness.js|exit:0|immediate resolve after the request event never races to deny
+T7.5|R7|R7.6|cli|-|./sofuu run scripts/contract/harness/t75_shared_shape.js|exit:0|shell strip + fs jail answer identically on JS/CLI/HTTP; R7.2 no bypass
 T7.6|R7|R7.6|js|SOFUU_NO_SHELL=1|sofuu.tools.GROUP.indexOf('bash')|-1|bash still advertised in the tool group
-T7.7|R7|R7.1|manual|-|-|-|needs a netPolicy harness
-T7.8|R7|R7.5|manual|-|-|-|needs a unified log
-T7.9|R7|R7.7|manual|-|-|-|needs an MCP allowlist
+T7.7|R7|R7.1|cli|-|./sofuu run scripts/contract/harness/t77_net_policy.js|exit:0|net policy: suffix-anchored wildcards, :port/user@/[v6] normalize first
+T7.8|R7|R7.5|cli|-|./sofuu run scripts/contract/harness/t78_secrets_never_emitted.js|exit:0|provider key never reaches events, the session doc, or error text (R7.5)
+T7.9|R7|R7.7|cli|-|./sofuu run scripts/contract/harness/t79_mcp_allowlist.js|exit:0|MCP allowlist: non-allowlisted server refused; allowlisted tools still policy-gated

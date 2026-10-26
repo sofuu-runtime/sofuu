@@ -152,6 +152,11 @@ jobs:
       - name: ABI symbol guard
         run: make abi-check
 
+      - name: Install integrity (checksums + capabilities-vs-claim + version parity)
+        run: |
+          bash scripts/verify-dist.sh dist/runtimes 2>/dev/null \
+            || bash scripts/verify-dist.sh dist ./sofuu
+
       # ── E1-6: the embeddable SDK's own gates ────────────────────
       # The headless C samples assert their calls (make headless-test), and
       # `cargo test --release` above already runs the sofuu-capi suite

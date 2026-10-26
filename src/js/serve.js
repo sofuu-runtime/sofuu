@@ -1037,6 +1037,17 @@
 
   function start(opts) {
     var cfg = normalize(opts || {});
+    /* R7.1: the HTTP surface answers to the SAME policy as every other one —
+     * a project policy (.sofuu/policy.json) installs here at boot, so a deny
+     * cannot be bypassed by entering through serve instead of chat/CLI. A
+     * missing or broken policy file keeps whatever is already installed. */
+    try {
+      if (sofuu.policy && typeof sofuu.policy.set === 'function' &&
+          typeof __session_read_file === 'function') {
+        var praw = __session_read_file('.sofuu/policy.json');
+        if (praw) { try { sofuu.policy.set(String(praw)); } catch (ePol) {} }
+      }
+    } catch (ePl) {}
     var auth = authMode();
     if (auth !== 'none' && !cfg.token) {
       throw new Error('serve: a bearer token is required (set --token / SOFUU_SERVE_TOKEN, or policy http.auth:"none" explicitly)');

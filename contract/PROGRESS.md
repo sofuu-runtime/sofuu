@@ -13,13 +13,13 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 | P1 — R1 capability model + R3 tiers | ✅ **complete** (2026-10-25) | `sofuu.capabilities()`, `sofuu.model.describe()`, doctor assertion, typed memory refusal on QTSQ-free builds, `text_gate` receipts + `--require-identical`, the R3 CI gate, and the committed fixture model (T3.3) — all landed and verified; suite 12 PASS / 4 FAIL / 36 BLOCKED, and the FORK enforcement demonstrated (exit 3, `|dtop1|=0.2770`) |
 | P2 — R2 async contract + R6 observability | ✅ **complete** (2026-10-26) | `sofuu.async.*` + `sofuu.events.*` substrates; envelope stamped at both emit choke points; exactly-one-terminal stop; chaos harnesses T2.1–T2.5 + T2.7/T2.8 all live (mid-tool cancel kills the subprocess — no orphan; server-side disconnect visible; pump backpressure is typed); usage reconciled through `sofuu.events.canonicalUsage` (T6.7, `ai.complete` now reports provider usage); chat appends the turn's envelopes to `events.ndjson`; deterministic renderer pinned byte-for-byte by the committed golden fixtures (T6.3); suite 26 PASS / 2 FAIL / 24 BLOCKED |
 | P3 — R4 portability + R5 surface parity | ✅ **complete (2026-10-26)** | the §5.2 session document written once in the engine (`rt/session_doc.rs`) behind `sofuu.session.{list,export,import,sync}` AND `sofuu session export|import` — **T4.1/T4.3 round-trip + idempotence, T4.5 namespace, T4.6 redaction, T4.7 version stamp all executable and green**; chat persists `session.json` with restart-stable `<sid>-t<N>` turn ids; config carries `schema_version` (v0 accepted, forward-only); serve `/v1/*` conformance **T5.2/T5.3/T5.4 executable** against the committed fixture model; **T5.5 C-ABI symbol check executable** (suite + CI via CONTRACT_LIBSOFUU); matrix regenerated (session×js, model×http → full, 0 unknowns). Residue by design: device round-trip (T4.2, needs runners), v0.2 migration fixture (T4.4), MCP fixture server (T5.6), four-surface error parity (T5.8), CHANGELOG/semver (P4), app stores as caches (app lanes) |
-| P4 — R7 security + install integrity | ⬜ not started | policy evaluator + approval modes landed by peers (`0b753686c`, `cdd16835b`); four-surface denial matrix still missing |
+| P4 — R7 security + install integrity | ✅ **complete (2026-10-26)** | one policy object, evaluated identically on JS/CLI/HTTP/C ABI (`t72` matrix: same decision + same rule id everywhere, no entry-point bypass); the evaluator now normalizes `scheme://`, `user@`, `:port`, paths, and `[v6]` before the host match (`t77`); approval deadline→typed-deny and the registration-order resolve, both in the trace (`t73`); shell strip + fs jail with the shared refusal shape on every surface (`t75`); secrets never reach trace/log/doc/error (`t78`); MCP allowlist gate (`t79`); serve boots with the project policy; install integrity (`scripts/verify-dist.sh`: checksums, capabilities-vs-claim, doctor, version parity — in CI); CHANGELOG + npm/Cargo/CLI semver aligned. Residue by design: a behavioral C-ABI policy sample (`examples/` is local-only — the S5 config-policy path + the capi suite carry it), an MCP fixture server (T5.6), the four-surface FAILURE-injection harness family (T2.6/T5.8) |
 | P5 — platform matrix + conformance + benchmark | ⬜ not started | CI is macOS-only; suite is local |
 | P6 — external adoption | ⬜ not started | no external deployment yet |
 
 ## Conformance suite
 
-**52 cases — PASS 33 · FAIL 0 · BLOCKED 19.**
+**52 cases — PASS 42 · FAIL 0 · BLOCKED 10.**
 (`CONTRACT_LIBSOFUU=dist/libsofuu.dylib` now enables the C-ABI parity check.)
 (`CONTRACT_NOQTSQ_BIN=target-noqts/release/sofuu` enables T1.3.)
 
@@ -60,8 +60,16 @@ Passing:
 | T5.3 | `POST /v1/chat/completions` `stream:true` yields OpenAI delta-frame SSE chunks terminated by `[DONE]` |
 | T5.4 | `POST /v1/chat/completions` JSON matches the OpenAI completion shape (choices[].message.{role,content}, usage) |
 | T5.5 | the C ABI keeps the versioned symbol contract: `sofuu_rt_call` exported from the built library (suite + CI) |
+| T7.1 | one policy object denies the same operation with the same rule id on JS, CLI (`sofuu policy why`), HTTP (serve 403 + rule), and the C ABI |
+| T7.2 | no bypass by entry point: the real tool belt refuses under policy on JS while serve refuses the same call over HTTP |
+| T7.3 | a pending approval whose deadline passes resolves to a typed deny, recorded in the trace with the tool named |
+| T7.4 | resolving immediately out of the request event is allowed — never raced to deny (pre-registration guarantee) |
+| T7.5 | `SOFUU_NO_SHELL`/shell-strip and the fs jail answer identically on JS/CLI/HTTP; a direct HTTP bash call is refused, never executed |
+| T7.7 | net-policy wildcards are suffix-anchored and `scheme://`, `user@`, `:port`, paths, and `[v6]` normalize before the match |
+| T7.8 | a provider key never reaches the trace, the event log, the session document, or error text (even a 401 that echoes the key) |
+| T7.9 | the MCP allowlist refuses non-allowlisted servers; allowlisted tools still answer through the same tools policy |
 
-No failing cases. Previously failing `T4.1`/`T4.5` (and `T4.3`/`T4.6`) are executable and green as of P3.
+No failing cases. `T4.1`/`T4.5` (P3) and the eight T7 cases (P4) all run in the suite and CI.
 
 ## What landed in P2 (2026-10-25/26)
 
@@ -136,6 +144,43 @@ Harness notes of record: `t61`'s chat leg is raced with a dead-local
 into a contract harness) and kills its tool children so later orphan
 checks see a clean process table.
 
+## What landed in P4 (2026-10-26)
+
+- **The deny matrix that proves R7.1/R7.2** (`t72_policy_matrix.js`) — ONE
+  policy object installed by value; JS (`sofuu.policy.evaluate` + the real
+  tool belt), CLI (`sofuu policy why`), HTTP (`serve` 403 `policy_denied`
+  carrying the rule), and the C ABI (the S5 create-config policy path +
+  the symbol gate) all return the same decision with the same rule id.
+- **The evaluator now normalizes hosts** — `norm_host` strips `scheme://`,
+  `user@`, `:port`, path suffixes, and reduces `[v6]` literals before the
+  suffix anchor match. This closes a real R7.1 drift where the agent's JS
+  netPolicy normalized but the Rust evaluator did not (`t77`).
+- **Approvals in the trace** (`t73_approval_harness.js`) — the deadline
+  resolves to a typed deny with the tool named (T7.3), and a resolve that
+  arrives with the request event is allowed, never raced to deny (T7.4).
+- **The shared refusal shape** (`t75_shared_shape.js`) — `SOFUU_NO_SHELL`
+  strips the belt everywhere; serve boots with the project policy; the
+  fs jail's escape refusal is one text on every surface.
+- **Secrets-never-emitted** (`t78_secrets_never_emitted.js`) — a live key
+  survives neither a successful trace, a 401 that echoes the Authorization
+  header, the event log, nor the session document.
+- **MCP allowlist** (`t79_mcp_allowlist.js`) — non-allowlisted servers
+  refused with the rule; allowlisted tools still pass the tools policy.
+- **Install integrity** — `scripts/verify-dist.sh` stamps/verifies
+  `dist/SHA256SUMS`, asserts the live capabilities against the build's
+  claim (memory full vs typed-refusal, session/R6 surfaces), runs doctor,
+  and checks Cargo↔CLI↔npm version parity; a CI step runs it after
+  `make libsofuu`. npm aligned to `0.2.0-beta`; `CHANGELOG.md` added.
+- **serve joins the policy story** — `sofuu.serve.start` installs
+  `<project>/.sofuu/policy.json` at boot, so HTTP cannot bypass a deny
+  made for chat/CLI.
+
+Harness lessons of record: a JS-created mock server must be held by a
+module-scope reference for the run's lifetime — an unreachable listener is
+garbage-collected and the run sees connection-refused (`t73`'s KEEPERS);
+port ranges for contract harnesses rely on `Date.now()` offsets and collide
+with concurrently-benching lanes — the P4 family moved to 38–39k.
+
 ## The fixture model and the FORK demonstration (T3.3)
 
 `contract/fixtures/sofuu-fixture.gguf` is a **77 KB, 1-layer llama-arch model**
@@ -207,10 +252,17 @@ merged registration — not done here to avoid crossing lanes.
 
 ## Next actions
 
-1. **P4** — R7 security + install integrity: the four-surface deny matrix
-   (`T7.1–T5.8` harness family), policy evaluator conformance, install
-   integrity (checksummed installs, manifest-true capabilities), CHANGELOG +
-   version alignment (also an R4/R5 implementation step). P4's successor work.
+1. **P5** — platform matrix + conformance + benchmark: CI beyond
+   macOS-arm64 (Linux x86_64/arm64, Windows, Android/iOS compile jobs, the
+   32-token smoke on every platform), `sofuu conformance` per-release
+   reports, the two-build app benchmark protocol. With P0–P4 complete, the
+   conformance program itself is done — what remains is proving it on
+   runners beyond this one.
+2. **Residual harness families** — failure injection (T2.6), the v0.2
+   migration fixture (T4.4), an MCP fixture server (T5.6), the four-surface
+   error-parity harness (T5.8), cloud+local fixtures (T6.4), and a
+   behavioral C-ABI policy sample (examples/ is local-only — the S5
+   create-config policy path and the capi suite carry it behaviorally).
 2. **App-lane residue from P3** — the device round-trip (T4.2) on
    macOS+Android runners, the v0.2 migration fixture (T4.4), an MCP fixture
    server (T5.6), the four-surface error-parity harness (T5.8), the app

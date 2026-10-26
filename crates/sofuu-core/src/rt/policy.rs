@@ -88,7 +88,34 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 fn norm_host(h: &str) -> String {
+    // R7.1: `:port`, `user@`, a scheme:// prefix, a path suffix, and an
+    // RFC-3986 [v6] literal all normalize BEFORE the suffix match — the
+    // agent's JS netPolicy already did this (hostOf), so the evaluator must
+    // not answer differently on a URL-shaped host.
     let mut s = h.trim().to_ascii_lowercase();
+    if let Some(i) = s.find("://") {
+        s = s[i + 3..].to_string();
+    }
+    if let Some(i) = s.find('/') {
+        s.truncate(i);
+    }
+    if let Some(i) = s.rfind('@') {
+        s = s[i + 1..].to_string();
+    }
+    if s.starts_with('[') {
+        // [v6] literal: everything up to ']' is the host (a trailing :port
+        // after the bracket is cut with it).
+        if let Some(end) = s.find(']') {
+            s = s[1..end].to_string();
+        }
+    } else if let Some(colon) = s.rfind(':') {
+        // Bare-host name/port: strip the port only when the tail is digits
+        // (a name may itself contain no ':', so this is safe either way).
+        let tail = &s[colon + 1..];
+        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+            s.truncate(colon);
+        }
+    }
     if s.ends_with('.') {
         s.pop();
     }

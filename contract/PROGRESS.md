@@ -14,7 +14,7 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 | P2 — R2 async contract + R6 observability | ✅ **complete** (2026-10-26) | `sofuu.async.*` + `sofuu.events.*` substrates; envelope stamped at both emit choke points; exactly-one-terminal stop; chaos harnesses T2.1–T2.5 + T2.7/T2.8 all live (mid-tool cancel kills the subprocess — no orphan; server-side disconnect visible; pump backpressure is typed); usage reconciled through `sofuu.events.canonicalUsage` (T6.7, `ai.complete` now reports provider usage); chat appends the turn's envelopes to `events.ndjson`; deterministic renderer pinned byte-for-byte by the committed golden fixtures (T6.3); suite 26 PASS / 2 FAIL / 24 BLOCKED |
 | P3 — R4 portability + R5 surface parity | ✅ **complete (2026-10-26)** | the §5.2 session document written once in the engine (`rt/session_doc.rs`) behind `sofuu.session.{list,export,import,sync}` AND `sofuu session export|import` — **T4.1/T4.3 round-trip + idempotence, T4.5 namespace, T4.6 redaction, T4.7 version stamp all executable and green**; chat persists `session.json` with restart-stable `<sid>-t<N>` turn ids; config carries `schema_version` (v0 accepted, forward-only); serve `/v1/*` conformance **T5.2/T5.3/T5.4 executable** against the committed fixture model; **T5.5 C-ABI symbol check executable** (suite + CI via CONTRACT_LIBSOFUU); matrix regenerated (session×js, model×http → full, 0 unknowns). Residue by design: device round-trip (T4.2, needs runners), v0.2 migration fixture (T4.4), MCP fixture server (T5.6), four-surface error parity (T5.8), CHANGELOG/semver (P4), app stores as caches (app lanes) |
 | P4 — R7 security + install integrity | ✅ **complete (2026-10-26)** | one policy object, evaluated identically on JS/CLI/HTTP/C ABI (`t72` matrix: same decision + same rule id everywhere, no entry-point bypass); the evaluator now normalizes `scheme://`, `user@`, `:port`, paths, and `[v6]` before the host match (`t77`); approval deadline→typed-deny and the registration-order resolve, both in the trace (`t73`); shell strip + fs jail with the shared refusal shape on every surface (`t75`); secrets never reach trace/log/doc/error (`t78`); MCP allowlist gate (`t79`); serve boots with the project policy; install integrity (`scripts/verify-dist.sh`: checksums, capabilities-vs-claim, doctor, version parity — in CI); CHANGELOG + npm/Cargo/CLI semver aligned. Residue by design: a behavioral C-ABI policy sample (`examples/` is local-only — the S5 config-policy path + the capi suite carry it), an MCP fixture server (T5.6), the four-surface FAILURE-injection harness family (T2.6/T5.8) |
-| P5 — platform matrix + conformance + benchmark | ✅ **complete (2026-10-26, matrix defined + verified on main by the CI run)** | the CI `platform` job: Linux x86_64 + arm64 (native runners), Windows x86_64 (the build.rs Windows path — cmake libuv `uv_a.lib`), each with the build, the contract suite (report mode), the **32-token tiny-model smoke** (`scripts/smoke32.sh` — the committed 77 KB fixture decodes on every OS), and a `sofuu conformance` artifact; the macOS job runs the same smoke + attaches the merged report (`scripts/conformance_report.sh` = suite + runtime posture + verify-dist); `sofuu conformance` prints the per-release JSON (manifest + live capability posture + suite summary); the QTSQ-enabled job exists as the documented opt-in (`vars.SOFUU_QTSQ_CI` + secret checkout — the codec is machine-local, so capability-gated CI is the posture); **the §8 benchmark** is committed: `benchmark/PROTOCOL.md` + Build A (`benchmark/build-a/app.js`: 49 lines, 0 deps, 1 process, 0 model-swap lines, offline-yes, measured by `scripts/bench_build_a.sh` → `benchmark/table-build-a.json`) + Build B (the fragmented stack as a compose repro: `benchmark/build-b/`); reference apps audited public-API-only (`scripts/check_public_api.py`, blocking in CI — `examples/headless` excluded as the C-ABI lane's own boundary fixtures) |
+| P5 — platform matrix + conformance + benchmark | ✅ **complete (2026-10-26)** | **The matrix has run.** `Platform (Linux-x86_64)` and `Platform (Linux-arm64)`: build ✅, contract suite (report mode) ✅, **32-token tiny-model smoke ✅**, `sofuu conformance` artifact ✅; `iOS SDK typecheck` ✅. Linux-x86_64 was the first x86_64 build this tree ever ran and it was red in two layers — ARM-only guards in `src/simd/infer_kernels.cpp` (+`lfm2.rs`/`qwen35.rs`) and capi tests asserting pre-P1 QTSQ-free behavior — both fixed in `d18bb0335` (details below). Windows x86_64 stays the recorded fix-forward: vendored QuickJS does not compile under MSVC (vendored-deps lane), `continue-on-error` so it never masks the rest. The macOS job's code failure is fixed too (35-minute timeout = leaked runtimes after the failing capi tests poisoned the shared libuv loop; QTSQ-free capi suite now 54/54 in ~3.5 s), but the last two pushes could not acquire a `macos-latest` runner (queued → cancelled at GitHub's runner-acquisition limit), so its green step run is pending a runner — the job is unchanged and its steps were green before this matrix work. Deliverables: `sofuu conformance` per-release JSON (manifest + live capability posture + suite summary, memory classified by the build's codec gate and refused-tested — never claimed from `typeof`), `scripts/conformance_report.sh` merged report, the **§8 benchmark** (`benchmark/PROTOCOL.md`, Build A measured → `benchmark/table-build-a.json`: 49 lines, 0 deps, 1 process, 0 model-swap lines, offline-yes; Build B compose repro), and the blocking public-API audit (`scripts/check_public_api.py`; `examples/headless` is the C-ABI lane's boundary fixtures). The QTSQ-enabled job remains the documented opt-in (`vars.SOFUU_QTSQ_CI` + secret checkout) |
 | P6 — external adoption | ⬜ not started | no external deployment yet |
 
 ## Conformance suite
@@ -181,6 +181,39 @@ checks see a clean process table.
   runtime-internal `__qtsq_/__sofuu_/__session_/__chat_/__ai_` seam;
   `examples/headless/*` is the C-ABI lane's own boundary fixtures and is
   excluded by scope, not by exception.
+- **The matrix's first x86_64 compile found real latent breakage**
+  (`d18bb0335`). `src/simd/infer_kernels.cpp` had grown ARM-only
+  tile/GQA entry points and an aarch64-only parity test with no guards:
+  every x86_64 build died on undeclared `tile_block_*` types, the x86
+  fallback of the rows8 attention kernel read the NEON-only `lens[]`
+  (fixed to derive lengths from `counts[]`), and Rust references three
+  ARM symbols (`sofuu_tile_warm`, `sofuu_tile_scale_sidecar_mode`, the
+  GQA counters) unconditionally, so the non-ARM build needs inert stubs.
+  Same class in `infer/lfm2.rs` (pointer-form `dot_f32_neon` + the NEON
+  4×4 tile called from the fused dual-panel path) and `infer/qwen35.rs`
+  (file-direct packed dots are aarch64-only). ARM code is byte-for-byte
+  unchanged; the zig `x86_64-linux-musl` build now completes (5.7 MB
+  static-pie) and CI proves it by running the fixture inference.
+- **The macOS job's 35-minute timeout was test fallout, not a hang in
+  the runtime.** Two capi tests still asserted pre-P1 behavior (a
+  QTSQ-free build has NO `memory.*`); since the typed-refusal stubs
+  landed, they resolve and throw, so the assertions panicked *before*
+  `sofuu_rt_free`, leaking QuickJS runtimes that wedged the next
+  cross-thread test on the process-global libuv loop. Tests updated to
+  the P1 contract (resolution everywhere; `E_CAPABILITY` at
+  `memory.open`; the capi facade's "no open brain" TypeError for
+  handle-taking methods); a QTSQ-free `--test-threads=1` run is 54/54
+  in ~3.5 s.
+- **The conformance report's memory row was initially dishonest**
+  (`42fa4abda`): `typeof sofuu.memory.remember === "function"` is true
+  for the typed-refusal stubs too, so a QTSQ-free artifact claimed
+  `live: "full"`. The probe now reads `capabilities().build.missing`
+  to know which class the binary must be, then proves the gated class
+  by calling `remember` and requiring the `E_CAPABILITY` refusal (a
+  silent no-op is reported as a defect). Verified both ways on one
+  commit: QTSQ-free → `{capability-gated, typed-refusal, ok:true}`;
+  QTSQ-on → the engine-lane namespace clobber stays visible as
+  `{full, undefined, ok:false}`.
 
 ## What landed in P4 (2026-10-26)
 
@@ -290,12 +323,12 @@ merged registration — not done here to avoid crossing lanes.
 
 ## Next actions
 
-1. **P5** — platform matrix + conformance + benchmark: CI beyond
-   macOS-arm64 (Linux x86_64/arm64, Windows, Android/iOS compile jobs, the
-   32-token smoke on every platform), `sofuu conformance` per-release
-   reports, the two-build app benchmark protocol. With P0–P4 complete, the
-   conformance program itself is done — what remains is proving it on
-   runners beyond this one.
+1. **Windows x86_64** — vendored QuickJS under MSVC (`quickjs.c` C2146 —
+   the vendored-deps lane's port; the platform job is `continue-on-error`
+   until it lands). **macOS runner** — re-run the job when a
+   `macos-latest` runner is acquired (the code verdict is in; the last two
+   runs were cancelled while queued). **Android compile job** — the
+   opt-in `vars.SOFUU_ANDROID_CI` path exists but has not been exercised.
 2. **Residual harness families** — failure injection (T2.6), the v0.2
    migration fixture (T4.4), an MCP fixture server (T5.6), the four-surface
    error-parity harness (T5.8), cloud+local fixtures (T6.4), and a

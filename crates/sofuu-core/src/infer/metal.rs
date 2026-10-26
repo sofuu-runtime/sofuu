@@ -39,6 +39,7 @@ pub const OP_NAMES: [&str; OP_KINDS] = [
     "head", "gguf_b4s",
 ];
 
+
 pub struct MetalEngine {
     /// P0.2 per-op HOST enqueue timing (SOFUU_GPU_TIMING=2): nanos + count
     /// per op kind, reported by take_op_timing/print_op_timing.
@@ -1722,7 +1723,6 @@ impl MetalEngine {
                 ) == 1
             };
         }
-        self.op_tock(K_GGUF_B4, __t);
         if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
             self.sync();
         }
@@ -1791,20 +1791,23 @@ impl MetalEngine {
                 ) == 1
             };
         }
-        self.op_tock(K_GGUF_B4_SECS, __t);
         if std::env::var_os("SOFUU_SYNC_EACH").is_some() {
             self.sync();
         }
         __r
     }
 
-    /// SOFUU_GPU_F16W=1 opts into the fp16 materialisation. Shipped default is
-    /// unset (q4_K unpack per tile) until a bit-identical, faster arm is
-    /// measured; see the arm table in TASKS.md.
+    /// fp16 materialisation is ON by default: measured bit-identical (whole-vocab
+    /// FNV f0a88a5bd964de90 in both arms, 40/40 runs) and +4.5..+5.5% prefill on
+    /// the chain route (in-situ GEMM -10.7%, chunk -5.9%), order-balanced.
+    /// SOFUU_GPU_F16W=0 turns it off. Cost is one arena, ~728 MB for a 0.6B Q4_K_M
+    /// model (2 B/param for the q4_K chain matrices only), capped by
+    /// SOFUU_GPU_F16W_MAX_MB; over cap, an allocation failure or a rejected
+    /// dispatch each print "[f16w] refused: ..." and leave the q4_K path in charge.
     pub fn f16_weights_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("SOFUU_GPU_F16W").map(|v| v == "1").unwrap_or(false)
+            std::env::var("SOFUU_GPU_F16W").map(|v| v != "0").unwrap_or(true)
         })
     }
 
@@ -1812,12 +1815,12 @@ impl MetalEngine {
     /// q4_K path. `ntok` gates the diversion: below a 16-token chunk the chain
     /// walks the b4 GEMV class, and an fp16 buffer would only double the bytes
     /// that class streams.
+
     #[inline]
     fn f16_slot(
         &self, w_offset: usize, rows: usize, cols: usize, ntok: usize,
     ) -> Option<(*mut c_void, usize)> {
-        if ntok < 16 { return None; }
-        let w = self.f16w.get()?;
+        let Some(w) = self.f16w.get() else { return None; };
         w.slot(w_offset, rows, cols).map(|off| (w.buf.handle, off))
     }
 
@@ -2255,7 +2258,6 @@ impl MetalEngine {
                 rows, cols, b,
             ) == 1
         };
-        self.op_tock(K_GGUF_GEMM, __t);
         __r
     }
 

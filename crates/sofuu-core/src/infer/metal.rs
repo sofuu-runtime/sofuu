@@ -656,6 +656,26 @@ extern "C" {
         u_buf: *mut c_void, u_offset: usize,
         n: usize,
     ) -> i32;
+    // W2 feature split: compact [rows][n] block -> column slice of the
+    // canonical [rows][dst_stride] layout.
+    fn sofuu_metal_batch_strided_copy_f32(
+        ctx: *mut c_void,
+        dst_buf: *mut c_void, dst_offset: usize,
+        dst_stride: usize,
+        src_buf: *mut c_void, src_offset: usize,
+        src_stride: usize,
+        n: usize, rows: usize,
+    ) -> i32;
+    // W2 feature split: y[t][j] += (j < n_a ? pa[t][j] : pb[t][j - n_a]).
+    fn sofuu_metal_batch_resid_split_add_f32(
+        ctx: *mut c_void,
+        y_buf: *mut c_void, y_offset: usize,
+        pa_buf: *mut c_void, pa_offset: usize,
+        n_a: usize,
+        pb_buf: *mut c_void, pb_offset: usize,
+        n_b: usize,
+        cols: usize, rows: usize,
+    ) -> i32;
     fn sofuu_metal_batch_rmsnorm(
         ctx: *mut c_void,
         x_buf: *mut c_void, x_offset: usize,
@@ -1319,6 +1339,51 @@ impl MetalEngine {
                 n,
             ) == 1 };
         self.op_tock(K_SWIGLU, __t);
+        __r
+    }
+
+    /// W2 feature split: copy a compact [rows][n] block into a column slice of
+    /// a canonical [rows][dst_stride] block (offsets/strides in ELEMENTS).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_strided_copy_f32(
+        &self,
+        dst_buf: &MetalBuffer, dst_offset: usize, dst_stride: usize,
+        src_buf: &MetalBuffer, src_offset: usize, src_stride: usize,
+        n: usize, rows: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_ADD);
+        let __r = unsafe {
+            sofuu_metal_batch_strided_copy_f32(
+                self.ctx,
+                dst_buf.handle, dst_offset, dst_stride,
+                src_buf.handle, src_offset, src_stride,
+                n, rows,
+            ) == 1
+        };
+        self.op_tock(K_ADD, __t);
+        __r
+    }
+
+    /// W2 feature split: fold a two-owner residual partial pair into y.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_resid_split_add_f32(
+        &self,
+        y_buf: &MetalBuffer, y_offset: usize,
+        pa_buf: &MetalBuffer, pa_offset: usize, n_a: usize,
+        pb_buf: &MetalBuffer, pb_offset: usize, n_b: usize,
+        cols: usize, rows: usize,
+    ) -> bool {
+        let __t = self.op_tick(K_ADD);
+        let __r = unsafe {
+            sofuu_metal_batch_resid_split_add_f32(
+                self.ctx,
+                y_buf.handle, y_offset,
+                pa_buf.handle, pa_offset, n_a,
+                pb_buf.handle, pb_offset, n_b,
+                cols, rows,
+            ) == 1
+        };
+        self.op_tock(K_ADD, __t);
         __r
     }
 
@@ -2974,6 +3039,44 @@ impl MetalEngine {
                 )
             };
             r == 1
+        };
+        self.op_tock(K_ATTN_1C, __t);
+        __r
+    }
+
+    /// W2 feature split: `batch_llama_attn_row` with an EXPLICIT output row
+    /// stride. The attention head split gives each engine a compact q block
+    /// ([rows][n_heads*hd]) but both must land their rows in the SAME
+    /// canonical [rows][q_rows] head_out, at their own head offset — the
+    /// kernel already takes the stride, only the shipped wrapper derives it
+    /// from n_heads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_row_os(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        kc_buf: &MetalBuffer, kc_layer_offset: usize,
+        vc_buf: &MetalBuffer, vc_layer_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32, out_stride: u32,
+    ) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let __t = self.op_tick(K_ATTN_1C);
+        let __r = unsafe {
+            sofuu_metal_batch_llama_attn_row(
+                self.ctx,
+                q_buf.handle, q_offset,
+                kc_buf.handle, kc_layer_offset,
+                vc_buf.handle, vc_layer_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                out_stride,
+            ) == 1
         };
         self.op_tock(K_ATTN_1C, __t);
         __r

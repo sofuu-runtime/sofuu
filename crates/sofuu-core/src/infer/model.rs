@@ -1526,6 +1526,7 @@ impl TransformerModel {
                 );
             }
 
+
             // SOFUU_QKV_SNAP s3 (K/V cache rows post k-norm+rope) + s4
             // (q post q-norm+rope) — GPU mirror after kv_write/head_rmsnorm.
             if layer_idx == snap_layer {
@@ -1742,6 +1743,18 @@ impl TransformerModel {
         // gpu_forward_prefill_split for the ordering argument. A false return
         // means "not taken" and the chunk falls through to the whole-chunk
         // routes below, so the split can never be why a chunk fails.
+        // W2: CPU+GPU FEATURE split (SOFUU_SPLIT_AXIS=feat). Checked before
+        // the row split so the axis knob actually selects the axis; a false
+        // return falls through to the row split and then the whole-chunk
+        // routes, so the arm can never be why a chunk fails.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(sh) = self.prefill_feat_shares(b_size) {
+            if self.gpu_forward_prefill_feat(tokens, start_pos, sh, compute_last_logits) {
+                self.logits_gap_probe_tagged("feat_head", start_pos + b_size - 1);
+                return &self.logits;
+            }
+        }
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(kg) = self.prefill_split_gpu_rows(b_size) {
             if self.gpu_forward_prefill_split(tokens, start_pos, kg, compute_last_logits) {
@@ -3803,6 +3816,1186 @@ impl TransformerModel {
         Some((base, secs))
     }
 
+    // ─── W2: CPU+GPU FEATURE SPLIT (SOFUU_SPLIT=1 SOFUU_SPLIT_AXIS=feat) ─────
+    //
+    // The shipped split (W1) cuts the chunk's ROWS: each engine owns whole
+    // activation rows, so both stream EVERY weight of every layer and the model
+    // is read twice per chunk. This arm cuts the OUTPUT FEATURES instead: for
+    // every projection each engine computes a contiguous range of W's rows for
+    // ALL chunk rows, so the weight stream is divided - every weight byte is
+    // read by exactly one engine. A projection's output is the next
+    // projection's input, so the layer has to be walked in ROUNDS:
+    //
+    //   R1 attention  q/k/v (head split) + KV write + RoPE + attention
+    //                   -> the full [b][q_dim] head_out        (exchange)
+    //   R2 o proj     output-feature split -> a [b][dim] partial pair
+    //                   -> folded into x                       (exchange)
+    //   R3 ffn        ffn_norm + gate/up (feature split) + SwiGLU
+    //                   -> the full [b][hidden] swiGLU rows     (exchange)
+    //   R4 down proj  output-feature split -> a [b][dim] partial pair
+    //                   -> folded into x                       (exchange)
+    //
+    // ORDERING: the GPU's round k is encoded and committed BEFORE the CPU
+    // starts round k, so the CPU's share of a round runs underneath the GPU's
+    // command buffer; the wait that ends the round is its exchange point (the
+    // CPU cannot start round k+1 without the GPU's round-k output, the same
+    // dependency the row split expresses with one commit per layer group). The
+    // next buffer is opened only after that wait, so no round reads a
+    // half-written neighbour.
+    //
+    // x has ONE writer per round: the GPU folds the two residual partials into
+    // the slab with resid_split_add_f32, while the CPU folds the same two
+    // operand blocks into its own [b][dim] view with the same f32 add - the two
+    // copies agree bit for bit, so the CPU's KV rows and partials carry the
+    // arithmetic GPU-only would have produced.
+    //
+    // Attention head split under GQA: the KV head is the awkward part (a q head
+    // must share its group's KV head), so each engine owns WHOLE KV heads plus
+    // the q heads of their groups. Its K/V slice binds at
+    // kc_layer + kc*max_seq*head_dim*4 with the COMPACT head counts, and its q
+    // block is compact with the attention output written at its own head offset
+    // of the canonical head_out (the kernel already takes an output stride), so
+    // every shipped attention kernel runs unchanged.
+    //
+    // o and ffn_down CANNOT be K-split: a column slice of a quantized row is
+    // not a contiguous byte range, so those two are output-feature split and
+    // their partials are folded - which is what forces R2 and R4.
+
+    /// SOFUU_SPLIT_AXIS=feat selects the output-feature split. Unset (or
+    /// "rows", or anything else) keeps the shipped row split, so an existing
+    /// SOFUU_SPLIT=1 run is the same configuration it was before this arm.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_split_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("SOFUU_SPLIT_AXIS")
+                .map(|v| v.trim().eq_ignore_ascii_case("feat"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Packed bytes of ONE weight row (mirror of the loader's private
+    /// packed_row_bytes): the split addresses a row range by byte offset.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_row_bytes(type_id: u32, cols: usize) -> Option<usize> {
+        match type_id {
+            GGML_TYPE_Q4_0 if cols % 32 == 0 => Some((cols / 32) * 18),
+            GGML_TYPE_Q8_0 if cols % 32 == 0 => Some((cols / 32) * 34),
+            GGML_TYPE_Q4_K if cols % 256 == 0 => Some((cols / 256) * 144),
+            GGML_TYPE_Q6_K if cols % 256 == 0 => Some((cols / 256) * 210),
+            GGML_TYPE_F32 => Some(cols * 4),
+            GGML_TYPE_F16 => Some(cols * 2),
+            _ => None,
+        }
+    }
+
+    /// One projection's CPU share: a 32-output-feature multiple, never all and
+    /// never none (the point of the arm is that BOTH engines stream weights).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_part(total: usize, pct: usize) -> Option<usize> {
+        if total < 64 {
+            return None;
+        }
+        let mut r = total * pct.clamp(1, 99) / 100;
+        r -= r % 32;
+        r = r.clamp(32, total - 32);
+        if r == 0 || r >= total || r % 32 != 0 {
+            return None;
+        }
+        Some(r)
+    }
+
+    /// f32 view of a norm tensor (the CPU tile path's pattern).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_f32w<'a>(gguf: &'a GgufFile, tv: &TensorView, n: usize) -> &'a [f32] {
+        let bytes = Self::tensor_slice(gguf, tv);
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n) }
+    }
+
+    /// Some(shares) when this chunk can run the feature split. Everything that
+    /// could fail later is checked HERE, before a single dispatch, so an
+    /// unsupported model falls through to the whole-chunk routes untouched.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn prefill_feat_shares(&self, b: usize) -> Option<FeatSplit> {
+        if !Self::split_enabled() || !Self::feat_split_enabled() || b < 8 || b > 128 {
+            return None;
+        }
+        let cfg = &self.config;
+        if cfg.n_layers == 0 || cfg.n_layers != self.layers.len() {
+            return None;
+        }
+        if self.k16_prefill
+            || self.kv_f16
+            || self.kivi.is_some()
+            || self.streaming_weights
+            || self.dynamic_ffn.enabled
+        {
+            return None;
+        }
+        {
+            // The GPU arm is the chain client: its wide-chunk GEMV class is
+            // mma8 (the plain q4_K route is a FOUR-row kernel), and the CPU arm
+            // reads the f32 cache - the row split's contract verbatim.
+            let g = self.gpu.as_ref()?;
+            if !g.token_commit || !crate::infer::metal::MetalEngine::mma8_enabled() {
+                return None;
+            }
+        }
+        let (n_heads, n_kv_heads, hd, dim, hidden) = (
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            cfg.dim,
+            cfg.hidden_dim,
+        );
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 || hd < 4 || hd % 4 != 0 {
+            return None;
+        }
+        let q_rows = n_heads * hd;
+        // The GPU's GEMM class reads 256-column superblocks; the o projection's
+        // K is q_rows and ffn_down's K is hidden, so all three must divide.
+        if dim % 256 != 0 || hidden % 256 != 0 || q_rows % 256 != 0 {
+            return None;
+        }
+        let group = n_heads / n_kv_heads;
+        if group == 0 || n_heads < 2 * group {
+            return None;
+        }
+        // Head split: whole KV groups only, at least one group on each side.
+        let mut hc = std::env::var("SOFUU_FEAT_HEADS_CPU")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or((n_heads / 2 / group) * group);
+        hc -= hc % group;
+        if hc < group || hc > n_heads - group {
+            hc = (n_heads / 2 / group) * group;
+        }
+        if hc == 0 || hc >= n_heads || hc % group != 0 {
+            return None;
+        }
+        let pct = |k: &str, d: usize| -> usize {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(d)
+        };
+        let o_cpu = Self::feat_part(dim, pct("SOFUU_FEAT_O_CPU_PCT", 50))?;
+        let f_cpu = Self::feat_part(hidden, pct("SOFUU_FEAT_FFN_CPU_PCT", 50))?;
+        let d_cpu = Self::feat_part(dim, pct("SOFUU_FEAT_DOWN_CPU_PCT", 50))?;
+        for l in self.layers.iter() {
+            if l.attn_q_bias.is_some() || l.attn_k_bias.is_some() || l.attn_v_bias.is_some() {
+                return None;
+            }
+            for (tv, cols) in [
+                (&l.attn_q, dim),
+                (&l.attn_k, dim),
+                (&l.attn_v, dim),
+                (&l.attn_output, q_rows),
+                (&l.ffn_gate, dim),
+                (&l.ffn_up, dim),
+                (&l.ffn_down, hidden),
+            ] {
+                if Self::feat_row_bytes(tv.tensor_type, cols).is_none() {
+                    return None;
+                }
+            }
+        }
+        Some(FeatSplit {
+            hc,
+            kc: hc / group,
+            o_cpu,
+            f_cpu,
+            d_cpu,
+        })
+    }
+
+    /// W2: y[0..rows) = W[row0..row0+rows) · x for all b rows, compact
+    /// [b][rows] out. mma8 for q4_K (the chain's wide-chunk class), the
+    /// sectioned tiled GEMM otherwise (q6_K). Both address the weights by byte
+    /// offset, so a contiguous OUTPUT-FEATURE range is a base plus a row count.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    fn feat_gemm_rows(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        tv: &TensorView,
+        row0: usize,
+        rows: usize,
+        cols: usize,
+        b: usize,
+        x_off: usize,
+        y_off: usize,
+    ) -> bool {
+        if rows == 0 {
+            return true;
+        }
+        let rb = match Self::feat_row_bytes(tv.tensor_type, cols) {
+            Some(v) => v,
+            None => return false,
+        };
+        let woff = gguf.data_offset + tv.offset + row0 * rb;
+        if tv.tensor_type == GGML_TYPE_Q4_K
+            && b > 4
+            && crate::infer::metal::MetalEngine::mma8_enabled()
+            && g.engine.batch_gguf_mma8(
+                &g.w_buf,
+                woff,
+                &g.act_buf,
+                x_off,
+                &g.act_buf,
+                y_off,
+                rows,
+                cols,
+                b,
+            )
+        {
+            return true;
+        }
+        let base = woff & !255usize;
+        let rem = (woff - base) as u32;
+        let secs = [[0u32, rem, rows as u32, 0u32, rows as u32]];
+        g.engine.batch_gguf_gemm_tiled_multi_chain(
+            tv.tensor_type,
+            &g.w_buf,
+            base,
+            &g.act_buf,
+            x_off,
+            &g.act_buf,
+            y_off,
+            rows,
+            cols,
+            b,
+            &secs,
+        )
+    }
+
+    /// W2 R1 (GPU): its share of the attention block for all b slab rows -
+    /// attn-norm, q/k/v over its head range, KV write + RoPE on its KV heads,
+    /// q/k-norm + RoPE, attention into its head slice of the canonical
+    /// head_out. fold = the previous round's residual partial pair to apply to
+    /// x first (R1 of every layer but the first).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    /// Warm the CPU arm's row range of a projection into the tiled-GEMM
+    /// cache. That cache is keyed by (pointer, rows, cols), so a feature-split
+    /// range is a different entry from the whole tensor the other arms use: the
+    /// first use pays the repack (a per-row-group shuffle, bit-identical math),
+    /// every later chunk hits it. Without it the CPU half runs the untiled
+    /// kernels, measured ~3x slower per MAC on this tree.
+    fn feat_warm(gguf: &GgufFile, tv: &TensorView, rows: usize, cols: usize) {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let Some(rb) = Self::feat_row_bytes(tv.tensor_type, cols) else {
+            return;
+        };
+        let bytes = Self::tensor_slice(gguf, tv);
+        if rows * rb > bytes.len() {
+            return;
+        }
+        super::quant::tile_warm(bytes.as_ptr(), rows, cols, tv.tensor_type);
+    }
+
+    fn feat_gpu_attn(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        layer_idx: usize,
+        b: usize,
+        sh: FeatSplit,
+        fold: Option<(usize, usize)>,
+    ) -> bool {
+        let dim = cfg.dim;
+        let hd = cfg.head_dim;
+        let (n_heads, n_kv_heads) = (cfg.n_heads, cfg.n_kv_heads);
+        let max_seq = cfg.max_seq_len;
+        let q_rows = n_heads * hd;
+        let hg = n_heads - sh.hc;
+        let kgv = n_kv_heads - sh.kc;
+        if hg == 0 || kgv == 0 {
+            return false;
+        }
+        let rope_mode: u32 = if cfg.rope_interleaved { 1 } else { 0 };
+        if let Some((n_a, n_b)) = fold {
+            // FFI offsets are f32 ELEMENT counts; slot offsets are bytes.
+            if !g.engine.batch_resid_split_add_f32(
+                &g.act_buf,
+                g.slots.x / 4,
+                &g.act_buf,
+                g.slots.pc / 4,
+                n_a,
+                &g.act_buf,
+                g.slots.xo / 4,
+                n_b,
+                dim,
+                b,
+            ) {
+                return false;
+            }
+        }
+        if !g.engine.batch_rmsnorm_f32w_b4(
+            &g.act_buf,
+            g.slots.x,
+            &g.w_buf,
+            gguf.data_offset + l.attn_norm.offset,
+            &g.act_buf,
+            g.slots.xn,
+            dim,
+            cfg.norm_eps,
+            b,
+        ) {
+            return false;
+        }
+        if !Self::feat_gemm_rows(g, gguf, &l.attn_q, sh.hc * hd, hg * hd, dim, b, g.slots.xn, g.slots.qa)
+            || !Self::feat_gemm_rows(g, gguf, &l.attn_k, sh.kc * hd, kgv * hd, dim, b, g.slots.xn, g.slots.ka)
+            || !Self::feat_gemm_rows(g, gguf, &l.attn_v, sh.kc * hd, kgv * hd, dim, b, g.slots.xn, g.slots.va)
+        {
+            return false;
+        }
+        let kv_head_bytes = n_kv_heads * max_seq * hd * 4;
+        let kc_layer = layer_idx * kv_head_bytes + sh.kc * max_seq * hd * 4;
+        let k_norm_off = l.attn_k_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+        let q_norm_off = l.attn_q_norm.as_ref().map(|tv| gguf.data_offset + tv.offset);
+        let has_q = u32::from(q_norm_off.is_some());
+        let has_k = u32::from(k_norm_off.is_some());
+        let (kln_buf, kln_off) = (k_norm_off.map(|_| &g.w_buf), k_norm_off.unwrap_or(0));
+        g.engine.batch_llama_kv_write_b4(
+            &g.act_buf,
+            g.slots.ka,
+            &g.act_buf,
+            g.slots.va,
+            &g.k_buf,
+            kc_layer,
+            &g.v_buf,
+            kc_layer,
+            kln_buf,
+            kln_off,
+            has_k,
+            &g.act_buf,
+            g.slots.posb,
+            b,
+            hd as u32,
+            kgv as u32,
+            max_seq as u32,
+            cfg.norm_eps,
+            cfg.rope_freq_base,
+            rope_mode,
+            None,
+        );
+        g.engine.batch_head_rmsnorm_b4(
+            &g.act_buf,
+            g.slots.qa,
+            q_norm_off.map(|_| &g.w_buf),
+            q_norm_off.unwrap_or(0),
+            &g.act_buf,
+            g.slots.posb,
+            b,
+            hd as u32,
+            hg as u32,
+            has_q,
+            cfg.norm_eps,
+            cfg.rope_freq_base,
+            rope_mode,
+            None,
+        );
+        // Whole-row attention on the compact head count, landing its heads at
+        // its own offset of the canonical [b][q_rows] block: a false return
+        // means NOTHING was dispatched (pipeline missing, unsupported
+        // geometry, SOFUU_PRE_ATTN=0 or a position ceiling), so the round is
+        // aborted and the chunk falls through to a whole-chunk route.
+        if !g.engine.batch_llama_attn_row_os(
+            &g.act_buf,
+            g.slots.qa,
+            &g.k_buf,
+            kc_layer,
+            &g.v_buf,
+            kc_layer,
+            &g.act_buf,
+            g.slots.ao + sh.hc * hd * 4,
+            &g.act_buf,
+            g.slots.posb,
+            b,
+            hd as u32,
+            hg as u32,
+            kgv as u32,
+            max_seq as u32,
+            q_rows as u32,
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// W2 R2 (GPU): its output-feature range of the o projection, off the
+    /// canonical head_out rows, into its [b][dim] partial block.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_gpu_oproj(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let q_rows = cfg.n_heads * cfg.head_dim;
+        Self::feat_gemm_rows(
+            g,
+            gguf,
+            &l.attn_output,
+            sh.o_cpu,
+            cfg.dim - sh.o_cpu,
+            q_rows,
+            b,
+            g.slots.ao,
+            g.slots.xo,
+        )
+    }
+
+    /// W2 R3 (GPU): fold the o halves into x, ffn-norm, gate/up over its
+    /// output-feature range, SwiGLU, then place its compact range into the
+    /// canonical [b][hidden] swiGLU rows.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_gpu_ffn(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let f_gpu = hidden - sh.f_cpu;
+        if f_gpu == 0 {
+            return false;
+        }
+        if !g.engine.batch_resid_split_add_f32(
+            &g.act_buf,
+            g.slots.x / 4,
+            &g.act_buf,
+            g.slots.pc / 4,
+            sh.o_cpu,
+            &g.act_buf,
+            g.slots.xo / 4,
+            dim - sh.o_cpu,
+            dim,
+            b,
+        ) {
+            return false;
+        }
+        if !g.engine.batch_rmsnorm_f32w_b4(
+            &g.act_buf,
+            g.slots.x,
+            &g.w_buf,
+            gguf.data_offset + l.ffn_norm.offset,
+            &g.act_buf,
+            g.slots.xn,
+            dim,
+            cfg.norm_eps,
+            b,
+        ) {
+            return false;
+        }
+        if !Self::feat_gemm_rows(g, gguf, &l.ffn_gate, sh.f_cpu, f_gpu, dim, b, g.slots.xn, g.slots.gate)
+            || !Self::feat_gemm_rows(g, gguf, &l.ffn_up, sh.f_cpu, f_gpu, dim, b, g.slots.xn, g.slots.up)
+        {
+            return false;
+        }
+        if !g.engine.batch_swiglu(&g.act_buf, g.slots.gate, &g.act_buf, g.slots.up, b * f_gpu) {
+            return false;
+        }
+        // The CPU arm's half is already in place (it owns the prefix), so only
+        // the GPU's suffix has to be moved; the destination stride is the
+        // canonical row width, the source stride is its compact range.
+        g.engine.batch_strided_copy_f32(
+            &g.act_buf,
+            g.slots.swg / 4 + sh.f_cpu,
+            hidden,
+            &g.act_buf,
+            g.slots.gate / 4,
+            f_gpu,
+            f_gpu,
+            b,
+        )
+    }
+
+    /// W2 R4 (GPU): its output-feature range of ffn_down off the canonical
+    /// swiGLU rows, into its [b][dim] partial block.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_gpu_down(
+        g: &mut GgufGpu,
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        Self::feat_gemm_rows(
+            g,
+            gguf,
+            &l.ffn_down,
+            sh.d_cpu,
+            cfg.dim - sh.d_cpu,
+            cfg.hidden_dim,
+            b,
+            g.slots.swg,
+            g.slots.xo,
+        )
+    }
+
+    /// W2 R1 (CPU): its share of the attention block, off the CPU's folded x
+    /// view (the slab x has a single writer - the GPU), writing its q heads
+    /// into the canonical head_out at its own offset.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    fn feat_cpu_attn(
+        cfg: &ModelConfig,
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        k_cache: &mut [f32],
+        v_cache: &mut [f32],
+        x_src: &[f32],
+        xn: &mut [f32],
+        qb: &mut [f32],
+        kb: &mut [f32],
+        vb: &mut [f32],
+        head_c: &mut [f32],
+        ao: &mut [f32],
+        b: usize,
+        start_pos: usize,
+        layer_idx: usize,
+        sliding_window: usize,
+        sink_tokens: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let dim = cfg.dim;
+        let hd = cfg.head_dim;
+        let (n_heads, n_kv_heads) = (cfg.n_heads, cfg.n_kv_heads);
+        let max_seq = cfg.max_seq_len;
+        let q_d = sh.hc * hd;
+        let kv_d = sh.kc * hd;
+        let q_rows = n_heads * hd;
+        let rope_mode: i32 = if cfg.rope_interleaved { 1 } else { 0 };
+        if q_d == 0 || kv_d == 0 || dim == 0 || b == 0 {
+            return false;
+        }
+        let wnorm = Self::feat_f32w(gguf, &l.attn_norm, dim);
+        batched_rmsnorm(&mut xn[..b * dim], &x_src[..b * dim], wnorm, b, dim, cfg.norm_eps);
+        let (q_rb, k_rb, v_rb) = match (
+            Self::feat_row_bytes(l.attn_q.tensor_type, dim),
+            Self::feat_row_bytes(l.attn_k.tensor_type, dim),
+            Self::feat_row_bytes(l.attn_v.tensor_type, dim),
+        ) {
+            (Some(a), Some(c), Some(d)) => (a, c, d),
+            _ => return false,
+        };
+        Self::feat_warm(gguf, &l.attn_q, q_d, dim);
+        Self::feat_warm(gguf, &l.attn_k, kv_d, dim);
+        Self::feat_warm(gguf, &l.attn_v, kv_d, dim);
+        let q_bytes = Self::tensor_slice(gguf, &l.attn_q);
+        matmat(
+            &q_bytes[..q_d * q_rb],
+            l.attn_q.tensor_type,
+            q_d,
+            dim,
+            &xn[..b * dim],
+            b,
+            &mut qb[..b * q_d],
+        );
+        let k_bytes = Self::tensor_slice(gguf, &l.attn_k);
+        matmat(
+            &k_bytes[..kv_d * k_rb],
+            l.attn_k.tensor_type,
+            kv_d,
+            dim,
+            &xn[..b * dim],
+            b,
+            &mut kb[..b * kv_d],
+        );
+        let v_bytes = Self::tensor_slice(gguf, &l.attn_v);
+        matmat(
+            &v_bytes[..kv_d * v_rb],
+            l.attn_v.tensor_type,
+            kv_d,
+            dim,
+            &xn[..b * dim],
+            b,
+            &mut vb[..b * kv_d],
+        );
+        if let Some(ref qn) = l.attn_q_norm {
+            let w = Self::feat_f32w(gguf, qn, hd);
+            batched_rmsnorm_in_place(&mut qb[..b * q_d], w, b * sh.hc, hd, cfg.norm_eps);
+        }
+        if let Some(ref kn) = l.attn_k_norm {
+            let w = Self::feat_f32w(gguf, kn, hd);
+            batched_rmsnorm_in_place(&mut kb[..b * kv_d], w, b * sh.kc, hd, cfg.norm_eps);
+        }
+        // The cache slice starts at this layer with layer_idx = 0 and the CPU's
+        // COMPACT head counts, so the shipped slot arithmetic
+        // (kh*max_seq + pos)*head_dim lands on this layer's own first kc heads -
+        // i.e. on exactly the heads this engine owns.
+        let base = layer_idx
+            .saturating_mul(n_kv_heads)
+            .saturating_mul(max_seq)
+            .saturating_mul(hd);
+        let span = sh
+            .kc
+            .saturating_mul(max_seq)
+            .saturating_mul(hd);
+        if base + span > k_cache.len() || base + span > v_cache.len() {
+            return false;
+        }
+        batched_rope_kv(
+            &mut qb[..b * q_d],
+            &mut kb[..b * kv_d],
+            &vb[..b * kv_d],
+            &mut k_cache[base..],
+            &mut v_cache[base..],
+            b,
+            start_pos,
+            0,
+            sh.hc,
+            sh.kc,
+            hd,
+            max_seq,
+            cfg.rope_freq_base,
+            rope_mode,
+        );
+        batched_attention_ext(
+            &qb[..b * q_d],
+            &k_cache[base..],
+            &v_cache[base..],
+            &mut head_c[..b * q_d],
+            b,
+            start_pos,
+            0,
+            sh.hc,
+            sh.kc,
+            hd,
+            max_seq,
+            sliding_window,
+            sink_tokens,
+        );
+        // Its heads are a prefix of the q row, so the canonical block only
+        // changes the row stride.
+        for t in 0..b {
+            ao[t * q_rows..t * q_rows + q_d].copy_from_slice(&head_c[t * q_d..(t + 1) * q_d]);
+        }
+        true
+    }
+
+    /// W2 R2 (CPU): its output-feature range of the o projection off the
+    /// canonical head_out rows, into its [b][dim] partial block.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_cpu_oproj(
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        head_canon: &[f32],
+        pc: &mut [f32],
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let cols = cfg.n_heads * cfg.head_dim;
+        let rb = match Self::feat_row_bytes(l.attn_output.tensor_type, cols) {
+            Some(v) => v,
+            None => return false,
+        };
+        Self::feat_warm(gguf, &l.attn_output, sh.o_cpu, cols);
+        let bytes = Self::tensor_slice(gguf, &l.attn_output);
+        matmat(
+            &bytes[..sh.o_cpu * rb],
+            l.attn_output.tensor_type,
+            sh.o_cpu,
+            cols,
+            head_canon,
+            b,
+            &mut pc[..b * sh.o_cpu],
+        );
+        true
+    }
+
+    /// W2 R3 (CPU): ffn_norm of its folded x view, gate/up over its
+    /// output-feature range, SwiGLU, then its range written into the canonical
+    /// row block (it owns the prefix, so only the row stride changes).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    fn feat_cpu_ffn(
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        xn: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        swg: &mut [f32],
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let f = sh.f_cpu;
+        if f == 0 {
+            return false;
+        }
+        let (grb, urb) = match (
+            Self::feat_row_bytes(l.ffn_gate.tensor_type, dim),
+            Self::feat_row_bytes(l.ffn_up.tensor_type, dim),
+        ) {
+            (Some(a), Some(c)) => (a, c),
+            _ => return false,
+        };
+        Self::feat_warm(gguf, &l.ffn_gate, f, dim);
+        Self::feat_warm(gguf, &l.ffn_up, f, dim);
+        let gb = Self::tensor_slice(gguf, &l.ffn_gate);
+        let ub = Self::tensor_slice(gguf, &l.ffn_up);
+        let mut done = false;
+        if l.ffn_gate.tensor_type == l.ffn_up.tensor_type && grb == urb {
+            // The tiled pair kernel only runs for geometries it has a tiled
+            // copy of; a partial row range can miss that cache, in which case
+            // it returns false with the outputs untouched. Fall through to the
+            // plain GEMMs instead of publishing zeros.
+            done = matmat_pair(
+                &gb[..f * grb],
+                &ub[..f * urb],
+                l.ffn_gate.tensor_type,
+                f,
+                dim,
+                &xn[..b * dim],
+                b,
+                &mut gate[..b * f],
+                &mut up[..b * f],
+            );
+        }
+        if !done {
+            matmat(
+                &gb[..f * grb],
+                l.ffn_gate.tensor_type,
+                f,
+                dim,
+                &xn[..b * dim],
+                b,
+                &mut gate[..b * f],
+            );
+            matmat(
+                &ub[..f * urb],
+                l.ffn_up.tensor_type,
+                f,
+                dim,
+                &xn[..b * dim],
+                b,
+                &mut up[..b * f],
+            );
+        }
+        batched_swiglu(&mut gate[..b * f], &up[..b * f], b, f);
+        for t in 0..b {
+            swg[t * hidden..t * hidden + f].copy_from_slice(&gate[t * f..(t + 1) * f]);
+        }
+        true
+    }
+
+    /// W2 R4 (CPU): its output-feature range of ffn_down off the canonical
+    /// swiGLU rows, into its [b][dim] partial block.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn feat_cpu_down(
+        gguf: &GgufFile,
+        l: &LayerWeights,
+        cfg: &ModelConfig,
+        swg: &[f32],
+        pc: &mut [f32],
+        b: usize,
+        sh: FeatSplit,
+    ) -> bool {
+        let hidden = cfg.hidden_dim;
+        let rb = match Self::feat_row_bytes(l.ffn_down.tensor_type, hidden) {
+            Some(v) => v,
+            None => return false,
+        };
+        Self::feat_warm(gguf, &l.ffn_down, sh.d_cpu, hidden);
+        let bytes = Self::tensor_slice(gguf, &l.ffn_down);
+        matmat(
+            &bytes[..sh.d_cpu * rb],
+            l.ffn_down.tensor_type,
+            sh.d_cpu,
+            hidden,
+            &swg[..b * hidden],
+            b,
+            &mut pc[..b * sh.d_cpu],
+        );
+        true
+    }
+
+    /// W2: the CPU's view of the residual state - x_slab + (j < n_a ? pa : pb).
+    /// Same f32 add, same operand order as the GPU's resid_split_add_f32, so
+    /// the two copies of x agree bit for bit without a copy-back.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(clippy::too_many_arguments)]
+    fn feat_fold(
+        dst: &mut [f32],
+        slab: &[f32],
+        x_off: usize,
+        pa_off: usize,
+        pb_off: usize,
+        b: usize,
+        cols: usize,
+        n_a: usize,
+        n_b: usize,
+    ) {
+        for t in 0..b {
+            let xr = &slab[x_off + t * cols..x_off + (t + 1) * cols];
+            let d = &mut dst[t * cols..(t + 1) * cols];
+            if n_b == 0 {
+                d.copy_from_slice(xr);
+                continue;
+            }
+            let ar = &slab[pa_off + t * n_a..pa_off + (t + 1) * n_a];
+            let br = &slab[pb_off + t * n_b..pb_off + (t + 1) * n_b];
+            for j in 0..n_a {
+                d[j] = xr[j] + ar[j];
+            }
+            for j in 0..n_b {
+                d[n_a + j] = xr[n_a + j] + br[j];
+            }
+        }
+    }
+
+    /// W2: entry point from the chunk dispatcher (mirrors
+    /// gpu_forward_prefill_split: the GPU client leaves self for the duration,
+    /// so the CPU arm can hold its own batch buffers).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[inline(never)]
+    fn gpu_forward_prefill_feat(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        sh: FeatSplit,
+        want_logits: bool,
+    ) -> bool {
+        if start_pos + tokens.len() > self.config.max_seq_len {
+            return false;
+        }
+        let mut gpu = match self.gpu.take() {
+            Some(g) => g,
+            None => return false,
+        };
+        let ok = self.prefill_feat_inner(&mut gpu, tokens, start_pos, sh, want_logits);
+        if !ok {
+            // A rejected round must not leave a command buffer in flight for
+            // the next chunk (or the fall-through route) to trip over.
+            gpu.engine.batch_wait_all();
+        }
+        self.gpu = Some(gpu);
+        ok
+    }
+
+    /// W2: the round loop (see the block comment above for the ordering
+    /// argument). Returns false when a round could not be encoded - the caller
+    /// then falls through to a whole-chunk route, which rewrites the same K/V
+    /// positions idempotently, so a partial pass is never observable.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[inline(never)]
+    fn prefill_feat_inner(
+        &mut self,
+        g: &mut GgufGpu,
+        tokens: &[u32],
+        start_pos: usize,
+        sh: FeatSplit,
+        want_logits: bool,
+    ) -> bool {
+        let b = tokens.len();
+        let dim = self.config.dim;
+        let hidden = self.config.hidden_dim;
+        let n_heads = self.config.n_heads;
+        let hd = self.config.head_dim;
+        let q_rows = n_heads * hd;
+        let n_layers = self.config.n_layers;
+        let vocab_size = self.config.vocab_size;
+        let (hc, kc) = (sh.hc, sh.kc);
+        let (o_cpu, f_cpu, d_cpu) = (sh.o_cpu, sh.f_cpu, sh.d_cpu);
+        let (o_gpu, d_gpu) = (dim - o_cpu, dim - d_cpu);
+        if b == 0 || b > 128 || q_rows == 0 || n_layers == 0 {
+            return false;
+        }
+        // slab exchange blocks, in f32 ELEMENT units
+        let ex = g.slots.x / 4;
+        let exo = g.slots.xo / 4;
+        let epc = g.slots.pc / 4;
+        let eao = g.slots.ao / 4;
+        let eswg = g.slots.swg / 4;
+        let t_pass = std::time::Instant::now();
+        let mut cpu_ns = [0u64; 5];
+        let mut wait_ns = [0u64; 4];
+
+        let dbg = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
+        if dbg {
+        }
+        Self::chain_embed_posb(g, &self.gguf, &self.token_embd, tokens, start_pos, dim, b);
+        if !g.engine.batch_open() {
+            return false;
+        }
+        // Which residual fold the CPU's x view still owes: 0 none, 1 the o
+        // partials, 2 the ffn_down partials.
+        let mut pend = 0u8;
+        for layer_idx in 0..n_layers {
+            let layer = &self.layers[layer_idx];
+            let sw = self.layer_sliding_window(layer_idx);
+            let sink = self.sink_tokens;
+            let last = layer_idx + 1 == n_layers;
+
+            // ── R1: attention (head split) ───────────────────────────────
+            let fold1 = if pend == 2 { Some((d_cpu, d_gpu)) } else { None };
+            if !Self::feat_gpu_attn(g, &self.gguf, layer, &self.config, layer_idx, b, sh, fold1) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+            let t0 = std::time::Instant::now();
+            {
+                let na = if pend == 2 { d_cpu } else { dim };
+                let nb = dim - na;
+                let slab: &mut [f32] = &mut g.act[..];
+                Self::feat_fold(&mut self.x_batch[..b * dim], slab, ex, epc, exo, b, dim, na, nb);
+                let ok = Self::feat_cpu_attn(
+                    &self.config,
+                    &self.gguf,
+                    layer,
+                    &mut self.k_cache,
+                    &mut self.v_cache,
+                    &self.x_batch[..b * dim],
+                    &mut self.x_norm_batch[..b * dim],
+                    &mut self.q_batch[..b * hc * hd],
+                    &mut self.k_batch[..b * kc * hd],
+                    &mut self.v_batch[..b * kc * hd],
+                    &mut self.head_out_batch[..b * hc * hd],
+                    // its heads land in the head_out slot, at its own column
+                    // slice (the GPU writes the suffix of the same block)
+                    &mut slab[eao..],
+                    b,
+                    start_pos,
+                    layer_idx,
+                    sw,
+                    sink,
+                    sh,
+                );
+                if !ok {
+                    return false;
+                }
+            }
+            cpu_ns[0] += t0.elapsed().as_nanos() as u64;
+            let tw = std::time::Instant::now();
+            let wok = g.engine.batch_wait_all();
+            wait_ns[0] += tw.elapsed().as_nanos() as u64;
+            if !wok {
+                return false;
+            }
+            pend = 0;
+            if !g.engine.batch_open_async() {
+                return false;
+            }
+
+            // ── R2: o projection (output-feature split) ──────────────────
+            if !Self::feat_gpu_oproj(g, &self.gguf, layer, &self.config, b, sh) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+            let t0 = std::time::Instant::now();
+            {
+                let slab: &mut [f32] = &mut g.act[..];
+                let (left, right) = slab.split_at_mut(epc);
+                let ok = Self::feat_cpu_oproj(
+                    &self.gguf,
+                    layer,
+                    &self.config,
+                    &left[eao..eao + b * q_rows],
+                    &mut right[..b * o_cpu],
+                    b,
+                    sh,
+                );
+                if !ok {
+                    return false;
+                }
+            }
+            cpu_ns[1] += t0.elapsed().as_nanos() as u64;
+            let tw = std::time::Instant::now();
+            let wok = g.engine.batch_wait_all();
+            wait_ns[1] += tw.elapsed().as_nanos() as u64;
+            if !wok {
+                return false;
+            }
+            pend = 1;
+            if !g.engine.batch_open_async() {
+                return false;
+            }
+
+            // ── R3: ffn gate/up + SwiGLU (output-feature split) ──────────
+            if !Self::feat_gpu_ffn(g, &self.gguf, layer, &self.config, b, sh) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+            let t0 = std::time::Instant::now();
+            {
+                let slab: &mut [f32] = &mut g.act[..];
+                Self::feat_fold(
+                    &mut self.x_batch[..b * dim],
+                    slab,
+                    ex,
+                    epc,
+                    exo,
+                    b,
+                    dim,
+                    o_cpu,
+                    o_gpu,
+                );
+                let wnorm = Self::feat_f32w(&self.gguf, &layer.ffn_norm, dim);
+                batched_rmsnorm(
+                    &mut self.x_norm_batch[..b * dim],
+                    &self.x_batch[..b * dim],
+                    wnorm,
+                    b,
+                    dim,
+                    self.config.norm_eps,
+                );
+                let (_, right) = slab.split_at_mut(eswg);
+                let ok = Self::feat_cpu_ffn(
+                    &self.gguf,
+                    layer,
+                    &self.config,
+                    &self.x_norm_batch[..b * dim],
+                    &mut self.ffn_gate_batch[..b * f_cpu],
+                    &mut self.ffn_up_batch[..b * f_cpu],
+                    &mut right[..b * hidden],
+                    b,
+                    sh,
+                );
+                if !ok {
+                    return false;
+                }
+            }
+            cpu_ns[2] += t0.elapsed().as_nanos() as u64;
+            let tw = std::time::Instant::now();
+            let wok = g.engine.batch_wait_all();
+            wait_ns[2] += tw.elapsed().as_nanos() as u64;
+            if !wok {
+                return false;
+            }
+            pend = 0;
+            if !g.engine.batch_open_async() {
+                return false;
+            }
+
+            // ── R4: ffn_down (output-feature split) ─────────────────────
+            if !Self::feat_gpu_down(g, &self.gguf, layer, &self.config, b, sh) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+            let t0 = std::time::Instant::now();
+            {
+                let slab: &mut [f32] = &mut g.act[..];
+                let (left, right) = slab.split_at_mut(eswg);
+                let ok = Self::feat_cpu_down(
+                    &self.gguf,
+                    layer,
+                    &self.config,
+                    &right[..b * hidden],
+                    &mut left[epc..epc + b * d_cpu],
+                    b,
+                    sh,
+                );
+                if !ok {
+                    return false;
+                }
+            }
+            cpu_ns[3] += t0.elapsed().as_nanos() as u64;
+            let tw = std::time::Instant::now();
+            let wok = g.engine.batch_wait_all();
+            wait_ns[3] += tw.elapsed().as_nanos() as u64;
+            if !wok {
+                return false;
+            }
+            pend = 2;
+            if !last || want_logits {
+                if !g.engine.batch_open_async() {
+                    return false;
+                }
+            }
+        }
+
+        if want_logits {
+            // The last layer's ffn_down partials are still unfolded; the head
+            // is the final reader of x, so the fold rides in its buffer.
+            if !g.engine.batch_resid_split_add_f32(
+                &g.act_buf,
+                g.slots.x / 4,
+                &g.act_buf,
+                g.slots.pc / 4,
+                d_cpu,
+                &g.act_buf,
+                g.slots.xo / 4,
+                d_gpu,
+                dim,
+                b,
+            ) {
+                return false;
+            }
+            if !Self::chain_head_into(
+                g,
+                &self.gguf,
+                &self.output,
+                &self.output_norm,
+                &self.config,
+                b,
+                Some(b - 1),
+            ) {
+                return false;
+            }
+            if !g.engine.batch_commit_async() {
+                return false;
+            }
+        }
+        if !g.engine.batch_wait_all() {
+            return false;
+        }
+        let wall_us = t_pass.elapsed().as_micros() as u64;
+        if want_logits {
+            self.logits[0..vocab_size].copy_from_slice(g.slot_f32(g.slots.logits, vocab_size));
+            self.spec_rows_valid = false;
+        }
+        if std::env::var_os("SOFUU_GPU_PROFILE").is_some() {
+            eprintln!(
+                "[gpu-profile] feat-chunk: start={} b={} heads_cpu={}/{} o_cpu={}/{} f_cpu={}/{} d_cpu={}/{} wall={}us cpu_arm={}us r1={}us r2={}us r3={}us r4={}us wait={}us w1={}us w2={}us w3={}us w4={}us",
+                start_pos,
+                b,
+                hc,
+                n_heads,
+                o_cpu,
+                dim,
+                f_cpu,
+                hidden,
+                d_cpu,
+                dim,
+                wall_us,
+                cpu_ns.iter().sum::<u64>() / 1000,
+                cpu_ns[0] / 1000,
+                cpu_ns[1] / 1000,
+                cpu_ns[2] / 1000,
+                cpu_ns[3] / 1000,
+                wait_ns.iter().sum::<u64>() / 1000,
+                wait_ns[0] / 1000,
+                wait_ns[1] / 1000,
+                wait_ns[2] / 1000,
+                wait_ns[3] / 1000,
+            );
+        }
+        true
+    }
+
     /// W1 CPU+GPU row split: ONE chain layer over b contiguous slab rows
     /// (slab row t = token t of this pass, its position start_pos + t). This is
     /// the body of gpu_forward_chain_core's layer loop moved verbatim into its
@@ -5830,6 +7023,15 @@ struct GgufGpuSlots {
     va: usize,
     ao: usize,
     xo: usize,
+    /// W2 feature split: the CPU arm's residual partial block ([b][dim] f32,
+    /// compact: the CPU's output-feature range of attn_output / ffn_down) -
+    /// the other half of the pair whose GPU half lands in xo.
+    pc: usize,
+    /// W2 feature split: the canonical [b][hidden] SwiGLU rows. The CPU arm
+    /// owns a prefix, the GPU arm a suffix, both written in place, so ffn_down
+    /// (an output-feature split: its rows read the whole swiGLU row) sees one
+    /// contiguous block on either engine.
+    swg: usize,
     gate: usize,
     up: usize,
     logits: usize,
@@ -5855,6 +7057,19 @@ struct PrefillSlots {
     rope: usize,
     xq8: usize,
     logits: usize,
+}
+
+/// W2 CPU+GPU feature split: which slice of every projection each engine
+/// owns. CPU owns q heads [0, hc) (and so KV heads [0, hc/group)), and output
+/// features [0, n) of attn_output / ffn_gate+ffn_up / ffn_down.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(Clone, Copy, Debug)]
+struct FeatSplit {
+    hc: usize,
+    kc: usize,
+    o_cpu: usize,
+    f_cpu: usize,
+    d_cpu: usize,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -6026,6 +7241,9 @@ const SPEC_B: usize = 128;
             va: gguf_gpu_slot(&mut cursor, SPEC_B * kv_rows),
             ao: gguf_gpu_slot(&mut cursor, SPEC_B * q_rows),
             xo: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            // W2 feature split exchange blocks (~2MB on a 0.6B, paid once).
+            pc: gguf_gpu_slot(&mut cursor, SPEC_B * dim),
+            swg: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
             gate: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
             up: gguf_gpu_slot(&mut cursor, SPEC_B * inter.max(dim)),
             logits: gguf_gpu_slot(&mut cursor, SPEC_B * vocab),

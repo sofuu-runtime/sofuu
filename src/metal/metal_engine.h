@@ -242,6 +242,12 @@ void sofuu_metal_batch_mlx4(void* ctx, void* w_buf, size_t w_offset, void* s_buf
 // slot-to-slot inside one encoder, one commit per batch (see infer/metal.rs).
 int sofuu_metal_batch_add(void* ctx, void* acc_buf, size_t acc_offset, void* add_buf, size_t add_offset, size_t n);
 int sofuu_metal_batch_swiglu(void* ctx, void* g_buf, size_t g_offset, void* u_buf, size_t u_offset, size_t n);
+// W2 CPU+GPU feature split glue (SOFUU_SPLIT_AXIS=feat): place a compact
+// [rows][n] block into a column slice of a canonical [rows][stride] block, and
+// fold a two-owner residual partial pair into y. Offsets and strides are f32
+// ELEMENT counts into the bound buffers.
+int sofuu_metal_batch_strided_copy_f32(void* ctx, void* dst_buf, size_t dst_offset, size_t dst_stride, void* src_buf, size_t src_offset, size_t src_stride, size_t n, size_t rows);
+int sofuu_metal_batch_resid_split_add_f32(void* ctx, void* y_buf, size_t y_offset, void* pa_buf, size_t pa_offset, size_t n_a, void* pb_buf, size_t pb_offset, size_t n_b, size_t cols, size_t rows);
 void sofuu_metal_batch_rmsnorm(void* ctx, void* x_buf, size_t x_offset, void* w_buf, size_t w_offset, void* y_buf, size_t y_offset, size_t dim, float eps);
 void sofuu_metal_batch_conv_gate(void* ctx, void* bcx_buf, size_t bcx_offset, void* conv_w_buf, size_t conv_w_offset, void* state_buf, size_t state_offset, void* out_buf, size_t out_offset, size_t dim);
 void sofuu_metal_batch_kv_write(void* ctx, void* k_buf, size_t k_offset, void* v_buf, size_t v_offset, void* kc_buf, size_t kc_layer_offset, void* vc_buf, size_t vc_layer_offset, void* kln_buf, size_t kln_offset, uint32_t pos, uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq, float eps, float rope_base);

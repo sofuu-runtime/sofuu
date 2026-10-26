@@ -206,6 +206,57 @@ kernel void add_inplace(
     acc[id] += add[id];
 }
 
+// ── W2 feature split: place a compact [rows][n] block into a column slice ──
+// The output-feature split has each engine compute a CONTIGUOUS range of
+// output features, which every GEMM writes compact ([rows][n]); the consumer
+// of that range reads the CANONICAL [rows][stride] layout (the o projection
+// wants the whole head_out row, ffn_down the whole swiGLU row). This is that
+// placement: dst[dst_off + r*dst_stride + j] = src[src_off + r*src_stride + j].
+kernel void strided_copy_f32(
+    device float       *dst          [[buffer(0)]],
+    constant uint      &dst_off      [[buffer(1)]],
+    constant uint      &dst_stride   [[buffer(2)]],
+    device const float *src          [[buffer(3)]],
+    constant uint      &src_off      [[buffer(4)]],
+    constant uint      &src_stride   [[buffer(5)]],
+    constant uint      &n            [[buffer(6)]],
+    constant uint      &rows         [[buffer(7)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint ti                             [[thread_index_in_threadgroup]]
+) {
+    uint id = (tg.y * 1024u + tg.x) * 256u + ti;
+    if (id >= n * rows) { return; }
+    uint r = id / n;
+    uint j = id - r * n;
+    dst[dst_off + (size_t)r * dst_stride + j] = src[src_off + (size_t)r * src_stride + j];
+}
+
+// ── W2 feature split: residual add from a two-owner partial pair ───────────
+// y[t][j] += (j < n_a) ? pa[t][j] : pb[t][j - n_a]
+// The o / ffn_down projections of a layer are split by OUTPUT feature, so
+// engine A owns columns [0, n_a) and engine B owns [n_a, n_a + n_b). Both
+// partials are whole [rows][n] blocks; this single pass folds them into the
+// residual, which keeps x single-writer (this kernel) - that is what makes the
+// two engines' x copies identical without an extra barrier.
+kernel void resid_split_add_f32(
+    device float       *y            [[buffer(0)]],
+    device const float *pa           [[buffer(1)]],
+    constant uint      &n_a          [[buffer(2)]],
+    device const float *pb           [[buffer(3)]],
+    constant uint      &n_b          [[buffer(4)]],
+    constant uint      &cols         [[buffer(5)]],
+    constant uint      &rows         [[buffer(6)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint ti                             [[thread_index_in_threadgroup]]
+) {
+    uint id = (tg.y * 1024u + tg.x) * 256u + ti;
+    if (id >= cols * rows) { return; }
+    uint r = id / cols;
+    uint j = id - r * cols;
+    float p = (j < n_a) ? pa[(size_t)r * n_a + j] : pb[(size_t)r * n_b + (j - n_a)];
+    y[(size_t)r * cols + j] += p;
+}
+
 kernel void conv1d_3(
     device const uchar *conv_w_base     [[buffer(0)]],
     device const float *state           [[buffer(1)]],

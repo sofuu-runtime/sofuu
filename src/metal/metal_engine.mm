@@ -24,6 +24,9 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_conv1d_3;
     // GPU1: in-batch glue kernels (whole-decode-step batches).
     id<MTLComputePipelineState> pso_add_inplace;
+    // W2 CPU+GPU feature split: compact-range placement + two-owner residual.
+    id<MTLComputePipelineState> pso_strided_copy_f32;
+    id<MTLComputePipelineState> pso_resid_split_add_f32;
     id<MTLComputePipelineState> pso_lfm2_conv_gate;
     id<MTLComputePipelineState> pso_lfm2_kv_write;
     id<MTLComputePipelineState> pso_lfm2_attn;
@@ -429,6 +432,8 @@ void* sofuu_metal_init(void) {
         ctx->pso_swiglu    = load_pso(@"swiglu");
         ctx->pso_conv1d_3  = load_pso(@"conv1d_3");
         ctx->pso_add_inplace     = load_pso(@"add_inplace");
+        ctx->pso_strided_copy_f32    = load_pso(@"strided_copy_f32");
+        ctx->pso_resid_split_add_f32 = load_pso(@"resid_split_add_f32");
         ctx->pso_lfm2_conv_gate  = load_pso(@"lfm2_conv_gate");
         ctx->pso_lfm2_kv_write   = load_pso(@"lfm2_kv_write");
         ctx->pso_lfm2_attn       = load_pso(@"lfm2_attn");
@@ -2949,6 +2954,79 @@ int sofuu_metal_batch_swiglu(
     return 1;
 }
 
+// ── W2 CPU+GPU feature split glue ─────────────────────────────────────────
+// strided_copy_f32: place a compact [rows][n] block into a column slice of the
+// canonical [rows][dst_stride] layout. Offsets AND strides are f32 ELEMENT
+// counts into the bound buffers (the kernels index a device float*).
+int sofuu_metal_batch_strided_copy_f32(
+    void* ctx_ptr,
+    void* dst_buf_ptr, size_t dst_offset,
+    size_t dst_stride,
+    void* src_buf_ptr, size_t src_offset,
+    size_t src_stride,
+    size_t n, size_t rows
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !dst_buf_ptr || !src_buf_ptr || n == 0 || rows == 0) return 0;
+    if (ctx->pso_strided_copy_f32 == nil) return 0;
+    sofuu_batch_barrier(ctx);
+    uint doff = (uint)dst_offset, dstr = (uint)dst_stride;
+    uint soff = (uint)src_offset, sstr = (uint)src_stride;
+    uint un = (uint)n, rn = (uint)rows;
+    size_t total = n * rows;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_strided_copy_f32];
+    // off/stride are ELEMENT offsets relative to the (byte) buffer bindings.
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)dst_buf_ptr offset:0 atIndex:0];
+    [ctx->batch_enc setBytes:&doff length:sizeof(uint) atIndex:1];
+    [ctx->batch_enc setBytes:&dstr length:sizeof(uint) atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)src_buf_ptr offset:0 atIndex:3];
+    [ctx->batch_enc setBytes:&soff length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&sstr length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&un length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:7];
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((total + 255) / 256))
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
+// resid_split_add_f32: y += (j < n_a ? pa : pb) over rows x cols.
+int sofuu_metal_batch_resid_split_add_f32(
+    void* ctx_ptr,
+    void* y_buf_ptr, size_t y_offset,
+    void* pa_buf_ptr, size_t pa_offset,
+    size_t n_a,
+    void* pb_buf_ptr, size_t pb_offset,
+    size_t n_b,
+    size_t cols, size_t rows
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || !y_buf_ptr || !pa_buf_ptr || !pb_buf_ptr) return 0;
+    if (ctx->pso_resid_split_add_f32 == nil) return 0;
+    if (cols == 0 || rows == 0 || n_a + n_b != cols) return 0;
+    sofuu_batch_barrier(ctx);
+    // Buffers bind at their region (byte offsets = element offsets * 4), so the
+    // kernel's y/pa/pb are already the three blocks and no offset arithmetic is
+    // needed inside the shader.
+    size_t yb = y_offset * sizeof(float);
+    size_t pab = pa_offset * sizeof(float);
+    size_t pbb = pb_offset * sizeof(float);
+    uint na = (uint)n_a, nb = (uint)n_b, cn = (uint)cols, rn = (uint)rows;
+    size_t total = cols * rows;
+    [ctx->batch_enc setComputePipelineState:ctx->pso_resid_split_add_f32];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:yb atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pa_buf_ptr offset:pab atIndex:1];
+    [ctx->batch_enc setBytes:&na length:sizeof(uint) atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pb_buf_ptr offset:pbb atIndex:3];
+    [ctx->batch_enc setBytes:&nb length:sizeof(uint) atIndex:4];
+    [ctx->batch_enc setBytes:&cn length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&rn length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d((uint)((total + 255) / 256))
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
 // Slot-based RMSNorm (w is bf16 in the model buffer) reusing the per-op
 // `rmsnorm` kernel with caller offsets.
 void sofuu_metal_batch_rmsnorm(
@@ -4468,6 +4546,8 @@ int sofuu_metal_batch_wait_all(void* ctx) { (void)ctx; return 0; }
 void sofuu_metal_batch_mlx4(void* ctx, void* w, size_t wo, void* s, size_t so, void* b, size_t bo, void* x, size_t xo, void* y, size_t yo, size_t r, size_t c, size_t g, int bf) { (void)ctx;(void)w;(void)wo;(void)s;(void)so;(void)b;(void)bo;(void)x;(void)xo;(void)y;(void)yo;(void)r;(void)c;(void)g;(void)bf; }
 void sofuu_metal_batch_gemv_staged(void* ctx, void* w, size_t wo, const float* x, void* y, size_t yo, size_t r, size_t c, int d) { (void)ctx;(void)w;(void)wo;(void)x;(void)y;(void)yo;(void)r;(void)c;(void)d; }
 int sofuu_metal_batch_add(void* ctx, void* acc, size_t ao, void* add, size_t ado, size_t n) { (void)ctx;(void)acc;(void)ao;(void)add;(void)ado;(void)n; return 0; }
+int sofuu_metal_batch_strided_copy_f32(void* ctx, void* d, size_t dob, size_t ds, void* s, size_t sob, size_t ss, size_t n, size_t r) { (void)ctx;(void)d;(void)dob;(void)ds;(void)s;(void)sob;(void)ss;(void)n;(void)r; return 0; }
+int sofuu_metal_batch_resid_split_add_f32(void* ctx, void* y, size_t yo, void* pa, size_t pao, size_t na, void* pb, size_t pbo, size_t nb, size_t c, size_t r) { (void)ctx;(void)y;(void)yo;(void)pa;(void)pao;(void)na;(void)pb;(void)pbo;(void)nb;(void)c;(void)r; return 0; }
 int sofuu_metal_batch_swiglu(void* ctx, void* g, size_t go, void* u, size_t uo, size_t n) { (void)ctx;(void)g;(void)go;(void)u;(void)uo;(void)n; return 0; }
 void sofuu_metal_batch_rmsnorm(void* ctx, void* x, size_t xo, void* w, size_t wo, void* y, size_t yo, size_t dim, float eps) { (void)ctx;(void)x;(void)xo;(void)w;(void)wo;(void)y;(void)yo;(void)dim;(void)eps; }
 void sofuu_metal_batch_conv_gate(void* ctx, void* bcx, size_t bco, void* cw, size_t cwo, void* st, size_t sto, void* out, size_t oo, size_t dim) { (void)ctx;(void)bcx;(void)bco;(void)cw;(void)cwo;(void)st;(void)sto;(void)out;(void)oo;(void)dim; }

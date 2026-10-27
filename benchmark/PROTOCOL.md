@@ -57,6 +57,7 @@ kernel's GPUStartTime/GPUEndTime barely moves.
   be compared bit for bit — `SOFUU_DUMP_LOGITS` only ever covered prefill, which
   never runs a b=1 GEMV.
 
+<<<<<<< ours
 ## Closed: ANE forward-path offload (do not re-attempt without new hardware)
 
 Measured twice, on real weights and real engine hidden states, and rejected both times. Recorded here
@@ -102,3 +103,92 @@ Conclusion: on this M2 Pro, with a correct fp16 implementation and the seam cost
 beat the GPU for either prefill or decode of this workload. The machine's usable structure is GPU + CPU
 together, one commit per token, which is what ships. Keep /tmp/ane-lab scripts (bench.swift, build_ffn.py,
 chain28.py, RESULTS.md) for a future SoC where the seam or the bandwidth ratio differs.
+=======
+### Fusing projection dispatches (`SOFUU_GEMV_SECS`) — bit-exact, and a measured loss
+
+196 of a decode token's 254 dispatches are the per-layer projections, so the
+question is whether a stage can share one grid. Only same-x, disjoint-output
+groups can, and only when they need the **same thread-group geometry**:
+
+* this model's stage is `q(12) k(12) v(14)`, `o(12)`, `gate(12) up(12)`,
+  `down(14)` (`ffn_down` and `attn_v` are the q6_K ones — check the GGUF, not the
+  family reputation), and `lm_head` is q6_K;
+* q4_K's bit-exact body (`gemv_q4_k_b1v2`) needs 256 threads/group with `rpt` rows
+  per group; q6_K's (`gemv_q6_k`) needs 32 threads/group with **one** row. A
+  dispatch has one thread-group size, so q(12)+k(12) can fuse and k(12)+v(14)
+  cannot, and "one dispatch per layer" is not expressible at all without a
+  grid-wide barrier;
+* so the floor for this graph is **7 -> 5 per layer, 196 -> 140 per token**, and
+  `=1` reaches exactly that.
+
+The sectioned kernels keep each section's shipped body verbatim
+(`gemv_q4_k_secs2`, `gemv_q6_k_secs`), and the dispatch counter confirms the
+counts. Measured with `SOFUU_GPU_TRACE=1`, which prints
+`[proj-dispatch] N projection dispatches this token`:
+
+| arm | dispatches/token | dump md5 | 64-token md5 |
+|---|---|---|---|
+| frozen (`=0`) | **196** | `8f6739367691258cc4268f9ccf3b79e2` | `39703b5415de4eb91da72370c006be31` |
+| `=qkv` (q+k fused) | **168** | identical | identical |
+| `=gu` (gate+up fused) | **168** | identical | identical |
+| `=1` (both) | **140** | identical | identical |
+
+So the fusion is bit-exact by construction and in fact. It is also **slower** —
+paired in-token device time, 3 runs per arm:
+
+| arm | short prompt | 1427-token prompt |
+|---|---|---|
+| frozen (`=0`) | 6551 us | 10052 us |
+| `=qkv` | 6855 us (**+4.6%**) | 10397 us (+3.4%) |
+| `=gu` | 6960 us (**+6.2%**) | 10437 us (+3.8%) |
+| `=1` | 6969 us (**+6.4%**) | 10533 us (+4.8%) |
+
+Both fused stages carry the same penalty, and it is far larger than the ramp it
+removes: gate+up is 99 MB of the token's stream (~1.3 ms of work at 74 GB/s), and
+fusing it costs +409 us, i.e. **~30% on that work**, while deleting one dispatch
+per layer. The sectioned kernel is therefore intrinsically slower than the shipped
+per-projection kernel (most likely register pressure: it carries the section
+prologue and dynamic `rows`/offsets into the same body), and the per-dispatch ramp
+it was meant to recover is already hidden behind the GEMV stream. Conclusion: the
+default stays the frozen path, `=qkv`/`=gu` remain opt-in for anyone re-testing
+the idea, and **`=gu` should not be armed**. What would make fusion pay is a
+sectioned kernel that matches `gemv_q4_k_b1v2`'s occupancy — the ramp is worth
+less than 4% of a projection's own time, so the kernel has to be free.
+
+### Why there is no `numeric_effect=yes` arm in the decode path
+
+The first candidate was the Q6_K head: `gemv_q6_k` gives a row to a whole
+32-lane simdgroup, but a 1024-column row is 4 blocks, so lanes 4-31 retire
+immediately and 7/8 of every warp is idle on 19% of the token. Packing 8 rows per
+warp (4 lanes each, one block per lane, butterfly sum) was built and measured:
+
+| | frozen `gemv_q6_k` | 8 rows/warp |
+|---|---|---|
+| decode dump md5 | `8f6739367691258cc4268f9ccf3b79e2` | `46055397b582b654e98ba196c12eb2fb` |
+| max abs dlogit | none | **7.63e-06** on `|logit|` 17.1, mean 1.11e-06 |
+| logits differing | none | 143419 / 151936 |
+| argmax | reference | same |
+| 64-token text | `39703b5415de4eb91da72370c006be31` | identical |
+| head plan, 1021 MB, device time | 9381 us = **108.8 GB/s** | 44043 us = **23.2 GB/s** |
+| full plan, 262.9 MB | 3560 us = 73.8 GB/s | 5259 us = 50.0 GB/s |
+| per-token device time | 6589 us | 12564 us (+90.7%) |
+
+The arm is **0.213x**: interleaving 8 rows per warp turns each warp's contiguous
+840-byte row stream into eight streams 840 bytes apart, so the lanes that stop
+retiring are paid for with coalescing, which costs more. The frozen kernel sits at
+108.8 GB/s against the ~117 GB/s zero-math ceiling for that mapping, i.e. the idle
+lanes were never what limited it. The arm was therefore deleted rather than
+shipped behind a flag: no decode-path kernel with a relaxed determinism tier
+ships, and the only numeric knob this work added (`SOFUU_GEMV_SECS`) is backed by
+bit-identical receipts, so its determinism tier is `exact`.
+
+**The rule this leaves behind**, for whoever arms the next one: a decode arm may
+change logits by ~1 ULP (about 1e-05 absolute at a logit magnitude of ~17) only
+while (a) the argmax is unchanged on the decode dump, (b) the 64-token text md5 is
+unchanged, and (c) the doc carries both arms' md5s. That tolerance is three orders
+of magnitude below the engine's own activation quantisation (Q8_K, ~1.4e-02
+relative), so it cannot move a sampling decision that quantisation does not
+already move; what it does move is *reproducibility* — a bit-exact replay claim
+requires the flag off, and the arm id has to be recorded with any receipt that
+used it.
+>>>>>>> theirs

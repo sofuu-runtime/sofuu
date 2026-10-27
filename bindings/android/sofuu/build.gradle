@@ -140,12 +140,16 @@ afterEvaluate {
     signing {
         // Signing is mandatory only when the operator asks for it. A local
         // publish must still work on a fresh checkout.
-        required { System.getenv('REQUIRE_SIGNING') == '1' }
+        def requireSigning = System.getenv('REQUIRE_SIGNING') == '1'
+        required { requireSigning }
         def signingKey = System.getenv('MAVEN_SIGNING_KEY') ?: project.findProperty('signingKey')
         def signingPassword = System.getenv('MAVEN_SIGNING_PASSWORD') ?: project.findProperty('signingPassword')
         if (signingKey && signingPassword) {
             useInMemoryPgpKeys(signingKey.toString(), signingPassword.toString())
             sign publishing.publications.release
+        } else if (requireSigning) {
+            throw new GradleException(
+                'REQUIRE_SIGNING=1 needs MAVEN_SIGNING_KEY and MAVEN_SIGNING_PASSWORD')
         }
     }
 }

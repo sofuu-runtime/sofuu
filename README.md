@@ -425,6 +425,34 @@ curl -s localhost:7707/v1/chat/completions \
 
 ---
 
+## Conformance, stability and adoption
+
+Sofuu publishes receipts, not claims:
+
+- **[Contract suite](contract/CONFORMANCE.md)** — 52 clauses, currently
+  42 PASS / 0 FAIL / 10 BLOCKED across the platform matrix; the same page
+  carries the live capability posture and the stability index.
+- **[Surface matrix](contract/SURFACE-MATRIX.md)** — all 48 (primitive × surface)
+  cells with status, missing operations and evidence.
+- **[Stability index](contract/STABILITY-INDEX.md)** — T1 (guaranteed), T2
+  (supported), T3 (experimental) for every public symbol.
+- **[Performance scoreboard](contract/SCOREBOARD.md)** — the inference-parity
+  engineering ledger against llama.cpp, fed by real sweep receipts.
+- **[Adoption loop](contract/adoption/README.md)** — the P6 protocol and the
+  external-deployment ledger.
+
+Reproduce any of it from a checkout:
+
+```bash
+make && make libsofuu
+bash scripts/contract/run_contract_tests.sh      # the 52-case board
+bash scripts/verify-dist.sh dist ./sofuu         # install integrity
+bash scripts/conformance_report.sh               # merged release report
+python3 scripts/scoreboard.py --check --live-report dist/conformance-report.json
+```
+
+---
+
 ## Embed Sofuu (libsofuu)
 
 ```swift

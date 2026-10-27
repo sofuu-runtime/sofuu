@@ -13,10 +13,15 @@ Created in **P0** (2026-10-23 audit). Nothing here changes runtime behavior.
 | [`PROGRESS.md`](PROGRESS.md) | Live phase status, suite results, verification provenance |
 | [`matrix.json`](matrix.json) | Source of truth for the 48-cell surface matrix (8 primitives × 6 surfaces), with per-cell status, missing operations, evidence and test ids |
 | [`SURFACE-MATRIX.md`](SURFACE-MATRIX.md) | Generated, readable matrix + per-cell detail |
-| [`stability.json`](stability.json) | Source of truth for the T1/T2/T3 stability index (34 C ABI exports, 21 CLI commands, 11 HTTP routes, 23 JS namespaces, 43 config keys — 132 entries) |
+| [`stability.json`](stability.json) | Source of truth for the T1/T2/T3 stability index (34 C ABI exports, 21 CLI commands, 11 HTTP routes, 25 JS namespaces, 43 config keys — 134 entries) |
 | [`STABILITY-INDEX.md`](STABILITY-INDEX.md) | Generated stability tables |
 | [`knobs.json`](knobs.json) | Generated inventory of every directly-read `SOFUU_*` env knob (123), with class and numeric-effect decision |
 | [`KNOBS.md`](KNOBS.md) | Generated knob table |
+| [`CONFORMANCE.md`](CONFORMANCE.md) | **Published** conformance + stability + adoption summary (generated) |
+| [`SCOREBOARD.md`](SCOREBOARD.md) | **Published** llama.cpp parity scoreboard (generated) |
+| [`scoreboard.json`](scoreboard.json) | Machine-readable digest of the two published pages (generated) |
+| [`scoreboard/`](scoreboard/README.md) | Tracked sources: parity receipts, conformance snapshots, regression baseline |
+| [`adoption/`](adoption/README.md) | P6 external-adoption protocol + ledger (`ledger.json` → generated `LEDGER.md`) |
 
 **Rule:** edit the JSON, then regenerate. Never hand-edit the generated `.md`.
 
@@ -24,6 +29,8 @@ Created in **P0** (2026-10-23 audit). Nothing here changes runtime behavior.
 
 ```bash
 python3 scripts/contract/gen_contract_docs.py
+python3 scripts/scoreboard.py          # CONFORMANCE.md, SCOREBOARD.md, LEDGER.md
+python3 scripts/scoreboard.py --check  # the CI gate (drift + regressions)
 ```
 
 The generator validates before writing:
@@ -65,11 +72,11 @@ artifact checks that already hold (matrix completeness, ABI gate presence).
 The runner exits non-zero until the contract is implemented — that is the
 intended signal, not a defect in the runner.
 
-Current state (2026-10-25): **12 PASS · 4 FAIL · 36 BLOCKED** — P1 is fully
-complete, including the committed fixture model running the two-route exact
-gate in CI (T3.3) and the demonstrated FORK enforcement (exit 3). See
-[`PROGRESS.md`](PROGRESS.md) for the per-test detail, what landed in P1, and
-the memory-clobber finding.
+Current state (2026-10-27): **42 PASS · 0 FAIL · 10 BLOCKED** — P0–P5 are
+complete and the platform matrix is green (runs `40457020037` and `40458259877`);
+the 10 remaining cases need harnesses (device round-trip, MCP fixture server,
+failure injection, …). See [`PROGRESS.md`](PROGRESS.md) for the per-test detail
+and the published [`CONFORMANCE.md`](CONFORMANCE.md).
 
 ## P0 findings (2026-10-23)
 

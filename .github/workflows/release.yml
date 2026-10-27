@@ -43,6 +43,14 @@ jobs:
       - name: ABI symbol guard
         run: make abi-check
 
+      # P5/P6: every release ships its own conformance report, and the frozen
+      # regression floor gates the release. `conformance_report.sh` runs the
+      # 52-case suite (report mode) and merges it with the live posture.
+      - name: Conformance report + regression gate (P6)
+        run: |
+          bash scripts/conformance_report.sh dist/conformance-report.json
+          python3 scripts/scoreboard.py --check --live-report dist/conformance-report.json
+
       - name: Create archive
         run: |
           mkdir -p dist
@@ -99,6 +107,10 @@ jobs:
             dist/libsofuu-darwin-arm64.tar.gz.sha256
             dist/libsofuu.xcframework.zip
             dist/libsofuu.xcframework.zip.sha256
+            dist/conformance-report.json
+            contract/CONFORMANCE.md
+            contract/SCOREBOARD.md
+            contract/scoreboard.json
           generate_release_notes: true
 
       # The stamped Package.swift is the thing consumers actually resolve, so

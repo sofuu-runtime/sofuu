@@ -166,6 +166,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # P6: the published scoreboard/conformance pages must match their tracked
+      # sources, and the fresh report must not regress the frozen floor. This is
+      # the blocking conformance gate even while the suite runner stays in
+      # report mode (10 BLOCKED make its own exit code non-zero).
+      - name: Scoreboard + conformance regression gate (P6)
+        run: python3 scripts/scoreboard.py --check --live-report dist/conformance-report.json
+
       - name: ABI symbol guard
         run: make abi-check
 

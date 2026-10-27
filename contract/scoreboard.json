@@ -1,0 +1,218 @@
+{
+ "adoption": {
+  "deployments": 0,
+  "independent_conformance_proofs": 0,
+  "upgrade_drills": 0
+ },
+ "conformance": {
+  "rows": [
+   {
+    "arch": "aarch64",
+    "blocked": null,
+    "build": "simd (missing: qtsq, metal)",
+    "cases": null,
+    "fail": null,
+    "generated_at": 1793080065,
+    "os": "linux",
+    "pass": null,
+    "platform": "linux-arm64",
+    "posture_ok": true,
+    "verify_dist": null,
+    "version": "0.2.0-beta"
+   },
+   {
+    "arch": "x86_64",
+    "blocked": null,
+    "build": "simd (missing: qtsq, metal)",
+    "cases": null,
+    "fail": null,
+    "generated_at": 1793080040,
+    "os": "linux",
+    "pass": null,
+    "platform": "linux-x86_64",
+    "posture_ok": true,
+    "verify_dist": null,
+    "version": "0.2.0-beta"
+   },
+   {
+    "arch": "aarch64",
+    "blocked": 10,
+    "build": "simd+metal (missing: qtsq)",
+    "cases": 52,
+    "fail": 0,
+    "generated_at": 1793080233,
+    "os": "macos",
+    "pass": 42,
+    "platform": "macos-arm64",
+    "posture_ok": true,
+    "verify_dist": "ok",
+    "version": "0.2.0-beta"
+   }
+  ],
+  "versions": [
+   "0.2.0-beta"
+  ]
+ },
+ "kind": "sofuu-scoreboard",
+ "parity": {
+  "headline": {
+   "Llama-3.2-1B-Q8_0": {
+    "ll_pp": 2055.1,
+    "ll_tg": 121.9,
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,load=1.25",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 7,
+    "sofuu_pp": 128.5,
+    "sofuu_tg": 56.3,
+    "text_exact": null,
+    "ts": "2026-10-22T00:53:58Z"
+   },
+   "Qwen-3-0.6B-Claude-dist-i1": {
+    "ll_pp": 3396.5,
+    "ll_tg": 224.5,
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,load=1.48",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 5,
+    "sofuu_pp": 33.2,
+    "sofuu_tg": 35.7,
+    "text_exact": null,
+    "ts": "2026-10-22T00:53:58Z"
+   },
+   "Qwen-3-0.6B-i1-Q4_K_M": {
+    "ll_pp": 3416.0,
+    "ll_tg": 223.0,
+    "note": "post-wave-2 sweep, ll load 3.0-13, sofuu rows load 11.2-13.1",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 1,
+    "sofuu_pp": 605.0,
+    "sofuu_tg": 23.4,
+    "text_exact": null,
+    "ts": "2026-10-20T09:18:19Z"
+   },
+   "Qwen3-8B-Q4_K_M": {
+    "ll_pp": 264.3,
+    "ll_tg": 31.2,
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,load=2.00",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 7,
+    "sofuu_pp": 2.4,
+    "sofuu_tg": 3.3,
+    "text_exact": null,
+    "ts": "2026-10-22T00:53:58Z"
+   },
+   "Sharp-MiniCPM5-2B-Q6_K_XL": {
+    "ll_pp": 865.0,
+    "ll_tg": 73.0,
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,load=1.41",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 7,
+    "sofuu_pp": 11.5,
+    "sofuu_tg": 9.9,
+    "text_exact": null,
+    "ts": "2026-10-22T00:53:58Z"
+   },
+   "Spark-X2.5-4B-Q4_K_M": {
+    "ll_pp": 461.4,
+    "ll_tg": 51.0,
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,load=2.27",
+    "pass_pp": false,
+    "pass_tg": false,
+    "receipts": 6,
+    "sofuu_pp": 74.3,
+    "sofuu_tg": 31.2,
+    "text_exact": null,
+    "ts": "2026-10-22T00:53:58Z"
+   }
+  },
+  "measured": 6,
+  "models": 12,
+  "pass_pp": 0,
+  "pass_tg": 0,
+  "receipts": 41,
+  "unmeasured": [
+   {
+    "last_ts": "2026-10-21T06:32:15Z",
+    "model": "Llama-3.2-1B-Ins",
+    "note": "post-minbase-fix pinned receipts (full-text gate, fused defaults ON)",
+    "receipts": 1
+   },
+   {
+    "last_ts": "2026-10-22T00:53:58Z",
+    "model": "Phi-4-mini-reasoning-UD-Q6_K_XL",
+    "note": "PHASE-4 deciding sweep (calm 1.1-2.3, PROMPT-DECIDING); chunk=c128,no-route (loader gate),load=1.28",
+    "receipts": 2
+   },
+   {
+    "last_ts": "2026-10-21T06:32:18Z",
+    "model": "Qwen-3-0.6B-Clau",
+    "note": "post-minbase-fix pinned receipts (full-text gate, fused defaults ON)",
+    "receipts": 1
+   },
+   {
+    "last_ts": "2026-10-21T17:33:42Z",
+    "model": "Qwen-3-0.6B-Claude-distilled-i1",
+    "note": "P3 chunk-32 prefill GEMM control, same window as the 51.1 row",
+    "receipts": 2
+   },
+   {
+    "last_ts": "2026-10-21T06:32:45Z",
+    "model": "Sharp-MiniCPM5-2",
+    "note": "post-minbase-fix pinned receipts (full-text gate, fused defaults ON)",
+    "receipts": 1
+   },
+   {
+    "last_ts": "2026-10-21T06:32:31Z",
+    "model": "Spark-X2.5-4B-Q4",
+    "note": "post-minbase-fix pinned receipts (full-text gate, fused defaults ON)",
+    "receipts": 1
+   }
+  ]
+ },
+ "schema": 1,
+ "stability": {
+  "gaps": 7,
+  "surfaces": {
+   "cabi": {
+    "T1": 18,
+    "T2": 16,
+    "T3": 0,
+    "total": 34
+   },
+   "cli": {
+    "T1": 13,
+    "T2": 8,
+    "T3": 0,
+    "total": 21
+   },
+   "config": {
+    "T1": 11,
+    "T2": 27,
+    "T3": 5,
+    "total": 43
+   },
+   "http": {
+    "T1": 6,
+    "T2": 5,
+    "T3": 0,
+    "total": 11
+   },
+   "js": {
+    "T1": 12,
+    "T2": 9,
+    "T3": 4,
+    "total": 25
+   }
+  },
+  "total": {
+   "T1": 60,
+   "T2": 65,
+   "T3": 9,
+   "total": 134
+  }
+ }
+}

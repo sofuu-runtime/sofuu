@@ -1,8 +1,11 @@
 #!/bin/bash
 # P0.1 standing parity harness (llama.cpp-parity program): llama-bench bar vs
-# Sofuu best, same window, per model, pp+tg, appended machine-checkably to
+# Sofuu best, same window, per model, pp+tg, appended machine-checkably to the
+# TRACKED public ledger (contract/scoreboard/parity.jsonl) and the local-only
 # docs/bench/parity.jsonl. Bar = llama.cpp DEFAULT config (Metal offload).
 # Acceptance: sofuu_pp >= ll_pp AND sofuu_tg >= ll_tg.
+# After a sweep: python3 scripts/scoreboard.py && commit the ledger + pages;
+# `scripts/scoreboard.py --check` is the CI regression gate.
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 OUT=/tmp/parity_sweep_run.txt; : > $OUT
@@ -28,7 +31,8 @@ now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 def stat(seg, i):  # i=0 prefill t/s, 1 decode t/s from the engine stats line
     m = re.findall(r"\(([\d.]+) tk/s\)", seg or "")
     return float(m[i]) if len(m) > i else 0.0
-with open(sys.argv[1]) as f, open("docs/bench/parity.jsonl", "a") as out:
+with open(sys.argv[1]) as f, open("docs/bench/parity.jsonl", "a") as out, \
+        open("contract/scoreboard/parity.jsonl", "a") as pub:
     for line in f:
         p = line.strip().split("|")
         if len(p) < 6: continue
@@ -37,6 +41,8 @@ with open(sys.argv[1]) as f, open("docs/bench/parity.jsonl", "a") as out:
         row = {"model": name, "ll_pp": llpp, "ll_tg": lltg, "sofuu_pp": pfx,
                "sofuu_tg": dec, "pass_pp": bool(pfx >= llpp), "pass_tg": bool(dec >= lltg),
                "note": ld, "ts": now}
-        out.write(json.dumps(row) + "\n")
+        payload = json.dumps(row) + "\n"
+        out.write(payload)
+        pub.write(payload)
         print(f"{name}: ll {llpp}/{lltg} vs sofuu {pfx:.1f}/{dec:.1f} -> pp={'PASS' if row['pass_pp'] else 'fail'} tg={'PASS' if row['pass_tg'] else 'fail'} ({ld})")
 PYEOF

@@ -1,0 +1,57 @@
+{
+ "conformance": {
+  "max_fail": 0,
+  "min_cases": 52,
+  "min_pass": 42,
+  "min_reports": 3,
+  "require_posture_ok": true,
+  "require_verify_dist_ok": true
+ },
+ "note": "Frozen acceptance floor. Update deliberately with --freeze-baseline.",
+ "parity": {
+  "Llama-3.2-1B-Q8_0": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 128.5,
+   "tg": 56.3,
+   "ts": "2026-10-22T00:53:58Z"
+  },
+  "Qwen-3-0.6B-Claude-dist-i1": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 33.2,
+   "tg": 35.7,
+   "ts": "2026-10-22T00:53:58Z"
+  },
+  "Qwen-3-0.6B-i1-Q4_K_M": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 605.0,
+   "tg": 23.4,
+   "ts": "2026-10-20T09:18:19Z"
+  },
+  "Qwen3-8B-Q4_K_M": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 2.4,
+   "tg": 3.3,
+   "ts": "2026-10-22T00:53:58Z"
+  },
+  "Sharp-MiniCPM5-2B-Q6_K_XL": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 11.5,
+   "tg": 9.9,
+   "ts": "2026-10-22T00:53:58Z"
+  },
+  "Spark-X2.5-4B-Q4_K_M": {
+   "pass_pp": false,
+   "pass_tg": false,
+   "pp": 74.3,
+   "tg": 31.2,
+   "ts": "2026-10-22T00:53:58Z"
+  }
+ },
+ "parity_tolerance_pct": 10.0,
+ "schema": 1
+}

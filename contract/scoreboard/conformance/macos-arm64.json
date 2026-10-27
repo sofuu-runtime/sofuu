@@ -1,0 +1,421 @@
+{
+ "capability_posture": {
+  "async_contract": {
+   "claimed": "full (P2)",
+   "live": "function",
+   "ok": true
+  },
+  "events": {
+   "claimed": "full (P2)",
+   "live": "function",
+   "ok": true
+  },
+  "memory": {
+   "claimed": "capability-gated",
+   "live": "typed-refusal",
+   "note": "",
+   "ok": true
+  },
+  "policy": {
+   "claimed": "one evaluator (P4)",
+   "live": "function",
+   "ok": true
+  },
+  "session_document": {
+   "claimed": "full (P3)",
+   "live": "function",
+   "ok": true
+  }
+ },
+ "capability_posture_ok": true,
+ "contract_suite": {
+  "blocked": 10,
+  "cases": 52,
+  "fail": 0,
+  "pass": 42,
+  "suite_rc": 1,
+  "violations": [
+   [
+    "T1.2",
+    "needs capabilities on JS+CLI+HTTP+CABI"
+   ],
+   [
+    "T2.6",
+    "needs failure injection"
+   ],
+   [
+    "T3.1",
+    "needs engine.paths"
+   ],
+   [
+    "T3.5",
+    "needs fixture + reference route"
+   ],
+   [
+    "T3.6",
+    "needs default introspection"
+   ],
+   [
+    "T4.2",
+    "needs macOS+Android runners"
+   ],
+   [
+    "T4.4",
+    "needs a committed v0.2 fixture"
+   ],
+   [
+    "T5.6",
+    "needs an MCP fixture server"
+   ],
+   [
+    "T5.8",
+    "needs a four-surface failure harness"
+   ],
+   [
+    "T6.4",
+    "needs cloud+local fixtures"
+   ]
+  ]
+ },
+ "generated_at": 1793080233,
+ "how_to_reproduce": "bash scripts/contract/run_contract_tests.sh; bash scripts/verify-dist.sh; sofuu conformance",
+ "install_integrity": {
+  "runtime_part_ok": true,
+  "script": "scripts/verify-dist.sh (checksums + capabilities-vs-claim + version parity)",
+  "verify_dist": "ok"
+ },
+ "kind": "sofuu-conformance",
+ "manifest": {
+  "build": {
+   "features": [
+    "simd",
+    "metal"
+   ],
+   "missing": [
+    "qtsq"
+   ]
+  },
+  "engine": {
+   "formats": [
+    "gguf",
+    "safetensors",
+    "pt",
+    "npy"
+   ],
+   "kv_modes": [
+    "f16",
+    "kivi4",
+    "kivi2"
+   ],
+   "max_ctx": null,
+   "paths": {
+    "cpu-tiles": {
+     "default": true,
+     "tier": "exact"
+    },
+    "metal-mma": {
+     "bound": "2e-2 abs/scale",
+     "default": false,
+     "tier": "tolerant"
+    },
+    "mmq": {
+     "default": false,
+     "tier": "best-effort"
+    }
+   },
+   "prefill_backends": [
+    "cpu-tiles",
+    "metal-mma"
+   ],
+   "quant_types": [
+    "f32",
+    "f16",
+    "q4_K",
+    "q6_K",
+    "q8_0",
+    "q3_K_S"
+   ]
+  },
+  "model": {
+   "loaded": false
+  },
+  "notes": [
+   "max_ctx is model-dependent; null until a model is loaded",
+   "ram_mb is null when the platform probe is unavailable",
+   "quant_types lists the types with shipped kernels; the loader gate is authoritative"
+  ],
+  "runtime": {
+   "arch": "aarch64",
+   "gpu": {
+    "available": true,
+    "backend": "metal"
+   },
+   "os": "macos",
+   "ram_mb": 7168,
+   "threads": 3,
+   "version": "0.2.0-beta"
+  },
+  "schema": 1,
+  "surfaces": {
+   "cabi": {
+    "agent": {
+     "status": "full"
+    },
+    "memory": {
+     "status": "full"
+    },
+    "model": {
+     "missing": [
+      "model.list",
+      "persistent selection"
+     ],
+     "status": "partial"
+    },
+    "session": {
+     "status": "full"
+    },
+    "stream": {
+     "status": "full"
+    },
+    "tool": {
+     "missing": [
+      "tool inspection/list",
+      "in-run approval from the host thread"
+     ],
+     "status": "partial"
+    },
+    "transport": {
+     "missing": [
+      "mcp.serve through the funnel",
+      "OpenAI-compatible /v1 routes"
+     ],
+     "status": "partial"
+    },
+    "usage": {
+     "missing": [
+      "ai.complete usage"
+     ],
+     "status": "partial"
+    }
+   },
+   "cli": {
+    "agent": {
+     "missing": [
+      "update/delete",
+      "durable run management"
+     ],
+     "status": "partial"
+    },
+    "memory": {
+     "missing": [
+      "dedicated `sofuu memory` command"
+     ],
+     "status": "partial"
+    },
+    "model": {
+     "status": "full"
+    },
+    "session": {
+     "status": "full"
+    },
+    "stream": {
+     "status": "full"
+    },
+    "tool": {
+     "missing": [
+      "standalone tool management",
+      "approval control from the CLI"
+     ],
+     "status": "partial"
+    },
+    "transport": {
+     "status": "full"
+    },
+    "usage": {
+     "missing": [
+      "uniform usage output across commands"
+     ],
+     "status": "partial"
+    }
+   },
+   "http": {
+    "agent": {
+     "reason": "no agent routes",
+     "status": "unavailable"
+    },
+    "memory": {
+     "missing": [
+      "import"
+     ],
+     "status": "partial"
+    },
+    "model": {
+     "status": "full"
+    },
+    "session": {
+     "reason": "no session routes; unmatched paths fall through to 404",
+     "status": "unavailable"
+    },
+    "stream": {
+     "status": "full"
+    },
+    "tool": {
+     "reason": "no tool routes; tools cannot be inspected, registered, or approved over HTTP",
+     "status": "unavailable"
+    },
+    "transport": {
+     "status": "full"
+    },
+    "usage": {
+     "reason": "completion responses carry no usage object",
+     "status": "unavailable"
+    }
+   },
+   "js": {
+    "agent": {
+     "status": "full"
+    },
+    "memory": {
+     "status": "full"
+    },
+    "model": {
+     "missing": [
+      "model.describe",
+      "model.list",
+      "persistent model selection",
+      "pricing in the runtime"
+     ],
+     "status": "partial"
+    },
+    "session": {
+     "missing": [
+      "tool_use/tool_result pairing fidelity"
+     ],
+     "status": "full"
+    },
+    "stream": {
+     "missing": [
+      "uniform backpressure",
+      "cancel token for every stream",
+      "structured per-chunk tool-call events"
+     ],
+     "status": "partial"
+    },
+    "tool": {
+     "missing": [
+      "uniform tool result shape"
+     ],
+     "status": "partial"
+    },
+    "transport": {
+     "missing": [
+      "WebSocket",
+      "HTTP/2",
+      "explicit connection lifecycle"
+     ],
+     "status": "partial"
+    },
+    "usage": {
+     "missing": [
+      "usage from ai.complete",
+      "cost from agent results",
+      "one usage shape across chat/agent/ai"
+     ],
+     "status": "partial"
+    }
+   },
+   "mcp": {
+    "agent": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    },
+    "memory": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    },
+    "model": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    },
+    "session": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    },
+    "stream": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    },
+    "tool": {
+     "status": "full"
+    },
+    "transport": {
+     "status": "full"
+    },
+    "usage": {
+     "applicable": false,
+     "reason": "not applicable on this surface",
+     "status": "unavailable"
+    }
+   },
+   "swift_kotlin": {
+    "agent": {
+     "status": "full"
+    },
+    "memory": {
+     "missing": [
+      "Swift: forget/export/import/list/stats",
+      "Kotlin: typed memory API"
+     ],
+     "status": "partial"
+    },
+    "model": {
+     "missing": [
+      "model list/describe/select"
+     ],
+     "status": "partial"
+    },
+    "session": {
+     "missing": [
+      "typed session API"
+     ],
+     "status": "partial"
+    },
+    "stream": {
+     "status": "full"
+    },
+    "tool": {
+     "missing": [
+      "tool inspection",
+      "approval resolution"
+     ],
+     "status": "partial"
+    },
+    "transport": {
+     "missing": [
+      "typed MCP client",
+      "HTTP server helper"
+     ],
+     "status": "partial"
+    },
+    "usage": {
+     "missing": [
+      "typed usage model",
+      "stream usage"
+     ],
+     "status": "partial"
+    }
+   }
+  }
+ },
+ "platform": {
+  "arch": "aarch64",
+  "os": "macos"
+ },
+ "schema_version": 1,
+ "version": "0.2.0-beta"
+}

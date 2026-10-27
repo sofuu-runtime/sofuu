@@ -37,7 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build \
-        scoreboard scoreboard-check \
+        deps scoreboard scoreboard-check \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -91,6 +91,15 @@ c-only:
 # file: QuickJS bytecode is deterministic for a given binary.
 bc-check: $(TARGET)
 	@./scripts/check-driver-bc.sh
+
+# ── Vendored C dependencies ───────────────────────────────────────────
+# The Rust build links libuv from deps/libuv/build; a fresh clone has no
+# build tree, so `make` alone panics in sofuu-ffi/build.rs. This is the
+# documented first step for a source build (CI runs the same two cmake
+# commands).
+deps:
+	cmake -S deps/libuv -B deps/libuv/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+	cmake --build deps/libuv/build -j
 
 # ── P6: published conformance/stability + parity scoreboard ──────────
 # Generated from tracked receipts (contract/scoreboard/, stability.json,

@@ -444,7 +444,8 @@ Sofuu publishes receipts, not claims:
 Reproduce any of it from a checkout:
 
 ```bash
-make && make libsofuu
+make deps
+SOFUU_ALLOW_NO_QTSQ=1 make && SOFUU_ALLOW_NO_QTSQ=1 make libsofuu
 bash scripts/contract/run_contract_tests.sh      # the 52-case board
 bash scripts/verify-dist.sh dist ./sofuu         # install integrity
 bash scripts/conformance_report.sh               # merged release report
@@ -492,18 +493,27 @@ From source: `make libsofuu`, `make dist-macos`, `make dist-ios` (xcframework), 
 ## Build from Source
 
 ```bash
-# Requirements: Rust (cargo), clang, make. libcurl for HTTP features.
+# Requirements: Rust (cargo), clang, cmake, make. libcurl for HTTP features
+# (brew install cmake curl on macOS; the vendored libuv is built below).
 git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
-export SOFUU_QTSQ_DIR=/path/to/black-hole-disk   # the encrypted-brain codec
-make                 # cargo build --release
-make test            # JS e2e suite
-make size-check      # fails if the binary exceeds 5MB
-make bc-check        # fails if a shipped driver .bc lags its .js
-./sofuu doctor       # confirms QTSQ linkage + a real brain round-trip
+make deps                                  # vendored libuv (required first build)
+
+# Option A — the encrypted-brain codec (in-tree licensees):
+export SOFUU_QTSQ_DIR=/path/to/black-hole-disk
+make                                       # cargo build --release
+
+# Option B — capability-gated build, no proprietary codec:
+SOFUU_ALLOW_NO_QTSQ=1 make                 # memory/session persist refuse with E_CAPABILITY
+
+make libsofuu         # embeddable library (needed by the C-ABI conformance cases)
+make test             # JS e2e suite
+make size-check       # fails if the binary exceeds 5MB
+make bc-check         # fails if a shipped driver .bc lags its .js
+./sofuu doctor        # QTSQ linkage + a real brain round-trip (declared gap on option B)
 ```
 
-`make` refuses to build without the QTSQ codec (pass `SOFUU_ALLOW_NO_QTSQ=1` for a memory-less binary) — a codec-less build silently no-ops memory, so it is opt-out, not opt-in.
+`make` refuses to build without the QTSQ codec (pass `SOFUU_ALLOW_NO_QTSQ=1` for a capability-gated binary) — the codec-less build used to silently no-op memory, so the codec is opt-out, not opt-in; today every missing capability is a typed `E_CAPABILITY` refusal and `sofuu.capabilities()` says so before any call.
 
 Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 C samples assert) · `make abi-check` · `make size-check` · `make bc-check` · `./sofuu doctor`.
 

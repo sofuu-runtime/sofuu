@@ -52,15 +52,18 @@ Open stability gaps (target tier not yet met): **7**.
 ## Reproduce it yourself
 
 ```bash
-make && make libsofuu
+make deps                                       # vendored libuv (first build only)
+SOFUU_ALLOW_NO_QTSQ=1 make && SOFUU_ALLOW_NO_QTSQ=1 make libsofuu
 bash scripts/contract/run_contract_tests.sh      # the 52-case board
 bash scripts/verify-dist.sh dist ./sofuu         # install integrity
 bash scripts/conformance_report.sh               # merged release report
 python3 scripts/scoreboard.py --check --live-report dist/conformance-report.json
 ```
 
-Expected on a QTSQ-free build: 52 cases, 42 PASS / 0 FAIL / 10 BLOCKED
-(see `contract/README.md` for the per-case prerequisites).
+Expected on a build without the proprietary QTSQ codec (`SOFUU_ALLOW_NO_QTSQ=1`):
+52 cases, 42 PASS / 0 FAIL / 10 BLOCKED, memory `capability-gated / typed-refusal`
+(see `contract/README.md` for the per-case prerequisites). A codec-bearing build
+reports memory `full` instead; the board's counts do not change.
 
 ## Regression gates
 

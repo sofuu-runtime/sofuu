@@ -56,3 +56,49 @@ kernel's GPUStartTime/GPUEndTime barely moves.
   the first generated token (SFLOG01 container, raw LE f32) so two kernels can
   be compared bit for bit — `SOFUU_DUMP_LOGITS` only ever covered prefill, which
   never runs a b=1 GEMV.
+
+## Closed: ANE forward-path offload (do not re-attempt without new hardware)
+
+Measured twice, on real weights and real engine hidden states, and rejected both times. Recorded here
+because the idea is attractive and will be proposed again.
+
+**1. Whole transformer block on the ANE: rejected on numerics.** A real-weight fp16 MLProgram for a full
+Qwen3-0.6B block dispatches perfectly (MLComputePlan 82/82 device-assigned ops on neuralEngine, zero CPU,
+zero GPU) and is fast (1.05-1.28 ms/block vs 3.2-4.8 ms in-engine). But on real hidden states the block's own
+contribution is 51% wrong at L0 and 95% wrong at L13 vs a validated f32 reference. Mechanism: Qwen3's per-head
+q/k RMSNorm gains are large (max 96.5), pushing attention scores into the tens, where fp16 ulp is ~0.03 and
+128 accumulating adds give ~0.1 error - the same size as the p10 top-2 score gap. Near-tied heads collapse
+(per-head cosine down to 0.29) while peaked heads survive (0.99). The engine keeps prefill attention in f32
+(proved: CPU and GPU prefill routes are bit-identical at every layer), so a whole-block ANE program cannot
+reproduce it, and forcing fp32 ops pushes them off the ANE.
+
+**2. GEMM-only split (norms+qkv on ANE, attention in the engine f32 kernel, o+FFN on ANE): numerically CLEAN
+but does NOT pay.** It passed every gate: per-block rel error vs the f32 chain 9.96e-3 (L0) / 2.77e-4 (L13),
+cos 0.9999508 / 0.9999998; a 28-layer chained emulation fed each layer into the next and produced 16/16
+identical greedy tokens vs the f32 chain; the ANE's own logit contribution was 0.258 - six times SMALLER than
+the engine's own Q8_K activation quantisation gap of 1.518. Implemented as a default-off flag with the seam at
+the FFN boundary (so the fused attention epilogue is untouched and its loss is exactly zero), loud
+load-time MLComputePlan refusal, programs loaded at model load, and no Core ML in the default binary
+(otool/nm/strings all clean). Prefill-only, interleaved ABBA:
+
+  prompt    comparison    med     min
+  124 tk    k=0 vs k=7   0.887   1.052
+  1454 tk   k=0 vs k=7   1.047   1.214
+  1454 tk   k=0 vs k=14  0.987   0.994
+  1454 tk   k=0 vs k=18  0.991   0.991
+
+A wash at 124 tokens, a wash at 1454 with k=14/18, a loss at k=7/1454. Why: forcing one batch_end/batch_open
+per offloaded layer costs 1.5-7% of a long prefill on its own (measured 4780 -> 4850 ms with the seam
+inert), the seam adds two 0.5 MB copies per layer, and the ANE's 0.63 ms per 128-row FFN beats the GPU's
+~1.2 ms by less than the seam consumes. The earlier synthetic 2.2x-4.5x projection came from comparing ANE
+block time against the ENGINE's per-block time while ignoring the seam and the remaining f32 attention.
+
+**3. Decode on the ANE: rejected on bandwidth.** B=1 is a streaming problem: GPU 8.4 ms vs ANE 14.5 ms per
+0.44 G-param token; ANE streams 57-61 GB/s vs the GPU's 104. At B=32 all three engines tie at ~48-50 GB/s of
+effective weight streaming, confirming the mechanism. int4 palettised reaches parity at best, and is ~5 dB
+worse than Q4_K on real weights (17.9-18.3 dB vs 22.9 dB SNR), so it is not a drop-in either.
+
+Conclusion: on this M2 Pro, with a correct fp16 implementation and the seam cost included, the ANE does not
+beat the GPU for either prefill or decode of this workload. The machine's usable structure is GPU + CPU
+together, one commit per token, which is what ships. Keep /tmp/ane-lab scripts (bench.swift, build_ffn.py,
+chain28.py, RESULTS.md) for a future SoC where the seam or the bandwidth ratio differs.

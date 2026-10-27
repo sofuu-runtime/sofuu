@@ -1,0 +1,66 @@
+name: Publish Android SDK Maven repository
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the Pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Download the published AAR artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p maven/com/sofuu/sofuu-android/0.2.0
+          gh release download android-sdk-v0.2.0 \
+            --pattern 'sofuu-android-0.2.0*' \
+            --dir maven/com/sofuu/sofuu-android/0.2.0 \
+            --clobber
+
+      - name: Generate Maven metadata and checksums
+        run: |
+          set -euo pipefail
+          cat > maven/com/sofuu/sofuu-android/maven-metadata.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <metadata>
+            <groupId>com.sofuu</groupId>
+            <artifactId>sofuu-android</artifactId>
+            <versioning>
+              <latest>0.2.0</latest>
+              <release>0.2.0</release>
+              <versions><version>0.2.0</version></versions>
+              <lastUpdated>20261027140000</lastUpdated>
+            </versioning>
+          </metadata>
+          XML
+          find maven -type f \
+            ! -name '*.md5' ! -name '*.sha1' ! -name '*.sha256' ! -name '*.sha512' \
+            -print0 | while IFS= read -r -d '' f; do
+              sha1sum "$f" | awk '{print $1}' > "$f.sha1"
+              md5sum "$f" | awk '{print $1}' > "$f.md5"
+              sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+              sha512sum "$f" | awk '{print $1}' > "$f.sha512"
+            done
+
+      - name: Commit and push to gh-pages
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add maven
+          if git diff --cached --quiet; then
+            echo "No artifact changes"
+            exit 0
+          fi
+          git commit -m "Publish com.sofuu:sofuu-android:0.2.0"
+          git push origin HEAD:gh-pages

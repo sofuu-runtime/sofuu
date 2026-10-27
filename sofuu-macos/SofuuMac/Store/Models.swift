@@ -193,6 +193,62 @@ struct ChatMessage: Identifiable {
     var usage: Usage?
     var status = "done" // streaming | done | error
     var error: String?
+
+    /// Rebuild bubbles from the engine's session document (R4 / §5.2).
+    /// The document is the source of truth; this is the macOS twin of the
+    /// Android `SessionMessageStore.turnsToMessages`, so both apps render the
+    /// same transcript from `session.json` (turn prompts/answers, tool rows
+    /// and usage). Ids are derived from the turn index, which is stable for
+    /// a given document.
+    static func fromTurns(_ turns: [JSONObject]) -> [ChatMessage] {
+        var out: [ChatMessage] = []
+        for (i, turn) in turns.enumerated() {
+            let prompt = turn.optString("prompt").trimmingCharacters(in: .whitespacesAndNewlines)
+            let answer = turn.optString("answer").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prompt.isEmpty {
+                out.append(ChatMessage(id: "h_u_\(i)", role: .user, content: prompt))
+            }
+            var timeline: [TimelineEntry] = []
+            for (j, raw) in (turn.optArray("tools") ?? []).enumerated() {
+                guard let t = raw as? JSONObject else { continue }
+                let name = t.optString("n")
+                let args = t.optString("a")
+                let result = t.optString("r")
+                timeline.append(TimelineEntry(
+                    id: "tl_h_\(i)_\(j)",
+                    kind: "tool",
+                    title: name.isEmpty ? "tool" : name,
+                    tool: name.isEmpty ? nil : name,
+                    detail: args.isEmpty ? nil : args,
+                    result: result.isEmpty ? nil : result,
+                    ok: true
+                ))
+            }
+            var usage: Usage?
+            if let u = turn.optObject("usage") {
+                usage = Usage(
+                    promptTokens: u.optInt("promptTokens"),
+                    completionTokens: u.optInt("completionTokens"),
+                    costUsd: u.optDouble("costUsd"),
+                    steps: u.optInt("steps"),
+                    servedBy: u.optString("servedBy").nilIfEmpty
+                )
+            } else if let servedBy = turn.optString("servedBy").nilIfEmpty {
+                usage = Usage(servedBy: servedBy)
+            }
+            if !answer.isEmpty || !timeline.isEmpty {
+                out.append(ChatMessage(
+                    id: "h_a_\(i)",
+                    role: .assistant,
+                    content: answer,
+                    timeline: timeline,
+                    usage: usage,
+                    status: "done"
+                ))
+            }
+        }
+        return out
+    }
 }
 
 /// One working-tree file in the commit panel: column-split porcelain.

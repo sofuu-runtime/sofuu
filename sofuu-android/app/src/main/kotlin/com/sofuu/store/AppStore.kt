@@ -1024,7 +1024,7 @@ val runtimeEnv = RuntimeEnv(app)
      *  Main thread for EVERY warning row. Batching is keyed by session id,
      *  so a switch still persists the old chat — only the burst within one
      *  chat is collapsed. */
-    private val pendingSaves = LinkedHashMap<String, Pair<String?, List<ChatMessage>>>()
+    private val pendingSaves = LinkedHashMap<String, List<ChatMessage>>()
     private var saveJob: kotlinx.coroutines.Job? = null
 
     fun saveCurrentSessionMessages() {
@@ -1034,8 +1034,7 @@ val runtimeEnv = RuntimeEnv(app)
         val cache = state.messageCache.toMutableMap()
         cache[sid] = msgs
         state = state.copy(messageCache = cache)
-        val pDir = state.projectDir ?: engine.projectDir
-        synchronized(pendingSaves) { pendingSaves[sid] = pDir to msgs }
+        synchronized(pendingSaves) { pendingSaves[sid] = msgs }
         if (saveJob?.isActive == true) return
         saveJob = viewModelScope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(250)
@@ -1059,43 +1058,54 @@ val runtimeEnv = RuntimeEnv(app)
                 copy
             }
             if (batch.isEmpty()) return
-            for ((sid, v) in batch) {
-                SessionMessageStore.save(getApplication(), v.first, sid, v.second)
+            for ((sid, msgs) in batch) {
+                SessionMessageStore.save(getApplication(), sid, msgs)
             }
         }
     }
 
+    /**
+     * Load a transcript for the UI.
+     *
+     * `session.json` (engine) is the source of truth (R4/§5.2); the app store
+     * is a fast path that may carry richer UI rows. So: take the engine's
+     * turns, rebuild from them, and replace the cache whenever it is missing
+     * or its turn count disagrees with the engine (a session edited by the
+     * CLI or another host). A matching cache is kept as-is (no churn).
+     */
     suspend fun loadSessionMessages(sessionId: String): List<ChatMessage> {
         val mem = state.messageCache[sessionId]
-        if (!mem.isNullOrEmpty()) return mem
-
         val pDir = state.projectDir ?: engine.projectDir
-        val fromDisk = withContext(Dispatchers.IO) {
-            SessionMessageStore.load(getApplication(), pDir, sessionId)
-        }
-        if (!fromDisk.isNullOrEmpty()) {
-            val cache = state.messageCache.toMutableMap()
-            cache[sessionId] = fromDisk
-            state = state.copy(messageCache = cache)
-            return fromDisk
-        }
 
         val turns = withContext(Dispatchers.Default) {
             engine.sessionTurns(sessionId).get()
         }
-        if (turns != null && turns.length() > 0) {
-            val msgs = SessionMessageStore.turnsToMessages(turns)
-            if (msgs.isNotEmpty()) {
-                withContext(Dispatchers.IO) {
-                    SessionMessageStore.save(getApplication(), pDir, sessionId, msgs)
-                }
-                val cache = state.messageCache.toMutableMap()
-                cache[sessionId] = msgs
-                state = state.copy(messageCache = cache)
-                return msgs
-            }
+        val fromEngine = if (turns != null && turns.length() > 0) {
+            SessionMessageStore.turnsToMessages(turns)
+        } else {
+            emptyList()
         }
-        return emptyList()
+
+        val cached = mem ?: withContext(Dispatchers.IO) {
+            SessionMessageStore.load(getApplication(), pDir, sessionId)
+        }
+        val cachedTurns = cached?.count { it.role == MsgRole.USER } ?: 0
+        val engineTurns = turns?.length() ?: 0
+        val useEngine = fromEngine.isNotEmpty() &&
+            (cached.isNullOrEmpty() || cachedTurns != engineTurns)
+
+        val msgs = if (useEngine) fromEngine else (cached ?: emptyList())
+        if (msgs.isNotEmpty()) {
+            if (useEngine) {
+                withContext(Dispatchers.IO) {
+                    SessionMessageStore.save(getApplication(), sessionId, msgs)
+                }
+            }
+            val cache = state.messageCache.toMutableMap()
+            cache[sessionId] = msgs
+            state = state.copy(messageCache = cache)
+        }
+        return msgs
     }
 
     fun refreshSessions(resumeNewest: Boolean = false) {

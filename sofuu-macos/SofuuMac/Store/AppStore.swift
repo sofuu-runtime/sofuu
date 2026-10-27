@@ -860,6 +860,9 @@ final class AppStore: ObservableObject {
                 state.approvals = []
                 state.preview = nil
                 state.ctx = nextActive.flatMap { state.ctxCache[$0] }
+                if state.messages.isEmpty, let nid = nextActive {
+                    Task { await hydrateSessionMessages(nid) }
+                }
             }
             // Resume ONLY on the boot pass: the engine attached the newest
             // session itself, so a first send appends to it instead of
@@ -888,7 +891,30 @@ final class AppStore: ObservableObject {
         state.approvals = []
         state.preview = nil
         state.ctx = id.flatMap { state.ctxCache[$0] }
-        if let id { Task { _ = await engine.resumeSession(id) } }
+        if let id {
+            Task {
+                _ = await engine.resumeSession(id)
+                await hydrateSessionMessages(id)
+            }
+        }
+    }
+
+    /// Fill the transcript from the engine's session document when this
+    /// session has no cached rows (app relaunch, first visit to a session
+    /// created by the CLI, evicted cache). `session.json` is the source of
+    /// truth (R4/§5.2) and the cache is only a fast path, so a miss rebuilds
+    /// from `sofuu.chat.sessionTurns` instead of showing an empty chat.
+    /// The guards are re-checked after the await: a late reply must never
+    /// clobber a chat the user has since opened or a turn that started
+    /// streaming while the document was loading.
+    private func hydrateSessionMessages(_ id: String) async {
+        guard state.activeSessionId == id, !state.streaming, state.messages.isEmpty else { return }
+        guard let raw = await engine.sessionTurns(id) else { return }
+        let msgs = ChatMessage.fromTurns(raw.compactMap { $0 as? JSONObject })
+        guard !msgs.isEmpty else { return }
+        guard state.activeSessionId == id, !state.streaming, state.messages.isEmpty else { return }
+        state.messages = msgs
+        state.messageCache[id] = msgs
     }
 
     func newChat() {

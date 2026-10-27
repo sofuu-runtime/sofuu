@@ -396,9 +396,13 @@ reports `memory: {claimed: full, live: full, ok: true}` on a QTSQ build.
    create-config policy path and the capi suite carry it behaviorally).
 5. **App-lane residue from P3** — the device round-trip (T4.2) on
    macOS+Android runners, the v0.2 migration fixture (T4.4), an MCP fixture
-   server (T5.6), the four-surface error-parity harness (T5.8), the app
-   stores becoming caches of `session.json` (Android `SessionMessageStore`,
-   macOS), and the `/v1/*` README section.
+   server (T5.6), and the four-surface error-parity harness (T5.8).
+   ~~App stores becoming caches of `session.json`; `/v1/*` README section~~ —
+   **landed 2026-10-27**: Android's `SessionMessageStore` is app-private
+   (legacy `ui_messages.json` migrated then deleted; `sessionTurns` decides
+   when a cache is stale), the macOS app rebuilds a transcript from
+   `sessionTurns` on a cache miss, and README documents the serve
+   routes/auth/errors.
 6. ~~Memory clobber~~ — **resolved 2026-10-27** (finding #13 section above):
    the flat memory/brain surface is engine-installed, matrix memory × js is
    `full`, and verify-dist's memory row passes on QTSQ builds.

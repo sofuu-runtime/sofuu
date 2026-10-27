@@ -6,36 +6,37 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Persistence layer for chat conversations, activity timelines, tool calls,
- * and edits. Saves to both the workspace's `.sofuu/sessions/<id>/` folder and
- * the app's internal cache, ensuring messages survive app restarts, process
- * kills, and session switching.
+ * UI fast-path cache for chat conversations, activity timelines, tool calls
+ * and edits.
+ *
+ * The SOURCE OF TRUTH is the engine's session document,
+ * `<project>/.sofuu/sessions/<id>/session.json` (R4 / §5.2): turns, per-turn
+ * ids, usage and redacted events. This store never writes into that folder —
+ * an app-private cache lives under `filesDir/session_ui/` and is always
+ * rebuildable from the engine (`sofuu.chat.sessionTurns` → turnsToMessages).
+ * It exists so a session switch does not pay a JS round-trip, and it can
+ * carry UI rows (activity entries, edits) that the engine document does not
+ * model.
+ *
+ * Older app builds wrote `ui_messages.json` INSIDE the engine's session
+ * folder. That file is a second authoring format in the canonical store; it
+ * is migrated into the cache on first load and then deleted.
  */
 object SessionMessageStore {
 
     private const val FILE_NAME = "ui_messages.json"
     private const val CACHE_DIR = "session_ui"
 
-    fun save(context: Context, projectDir: String?, sessionId: String, messages: List<ChatMessage>) {
+    fun save(context: Context, sessionId: String, messages: List<ChatMessage>) {
         if (sessionId.isBlank() || messages.isEmpty()) return
         try {
             val jsonArr = JSONArray()
             for (m in messages) {
                 jsonArr.put(m.toJson())
             }
-            val content = jsonArr.toString()
-
-            // 1. Primary: save in workspace .sofuu/sessions/<sessionId>/
-            if (!projectDir.isNullOrBlank()) {
-                val dir = File(projectDir, ".sofuu/sessions/$sessionId")
-                dir.mkdirs()
-                File(dir, FILE_NAME).writeText(content)
-            }
-
-            // 2. App-internal fallback cache
             val cacheDir = File(context.filesDir, CACHE_DIR)
             cacheDir.mkdirs()
-            File(cacheDir, "$sessionId.json").writeText(content)
+            File(cacheDir, "$sessionId.json").writeText(jsonArr.toString())
         } catch (e: Exception) {
             android.util.Log.w("SessionMessageStore", "Failed to save messages for $sessionId: ${e.message}")
         }
@@ -44,20 +45,25 @@ object SessionMessageStore {
     fun load(context: Context, projectDir: String?, sessionId: String): List<ChatMessage>? {
         if (sessionId.isBlank()) return null
         try {
-            // 1. Check workspace file
-            if (!projectDir.isNullOrBlank()) {
-                val f = File(projectDir, ".sofuu/sessions/$sessionId/$FILE_NAME")
-                if (f.exists() && f.length() > 0) {
-                    val list = parseJsonMessages(f.readText())
-                    if (list.isNotEmpty()) return list
-                }
-            }
-
-            // 2. Check internal cache
+            // 1. The app-private cache.
             val cacheFile = File(context.filesDir, "$CACHE_DIR/$sessionId.json")
             if (cacheFile.exists() && cacheFile.length() > 0) {
-                val list = parseJsonMessages(cacheFile.readText())
-                if (list.isNotEmpty()) return list
+                val cached = parseJsonMessages(cacheFile.readText())
+                if (cached.isNotEmpty()) return cached
+            }
+
+            // 2. One-time migration of the legacy in-workspace file. Copy it
+            //    into the cache, then remove it so the engine's session folder
+            //    holds only engine-owned files.
+            val legacy = legacyFile(projectDir, sessionId)
+            if (legacy != null && legacy.exists() && legacy.length() > 0) {
+                val list = parseJsonMessages(legacy.readText())
+                if (list.isNotEmpty()) {
+                    save(context, sessionId, list)
+                    legacy.delete()
+                    return list
+                }
+                legacy.delete()
             }
         } catch (e: Exception) {
             android.util.Log.w("SessionMessageStore", "Failed to load messages for $sessionId: ${e.message}")
@@ -68,22 +74,19 @@ object SessionMessageStore {
     fun delete(context: Context, projectDir: String?, sessionId: String) {
         if (sessionId.isBlank()) return
         try {
-            if (!projectDir.isNullOrBlank()) {
-                File(projectDir, ".sofuu/sessions/$sessionId/$FILE_NAME").delete()
-            }
             File(context.filesDir, "$CACHE_DIR/$sessionId.json").delete()
+            legacyFile(projectDir, sessionId)?.delete()
         } catch (_: Exception) {}
     }
 
     fun deleteAll(context: Context, projectDir: String?) {
         try {
             File(context.filesDir, CACHE_DIR).deleteRecursively()
+            // Clean up only OUR deprecated artifact; the session folders,
+            // session.json and registry files belong to the engine.
             if (!projectDir.isNullOrBlank()) {
-                val sessionsDir = File(projectDir, ".sofuu/sessions")
-                sessionsDir.listFiles()?.forEach { dir ->
-                    if (dir.isDirectory) {
-                        File(dir, FILE_NAME).delete()
-                    }
+                File(projectDir, ".sofuu/sessions").listFiles()?.forEach { dir ->
+                    if (dir.isDirectory) File(dir, FILE_NAME).delete()
                 }
             }
         } catch (_: Exception) {}
@@ -93,6 +96,8 @@ object SessionMessageStore {
     fun getLocalSessionIds(context: Context, projectDir: String?): List<String> {
         val ids = LinkedHashSet<String>()
         try {
+            // Read-only discovery: a session folder the engine created (by
+            // the CLI or an older app build) should still appear in the list.
             if (!projectDir.isNullOrBlank()) {
                 val sDir = File(projectDir, ".sofuu/sessions")
                 if (sDir.exists()) {
@@ -119,6 +124,12 @@ object SessionMessageStore {
     fun getSessionTask(context: Context, projectDir: String?, sessionId: String): String? {
         val msgs = load(context, projectDir, sessionId) ?: return null
         return msgs.firstOrNull { it.role == MsgRole.USER }?.content?.take(40)?.replace("\n", " ")
+    }
+
+    private fun legacyFile(projectDir: String?, sessionId: String): File? {
+        if (projectDir.isNullOrBlank() || sessionId.isBlank()) return null
+        if (sessionId.contains('/') || sessionId.contains('\\') || sessionId.startsWith(".")) return null
+        return File(projectDir, ".sofuu/sessions/$sessionId/$FILE_NAME")
     }
 
     private fun parseJsonMessages(jsonText: String): List<ChatMessage> {

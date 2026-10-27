@@ -208,7 +208,7 @@ sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
 sofuu install / add <package>          # npm packages
 sofuu agent list             # List agent definitions (~/.sofuu/agents/*.js)
 sofuu agent run <name> "task" [--json] # Run one agent headless
-sofuu serve --brain <path>   # Serve the brain over HTTP
+sofuu serve --brain <path>   # OpenAI-compatible HTTP server (--model, --model-id, --host, --port)
 sofuu doctor                 # Health check: QTSQ link, brain round-trip, ctx
 sofuu version / help
 ```
@@ -364,6 +364,41 @@ await sofuu.fs.writeFile("./output.txt", "Hello from Sofuu!");
 setTimeout(() => console.log("done"), 1000);
 await sleep(500);
 process.env.API_KEY; process.argv; process.cwd();
+```
+
+### `sofuu serve` — OpenAI-compatible HTTP server
+
+```bash
+export SOFUU_SERVE_TOKEN=$(openssl rand -hex 24)  # --token works, but `ps` can see it
+sofuu serve --model ./qwen3-0.6b-q4_k_m.gguf --model-id qwen3-0.6b \
+            --host 127.0.0.1 --port 7707 --brain ./mem.sofuu
+```
+
+Every route except `GET /health` requires `Authorization: Bearer $SOFUU_SERVE_TOKEN`
+(constant-time compare). `policy.http.auth: "none"` opts out explicitly and logs
+a startup warning; `policy.http.deny` path prefixes are evaluated per request.
+
+| Route | What it does |
+| --- | --- |
+| `GET /health` | liveness only, no auth, no data |
+| `GET /v1/models` | configured ids (`--model-id`, default: the model file name) |
+| `POST /v1/chat/completions` | OpenAI chat. `stream: true` → SSE `chat.completion.chunk` events + `data: [DONE]`; otherwise one JSON `chat.completion`. Honors `messages`, `max_tokens`, `temperature`, `stop` (up to 4), `tools`, and `stream_options.include_usage` |
+| `POST /v1/completions` · `/infer` | raw text completion, no chat template |
+| `POST /v1/embeddings` | OpenAI embeddings: 1–64 string inputs, 8192-token cap per input |
+| `POST /v1/sessions` · `GET /v1/sessions` · `GET /v1/sessions/:id/turns` | process-local sessions and their recorded turns |
+| `POST /v1/agent/runs` | `sofuu.agent.run`; SSE events when `stream: true`, else JSON |
+| `GET /v1/tools` · `POST /v1/tools/:name/call` | tool inventory, then policy-gated execution |
+| `POST /remember` · `GET /recall?q=&k=` · `GET /memories` · `POST /forget` · `POST /share` | brain-backed memory (requires `--brain`) |
+
+Errors use the OpenAI envelope `{error:{message,type,param,code}}`: `401`
+`invalid_api_key`, `404` `model_not_found`, and policy denials are `403` with
+`code: "policy_denied"` plus the `rule` that fired (the same verdict
+`sofuu.policy.evaluate` gives in-process tool calls).
+
+```bash
+curl -s localhost:7707/v1/chat/completions \
+  -H "Authorization: Bearer $SOFUU_SERVE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-0.6b","messages":[{"role":"user","content":"Name three prime numbers"}]}'
 ```
 
 ---

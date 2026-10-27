@@ -1102,7 +1102,9 @@ impl TransformerModel {
                 None
             }
         };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let rope_gpu_ok = rope_gate.is_none();
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if config.rope_custom && rope_gpu_ok {
             eprintln!(
                 "[gguf-gpu] custom rope profile is expressible on the GPU (n_rot {}/{}, mscale {:.6}, {} factor pair(s)): the decode/prefill rope sites consume a host-built cos|sin table identical to the CPU rope",
@@ -1112,6 +1114,7 @@ impl TransformerModel {
                 rope_freq_adjust.len(),
             );
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let gpu = {
             let wanted = gpu_allowed
                 && cfg!(target_os = "macos")
@@ -3681,6 +3684,7 @@ impl TransformerModel {
         Self::gpu_rope_table(cfg, adjust, g, &positions)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;

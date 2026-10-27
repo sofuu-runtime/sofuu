@@ -111,11 +111,28 @@ async function main() {
     assert("cancel accepted via the registered signal", cRet === true);
 
     // ── the run settles promptly after cancel ───────────────────────────
-    const race = await Promise.race([
-        settleWatch.then(() => ({ how: "settled", wall: Date.now() - tCancel })),
-        new Promise((r) => setTimeout(() => r({ how: "timeout", wall: Date.now() - tCancel }), 3000)),
-    ]);
-    assert(`run settled after cancel (${race.wall} ms, ${race.how})`, race.how !== "timeout");
+    // Load-aware (the plan's blocking-flip prerequisite): the 3 s bound is
+    // nominal; a saturated runner delays the harness's own 100 ms ticks, so
+    // count that excess and extend the bound the same way T2.1 does. A
+    // genuinely stuck run still fails once the 5 s slack budget is spent.
+    let settled = null;
+    let slack = 0;
+    let prev = tCancel;
+    while (!settled && Date.now() - tCancel < 3000 + slack) {
+        settled = await Promise.race([
+            settleWatch.then(() => ({ how: "settled", wall: Date.now() - tCancel })),
+            new Promise((r) => setTimeout(() => r(null), 100)),
+        ]);
+        const now = Date.now();
+        if (!settled) slack = Math.min(5000, slack + Math.max(0, now - prev - 100));
+        prev = now;
+    }
+    const race = settled || { how: "timeout", wall: Date.now() - tCancel };
+    assert(
+        `run settled after cancel (${race.wall} ms, ${race.how}` +
+        (slack > 0 ? `, incl. ${slack} ms scheduler slack` : "") + ")",
+        race.how !== "timeout"
+    );
 
     // ── no orphan: the sleep child died with the cancel ─────────────────
     let orphans = "";

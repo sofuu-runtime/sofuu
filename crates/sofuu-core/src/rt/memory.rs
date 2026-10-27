@@ -4216,6 +4216,20 @@ mod impl_qtsq {
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"memory".as_ptr(), qjs::sofuu_js_dup_value(ctx, mem_obj));
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"brain".as_ptr(), mem_obj);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
+
+        /* R1/T1.3 flat surface (src/js/memory_api.js): the contract documents
+         * `sofuu.memory.remember({...})`, and a QTSQ-free build already
+         * presents exactly that name set (typed-refusal stubs). Install the
+         * same flat methods on the module object here — `sofuu.brain` is an
+         * alias of the same object — delegating to the last-opened brain or
+         * `{handle}`. Compiled out on capability-gated builds by this
+         * function's own cfg, so their stubs stay the surface. */
+        const MEMORY_FLAT_API_JS: &str = include_str!("../../../../src/js/memory_api.js");
+        crate::shipped::eval_shipped(
+            ctx as *mut std::ffi::c_void,
+            MEMORY_FLAT_API_JS,
+            "<memory-api>",
+        );
     }
 
     /// mod_kv_register — sofuu.kv.open + the KVStore class.

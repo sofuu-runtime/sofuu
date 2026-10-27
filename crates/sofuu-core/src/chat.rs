@@ -7737,6 +7737,7 @@ mod tests {
         check_parse("extractor.js", include_str!("../../../src/js/extractor.js"), true);
         check_parse("storage.js", include_str!("../../../src/js/storage.js"), true);
         check_parse("chat.js", include_str!("../../../src/js/chat.js"), true);
+        check_parse("memory_api.js", include_str!("../../../src/js/memory_api.js"), true);
     }
 
     /// Settings changes must never wipe a lived-in transcript: every

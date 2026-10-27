@@ -409,15 +409,13 @@
   {
    "primitive": "memory",
    "surface": "js",
-   "status": "partial",
-   "missing": [
-    "remember/recall reachable from JS"
-   ],
-   "note": "P1 finding (2026-10-25): the zerocopy bridge registers sofuu.memory/sofuu.brain AFTER the CMA memory module, clobbering both \u2014 on the release build sofuu.memory is the buffer bridge (allocAligned/viewFloat32/\u2026) and typeof sofuu.memory.remember is undefined. Chat's brain works via internal __qtsq_* globals, so the loss is silent.",
+   "status": "full",
+   "missing": [],
+   "note": "R1/T1.3 flat surface unified (2026-10-27): the engine installs src/js/memory_api.js on QTSQ builds, so sofuu.memory and sofuu.brain (the same object) expose the documented flat methods \u2014 remember/recall/search/count/learn/list/export/stats/working-set/entity/forget/flush/close and the read-only module helpers \u2014 delegating to the last-opened brain or {handle}. Both the options form and the instance-argument form are accepted, close() flushes, and a QTSQ-free build presents the same names as typed-refusal stubs. The earlier P1 note blamed the zerocopy bridge for clobbering the namespace; what actually differed was the module-vs-instance shape (module had open() only), now unified. Regression test: sofuu-capi flat_memory_and_brain_surface_is_complete.",
    "evidence": [
-    "crates/sofuu-core/src/rt/memory.rs:4216-4217",
-    "crates/sofuu-core/src/rt/zerocopy.rs:274-470",
-    "crates/sofuu-core/src/rt/engine.rs:270-273"
+    "src/js/memory_api.js",
+    "crates/sofuu-core/src/rt/memory.rs",
+    "crates/sofuu-capi/src/lib.rs"
    ],
    "tests": [
     "T1.3",
@@ -463,7 +461,8 @@
    "status": "full",
    "missing": [],
    "evidence": [
-    "crates/sofuu-capi/src/lib.rs:193-374"
+    "src/js/memory_api.js",
+    "crates/sofuu-capi/src/lib.rs"
    ],
    "tests": [
     "T1.3"

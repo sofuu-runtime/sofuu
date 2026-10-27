@@ -338,17 +338,37 @@ Verification: main release build clean; 5/5 capability unit tests pass; a
 genuine QTSQ-free build (`SOFUU_QTSQ_DIR=/nonexistent SOFUU_ALLOW_NO_QTSQ=1`,
 `target-noqts/`) shows doctor exit 1 + the typed refusal.
 
-## New P0-class finding (2026-10-25)
+## P1 finding #13 — RESOLVED (2026-10-27)
 
-**`sofuu.memory` and `sofuu.brain` are clobbered by the zerocopy bridge on
-every build.** `rt/zerocopy.rs` registers `sofuu.memory` (the alloc/view buffer
-bridge) after `rt/memory.rs` registers the CMA brain on the same names, so on
-the release build `typeof sofuu.memory.remember` is `undefined` and the CMA
-brain is unreachable from JS. Chat's brain keeps working via internal
-`__qtsq_*` globals, which is why the loss is silent. Recorded in
-`matrix.json` (memory × js → `partial`) and in the spec's findings table. The
-fix belongs to the engine lane: distinct namespaces (e.g. `sofuu.buffer`) or
-merged registration — not done here to avoid crossing lanes.
+**The JS memory/brain surface is unified across builds.** The original finding
+(2026-10-25) said the zerocopy bridge "clobbered" `sofuu.memory`/`sofuu.brain`
+on every build. Re-reading the code for the fix corrected the mechanism: the
+CMA module registered `sofuu.memory` with `open/migrate/embeddingInfo/inspect`
+and aliased `sofuu.brain` to the same object; the dataset methods
+(`remember/recall/...`) live on the instance `open()` returns; zerocopy
+*merges* its alloc/view helpers onto that same object; chat's brain already
+worked via `sofuu.brain.open(...)`. What was actually wrong is that the
+contract (R1/T1.3) documents the FLAT shape, which existed only on QTSQ-free
+builds (typed-refusal stubs) and in capi's handle facade — so the documented
+API was present on the degraded build and absent on the real one, and
+`typeof sofuu.memory.remember` was `undefined` on the release build.
+
+Fix: `src/js/memory_api.js`, installed by `rt/memory.rs` at registration on
+QTSQ builds (capability-gated builds keep their stubs untouched). It exposes
+the full documented flat set on `sofuu.memory` (same object as `sofuu.brain`),
+delegating to the most recently opened brain or `{handle}`; both the options
+form (`remember({vec,text})`) and the instance-argument form
+(`remember(vec,text)`) work; `close()` flushes before releasing the handle.
+capi's duplicated memory block is gone (the engine installs it for every
+host, including the C ABI).
+
+Receipts: the regression test
+`sofuu-capi :: flat_memory_and_brain_surface_is_complete` (every documented
+method resolves on both namespaces; flat round-trip; close→reopen persists;
+flat answer == instance answer); `contract/matrix.json` memory × js → `full`
+(0 unknowns unchanged); `verify-dist`'s memory row is green on a QTSQ build
+(and still green as typed-refusal on a QTSQ-free one); `sofuu conformance`
+reports `memory: {claimed: full, live: full, ok: true}` on a QTSQ build.
 
 ## Next actions
 
@@ -379,9 +399,9 @@ merged registration — not done here to avoid crossing lanes.
    server (T5.6), the four-surface error-parity harness (T5.8), the app
    stores becoming caches of `session.json` (Android `SessionMessageStore`,
    macOS), and the `/v1/*` README section.
-6. **Memory clobber** — engine-lane fix for the `sofuu.memory`/`sofuu.brain`
-   namespace collision; then matrix memory × js returns to `full`, and
-   verify-dist's memory row stops failing on QTSQ-bearing builds.
+6. ~~Memory clobber~~ — **resolved 2026-10-27** (finding #13 section above):
+   the flat memory/brain surface is engine-installed, matrix memory × js is
+   `full`, and verify-dist's memory row passes on QTSQ builds.
 7. Refresh the remaining `partial` cells (tool/usage on the app lanes) as the
    protocol work lands; several are stale in the good direction.
 8. Investigate the live FORK the gate caught (0.6B q4_K default pair, depth 32,

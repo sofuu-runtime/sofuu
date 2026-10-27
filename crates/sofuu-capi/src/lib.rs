@@ -139,29 +139,10 @@ unsafe fn eval_init_snippet(ctx: *mut qjs::JSContext, src: &CString, filename: &
     ok
 }
 
-// ── Memory facade (E0-1) ──────────────────────────────────────────
+// ── C-ABI funnel facades (E0-1; memory moved to the engine) ───────
 
-/// The brain's instance methods (`remember`/`recall`/`count`/`flush`…)
-/// live on the object `memory.open()` returns. The JSON funnel can only
-/// call *functions under `sofuu.*`*, and that object stringifies to `{}`
-/// — so before this shim, the entire memory surface was unreachable from
-/// C without hand-building `rt_eval` strings (7 of the 17 documented
-/// funnel methods were dead ends).
-///
-/// The shim keeps the in-process API byte-for-byte compatible and adds a
-/// handle-addressed, JSON-serializable layer on top:
-///
-///   - `memory.open(path, dim, spaceId?)` still returns the real CMA
-///     object, now carrying a non-enumerable `__handle` and a `toJSON`
-///     that serializes to `{"handle":N,"dim":D}`. The funnel therefore
-///     returns a usable handle instead of `{}`.
-///   - `memory.remember({handle, vec, text, role, kv})` and friends take
-///     a single options object and operate on that handle. `handle` is
-///     optional — it defaults to the most recently opened brain, so the
-///     common single-brain case reads `{"vec":[…],"text":"…"}`.
-///
-/// The same dead-end and the same fix apply to two more namespaces, which
-/// is why all three are handled here:
+/// Two namespaces still need a JSON-funnel facade here because their
+/// instance-shaped APIs cannot be called through `sofuu.*` functions:
 ///
 ///   - **MCP** — `mcp.connect()` returns a client whose `call`/`listTools`
 ///     are instance methods, so a host could connect but never call a tool.
@@ -170,7 +151,7 @@ unsafe fn eval_init_snippet(ctx: *mut qjs::JSContext, src: &CString, filename: &
 ///     `http.serve({handler:"<globalName>", port, host})` takes the *name*
 ///     of a handler the host defined with `sofuu_rt_eval`. (This replaces
 ///     the documented-but-nonexistent `http.serve.start`.)
-const MEMORY_FACADE_JS: &str = r#"
+const CAPI_FACADE_JS: &str = r#"
 (function () {
   /* The funnel facade. Each namespace is installed INDEPENDENTLY — an
    * early `return` used to gate the whole IIFE on sofuu.memory, which meant
@@ -182,201 +163,11 @@ const MEMORY_FACADE_JS: &str = r#"
   if (S.__sofuu_facade) return;
   S.__sofuu_facade = true;
 
-  /* ── Memory. Only exists when the QTSQ codec is linked; a QTSQ-free
-   * build legitimately has no sofuu.memory, and the funnel answers
-   * unknown_method for it. ── */
-  var M = S.memory;
-  if (M && typeof M.open === 'function' && !M.__sofuu_facade) {
-  var live = [];
-  var realOpen = M.open;
-
-  M.open = function (a, dim, spaceId) {
-    // Accept both the funnel's object form {"path","dim","embed_id"} and
-    // the in-process positional form (path, dim, spaceId).
-    var path, d, sid;
-    if (a && typeof a === 'object') {
-      path = a.path; d = a.dim; sid = a.embed_id !== undefined ? a.embed_id : a.space;
-    } else {
-      path = a; d = dim; sid = spaceId;
-    }
-    var inst = sid === undefined || sid === null ? realOpen(path, d) : realOpen(path, d, sid);
-    var id = live.indexOf(inst);
-    if (id < 0) {
-      var emptyIdx = live.indexOf(null);
-      if (emptyIdx >= 0) {
-        id = emptyIdx;
-        live[id] = inst;
-      } else {
-        id = live.length;
-        live.push(inst);
-      }
-    }
-    try {
-      Object.defineProperty(inst, '__handle', { value: id, enumerable: false });
-      inst.toJSON = function () {
-        return { handle: id, dim: (function () { try { return d; } catch (e) { return null; } })() };
-      };
-    } catch (e) { /* sealed object — handle registry still works */ }
-    return inst;
-  };
-
-  function pick(a) {
-    if (a && a.handle !== undefined && a.handle !== null) {
-      var got = live[a.handle | 0];
-      if (!got) throw new TypeError('memory: no open brain with handle ' + a.handle);
-      return got;
-    }
-    for (var i = live.length - 1; i >= 0; i--) {
-      if (live[i]) return live[i];
-    }
-    throw new TypeError('memory: no open brain — call memory.open first');
-  }
-  function f32(v) {
-    if (v instanceof Float32Array) return v;
-    return new Float32Array(v || []);
-  }
-  function one(a, method, args) {
-    var inst = pick(a);
-    return inst[method].apply(inst, args);
-  }
-
-  M.remember = function (a) {
-    a = a || {};
-    if (!a.vec && a.text) {
-      return one(a, 'remember', [String(a.text), a.role || 'user', a.kv_page_id | 0,
-                                 a.source === undefined ? undefined : String(a.source)]);
-    }
-    return one(a, 'remember', [f32(a.vec), a.text, a.role || 'user', a.kv_page_id | 0,
-                               a.source === undefined ? undefined : String(a.source)]);
-  };
-  M.learn = function (a) {
-    a = a || {};
-    var text = typeof a === 'string' ? a : (a.text !== undefined ? a.text : '');
-    var role = a.role || 'user';
-    var source = a.source !== undefined ? String(a.source) : undefined;
-    return one(a, 'learn', [String(text), role, source]);
-  };
-  /* B1.5: the read-out surface, same shape as the in-process API. */
-  M.list = function (a) {
-    a = a || {};
-    var opts = {};
-    if (a.tier !== undefined) opts.tier = a.tier | 0;
-    if (a.role !== undefined) opts.role = String(a.role);
-    if (a.entity !== undefined) opts.entity = String(a.entity);
-    if (a.text !== undefined) opts.text = String(a.text);
-    if (a.min_strength !== undefined) opts.minStrength = +a.min_strength;
-    if (a.offset !== undefined) opts.offset = a.offset | 0;
-    if (a.limit !== undefined) opts.limit = a.limit | 0;
-    return one(a, 'list', [opts]);
-  };
-  M.export = function (a) { return one(a || {}, 'export', []); };
-  M.recall = function (a) {
-    a = a || {};
-    var q = a.text !== undefined ? a.text : a.query;
-    var k = a.k === undefined ? (a.top_k !== undefined ? (a.top_k | 0) : 5) : (a.k | 0);
-    if (!a.vec && q !== undefined && q !== null) {
-      return one(a, 'recall', [String(q), k]);
-    }
-    var args = [f32(a.vec), k];
-    if (q !== undefined && q !== null) args.push(String(q));
-    return one(a, 'recall', args);
-  };
-  M.search = function (a) {
-    a = a || {};
-    var q = typeof a === 'string' ? a : (a.text !== undefined ? a.text : (a.query !== undefined ? a.query : ''));
-    var k = a.k === undefined ? (a.top_k !== undefined ? (a.top_k | 0) : 5) : (a.k | 0);
-    return one(a, 'search', [String(q), k]);
-  };
-  M.count = function (a) { return one(a || {}, 'count', []); };
-  M.flush = function (a) { return one(a || {}, 'flush', []); };
-  M.forget = function (a) {
-    a = a || {};
-    return one(a, 'forget', [a.index | 0]);
-  };
-  /* B6 (ROADMAP-BRAIN-CMA): the session working set, same shapes as the
-   * in-process API — a headless embedder promotes exactly like the chat
-   * driver does. */
-  M.rememberWorking = function (a) {
-    a = a || {};
-    return one(a, 'rememberWorking', [f32(a.vec), a.text || '',
-                                      a.role || 'user', a.kv_page_id | 0,
-                                      a.source === undefined ? undefined : String(a.source)]);
-  };
-  M.promoteWorking = function (a) {
-    a = a || {};
-    return one(a, 'promoteWorking', [JSON.stringify(Array.isArray(a.ids) ? a.ids : (a.id !== undefined ? [a.id] : []))]);
-  };
-  M.clearWorking = function (a) { return one(a || {}, 'clearWorking', []); };
-  /* B7.1: stats is part of the read-out parity (doctor and /brain info
-   * read the same numbers a headless host does). */
-  M.stats = function (a) { return one(a || {}, 'stats', []); };
-
-  /* CMA parity additions */
-  M.rememberEntity = function (a) {
-    a = a || {};
-    return one(a, 'rememberEntity', [
-      f32(a.vec),
-      a.text || '',
-      a.entity_name || a.entityName || '',
-      a.entity_type || a.entityType || 'unknown'
-    ]);
-  };
-  M.rememberEntityTurn = function (a) {
-    a = a || {};
-    return one(a, 'rememberEntityTurn', [
-      f32(a.vec),
-      a.text || '',
-      a.entity_name || a.entityName || '',
-      a.entity_type || a.entityType || 'unknown'
-    ]);
-  };
-  M.markPositive = function (a) {
-    a = a || {};
-    var ids = a.ids !== undefined ? a.ids : a.id;
-    return one(a, 'markPositive', [ids]);
-  };
-  M.decayTick = function (a) {
-    a = a || {};
-    var dt = a.dt !== undefined ? +a.dt : (a.seconds !== undefined ? +a.seconds : (a.hours !== undefined ? (+a.hours * 3600) : 1));
-    one(a, 'decayTick', [dt]);
-    return true;
-  };
-  M.retain = function (a) { return one(a || {}, 'retain', []); };
-  M.retainAgainst = function (a) {
-    a = a || {};
-    var otherHandle = a.other !== undefined ? a.other : (a.canonical !== undefined ? a.canonical : a.target);
-    var otherInst = pick({ handle: otherHandle });
-    return one(a, 'retainAgainst', [otherInst]);
-  };
-  M.consolidate = function (a) { return one(a || {}, 'consolidate', []); };
-  M.compact = function (a) { return one(a || {}, 'compact', []); };
-  M.importRecords = function (a) {
-    a = a || {};
-    var json = typeof a.records === 'string' ? a.records : JSON.stringify(a.records || []);
-    return one(a, 'importRecords', [f32(a.vecs || a.vec), json]);
-  };
-  M.kvHints = function (a) {
-    a = a || {};
-    var n = a.n_hints !== undefined ? (a.n_hints | 0) : (a.n === undefined ? 5 : (a.n | 0));
-    return one(a, 'kvHints', [f32(a.vec), n]);
-  };
-
-  M.close = function (a) {
-    var inst = pick(a || {});
-    var id = live.indexOf(inst);
-    if (id >= 0) live[id] = null;
-    return true;
-  };
-  M.handles = function () {
-    var count = 0;
-    for (var i = 0; i < live.length; i++) if (live[i]) count++;
-    return count;
-  };
-  M.__sofuu_facade = true;
-  if (S.brain && !S.brain.__sofuu_facade) {
-    S.brain = M;
-  }
-  } /* end memory block */
+  /* ── Memory: installed by the ENGINE now (src/js/memory_api.js), on
+   * QTSQ builds only, so every host — CLI, eval, serve, capi — gets
+   * the same flat surface and the capability-gated builds keep their
+   * typed-refusal stubs. Nothing to do here; a host that reaches
+   * memory.* through this funnel calls the engine-installed methods. ── */
 
   /* ── MCP: the same dead-end, and the highest-value one after memory.
    * `mcp.connect` returns a client whose `call`/`listTools` are instance
@@ -541,12 +332,13 @@ const MEMORY_FACADE_JS: &str = r#"
 })();
 "#;
 
-/// Evaluate the memory facade shim on a fresh context. Returns true when it
-/// installed (a false result means `sofuu.memory` is unavailable on this
-/// build — the runtime still works, only the memory funnel is absent).
-unsafe fn install_memory_facade(ctx: *mut qjs::JSContext) -> bool {
-    let src = CString::new(MEMORY_FACADE_JS).unwrap_or_default();
-    eval_init_snippet(ctx, &src, c"<memory-facade>")
+/// Evaluate the C-ABI funnel facades (mcp + http) on a fresh context.
+/// Memory is not here: the engine installs the flat memory/brain surface
+/// itself (src/js/memory_api.js) on QTSQ builds, and a QTSQ-free build
+/// keeps its typed-refusal stubs.
+unsafe fn install_capi_facade(ctx: *mut qjs::JSContext) -> bool {
+    let src = CString::new(CAPI_FACADE_JS).unwrap_or_default();
+    eval_init_snippet(ctx, &src, c"<capi-facade>")
 }
 
 // ── ABI version ───────────────────────────────────────────────────
@@ -771,7 +563,7 @@ unsafe fn sofuu_rt_new_impl(config_json: *const c_char) -> *mut CapiRuntime {
                 // E0-1: make the brain reachable from the JSON funnel. Runs
                 // on the same context, after the embed config, because the
                 // facade keys brain paths off it.
-                install_memory_facade(ctx);
+                install_capi_facade(ctx);
             }
         }
     }
@@ -4612,6 +4404,131 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
+    /// R1/T1.3, finding #13: the flat memory/brain surface must be the SAME
+    /// on every build. A QTSQ-free build presents the documented names as
+    /// typed refusals; the real (QTSQ) build used to present only the
+    /// instance shape (`open()` → object methods), so `typeof
+    /// sofuu.memory.remember` was `undefined` on the build that actually
+    /// has memory. The engine now installs src/js/memory_api.js on QTSQ
+    /// builds: the flat methods delegate to the last-opened brain or
+    /// `{handle}`, `sofuu.brain` is the same surface, and both call forms
+    /// work. This test is the regression gate for all of that.
+    #[test]
+    fn flat_memory_and_brain_surface_is_complete() {
+        require_qtsq!();
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        // 1. Every documented flat method resolves on BOTH namespaces.
+        let shape = CString::new(
+            r#"var names = ["open","remember","learn","recall","search","count","flush",
+                          "forget","close","list","export","importRecords","stats",
+                          "retain","consolidate","compact","markPositive",
+                          "rememberWorking","promoteWorking","clearWorking",
+                          "rememberEntity","migrate","embeddingInfo","inspect",
+                          "handles","rememberEntityTurn","decayTick","retainAgainst","kvHints"];
+               function missing(ns){ return names.filter(function(n){
+                 return !(ns && typeof ns[n] === "function"); }); }
+               JSON.stringify({ memMissing: missing(sofuu.memory),
+                                brainMissing: missing(sofuu.brain),
+                                sameObject: sofuu.memory === sofuu.brain,
+                                marked: sofuu.memory && sofuu.memory.__flat_memory_api });"#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, shape.as_ptr(), &mut out) }, 0);
+        let raw = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+        let env: JsonValue = serde_json::from_str(&raw).expect("shape envelope is JSON");
+        let inner: JsonValue = serde_json::from_str(
+            env["result"].as_str().unwrap_or_else(|| panic!("shape result is a string: {env}")),
+        )
+        .expect("shape payload is JSON");
+        assert_eq!(inner["memMissing"], serde_json::json!([]), "missing flat methods on sofuu.memory: {inner}");
+        assert_eq!(inner["brainMissing"], serde_json::json!([]), "missing flat methods on sofuu.brain: {inner}");
+        assert_eq!(inner["sameObject"], true, "sofuu.brain must be the same namespace object: {inner}");
+        assert_eq!(inner["marked"], "full", "the flat surface must be marked full: {inner}");
+
+        // 2. A real round-trip through the flat (contract) form, on disk.
+        let dir = std::env::temp_dir().join(format!("sofuu-flat-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("brain.qtsq");
+        let path_json = serde_json::to_string(path.to_str().unwrap()).unwrap();
+        let dim = 4usize;
+        let opened = call(rt, "memory.open", &format!(r#"{{"path":{path_json},"dim":{dim}}}"#));
+        let hid = opened.get("handle").and_then(|h| h.as_i64()).expect("open must return a handle");
+
+        let mut ids = Vec::new();
+        for (i, text) in ["alpha memory", "beta memory"].iter().enumerate() {
+            let mut v = [0.0f32; 4];
+            v[i] = 1.0;
+            let idx = call(
+                rt,
+                "memory.remember",
+                &format!(
+                    r#"{{"handle":{hid},"vec":[{},{},{},{}],"text":{}}}"#,
+                    v[0], v[1], v[2], v[3],
+                    serde_json::to_string(text).unwrap()
+                ),
+            );
+            ids.push(idx.as_i64().expect("remember returns an index"));
+        }
+        assert!(ids.iter().all(|i| *i >= 0), "both records must store: {ids:?}");
+        let count = call(rt, "memory.count", &format!(r#"{{"handle":{hid}}}"#));
+        assert_eq!(count.as_u64(), Some(2), "flat count must see both records");
+
+        // Vector recall through the flat form (the brain's dim is 4, so an
+        // explicit vector — text auto-embed is the 768-dim path).
+        let hits = call(
+            rt,
+            "memory.recall",
+            &format!(r#"{{"handle":{hid},"vec":[1,0,0,0],"k":2}}"#),
+        );
+        let arr = hits.as_array().unwrap_or_else(|| panic!("recall must return hits, got {hits}"));
+        assert!(
+            arr.iter().any(|h| h.get("text").and_then(|t| t.as_str()) == Some("alpha memory")),
+            "the stored record must be retrievable: {hits}"
+        );
+
+        // 3. close() flushes and releases; reopening the same file sees the
+        //    records (the persistence half of "fully functional").
+        call(rt, "memory.close", &format!(r#"{{"handle":{hid}}}"#));
+        let reopened = call(rt, "memory.open", &format!(r#"{{"path":{path_json},"dim":{dim}}}"#));
+        let hid2 = reopened.get("handle").and_then(|h| h.as_i64()).expect("reopen must return a handle");
+        let count2 = call(rt, "memory.count", &format!(r#"{{"handle":{hid2}}}"#));
+        assert_eq!(count2.as_u64(), Some(2), "close must flush and reopen must see both records");
+
+        // 4. The instance path and the flat path address the same brain:
+        //    open a second file in JS, compare b.count() with the flat call.
+        let second = dir.join("brain2.qtsq");
+        let second_json = serde_json::to_string(second.to_str().unwrap()).unwrap();
+        let parity = CString::new(format!(
+            r#"var b = sofuu.memory.open({second_json}, {dim});
+               JSON.stringify({{ instCount: b.count(),
+                                 flatCount: sofuu.memory.count({{handle: b.__handle}}),
+                                 handles: sofuu.memory.handles() }});"#
+        ))
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { sofuu_rt_eval(rt, parity.as_ptr(), &mut out) }, 0);
+        let raw = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+        let env: JsonValue = serde_json::from_str(&raw).expect("parity envelope is JSON");
+        let inner: JsonValue = serde_json::from_str(
+            env["result"].as_str().unwrap_or_else(|| panic!("parity result is a string: {env}")),
+        )
+        .expect("parity payload is JSON");
+        assert_eq!(inner["instCount"], inner["flatCount"],
+            "the flat call must answer exactly like the instance method: {inner}");
+        assert_eq!(inner["handles"], 2, "two live brains (reopened + second): {inner}");
+
+        call(rt, "memory.close", &format!(r#"{{"handle":{hid2}}}"#));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { sofuu_rt_free(rt) };
+    }
+
     /// E0-4b: the mcp + http facades must actually install on the JS
     /// namespace. `mcp.call` used to be documented but unreachable (the
     /// client is an instance); `http.serve` replaces the documented-but-
@@ -4627,8 +4544,8 @@ mod tests {
         // The facade must have installed module-level methods. Reading them
         // as properties proves they are functions, not undefined.
         //
-        // Each lookup must be null-safe: on a QTSQ-free build `sofuu.memory`
-        // is undefined, and a bare `sofuu.memory.remember` THROWS (TypeError),
+        // Each lookup must be null-safe: a host/runtime can lack a namespace
+        // entirely, and a bare `sofuu.memory.remember` THROWS (TypeError),
         // which would abort the whole eval and take the mcp/http assertions
         // down with it. `__t` walks the path and reports "undefined" instead.
         let src = CString::new(

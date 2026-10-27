@@ -4452,6 +4452,160 @@ kernel void gemm_q8_0_tiled_fused(
     }
 }
 
+
+// ── q4_0 wide-chunk typed GEMM (the tiled-fused family's fourth member) ────
+// Same tile geometry, section table and epilogue as gemm_q8_0_tiled_fused:
+// one threadgroup owns 32 rows x 64 tokens, TILED_BK = 32 = ONE q4_0 block, so
+// the k-slice index IS the block index. Only the block layout differs: 18
+// bytes (f16 d + 16 packed bytes) per 32 values, byte j holding value j in its
+// low nibble and value j+16 in its high nibble (ggml's q4_0), with the -8
+// offset folded into the dequant.
+//
+// Why it exists: every q4_0 projection used to fall back to the per-row GEMV
+// walk, so a 128-row prefill chunk cost 128 dispatches PER PROJECTION and
+// re-streamed the whole matrix 128 times (a 4-token chunk: 672 dispatches).
+// This kernel makes a whole projection ONE dispatch, exactly like q8_0/q4_K.
+kernel void gemm_q4_0_tiled_fused(
+    device const uchar      *w_base     [[buffer(0)]],
+    device const float      *x          [[buffer(1)]],
+    device const float      *res        [[buffer(2)]],
+    device float            *y          [[buffer(3)]],
+    constant uint           &cols       [[buffer(4)]],
+    constant uint           &B          [[buffer(5)]],
+    constant uint           &rows_tot   [[buffer(6)]],
+    constant uint           &res_stride [[buffer(7)]],
+    constant GemmSection    *secs       [[buffer(8)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]]
+) {
+    threadgroup float ws[TILED_R * TILED_PAD];
+    threadgroup float xs[TILED_T * TILED_PAD];
+
+    uint r0 = tg.x * TILED_R;
+    uint t0 = tg.y * TILED_T;
+    uint nb = cols / 32u;             // 18-byte blocks per weight row
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = 0.0f; }
+    }
+
+    uint srow = r0 + (tid >> 2);
+    device const uchar *s_blk = w_base;
+    bool s_live = false;
+    {
+        uint prev_end = 0u, sec_off = 0u, sec_rem = 0u;
+        for (uint i = 0u; i < GEMM_MAX_SECTIONS; ++i) {
+            uint end_i = secs[i].rows_end;
+            if (srow >= prev_end && srow < end_i) {
+                sec_off = secs[i].off;
+                sec_rem = secs[i].rem;
+                break;
+            }
+            prev_end = end_i;
+        }
+        if (srow < rows_tot) {
+            s_blk = w_base + sec_off + sec_rem + (srow - prev_end) * nb * 18u;
+            s_live = true;
+        }
+    }
+    uint sv0 = (tid & 3) * 8;
+
+    uint nbk = cols / TILED_BK;
+    for (uint kb = 0; kb < nbk; ++kb) {
+        uint k0 = kb * TILED_BK;
+
+        // ── stage 32 rows x 32 values ──
+        {
+            float wv[8];
+            if (s_live) {
+                // q4_0: ONE 32-value block per k-slice, so kb IS the block index.
+                device const uchar *blk = s_blk + kb * 18u;
+                float d = float(read_f16(s_blk, kb * 18u));
+                for (uint u = 0; u < 8; ++u) {
+                    uint v = sv0 + u;
+                    // values 0..15 are the low nibbles of bytes 0..15,
+                    // values 16..31 the high nibbles of the same bytes.
+                    uchar byte = blk[2 + (v & 15u)];
+                    uint nib = (v < 16u) ? (uint)(byte & 0x0Fu) : (uint)(byte >> 4);
+                    wv[u] = d * ((float)nib - 8.0f);
+                }
+            } else {
+                for (uint u = 0; u < 8; ++u) { wv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 8; ++u) { ws[(tid >> 2) * TILED_PAD + sv0 + u] = wv[u]; }
+        }
+        // ── stage 64 tokens x 32 values ──
+        {
+            uint t = tid >> 1;
+            uint v0 = (tid & 1) * 16;
+            uint gt = t0 + t;
+            float xv[16];
+            if (gt < B) {
+                device const float *xt = x + (size_t)gt * cols + k0 + v0;
+                for (uint u = 0; u < 16; ++u) { xv[u] = xt[u]; }
+            } else {
+                for (uint u = 0; u < 16; ++u) { xv[u] = 0.0f; }
+            }
+            for (uint u = 0; u < 16; ++u) { xs[t * TILED_PAD + v0 + u] = xv[u]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tx = tid & 15;
+        uint ry = tid >> 4;
+        uint tbase = tx * 4;
+        uint rbase = ry * 4;
+        for (uint kk = 0; kk < TILED_BK; ++kk) {
+            float xv0 = xs[(tbase + 0) * TILED_PAD + kk];
+            float xv1 = xs[(tbase + 1) * TILED_PAD + kk];
+            float xv2 = xs[(tbase + 2) * TILED_PAD + kk];
+            float xv3 = xs[(tbase + 3) * TILED_PAD + kk];
+            float wv0 = ws[(rbase + 0) * TILED_PAD + kk];
+            float wv1 = ws[(rbase + 1) * TILED_PAD + kk];
+            float wv2 = ws[(rbase + 2) * TILED_PAD + kk];
+            float wv3 = ws[(rbase + 3) * TILED_PAD + kk];
+            acc[0][0] += wv0 * xv0; acc[0][1] += wv0 * xv1;
+            acc[0][2] += wv0 * xv2; acc[0][3] += wv0 * xv3;
+            acc[1][0] += wv1 * xv0; acc[1][1] += wv1 * xv1;
+            acc[1][2] += wv1 * xv2; acc[1][3] += wv1 * xv3;
+            acc[2][0] += wv2 * xv0; acc[2][1] += wv2 * xv1;
+            acc[2][2] += wv2 * xv2; acc[2][3] += wv2 * xv3;
+            acc[3][0] += wv3 * xv0; acc[3][1] += wv3 * xv1;
+            acc[3][2] += wv3 * xv2; acc[3][3] += wv3 * xv3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── epilogue: per-row section (y cursor) + optional residual ──
+    uint ey = tid >> 4;
+    uint et = tid & 15;
+    uint gt0 = t0 + et * 4;
+    for (uint i = 0; i < 4; ++i) {
+        uint grow = r0 + ey * 4 + i;
+        if (grow >= rows_tot) { continue; }
+        uint prev_end = 0u, y_off = 0u, y_str = 0u;
+        for (uint s = 0u; s < GEMM_MAX_SECTIONS; ++s) {
+            uint end_i = secs[s].rows_end;
+            if (grow >= prev_end && grow < end_i) {
+                y_off = secs[s].y_off;
+                y_str = secs[s].y_stride;
+                break;
+            }
+            prev_end = end_i;
+        }
+        uint local_row = grow - prev_end;
+        device float *yr = y + (y_off >> 2) + local_row;
+        device const float *rr = res + (size_t)grow;
+        for (uint j = 0; j < 4; ++j) {
+            uint gt = gt0 + j;
+            if (gt >= B) { continue; }
+            float v = acc[i][j];
+            if (res_stride != 0u) { v += rr[(size_t)gt * res_stride]; }
+            yr[(size_t)gt * y_str] = v;
+        }
+    }
+}
+
 // ── P5 arm-b: flash-style batched prefill attention ────────────────────────
 // The shipped llama_attn_1c_b4 recomputes every Q·K dot THREE times (max
 // pass, sum pass, weight table), reads K with a 512-byte lane stride, and

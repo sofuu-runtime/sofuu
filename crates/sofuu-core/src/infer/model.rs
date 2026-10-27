@@ -1095,8 +1095,31 @@ impl TransformerModel {
                 // off and the model runs on the CPU reference path.
                 && !config.rope_custom;
             if wanted {
-                GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm)
+                let armed = GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm);
+                if armed.is_none() {
+                    // Silent until now, and a silent None means the whole model
+                    // decodes on the CPU: the exact shape of the "zero GPU
+                    // gain on Spark-X2.5" report. Say it, and say why.
+                    eprintln!(
+                        "[gguf-gpu] decode client NOT armed: building it failed (no Metal device, or a buffer/allocation refusal above) - this model decodes on the CPU"
+                    );
+                }
+                armed
             } else {
+                // One loud line: a model that quietly falls back to the CPU
+                // route looks exactly like a GPU route with no gain.
+                let why = if !gpu_allowed {
+                    "the caller asked for the CPU route"
+                } else if !cfg!(target_os = "macos") {
+                    "not macOS"
+                } else if std::env::var("SOFUU_GPU_DECODE").map(|v| v == "0").unwrap_or(false) {
+                    "SOFUU_GPU_DECODE=0"
+                } else if gguf.resident.is_some() {
+                    "resident weights (SOFUU_RESIDENT_WEIGHTS=1)"
+                } else {
+                    "custom rope profile (partial rotary / longrope / llama3 scaling)"
+                };
+                eprintln!("[gguf-gpu] decode client NOT armed: {why} - this model runs the CPU route end to end");
                 None
             }
         };
@@ -3411,13 +3434,6 @@ impl TransformerModel {
         true
     }
 
-    /// GPU2.1 decode step: ALL layers across ONE commit each. Norms run as
-    /// in-batch kernels reading f32 weights straight from the weight mmap;
-    /// q/k RoPE + QK-norm fuse into the KV-write/attention kernels; x, the
-    /// activation slots and the KV caches (registered zero-copy, shared with
-    /// the CPU) are all command-buffer-resident between layers; x syncs back
-    /// to Vec once per token.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
     /// Every quant type this backend implements end to end: the CPU dequant /
     /// dot / matvec / matmat dispatch, the GGUF loader's row-size table and the
     /// Metal GEMV + GEMM kernels all cover exactly this set. Q5_K (13), Q4_1,
@@ -3520,6 +3536,12 @@ impl TransformerModel {
         secs
     }
 
+    /// ONE commit per layer, ALL layers. GPU-only (it drives `self.gpu`, which
+    /// exists on Apple targets only) and called from exactly one place,
+    /// `execute_layers_gpu` — so it carries the same gate as its caller. It
+    /// used to be ungated while `self.gpu` and the PROFILE_* statics it touches
+    /// were gated, which broke every non-Apple build.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
@@ -5792,7 +5814,7 @@ impl TransformerModel {
                     )
                 };
             let __tiled_ok = !__mma8_ok && !__q6_ok && b > 4
-                && matches!(__ty, 8u32 | 12u32 | 14u32)
+                && matches!(__ty, 2u32 | 8u32 | 12u32 | 14u32)
                 // SOFUU_CHAIN_NO_TILED=1 restores the per-row walk for the
                 // whole chunk, which is the A/B arm for this route's
                 // numeric receipt (same chunk width, different GEMM).
@@ -5800,8 +5822,11 @@ impl TransformerModel {
                 && {
                     // WIDE chunk (b > 4) on a tensor class with no mma8
                     // section of its own: q8_0 always (the Llama-3.2-1B /
-                    // SmolLM2 / K2-Horizon class is pure q8_0), and q4_K /
-                    // q6_K when their own forms above refused. Before this
+                    // SmolLM2 / K2-Horizon class is pure q8_0), q4_0 always
+                    // (the qwen2.5-0.5b q4_0 class, whose ONLY alternative is
+                    // the per-row GEMV: 168 dispatches per token, 21504 per
+                    // 128-row chunk), and q4_K / q6_K when their own forms
+                    // above refused. Before this
                     // arm the remaining routes were both wrong for a wide
                     // chunk: the b4 GEMV computes FOUR rows (124 of 128
                     // would stay stale) and the per-row loop costs b

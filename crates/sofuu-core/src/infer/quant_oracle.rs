@@ -1067,12 +1067,10 @@ fn oracle_q3_k_scale_permutation_round_trips() {
 /// THE STRUCTURAL GATE. Every type the loader accepts must have an oracle
 /// here that RUNS and passes; a type added to SUPPORTED_QUANT_TYPES without
 /// one fails this test instead of shipping as "supported" on a constant.
-// Gate this on the same platforms as the list it reads: model.rs:3420 carries
-// a stray cfg(macos|ios) between a removed GPU fn doc block and
-// SUPPORTED_QUANT_TYPES, so the const only exists on Apple targets.
-// (Pre-existing; reported rather than "fixed" here, because the const and
-// gate_quant_type disagreeing about it is a loader question, not a test one.)
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+// This list is platform-independent. It used to inherit a stray
+// cfg(macos|ios) from a removed GPU fn's doc block while gate_quant_type
+// (model.rs:1319) read it unconditionally, so a non-Apple build could not
+// resolve the const. The attribute was deleted rather than propagated here.
 #[test]
 fn every_accepted_quant_type_has_a_kernel_oracle() {
     for ty in TransformerModel::SUPPORTED_QUANT_TYPES {

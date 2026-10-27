@@ -352,6 +352,10 @@ struct MetalContext {
     bool pso_gemm_q6_k_tiled_fused_live;
     id<MTLComputePipelineState> pso_gemm_q8_0_tiled_fused;
     bool pso_gemm_q8_0_tiled_fused_live;
+    // q4_0's wide-chunk GEMM: same 32x64 tile as q8_0 (q4_0 is also one block
+    // per 32 values), so the whole q4_0 fleet stops walking one GEMV per token.
+    id<MTLComputePipelineState> pso_gemm_q4_0_tiled_fused;
+    bool pso_gemm_q4_0_tiled_fused_live;
     id<MTLComputePipelineState> pso_gemm_q4_k_mmq;
     bool pso_gemm_q4_k_mmq_live;
     id<MTLComputePipelineState> pso_gemm_q6_k_mmq;
@@ -1006,6 +1010,19 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemm_q6_k_tiled_fused_live = ctx->pso_gemm_q6_k_tiled_fused != nil;
         ctx->pso_gemm_q8_0_tiled_fused = load_pso(@"gemm_q8_0_tiled_fused");
         ctx->pso_gemm_q8_0_tiled_fused_live = ctx->pso_gemm_q8_0_tiled_fused != nil;
+        ctx->pso_gemm_q4_0_tiled_fused = load_pso(@"gemm_q4_0_tiled_fused");
+        // The 32x64 tile dispatches 128 threads. Metal DROPS an over-wide
+        // threadgroup silently, which would leave y stale, so a pipeline that
+        // cannot take 128 threads is nilled here and the typed entry points
+        // return 0 (the chain then keeps its per-row q4_0 GEMV fallback).
+        if (ctx->pso_gemm_q4_0_tiled_fused != nil &&
+            ctx->pso_gemm_q4_0_tiled_fused.maxTotalThreadsPerThreadgroup < 128ul) {
+            fprintf(stderr,
+                    "[metal] gemm_q4_0_tiled_fused needs 128 threads/group, pipeline allows %lu - q4_0 tiled disabled\n",
+                    (unsigned long)ctx->pso_gemm_q4_0_tiled_fused.maxTotalThreadsPerThreadgroup);
+            ctx->pso_gemm_q4_0_tiled_fused = nil;
+        }
+        ctx->pso_gemm_q4_0_tiled_fused_live = ctx->pso_gemm_q4_0_tiled_fused != nil;
         ctx->pso_gemm_q4_k_mmq = load_pso(@"gemm_q4_k_mmq");
         ctx->pso_gemm_q4_k_mmq_live = ctx->pso_gemm_q4_k_mmq != nil;
         ctx->pso_gemm_q6_k_mmq = load_pso(@"gemm_q6_k_mmq");
@@ -2682,6 +2699,7 @@ extern "C" int sofuu_metal_batch_gguf_gemv_q4k_v2(
 static inline bool sf_gemm_cols_ok(uint32_t ty, size_t cols) {
     if (cols == 0) return false;
     switch (ty) {
+        case 2:  return (cols % 32u) == 0;   // q4_0: 18-byte block, 32 values
         case 8:  return (cols % 32u) == 0;
         case 12: return (cols % 256u) == 0;
         case 14: return (cols % 256u) == 0;
@@ -2813,6 +2831,7 @@ int sofuu_metal_batch_gguf_gemm_tiled_multi(
         case 12: pso = ctx->pso_gemm_q4_k_tiled_fused; break;
         case 14: pso = ctx->pso_gemm_q6_k_tiled_fused; break;
         case 8:  pso = ctx->pso_gemm_q8_0_tiled_fused; break;
+        case 2:  pso = ctx->pso_gemm_q4_0_tiled_fused_live ? ctx->pso_gemm_q4_0_tiled_fused : nil; break;
         default: return 0;
     }
     if (pso == nil) return 0;
@@ -2900,6 +2919,7 @@ int sofuu_metal_batch_gguf_gemm_tiled_acc(
         case 12: pso = ctx->pso_gemm_q4_k_tiled_fused; break;
         case 14: pso = ctx->pso_gemm_q6_k_tiled_fused; break;
         case 8:  pso = ctx->pso_gemm_q8_0_tiled_fused; break;
+        case 2:  pso = ctx->pso_gemm_q4_0_tiled_fused_live ? ctx->pso_gemm_q4_0_tiled_fused : nil; break;
         default: return 0;
     }
     if (pso == nil) return 0;

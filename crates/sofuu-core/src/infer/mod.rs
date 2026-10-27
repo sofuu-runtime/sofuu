@@ -635,10 +635,114 @@ pub fn clean_model_path(path: &str) -> std::path::PathBuf {
 #[derive(Debug, Clone)]
 pub struct ScoreStats {
     pub tokens_total: usize,
+    /// Effective scoring window (max left context a scored token can see);
+    /// the caller's 0 becomes `DEFAULT_SCORE_WINDOW`, clamped to the model's
+    /// own `max_seq_len`. Reported so the number can be compared to another
+    /// tool's `-c`.
+    pub window: usize,
     pub scored: usize,
     pub windows: usize,
     pub nll_total: f64,
     pub ppl: f64,
+}
+
+/// Default scoring window (context a scored token may see). 512 is
+/// llama-perplexity's default `n_ctx`, so `--score` and that tool measure the
+/// same thing out of the box. The previous default (64) silently made every
+/// sofuu ppl a short-context number and therefore incomparable.
+pub const DEFAULT_SCORE_WINDOW: usize = 512;
+
+/// Below this many scored tokens the mean NLL is a handful-of-samples estimate
+/// — exp() of a few draws, not a perplexity. `--score` prints the count and
+/// warns, so a 1-token number can never pass for a corpus perplexity again.
+pub const MIN_SCORE_SAMPLE: usize = 32;
+
+/// One window of the teacher-forced pass. `tokens[start..start+prefill]` only
+/// fill the KV cache (the batched prefill returns the last row's logits only,
+/// so those positions cannot be scored without paying a decode step each);
+/// `tokens[first_scored..end]` are scored, one decode step apiece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreWindow {
+    pub start: usize,
+    pub prefill: usize,
+    pub first_scored: usize,
+    pub end: usize,
+}
+
+/// Plan the scoring pass: every token index in `1..len` is scored exactly
+/// once, windows overlap by exactly one token (the last token of a window is
+/// the first CONTEXT token of the next, so it is never scored twice), and the
+/// context-only prefix of a window is capped at half its span — without that
+/// cap a tail window shorter than the prefill batch degenerated to a single
+/// scored token (a 24-token text reported "ppl 10.73" from ONE token, and a
+/// 139-token text at window 512 from 11).
+pub fn score_windows(len: usize, window: usize, batch: usize) -> Vec<ScoreWindow> {
+    let mut out = Vec::new();
+    if len < 3 {
+        return out;
+    }
+    let window = window.max(2);
+    let batch = batch.max(1);
+    // Head: the one context-only prefix of the whole pass — the only tokens a
+    // score run never sees scored. It is as large as the fast prefill path
+    // allows, so the coverage loss is paid once per text instead of once per
+    // window.
+    let head = (len - 2).min(batch).min(window / 2).min((len / 4).max(1));
+    let mut scored_from = head;
+    while scored_from < len {
+        let remaining = len - scored_from;
+        // A window can hold `window` positions TOTAL (its context-only prefix
+        // plus its scored run): exceeding that is what used to make the
+        // runtime loop break early and skip tokens the plan had counted.
+        let last = remaining <= window;
+        let total = if last { remaining } else { window };
+        let prefill = if out.is_empty() {
+            head
+        } else {
+            // Each later window re-prefills the tail of what was just scored
+            // as ITS context, so scored runs stay CONTIGUOUS: every token after
+            // the head is scored exactly once. The old stride (one-token
+            // overlap, prefix repeated per window) silently dropped
+            // min(batch, span/2) - 1 tokens between windows — 25% of a corpus
+            // at window 512 and 50% at the old default of 64 — and nothing in
+            // the output said so.
+            (total - 1).min(batch).min(total / 2).min(scored_from).max(1)
+        };
+        if total <= prefill {
+            break;
+        }
+        let end = if last { len } else { scored_from + (total - prefill) };
+        out.push(ScoreWindow { start: scored_from - prefill, prefill, first_scored: scored_from, end });
+        scored_from = end;
+    }
+    out
+}
+
+/// NLL of `target` under the full-vocabulary log-softmax of `logits`, in
+/// nats. One definition, used by `score_text` and pinned by the tests: base-e
+/// log, max-subtracted for stability, whole vocabulary — the same quantity a
+/// `SOFUU_DUMP_LOGITS` dump yields when recomputed in f64 off-line.
+pub fn log_softmax_nll(logits: &[f32], target: usize) -> f64 {
+    let mut mx = f32::NEG_INFINITY;
+    for &l in logits {
+        if l > mx {
+            mx = l;
+        }
+    }
+    let mut sum = 0.0f32;
+    for &l in logits {
+        sum += (l - mx).exp();
+    }
+    -((logits[target] - mx) - sum.ln()) as f64
+}
+
+/// ppl = exp(mean NLL) = exp(nll_total / scored); NaN when nothing was scored.
+pub fn ppl_from_nll(nll_total: f64, scored: usize) -> f64 {
+    if scored == 0 {
+        f64::NAN
+    } else {
+        (nll_total / scored as f64).exp()
+    }
 }
 
 impl InferEngine {
@@ -901,20 +1005,33 @@ impl InferEngine {
 
     /// Teacher-forced NLL scoring (PLAN-LONG-CONTEXT-PERSISTENCE §8 P3): run
     /// the text through the model and accumulate the NLL of every next token
-    /// given its left context, in sliding windows of `window` tokens
-    /// (1-token overlap; each window's first token is context, not scored).
+    /// given its left context, in sliding windows of `window` tokens (each
+    /// window re-prefills the tail of the previous one as context, so the
+    /// scored runs are contiguous; see `score_windows`).
     /// This is the surface Gate 2 needs (PPL ratio f16 vs KIVI) and the only
     /// honest perplexity measurement available without touching the prefill
     /// kernels: the batched prefill keeps only the LAST token's logits, so
     /// every other scored position costs one single-token `forward` (decode
     /// speed — a 4k-token slice is minutes, not seconds).
     ///
-    /// Per window: one batched prefill of the first `batch` tokens (the fast
-    /// GEMM path), then per-token forwards for the rest, scoring from the
-    /// returned logits before each step. With `options.kivi`, KIVI is armed
-    /// after every window's prefill (the same prefill-FP32 → decode-quantized
-    /// flow as `stream`), so f16-vs-KIVI ratios measure exactly the shipped
-    /// decode path. The multi-turn prefix cache is cleared and left cleared.
+    /// Per window: one batched prefill of the first `prefill` tokens (the fast
+    /// GEMM path; those rows are CONTEXT ONLY — their logits are not computed),
+    /// then per-token forwards for the rest, scoring from the returned logits
+    /// before each step. With `options.kivi`, KIVI is armed after every
+    /// window's prefill (the same prefill-FP32 → decode-quantized flow as
+    /// `stream`), so f16-vs-KIVI ratios measure exactly the shipped decode
+    /// path. The multi-turn prefix cache is cleared and left cleared.
+    ///
+    /// CONVENTION (the numbers are only comparable to another tool when these
+    /// match): ppl = exp(mean NLL) over the SCORED tokens, natural log,
+    /// full-vocab log-softmax, token 0 always unscored, `window` = the left
+    /// context a scored token can see (default `DEFAULT_SCORE_WINDOW` = 512 =
+    /// llama-perplexity's default `n_ctx`), and each window's first `prefill`
+    /// tokens are context only — so `scored` < `tokens_total` - 1 and is
+    /// reported alongside the ppl. A ppl over a handful of tokens is a
+    /// handful-of-samples estimate, not a perplexity: `MIN_SCORE_SAMPLE`
+    /// exists because a 1-token "ppl" (45.19 on one token) was once reported
+    /// next to a 1.42 over a thousand.
     pub fn score_text(
         &mut self,
         text: &str,
@@ -927,50 +1044,40 @@ impl InferEngine {
         }
         let vocab = self.model.config.vocab_size;
         let max_seq = self.model.config.max_seq_len;
-        let window = window.max(64).min(max_seq);
+        let window = if window == 0 { DEFAULT_SCORE_WINDOW } else { window };
+        let window = window.max(8).min(max_seq);
         let batch = self::model::max_prefill_batch().min(window / 2).max(1);
 
         let mut stats = ScoreStats {
             tokens_total: tokens.len(),
+            window,
             scored: 0,
             windows: 0,
             nll_total: 0.0,
             ppl: f64::NAN,
         };
         let mut logits = vec![0.0f32; vocab];
-        let mut start = 0usize;
-        while start + 2 < tokens.len() {
-            let end = (start + window).min(tokens.len());
-            let prefill_n = (end - 1 - start).min(batch);
+        for w in score_windows(tokens.len(), window, batch) {
             self.model.reset_cache();
             self.cached_tokens.clear();
-            let lg = self.model.forward_prefill_all_with_logits(&tokens[start..start + prefill_n], 0);
+            let lg = self
+                .model
+                .forward_prefill_all_with_logits(&tokens[w.start..w.start + w.prefill], 0);
             logits.copy_from_slice(lg);
-            let mut kvpos = prefill_n;
+            let mut kvpos = w.prefill;
             if options.kivi {
                 self.model.enable_kivi(options.kivi_bits, kvpos);
             }
-            let mut i = start + prefill_n;
+            let mut i = w.first_scored;
             loop {
                 /* logits currently predict tokens[i] — score it. */
                 let t = tokens[i] as usize;
                 if t < vocab {
-                    let mut lse = f32::NEG_INFINITY;
-                    for &l in logits.iter() {
-                        if l > lse {
-                            lse = l;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for &l in logits.iter() {
-                        sum += (l - lse).exp();
-                    }
-                    let nll = -((logits[t] - lse) - sum.ln()) as f64;
-                    stats.nll_total += nll;
+                    stats.nll_total += log_softmax_nll(&logits, t);
                     stats.scored += 1;
                 }
                 i += 1;
-                if i >= end || kvpos + 1 >= window {
+                if i >= w.end || kvpos + 1 >= window {
                     break;
                 }
                 let out = self.model.forward(tokens[i - 1], kvpos);
@@ -978,14 +1085,8 @@ impl InferEngine {
                 kvpos += 1;
             }
             stats.windows += 1;
-            /* 1-token overlap: the next window re-prefills this token as
-             * context, so every token is scored with full in-window left
-             * context and scored exactly once. */
-            start = end - 1;
         }
-        if stats.scored > 0 {
-            stats.ppl = (stats.nll_total / stats.scored as f64).exp();
-        }
+        stats.ppl = ppl_from_nll(stats.nll_total, stats.scored);
         Ok(stats)
     }
 
@@ -1963,3 +2064,107 @@ mod prefix_cache_tests {
         assert_eq!(super::reusable_history_len(false, 3, 1), 1);
     }
 }
+
+
+#[cfg(test)]
+mod score_ppl_tests {
+    use super::{log_softmax_nll, ppl_from_nll, score_windows, DEFAULT_SCORE_WINDOW, MIN_SCORE_SAMPLE};
+
+    /// Convention pin: ppl is exp(mean NLL) in NATS. Uniform logits over a
+    /// 4-way vocabulary put exactly 1/4 on every token, so one token's NLL is
+    /// ln 4 and the perplexity of that single token is exactly 4 — if anyone
+    /// switches the base (log2/log10), drops the normaliser or forgets the
+    /// exp, this fails with an exact number instead of a tolerance.
+    #[test]
+    fn nll_is_natural_log_of_the_full_vocab_softmax() {
+        let uniform = [0.0f32; 4];
+        for t in 0..4 {
+            assert!((log_softmax_nll(&uniform, t) - std::f64::consts::LN_2 * 2.0).abs() < 1e-6);
+        }
+        assert!((ppl_from_nll(log_softmax_nll(&uniform, 1), 1) - 4.0).abs() < 1e-5);
+        // Two scored tokens, NLL ln 4 and ln 2: mean = (ln 4 + ln 2)/2 so the
+        // ppl is exactly sqrt(8) — the averaging and the exp, both pinned.
+        let two = [1.0f32, 0.0, 0.0, 0.0]; // log-softmax[1] = ln(e^-1/(e^-1+3))
+        let nll_a = log_softmax_nll(&uniform, 0);
+        let nll_b = log_softmax_nll(&two, 1);
+        let expect = ((nll_a + nll_b) / 2.0).exp();
+        assert!((ppl_from_nll(nll_a + nll_b, 2) - expect).abs() < 1e-9);
+        assert!(expect > 4.0 && expect < 8.0);
+        // Stability: a huge logit range must not overflow (f32 exp of 500 -> inf).
+        let wide = [500.0f32, -500.0, 0.0, 0.0];
+        let v = log_softmax_nll(&wide, 1);
+        assert!(v.is_finite() && v > 0.0, "nll {v} must be finite and positive");
+        // Zero scored tokens has no perplexity.
+        assert!(ppl_from_nll(0.0, 0).is_nan());
+    }
+
+    /// The convention that produced the false "32x worse than llama.cpp":
+    /// every scored token is scored exactly once, and the corpus is not
+    /// silently reduced to a couple of samples.
+    #[test]
+    fn windows_score_every_token_exactly_once() {
+        for &len in &[8usize, 24, 33, 64, 139, 913, 2579] {
+            for &window in &[8usize, 64, 128, 512, 4096] {
+                for &batch in &[1usize, 4, 32, 128] {
+                    let plan = score_windows(len, window, batch);
+                    let mut hits = vec![0u8; len];
+                    for w in &plan {
+                        assert!(w.prefill >= 1, "a window needs at least one context token");
+                        assert!(w.first_scored > w.start && w.first_scored < w.end);
+                        assert!(w.end <= len);
+                        for i in w.first_scored..w.end {
+                            hits[i] += 1;
+                        }
+                    }
+                    // Token 0 never has a left context, and the head of the
+                    // text is the first window's context-only prefix. From
+                    // there on, coverage must be contiguous and single.
+                    let head = plan.first().map(|w| w.first_scored).unwrap_or(0);
+                    for (i, h) in hits.iter().enumerate() {
+                        assert!(*h <= 1, "len={len} window={window} batch={batch}: token {i} scored {h} times");
+                        if i >= head {
+                            assert_eq!(*h, 1, "len={len} window={window} batch={batch}: token {i} never scored (head={head})");
+                        } else {
+                            assert_eq!(*h, 0, "len={len} window={window} batch={batch}: token {i} < head");
+                        }
+                    }
+                    // No window may spend more than half of itself on context.
+                    for w in &plan {
+                        let win_span = w.end - w.start;
+                        assert!(
+                            w.prefill * 2 <= win_span.max(2),
+                            "len={len} window={window}: prefix {} of window span {win_span}",
+                            w.prefill
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The regression itself: with the shipped default window, a text of a few
+    /// hundred tokens used to yield a ppl from ONE token (or 11), because the
+    /// prefill prefix was allowed to eat the whole window. Pin the sample size.
+    #[test]
+    fn short_text_sample_is_not_degenerate() {
+        let n = |len: usize, window: usize, batch: usize| -> usize {
+            score_windows(len, window, batch).iter().map(|w| w.end - w.first_scored).sum()
+        };
+        // 24-token text, default window: was 1 scored token, ppl "10.73".
+        assert!(n(24, DEFAULT_SCORE_WINDOW, 128) >= 11);
+        // 139-token text at window 512: was 11.
+        assert!(n(139, 512, 128) >= 64);
+        // A window no longer than its own prefill batch still scores half.
+        assert!(n(40, 32, 128) >= 20);
+        // The head of every window is context only, so the scored FRACTION is
+        // bounded below by (window-batch)/window: 75% at the default, 50% at
+        // window 64. Pin it so no future change can quietly score a tenth.
+        let scored = n(2579, DEFAULT_SCORE_WINDOW, 128);
+        assert!(scored * 100 / (2579 - 1) >= 70, "scored {scored} of 2578");
+        assert!(scored >= MIN_SCORE_SAMPLE);
+        // Coverage is now the head plus everything after it, so a longer
+        // window must not score LESS of the corpus than a shorter one.
+        assert!(n(2579, 2048, 128) >= n(2579, DEFAULT_SCORE_WINDOW, 128));
+    }
+}
+

@@ -64,6 +64,7 @@ pub const OP_NAMES: [&str; OP_KINDS] = [
 /// below the floor is a silent wrong answer, not a slow one.
 pub fn gemm_cols_floor(ty: u32) -> Option<usize> {
     match ty {
+        GGML_TYPE_Q4_0 => Some(32),
         GGML_TYPE_Q8_0 => Some(32),
         GGML_TYPE_Q4_K => Some(256),
         GGML_TYPE_Q6_K => Some(256),
@@ -2344,7 +2345,7 @@ impl MetalEngine {
         rows_total: usize, cols: usize, b: usize,
         secs: &[[u32; 5]],
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || b < 2 {
+        if !matches!(ty, 2 | 8 | 12 | 14) || secs.is_empty() || secs.len() > 4 || b < 2 {
             return false;
         }
         if !gemm_cols_ok(ty, cols) {
@@ -2380,7 +2381,7 @@ impl MetalEngine {
         y_buf: &MetalBuffer, y_offset: usize,
         rows: usize, cols: usize, b: usize,
     ) -> bool {
-        if !matches!(ty, 8 | 12 | 14) || b < 2 || res_stride != rows {
+        if !matches!(ty, 2 | 8 | 12 | 14) || b < 2 || res_stride != rows {
             return false;
         }
         if !gemm_cols_ok(ty, cols) {
@@ -4260,6 +4261,258 @@ mod batch_gguf_parity_tests {
         );
     }
 
+
+
+    /// The q4_0 twin of the q8_0 oracle above: same 32x64 tiled fused GEMM
+    /// (gemm_q4_0_tiled_fused), same section table, DIFFERENT block layout —
+    /// 18 bytes per 32 values, f16 d then 16 packed bytes where byte j carries
+    /// value j in its low nibble and value j+16 in its high nibble, dequant
+    /// d*(nib-8). q4_0 was the one quant class with NO wide-chunk GEMM at all
+    /// (every projection walked one GEMV per token), so this kernel is new and
+    /// gets its own reference rather than a tolerance on the per-row path.
+    ///
+    /// Fixtures: three sections at RAW, non-256-aligned offsets with
+    /// inter-section padding (the section cursor's off+rem split); widths
+    /// 960/992/1024/2080/3200 = 30/31/32/65/100 blocks, i.e. many k-tiles, and
+    /// 960 & 2080 & 3200 are NOT multiples of 256 so the q4_K-family floor
+    /// could never cover them; b_tok 9/17 (a 1-token tail past the 8-value
+    /// subtile) and 70 (past the 64-token tile, where the store cursor has to
+    /// carry t0 forward — the defect that once left tokens 8..B-1 unwritten).
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gemm_q4_0_multi_matches_dequant_oracle() {
+        let engine = match MetalEngine::new() {
+            Some(e) => e,
+            None => {
+                eprintln!("[oracle-q4_0] no Metal device - skipped");
+                return;
+            }
+        };
+
+        let b_toks = [9usize, 17usize, 70usize];
+        let sec_rows = [640usize, 320usize, 320usize];
+        let total: usize = sec_rows.iter().sum();
+        let widths = [960usize, 992, 1024, 2080, 3200];
+
+        let mut state = 0x51ED270B9F4A7C15u64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let f16_bytes = |v: f32| -> [u8; 2] {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = (((b >> 23) & 0xFF) as i32 - 127 + 15).clamp(1, 30) as u16;
+            let man = (b >> 13) & 0x3FF;
+            (sign | (exp << 10) | (man as u16)).to_le_bytes()
+        };
+        let f16_read = |lo: u8, hi: u8| -> f64 {
+            let h = u16::from_le_bytes([lo, hi]);
+            let sign = if h & 0x8000 != 0 { -1.0f64 } else { 1.0f64 };
+            let exp = ((h >> 10) & 0x1F) as i32;
+            let man = (h & 0x3FF) as f64;
+            if exp == 0 {
+                sign * man * 2f64.powi(-24)
+            } else {
+                sign * (1.0 + man / 1024.0) * 2f64.powi(exp - 15)
+            }
+        };
+
+        let mut rows: Vec<(usize, usize, f64, f64)> = Vec::new();
+
+        for &b_tok in b_toks.iter() {
+            for &cols in widths.iter() {
+                let nb = cols / 32; // q4_0 block = 32 values / 18 bytes
+                let row_bytes = nb * 18;
+
+                let mut sec_raw = [0usize; 3];
+                let mut cur = 96usize;
+                let mut w_len = 0usize;
+                for s in 0..3 {
+                    sec_raw[s] = cur;
+                    cur += row_bytes * sec_rows[s];
+                    w_len = cur;
+                    cur += 64 + 128 * s;
+                }
+                let w_arena = Arena::new(w_len.max(4096));
+                {
+                    let w = unsafe { std::slice::from_raw_parts_mut(w_arena.ptr, w_arena.len) };
+                    for s in 0..3 {
+                        for r in 0..sec_rows[s] {
+                            let base = sec_raw[s] + r * row_bytes;
+                            for b in 0..nb {
+                                let off = base + b * 18;
+                                w[off..off + 2]
+                                    .copy_from_slice(&f16_bytes(0.03125f32 * ((rand() % 32) + 1) as f32));
+                                // every nibble value 0..15 appears: the -8
+                                // offset and both halves of each byte matter.
+                                for j in 0..16 {
+                                    w[off + 2 + j] = (rand() % 256) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+                let w_buf = engine.register_zerocopy_only(w_arena.as_slice()).expect("w buf");
+
+                let x_f32 = b_tok * cols;
+                let region = b_tok * total;
+                let out_off = x_f32 * 4;
+                let slab_arena = Arena::new(out_off + region * 4);
+                let slab = unsafe { std::slice::from_raw_parts_mut(slab_arena.ptr, slab_arena.len) };
+                for t in 0..b_tok {
+                    for i in 0..cols {
+                        let v = ((i * 7 + t * 3) % 23) as f32 * 0.25 - 2.5;
+                        slab[(t * cols + i) * 4..(t * cols + i) * 4 + 4]
+                            .copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                for byte in slab[out_off..].iter_mut() {
+                    *byte = 0x7F;
+                }
+                let slab_buf = engine.register_zerocopy_only(slab_arena.as_slice()).expect("slab");
+
+                let mut sec_ybase = [0usize; 3];
+                {
+                    let mut acc = 0usize;
+                    for s in 0..3 {
+                        sec_ybase[s] = acc;
+                        acc += b_tok * sec_rows[s];
+                    }
+                }
+
+                // -- host reference: dequant from the SAME bytes in GGML order
+                // (byte j -> value j and value j+16), f64 accumulate.
+                let reference = {
+                    let mut v = vec![0f64; region];
+                    let w = w_arena.as_slice();
+                    for s in 0..3 {
+                        for t in 0..b_tok {
+                            for r in 0..sec_rows[s] {
+                                let base = sec_raw[s] + r * row_bytes;
+                                let mut acc = 0f64;
+                                for b in 0..nb {
+                                    let off = base + b * 18;
+                                    let d = f16_read(w[off], w[off + 1]);
+                                    let xb0 = (t * cols + b * 32) * 4;
+                                    for j in 0..16 {
+                                        let byte = w[off + 2 + j];
+                                        let lo = ((byte & 0x0F) as f64) - 8.0;
+                                        let hi = ((byte >> 4) as f64) - 8.0;
+                                        let x_lo = f32::from_le_bytes(
+                                            slab[xb0 + j * 4..xb0 + j * 4 + 4].try_into().unwrap(),
+                                        ) as f64;
+                                        let x_hi = f32::from_le_bytes(
+                                            slab[xb0 + (j + 16) * 4..xb0 + (j + 16) * 4 + 4]
+                                                .try_into()
+                                                .unwrap(),
+                                        ) as f64;
+                                        acc += d * (lo * x_lo + hi * x_hi);
+                                    }
+                                }
+                                v[sec_ybase[s] + t * sec_rows[s] + r] = acc;
+                            }
+                        }
+                    }
+                    v
+                };
+
+                let mut blob = [[0u32; 5]; 4];
+                let base = (0..3).map(|s| sec_raw[s] & !255usize).min().unwrap();
+                let mut end = 0u32;
+                let mut y_acc = out_off;
+                for s in 0..3 {
+                    blob[s][0] = ((sec_raw[s] & !255usize) - base) as u32;
+                    blob[s][1] = (sec_raw[s] & 255usize) as u32;
+                    end += sec_rows[s] as u32;
+                    blob[s][2] = end;
+                    blob[s][3] = y_acc as u32;
+                    blob[s][4] = sec_rows[s] as u32;
+                    y_acc += b_tok * sec_rows[s] * 4;
+                }
+
+                assert!(engine.batch_open());
+                let ok = unsafe {
+                    sofuu_metal_batch_gguf_gemm_tiled_multi(
+                        engine.ctx,
+                        2u32, // GGML_TYPE_Q4_0
+                        w_buf.handle,
+                        base,
+                        slab_buf.handle,
+                        0,
+                        slab_buf.handle,
+                        0,
+                        total,
+                        cols,
+                        b_tok,
+                        blob.as_ptr() as *const u32,
+                        3,
+                    ) == 1
+                };
+                assert!(engine.batch_end(), "[oracle-q4_0] batch_end failed cols={cols}");
+                assert!(ok, "[oracle-q4_0] gemm_q4_0_tiled_fused unavailable at cols={cols}");
+
+                let read = |s: usize, t: usize, r: usize| -> f32 {
+                    let byte = out_off + (sec_ybase[s] + t * sec_rows[s] + r) * 4;
+                    f32::from_le_bytes(slab[byte..byte + 4].try_into().unwrap())
+                };
+                let mut max_d = 0f64;
+                let mut max_ref = 0f64;
+                let mut worst = (0usize, 0usize, 0usize);
+                let mut nbad = 0usize;
+                for s in 0..3 {
+                    for t in 0..b_tok {
+                        for r in 0..sec_rows[s] {
+                            let g = read(s, t, r) as f64;
+                            let e = reference[sec_ybase[s] + t * sec_rows[s] + r];
+                            max_ref = max_ref.max(e.abs());
+                            let d = (g - e).abs();
+                            if d > max_d {
+                                max_d = d;
+                                worst = (s, t, r);
+                            }
+                            if d > 4e-3 * e.abs().max(1.0) {
+                                nbad += 1;
+                            }
+                        }
+                    }
+                }
+                let poison = f32::from_bits(0x7F7F_7F7F);
+                let mut n_untouched = 0usize;
+                for s in 0..3 {
+                    for t in 0..b_tok {
+                        for r in 0..sec_rows[s] {
+                            if read(s, t, r) == poison {
+                                n_untouched += 1;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    n_untouched == 0,
+                    "[oracle-q4_0] cols={cols} b_tok={b_tok}: {n_untouched}/{region} output cells \
+                     were NEVER written (still the 0x7F poison sentinel) - a subtile/threadgroup \
+                     was dropped or its store index is wrong"
+                );
+                let max_rel = if max_ref > 0.0 { max_d / max_ref } else { max_d };
+                println!(
+                    "[oracle-q4_0] cols={cols:4} b_tok={b_tok:2} nb={nb} row_bytes={row_bytes} \
+                     max_d={max_d:.3e} rel={max_rel:.3e} max_ref={max_ref:.3e} bad={nbad}/{region} \
+                     worst=(s={} t={} r={})",
+                    worst.0, worst.1, worst.2
+                );
+                rows.push((cols, b_tok, max_d, max_rel));
+            }
+        }
+
+        let bad: Vec<_> = rows.iter().filter(|(_, _, _, rel)| *rel > 1e-4).collect();
+        assert!(
+            bad.is_empty(),
+            "[oracle-q4_0] gemm_q4_0_tiled_fused is NOT the dequant reference at these shapes: \
+             {:?} (width, b_tok, max_abs_delta, rel)",
+            bad
+        );
+    }
 
     /// Same oracle for the q6_K twin (\`gemm_q6_k_multi\`), which carried the
     /// identical store-index defect and had no numeric test of its own.
@@ -10397,6 +10650,10 @@ fn gqa_each_shape_matches_per_head_kernel() {
 // Both directions are wrong answers, so both are pinned here.
 #[test]
 fn gemm_cols_floor_matches_the_kernel_block_size() {
+    // q4_0 is the 18-byte / 32-value block family: same floor as q8_0, and
+    // the qwen2.5-0.5b q4_0 class depends on it (before the q4_0 kernel that
+    // model walked one GEMV per token per projection).
+    assert_eq!(gemm_cols_floor(GGML_TYPE_Q4_0), Some(32));
     assert_eq!(gemm_cols_floor(GGML_TYPE_Q8_0), Some(32));
     assert_eq!(gemm_cols_floor(GGML_TYPE_Q4_K), Some(256));
     assert_eq!(gemm_cols_floor(GGML_TYPE_Q6_K), Some(256));
@@ -10404,7 +10661,6 @@ fn gemm_cols_floor_matches_the_kernel_block_size() {
     // to a kernel that would compute a partial dot product.
     assert_eq!(gemm_cols_floor(GGML_TYPE_F32), None);
     assert_eq!(gemm_cols_floor(GGML_TYPE_F16), None);
-    assert_eq!(gemm_cols_floor(GGML_TYPE_Q4_0), None);
     assert_eq!(gemm_cols_floor(99), None);
 }
 
@@ -10428,6 +10684,15 @@ fn gemm_cols_ok_accepts_the_fleet_widths_and_refuses_every_tail() {
     assert!(!gemm_cols_ok(GGML_TYPE_Q4_K, 3200));
     assert!(!gemm_cols_ok(GGML_TYPE_Q6_K, 2080));
     assert!(!gemm_cols_ok(GGML_TYPE_F16, 2048));
+    // q4_0 covers exactly the whole-32-value widths (the qwen2.5-0.5b's own
+    // 896 and 4864 are both multiples of 32 but NOT of 256, so the q4_K floor
+    // could never have carried them).
+    for &cols in &[896usize, 960, 1024, 2080, 4864] {
+        assert!(gemm_cols_ok(GGML_TYPE_Q4_0, cols), "q4_0 must cover cols={cols}");
+    }
+    for &cols in &[0usize, 1, 31, 1000, 2047, 4095] {
+        assert!(!gemm_cols_ok(GGML_TYPE_Q4_0, cols), "q4_0 must refuse cols={cols}");
+    }
 }
 
 /// The multi-section kernels must put the SUBTILE token offset into the store
@@ -10531,6 +10796,18 @@ fn q8_0_tiled_fused_strides_rows_by_32_value_blocks() {
     assert!(
         q6.contains("cols / 256"),
         "gemm_q6_k_tiled_fused must keep 256-value super-blocks"
+    );
+    // q4_0's twin: 18 bytes per 32 values, so a row is (cols/32)*18 bytes and
+    // the dequant must be d*(nib-8) with byte j feeding value j (low nibble)
+    // and value j+16 (high nibble) - the GGML order, not consecutive pairs.
+    let q40 = kernel_body(KERNELS, "kernel void gemm_q4_0_tiled_fused(");
+    assert!(
+        q40.contains("* nb * 18u") && q40.contains("cols / 32u"),
+        "gemm_q4_0_tiled_fused must stride rows by (cols/32)*18 bytes"
+    );
+    assert!(
+        q40.contains("(v & 15u)") && q40.contains("(v < 16u)") && q40.contains("- 8.0f"),
+        "gemm_q4_0_tiled_fused must dequant d*((nib)-8) with byte j = values j and j+16"
     );
 }
 

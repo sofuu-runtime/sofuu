@@ -1,4 +1,6 @@
 /* memory_api.js — the flat memory/brain API over the CMA instance methods.
+ * @sofuu-source-only — eval'd at registration; NOT a shipped .bc driver
+ * (scripts/gen-driver-bc.sh and scripts/check-driver-bc.sh skip this marker).
  *
  * The engine's CMA module (rt/memory.rs) exposes `open` on the module and the
  * dataset methods on the object `open` returns:

@@ -35,6 +35,12 @@ cd "$ROOT" || exit 1
 fail=0
 n=0
 for js in src/js/*.js; do
+    # Source-only files (marker in the header) are eval'd at registration and
+    # intentionally have no snapshot — e.g. memory_api.js, which the engine
+    # includes as source from rt/memory.rs.
+    if grep -q '@sofuu-source-only' "$js"; then
+        continue
+    fi
     bc="${js%.js}.bc"
     name="$(basename "$bc")"
     if [ ! -f "$bc" ]; then

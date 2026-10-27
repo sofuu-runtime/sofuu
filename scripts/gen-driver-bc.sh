@@ -17,6 +17,11 @@ fi
 
 cd "$ROOT" || exit 1
 for js in src/js/*.js; do
+    # Keep source-only files out of the snapshot lane (same marker the check
+    # script uses; see memory_api.js).
+    if grep -q '@sofuu-source-only' "$js"; then
+        continue
+    fi
     name="$(basename "$js" .js)"
     "$SOFUU" compile-bc "$js" "src/js/$name.bc" >/dev/null
     gzip -9 -n -k -f "src/js/$name.bc"

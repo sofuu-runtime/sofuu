@@ -1837,16 +1837,35 @@ fn main() -> ExitCode {
                         eprintln!("\x1b[31mScoring error:\x1b[0m {e}");
                         std::process::exit(1);
                     });
+                // The ppl is only comparable to another tool when the
+                // convention matches, and it is only a perplexity when enough
+                // tokens were averaged: print both, and say so out loud when
+                // the sample is small (a 1-token "ppl" once read as a 32x
+                // quality gap against llama-perplexity's 1.42).
+                let scored_frac = if stats.tokens_total > 1 {
+                    stats.scored as f64 / (stats.tokens_total - 1) as f64
+                } else {
+                    0.0
+                };
+                let sample_warn = stats.scored < sofuu_core::infer::MIN_SCORE_SAMPLE;
+                if sample_warn {
+                    eprintln!(
+                        "\x1b[33m[sofuu infer]\x1b[0m --score: ppl averaged over only {} of {} tokens — a few-sample estimate, not a perplexity. Score a longer text; llama-perplexity's nearest setting is -c {}.",
+                        stats.scored, stats.tokens_total, score_window
+                    );
+                }
                 println!(
-                    "{{\"kind\":\"score\",\"model\":{},\"kv\":\"{}\",\"window\":{},\"tokens_total\":{},\"scored\":{},\"windows\":{},\"nll_total\":{:.4},\"ppl\":{:.4}}}",
+                    "{{\"kind\":\"score\",\"model\":{},\"kv\":\"{}\",\"window\":{},\"tokens_total\":{},\"scored\":{},\"windows\":{},\"nll_total\":{:.4},\"ppl\":{:.4},\"scored_frac\":{:.4},\"sample_warn\":{},\"convention\":\"ppl = exp(mean NLL) over the SCORED tokens; natural log, full-vocab log-softmax; window = max left context a scored token sees (llama-perplexity -c equivalent); the first tokens of the text are context-only, every later token is scored exactly once, and a window holds at most window+context positions\"}}",
                     serde_json::to_string(&model_path).unwrap_or_else(|_| "\"\"".into()),
                     if kivi { format!("kivi{}", kivi_bits) } else { "f16".to_string() },
-                    score_window,
+                    stats.window,
                     stats.tokens_total,
                     stats.scored,
                     stats.windows,
                     stats.nll_total,
-                    stats.ppl
+                    stats.ppl,
+                    scored_frac,
+                    sample_warn
                 );
                 return ExitCode::SUCCESS;
             }

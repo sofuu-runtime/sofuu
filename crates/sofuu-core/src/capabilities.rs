@@ -613,10 +613,12 @@ mod tests {
             );
         }
         assert_eq!(m["surfaces"]["mcp"]["session"]["applicable"], false);
-        // The P1 memory-clobber finding must stay visible in the manifest
-        // until the engine lane fixes the namespace collision.
-        assert_eq!(m["surfaces"]["js"]["memory"]["status"], "partial");
-        assert!(m["surfaces"]["js"]["memory"]["missing"].as_array().is_some());
+        // Finding #13 (the module-vs-instance shape split) is resolved: the
+        // engine installs one flat memory/brain facade on QTSQ builds, so the
+        // audited cell is `full` and carries no missing methods. The
+        // QTSQ-free lane still refuses via build.missing + E_CAPABILITY.
+        assert_eq!(m["surfaces"]["js"]["memory"]["status"], "full");
+        assert!(m["surfaces"]["js"]["memory"].get("missing").is_none());
     }
 
     #[test]

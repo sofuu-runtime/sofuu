@@ -850,7 +850,7 @@ impl TransformerModel {
                 if rope_n_rot < head_dim { " (partial rotary: the remaining dims pass through)" } else { "" },
             );
             eprintln!(
-                "[rope] {arch}: the Metal decode/prefill kernels, the batched rope+KV kernels and the speculative tree implement plain full-width rope only — they are DISABLED for this model (this becomes a CPU-route model, not a silently-wrong GPU one)"
+                "[rope] {arch}: the Metal decode/prefill ropes and the batched rope+KV kernels take this profile (n_rot/mscale/1-factor table) and consume a host-built cos|sin table identical to the CPU rope, so the GPU route stays armed when n_rot <= head_dim and the factor table is present. NOT covered: the speculative-tree rope (CPU-only, full width) stays gated for this model."
             );
         }
 
@@ -1077,6 +1077,41 @@ impl TransformerModel {
         let v_cache = AnonBuffer::try_new(kv_cache_size)
             .map_err(|e| format!("cannot allocate the second KV cache ({kv_mb} MB): {e}"))?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // The one place the GPU rope gate is decided; None = armable. Kept as a
+        // named cause so the "NOT armed" line below can say WHICH profile
+        // property refused instead of one catch-all sentence.
+        let rope_gate: Option<&'static str> = {
+            let n_rot = if config.rope_n_rot == 0 { config.head_dim } else { config.rope_n_rot };
+            // Whole-head rotation, unchanged amplitude: llama3 frequency
+            // scaling. Same mechanism, no GPU verification yet.
+            let llama3_style = config.rope_custom
+                && n_rot >= config.head_dim
+                && (config.rope_mscale - 1.0).abs() <= f32::EPSILON;
+            let llama3_opt_in = std::env::var("SOFUU_GPU_ROPE_LLAMA3")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            if !config.rope_custom {
+                None
+            } else if n_rot > config.head_dim {
+                Some("rotary width (rope.dimension_count) is wider than head_dim")
+            } else if rope_freq_adjust.is_empty() {
+                Some("custom rope profile with no multiplier table")
+            } else if llama3_style && !llama3_opt_in {
+                Some("llama3 rope scaling is not verified on the GPU (SOFUU_GPU_ROPE_LLAMA3=1 to measure)")
+            } else {
+                None
+            }
+        };
+        let rope_gpu_ok = rope_gate.is_none();
+        if config.rope_custom && rope_gpu_ok {
+            eprintln!(
+                "[gguf-gpu] custom rope profile is expressible on the GPU (n_rot {}/{}, mscale {:.6}, {} factor pair(s)): the decode/prefill rope sites consume a host-built cos|sin table identical to the CPU rope",
+                config.rope_n_rot,
+                config.head_dim,
+                config.rope_mscale,
+                rope_freq_adjust.len(),
+            );
+        }
         let gpu = {
             let wanted = gpu_allowed
                 && cfg!(target_os = "macos")
@@ -1087,13 +1122,25 @@ impl TransformerModel {
                 // SOFUU_GPU_DECODE=0 opts out.
                 && std::env::var("SOFUU_GPU_DECODE").map(|v| v != "0").unwrap_or(true)
                 && gguf.resident.is_none()
-                // A custom rope profile (phi3 partial rotary / longrope, llama3
-                // frequency scaling) is not implemented in the Metal rope
-                // dispatch or the batched C rope+KV kernels. Arming the client
-                // would run this model's angles through a full-width plain rope
-                // and produce fluent, wrong text — so the whole GPU route stays
-                // off and the model runs on the CPU reference path.
-                && !config.rope_custom;
+                // rope gate — every Metal rope site (decode single-token q/k,
+                // the batched rope+KV the prefill/chain pass uses, and the
+                // warp-cooperative attention forms) takes ONE profile: n_rot,
+                // mscale, the 1/factor multiplier list. The values come from a
+                // host-built cos|sin table that reproduces quant::rope_style_ex
+                // exactly, so a partial-rotary / longrope checkpoint (phi3) is
+                // now a supported GPU shape instead of a CPU-only one. Still
+                // refused:
+                //   * n_rot > head_dim — no table entries exist for a rotary
+                //     width past the head, so the kernel would rotate nothing;
+                //   * a custom profile with NO multiplier table — the loader
+                //     rejects that shape too (it is half-interpreted rope), and
+                //     roping it with plain angles silently changes the model.
+                // llama3 frequency scaling is expressible by the same mechanism
+                // (whole-head, mscale 1, table = pure per-pair rescale) but is
+                // NOT verified on the GPU — no llama3-scaled checkpoint exists
+                // on this machine to compare CPU against GPU — so it stays
+                // gated; SOFUU_GPU_ROPE_LLAMA3=1 opts in for a measurement.
+                && rope_gpu_ok;
             if wanted {
                 let armed = GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm);
                 if armed.is_none() {
@@ -1116,8 +1163,10 @@ impl TransformerModel {
                     "SOFUU_GPU_DECODE=0"
                 } else if gguf.resident.is_some() {
                     "resident weights (SOFUU_RESIDENT_WEIGHTS=1)"
+                } else if let Some(why) = rope_gate {
+                    why
                 } else {
-                    "custom rope profile (partial rotary / longrope / llama3 scaling)"
+                    "unknown"
                 };
                 eprintln!("[gguf-gpu] decode client NOT armed: {why} - this model runs the CPU route end to end");
                 None
@@ -2973,12 +3022,16 @@ impl TransformerModel {
         // special paths are all off (streaming/dynamic-FFN/KIVI fall back).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
+            // A custom rope profile used to be a hard "CPU only" here because
+            // the Metal ropes could not take n_rot/mscale/factors. They can now
+            // (a host-built cos|sin table, see gpu_rope_table), and arming the
+            // client already required the profile to be expressible — so the
+            // armed client, not the profile, decides. llama3 scaling never
+            // reaches this point: the gate above refuses to arm it.
             if self.gpu.is_some()
                 && !self.streaming_weights
                 && !self.dynamic_ffn.enabled
                 && self.kivi.is_none()
-                && self.rope_freq_adjust.is_empty()
-                && !self.config.rope_custom
             {
                 if self.execute_layers_gpu(pos, start_layer, end_layer) {
                     return true;
@@ -3542,6 +3595,92 @@ impl TransformerModel {
     /// used to be ungated while `self.gpu` and the PROFILE_* statics it touches
     /// were gated, which broke every non-Apple build.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
+    /// The rope profile a Metal rope dispatch takes for this model.
+    ///
+    /// rope_custom == false -> RopeKernel::plain(): no table, whole head,
+    /// mscale 1, no factors. The kernels then run their on-device theta path,
+    /// which is arithmetically identical to the pre-profile code, so every
+    /// model that was GPU-armed before this change dispatches the same values
+    /// (that is the byte-identical-path requirement of the regression dump).
+    ///
+    /// rope_custom == true -> the model's (n_rot, mscale) plus the factor list
+    /// scratch slot; the caller pairs it with a table row written by
+    /// gpu_rope_fill, and the kernels then take every angle from that table.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_rope_profile(
+        cfg: &ModelConfig,
+        adjust: &[f32],
+        g: &GgufGpu,
+    ) -> crate::infer::metal::RopeKernel {
+        let mut rk = crate::infer::metal::RopeKernel::plain();
+        if cfg.rope_custom {
+            rk.n_rot = cfg.rope_n_rot as u32;
+            rk.mscale = cfg.rope_mscale;
+            if !adjust.is_empty() {
+                rk.adj = Some((g.act_buf.handle, g.slots.radj));
+                rk.n_pairs = adjust.len() as u32;
+            }
+        }
+        rk
+    }
+
+    /// The same profile, with the cos|sin rows for `positions` written into the
+    /// act slab first. Row r is token positions[r]'s table: layout
+    /// [row] = cos(head_dim/2) | sin(head_dim/2), produced by
+    /// quant::rope_table_rows (bit-for-bit quant::rope_style_ex).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_rope_table(
+        cfg: &ModelConfig,
+        adjust: &[f32],
+        g: &mut GgufGpu,
+        positions: &[usize],
+    ) -> crate::infer::metal::RopeKernel {
+        let mut rk = Self::gpu_rope_profile(cfg, adjust, g);
+        if !cfg.rope_custom {
+            return rk;
+        }
+        assert!(
+            positions.len() <= 128,
+            "rope table rows {} past the act slab's 128-row rope slot",
+            positions.len()
+        );
+        let key = (positions.first().copied().unwrap_or(0), positions.len());
+        if g.rtab_key != Some(key) {
+            let hd = cfg.head_dim;
+            {
+                let dst = g.slot_f32_mut(g.slots.rtab, positions.len() * hd);
+                crate::infer::quant::rope_table_rows(
+                    dst,
+                    hd,
+                    cfg.rope_n_rot,
+                    cfg.rope_mscale,
+                    cfg.rope_freq_base,
+                    adjust,
+                    positions,
+                );
+            }
+            g.rtab_key = Some(key);
+        }
+        rk.table = Some((g.act_buf.handle, g.slots.rtab));
+        rk
+    }
+
+    /// Same, for a contiguous run of positions (every prefill/chain chunk).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn gpu_rope_table_seq(
+        cfg: &ModelConfig,
+        adjust: &[f32],
+        g: &mut GgufGpu,
+        start_pos: usize,
+        rows: usize,
+    ) -> crate::infer::metal::RopeKernel {
+        if !cfg.rope_custom {
+            return Self::gpu_rope_profile(cfg, adjust, g);
+        }
+        let positions: Vec<usize> = (start_pos..start_pos + rows).collect();
+        Self::gpu_rope_table(cfg, adjust, g, &positions)
+    }
+
     fn layers_one_commit(&mut self, pos: usize, start_layer: usize, end_layer: usize) -> bool {
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
@@ -3612,6 +3751,11 @@ impl TransformerModel {
             }};
         }
         g.slot_f32_mut(g.slots.x, dim).copy_from_slice(&self.x[..dim]);
+        // phi3/longrope: every rope dispatch this token takes row 0 of the
+        // host-built cos|sin table for THIS position, i.e. the exact angles the
+        // CPU reference would use. A default profile leaves the table unarmed
+        // and the kernels keep their on-device theta path.
+        let rope = Self::gpu_rope_table(&self.config, &self.rope_freq_adjust, g, &[pos]);
         let prof = std::env::var_os("SOFUU_GPU_PROFILE").is_some();
         let t_start = std::time::Instant::now();
         if token_commit {
@@ -3723,8 +3867,7 @@ impl TransformerModel {
                 kln_buf, kln_off,
                 has_k, pos as u32,
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
-                norm_eps, rope_freq_base, rope_mode,
-            ) {
+                norm_eps, rope_freq_base, rope_mode, rope ) {
                 return false;
             }
             // GPU3 chunked attention (default; the meta-overlap bug is fixed —
@@ -3739,8 +3882,7 @@ impl TransformerModel {
                     &g.act_buf, g.slots.qa,
                     q_norm_off.map(|_| &g.w_buf), q_norm_off.unwrap_or(0),
                     head_dim as u32, n_heads as u32,
-                    has_q, pos as u32, norm_eps, rope_freq_base, rope_mode,
-                ) {
+                    has_q, pos as u32, norm_eps, rope_freq_base, rope_mode, rope ) {
                     return false;
                 }
                 if !g.engine.batch_llama_attn_part(
@@ -3775,8 +3917,7 @@ impl TransformerModel {
                         &g.act_buf, g.slots.ao,
                         has_q != 0, pos as u32,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                        norm_eps, rope_freq_base, rope_mode,
-                    )
+                        norm_eps, rope_freq_base, rope_mode, rope )
                 } else if warps >= 8 {
                     g.engine.batch_llama_attn_w8(
                         &g.act_buf, g.slots.qa,
@@ -3786,8 +3927,7 @@ impl TransformerModel {
                         &g.act_buf, g.slots.ao,
                         has_q != 0, pos as u32,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                        norm_eps, rope_freq_base, rope_mode,
-                    )
+                        norm_eps, rope_freq_base, rope_mode, rope )
                 } else {
                     g.engine.batch_llama_attn_w4(
                         &g.act_buf, g.slots.qa,
@@ -3797,8 +3937,7 @@ impl TransformerModel {
                         &g.act_buf, g.slots.ao,
                         has_q != 0, pos as u32,
                         head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                        norm_eps, rope_freq_base, rope_mode,
-                    )
+                        norm_eps, rope_freq_base, rope_mode, rope )
                 };
                 if !attn_ok {
                     return false;
@@ -3814,8 +3953,7 @@ impl TransformerModel {
                     &g.act_buf, g.slots.ao,
                     has_q != 0, pos as u32,
                     head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode,
-                ) {
+                    norm_eps, rope_freq_base, rope_mode, rope ) {
                     return false;
                 }
             } else {
@@ -3829,8 +3967,7 @@ impl TransformerModel {
                     &g.act_buf, g.slots.ao,
                     has_q, pos as u32,
                     head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode,
-                );
+                    norm_eps, rope_freq_base, rope_mode, rope );
             }
             let trace = dec_trace;
             if trace && (layer_idx == 0 || layer_idx == 17 || layer_idx == 35) {
@@ -4033,15 +4170,15 @@ impl TransformerModel {
         if b < 2 || b > 128 || start_pos + b > self.config.max_seq_len {
             return false;
         }
-        // A rope-frequency table (llama3 scaling: factor/orig-ctx/low/high) is
-        // applied by the CPU rope path and by nothing on the GPU side, so the
-        // whole GPU chain pass would silently use plain rope for a scaled
-        // model. The decode client already refuses this case; the prefill chain
-        // did not, which made SOFUU_GPU_PREFILL=1 on a llama3-scaled model a
-        // quiet wrong-answer switch rather than a slow one.
-        if !self.rope_freq_adjust.is_empty() {
+        // The chain pass takes the SAME rope profile as decode: n_rot, mscale
+        // and the 1/factor list, with the cos|sin rows written once per chunk
+        // (gpu_rope_table_seq) and handed to every b4 rope+KV dispatch. The
+        // previous unconditional refusal of any factor table is what made a
+        // partial-rotary model CPU-only here; llama3 scaling still cannot reach
+        // this point because the arm gate refuses it.
+        if self.config.rope_custom && self.rope_freq_adjust.is_empty() {
             if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
-                eprintln!("[chain] refused: rope frequency table (llama3 scaling) is CPU-only");
+                eprintln!("[chain] refused: custom rope profile with no multiplier table");
             }
             return false;
         }
@@ -4440,6 +4577,11 @@ impl TransformerModel {
         if !g.engine.batch_open() {
             return false;
         }
+        // rope profile for the GPU arm's rows: for a partial-rotary model the
+        // host builds this chunk's cos|sin rows ONCE here and every layer's
+        // rope+KV dispatch reads the same table; a default profile gets the
+        // plain on-device theta path with no table.
+        let rope = Self::gpu_rope_table_seq(&self.config, &self.rope_freq_adjust, g, gpu_start, kg);
         for layer_idx in 0..n_layers {
             // ---- CPU arm: its rows, this layer. No wait: its attention never
             //      looks past its own last position.
@@ -4455,6 +4597,7 @@ impl TransformerModel {
                 layer_idx,
                 kg,
                 gpu_start,
+                rope,
                 fuse_on,
                 &mut ffn_ops,
             ) {
@@ -4857,6 +5000,15 @@ impl TransformerModel {
             return false;
         }
         let rope_mode: u32 = if cfg.rope_interleaved { 1 } else { 0 };
+        // A custom rope profile needs this chunk's positions to build its
+        // cos|sin rows, and this arm is reached without them (it takes a slab
+        // slice, not a position base). Refuse here — nothing has been
+        // dispatched at this point — so the chunk falls through to the
+        // whole-chunk route, which carries the table. Default profiles are
+        // unaffected.
+        if cfg.rope_custom {
+            return false;
+        }
         if let Some((n_a, n_b)) = fold {
             // FFI offsets are f32 ELEMENT counts; slot offsets are bytes.
             if !g.engine.batch_resid_split_add_f32(
@@ -4921,7 +5073,7 @@ impl TransformerModel {
             cfg.norm_eps,
             cfg.rope_freq_base,
             rope_mode,
-            None,
+            crate::infer::metal::RopeKernel::plain(),
         );
         g.engine.batch_head_rmsnorm_b4(
             &g.act_buf,
@@ -4937,7 +5089,7 @@ impl TransformerModel {
             cfg.norm_eps,
             cfg.rope_freq_base,
             rope_mode,
-            None,
+            crate::infer::metal::RopeKernel::plain(),
         );
         // Whole-row attention on the compact head count, landing its heads at
         // its own offset of the canonical [b][q_rows] block: a false return
@@ -5745,6 +5897,7 @@ impl TransformerModel {
     /// rejected, exactly like the in-loop returns did.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn chain_layer_into(
         g: &mut GgufGpu,
         l: &LayerWeights,
@@ -5753,6 +5906,9 @@ impl TransformerModel {
         layer_idx: usize,
         b: usize,
         start_pos: usize,
+        // The rope profile for this chunk's rows, table already written by the
+        // caller (once per chunk, not once per layer).
+        rope: crate::infer::metal::RopeKernel,
         fuse_on: bool,
         ffn_ops: &mut usize,
     ) -> bool {
@@ -6121,7 +6277,7 @@ impl TransformerModel {
                 b,
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                 norm_eps, rope_freq_base, rope_mode,
-                None,
+                rope,
             );
             g.engine.batch_head_rmsnorm_b4(
                 &g.act_buf, g.slots.qa,
@@ -6130,7 +6286,7 @@ impl TransformerModel {
                 b,
                 head_dim as u32, n_heads as u32,
                 has_q, norm_eps, rope_freq_base, rope_mode,
-                None,
+                rope,
             );
             // Whole-row attention first (ONE dispatch for the whole chunk,
             // every row's full softmax): llama_attn_pre_row on the 128-row
@@ -6421,6 +6577,7 @@ impl TransformerModel {
         // against the CPU tiles' SOFUU_LAYER_SNAP (the slab is unreadable
         // mid-buffer otherwise).
         assert!(g.engine.batch_open());
+        let rope = Self::gpu_rope_table_seq(&self.config, &self.rope_freq_adjust, g, start_pos, b);
         for layer_idx in 0..self.config.n_layers {
             if !Self::chain_layer_into(
                 g,
@@ -6430,6 +6587,7 @@ impl TransformerModel {
                 layer_idx,
                 b,
                 start_pos,
+                rope,
                 fuse_on,
                 &mut ffn_ops,
             ) {
@@ -6626,23 +6784,25 @@ impl TransformerModel {
                     .collect();
                 let _ = std::fs::write(format!("{prefix}.emb"), &esl);
             }
-            // rope table: EXACT mirror of sofuu_rope_fill_rows —
-            // freqs[j] = 1/powf(base, 2j/hd) (f32 powf), theta = pos × freq,
-            // layout [row] = cos(hd/2) | sin(hd/2). The kernels take this
-            // instead of on-device pow so the routes share one value source.
-            let half = head_dim / 2;
-            let mut freqs = vec![0f32; half];
-            for (j, f) in freqs.iter_mut().enumerate() {
-                *f = 1.0f32 / rope_freq_base.powf((2 * j) as f32 / head_dim as f32);
-            }
-            let dst = &mut ph_buf[pslots.rope / 4..pslots.rope / 4 + b * head_dim];
-            for t in 0..b {
-                let pos_f = (start_pos + t) as f32;
-                for j in 0..half {
-                    let theta = pos_f * freqs[j];
-                    dst[t * head_dim + j] = theta.cos();
-                    dst[t * head_dim + half + j] = theta.sin();
-                }
+            // rope table, layout [row] = cos(hd/2) | sin(hd/2): the kernels
+            // take this instead of an on-device pow so every route shares ONE
+            // value source, and it is the same quant::rope_table_rows the CPU
+            // reference uses (freqs[j] = 1/base^(2j/n_rot) * factor, theta =
+            // pos x freq, f32 powf/cos/sin in this order). For a default
+            // profile n_rot = head_dim, no factors and mscale = 1, which
+            // reproduces the previous inline builder bit for bit.
+            {
+                let positions: Vec<usize> = (start_pos..start_pos + b).collect();
+                let dst = &mut ph_buf[pslots.rope / 4..pslots.rope / 4 + b * head_dim];
+                crate::infer::quant::rope_table_rows(
+                    dst,
+                    head_dim,
+                    self.config.rope_n_rot,
+                    self.config.rope_mscale,
+                    rope_freq_base,
+                    &self.rope_freq_adjust,
+                    &positions,
+                );
             }
         }
 
@@ -6929,7 +7089,8 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                     norm_eps, rope_freq_base, rope_mode,
-                    Some((pbuf, pslots.rope)),
+                    Self::gpu_rope_profile(&self.config, &self.rope_freq_adjust, g)
+                        .with_table(Some((pbuf, pslots.rope))),
                 );
                 g.engine.batch_head_rmsnorm_b4(
                     pbuf, pslots.qa,
@@ -6938,7 +7099,8 @@ impl TransformerModel {
                     b,
                     head_dim as u32, n_heads as u32,
                     has_q, norm_eps, rope_freq_base, rope_mode,
-                    Some((pbuf, pslots.rope)),
+                    Self::gpu_rope_profile(&self.config, &self.rope_freq_adjust, g)
+                        .with_table(Some((pbuf, pslots.rope))),
                 );
                 if layer_idx == snap_layer {
                     if let Some(prefix) = std::env::var_os("SOFUU_QKV_SNAP") {
@@ -7012,6 +7174,9 @@ impl TransformerModel {
                             b,
                             head_dim as u32, n_heads as u32, n_kv_heads as u32,
                             max_seq_len as u32,
+                            // llama_attn_1c_b4 applies NO rope (head_rmsnorm_b4
+                            // already roped q, kv_write_b4 roped k), so the
+                            // table it is handed is bound but never read.
                             Some((pbuf, pslots.rope)),
                         ));
                 if !fused {
@@ -7362,8 +7527,26 @@ impl TransformerModel {
             super::quant::batched_rmsnorm_in_place(&mut self.k, w, n_kv_heads, head_dim, norm_eps);
         }
         let rope_mode = if self.config.rope_interleaved { 1 } else { 0 };
-        super::quant::rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
-        super::quant::rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
+        // The 3-commit client ropes q/k on the HOST, so this is the CPU
+        // reference rope — it must take the model's profile (partial rotary,
+        // mscale, 1/factor list) or a longrope model would be spun with plain
+        // full-width angles here while every other route uses the real ones.
+        // Default profiles keep the identical plain call.
+        if self.config.rope_custom {
+            let n_rot = if self.config.rope_n_rot == 0 { head_dim } else { self.config.rope_n_rot };
+            let mscale = self.config.rope_mscale;
+            super::quant::rope_style_ex(
+                &mut self.q, n_heads, head_dim, n_rot, pos, rope_freq_base, rope_mode,
+                &self.rope_freq_adjust, mscale,
+            );
+            super::quant::rope_style_ex(
+                &mut self.k, n_kv_heads, head_dim, n_rot, pos, rope_freq_base, rope_mode,
+                &self.rope_freq_adjust, mscale,
+            );
+        } else {
+            super::quant::rope_style(&mut self.q, n_heads, head_dim, pos, rope_freq_base, rope_mode);
+            super::quant::rope_style(&mut self.k, n_kv_heads, head_dim, pos, rope_freq_base, rope_mode);
+        }
 
         let cache_pos = pos % max_seq_len;
         for kv_h in 0..n_kv_heads {
@@ -8176,6 +8359,16 @@ struct GgufGpuSlots {
     up: usize,
     logits: usize,
     xq8e: usize,
+    /// RoPE table rows for the single-token decode pass and the B-row chain
+    /// pass (SPEC_B rows of cos(head_dim/2)|sin(head_dim/2), the format the
+    /// kernels' rope_tab takes). Written by the host with the same maths as
+    /// quant::rope_style_ex, and only read when the model carries a custom
+    /// rope profile — a default profile leaves it untouched and the kernels
+    /// keep their on-device theta path (byte-identical to pre-profile HEAD).
+    rtab: usize,
+    /// The per-pair inverse-frequency multipliers (1/ggml factor), one float
+    /// per rotated pair. Only read by the on-device theta path.
+    radj: usize,
 }
 
 /// P1 (llama.cpp parity): B-row GEMM prefill slab layout (byte offsets
@@ -8256,6 +8449,12 @@ pub struct GgufGpu {
     /// forward paths read this field, never the env again, so slab and
     /// chunk cannot diverge). 0 when the prefill slab was not built.
     pre_chunk: usize,
+    /// (first position, row count) of the cos|sin rows currently sitting in
+    /// slots.rtab. A chunk re-enters the rope profile once per layer with the
+    /// same positions, and rebuilding 128 rows of powf/cos per layer would be
+    /// pure waste on a partial-rotary model — so the host writes them once per
+    /// position range and every layer's dispatch reads the same table.
+    rtab_key: Option<(usize, usize)>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -8416,6 +8615,23 @@ const SPEC_B: usize = 128;
                 &mut cursor,
                 (dim.max(q_rows).max(inter.max(dim)) / 32) * 10,
             ),
+            // rope profile scratch: SPEC_B cos|sin rows (one per row of the
+            // chain pass; decode uses row 0) and the factor list. A model with
+            // the default profile never writes either, and allocating them
+            // anyway would grow the activation slab (and with it the engine's
+            // buffer-size-driven kernel choice) for every pre-existing model:
+            // the zero-size case keeps those models' slabs bit-for-bit the
+            // size they had before this profile existed.
+            rtab: if config.rope_custom {
+                gguf_gpu_slot(&mut cursor, SPEC_B * config.head_dim)
+            } else {
+                0
+            },
+            radj: if config.rope_custom {
+                gguf_gpu_slot(&mut cursor, config.head_dim)
+            } else {
+                0
+            },
         };
         let act_bytes = gguf_gpu_page(cursor);
         let act = crate::infer::model::AnonBuffer::new(act_bytes / 4);
@@ -8665,6 +8881,7 @@ const SPEC_B: usize = 128;
             pref_slots,
             pref_bytes,
             pre_chunk,
+            rtab_key: None,
             slots,
         })
     }
@@ -8686,8 +8903,18 @@ const SPEC_B: usize = 128;
         }
         let q_rows = config.n_heads * config.head_dim;
         let kv_rows = config.n_kv_heads * config.head_dim;
+        // A window at or past the context can never clip a sequence this engine
+        // can hold: every position still sees the whole cache, so the
+        // one-commit path's full causal attention IS the windowed attention.
+        // phi3 advertises attention.sliding_window=262144 with a 4096-token
+        // context, which used to cost it this client outright (and with it the
+        // whole fast decode and prefill route) for a window it never applies.
+        // A window SHORTER than the context still blocks, exactly as before.
+        let window_clips = config.sliding_window > 0 && config.sliding_window < config.max_seq_len;
         for i in 0..layers.len() {
-            if TransformerModel::calc_layer_sliding_window(is_gemma2, config.sliding_window, i) != 0 {
+            if window_clips
+                && TransformerModel::calc_layer_sliding_window(is_gemma2, config.sliding_window, i) != 0
+            {
                 return Some("sliding-window layers present");
             }
             let l = &layers[i];

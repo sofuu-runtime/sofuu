@@ -42,6 +42,84 @@ static inline half read_f16(device const uchar* base, uint byte_offset) {
     }
 }
 
+// ── RoPE, one parameterisation for every Metal rope site ────────────────────
+// The single value source for the three rope sites (decode single-token
+// q/k, the batched rope+KV prefill pass, the speculative-tree chain pass).
+// It is the device side of quant::rope_style_ex and reproduces that function
+// operation for operation:
+//
+//   n_rot    dims per head actually rotated (0 or > head_dim = whole head).
+//            phi3 stores rope.dimension_count = 96 against head_dim 128, so
+//            the ladder is built over 96 dims and dims 96..127 pass through.
+//   mscale   multiplies cos and sin (HF longrope attn_factor). It scales the
+//            rotation amplitudes, i.e. attention logits by mscale^2 — not the
+//            output vector — so it cannot be folded after the fact.
+//   adj[i]   multiplier on pair i's inverse frequency, exactly ggml's
+//            theta / freq_factors[i] (the loader stores 1/factor). n_pairs
+//            entries; pairs past the table use 1.0.
+//   tab      OPTIONAL host-built cos|sin rows, layout
+//            [row] = cos(head_dim/2) | sin(head_dim/2), row stride head_dim,
+//            built by quant::rope_table_rows with the SAME maths above. With a
+//            table the kernel is a pure consumer (bit-identical to the CPU
+//            reference); with has_table = 0 it computes theta on device, which
+//            is the legacy path and is bit-identical to the pre-profile
+//            kernels for the default profile (n_rot = head_dim, mscale = 1,
+//            n_pairs = 0): multiplying by 1.0f is exact.
+static inline float2 sofuu_rope_cs(
+    device const float *tab, uint tab_off, uint has_table,
+    uint j, device const float *adj, uint n_pairs, float mscale,
+    uint pos, float base, uint n_rot, uint head_dim)
+{
+    if (has_table != 0u) {
+        return float2(tab[tab_off + j], tab[tab_off + head_dim / 2u + j]);
+    }
+    // Deliberately the SAME expression the pre-profile kernels had when a
+    // model has no profile (n_pairs = 0, mscale = 1): the factor and the
+    // mscale are applied as separate, guarded steps instead of being folded
+    // into one expression, so the default-profile path keeps HEAD's exact
+    // rounding and every pre-existing model's dispatch stays bit-identical.
+    float theta = float(pos) / pow(base, (2.0f * float(j)) / float(n_rot));
+    if (n_pairs != 0u && j < n_pairs) {
+        theta *= adj[j];
+    }
+    float c = cos(theta);
+    float s = sin(theta);
+    if (mscale != 1.0f) {
+        c *= mscale;
+        s *= mscale;
+    }
+    return float2(c, s);
+}
+
+// Rotate one head in place. mode 0 = NeoX split-half pairs (i, i + n_rot/2) —
+// phi3 and the GGUF llama/qwen families; mode 1 = consecutive pairs
+// (2i, 2i+1). Only the first n_rot dims move; the tail is untouched.
+static inline void sofuu_rope_apply(
+    device float *head, uint head_dim, uint n_rot, uint rope_mode,
+    uint pos, float base, uint lane, uint stride,
+    device const float *tab, uint tab_off, uint has_table,
+    device const float *adj, uint n_pairs, float mscale)
+{
+    uint nhalf = n_rot >> 1u;
+    for (uint j = lane; j < nhalf; j += stride) {
+        float2 cs = sofuu_rope_cs(tab, tab_off, has_table, j, adj, n_pairs,
+                                  mscale, pos, base, n_rot, head_dim);
+        float c = cs.x;
+        float s = cs.y;
+        if (rope_mode == 0u) {
+            float v0 = head[j];
+            float v1 = head[j + nhalf];
+            head[j]        = v0 * c - v1 * s;
+            head[j + nhalf] = v1 * c + v0 * s;
+        } else {
+            float v0 = head[2u * j];
+            float v1 = head[2u * j + 1u];
+            head[2u * j]      = v0 * c - v1 * s;
+            head[2u * j + 1u] = v1 * c + v0 * s;
+        }
+    }
+}
+
 kernel void gemv_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const float  *x              [[buffer(1)]],
@@ -970,6 +1048,10 @@ kernel void llama_kv_write_b4(
     constant uint      &rope_mode      [[buffer(13)]],
     device const float *rope_tab      [[buffer(14)]],
     constant uint      &has_table      [[buffer(15)]],
+    constant uint      &rope_n_rot     [[buffer(16)]],
+    constant float     &rope_mscale    [[buffer(17)]],
+    device const float *rope_adj       [[buffer(18)]],
+    constant uint      &rope_n_pairs   [[buffer(19)]],
     uint3 kvtg                         [[threadgroup_position_in_grid]],
     uint lane                         [[thread_index_in_simdgroup]]
 ) {
@@ -993,29 +1075,8 @@ kernel void llama_kv_write_b4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float c;
-        float s;
-        if (has_table != 0u) {
-            c = rope_tab[tab_r + j];
-            s = rope_tab[tab_r + head_dim / 2 + j];
-        } else {
-            float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-            c = cos(theta);
-            s = sin(theta);
-        }
-        if (rope_mode == 0u) {
-            float k0 = k_head[j];
-            float k1 = k_head[j + head_dim / 2];
-            k_head[j]                = k0 * c - k1 * s;
-            k_head[j + head_dim / 2] = k1 * c + k0 * s;
-        } else {
-            float k0 = k_head[2 * j];
-            float k1 = k_head[2 * j + 1];
-            k_head[2 * j]     = k0 * c - k1 * s;
-            k_head[2 * j + 1] = k1 * c + k0 * s;
-        }
-    }
+    sofuu_rope_apply(k_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, tab_r, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     device float *k_dst = k_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
     device float *v_dst = v_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
@@ -1038,6 +1099,10 @@ kernel void head_rmsnorm_b4(
     constant uint      &rope_mode       [[buffer(9)]],
     device const float *rope_tab      [[buffer(10)]],
     constant uint      &has_table      [[buffer(11)]],
+    constant uint      &rope_n_rot     [[buffer(12)]],
+    constant float     &rope_mscale    [[buffer(13)]],
+    device const float *rope_adj       [[buffer(14)]],
+    constant uint      &rope_n_pairs   [[buffer(15)]],
     uint3 htg                          [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -1059,29 +1124,8 @@ kernel void head_rmsnorm_b4(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     uint tab_r = has_table != 0u ? row * head_dim : 0u;
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float c;
-        float s;
-        if (has_table != 0u) {
-            c = rope_tab[tab_r + j];
-            s = rope_tab[tab_r + head_dim / 2 + j];
-        } else {
-            float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-            c = cos(theta);
-            s = sin(theta);
-        }
-        if (rope_mode == 0u) {
-            float r0 = rp[j];
-            float r1 = rp[j + head_dim / 2];
-            rp[j]                = r0 * c - r1 * s;
-            rp[j + head_dim / 2] = r1 * c + r0 * s;
-        } else {
-            float r0 = rp[2 * j];
-            float r1 = rp[2 * j + 1];
-            rp[2 * j]     = r0 * c - r1 * s;
-            rp[2 * j + 1] = r1 * c + r0 * s;
-        }
-    }
+    sofuu_rope_apply(rp, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, tab_r, has_table, rope_adj, rope_n_pairs, rope_mscale);
 }
 
 kernel void llama_attn_part_b4(
@@ -2005,6 +2049,12 @@ kernel void head_rmsnorm(
     constant uint      &pos             [[buffer(7)]],
     constant float     &rope_base       [[buffer(8)]],
     constant uint      &rope_mode       [[buffer(9)]],
+    device const float *rope_tab        [[buffer(10)]],
+    constant uint      &has_table       [[buffer(11)]],
+    constant uint      &rope_n_rot      [[buffer(12)]],
+    constant float     &rope_mscale     [[buffer(13)]],
+    device const float *rope_adj        [[buffer(14)]],
+    constant uint      &rope_n_pairs    [[buffer(15)]],
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -2027,22 +2077,8 @@ kernel void head_rmsnorm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float r0 = row[j];
-            float r1 = row[j + head_dim / 2];
-            row[j]                = r0 * c - r1 * s;
-            row[j + head_dim / 2] = r1 * c + r0 * s;
-        } else {
-            float r0 = row[2 * j];
-            float r1 = row[2 * j + 1];
-            row[2 * j]     = r0 * c - r1 * s;
-            row[2 * j + 1] = r1 * c + r0 * s;
-        }
-    }
+    sofuu_rope_apply(row, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, 0, has_table, rope_adj, rope_n_pairs, rope_mscale);
 }
 
 // ── GPU3: chunked decode attention (replaces serial per-head llama_attn) ───
@@ -2233,6 +2269,12 @@ kernel void llama_kv_write(
     constant float     &eps            [[buffer(11)]],
     constant float     &rope_base      [[buffer(12)]],
     constant uint      &rope_mode      [[buffer(13)]],
+    device const float *rope_tab       [[buffer(14)]],
+    constant uint      &has_table      [[buffer(15)]],
+    constant uint      &rope_n_rot     [[buffer(16)]],
+    constant float     &rope_mscale    [[buffer(17)]],
+    device const float *rope_adj       [[buffer(18)]],
+    constant uint      &rope_n_pairs   [[buffer(19)]],
     uint kv                             [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -2252,22 +2294,8 @@ kernel void llama_kv_write(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float k0 = k_head[j];
-            float k1 = k_head[j + head_dim / 2];
-            k_head[j]                = k0 * c - k1 * s;
-            k_head[j + head_dim / 2] = k1 * c + k0 * s;
-        } else {
-            float k0 = k_head[2 * j];
-            float k1 = k_head[2 * j + 1];
-            k_head[2 * j]     = k0 * c - k1 * s;
-            k_head[2 * j + 1] = k1 * c + k0 * s;
-        }
-    }
+    sofuu_rope_apply(k_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, 0, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     device float *k_dst = k_cache_layer + ((size_t)kv * max_seq + pos) * head_dim;
     device float *v_dst = v_cache_layer + ((size_t)kv * max_seq + pos) * head_dim;
@@ -2296,6 +2324,12 @@ kernel void llama_attn(
     constant float     &eps             [[buffer(12)]],
     constant float     &rope_base       [[buffer(13)]],
     constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -2316,22 +2350,8 @@ kernel void llama_attn(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float q0 = q_head[j];
-            float q1 = q_head[j + head_dim / 2];
-            q_head[j]                = q0 * c - q1 * s;
-            q_head[j + head_dim / 2] = q1 * c + q0 * s;
-        } else {
-            float q0 = q_head[2 * j];
-            float q1 = q_head[2 * j + 1];
-            q_head[2 * j]     = q0 * c - q1 * s;
-            q_head[2 * j + 1] = q1 * c + q0 * s;
-        }
-    }
+    sofuu_rope_apply(q_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, 0, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     uint kv = h / (n_heads / n_kv_heads);
@@ -6568,6 +6588,12 @@ kernel void llama_attn_fast(
     constant float     &eps             [[buffer(12)]],
     constant float     &rope_base       [[buffer(13)]],
     constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
     uint h                              [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -6583,22 +6609,8 @@ kernel void llama_attn_fast(
         float rms = rsqrt(ss / float(head_dim) + eps);
         for (uint i = lane; i < head_dim; i += 32) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
     }
-    for (uint j = lane; j < head_dim / 2; j += 32) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float q0 = q_head[j];
-            float q1 = q_head[j + head_dim / 2];
-            q_head[j]                = q0 * c - q1 * s;
-            q_head[j + head_dim / 2] = q1 * c + q0 * s;
-        } else {
-            float q0 = q_head[2 * j];
-            float q1 = q_head[2 * j + 1];
-            q_head[2 * j]     = q0 * c - q1 * s;
-            q_head[2 * j + 1] = q1 * c + q0 * s;
-        }
-    }
+    sofuu_rope_apply(q_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
+                     rope_tab, 0, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint kv = h / (n_heads / n_kv_heads);
@@ -6666,6 +6678,12 @@ kernel void llama_attn_wN(
     constant float     &eps             [[buffer(12)]],
     constant float     &rope_base       [[buffer(13)]],
     constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
     uint h                              [[threadgroup_position_in_grid]],
     uint tid                            [[thread_position_in_threadgroup]]
 ) {
@@ -6696,22 +6714,9 @@ kernel void llama_attn_wN(
     // it made greedy decode nondeterministic on every model with q-norm
     // (Qwen3 family) while Llama-style models stayed stable. Order them.
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    for (uint j = tid; j < head_dim / 2; j += 32 * ATTN_WARPS) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float q0 = q_head[j];
-            float q1 = q_head[j + head_dim / 2];
-            q_head[j]                = q0 * c - q1 * s;
-            q_head[j + head_dim / 2] = q1 * c + q0 * s;
-        } else {
-            float q0 = q_head[2 * j];
-            float q1 = q_head[2 * j + 1];
-            q_head[2 * j]     = q0 * c - q1 * s;
-            q_head[2 * j + 1] = q1 * c + q0 * s;
-        }
-    }
+    sofuu_rope_apply(q_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, tid,
+                     32 * ATTN_WARPS, rope_tab, 0, has_table, rope_adj,
+                     rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     uint kv = h / (n_heads / n_kv_heads);
@@ -6781,17 +6786,20 @@ template [[host_name("llama_attn_w4")]] kernel void llama_attn_wN<4>(
     device float*, device const float*, device const float*, device const float*,
     device float*, constant uint&, constant uint&, constant uint&, constant uint&,
     constant uint&, constant uint&, constant uint&, constant float&,
-    constant float&, constant uint&, uint, uint);
+    constant float&, constant uint&, const device float*, constant uint&,
+    constant uint&, constant float&, const device float*, constant uint&, uint, uint);
 template [[host_name("llama_attn_w8")]] kernel void llama_attn_wN<8>(
     device float*, device const float*, device const float*, device const float*,
     device float*, constant uint&, constant uint&, constant uint&, constant uint&,
     constant uint&, constant uint&, constant uint&, constant float&,
-    constant float&, constant uint&, uint, uint);
+    constant float&, constant uint&, const device float*, constant uint&,
+    constant uint&, constant float&, const device float*, constant uint&, uint, uint);
 template [[host_name("llama_attn_w16")]] kernel void llama_attn_wN<16>(
     device float*, device const float*, device const float*, device const float*,
     device float*, constant uint&, constant uint&, constant uint&, constant uint&,
     constant uint&, constant uint&, constant uint&, constant float&,
-    constant float&, constant uint&, uint, uint);
+    constant float&, constant uint&, const device float*, constant uint&,
+    constant uint&, constant float&, const device float*, constant uint&, uint, uint);
 
 // ── decode attention, 32 warps per head ─────────────────────────────────────
 // The GQA-fused kernel above halves K/V traffic but launches one threadgroup per
@@ -6820,6 +6828,12 @@ kernel void llama_attn_w32(
     constant float     &eps             [[buffer(12)]],
     constant float     &rope_base       [[buffer(13)]],
     constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
     uint h                              [[threadgroup_position_in_grid]],
     uint tid                            [[thread_position_in_threadgroup]]
 ) {
@@ -6846,22 +6860,9 @@ kernel void llama_attn_w32(
         for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    for (uint j = tid; j < head_dim / 2; j += 32 * AW32_WARPS) {
-        float theta = float(pos) / pow(rope_base, (2.0f * float(j)) / float(head_dim));
-        float c = cos(theta);
-        float s = sin(theta);
-        if (rope_mode == 0u) {
-            float q0 = q_head[j];
-            float q1 = q_head[j + head_dim / 2];
-            q_head[j]                = q0 * c - q1 * s;
-            q_head[j + head_dim / 2] = q1 * c + q0 * s;
-        } else {
-            float q0 = q_head[2 * j];
-            float q1 = q_head[2 * j + 1];
-            q_head[2 * j]     = q0 * c - q1 * s;
-            q_head[2 * j + 1] = q1 * c + q0 * s;
-        }
-    }
+    sofuu_rope_apply(q_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, tid,
+                     32 * AW32_WARPS, rope_tab, 0, has_table, rope_adj,
+                     rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     uint kv = h / (n_heads / n_kv_heads);

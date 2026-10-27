@@ -2168,6 +2168,56 @@ pub fn rope_style_ex(
     }
 }
 
+
+/// Fill the Metal kernels' rope table: one row per position, layout
+/// `[row] = cos(head_dim/2) | sin(head_dim/2)`, row stride `head_dim`.
+///
+/// This is the ONLY value source for a GPU rope dispatch on a model with a
+/// custom profile, and it reproduces `rope_style_ex` operation for operation
+/// (same f32 powf/cos/sin, same order: freq = base^(-2i/n_rot) * adj, then
+/// theta = pos * freq, then cos/sin scaled by mscale). Because the kernel then
+/// only multiplies the pair by (c, -s)/(s, c), a table-armed dispatch is
+/// bit-identical to the CPU reference rope — that is what makes the phi3 GPU
+/// route verifiable instead of "close enough".
+///
+/// * `n_rot` — dims per head actually rotated; 0 or > head_dim means the whole
+///   head (the same sentinel `rope_style_ex` uses).
+/// * `adjust` — 1/ggml factor per pair; empty = no factors.
+/// * pairs at or past n_rot/2 are left zero: the kernels never read them.
+pub fn rope_table_rows(
+    dst: &mut [f32],
+    head_dim: usize,
+    n_rot: usize,
+    mscale: f32,
+    freq_base: f32,
+    adjust: &[f32],
+    positions: &[usize],
+) {
+    let n_rot = if n_rot == 0 || n_rot > head_dim { head_dim } else { n_rot };
+    let half = n_rot / 2;
+    let keep = head_dim / 2;
+    assert!(
+        dst.len() >= positions.len() * head_dim,
+        "rope table: {} floats for {} rows of {head_dim}",
+        dst.len(),
+        positions.len()
+    );
+    for (row, &pos) in positions.iter().enumerate() {
+        let base = row * head_dim;
+        for i in 0..half {
+            let adj = if adjust.is_empty() { 1.0f32 } else { *adjust.get(i).unwrap_or(&1.0) };
+            let freq = 1.0f32 / freq_base.powf((2 * i) as f32 / n_rot as f32) * adj;
+            let theta = pos as f32 * freq;
+            dst[base + i] = theta.cos() * mscale;
+            dst[base + keep + i] = theta.sin() * mscale;
+        }
+        for i in half..keep {
+            dst[base + i] = 0.0;
+            dst[base + keep + i] = 0.0;
+        }
+    }
+}
+
 /// Rotary Position Embedding (RoPE) via C++ SIMD.
 #[inline]
 pub fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, freq_base: f32) {

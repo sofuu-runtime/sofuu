@@ -710,6 +710,73 @@ impl Drop for MetalBuffer {
 // Phase G0 of PLAN-GPU-METAL: one GPU submission per decode step regardless
 // of op count. Ops chain y→x with zero CPU staging (caller-owned MTLBuffers).
 
+// ── RoPE profile for the Metal rope sites ─────────────────────────────────
+// ONE parameterisation shared by every rope dispatch: the decode single-token
+// q/k pass (head_rmsnorm + llama_kv_write and their warp-cooperative
+// siblings), the batched rope+KV pass the prefill route uses
+// (head_rmsnorm_b4 + llama_kv_write_b4) and the speculative-tree chain pass
+// (the same b4 kernels, per-row positions). It is the device twin of
+// quant::rope_style_ex:
+//
+//   n_rot    dims per head actually rotated (0 or > head_dim = whole head).
+//   mscale   cos/sin amplitude (phi3 longrope attn_factor) — scales the
+//            rotation, i.e. attention logits by mscale^2.
+//   adj      1/ggml factor per pair, k-th entry divides theta of pair k.
+//   table    host-built cos|sin rows (quant::rope_table_rows) — the EXACT
+//            value sequence of rope_style_ex, so a table-armed dispatch is
+//            bit-identical to the CPU rope.
+//
+// Default::default() is the plain full-width rope every site ran before this
+// existed; with no table the kernels' on-device theta path reproduces it
+// exactly (n_rot = head_dim, mscale = 1 and no factors are all exact
+// identities), which is why a model with rope_custom == false takes the
+// byte-identical path.
+#[derive(Clone, Copy)]
+pub struct RopeKernel {
+    pub n_rot: u32,
+    pub mscale: f32,
+    /// (buffer handle, byte offset) of the per-pair factor list.
+    pub adj: Option<(*mut c_void, usize)>,
+    pub n_pairs: u32,
+    /// (buffer handle, byte offset) of the host-built cos|sin rows.
+    pub table: Option<(*mut c_void, usize)>,
+}
+
+impl RopeKernel {
+    /// The plain full-width profile: no table, whole-head, unscaled, no
+    /// factors. Every pre-profile call site maps to exactly this.
+    pub fn plain() -> Self {
+        Self { n_rot: 0, mscale: 1.0, adj: None, n_pairs: 0, table: None }
+    }
+
+    pub fn with_table(mut self, table: Option<(&MetalBuffer, usize)>) -> Self {
+        self.table = table.map(|(b, o)| (b.handle, o));
+        self
+    }
+
+    pub fn with_adj(mut self, adj: Option<(&MetalBuffer, usize)>) -> Self {
+        self.adj = adj.map(|(b, o)| (b.handle, o));
+        self
+    }
+
+    /// The eight C arguments every rope dispatch appends, in order:
+    /// (table ptr, table off, has_table, n_rot, mscale, adj ptr, adj off,
+    /// n_pairs). A missing buffer is passed as a null pointer, which the
+    /// dispatcher replaces with a buffer the kernel already has bound; the
+    /// kernels only read either pointer behind their own flag.
+    fn bind(&self) -> (*mut c_void, usize, u32, u32, f32, *mut c_void, usize, u32) {
+        let (tab, tab_off, has) = match self.table {
+            Some((h, o)) => (h, o, 1u32),
+            None => (std::ptr::null_mut(), 0usize, 0u32),
+        };
+        let (adj, adj_off) = match self.adj {
+            Some((h, o)) => (h, o),
+            None => (std::ptr::null_mut(), 0usize),
+        };
+        (tab, tab_off, has, self.n_rot, self.mscale, adj, adj_off, self.n_pairs)
+    }
+}
+
 extern "C" {
 
     fn sofuu_metal_batch_barrier_mark(ctx: *mut c_void);
@@ -1019,6 +1086,8 @@ extern "C" {
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     );
     fn sofuu_metal_batch_head_rmsnorm_b4(
         ctx: *mut c_void,
@@ -1029,6 +1098,8 @@ extern "C" {
         head_dim: u32, n_heads: u32,
         has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     );
     fn sofuu_metal_batch_llama_attn_part_b4(
         ctx: *mut c_void,
@@ -1097,6 +1168,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_llama_attn_w8(
         ctx: *mut c_void, q: *mut c_void, q_off: usize,
@@ -1105,6 +1179,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_llama_attn_w4(
         ctx: *mut c_void, q: *mut c_void, q_off: usize,
@@ -1113,6 +1190,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_llama_attn_fast(
         ctx: *mut c_void, q: *mut c_void, q_off: usize,
@@ -1121,6 +1201,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_gguf_gemv_q4k_flat(
         ctx: *mut c_void, w_buf: *mut c_void, w_offset: usize,
@@ -1264,6 +1347,10 @@ extern "C" {
     fn sofuu_metal_attn_gqa_rg(idx: i32) -> u32;
     fn sofuu_metal_attn_gqa_ratio(idx: i32) -> u32;
     fn sofuu_metal_attn_gqa_last() -> i32;
+    /// maxTotalThreadsPerThreadgroup of the shape's pipeline, 0 when the
+    /// pipeline could not be created on this GPU (the ceiling that decides
+    /// whether a shape may ever be dispatched is checked against this).
+    fn sofuu_metal_attn_gqa_max_threads(idx: i32) -> u32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,
@@ -1314,6 +1401,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_head_rmsnorm(
         ctx: *mut c_void,
@@ -1321,6 +1411,9 @@ extern "C" {
         w_buf: *mut c_void, w_offset: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     ) -> i32;
     fn sofuu_metal_batch_llama_attn_part(
         ctx: *mut c_void,
@@ -1349,6 +1442,9 @@ extern "C" {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
     );
 }
 
@@ -2692,11 +2788,14 @@ impl MetalEngine {
         has_norm: u32, pos: u32,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
-        };        let __t = self.op_tick(K_KVWRITE);
+        };
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
+        let __t = self.op_tick(K_KVWRITE);
         let __r = unsafe { sofuu_metal_batch_llama_kv_write(
                 self.ctx,
                 k_buf.handle, k_offset,
@@ -2707,6 +2806,7 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1 };
         self.op_tock(K_KVWRITE, __t);
         __r
@@ -2719,17 +2819,20 @@ impl MetalEngine {
         w_buf: Option<&MetalBuffer>, w_offset: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, pos: u32, eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let (w_handle, w_off) = match w_buf {
             Some(b) => (b.handle, w_offset),
             None => (x_buf.handle, 0),
         };
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
         let __r = unsafe { sofuu_metal_batch_head_rmsnorm(
                 self.ctx,
                 x_buf.handle, x_offset,
                 w_handle, w_off,
                 head_dim, n_heads,
                 has_norm, pos, eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1 };
         __r
     }
@@ -2796,16 +2899,13 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
-        rope_tab: Option<(&MetalBuffer, usize)>,
+        rope: RopeKernel,
     ) {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
             None => (k_buf.handle, 0),
         };
-        let (tab_handle, tab_off, has_table) = match rope_tab {
-            Some((b, o)) => (b.handle, o, 1u32),
-            None => (pos_buf.handle, 0, 0u32),
-        };
+        let (tab_handle, tab_off, has_table, rn_rot, rmsc, radj, radj_off, rnp) = rope.bind();
         let __t = self.op_tick(K_KVWRITE_B4);
         unsafe {
             sofuu_metal_batch_llama_kv_write_b4(
@@ -2821,6 +2921,7 @@ impl MetalEngine {
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
                 tab_handle, tab_off, has_table,
+                rn_rot, rmsc, radj, radj_off, rnp,
             );
         }
         self.op_tock(K_KVWRITE_B4, __t);
@@ -2836,16 +2937,13 @@ impl MetalEngine {
         rows: usize,
         head_dim: u32, n_heads: u32,
         has_norm: u32, eps: f32, rope_base: f32, rope_mode: u32,
-        rope_tab: Option<(&MetalBuffer, usize)>,
+        rope: RopeKernel,
     ) {
         let (w_handle, w_off) = match w_buf {
             Some(b) => (b.handle, w_offset),
             None => (x_buf.handle, 0),
         };
-        let (tab_handle, tab_off, has_table) = match rope_tab {
-            Some((b, o)) => (b.handle, o, 1u32),
-            None => (x_buf.handle, 0, 0u32),
-        };
+        let (tab_handle, tab_off, has_table, rn_rot, rmsc, radj, radj_off, rnp) = rope.bind();
         let __t = self.op_tick(K_HEAD_RMSNORM);
         unsafe {
             sofuu_metal_batch_head_rmsnorm_b4(
@@ -2857,6 +2955,7 @@ impl MetalEngine {
                 head_dim, n_heads,
                 has_norm, eps, rope_base, rope_mode,
                 tab_handle, tab_off, has_table,
+                rn_rot, rmsc, radj, radj_off, rnp,
             );
         }
         self.op_tock(K_HEAD_RMSNORM, __t);
@@ -3623,14 +3722,17 @@ impl MetalEngine {
         has_norm: bool, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
         unsafe {
             sofuu_metal_batch_llama_attn_w16(
                 self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
                 qln_handle, qln_off, out.handle, out_off,
                 has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1
         }
     }
@@ -3645,14 +3747,17 @@ impl MetalEngine {
         has_norm: bool, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
         unsafe {
             sofuu_metal_batch_llama_attn_w8(
                 self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
                 qln_handle, qln_off, out.handle, out_off,
                 has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1
         }
     }
@@ -3667,14 +3772,17 @@ impl MetalEngine {
         has_norm: bool, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
         unsafe {
             sofuu_metal_batch_llama_attn_w4(
                 self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
                 qln_handle, qln_off, out.handle, out_off,
                 has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1
         }
     }
@@ -3691,14 +3799,17 @@ impl MetalEngine {
         has_norm: bool, pos: u32,
         head_dim: u32, n_heads: u32, n_kv: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) -> bool {
         let qln_handle = qln.map(|b| b.handle).unwrap_or(std::ptr::null_mut());
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
         unsafe {
             sofuu_metal_batch_llama_attn_fast(
                 self.ctx, q.handle, q_off, kc.handle, kc_off, vc.handle, vc_off,
                 qln_handle, qln_off, out.handle, out_off,
                 has_norm as u32, pos, head_dim, n_heads, n_kv, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             ) == 1
         }
     }
@@ -3713,11 +3824,14 @@ impl MetalEngine {
         has_norm: u32, pos: u32,
         head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
     ) {
         let (qln_handle, qln_off) = match qln_buf {
             Some(b) => (b.handle, qln_offset),
             None => (q_buf.handle, 0),
-        };        let __t = self.op_tick(K_ATTN);
+        };
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
+        let __t = self.op_tick(K_ATTN);
         unsafe {
             sofuu_metal_batch_llama_attn(
                 self.ctx,
@@ -3729,6 +3843,7 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_heads, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
             );
         }
         self.op_tock(K_ATTN, __t);
@@ -4943,8 +5058,7 @@ mod q4k_crafted_probe {
                 Some(&wb), 128,
                 1, pos as u32,
                 hd as u32, n_kv as u32, max_seq as u32,
-                eps, rope_base, rope_mode,
-            );
+                eps, rope_base, rope_mode, RopeKernel::plain() );
             engine.batch_llama_attn(
                 &slab_buf, f_qa * 4,
                 &k_buf, 0,
@@ -4953,8 +5067,7 @@ mod q4k_crafted_probe {
                 &slab_buf, f_ao * 4,
                 1, pos as u32,
                 hd as u32, n_heads as u32, n_kv as u32, max_seq as u32,
-                eps, rope_base, rope_mode,
-            );
+                eps, rope_base, rope_mode, RopeKernel::plain() );
             engine.batch_end();
 
             let view = unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, slab_alloc / 4) };
@@ -5361,8 +5474,7 @@ mod q4k_crafted_probe {
                             Some(&wnorm), 4096,
                             1, 8,
                             hd as u32, 8, 64,
-                            1e-5, 10000.0, 0,
-                        );
+                            1e-5, 10000.0, 0, RopeKernel::plain() );
                         engine.batch_llama_attn(
                             &slab_buf, fqa * 4,
                             &k_buf, 0,
@@ -5371,8 +5483,7 @@ mod q4k_crafted_probe {
                             &slab_buf, fao * 4,
                             1, 8,
                             hd as u32, 32, 8, 64,
-                            1e-5, 10000.0, 0,
-                        );
+                            1e-5, 10000.0, 0, RopeKernel::plain() );
                     }
                     engine.batch_gguf(12, &w_buf, wj, &slab_buf, fao * 4, &slab_buf, fxo * 4, dim, q_rows);
                     if mode != "no-glue" && mode != "gemv-only" {
@@ -6471,8 +6582,7 @@ mod q4k_crafted_probe {
             &slab_buf, 0,
             Some(&wb), 0,
             hd as u32, n_heads as u32,
-            1, pos as u32, eps, rope_base, rope_mode,
-        );
+            1, pos as u32, eps, rope_base, rope_mode, RopeKernel::plain() );
         engine.batch_llama_attn_part(
             &slab_buf, 0,
             &kc, 0,
@@ -7260,15 +7370,11 @@ mod q4k_crafted_probe {
                     Some(&nw_buf), 0, 1,
                     &pos_buf, 0, b,
                     hd as u32, n_kv as u32, 4096,
-                    1e-5, 10000.0, 0,
-                None,
-                );
+                    1e-5, 10000.0, 0, RopeKernel::plain() );
                 engine.batch_head_rmsnorm_b4(
                     &slab_buf, oqa * 4, Some(&nw_buf), 0,
                     &pos_buf, 0, b,
-                    hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
-                None,
-                );
+                    hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0, RopeKernel::plain() );
                 engine.batch_llama_attn_part_b4(
                     &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
                     &meta_buf, 0, &pos_buf, 0, b,
@@ -7302,9 +7408,7 @@ mod q4k_crafted_probe {
                                 Some(&nw_buf), 0, 1,
                                 &pos_buf, 0, b,
                                 hd as u32, n_kv as u32, 4096,
-                                1e-5, 10000.0, 0,
-                            None,
-                            );
+                                1e-5, 10000.0, 0, RopeKernel::plain() );
                         }
                     }
                     "part4" => {
@@ -7324,9 +7428,7 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0,
-                        None,
-                        );
+                            1e-5, 10000.0, 0, RopeKernel::plain() );
                         engine.batch_llama_attn_part_b4(
                             &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
                             &meta_buf, 0, &pos_buf, 0, b,
@@ -7353,15 +7455,11 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0,
-                        None,
-                        );
+                            1e-5, 10000.0, 0, RopeKernel::plain() );
                         engine.batch_head_rmsnorm_b4(
                             &slab_buf, oqa * 4, Some(&nw_buf), 0,
                             &pos_buf, 0, b,
-                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
-                        None,
-                        );
+                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0, RopeKernel::plain() );
                     }
                     "kv" => {
                         engine.batch_llama_kv_write_b4(
@@ -7370,17 +7468,13 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0,
-                        None,
-                        );
+                            1e-5, 10000.0, 0, RopeKernel::plain() );
                     }
                     "qn" => {
                         engine.batch_head_rmsnorm_b4(
                             &slab_buf, oqa * 4, Some(&nw_buf), 0,
                             &pos_buf, 0, b,
-                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0,
-                        None,
-                        );
+                            hd as u32, n_heads as u32, 1, 1e-5, 10000.0, 0, RopeKernel::plain() );
                     }
                     "part" => {
                         engine.batch_llama_attn_part_b4(
@@ -7576,17 +7670,13 @@ mod q4k_crafted_probe {
             Some(&wb_buf), 4096, 1,
             &slab_buf, pos_off, b,
             hd as u32, n_kv as u32, max_seq as u32,
-            eps, rope_base, rope_mode,
-        None,
-        );
+            eps, rope_base, rope_mode, RopeKernel::plain() );
         engine.batch_head_rmsnorm_b4(
             &slab_buf, q_off,
             Some(&wb_buf), 0,
             &slab_buf, pos_off,
             b,
-            hd as u32, n_heads as u32, 1, eps, rope_base, rope_mode,
-        None,
-        );
+            hd as u32, n_heads as u32, 1, eps, rope_base, rope_mode, RopeKernel::plain() );
         engine.batch_llama_attn_part_b4(
             &slab_buf, q_off, &kc_buf, 0, &vc_buf, 0,
             &meta_buf, 0, &slab_buf, pos_off, b,
@@ -7742,8 +7832,7 @@ mod q4k_crafted_probe {
             &slab_buf, 0,
             Some(&wb), 0,
             hd as u32, n_heads as u32,
-            1, pos as u32, eps, rope_base, rope_mode,
-        );
+            1, pos as u32, eps, rope_base, rope_mode, RopeKernel::plain() );
         engine.batch_llama_attn_part(
             &slab_buf, 0,
             &kc, 0,
@@ -9329,9 +9418,9 @@ fn attn_glue_b4_fault_isolation_1b() {
         }
         run_isolated!("kv_write_b4", engine.batch_llama_kv_write_b4(
             k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, None));
+            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain() ));
         run_isolated!("head_rmsnorm_b4", engine.batch_head_rmsnorm_b4(
-            q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, None));
+            q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, RopeKernel::plain() ));
         run_isolated!("attn_part_b4", engine.batch_llama_attn_part_b4(
             q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
             hd, nh, nkv, max_seq, ncm, meta_per_layer as u32));
@@ -9340,9 +9429,9 @@ fn attn_glue_b4_fault_isolation_1b() {
         run_isolated!("ALL-IN-ONE", {
             engine.batch_llama_kv_write_b4(
                 k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, None);
+                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain() );
             engine.batch_head_rmsnorm_b4(
-                q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, None);
+                q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, RopeKernel::plain() );
             engine.batch_llama_attn_part_b4(
                 q_b, 0, kvc_b, 0, kvc_b, 0, meta_b, layer8_off, pos_b, 0, b,
                 hd, nh, nkv, max_seq, ncm, meta_per_layer as u32);
@@ -10513,8 +10602,10 @@ fn gqa_each_shape_matches_per_head_kernel() {
     // (table index, n_kv_heads, head_dim). Covers every new entry at a head_dim
     // from each divisibility class: 64 and 96 are not multiples of 128, the only
     // value the shipped model was ever measured at.
-    let cases: [(i32, usize, usize); 14] = [
+    let cases: [(i32, usize, usize); 16] = [
         (1, 4, 128),  // shipped 2:1 default, the reference shape
+        (8, 8, 128),  // 3:1 at the phi3 geometry: 24 q heads / 8 kv heads, hd 128
+        (9, 8, 128),  // 3:1 256-thread form at the same geometry
         (2, 4, 96),   // 2:1, 256 threads, hd 96
         (5, 4, 128),  // 4:1 512
         (6, 4, 64),   // 4:1 256  <- the <=384-thread form, hd 64
@@ -10625,7 +10716,8 @@ fn gqa_each_shape_matches_per_head_kernel() {
         if last != idx {
             // the threadgroup guard refused this pipeline on this GPU: a real
             // outcome, but it leaves the shape unverified here.
-            println!("[gqa-parity] shape {idx} (ratio {ratio}, hd {hd}): pipeline unavailable on this GPU - skipped");
+            let ceiling = unsafe { sofuu_metal_attn_gqa_max_threads(idx) };
+            println!("[gqa-parity] shape {idx} (ratio {ratio}, hd {hd}): pipeline unavailable on this GPU (ceiling {ceiling} threads) - skipped");
             skipped.push(idx);
             continue;
         }
@@ -11145,3 +11237,565 @@ mod chan_bias_tests {
     }
 }
 
+
+
+// ── G1: every Metal rope site vs the CPU reference rope ────────────────────
+// Exercised at the profile that motivated the parameterisation (phi3: n_rot 96
+// of 128 dims, mscale 1.190238, a 48-pair 1/factor table) and compared to
+// quant::rope_style_ex — the CPU reference every other route uses.
+//
+// The comparison is two-layered, because the two halves of a rope dispatch have
+// different exactness properties:
+//   * the ANGLES come from the host (quant::rope_table_rows) for a custom
+//     profile, so cos|sin are BIT-IDENTICAL to the CPU's by construction, and
+//     the tail dims (>= n_rot) must come out bit-identical too;
+//   * the ROTATION (v0*c - v1*s / v0*s + v1*c) is contracted into FMAs by the
+//     Metal compiler while the host evaluates it as written, so values are
+//     compared against a per-element rounding budget instead of bit-for-bit.
+// The default-profile case covers the on-device theta path (no table) that
+// every pre-existing model runs.
+#[cfg(all(test, target_os = "macos"))]
+mod rope_profile_tests {
+    use super::*;
+    use crate::infer::quant;
+
+    const HD: usize = 128;
+    /// phi3 partial rotary: 96 of 128 dims rotate, the last 32 pass through.
+    const N_ROT: usize = 96;
+    const MS: f32 = 1.190_238_1;
+    const BASE: f32 = 10_000.0;
+    /// 0, the n_rot/2 boundary (47/48), the n_rot boundary (95/96), a
+    /// mid-context position and one past the 4096-token trained window.
+    const POSITIONS: [usize; 7] = [0, 1, 47, 48, 95, 4095, 60_000];
+
+    fn phi3_adjust() -> Vec<f32> {
+        // The loader stores 1/ggml-factor; phi3's real factors climb
+        // 1.0 -> 47.77 across its 48 pairs. This reproduces that shape, so the
+        // test needs no checkpoint.
+        (0..N_ROT / 2).map(|i| 1.0f32 / (1.0f32 + 0.973_4 * i as f32)).collect()
+    }
+
+    fn anon(bytes: usize) -> &'static mut [u8] {
+        let page = 16384usize;
+        let len = ((bytes + page - 1) / page) * page;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(p != libc::MAP_FAILED, "anon mmap");
+        unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) }
+    }
+
+    fn put_f32(slab: &mut [u8], vals: &[f32]) {
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut f32, slab.len() / 4)
+        };
+        dst[..vals.len()].copy_from_slice(vals);
+    }
+
+    fn put_u32(slab: &mut [u8], vals: &[u32]) {
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut u32, slab.len() / 4)
+        };
+        dst[..vals.len()].copy_from_slice(vals);
+    }
+
+    fn as_f32(slab: &[u8]) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const f32, slab.len() / 4) }
+    }
+
+    fn pattern(n: usize, seed: u32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed);
+                ((x >> 8) as f32 / 8_388_608.0) - 1.0
+            })
+            .collect()
+    }
+
+    fn cpu_rows(
+        x: &[f32],
+        positions: &[usize],
+        mode: i32,
+        n_rot: usize,
+        mscale: f32,
+        adjust: &[f32],
+    ) -> Vec<f32> {
+        let mut out = x.to_vec();
+        for (r, &p) in positions.iter().enumerate() {
+            let mut head = out[r * HD..(r + 1) * HD].to_vec();
+            quant::rope_style_ex(&mut head, 1, HD, n_rot, p, BASE, mode, adjust, mscale);
+            out[r * HD..(r + 1) * HD].copy_from_slice(&head);
+        }
+        out
+    }
+
+    /// The two dims of one rotation pair under a rope mode.
+    fn pair_idx(i: usize, mode: i32, nrot: usize) -> (usize, usize) {
+        if mode == 1 { (2 * i, 2 * i + 1) } else { (i, i + nrot / 2) }
+    }
+
+    /// Per-element rounding budget: the Metal kernel contracts each rotation
+    /// pair into FMAs while the host evaluates the two products separately, so
+    /// the honest bound is a small multiple of one ULP of the pair's terms.
+    fn rotation_bound(
+        x: &[f32],
+        positions: &[usize],
+        mode: i32,
+        n_rot: usize,
+        mscale: f32,
+        adjust: &[f32],
+    ) -> Vec<f32> {
+        let nrot = if n_rot == 0 || n_rot > HD { HD } else { n_rot };
+        let mut out = vec![0f32; positions.len() * HD];
+        for (r, &p) in positions.iter().enumerate() {
+            for i in 0..nrot / 2 {
+                let adj = if adjust.is_empty() { 1.0f32 } else { *adjust.get(i).unwrap_or(&1.0) };
+                let freq = 1.0f32 / BASE.powf((2 * i) as f32 / nrot as f32) * adj;
+                let theta = p as f32 * freq;
+                let c = theta.cos() * mscale;
+                let s = theta.sin() * mscale;
+                let (i0, i1) = pair_idx(i, mode, nrot);
+                let v0 = x[r * HD + i0];
+                let v1 = x[r * HD + i1];
+                // dim i0 = v0*c - v1*s, dim i1 = v0*s + v1*c: each dim gets the
+                // budget of ITS OWN two terms, not the pair's.
+                out[r * HD + i0] = 8.0 * f32::EPSILON * ((v0 * c).abs() + (v1 * s).abs());
+                out[r * HD + i1] = 8.0 * f32::EPSILON * ((v0 * s).abs() + (v1 * c).abs());
+            }
+        }
+        out
+    }
+
+    /// Compare against the CPU route inside the rounding budget, and report how
+    /// many values came out bit-identical anyway.
+    fn check(
+        tag: &str,
+        got: &[f32],
+        want: &[f32],
+        bound: &[f32],
+        tail_from: usize,
+    ) {
+        let mut exact = 0usize;
+        let mut worst_ratio = 0f32;
+        for i in 0..want.len() {
+            if got[i].to_bits() == want[i].to_bits() {
+                exact += 1;
+            }
+            if i % HD >= tail_from {
+                // dims at/after n_rot must pass THROUGH untouched
+                assert_eq!(
+                    got[i].to_bits(), want[i].to_bits(),
+                    "{tag}: tail dim {} of row {} moved ({} vs {})",
+                    i % HD, i / HD, got[i], want[i]
+                );
+                continue;
+            }
+            let d = (got[i] - want[i]).abs();
+            worst_ratio = worst_ratio.max(d / bound[i].max(f32::MIN_POSITIVE));
+            assert!(
+                d <= bound[i],
+                "{tag}: value {i} off by {d:e} (budget {:e}): gpu {} vs cpu {}",
+                bound[i], got[i], want[i]
+            );
+        }
+        println!(
+            "[G1] {tag}: {} values vs rope_style_ex — {exact} bit-identical, worst {:.3} of the rounding budget",
+            want.len(), worst_ratio
+        );
+    }
+
+
+    /// The table/adj/pos buffers one dispatch needs, plus the profile that
+    /// points at them.
+    struct Rig {
+        _tab: &'static mut [u8],
+        _adj: &'static mut [u8],
+        _pos: &'static mut [u8],
+        pos_buf: MetalBuffer,
+        tab_buf: MetalBuffer,
+        rk: RopeKernel,
+    }
+
+    fn rig(
+        engine: &MetalEngine,
+        positions: &[usize],
+        adjust: &[f32],
+        n_rot: usize,
+        mscale: f32,
+        with_table: bool,
+    ) -> Rig {
+        let rows = positions.len();
+        let tab = anon(rows * HD * 4);
+        {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(tab.as_mut_ptr() as *mut f32, rows * HD)
+            };
+            quant::rope_table_rows(dst, HD, n_rot, mscale, BASE, adjust, positions);
+        }
+        let tab_buf = engine.register_zerocopy_buffer(&tab[..]).expect("table buf");
+        let adj = anon(adjust.len().max(1) * 4);
+        put_f32(adj, adjust);
+        let adj_buf = engine.register_zerocopy_buffer(&adj[..]).expect("adj buf");
+        let pos = anon(rows * 4);
+        put_u32(pos, &positions.iter().map(|p| *p as u32).collect::<Vec<u32>>());
+        let pos_buf = engine.register_zerocopy_buffer(&pos[..]).expect("pos buf");
+
+        let mut rk = RopeKernel::plain();
+        rk.n_rot = n_rot as u32;
+        rk.mscale = mscale;
+        if !adjust.is_empty() {
+            rk.adj = Some((adj_buf.handle, 0));
+            rk.n_pairs = adjust.len() as u32;
+        }
+        if with_table {
+            rk.table = Some((tab_buf.handle, 0));
+        }
+        Rig { _tab: tab, _adj: adj, _pos: pos, pos_buf, tab_buf, rk }
+    }
+
+    /// The batched rope+KV class — the prefill chunk pass and the GPU chain
+    /// both rope q through this kernel (and k through its kv_write twin).
+    #[test]
+    fn rope_b4_matches_cpu_reference() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let adjust = phi3_adjust();
+        let rows = POSITIONS.len();
+        let n = rows * HD;
+        for mode in [0i32, 1] {
+            let x = pattern(n, 11 + mode as u32);
+            let want = cpu_rows(&x, &POSITIONS, mode, N_ROT, MS, &adjust);
+            let bound = rotation_bound(&x, &POSITIONS, mode, N_ROT, MS, &adjust);
+            let q = anon(n * 4);
+            put_f32(q, &x);
+            let qb = engine.register_zerocopy_buffer(&q[..]).expect("q");
+            let r = rig(&engine, &POSITIONS, &adjust, N_ROT, MS, true);
+
+            assert!(engine.batch_open());
+            engine.batch_head_rmsnorm_b4(
+                &qb, 0, None, 0, &r.pos_buf, 0, rows,
+                HD as u32, 1, 0, 1e-5, BASE, mode as u32, r.rk,
+            );
+            assert!(engine.batch_end());
+
+            check(
+                &format!("head_rmsnorm_b4 (batched prefill/chain rope) mode {mode}"),
+                &as_f32(q)[..n], &want, &bound, N_ROT,
+            );
+        }
+    }
+
+    /// The decode class: one dispatch per token, q-norm+rope in one kernel.
+    #[test]
+    fn rope_decode_matches_cpu_reference() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let adjust = phi3_adjust();
+        let rows = POSITIONS.len();
+        let n = rows * HD;
+        for mode in [0i32, 1] {
+            let x = pattern(n, 33 + mode as u32);
+            let want = cpu_rows(&x, &POSITIONS, mode, N_ROT, MS, &adjust);
+            let bound = rotation_bound(&x, &POSITIONS, mode, N_ROT, MS, &adjust);
+            let q = anon(n * 4);
+            put_f32(q, &x);
+            let qb = engine.register_zerocopy_buffer(&q[..]).expect("q");
+            let r = rig(&engine, &POSITIONS, &adjust, N_ROT, MS, true);
+
+            assert!(engine.batch_open());
+            for (row, &p) in POSITIONS.iter().enumerate() {
+                // ONE position per dispatch, so the table offset selects that
+                // position's row — exactly what the model does with a one-row
+                // table (gpu_rope_table(&[pos])).
+                let mut rk = r.rk;
+                rk.table = Some((r.tab_buf.handle, row * HD * 4));
+                engine.batch_head_rmsnorm(
+                    &qb, row * HD * 4, None, 0,
+                    HD as u32, 1, 0, p as u32, 1e-5, BASE, mode as u32, rk,
+                );
+            }
+            assert!(engine.batch_end());
+
+            check(
+                &format!("head_rmsnorm (single-token decode rope) mode {mode}"),
+                &as_f32(q)[..n], &want, &bound, N_ROT,
+            );
+        }
+    }
+
+    /// The KV-append class: k is normed+roped and lands in the cache; v must be
+    /// copied through untouched.
+    #[test]
+    fn rope_kv_write_matches_cpu_reference() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let adjust = phi3_adjust();
+        let max_seq = 128usize;
+        // positions must index inside the cache, so no 60000 here: the rope
+        // value coverage above already includes it.
+        let positions = [0usize, 1, 47, 48, 95];
+        let rows = positions.len();
+        for mode in [0i32, 1] {
+            let k = pattern(rows * HD, 51 + mode as u32);
+            let v = pattern(rows * HD, 71 + mode as u32);
+            let want = cpu_rows(&k, &positions, mode, N_ROT, MS, &adjust);
+            let bound = rotation_bound(&k, &positions, mode, N_ROT, MS, &adjust);
+
+            let kb = anon(rows * HD * 4);
+            put_f32(kb, &k);
+            let k_buf = engine.register_zerocopy_buffer(&kb[..]).expect("k");
+            let vb = anon(rows * HD * 4);
+            put_f32(vb, &v);
+            let v_buf = engine.register_zerocopy_buffer(&vb[..]).expect("v");
+            // cache layout: [kv_head][max_seq][hd]; one kv head, so each
+            // position's record is a separate 128-float row.
+            let kc = anon(max_seq * HD * 4);
+            let kc_buf = engine.register_zerocopy_buffer(&kc[..]).expect("kc");
+            let vc = anon(max_seq * HD * 4);
+            let vc_buf = engine.register_zerocopy_buffer(&vc[..]).expect("vc");
+            let r = rig(&engine, &positions, &adjust, N_ROT, MS, true);
+
+            assert!(engine.batch_open());
+            for (row, &p) in positions.iter().enumerate() {
+                let mut rk = r.rk;
+                rk.table = Some((r.tab_buf.handle, row * HD * 4));
+                engine.batch_llama_kv_write(
+                    &k_buf, row * HD * 4,
+                    &v_buf, row * HD * 4,
+                    &kc_buf, 0,
+                    &vc_buf, 0,
+                    None, 0,
+                    0, p as u32,
+                    HD as u32, 1, max_seq as u32,
+                    1e-5, BASE, mode as u32, rk,
+                );
+            }
+            assert!(engine.batch_end());
+
+            let got_all = as_f32(kc);
+            let rowslice: Vec<f32> = positions
+                .iter()
+                .flat_map(|p| got_all[p * HD..(p + 1) * HD].iter().copied())
+                .collect();
+            check(
+                &format!("llama_kv_write (k rope into the cache) mode {mode}"),
+                &rowslice, &want, &bound, N_ROT,
+            );
+            let gv = as_f32(vc);
+            for (row, &p) in positions.iter().enumerate() {
+                for d in 0..HD {
+                    assert_eq!(
+                        gv[p * HD + d].to_bits(), v[row * HD + d].to_bits(),
+                        "kv_write v pos {p} dim {d} was modified"
+                    );
+                }
+            }
+            println!("[G1] llama_kv_write mode {mode}: v copied through bit-identically");
+        }
+    }
+
+    /// The default profile takes the ON-DEVICE theta path (no table), which is
+    /// the path every pre-existing model runs: same angles as
+    /// quant::rope_style up to Metal's pow/cos.
+    #[test]
+    fn rope_default_profile_ondevice_path_matches_cpu() {
+        let engine = MetalEngine::new().expect("metal engine");
+        let positions = [0usize, 1, 47, 63];
+        let rows = positions.len();
+        let n = rows * HD;
+        for mode in [0i32, 1] {
+            let x = pattern(n, 91 + mode as u32);
+            let mut want = x.clone();
+            for (r, &p) in positions.iter().enumerate() {
+                let mut head = want[r * HD..(r + 1) * HD].to_vec();
+                quant::rope_style(&mut head, 1, HD, p, BASE, mode);
+                want[r * HD..(r + 1) * HD].copy_from_slice(&head);
+            }
+            let q = anon(n * 4);
+            put_f32(q, &x);
+            let qb = engine.register_zerocopy_buffer(&q[..]).expect("q");
+            // no table, no factors, whole head: RopeKernel::plain()
+            let r = rig(&engine, &positions, &[], HD, 1.0, false);
+
+            assert!(engine.batch_open());
+            engine.batch_head_rmsnorm_b4(
+                &qb, 0, None, 0, &r.pos_buf, 0, rows,
+                HD as u32, 1, 0, 1e-5, BASE, mode as u32, r.rk,
+            );
+            assert!(engine.batch_end());
+
+            let got = as_f32(q);
+            let mut worst = 0f32;
+            for i in 0..n {
+                let d = (got[i] - want[i]).abs();
+                worst = worst.max(d / (1.0 + want[i].abs()));
+                assert!(
+                    d <= 2e-5 * (1.0 + want[i].abs()),
+                    "on-device theta path mode {mode} value {i}: {} vs {}",
+                    got[i], want[i]
+                );
+            }
+            println!("[G1] default profile (on-device theta) mode {mode}: worst rel {worst:e}");
+        }
+    }
+}
+
+
+// ── GQA shape cost order at the phi3 geometry (24 q / 8 kv, hd 128) ─────────
+// The hd-64 receipt for 3:1 ranked the 256-thread nr2 form ahead of the
+// 512-thread nr1 form by 9%; this re-measures the SAME question at hd 128 on
+// the shape the phi3 GPU route actually needs. Interleaved ABBA (A B B A per
+// round, 5 rounds) so a load drift hits both arms equally, median AND min
+// reported, and the machine's load average quoted with the numbers.
+#[cfg(all(test, target_os = "macos"))]
+mod gqa_cost_tests {
+    use super::*;
+
+    const ROWS: usize = 32;
+    const NKV: usize = 8;
+    const NH: usize = 24;
+    const HD: usize = 128;
+    const MAX_SEQ: usize = 1024;
+    const ITERS: usize = 200;
+    const ROUNDS: usize = 5;
+
+    struct Arm {
+        engine: MetalEngine,
+        q: MetalBuffer,
+        kc: MetalBuffer,
+        vc: MetalBuffer,
+        out: MetalBuffer,
+        pos: MetalBuffer,
+        _ptrs: Vec<(*mut u8, usize)>,
+    }
+
+    fn mk_ptr(bytes: usize) -> *mut u8 {
+        let page = 16384usize;
+        let len = bytes.div_ceil(page) * page;
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED);
+        p as *mut u8
+    }
+
+    fn arm(pin: i32) -> Arm {
+        std::env::set_var("SOFUU_ATTN_GQA_ONLY", pin.to_string());
+        std::env::set_var("SOFUU_ATTN_GQA_ALL", "1");
+        std::env::remove_var("SOFUU_ATTN_GQA");
+        let engine = MetalEngine::new().expect("engine");
+        let mut state = 0x243f6a8885a308d3u64;
+        let mut rand = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) % 2003) as f32 / 1000.0f32 - 1.0f32
+        };
+        let mut ptrs = Vec::new();
+        let mut buf = |vals: &[f32], engine: &MetalEngine, ptrs: &mut Vec<(*mut u8, usize)>| {
+            let bytes = vals.len() * 4;
+            let p = mk_ptr(bytes);
+            unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, p, bytes) };
+            let page = 16384usize;
+            let len = bytes.div_ceil(page) * page;
+            ptrs.push((p, len));
+            engine
+                .register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(p, len) })
+                .expect("reg")
+        };
+        let qv: Vec<f32> = (0..ROWS * NH * HD).map(|_| rand()).collect();
+        let kv: Vec<f32> = (0..NKV * MAX_SEQ * HD).map(|_| rand()).collect();
+        let kcv = kv.clone();
+        let q = buf(&qv, &engine, &mut ptrs);
+        let kc = buf(&kv, &engine, &mut ptrs);
+        let vc = buf(&kcv, &engine, &mut ptrs);
+        let outv = vec![0f32; ROWS * NH * HD];
+        let out = buf(&outv, &engine, &mut ptrs);
+        let posv: Vec<u32> = (0..ROWS).map(|t| (MAX_SEQ - ROWS + t) as u32).collect();
+        let posbytes = posv.len() * 4;
+        let pp = mk_ptr(posbytes);
+        unsafe { std::ptr::copy_nonoverlapping(posv.as_ptr() as *const u8, pp, posbytes) };
+        let page = 16384usize;
+        let plen = posbytes.div_ceil(page) * page;
+        ptrs.push((pp, plen));
+        let pos = engine
+            .register_zerocopy_only(unsafe { std::slice::from_raw_parts_mut(pp, plen) })
+            .expect("reg pos");
+        Arm { engine, q, kc, vc, out, pos, _ptrs: ptrs }
+    }
+
+    fn time_arm(a: &Arm) -> f64 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            assert!(a.engine.batch_open());
+            let ok = a.engine.batch_llama_attn_row(
+                &a.q, 0, &a.kc, 0, &a.vc, 0, &a.out, 0, &a.pos, 0,
+                ROWS, HD as u32, NH as u32, NKV as u32, MAX_SEQ as u32,
+            );
+            assert!(ok, "dispatch refused");
+            assert!(a.engine.batch_end());
+            assert!(a.engine.batch_wait_all());
+        }
+        t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64 // us per dispatch
+    }
+
+    fn load() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|| "?".into())
+    }
+
+    #[test]
+    #[ignore = "GPU bench class: interleaved ABBA cost order"]
+    fn gqa_shape_cost_order_at_hd128() {
+        let a = arm(8); // r3 nr1 rg16: 512 threads
+        let b = arm(9); // r3 nr2 rg16: 256 threads
+        let last_a = unsafe { sofuu_metal_attn_gqa_last() };
+        let _ = last_a;
+        // warm both arms
+        time_arm(&a);
+        time_arm(&b);
+        let ca = unsafe { sofuu_metal_attn_gqa_max_threads(8) };
+        let cb = unsafe { sofuu_metal_attn_gqa_max_threads(9) };
+        println!(
+            "[gqa-cost] geometry nh={NH} nkv={NKV} hd={HD} rows={ROWS} max_seq={MAX_SEQ} iters={ITERS}"
+        );
+        println!("[gqa-cost] shape 8 (r3 nr1 rg16, 512 threads, pipeline ceiling {ca}) vs shape 9 (r3 nr2 rg16, 256 threads, ceiling {cb})");
+        let mut sa = Vec::new();
+        let mut sb = Vec::new();
+        for r in 0..ROUNDS {
+            let la = load();
+            // ABBA
+            let a1 = time_arm(&a);
+            let b1 = time_arm(&b);
+            let b2 = time_arm(&b);
+            let a2 = time_arm(&a);
+            sa.push(a1.min(a2));
+            sb.push(b1.min(b2));
+            println!(
+                "[gqa-cost] round {}: A {a1:.1}/{a2:.1} us  B {b1:.1}/{b2:.1} us  (load {la})",
+                r + 1
+            );
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            v[v.len() / 2]
+        };
+        let min = |v: &Vec<f64>| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (ma, mb) = (med(&mut sa.clone()), med(&mut sb.clone()));
+        let (na, nb) = (min(&sa), min(&sb));
+        println!("[gqa-cost] shape 8 (512t, nr1): median {ma:.1} us  min {na:.1} us");
+        println!("[gqa-cost] shape 9 (256t, nr2): median {mb:.1} us  min {nb:.1} us");
+        println!(
+            "[gqa-cost] nr2/nr1 ratio: median {:.3}  min {:.3}  (>1 means nr1 is cheaper)",
+            mb / ma,
+            nb / na
+        );
+        std::env::remove_var("SOFUU_ATTN_GQA_ONLY");
+        std::env::remove_var("SOFUU_ATTN_GQA_ALL");
+    }
+}

@@ -158,9 +158,10 @@ checks see a clean process table.
   version, platform, the FULL capability manifest, and the LIVE
   capability posture (memory full-or-typed-refusal, the P2/P3/P4
   surfaces present) with `capability_posture_ok`. The probe is honest
-  about the engine-lane memory finding (a clobbered namespace reports
-  `not-a-function`, not a claimed pass) — the posture stays visible
-  until the engine lane lands the namespace fix.
+  about the build variant: a QTSQ-free binary must throw a typed refusal
+  (`E_CAPABILITY`), and a codec-bearing build must expose the flat
+  `sofuu.memory.remember` — after finding #13 the QTSQ report reads
+  `memory: {claimed: full, live: full, ok: true}`.
 - **`scripts/conformance_report.sh`** — one release artifact: the
   52-case board's summary parsed into the runtime's report + the
   verify-dist gate verdict. Attach it to every release.
@@ -369,6 +370,15 @@ flat answer == instance answer); `contract/matrix.json` memory × js → `full`
 (0 unknowns unchanged); `verify-dist`'s memory row is green on a QTSQ build
 (and still green as typed-refusal on a QTSQ-free one); `sofuu conformance`
 reports `memory: {claimed: full, live: full, ok: true}` on a QTSQ build.
+
+Follow-on CI: the first green matrix run with the fix is `40457020037` @
+`d92ff9599` (artifact 42/0/10, `capability_posture_ok`, `verify_dist: ok`).
+Two latent guards fired on the way there and are now fixed too:
+`capabilities::tests::surfaces_cover_every_matrix_cell` still pinned memory
+to `partial` (`68071cd2d`), and `scripts/check-driver-bc.sh` globbed
+`src/js/*.js` so the new source-only file was reported as a MISSING driver
+snapshot — files eval'd at registration now carry `@sofuu-source-only` and
+both the generator and the checker skip them (`d92ff9599`).
 
 ## Next actions
 

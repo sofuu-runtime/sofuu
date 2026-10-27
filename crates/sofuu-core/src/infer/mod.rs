@@ -17,6 +17,7 @@ pub mod mmap;
 pub mod model;
 pub mod npy;
 pub mod paged_kv;
+pub mod prefill_sched;
 pub mod pytorch;
 pub mod quant;
 #[cfg(test)]

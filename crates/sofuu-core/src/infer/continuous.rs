@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::paged_kv::{BlockPool, SequenceBlockTable};
+use super::prefill_sched::{self, SliceStep};
 use super::sampler::{Sampler, SamplerConfig};
 use super::{GenerateOptions, InferEngine};
 
@@ -186,6 +187,11 @@ pub struct ActiveStream {
     pub status: StreamStatus,
     pub block_tables: Vec<SequenceBlockTable>,
     pub full_generated: String,
+    /// Wall time this stream has spent in the Prefilling arm, summed over its
+    /// slices. One prompt can now span many scheduler iterations (chunked
+    /// prefill), so the phase metric is accumulated here and reported once, at
+    /// the slice that completes the prompt — not per slice.
+    pub prefill_us: u64,
 }
 
 /// Shared state of the continuous batch scheduler.
@@ -361,6 +367,7 @@ impl ContinuousBatchServer {
                         status: StreamStatus::Prefilling,
                         block_tables,
                         full_generated: String::new(),
+                        prefill_us: 0,
                     };
                     next_seq_id += 1;
                     state.active.push(active_stream);
@@ -372,7 +379,21 @@ impl ContinuousBatchServer {
             let mut streams_to_retain = Vec::new();
             {
                 let mut state = state_arc.lock().unwrap();
-                let active_streams = std::mem::take(&mut state.active);
+                let mut active_streams = std::mem::take(&mut state.active);
+
+                // ADMISSION ORDER (chunked prefill): decoding streams keep the
+                // front of the pass (their step is short and latency-critical),
+                // prefilling streams follow shortest-remaining-first, so a short
+                // request admitted behind a 3k-token prompt gets its slice — and
+                // therefore its first token — in THIS iteration. Stable sort:
+                // FIFO is preserved among equals, and no stream is dropped,
+                // merged or skipped (pure reordering).
+                active_streams.sort_by_key(|st| {
+                    prefill_sched::order_key(
+                        st.status == StreamStatus::Prefilling,
+                        st.prompt_tokens.len().saturating_sub(st.cur_pos),
+                    )
+                });
 
                 for mut stream in active_streams {
                     if stream.aborted.load(Ordering::Relaxed) {
@@ -389,25 +410,44 @@ impl ContinuousBatchServer {
 
                     match stream.status {
                         StreamStatus::Prefilling => {
+                            // CHUNKED PREFILL: one slice per iteration, so a
+                            // long prompt stops monopolising the scheduler.
+                            // cur_pos doubles as "prompt tokens already in the
+                            // KV cache" while Prefilling. Slice size comes from
+                            // prefill_sched (SOFUU_PREFILL_LIMIT, 0 = one shot)
+                            // and is a whole number of backend prefill groups,
+                            // so the batched calls the model sees are the ones
+                            // a one-shot prefill would have issued — bit-exact.
                             let pf_t0 = std::time::Instant::now();
                             let mut eng = engine_arc.lock().unwrap();
                             let p_len = stream.prompt_tokens.len();
+                            let chunk = prefill_sched::chunk_tokens(&eng.model);
 
-                            if p_len == 1 {
-                                let tok = stream.prompt_tokens[0];
-                                let logits = eng.model.forward(tok, 0);
-                                stream.logits_buf.copy_from_slice(logits);
-                                stream.cur_pos = 1;
-                            } else {
-                                // Unified fast prefill
-                                let logits = eng.model.forward_prefill_all_with_logits(&stream.prompt_tokens, 0);
-                                stream.logits_buf.copy_from_slice(logits);
-                                stream.cur_pos = p_len;
+                            let start = stream.cur_pos;
+                            match prefill_sched::step(
+                                &mut eng.model,
+                                &stream.prompt_tokens,
+                                start,
+                                chunk,
+                                &mut stream.logits_buf,
+                            ) {
+                                SliceStep::Continue => {
+                                    // Continue only when the slice fit whole.
+                                    stream.cur_pos = start + chunk.min(p_len - start);
+                                }
+                                SliceStep::Complete => {
+                                    stream.cur_pos = p_len;
+                                    stream.status = StreamStatus::Decoding;
+                                }
                             }
                             drop(eng);
-                            metrics_add(0, 0, 0, pf_t0.elapsed().as_micros() as u64, 1, 0);
-                            decode_metrics_emit(false);
-                            stream.status = StreamStatus::Decoding;
+                            stream.prefill_us += pf_t0.elapsed().as_micros() as u64;
+                            if stream.status == StreamStatus::Decoding {
+                                // Prefill boundary: report the whole prompt's
+                                // prefill time (all slices) once.
+                                metrics_add(0, 0, 0, stream.prefill_us, 1, 0);
+                                decode_metrics_emit(false);
+                            }
                             progressed = true;
                             streams_to_retain.push(stream);
                         }

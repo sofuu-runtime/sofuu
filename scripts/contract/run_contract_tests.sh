@@ -89,21 +89,25 @@ run_noqts_case() {
 }
 
 run_cli_case() {
-    local envspec="$1" cmd="$2" expect="$3" out code
+    local envspec="$1" cmd="$2" expect="$3" out code out_tail
     if [ "$envspec" = "-" ]; then
         out="$(cd "$ROOT" && bash -c "$cmd" 2>&1)"; code=$?
     else
         out="$(cd "$ROOT" && env "$envspec" bash -c "$cmd" 2>&1)"; code=$?
     fi
+    # A failed CLI case must say WHICH assertion failed. The harness prints
+    # its checks to the captured stream; keep a short tail in the FAIL line so
+    # the CI gate's report is diagnosable without a local rerun.
+    out_tail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 6 | tr '\n' '~' | cut -c1-400)"
     case "$expect" in
         exit:*)
             if [ "$code" = "${expect#exit:}" ]; then report_pass "$id" "exit $code"
-            else report_fail "$id" "expected exit ${expect#exit:}, got $code"; fi ;;
+            else report_fail "$id" "expected exit ${expect#exit:}, got $code [out: $out_tail]"; fi ;;
         stdout_has:*)
             if printf '%s' "$out" | grep -qF -- "${expect#stdout_has:}"; then report_pass "$id" "stdout contains '${expect#stdout_has:}'"
-            else report_fail "$id" "stdout missing '${expect#stdout_has:}'"; fi ;;
+            else report_fail "$id" "stdout missing '${expect#stdout_has:}' [out: $out_tail]"; fi ;;
         stdout_absent:*)
-            if printf '%s' "$out" | grep -qF -- "${expect#stdout_absent:}"; then report_fail "$id" "stdout still contains '${expect#stdout_absent:}'"
+            if printf '%s' "$out" | grep -qF -- "${expect#stdout_absent:}"; then report_fail "$id" "stdout still contains '${expect#stdout_absent:}' [out: $out_tail]"
             else report_pass "$id" "stdout free of '${expect#stdout_absent:}'"; fi ;;
         *) report_fail "$id" "bad cli expectation: $expect" ;;
     esac

@@ -18,11 +18,27 @@ const DEALINE_MS = 700;
 const BOUND_MS = DEALINE_MS + 2000; // SPEC T2.1: fail within deadline ± 2 s
 
 async function main() {
+    // Orphan detection must look at OUR child only: any unrelated `sleep` on
+    // the machine (a loaded runner, another agent's wait loop) would
+    // otherwise make the case fail. `exec -a` gives the child a unique
+    // argv[0], so pgrep -f matches exactly this process.
+    const MARKER = "sofuu-t21-child";
+    function pgrepChild() {
+        return new Promise((resolve) => {
+            let out = "";
+            sofuu.spawn({
+                command: "pgrep", args: ["-f", MARKER],
+                onStdout: (c) => { out += String(c); },
+                onExit: () => resolve(out.trim().split(/\s+/).filter(Boolean)),
+            });
+        });
+    }
+
     const t0 = Date.now();
     let ended = false, exitInfo = null;
     const child = sofuu.spawn({
-        command: "sleep",
-        args: ["5"],
+        command: "bash",
+        args: ["-c", "exec -a " + MARKER + " sleep 5"],
         onExit: (info) => { ended = true; exitInfo = info; },
         onStdout: () => {},
         onStderr: () => {},
@@ -61,28 +77,18 @@ async function main() {
     );
     assert("exit reflects the kill, not a clean 5 s sleep", exitInfo == null || true);
 
-    // No orphan: `pgrep -x sleep` must come back empty after the kill.
-    // Reaping is asynchronous — a killed child can linger in the process
-    // table for a scheduler tick (longer on a loaded runner), so poll instead
-    // of taking one snapshot: the case asserts "no orphan", not "no reap
-    // latency". A genuinely surviving child still fails after the window.
-    function pgrepSleep() {
-        return new Promise((resolve) => {
-            let out = "";
-            sofuu.spawn({
-                command: "pgrep", args: ["-x", "sleep"],
-                onStdout: (c) => { out += String(c); },
-                onExit: () => resolve(out.trim()),
-            });
-        });
-    }
-    let orphans = await pgrepSleep();
+    // No orphan: the marked child must be gone. Reaping is asynchronous — a
+    // killed child can linger in the process table for a scheduler tick
+    // (longer on a loaded runner), so poll instead of taking one snapshot:
+    // the case asserts "no orphan", not "no reap latency". A genuinely
+    // surviving child still fails after the window.
+    let left = await pgrepChild();
     const tOrphan = Date.now();
-    while (orphans !== "" && Date.now() - tOrphan < 2000) {
+    while (left.length > 0 && Date.now() - tOrphan < 2000) {
         await new Promise((r) => setTimeout(r, 100));
-        orphans = await pgrepSleep();
+        left = await pgrepChild();
     }
-    assert("no orphan sleep process survived the kill", orphans === "");
+    assert("no orphan sleep process survived the kill", left.length === 0);
 
     console.log(`\n=== t21 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

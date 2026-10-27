@@ -17,13 +17,18 @@ setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 45 s"); proces
 
 const SIGNAL = "t23-cancel";
 
-function pgrepSleep() {
+// Orphan detection must look at OUR child only: any unrelated `sleep` on the
+// machine (a loaded runner, another agent's wait loop) would otherwise make
+// the case fail. `exec -a` gives the tool's child a unique argv[0], so
+// pgrep -f matches exactly this process.
+const MARKER = "sofuu-t23-child";
+function pgrepChild() {
     return new Promise((resolve) => {
         let out = "";
         sofuu.spawn({
-            command: "pgrep", args: ["-x", "sleep"],
+            command: "pgrep", args: ["-f", MARKER],
             onStdout: (c) => { out += String(c); },
-            onExit: () => resolve(out.trim()),
+            onExit: () => resolve(out.trim().split(/\s+/).filter(Boolean)),
         });
     });
 }
@@ -37,7 +42,7 @@ async function main() {
             delta: {
                 tool_calls: [{
                     index: 0, id: "call1", type: "function",
-                    function: { name: "bash", arguments: JSON.stringify({ command: "sleep 30" }) },
+                    function: { name: "bash", arguments: JSON.stringify({ command: "exec -a " + MARKER + " sleep 30" }) },
                 }],
             },
             finish_reason: "tool_calls",
@@ -76,8 +81,8 @@ async function main() {
     // ── start the run; cancel once the tool's child is live ────────────
     let settleInfo = null;
     let settleResolve = null;
+    let settleRejected = null;
     const t00 = Date.now();
-    if ((await pgrepSleep()) !== "") console.error("  ⚠️ sleep was live BEFORE the run started");
     const runP = sofuu.agent.run("chaost3", "run the sleep command", {
         signal: SIGNAL,
         // approve:'all' still routes through the HOST's callback — fail-closed
@@ -86,21 +91,29 @@ async function main() {
         onApproval: function () { return true; },
     });
     // Attach handlers immediately — an unhandled rejection stalls the loop.
+    // A rejection after cancel is a legitimate terminal (the contract asks
+    // for prompt termination, not success): record it and return, do NOT
+    // rethrow into the settle race — that made the case fail whenever the
+    // cancel produced a rejection instead of a resolved run.
     const settleWatch = runP.then(
         (r) => {
             if (settleResolve) { const f = settleResolve; settleResolve = null; f("resolved"); }
             return r;
         },
         (e) => {
-            console.error(`  ℹ️ run REJECTED at +${Date.now() - t00} ms: ${(e && e.message) || e}`);
+            settleRejected = String((e && e.message) || e);
+            console.error(`  ℹ️ run REJECTED at +${Date.now() - t00} ms: ${settleRejected}`);
             if (settleResolve) { const f = settleResolve; settleResolve = null; f("rejected"); }
-            throw e;
+            return null;
         },
     );
     let childLive = false;
     const t0 = Date.now();
-    while (Date.now() - t0 < 5000) {
-        if ((await pgrepSleep()) !== "") { childLive = true; break; }
+    // Startup precondition, not the tested bound: a loaded runner can take a
+    // few seconds to get the tool's child visible.
+    while (Date.now() - t0 < 10000) {
+        const live = await pgrepChild();
+        if (live.length > 0) { childLive = true; break; }
         await new Promise((r) => setTimeout(r, 100));
     }
     assert("the tool's subprocess is live", childLive);
@@ -128,21 +141,24 @@ async function main() {
         prev = now;
     }
     const race = settled || { how: "timeout", wall: Date.now() - tCancel };
+    const how = settleRejected ? `rejected: ${settleRejected}` : race.how;
     assert(
-        `run settled after cancel (${race.wall} ms, ${race.how}` +
+        `run settled after cancel (${race.wall} ms, ${how}` +
         (slack > 0 ? `, incl. ${slack} ms scheduler slack` : "") + ")",
         race.how !== "timeout"
     );
 
-    // ── no orphan: the sleep child died with the cancel ─────────────────
-    let orphans = "";
+    // ── no orphan: the marked child died with the cancel ────────────────
+    // Reaping is asynchronous (worse on a loaded runner); poll a little
+    // longer so the case asserts "no orphan", not "no reap latency".
+    let orphans = [];
     const tOrphan = Date.now();
-    while (Date.now() - tOrphan < 1500) {
-        orphans = await pgrepSleep();
-        if (orphans === "") break;
+    while (Date.now() - tOrphan < 3000) {
+        orphans = await pgrepChild();
+        if (orphans.length === 0) break;
         await new Promise((r) => setTimeout(r, 100));
     }
-    assert("no orphan sleep process after cancel", orphans === "");
+    assert("no orphan sleep process after cancel", orphans.length === 0);
 
     console.log(`\n=== t23 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

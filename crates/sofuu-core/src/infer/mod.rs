@@ -18,6 +18,7 @@ pub mod model;
 pub mod npy;
 pub mod paged_kv;
 pub mod prefill_sched;
+pub mod prefix_cache;
 pub mod pytorch;
 pub mod quant;
 #[cfg(test)]
@@ -429,6 +430,51 @@ impl InferModel {
         }
     }
 
+
+    // ── Shared-prefix KV reuse (prefix_cache) ──────────────────────
+    // Only the GGUF backend exposes its KV caches as a flat, block-addressable
+    // array; the other backends own opaque caches, so they report no geometry
+    // and the prefix cache stays off for them instead of guessing.
+
+    /// (n_layers * n_kv_heads, head_dim, max_seq_len), None when the backend
+    /// does not expose block-addressable KV.
+    pub fn kv_geom(&self) -> Option<(usize, usize, usize)> {
+        match &self.backend {
+            ModelBackend::Gguf(m) => Some(m.kv_geom()),
+            _ => None,
+        }
+    }
+
+    /// True when attention reads an f16 mirror of the f32 KV (prefix reuse
+    /// must not engage: a restored f32 row would be invisible to attention).
+    pub fn kv_shadowed(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.kv_shadowed(),
+            _ => true,
+        }
+    }
+
+    pub fn kv_block_snapshot(&self, block: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.kv_block_snapshot(block),
+            _ => None,
+        }
+    }
+
+    pub fn kv_block_restore(&mut self, block: usize, k: &[f32], v: &[f32]) -> bool {
+        match &mut self.backend {
+            ModelBackend::Gguf(m) => m.kv_block_restore(block, k, v),
+            _ => false,
+        }
+    }
+
+    pub fn kv_dump_prefix(&self, tokens: usize, path: &str) -> Result<(), String> {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.kv_dump_prefix(tokens, path),
+            _ => Err("KV prefix dumps are only available on the GGUF backend".to_string()),
+        }
+    }
+
     pub fn forward_speculative_batch(&mut self, tokens: &[u32], start_pos: usize, out_logits: &mut [f32]) {
         match &mut self.backend {
             ModelBackend::Gguf(m) => m.forward_speculative_batch(tokens, start_pos, out_logits),
@@ -587,8 +633,74 @@ fn reusable_history_len(compacted: bool, kv_len: usize, history_len: usize) -> u
     }
 }
 
+/// Expand a diagnostic dump path for the request that is running: the literal
+/// `{n}` becomes the 1-based stream()/request index, so a harness that issues
+/// several requests in one process keeps one dump per request instead of
+/// overwriting a single file. No placeholder -> the path is returned verbatim.
+fn dump_path_for(var: &str, seq: u64) -> Option<String> {
+    std::env::var_os(var).map(|p| {
+        let p = p.to_string_lossy();
+        if p.contains("{n}") {
+            p.replace("{n}", &seq.to_string())
+        } else {
+            p.into_owned()
+        }
+    })
+}
+
+/// DIAGNOSTIC ONLY: write one full-vocabulary logit vector as an SFLOG01
+/// container (tag, len, f32...). Both inference paths call this, so the same
+/// receipts exist for the engine (CLI) and for the continuous server: two runs
+/// are bit-identical exactly when their files are.
+pub fn dump_logits_receipt(var: &str, tag: &str, seq: u64, logits: &[f32]) {
+    let Some(path) = dump_path_for(var, seq) else { return };
+    let mut bytes = Vec::with_capacity(logits.len() * 4 + 64);
+    bytes.extend_from_slice(b"SFLOG01\0");
+    bytes.extend_from_slice(&(logits.len() as u64).to_le_bytes());
+    for v in logits.iter() {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => {
+            let mut amax = 0.0f32;
+            let mut argmax = 0usize;
+            for (i, v) in logits.iter().enumerate() {
+                let a = v.abs();
+                if a > amax {
+                    amax = a;
+                }
+                if *v > logits[argmax] {
+                    argmax = i;
+                }
+            }
+            eprintln!(
+                "[{tag}] {path} n={} maxabs={:.6} argmax={} top={:.6}",
+                logits.len(),
+                amax,
+                argmax,
+                logits.get(argmax).copied().unwrap_or(f32::NAN)
+            );
+        }
+        Err(e) => eprintln!("[{tag}] write {path} failed: {e}"),
+    }
+}
+
 pub struct InferEngine {
     pub model: InferModel,
+    /// Shared-prefix KV cache (prefix_cache.rs): refcounted, immutable KV
+    /// blocks keyed by token sequence, so request N+1 reuses the system
+    /// prompt's prefill instead of recomputing it. Empty and inert with
+    /// SOFUU_PREFIX_CACHE=0.
+    pub prefix_cache: prefix_cache::PrefixCache,
+    /// Tokens the LAST request skipped recomputing from that cache (0 = cold).
+    pub last_prefix_reuse: usize,
+    /// Wall time the LAST restore spent copying cached KV rows into the model
+    /// (the price of the reuse: a memcpy of reused_tokens * bytes_per_token).
+    pub last_prefix_restore: std::time::Duration,
+    /// 1-based counter of stream() calls on this engine; the diagnostic dump
+    /// paths substitute it for {n} so a multi-request harness can keep one
+    /// dump per request instead of overwriting a single file.
+    pub request_seq: u64,
     pub tokenizer: BpeTokenizer,
     pub last_prefill_tokens: usize,
     pub last_prefill_duration: std::time::Duration,
@@ -836,6 +948,10 @@ impl InferEngine {
                         last_setup_duration: std::time::Duration::ZERO,
                         last_token_trace: Vec::new(),
                         cached_tokens: Vec::new(),
+                        prefix_cache: prefix_cache::PrefixCache::from_env(),
+                        last_prefix_reuse: 0,
+                        last_prefix_restore: std::time::Duration::ZERO,
+                        request_seq: 0,
                     }, enable_gpu);
                 }
 
@@ -853,6 +969,10 @@ impl InferEngine {
                                     last_setup_duration: std::time::Duration::ZERO,
                         last_token_trace: Vec::new(),
                                     cached_tokens: Vec::new(),
+                                    prefix_cache: prefix_cache::PrefixCache::from_env(),
+                                    last_prefix_reuse: 0,
+                                    last_prefix_restore: std::time::Duration::ZERO,
+                                    request_seq: 0,
                                 }, enable_gpu);
                             }
                         }
@@ -911,6 +1031,10 @@ impl InferEngine {
                             last_setup_duration: std::time::Duration::ZERO,
                         last_token_trace: Vec::new(),
                             cached_tokens: Vec::new(),
+                            prefix_cache: prefix_cache::PrefixCache::from_env(),
+                            last_prefix_reuse: 0,
+                            last_prefix_restore: std::time::Duration::ZERO,
+                            request_seq: 0,
                         }, enable_gpu);
                     }
 
@@ -924,6 +1048,10 @@ impl InferEngine {
                             last_setup_duration: std::time::Duration::ZERO,
                         last_token_trace: Vec::new(),
                             cached_tokens: Vec::new(),
+                            prefix_cache: prefix_cache::PrefixCache::from_env(),
+                            last_prefix_reuse: 0,
+                            last_prefix_restore: std::time::Duration::ZERO,
+                            request_seq: 0,
                         }, enable_gpu);
                     }
                 }
@@ -967,6 +1095,10 @@ impl InferEngine {
             last_setup_duration: std::time::Duration::ZERO,
                         last_token_trace: Vec::new(),
             cached_tokens: Vec::new(),
+            prefix_cache: prefix_cache::PrefixCache::from_env(),
+            last_prefix_reuse: 0,
+            last_prefix_restore: std::time::Duration::ZERO,
+            request_seq: 0,
         })
     }
 
@@ -983,6 +1115,132 @@ impl InferEngine {
     pub fn reset_cache(&mut self) {
         self.model.reset_cache();
         self.cached_tokens.clear();
+    }
+
+    // ── Shared-prefix KV reuse (prefix_cache) ──────────────────────
+
+    /// Reuse the longest cached KV prefix of `tokens`: look it up, align the
+    /// reusable length to the prefill chunk grid, and copy those rows into the
+    /// model's live caches. Returns how many prompt tokens now have KV rows
+    /// that are bit-identical to a fresh prefill of the same prefix (0 =
+    /// nothing reused, the caller must prefill from position 0).
+    ///
+    /// The copy is a memcpy per (layer, kv_head, block): the rows themselves
+    /// are never recomputed, rescaled or re-roped — that is what makes the
+    /// reuse output-identical instead of approximately identical. Only the
+    /// blocks the caller will actually keep are copied, so a hit that the
+    /// chunk alignment discards costs nothing.
+    pub fn prefix_cache_restore(&mut self, tokens: &[u32]) -> usize {
+        if !self.prefix_cache.enabled() || self.model.kv_shadowed() || self.model.kv_geom().is_none() {
+            return 0;
+        }
+        let block = self::paged_kv::KV_BLOCK_SIZE;
+        let blocks = self.prefix_cache.lookup(tokens);
+        let hit = blocks.len() * block;
+        let reuse = self.prefix_cache_align(hit, tokens.len());
+        if reuse < self.prefix_cache.min_tokens().max(block) {
+            return 0;
+        }
+        let keep = (reuse / block).min(blocks.len());
+        let t0 = std::time::Instant::now();
+        let mut restored = 0usize;
+        for (i, b) in blocks.iter().take(keep).enumerate() {
+            if !self.model.kv_block_restore(i, &b.k, &b.v) {
+                self.last_prefix_restore = t0.elapsed();
+                return 0;
+            }
+            restored = (i + 1) * block;
+        }
+        self.last_prefix_restore = t0.elapsed();
+        if restored > 0 {
+            self.prefix_cache.note_reused(restored);
+        }
+        restored
+    }
+
+    /// How much of a `hit` may be skipped so the remaining suffix is chunked
+    /// EXACTLY the way a cold prefill of the whole prompt would chunk it.
+    ///
+    /// This is not cosmetic. The prefill walks the prompt in fixed chunks from
+    /// position 0; skipping `reuse` tokens that are not a multiple of that
+    /// chunk leaves the tail chunk with a different number of rows, and the
+    /// last row is the one whose logits pick the first token. Aligning the
+    /// reuse to whole chunks keeps every chunk boundary — hence every row's
+    /// kernel shape — identical to the cold run, so the logits of the final
+    /// row are bit-identical rather than merely close.
+    pub fn prefix_cache_align(&self, hit: usize, prompt_len: usize) -> usize {
+        let block = self::paged_kv::KV_BLOCK_SIZE;
+        // G = the backend's own prefill group (prefill_sched::group_rows): the
+        // rows the model always batches together. Aligning to G makes the
+        // projection-bearing group — rows [prompt_len - prompt_len % G,
+        // prompt_len) — identical to a cold run's, whether the caller feeds the
+        // suffix in one call (stream()) or one scheduler slice at a time
+        // (continuous.rs), and whether or not SOFUU_PREFILL_LIMIT slices it.
+        let group = self::prefill_sched::group_rows(&self.model).max(block);
+        let align = if group % block == 0 { group } else { group * block };
+        let mut reuse = (hit / align) * align;
+        // leave the last few prompt tokens for the final (logits) group
+        while reuse > 0 && reuse + 4 > prompt_len {
+            reuse -= align;
+        }
+        reuse.min(hit)
+    }
+
+    /// Snapshot the KV rows of `tokens[..kv_len]` (whole blocks only) into the
+    /// shared prefix index. `kv_len` must be the positions the model really
+    /// holds at [0, kv_len) — i.e. cur_pos right after the prefill and BEFORE
+    /// any compaction (SnapKV/KIVI re-anchor positions and must not feed this
+    /// cache).
+    pub fn prefix_cache_insert(&mut self, tokens: &[u32], kv_len: usize) {
+        if !self.prefix_cache.enabled() || self.model.kv_shadowed() || self.model.kv_geom().is_none() {
+            return;
+        }
+        let block = self::paged_kv::KV_BLOCK_SIZE;
+        let mut n = (kv_len.min(tokens.len()) / block) * block;
+        if n == 0 || n < self.prefix_cache.min_tokens().max(block) {
+            return;
+        }
+        // Never snapshot more than the budget can hold: the bound would evict
+        // it again straight away, and the bytes copied out of the cache are
+        // the expensive part of an insert. Keeping the HEAD is deliberate —
+        // under a tight budget the shared system prompt is what must survive,
+        // the per-request tail is what gets peeled off.
+        if let Some((n_h, head_dim, _)) = self.model.kv_geom() {
+            let block_bytes = 2 * n_h * block * head_dim * std::mem::size_of::<f32>();
+            if block_bytes > 0 {
+                let cap = self.prefix_cache.config().max_bytes / block_bytes;
+                n = n.min(cap.max(1) * block);
+            }
+        }
+        if n < self.prefix_cache.min_tokens().max(block) {
+            return;
+        }
+        let InferEngine { model, prefix_cache, .. } = self;
+        let model_ref: &InferModel = model;
+        let prefix = &tokens[..n];
+        prefix_cache.insert(prefix, &mut |bidx| {
+            let (k, v) = model_ref.kv_block_snapshot(bidx)?;
+            let (n_h, head_dim, _) = model_ref.kv_geom()?;
+            Some(prefix_cache::PrefixBlock::new(
+                prefix[bidx * block..(bidx + 1) * block].to_vec(),
+                k,
+                v,
+                n_h,
+                head_dim,
+            ))
+        });
+    }
+
+    /// Cache counters (hits, misses, tokens reused, resident bytes).
+    pub fn prefix_cache_stats(&self) -> prefix_cache::PrefixCacheStats {
+        self.prefix_cache.stats()
+    }
+
+    /// Diagnostic receipt: write the KV rows of positions [0, tokens) as an
+    /// SFKV01 file. Two runs that agree byte for byte on a shared prefix have
+    /// identical md5s for this dump.
+    pub fn dump_kv_prefix(&self, tokens: usize, path: &str) -> Result<(), String> {
+        self.model.kv_dump_prefix(tokens, path)
     }
 
     pub fn forward_embed(&mut self, token: u32, out_hidden: &mut [f32]) {
@@ -1109,6 +1367,8 @@ impl InferEngine {
     {
         // A fresh trace per call — callers read it after stream returns.
         self.last_token_trace.clear();
+        // 1-based request index for the diagnostic dump paths ("{n}").
+        self.request_seq += 1;
         // Auto mode adjusts the pool per phase; restore the caller's count on
         // every exit path so a stream() call never leaks its decode
         // configuration to other users of the global pool.
@@ -1210,6 +1470,30 @@ impl InferEngine {
             common_prefix = 0;
         }
 
+        // ── Serving prefix cache (prefix_cache.rs) ──────────────────
+        // The multi-turn reuse above only helps when this prompt EXTENDS the
+        // previous call's history. A server never does that: request N+1 shares
+        // the system prompt and diverges at the first user turn, so
+        // common_prefix is 0 here and the whole shared prompt used to be
+        // re-prefilled. Reuse the longest cached KV prefix instead. The rows
+        // are copied verbatim out of the index, so they are bit-identical to
+        // what this prefill would have computed.
+        let mut prefix_reuse = 0usize;
+        let prefix_ok = common_prefix == 0
+            && self.prefix_cache.enabled()
+            && !ring_mode
+            // SnapKV/KIVI re-anchor positions after the prefill: their KV no
+            // longer maps onto token order, so neither insert nor restore may
+            // run in those modes.
+            && !options.snapkv
+            && !options.kivi
+            && !options.dynamic_ffn
+            && input_tokens.len() > 4;
+        if prefix_ok {
+            prefix_reuse = self.prefix_cache_restore(&input_tokens);
+        }
+        self.last_prefix_reuse = prefix_reuse;
+
         let sink = self.model.sink_tokens.min(max_seq_len / 4).max(1);
         let drop = ((max_seq_len - sink) / 4).max(1).min((max_seq_len - sink).saturating_sub(1));
         let chunk_size = self::model::max_prefill_batch().min((max_seq_len - sink).saturating_sub(drop).max(1));
@@ -1250,44 +1534,25 @@ impl InferEngine {
             if ring_mode {
                 self.model.enable_kivi_streaming(options.kivi_bits);
             }
-            // Fast-path: unified prefill with last-token logits projection
-            let initial_logits = self.model.forward_prefill_all_with_logits(&input_tokens, 0);
+            // Fast-path: unified prefill with last-token logits projection.
+            // With a prefix-cache hit only the SUFFIX is prefilled, starting at
+            // a whole-chunk boundary so the chunk layout (and therefore every
+            // row's kernel shape) matches a cold prefill of the whole prompt.
+            let start = prefix_reuse;
+            let initial_logits = self
+                .model
+                .forward_prefill_all_with_logits(&input_tokens[start..], start);
             if std::env::var_os("SOFUU_DEBUG_DETERMINISM").is_some() {
                 eprintln!("[determ] prefill_logits[..8] = {:?}", &initial_logits[..8]);
             }
             // DIAGNOSTIC ONLY: dump the WHOLE last-row logit vector so a
             // GPU-vs-CPU numeric comparison covers every vocabulary entry
             // instead of the 8 printed above. Raw little-endian f32.
-            if let Some(p) = std::env::var_os("SOFUU_DUMP_LOGITS") {
-                let mut bytes = Vec::with_capacity(initial_logits.len() * 4 + 64);
-                bytes.extend_from_slice(b"SFLOG01\0");
-                bytes.extend_from_slice(&(initial_logits.len() as u64).to_le_bytes());
-                for v in initial_logits.iter() {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                if let Err(e) = std::fs::write(&p, &bytes) {
-                    eprintln!("[logits-dump] write {} failed: {e}", p.to_string_lossy());
-                } else {
-                    let mut amax = 0.0f32;
-                    let mut argmax = 0usize;
-                    for (i, v) in initial_logits.iter().enumerate() {
-                        let a = v.abs();
-                        if a > amax { amax = a; }
-                        if *v > initial_logits[argmax] { argmax = i; }
-                    }
-                    eprintln!(
-                        "[logits-dump] {} n={} maxabs={:.6} argmax={} top={:.6}",
-                        p.to_string_lossy(),
-                        initial_logits.len(),
-                        amax,
-                        argmax,
-                        initial_logits[argmax]
-                    );
-                }
-            }
+            dump_logits_receipt("SOFUU_DUMP_LOGITS", "logits-dump", self.request_seq, initial_logits);
             logits_buf.copy_from_slice(initial_logits);
             cur_pos = input_tokens.len();
-            self.last_prefill_tokens = input_tokens.len();
+            // Tokens the PREFILL COMPUTED (a cache hit leaves only the suffix).
+            self.last_prefill_tokens = input_tokens.len() - start;
         } else if common_prefix < input_tokens.len() {
             let new_tokens = &input_tokens[common_prefix..];
             let n_new = new_tokens.len();
@@ -1354,6 +1619,15 @@ impl InferEngine {
                 "a worker pool task failed during prefill ({} total); the attention/GEMM result would be incomplete",
                 self::quant::pool_failures()
             ));
+        }
+
+        // Snapshot this prompt's KV into the shared prefix index. Placement is
+        // the contract: AFTER the rows are final and BEFORE SnapKV/KIVI
+        // compaction, which re-anchors positions so the rows no longer describe
+        // the token order this cache is keyed by. `compacted` also covers a
+        // window overflow during prefill.
+        if prefix_ok && !compacted && cur_pos == input_tokens.len() {
+            self.prefix_cache_insert(&input_tokens, cur_pos);
         }
 
         // SnapKV Observation Window Compaction (Prunes inactive middle blocks after prefill)
@@ -1851,25 +2125,7 @@ impl InferEngine {
                 // raw little-endian f32 in the same SFLOG01 container so two
                 // binaries/kernels can be compared bit for bit.
                 if step == 1 {
-                    if let Ok(p) = std::env::var("SOFUU_DUMP_LOGITS_DEC") {
-                        let mut bytes = Vec::with_capacity(next_logits.len() * 4 + 64);
-                        bytes.extend_from_slice(b"SFLOG01\0");
-                        bytes.extend_from_slice(&(next_logits.len() as u64).to_le_bytes());
-                        for v in next_logits.iter() {
-                            bytes.extend_from_slice(&v.to_le_bytes());
-                        }
-                        match std::fs::write(&p, &bytes) {
-                            Ok(()) => eprintln!(
-                                "[logits-dump-dec] {} n={} argmax={} top={:.6}",
-                                p,
-                                next_logits.len(),
-                                next_logits.iter().enumerate()
-                                    .fold(0usize, |b, (i, v)| if *v > next_logits[b] { i } else { b }),
-                                next_logits.iter().cloned().fold(f32::MIN, f32::max)
-                            ),
-                            Err(e) => eprintln!("[logits-dump-dec] write failed: {e}"),
-                        }
-                    }
+                    dump_logits_receipt("SOFUU_DUMP_LOGITS_DEC", "logits-dump-dec", self.request_seq, next_logits);
                 }
                 // W3 probe: time everything AFTER forward returns (logits copy + sampler +
                 // token probe). If this carries the bulk of the wall time, the [dp] forward

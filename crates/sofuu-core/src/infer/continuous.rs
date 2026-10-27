@@ -192,6 +192,10 @@ pub struct ActiveStream {
     /// prefill), so the phase metric is accumulated here and reported once, at
     /// the slice that completes the prompt — not per slice.
     pub prefill_us: u64,
+    /// Prompt tokens this stream got from the shared prefix cache on its first
+    /// slice (0 = the whole prompt is being recomputed). Restored rows are real
+    /// KV for [0, prefix_reuse), so the slice planner starts at them.
+    pub prefix_reuse: usize,
 }
 
 /// Shared state of the continuous batch scheduler.
@@ -368,6 +372,7 @@ impl ContinuousBatchServer {
                         block_tables,
                         full_generated: String::new(),
                         prefill_us: 0,
+                        prefix_reuse: 0,
                     };
                     next_seq_id += 1;
                     state.active.push(active_stream);
@@ -423,6 +428,22 @@ impl ContinuousBatchServer {
                             let p_len = stream.prompt_tokens.len();
                             let chunk = prefill_sched::chunk_tokens(&eng.model);
 
+                            // SHARED-PREFIX KV REUSE, once, before the first
+                            // slice. The restore leaves `reuse` prompt tokens
+                            // really present in the KV cache, so cur_pos — which
+                            // doubles as "prompt tokens already in KV" while
+                            // Prefilling — starts there and the slice planner just
+                            // sees a shorter remainder. Reuse is aligned to whole
+                            // backend prefill groups (prefix_cache_align), so the
+                            // group that computes the last-token projection,
+                            // rows [p_len - p_len % G, p_len), is the SAME group a
+                            // cold run would have used: identity survives slicing.
+                            if stream.cur_pos == 0 && p_len > 1 {
+                                let reuse = eng.prefix_cache_restore(&stream.prompt_tokens);
+                                stream.prefix_reuse = reuse;
+                                stream.cur_pos = reuse;
+                            }
+
                             let start = stream.cur_pos;
                             match prefill_sched::step(
                                 &mut eng.model,
@@ -437,6 +458,33 @@ impl ContinuousBatchServer {
                                 }
                                 SliceStep::Complete => {
                                     stream.cur_pos = p_len;
+                                    // SOFUU_DUMP_LOGITS receipt on the SERVING
+                                    // path: the prefill projection of this
+                                    // request, so a cold and a cache-warm run
+                                    // can be compared bit for bit ({n} = stream
+                                    // id). Emitted once, at the slice that
+                                    // completes the prompt.
+                                    crate::infer::dump_logits_receipt(
+                                        "SOFUU_DUMP_LOGITS",
+                                        "logits-dump",
+                                        stream.id,
+                                        &stream.logits_buf,
+                                    );
+                                    // Rows are final here and nothing has
+                                    // compacted the cache, so this prompt's
+                                    // prefix is safe to publish for the next
+                                    // request. Counters describe the WHOLE
+                                    // prompt: reuse is what the restore wrote
+                                    // before the first slice, the rest is what
+                                    // all slices computed.
+                                    eng.prefix_cache_insert(&stream.prompt_tokens, stream.cur_pos);
+                                    eng.last_prefill_tokens = p_len - stream.prefix_reuse;
+                                    eng.last_prefix_reuse = stream.prefix_reuse;
+                                    eng.last_prefill_duration =
+                                        std::time::Duration::from_micros(
+                                            stream.prefill_us
+                                                + pf_t0.elapsed().as_micros() as u64,
+                                        );
                                     stream.status = StreamStatus::Decoding;
                                 }
                             }
@@ -500,6 +548,17 @@ impl ContinuousBatchServer {
                                 let mut eng = engine_arc.lock().unwrap();
                                 let logits = eng.model.forward(next_token, stream.cur_pos);
                                 stream.logits_buf.copy_from_slice(logits);
+                                // SOFUU_DUMP_LOGITS_DEC receipt: the first decode
+                                // step's full-vocabulary logits of this stream
+                                // (the engine's decode receipt, same container).
+                                if stream.generated_tokens.len() == 1 {
+                                    crate::infer::dump_logits_receipt(
+                                        "SOFUU_DUMP_LOGITS_DEC",
+                                        "logits-dump-dec",
+                                        stream.id,
+                                        &stream.logits_buf,
+                                    );
+                                }
                             }
                             let fwd_us = f_t0.elapsed().as_micros() as u64;
                             stream.cur_pos += 1;

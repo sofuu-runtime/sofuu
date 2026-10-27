@@ -1483,6 +1483,106 @@ impl TransformerModel {
         self.kivi = None;
     }
 
+    // ── Shared-prefix KV blocks (prefix_cache) ──────────────────────
+    // The KV caches are [layer, kv_head, max_seq_len, head_dim], i.e. one
+    // contiguous run of (max_seq_len * head_dim) floats per (layer, kv_head)
+    // pair. A 16-token block of a prefix is therefore 16 * head_dim floats at a
+    // fixed offset inside every one of those runs — the unit prefix_cache
+    // snapshots and restores. Both directions are plain f32 copies: a restored
+    // row is bit-identical to a recomputed one, which is the property the whole
+    // feature stands on.
+
+    /// (n_layers * n_kv_heads, head_dim, max_seq_len) of the KV caches.
+    pub fn kv_geom(&self) -> (usize, usize, usize) {
+        (
+            self.config.n_layers * self.config.n_kv_heads,
+            self.config.head_dim,
+            self.config.max_seq_len,
+        )
+    }
+
+    /// True when the attention path reads an f16 MIRROR of the f32 caches. A
+    /// restored f32 row would then be invisible to attention, so prefix reuse
+    /// refuses to engage instead of serving wrong history (the mirror is only
+    /// armed on the CPU-only f16 lanes, where a restore would have to write both
+    /// stores).
+    pub fn kv_shadowed(&self) -> bool {
+        self.kv_f16 || self.k16_prefill
+    }
+
+    /// Copy block N (positions [16*N, 16*N+16)) out of the live KV caches, for
+    /// every (layer, kv_head). None when the block is past the context window.
+    pub fn kv_block_snapshot(&self, block: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        let (n_h, head_dim, seq) = self.kv_geom();
+        let p0 = block * super::paged_kv::KV_BLOCK_SIZE;
+        if n_h == 0 || head_dim == 0 || p0 + super::paged_kv::KV_BLOCK_SIZE > seq {
+            return None;
+        }
+        let span = super::paged_kv::KV_BLOCK_SIZE * head_dim;
+        let k_all = &self.k_cache[..];
+        let v_all = &self.v_cache[..];
+        let mut k = vec![0.0f32; n_h * span];
+        let mut v = vec![0.0f32; n_h * span];
+        for h in 0..n_h {
+            let src = h * seq * head_dim + p0 * head_dim;
+            k[h * span..(h + 1) * span].copy_from_slice(&k_all[src..src + span]);
+            v[h * span..(h + 1) * span].copy_from_slice(&v_all[src..src + span]);
+        }
+        Some((k, v))
+    }
+
+    /// Write a cached block back into positions [16*N, 16*N+16) of the live KV
+    /// caches. Returns false (and writes nothing) when the payload does not
+    /// match this model's geometry — a stale cache from a reloaded model must
+    /// never be blended into a different checkpoint's rows.
+    pub fn kv_block_restore(&mut self, block: usize, k: &[f32], v: &[f32]) -> bool {
+        let (n_h, head_dim, seq) = self.kv_geom();
+        let p0 = block * super::paged_kv::KV_BLOCK_SIZE;
+        if n_h == 0 || head_dim == 0 || p0 + super::paged_kv::KV_BLOCK_SIZE > seq {
+            return false;
+        }
+        let span = super::paged_kv::KV_BLOCK_SIZE * head_dim;
+        if k.len() != n_h * span || v.len() != n_h * span {
+            return false;
+        }
+        let k_all = &mut self.k_cache[..];
+        let v_all = &mut self.v_cache[..];
+        for h in 0..n_h {
+            let dst = h * seq * head_dim + p0 * head_dim;
+            k_all[dst..dst + span].copy_from_slice(&k[h * span..(h + 1) * span]);
+            v_all[dst..dst + span].copy_from_slice(&v[h * span..(h + 1) * span]);
+        }
+        true
+    }
+
+    /// Write the KV rows of positions [0, tokens) to a SFKV01 container
+    /// (n_h, tokens, head_dim, then k for every head, then v). Diagnostic
+    /// receipt for prefix reuse: two runs that agree on the KV of a shared
+    /// prefix produce byte-identical files, so their md5s agree.
+    pub fn kv_dump_prefix(&self, tokens: usize, path: &str) -> Result<(), String> {
+        let (n_h, head_dim, seq) = self.kv_geom();
+        let n = tokens.min(seq);
+        if n == 0 || n_h == 0 || head_dim == 0 {
+            return Err("nothing to dump (empty cache geometry)".to_string());
+        }
+        let run = n * head_dim;
+        let mut out = Vec::with_capacity(2 * n_h * run * 4 + 32);
+        out.extend_from_slice(b"SFKV01\0\0");
+        out.extend_from_slice(&(n_h as u64).to_le_bytes());
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&(head_dim as u64).to_le_bytes());
+        for cache in [&self.k_cache, &self.v_cache] {
+            let all = &cache[..];
+            for h in 0..n_h {
+                let base = h * seq * head_dim;
+                for &x in &all[base..base + run] {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+        std::fs::write(path, &out).map_err(|e| format!("write {path}: {e}"))
+    }
+
     /// Configure Non-Temporal Streaming Weights (Cache-Bypass).
     /// When enabled, advises the OS kernel sequentially via libc::madvise(MADV_SEQUENTIAL)
     /// and activates non-temporal streaming prefetch in the layer execution pipeline to bypass

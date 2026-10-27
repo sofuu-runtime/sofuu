@@ -3,6 +3,7 @@
   "max_fail": 0,
   "min_cases": 52,
   "min_pass": 42,
+  "min_pass_when_qtsq_linked": 41,
   "min_reports": 3,
   "require_posture_ok": true,
   "require_verify_dist_ok": true

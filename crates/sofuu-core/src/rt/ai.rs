@@ -4226,7 +4226,8 @@ unsafe fn launch_local_stream(
         let res = match srv_res {
             Ok(srv) => {
                 let (chunk_tx, chunk_rx) = std::sync::mpsc::channel();
-                srv.submit(
+                let mut stream_err = None;
+                if let Err(e) = srv.submit(
                     &prompt_str,
                     crate::infer::GenerateOptions {
                         max_tokens,
@@ -4236,8 +4237,13 @@ unsafe fn launch_local_stream(
                     },
                     chunk_tx,
                     aborted.clone(),
-                );
-                let mut stream_err = None;
+                ) {
+                    // Bounded inbound queue refused the request (backpressure,
+                    // not a lost prompt). The request's sender died with it, so
+                    // the drain loop below exits at once and this surfaces on
+                    // the same error path a stream failure would.
+                    stream_err = Some(e.to_string());
+                }
                 while let Ok(out) = chunk_rx.recv() {
                     match out {
                         crate::infer::continuous::StreamOutput::Token(tok) => {

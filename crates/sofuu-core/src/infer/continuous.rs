@@ -168,6 +168,83 @@ pub struct StreamRequest {
     pub aborted: Arc<AtomicBool>,
 }
 
+/// Default bound on the inbound queue a caller can fill before
+/// `submit()` starts refusing (overridable with SOFUU_INBOUND_CAP).
+///
+/// One scheduler iteration admits everything that was queued, so this queue
+/// only ever holds arrivals that landed while an iteration was running. 64 is
+/// far above the steady-state depth of any load this scheduler can serve (the
+/// burst tests queue 4) and still bounds memory at 64 prompt strings instead of
+/// "as many as the caller sends".
+pub const INBOUND_CAPACITY: usize = 64;
+
+/// Why `ContinuousBatchServer::submit` refused a request.
+///
+/// Backpressure, not a lost request: nothing was enqueued, the request's
+/// stream sender was dropped (so a caller blocked on its receiver sees EOF
+/// immediately) and the caller may retry after the worker has admitted the
+/// queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The inbound queue already holds `capacity` un-admitted requests.
+    QueueFull { capacity: usize },
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::QueueFull { capacity } => write!(
+                f,
+                "continuous batch server inbound queue is full (capacity {capacity}); request was not enqueued"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+/// Un-admitted submissions, behind their OWN mutex.
+///
+/// This split is the point: `submit()` locks only this, so a request enqueues
+/// at any instant — mid-prefill, mid-decode, mid-admission — instead of waiting
+/// for the worker to end an iteration and release the scheduler state.
+/// `worker_loop` drains it at the TOP of an iteration (section 1) and admits the
+/// batch in section 2, so a request that arrives during a step is in
+/// `pending` in time for the very next shortest-remaining-first pass.
+struct InboundQueue {
+    pending: VecDeque<StreamRequest>,
+    capacity: usize,
+}
+
+impl InboundQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn try_push(&mut self, req: StreamRequest) -> Result<(), SubmitError> {
+        if self.pending.len() >= self.capacity {
+            return Err(SubmitError::QueueFull {
+                capacity: self.capacity,
+            });
+        }
+        self.pending.push_back(req);
+        Ok(())
+    }
+}
+
+/// This process's queue bound: SOFUU_INBOUND_CAP when set and sane.
+fn inbound_capacity() -> usize {
+    std::env::var("SOFUU_INBOUND_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(4096))
+        .unwrap_or(INBOUND_CAPACITY)
+}
+
 /// Per-sequence state inside the continuous batch scheduler.
 pub struct ActiveStream {
     pub id: u64,
@@ -199,15 +276,22 @@ pub struct ActiveStream {
 }
 
 /// Shared state of the continuous batch scheduler.
+///
+/// Written only by the worker (plus `metrics()` readers). Arrivals do NOT come
+/// through here — they live in `InboundQueue` under a separate mutex, which is
+/// what keeps `submit()` off this lock.
 pub struct SchedulerState {
-    pub pending: VecDeque<StreamRequest>,
     pub active: Vec<ActiveStream>,
     pub running: bool,
 }
 
 /// Continuous batch inference daemon and server.
 pub struct ContinuousBatchServer {
+    /// Worker-owned scheduler state; never held across a prefill or decode step.
     state: Arc<Mutex<SchedulerState>>,
+    /// Submissions not yet admitted. Separate mutex on purpose: `submit()`
+    /// takes this one only, so it cannot be stopped by a running iteration.
+    inbound: Arc<Mutex<InboundQueue>>,
     condvar: Arc<Condvar>,
     engine: Arc<Mutex<InferEngine>>,
     block_pools: Arc<Mutex<Vec<BlockPool>>>,
@@ -234,24 +318,32 @@ impl ContinuousBatchServer {
         }
 
         let state = Arc::new(Mutex::new(SchedulerState {
-            pending: VecDeque::new(),
             active: Vec::new(),
             running: true,
         }));
+        let inbound = Arc::new(Mutex::new(InboundQueue::new(inbound_capacity())));
         let condvar = Arc::new(Condvar::new());
         let block_pools = Arc::new(Mutex::new(pools));
 
         let state_clone = state.clone();
+        let inbound_clone = inbound.clone();
         let condvar_clone = condvar.clone();
         let engine_clone = engine.clone();
         let pools_clone = block_pools.clone();
 
         let worker_handle = std::thread::spawn(move || {
-            Self::worker_loop(state_clone, condvar_clone, engine_clone, pools_clone);
+            Self::worker_loop(
+                state_clone,
+                inbound_clone,
+                condvar_clone,
+                engine_clone,
+                pools_clone,
+            );
         });
 
         Self {
             state,
+            inbound,
             condvar,
             engine,
             block_pools,
@@ -260,14 +352,26 @@ impl ContinuousBatchServer {
         }
     }
 
-    /// Submit a new prompt for streaming generation. Non-blocking.
+    /// Submit a new prompt for streaming generation.
+    ///
+    /// Non-blocking with respect to the worker: the request is pushed onto the
+    /// inbound queue (one short lock, its own mutex — NOT the scheduler state
+    /// the worker holds across a step) and the call returns. The worker drains
+    /// the queue at the top of its next iteration, so an arrival that lands
+    /// mid-prefill is admitted by the next shortest-remaining-first pass
+    /// instead of waiting for the current iteration to end.
+    ///
+    /// Returns `Err(SubmitError::QueueFull)` when the bounded queue is full:
+    /// explicit backpressure rather than unbounded growth. Nothing is enqueued
+    /// in that case and the request (with its stream sender) is dropped, so a
+    /// caller blocked on the receiver sees EOF instead of hanging.
     pub fn submit(
         &self,
         prompt: &str,
         options: GenerateOptions,
         tx: std::sync::mpsc::Sender<StreamOutput>,
         aborted: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), SubmitError> {
         let req = StreamRequest {
             prompt: prompt.to_string(),
             options,
@@ -275,17 +379,26 @@ impl ContinuousBatchServer {
             aborted,
         };
         {
-            let mut state = self.state.lock().unwrap();
-            state.pending.push_back(req);
+            let mut inbound = self.inbound.lock().unwrap_or_else(|p| p.into_inner());
+            inbound.try_push(req)?;
         }
+        // Wake the worker if it is parked in section 1. Notifying with no lock
+        // held cannot lose the wakeup: the worker re-checks the queue under
+        // this same mutex after waking, and a push has to take that mutex, so a
+        // push-then-notify cannot slip between its check and its wait.
         self.condvar.notify_one();
+        Ok(())
     }
 
     /// Get current metrics for server diagnostics.
     pub fn metrics(&self) -> (usize, usize, usize) {
-        let (pending, active) = {
-            let state = self.state.lock().unwrap();
-            (state.pending.len(), state.active.len())
+        let pending = {
+            let inbound = self.inbound.lock().unwrap_or_else(|p| p.into_inner());
+            inbound.pending.len()
+        };
+        let active = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.active.len()
         };
         let allocated_blocks = {
             let pools = self.block_pools.lock().unwrap();
@@ -296,6 +409,7 @@ impl ContinuousBatchServer {
 
     fn worker_loop(
         state_arc: Arc<Mutex<SchedulerState>>,
+        inbound_arc: Arc<Mutex<InboundQueue>>,
         condvar: Arc<Condvar>,
         engine_arc: Arc<Mutex<InferEngine>>,
         pools_arc: Arc<Mutex<Vec<BlockPool>>>,
@@ -303,20 +417,44 @@ impl ContinuousBatchServer {
         let mut next_seq_id = 1u64;
 
         loop {
-            // 1. Wait when idle
+            // 1. Park when idle, then DRAIN the inbound queue at the TOP of the
+            //    iteration. Held here: the inbound mutex (plus a one-field read
+            //    of the scheduler state for the idle predicate) — no engine, no
+            //    model call. So a submit() that arrived during the previous
+            //    iteration's prefill is already waiting in this queue, and one
+            //    that arrives DURING the drain only waits behind a push-sized
+            //    critical section instead of behind a whole GPU step.
+            //
+            //    Lock order: inbound -> state. No other path takes them the
+            //    other way round (submit() takes neither while holding the
+            //    other; sections 2 and 3 take only `state`).
+            let mut batch: Vec<StreamRequest> = Vec::new();
             let (has_work, is_running) = {
-                let mut state = state_arc.lock().unwrap();
-                while state.running && state.pending.is_empty() && state.active.is_empty() {
-                    state = condvar.wait(state).unwrap();
+                let mut inbound = inbound_arc.lock().unwrap_or_else(|p| p.into_inner());
+                let (running, active) = loop {
+                    let (running, active) = {
+                        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                        (st.running, st.active.len())
+                    };
+                    if !running || !inbound.pending.is_empty() || active > 0 {
+                        break (running, active);
+                    }
+                    inbound = condvar.wait(inbound).unwrap_or_else(|p| p.into_inner());
+                };
+                while let Some(req) = inbound.pending.pop_front() {
+                    batch.push(req);
                 }
-                (!state.pending.is_empty() || !state.active.is_empty(), state.running)
+                (!batch.is_empty() || active > 0, running)
             };
 
             if !is_running && !has_work {
                 break;
             }
 
-            // 2. Admit pending requests into active streams
+            // 2. Admit the drained arrivals into active streams. The inbound
+            //    queue is NOT held here, so new submissions keep landing while
+            //    admission runs; this section holds `state` only for tokenizer
+            //    work and Vec pushes — never across a model call.
             {
                 let mut state = state_arc.lock().unwrap();
                 // Phase snapshot BEFORE the work: admissions mean prefill;
@@ -327,7 +465,7 @@ impl ContinuousBatchServer {
                 } else {
                     size_pool_for_phase(PoolPhase::Prefill);
                 }
-                while let Some(req) = state.pending.pop_front() {
+                for req in batch {
                     if req.aborted.load(Ordering::Relaxed) {
                         let _ = req.tx.send(StreamOutput::Done(0, 0));
                         continue;
@@ -379,12 +517,20 @@ impl ContinuousBatchServer {
                 }
             }
 
-            // 3. Execute iteration-level step across all active streams
+            // 3. Execute iteration-level step across all active streams.
+            //    The scheduler state is NOT held across the step: the streams
+            //    are moved out, the guard is dropped, and the survivors are put
+            //    back afterwards. A step is a GPU prefill slice or a decode
+            //    forward — up to a full second per 256-token slice on a loaded
+            //    box — and holding `state` across it is what used to make
+            //    submit() (and metrics()) wait for a whole iteration.
             let mut progressed = false;
             let mut streams_to_retain = Vec::new();
             {
-                let mut state = state_arc.lock().unwrap();
-                let mut active_streams = std::mem::take(&mut state.active);
+                let mut active_streams = {
+                    let mut state = state_arc.lock().unwrap();
+                    std::mem::take(&mut state.active)
+                };
 
                 // ADMISSION ORDER (chunked prefill): decoding streams keep the
                 // front of the pass (their step is short and latency-critical),
@@ -569,6 +715,10 @@ impl ContinuousBatchServer {
                         _ => {}
                     }
                 }
+                // Put the survivors back. Nobody else writes `active`, so the
+                // gap between the take above and this store is invisible to
+                // the scheduler (metrics() may see 0 active for that window).
+                let mut state = state_arc.lock().unwrap();
                 state.active = streams_to_retain;
             }
 
@@ -586,10 +736,16 @@ impl ContinuousBatchServer {
 
 impl Drop for ContinuousBatchServer {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.running = false;
+        // Hold the inbound mutex across the flag flip + notify so the worker
+        // cannot miss the wakeup: it parks on `condvar` with that same mutex
+        // released and re-reads the flag after waking.
+        {
+            let _inbound = self.inbound.lock().unwrap_or_else(|p| p.into_inner());
+            if let Ok(mut state) = self.state.lock() {
+                state.running = false;
+            }
+            self.condvar.notify_all();
         }
-        self.condvar.notify_all();
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }

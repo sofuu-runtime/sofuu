@@ -657,6 +657,7 @@ pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ml::supervisor::model;
 
     #[test]
     fn fixtures_are_separated_by_the_pretrained_net() {

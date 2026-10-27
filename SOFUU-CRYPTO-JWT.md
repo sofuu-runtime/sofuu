@@ -2,7 +2,7 @@
 
 - **Status:** implemented 2026-10-26 in the local Sofuu checkout
 - **Target:** Sofuu `0.2.0-beta`
-- **Motivation:** Clerk/OIDC session tokens are RS256 JWTs verified against a
+- **Motivation:** OIDC-style session tokens are RS256 JWTs verified against a
   public JWKS. The runtime had no crypto surface, so hosted applications had
   no way to authenticate a bearer token locally.
 - **Gap closed:** before this change `sofuu` had no `crypto.subtle`,
@@ -42,8 +42,8 @@ const result = sofuu.crypto.verifyJWT(
   request.headers.authorization.replace(/^Bearer /, ""),
   { keys: [/* JWKS from https://<frontend-api>/.well-known/jwks.json */] },
   {
-    issuer: "https://veliora-app.rikuhana.com",
-    authorizedParties: ["https://veliora-app.rikuhana.com"],
+    issuer: "https://app.example.com",
+    authorizedParties: ["https://app.example.com"],
     clockSkewSeconds: 5,       // optional, default 5
     nowMs: Date.now(),         // optional, for tests
   },
@@ -89,7 +89,9 @@ required; `opts` is optional.
 - `exp` is required; expired tokens fail.
 - `nbf`, when present, is enforced with clock skew.
 - `iss`, when `opts.issuer` is set, must match exactly.
-- Clerk's `azp`, when `opts.authorizedParties` is non-empty, must be allow-listed.
+- The `azp` claim, when present, must be allow-listed when
+  `opts.authorizedParties` is non-empty. Native SDK tokens may omit `azp`
+  because they have no browser `Origin`; a missing claim is accepted.
 - `aud`, when `opts.audience` is set, must match (string or array).
 - `sub` must be a non-empty string.
 
@@ -126,17 +128,17 @@ console.log(sofuu.crypto.sha256("abc"));
 // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 
 const result = sofuu.crypto.verifyJWT(token, { keys: [jwk] }, {
-  issuer: "https://veliora-app.rikuhana.com",
-  authorizedParties: ["https://veliora-app.rikuhana.com"],
+  issuer: "https://app.example.com",
+  authorizedParties: ["https://app.example.com"],
 });
 console.log(result.ok, result.payload && result.payload.sub);
 ```
 
 ## Notes for future work
 
-- Only `RS256` is implemented. Clerk uses RS256. Adding `RS384`/`RS512`
-  would mean adding their DigestInfo prefixes; ES256/EdDSA would need new
-  verification code.
+- Only `RS256` is implemented. OIDC providers commonly use RS256; adding
+  `RS384`/`RS512` would mean adding their DigestInfo prefixes; ES256/EdDSA
+  would need new verification code.
 - JWKS fetching and caching are intentionally left to the application. The
   runtime primitive is synchronous and network-free; `fetch` plus a short
   cache in the app is enough.

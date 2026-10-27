@@ -244,8 +244,8 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::events::mod_events_register(ctx);
         crate::rt::async_contract::mod_async_contract_register(ctx);
         // Hosted-auth primitive: RS256 JWT verification against a JWKS
-        // (Clerk/OIDC). Registered after `sofuu` exists, before the shipped
-        // drivers so application code sees it at startup.
+        // (OIDC/JWT providers). Registered after `sofuu` exists, before the
+        // shipped drivers so application code sees it at startup.
         crate::rt::crypto::mod_crypto_register(ctx);
         // P3 (SPEC §5/§6): the session document — one export/import format
         // behind `sofuu.session` (T4.5) and the CLI's export/import arms.

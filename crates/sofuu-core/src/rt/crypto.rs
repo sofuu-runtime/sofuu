@@ -6,14 +6,14 @@
 //   sofuu.crypto.base64urlDecode(text)           UTF-8 string or null
 //   sofuu.crypto.verifyJWT(token, jwks, opts?)   RS256 verification + claims
 //
-// Why this exists: Clerk (and every other OIDC provider) hands a frontend an
-// RS256-signed session JWT and expects the backend to verify it against the
-// project's public JWKS. QuickJS has no WebCrypto, no atob, no TextEncoder,
-// and the runtime deliberately has no TLS/OpenSSL dependency. The module keeps
-// that posture: SHA-256 is the pure-Rust implementation already used by the
-// WAL, base64url is ~40 lines, and RSA PKCS#1 v1.5 verification is BigUint
-// modular exponentiation with the public exponent. No secret key ever enters
-// the runtime, so constant-time comparison is a correctness detail, not a
+// Why this exists: OIDC-style providers hand a client an RS256-signed session
+// JWT and expect the backend to verify it against the project's public JWKS.
+// QuickJS has no WebCrypto, no atob, no TextEncoder, and the runtime
+// deliberately has no TLS/OpenSSL dependency. The module keeps that posture:
+// SHA-256 is the pure-Rust implementation already used by the WAL, base64url is
+// ~40 lines, and RSA PKCS#1 v1.5 verification is BigUint modular
+// exponentiation with the public exponent. No secret key ever enters the
+// runtime, so constant-time comparison is a correctness detail, not a
 // side-channel boundary.
 
 use num_bigint::BigUint;
@@ -332,13 +332,18 @@ fn validate_claims(payload: &Value, options: &Value) -> Result<()> {
         .and_then(Value::as_array);
     if let Some(parties) = parties {
         if !parties.is_empty() {
-            let azp = payload.get("azp").and_then(Value::as_str).unwrap_or("");
-            let ok = parties.iter().any(|party| party.as_str() == Some(azp));
-            if !ok {
-                return Err(AuthError::new(
-                    "azp_mismatch",
-                    "token authorized party is not in the allow-list",
-                ));
+            // OIDC providers commonly define `azp` as the authorized party
+            // (the browser Origin). Native SDK tokens may omit it because they
+            // have no browser origin; a missing claim is therefore allowed.
+            // When present, it must be in the allow-list.
+            if let Some(azp) = payload.get("azp").and_then(Value::as_str) {
+                let ok = parties.iter().any(|party| party.as_str() == Some(azp));
+                if !ok {
+                    return Err(AuthError::new(
+                        "azp_mismatch",
+                        "token authorized party is not in the allow-list",
+                    ));
+                }
             }
         }
     }
@@ -624,14 +629,14 @@ mod tests {
 
     const TEST_JWK: &str = r#"{
         "kty": "RSA",
-        "n": "6MPBBcoeUMYuDhy60e955QtZK2cakYQ69eyfC_A4rUs64TjbQUoRIw9mmVVqEWaSq6li5Ptzn9FBYj9siU2i5CkpQcrDarMLt2iRCqPz1894CeR6KH9pK-3ncngrmFlg16TAYNs7KYnJXfBM5X9RDgQ0VsD7kWc7Z8tuYI4ijJNGiguqiim25MoEdgF9HteDpgilhC0tTKdzjJJK7jrH09dE36fxiGq9n4seGOz6oWlaeHembB3SeUUn6NRN0EWiBELulu0eXrqMP4yo3mQFtAn8kST8tOy-Cbo2r2CN89XdNmMRdUE3SeN0iNJtw7IPLyADnzMs_H4C3L--I45KZw",
+        "n": "ntahXsbkEUCoSvUhRJtDJSf_XE4uHz4KDeGeSRblbbrhIJdHfxl8vVWMGRI9VHXDZbjBkBAKsOjRM_cRNO2n7K9TksqSAnmc4rDfzMIc4wAIYiWYW5txI23Zk26FigaFS-Px-KkBKSmH_2tEB9D-Ens8avhnciaT1b3Z1Q425vgG8MNCOHaYhmIuMtNZRYGSQe9AYfirdhGn8FqyhcGgeDea8iZXwQ1mDAypJgN5X4k5yDs2engA_dzPbjWvnZOPJiftIgT4ZpgvahY7zCZscofz4BKgPRPmIpXOdIKTHqQSpyDvDmg9j8HBcgo_x7iPWQB0iHmB60sb7Lg_QdYnaw",
         "e": "AQAB",
         "alg": "RS256",
         "use": "sig",
         "kid": "test-key-1"
     }"#;
 
-    const TEST_JWT: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJpc3MiOiJodHRwczovL3ZlbGlvcmEtYXBwLnJpa3VoYW5hLmNvbSIsInN1YiI6InVzZXJfdGVzdF8xMjMiLCJzaWQiOiJzZXNzX3Rlc3RfNDU2IiwiYXpwIjoiaHR0cHM6Ly92ZWxpb3JhLWFwcC5yaWt1aGFuYS5jb20iLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6MTcwMDAwMDAwMCwiaWF0IjoxNzAwMDAwMDAwfQ.zfnAcbmhsFakar4NZnVK9qzmWOIVpggoIx4FcpMsPTkYrM3nIrXoYdll7F8N0v_rULlvJZfJ1PwctLy5FFEk_WiM0LuurNAEaaajIJqbD3tncdLLGiE7-skb9JcxDxjNu7YI_0_hjSj4uAiNs6Vl8_6z15V6syEsvV8FI3mkIc8k8Y6LFrCIOiTDlrg1okhyikXu75QYqobjm5pNTxrRKSpy1rpynLoq8G6mraUfV3cMC-qPovlLhwLfp1QGrZXHsxR5SsmAqd6KMhKohqb23NMFmUiRZcmiuJssUpiefbrchTXJaAcIHXqpjfuwd8wQHFYAFYpl_iD1ZSl8U5gLoQ";
+    const TEST_JWT: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJpc3MiOiJodHRwczovL2FwcC5leGFtcGxlLmNvbSIsInN1YiI6InVzZXJfdGVzdF8xMjMiLCJzaWQiOiJzZXNzX3Rlc3RfNDU2IiwiYXpwIjoiaHR0cHM6Ly9hcHAuZXhhbXBsZS5jb20iLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6MTcwMDAwMDAwMCwiaWF0IjoxNzAwMDAwMDAwfQ.GhyZRPrfTY4lDCrM4iaJ_WXdu1tonF8UF32GwQNNswKM2fpSf4HK7vqkCm2TzzlmUlRVsCjNpKftBKJ8R5Byf0IS1Yp65_kXKZY47sYqiv5W2tcYUB1IH1b4m2sx6PSUmNhpqzDUoN8wx9CCsJ_r-QZpvphenUr9OYC4Cx2NfuyuitZLSuDzFZV54knUf9Obm_tmaP8QqfJfmJLFsmeUUQGctf7VXTDJv7CPvLVAYWxyMBzRyt48ZuxH0HLJOqHEa2fFBHrXbbPrBGdRZHrcMLpDbcUa2jZ1y3g98tbOFF8ZnjBZecs3yMiybxfga0FYRg5Cs4PMsdEGS3UHYGDpug";
 
     fn jwks() -> Value {
         serde_json::from_str::<Value>(TEST_JWK).unwrap()
@@ -639,8 +644,8 @@ mod tests {
 
     fn options() -> Value {
         json!({
-            "issuer": "https://veliora-app.rikuhana.com",
-            "authorizedParties": ["https://veliora-app.rikuhana.com"],
+            "issuer": "https://app.example.com",
+            "authorizedParties": ["https://app.example.com"],
             "nowMs": 1_800_000_000_000i64,
         })
     }
@@ -691,8 +696,8 @@ mod tests {
     #[test]
     fn expired_and_wrong_issuer_tokens_are_rejected() {
         let opts = json!({
-            "issuer": "https://veliora-app.rikuhana.com",
-            "authorizedParties": ["https://veliora-app.rikuhana.com"],
+            "issuer": "https://app.example.com",
+            "authorizedParties": ["https://app.example.com"],
             "nowMs": 4_102_444_800_000i64 + 10_000,
         });
         let expired = verify_jwt(TEST_JWT, &json!({"keys": [jwks()]}), &opts);
@@ -706,6 +711,28 @@ mod tests {
         let mismatch = verify_jwt(TEST_JWT, &json!({"keys": [jwks()]}), &wrong);
         assert_eq!(mismatch["ok"], false, "{mismatch}");
         assert_eq!(mismatch["error"]["code"], "issuer_mismatch");
+    }
+
+    #[test]
+    fn missing_azp_is_allowed_but_a_wrong_one_is_rejected() {
+        let payload = json!({
+            "iss": "https://app.example.com",
+            "sub": "user_native",
+            "exp": 4_102_444_800i64,
+        });
+        assert!(
+            validate_claims(&payload, &options()).is_ok(),
+            "native tokens may omit azp"
+        );
+
+        let wrong = json!({
+            "iss": "https://app.example.com",
+            "sub": "user_native",
+            "exp": 4_102_444_800i64,
+            "azp": "https://evil.example",
+        });
+        let error = validate_claims(&wrong, &options()).unwrap_err();
+        assert_eq!(error.code, "azp_mismatch");
     }
 
     #[test]

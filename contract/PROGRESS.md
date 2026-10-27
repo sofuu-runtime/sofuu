@@ -380,6 +380,42 @@ to `partial` (`68071cd2d`), and `scripts/check-driver-bc.sh` globbed
 snapshot — files eval'd at registration now carry `@sofuu-source-only` and
 both the generator and the checker skip them (`d92ff9599`).
 
+## P6 — the external-adoption loop (2026-10-27)
+
+**Publishing + gates are live; the loop is waiting on a real outside team.**
+
+- `contract/CONFORMANCE.md` (generated): the current 52-case board per
+  platform, the live capability posture (memory `full` on a codec build,
+  typed-refusal on a codec-free one), the 134-entry stability index summary,
+  reproduction commands and the gate policy.
+- `contract/SCOREBOARD.md` (generated): the llama.cpp parity ledger. The
+  headline is the latest valid receipt per model with its config note;
+  zero-metric rows are listed as unmeasured, not scored. It is labelled as
+  the inference-parity engineering bar, not the product benchmark.
+- Sources are tracked in `contract/scoreboard/` (41 parity receipts, three
+  conformance snapshots from green run `40457020037`, the frozen baseline)
+  and `contract/adoption/ledger.json`; `scripts/scoreboard.py` renders both
+  pages and `contract/scoreboard.json`.
+- `python3 scripts/scoreboard.py --check --live-report …` is blocking in CI
+  (after the conformance report) and in the release job. It fails on
+  generated-page drift, any contract FAIL, PASS below the variant floor
+  (42 codec-free / 41 codec-bearing — T1.3 needs a codec-free refusal
+  target), a posture or `verify_dist` failure, or a parity metric more than
+  10% below baseline. `--freeze-baseline` is the only way to accept a new
+  floor. The release job now also attaches the report and pages.
+- **Unaided-path rehearsal (2026-10-27)**: a clean public clone followed only
+  the published instructions (`make deps`, `SOFUU_QTSQ_DIR=
+  SOFUU_ALLOW_NO_QTSQ=1 make` + `make libsofuu`, `conformance_report.sh`,
+  then the gate). It produced the expected board — 52 cases, 42 PASS /
+  0 FAIL / 10 BLOCKED — memory `capability-gated / typed-refusal`,
+  `verify_dist: ok`, `SCOREBOARD: OK`. Two onboarding defects were found and
+  fixed on the way: the missing libuv step (`360832fc8`, now `make deps`) and
+  the verify-dist declared-gap env (`3cefa32d9`).
+- **Still open (the P6 exit)**: zero external deployments, zero upgrade
+  drills, zero independent conformance proofs. The ledger and protocol
+  (`contract/adoption/README.md`) are ready; recruiting the first outside
+  deployment is the next action and cannot be manufactured in-repo.
+
 ## Next actions
 
 1. **Recruit the first external deployment** — the only remaining P6 exit
@@ -397,15 +433,19 @@ both the generator and the checker skip them (`d92ff9599`).
    queued for a `macos-latest` runner; a targeted job re-run acquired one
    and went green, so treat a queued-then-cancelled macOS job as
    infrastructure, not a code verdict.
-3. **Local-load flakes worth knowing** — `t21_timeout` (T2.1) and
-   `t23_cancel_tool` (T2.3) can fail their wall-clock/orphan bounds when
-   the machine is saturated by concurrent builds (seen once each locally;
-   green on CI and when re-run alone). They are report-mode cases, but a
-   future blocking flip should give them load-aware bounds.
+3. ~~Local-load flakes worth knowing~~ — **load-aware bounds landed
+   2026-10-27** (`8f5bdb54a` T2.1, `15809e197` T2.3): both harnesses count
+   the excess over their expected poll interval into a capped slack and print
+   it, and T2.1 now polls `pgrep` for up to 2 s instead of taking one
+   snapshot. A real engine delay or surviving child still fails. The gate
+   below makes this class fatal, so keep tuning if a new runner shape
+   produces lag beyond the 5 s slack budget.
 4. **Flip the suite to blocking** — the board is 42/0/10 and the FAIL list
    is empty, but the runner exits 1 when cases are BLOCKED, so every CI
-   step still runs it in report mode. The flip needs a FAIL-only exit code
-   (0 with blocked>0) before `|| echo` can be removed.
+   step still runs it in report mode. The P6 scoreboard gate already blocks
+   a FAIL or a PASS-floor regression on macOS; the runner-level flip still
+   needs a FAIL-only exit code (0 with blocked>0) before the `|| echo`
+   guards can be dropped.
 5. **Residual harness families** — failure injection (T2.6), the v0.2
    migration fixture (T4.4), an MCP fixture server (T5.6), the four-surface
    error-parity harness (T5.8), cloud+local fixtures (T6.4), and a

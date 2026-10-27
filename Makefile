@@ -37,10 +37,11 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build \
+        scoreboard scoreboard-check \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
-        sdk-jvm-check \
+        sdk-jvm-check android-sdk android-aar android-publish-local \
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
@@ -90,6 +91,15 @@ c-only:
 # file: QuickJS bytecode is deterministic for a given binary.
 bc-check: $(TARGET)
 	@./scripts/check-driver-bc.sh
+
+# ── P6: published conformance/stability + parity scoreboard ──────────
+# Generated from tracked receipts (contract/scoreboard/, stability.json,
+# adoption/ledger.json); the check variant is the CI regression gate.
+scoreboard:
+	@python3 scripts/scoreboard.py
+
+scoreboard-check:
+	@python3 scripts/scoreboard.py --check
 
 # ── Distribution dry-run (funnel plan F3): every channel's LOCAL half ──
 # SwiftPM manifest+checksum, podspec lint, Gradle evaluate, npm pack --dry-run.
@@ -257,6 +267,18 @@ dist-ios:
 
 dist-android:
 	@bash scripts/dist/android.sh all
+
+# ── Android SDK AAR (com.sofuu:sofuu-android) ───────────────────────
+# The publishable artifact: QTSQ-free native packs staged with the JNI shim
+# and libc++_shared, then the release AAR. Credentials are operator-owned.
+android-sdk: dist-android
+	@bash scripts/mobile/stage_android_sdk.sh
+
+android-aar:
+	@cd bindings/android && gradle :sofuu:assembleRelease
+
+android-publish-local:
+	@cd bindings/android && gradle :sofuu:publishToMavenLocal
 
 # ── Sofuu Mobile (Android app) ─────────────────────────────────────
 # `make mobile-engine`: build the QTSQ-linked libsofuu per Android ABI

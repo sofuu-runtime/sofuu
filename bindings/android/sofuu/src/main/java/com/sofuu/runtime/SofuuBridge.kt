@@ -93,6 +93,59 @@ class SofuuBridge(configJson: String? = null) {
         return nativeRtCall(rtPtr, method, argsJson)
     }
 
+    /// Call a funnel method and return only the `result` value as JSON text.
+    ///
+    /// `call` returns the C ABI envelope (`{"ok":true,"result":...}`). This
+    /// helper unwraps it so callers can consume the method's own value. It
+    /// returns null when the call could not be dispatched or the envelope
+    /// reports an error; the raw `call` is still available when the error
+    /// details matter.
+    fun callResult(method: String, argsJson: String? = null): String? {
+        return funnelResult(method, validatedArgs(argsJson))
+    }
+
+    /// Lowercase SHA-256 hex digest through `sofuu.crypto`.
+    fun sha256(text: String): String? =
+        callResult("crypto.sha256", "[${org.json.JSONObject.quote(text)}]")
+
+    /// Unpadded base64url encoding through `sofuu.crypto`.
+    fun base64urlEncode(text: String): String? =
+        callResult("crypto.base64urlEncode", "[${org.json.JSONObject.quote(text)}]")
+
+    /// Decode unpadded base64url to a UTF-8 string through `sofuu.crypto`.
+    fun base64urlDecode(text: String): String? =
+        callResult("crypto.base64urlDecode", "[${org.json.JSONObject.quote(text)}]")
+
+    /// Verify an RS256 JWT against a JWKS object and optional claims options.
+    ///
+    /// `jwksJson` is the JWKS object (or a JSON string containing it);
+    /// `optionsJson` accepts `issuer`, `audience`, `authorizedParties`, and
+    /// `clockSkewSeconds`. The return value is the verifier's JSON object:
+    /// `{"ok":true,"payload":{...},"kid":...}` on success or
+    /// `{"ok":false,"error":{"code":...,"message":...}}` on failure.
+    ///
+    /// This is a synchronous funnel call: no network is performed here. The
+    /// host fetches and caches the JWKS, then passes it in. That keeps the
+    /// AAR free of any identity-vendor dependency.
+    fun verifyJWT(token: String, jwksJson: String, optionsJson: String? = null): String? {
+        val options = if (optionsJson.isNullOrBlank()) "{}" else optionsJson
+        val args = "[${org.json.JSONObject.quote(token)}, $jwksJson, $options]"
+        return callResult("crypto.verifyJWT", args)
+    }
+
+    private fun funnelResult(method: String, argsJson: String): String? {
+        val envelope = nativeRtCall(rtPtr, method, argsJson) ?: return null
+        return try {
+            val obj = org.json.JSONObject(envelope)
+            if (!obj.optBoolean("ok", false)) return null
+            val value = obj.opt("result")
+            if (value == null || value === org.json.JSONObject.NULL) null
+            else value.toString()
+        } catch (_: org.json.JSONException) {
+            null
+        }
+    }
+
     // ── Streaming ────────────────────────────────────────────────────
 
     /// One event of a streaming call, as a JSON string.
@@ -239,10 +292,19 @@ class SofuuBridge(configJson: String? = null) {
             has_memory: typeof sofuu.memory !== 'undefined',
             has_mcp: typeof sofuu.mcp !== 'undefined',
             has_http: typeof sofuu.http !== 'undefined',
-            has_fs: typeof sofuu.fs !== 'undefined'
+            has_fs: typeof sofuu.fs !== 'undefined',
+            has_storage: typeof sofuu.storage !== 'undefined',
+            has_crypto: typeof sofuu.crypto !== 'undefined' &&
+                        typeof sofuu.crypto.verifyJWT === 'function'
         })
         """.trimIndent()
-        return eval(js) ?: "{}"
+        val envelope = eval(js) ?: return "{}"
+        return try {
+            val obj = org.json.JSONObject(envelope)
+            if (obj.optBoolean("ok", false)) obj.optString("result", "{}") else "{}"
+        } catch (_: org.json.JSONException) {
+            "{}"
+        }
     }
 
     /// Embed text using the bundled offline embedder (no network, no JSON).

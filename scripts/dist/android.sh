@@ -45,19 +45,23 @@ build_abi() {
     local RUST_TARGET=""
     local API_LEVEL="${ANDROID_API_LEVEL:-24}"  # minSdk 24
     local NDK_PREFIX=""
+    local CMAKE_ABI=""
 
     case "$ABI" in
         aarch64)
             RUST_TARGET="aarch64-linux-android"
             NDK_PREFIX="aarch64-linux-android${API_LEVEL}"
+            CMAKE_ABI="arm64-v8a"
             ;;
         armv7)
             RUST_TARGET="armv7-linux-androideabi"
             NDK_PREFIX="armv7a-linux-androideabi${API_LEVEL}"
+            CMAKE_ABI="armeabi-v7a"
             ;;
         x86_64)
             RUST_TARGET="x86_64-linux-android"
             NDK_PREFIX="x86_64-linux-android${API_LEVEL}"
+            CMAKE_ABI="x86_64"
             ;;
         *) echo "Unknown ABI: $ABI"; exit 1 ;;
     esac
@@ -79,22 +83,36 @@ build_abi() {
     export CXX="$NDK_CC/${NDK_PREFIX}-clang++"
     export AR="$NDK_CC/llvm-ar"
     export RANLIB="$NDK_CC/llvm-ranlib"
+    # Cargo's default linker is the host `cc`; name the NDK clang for the
+    # Rust target explicitly. Without this the cross build reaches the final
+    # link, then a macOS ld rejects the Android linker flags.
+    local linker_var="CARGO_TARGET_$(echo "$RUST_TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
+    export "$linker_var=$NDK_CC/${NDK_PREFIX}-clang"
 
     cmake -S "$UV_DIR" -B "$UV_BUILD" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DBUILD_TESTING=OFF \
         -DCMAKE_SYSTEM_NAME=Android \
-        -DCMAKE_ANDROID_ARCH_ABI="$ABI" \
+        -DCMAKE_ANDROID_ARCH_ABI="$CMAKE_ABI" \
         -DCMAKE_ANDROID_API="$API_LEVEL" \
         -DCMAKE_ANDROID_NDK="$NDK_HOME" \
         2>&1 | tail -3
     cmake --build "$UV_BUILD" --target uv_a 2>&1 | tail -3
 
-    # Build libcurl for the target.
-    bash "$REPO_ROOT/scripts/cross/build_libcurl_static.sh" "android-$ABI" 2>/dev/null || true
+    # The Android runtime needs a TLS-capable static libcurl. The mobile
+    # scripts build it with OpenSSL; the old dist path silently skipped this
+    # and then failed at the final link with "unable to find library -lcurl".
+    local CURL_DIR="$DIST/libcurl-android-$CMAKE_ABI/lib"
+    if [ ! -f "$CURL_DIR/libcurl.a" ]; then
+        echo "  ✗ libcurl missing for $CMAKE_ABI at $CURL_DIR"
+        echo "    run scripts/mobile/build_openssl_android.sh and"
+        echo "    scripts/mobile/build_libcurl_android.sh first"
+        exit 1
+    fi
+    export SOFUU_CURL_STATIC_DIR="$CURL_DIR"
 
-    export SOFUU_UV_DIR="$UV_BUILD"
+    export SOFUU_UV_DIR="$REPO_ROOT/$UV_BUILD"
     mkdir -p "$DIST/no-qtsq"
     export SOFUU_QTSQ_DIR="$DIST/no-qtsq"
 
@@ -107,10 +125,14 @@ build_abi() {
     local SIZE=$(du -sh "$DIST/libsofuu-android-$ABI.so" 2>/dev/null | cut -f1)
     echo "  \033[32m✓\033[0m libsofuu-android-$ABI.so ($SIZE)"
 
-    # Size check (5MB cap).
+    # Size budget. Android includes the in-process inference path (GGUF /
+    # SafeTensors) plus HTTP/TLS, so it does not fit the 5 MB desktop-pack
+    # cap. Keep a hard ceiling and allow an operator override for a slimmer
+    # feature build.
+    local MAX_SIZE="${SOFUU_ANDROID_MAX_SIZE:-12582912}"
     local SO_SIZE=$(stat -f%z "$DIST/libsofuu-android-$ABI.so" 2>/dev/null || stat -c%s "$DIST/libsofuu-android-$ABI.so" 2>/dev/null || echo 0)
-    if [ "$SO_SIZE" -gt 5242880 ]; then
-        echo "  \033[31m✗ Shared lib exceeds 5MB cap ($SO_SIZE bytes)\033[0m"
+    if [ "$SO_SIZE" -gt "$MAX_SIZE" ]; then
+        echo "  \033[31m✗ Shared lib exceeds Android size cap ($SO_SIZE > $MAX_SIZE bytes)\033[0m"
         exit 1
     fi
 }

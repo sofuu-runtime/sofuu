@@ -28,6 +28,22 @@ private fun check(cond: Boolean, what: String) {
 
 private fun jsonQuote(s: String) = org.json.JSONObject.quote(s)
 
+// Generic RS256 fixture shared with the Rust crypto tests. The token is
+// signed for https://app.example.com and expires in 2100.
+private const val TEST_JWKS = """
+{"keys":[{
+  "kty":"RSA",
+  "n":"ntahXsbkEUCoSvUhRJtDJSf_XE4uHz4KDeGeSRblbbrhIJdHfxl8vVWMGRI9VHXDZbjBkBAKsOjRM_cRNO2n7K9TksqSAnmc4rDfzMIc4wAIYiWYW5txI23Zk26FigaFS-Px-KkBKSmH_2tEB9D-Ens8avhnciaT1b3Z1Q425vgG8MNCOHaYhmIuMtNZRYGSQe9AYfirdhGn8FqyhcGgeDea8iZXwQ1mDAypJgN5X4k5yDs2engA_dzPbjWvnZOPJiftIgT4ZpgvahY7zCZscofz4BKgPRPmIpXOdIKTHqQSpyDvDmg9j8HBcgo_x7iPWQB0iHmB60sb7Lg_QdYnaw",
+  "e":"AQAB","alg":"RS256","use":"sig","kid":"test-key-1"
+}]}
+"""
+
+private const val TEST_JWT =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJpc3MiOiJodHRwczovL2FwcC5leGFtcGxlLmNvbSIsInN1YiI6InVzZXJfdGVzdF8xMjMiLCJzaWQiOiJzZXNzX3Rlc3RfNDU2IiwiYXpwIjoiaHR0cHM6Ly9hcHAuZXhhbXBsZS5jb20iLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6MTcwMDAwMDAwMCwiaWF0IjoxNzAwMDAwMDAwfQ.GhyZRPrfTY4lDCrM4iaJ_WXdu1tonF8UF32GwQNNswKM2fpSf4HK7vqkCm2TzzlmUlRVsCjNpKftBKJ8R5Byf0IS1Yp65_kXKZY47sYqiv5W2tcYUB1IH1b4m2sx6PSUmNhpqzDUoN8wx9CCsJ_r-QZpvphenUr9OYC4Cx2NfuyuitZLSuDzFZV54knUf9Obm_tmaP8QqfJfmJLFsmeUUQGctf7VXTDJv7CPvLVAYWxyMBzRyt48ZuxH0HLJOqHEa2fFBHrXbbPrBGdRZHrcMLpDbcUa2jZ1y3g98tbOFF8ZnjBZecs3yMiybxfga0FYRg5Cs4PMsdEGS3UHYGDpug"
+
+private const val JWT_OPTIONS =
+    """{"issuer":"https://app.example.com","authorizedParties":["https://app.example.com"],"nowMs":1800000000000}"""
+
 /** Mock provider that calls [tool] in round 1 and reports CONFIRMED only
  *  when it sees [token] in the messages it is handed in round 2. */
 private fun mockAgent(token: String, agent: String, tool: String): String = """
@@ -91,7 +107,27 @@ fun main() {
     val evalOut = rt.eval("JSON.stringify({t:\"$emoji\"})")
     check(evalOut != null && evalOut.contains(emoji), "eval round-trips emoji + CJK (got: $evalOut)")
 
-    // 2) Malformed argsJson is rejected before it reaches the ABI.
+    // 2) Crypto/JWT primitives exposed by the same bridge. The fixture is
+    //    generic (app.example.com) and the signature is pre-generated.
+    val caps = rt.checkCaps()
+    check(caps.contains("\"has_crypto\":true"), "checkCaps reports crypto (got: $caps)")
+    check(caps.contains("\"has_storage\":true"), "checkCaps reports storage")
+    check(
+        rt.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "sha256 FIPS vector",
+    )
+    check(rt.base64urlEncode("hello") == "aGVsbG8", "base64url encodes without padding")
+    check(rt.base64urlDecode("aGVsbG8") == "hello", "base64url decodes without padding")
+    check(rt.base64urlDecode("aGk==") == null, "base64url rejects over-padding")
+
+    val jwtOut = rt.verifyJWT(TEST_JWT, TEST_JWKS, JWT_OPTIONS)
+    check(jwtOut != null && jwtOut.contains("\"ok\":true"), "valid RS256 JWT verifies (got: $jwtOut)")
+    check(jwtOut != null && jwtOut.contains("user_test_123"), "verified JWT exposes sub")
+    val tampered = TEST_JWT.substringBeforeLast('.') + "." + rt.base64urlEncode("tampered")
+    val bad = rt.verifyJWT(tampered, TEST_JWKS, JWT_OPTIONS)
+    check(bad != null && bad.contains("\"ok\":false"), "tampered JWT is rejected (got: $bad)")
+
+    // 3) Malformed argsJson is rejected before it reaches the ABI.
     var threw = false
     try {
         rt.callStream("ai.stream", "{not json") { true }
@@ -100,7 +136,7 @@ fun main() {
     }
     check(threw, "callStream rejects malformed argsJson")
 
-    // 3) Streaming: deltas, terminal done, emoji in ARGS and in EVENTS.
+    // 4) Streaming: deltas, terminal done, emoji in ARGS and in EVENTS.
     rt.eval("""
       sofuu.ai.stream = function(opts){
         return (async function*(){

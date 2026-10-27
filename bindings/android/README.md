@@ -8,13 +8,24 @@ no API key in your APK, and no telemetry.
 
 ```groovy
 // app/build.gradle
+repositories {
+    mavenLocal()   // after `make android-publish-local`
+    // or your Maven/GitHub Packages repository
+}
+
 dependencies {
     implementation 'com.sofuu:sofuu-android:0.2.0'
 }
 ```
 
+The 0.2.0 artifact is built and published to the local Maven repository by
+this checkout. A public Maven Central release additionally requires ownership
+of the `com.sofuu` group and signing credentials; those are operator-owned and
+are never committed.
+
 That is the whole integration. The AAR bundles the per-ABI `libsofuu` native
-runtime and the JNI bridge; you do **not** copy `.so` files by hand.
+runtime, the JNI bridge, and `libc++_shared.so`; you do **not** copy `.so`
+files by hand.
 
 ## Use
 
@@ -39,6 +50,54 @@ val hits = sofuu.call("memory.recall", """{"vec": $vec, "k": 3}""")
 See `src/main/java/com/sofuu/runtime/SofuuBridge.kt` for the full wrapper
 (eval, funnel calls, embedding, image, voice) and `SofuuVoice.kt` for
 on-device STT/TTS with no network.
+
+## Crypto and JWT verification
+
+`sofuu.crypto` is available through the same bridge. The host supplies the
+JWKS; no identity vendor, API key, or network call is built into the SDK.
+
+```kotlin
+val digest = sofuu.sha256("abc")                  // lowercase hex
+val encoded = sofuu.base64urlEncode("hello")      // "aGVsbG8"
+val decoded = sofuu.base64urlDecode("aGVsbG8")    // "hello"
+
+val claims = sofuu.verifyJWT(
+    token = sessionJwt,
+    jwksJson = jwksJson,
+    optionsJson = """{"issuer":"https://id.example.com",
+                       "authorizedParties":["https://app.example.com"]}""",
+)
+// {"ok":true,"payload":{...}} or {"ok":false,"error":{...}}
+```
+
+A missing `azp` is accepted because native SDK tokens have no browser origin;
+a present `azp` must be in `authorizedParties`.
+
+`checkCaps()` reports `has_crypto`, `has_storage`, `has_ai`, `has_agent`, and
+`has_memory` for the loaded build.
+
+## Local pipeline
+
+A local-first host runs its JS pipeline in-process with `eval` (one bundled
+script) and drives it through `call`/`callStream`. No HTTP server is needed.
+
+```kotlin
+val sofuu = SofuuBridge()
+
+// Start a local model stream; the callback runs on this worker thread.
+val stop = AtomicBoolean(false)
+sofuu.callStream(
+    method = "agent.run",
+    argsJson = """{"target":"researcher","task":"summarize this"}""",
+) { event ->
+    render(event)
+    !stop.get()
+}
+```
+
+`callResult` unwraps the C ABI envelope when you want the method's value
+without the outer `{"ok":true,"result":...}`. Use `call` when the error
+envelope itself matters.
 
 ## Streaming, cancel, and host tools
 
@@ -76,30 +135,65 @@ This whole surface is exercised on the host JVM with no device attached:
 `make sdk-jvm-check` compiles this module's `jni_bridge.c` for the host OS
 and runs its assertions through the real wrapper and runtime.
 
-## Building the AAR yourself
+## Building and publishing the AAR
 
 The AAR wraps the prebuilt native runtime, so build that first:
 
 ```bash
-make dist-android            # → dist/libsofuu-android-{aarch64,x86_64}.so
-# stage the .so into the library, then:
+export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/27.0.12077973"
+make dist-android                       # QTSQ-free libsofuu per ABI
+bash scripts/mobile/stage_android_sdk.sh
+
 cd bindings/android
-mkdir -p sofuu/src/main/jniLibs/{arm64-v8a,x86_64}
-cp ../../dist/libsofuu-android-aarch64.so sofuu/src/main/jniLibs/arm64-v8a/libsofuu.so
-cp ../../dist/libsofuu-android-x86_64.so  sofuu/src/main/jniLibs/x86_64/libsofuu.so
-./gradlew :sofuu:assembleRelease
+gradle :sofuu:assembleRelease
+gradle :sofuu:publishToMavenLocal
 ```
 
-The `.so` files are QTSQ-free in a release build (pure MIT). A QTSQ-linked
+`stage_android_sdk.sh` copies `libsofuu.so`, the NDK's
+`libc++_shared.so`, and the C header into the module. Both are required:
+`libsofuu.so` declares `NEEDED libc++_shared.so`, and the AAR's CMake target
+is pure C, so AGP would not package the C++ runtime on its own.
+
+The release AAR contains, per ABI:
+
+```text
+jni/<abi>/libsofuu.so
+jni/<abi>/libsofuu_jni.so
+jni/<abi>/libc++_shared.so
+```
+
+The `.so` files are QTSQ-free in the public release (pure MIT). A QTSQ-linked
 build adds the encrypted-brain codec and falls under
-`LICENSES/QTSQ-FORMAT.txt`.
+`LICENSES/QTSQ-FORMAT.txt`; do not publish that variant as the MIT artifact.
+
+### Remote publication
+
+The module has `maven-publish` configured for `com.sofuu:sofuu-android` with a
+POM, sources JAR, and Gradle module metadata. Supply the repository and
+signing values in the operator's environment:
+
+```bash
+export MAVEN_REPO_URL=https://your-maven-repository
+export MAVEN_REPO_USERNAME=...
+export MAVEN_REPO_PASSWORD=...
+export MAVEN_SIGNING_KEY="$(cat signing-key.asc)"
+export MAVEN_SIGNING_PASSWORD=...
+export REQUIRE_SIGNING=1
+
+cd bindings/android
+gradle :sofuu:publishReleasePublicationToRemoteRepository
+```
+
+Maven Central additionally requires ownership of the `com.sofuu` group and a
+signed release; no credentials or private keys are stored in this repository.
 
 ## Manual (non-Gradle) integration
 
 If you are not using the AAR — e.g. a host that already manages its own
 `.so` layout — the original sample still works and is the reference for the
 CMake wiring: `examples/headless/KotlinSample/` (`CMakeLists.txt`,
-`jni_bridge.c`, `SofuuBridge.kt`).
+`jni_bridge.c`, `SofuuBridge.kt`). It must also package
+`libc++_shared.so`.
 
 ## License
 

@@ -23,6 +23,47 @@
  * Multiple runtimes per process are supported, each on its own thread; they
  * share the centralized libuv loop, so concurrent loop-driven work is
  * serialized on it (see docs/EMBEDDING.md).
+ *
+ * ── Threading contract, per entry (v2 freeze, 2026-10-16) ──────────────
+ * The owning-thread rule above is the base. Per entry, the truth is:
+ *
+ *   sofuu_rt_new                owning thread (thread becomes the owner)
+ *   sofuu_rt_free               owning thread
+ *   sofuu_rt_call               owning thread (blocks; drains the loop)
+ *   sofuu_rt_call_stream        owning thread (blocks; pumps the loop)
+ *   sofuu_rt_cancel             owning thread (it RUNS JS to flag the cancel,
+ *                               and reads the stream registry thread-locals —
+ *                               cross-thread cancel is undefined today;
+ *                               cross-thread STOPPING still works through
+ *                               host_tool_resolve-side cancellation and the
+ *                               opts.signal token flowing in JS)
+ *   sofuu_rt_eval               owning thread (blocks)
+ *   sofuu_rt_eval_nb            owning thread (queues; never waits on I/O)
+ *   sofuu_rt_register_host_tool owning thread
+ *   sofuu_rt_host_tool_resolve  ANY thread (header-documented exception; the
+ *                               result is marshalled onto the owning thread
+ *                               through the runtime's event loop)
+ *   sofuu_embed_set_log_cb      any thread BEFORE runtimes exist; process glob
+ *   sofuu_embed_local/batch/
+ *   image/info + voice        any thread (stateless pure functions)
+ * Contained-panic note: after SOFUU_ERR_PANIC, the runtime is POISONED —
+ * rt_free it and create a fresh one on the owning thread; the process
+ * survives by contract.
+ *
+ * ── Stability: v2 FROZEN (2026-10-16) ─────────────────────────────────
+ * v2 is frozen: existing signatures, existing semantic guarantees (one-done
+ * streaming, error envelope, handle tombstones), and existing code numbering
+ * do not change. The amendment ladder, in increasing severity:
+ *   1. additive: new error ENUM values, new optional config keys, new funnel
+ *      METHODS via the existing string funnel (no new symbols) — any minor.
+ *   2. additive symbol: a genuinely new export — any minor, abi-check
+ *      baseline acknowledged in the same commit.
+ *   3. wire-shape change to an existing envelope/event — requires a bump to
+ *      v3 and a migration note; never silently.
+ * Enforcement = scripts/abi_symbols.txt + scripts/check_abi.sh (the dylib's
+ * exported symbol set must equal the acknowledged baseline); linker-level
+ * symbol versioning is deliberately NOT used (ELF/MachO divergence, and the
+ * baseline gate already fails any un-acknowledged export).
  */
 #ifndef SOFUU_EMBED_H
 #define SOFUU_EMBED_H
@@ -54,10 +95,19 @@ typedef void (*sofuu_event_cb)(const char *event_json, void *opaque);
 #define SOFUU_ERR_UNKNOWN_SPACE -7   /* space id not recognized            */
 #define SOFUU_ERR_MODEL_UNAVAIL -8   /* baked embedding artifact unusable  */
 #define SOFUU_ERR_NOMEM         -9   /* host-visible malloc failed         */
+/* Embedded builds unwind at the ABI boundary (the `sofuu` CLI binary keeps
+ * panic=abort): a contained Rust panic returns this, with details in
+ * out_json's error envelope — or, for sofuu_rt_call_stream, in a synthesized
+ * terminal {"kind":"done","error":{...}} so the one-terminal contract holds
+ * even through a panic. The runtime stays usable for the next call. */
+#define SOFUU_ERR_PANIC         -10  /* Rust panic contained at the ABI    */
 
 /* ── Versioning ────────────────────────────────────────────────── */
-/* Returns the ABI version this library implements (v2 = 2). The ABI is
- * `experimental` for one release, then frozen with symbol versioning. */
+/* Returns the ABI version this library implements (v2 = 2). v2 is FROZEN
+ * (2026-10-16): semantics and signatures above are stable under the
+ * amendment ladder in the header preamble — additive enum values and new
+ * funnel methods are minor; any change to an existing wire shape or
+ * signature bumps to v3 and requires a migration note. */
 uint32_t sofuu_embed_abi_version(void);
 
 /* ── Host log callback ─────────────────────────────────────────── */
@@ -159,6 +209,40 @@ int sofuu_rt_call_stream(SofuuRuntime *rt, const char *method,
  * it once per chunk), and agent.cancel(id) is nudged when present.
  * Returns SOFUU_OK if the cancel ID was recognized, -1 if not found. */
 int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
+
+/* ── Local-first modules through the funnel ────────────────────── */
+/* The generic funnel already reaches the modules an embedded host needs;
+ * no extra exported symbol is involved. A JSON array is spread as
+ * positional arguments, a JSON object is one options argument.
+ *
+ * Auth / crypto (no network; the host supplies the JWKS):
+ *
+ *   sofuu_rt_call(rt, "crypto.sha256", "[\"abc\"]", &out);
+ *   sofuu_rt_call(rt, "crypto.base64urlEncode", "[\"hello\"]", &out);
+ *   sofuu_rt_call(rt, "crypto.verifyJWT",
+ *       "[\"<jwt>\", {\"keys\":[...]}, {\"issuer\":\"https://id.example\"}]",
+ *       &out);
+ *
+ * The outer envelope is {"ok":true,"result":...}; verifyJWT's own result is
+ * {"ok":true,"payload":{...}} or {"ok":false,"error":{...}}. A missing
+ * `azp` is accepted (native SDK tokens have no browser origin); a present
+ * `azp` must be in authorizedParties.
+ *
+ * Local storage and agents:
+ *
+ *   sofuu_rt_call(rt, "storage.open", "{\"base_path\":\"/data/app\"}", &out);
+ *   sofuu_rt_call(rt, "agent.run", "[\"researcher\",\"task\",{}]", &out);
+ *   sofuu_rt_call_stream(rt, "ai.streamLocal",
+ *       "[\"/models/model.gguf\",\"prompt\",{}]", on_event, opaque, &cancel);
+ *
+ * `storage.*` works in every build. `memory.*` is present but a no-op when
+ * the library was linked without QTSQ; check the build manifest before
+ * promising encrypted-brain behavior. `ai.streamLocal` is in-process and
+ * needs no provider or network.
+ *
+ * A host that wants the JS implementation of a pipeline can load a single
+ * bundled script with sofuu_rt_eval (ES modules must be bundled first) and
+ * then drive it through call/call_stream. */
 
 /* ── Host-native tools (PLAN-EMBED-SDK E2) ─────────────────────── */
 /* Register a native host function so an in-app agent can call it as a tool.

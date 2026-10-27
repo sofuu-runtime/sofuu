@@ -3,22 +3,33 @@
 // One dependency gives an app the whole runtime. The native payload is the
 // prebuilt libsofuu .so per ABI (built by `make dist-android`, QTSQ-free
 // for a pure-MIT release) plus the small JNI bridge in src/main/cpp.
+//
+// Publishing is environment-driven: `publishToMavenLocal` works with no
+// credentials, while a remote repository and signing require the operator's
+// own secrets. Nothing in this file contains a key.
 
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
+apply plugin: 'maven-publish'
+apply plugin: 'signing'
+
+def sofuuVersion = (project.findProperty('sofuuVersion') ?: '0.2.0').toString()
+group = 'com.sofuu'
+version = sofuuVersion
 
 android {
     namespace 'com.sofuu.runtime'
     compileSdk 34
-    ndkVersion '26.1.10909125'
+    ndkVersion '27.0.12077973'
 
     defaultConfig {
         minSdk 24
         targetSdk 34
 
-        // The .so files are staged into jniLibs by `make dist-android`.
-        // If none are present the AAR still builds, but any call into the
-        // runtime throws UnsatisfiedLinkError with this message.
+        // The .so files are staged into jniLibs by `make dist-android`
+        // followed by scripts/mobile/stage_android_sdk.sh. If none are
+        // present the AAR still builds, but any call into the runtime throws
+        // UnsatisfiedLinkError with a message pointing at this step.
         consumerProguardFiles 'consumer-rules.pro'
 
         externalNativeBuild {
@@ -53,10 +64,120 @@ android {
             useLegacyPackaging = false
         }
     }
+
+    // AGP's publication component is what `from components.release` uses.
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+        }
+    }
 }
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
     // Nothing else. The runtime is dependency-free by design — a host app
     // should not inherit curl, a JSON lib, or an HTTP client we already ship.
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.sofuu'
+                artifactId = 'sofuu-android'
+                version = sofuuVersion
+
+                pom {
+                    name = 'Sofuu Android runtime'
+                    description = 'Embedded offline AI runtime for Android: local inference, agents, storage, memory, embeddings, and crypto/JWT verification.'
+                    url = 'https://sofuu.xyz'
+                    licenses {
+                        license {
+                            name = 'MIT License'
+                            url = 'https://opensource.org/licenses/MIT'
+                        }
+                    }
+                    developers {
+                        developer {
+                            id = 'sofuu'
+                            name = 'Sofuu'
+                            url = 'https://sofuu.xyz'
+                        }
+                    }
+                    scm {
+                        connection = 'scm:git:https://github.com/sofuu-runtime/sofuu.git'
+                        developerConnection = 'scm:git:ssh://git@github.com/sofuu-runtime/sofuu.git'
+                        url = 'https://github.com/sofuu-runtime/sofuu'
+                    }
+                }
+            }
+        }
+
+        repositories {
+            // A local, inspectable repository in build/repo. This is what CI
+            // can archive without touching Maven Central.
+            maven {
+                name = 'buildRepo'
+                url = layout.buildDirectory.dir('repo')
+            }
+            // Optional remote target. Set MAVEN_REPO_URL (and credentials)
+            // in the operator's environment; never commit them.
+            def remoteUrl = System.getenv('MAVEN_REPO_URL')
+            if (remoteUrl) {
+                maven {
+                    name = 'remote'
+                    url = remoteUrl
+                    credentials {
+                        username = System.getenv('MAVEN_REPO_USERNAME') ?: ''
+                        password = System.getenv('MAVEN_REPO_PASSWORD') ?: ''
+                    }
+                }
+            }
+        }
+    }
+
+    signing {
+        // Signing is mandatory only when the operator asks for it. A local
+        // publish must still work on a fresh checkout.
+        required { System.getenv('REQUIRE_SIGNING') == '1' }
+        def signingKey = System.getenv('MAVEN_SIGNING_KEY') ?: project.findProperty('signingKey')
+        def signingPassword = System.getenv('MAVEN_SIGNING_PASSWORD') ?: project.findProperty('signingPassword')
+        if (signingKey && signingPassword) {
+            useInMemoryPgpKeys(signingKey.toString(), signingPassword.toString())
+            sign publishing.publications.release
+        }
+    }
+}
+
+tasks.register('verifyAarContents') {
+    dependsOn 'assembleRelease'
+    description = 'Fails unless the release AAR contains every required ABI library.'
+    group = 'verification'
+    doLast {
+        def aar = layout.buildDirectory.file('outputs/aar/sofuu-release.aar').get().asFile
+        if (!aar.exists()) {
+            throw new GradleException("release AAR not found: ${aar}")
+        }
+        def required = [
+            'classes.jar',
+            'jni/arm64-v8a/libsofuu.so',
+            'jni/arm64-v8a/libsofuu_jni.so',
+            'jni/arm64-v8a/libc++_shared.so',
+            'jni/x86_64/libsofuu.so',
+            'jni/x86_64/libsofuu_jni.so',
+            'jni/x86_64/libc++_shared.so',
+        ]
+        def zip = new java.util.zip.ZipFile(aar)
+        try {
+            def names = zip.entries().collect { it.name } as Set
+            def missing = required.findAll { !names.contains(it) }
+            if (!missing.isEmpty()) {
+                throw new GradleException("AAR is missing required entries: ${missing}")
+            }
+        } finally {
+            zip.close()
+        }
+        logger.lifecycle("verifyAarContents: ${required.size()} required entries present")
+    }
 }

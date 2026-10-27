@@ -210,6 +210,40 @@ int sofuu_rt_call_stream(SofuuRuntime *rt, const char *method,
  * Returns SOFUU_OK if the cancel ID was recognized, -1 if not found. */
 int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
 
+/* ── Local-first modules through the funnel ────────────────────── */
+/* The generic funnel already reaches the modules an embedded host needs;
+ * no extra exported symbol is involved. A JSON array is spread as
+ * positional arguments, a JSON object is one options argument.
+ *
+ * Auth / crypto (no network; the host supplies the JWKS):
+ *
+ *   sofuu_rt_call(rt, "crypto.sha256", "[\"abc\"]", &out);
+ *   sofuu_rt_call(rt, "crypto.base64urlEncode", "[\"hello\"]", &out);
+ *   sofuu_rt_call(rt, "crypto.verifyJWT",
+ *       "[\"<jwt>\", {\"keys\":[...]}, {\"issuer\":\"https://id.example\"}]",
+ *       &out);
+ *
+ * The outer envelope is {"ok":true,"result":...}; verifyJWT's own result is
+ * {"ok":true,"payload":{...}} or {"ok":false,"error":{...}}. A missing
+ * `azp` is accepted (native SDK tokens have no browser origin); a present
+ * `azp` must be in authorizedParties.
+ *
+ * Local storage and agents:
+ *
+ *   sofuu_rt_call(rt, "storage.open", "{\"base_path\":\"/data/app\"}", &out);
+ *   sofuu_rt_call(rt, "agent.run", "[\"researcher\",\"task\",{}]", &out);
+ *   sofuu_rt_call_stream(rt, "ai.streamLocal",
+ *       "[\"/models/model.gguf\",\"prompt\",{}]", on_event, opaque, &cancel);
+ *
+ * `storage.*` works in every build. `memory.*` is present but a no-op when
+ * the library was linked without QTSQ; check the build manifest before
+ * promising encrypted-brain behavior. `ai.streamLocal` is in-process and
+ * needs no provider or network.
+ *
+ * A host that wants the JS implementation of a pipeline can load a single
+ * bundled script with sofuu_rt_eval (ES modules must be bundled first) and
+ * then drive it through call/call_stream. */
+
 /* ── Host-native tools (PLAN-EMBED-SDK E2) ─────────────────────── */
 /* Register a native host function so an in-app agent can call it as a tool.
  *

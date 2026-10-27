@@ -546,6 +546,27 @@ impl ContinuousBatchServer {
                     )
                 });
 
+                // STICKY PREFILL LEASE (prefill_sched::cache_owner). The backend
+                // has ONE KV cache addressed by absolute position, so at most ONE
+                // prefilling stream may take a slice per pass, and a stream that
+                // has already written KV (cur_pos > 0) keeps the cache until its
+                // prompt completes. Without it two streams prefilling in the same
+                // pass overwrite each other's rows at the same positions and both
+                // finish on a logits vector made of half of each prompt.
+                // SOFUU_PREFILL_LEASE=0 restores the interleaving (A/B arm).
+                let prefill_lease_owner = if prefill_sched::lease_enabled() {
+                    prefill_sched::cache_owner(active_streams.iter().map(|st| {
+                        (
+                            st.id,
+                            st.status == StreamStatus::Prefilling,
+                            st.cur_pos,
+                            st.prompt_tokens.len().saturating_sub(st.cur_pos),
+                        )
+                    }))
+                } else {
+                    None
+                };
+
                 for mut stream in active_streams {
                     if stream.aborted.load(Ordering::Relaxed) {
                         let p_len = stream.prompt_tokens.len();
@@ -556,6 +577,20 @@ impl ContinuousBatchServer {
                         for (tbl, pool) in stream.block_tables.iter_mut().zip(pools.iter_mut()) {
                             tbl.clear(pool);
                         }
+                        continue;
+                    }
+
+                    // LEASE WAIT: another stream owns the k_cache until its own
+                    // prompt completes. This stream keeps its status and its
+                    // place in the queue and takes no slice this pass -- the
+                    // block is HERE, before the engine lock and before the slice
+                    // planner, so nothing is written, no slice counter moves and
+                    // no prefill time is charged to a stream that did no work.
+                    if matches!(stream.status, StreamStatus::Prefilling)
+                        && prefill_lease_owner.is_some()
+                        && prefill_lease_owner != Some(stream.id)
+                    {
+                        streams_to_retain.push(stream);
                         continue;
                     }
 

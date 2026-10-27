@@ -190,6 +190,48 @@ for await (const chunk of stream) {
 | **Raspberry Pi 5** (ARM64 musl) | `Spark-X2.5-4B` (Q4_K_M GGUF) | **2.1 s** | **25.3–25.4 tk/s** | **4.4 tk/s** | Ahead of llama.cpp (+11% prefill / +5% decode), matched prompt & context |
 | **Raspberry Pi 5** (ARM64 musl) | `Ternary-Bonsai-2-9B` (PQ2_0 GGUF) | **440 ms** | **1.4 tk/s** | **0.7 tk/s** | Loadable only here (ternary-weight format); v1 dequant path, not yet optimized |
 
+### Apple M2 Pro — full local matrix (2026-10-27)
+
+Every model on this Mac, same binary at `ff2685ee2`, 148-token prompt, 16 generated tokens, `--temp 0`
+greedy, load 3.5–5.1. **GPU** = `SOFUU_GPU_PREFILL=1 SOFUU_GEMM_MMA8=1`; **CPU** = the same binary with
+those flags absent. One run per cell (not ABBA), so read the ratio, not the absolute.
+
+| Model | Quant | CPU prefill | CPU decode | GPU prefill | GPU decode | GPU gain (prefill / decode) |
+|---|---|---|---|---|---|---|
+| `Qwen3-0.6B` | Q4_K_M | 527.2 tk/s | 36.7 tk/s | **927.0 tk/s** | **135.4 tk/s** | 1.76× / **3.69×** |
+| `Qwen3-0.6B` | Q3_K | 447.2 tk/s | 76.7 tk/s | **492.1 tk/s** | **92.6 tk/s** | 1.10× / 1.21× |
+| `Qwen2.5-0.5B` | Q4_0 | 146.2 tk/s | 85.5 tk/s | **721.4 tk/s** | **152.2 tk/s** | **4.93×** / 1.78× |
+| `SmolLM2-360M` | Q8_0 | **930.5 tk/s** | 109.2 tk/s | 787.6 tk/s | **156.2 tk/s** | 0.85× / 1.43× |
+| `TinyMistral-248M` (hd 32) | Q8_0 | **1520.8 tk/s** | 124.9 tk/s | 978.9 tk/s | **252.6 tk/s** | 0.64× / **2.02×** |
+| `Llama-3.2-1B` | Q8_0 | **438.5 tk/s** | 50.3 tk/s | 311.9 tk/s | **70.4 tk/s** | 0.71× / 1.40× |
+| `MiniCPM5-2B` | Q6_K_XL | 117.4 tk/s | 22.5 tk/s | **195.1 tk/s** | **41.8 tk/s** | 1.66× / 1.86× |
+| `Phi-4-mini` (phi3) | Q6_K_XL | 90.0 tk/s | 4.6 tk/s | **107.9 tk/s** | **6.6 tk/s** | 1.20× / 1.43× |
+| `K2-Horizon-4B` | Q8_0 | **88.7 tk/s** | 1.9 tk/s | 36.1 tk/s | **21.4 tk/s** | 0.41× / **11.3×** |
+| `Qwen3-8B` | Q4_K_M | **49.5 tk/s** | 2.7 tk/s | 32.0 tk/s | **16.7 tk/s** | 0.65× / **6.2×** |
+| `Spark2.5-4B` (hd 256) | Q4_K_M | **54.5 tk/s** | **14.5 tk/s** | 55.1 tk/s | 13.9 tk/s | 1.01× / 0.96× |
+
+Reading it, honestly:
+
+* **Decode is where the GPU pays**, from 1.2× to 11.3×. The bigger the model, the larger the win —
+  `K2-Horizon-4B` goes 1.9 → 21.4 tk/s and `Qwen3-8B` 2.7 → 16.7 tk/s, because decode is a weight-streaming
+  problem and CPU cores cannot stream as fast as the GPU.
+* **Prefill at 148 tokens is not a fair test of the GPU.** It wins by 5× on `Q4_0` (that model only got a
+  wide-chunk GPU GEMM on 2026-10-27) and 1.8× on `Qwen3-0.6B` Q4_K_M, but loses on `K2-Horizon-4B`,
+  `Qwen3-8B` and `Llama-3.2-1B` where setup and per-chunk overhead dominate a short prompt. Depth sweep on
+  `Qwen3-0.6B` Q4_K_M, same binary: 400 tk **1469** vs 511 CPU, 800 tk **1616** vs 442, 1454 tk **1355** vs
+  399 tk/s — the GPU wins from ~400 tokens up and never looks back.
+* **`Spark2.5-4B` is a CPU model.** That architecture has its own backend (`infer/spark.rs`) and never
+  constructs the GPU client, so its two columns are the same engine measured twice (0.96–1.01×, i.e. noise).
+  Its decode is already at ~79 GB/s of CPU streaming.
+* **`Phi-4-mini` needs the GPU prefill too.** Arming GPU decode after a CPU prefill pays a one-off KV upload,
+  which a 16-token generation cannot amortise.
+* **`Q3_K` is verified here only as a pure-Q3_K file.** A Q3_K_M-style mix carrying Q5_K tensors is still
+  refused at load (`blk.0.attn_v.weight [Q5_K]`), because Q5_K has no CPU dot and no GPU kernel in this
+  build — a loud refusal, not a silent downgrade.
+
+These rows supersede the older Apple Silicon entries above, which predate the fp16 weight arena, the 64×64
+MMA tile, the q4_0 wide-chunk GEMM and the bit-identical q4_K decode GEMV v2.
+
 Pi 5 receipts: 2026-10-26 battery, current main, 4× Cortex-A76 with NEON+dotprod at the adopted `arm_freq=2800` + 25 mV boot config, `performance` governor, 4 threads, temp 0, 234–252-token prompt, fresh llama.cpp build 11041 references from the same session. Load times are warm page-cache.
 
 ---

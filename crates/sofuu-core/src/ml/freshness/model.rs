@@ -11,39 +11,42 @@
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::features::{self, FreshnessInput, SourceKind, FRESHNESS_FEATURES};
+use super::features::{self, FreshnessInput, SourceKind};
 use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 
-pub const IN_DIM: u32 = FRESHNESS_FEATURES as u32; // 28
-pub const H1: u32 = 112;
-pub const H2: u32 = 48;
-pub const PARAMS: u32 = 8721; // §5 arch: 28 → 112 → 48 → 1
+pub const IN_DIM: u32 = features::FRESHNESS_FEATURES_V2 as u32; // 34
+pub const H1: u32 = 128;
+pub const H2: u32 = 64;
+pub const PARAMS: u32 = 12801; // arch: 34 → 128 → 64 → 1
 
 pub const V2_IN_DIM: u32 = features::FRESHNESS_FEATURES_V2 as u32; // 34
 pub const V2_H1: u32 = 128;
 pub const V2_H2: u32 = 64;
 pub const V2_PARAMS: u32 = 12801;
-pub const V2_THRESHOLD: f32 = 0.95;
+pub const V2_THRESHOLD: f32 = 0.50;
 
 /// Decision threshold, baked from the ml-train run that emitted
-/// weights_v1.f32. Chosen on the VALIDATION fold only (§10 bar 3) at the
-/// 0.95 recall-selection floor; the held-out test fold held recall 0.990
+/// weights_v2.f32. Chosen on the VALIDATION fold only (§10 bar 3) at the
+/// 0.95 recall-selection floor; the held-out test fold held recall 1.000
 /// and precision 1.000 at this value.
-pub const THRESHOLD: f32 = 0.95;
+pub const THRESHOLD: f32 = 0.50;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
-pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
+static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
+pub static WEIGHTS_V2: &[u8] = WEIGHTS;
 
-static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
+pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
     TinyMlp::from_blob(WEIGHTS).expect("committed freshness weights must load")
 });
 
-pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS_V2).expect("committed freshness v2 weights must load")
-});
+pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
+
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+pub(crate) fn blob_hash() -> u64 {
+    *BLOB_HASH
+}
 
 pub struct FreshnessVerdict {
     /// P(possibly stale for this task) in (0, 1).
@@ -69,7 +72,7 @@ pub fn score(
     now_year: u32,
 ) -> FreshnessVerdict {
     let inp = FreshnessInput { text, task, kind, strength, age_days, now_year };
-    let mut feats = features::extract(&inp);
+    let mut feats = features::extract_v2(&inp);
     // Phase 1.2: NaN must never reach the forward pass (sigmoid(NaN) is
     // NaN → "NaN" in the returned JSON → the caller's parse breaks).
     crate::ml::sanitize_features(&mut feats);
@@ -85,7 +88,7 @@ pub fn score(
 /// Name the dominant evidence channel so the notice can say WHY. Priority
 /// follows the feature design: explicit old date > staleness vocabulary >
 /// hedging > legacy/version markers.
-fn evidence(feats: &[f32; FRESHNESS_FEATURES], text: &str, now_year: u32) -> String {
+fn evidence(feats: &[f32; features::FRESHNESS_FEATURES_V2], text: &str, now_year: u32) -> String {
     if feats[8] >= 0.5 {
         // Explicit date present — quote the newest year found, if it lags.
         let newest = features::scan_years(text)

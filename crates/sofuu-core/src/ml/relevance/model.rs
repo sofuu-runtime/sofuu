@@ -11,31 +11,24 @@
 
 use std::sync::LazyLock;
 
-use super::features::{self, CandKind, CandidateInput, RELEVANCE_FEATURES};
+use super::features::{self, CandKind, CandidateInput};
 use crate::ml::net::TinyMlp;
 use crate::ml::cap_str;
 
-pub const IN_DIM: u32 = RELEVANCE_FEATURES as u32; // 37
-pub const H1: u32 = 104;
-pub const H2: u32 = 44;
-pub const PARAMS: u32 = 8617; // §6 arch: 37 → 104 → 44 → 1
+pub const IN_DIM: u32 = features::RELEVANCE_FEATURES_V2 as u32; // 45
+pub const H1: u32 = 128;
+pub const H2: u32 = 64;
+pub const PARAMS: u32 = 14209; // arch: 45 → 128 → 64 → 1
 
 pub const V2_IN_DIM: u32 = features::RELEVANCE_FEATURES_V2 as u32; // 45
 pub const V2_H1: u32 = 128;
 pub const V2_H2: u32 = 64;
 pub const V2_PARAMS: u32 = 14209;
-pub const V2_THRESHOLD: f32 = 0.95;
+pub const V2_THRESHOLD: f32 = 0.51;
 
 /// Decision threshold, baked from the ml-train run that emitted
-/// weights_v1.f32. Selected on the VALIDATION fold only (§10 bar 3) at the
-/// 0.90-recall floor: val separated with a wide margin (lowest use score
-/// 0.868, highest skip score 0.410), so 0.95 sits deep inside the margin.
-/// The asymmetry is recall-first (§6): a false drop is invisible and costs
-/// correctness, a false use only wastes tokens and stays visible — so a
-/// candidate must clear a HIGH bar before the advisor recommends spending
-/// tokens on it, and the mechanical rules below only ever add skips that
-/// are information-preserving by construction.
-pub const THRESHOLD: f32 = 0.95;
+/// weights_v2.f32.
+pub const THRESHOLD: f32 = 0.51;
 
 /// Mechanical skip floor: a candidate whose embedding cosine with an
 /// already-KEPT candidate reaches this is a near-verbatim repeat — pulling
@@ -48,18 +41,21 @@ pub const MECHANICAL_DUP_COSINE: f32 = 0.90;
 /// deterministic skip — such content never answers a coding task.
 pub const MECHANICAL_NEVER_USE: f32 = 0.50;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
-pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
+static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
+pub static WEIGHTS_V2: &[u8] = WEIGHTS;
 
-static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
+pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
     TinyMlp::from_blob(WEIGHTS).expect("committed relevance weights must load")
 });
 
-pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS_V2).expect("committed relevance v2 weights must load")
-});
+pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
+
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+pub(crate) fn blob_hash() -> u64 {
+    *BLOB_HASH
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RelevancePlan {
@@ -91,7 +87,7 @@ pub fn plan(
         return out;
     }
 
-    let mut feats = features::extract_all(&features::RelevanceContext {
+    let mut feats = features::extract_all_v2(&features::RelevanceContext {
         task,
         recent,
         candidates,

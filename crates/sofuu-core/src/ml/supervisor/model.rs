@@ -17,34 +17,27 @@
 
 use std::sync::LazyLock;
 
-use super::features::{self, SupervisorContext, TrajCall, LOOP_TOOL, SUPERVISOR_FEATURES};
+use super::features::{self, SupervisorContext, TrajCall, LOOP_TOOL};
 use crate::ml::context::{self, CallRec};
 use crate::ml::net::TinyMlp;
 
-pub const IN_DIM: u32 = SUPERVISOR_FEATURES as u32; // 33
-pub const H1: u32 = 104;
-pub const H2: u32 = 44;
-pub const PARAMS: u32 = 8201; // §11 arch: 33 → 104 → 44 → 1
+pub const IN_DIM: u32 = features::SUPERVISOR_FEATURES_V2 as u32; // 42
+pub const H1: u32 = 128;
+pub const H2: u32 = 64;
+pub const PARAMS: u32 = 13825; // arch: 42 → 128 → 64 → 1
 
 pub const V2_IN_DIM: u32 = features::SUPERVISOR_FEATURES_V2 as u32; // 42
 pub const V2_H1: u32 = 128;
 pub const V2_H2: u32 = 64;
 pub const V2_PARAMS: u32 = 13825;
-pub const V2_THRESHOLD: f32 = 0.85;
+pub const V2_THRESHOLD: f32 = 0.95;
 
 /// Decision threshold, baked from the ml-train run that emitted
-/// weights_v1.f32. Chosen on the VALIDATION fold only (§10 bar 3) at the
-/// 0.90 recall-selection floor -- with the val fold perfectly separated
-/// the margin-midpoint fallback placed it halfway between the highest
-/// clean score (0.638) and the lowest waste score (0.998), so it carries
-/// ~0.18 of margin on both sides against real-world messiness. The
-/// held-out test fold held recall 1.000 and precision 1.000 at this
-/// value. Still deliberately conservative: a nudge that cries wolf gets
-/// ignored, which is its own failure mode (§11).
-pub const THRESHOLD: f32 = 0.82;
+/// weights_v2.f32.
+pub const THRESHOLD: f32 = 0.95;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
-pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
+static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
+pub static WEIGHTS_V2: &[u8] = WEIGHTS;
 
 static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
@@ -52,31 +45,20 @@ static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     TinyMlp::from_blob(WEIGHTS).expect("committed supervisor weights must load")
 });
 
-pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS_V2).expect("committed supervisor v2 weights must load")
-});
+pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
 
 /// The committed net (online.rs adapts only its output layer, §13).
 pub(crate) fn net() -> &'static TinyMlp {
     &NET
 }
 
-static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| fnv1a64(WEIGHTS));
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
 
 /// FNV-1a 64 over the committed blob — the identity key that ties an
 /// online-adapted layer to the exact pretrained weights it came from.
 /// A re-bake changes the hash and invalidates every stored adaptation.
 pub(crate) fn blob_hash() -> u64 {
     *BLOB_HASH
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// One supervisor verdict. `ok` = nothing to flag; otherwise `reason` is
@@ -157,7 +139,7 @@ fn extract_features(
     args_text: &str,
     target: &str,
     sig: &str,
-) -> [f32; SUPERVISOR_FEATURES] {
+) -> [f32; features::SUPERVISOR_FEATURES_V2] {
     let ctx = SupervisorContext {
         task: task.to_string(),
         budget,
@@ -169,7 +151,7 @@ fn extract_features(
         sig: sig.to_string(),
         step,
     };
-    let mut f = features::extract(&ctx);
+    let mut f = features::extract_v2(&ctx);
     // Phase 1.2: NaN must never reach the forward pass (the supervisor
     // runs on every tool call — a NaN score would break the check JSON).
     crate::ml::sanitize_features(&mut f);
@@ -178,7 +160,7 @@ fn extract_features(
 
 /// Forward through the adopted online output layer when present, else the
 /// pretrained layer. Hidden activations are shared — only W3/b3 differ.
-fn forward_with_online(feats: &[f32; SUPERVISOR_FEATURES]) -> f32 {
+fn forward_with_online(feats: &[f32; features::SUPERVISOR_FEATURES_V2]) -> f32 {
     let h = NET.forward_hidden(feats);
     match crate::ml::online::output_layer() {
         Some(w3) => NET.forward_output_with(&w3, &h),
@@ -276,7 +258,7 @@ pub fn loop_check(run_id: &str, step: u32, budget: u32) -> SupervisorVerdict {
         sig: String::new(),
         step,
     };
-    let feats = features::extract(&ctx);
+    let feats = features::extract_v2(&ctx);
     let (reason, nudge) = loop_class(&feats);
     SupervisorVerdict { ok: false, score, reason, nudge: Some(nudge), source: "model" }
 }
@@ -284,7 +266,7 @@ pub fn loop_check(run_id: &str, step: u32, budget: u32) -> SupervisorVerdict {
 /// Name the pre-call waste class from the decisive channels so the nudge
 /// says WHY. Priority follows certainty: duplication > skip advice >
 /// breadth > budget > spin > off-task.
-fn precall_class(f: &[f32; SUPERVISOR_FEATURES]) -> (String, String) {
+fn precall_class(f: &[f32; features::SUPERVISOR_FEATURES_V2]) -> (String, String) {
     if f[3] >= 0.5 {
         return (
             "dup_call".into(),
@@ -340,7 +322,7 @@ fn precall_class(f: &[f32; SUPERVISOR_FEATURES]) -> (String, String) {
 }
 
 /// Name the loop-boundary class: budget > spin > stall.
-fn loop_class(f: &[f32; SUPERVISOR_FEATURES]) -> (String, String) {
+fn loop_class(f: &[f32; features::SUPERVISOR_FEATURES_V2]) -> (String, String) {
     if f[13] >= 0.5 {
         return (
             "loop_over_budget".into(),

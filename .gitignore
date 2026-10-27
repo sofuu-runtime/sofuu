@@ -80,6 +80,11 @@ ascii-art.png
 .zcode/
 .mimosa/
 .workbuddy-ai/
+.openqodex/
+
+# ── Training caches / scratch ─────────────────────
+crates/ml-train/data/processed/
+patch/
 
 # ── Excluded research dir (not part of this repo) ─
 new-model-arch./

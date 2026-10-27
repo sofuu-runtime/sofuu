@@ -12,32 +12,24 @@
 
 use std::sync::LazyLock;
 
-use super::features::{self, SegKind, SegmentInput, COMPACTION_FEATURES};
+use super::features::{self, SegKind, SegmentInput};
 use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 
-pub const IN_DIM: u32 = COMPACTION_FEATURES as u32; // 33
-pub const H1: u32 = 104;
-pub const H2: u32 = 44;
-pub const PARAMS: u32 = 8201; // §12 arch: 33 → 104 → 44 → 1
+pub const IN_DIM: u32 = features::COMPACTION_FEATURES_V2 as u32; // 41
+pub const H1: u32 = 128;
+pub const H2: u32 = 64;
+pub const PARAMS: u32 = 13697; // arch: 41 → 128 → 64 → 1
 
 pub const V2_IN_DIM: u32 = features::COMPACTION_FEATURES_V2 as u32; // 41
 pub const V2_H1: u32 = 128;
 pub const V2_H2: u32 = 64;
 pub const V2_PARAMS: u32 = 13697;
-pub const V2_THRESHOLD: f32 = 0.45;
+pub const V2_THRESHOLD: f32 = 0.47;
 
 /// Decision threshold, baked from the ml-train run that emitted
-/// weights_v1.f32. Selected on the VALIDATION fold only (§10 bar 3): the
-/// fold (off-task musings, held-out decision phrasings, held-out
-/// paraphrased references) separated with a wide margin — highest keep
-/// score 0.000, lowest disposable score 0.824 — so the threshold is the
-/// midpoint of that margin (0.41): the point farthest from both classes.
-/// A segment must score above 0.41 before it is even a candidate; the
-/// policy layer below adds hard keep-window protection on top. The
-/// held-out test fold (held-out dups + held-out references) measured
-/// precision 1.000 / recall 1.000 at it.
-pub const THRESHOLD: f32 = 0.41;
+/// weights_v2.f32.
+pub const THRESHOLD: f32 = 0.47;
 
 /// Default per-pass budget when the caller doesn't name one: free ~12% of
 /// the window (§12 "small budget per pass"). Context degrades gracefully
@@ -58,18 +50,21 @@ pub const KEEP_WINDOW_AGE: u32 = 1;
 /// measured distinct-text cosine ceiling (~0.81 on same-topic pairs).
 pub const MECHANICAL_DUP_COSINE: f32 = 0.95;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
-pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
+static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
+pub static WEIGHTS_V2: &[u8] = WEIGHTS;
 
-static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
+pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
     TinyMlp::from_blob(WEIGHTS).expect("committed compaction weights must load")
 });
 
-pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS_V2).expect("committed compaction v2 weights must load")
-});
+pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
+
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+pub(crate) fn blob_hash() -> u64 {
+    *BLOB_HASH
+}
 
 /// How a flagged segment can be compacted. The free tiers need no LLM
 /// call (§12 "free tier below"): prefer them, spend an LLM summarization
@@ -129,7 +124,7 @@ pub struct CompactionPlan {
 /// Classify HOW a flagged segment gets compacted from its features.
 /// Thresholds sit well inside the trained channels' firing ranges (dup
 /// cosine ≥ 0.85 is paraphrase-or-better; boilerplate cosine ≥ 0.45).
-fn tier_of(feats: &[f32; COMPACTION_FEATURES]) -> Tier {
+fn tier_of(feats: &[f32; features::COMPACTION_FEATURES_V2]) -> Tier {
     if feats[16] >= 0.85 {
         Tier::Dup
     } else if feats[14] >= 0.45 {
@@ -163,7 +158,7 @@ pub fn plan(
         return out;
     }
 
-    let mut feats = features::extract_all(&features::CompactionContext {
+    let mut feats = features::extract_all_v2(&features::CompactionContext {
         task,
         summary,
         recent,

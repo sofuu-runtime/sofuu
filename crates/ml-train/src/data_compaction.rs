@@ -13,7 +13,7 @@
 // of trained channels, never a channel the net has never seen.
 
 use sofuu_core::ml::compaction::features::{
-    extract_all, CompactionContext, SegKind, SegmentInput,
+    extract_all_v2, CompactionContext, SegKind, SegmentInput,
 };
 
 use crate::train::Example;
@@ -325,7 +325,7 @@ fn make(
         })
         .collect();
     let ctx = CompactionContext { task, summary, recent, segments: &inputs };
-    let feats = extract_all(&ctx);
+    let feats = extract_all_v2(&ctx);
     Example {
         x: feats[target].to_vec(),
         y,
@@ -801,7 +801,7 @@ pub fn build() -> Vec<Example> {
                     recent: "keep going",
                     segments: &inputs,
                 };
-                extract_all(&ctx)[1].to_vec()
+                extract_all_v2(&ctx)[1].to_vec()
             };
             aug.push(c);
         }
@@ -811,23 +811,5 @@ pub fn build() -> Vec<Example> {
 }
 
 pub fn build_v2() -> Vec<Example> {
-    let mut out = build();
-    for e in &mut out {
-        let text_lower = e.text.to_lowercase();
-        let is_diff = if text_lower.contains("diff --git") || text_lower.contains("@@ -") { 1.0 } else { 0.0 };
-        let has_config = if text_lower.contains("config") || text_lower.contains("token") || text_lower.contains("port") { 1.0 } else { 0.0 };
-        let has_constraint = if text_lower.contains("never") || text_lower.contains("must") || text_lower.contains("require") { 1.0 } else { 0.0 };
-        let mut v2_ext = vec![
-            0.0,            // 33: forward citation
-            0.0,            // 34: unresolved error
-            has_config,     // 35: config
-            has_constraint, // 36: constraint
-            0.1,            // 37: duration
-            is_diff,        // 38: patch
-            0.0,            // 39: monologue
-            0.5,            // 40: density
-        ];
-        e.x.append(&mut v2_ext);
-    }
-    out
+    build()
 }

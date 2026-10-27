@@ -54,6 +54,16 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Standard 64-bit FNV-1a hash — used for blob identity tracking and cache keys.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 impl TinyMlp {
     pub fn new(in_dim: u32, h1: u32, h2: u32, w: Vec<f32>) -> Self {
         assert_eq!(

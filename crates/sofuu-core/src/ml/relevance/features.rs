@@ -335,7 +335,7 @@ fn bm25_scores(task: &str, candidates: &[CandidateInput]) -> Vec<f32> {
 
 /* ── Set-level precomputation ────────────────────────────────────── */
 
-struct SetStats {
+pub struct SetStats {
     emb: Vec<Vec<f32>>,
     task_emb: Vec<f32>,
     recent_emb: Vec<f32>,

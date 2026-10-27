@@ -149,7 +149,7 @@ fn current_year_is_sane() {
 
 #[test]
 fn blob_integrity_and_architecture() {
-    static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
+    static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
     let net = crate::ml::net::TinyMlp::from_blob(WEIGHTS).expect("committed blob loads");
     assert_eq!((net.in_dim, net.h1, net.h2), (model::IN_DIM, model::H1, model::H2));
     assert_eq!(net.w.len() as u32, model::PARAMS);

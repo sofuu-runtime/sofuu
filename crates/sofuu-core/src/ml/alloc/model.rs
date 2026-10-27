@@ -16,30 +16,26 @@
 
 use std::sync::LazyLock;
 
-use super::features::{self, AllocInput, ALLOC_FEATURES, THINK_BUDGET, THINK_EFFORT, THINK_UNKNOWN};
+use super::features::{self, AllocInput, THINK_BUDGET, THINK_EFFORT, THINK_UNKNOWN};
 use super::policy::{self, Resolved};
 use crate::ml::cap_str;
 use crate::ml::net::TinyMlp;
 use crate::rt::model_caps;
 
-pub const IN_DIM: u32 = ALLOC_FEATURES as u32; // 24
-pub const H1: u32 = 96;
-pub const H2: u32 = 40;
-pub const PARAMS: u32 = 6321; // 24 → 96 → 40 → 1
+pub const IN_DIM: u32 = features::ALLOC_FEATURES_V2 as u32; // 30
+pub const H1: u32 = 128;
+pub const H2: u32 = 64;
+pub const PARAMS: u32 = 12289; // arch: 30 → 128 → 64 → 1
 
 pub const V2_IN_DIM: u32 = features::ALLOC_FEATURES_V2 as u32; // 30
 pub const V2_H1: u32 = 128;
 pub const V2_H2: u32 = 64;
 pub const V2_PARAMS: u32 = 12289;
-pub const V2_THRESHOLD: f32 = 0.51;
+pub const V2_THRESHOLD: f32 = 0.48;
 
 /// Decision threshold baked from the ml-train run that emitted
-/// weights_v1.f32 — selected on the VALIDATION fold only, at the
-/// recall floor (a missed pressure event is exactly the provider-400
-/// failure mode this model exists to prevent; a false alarm only
-/// compacts a little early). Trainer: test acc 0.986 (majority 0.810,
-/// logreg 0.969), recall 0.994, precision 0.988.
-pub const THRESHOLD: f32 = 0.51;
+/// weights_v2.f32.
+pub const THRESHOLD: f32 = 0.48;
 
 /* ── Policy ranges — the allocation the net drives, all clamped ──────
  * Slack sessions (p→0) breathe: late compaction, generous tool/attach
@@ -79,16 +75,19 @@ const WRITING_OUTPUT_BOOST: f32 = 1.25;
 /// an oversized request).
 const UNKNOWN_PRESSURE_FLOOR: f32 = 0.50;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.f32");
-pub static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.f32");
+static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
+pub static WEIGHTS_V2: &[u8] = WEIGHTS;
 
-static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
+pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     TinyMlp::from_blob(WEIGHTS).expect("committed alloc weights must load")
 });
 
-pub static NET_V2: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS_V2).expect("committed alloc v2 weights must load")
-});
+pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
+
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+pub(crate) fn blob_hash() -> u64 {
+    *BLOB_HASH
+}
 
 /// One turn's allocation. Every number is clamped to the selected
 /// model's resolved limits — a plan can be applied as-is.
@@ -170,7 +169,7 @@ pub fn plan_with(input: &AllocInput, resolved: Resolved) -> AllocPlan {
     inp.ctx_window = resolved.window;
     inp.max_output = resolved.max_output;
     inp.thinking = if resolved.known { inp.thinking } else { THINK_UNKNOWN };
-    let feats = features::extract(&inp);
+    let feats = features::extract_v2(&inp);
 
     let mut pressure = NET.forward(&feats);
     if !resolved.known && pressure < UNKNOWN_PRESSURE_FLOOR {

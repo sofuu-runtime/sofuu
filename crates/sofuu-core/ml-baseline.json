@@ -1,23 +1,23 @@
 {
-  "v": 1,
-  "frozen": "2026-08-30",
-  "plan": "PLAN-ML-IMPROVEMENT-NO-RETRAINING.md (Phase 0, section 4.1)",
-  "note": "Immutable baseline for the five committed ML models. A future change that alters ANY recorded value here is a schema/blob/semantics break: it must either be reverted or wait for a versioned re-bake. Verified by crates/sofuu-core/tests/ml_baseline_freeze.rs on every cargo test run.",
+  "v": 2,
+  "frozen": "2026-10-27",
+  "plan": "Promote v2 decision ML suite as primary, purge v1 weights, enable universal online learning",
+  "note": "Immutable baseline for the five committed ML v2 models. Verified by crates/sofuu-core/tests/ml_baseline_freeze.rs on every cargo test run.",
   "models": {
     "freshness": {
-      "arch": [28, 112, 48, 1],
-      "params": 8721,
-      "threshold": 0.95,
+      "arch": [34, 128, 64, 1],
+      "params": 12801,
+      "threshold": 0.50,
       "blob": {
-        "file": "crates/sofuu-core/src/ml/freshness/weights_v1.f32",
-        "bytes": 34912,
-        "weight_bytes": 34884,
-        "crc32": 3840614405,
-        "fnv1a64_blob": "bf6e050ce597e0b8",
-        "sha256_blob": "b84d5f567880b112c1eda44c4c64e98d7b5eb6d9aead1665942b6b607c576d39",
+        "file": "crates/sofuu-core/src/ml/freshness/weights_v2.f32",
+        "bytes": 51232,
+        "weight_bytes": 51204,
+        "crc32": 1184442710,
+        "fnv1a64_blob": "6413675cbc1f572e",
+        "sha256_blob": "1d57c6823f35998c88668c28fa3b695970c93ab7584e64b7f17d309a68f69e04",
         "trailing_data": false
       },
-      "features": 28,
+      "features": 34,
       "slots": [
         "0  stale keyword density",
         "1  hedge keyword density",
@@ -46,25 +46,31 @@
         "24 brain strength",
         "25 brain age norm (/730d)",
         "26 stale sentence-max cosine",
-        "27 hedge sentence-max cosine"
+        "27 hedge sentence-max cosine",
+        "28 breaking change keyword density",
+        "29 SemVer major difference / legacy version indicator",
+        "30 lockfile drift flag",
+        "31 relative date keyword density",
+        "32 signature / argument mismatch keyword density",
+        "33 changelog / release notes marker density"
       ],
-      "threshold_rationale": "chosen on the VALIDATION fold at the 0.95 recall-selection floor; held-out test fold held recall 0.990 / precision 1.000 at this value. Recall-first: a missed stale signal costs correctness, a false notice costs one ephemeral message.",
+      "threshold_rationale": "chosen on the VALIDATION fold at 0.50 floor for v2 balanced F1/recall.",
       "mechanical": {}
     },
     "relevance": {
-      "arch": [37, 104, 44, 1],
-      "params": 8617,
-      "threshold": 0.95,
+      "arch": [45, 128, 64, 1],
+      "params": 14209,
+      "threshold": 0.51,
       "blob": {
-        "file": "crates/sofuu-core/src/ml/relevance/weights_v1.f32",
-        "bytes": 34496,
-        "weight_bytes": 34468,
-        "crc32": 1458123543,
-        "fnv1a64_blob": "e99fe129f96a09fc",
-        "sha256_blob": "8c29bfc7cf9d6f81a8739e0785c762ffe751928fadec909dc929867547b23353",
+        "file": "crates/sofuu-core/src/ml/relevance/weights_v2.f32",
+        "bytes": 56864,
+        "weight_bytes": 56836,
+        "crc32": 1291880181,
+        "fnv1a64_blob": "59393c2d787fce16",
+        "sha256_blob": "ce20999231c9cb9f385dadce144fce64b46f491714b184b718646d59925beebb",
         "trailing_data": false
       },
-      "features": 37,
+      "features": 45,
       "slots": [
         "0  sim(candidate, task)",
         "1  BM25 normalized score",
@@ -102,28 +108,36 @@
         "33 never-use class (generated/lock/license)",
         "34 BM25 x semantic interaction",
         "35 task-sim gated on not-visible",
-        "36 stem match (morphological echo)"
+        "36 stem match (morphological echo)",
+        "37 AST symbol proximity",
+        "38 file recency / project source indicator",
+        "39 import graph / recent context proximity",
+        "40 test-to-implementation pairing",
+        "41 chunk offset norm",
+        "42 syntax validity flag",
+        "43 lexical x semantic contrast (BM25 - cosine)",
+        "44 candidate line count norm"
       ],
-      "threshold_rationale": "selected on the VALIDATION fold at the 0.90-recall floor; the fold separated with a wide margin (lowest use 0.868, highest skip 0.410), so 0.95 sits deep inside it. Recall-first asymmetry: a false drop is invisible and costs correctness.",
+      "threshold_rationale": "selected on the VALIDATION fold at 0.51 floor; high recall with AST/syntax context.",
       "mechanical": {
         "MECHANICAL_DUP_COSINE": 0.9,
         "MECHANICAL_NEVER_USE": 0.5
       }
     },
     "supervisor": {
-      "arch": [33, 104, 44, 1],
-      "params": 8201,
-      "threshold": 0.82,
+      "arch": [42, 128, 64, 1],
+      "params": 13825,
+      "threshold": 0.95,
       "blob": {
-        "file": "crates/sofuu-core/src/ml/supervisor/weights_v1.f32",
-        "bytes": 32832,
-        "weight_bytes": 32804,
-        "crc32": 3321651938,
-        "fnv1a64_blob": "64ab5b22694555ab",
-        "sha256_blob": "9725f3f0209a9548def0e5c9d7fe28078678d6e21743898303e4b50cf6db9e52",
+        "file": "crates/sofuu-core/src/ml/supervisor/weights_v2.f32",
+        "bytes": 55328,
+        "weight_bytes": 55300,
+        "crc32": 4052578305,
+        "fnv1a64_blob": "3fe0b7a27f1118d4",
+        "sha256_blob": "09af08eb3005a114c686f4cd805688e7ff559230c426d312b09f1fceb5ae8f01",
         "trailing_data": false
       },
-      "features": 33,
+      "features": 42,
       "slots": [
         "0  action-task cosine",
         "1  ident-part overlap with task",
@@ -157,28 +171,37 @@
         "29 same-target streak (/4)",
         "30 args size (/2000)",
         "31 off-task x late-in-run",
-        "32 trajectory adjacency (target echo)"
+        "32 trajectory adjacency (target echo)",
+        "33 command entropy (character variety ratio)",
+        "34 cross-tool equivalence / tool alternation",
+        "35 target invalidation count",
+        "36 AST churn rate",
+        "37 error streak similarity",
+        "38 trajectory non-zero exit streak",
+        "39 argument size growth velocity",
+        "40 dangerous pattern hit",
+        "41 off-task target distance"
       ],
-      "threshold_rationale": "margin-midpoint fallback on the validation fold (highest clean 0.638, lowest waste 0.998): ~0.18 margin both sides. Held-out test fold recall/precision 1.000. Deliberately conservative: a nudge that cries wolf gets ignored.",
+      "threshold_rationale": "conservative threshold 0.95 on the validation fold to minimize false alarms while catching runaway tool loops and destructive patterns.",
       "mechanical": {
         "loop_evidence_floor_calls": 3,
         "USELESS_RESULT_CHARS": 80
       }
     },
     "compaction": {
-      "arch": [33, 104, 44, 1],
-      "params": 8201,
-      "threshold": 0.41,
+      "arch": [41, 128, 64, 1],
+      "params": 13697,
+      "threshold": 0.47,
       "blob": {
-        "file": "crates/sofuu-core/src/ml/compaction/weights_v1.f32",
-        "bytes": 32832,
-        "weight_bytes": 32804,
-        "crc32": 1358192304,
-        "fnv1a64_blob": "c346aad8db948a11",
-        "sha256_blob": "ee8016ba10c4c6da942a15a9718a9791d67f6caf042b2ca762456c37f92b5e04",
+        "file": "crates/sofuu-core/src/ml/compaction/weights_v2.f32",
+        "bytes": 54816,
+        "weight_bytes": 54788,
+        "crc32": 114479263,
+        "fnv1a64_blob": "d266e12b37f8ac15",
+        "sha256_blob": "da531efb4863411db68f8f4bc419aecb478c361738b04c1ca482fa317236ac34",
         "trailing_data": false
       },
-      "features": 33,
+      "features": 41,
       "slots": [
         "0  age / max age",
         "1  log age (/10)",
@@ -212,9 +235,17 @@
         "29 old-but-referenced interaction",
         "30 old-and-retrievable interaction",
         "31 position in history",
-        "32 instruction language"
+        "32 instruction language",
+        "33 forward citation count (symbols referenced in subsequent segments)",
+        "34 unresolved error flag",
+        "35 configuration state marker",
+        "36 user constraint echo",
+        "37 turn duration seconds norm",
+        "38 patch application target (contains diff markers)",
+        "39 consecutive assistant monologue depth",
+        "40 semantic density ratio (distinct tokens / length)"
       ],
-      "threshold_rationale": "margin-midpoint on the validation fold (highest keep 0.000, lowest disposable 0.824). Held-out test fold precision/recall 1.000 at it. Keep-safety orientation: a load-bearing segment must never be flagged.",
+      "threshold_rationale": "threshold 0.47 selected on validation fold with seed 2 sweep, enforcing 0 false positives on load-bearing decisions while flagging disposable segments.",
       "mechanical": {
         "KEEP_WINDOW_AGE": 1,
         "MECHANICAL_DUP_COSINE": 0.95,
@@ -225,19 +256,19 @@
       }
     },
     "alloc": {
-      "arch": [24, 96, 40, 1],
-      "params": 6321,
-      "threshold": 0.51,
+      "arch": [30, 128, 64, 1],
+      "params": 12289,
+      "threshold": 0.48,
       "blob": {
-        "file": "crates/sofuu-core/src/ml/alloc/weights_v1.f32",
-        "bytes": 25312,
-        "weight_bytes": 25284,
-        "crc32": 3468259067,
-        "fnv1a64_blob": "71c6ddc29a182378",
-        "sha256_blob": "d79c93884f9e66cc1849dda52959fd64ff06572550457e65be550b6a624f0f85",
+        "file": "crates/sofuu-core/src/ml/alloc/weights_v2.f32",
+        "bytes": 49184,
+        "weight_bytes": 49156,
+        "crc32": 131679184,
+        "fnv1a64_blob": "7cfa4ad8a590519a",
+        "sha256_blob": "1146e2a3ffd08f0535b4f03a55773e4c3de15da5d4833ae83923a2c2b18746d3",
         "trailing_data": false
       },
-      "features": 24,
+      "features": 30,
       "slots": [
         "0  window size (log2/20)",
         "1  caps-known flag",
@@ -262,9 +293,15 @@
         "20 output-starved recently flag",
         "21 slack fraction",
         "22 turns until full (log2/6)",
-        "23 feasible output reserve"
+        "23 feasible output reserve",
+        "24 thinking token acceleration (growth accel if thinking active)",
+        "25 streaming jitter / latency variance flag",
+        "26 multi-modal payload weight (attachment / window)",
+        "27 rate-limit backoff signal (recent throttling)",
+        "28 projected turns to completion",
+        "29 tool schema overhead ratio"
       ],
-      "threshold_rationale": "selected on the VALIDATION fold at the recall floor (trainer: test acc 0.986, recall 0.994, precision 0.988). A missed pressure event is the provider-400 failure class the model exists to prevent; a false alarm only compacts early.",
+      "threshold_rationale": "selected on validation fold at 0.48 with recall 0.98+ to prevent provider-400 context window overflows.",
       "mechanical": {
         "UNKNOWN_WINDOW": 32768,
         "UNKNOWN_MAX_OUTPUT": 4096,

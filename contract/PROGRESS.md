@@ -411,6 +411,10 @@ both the generator and the checker skip them (`d92ff9599`).
   `verify_dist: ok`, `SCOREBOARD: OK`. Two onboarding defects were found and
   fixed on the way: the missing libuv step (`360832fc8`, now `make deps`) and
   the verify-dist declared-gap env (`3cefa32d9`).
+- **Evidence**: the gate's first fully green matrix run with the harness
+  fixes is `40486855259` @ `8c19d7d10`; its macOS artifact is 52 cases —
+  42 PASS / 0 FAIL / 10 BLOCKED, `capability_posture_ok: true`,
+  `install_integrity.verify_dist: ok`.
 - **Still open (the P6 exit)**: zero external deployments, zero upgrade
   drills, zero independent conformance proofs. The ledger and protocol
   (`contract/adoption/README.md`) are ready; recruiting the first outside
@@ -433,13 +437,12 @@ both the generator and the checker skip them (`d92ff9599`).
    queued for a `macos-latest` runner; a targeted job re-run acquired one
    and went green, so treat a queued-then-cancelled macOS job as
    infrastructure, not a code verdict.
-3. ~~Local-load flakes worth knowing~~ — **load-aware bounds landed
-   2026-10-27** (`8f5bdb54a` T2.1, `15809e197` T2.3): both harnesses count
-   the excess over their expected poll interval into a capped slack and print
-   it, and T2.1 now polls `pgrep` for up to 2 s instead of taking one
-   snapshot. A real engine delay or surviving child still fails. The gate
-   below makes this class fatal, so keep tuning if a new runner shape
-   produces lag beyond the 5 s slack budget.
+3. ~~Local-load flakes worth knowing~~ — **fixed 2026-10-27**
+   (`8f5bdb54a`, `15809e197`, `8c19d7d10`): both harnesses count scheduler
+   slack into their bounds, and the orphan checks now match only the harness's
+   own child (`exec -a` marker + `pgrep -f`), so an unrelated `sleep` on a
+   loaded machine cannot fail the case. T2.3 also treats a post-cancel
+   rejection as a legitimate terminal instead of failing the settle race.
 4. **Flip the suite to blocking** — the board is 42/0/10 and the FAIL list
    is empty, but the runner exits 1 when cases are BLOCKED, so every CI
    step still runs it in report mode. The P6 scoreboard gate already blocks

@@ -8437,6 +8437,23 @@ const SPEC_B: usize = 128;
                 for _ in 0..8 {
                     plan.push((output.tensor_type, vocab, dim, gguf.data_offset + output.offset));
                 }
+            } else if std::env::var("SOFUU_GEMV_BENCH").map(|v| v == "full").unwrap_or(false) {
+                // SOFUU_GEMV_BENCH=full: the COMPLETE per-layer projection stream
+                // a decode token issues — q, k, v, o, gate, up, down for every
+                // layer, at their real shapes — so the measured rate is the
+                // token's own GEMV stream rather than two representatives of it.
+                // This is what separates "the kernels are slower inside a token"
+                // from "the token spends its time elsewhere": 196 dispatches,
+                // ~248 MB, one commit, same weights the decode reads.
+                for l in layers.iter() {
+                    plan.push((l.attn_q.tensor_type, q_rows, dim, gguf.data_offset + l.attn_q.offset));
+                    plan.push((l.attn_k.tensor_type, kv_rows, dim, gguf.data_offset + l.attn_k.offset));
+                    plan.push((l.attn_v.tensor_type, kv_rows, dim, gguf.data_offset + l.attn_v.offset));
+                    plan.push((l.attn_output.tensor_type, dim, q_rows, gguf.data_offset + l.attn_output.offset));
+                    plan.push((l.ffn_gate.tensor_type, inter, dim, gguf.data_offset + l.ffn_gate.offset));
+                    plan.push((l.ffn_up.tensor_type, inter, dim, gguf.data_offset + l.ffn_up.offset));
+                    plan.push((l.ffn_down.tensor_type, dim, inter, gguf.data_offset + l.ffn_down.offset));
+                }
             } else {
                 for l in layers.iter() {
                     plan.push((l.ffn_gate.tensor_type, inter, dim, gguf.data_offset + l.ffn_gate.offset));
@@ -8496,6 +8513,51 @@ const SPEC_B: usize = 128;
                 }
             }
             eprintln!("[gemv-bench] best {best:.1} GB/s");
+
+            // ── paired A/B on DEVICE time ──────────────────────────────────
+            // SOFUU_GEMV_BENCH_AB="4,6" runs the same plan with each arm as
+            // adjacent commits (ABBA per round) and reports GPUStartTime/
+            // GPUEndTime per commit, so a noisy neighbour shows up in both
+            // arms of a pair instead of between two process runs.
+            if let Ok(spec) = std::env::var("SOFUU_GEMV_BENCH_AB") {
+                let arms: Vec<i32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                if arms.len() >= 2 {
+                    let rounds: usize = std::env::var("SOFUU_GEMV_BENCH_AB_N")
+                        .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+                    let outs = [slots.xo, slots.gate, slots.up, slots.qa];
+                    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+                    for r in 0..rounds {
+                        let order: Vec<usize> = if r % 2 == 0 {
+                            (0..arms.len()).collect()
+                        } else {
+                            (0..arms.len()).rev().collect()
+                        };
+                        for &ai in order.iter() {
+                            engine.set_gemv_b1(arms[ai]);
+                            if !engine.batch_open() { break; }
+                            for (i, (ty, rows, cols, w_off)) in plan.iter().enumerate() {
+                                let _ = engine.batch_gguf(*ty, &w_buf, *w_off, &act_buf, slots.x,
+                                                          &act_buf, outs[i % outs.len()], *rows, *cols);
+                            }
+                            let _ = engine.batch_end();
+                            let us = engine.last_gpu_us();
+                            if us > 0.0 {
+                                samples[ai].push(total_bytes as f64 / 1e9 / (us / 1e6));
+                                eprintln!("[gemv-ab] arm={} round={r} gpu_us={us:.0} -> {:.1} GB/s",
+                                    arms[ai], total_bytes as f64 / 1e9 / (us / 1e6));
+                            }
+                        }
+                    }
+                    for (ai, a) in arms.iter().enumerate() {
+                        let mut v = samples[ai].clone();
+                        if v.is_empty() { continue; }
+                        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                        let med = v[v.len() / 2];
+                        eprintln!("[gemv-ab] ARM {} med={:.1} min={:.1} max={:.1} GB/s (n={})",
+                            a, med, v[0], v[v.len() - 1], v.len());
+                    }
+                }
+            }
         }
         // P1 (llama.cpp parity): the GEMM prefill slab, built only when the
         // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B =

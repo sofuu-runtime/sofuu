@@ -1844,6 +1844,32 @@ impl InferEngine {
                         &next_logits[..8.min(next_logits.len())]
                     );
                 }
+                // DIAGNOSTIC ONLY: the decode path's own full-vocabulary logit
+                // vector for this step (SOFUU_DUMP_LOGITS covers the prefill
+                // projection, which does not run the b=1 GEMV at all). Written
+                // raw little-endian f32 in the same SFLOG01 container so two
+                // binaries/kernels can be compared bit for bit.
+                if step == 1 {
+                    if let Ok(p) = std::env::var("SOFUU_DUMP_LOGITS_DEC") {
+                        let mut bytes = Vec::with_capacity(next_logits.len() * 4 + 64);
+                        bytes.extend_from_slice(b"SFLOG01\0");
+                        bytes.extend_from_slice(&(next_logits.len() as u64).to_le_bytes());
+                        for v in next_logits.iter() {
+                            bytes.extend_from_slice(&v.to_le_bytes());
+                        }
+                        match std::fs::write(&p, &bytes) {
+                            Ok(()) => eprintln!(
+                                "[logits-dump-dec] {} n={} argmax={} top={:.6}",
+                                p,
+                                next_logits.len(),
+                                next_logits.iter().enumerate()
+                                    .fold(0usize, |b, (i, v)| if *v > next_logits[b] { i } else { b }),
+                                next_logits.iter().cloned().fold(f32::MIN, f32::max)
+                            ),
+                            Err(e) => eprintln!("[logits-dump-dec] write failed: {e}"),
+                        }
+                    }
+                }
                 // W3 probe: time everything AFTER forward returns (logits copy + sampler +
                 // token probe). If this carries the bulk of the wall time, the [dp] forward
                 // figure is encode-time only and the real wait is a late GPU sync.

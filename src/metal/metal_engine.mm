@@ -234,6 +234,7 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_gemv_q4_k_v2;
     bool pso_gemv_q4_k_v2_live;
     id<MTLComputePipelineState> pso_gemv_q4_k_b1blk;
+    id<MTLComputePipelineState> pso_gemv_q4_k_b1v2;
     id<MTLComputePipelineState> pso_gemv_q4_k;
     id<MTLComputePipelineState> pso_gemv_q6_k;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4;
@@ -452,15 +453,33 @@ static inline void sofuu_batch_barrier(MetalContext* ctx) {
 #include "kernels_metal.h"
 
 
-// Decode (b=1) q4_K GEMV kernel choice: gemv_q4_k_b1blk by default, SOFUU_GEMV_B1=0
-// restores the shipped per-row kernel for an A/B on one binary.
+static int g_gemv_b1_override = -1;
+static double g_last_gpu_us = 0.0;
+
+// Decode (b=1) q4_K GEMV kernel choice (SOFUU_GEMV_B1):
+//   6 (default) = gemv_q4_k_b1v2   — the shipped decode kernel
+//   4 or 1      = gemv_q4_k_b1blk  — the kernel it replaced, kept as the A/B
+//                                    reference (bit-identical output, measured
+//                                    ~5% slower on the real token GEMV stream)
+//   0           = the older per-row gemv_q4_k_c2 path
+// Arms are read once per process; sofuu_metal_set_gemv_b1() lets the GEMV probe
+// switch them inside one process (SOFUU_GEMV_BENCH_AB).
 static inline int sofuu_gemv_b1_on(void) {
     static int on = -1;
     if (on < 0) {
         const char* v = getenv("SOFUU_GEMV_B1");
-        on = v ? atoi(v) : 4;
+        on = v ? atoi(v) : 6;
     }
     return on;
+}
+
+// A/B instrumentation: lets the GEMV probe switch the decode q4_K kernel inside
+// one process, so the two arms are measured against the same machine state.
+extern "C" void sofuu_metal_set_gemv_b1(int v) { g_gemv_b1_override = v; }
+// Device-side (GPUStartTime/GPUEndTime) duration of the last committed batch.
+extern "C" double sofuu_metal_last_gpu_us(void) { return g_last_gpu_us; }
+static inline int sofuu_gemv_b1_arm(void) {
+    return g_gemv_b1_override >= 0 ? g_gemv_b1_override : sofuu_gemv_b1_on();
 }
 
 // Decode attention warps per query head: 32 (llama_attn_w32) by default, 16 (the
@@ -704,6 +723,7 @@ void* sofuu_metal_init(void) {
         ctx->pso_gemv_q4_0 = load_pso(@"gemv_q4_0");
         ctx->pso_gemv_q4_k = load_pso(@"gemv_q4_k");
         ctx->pso_gemv_q4_k_b1blk = load_pso(@"gemv_q4_k_b1blk");
+        ctx->pso_gemv_q4_k_b1v2 = load_pso(@"gemv_q4_k_b1v2");
         // SOFUU_Q4K_COALESCED=1 flips BOTH q4_K PSOs to the coalesced-lane
         // kernels — one kernel class per engine instance so serial, spec and
         // b4 GEMVs all share the same f32 summation order (text parity holds
@@ -1234,9 +1254,10 @@ static inline bool wait_and_report(id<MTLCommandBuffer> cmd, const char* kernel)
     // that attributes the spec-pass overhead without an Instruments trace
     static int timing = -1;
     if (timing < 0) { const char* t = getenv("SOFUU_GPU_TIMING"); timing = (t && atoi(t) != 0) ? 1 : 0; }
+    g_last_gpu_us = (cmd.GPUEndTime - cmd.GPUStartTime) * 1e6;
     if (timing) {
         fprintf(stderr, "SOFUU_CMD_TIMING kernel=%s gpu_us=%.0f\n",
-                kernel, (cmd.GPUEndTime - cmd.GPUStartTime) * 1e6);
+                kernel, g_last_gpu_us);
     }
     return true;
 }
@@ -4938,15 +4959,22 @@ int sofuu_metal_batch_gguf(
     // Decode (b=1) q4_K GEMV: one whole 144-byte block per thread. This is the
     // measured winner over the shipped per-row kernel ("SOFUU_GEMV_B1=0" restores
     // that one, which is also the fallback for any shape this branch declines).
-    if (ty == 12 && sofuu_gemv_b1_on() != 0 && ctx->pso_gemv_q4_k_b1blk != nil
+    if (ty == 12 && sofuu_gemv_b1_arm() != 0 && ctx->pso_gemv_q4_k_b1blk != nil
         && cols % 256 == 0 && cols <= 4096 && (w_offset & 15) == 0) {
+        // SOFUU_GEMV_B1: 6 (default) = gemv_q4_k_b1v2, the shipped decode kernel;
+        // 1/4 = gemv_q4_k_b1blk, the kernel it replaces, kept as the A/B
+        // reference for SOFUU_GEMV_BENCH_AB; 0 = the older per-row c2 path.
+        int arm = sofuu_gemv_b1_arm();
+        id<MTLComputePipelineState> kp = (arm == 6) ? ctx->pso_gemv_q4_k_b1v2
+                                                    : ctx->pso_gemv_q4_k_b1blk;
+        if (kp == nil) { kp = ctx->pso_gemv_q4_k_b1blk; }
         uint nb = (uint)(cols >> 8);
         uint rpt = 256u / nb;               // whole rows this threadgroup covers
         sofuu_batch_barrier(ctx);
         size_t aligned = w_offset & ~255ULL;
         uint w_rem = (uint)(w_offset & 255ULL);
         uint c = (uint)cols, r = (uint)rows;
-        [ctx->batch_enc setComputePipelineState:ctx->pso_gemv_q4_k_b1blk];
+        [ctx->batch_enc setComputePipelineState:kp];
         [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)w_buf_ptr offset:aligned atIndex:0];
         [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)x_buf_ptr offset:x_offset atIndex:1];
         [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)y_buf_ptr offset:y_offset atIndex:2];

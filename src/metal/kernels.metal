@@ -5997,7 +5997,8 @@ kernel void bw_probe_q4k(
         }
     }
 
-    for (uint bb = active; bb < nblk && mode != 4u && mode != 5u; bb += active_total) {
+
+    for (uint bb = active; bb < nblk && mode < 4u; bb += active_total) {
         uint b = base + bb;
         device const uint4 *p = (device const uint4 *)(w + (size_t)b * 144);
         uint4 a = p[0], c = p[1], d4 = p[2], e = p[3];
@@ -6352,6 +6353,27 @@ static inline uint u4_comp(uint4 v, uint c) {
     return (c == 0u) ? v.x : (c == 1u) ? v.y : (c == 2u) ? v.z : v.w;
 }
 
+// The same scale/min decode as q4k_scale_min, but from the three scale words
+// of an already-loaded block header (A = scales[0..3], B = scales[4..7],
+// C = scales[8..11]) and returning (d | m << 8). Every shift is a compile-time
+// constant once the caller's loops unroll, so this is register arithmetic —
+// where the device-pointer form re-reads up to two bytes per call.
+static inline uint q4k_scmin_pack(uint A, uint B, uint C, uint j) {
+    uint d, m;
+    if (j < 4u) {
+        d = (A >> (8u * j)) & 63u;
+        m = (B >> (8u * j)) & 63u;
+    } else {
+        uint i = j - 4u;
+        uint a = (A >> (8u * i)) & 0xFFu;
+        uint bb = (B >> (8u * i)) & 0xFFu;
+        uint c = (C >> (8u * i)) & 0xFFu;
+        d = (c & 0x0Fu) | ((a >> 6) << 4);
+        m = (c >> 4) | ((bb >> 6) << 4);
+    }
+    return d | (m << 8);
+}
+
 // ── b=1 q4_K GEMV: one whole 144-byte block per thread ──────────────────────
 // The measured shape of the problem (SOFUU_BW_PROBE + the per-shape ablation):
 // the q4_K projection class costs 3722 us of a 14640 us decode batch, and its
@@ -6437,6 +6459,90 @@ kernel void gemv_q4_k_b1blk(
         }
     }
 }
+
+
+// ── b=1 q4_K GEMV, vector-wide header + nibble unpack ───────────────────────
+// Same mapping, same dequant values, same per-block accumulation ORDER as
+// gemv_q4_k_b1blk — every output row's dot is summed in exactly the same
+// sequence, so this is bit-identical by construction. What changes is how much
+// work each of the 256 values costs, which the ablation ladder says is where
+// the kernel actually spends its time (SOFUU_GEMV_B1=20 runs the same mapping
+// with the math removed: 103 GB/s against 55 for the shipped body, while the
+// same bytes coalesced instead of 144-byte-strided measure the same 103 —
+// addressing is NOT the cost, the per-value instruction count is):
+//
+//   * the 16-byte block header (d, dmin, twelve scale bytes) arrives in ONE
+//     uint4 load instead of sixteen device byte reads through a pointer;
+//   * the nibble unpack becomes two masks plus two vector conversions
+//     (as_type<uchar4> + float4) instead of eight shifts, eight masks and
+//     eight scalar conversions per word;
+//   * the qs word is loaded in its own iteration, so one 16-byte word is live
+//     at a time instead of eight.
+//
+// The values are the shipped d*sc*nib - dmin*m with the shipped mapping and the
+// shipped grouping, so no rounding path changes. Measured against
+// gemv_q4_k_b1blk on this machine with the SOFUU_GEMV_BENCH probe.
+kernel void gemv_q4_k_b1v2(
+    device const uchar  *w_base      [[buffer(0)]],
+    device const float  *x           [[buffer(1)]],
+    device float        *y           [[buffer(2)]],
+    constant uint       &cols        [[buffer(3)]],
+    constant uint       &w_rem       [[buffer(4)]],
+    constant uint       &rows        [[buffer(5)]],
+    uint tg                          [[threadgroup_position_in_grid]],
+    uint tid                         [[thread_position_in_threadgroup]]
+) {
+    threadgroup float part[GB6_THREADS];
+    uint nb = cols >> 8;
+    uint rpt = GB6_THREADS / nb;
+    uint njobs = rpt * nb;
+    uint job = tg * njobs + tid;
+    uint r = job / nb;
+    uint b = job - r * nb;
+    uint row0 = tg * rpt;
+    float4 acc = 0.0f;
+    if (tid < njobs && r < rows) {
+        size_t off = (size_t)w_rem + (size_t)r * nb * 144u + (size_t)b * 144u;
+        uint4 hd = *(device const uint4 *)(w_base + off);
+        float d = float(as_type<half>(ushort(hd.x & 0xFFFFu)));
+        float dmin = float(as_type<half>(ushort(hd.x >> 16u)));
+        uint scA = hd.y, scB = hd.z, scC = hd.w;
+        uint xb = b * 256u;
+        device const uint4 *qs = (device const uint4 *)(w_base + off + 16u);
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; ++j) {
+            uint4 q = qs[j];
+            uint g = j >> 1;
+            uint hs = j & 1u;
+            uint p1 = q4k_scmin_pack(scA, scB, scC, 2u * g);
+            uint p2 = q4k_scmin_pack(scA, scB, scC, 2u * g + 1u);
+            float s1 = d * float(p1 & 0xFFu), f1 = dmin * float((p1 >> 8) & 0xFFu);
+            float s2 = d * float(p2 & 0xFFu), f2 = dmin * float((p2 >> 8) & 0xFFu);
+            uint xo = xb + g * 64u + hs * 16u;
+#pragma clang loop unroll(full)
+            for (uint c = 0; c < 4; ++c) {
+                uint comp = u4_comp(q, c);
+                float4 lo4 = float4(as_type<uchar4>(comp & 0x0F0F0F0Fu));
+                float4 hi4 = float4(as_type<uchar4>((comp >> 4) & 0x0F0F0F0Fu));
+                float4 xl = *(device const float4 *)(x + xo + 4u * c);
+                float4 xh = *(device const float4 *)(x + xo + 32u + 4u * c);
+                acc += (float4(s1) * lo4 - float4(f1)) * xl
+                     + (float4(s2) * hi4 - float4(f2)) * xh;
+            }
+        }
+    }
+    part[tid] = (acc.x + acc.y) + (acc.z + acc.w);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < rpt) {
+        uint row = row0 + tid;
+        if (row < rows) {
+            float s = 0.0f;
+            for (uint k = 0; k < nb; ++k) { s += part[tid * nb + k]; }
+            y[row] = s;
+        }
+    }
+}
+
 
 // ── decode attention, warp-cooperative ──────────────────────────────────────
 // The serial kernel gives each lane a whole position, so every step of its q.k dot

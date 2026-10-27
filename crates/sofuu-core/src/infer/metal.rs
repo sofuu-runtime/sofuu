@@ -171,6 +171,18 @@ impl MetalEngine {
     pub fn bw_probe(&self, w_buf: *mut c_void, nbytes: usize, threads: usize, iters: usize, lanes: usize, tgsz: usize, mode: usize, slice_blocks: usize) -> f32 {
         unsafe { sofuu_metal_bw_probe(self.ctx, w_buf, nbytes, threads, iters, lanes, tgsz, mode, slice_blocks) }
     }
+
+    /// A/B instrumentation (SOFUU_GEMV_BENCH_AB): switch the decode q4_K GEMV
+    /// arm inside one process so both arms see the same machine state.
+    pub fn set_gemv_b1(&self, arm: i32) {
+        unsafe { sofuu_metal_set_gemv_b1(arm) }
+    }
+
+    /// Device-side duration (GPUStartTime/GPUEndTime) of the last committed
+    /// batch, in microseconds. 0.0 when the platform has no Metal.
+    pub fn last_gpu_us(&self) -> f64 {
+        unsafe { sofuu_metal_last_gpu_us() }
+    }
     pub fn new() -> Option<Self> {
         unsafe {
             if !sofuu_metal_available() {
@@ -1138,6 +1150,8 @@ extern "C" {
         w_buf: *mut c_void, nbytes: usize,
         threads: usize, iters: usize, lanes: usize, tgsz: usize, mode: usize, slice_blocks: usize,
     ) -> f32;
+    fn sofuu_metal_set_gemv_b1(v: i32);
+    fn sofuu_metal_last_gpu_us() -> f64;
     fn sofuu_metal_batch_gguf_gemv_q4k_v2(
         ctx: *mut c_void,
         w_buf: *mut c_void, w_offset: usize,

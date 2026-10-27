@@ -667,7 +667,49 @@ impl TransformerModel {
         // site stays stride-correct, while compaction triggers / F-LC1
         // refusals consult logical_max_seq_len.
         let logical_max_seq_len = final_seq_len;
-        let kv_ring = if kv_ring_req > 0 && kv_ring_req < final_seq_len {
+        // ---- KV4: quantized KV cache on the GPU decode path ---------------
+        // The history is stored as 32-token packed blocks (4-bit by default),
+        // so the f32 arrays only have to hold the residual ring - the same
+        // f32-vs-logical split the P7 ring above already relies on. This is
+        // decided BEFORE the caches are allocated: sizing them is the point,
+        // since a 4096-token f32 K+V cache on a 28-layer 0.6B is 940 MB.
+        // The measured default is F32: 4-bit KV does not hold the ~1% ppl band
+        // on the whole local fleet (SmolLM2-360M Q8_0 +7.7% at 3.7k context)
+        // and greedy output drifts from the f32 arm on every model. Opt in with
+        // --kv-dtype 4 (SOFUU_KV_DTYPE=4); see contract/KV4-OPERATOR-NOTE.md.
+        let kv_dtype =
+            crate::infer::kv4::KvDtype::from_env().unwrap_or(crate::infer::kv4::KvDtype::F32);
+        let kv4_geom = n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+            && head_dim > 0
+            && head_dim <= 128
+            && head_dim % crate::infer::kv4::GROUP == 0;
+        let kv4_ring_min = crate::infer::kv4::ring_rows(crate::infer::kv4::MAX_CHUNK);
+        let kv4_want = kv_dtype.is_quantized()
+            && gpu_allowed
+            && cfg!(target_os = "macos")
+            && std::env::var("SOFUU_GPU_DECODE").map(|v| v != "0").unwrap_or(true)
+            && gguf.resident.is_none()
+            && kv4_geom
+            && final_seq_len > kv4_ring_min;
+        if kv_dtype.is_quantized() && !kv4_want {
+            eprintln!(
+                "[kv4] {} KV cache requested, but it does not apply here (gpu_allowed={gpu_allowed} geometry_ok={kv4_geom} ctx={final_seq_len} resident={}) - keeping the f32 KV cache",
+                kv_dtype.label(),
+                gguf.resident.is_some()
+            );
+        } else if kv4_want {
+            eprintln!(
+                "[kv4] {} KV cache: {} -token blocks, f32 residual ring {} rows, logical window {} (--kv-dtype f32 restores the byte-identical f32 cache)",
+                kv_dtype.label(),
+                crate::infer::kv4::BLOCK,
+                kv4_ring_min,
+                final_seq_len,
+            );
+        }
+        let kv_ring = if kv4_want {
+            kv4_ring_min
+        } else if kv_ring_req > 0 && kv_ring_req < final_seq_len {
             kv_ring_req
         } else {
             0
@@ -854,7 +896,7 @@ impl TransformerModel {
             );
         }
 
-        let config = ModelConfig {
+        let mut config = ModelConfig {
             dim,
             n_layers,
             n_heads,
@@ -1071,10 +1113,10 @@ impl TransformerModel {
         // yield (it falls back to the per-row kernels) rather than starve the
         // KV cache and abort the load.
         let kv_mb = kv_cache_size / (1 << 18); // f32 bytes / 2^20
-        let k_cache = AnonBuffer::try_new(kv_cache_size).map_err(|e| {
+        let mut k_cache = AnonBuffer::try_new(kv_cache_size).map_err(|e| {
             format!("cannot allocate the KV cache ({kv_mb} MB x2 for the configured context): {e}")
         })?;
-        let v_cache = AnonBuffer::try_new(kv_cache_size)
+        let mut v_cache = AnonBuffer::try_new(kv_cache_size)
             .map_err(|e| format!("cannot allocate the second KV cache ({kv_mb} MB): {e}"))?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         // The one place the GPU rope gate is decided; None = armable. Kept as a
@@ -1145,7 +1187,30 @@ impl TransformerModel {
                 // gated; SOFUU_GPU_ROPE_LLAMA3=1 opts in for a measurement.
                 && rope_gpu_ok;
             if wanted {
-                let armed = GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm);
+                let mut armed = GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm, kv_dtype);
+                if armed.is_none() && kv4_want {
+                    // The quantized cache could not be built (each refusal is
+                    // named above). The f32 arrays were sized to the residual
+                    // ring and the CPU route cannot address that: restore the
+                    // full f32 cache and arm again in plain f32 mode, so this
+                    // degrades to the shipped semantics instead of answering
+                    // from a fraction of the history.
+                    eprintln!("[kv4] the quantized cache could not be armed - restoring the full f32 KV cache ({final_seq_len} tokens) and continuing with f32 KV semantics");
+                    config.max_seq_len = final_seq_len;
+                    let full = n_layers * final_seq_len * kv_dim;
+                    match (AnonBuffer::try_new(full), AnonBuffer::try_new(full)) {
+                        (Ok(k), Ok(v)) => {
+                            k_cache = k;
+                            v_cache = v;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "cannot allocate the f32 KV cache fallback ({full} f32 slots x2)"
+                            ));
+                        }
+                    }
+                    armed = GgufGpu::arm(&gguf, &config, &layers, vocab_size, &k_cache, &v_cache, is_gemma2, &output, &output_norm, crate::infer::kv4::KvDtype::F32);
+                }
                 if armed.is_none() {
                     // Silent until now, and a silent None means the whole model
                     // decodes on the CPU: the exact shape of the "zero GPU
@@ -1467,6 +1532,41 @@ impl TransformerModel {
     /// physical memory (≈0.5 s on the Pi 5, once per fresh prompt) and keep it
     /// resident for a conversation that may never use it.
     /// `SOFUU_KV_ZERO=1` restores the fill for deterministic cache dumps.
+    /// True when the quantized KV cache owns the history: the f32 arrays then
+    /// hold only the residual ring, so nothing that walks them as if they were
+    /// the full prefix may run.
+    pub fn kv4_armed(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            self.gpu.as_ref().map(|g| g.kv4.is_some()).unwrap_or(false)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            false
+        }
+    }
+
+    /// KV precision the GPU decode path actually armed (0 = the f32 cache).
+    pub fn kv_bits(&self) -> u32 {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            self.gpu
+                .as_ref()
+                .and_then(|g| g.kv4.as_ref().map(|k| k.layout.bits))
+                .unwrap_or(0)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            0
+        }
+    }
+
+    /// The context bound every position-taking route must respect. With KV4
+    /// armed the CACHE row count is the residual ring, not the context.
+    pub fn logical_ctx(&self) -> usize {
+        self.config.logical_max_seq_len
+    }
+
     pub fn reset_cache(&mut self) {
         static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let zero = *ZERO.get_or_init(|| super::quant::env_flag("SOFUU_KV_ZERO"));
@@ -1481,6 +1581,11 @@ impl TransformerModel {
             }
         }
         self.kivi = None;
+        // KV4: positions restart here, so the block roll cursor must too
+        // (blocks_needed() is a pure function of pos).
+        if let Some(g) = self.gpu.as_mut() {
+            g.kv4_qb_done = 0;
+        }
     }
 
     // ── Shared-prefix KV blocks (prefix_cache) ──────────────────────
@@ -1599,6 +1704,13 @@ impl TransformerModel {
     /// Enable KIVI 2-bit or 4-bit Asymmetric Quantized KV Cache.
     /// Ingests any prefilled tokens from `k_cache` and `v_cache` into historical quantized blocks.
     pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
+        if self.kv4_armed() {
+            // The quantized cache holds only a 192-row f32 ring; KIVI would
+            // quantize that ring and read it as if it were the whole history.
+            kv4_fatal(
+                "kivi armed on the quantized GPU KV cache (its f32 history is only a ring) - pass --kv-dtype f32",
+            );
+        }
         // P6 contract (long-context §8): the quantized-KV decode path runs
         // the CPU layer loop only — execute_layers_checked bypasses the GPU
         // whole-layer batch while KIVI is armed (`kivi.is_none()` gate), so a
@@ -2544,6 +2656,13 @@ impl TransformerModel {
             return &self.logits;
         }
 
+        // KV4: the CPU chunk route writes f32 rows AT pos, and those arrays
+        // are only the residual ring - the packed blocks would silently miss
+        // the whole chunk. Stop instead of answering from a broken history.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.kv4_armed() {
+            kv4_fatal("prefill chunk route (GPU chunk pass refused)");
+        }
         self.forward_batch_layers_chunk(tokens, start_pos);
 
         if compute_last_logits {
@@ -2603,6 +2722,13 @@ impl TransformerModel {
             return;
         }
 
+        // KV4: the CPU chunk route writes f32 rows AT pos, and those arrays
+        // are only the residual ring - the packed blocks would silently miss
+        // the whole chunk. Stop instead of answering from a broken history.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.kv4_armed() {
+            kv4_fatal("prefill chunk route (GPU chunk pass refused)");
+        }
         self.forward_batch_layers_chunk(tokens, start_pos);
 
         let norm_bytes = Self::tensor_slice(&self.gguf, &self.output_norm);
@@ -3150,6 +3276,13 @@ impl TransformerModel {
                 // layers 0..(start_layer) were never touched by this call.
             }
         }
+        // KV4: the CPU layer loop writes f32 rows AT pos. The arrays are the
+        // residual ring, so this fallback would write outside the layer and
+        // read a history that is not there. Stop instead of answering.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.kv4_armed() {
+            kv4_fatal("decode layer batch (CPU fallback reached)");
+        }
         let dim = self.config.dim;
         let n_heads = self.config.n_heads;
         let n_kv_heads = self.config.n_kv_heads;
@@ -3573,7 +3706,12 @@ impl TransformerModel {
         let end = end_layer.min(self.config.n_layers);
         // Wrap-around (context past max_seq_len) stays on the 3-commit path,
         // whose KV writes match the CPU modulo arithmetic.
-        if self.gpu.as_ref().map(|g| g.one_commit).unwrap_or(false) && pos < self.config.max_seq_len {
+        let ctx_bound = if self.kv4_armed() {
+            self.config.logical_max_seq_len
+        } else {
+            self.config.max_seq_len
+        };
+        if self.gpu.as_ref().map(|g| g.one_commit).unwrap_or(false) && pos < ctx_bound {
             if !self.layers_one_commit(pos, start_layer, end) {
                 return false;
             }
@@ -3799,6 +3937,15 @@ impl TransformerModel {
 
         let g = self.gpu.as_mut().expect("one_commit without gpu");
         let token_commit = g.token_commit && start_layer == 0 && end_layer == self.config.n_layers;
+        // KV4 roll cursor for this position: the blocks that must be packed
+        // before any layer can attend. blocks_needed() is a pure function of
+        // pos, so host and kernel agree without extra state.
+        let kv4_qb_from = g.kv4_qb_done;
+        let kv4_qb_to = crate::infer::kv4::blocks_needed(pos);
+        if g.kv4.is_some() {
+            g.kv4_qb_done = kv4_qb_to;
+        }
+        let kv4_ring = if g.kv4.is_some() { max_seq_len as u32 } else { 0 };
 
         // SOFUU_DECODE_MMQ=1: per-token GEMVs through the act-quantized
         // kernels that bit-mirror the CPU's a76 dotprod serial matvec (the
@@ -3971,7 +4118,7 @@ impl TransformerModel {
                 kln_buf, kln_off,
                 has_k, pos as u32,
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
-                norm_eps, rope_freq_base, rope_mode, rope ) {
+                norm_eps, rope_freq_base, rope_mode, rope, kv4_ring ) {
                 return false;
             }
             // GPU3 chunked attention (default; the meta-overlap bug is fixed —
@@ -3979,7 +4126,57 @@ impl TransformerModel {
             // SOFUU_GPU_ATTN=0 restores the pre-GPU3 serial kernel.
             // the serial kernel is 14% cheaper per token (9.1 vs 10.6 ms/token, GPU timer).
             let attn_new = dec_attn_env && pos >= dec_attn_min;
-            if attn_new {
+            if let Some(kv4) = g.kv4.as_ref() {
+                // ---- KV4 decode attention -----------------------------------
+                // Pack the blocks that just left the f32 ring, then ONE
+                // quantized pass. Nothing else may run for this layer: the f32
+                // rows the other arms read are the residual ring, not the
+                // history, so a fallback here would answer from a fraction of
+                // the context (loud abort, never a quiet wrong answer).
+                let [o_qk, o_qks, o_qkm, o_qv, o_qvs, o_qvm] = kv4.layer_offsets(layer_idx);
+                if kv4_qb_to > kv4_qb_from {
+                    if !g.engine.batch_kv4_quant(
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        head_dim as u32, n_kv_heads as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.nblk as u32,
+                        kv4_qb_from as u32, (kv4_qb_to - kv4_qb_from) as u32,
+                        kv4.layout.bits,
+                    ) {
+                        kv4_fatal("quantize");
+                    }
+                }
+                let (qln_buf, qln_off) =
+                    (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
+                if !g.engine.batch_llama_attn_w32_kv4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    qln_buf, qln_off,
+                    &g.act_buf, g.slots.ao,
+                    has_q, pos as u32,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                    norm_eps, rope_freq_base, rope_mode, rope,
+                    &kv4.qk_buf, o_qk,
+                    &kv4.qks_buf, o_qks,
+                    &kv4.qkm_buf, o_qkm,
+                    &kv4.qv_buf, o_qv,
+                    &kv4.qvs_buf, o_qvs,
+                    &kv4.qvm_buf, o_qvm,
+                    kv4.layout.nblk as u32,
+                    crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                    kv4.layout.bits,
+                ) {
+                    kv4_fatal("decode attention");
+                }
+            } else if attn_new {
                 // GPU3: q-norm + q-RoPE as their own dispatch (no intra-dispatch
                 // race), then chunked attention partials + finish rescale.
                 if !g.engine.batch_head_rmsnorm(
@@ -4264,14 +4461,18 @@ impl TransformerModel {
         // GPU prefill, but at current q4_K kernel rates (~50GB/s class) it
         // still loses to the CPU tile path on most models — it becomes the
         // default together with the higher-bandwidth kernel generation.
-        if std::env::var("SOFUU_GPU_PREFILL")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        // KV4 has no f32 history to fall back to: this chunk pass is the only
+        // prefill route that can fill the packed blocks, so it is forced on.
+        let kv4 = self.kv4_armed();
+        if !kv4
+            && std::env::var("SOFUU_GPU_PREFILL")
+                .map(|v| v != "1")
+                .unwrap_or(true)
         {
             return false;
         }
         let b = tokens.len();
-        if b < 2 || b > 128 || start_pos + b > self.config.max_seq_len {
+        if b < 2 || b > 128 || start_pos + b > self.logical_ctx() {
             return false;
         }
         // The chain pass takes the SAME rope profile as decode: n_rot, mscale
@@ -4610,7 +4811,7 @@ impl TransformerModel {
         gpu_rows: usize,
         want_logits: bool,
     ) -> bool {
-        if start_pos + tokens.len() > self.config.max_seq_len {
+        if start_pos + tokens.len() > self.logical_ctx() {
             return false;
         }
         // The CPU arm holds &mut self (the tile path's batch buffers), so the
@@ -5178,6 +5379,9 @@ impl TransformerModel {
             cfg.rope_freq_base,
             rope_mode,
             crate::infer::metal::RopeKernel::plain(),
+            // KV4 never reaches the spec-verify chain: spec_chain_ready
+            // refuses it, so 0 keeps the shipped absolute row addressing.
+            0,
         );
         g.engine.batch_head_rmsnorm_b4(
             &g.act_buf,
@@ -6027,6 +6231,11 @@ impl TransformerModel {
         let rope_mode: u32 = if cfg.rope_interleaved { 1 } else { 0 };
         let q_rows = n_heads * head_dim;
         let kv_rows = n_kv_heads * head_dim;
+        // KV4: blocks the chunk LAST row needs, packed once per layer after
+        // the chunk KV write and before this chunk attention (the cursor
+        // advances once per chunk, on the last layer - see below).
+        let kv4_qb_from = g.kv4_qb_done;
+        let kv4_qb_to = crate::infer::kv4::blocks_needed(start_pos + b - 1);
     // GEMV of one tensor over the whole chain: batch_gguf_b4 when the
     // tensor is q4_K (the b4 kernel's token-major [4][cols]/[4][rows]
     // layout matches the x/xn/qa/gate... slot regions exactly), one
@@ -6382,6 +6591,7 @@ impl TransformerModel {
                 head_dim as u32, n_kv_heads as u32, max_seq_len as u32,
                 norm_eps, rope_freq_base, rope_mode,
                 rope,
+                if g.kv4.is_some() { max_seq_len as u32 } else { 0 },
             );
             g.engine.batch_head_rmsnorm_b4(
                 &g.act_buf, g.slots.qa,
@@ -6402,16 +6612,72 @@ impl TransformerModel {
             // means nothing was dispatched (pipeline missing, unsupported
             // geometry, SOFUU_PRE_ATTN=0, or SOFUU_PREW_MAXPOS below this
             // chunk), so the b4 family still owns attention in that case.
-            let row_attn = g.engine.batch_llama_attn_row(
-                &g.act_buf, g.slots.qa,
-                &g.k_buf, kc_layer,
-                &g.v_buf, kc_layer,
-                &g.act_buf, g.slots.ao,
-                &g.act_buf, g.slots.posb,
-                b,
-                head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                max_seq_len as u32,
-            );
+            let row_attn = if let Some(kv4) = g.kv4.as_ref() {
+                // ---- KV4 prefill attention ---------------------------------
+                // The chunk's rows are in the f32 ring already (kv_write_b4
+                // above); pack the blocks the chunk's last row needs, then run
+                // ONE whole-chunk pass. Rows inside the chunk read the packed
+                // blocks below nq(pos) and the ring from nq(pos) up - the same
+                // split the next decode token will use.
+                let [o_qk, o_qks, o_qkm, o_qv, o_qvs, o_qvm] = kv4.layer_offsets(layer_idx);
+                if kv4_qb_to > kv4_qb_from {
+                    if !g.engine.batch_kv4_quant(
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        head_dim as u32, n_kv_heads as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.nblk as u32,
+                        kv4_qb_from as u32, (kv4_qb_to - kv4_qb_from) as u32,
+                        kv4.layout.bits,
+                    ) {
+                        kv4_fatal("prefill quantize");
+                    }
+                }
+                if !g.engine.batch_llama_attn_pre_w32_kv4(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    cfg.logical_max_seq_len as u32,
+                    &kv4.qk_buf, o_qk,
+                    &kv4.qks_buf, o_qks,
+                    &kv4.qkm_buf, o_qkm,
+                    &kv4.qv_buf, o_qv,
+                    &kv4.qvs_buf, o_qvs,
+                    &kv4.qvm_buf, o_qvm,
+                    kv4.layout.nblk as u32,
+                    crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                    kv4.layout.bits,
+                ) {
+                    kv4_fatal("prefill attention");
+                }
+                true
+            } else {
+                g.engine.batch_llama_attn_row(
+                    &g.act_buf, g.slots.qa,
+                    &g.k_buf, kc_layer,
+                    &g.v_buf, kc_layer,
+                    &g.act_buf, g.slots.ao,
+                    &g.act_buf, g.slots.posb,
+                    b,
+                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                    max_seq_len as u32,
+                )
+            };
+            // KV4: advance the pack cursor once per chunk, when this chunk
+            // last layer has packed its blocks.
+            if g.kv4.is_some() && layer_idx + 1 == cfg.n_layers {
+                g.kv4_qb_done = kv4_qb_to;
+            }
             // pos < 128 (one softmax chunk): part+fin fuse into one
             // dispatch — one barrier drain instead of two
             let flashed = !row_attn && g.engine.batch_llama_attn_flash_b4(
@@ -6631,7 +6897,8 @@ impl TransformerModel {
         if std::env::var_os("SOFUU_CHAIN_TRACE").is_some() {
             eprintln!("[chain] core token_commit={} b={} start={}", g.token_commit, b, start_pos);
         }
-        if b < 2 || b > 128 || positions.len() != b || start_pos + b > self.config.max_seq_len {
+        let logical_ctx = self.config.logical_max_seq_len;
+        if b < 2 || b > 128 || positions.len() != b || start_pos + b > logical_ctx {
             return false;
         }
         // LEDGER #118 (fixed in #153): stale-read test. Zero every activation slot region, bounded by
@@ -6784,7 +7051,7 @@ impl TransformerModel {
         let b = tokens.len();
         // The chunk cap the slab was sized for (parsed once at arm()).
         let cap = self.gpu.as_ref().map(|g| g.pre_chunk).unwrap_or(0);
-        if !(1..=cap).contains(&b) || start_pos + b > self.config.max_seq_len {
+        if !(1..=cap).contains(&b) || start_pos + b > self.logical_ctx() {
             return false;
         }
         let g = match self.gpu.as_mut() {
@@ -7195,6 +7462,9 @@ impl TransformerModel {
                     norm_eps, rope_freq_base, rope_mode,
                     Self::gpu_rope_profile(&self.config, &self.rope_freq_adjust, g)
                         .with_table(Some((pbuf, pslots.rope))),
+                    // KV4 refuses this route (SOFUU_GPU_PREFILL_GEMM): 0 is
+                    // the shipped absolute addressing.
+                    0,
                 );
                 g.engine.batch_head_rmsnorm_b4(
                     pbuf, pslots.qa,
@@ -8510,6 +8780,62 @@ struct FeatSplit {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+/// KV4: the quantized KV cache. The packed blocks live here; the f32 residual
+/// ring is the k_cache/v_cache pair the client already binds (sized down to
+/// the ring by the constructor when KV4 is armed).
+/// KV4 dispatch refused: the quantized cache is the only copy of the history,
+/// so the CPU fallback cannot reproduce it. Stop loudly instead of answering
+/// from a cache that is not the model's state.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn kv4_fatal(what: &str) -> ! {
+    eprintln!("[kv4] FATAL: the {what} dispatch was refused with the quantized KV cache armed.");
+    eprintln!("[kv4] The history lives in packed blocks plus a residual ring, so the f32 CPU");
+    eprintln!("[kv4] fallback cannot rebuild it. Aborting rather than returning an answer from");
+    eprintln!("[kv4] a cache that is not the model state. Use --kv-dtype f32 for the f32 path.");
+    std::process::abort()
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub struct Kv4Buffers {
+    pub layout: crate::infer::kv4::Kv4Layout,
+    // Metal wrappers FIRST: fields drop in declaration order, and a wrapper
+    // must be released before the pages it wraps.
+    qk_buf: crate::infer::metal::MetalBuffer,
+    qks_buf: crate::infer::metal::MetalBuffer,
+    qkm_buf: crate::infer::metal::MetalBuffer,
+    qv_buf: crate::infer::metal::MetalBuffer,
+    qvs_buf: crate::infer::metal::MetalBuffer,
+    qvm_buf: crate::infer::metal::MetalBuffer,
+    _qk: AnonBuffer,
+    _qks: AnonBuffer,
+    _qkm: AnonBuffer,
+    _qv: AnonBuffer,
+    _qvs: AnonBuffer,
+    _qvm: AnonBuffer,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl Kv4Buffers {
+    /// Byte offsets of one layer's slice inside the six packed buffers.
+    pub fn layer_offsets(&self, layer: usize) -> [usize; 6] {
+        let ks = self.layout.k_scale_bytes();
+        let vs = self.layout.v_scale_bytes();
+        [
+            layer * self.layout.kq_bytes(),
+            layer * ks,
+            layer * ks,
+            layer * self.layout.qv_bytes(),
+            layer * vs,
+            layer * vs,
+        ]
+    }
+    /// Total bytes of packed blocks across every layer.
+    pub fn packed_bytes(&self) -> usize {
+        self.layout.kq_bytes() + 2 * self.layout.k_scale_bytes()
+            + self.layout.qv_bytes() + 2 * self.layout.v_scale_bytes()
+    }
+}
+
 pub struct GgufGpu {
     engine: crate::infer::metal::MetalEngine,
     /// Zero-copy wrap of the whole GGUF file mmap: every weight bind is
@@ -8559,6 +8885,12 @@ pub struct GgufGpu {
     /// pure waste on a partial-rotary model — so the host writes them once per
     /// position range and every layer's dispatch reads the same table.
     rtab_key: Option<(usize, usize)>,
+    /// KV4 (quantized KV cache): packed blocks for every layer. None means
+    /// the shipped f32 cache - the only mode a CPU fallback can reproduce,
+    /// because the f32 arrays hold just the residual ring when this is Some.
+    pub kv4: Option<Kv4Buffers>,
+    /// Blocks already quantized out of the ring (host roll cursor).
+    pub kv4_qb_done: usize,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -8568,6 +8900,9 @@ impl GgufGpu {
     /// for timing work); SOFUU_GPU_SPEC=0 routes the verify pass to CPU.
     fn spec_chain_ready(&self) -> bool {
         self.token_commit
+            // KV4: the spec-verify chain writes and reads f32 rows by absolute
+            // position; the quantized cache has no such rows to offer it.
+            && self.kv4.is_none()
             && std::env::var("SOFUU_GPU_SPEC")
                 .map(|v| v != "0")
                 .unwrap_or(true)
@@ -8583,8 +8918,9 @@ impl GgufGpu {
         is_gemma2: bool,
         output: &TensorView,
         output_norm: &TensorView,
+        kv_dtype: crate::infer::kv4::KvDtype,
     ) -> Option<Self> {
-        if config.max_seq_len > 4096 {
+        if config.logical_max_seq_len > 4096 {
             eprintln!("[gguf-gpu] disabled: seq > 4096 above the kernel range");
             return None;
         }
@@ -8883,9 +9219,14 @@ const SPEC_B: usize = 128;
         // route is requested at load (SOFUU_GPU_PREFILL_GEMM=1). PRE_B =
         // pre_chunk rows (SOFUU_PREFILL_CHUNK, clamped 1..=128, default 32);
         // every stage's [B x rows] region sized accordingly.
-        let pre_enabled = std::env::var("SOFUU_GPU_PREFILL_GEMM")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let kv4_on = kv_dtype.is_quantized()
+            && one_commit
+            && token_commit
+            && config.max_seq_len < config.logical_max_seq_len;
+        let pre_enabled = !kv4_on
+            && std::env::var("SOFUU_GPU_PREFILL_GEMM")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         let pre_chunk = if pre_enabled {
             let requested = std::env::var("SOFUU_PREFILL_CHUNK")
                 .ok()
@@ -8932,6 +9273,82 @@ const SPEC_B: usize = 128;
             (Some(pbuf), Some(pa), Some(ps), pb)
         } else {
             (None, None, None, 0usize)
+        };
+        // ---- KV4: the packed blocks ----------------------------------------
+        // Built only when the constructor already sized the f32 caches down to
+        // the residual ring (max_seq_len < logical_max_seq_len): that is the
+        // only configuration in which the f32 cache IS the ring these kernels
+        // read, and the only one where a CPU fallback could not reconstruct
+        // the history.
+        let kv4 = if kv4_on {
+            let bits = kv_dtype.bits();
+            if !engine.kv4_support(
+                config.head_dim as u32,
+                config.n_heads as u32,
+                config.n_kv_heads as u32,
+                bits,
+            ) {
+                eprintln!("[kv4] the KV4 kernels refused this geometry - not arming the quantized cache");
+                return None;
+            }
+            fn alloc_pages(
+                engine: &crate::infer::metal::MetalEngine,
+                bytes: usize,
+            ) -> Option<(AnonBuffer, crate::infer::metal::MetalBuffer)> {
+                let n = (bytes + 3) / 4;
+                let ab = AnonBuffer::try_new(n).ok()?;
+                let slice: &[u8] = unsafe {
+                    std::slice::from_raw_parts(ab.as_ptr() as *const u8, n * 4)
+                };
+                let buf = engine.register_zerocopy_only(slice)?;
+                Some((ab, buf))
+            }
+            let layout = crate::infer::kv4::Kv4Layout::new(
+                config.head_dim,
+                config.n_kv_heads,
+                config.logical_max_seq_len,
+                config.max_seq_len,
+                bits,
+                kv_dtype.k_f16(),
+            );
+            let nb = layers.len();
+            let Some((_qk, qk_buf)) = alloc_pages(&engine, nb * layout.kq_bytes()) else { return None };
+            let Some((_qks, qks_buf)) = alloc_pages(&engine, nb * layout.k_scale_bytes()) else { return None };
+            let Some((_qkm, qkm_buf)) = alloc_pages(&engine, nb * layout.k_scale_bytes()) else { return None };
+            let Some((_qv, qv_buf)) = alloc_pages(&engine, nb * layout.qv_bytes()) else { return None };
+            let Some((_qvs, qvs_buf)) = alloc_pages(&engine, nb * layout.v_scale_bytes()) else { return None };
+            let Some((_qvm, qvm_buf)) = alloc_pages(&engine, nb * layout.v_scale_bytes()) else { return None };
+            let packed_per_layer = layout.kq_bytes() + 2 * layout.k_scale_bytes()
+                + layout.qv_bytes() + 2 * layout.v_scale_bytes();
+            let f32_full = nb * 2 * layout.n_kv_heads * config.logical_max_seq_len
+                * layout.head_dim * 4;
+            eprintln!(
+                "[kv4] quantized KV armed: {bits}-bit, {} blocks x {} tokens, f32 ring {} rows, blocks {}MB vs {}MB for the f32 cache ({:.1}x), {} B/token/layer",
+                layout.nblk,
+                crate::infer::kv4::BLOCK,
+                layout.ring,
+                (nb * packed_per_layer) / (1 << 20),
+                f32_full / (1 << 20),
+                f32_full as f64 / (nb * packed_per_layer).max(1) as f64,
+                layout.bytes_per_token(),
+            );
+            Some(Kv4Buffers {
+                layout,
+                qk_buf,
+                qks_buf,
+                qkm_buf,
+                qv_buf,
+                qvs_buf,
+                qvm_buf,
+                _qk,
+                _qks,
+                _qkm,
+                _qv,
+                _qvs,
+                _qvm,
+            })
+        } else {
+            None
         };
         let k_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, kv_region_bytes)
@@ -8985,6 +9402,8 @@ const SPEC_B: usize = 128;
             pref_slots,
             pref_bytes,
             pre_chunk,
+            kv4,
+            kv4_qb_done: 0,
             rtab_key: None,
             slots,
         })
@@ -9014,7 +9433,7 @@ const SPEC_B: usize = 128;
         // context, which used to cost it this client outright (and with it the
         // whole fast decode and prefill route) for a window it never applies.
         // A window SHORTER than the context still blocks, exactly as before.
-        let window_clips = config.sliding_window > 0 && config.sliding_window < config.max_seq_len;
+        let window_clips = config.sliding_window > 0 && config.sliding_window < config.logical_max_seq_len;
         for i in 0..layers.len() {
             if window_clips
                 && TransformerModel::calc_layer_sliding_window(is_gemma2, config.sliding_window, i) != 0

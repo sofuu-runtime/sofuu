@@ -1613,6 +1613,7 @@ fn main() -> ExitCode {
             let mut snapkv = false;
             let mut dynamic_ffn = false;
             let mut kivi = false;
+            let mut kv_dtype_explicit = false;
             let mut kivi_bits = 4usize;
             let mut streaming_weights = false;
             let mut chat = false;
@@ -1671,8 +1672,54 @@ fn main() -> ExitCode {
                 } else if args[i] == "--dynamic-ffn" {
                     dynamic_ffn = true;
                     i += 1;
+                } else if args[i] == "--kv-dtype" && i + 1 < args.len() {
+                    kv_dtype_explicit = true;
+                    // GPU decode KV cache precision: 4 (default) or 2 quantize
+                    // the history into KIVI-layout packed blocks; f32 keeps the
+                    // byte-identical f32 cache. Communicated through the env so
+                    // every route reads one knob (SOFUU_KV_DTYPE overrides).
+                    let v = args[i + 1].to_ascii_lowercase();
+                    if !matches!(
+                        v.as_str(),
+                        "f32" | "4" | "4bit" | "q4" | "2" | "2bit" | "q2" | "f16k" | "k16" | "8" | "q8" | "8bit"
+                    ) {
+                        eprintln!("[sofuu] --kv-dtype accepts f32, 4 or 2 (got {})", args[i + 1]);
+                        std::process::exit(2);
+                    }
+                    if kivi && v != "f32" {
+                        eprintln!(
+                            "[sofuu] --kivi cannot run on a quantized GPU KV cache: pass --kv-dtype f32 (or drop one of the two flags)"
+                        );
+                        std::process::exit(2);
+                    }
+                    let canonical = match v.as_str() {
+                        "f32" => "f32",
+                        "2" | "2bit" | "q2" => "2",
+                        "f16k" | "k16" => "f16k",
+                        "8" | "q8" | "8bit" => "8",
+                        _ => "4",
+                    };
+                    std::env::set_var("SOFUU_KV_DTYPE", canonical);
+                    i += 2;
                 } else if args[i] == "--kivi" {
                     kivi = true;
+                    // --kivi quantizes the f32 history itself on the CPU layer
+                    // loop; the quantized GPU cache keeps only a ring of f32
+                    // rows, so the two cannot share a cache. f32 unless the
+                    // operator asked for a specific dtype.
+                    if kv_dtype_explicit {
+                        if std::env::var("SOFUU_KV_DTYPE").ok().as_deref() != Some("f32") {
+                            eprintln!(
+                                "[sofuu] --kivi cannot run on a quantized GPU KV cache: pass --kv-dtype f32 (or drop one of the two flags)"
+                            );
+                            std::process::exit(2);
+                        }
+                    } else {
+                        std::env::set_var("SOFUU_KV_DTYPE", "f32");
+                        eprintln!(
+                            "[sofuu infer] --kivi: keeping the f32 KV cache (the CPU KIVI stream does its own quantization)"
+                        );
+                    }
                     i += 1;
                 } else if args[i] == "--kivi-bits" && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
@@ -1842,6 +1889,7 @@ fn main() -> ExitCode {
                 // tokens were averaged: print both, and say so out loud when
                 // the sample is small (a 1-token "ppl" once read as a 32x
                 // quality gap against llama-perplexity's 1.42).
+                let score_kv4 = engine.model.kv_bits();
                 let scored_frac = if stats.tokens_total > 1 {
                     stats.scored as f64 / (stats.tokens_total - 1) as f64
                 } else {
@@ -1857,7 +1905,15 @@ fn main() -> ExitCode {
                 println!(
                     "{{\"kind\":\"score\",\"model\":{},\"kv\":\"{}\",\"window\":{},\"tokens_total\":{},\"scored\":{},\"windows\":{},\"nll_total\":{:.4},\"ppl\":{:.4},\"scored_frac\":{:.4},\"sample_warn\":{},\"convention\":\"ppl = exp(mean NLL) over the SCORED tokens; natural log, full-vocab log-softmax; window = max left context a scored token sees (llama-perplexity -c equivalent); the first tokens of the text are context-only, every later token is scored exactly once, and a window holds at most window+context positions\"}}",
                     serde_json::to_string(&model_path).unwrap_or_else(|_| "\"\"".into()),
-                    if kivi { format!("kivi{}", kivi_bits) } else { "f16".to_string() },
+                    if kivi {
+                        format!("kivi{}", kivi_bits)
+                    } else if score_kv4 > 0 {
+                        // the receipt must name the cache it measured: the GPU
+                        // decode path now defaults to the quantized KV cache.
+                        format!("kv{}", score_kv4)
+                    } else {
+                        "f16".to_string()
+                    },
                     stats.window,
                     stats.tokens_total,
                     stats.scored,

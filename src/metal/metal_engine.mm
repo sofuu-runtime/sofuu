@@ -228,6 +228,17 @@ struct MetalContext {
     id<MTLComputePipelineState> pso_llama_attn_w16;
     id<MTLComputePipelineState> pso_llama_attn_w32;
     id<MTLComputePipelineState> pso_llama_attn_fast;
+    // KV4 class (quantized KV cache): the block quantizer and the two attention
+    // kernels that read the packed blocks plus the f32 residual ring.
+    id<MTLComputePipelineState> pso_kv4_quant4;
+    id<MTLComputePipelineState> pso_kv4_quant2;
+    id<MTLComputePipelineState> pso_kv4_quant8;
+    id<MTLComputePipelineState> pso_llama_attn_w32_kv8;
+    id<MTLComputePipelineState> pso_llama_attn_pre_w32_kv8;
+    id<MTLComputePipelineState> pso_llama_attn_w32_kv4;
+    id<MTLComputePipelineState> pso_llama_attn_w32_kv2;
+    id<MTLComputePipelineState> pso_llama_attn_pre_w32_kv4;
+    id<MTLComputePipelineState> pso_llama_attn_pre_w32_kv2;
     id<MTLComputePipelineState> pso_gemv_q4_k_flat;
     id<MTLComputePipelineState> pso_add_rmsnorm_f32w;
     id<MTLComputePipelineState> pso_gemv_q4_k_split1;
@@ -823,6 +834,40 @@ void* sofuu_metal_init(void) {
                     "[metal] llama_attn_pre_row needs 1024 threads/group, pipeline allows %lu - row fast path disabled\n",
                     (unsigned long)ctx->pso_llama_attn_pre_row.maxTotalThreadsPerThreadgroup);
             ctx->pso_llama_attn_pre_row = nil;
+        }
+
+        // KV4 (quantized-KV) class: the block quantizer and the two attention
+        // kernels that read the packed blocks + the f32 residual ring. Loaded
+        // unconditionally - --kv-dtype=4 selects this class, so a GEMV tuning
+        // level must not gate it. Same 1024-thread discipline as
+        // llama_attn_pre_w32 above: Metal DROPS an oversized threadgroup
+        // without an error, so a pipeline whose register budget falls below
+        // 1024 threads is nilled here and reported by
+        // sofuu_metal_kv4_support() instead of being dispatched into the void.
+        ctx->pso_kv4_quant4 = load_pso(@"kv4_quant_b4");
+        ctx->pso_kv4_quant2 = load_pso(@"kv4_quant_b2");
+        ctx->pso_kv4_quant8 = load_pso(@"kv4_quant_b8");
+        ctx->pso_llama_attn_w32_kv8 = load_pso(@"llama_attn_w32_kv8");
+        ctx->pso_llama_attn_pre_w32_kv8 = load_pso(@"llama_attn_pre_w32_kv8");
+        ctx->pso_llama_attn_w32_kv4 = load_pso(@"llama_attn_w32_kv4");
+        ctx->pso_llama_attn_w32_kv2 = load_pso(@"llama_attn_w32_kv2");
+        ctx->pso_llama_attn_pre_w32_kv4 = load_pso(@"llama_attn_pre_w32_kv4");
+        ctx->pso_llama_attn_pre_w32_kv2 = load_pso(@"llama_attn_pre_w32_kv2");
+        if (ctx->pso_llama_attn_w32_kv4 != nil &&
+            ctx->pso_llama_attn_w32_kv4.maxTotalThreadsPerThreadgroup < 1024ul) {
+            fprintf(stderr,
+                    "[metal] llama_attn_w32_kv4 needs 1024 threads/group, pipeline allows %lu - 4-bit KV decode disabled\n",
+                    (unsigned long)ctx->pso_llama_attn_w32_kv4.maxTotalThreadsPerThreadgroup);
+            ctx->pso_llama_attn_w32_kv4 = nil;
+            ctx->pso_llama_attn_w32_kv2 = nil;
+        }
+        if (ctx->pso_llama_attn_pre_w32_kv4 != nil &&
+            ctx->pso_llama_attn_pre_w32_kv4.maxTotalThreadsPerThreadgroup < 1024ul) {
+            fprintf(stderr,
+                    "[metal] llama_attn_pre_w32_kv4 needs 1024 threads/group, pipeline allows %lu - 4-bit KV prefill disabled\n",
+                    (unsigned long)ctx->pso_llama_attn_pre_w32_kv4.maxTotalThreadsPerThreadgroup);
+            ctx->pso_llama_attn_pre_w32_kv4 = nil;
+            ctx->pso_llama_attn_pre_w32_kv2 = nil;
         }
         // GQA-paired whole-row chunk attention: one table, one guard loop.
         // Index -> (kernel, rows per threadgroup). Entry 0 is the shape this
@@ -3930,6 +3975,222 @@ int sofuu_metal_batch_llama_attn_fin(
 // FUSED 1-chunk attention (pos<128): part+fin in one dispatch, no meta.
 // Returns 1 when dispatched, 0 when the PSO is unavailable (caller falls
 // back to the part+fin pair).
+
+// ===========================================================================
+// KV4 (quantized KV cache, KIVI layout) - batch entry points.
+// ===========================================================================
+
+// Can this GPU + this model geometry run the KV4 class? 0 = no (a one-line
+// reason is printed once), 1 = yes. The geometry gate is exactly what the two
+// kernels accept: head_dim a multiple of 32 and <= 128 (one warp covers a head
+// with <= 4 channels per lane), n_heads divisible by n_kv_heads (GQA ratio), a
+// block/ring layout that fits (head_dim/32 groups, 32-token blocks) and BOTH
+// pipelines live at their 1024-thread shape. Anything else must NOT be
+// dispatched: the caller keeps the f32 KV cache instead (loudly).
+int sofuu_metal_kv4_support(void* ctx_ptr, uint32_t head_dim, uint32_t n_heads,
+                            uint32_t n_kv_heads, uint32_t bits) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->pso_kv4_quant4 == nil || ctx->pso_llama_attn_w32_kv4 == nil ||
+        ctx->pso_llama_attn_pre_w32_kv4 == nil) {
+        fprintf(stderr, "[kv4] unavailable: a KV4 pipeline is missing "
+                        "(quant=%d decode_attn=%d prefill_attn=%d)\n",
+                ctx->pso_kv4_quant4 != nil, ctx->pso_llama_attn_w32_kv4 != nil,
+                ctx->pso_llama_attn_pre_w32_kv4 != nil);
+        return 0;
+    }
+    if ((bits != 4u && bits != 2u && bits != 8u) ||
+        (bits == 2u && (ctx->pso_kv4_quant2 == nil || ctx->pso_llama_attn_w32_kv2 == nil ||
+                        ctx->pso_llama_attn_pre_w32_kv2 == nil)) ||
+        (bits == 8u && (ctx->pso_kv4_quant8 == nil || ctx->pso_llama_attn_w32_kv8 == nil ||
+                        ctx->pso_llama_attn_pre_w32_kv8 == nil))) {
+        fprintf(stderr, "[kv4] unavailable: %u-bit pipelines missing\n", bits);
+        return 0;
+    }
+    if (head_dim == 0u || (head_dim % 32u) != 0u || head_dim > 128u) {
+        fprintf(stderr, "[kv4] unavailable: head_dim %u is not a multiple of 32 in (0,128]\n", head_dim);
+        return 0;
+    }
+    if (n_kv_heads == 0u || n_heads == 0u || (n_heads % n_kv_heads) != 0u) {
+        fprintf(stderr, "[kv4] unavailable: n_heads %u / n_kv_heads %u is not an integer GQA ratio\n",
+                n_heads, n_kv_heads);
+        return 0;
+    }
+    return 1;
+}
+
+// Quantize nblocks of the 32-token blocks that have just rolled out of the f32
+// residual ring, for ONE layer (all kv heads). Buffers are this layer's slices.
+int sofuu_metal_batch_kv4_quant(
+    void* ctx_ptr,
+    void* k_ring_ptr, size_t k_ring_offset,
+    void* v_ring_ptr, size_t v_ring_offset,
+    void* qk_ptr, size_t qk_offset,
+    void* qks_ptr, size_t qks_offset,
+    void* qkm_ptr, size_t qkm_offset,
+    void* qv_ptr, size_t qv_offset,
+    void* qvs_ptr, size_t qvs_offset,
+    void* qvm_ptr, size_t qvm_offset,
+    uint32_t head_dim, uint32_t n_kv_heads, uint32_t ring, uint32_t nblk,
+    uint32_t block0, uint32_t nblocks, uint32_t bits
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    if (ctx->batch_enc == nil || nblocks == 0u || ring == 0u) return 0;
+    if (!k_ring_ptr || !v_ring_ptr || !qk_ptr || !qks_ptr || !qkm_ptr ||
+        !qv_ptr || !qvs_ptr || !qvm_ptr) return 0;
+    id<MTLComputePipelineState> pso = (bits == 2u)   ? ctx->pso_kv4_quant2
+                                    : (bits == 8u) ? ctx->pso_kv4_quant8
+                                                   : ctx->pso_kv4_quant4;
+    if (pso == nil) return 0;
+    sofuu_batch_barrier(ctx);
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)k_ring_ptr offset:k_ring_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)v_ring_ptr offset:v_ring_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qk_ptr offset:qk_offset atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qks_ptr offset:qks_offset atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qkm_ptr offset:qkm_offset atIndex:4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qv_ptr offset:qv_offset atIndex:5];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvs_ptr offset:qvs_offset atIndex:6];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvm_ptr offset:qvm_offset atIndex:7];
+    [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:8];
+    [ctx->batch_enc setBytes:&ring length:sizeof(uint) atIndex:9];
+    [ctx->batch_enc setBytes:&nblk length:sizeof(uint) atIndex:10];
+    [ctx->batch_enc setBytes:&block0 length:sizeof(uint) atIndex:11];
+    [ctx->batch_enc setBytes:&nblocks length:sizeof(uint) atIndex:12];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(nblocks, n_kv_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return 1;
+}
+
+// Decode attention over (quantized blocks + f32 residual ring). Same shape and
+// bindings as sofuu_metal_batch_llama_attn_w32_out for buffers 0..20.
+int sofuu_metal_batch_llama_attn_w32_kv4(
+    void* ctx_ptr,
+    void* q_ptr, size_t q_offset,
+    void* k_ring_ptr, size_t k_ring_offset,
+    void* v_ring_ptr, size_t v_ring_offset,
+    void* qln_ptr, size_t qln_offset,
+    void* out_ptr, size_t out_offset,
+    uint32_t has_norm, uint32_t pos,
+    uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_seq,
+    float eps, float rope_base, uint32_t rope_mode,
+    void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table,
+    uint32_t rope_n_rot, float rope_mscale,
+    void* rope_adj_ptr, size_t rope_adj_offset, uint32_t rope_n_pairs,
+    void* qk_ptr, size_t qk_offset,
+    void* qks_ptr, size_t qks_offset,
+    void* qkm_ptr, size_t qkm_offset,
+    void* qv_ptr, size_t qv_offset,
+    void* qvs_ptr, size_t qvs_offset,
+    void* qvm_ptr, size_t qvm_offset,
+    uint32_t nblk, uint32_t ring, uint32_t bits
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLComputePipelineState> pso = (bits == 2u)   ? ctx->pso_llama_attn_w32_kv2
+                                    : (bits == 8u) ? ctx->pso_llama_attn_w32_kv8
+                                                   : ctx->pso_llama_attn_w32_kv4;
+    if (ctx->batch_enc == nil || pso == nil) return 0;
+    if (!q_ptr || !k_ring_ptr || !v_ring_ptr || !out_ptr) return 0;
+    if (!qk_ptr || !qks_ptr || !qkm_ptr || !qv_ptr || !qvs_ptr || !qvm_ptr) return 0;
+    if (pos >= 4096u || head_dim > 128u || n_kv_heads == 0u || (n_heads % n_kv_heads) != 0u) return 0;
+    sofuu_batch_barrier(ctx);
+    size_t aligned_offset = qln_ptr ? (qln_offset & ~255ULL) : 0;
+    uint w_rem = qln_ptr ? (uint)(qln_offset & 255ULL) / 4 : 0;
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)k_ring_ptr offset:k_ring_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)v_ring_ptr offset:v_ring_offset atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)(qln_ptr ? qln_ptr : q_ptr)
+                      offset: aligned_offset atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_ptr offset:out_offset atIndex:4];
+    [ctx->batch_enc setBytes:&w_rem length:sizeof(uint) atIndex:5];
+    [ctx->batch_enc setBytes:&has_norm length:sizeof(uint) atIndex:6];
+    if (ctx->attn_noop == 1 || ctx->attn_noop == 2) { pos = 0xFFFFFFFFu; }
+    [ctx->batch_enc setBytes:&pos length:sizeof(uint) atIndex:7];
+    [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:8];
+    [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:9];
+    [ctx->batch_enc setBytes:&n_kv_heads length:sizeof(uint) atIndex:10];
+    [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:11];
+    [ctx->batch_enc setBytes:&eps length:sizeof(float) atIndex:12];
+    [ctx->batch_enc setBytes:&rope_base length:sizeof(float) atIndex:13];
+    [ctx->batch_enc setBytes:&rope_mode length:sizeof(uint) atIndex:14];
+    sofuu_bind_rope(ctx, 15, rope_tab_ptr, rope_tab_offset, has_table,
+                    rope_adj_ptr, rope_adj_offset, rope_n_pairs,
+                    head_dim, rope_n_rot, rope_mscale, q_ptr);
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qk_ptr offset:qk_offset atIndex:21];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qks_ptr offset:qks_offset atIndex:22];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qkm_ptr offset:qkm_offset atIndex:23];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qv_ptr offset:qv_offset atIndex:24];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvs_ptr offset:qvs_offset atIndex:25];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvm_ptr offset:qvm_offset atIndex:26];
+    [ctx->batch_enc setBytes:&nblk length:sizeof(uint) atIndex:27];
+    [ctx->batch_enc setBytes:&ring length:sizeof(uint) atIndex:28];
+    [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    return 1;
+}
+
+// Prefill (whole 128-row chunk) attention over the same two K/V sources: one
+// threadgroup per (row, head), 32 warps splitting the key range.
+int sofuu_metal_batch_llama_attn_pre_w32_kv4(
+    void* ctx_ptr,
+    void* q_ptr, size_t q_offset,
+    void* k_ring_ptr, size_t k_ring_offset,
+    void* v_ring_ptr, size_t v_ring_offset,
+    void* out_ptr, size_t out_offset,
+    void* pos_buf_ptr, size_t pos_offset,
+    uint32_t rows, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
+    uint32_t max_seq, uint32_t out_stride,
+    void* qk_ptr, size_t qk_offset,
+    void* qks_ptr, size_t qks_offset,
+    void* qkm_ptr, size_t qkm_offset,
+    void* qv_ptr, size_t qv_offset,
+    void* qvs_ptr, size_t qvs_offset,
+    void* qvm_ptr, size_t qvm_offset,
+    uint32_t nblk, uint32_t ring, uint32_t bits
+) {
+    if (!ctx_ptr) return 0;
+    MetalContext* ctx = (MetalContext*)ctx_ptr;
+    id<MTLComputePipelineState> pso = (bits == 2u)   ? ctx->pso_llama_attn_pre_w32_kv2
+                                    : (bits == 8u) ? ctx->pso_llama_attn_pre_w32_kv8
+                                                   : ctx->pso_llama_attn_pre_w32_kv4;
+    if (ctx->batch_enc == nil || pso == nil) return 0;
+    if (!q_ptr || !k_ring_ptr || !v_ring_ptr || !out_ptr || !pos_buf_ptr) return 0;
+    if (!qk_ptr || !qks_ptr || !qkm_ptr || !qv_ptr || !qvs_ptr || !qvm_ptr) return 0;
+    if (rows == 0u || head_dim == 0u || head_dim > 128u || n_kv_heads == 0u ||
+        (n_heads % n_kv_heads) != 0u) return 0;
+    sofuu_batch_barrier(ctx);
+    uint rpt = 1u, n_chunks_max = 1u;
+    [ctx->batch_enc setComputePipelineState:pso];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:0];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)k_ring_ptr offset:k_ring_offset atIndex:1];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)v_ring_ptr offset:v_ring_offset atIndex:2];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)q_ptr offset:q_offset atIndex:3];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)out_ptr offset:out_offset atIndex:4];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)pos_buf_ptr offset:pos_offset atIndex:5];
+    [ctx->batch_enc setBytes:&head_dim length:sizeof(uint) atIndex:6];
+    [ctx->batch_enc setBytes:&n_heads length:sizeof(uint) atIndex:7];
+    [ctx->batch_enc setBytes:&n_kv_heads length:sizeof(uint) atIndex:8];
+    [ctx->batch_enc setBytes:&max_seq length:sizeof(uint) atIndex:9];
+    [ctx->batch_enc setBytes:&n_chunks_max length:sizeof(uint) atIndex:10];
+    [ctx->batch_enc setBytes:&out_stride length:sizeof(uint) atIndex:11];
+    [ctx->batch_enc setBytes:&rows length:sizeof(uint) atIndex:12];
+    [ctx->batch_enc setBytes:&rpt length:sizeof(uint) atIndex:13];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qk_ptr offset:qk_offset atIndex:14];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qks_ptr offset:qks_offset atIndex:15];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qkm_ptr offset:qkm_offset atIndex:16];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qv_ptr offset:qv_offset atIndex:17];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvs_ptr offset:qvs_offset atIndex:18];
+    [ctx->batch_enc setBuffer:(__bridge id<MTLBuffer>)qvm_ptr offset:qvm_offset atIndex:19];
+    [ctx->batch_enc setBytes:&nblk length:sizeof(uint) atIndex:20];
+    [ctx->batch_enc setBytes:&ring length:sizeof(uint) atIndex:21];
+    [ctx->batch_enc dispatchThreadgroups:sf_grid2d(rows * n_heads)
+                    threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    return 1;
+}
+
 int sofuu_metal_batch_llama_attn_1c_b4(
     void* ctx_ptr,
     void* q_buf_ptr, size_t q_offset,
@@ -4016,7 +4277,8 @@ void sofuu_metal_batch_llama_kv_write_b4(
     float eps, float rope_base, uint32_t rope_mode,
     void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table,
     uint32_t rope_n_rot, float rope_mscale,
-    void* rope_adj_ptr, size_t rope_adj_offset, uint32_t rope_n_pairs
+    void* rope_adj_ptr, size_t rope_adj_offset, uint32_t rope_n_pairs,
+    uint32_t ring
 ) {
     if (!ctx_ptr) return;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -4044,6 +4306,9 @@ void sofuu_metal_batch_llama_kv_write_b4(
     sofuu_bind_rope(ctx, 14, rope_tab_ptr, rope_tab_offset, has_table,
                     rope_adj_ptr, rope_adj_offset, rope_n_pairs,
                     head_dim, rope_n_rot, rope_mscale, pos_buf_ptr);
+    // KV4 ring mode: 0 = the shipped absolute (pos) row addressing, else the
+    // f32 residual ring is `ring` rows per head and rows land at pos % ring.
+    [ctx->batch_enc setBytes:&ring length:sizeof(uint) atIndex:20];
     uint grid = rows * n_kv_heads;
     [ctx->batch_enc dispatchThreadgroups:sf_grid2d(grid)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -4717,7 +4982,8 @@ int sofuu_metal_batch_llama_kv_write(
     float eps, float rope_base, uint32_t rope_mode,
     void* rope_tab_ptr, size_t rope_tab_offset, uint32_t has_table,
     uint32_t rope_n_rot, float rope_mscale,
-    void* rope_adj_ptr, size_t rope_adj_offset, uint32_t rope_n_pairs
+    void* rope_adj_ptr, size_t rope_adj_offset, uint32_t rope_n_pairs,
+    uint32_t ring
 ) {
     if (!ctx_ptr) return 0;
     MetalContext* ctx = (MetalContext*)ctx_ptr;
@@ -4745,6 +5011,8 @@ int sofuu_metal_batch_llama_kv_write(
     sofuu_bind_rope(ctx, 14, rope_tab_ptr, rope_tab_offset, has_table,
                     rope_adj_ptr, rope_adj_offset, rope_n_pairs,
                     head_dim, rope_n_rot, rope_mscale, k_buf_ptr);
+    // KV4 ring mode: 0 = shipped absolute row addressing.
+    [ctx->batch_enc setBytes:&ring length:sizeof(uint) atIndex:20];
     [ctx->batch_enc dispatchThreadgroups:MTLSizeMake(n_kv_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     return 1;
@@ -5587,6 +5855,44 @@ void sofuu_metal_gemv_async(void* ctx, void* w_buf, size_t w_offset, const float
 void sofuu_metal_sync(void* ctx) {}
 void sofuu_metal_gemv_qkv_mlx4(void* ctx, void* q_buf, size_t q_offset, size_t q_rows, void* q_scales_buf, size_t q_scales_offset, void* q_biases_buf, size_t q_biases_offset, void* k_buf, size_t k_offset, size_t k_rows, void* k_scales_buf, size_t k_scales_offset, void* k_biases_buf, size_t k_biases_offset, void* v_buf, size_t v_offset, size_t v_rows, void* v_scales_buf, size_t v_scales_offset, void* v_biases_buf, size_t v_biases_offset, const float* x, float* q_out, float* k_out, float* v_out, size_t cols, size_t group_size, int is_bf16) {}
 void sofuu_metal_gemv_gate_up_mlx4(void* ctx, void* gate_buf, size_t gate_offset, size_t gate_rows, void* gate_scales_buf, size_t gate_scales_offset, void* gate_biases_buf, size_t gate_biases_offset, void* up_buf, size_t up_offset, size_t up_rows, void* up_scales_buf, size_t up_scales_offset, void* up_biases_buf, size_t up_biases_offset, const float* x, float* gate_out, float* up_out, size_t cols, size_t group_size, int is_bf16) {}
+
+
+// KV4: no Metal, so the class is unavailable (the Rust side keeps f32 KV).
+int sofuu_metal_kv4_support(void* ctx, uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t bits) {
+    (void)ctx;(void)hd;(void)nh;(void)nkv;(void)bits; return 0;
+}
+int sofuu_metal_batch_kv4_quant(void* ctx, void* kr, size_t kro, void* vr, size_t vro,
+    void* qk, size_t qko, void* qks, size_t qkso, void* qkm, size_t qkmo,
+    void* qv, size_t qvo, void* qvs, size_t qvso, void* qvm, size_t qvmo,
+    uint32_t hd, uint32_t nkv, uint32_t ring, uint32_t nblk, uint32_t b0, uint32_t nb, uint32_t bits) {
+    (void)ctx;(void)kr;(void)kro;(void)vr;(void)vro;(void)qk;(void)qko;(void)qks;(void)qkso;
+    (void)qkm;(void)qkmo;(void)qv;(void)qvo;(void)qvs;(void)qvso;(void)qvm;(void)qvmo;
+    (void)hd;(void)nkv;(void)ring;(void)nblk;(void)b0;(void)nb;(void)bits; return 0;
+}
+int sofuu_metal_batch_llama_attn_w32_kv4(void* ctx, void* q, size_t qo, void* kr, size_t kro,
+    void* vr, size_t vro, void* qln, size_t qlno, void* out, size_t outo, uint32_t hn, uint32_t pos,
+    uint32_t hd, uint32_t nh, uint32_t nkv, uint32_t ms, float e, float rb, uint32_t rm,
+    void* rt, size_t rto, uint32_t ht, uint32_t nr, float msc, void* ra, size_t rao, uint32_t np,
+    void* qk, size_t qko, void* qks, size_t qkso, void* qkm, size_t qkmo,
+    void* qv, size_t qvo, void* qvs, size_t qvso, void* qvm, size_t qvmo,
+    uint32_t nblk, uint32_t ring, uint32_t bits) {
+    (void)ctx;(void)q;(void)qo;(void)kr;(void)kro;(void)vr;(void)vro;(void)qln;(void)qlno;
+    (void)out;(void)outo;(void)hn;(void)pos;(void)hd;(void)nh;(void)nkv;(void)ms;(void)e;(void)rb;
+    (void)rm;(void)rt;(void)rto;(void)ht;(void)nr;(void)msc;(void)ra;(void)rao;(void)np;
+    (void)qk;(void)qko;(void)qks;(void)qkso;(void)qkm;(void)qkmo;(void)qv;(void)qvo;(void)qvs;
+    (void)qvso;(void)qvm;(void)qvmo;(void)nblk;(void)ring;(void)bits; return 0;
+}
+int sofuu_metal_batch_llama_attn_pre_w32_kv4(void* ctx, void* q, size_t qo, void* kr, size_t kro,
+    void* vr, size_t vro, void* out, size_t outo, void* pb, size_t po, uint32_t rows, uint32_t hd,
+    uint32_t nh, uint32_t nkv, uint32_t ms, uint32_t os,
+    void* qk, size_t qko, void* qks, size_t qkso, void* qkm, size_t qkmo,
+    void* qv, size_t qvo, void* qvs, size_t qvso, void* qvm, size_t qvmo,
+    uint32_t nblk, uint32_t ring, uint32_t bits) {
+    (void)ctx;(void)q;(void)qo;(void)kr;(void)kro;(void)vr;(void)vro;(void)out;(void)outo;
+    (void)pb;(void)po;(void)rows;(void)hd;(void)nh;(void)nkv;(void)ms;(void)os;
+    (void)qk;(void)qko;(void)qks;(void)qkso;(void)qkm;(void)qkmo;(void)qv;(void)qvo;(void)qvs;
+    (void)qvso;(void)qvm;(void)qvmo;(void)nblk;(void)ring;(void)bits; return 0;
+}
 
 #endif
 

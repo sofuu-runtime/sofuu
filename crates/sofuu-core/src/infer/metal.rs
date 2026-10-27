@@ -1073,6 +1073,62 @@ extern "C" {
         rows_total: usize, cols: usize,
         secs: *const u32, n_sec: usize,
     ) -> i32;
+    // ---- KV4 (quantized KV cache): see infer/kv4.rs for the layout ----------
+    fn sofuu_metal_kv4_support(
+        ctx: *mut c_void,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, bits: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_kv4_quant(
+        ctx: *mut c_void,
+        k_ring: *mut c_void, k_ring_offset: usize,
+        v_ring: *mut c_void, v_ring_offset: usize,
+        qk: *mut c_void, qk_offset: usize,
+        qks: *mut c_void, qks_offset: usize,
+        qkm: *mut c_void, qkm_offset: usize,
+        qv: *mut c_void, qv_offset: usize,
+        qvs: *mut c_void, qvs_offset: usize,
+        qvm: *mut c_void, qvm_offset: usize,
+        head_dim: u32, n_kv_heads: u32, ring: u32, nblk: u32,
+        block0: u32, nblocks: u32, bits: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_w32_kv4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        k_ring: *mut c_void, k_ring_offset: usize,
+        v_ring: *mut c_void, v_ring_offset: usize,
+        qln_buf: *mut c_void, qln_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
+        qk: *mut c_void, qk_offset: usize,
+        qks: *mut c_void, qks_offset: usize,
+        qkm: *mut c_void, qkm_offset: usize,
+        qv: *mut c_void, qv_offset: usize,
+        qvs: *mut c_void, qvs_offset: usize,
+        qvm: *mut c_void, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_pre_w32_kv4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        k_ring: *mut c_void, k_ring_offset: usize,
+        v_ring: *mut c_void, v_ring_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32,
+        max_seq: u32, out_stride: u32,
+        qk: *mut c_void, qk_offset: usize,
+        qks: *mut c_void, qks_offset: usize,
+        qkm: *mut c_void, qkm_offset: usize,
+        qv: *mut c_void, qv_offset: usize,
+        qvs: *mut c_void, qvs_offset: usize,
+        qvm: *mut c_void, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> i32;
     fn sofuu_metal_batch_llama_kv_write_b4(
         ctx: *mut c_void,
         k_buf: *mut c_void, k_offset: usize,
@@ -1088,6 +1144,7 @@ extern "C" {
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
         rope_n_rot: u32, rope_mscale: f32,
         rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
+        ring: u32,
     );
     fn sofuu_metal_batch_head_rmsnorm_b4(
         ctx: *mut c_void,
@@ -1404,6 +1461,7 @@ extern "C" {
         rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
         rope_n_rot: u32, rope_mscale: f32,
         rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
+        ring: u32,
     ) -> i32;
     fn sofuu_metal_batch_head_rmsnorm(
         ctx: *mut c_void,
@@ -2789,6 +2847,7 @@ impl MetalEngine {
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
         rope: RopeKernel,
+        ring: u32,
     ) -> bool {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
@@ -2806,7 +2865,7 @@ impl MetalEngine {
                 has_norm, pos,
                 head_dim, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
-                rt, rto, ht, nr, msc, ra, rao, np,
+                rt, rto, ht, nr, msc, ra, rao, np, ring,
             ) == 1 };
         self.op_tock(K_KVWRITE, __t);
         __r
@@ -2900,6 +2959,7 @@ impl MetalEngine {
         head_dim: u32, n_kv_heads: u32, max_seq: u32,
         eps: f32, rope_base: f32, rope_mode: u32,
         rope: RopeKernel,
+        ring: u32,
     ) {
         let (kln_handle, kln_off) = match kln_buf {
             Some(b) => (b.handle, kln_offset),
@@ -2922,6 +2982,7 @@ impl MetalEngine {
                 eps, rope_base, rope_mode,
                 tab_handle, tab_off, has_table,
                 rn_rot, rmsc, radj, radj_off, rnp,
+                ring,
             );
         }
         self.op_tock(K_KVWRITE_B4, __t);
@@ -3502,6 +3563,136 @@ impl MetalEngine {
     /// with no dispatch at all when the arm cannot run, so the caller falls back
     /// instead of leaving attention undone.
     #[allow(clippy::too_many_arguments)]
+    // ---- KV4 (quantized KV cache) entry points -----------------------------
+    /// Does this device+geometry support the KV4 kernels? Prints the reason
+    /// once when it does not (via the C side).
+    pub fn kv4_support(&self, head_dim: u32, n_heads: u32, n_kv_heads: u32, bits: u32) -> bool {
+        unsafe { sofuu_metal_kv4_support(self.ctx, head_dim, n_heads, n_kv_heads, bits) == 1 }
+    }
+
+    /// Quantize blocks [block0, block0+nblocks) of ONE layer out of the f32
+    /// residual ring into its packed blocks. `ring` is the ring row count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_kv4_quant(
+        &self,
+        k_ring: &MetalBuffer, k_ring_offset: usize,
+        v_ring: &MetalBuffer, v_ring_offset: usize,
+        qk: &MetalBuffer, qk_offset: usize,
+        qks: &MetalBuffer, qks_offset: usize,
+        qkm: &MetalBuffer, qkm_offset: usize,
+        qv: &MetalBuffer, qv_offset: usize,
+        qvs: &MetalBuffer, qvs_offset: usize,
+        qvm: &MetalBuffer, qvm_offset: usize,
+        head_dim: u32, n_kv_heads: u32, ring: u32, nblk: u32,
+        block0: u32, nblocks: u32, bits: u32,
+    ) -> bool {
+        unsafe {
+            sofuu_metal_batch_kv4_quant(
+                self.ctx,
+                k_ring.handle, k_ring_offset,
+                v_ring.handle, v_ring_offset,
+                qk.handle, qk_offset,
+                qks.handle, qks_offset,
+                qkm.handle, qkm_offset,
+                qv.handle, qv_offset,
+                qvs.handle, qvs_offset,
+                qvm.handle, qvm_offset,
+                head_dim, n_kv_heads, ring, nblk, block0, nblocks, bits,
+            ) == 1
+        }
+    }
+
+    /// Decode attention over the quantized blocks + f32 residual ring (one
+    /// threadgroup of 32 warps per q head, like llama_attn_w32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_w32_kv4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        k_ring: &MetalBuffer, k_ring_offset: usize,
+        v_ring: &MetalBuffer, v_ring_offset: usize,
+        qln_buf: Option<&MetalBuffer>, qln_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
+        qk: &MetalBuffer, qk_offset: usize,
+        qks: &MetalBuffer, qks_offset: usize,
+        qkm: &MetalBuffer, qkm_offset: usize,
+        qv: &MetalBuffer, qv_offset: usize,
+        qvs: &MetalBuffer, qvs_offset: usize,
+        qvm: &MetalBuffer, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> bool {
+        let (qln_handle, qln_off) = match qln_buf {
+            Some(b) => (b.handle, qln_offset),
+            None => (q_buf.handle, 0),
+        };
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
+        unsafe {
+            sofuu_metal_batch_llama_attn_w32_kv4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                k_ring.handle, k_ring_offset,
+                v_ring.handle, v_ring_offset,
+                qln_handle, qln_off,
+                out_buf.handle, out_offset,
+                has_norm, pos,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
+                qk.handle, qk_offset,
+                qks.handle, qks_offset,
+                qkm.handle, qkm_offset,
+                qv.handle, qv_offset,
+                qvs.handle, qvs_offset,
+                qvm.handle, qvm_offset,
+                nblk, ring, bits,
+            ) == 1
+        }
+    }
+
+    /// Whole-chunk prefill attention over the same two K/V sources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_pre_w32_kv4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        k_ring: &MetalBuffer, k_ring_offset: usize,
+        v_ring: &MetalBuffer, v_ring_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        qk: &MetalBuffer, qk_offset: usize,
+        qks: &MetalBuffer, qks_offset: usize,
+        qkm: &MetalBuffer, qkm_offset: usize,
+        qv: &MetalBuffer, qv_offset: usize,
+        qvs: &MetalBuffer, qvs_offset: usize,
+        qvm: &MetalBuffer, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> bool {
+        let out_stride = (n_heads as usize * head_dim as usize) as u32;
+        unsafe {
+            sofuu_metal_batch_llama_attn_pre_w32_kv4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                k_ring.handle, k_ring_offset,
+                v_ring.handle, v_ring_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq, out_stride,
+                qk.handle, qk_offset,
+                qks.handle, qks_offset,
+                qkm.handle, qkm_offset,
+                qv.handle, qv_offset,
+                qvs.handle, qvs_offset,
+                qvm.handle, qvm_offset,
+                nblk, ring, bits,
+            ) == 1
+        }
+    }
+
     pub fn batch_llama_attn_row(
         &self,
         q_buf: &MetalBuffer, q_offset: usize,
@@ -5058,7 +5249,7 @@ mod q4k_crafted_probe {
                 Some(&wb), 128,
                 1, pos as u32,
                 hd as u32, n_kv as u32, max_seq as u32,
-                eps, rope_base, rope_mode, RopeKernel::plain() );
+                eps, rope_base, rope_mode, RopeKernel::plain(), 0);
             engine.batch_llama_attn(
                 &slab_buf, f_qa * 4,
                 &k_buf, 0,
@@ -5474,7 +5665,7 @@ mod q4k_crafted_probe {
                             Some(&wnorm), 4096,
                             1, 8,
                             hd as u32, 8, 64,
-                            1e-5, 10000.0, 0, RopeKernel::plain() );
+                            1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                         engine.batch_llama_attn(
                             &slab_buf, fqa * 4,
                             &k_buf, 0,
@@ -7370,7 +7561,7 @@ mod q4k_crafted_probe {
                     Some(&nw_buf), 0, 1,
                     &pos_buf, 0, b,
                     hd as u32, n_kv as u32, 4096,
-                    1e-5, 10000.0, 0, RopeKernel::plain() );
+                    1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                 engine.batch_head_rmsnorm_b4(
                     &slab_buf, oqa * 4, Some(&nw_buf), 0,
                     &pos_buf, 0, b,
@@ -7408,7 +7599,7 @@ mod q4k_crafted_probe {
                                 Some(&nw_buf), 0, 1,
                                 &pos_buf, 0, b,
                                 hd as u32, n_kv as u32, 4096,
-                                1e-5, 10000.0, 0, RopeKernel::plain() );
+                                1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                         }
                     }
                     "part4" => {
@@ -7428,7 +7619,7 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0, RopeKernel::plain() );
+                            1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                         engine.batch_llama_attn_part_b4(
                             &slab_buf, oqa * 4, &kc_buf, layer_off, &vc_buf, layer_off,
                             &meta_buf, 0, &pos_buf, 0, b,
@@ -7455,7 +7646,7 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0, RopeKernel::plain() );
+                            1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                         engine.batch_head_rmsnorm_b4(
                             &slab_buf, oqa * 4, Some(&nw_buf), 0,
                             &pos_buf, 0, b,
@@ -7468,7 +7659,7 @@ mod q4k_crafted_probe {
                             Some(&nw_buf), 0, 1,
                             &pos_buf, 0, b,
                             hd as u32, n_kv as u32, 4096,
-                            1e-5, 10000.0, 0, RopeKernel::plain() );
+                            1e-5, 10000.0, 0, RopeKernel::plain(), 0);
                     }
                     "qn" => {
                         engine.batch_head_rmsnorm_b4(
@@ -7670,7 +7861,7 @@ mod q4k_crafted_probe {
             Some(&wb_buf), 4096, 1,
             &slab_buf, pos_off, b,
             hd as u32, n_kv as u32, max_seq as u32,
-            eps, rope_base, rope_mode, RopeKernel::plain() );
+            eps, rope_base, rope_mode, RopeKernel::plain(), 0);
         engine.batch_head_rmsnorm_b4(
             &slab_buf, q_off,
             Some(&wb_buf), 0,
@@ -9418,7 +9609,7 @@ fn attn_glue_b4_fault_isolation_1b() {
         }
         run_isolated!("kv_write_b4", engine.batch_llama_kv_write_b4(
             k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain() ));
+            pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain(), 0));
         run_isolated!("head_rmsnorm_b4", engine.batch_head_rmsnorm_b4(
             q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, RopeKernel::plain() ));
         run_isolated!("attn_part_b4", engine.batch_llama_attn_part_b4(
@@ -9429,7 +9620,7 @@ fn attn_glue_b4_fault_isolation_1b() {
         run_isolated!("ALL-IN-ONE", {
             engine.batch_llama_kv_write_b4(
                 k_buf, 0, v_buf, 0, kvc_b, 0, kvc_b, 0, Some(w_b), (hd as usize) * 4, 1u32,
-                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain() );
+                pos_b, 0, b, hd, nkv, max_seq, eps, rope, 0u32, RopeKernel::plain(), 0);
             engine.batch_head_rmsnorm_b4(
                 q_b, 0, Some(w_b), 0, pos_b, 0, b, hd, nh, 1u32, eps, rope, 0u32, RopeKernel::plain() );
             engine.batch_llama_attn_part_b4(
@@ -11572,7 +11763,7 @@ mod rope_profile_tests {
                     0, p as u32,
                     HD as u32, 1, max_seq as u32,
                     1e-5, BASE, mode as u32, rk,
-                );
+                   0);
             }
             assert!(engine.batch_end());
 

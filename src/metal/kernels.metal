@@ -1052,6 +1052,7 @@ kernel void llama_kv_write_b4(
     constant float     &rope_mscale    [[buffer(17)]],
     device const float *rope_adj       [[buffer(18)]],
     constant uint      &rope_n_pairs   [[buffer(19)]],
+    constant uint      &ring           [[buffer(20)]],
     uint3 kvtg                         [[threadgroup_position_in_grid]],
     uint lane                         [[thread_index_in_simdgroup]]
 ) {
@@ -1078,8 +1079,10 @@ kernel void llama_kv_write_b4(
     sofuu_rope_apply(k_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
                      rope_tab, tab_r, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-    device float *k_dst = k_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
-    device float *v_dst = v_cache_layer + ((size_t)kh * max_seq + pos) * head_dim;
+    // KV4 ring mode: see llama_kv_write (ring == 0 keeps absolute addressing).
+    uint slot = (ring != 0u) ? (pos % ring) : pos;
+    device float *k_dst = k_cache_layer + ((size_t)kh * max_seq + slot) * head_dim;
+    device float *v_dst = v_cache_layer + ((size_t)kh * max_seq + slot) * head_dim;
     for (uint i = lane; i < head_dim; i += 32) {
         k_dst[i] = k_head[i];
         v_dst[i] = v[(size_t)row * n_kv_heads * head_dim + kh * head_dim + i];
@@ -2275,6 +2278,7 @@ kernel void llama_kv_write(
     constant float     &rope_mscale    [[buffer(17)]],
     device const float *rope_adj       [[buffer(18)]],
     constant uint      &rope_n_pairs   [[buffer(19)]],
+    constant uint      &ring           [[buffer(20)]],
     uint kv                             [[threadgroup_position_in_grid]],
     uint lane                           [[thread_index_in_simdgroup]]
 ) {
@@ -2297,8 +2301,13 @@ kernel void llama_kv_write(
     sofuu_rope_apply(k_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, lane, 32,
                      rope_tab, 0, has_table, rope_adj, rope_n_pairs, rope_mscale);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-    device float *k_dst = k_cache_layer + ((size_t)kv * max_seq + pos) * head_dim;
-    device float *v_dst = v_cache_layer + ((size_t)kv * max_seq + pos) * head_dim;
+    // KV4 ring mode (ring != 0): the destination is a rolling f32 window of
+    // ring rows per head, addressed by pos % ring; the quantized blocks live
+    // in their own buffers. ring == 0 is the shipped absolute addressing
+    // (max_seq == the pos window), bit-for-bit unchanged.
+    uint slot = (ring != 0u) ? (pos % ring) : pos;
+    device float *k_dst = k_cache_layer + ((size_t)kv * max_seq + slot) * head_dim;
+    device float *v_dst = v_cache_layer + ((size_t)kv * max_seq + slot) * head_dim;
     for (uint i = lane; i < head_dim; i += 32) {
         k_dst[i] = k_head[i];
         v_dst[i] = v[kv * head_dim + i];
@@ -7561,3 +7570,495 @@ kernel void llama_attn_copy_b4(
     device float *dst = head_out + ((size_t)row * n_heads + h) * head_dim;
     for (uint d = lid.x; d < head_dim; d += 32u) { dst[d] = src[d]; }
 }
+
+// ===========================================================================
+// KV4 - KIVI-layout quantized KV cache for the GPU DECODE (llama_attn_w32) and
+// PREFILL (llama_attn_pre_w32) attention kernels.
+//
+// The scheme is crates/sofuu-core/src/infer/kivi.rs, unchanged:
+//   * K is quantized PER-CHANNEL over a block of 32 consecutive tokens
+//     (one f32 scale + f32 min per channel per block),
+//   * V is quantized PER-TOKEN over channel groups of 32
+//     (one f32 scale + f32 min per (token, channel-group)),
+//   * the newest 32 tokens stay f32 in a ring; a block is quantized only once
+//     it is 32 tokens older than the newest 32, i.e. the quantized prefix is
+//     nq(pos) = (floor((pos+1)/32) - 1) * 32 rows and every row newer than that
+//     is read from the f32 ring,
+//   * byte order inside a block is kivi.rs's: K byte = data[(b*hd + c)*bpc +
+//     s/2] with the EVEN token in the low nibble, V byte = data[(b*32+s)*tp +
+//     c/2] with the EVEN channel in the low nibble - the same bits a CPU reader
+//     of QuantizedKBlock/QuantizedVBlock sees, so the Rust reference and these
+//     kernels can be compared byte for byte.
+//
+// Dequantization happens in REGISTERS: nothing here writes an f32 copy of a
+// quantized row. Per position the warp lanes each own head_dim/32 channels:
+//   score(t) = sum_c q[c] * (code(t,c) * Kscale[b][c] + Kmin[b][c])
+//   out[c]  += w(t) * (code(t,c) * Vscale[t][g] + Vmin[t][g])
+// - the same arithmetic kivi.rs::compute_q_dot_k / accumulate_v does, in the
+// lane-parallel sum order of the f32 kernel it replaces.
+#define KV4_BLOCK 32u
+#define KV4_DMAX  8u
+
+// kivi.rs::QuantizedKBlock::new / QuantizedVBlock::new arithmetic: asymmetric
+// min/max, f32 scale + f32 min, round-half-away-from-zero, clamp to the code
+// range, degenerate range -> zero scale with min = lo.
+template <uint BITS>
+static inline void kv4_quant_range(float lo, float hi, thread float &scale, thread float &mn) {
+    const float qmax = float((1u << BITS) - 1u);
+    mn = lo;
+    scale = (hi > lo) ? (hi - lo) / qmax : 0.0f;
+}
+
+template <uint BITS>
+static inline uchar kv4_code(float x, float scale, float mn) {
+    const float qmax = float((1u << BITS) - 1u);
+    const float inv = (scale > 1e-12f) ? (1.0f / scale) : 0.0f;
+    return (uchar)clamp(round((x - mn) * inv), 0.0f, qmax);
+}
+
+// -- block quantizer: one threadgroup per (block, kv-head) -------------------
+// Reads the block's 32 rows out of the f32 ring (they are the oldest rows the
+// ring still holds) and writes the packed block + scales/mins. Buffers are
+// bound at THIS layer's slice by the host, exactly like k_cache_layer.
+template <uint BITS>
+kernel void kv4_quant_blocks(
+    device const float *k_ring   [[buffer(0)]],
+    device const float *v_ring   [[buffer(1)]],
+    device uchar       *qk       [[buffer(2)]],
+    device float       *qks      [[buffer(3)]],
+    device float       *qkm      [[buffer(4)]],
+    device uchar       *qv       [[buffer(5)]],
+    device float       *qvs      [[buffer(6)]],
+    device float       *qvm      [[buffer(7)]],
+    constant uint      &head_dim [[buffer(8)]],
+    constant uint      &ring     [[buffer(9)]],
+    constant uint      &nblk     [[buffer(10)]],
+    constant uint      &block0   [[buffer(11)]],
+    constant uint      &nblocks  [[buffer(12)]],
+    // All three built-ins share one vector type: Metal refuses a mix of
+    // scalar and vector attributes in one kernel signature.
+    uint2 tg                     [[threadgroup_position_in_grid]],
+    uint2 tid2                   [[thread_position_in_threadgroup]],
+    uint2 tgsz2                  [[threads_per_threadgroup]]
+) {
+    const uint k_f16 = ring >> 31u;
+    const uint rng = ring & 0x7FFFFFFFu;
+    if (tg.x >= nblocks || head_dim == 0u || (head_dim % 32u) != 0u || rng == 0u) { return; }
+    const uint tid = tid2.x;
+    const uint tgsz = tgsz2.x;
+    const uint hd = head_dim;
+    const uint ng = hd / 32u;
+    const uint b = block0 + tg.x;
+    if (b >= nblk) { return; }
+    const uint per_byte = 8u / BITS;
+    const uint mask = (1u << BITS) - 1u;
+    const uint k_bpc = (KV4_BLOCK * BITS) / 8u;
+    const uint v_tp  = (hd * BITS) / 8u;
+    const uint kv = tg.y;
+
+    device const float *kb_ring = k_ring + (size_t)kv * rng * hd;
+    device const float *vb_ring = v_ring + (size_t)kv * rng * hd;
+    device uchar *kb  = qk  + (size_t)kv * nblk * hd * k_bpc;
+    device float *ks  = qks + (size_t)kv * nblk * hd;
+    device float *km  = qkm + (size_t)kv * nblk * hd;
+    device uchar *vb  = qv  + (size_t)kv * nblk * KV4_BLOCK * v_tp;
+    device float *vsc = qvs + (size_t)kv * nblk * KV4_BLOCK * ng;
+    device float *vmn = qvm + (size_t)kv * nblk * KV4_BLOCK * ng;
+
+    // K: per-channel min/max over the block's 32 tokens
+    for (uint c = tid; c < hd; c += tgsz) {
+        float lo = INFINITY, hi = -INFINITY;
+        if (k_f16 != 0u) {
+            device half *kh = (device half *)qk;
+            size_t bb = ((size_t)kv * nblk + b) * KV4_BLOCK * hd;
+            for (uint s = 0; s < KV4_BLOCK; ++s) {
+                float x = kb_ring[(size_t)(((b * KV4_BLOCK + s) % rng)) * hd + c];
+                kh[bb + (size_t)s * hd + c] = (half)x;
+            }
+            continue;
+        }
+        for (uint s = 0; s < KV4_BLOCK; ++s) {
+            float x = kb_ring[(size_t)(((b * KV4_BLOCK + s) % rng)) * hd + c];
+            lo = min(lo, x);
+            hi = max(hi, x);
+        }
+        float scale, mn;
+        kv4_quant_range<BITS>(lo, hi, scale, mn);
+        ks[(size_t)b * hd + c] = scale;
+        km[(size_t)b * hd + c] = mn;
+        size_t base = ((size_t)b * hd + c) * k_bpc;
+        for (uint s = 0; s < KV4_BLOCK; ++s) {
+            uchar code = kv4_code<BITS>(
+                kb_ring[(size_t)(((b * KV4_BLOCK + s) % ring)) * hd + c], scale, mn);
+            uint bi = s / per_byte;
+            uint sh = (s % per_byte) * BITS;
+            if ((s % per_byte) == 0u) { kb[base + bi] = (uchar)(code & mask); }
+            else                      { kb[base + bi] |= (uchar)((code & mask) << sh); }
+        }
+    }
+    // V: per-token min/max over each group of 32 channels
+    for (uint item = tid; item < KV4_BLOCK * ng; item += tgsz) {
+        uint s = item / ng;
+        uint g = item % ng;
+        uint slot = (b * KV4_BLOCK + s) % rng;
+        float lo = INFINITY, hi = -INFINITY;
+        for (uint j = 0; j < 32u; ++j) {
+            float x = vb_ring[(size_t)slot * hd + g * 32u + j];
+            lo = min(lo, x);
+            hi = max(hi, x);
+        }
+        float scale, mn;
+        kv4_quant_range<BITS>(lo, hi, scale, mn);
+        size_t trow = (size_t)b * KV4_BLOCK + s;
+        vsc[trow * ng + g] = scale;
+        vmn[trow * ng + g] = mn;
+        size_t base = trow * v_tp + (size_t)g * (32u / per_byte);
+        for (uint j = 0; j < 32u; ++j) {
+            uchar code = kv4_code<BITS>(vb_ring[(size_t)slot * hd + g * 32u + j], scale, mn);
+            uint sh = (j % per_byte) * BITS;
+            if ((j % per_byte) == 0u) { vb[base + j / per_byte] = (uchar)(code & mask); }
+            else                      { vb[base + j / per_byte] |= (uchar)((code & mask) << sh); }
+        }
+    }
+}
+
+// -- fold ONE position into the online-softmax state -------------------------
+// t <  nq : dequantized from the packed block, in registers
+// t >= nq : read straight out of the f32 residual ring
+template <uint BITS>
+static inline void kv4_fold_token(
+    device const uchar *qk, device const float *qks, device const float *qkm,
+    device const uchar *qv, device const float *qvs, device const float *qvm,
+    device const float *kring, device const float *vring,
+    device const float *q_head,
+    uint lane, uint t, uint nq, uint hd, uint kv, uint nblk, uint ring, uint k_f16, float attn_scale,
+    thread float &m, thread float &l, thread float *acc
+) {
+    const uint ng = hd / 32u;
+    const uint per_byte = 8u / BITS;
+    const uint mask = (1u << BITS) - 1u;
+    const uint k_bpc = (KV4_BLOCK * BITS) / 8u;
+    const uint v_tp  = (hd * BITS) / 8u;
+    const bool quant = (t < nq);
+    uint b = 0u, s = 0u, slot = 0u;
+    if (quant) { b = t / KV4_BLOCK; s = t % KV4_BLOCK; }
+    else       { slot = t % ring; }
+
+    // Q.K
+    float part = 0.0f;
+    if (quant && k_f16 != 0u) {
+        // f16-K variant: K lives as raw halves, token-major, one block of
+        // KV4_BLOCK tokens per (kv head, block) - no scale/min needed.
+        device const half *kh = (device const half *)qk;
+        size_t kbase = ((size_t)kv * nblk + b) * KV4_BLOCK * hd;
+        for (uint i = lane; i < hd; i += 32u) {
+            part += q_head[i] * float(kh[kbase + (size_t)s * hd + i]);
+        }
+    } else if (quant) {
+        device const uchar *kbp = qk  + (size_t)kv * nblk * hd * k_bpc;
+        device const float *ksp = qks + (size_t)kv * nblk * hd;
+        device const float *kmp = qkm + (size_t)kv * nblk * hd;
+        size_t srow = (size_t)b * hd;
+        uint bi = s / per_byte;
+        uint sh = (s % per_byte) * BITS;
+        for (uint i = lane; i < hd; i += 32u) {
+            uchar byte = kbp[(srow + i) * k_bpc + bi];
+            float code = float((byte >> sh) & mask);
+            part += q_head[i] * (code * ksp[srow + i] + kmp[srow + i]);
+        }
+    } else {
+        device const float *kr = kring + (size_t)kv * ring * hd;
+        for (uint i = lane; i < hd; i += 32u) {
+            part += q_head[i] * kr[(size_t)slot * hd + i];
+        }
+    }
+    float sco = simd_sum(part) * attn_scale;
+
+    // V (loaded before the softmax update so its load does not wait on it)
+    float vv[KV4_DMAX];
+    uint di = 0;
+    if (quant) {
+        device const uchar *vbp = qv  + (size_t)kv * nblk * KV4_BLOCK * v_tp;
+        device const float *vsp = qvs + (size_t)kv * nblk * KV4_BLOCK * ng;
+        device const float *vmp = qvm + (size_t)kv * nblk * KV4_BLOCK * ng;
+        size_t trow = (size_t)b * KV4_BLOCK + s;
+        for (uint i = lane, g = 0; i < hd; i += 32u, ++g) {
+            uchar byte = vbp[trow * v_tp + (i / per_byte)];
+            float code = float((byte >> ((i % per_byte) * BITS)) & mask);
+            vv[di] = code * vsp[trow * ng + g] + vmp[trow * ng + g];
+            di++;
+        }
+    } else {
+        device const float *vr = vring + (size_t)kv * ring * hd;
+        for (uint i = lane; i < hd; i += 32u) {
+            vv[di] = vr[(size_t)slot * hd + i];
+            di++;
+        }
+    }
+
+    float mnew = max(m, sco);
+    float corr = exp(m - mnew);
+    float w = exp(sco - mnew);
+    l = l * corr + w;
+    for (uint d = 0; d < di; ++d) { acc[d] = acc[d] * corr + w * vv[d]; }
+    m = mnew;
+}
+
+// -- DECODE attention over a quantized KV cache ------------------------------
+// llama_attn_w32 with the K/V stream split into (quantized blocks, f32 ring).
+// Everything else - the q-norm, the RoPE, the 32-warp position split, the
+// threadgroup rescale and the sacc reduce - is the shipped kernel verbatim, so
+// the only arithmetic that moves is the K/V read itself.
+template <uint BITS>
+kernel void llama_attn_w32_kv4(
+    device float       *q               [[buffer(0)]],
+    device const float *k_ring          [[buffer(1)]],
+    device const float *v_ring          [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *head_out        [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
+    device const uchar *qk              [[buffer(21)]],
+    device const float *qks             [[buffer(22)]],
+    device const float *qkm             [[buffer(23)]],
+    device const uchar *qv              [[buffer(24)]],
+    device const float *qvs             [[buffer(25)]],
+    device const float *qvm             [[buffer(26)]],
+    constant uint      &nblk            [[buffer(27)]],
+    constant uint      &kring           [[buffer(28)]],
+    uint h                              [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_position_in_threadgroup]]
+) {
+    if (pos == 0xFFFFFFFFu || pos >= 4096u || head_dim > 128u) { return; }
+    threadgroup float rbuf[AW32_WARPS];
+    threadgroup float sm[AW32_WARPS];
+    threadgroup float sl[AW32_WARPS];
+    threadgroup float sr[AW32_WARPS];
+    threadgroup float sacc[AW32_WARPS][128];
+
+    uint lane = tid & 31u;
+    uint warp = tid >> 5;
+    device float *q_head = q + h * head_dim;
+    float scale = rsqrt(float(head_dim));
+    if (has_norm != 0u) {
+        float ss = 0.0f;
+        for (uint i = tid; i < head_dim; i += 32 * AW32_WARPS) { ss += q_head[i] * q_head[i]; }
+        ss = simd_sum(ss);
+        if (lane == 0u) { rbuf[warp] = ss; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (uint w = 0; w < AW32_WARPS; ++w) { tot += rbuf[w]; }
+        float rms = rsqrt(tot / float(head_dim) + eps);
+        for (uint i = tid; i < head_dim; i += 128) { q_head[i] = q_head[i] * rms * q_ln[q_ln_rem + i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    sofuu_rope_apply(q_head, head_dim, rope_n_rot, rope_mode, pos, rope_base, tid,
+                     32 * AW32_WARPS, rope_tab, 0, has_table, rope_adj,
+                     rope_n_pairs, rope_mscale);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    uint kv = h / (n_heads / n_kv_heads);
+    uint seq = pos + 1u;
+    uint nq = (seq >= 2u * KV4_BLOCK) ? ((seq / KV4_BLOCK) - 1u) * KV4_BLOCK : 0u;
+    // bit 31 of kring flags the f16-K layout (K halves, V codes)
+    const uint k_f16 = kring >> 31u;
+    const uint ring = kring & 0x7FFFFFFFu;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[8];
+    for (uint d = 0; d < 8u; ++d) { acc[d] = 0.0f; }
+    for (uint t = warp; t < nq; t += AW32_WARPS) {
+        kv4_fold_token<BITS>(qk, qks, qkm, qv, qvs, qvm, k_ring, v_ring, q_head,
+                             lane, t, nq, head_dim, kv, nblk, ring, k_f16, scale, m, l, acc);
+    }
+    for (uint t = nq + warp; t < seq; t += AW32_WARPS) {
+        kv4_fold_token<BITS>(qk, qks, qkm, qv, qvs, qvm, k_ring, v_ring, q_head,
+                             lane, t, nq, head_dim, kv, nblk, ring, k_f16, scale, m, l, acc);
+    }
+
+    if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = sm[0];
+    for (uint w = 1; w < AW32_WARPS; ++w) { gmax = max(gmax, sm[w]); }
+    float ltot = 0.0f;
+    for (uint w = 0; w < AW32_WARPS; ++w) {
+        float r = exp(sm[w] - gmax);
+        sr[w] = r;
+        ltot += sl[w] * r;
+    }
+    uint di = 0;
+    for (uint i = lane; i < head_dim; i += 32) { sacc[warp][i] = acc[di++] * sr[warp]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    for (uint i = tid; i < head_dim; i += 128) {
+        float s = 0.0f;
+        for (uint w = 0; w < AW32_WARPS; ++w) { s += sacc[w][i]; }
+        head_out[h * head_dim + i] = s * inv;
+    }
+}
+template [[host_name("llama_attn_w32_kv4")]] kernel void llama_attn_w32_kv4<4>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&, constant float&,
+    constant uint&, device const float*, constant uint&, constant uint&,
+    constant float&, device const float*, constant uint&, device const uchar*,
+    device const float*, device const float*, device const uchar*, device const float*,
+    device const float*, constant uint&, constant uint&, uint, uint);
+template [[host_name("llama_attn_w32_kv2")]] kernel void llama_attn_w32_kv4<2>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&, constant float&,
+    constant uint&, device const float*, constant uint&, constant uint&,
+    constant float&, device const float*, constant uint&, device const uchar*,
+    device const float*, device const float*, device const uchar*, device const float*,
+    device const float*, constant uint&, constant uint&, uint, uint);
+
+// -- PREFILL attention over a quantized KV cache -----------------------------
+// llama_attn_pre_w32 (one threadgroup per (row, head), 32 warps splitting the
+// key range) with the same K/V split. pos comes from the chunk positions
+// buffer and the row bound is positions[row] exactly as before; the quantized
+// prefix is a pure function of that position, so a row inside the chunk sees
+// the older rows quantized and the newest <=63 rows f32 - the same split the
+// decode pass will use on the next token.
+template <uint BITS>
+kernel void llama_attn_pre_w32_kv4(
+    device const float *q               [[buffer(0)]],
+    device const float *k_ring          [[buffer(1)]],
+    device const float *v_ring          [[buffer(2)]],
+    device float       *q_unused        [[buffer(3)]],
+    device float       *out             [[buffer(4)]],
+    device const uint  *positions       [[buffer(5)]],
+    constant uint      &head_dim        [[buffer(6)]],
+    constant uint      &n_heads         [[buffer(7)]],
+    constant uint      &n_kv_heads      [[buffer(8)]],
+    constant uint      &max_seq         [[buffer(9)]],
+    constant uint      &n_chunks_max    [[buffer(10)]],
+    constant uint      &meta_stride     [[buffer(11)]],
+    constant uint      &rows            [[buffer(12)]],
+    constant uint      &rpt             [[buffer(13)]],
+    device const uchar *qk              [[buffer(14)]],
+    device const float *qks             [[buffer(15)]],
+    device const float *qkm             [[buffer(16)]],
+    device const uchar *qv              [[buffer(17)]],
+    device const float *qvs             [[buffer(18)]],
+    device const float *qvm             [[buffer(19)]],
+    constant uint      &nblk            [[buffer(20)]],
+    constant uint      &kring           [[buffer(21)]],
+    uint3 gid                           [[threadgroup_position_in_grid]],
+    uint3 lid                           [[thread_position_in_threadgroup]]
+) {
+    if (head_dim == 0u || head_dim > 128u || n_kv_heads == 0u || n_heads % n_kv_heads != 0u) { return; }
+    uint g = gid.y * 1024u + gid.x;
+    uint row = g / n_heads;
+    uint h = g % n_heads;
+    if (row >= rows) { return; }
+    uint pos = positions[row];
+    if (pos == 0xFFFFFFFFu || pos >= max_seq) { return; }
+    (void)rpt; (void)n_chunks_max; (void)q_unused;
+
+    threadgroup float sm[PREW_WARPS];
+    threadgroup float sl[PREW_WARPS];
+    threadgroup float sr[PREW_WARPS];
+    threadgroup float sacc[PREW_WARPS][128];
+
+    uint lane = lid.x & 31u;
+    uint warp = lid.x >> 5u;
+    uint kv = h / (n_heads / n_kv_heads);
+    device const float *q_head = q + ((size_t)row * n_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    uint seq = pos + 1u;
+    uint nq = (seq >= 2u * KV4_BLOCK) ? ((seq / KV4_BLOCK) - 1u) * KV4_BLOCK : 0u;
+    // bit 31 of kring flags the f16-K layout (K halves, V codes)
+    const uint k_f16 = kring >> 31u;
+    const uint ring = kring & 0x7FFFFFFFu;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[PREW_DMAX];
+    for (uint d = 0; d < PREW_DMAX; ++d) { acc[d] = 0.0f; }
+    for (uint t = warp; t < nq; t += PREW_WARPS) {
+        kv4_fold_token<BITS>(qk, qks, qkm, qv, qvs, qvm, k_ring, v_ring, q_head,
+                             lane, t, nq, head_dim, kv, nblk, ring, k_f16, scale, m, l, acc);
+    }
+    for (uint t = nq + warp; t < seq; t += PREW_WARPS) {
+        kv4_fold_token<BITS>(qk, qks, qkm, qv, qvs, qvm, k_ring, v_ring, q_head,
+                             lane, t, nq, head_dim, kv, nblk, ring, k_f16, scale, m, l, acc);
+    }
+
+    if (lane == 0u) { sm[warp] = m; sl[warp] = l; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = sm[0];
+    for (uint w = 1; w < PREW_WARPS; ++w) { gmax = max(gmax, sm[w]); }
+    float ltot = 0.0f;
+    for (uint w = 0; w < PREW_WARPS; ++w) {
+        float r = exp(sm[w] - gmax);
+        sr[w] = r;
+        ltot += sl[w] * r;
+    }
+    uint di2 = 0;
+    for (uint i = lane; i < head_dim; i += 32u) { sacc[warp][i] = acc[di2++] * sr[warp]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    device float *dst = out + (size_t)row * meta_stride + (size_t)h * head_dim;
+    for (uint i = lid.x; i < head_dim; i += 128u) {
+        float s = 0.0f;
+        for (uint w = 0; w < PREW_WARPS; ++w) { s += sacc[w][i]; }
+        dst[i] = s * inv;
+    }
+}
+template [[host_name("llama_attn_pre_w32_kv4")]] kernel void llama_attn_pre_w32_kv4<4>(
+    device const float*, device const float*, device const float*, device float*,
+    device float*, device const uint*, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    device const uchar*, device const float*, device const float*, device const uchar*,
+    device const float*, device const float*, constant uint&, constant uint&, uint3, uint3);
+template [[host_name("llama_attn_pre_w32_kv2")]] kernel void llama_attn_pre_w32_kv4<2>(
+    device const float*, device const float*, device const float*, device float*,
+    device float*, device const uint*, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    device const uchar*, device const float*, device const float*, device const uchar*,
+    device const float*, device const float*, constant uint&, constant uint&, uint3, uint3);
+
+template [[host_name("kv4_quant_b4")]] kernel void kv4_quant_blocks<4>(
+    device const float*, device const float*, device uchar*, device float*,
+    device float*, device uchar*, device float*, device float*, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint2, uint2);
+template [[host_name("kv4_quant_b2")]] kernel void kv4_quant_blocks<2>(
+    device const float*, device const float*, device uchar*, device float*,
+    device float*, device uchar*, device float*, device float*, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint2, uint2);
+
+// 8-bit probe instantiations (same kernels, BITS=8).
+template [[host_name("llama_attn_w32_kv8")]] kernel void llama_attn_w32_kv4<8>(
+    device float*, device const float*, device const float*, device const float*,
+    device float*, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant float&, constant float&,
+    constant uint&, device const float*, constant uint&, constant uint&,
+    constant float&, device const float*, constant uint&, device const uchar*,
+    device const float*, device const float*, device const uchar*, device const float*,
+    device const float*, constant uint&, constant uint&, uint, uint);
+template [[host_name("llama_attn_pre_w32_kv8")]] kernel void llama_attn_pre_w32_kv4<8>(
+    device const float*, device const float*, device const float*, device float*,
+    device float*, device const uint*, constant uint&, constant uint&, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    device const uchar*, device const float*, device const float*, device const uchar*,
+    device const float*, device const float*, constant uint&, constant uint&, uint3, uint3);
+template [[host_name("kv4_quant_b8")]] kernel void kv4_quant_blocks<8>(
+    device const float*, device const float*, device uchar*, device float*,
+    device float*, device uchar*, device float*, device float*, constant uint&,
+    constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint2, uint2);

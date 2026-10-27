@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "generated_from": "scan of src/, crates/*/src/, bindings/ (getenv | env::var | process.env)",
-  "count": 173,
+  "count": 175,
   "counts_by_class": {
-    "tuning": 107,
+    "tuning": 108,
     "debug": 13,
     "test": 33,
-    "public": 19,
+    "public": 20,
     "build": 1
   },
   "unclassified_numeric_effect": [
@@ -76,6 +76,7 @@
     "SOFUU_GPU_GEMM_WIDE",
     "SOFUU_GPU_PREFILL",
     "SOFUU_GPU_PREFILL_GEMM",
+    "SOFUU_GPU_ROPE_LLAMA3",
     "SOFUU_GPU_SKIP",
     "SOFUU_GPU_SPEC",
     "SOFUU_GPU_TILE_MMQ",
@@ -158,7 +159,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3279"
+        "crates/sofuu-core/src/infer/metal.rs:3439"
       ]
     },
     {
@@ -168,7 +169,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:4425"
+        "src/metal/metal_engine.mm:4750"
       ]
     },
     {
@@ -178,7 +179,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3292"
+        "crates/sofuu-core/src/infer/metal.rs:3452"
       ]
     },
     {
@@ -188,7 +189,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:872"
+        "src/metal/metal_engine.mm:969"
       ]
     },
     {
@@ -198,7 +199,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:800"
+        "src/metal/metal_engine.mm:895"
       ]
     },
     {
@@ -208,7 +209,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:807"
+        "src/metal/metal_engine.mm:902"
       ]
     },
     {
@@ -218,7 +219,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:4349"
+        "src/metal/metal_engine.mm:4674"
       ]
     },
     {
@@ -228,7 +229,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:1124"
+        "src/metal/metal_engine.mm:1221"
       ]
     },
     {
@@ -248,7 +249,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:4376"
+        "src/metal/metal_engine.mm:4701"
       ]
     },
     {
@@ -258,7 +259,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:484"
+        "src/metal/metal_engine.mm:545"
       ]
     },
     {
@@ -268,7 +269,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3287"
+        "crates/sofuu-core/src/infer/metal.rs:3447"
       ]
     },
     {
@@ -278,7 +279,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3267"
+        "crates/sofuu-core/src/infer/metal.rs:3427"
       ]
     },
     {
@@ -288,7 +289,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:441"
+        "src/metal/metal_engine.mm:460"
       ]
     },
     {
@@ -298,7 +299,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:431"
+        "src/metal/metal_engine.mm:450"
       ]
     },
     {
@@ -390,7 +391,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3420"
+        "crates/sofuu-core/src/infer/metal.rs:3710"
       ]
     },
     {
@@ -400,7 +401,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:2361"
+        "crates/sofuu-core/src/infer/model.rs:2525"
       ]
     },
     {
@@ -410,7 +411,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:1241"
+        "src/metal/metal_engine.mm:1338"
       ]
     },
     {
@@ -420,7 +421,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:3360"
+        "crates/sofuu-core/src/infer/model.rs:3549"
       ]
     },
     {
@@ -430,7 +431,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:3565"
+        "crates/sofuu-core/src/infer/model.rs:3855"
       ]
     },
     {
@@ -440,7 +441,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1853"
+        "crates/sofuu-core/src/infer/mod.rs:1896"
       ]
     },
     {
@@ -708,7 +709,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4701"
+        "crates/sofuu-core/src/infer/model.rs:5049"
       ]
     },
     {
@@ -718,7 +719,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:7089"
+        "crates/sofuu-core/src/infer/model.rs:7528"
       ]
     },
     {
@@ -728,7 +729,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:5913"
+        "crates/sofuu-core/src/infer/model.rs:6282"
       ]
     },
     {
@@ -738,8 +739,8 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3234",
-        "crates/sofuu-core/src/infer/model.rs:3343"
+        "crates/sofuu-core/src/infer/metal.rs:3394",
+        "crates/sofuu-core/src/infer/model.rs:3532"
       ]
     },
     {
@@ -749,8 +750,8 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:3349",
-        "crates/sofuu-core/src/infer/model.rs:6878"
+        "crates/sofuu-core/src/infer/model.rs:3538",
+        "crates/sofuu-core/src/infer/model.rs:7309"
       ]
     },
     {
@@ -760,7 +761,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:6733"
+        "crates/sofuu-core/src/infer/model.rs:7164"
       ]
     },
     {
@@ -800,7 +801,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:1780"
+        "crates/sofuu-core/src/infer/metal.rs:1934"
       ]
     },
     {
@@ -810,7 +811,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:1052"
+        "src/metal/metal_engine.mm:1149"
       ]
     },
     {
@@ -820,7 +821,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:6667"
+        "crates/sofuu-core/src/infer/model.rs:7098"
       ]
     },
     {
@@ -830,7 +831,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:464"
+        "src/metal/metal_engine.mm:525"
       ]
     },
     {
@@ -840,7 +841,8 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8430"
+        "crates/sofuu-core/src/infer/model.rs:8986",
+        "crates/sofuu-core/src/infer/model.rs:8996"
       ]
     },
     {
@@ -850,7 +852,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8505"
+        "crates/sofuu-core/src/infer/model.rs:9078"
       ]
     },
     {
@@ -860,7 +862,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8508"
+        "crates/sofuu-core/src/infer/model.rs:9081"
       ]
     },
     {
@@ -870,7 +872,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8433"
+        "crates/sofuu-core/src/infer/model.rs:8989"
       ]
     },
     {
@@ -880,7 +882,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3258"
+        "crates/sofuu-core/src/infer/metal.rs:3418"
       ]
     },
     {
@@ -890,7 +892,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3304"
+        "crates/sofuu-core/src/infer/metal.rs:3464"
       ]
     },
     {
@@ -900,7 +902,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3298"
+        "crates/sofuu-core/src/infer/metal.rs:3458"
       ]
     },
     {
@@ -910,7 +912,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3356"
+        "crates/sofuu-core/src/infer/metal.rs:3516"
       ]
     },
     {
@@ -920,7 +922,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3335"
+        "crates/sofuu-core/src/infer/metal.rs:3495"
       ]
     },
     {
@@ -930,7 +932,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3315"
+        "crates/sofuu-core/src/infer/metal.rs:3475"
       ]
     },
     {
@@ -940,7 +942,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:3627"
+        "crates/sofuu-core/src/infer/model.rs:3922"
       ]
     },
     {
@@ -950,7 +952,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3573"
+        "crates/sofuu-core/src/infer/metal.rs:3863"
       ]
     },
     {
@@ -960,8 +962,9 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:1088",
-        "crates/sofuu-core/src/infer/model.rs:1115"
+        "crates/sofuu-core/src/infer/model.rs:691",
+        "crates/sofuu-core/src/infer/model.rs:1168",
+        "crates/sofuu-core/src/infer/model.rs:1230"
       ]
     },
     {
@@ -971,7 +974,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:1941"
+        "crates/sofuu-core/src/infer/metal.rs:2095"
       ]
     },
     {
@@ -981,7 +984,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:1978"
+        "crates/sofuu-core/src/infer/metal.rs:2132"
       ]
     },
     {
@@ -991,8 +994,8 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4429",
-        "crates/sofuu-core/src/infer/model.rs:6409"
+        "crates/sofuu-core/src/infer/model.rs:4771",
+        "crates/sofuu-core/src/infer/model.rs:6836"
       ]
     },
     {
@@ -1002,7 +1005,7 @@
       "stability_tier": "T3",
       "determinism_tier": "tolerant",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3382"
+        "crates/sofuu-core/src/infer/metal.rs:3542"
       ]
     },
     {
@@ -1012,7 +1015,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:2257"
+        "crates/sofuu-core/src/infer/metal.rs:2411"
       ]
     },
     {
@@ -1022,7 +1025,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/metal.rs:3127"
+        "crates/sofuu-core/src/infer/metal.rs:3287"
       ]
     },
     {
@@ -1032,7 +1035,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4026"
+        "crates/sofuu-core/src/infer/model.rs:4368"
       ]
     },
     {
@@ -1042,8 +1045,18 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:2339",
-        "crates/sofuu-core/src/infer/model.rs:8549"
+        "crates/sofuu-core/src/infer/model.rs:2503",
+        "crates/sofuu-core/src/infer/model.rs:9127"
+      ]
+    },
+    {
+      "name": "SOFUU_GPU_ROPE_LLAMA3",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/infer/model.rs:1132"
       ]
     },
     {
@@ -1053,7 +1066,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8630"
+        "crates/sofuu-core/src/infer/model.rs:9284"
       ]
     },
     {
@@ -1063,8 +1076,8 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:3974",
-        "crates/sofuu-core/src/infer/model.rs:8268"
+        "crates/sofuu-core/src/infer/model.rs:4312",
+        "crates/sofuu-core/src/infer/model.rs:8806"
       ]
     },
     {
@@ -1074,7 +1087,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:6679"
+        "crates/sofuu-core/src/infer/model.rs:7110"
       ]
     },
     {
@@ -1084,9 +1097,9 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:1250",
+        "src/metal/metal_engine.mm:1347",
         "crates/sofuu-core/src/infer/metal.rs:211",
-        "crates/sofuu-core/src/infer/model.rs:6455"
+        "crates/sofuu-core/src/infer/model.rs:6884"
       ]
     },
     {
@@ -1116,7 +1129,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:1125"
+        "src/metal/metal_engine.mm:1222"
       ]
     },
     {
@@ -1191,13 +1204,24 @@
       ]
     },
     {
+      "name": "SOFUU_KV_DTYPE",
+      "class": "public",
+      "numeric_effect": "yes",
+      "stability_tier": "T2",
+      "determinism_tier": "tolerant",
+      "evidence": [
+        "crates/sofuu-core/src/infer/kv4.rs:132",
+        "crates/sofuu-core/src/main.rs:1711"
+      ]
+    },
+    {
       "name": "SOFUU_KV_F16",
       "class": "public",
       "numeric_effect": "yes",
       "stability_tier": "T2",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:1137"
+        "crates/sofuu-core/src/infer/model.rs:1254"
       ]
     },
     {
@@ -1207,7 +1231,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1740"
+        "crates/sofuu-core/src/main.rs:1787"
       ]
     },
     {
@@ -1239,7 +1263,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:5248"
+        "src/metal/metal_engine.mm:5615"
       ]
     },
     {
@@ -1249,7 +1273,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:5250"
+        "src/metal/metal_engine.mm:5617"
       ]
     },
     {
@@ -1259,7 +1283,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:5249"
+        "src/metal/metal_engine.mm:5616"
       ]
     },
     {
@@ -1289,7 +1313,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:1123"
+        "src/metal/metal_engine.mm:1220"
       ]
     },
     {
@@ -1422,7 +1446,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:8553"
+        "crates/sofuu-core/src/infer/model.rs:9131"
       ]
     },
     {
@@ -1432,7 +1456,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:1147"
+        "crates/sofuu-core/src/infer/model.rs:1264"
       ]
     },
     {
@@ -1442,7 +1466,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1171"
+        "crates/sofuu-core/src/infer/mod.rs:1206"
       ]
     },
     {
@@ -1452,7 +1476,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:521"
+        "src/metal/metal_engine.mm:582"
       ]
     },
     {
@@ -1462,7 +1486,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "src/metal/metal_engine.mm:506"
+        "src/metal/metal_engine.mm:567"
       ]
     },
     {
@@ -1472,7 +1496,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "src/metal/metal_engine.mm:530"
+        "src/metal/metal_engine.mm:591"
       ]
     },
     {
@@ -1482,7 +1506,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:957"
+        "crates/sofuu-core/src/infer/mod.rs:976"
       ]
     },
     {
@@ -1533,7 +1557,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "src/metal/metal_engine.mm:730"
+        "src/metal/metal_engine.mm:791"
       ]
     },
     {
@@ -1583,9 +1607,9 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:1820",
-        "crates/sofuu-core/src/infer/model.rs:4433",
-        "crates/sofuu-core/src/infer/model.rs:6672"
+        "crates/sofuu-core/src/infer/model.rs:1984",
+        "crates/sofuu-core/src/infer/model.rs:4775",
+        "crates/sofuu-core/src/infer/model.rs:7103"
       ]
     },
     {
@@ -1615,7 +1639,7 @@
       "stability_tier": "T3",
       "determinism_tier": "unsure",
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:686"
+        "crates/sofuu-core/src/infer/model.rs:728"
       ]
     },
     {
@@ -1665,7 +1689,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/quant.rs:3165"
+        "crates/sofuu-core/src/infer/quant.rs:3215"
       ]
     },
     {
@@ -1675,7 +1699,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1418"
+        "crates/sofuu-core/src/infer/mod.rs:1456"
       ]
     },
     {
@@ -1685,7 +1709,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1441"
+        "crates/sofuu-core/src/infer/mod.rs:1483"
       ]
     },
     {
@@ -1695,7 +1719,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1580"
+        "crates/sofuu-core/src/infer/mod.rs:1623"
       ]
     },
     {
@@ -1705,7 +1729,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1446"
+        "crates/sofuu-core/src/infer/mod.rs:1488"
       ]
     },
     {
@@ -1715,7 +1739,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1470"
+        "crates/sofuu-core/src/infer/mod.rs:1512"
       ]
     },
     {
@@ -1725,7 +1749,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1593"
+        "crates/sofuu-core/src/infer/mod.rs:1636"
       ]
     },
     {
@@ -1735,7 +1759,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1442"
+        "crates/sofuu-core/src/infer/mod.rs:1484"
       ]
     },
     {
@@ -1745,7 +1769,7 @@
       "stability_tier": "T3",
       "determinism_tier": "exact",
       "evidence": [
-        "crates/sofuu-core/src/infer/mod.rs:1598"
+        "crates/sofuu-core/src/infer/mod.rs:1641"
       ]
     },
     {
@@ -1755,7 +1779,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4328"
+        "crates/sofuu-core/src/infer/model.rs:4670"
       ]
     },
     {
@@ -1765,7 +1789,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4607"
+        "crates/sofuu-core/src/infer/model.rs:4955"
       ]
     },
     {
@@ -1775,7 +1799,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4278"
+        "crates/sofuu-core/src/infer/model.rs:4620"
       ]
     },
     {
@@ -1785,7 +1809,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4272"
+        "crates/sofuu-core/src/infer/model.rs:4614"
       ]
     },
     {
@@ -1795,7 +1819,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/infer/model.rs:4314"
+        "crates/sofuu-core/src/infer/model.rs:4656"
       ]
     },
     {

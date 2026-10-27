@@ -11,6 +11,7 @@ pub mod gptx3;
 pub mod qwen35;
 pub mod lfm2;
 pub mod kivi;
+pub mod kv4;
 pub mod lookahead;
 pub mod metal;
 pub mod mmap;
@@ -353,6 +354,24 @@ impl InferModel {
         match &self.backend {
             ModelBackend::Gguf(m) => m.spec_decode_supported(),
             _ => true,
+        }
+    }
+
+    /// True when the quantized KV cache owns the history (GPU decode path).
+    /// Every route that walks the f32 cache as if it were the full prefix
+    /// must be off in that mode.
+    pub fn kv4_armed(&self) -> bool {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.kv4_armed(),
+            _ => false,
+        }
+    }
+
+    /// KV precision the GPU decode path actually armed (0 = f32 cache).
+    pub fn kv_bits(&self) -> u32 {
+        match &self.backend {
+            ModelBackend::Gguf(m) => m.kv_bits(),
+            _ => 0,
         }
     }
 
@@ -1302,7 +1321,7 @@ impl InferEngine {
             return Err(format!("score_text needs >= 8 tokens, got {}", tokens.len()));
         }
         let vocab = self.model.config.vocab_size;
-        let max_seq = self.model.config.max_seq_len;
+        let max_seq = self.model.logical_seq_len();
         let window = if window == 0 { DEFAULT_SCORE_WINDOW } else { window };
         let window = window.max(8).min(max_seq);
         let batch = self::model::max_prefill_batch().min(window / 2).max(1);
@@ -1411,6 +1430,22 @@ impl InferEngine {
         // triggers. Equal to max_seq_len when ring mode is off.
         let logical_max_seq_len = self.model.logical_seq_len();
         let ring_mode = options.kivi && self.model.kv_ring_mode();
+        // KV4: the history lives in packed blocks indexed by absolute
+        // position, so compaction (which drops middle tokens and shifts the
+        // survivors down) cannot be expressed. The logical window is a hard
+        // cap: filling it stops loudly rather than rewriting the history.
+        let kv4_mode = self.model.kv4_armed();
+        let kv4_full_stop = |pos: usize, need: usize, where_: &str| {
+            if kv4_mode && pos + need >= logical_max_seq_len {
+                eprintln!(
+                    "[kv4] FATAL: {where_} reached the {logical_max_seq_len}-token logical window with the quantized KV cache armed; the packed blocks cannot slide.",
+                );
+                eprintln!(
+                    "[kv4] A sliding history needs the f32 cache: rerun with --kv-dtype f32 (or raise --ctx).",
+                );
+                std::process::abort();
+            }
+        };
         let vocab_size = self.model.config.vocab_size;
         let mut logits_buf = vec![0.0f32; vocab_size];
         // Setup work (tokenize, cache reset, SnapKV/KIVI) is reported apart
@@ -1561,13 +1596,15 @@ impl InferEngine {
             // Prefill new tokens up to the last one
             if n_new > 1 {
                 for chunk in new_tokens[..n_new - 1].chunks(chunk_size) {
-                    while cur_pos + chunk.len() >= max_seq_len && cur_pos > sink + drop {
+                    kv4_full_stop(cur_pos, chunk.len(), "prefill");
+                    while cur_pos + chunk.len() >= logical_max_seq_len && cur_pos > sink + drop {
                         compacted = true;
                         cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                     }
-                    if cur_pos + chunk.len() >= max_seq_len {
+                    if cur_pos + chunk.len() >= logical_max_seq_len {
                         for &tok in chunk {
-                            while cur_pos >= max_seq_len && cur_pos > sink + drop {
+                            kv4_full_stop(cur_pos, 1, "prefill");
+                            while cur_pos >= logical_max_seq_len && cur_pos > sink + drop {
                                 compacted = true;
                                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                             }
@@ -1583,7 +1620,8 @@ impl InferEngine {
 
             // Final prompt token computes logits
             let last_tok = new_tokens[n_new - 1];
-            while cur_pos >= max_seq_len && cur_pos > sink + drop {
+            kv4_full_stop(cur_pos, 1, "prefill");
+            while cur_pos >= logical_max_seq_len && cur_pos > sink + drop {
                 compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
             }
@@ -1691,7 +1729,11 @@ impl InferEngine {
         // implemented in the tree verify pass, so the tree is off for those
         // models whatever SOFUU_SPEC says.
         let spec_wanted = std::env::var("SOFUU_SPEC").map(|v| v == "1").unwrap_or(false)
-            && self.model.spec_decode_supported();
+            && self.model.spec_decode_supported()
+            // KV4: the tree commit rewrites f32 rows by absolute position,
+            // which the quantized cache cannot serve - it would attend a
+            // history that is not the accepted one.
+            && !self.model.kv4_armed();
         let mut ngram_cache = if spec_wanted && options.lookahead && matches!(self.model.backend, ModelBackend::Gguf(_)) {
             let mut cache = lookahead::NgramCache::new(2048);
             cache.ingest_sequence(&input_tokens);
@@ -1826,7 +1868,8 @@ impl InferEngine {
             // KV Cache auto-compaction before advancing. Ring mode skips it
             // entirely: the KIVI streams are the history of record, positions
             // never shift, and the ring's wrapped f32 rows are dead weight.
-            while !ring_mode && cur_pos >= max_seq_len && cur_pos > sink + drop {
+            kv4_full_stop(cur_pos, 1, "decode");
+            while !ring_mode && cur_pos >= logical_max_seq_len && cur_pos > sink + drop {
                 compacted = true;
                 cur_pos = self.model.compact_kv_cache(cur_pos, sink, drop);
                 // F-LC3: the compaction dropped middle tokens, shifted the

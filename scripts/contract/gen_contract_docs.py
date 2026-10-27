@@ -53,12 +53,12 @@ PUBLIC = {"SOFUU_NO_SHELL", "SOFUU_STORAGE", "SOFUU_BRAIN_KEY", "SOFUU_BRAIN_MAX
           "SOFUU_BRAIN_EF_SEARCH", "SOFUU_SERVE_TOKEN", "SOFUU_HTTP_HEADERS_MS",
           "SOFUU_HTTP_IDLE_MS", "SOFUU_STALL_TIMEOUT_SECS", "SOFUU_NUM_THREADS",
           "SOFUU_KIVI", "SOFUU_KIVI_BITS", "SOFUU_DYNAMIC_FFN", "SOFUU_RESIDENT_WEIGHTS",
-          "SOFUU_NO_ML", "SOFUU_NO_TILES", "SOFUU_KV_F16", "SOFUU_MCP_CONFIG",
+          "SOFUU_NO_ML", "SOFUU_NO_TILES", "SOFUU_KV_F16", "SOFUU_KV_DTYPE", "SOFUU_MCP_CONFIG",
           "SOFUU_POLICY"}
 NON_NUMERIC = {"SOFUU_AFFINITY", "SOFUU_NO_TOOLS"}
 NUMERIC_RE = re.compile(
     r"TILE|GEMM|GEMV|COALESCED|FUSE|PRE8|GQA|Q4|Q6|Q3|NIBBLE|SCALE_SIDECAR|SPEC_|"
-    r"LOOKAHEAD|FA2|MMQ|DECODE_|PREFILL|ROPE|KV_F16|KIVI|RESIDENT_WEIGHTS|"
+    r"LOOKAHEAD|FA2|MMQ|DECODE_|PREFILL|ROPE|KV_F16|KV_DTYPE|KIVI|RESIDENT_WEIGHTS|"
     r"GPU_ATTN|GPU_SKIP|GPU_SPEC|ATTN_|NO_BARRIER|NO_TILES|GEMM_TYPES|T143|PHASE|ENTROPY"
 )
 
@@ -72,6 +72,12 @@ DETERMINISM_EXACT = {
 }
 DETERMINISM_TOLERANT = {
     "SOFUU_GPU_GEMM_MMA",   # fp16 tiles, published 2e-2 abs/scale bound (parity LEDGER #7)
+    # Quantized KV on the GPU decode path is OPT-IN (the default is the f32
+    # cache). --kv-dtype 8 holds the ~1% ppl band on the local fleet (max
+    # +0.23%) at 3.2x less KV; --kv-dtype 4 does not (SmolLM2 +7.7%).
+    # f32 is the exact contract (byte-identical dumps); see
+    # contract/KV4-OPERATOR-NOTE.md for every receipt.
+    "SOFUU_KV_DTYPE",
 }
 DETERMINISM_BEST_EFFORT_PREFIX = "SOFUU_ENTROPY"  # sampler params: opt-in, change output
 

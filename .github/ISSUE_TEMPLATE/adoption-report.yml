@@ -1,0 +1,79 @@
+name: Adoption report (P6)
+description: Register an external deployment, an independent conformance run, or an upgrade drill.
+title: "[adoption] <team> - <surface>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Sofuu's P6 exit needs outside evidence, not internal claims. This form
+        records a deployment or an unaided conformance run. The protocol and
+        the ledger live in [`contract/adoption/`](https://github.com/sofuu-runtime/sofuu/tree/main/contract/adoption).
+
+        Expected board on a release (QTSQ-free) build: 52 cases — 42 PASS /
+        0 FAIL / 10 BLOCKED, `capability_posture_ok: true`, `verify_dist: ok`.
+        A codec-bearing build reports 41 PASS / 11 BLOCKED (T1.3 needs a
+        codec-free binary). Either is honest; a different board is a finding.
+
+  - type: input
+    id: team
+    attributes:
+      label: Team / organization
+      description: Who is running Sofuu, and where.
+      placeholder: "Acme Robotics - fleet service"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Deployment surface
+      options:
+        - Device app (Android / iOS / macOS / desktop)
+        - Fleet or server (sofuu serve / libsofuu)
+        - Regulated use case
+        - Independent conformance run (no deployment yet)
+    validations:
+      required: true
+
+  - type: input
+    id: release
+    attributes:
+      label: Release tag and checksum
+      description: The tag you pinned and the CHECKSUMS.txt entry for the artifact.
+      placeholder: "v0.2.0 (sha256: ...)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirement
+    attributes:
+      label: Hard requirement
+      description: What breaks if Sofuu fails here? (Internal demos do not count.)
+    validations:
+      required: true
+
+  - type: textarea
+    id: conformance
+    attributes:
+      label: Conformance result
+      description: |
+        Paste the summary line and the posture/verify_dist fields from
+        `sofuu conformance` (or attach `conformance-report.json`).
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: upgrade
+    attributes:
+      label: Upgrade drill (optional)
+      description: From -> to version and how many support conversations it took.
+      placeholder: "v0.2.0 -> v0.2.1, 0 support conversations"
+
+  - type: checkboxes
+    id: surface-only
+    attributes:
+      label: Public surface only
+      options:
+        - label: The app uses only documented public API (no private globals, forked drivers, or hand-written session files).
+          required: true

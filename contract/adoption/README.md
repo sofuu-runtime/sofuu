@@ -68,6 +68,11 @@ Then regenerate the published ledger and pages:
 python3 scripts/scoreboard.py
 ```
 
+Outside teams do not need repository write access: open an **Adoption report**
+issue (the template in `.github/ISSUE_TEMPLATE/adoption-report.yml`) with the
+release tag, the conformance summary and the upgrade evidence; accepted
+entries are mirrored into `ledger.json` here.
+
 ## Current status
 
 **Open.** No external deployment yet. The publishing half of P6 is live

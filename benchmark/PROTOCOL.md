@@ -57,7 +57,6 @@ kernel's GPUStartTime/GPUEndTime barely moves.
   be compared bit for bit — `SOFUU_DUMP_LOGITS` only ever covered prefill, which
   never runs a b=1 GEMV.
 
-<<<<<<< ours
 ## Closed: ANE forward-path offload (do not re-attempt without new hardware)
 
 Measured twice, on real weights and real engine hidden states, and rejected both times. Recorded here
@@ -103,7 +102,7 @@ Conclusion: on this M2 Pro, with a correct fp16 implementation and the seam cost
 beat the GPU for either prefill or decode of this workload. The machine's usable structure is GPU + CPU
 together, one commit per token, which is what ships. Keep /tmp/ane-lab scripts (bench.swift, build_ffn.py,
 chain28.py, RESULTS.md) for a future SoC where the seam or the bandwidth ratio differs.
-=======
+
 ### Fusing projection dispatches (`SOFUU_GEMV_SECS`) — bit-exact, and a measured loss
 
 196 of a decode token's 254 dispatches are the per-layer projections, so the
@@ -191,4 +190,4 @@ relative), so it cannot move a sampling decision that quantisation does not
 already move; what it does move is *reproducibility* — a bit-exact replay claim
 requires the flag off, and the arm id has to be recorded with any receipt that
 used it.
->>>>>>> theirs
+

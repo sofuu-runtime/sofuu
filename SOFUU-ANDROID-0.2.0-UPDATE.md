@@ -22,6 +22,10 @@ repository.
 - Remote Maven publication is implemented but not executed: Maven Central
   needs ownership of the `com.sofuu` group plus signing credentials, and those
   are operator-owned. The namespace must not be published by guessing.
+- The same layout is publicly available without credentials at
+  `https://sofuu-runtime.github.io/sofuu/maven`, and the GitHub pre-release
+  `android-sdk-v0.2.0` carries the AAR, sources, POM, module metadata, and
+  checksums as assets.
 - The 7.7 MB AAR reflects the full in-process inference path; the old Android
   script's 5 MB cap was raised to 12 MB for this artifact (override with
   `SOFUU_ANDROID_MAX_SIZE`).

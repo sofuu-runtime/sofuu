@@ -9,8 +9,9 @@ no API key in your APK, and no telemetry.
 ```groovy
 // app/build.gradle
 repositories {
-    mavenLocal()   // after `make android-publish-local`
-    // or your Maven/GitHub Packages repository
+    maven { url = uri("https://sofuu-runtime.github.io/sofuu/maven") }
+    mavenLocal()   // optional: after `make android-publish-local`
+    mavenCentral()
 }
 
 dependencies {
@@ -18,10 +19,10 @@ dependencies {
 }
 ```
 
-The 0.2.0 artifact is built and published to the local Maven repository by
-this checkout. A public Maven Central release additionally requires ownership
-of the `com.sofuu` group and signing credentials; those are operator-owned and
-are never committed.
+The same layout is available from the public GitHub Pages repository above and
+from `mavenLocal()` after `make android-publish-local`. A Maven Central release
+additionally requires ownership of the `com.sofuu` group and signing
+credentials; those are operator-owned and are never committed.
 
 That is the whole integration. The AAR bundles the per-ABI `libsofuu` native
 runtime, the JNI bridge, and `libc++_shared.so`; you do **not** copy `.so`

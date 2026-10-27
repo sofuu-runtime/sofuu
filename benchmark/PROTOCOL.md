@@ -191,3 +191,35 @@ already move; what it does move is *reproducibility* — a bit-exact replay clai
 requires the flag off, and the arm id has to be recorded with any receipt that
 used it.
 
+## Closed: DCOCO contextual correction over n-gram lookahead (2026-10-27)
+
+DCOCO (github.com/two-delta/DCOCO, arXiv 2610.12570) fixes a parallel drafter that picks each slot without
+seeing its predecessors: keep top-K per slot, score the (B-1)K^2 adjacent transitions in one batched pass,
+then walk prefix-first. Our n-gram lookahead has the same defect (each level proposed independently), so it
+was implemented in full (+558 lines, additive) and measured. **It loses. Default stays 0.**
+
+| model | tree off | DCOCO K=4 | delta |
+|---|---|---|---|
+| SmolLM2-360M Q8_0 (GPU chain, default) | 2.952 tok/pass | 2.773 | **-6.1%** |
+| SmolLM2-360M (CPU tree rows=8) | 3.158 | 2.952 | -6.5% |
+| Qwen3-8B Q4_K_M | 1.125 | 1.059 | -5.9% |
+| Qwen3-0.6B Q4_K_M | 1.000 | 1.000 | 0 (spec gated off after 8 zero-accept steps) |
+
+Cost was never the problem: the pair pass is 5.27 us/draft, **0.016%** of a 32-34 ms draft cycle. The reason
+is that the tree fails on **recall, not ranking** - at K=64 the model token is still absent from the lattice on
+5/21 deep breaks (SmolLM2) and **16/16** (Qwen3-8B), and only 3/21 deep breaks were rerankable at all (+14% at
+oracle precision is the whole headroom). An AR n-gram drafter already puts the approximate joint argmax in each
+slot top-1, so pair scoring is near-degenerate. Output stayed bit-identical (greedy md5 + full-vocab prefill and
+decode dump md5 across all 8 arms), so this is a pure throughput loss: no correctness risk, simply no win.
+
+**Finding that outlived the experiment - speculation is currently slower than not speculating.** SmolLM2,
+interleaved ABBA x5, n=10/arm: serial **130.70** tk/s, tree verify **83.55**, tree+DCOCO **77.90**. A 4-row
+verify accepts 2.95 tokens but costs ~4.6x a serial token, where amortising the weight read should make it
+~1.2x. The gate (`min_accept=1.15`) is acceptance-only, so it keeps a net loss enabled. Same root cause as
+batched decode failing to amortise at b=2: a multi-row forward costs ~N x a single row instead of ~1x. Do not
+add more drafter work (DCOCO, Medusa-style heads, wider lattices) until multi-row cost is fixed - recall and
+verify cost both have to be solved, and recall is cheap to fix only after the cost is.
+
+Also found here, pre-existing and unrelated: the CPU-tree **rows=5** route diverges from serial greedy text
+(SmolLM2, Qwen3-8B) with DCOCO off, and `SOFUU_NO_TILES=1` does not unify it - unlike the TASKS.md:3741 note.
+GPU chain (rows=3) and rows=8 do match serial. Full report: `docs/DCOCO-REPORT.md` (local-only, gitignored).

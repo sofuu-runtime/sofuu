@@ -139,8 +139,9 @@ void sofuu_embed_set_log_cb(sofuu_log_cb cb, void *opaque);
  * defaults never retarget another. The CLI sets none, so chat's
  * "no model configured" guidance is unchanged.
  *
- * NOTE: there is no "qtsq" config key. Whether the encrypted-brain codec is
- * present is a BUILD-time property of the library, not a runtime toggle.
+ * NOTE: there is no "qtsq" config key. QTSQ is a core runtime component and
+ * every published Android SDK artifact links it; a deliberate codec-less
+ * development build is a build-time property, not a runtime toggle.
  * In embedded mode process.exit(N) throws a catchable ExitError with an
  * `exitCode` property instead of terminating the host process, and the
  * config is visible to JS as globalThis.__sofuu_embed_config.
@@ -235,10 +236,11 @@ int sofuu_rt_cancel(SofuuRuntime *rt, uint64_t cancel_id);
  *   sofuu_rt_call_stream(rt, "ai.streamLocal",
  *       "[\"/models/model.gguf\",\"prompt\",{}]", on_event, opaque, &cancel);
  *
- * `storage.*` works in every build. `memory.*` is present but a no-op when
- * the library was linked without QTSQ; check the build manifest before
- * promising encrypted-brain behavior. `ai.streamLocal` is in-process and
- * needs no provider or network.
+ * `storage.*` works in every build. `memory.*` needs QTSQ, which is linked in
+ * every published Android SDK artifact; a deliberate codec-less development
+ * build refuses memory with a typed E_CAPABILITY instead of silently no-oping.
+ * Check `sofuu.capabilities()` for the loaded build. `ai.streamLocal` is
+ * in-process and needs no provider or network.
  *
  * A host that wants the JS implementation of a pipeline can load a single
  * bundled script with sofuu_rt_eval (ES modules must be bundled first) and

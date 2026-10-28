@@ -29,7 +29,14 @@ pub const DOC_SCHEMA_VERSION: u64 = 1;
 
 /// Top-level keys the format allows (R4.5: no app-private side channel — an
 /// unknown section is a validation error, not tolerated data).
-const DOC_KEYS: [&str; 4] = ["schema_version", "session", "turns", "events"];
+const DOC_KEYS: [&str; 6] = [
+    "schema_version",
+    "session",
+    "turns",
+    "events",
+    "state",
+    "metadata",
+];
 
 // ── Build ────────────────────────────────────────────────────────────────────
 
@@ -151,6 +158,10 @@ pub fn build(project: &str, sid: &str, meta: Option<&Value>) -> Result<Value, St
     let mut model = String::new();
     let mut provider = String::new();
     let mut title = String::new();
+    let mut kind = "chat".to_string();
+    let mut agent = String::new();
+    let mut status = "active".to_string();
+    let mut session_meta = Map::new();
     if let Some(m) = meta {
         if let Some(v) = m.get("model").and_then(Value::as_str) {
             model = v.to_string();
@@ -160,6 +171,18 @@ pub fn build(project: &str, sid: &str, meta: Option<&Value>) -> Result<Value, St
         }
         if let Some(v) = m.get("title").and_then(Value::as_str) {
             title = clip(v, 200);
+        }
+        if let Some(v) = m.get("kind").and_then(Value::as_str) {
+            kind = v.to_string();
+        }
+        if let Some(v) = m.get("agent").and_then(Value::as_str) {
+            agent = v.to_string();
+        }
+        if let Some(v) = m.get("status").and_then(Value::as_str) {
+            status = v.to_string();
+        }
+        if let Some(obj) = m.get("metadata").and_then(Value::as_object) {
+            session_meta = obj.clone();
         }
     }
 
@@ -176,17 +199,39 @@ pub fn build(project: &str, sid: &str, meta: Option<&Value>) -> Result<Value, St
             let usage = events::canonical_usage(&merge_meta_into_usage(
                 &raw_usage, &model, &provider,
             ));
-            turns.push(json!({
-                "id": t.get("id").cloned().unwrap_or(json!(format!("t_{i}"))),
-                "index": i,
-                "prompt": t.get("prompt").cloned().unwrap_or(json!("")),
-                "answer": t.get("answer").cloned().unwrap_or(json!("")),
-                "status": status,
-                "usage": usage,
-                "tools": t.get("tools").cloned().unwrap_or_else(|| json!([])),
-                "served_by": t.get("served_by").cloned().unwrap_or(json!(served_by)),
-                "error": t.get("error").cloned().unwrap_or(Value::Null),
-            }));
+            let prompt = t.get("prompt")
+                .or_else(|| t.get("input"))
+                .or_else(|| t.get("user"))
+                .cloned()
+                .unwrap_or(json!(""));
+            let answer = t.get("answer")
+                .or_else(|| t.get("output"))
+                .or_else(|| t.get("assistant"))
+                .cloned()
+                .unwrap_or(json!(""));
+            let mut turn_map = Map::new();
+            turn_map.insert("id".into(), t.get("id").cloned().unwrap_or(json!(format!("t_{i}"))));
+            turn_map.insert("index".into(), json!(i));
+            turn_map.insert("prompt".into(), prompt);
+            turn_map.insert("answer".into(), answer);
+            turn_map.insert("status".into(), json!(status));
+            turn_map.insert("usage".into(), usage);
+            turn_map.insert("tools".into(), t.get("tools").cloned().unwrap_or_else(|| json!([])));
+            turn_map.insert("served_by".into(), t.get("served_by").cloned().unwrap_or(json!(served_by)));
+            turn_map.insert("error".into(), t.get("error").cloned().unwrap_or(Value::Null));
+            if let Some(k) = t.get("kind").or_else(|| t.get("type")) {
+                turn_map.insert("kind".into(), k.clone());
+            }
+            if let Some(d) = t.get("data") {
+                turn_map.insert("data".into(), d.clone());
+            }
+            if let Some(u) = t.get("user") {
+                turn_map.insert("user".into(), u.clone());
+            }
+            if let Some(a) = t.get("assistant") {
+                turn_map.insert("assistant".into(), a.clone());
+            }
+            turns.push(Value::Object(turn_map));
         }
     } else {
         // Event-log fold: reconstruct's turns → the §5.2 shape. Usage
@@ -232,13 +277,29 @@ pub fn build(project: &str, sid: &str, meta: Option<&Value>) -> Result<Value, St
     sobj.insert("title".into(), json!(title));
     sobj.insert("model".into(), json!(model));
     sobj.insert("provider".into(), json!(provider));
+    sobj.insert("kind".into(), json!(kind));
+    if !agent.is_empty() {
+        sobj.insert("agent".into(), json!(agent));
+    }
+    if !status.is_empty() {
+        sobj.insert("status".into(), json!(status));
+    }
+    if !session_meta.is_empty() {
+        sobj.insert("metadata".into(), Value::Object(session_meta));
+    }
 
-    let mut doc = json!({
-        "schema_version": DOC_SCHEMA_VERSION,
-        "session": Value::Object(sobj),
-        "turns": turns,
-        "events": {"format": "ndjson", "path": "events.ndjson"},
-    });
+    let mut doc_map = Map::new();
+    doc_map.insert("schema_version".into(), json!(DOC_SCHEMA_VERSION));
+    doc_map.insert("session".into(), Value::Object(sobj));
+    doc_map.insert("turns".into(), Value::Array(turns));
+    doc_map.insert("events".into(), json!({"format": "ndjson", "path": "events.ndjson"}));
+    if let Some(st) = meta.and_then(|m| m.get("state")).and_then(Value::as_object) {
+        doc_map.insert("state".into(), Value::Object(st.clone()));
+    }
+    if let Some(md) = meta.and_then(|m| m.get("metadata")).and_then(Value::as_object) {
+        doc_map.insert("metadata".into(), Value::Object(md.clone()));
+    }
+    let mut doc = Value::Object(doc_map);
     redact_in_place(&mut doc);
     Ok(doc)
 }
@@ -259,10 +320,22 @@ fn merge_meta_into_usage(usage: &Value, model: &str, provider: &str) -> Value {
 }
 
 fn apply_meta(doc: &mut Value, meta: &Value) {
-    let Some(s) = doc.get_mut("session").and_then(Value::as_object_mut) else { return };
-    for k in ["title", "model", "provider", "project", "updated"] {
-        if let Some(v) = meta.get(k) {
-            s.insert(k.into(), v.clone());
+    if let Some(s) = doc.get_mut("session").and_then(Value::as_object_mut) {
+        for k in ["title", "model", "provider", "project", "updated", "kind", "agent", "status"] {
+            if let Some(v) = meta.get(k) {
+                s.insert(k.into(), v.clone());
+            }
+        }
+        if let Some(v) = meta.get("metadata") {
+            s.insert("metadata".into(), v.clone());
+        }
+    }
+    if let Some(doc_obj) = doc.as_object_mut() {
+        if let Some(st) = meta.get("state") {
+            doc_obj.insert("state".into(), st.clone());
+        }
+        if let Some(md) = meta.get("metadata") {
+            doc_obj.insert("metadata".into(), md.clone());
         }
     }
 }
@@ -295,6 +368,16 @@ pub fn validate(doc: &Value) -> Vec<String> {
     }
     if doc.pointer("/session/id").and_then(Value::as_str).is_none() {
         errs.push("session.id is required".into());
+    }
+    if let Some(st) = doc.get("state") {
+        if !st.is_object() {
+            errs.push("state must be a JSON object".into());
+        }
+    }
+    if let Some(md) = doc.get("metadata") {
+        if !md.is_object() {
+            errs.push("metadata must be a JSON object".into());
+        }
     }
     match doc.get("turns") {
         None | Some(Value::Null) => {}
@@ -376,6 +459,22 @@ pub fn import(project: &str, doc_text: &str) -> Result<Value, String> {
         return Err("E_SCHEMA: invalid session.id".into());
     }
     let mut doc = doc;
+    if let Some(turns) = doc.get_mut("turns").and_then(Value::as_array_mut) {
+        for t in turns.iter_mut() {
+            if let Some(t_obj) = t.as_object_mut() {
+                if !t_obj.contains_key("prompt") {
+                    if let Some(inp) = t_obj.get("input").cloned() {
+                        t_obj.insert("prompt".into(), inp);
+                    }
+                }
+                if !t_obj.contains_key("answer") {
+                    if let Some(out) = t_obj.get("output").cloned() {
+                        t_obj.insert("answer".into(), out);
+                    }
+                }
+            }
+        }
+    }
     redact_in_place(&mut doc);
     // Overwriting a DIFFERENT existing doc with the same id is reported, not
     // silent (R4.4); the write still happens (import is the user's intent).
@@ -410,12 +509,19 @@ pub fn list(project: &str) -> Value {
                 out.push(json!({"id": sid, "error": "session.json unparseable"}));
                 continue;
             };
-            out.push(json!({
+            let mut item = json!({
                 "id": doc.pointer("/session/id").cloned().unwrap_or(json!(sid)),
                 "title": doc.pointer("/session/title").cloned().unwrap_or(json!("")),
                 "updated": doc.pointer("/session/updated").cloned().unwrap_or(json!("")),
                 "turns": doc.get("turns").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
-            }));
+            });
+            if let Some(k) = doc.pointer("/session/kind") {
+                item.as_object_mut().unwrap().insert("kind".into(), k.clone());
+            }
+            if let Some(st) = doc.pointer("/session/status") {
+                item.as_object_mut().unwrap().insert("status".into(), st.clone());
+            }
+            out.push(item);
         }
     }
     json!({"ok": true, "sessions": out})
@@ -493,12 +599,34 @@ fn json_str(v: &str) -> CString {
 unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value> {
     let mut len = 0usize;
     let c = qjs::JS_ToCStringLen2(ctx, &mut len, arg, 0);
-    if c.is_null() {
-        return None;
+    if !c.is_null() {
+        let raw = std::ffi::CStr::from_ptr(c).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, c);
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            return Some(v);
+        }
     }
-    let raw = std::ffi::CStr::from_ptr(c).to_string_lossy().into_owned();
-    qjs::sofuu_js_free_cstring(ctx, c);
-    serde_json::from_str::<Value>(&raw).ok()
+    if qjs::is_object(arg) {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let json_obj = qjs::sofuu_js_get_property_str(ctx, global, c"JSON".as_ptr());
+        let stringify_fn = qjs::sofuu_js_get_property_str(ctx, json_obj, c"stringify".as_ptr());
+        let mut argv = [arg];
+        let res = qjs::JS_Call(ctx, stringify_fn, json_obj, 1, argv.as_mut_ptr());
+        let mut slen = 0usize;
+        let sc = qjs::JS_ToCStringLen2(ctx, &mut slen, res, 0);
+        let mut val = None;
+        if !sc.is_null() {
+            let sraw = std::ffi::CStr::from_ptr(sc).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, sc);
+            val = serde_json::from_str::<Value>(&sraw).ok();
+        }
+        qjs::sofuu_js_free_value(ctx, res);
+        qjs::sofuu_js_free_value(ctx, stringify_fn);
+        qjs::sofuu_js_free_value(ctx, json_obj);
+        qjs::sofuu_js_free_value(ctx, global);
+        return val;
+    }
+    None
 }
 
 fn project_arg(args: &Value) -> String {

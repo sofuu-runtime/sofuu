@@ -223,3 +223,102 @@ verify cost both have to be solved, and recall is cheap to fix only after the co
 Also found here, pre-existing and unrelated: the CPU-tree **rows=5** route diverges from serial greedy text
 (SmolLM2, Qwen3-8B) with DCOCO off, and `SOFUU_NO_TILES=1` does not unify it - unlike the TASKS.md:3741 note.
 GPU chain (rows=3) and rows=8 do match serial. Full report: `docs/DCOCO-REPORT.md` (local-only, gitignored).
+
+## Closed: quantized KV on the GPU decode path (2026-10-28)
+
+kv4 (`--kv-dtype 8|4`) was built on the promise "less KV memory, and at long context maybe faster". Measured
+on the shipped GPU decode path it is **slower than the f32 cache at every context tested**, by a gap that
+grows with context, and it aborts the process at the window. **The default stays f32; the flag stays opt-in
+and is not promoted.** Receipt: `kv-evidence/REPORT-kvlong.md`. Operator-facing summary:
+`contract/KV4-OPERATOR-NOTE.md`.
+
+Method: Qwen3-0.6B Q4_K_M, default 4096 window, `SOFUU_GPU_PREFILL=1 SOFUU_GEMM_MMA8=1`, serial decode
+(`--no-lookahead`; the arms generate identical token streams, so speculation would add risk and nothing
+else), prompts 493 / 1497 / 2993 / 3994 tokens from `/tmp/gen_prompt.txt`. Per point: 3 rounds of ABBA =
+6 runs per arm, 72 runs total. Decode rate is the median of the 31 per-token `forward_ns` values from
+`--trace`, not the CLI line, so the cold first step cannot bias an arm. Load (`sysctl -n vm.loadavg`) was
+1.5-3.8 for the whole matrix except one transient 8.87 at the tail of the 2993 point that decayed over about
+three minutes; it did not bias the 4k point (all three arms drifted up together, the inter-arm gap held at
++8.3 → +8.6 ms/token, fits still r2 >= 0.999). The instrument is deterministic: all 6 reps per arm and point
+produced bit-identical token streams AND logprobs (max |dlp| = 0).
+
+| prompt tok | f32 decode tk/s | 8-bit | 4-bit | 8-bit delta | 4-bit delta | f32 prefill tk/s | 8-bit | 4-bit |
+|---|---|---|---|---|---|---|---|---|
+| 493 | 111.6 | 100.1 | 98.3 | -10.3% | -12.0% | 1616 | 603 | 605 |
+| 1497 | 86.3 | 69.6 | 69.8 | -19.3% | -19.1% | 1412 | 278 | 275 |
+| 2993 | 66.2 | 46.9 | 47.5 | -29.2% | -28.3% | 1058 | 146 | 148 |
+| 3994 | 56.3 | 38.8 | 38.6 | -31.0% | -31.4% | 874 | 111 | 111 |
+
+Prefill deltas: -62.7% / -80.3% / -86.2% / -87.3% (8-bit), -62.6% / -80.5% / -86.0% / -87.3% (4-bit);
+0.30 s → 35.9 s of prefill at ~4k tokens. That is the largest single effect in the experiment and the
+opposite of the "quantized KV shrinks the prefill attention read" hope. 4-bit prefill == 8-bit prefill at
+every point (603/605, 278/275, 146/148, 111/111 tk/s).
+
+### Why it loses: 1.82x the f32 slope, not a fixed offset
+
+Decode ms/token fits `a + b*ctx` with r2 >= 0.999 in all three arms:
+
+| arm | a (fixed ms/token) | b (us per context token) | r2 |
+|---|---|---|---|
+| f32 | 7.76 | 2.49 | 0.99938 |
+| 8-bit | 7.69 | 4.53 (**1.82x**) | 0.99984 |
+| 4-bit | 7.78 | 4.49 (**1.80x**) | 0.99914 |
+
+The fixed per-token cost is identical, so the arms differ *only* in attention. The quantized attention kernel
+has 1.8x f32's slope while reading 3.2x (8-bit) / 5.3x (4-bit) fewer bytes, so it is **not bandwidth-bound**:
+4-bit and 8-bit are indistinguishable in time (±2%) even though 4-bit reads 1.7x fewer bytes than 8-bit. The
+dequant ALU/occupancy cost dominates the byte saving, which makes the gap a *slope* penalty — no context
+length turns it into a win. As ctx → ∞ the penalty approaches 1.82x ms/token (~-45% tk/s); it is already -31%
+at 4096. Fair-comparison note: with the default `SOFUU_ATTN_CHUNK_MIN=4096` the f32 arm uses
+`llama_attn_w32` at every point below 4096 — the same kernel family and threadgroup geometry as
+`llama_attn_w32_kv4` — so this is like-for-like, not a fused-vs-chunked artifact. Above 4096 f32 would also
+get the chunked path that kv4 never gets, and kv4 aborts there anyway.
+
+Engagement was proven three ways per point, not assumed: the `[kv4] quantized KV armed: ... 280MB vs 896MB
+(3.2x), 2560 B/token/layer` receipt printed 6/6 runs of every quantized arm (4-bit: 168MB, 5.3x); logprobs
+differed from f32 on 30-31 of 31 steps (max |dlp| 0.0005-0.022 for 8-bit, 0.015-1.55 for 4-bit); 8-bit
+reproduced f32's greedy tokens 31/31 at every point (4-bit diverged 8/31 at 493 tokens). No arm was inert.
+
+Contrast, Llama-3.2-1B Q8_0 (64 KiB KV/token, 3.5x smaller than Qwen; 2 rounds ABBA per point): 8-bit decode
+-13.4% at 1497 tokens and -20.9% at 2993, prefill -53.3% / -65.9%, slope 2.07x f32's. The smaller-KV model
+shows the smaller penalty (there is a byte-count term), but the sign never flips and it still grows with
+context.
+
+### What it does buy, and the claim that had to be retracted
+
+The KV region is genuinely smaller — 896 MB f32 vs 280 MB (8-bit) vs 168 MB (4-bit) at ctx 4096 = 3.2x / 5.3x,
+from the binary's own receipt. Peak **phys_footprint** falls with it: 1830 MB f32 vs 1701 MB 8-bit at a
+493-token prompt, 2134 vs 1704 MB at 3994 (per-arm spread 1-3 MB). Peak **RSS** is not reportable at long
+context: the *same arm* reads 1798 MB or 1283 MB depending on the rep, and 4-bit and 8-bit read identically.
+So quote footprint deltas, never RSS deltas at long context, and do not claim the full ~570 MB the buffer
+arithmetic predicts (footprint recovers only part of it, and the ~112 MB 4-bit should additionally save over
+8-bit measures 0 MB).
+
+### It aborts at the window, and the obvious escape is a trap
+
+- Crossing 4095 with kv4 armed **SIGABRTs** (rc = -6) right at the boundary, after ~100 already-streamed
+  tokens, same for 4-bit. The f32 arm on the identical input finishes all 200 tokens (rc = 0, 52.7 tk/s)
+  because it can slide.
+- A prompt longer than the window is refused cleanly by both arms (rc = 1, "prompt is 7988 tokens but the
+  context window is only 4096 — ... raise --ctx or shorten the prompt"). Not kv4-specific.
+- **`--ctx 8192` does not rescue it.** At that window the GPU decode client fails to build at all — even for
+  f32 ("decode client NOT armed: building it failed ... this model decodes on the CPU") — and the kv4 arm
+  additionally prints "the quantized cache could not be armed - restoring the full f32 KV cache (8192
+  tokens)". kv4 above 4096 is unreachable on this 16 GB M2 Pro, so a user who follows the old "raise --ctx"
+  advice silently lands on the CPU path instead.
+
+### Decided
+
+- Default stays f32. `--kv-dtype 8|4` stays opt-in; it is never promoted on throughput.
+- The kv4 FATAL advice no longer offers "raise --ctx": it states that packed blocks are absolute-position
+  indexed, that a sliding history needs `--kv-dtype f32`, and that 8192 does not arm the GPU client (one
+  string in `infer/mod.rs`, `kv4_full_stop`).
+- `--kivi` no longer silently disarms the GPU client: on a Metal build it refuses with the measured facts and
+  requires `SOFUU_KIVI_CPU=1` (5.1 tk/s with `--kivi` vs 99.3 tk/s f32 on the GPU at ~890 tokens, 19x);
+  CPU-only builds keep the flag because there the CPU layer loop is the only path.
+- The quantized-KV *line* is not dead in principle — the loss is a property of this kernel's
+  dequant-by-threadgroup structure (1.8x the ALU per attended token, insufficient parallelism at 16
+  threadgroups), not of quantization. Re-attempt only with a kernel whose slope matches f32.
+- Limits: one machine (M2 Pro, 10 cores, 16 GB); two small models (224 and 64 KiB KV/token) — no 8B-class
+  big-KV model was timed, so "bandwidth never wins" is proven only up to 224 KiB/token; one synthetic prompt
+  family; temp 0; serial decode.

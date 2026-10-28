@@ -141,8 +141,10 @@ sofuu infer ./Qwen-3-0.6B-Q4_K_M.gguf "Explain virtual memory paging." --max-tok
 # One-shot generation from a HuggingFace SafeTensors directory (LFM-2 BF16 or MLX4):
 sofuu infer ./liqiud-350 "Explain quantum entanglement in simple terms." --max-tokens 50
 
-# Extreme long-context with KIVI 2-bit & 4-bit Asymmetric Quantized KV Cache:
-sofuu infer ./model.gguf "Summarize this long document" --kivi --kivi-bits 4
+# CPU-stream KIVI 2-bit / 4-bit quantized KV (no GPU: on a Metal build --kivi
+# refuses unless SOFUU_KIVI_CPU=1 - it disarms the GPU client and measured 5.1
+# tk/s vs 99.3 tk/s for the f32 cache on the GPU decode path):
+SOFUU_KIVI_CPU=1 sofuu infer ./model.gguf "Summarize this long document" --kivi --kivi-bits 4
 
 # Eliminate CPU cache thrashing via Non-Temporal Streaming Weights (Cache-Bypass):
 sofuu infer ./model.gguf "Explain distributed consensus" --streaming-weights
@@ -211,6 +213,8 @@ grows to bound runtime — so the big-model prefill ratios are **not** a like-fo
 tokens is too short for GPU prefill to amortise setup; the same binary gives `Qwen3-0.6B` Q4_K_M 1469 vs 511
 tk/s CPU at 400 tokens, 1616 vs 442 at 800, 1355 vs 399 at 1454). One run per cell, not ABBA; load 3.5–5.1.
 Load times are warm page-cache.
+
+Quantized KV is opt-in, not a speed win: `--kv-dtype 8|4` measured **slower** than the f32 cache at every context tested here (Qwen3-0.6B, 493/1497/2993/3994 tokens: 8-bit decode -10.3%/-19.3%/-29.2%/-31.0%, 4-bit -12.0%/-19.1%/-28.3%/-31.4%, prefill -63% to -87% for both), and `--kivi` on Apple Silicon only reaches the CPU layer loop (5.1 tk/s vs 99.3 tk/s f32 on the GPU at ~890 tokens) - both because the quantized attention kernel spends more time on dequant ALU than it saves in bytes (1.82x the f32 ms/token slope while reading 3.2x fewer bytes, and 4-bit reads 1.7x fewer bytes than 8-bit for the same time), so the flag buys KV memory (3.2x smaller) and never throughput; the numbers and the 4096-token hard stop are in [contract/KV4-OPERATOR-NOTE.md](contract/KV4-OPERATOR-NOTE.md).
 
 Pi 5 receipts: 2026-10-26 battery, current main, 4× Cortex-A76 with NEON+dotprod at the adopted `arm_freq=2800` + 25 mV boot config, `performance` governor, 4 threads, temp 0, 234–252-token prompt, fresh llama.cpp build 11041 references from the same session. Load times are warm page-cache.
 

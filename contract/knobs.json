@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "generated_from": "scan of src/, crates/*/src/, bindings/ (getenv | env::var | process.env)",
-  "count": 177,
+  "count": 178,
   "counts_by_class": {
-    "tuning": 110,
+    "tuning": 111,
     "debug": 13,
     "test": 33,
     "public": 20,
@@ -85,6 +85,7 @@
     "SOFUU_GQA_ATTN",
     "SOFUU_KIVI",
     "SOFUU_KIVI_BITS",
+    "SOFUU_KIVI_CPU",
     "SOFUU_KV_F16",
     "SOFUU_NIBBLE_PLANES",
     "SOFUU_NIBBLE_PLANES_MB",
@@ -1206,6 +1207,16 @@
       ]
     },
     {
+      "name": "SOFUU_KIVI_CPU",
+      "class": "tuning",
+      "numeric_effect": "yes",
+      "stability_tier": "T3",
+      "determinism_tier": "unsure",
+      "evidence": [
+        "crates/sofuu-core/src/main.rs:1799"
+      ]
+    },
+    {
       "name": "SOFUU_KV_DTYPE",
       "class": "public",
       "numeric_effect": "yes",
@@ -1233,7 +1244,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1791"
+        "crates/sofuu-core/src/main.rs:1832"
       ]
     },
     {
@@ -1862,8 +1873,8 @@
       "stability_tier": "T2",
       "determinism_tier": null,
       "evidence": [
-        "src/js/agent.js:2290",
-        "src/js/agent.js:5200"
+        "src/js/agent.js:2299",
+        "src/js/agent.js:5264"
       ]
     },
     {

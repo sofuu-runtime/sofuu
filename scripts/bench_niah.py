@@ -167,7 +167,7 @@ def kv_flags(kv):
     if kv == "f16":
         return []
     if kv == "kivi4":
-        return ["--kivi"]
+        return ["--kivi", "--cpu"]
     if kv == "kivi2":
         return ["--kivi-bits", "2"]
     raise SystemExit(f"unknown kv mode: {kv}")

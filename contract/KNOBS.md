@@ -1,13 +1,13 @@
 # Runtime env knobs (generated)
 
-Generated from a source scan — 177 knobs. Class counts: build 1, debug 13, public 20, test 33, tuning 110.
+Generated from a source scan — 178 knobs. Class counts: build 1, debug 13, public 20, test 33, tuning 111.
 Classes: `public` (user-facing), `tuning` (performance knobs), `debug`,
 `test`, `build`. `numeric_effect=yes` means the knob changes results and
 therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 
 **Open items:** 23 knobs have `numeric_effect=unknown` and need a tier decision.
 
-**Open items (R3.5):** 77 numeric knobs have `determinism_tier=unsure` — each needs a receipt before it can map to a declared path tier.
+**Open items (R3.5):** 78 numeric knobs have `determinism_tier=unsure` — each needs a receipt before it can map to a declared path tier.
 
 | knob | class | numeric effect | determinism tier | stability tier | first evidence |
 |---|---|---|---|---|---|
@@ -118,9 +118,10 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_INBOUND_CAP` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/continuous.rs:240` |
 | `SOFUU_KIVI` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/kivi.rs:54` |
 | `SOFUU_KIVI_BITS` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/kivi.rs:57` |
+| `SOFUU_KIVI_CPU` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/main.rs:1799` |
 | `SOFUU_KV_DTYPE` | public | yes | tolerant | T2 | `crates/sofuu-core/src/infer/kv4.rs:132` |
 | `SOFUU_KV_F16` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/model.rs:1254` |
-| `SOFUU_KV_RING` | tuning | unknown | — | T3 | `crates/sofuu-core/src/main.rs:1791` |
+| `SOFUU_KV_RING` | tuning | unknown | — | T3 | `crates/sofuu-core/src/main.rs:1832` |
 | `SOFUU_LFM2_PROF` | debug | no | — | T3 | `crates/sofuu-core/src/infer/lfm2.rs:2014` |
 | `SOFUU_MCP_CONFIG` | public | no | — | T2 | `src/js/tools.js:1317` |
 | `SOFUU_METAL_CAPTURE` | debug | no | — | T3 | `src/metal/metal_engine.mm:5615` |
@@ -182,7 +183,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_SPLIT_GPU_ROWS` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4714` |
 | `SOFUU_SPLIT_GROUP` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4756` |
 | `SOFUU_STALL_TIMEOUT_SECS` | public | no | — | T2 | `crates/sofuu-core/src/rt/ai.rs:1692` |
-| `SOFUU_STORAGE` | public | no | — | T2 | `src/js/agent.js:2290` |
+| `SOFUU_STORAGE` | public | no | — | T2 | `src/js/agent.js:2299` |
 | `SOFUU_T143_DIRECT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/qwen35.rs:1222` |
 | `SOFUU_TEST_CONFIG_DIR` | test | no | — | T3 | `crates/sofuu-core/src/chat.rs:280` |
 | `SOFUU_TEST_LFM2_DIR` | test | no | — | T3 | `crates/sofuu-core/src/infer/lfm2.rs:3757` |

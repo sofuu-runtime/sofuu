@@ -1780,6 +1780,47 @@ fn main() -> ExitCode {
                 );
             }
 
+            // --kivi honesty gate (2026-10-28). The flag sets gpu_layers = 0 and
+            // decodes through the CPU layer loop, so on a Metal build it silently
+            // disarms the GPU client. Measured on this M2 Pro (Qwen3-0.6B Q4_K_M,
+            // ~890-token prompt, 6 runs/arm, quiet machine): --kivi 5.1 tk/s vs
+            // 99.3 tk/s for the f32 cache on the GPU decode path - 19x slower. The
+            // retired README row ("+168.7%", 26.6 tk/s) compared it against a
+            // 9.9 tk/s CPU baseline, which read as a speedup while being a
+            // regression against the default. Refuse instead of landing there
+            // silently; SOFUU_KIVI_CPU=1 is the explicit opt-in for the CPU stream.
+            // CPU-only targets (no Metal client, e.g. the Raspberry Pi 5 profile)
+            // keep the flag: there the CPU layer loop is the only path, and
+            // kivi.rs stays compiled and reached.
+            if kivi {
+                // Two explicit acknowledgements are accepted, so a script does
+                // not have to learn a new knob: the operator-level env escape
+                // hatch, or an explicit --cpu / --gpu-layers 0 on the command.
+                let kivi_cpu_opt_in = std::env::var("SOFUU_KIVI_CPU").ok().as_deref() == Some("1")
+                    || gpu_layers == 0;
+                if cfg!(any(target_os = "macos", target_os = "ios")) {
+                    if !kivi_cpu_opt_in {
+                        eprintln!("[sofuu infer] refusing --kivi: on a Metal build it sets gpu_layers=0 and decodes through the CPU layer loop.");
+                        eprintln!("[sofuu infer] Measured on this M2 Pro (Qwen3-0.6B Q4_K_M, ~890-token prompt, 6 runs/arm, quiet machine):");
+                        eprintln!("[sofuu infer]   5.1 tk/s with --kivi vs 99.3 tk/s with the f32 KV cache on the GPU decode path - 19x slower.");
+                        eprintln!("[sofuu infer] Replacement: drop --kivi and keep the default f32 cache (it also slides past --ctx). --kv-dtype 8|4 is");
+                        eprintln!("[sofuu infer] the GPU quantized cache and measured slower than f32 at every context too (see contract/KV4-OPERATOR-NOTE.md).");
+                        eprintln!("[sofuu infer] To run the CPU KIVI stream anyway, say so explicitly: pass --cpu (or set SOFUU_KIVI_CPU=1).");
+                        std::process::exit(2);
+                    }
+                    eprintln!("[sofuu infer] --kivi on the CPU path (explicit): gpu_layers=0, the GPU decode client is disarmed and decode runs the CPU layer loop with the quantized KIVI stream.");
+                    eprintln!("[sofuu infer] Measured 5.1 tk/s vs 99.3 tk/s for the f32 cache on the GPU (M2 Pro, ~890-token prompt, 6 runs/arm) - the slow path, chosen explicitly.");
+                } else {
+                    eprintln!("[sofuu infer] --kivi: quantized KIVI stream on the CPU layer loop (this build has no Metal client, so no GPU path is being disabled).");
+                    eprintln!("[sofuu infer] On an M2 Pro the same stream measured 5.1 tk/s vs 99.3 tk/s for f32 on the GPU; on a CPU-only target it is the only path KIVI has.");
+                }
+                // KIVI is a CPU-path contract, so the load below is CPU-only.
+                // Zero it here rather than inside the load branch: the banner
+                // printed just after this used to advertise the CPU+GPU engine
+                // for a run that could never use the GPU client.
+                gpu_layers = 0;
+            }
+
             let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
             eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
             let t0 = std::time::Instant::now();

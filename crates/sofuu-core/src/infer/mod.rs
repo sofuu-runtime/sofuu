@@ -1441,7 +1441,7 @@ impl InferEngine {
                     "[kv4] FATAL: {where_} reached the {logical_max_seq_len}-token logical window with the quantized KV cache armed; the packed blocks cannot slide.",
                 );
                 eprintln!(
-                    "[kv4] A sliding history needs the f32 cache: rerun with --kv-dtype f32 (or raise --ctx).",
+                    "[kv4] Packed blocks are indexed by absolute position and cannot slide: a sliding history needs the f32 cache - rerun with --kv-dtype f32. Raising --ctx does not help: at 8192 the GPU decode client does not arm on a 16 GB M2 Pro, so the run quietly decodes on the CPU.",
                 );
                 std::process::abort();
             }

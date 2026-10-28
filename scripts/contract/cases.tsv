@@ -9,7 +9,7 @@
 #          cabi -> present
 #          manual -> -
 T1.1|R1|R1.1|js|-|JSON.parse(sofuu.capabilities()).schema|1|capabilities() missing or malformed
-T1.2|R1|R1.3|manual|-|-|-|needs capabilities on JS+CLI+HTTP+CABI
+T1.2|R1|R1.3|cli|-|./sofuu run scripts/contract/harness/t12_capabilities_parity.js|exit:0|JS, CLI, HTTP, C-ABI capabilities manifest parity
 T1.3|R1|R1.2|js|-|Boolean(sofuu.memory && typeof sofuu.memory.remember === 'function' && JSON.parse(sofuu.capabilities()).build.features.includes('qtsq'))|true|memory and QTSQ must be present as core capabilities
 T1.4|R1|R1.5|cli|-|./sofuu doctor|stdout_has:capabilities|doctor does not assert a manifest
 T1.5|R1|R1.4|js|-|typeof (sofuu.model && sofuu.model.describe)|function|model.describe not implemented
@@ -20,19 +20,19 @@ T2.2|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t22_cancel_stream.js|exi
 T2.3|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t23_cancel_tool.js|exit:0|cancel mid-tool kills the subprocess (mock provider, no orphan)
 T2.4|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t24_disconnect.js|exit:0|server-side disconnect is visible to the handler (peer_closed)
 T2.5|R2|R2.4|cli|-|./sofuu run scripts/contract/harness/t25_backpressure.js|exit:0|non-draining consumer: typed E_BACKPRESSURE + provider abort
-T2.6|R2|R2.6|manual|-|-|-|needs failure injection
+T2.6|R2|R2.6|cli|-|./sofuu run scripts/contract/harness/t26_terminal_fuzz.js|exit:0|failure-injection fuzz: one terminal event, monotonic seq without gaps
 T2.7|R2|R2.2|cli|-|./sofuu run scripts/contract/harness/t27_deadline.js|exit:0|nested deadline inheritance
 T2.8|R2|R2.5|cli|-|./sofuu run scripts/contract/harness/t28_error_shape.js|exit:0|error taxonomy + §1.4 shape
-T3.1|R3|R3.1|manual|-|-|-|needs engine.paths
+T3.1|R3|R3.1|cli|-|./sofuu run scripts/contract/harness/t31_tier_declared.js|exit:0|engine.paths declares tiers and bounds for all paths
 T3.2|R3|R3.6|file|-|.github/workflows/ci.yml|has:text_gate|CI does not run the determinism gate
 T3.3|R3|R3.6|cli|-|python3 scripts/text_gate.py contract/fixtures/sofuu-fixture.gguf "Write three sentences about Paris." --max-tokens 8 --tier exact --require-identical --cpu-env "" --gpu-env SOFUU_NO_TILES=1 --prompt-id paris8 --label t33|exit:0|fixture model + full two-route gate
 T3.4|R3|R3.4|file|-|scripts/text_gate.py|has:tier|receipt schema fields missing
-T3.5|R3|R3.2|manual|-|-|-|needs fixture + reference route
-T3.6|R3|R3.3|manual|-|-|-|needs default introspection
+T3.5|R3|R3.2|cli|-|python3 scripts/text_gate.py contract/fixtures/sofuu-fixture.gguf "Write three sentences about Paris." --max-tokens 8 --tier tolerant --bound 2e-2 --cpu-env "" --gpu-env SOFUU_NO_TILES=1 --prompt-id paris8 --label t35|exit:0|tolerant path bound enforced on fixture
+T3.6|R3|R3.3|cli|-|./sofuu run scripts/contract/harness/t36_best_effort_opt_in.js|exit:0|best-effort mmq path is opt-in only
 T4.1|R4|R4.2|cli|-|./sofuu run scripts/contract/harness/t41_session_roundtrip.js|exit:0|session document round-trips JS⇄CLI: turns/tools/usage/ids identical
 T4.2|R4|R4.2|manual|-|-|-|needs macOS+Android runners
 T4.3|R4|R4.3|cli|-|./sofuu run scripts/contract/harness/t41_session_roundtrip.js|exit:0|ids stable: turn ids are stable shapes; re-import is idempotent
-T4.4|R4|R4.4|manual|-|-|-|needs a committed v0.2 fixture
+T4.4|R4|R4.4|cli|-|./sofuu run scripts/contract/harness/t44_migration.js|exit:0|v0.2 config and session fixtures migrate losslessly
 T4.5|R4|R4.5|js|-|typeof sofuu.session|object|the session primitive is a first-class namespace (list/export/import/sync)
 T4.6|R4|R4.6|cli|-|./sofuu run scripts/contract/harness/t46_export_redaction.js|exit:0|an export carrying secrets ships none; fields survive redaction
 T4.7|R4|R4.1|file|-|src/js/chat.js|has:schema_version|no version field today
@@ -41,13 +41,13 @@ T5.2|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|G
 T5.3|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions stream:true yields SSE delta frames + [DONE]
 T5.4|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions JSON matches the OpenAI completion shape
 T5.5|R5|R5.5|cabi|-|sofuu_rt_call|present|the C ABI keeps the versioned symbol contract (make libsofuu + CONTRACT_LIBSOFUU)
-T5.6|R5|R5.6|manual|-|-|-|needs an MCP fixture server
+T5.6|R5|R5.6|cli|-|./sofuu run scripts/contract/harness/t56_mcp_parity.js|exit:0|MCP tools and built-ins share identical event/trace envelope shape
 T5.7|R5|R5.5|file|-|.github/workflows/ci.yml|has:abi-check|gate exists
-T5.8|R5|R5.1|manual|-|-|-|needs a four-surface failure harness
+T5.8|R5|R5.1|cli|-|./sofuu run scripts/contract/harness/t58_error_parity.js|exit:0|unified error envelope and taxonomy codes across JS, HTTP, and CABI
 T6.1|R6|R6.1|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|envelope on real agent+chat events
 T6.2|R6|R6.2|cli|-|./sofuu run scripts/contract/harness/t62_eventlog.js|exit:0|event-log round-trip, seq order, backpressure bound
 T6.3|R6|R6.7|cli|-|./sofuu run scripts/contract/harness/t63_golden.js|exit:0|deterministic renderer == committed golden bytes
-T6.4|R6|R6.4|manual|-|-|-|needs cloud+local fixtures
+T6.4|R6|R6.4|cli|-|./sofuu run scripts/contract/harness/t64_usage_reconciles.js|exit:0|cloud totals match, cancelled stream accounts delivered tokens
 T6.5|R6|R6.3|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|terminal-once + total order on a real run
 T6.6|R6|R6.6|cli|-|./sofuu run scripts/contract/harness/t66_redaction.js|exit:0|redaction choke point
 T6.7|R6|R6.4|cli|-|./sofuu run scripts/contract/harness/t67_usage.js|exit:0|usage reconciles across complete/stream/agent; cost semantics

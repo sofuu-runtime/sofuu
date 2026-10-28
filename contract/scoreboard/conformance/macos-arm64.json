@@ -11,9 +11,8 @@
    "ok": true
   },
   "memory": {
-   "claimed": "capability-gated",
-   "live": "typed-refusal",
-   "note": "",
+   "claimed": "full",
+   "live": "full",
    "ok": true
   },
   "policy": {
@@ -29,55 +28,19 @@
  },
  "capability_posture_ok": true,
  "contract_suite": {
-  "blocked": 10,
+  "blocked": 1,
   "cases": 52,
   "fail": 0,
-  "pass": 42,
+  "pass": 51,
   "suite_rc": 1,
   "violations": [
    [
-    "T1.2",
-    "needs capabilities on JS+CLI+HTTP+CABI"
-   ],
-   [
-    "T2.6",
-    "needs failure injection"
-   ],
-   [
-    "T3.1",
-    "needs engine.paths"
-   ],
-   [
-    "T3.5",
-    "needs fixture + reference route"
-   ],
-   [
-    "T3.6",
-    "needs default introspection"
-   ],
-   [
     "T4.2",
     "needs macOS+Android runners"
-   ],
-   [
-    "T4.4",
-    "needs a committed v0.2 fixture"
-   ],
-   [
-    "T5.6",
-    "needs an MCP fixture server"
-   ],
-   [
-    "T5.8",
-    "needs a four-surface failure harness"
-   ],
-   [
-    "T6.4",
-    "needs cloud+local fixtures"
    ]
   ]
  },
- "generated_at": 1793080233,
+ "generated_at": 1793173968,
  "how_to_reproduce": "bash scripts/contract/run_contract_tests.sh; bash scripts/verify-dist.sh; sofuu conformance",
  "install_integrity": {
   "runtime_part_ok": true,
@@ -89,11 +52,10 @@
   "build": {
    "features": [
     "simd",
+    "qtsq",
     "metal"
    ],
-   "missing": [
-    "qtsq"
-   ]
+   "missing": []
   },
   "engine": {
    "formats": [
@@ -151,8 +113,8 @@
     "backend": "metal"
    },
    "os": "macos",
-   "ram_mb": 7168,
-   "threads": 3,
+   "ram_mb": 16384,
+   "threads": 10,
    "version": "0.2.0-beta"
   },
   "schema": 1,

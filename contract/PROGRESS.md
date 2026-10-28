@@ -19,7 +19,7 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 
 ## Conformance suite
 
-**52 cases — PASS 42 · FAIL 0 · BLOCKED 10.**
+**52 cases — PASS 51 · FAIL 0 · BLOCKED 1.**
 (`CONTRACT_LIBSOFUU=dist/libsofuu.dylib` now enables the C-ABI parity check.)
 
 Passing:
@@ -27,32 +27,41 @@ Passing:
 | Test | What it proves |
 |---|---|
 | T1.1 | `sofuu.capabilities()` returns a manifest with `schema: 1` |
+| T1.2 | JS, CLI, HTTP, and C ABI single-source manifest parity (`sofuu capabilities`, `GET /capabilities`, `sofuu_rt_call`) |
 | T1.3 | QTSQ and `sofuu.memory.remember()` are mandatory core capabilities |
 | T1.4 | `sofuu doctor` prints the capability section and exits non-zero on a missing declared feature |
 | T1.5 | `sofuu.model.describe(path)` exists |
 | T1.6 | the matrix has no unknown cells |
 | T1.7 | `engine.paths` in the manifest declares a tier for every path (`cpu-tiles` exact, `metal-mma` tolerant, `mmq` best-effort) |
+| T3.1 | `engine.paths` declares determinism tiers and bounds for all paths |
 | T3.2 | CI runs the determinism gate (`scripts/text_gate.py`) |
 | T3.3 | the committed fixture model runs the full two-route exact-tier gate (exit 0, IDENTICAL) |
 | T3.4 | the gate emits `tier`/`backend`/`sha256`/`knobs` receipt fields |
+| T3.5 | tolerant path bound (`2e-2 abs/scale`) enforced on fixture model via `text_gate.py` |
+| T3.6 | best-effort `mmq` path is opt-in only (`SOFUU_DECODE_MMQ=1`), default is exact `cpu-tiles` |
 | T5.1 | the generated surface matrix has no unknowns |
+| T5.6 | MCP-provided and built-in tools produce indistinguishable event/trace envelopes |
 | T5.7 | the ABI gate (`abi-check`) is wired in CI |
+| T5.8 | unified error envelope shape and §1.4 taxonomy codes across JS, HTTP, and CABI |
 | T7.6 | `SOFUU_NO_SHELL=1` removes `bash` from the advertised tool group |
 | T2.1 | a silent child is killed at its deadline (±2 s) with no orphan |
 | T2.2 | cancel terminates a real SSE stream promptly; usage accounted |
 | T2.3 | cancel mid-tool kills the tool's live subprocess via the registered signal — run settles promptly, no orphan |
 | T2.4 | a client disconnect is visible server-side (`res.closed()`) |
 | T2.5 | a non-draining consumer gets typed `E_BACKPRESSURE` (bound named) and the provider request is aborted |
+| T2.6 | failure-injection fuzz: exactly one terminal event, monotonic seq without gaps |
 | T2.7 | nested deadlines inherit (parent − margin) and refuse exhausted parents |
 | T2.8 | one error shape + the ten-code taxonomy, defaults per code |
 | T6.1 | the §7.2 identity fields ride on every real agent AND chat event; the runtime validator reports zero violations |
 | T6.2 | the session event log round-trips: append → read → reconstruct (answer, tools, usage, terminal) |
 | T6.3 | `sofuu.events.render` is deterministic and matches the committed golden bytes exactly |
+| T6.4 | usage reconciles: cloud totals match, cancelled stream accounts delivered tokens, local cost is 0 |
 | T6.5 | seq strictly increasing; exactly one terminal `stop` per run |
 | T6.6 | redaction strips secret-bearing fields recursively before any log/write |
 | T6.7 | usage reconciles: `ai.complete` reports `{promptTokens, completionTokens}`, stream matches the same provider totals, agent shape normalizes identically, local cost 0 / cloud cost carried |
 | T4.1 | the §5.2 session document round-trips CLI⇄JS: same turns, tools, usage, ids; one builder serves both surfaces |
 | T4.3 | turn ids are stable shapes and re-import is idempotent (`overwritten_existing` false on a same-content re-import) |
+| T4.4 | committed v0.2 config and session fixtures load and migrate losslessly |
 | T4.5 | `sofuu.session` is a first-class namespace (`schemaVersion/list/export/import/sync`); an app-private top-level section is rejected, not tolerated |
 | T4.6 | an export carrying secrets ships none (`api_key`/`Authorization`/tool tokens stripped), while lossless fields survive |
 | T5.2 | `GET /v1/models` returns the OpenAI `{object:'list', data:[…id, object:'model'…]}` shape for the loaded fixture model |
@@ -68,7 +77,7 @@ Passing:
 | T7.8 | a provider key never reaches the trace, the event log, the session document, or error text (even a 401 that echoes the key) |
 | T7.9 | the MCP allowlist refuses non-allowlisted servers; allowlisted tools still answer through the same tools policy |
 
-No failing cases. `T4.1`/`T4.5` (P3) and the eight T7 cases (P4) all run in the suite and CI.
+Only 1 remaining BLOCKED case: `T4.2` (`session_roundtrip_cross_device`), reserved for multi-device macOS+Android runners. All other 51 cases run automatically in the contract suite and pass with 0 failures.
 
 ## What landed in P2 (2026-10-25/26)
 

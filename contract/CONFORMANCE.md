@@ -13,7 +13,7 @@ Version: **0.2.0-beta**
 |---|---|---:|---:|---:|---:|:--:|:--:|
 | `linux-arm64` (linux/aarch64) | simd (missing: qtsq, metal) | — | — | — | — | ✅ | — |
 | `linux-x86_64` (linux/x86_64) | simd (missing: qtsq, metal) | — | — | — | — | ✅ | — |
-| `macos-arm64` (macos/aarch64) | simd+metal (missing: qtsq) | 52 | 42 | 0 | 10 | ✅ | ok |
+| `macos-arm64` (macos/aarch64) | simd+qtsq+metal | 52 | 51 | 0 | 1 | ✅ | ok |
 
 The macOS row is the merged release report (`sofuu conformance --suite`);
 the Linux rows are each platform's own posture report (their suites run in
@@ -28,7 +28,7 @@ From the `macos-arm64` report:
 |---|---|---|:--:|
 | async_contract | full (P2) | function | ✅ |
 | events | full (P2) | function | ✅ |
-| memory | capability-gated | typed-refusal | ✅ |
+| memory | full | full | ✅ |
 | policy | one evaluator (P4) | function | ✅ |
 | session_document | full (P3) | function | ✅ |
 

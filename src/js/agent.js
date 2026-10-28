@@ -2784,7 +2784,7 @@
         validated: respSchema ? (stopped ? undefined : validated) : undefined,
         data: (respSchema && validated) ? validatedData : undefined,
       };
-      emit(stopped ? 'stop' : 'answer', { answer: clip(answer, 200), stopped: stopped });
+      emit('answer', { answer: clip(answer, 200), stopped: stopped });
       if (res.evidence && (res.evidence.backed > 0 || res.evidence.unbacked > 0)) {
         emit('evidence', { backed: res.evidence.backed, unbacked: res.evidence.unbacked,
                            samples: res.evidence.samples });

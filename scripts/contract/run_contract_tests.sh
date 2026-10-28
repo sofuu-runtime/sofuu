@@ -23,6 +23,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CASES="$ROOT/scripts/contract/cases.tsv"
 SOFUU="${SOFUU_BIN:-$ROOT/sofuu}"
 HTTP_URL="${CONTRACT_HTTP_URL:-}"
+if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
+    for cand in dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a; do
+        if [ -f "$ROOT/$cand" ]; then CONTRACT_LIBSOFUU="$cand"; break; fi
+    done
+fi
 LIBSOFUU="${CONTRACT_LIBSOFUU:-}"
 
 if [ ! -x "$SOFUU" ]; then

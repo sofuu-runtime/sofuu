@@ -769,6 +769,14 @@
           return;
         }
 
+        /* Capabilities manifest (R1.3, T1.2). */
+        if (method === 'GET' && (path === '/capabilities' || path === '/v1/capabilities')) {
+          var caps = typeof sofuu.capabilities === 'function' ? sofuu.capabilities() : '{}';
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(typeof caps === 'string' ? caps : JSON.stringify(caps));
+          return;
+        }
+
         if (authMode() !== 'none') {
           var auth = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
           if (!ctEq(auth, 'Bearer ' + cfg.token)) {

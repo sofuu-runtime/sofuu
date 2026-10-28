@@ -311,7 +311,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1554"
+        "crates/sofuu-core/src/main.rs:1558"
       ]
     },
     {
@@ -331,7 +331,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1571"
+        "crates/sofuu-core/src/main.rs:1575"
       ]
     },
     {
@@ -341,7 +341,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1539"
+        "crates/sofuu-core/src/main.rs:1543"
       ]
     },
     {
@@ -1213,7 +1213,7 @@
       "determinism_tier": "tolerant",
       "evidence": [
         "crates/sofuu-core/src/infer/kv4.rs:132",
-        "crates/sofuu-core/src/main.rs:1711"
+        "crates/sofuu-core/src/main.rs:1715"
       ]
     },
     {
@@ -1233,7 +1233,7 @@
       "stability_tier": "T3",
       "determinism_tier": null,
       "evidence": [
-        "crates/sofuu-core/src/main.rs:1787"
+        "crates/sofuu-core/src/main.rs:1791"
       ]
     },
     {

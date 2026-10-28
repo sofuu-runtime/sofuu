@@ -1503,6 +1503,10 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "capabilities" => {
+            println!("{}", sofuu_core::capabilities::manifest_json());
+            ExitCode::SUCCESS
+        }
         "tools" | "policy" | "mcp" => {
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,

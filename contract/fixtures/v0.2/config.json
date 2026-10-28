@@ -1,0 +1,10 @@
+{
+  "provider": "legacy-openai",
+  "model": "gpt-4o-mini",
+  "api_key": "sk-legacy-test-key",
+  "base_url": "https://api.openai.com/v1",
+  "brain": true,
+  "ml": true,
+  "sync": false,
+  "effort": 1
+}

@@ -30,10 +30,10 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_ATTN_WARPS` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3427` |
 | `SOFUU_BARRIER_EVERY` | tuning | unknown | — | T3 | `src/metal/metal_engine.mm:460` |
 | `SOFUU_BARRIER_MODE` | tuning | unknown | — | T3 | `src/metal/metal_engine.mm:450` |
-| `SOFUU_BENCH_ATTN` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1554` |
+| `SOFUU_BENCH_ATTN` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1558` |
 | `SOFUU_BENCH_DIR` | test | no | — | T3 | `crates/ml-train/src/embedding_bench.rs:87` |
-| `SOFUU_BENCH_GEMM` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1571` |
-| `SOFUU_BENCH_GEMV` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1539` |
+| `SOFUU_BENCH_GEMM` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1575` |
+| `SOFUU_BENCH_GEMV` | test | no | — | T3 | `crates/sofuu-core/src/main.rs:1543` |
 | `SOFUU_BENCH_JSON` | test | no | — | T3 | `crates/ml-train/src/embedding_bench.rs:683` |
 | `SOFUU_BRAIN_EF_SEARCH` | public | no | — | T2 | `crates/sofuu-core/src/memory/cma.rs:134` |
 | `SOFUU_BRAIN_KEY` | public | no | — | T2 | `crates/sofuu-core/src/doctor.rs:272` |
@@ -120,7 +120,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_KIVI_BITS` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/kivi.rs:57` |
 | `SOFUU_KV_DTYPE` | public | yes | tolerant | T2 | `crates/sofuu-core/src/infer/kv4.rs:132` |
 | `SOFUU_KV_F16` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/model.rs:1254` |
-| `SOFUU_KV_RING` | tuning | unknown | — | T3 | `crates/sofuu-core/src/main.rs:1787` |
+| `SOFUU_KV_RING` | tuning | unknown | — | T3 | `crates/sofuu-core/src/main.rs:1791` |
 | `SOFUU_LFM2_PROF` | debug | no | — | T3 | `crates/sofuu-core/src/infer/lfm2.rs:2014` |
 | `SOFUU_MCP_CONFIG` | public | no | — | T2 | `src/js/tools.js:1317` |
 | `SOFUU_METAL_CAPTURE` | debug | no | — | T3 | `src/metal/metal_engine.mm:5615` |

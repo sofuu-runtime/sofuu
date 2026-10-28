@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "session": {
+    "id": "s-v02-fixture-12345",
+    "created": "2026-10-25T10:00:00Z",
+    "updated": "2026-10-25T10:05:00Z",
+    "project": ".",
+    "title": "v0.2 migration fixture session",
+    "model": "gpt-4o-mini",
+    "provider": "openai"
+  },
+  "turns": [
+    {
+      "id": "s-v02-fixture-12345-t1",
+      "user": "What is the status of the project?",
+      "assistant": "All systems operational.",
+      "tools": [
+        {
+          "id": "c1",
+          "name": "status_check",
+          "args": {},
+          "ok": true,
+          "ms": 15
+        }
+      ],
+      "usage": {
+        "in": 45,
+        "out": 18,
+        "model": "gpt-4o-mini",
+        "provider": "openai",
+        "cost_usd": 0.00002
+      }
+    }
+  ],
+  "events": {
+    "format": "ndjson",
+    "path": "events.ndjson"
+  }
+}

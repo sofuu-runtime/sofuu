@@ -6,8 +6,14 @@ carry the same version (checked by `scripts/verify-dist.sh`).
 
 ## 0.3.0-beta — 2026-10-28 (in development)
 
-Mandatory QTSQ core integration and runtime conformance program completion:
+Mandatory QTSQ core integration, runtime conformance program completion, and general-purpose AI runtime architectural alignment:
 
+- **General-Purpose AI Runtime Alignment & Decoupling**:
+  - *Prompt Sovereignty*: Developer-provided agent system prompts are 100% sacred and never prepended with terminal coding instructions (`CORE_PROMPT`). Custom agents with omitted prompts default to a neutral assistant persona; `CORE_PROMPT` and `AGENTS.md` context injection are strictly isolated to `preset: 'coding'` (used by `sofuu chat`).
+  - *Tool-Aware & Opt-In Task-Gate*: Task checklist nagging is strictly tool-aware (checked via `todo_write` in the active toolset) and opt-in via `budget.taskGate` (defaults to `false` for general agents, `true` for coding preset).
+  - *Decoupled Cognitive Memory (`remember`)*: Built-in `remember` tool persists facts directly into the on-device QTSQ Cognitive Vector Memory (`cma.remember(...)` with dual indexing in `semCma`); writing to project `AGENTS.md` is strictly guarded by `preset: 'coding'` or explicit `opts.agentsMd`.
+  - *Domain Toolpacks (`sofuu.tools.PACKS`)*: Reorganized tools into modular domain packs: `coding` (alias `code`), `web`, `memory`, `system`. Introduced first-class general tools: `system_info` (runtime version, OS platform, CPU architecture, GPU engine, capabilities), `memory_search` (natural language query of QTSQ vector memory), and `memory_remember`. Added `category` metadata and category filtering to `sofuu.tools.list()` and HTTP `GET /v1/tools?category=...`. Enabled direct multi-domain tool string resolution in `agent.define`.
+  - *Generalized Session Documents*: Expanded canonical session document top-level keys (`DOC_KEYS`) to include `state` (application/workflow state container) and `metadata` (custom annotations). General session headers support `kind` (`'chat'`, `'agent'`, `'workflow'`, `'task'`, `'pipeline'`), `agent`, `status`, and metadata. Generalized step records support `input` and `output` aliases and structured `data` payloads. `sofuu.session` JS surface accepts direct JS objects in addition to JSON strings.
 - **Mandatory QTSQ Core** — Made QTSQ memory a permanent core component of the
   runtime across all targets; retired the legacy QTSQ-free build variant.
 - **Contract Conformance Unblocking (51 PASS · 0 FAIL · 1 BLOCKED)** —

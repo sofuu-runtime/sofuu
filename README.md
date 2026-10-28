@@ -35,7 +35,7 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 - **JS/TS runtime** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3 ms startup, TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
 - **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
-- **Agents + sub-agents** — `sofuu.agent.define/run`, built-in `code` + `web` tools, budgets, cancel, trace rendering; the same loop powers chat
+- **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
 - **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
@@ -312,11 +312,11 @@ const s = await sofuu.ai.speak("hello", { provider: "openai", model: "tts-1", vo
 ```js
 sofuu.agent.define({
   name: "researcher",
-  system: "You research precisely. Cite sources.",
-  tools: ["web"],
-  memory: "agent",   // "shared" | "agent" | "off"
-  budget: { maxSteps: 12, maxDepth: 2, maxWallMs: 300_000 },
-  agents: ["librarian"],   // sub-agents reachable via `delegate`
+  system: "You research precisely. Cite sources.", // Sacred: developer prompt is preserved 100%
+  tools: ["web", "memory", "system"],             // Modular toolpacks or individual tool names
+  memory: "agent",                                 // "shared" | "agent" | "off"
+  budget: { maxSteps: 12, maxDepth: 2, maxWallMs: 300_000, taskGate: false }, // taskGate is opt-in & tool-aware
+  agents: ["librarian"],                           // sub-agents reachable via `delegate`
 });
 
 const r = await sofuu.agent.run("researcher", "compare Rust and Zig GC stories");
@@ -327,7 +327,34 @@ sofuu.agent.cancel(runIdOrSignal);
 sofuu.agent.renderTrace(r);   // human-readable run tree
 ```
 
-Built-in `code` tools: `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `list_dir`, `bash` (jailed to the project dir; `SOFUU_NO_SHELL=1` strips `bash`).
+#### Domain Toolpacks (`sofuu.tools.PACKS`)
+
+Agents select only what they need — non-coding agents are never forced into terminal coding tools:
+
+* **`coding`** (alias **`code`**) — `read_file`, `write_file`, `edit_file`, `apply_patch`, `grep`, `glob`, `list_dir`, `bash`, `code_eval`, `todo_write` (jailed to project dir; `SOFUU_NO_SHELL=1` strips `bash`).
+* **`web`** — `web_search`, `web_open` (keyless DuckDuckGo search and readable page fetching).
+* **`memory`** — `memory_search` (natural language vector search), `memory_remember` (persists facts directly to on-device QTSQ cognitive vector memory).
+* **`system`** — `system_info` (runtime version, platform, CPU architecture, GPU engine, memory, capabilities).
+
+#### `sofuu.session` — Generalized Session Documents
+
+Standardized format for chat, autonomous agents, and multi-step workflows:
+
+```js
+const doc = {
+  schema_version: 1,
+  session: { id: "wf_1", kind: "workflow", agent: "etl_bot", status: "completed" },
+  turns: [
+    { input: "Extract records", output: "250 records extracted", kind: "extract", data: { count: 250 } },
+    { input: "Transform schema", output: "Valid schema", kind: "transform", data: { errors: 0 } },
+  ],
+  state: { cursor: 250, completed: true },
+  metadata: { pipeline: "nightly_sync" },
+};
+
+sofuu.session.import(doc);       // accepts plain JS objects or JSON strings
+const exported = sofuu.session.export("wf_1");
+```
 
 ### `sofuu.rlm` — Long-Context Q&A
 
@@ -411,9 +438,9 @@ a startup warning; `policy.http.deny` path prefixes are evaluated per request.
 | `POST /v1/chat/completions` | OpenAI chat. `stream: true` → SSE `chat.completion.chunk` events + `data: [DONE]`; otherwise one JSON `chat.completion`. Honors `messages`, `max_tokens`, `temperature`, `stop` (up to 4), `tools`, and `stream_options.include_usage` |
 | `POST /v1/completions` · `/infer` | raw text completion, no chat template |
 | `POST /v1/embeddings` | OpenAI embeddings: 1–64 string inputs, 8192-token cap per input |
-| `POST /v1/sessions` · `GET /v1/sessions` · `GET /v1/sessions/:id/turns` | process-local sessions and their recorded turns |
+| `POST /v1/sessions` · `GET /v1/sessions` · `GET /v1/sessions/:id/turns` | process-local sessions (`kind`: chat, agent, workflow, pipeline) and recorded turns/state |
 | `POST /v1/agent/runs` | `sofuu.agent.run`; SSE events when `stream: true`, else JSON |
-| `GET /v1/tools` · `POST /v1/tools/:name/call` | tool inventory, then policy-gated execution |
+| `GET /v1/tools[?category=...]` · `POST /v1/tools/:name/call` | tool inventory (filterable by domain pack: `coding`, `web`, `memory`, `system`), then policy-gated execution |
 | `POST /remember` · `GET /recall?q=&k=` · `GET /memories` · `POST /forget` · `POST /share` | brain-backed memory (requires `--brain`) |
 
 Errors use the OpenAI envelope `{error:{message,type,param,code}}`: `401`

@@ -2,11 +2,11 @@
 
 # ⚡ Sofuu (素風)
 
-> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single < 5 MB binary (4.8 MB stripped release). Zero daemons, zero external deps.*
+> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)]()
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(x86__64%20%26%20ARM64)-lightgrey.svg)]()
 
 > 🚧 **Active development — iterating fast.** APIs may change before a stable release.
 
@@ -20,8 +20,8 @@ Sofuu is **not just a terminal coding agent or a local model runner**; the termi
 
 Everything AI workloads need is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
 - **In-process local LLM inference** (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
-- **Autonomous agent loops** with native tools and sandboxed execution
-- **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers
+- **Autonomous agent loops** with native tools, prompt sovereignty, and sandboxed execution
+- **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux)
 - **Model Context Protocol (MCP)** — first-class client and server support
 - **Unified R7 Security Policy** — deterministic firewall for tools, shell, filesystem, network, and MCP
 - **Async HTTP server & SIMD vector mathematics**
@@ -36,7 +36,7 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 - **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
-- **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving
+- **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving, now fully bundled on Linux and macOS
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
@@ -49,17 +49,19 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 ## Install
 
 ```bash
-# 1. curl | sh (no package manager)
+# 1. One-line install (Linux & macOS, auto-detects architecture)
 curl -fsSL https://sofuu.xyz/install | sh
 
-# 2. npm
-npm install -g sofuu      # or: npx sofuu
+# 2. Direct Downloads (with bundled QTSQ cognitive vector memory)
+#    → Linux x86_64:        https://sofuu.xyz/downloads/sofuu-linux-x86_64.tar.gz
+#    → Linux arm64 (RPi 5): https://sofuu.xyz/downloads/sofuu-linux-arm64.tar.gz
+#    → macOS arm64:         https://sofuu.xyz/downloads/sofuu-darwin-arm64.tar.gz
 
-# 3. Manual
-#    → https://sofuu.xyz/downloads  (macOS tarball + .sha256)
+# 3. npm
+npm install -g sofuu      # or: npx sofuu
 ```
 
-> **Platform: macOS is the only host with a prebuilt binary today.** Building from source works anywhere (see below).
+> **Platforms: Official standalone binaries available for macOS (Apple Silicon) and Linux (`x86_64` and `arm64` / Raspberry Pi 5).** Building from source works anywhere (see below).
 
 ---
 
@@ -541,6 +543,12 @@ make bc-check         # fails if a shipped driver .bc lags its .js
 ```
 
 `make` requires the QTSQ codec (mandatory core component) — brain persistence and sessions are fully operational in every build.
+
+To cross-compile static Linux release binaries (`x86_64` and `aarch64` / Raspberry Pi 5):
+```bash
+bash scripts/cross/build_qtsq_cross.sh   # builds lean static libqtsq.a/libqtc.a for linux
+bash scripts/cross/cross_compile.sh      # builds dist/sofuu-linux-x86_64 and dist/sofuu-linux-arm64
+```
 
 Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 C samples assert) · `make abi-check` · `make size-check` · `make bc-check` · `./sofuu doctor`.
 

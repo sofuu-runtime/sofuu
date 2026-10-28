@@ -16,6 +16,9 @@ repository.
 - The QTSQ license and the Sofuu NOTICE are packaged in the AAR under
   `META-INF/LICENSES/QTSQ-FORMAT.txt` and `META-INF/SOFUU-NOTICE.txt`, and
   both the POM and the Gradle module metadata name the QTSPL alongside MIT.
+- `verifyAarContents` rejects a packaged `libsofuu.so` without QTSQ or
+  `sofuu.crypto` markers, and the Pages publication workflow repeats the
+  check (including the legal notices) before committing the Maven repo.
 - `publishToMavenLocal` succeeds for
   `com.sofuu:sofuu-android:0.2.0` (AAR, sources JAR, POM, module metadata).
 - `make sdk-jvm-check` passes, including `sofuu.crypto.verifyJWT`, a tampered

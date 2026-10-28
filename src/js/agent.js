@@ -3434,25 +3434,76 @@
       var hasDelegate = false;
       if (!opts.plain) {
         toolset = await resolveTools(d, emit);
-        /* AGENTS.md pin tool (2026-09-12): model-callable surface of
-         * pinProjectFact — the model can persist standing project facts
-         * it just learned, same judgment split as /remember. Always
-         * available (every def has a cwd), skipped on name clash with a
-         * host/MCP-provided tool. */
+        /* Memory tool: persists facts to the agent's QTSQ cognitive brain
+         * (and to AGENTS.md only when in coding preset or explicitly opted in). */
         if (!toolset.exec['remember']) {
+          var isCoding = d.preset === 'coding' || d.profile === 'coding';
           toolset.specs.push({
             name: 'remember',
-            description: 'Pin a durable standing fact about THIS project (conventions, commands, environment, decisions) to the shared project context file (AGENTS.md). Use for facts that should outlive this chat and apply to future turns — not for transient findings, and never for anything the user did not state or confirm.',
+            description: isCoding
+              ? 'Pin a durable standing fact about this project to long-term memory and the project context file (AGENTS.md). Use for facts that should outlive this chat and apply to future turns.'
+              : 'Remember a durable fact, preference, or piece of information in long-term memory for future recall.',
             parameters: {
               type: 'object',
               properties: {
-                fact: { type: 'string', description: 'The standing fact, one line, self-contained' },
+                fact: { type: 'string', description: 'The durable fact, one line, self-contained' },
               },
               required: ['fact'],
             },
           });
-          toolset.exec['remember'] = function (args) {
-            return pinProjectFact((args && args.fact) || '');
+          toolset.exec['remember'] = async function (args) {
+            var fact = (args && args.fact) || '';
+            fact = String(fact).trim();
+            if (!fact) return 'error: empty fact';
+            var results = [];
+
+            // 1. Store into QTSQ Cognitive Vector Memory
+            if (cma && backend) {
+              try {
+                var v = await embedTextFor(d, backend, fact);
+                if (v && v.vec) {
+                  var id;
+                  if (d.memory === 'agent') {
+                    var ent = nsTurnKey('agent:' + d.name);
+                    id = typeof cma.rememberEntityTurn === 'function'
+                      ? cma.rememberEntityTurn(v.vec, clip(fact, STORE_CAP_CHARS), ent, 'pin')
+                      : cma.rememberEntity(v.vec, clip(fact, STORE_CAP_CHARS), ent, 'pin');
+                  } else {
+                    id = cma.remember(v.vec, clip(fact, STORE_CAP_CHARS), 'user', 0, 'pin');
+                  }
+                  try { cma.flush(); } catch (eF) {}
+                  if (semCma) {
+                    try {
+                      var sv = embedSemV2(clip(fact, STORE_CAP_CHARS));
+                      if (sv) {
+                        if (d.memory === 'agent') {
+                          var sent = nsTurnKey('agent:' + d.name);
+                          if (typeof semCma.rememberEntityTurn === 'function') {
+                            semCma.rememberEntityTurn(sv, clip(fact, STORE_CAP_CHARS), sent, 'pin');
+                          } else if (typeof semCma.rememberEntity === 'function') {
+                            semCma.rememberEntity(sv, clip(fact, STORE_CAP_CHARS), sent, 'pin');
+                          }
+                        } else {
+                          semCma.remember(sv, clip(fact, STORE_CAP_CHARS), 'user', 0, 'pin');
+                        }
+                        semCma.flush();
+                      }
+                    } catch (eS) {}
+                  }
+                  results.push('saved to memory brain (id: ' + id + ')');
+                }
+              } catch (eMem) {
+                results.push('brain error: ' + (eMem && eMem.message || eMem));
+              }
+            }
+
+            // 2. Only for coding preset or explicit opts.agentsMd: also pin to AGENTS.md
+            if (isCoding || (opts && opts.agentsMd)) {
+              var fileRes = await pinProjectFact(fact);
+              results.push('AGENTS.md: ' + fileRes);
+            }
+
+            return results.length ? results.join(' · ') : 'remembered';
           };
         }
         if (d.agents.length && depth < d.budget.maxDepth) {

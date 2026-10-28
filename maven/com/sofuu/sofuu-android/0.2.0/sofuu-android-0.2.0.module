@@ -26,11 +26,11 @@
         {
           "name": "sofuu-android-0.2.0.aar",
           "url": "sofuu-android-0.2.0.aar",
-          "size": 8046459,
-          "sha512": "639d52bdae12b079a9f2fc2718727d0b0258dba7d18354972faed7ec3a31c8760e00d67821f82bee29fdcce8f280f2d08fa8f42994600b14e04f0d7d661b6f59",
-          "sha256": "a009c24ae1995b05c23abf63a64d0c59c9b108d95027aed8cc53111d91d73a50",
-          "sha1": "7bbfdfba3228d852c36b11fc802cd6eb97f3205f",
-          "md5": "d65fb85c377a17447d9404057db72309"
+          "size": 8874883,
+          "sha512": "9a1edd7b79315f8de3c4cb3b6596d979f14c4efd353d3461e5b7c4229373eed1bbd053bec9b80eb5c71a463e716ed0a6970470c4630c4e8b5ccf30d3c6a5a06a",
+          "sha256": "4ee7dd4484ecbbd83f3af866ae4e44242a8dbf47eb856c519cde8504a3833a54",
+          "sha1": "3470ab9f097a1c640055809465acfac8f8fcf66a",
+          "md5": "3e05d8ae31aee53607cb4c54e76ed630"
         }
       ]
     },
@@ -55,11 +55,11 @@
         {
           "name": "sofuu-android-0.2.0.aar",
           "url": "sofuu-android-0.2.0.aar",
-          "size": 8046459,
-          "sha512": "639d52bdae12b079a9f2fc2718727d0b0258dba7d18354972faed7ec3a31c8760e00d67821f82bee29fdcce8f280f2d08fa8f42994600b14e04f0d7d661b6f59",
-          "sha256": "a009c24ae1995b05c23abf63a64d0c59c9b108d95027aed8cc53111d91d73a50",
-          "sha1": "7bbfdfba3228d852c36b11fc802cd6eb97f3205f",
-          "md5": "d65fb85c377a17447d9404057db72309"
+          "size": 8874883,
+          "sha512": "9a1edd7b79315f8de3c4cb3b6596d979f14c4efd353d3461e5b7c4229373eed1bbd053bec9b80eb5c71a463e716ed0a6970470c4630c4e8b5ccf30d3c6a5a06a",
+          "sha256": "4ee7dd4484ecbbd83f3af866ae4e44242a8dbf47eb856c519cde8504a3833a54",
+          "sha1": "3470ab9f097a1c640055809465acfac8f8fcf66a",
+          "md5": "3e05d8ae31aee53607cb4c54e76ed630"
         }
       ]
     },

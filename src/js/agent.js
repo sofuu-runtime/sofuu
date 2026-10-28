@@ -635,6 +635,11 @@
      * Off by default — it costs one LLM call; the P3.3 ledger below gives
      * the zero-token advisory for everyone else. */
     d.budget.verify = b.verify === true;
+    /* Task-gate: tool-aware & opt-in; enabled by default only for coding preset */
+    d.budget.taskGate = (typeof b.taskGate === 'boolean')
+      ? b.taskGate
+      : (d.preset === 'coding' || d.profile === 'coding');
+    d.budget.taskGateSteps = (b.taskGateSteps | 0) || TODO_GATE_STEPS;
     /* P4.1 structured outputs: an optional LIGHT JSON schema (required +
      * type checks, ≤2 levels of properties) the answer must satisfy —
      * failures get two quiet bounded re-asks, then result.validated:false
@@ -4804,11 +4809,15 @@
           emit('mlgate', { rule: 'freshness', tool: 'context', step: steps,
                            nudge: clip(freshNotice, 160) });
         }
-        /* Task-gate backstop: fires only if todo_write tool is available and
-         * agent is in coding preset or explicitly enabled. */
-        var hasTodoTool = !!(toolset && toolset.tools && toolset.tools.todo_write);
-        var taskGateAllowed = hasTodoTool && (d.preset === 'coding' || d.profile === 'coding' || (d.budget && d.budget.taskGate) || d.system === CORE_PROMPT);
-        if (taskGateAllowed && steps >= TODO_GATE_STEPS && !sawTodo && !todoNudged) {
+        /* Task-gate backstop: fires only if:
+         * 1. Agent has the todo_write tool in its resolved toolset (never nag if tool is absent)
+         * 2. taskGate is enabled in budget (opt-in; defaults true only for coding preset)
+         * 3. opts.taskGate is not explicitly disabled for this run
+         * 4. Steps reach threshold without sawTodo */
+        var hasTodoTool = !!(toolset && toolset.exec && toolset.exec.todo_write);
+        var gateThreshold = (d.budget && d.budget.taskGateSteps > 0) ? d.budget.taskGateSteps : TODO_GATE_STEPS;
+        var runTaskGate = (opts && opts.taskGate !== undefined) ? !!opts.taskGate : !!(d.budget && d.budget.taskGate);
+        if (hasTodoTool && runTaskGate && steps >= gateThreshold && !sawTodo && !todoNudged) {
           todoNudged = true;
           var todoNotice = '[task-gate] You are ' + steps + ' tool steps into this task ' +
             'with no todo_write checklist. If this work is long or multi-step, create the ' +

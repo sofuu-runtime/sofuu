@@ -555,19 +555,23 @@
     var d = {
       _sofuu_agent: true,
       name: name,
-      /* P1: no persona padding by default — CORE_PROMPT only; the identity
-       * line (below, run-time) carries the name when identity is set.
-       * A custom def.system COMPOSES AFTER the core (never replaces it) so
-       * the discipline lines survive user overrides; passing the core
-       * itself (the chat def does) is a no-op, not a duplication. */
-      system: (def.system && String(def.system) !== CORE_PROMPT)
-        ? (def.provider === 'local' ? String(def.system) : CORE_PROMPT + '\n' + String(def.system))
-        : (def.provider === 'local' ? 'You are a helpful AI assistant.' : CORE_PROMPT),
+      /* Prompt Sovereignty:
+       * If def.system is provided by the developer, it is 100% sacred and used
+       * directly without prepending CORE_PROMPT.
+       * If def.system is omitted:
+       * - if def.preset === 'coding' or def.profile === 'coding', use CORE_PROMPT.
+       * - otherwise, default to an unopinionated neutral assistant prompt. */
+      system: (def.system !== undefined && def.system !== null)
+        ? String(def.system)
+        : ((def.preset === 'coding' || def.profile === 'coding')
+          ? CORE_PROMPT
+          : 'You are a helpful AI assistant.'),
       provider: def.provider || '',
       model: def.model || '',
       effort: def.effort || '',
       apiKey: def.api_key || def.apiKey || '',
       baseUrl: def.base_url || def.baseUrl || '',
+      preset: def.preset || (def.profile === 'coding' ? 'coding' : ''),
       profile: def.profile || '',
       maxTokensOut: (def.max_tokens || def.maxTokensOut || 0) | 0,
       ctxWindow: (def.ctx_window || def.ctxWindow || 0) | 0,
@@ -3266,8 +3270,10 @@
        * this, it does not substitute for it. */
       if (d.provider !== 'local') {
         ctxParts.push('Current date: ' + isoDate() + '.');
-        var agentsMd = await readAgentsMd(d);
-        if (agentsMd) ctxParts.push(agentsMd);
+        if (d.preset === 'coding' || d.profile === 'coding' || d.agentsMd || (opts && opts.agentsMd) || d.system === CORE_PROMPT) {
+          var agentsMd = await readAgentsMd(d);
+          if (agentsMd) ctxParts.push(agentsMd);
+        }
       }
       if (recallBlock) {
         ctxParts.push(recallBlock);
@@ -4798,13 +4804,11 @@
           emit('mlgate', { rule: 'freshness', tool: 'context', step: steps,
                            nudge: clip(freshNotice, 160) });
         }
-        /* Task-gate backstop (owner 2026-09-08): the model jumped straight
-         * into long work with no checklist — inject ONE ephemeral "plan
-         * now" reminder past TODO_GATE_STEPS steps. CORE_PROMPT already
-         * says plan-first; this is the runtime enforcement when the model
-         * skips it. One-shot per run (supervisor no-nagging bar); rides the
-         * same loopMsgs path as the freshness/supervisor notices. */
-        if (steps >= TODO_GATE_STEPS && !sawTodo && !todoNudged) {
+        /* Task-gate backstop: fires only if todo_write tool is available and
+         * agent is in coding preset or explicitly enabled. */
+        var hasTodoTool = !!(toolset && toolset.tools && toolset.tools.todo_write);
+        var taskGateAllowed = hasTodoTool && (d.preset === 'coding' || d.profile === 'coding' || (d.budget && d.budget.taskGate) || d.system === CORE_PROMPT);
+        if (taskGateAllowed && steps >= TODO_GATE_STEPS && !sawTodo && !todoNudged) {
           todoNudged = true;
           var todoNotice = '[task-gate] You are ' + steps + ' tool steps into this task ' +
             'with no todo_write checklist. If this work is long or multi-step, create the ' +

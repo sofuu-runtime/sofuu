@@ -1667,6 +1667,7 @@
       S.noThink.indexOf(c.model) >= 0;
     var def = {
       name: 'chat',
+      preset: 'coding',
       system: sofuu.agent.CORE_PROMPT,
       /* "Just chat" mode: an empty toolset makes the run a pure
        * conversation turn (no tool loop, no approvals). */

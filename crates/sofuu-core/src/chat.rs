@@ -5824,6 +5824,7 @@ const DRIVER: &str = r#"
     const isLocal = c.provider === 'local';
     const def = {
       name: 'chat',
+      preset: isLocal ? undefined : 'coding',
       /* P1: the byte-stable shared core prompt. For local models, keep
        * it lean so CPU prefill latency matches direct `sofuu infer`. */
       system: isLocal ? 'You are a helpful AI assistant.' : sofuu.agent.CORE_PROMPT,

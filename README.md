@@ -67,14 +67,17 @@ npm install -g sofuu      # or: npx sofuu
 
 ## Quick Start
 
-### ⚡ The 10-Second "Hello World" (Zero Keys, Zero Downloads)
+### The 10-Second "Hello World" (Zero Keys, Zero Downloads)
 
 Most AI frameworks require hunting down an API key or downloading 2 GB of model weights before running a single line of code.
 
 With Sofuu, native AI primitives work the millisecond it installs:
 
 ```bash
-# Run the 10-second Hello World directly in your terminal:
+# 1. Install Sofuu (Linux & macOS)
+curl -fsSL https://sofuu.xyz/install | sh
+
+# 2. Run the 10-second Hello World directly in your terminal:
 sofuu eval '
 const brain = sofuu.memory.open("./brain.qtsq", 768);
 brain.remember(sofuu.ai.embedLocal("native AI runtime"), "Sofuu boots in 2ms with zero daemons.");
@@ -88,7 +91,7 @@ Recalled from vector brain: Sofuu boots in 2ms with zero daemons.
 # Completed in 2ms · 0 background daemons · 0 cloud API calls
 ```
 
-Or write a 4-line script `hello.js`:
+Or write a 4-line script `hello.js` and run `$ sofuu run hello.js`:
 
 ```js
 // hello.js — native AI in standard JavaScript

@@ -1583,6 +1583,7 @@ impl TransformerModel {
         self.kivi = None;
         // KV4: positions restart here, so the block roll cursor must too
         // (blocks_needed() is a pure function of pos).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(g) = self.gpu.as_mut() {
             g.kv4_qb_done = 0;
         }
@@ -1704,6 +1705,7 @@ impl TransformerModel {
     /// Enable KIVI 2-bit or 4-bit Asymmetric Quantized KV Cache.
     /// Ingests any prefilled tokens from `k_cache` and `v_cache` into historical quantized blocks.
     pub fn enable_kivi(&mut self, bits: usize, cur_pos: usize) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.kv4_armed() {
             // The quantized cache holds only a 192-row f32 ring; KIVI would
             // quantize that ring and read it as if it were the whole history.
@@ -8887,6 +8889,7 @@ impl Kv4Buffers {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct GgufGpu {
     engine: crate::infer::metal::MetalEngine,
     /// Zero-copy wrap of the whole GGUF file mmap: every weight bind is

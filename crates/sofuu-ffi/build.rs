@@ -363,6 +363,28 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_qtsq)");
     if has_qtsq {
         let qtsq_dir = qtsq_dir.as_deref().expect("has_qtsq implies SOFUU_QTSQ_DIR");
+
+        // ── Sofuu QTSQ Columnar Table Subsystem ──────────────────
+        // Compile BEFORE linking qtsq/qtc so that table -> qtsq -> qtc
+        // dependency order is preserved for static linkers (ld.lld).
+        let table_c = root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.c");
+        if table_c.exists() {
+            let mut table_cc = cc::Build::new();
+            table_cc
+                .opt_level(2)
+                .warnings(false)
+                .include(root.join("crates/sofuu-ffi/include"))
+                .include(qtsq_dir.join("include"))
+                .include(qtsq_dir.join("compressor/include"))
+                .file(&table_c);
+            table_cc.compile("sofuu_qtsq_table");
+            println!("cargo:rerun-if-changed={}", table_c.display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.h").display()
+            );
+        }
+
         println!("cargo:rustc-link-search=native={}", qtsq_search_dir.display());
         println!("cargo:rustc-link-lib=static=qtsq");
         // The POSIX Makefile product is TWO archives: libqtsq.a references
@@ -380,25 +402,6 @@ fn main() {
                 println!("cargo:rustc-link-lib=static=qtc");
                 println!("cargo:rerun-if-changed={}", qtc_lib.display());
             }
-        }
-
-        // ── Sofuu QTSQ Columnar Table Subsystem ──────────────────
-        let table_c = root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.c");
-        if table_c.exists() {
-            let mut table_cc = cc::Build::new();
-            table_cc
-                .opt_level(2)
-                .warnings(false)
-                .include(root.join("crates/sofuu-ffi/include"))
-                .include(qtsq_dir.join("include"))
-                .include(qtsq_dir.join("compressor/include"))
-                .file(&table_c);
-            table_cc.compile("sofuu_qtsq_table");
-            println!("cargo:rerun-if-changed={}", table_c.display());
-            println!(
-                "cargo:rerun-if-changed={}",
-                root.join("crates/sofuu-ffi/include/sofuu_qtsq_table.h").display()
-            );
         }
         // zlib: POSIX resolves -lz from the system toolchain. Windows has no
         // system zlib — probe the same vcpkg triplet the curl block uses

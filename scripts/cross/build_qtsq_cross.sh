@@ -53,20 +53,13 @@ if [ ! -f "$ZLIB_SRC/zlib.h" ]; then
     cp -R /tmp/zlib-1.3.1/. "$ZLIB_SRC/"
 fi
 
-# QTSQ core sources: the Makefile SRC_CORE list minus the Darwin-only
-# (Metal/CoreAudio) and Opus-optional additions — same set the Windows
-# CMake port compiles, which is the source of truth for non-Apple builds.
-QTSQ_CORE="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_pixel \
-qtsq_chandrasekhar qtsq_singularity qtsq_horizon qtsq_lensing qtsq_accretion \
-qtsq_triangle qtsq_radiation qtsq_redshift qtsq_wormhole qtsq_vault \
-qtsq_sanitize qtsq_secure qtsq_waves qtsq_paradox qtsq_gravitational \
-qtsq_splat2d qtsq_splat_only qtsq_triangle_only qtsq_video_encode \
-qtsq_video_decode qtsq_audio_encode qtsq_audio_decode qtsq_tensor \
-qtsq_container qtsq_photon_sonar qtsq_photon_tdoa qtsq_photon_wifi \
-qtsq_photon_fusion qtsq_splat4d qtsq_splat_tsubu qtsq_4dgs qtsq_geocrypt \
-qtsq_shamir qtsq_deniable qtsq_region_crypt qtsq_fingerprint qtsq_censorship \
-qtsq_keystore qtsq_seal qtsq_surfel qtsq_tsdf qtsq_seal_freqdct qtsq_turbo \
-qtsq_ionic qtsq_mf_merge qtsq_c2pa"
+# Minimal QTSQ subset required for Sofuu runtime (brain memory, vector
+# embeddings, columnar tables, container sessions, vault crypto).
+# Unneeded upstream multimedia/spatial components (3D Gaussian splatting,
+# video/audio codecs, photon radar/wifi, mesh delaunay) are excluded:
+QTSQ_CORE="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_container \
+qtsq_tensor qtsq_vault qtsq_secure qtsq_sanitize qtsq_keystore \
+qtsq_horizon qtsq_shamir qtsq_singularity"
 # P3 (AUDIT-2026-09-07): the crypto list came from `ls crypto/*/*.c | sort` —
 # a missing or renamed directory made ls emit the LITERAL glob pattern into
 # the list, breaking the link far away from the cause. Enumerate the four
@@ -83,10 +76,8 @@ for CRYPTO_SUBDIR in crypto/common crypto/ml-kem-768 crypto/ml-dsa-65 crypto/arg
     done
 done
 QTSQ_CRYPTO="$(printf '%s\n' $QTSQ_CRYPTO | sort)"
-QTC_SRC="qtc_model qtc_ans qtc_order1 qtc_lz qtc_image qtc_audio qtc_detect \
-qtc_mdct qtc_audio_mdct qtc_audio_mdct2 qtc_audio_float qtc_delaunay \
-qtc_image_mesh qtc_accretion qtc_image_dct qtc_tensor qtc_video qtc_core \
-qtc_text"
+# Minimal QTC compression core required for Sofuu runtime (tensor & text compression):
+QTC_SRC="qtc_core qtc_ans qtc_lz qtc_order1 qtc_model qtc_tensor qtc_text"
 
 # zlib objects (vendored; no gz* — the QTSQ callers only use the raw
 # compress/uncompress/deflate/inflate/crc32 surface).
@@ -132,12 +123,12 @@ build_one() {
 
     # qtc compressor core (POSIX: separate libqtc.a archive; Windows: baked
     # into qtsq.lib, mirroring the CMake single-archive layout).
-    local objs=()
+    local qtc_objs=()
     for s in $QTC_SRC; do
         local f="$out/obj/qtc_$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             "$QTSQ_DIR/compressor/src/$s.c" -o "$f"
-        objs+=("$f")
+        qtc_objs+=("$f")
     done
 
     # QTSQ core + crypto. Windows: force-include the shim master header in
@@ -147,11 +138,12 @@ build_one() {
     # hence the ${fi[@]+...} guard.
     local fi=()
     [ "$win" = 1 ] && fi=(-include "$QTSQ_DIR/windows/shim/qtsq_win_compat.h")
+    local qtsq_objs=()
     for s in $QTSQ_CORE; do
         local f="$out/obj/$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             ${fi[@]+"${fi[@]}"} "$QTSQ_DIR/src/$s.c" -o "$f"
-        objs+=("$f")
+        qtsq_objs+=("$f")
     done
     for c in $QTSQ_CRYPTO; do
         # ml-kem-768 and ml-dsa-65 share basenames (poly.c, ntt.c, …) — a
@@ -164,22 +156,23 @@ build_one() {
         local f="$out/obj/crypto_${tag}_$(basename "$c" .c).o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             ${fi[@]+"${fi[@]}"} "$QTSQ_DIR/$c" -o "$f"
-        objs+=("$f")
+        qtsq_objs+=("$f")
     done
     if [ "$win" = 1 ]; then
+        local win_objs=("${qtc_objs[@]}" "${qtsq_objs[@]}")
         for s in qtsq_win_compat qtsq_mmap_win; do
             local f="$out/obj/shim_$s.o"
             [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
                 "$QTSQ_DIR/windows/shim/$s.c" -o "$f"
-            objs+=("$f")
+            win_objs+=("$f")
         done
-        "${AR[@]}" crs "$out/qtsq.lib" "${objs[@]}"
+        "${AR[@]}" crs "$out/qtsq.lib" "${win_objs[@]}"
         # rustc's -lstatic=qtsq/-lzlib go through the mingw search path,
         # which resolves `libqtsq.a`/`libzlib.a`; sofuu-core's has_qtsq
         # probe additionally requires `$SOFUU_QTSQ_DIR/libqtsq.a`, and the
         # build.rs zlib probe requires a literal `zlib.lib`. Same members,
         # alias filenames (cp is fine here, but ar-from-objects is exact).
-        "${AR[@]}" crs "$out/libqtsq.a" "${objs[@]}"
+        "${AR[@]}" crs "$out/libqtsq.a" "${win_objs[@]}"
         "${AR[@]}" crs "$out/zlib.lib" "${zobjs[@]}"
         "${AR[@]}" crs "$out/libzlib.a" "${zobjs[@]}"
         echo "   qtsq.lib ($(du -h "$out/qtsq.lib" | cut -f1)) + libqtsq.a + zlib.lib/libzlib.a"
@@ -189,8 +182,9 @@ build_one() {
         # Makefile product) — stage it exactly there or -lqtc is never
         # emitted and the link dies on qtc_* symbols.
         mkdir -p "$out/compressor"
-        "${AR[@]}" crs "$out/compressor/libqtc.a" "${objs[@]:0:18}"
-        "${AR[@]}" crs "$out/libqtsq.a" "${objs[@]:18}"
+        "${AR[@]}" crs "$out/compressor/libqtc.a" "${qtc_objs[@]}"
+        cp "$out/compressor/libqtc.a" "$out/libqtc.a"
+        "${AR[@]}" crs "$out/libqtsq.a" "${qtsq_objs[@]}"
         echo "   libqtsq.a ($(du -h "$out/libqtsq.a" | cut -f1)) + compressor/libqtc.a + libz.a"
     fi
 }

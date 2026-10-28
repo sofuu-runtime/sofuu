@@ -27,10 +27,37 @@ jobs:
             --dir maven/com/sofuu/sofuu-android/0.2.0 \
             --clobber
 
+      - name: Verify the AAR is QTSQ-linked and carries its notices
+        run: |
+          set -euo pipefail
+          AAR=maven/com/sofuu/sofuu-android/0.2.0/sofuu-android-0.2.0.aar
+          POM=maven/com/sofuu/sofuu-android/0.2.0/sofuu-android-0.2.0.pom
+          for abi in arm64-v8a x86_64; do
+            unzip -p "$AAR" "jni/$abi/libsofuu.so" > "/tmp/libsofuu-$abi.so"
+            if grep -aqF 'built without the QTSQ codec' "/tmp/libsofuu-$abi.so"; then
+              echo "✗ $abi/libsofuu.so is a QTSQ-free build; refusing to publish"
+              exit 1
+            fi
+            if ! grep -aqF 'Invalid .qtsq format' "/tmp/libsofuu-$abi.so"; then
+              echo "✗ $abi/libsofuu.so has no QTSQ codec markers"
+              exit 1
+            fi
+            if ! grep -aqF 'verifyJWT' "/tmp/libsofuu-$abi.so"; then
+              echo "✗ $abi/libsofuu.so has no sofuu.crypto marker"
+              exit 1
+            fi
+          done
+          unzip -p "$AAR" classes.jar > /tmp/sofuu-classes.jar
+          unzip -p /tmp/sofuu-classes.jar 'META-INF/LICENSES/QTSQ-FORMAT.txt' > /dev/null
+          unzip -p /tmp/sofuu-classes.jar 'META-INF/SOFUU-NOTICE.txt' > /dev/null
+          grep -q 'Quantum Tensor Sequence' "$POM"
+          echo "✓ QTSQ-linked AAR with license and NOTICE"
+
       - name: Generate Maven metadata and checksums
         run: |
           set -euo pipefail
-          cat > maven/com/sofuu/sofuu-android/maven-metadata.xml <<'XML'
+          LAST_UPDATED="$(date -u +%Y%m%d%H%M%S)"
+          cat > maven/com/sofuu/sofuu-android/maven-metadata.xml <<XML
           <?xml version="1.0" encoding="UTF-8"?>
           <metadata>
             <groupId>com.sofuu</groupId>
@@ -39,7 +66,7 @@ jobs:
               <latest>0.2.0</latest>
               <release>0.2.0</release>
               <versions><version>0.2.0</version></versions>
-              <lastUpdated>20261027140000</lastUpdated>
+              <lastUpdated>${LAST_UPDATED}</lastUpdated>
             </versioning>
           </metadata>
           XML

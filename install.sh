@@ -7,7 +7,21 @@
 #   https://sofuu.xyz/downloads  (tarball + .sha256, any platform)
 set -e
 
-INSTALL_DIR="${SOFUU_INSTALL_DIR:-/usr/local/bin}"
+# ── Target directory ──────────────────────────────────────────
+if [ -n "$SOFUU_INSTALL_DIR" ]; then
+    INSTALL_DIR="$SOFUU_INSTALL_DIR"
+elif [ -w "/usr/local/bin" ] || [ -w "/usr/local/bin/sofuu" ]; then
+    INSTALL_DIR="/usr/local/bin"
+elif echo ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
+    INSTALL_DIR="$HOME/.local/bin"
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+elif [ "$(id -u)" -eq 0 ]; then
+    INSTALL_DIR="/usr/local/bin"
+elif [ -d "$HOME/.local/bin" ]; then
+    INSTALL_DIR="$HOME/.local/bin"
+else
+    INSTALL_DIR="/usr/local/bin"
+fi
 BINARY="sofuu"
 
 # ── Detect platform ───────────────────────────────────────────
@@ -101,10 +115,15 @@ fi
 
 # ── Install ───────────────────────────────────────────────────
 echo "→ Installing to ${INSTALL_DIR}/${BINARY}..."
-if [ -w "$INSTALL_DIR" ]; then
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+if cp -f "${TMP_DIR}/${ASSET_NAME}" "${INSTALL_DIR}/${BINARY}" 2>/dev/null; then
+    chmod +x "${INSTALL_DIR}/${BINARY}"
+elif [ -w "$INSTALL_DIR" ]; then
     mv "${TMP_DIR}/${ASSET_NAME}" "${INSTALL_DIR}/${BINARY}"
+    chmod +x "${INSTALL_DIR}/${BINARY}"
 else
-    sudo mv "${TMP_DIR}/${ASSET_NAME}" "${INSTALL_DIR}/${BINARY}"
+    sudo cp -f "${TMP_DIR}/${ASSET_NAME}" "${INSTALL_DIR}/${BINARY}"
+    sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 fi
 
 rm -rf "$TMP_DIR"

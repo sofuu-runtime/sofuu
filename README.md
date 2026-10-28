@@ -5,7 +5,7 @@
 > *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single < 5 MB binary (4.8 MB stripped release). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0--beta-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
 
 > 🚧 **Active development — iterating fast.** APIs may change before a stable release.

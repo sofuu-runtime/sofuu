@@ -40,7 +40,7 @@
    ]
   ]
  },
- "generated_at": 1793173968,
+ "generated_at": 1793176027,
  "how_to_reproduce": "bash scripts/contract/run_contract_tests.sh; bash scripts/verify-dist.sh; sofuu conformance",
  "install_integrity": {
   "runtime_part_ok": true,
@@ -115,7 +115,7 @@
    "os": "macos",
    "ram_mb": 16384,
    "threads": 10,
-   "version": "0.2.0-beta"
+   "version": "0.3.0-beta"
   },
   "schema": 1,
   "surfaces": {
@@ -379,5 +379,5 @@
   "os": "macos"
  },
  "schema_version": 1,
- "version": "0.2.0-beta"
+ "version": "0.3.0-beta"
 }

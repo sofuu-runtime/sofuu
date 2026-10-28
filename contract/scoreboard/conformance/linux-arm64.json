@@ -104,7 +104,7 @@
       "os": "linux",
       "ram_mb": 15947,
       "threads": 1,
-      "version": "0.2.0-beta"
+      "version": "0.3.0-beta"
     },
     "schema": 1,
     "surfaces": {
@@ -368,5 +368,5 @@
     "os": "linux"
   },
   "schema_version": 1,
-  "version": "0.2.0-beta"
+  "version": "0.3.0-beta"
 }

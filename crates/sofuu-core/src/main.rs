@@ -50,7 +50,7 @@ mod session;
 mod session_store;
 mod theme;
 
-const VERSION: &str = "0.2.0-beta";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_banner() {
     println!("\x1b[1;36m  ┌─────────────────────────────────┐");

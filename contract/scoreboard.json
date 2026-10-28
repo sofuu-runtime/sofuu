@@ -18,7 +18,7 @@
     "platform": "linux-arm64",
     "posture_ok": true,
     "verify_dist": null,
-    "version": "0.2.0-beta"
+    "version": "0.3.0-beta"
    },
    {
     "arch": "x86_64",
@@ -32,7 +32,7 @@
     "platform": "linux-x86_64",
     "posture_ok": true,
     "verify_dist": null,
-    "version": "0.2.0-beta"
+    "version": "0.3.0-beta"
    },
    {
     "arch": "aarch64",
@@ -40,17 +40,17 @@
     "build": "simd+qtsq+metal",
     "cases": 52,
     "fail": 0,
-    "generated_at": 1793173968,
+    "generated_at": 1793176027,
     "os": "macos",
     "pass": 51,
     "platform": "macos-arm64",
     "posture_ok": true,
     "verify_dist": "ok",
-    "version": "0.2.0-beta"
+    "version": "0.3.0-beta"
    }
   ],
   "versions": [
-   "0.2.0-beta"
+   "0.3.0-beta"
   ]
  },
  "kind": "sofuu-scoreboard",

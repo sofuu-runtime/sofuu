@@ -5,7 +5,7 @@ Receipts, not claims. This page is generated from the tracked artifacts in
 prose contract lives in `docs/SPEC-RUNTIME-CONTRACT.md` (local-only by repo
 policy); the machine-readable half is tracked here.
 
-Version: **0.2.0-beta**
+Version: **0.3.0-beta**
 
 ## Contract suite (52 cases)
 
@@ -17,8 +17,8 @@ Version: **0.2.0-beta**
 
 The macOS row is the merged release report (`sofuu conformance --suite`);
 the Linux rows are each platform's own posture report (their suites run in
-CI's report mode). The 10 BLOCKED cases are named in
-[`PROGRESS.md`](PROGRESS.md) — they are missing harnesses, not failures.
+CI's report mode). Any BLOCKED cases are named in
+[`PROGRESS.md`](PROGRESS.md) — reserved multi-device runners, not failures.
 
 ## Live capability posture
 

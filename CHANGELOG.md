@@ -1,10 +1,27 @@
 # Changelog
 
 All notable changes to the `sofuu` runtime are documented here.
-Versions follow the Cargo crate (`0.2.0-beta` line); npm and the CLI banner
+Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
-## 0.2.0-beta — 2026-10-26 (in development)
+## 0.3.0-beta — 2026-10-28 (in development)
+
+Mandatory QTSQ core integration and runtime conformance program completion:
+
+- **Mandatory QTSQ Core** — Made QTSQ memory a permanent core component of the
+  runtime across all targets; retired the legacy QTSQ-free build variant.
+- **Contract Conformance Unblocking (51 PASS · 0 FAIL · 1 BLOCKED)** —
+  Unblocked 9 previously blocked conformance test cases across capabilities
+  manifest parity, single terminal event enforcement, tier and bound declarations,
+  deterministic tolerant bounds, opt-in best effort decode, forward schema migration,
+  MCP envelope indistinguishability, cross-surface error taxonomy parity, and token
+  usage reconciliation.
+- **Single Terminal Event Fix** — Resolved agent runtime double-stop bug under
+  step budget exhaustion.
+- **Cross-Surface Capabilities** — Added `sofuu capabilities` CLI subcommand and
+  `/v1/capabilities` HTTP routes for 100% manifest parity with JS and C ABI.
+
+## 0.2.0-beta — 2026-10-26
 
 The runtime-contract program, phases P0–P4:
 

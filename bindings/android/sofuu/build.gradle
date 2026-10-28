@@ -191,6 +191,22 @@ tasks.register('verifyAarContents') {
                 throw new GradleException("AAR is missing required entries: ${missing}")
             }
 
+            // QTSQ is a core component. Refuse a codec-less payload even if
+            // someone bypassed stage_android_sdk.sh with stale jniLibs.
+            required.findAll { it.endsWith('/libsofuu.so') }.each { name ->
+                def bytes = zip.getInputStream(zip.getEntry(name)).bytes
+                def text = new String(bytes, 'ISO-8859-1')
+                if (text.contains('built without the QTSQ codec')) {
+                    throw new GradleException("${name} is a QTSQ-free build")
+                }
+                if (!text.contains('Invalid .qtsq format')) {
+                    throw new GradleException("${name} has no QTSQ codec markers")
+                }
+                if (!text.contains('verifyJWT')) {
+                    throw new GradleException("${name} has no sofuu.crypto marker")
+                }
+            }
+
             // The QTSQ codec is compiled into libsofuu, so its license and the
             // NOTICE must remain discoverable by anyone consuming the AAR.
             def classesEntry = zip.getEntry('classes.jar')

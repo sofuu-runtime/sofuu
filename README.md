@@ -469,6 +469,7 @@ let hits = try brain.recall("what colour is the sky?", k: 3)
 
 ```kotlin
 // Gradle: implementation 'com.sofuu:sofuu-android:0.2.0'
+// The published AAR links QTSQ, so sofuu.memory works on-device.
 val vec = sofuu.embedLocal("hello")   // FloatArray, 768-dim, no network
 ```
 

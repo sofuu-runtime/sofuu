@@ -12,11 +12,7 @@ import java.util.Locale
  * App-side token accounting, one line per finished turn.
  *
  * The engine already writes a `usage` record per turn, and `chat.usage()`
- * aggregates those — but they live in the workspace's QTSQ session store.
- * On an engine build without the QTSQ codec (allowed by
- * `SOFUU_ALLOW_NO_QTSQ=1`, and the reason the Makefile calls such a build
- * "INVISIBLY broken") that aggregation reads nothing and every Usage pane is
- * zero while the transcript still shows "1,385 in · 718 out".
+ * aggregates those — which live in the workspace's QTSQ session store.
  *
  * Those numbers reach the app on `TurnFinished`, so this ledger keeps them
  * independently: append-only JSONL in filesDir, capped, no engine call.

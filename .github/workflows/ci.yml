@@ -14,14 +14,6 @@ jobs:
     # test binary previously sat here until the job was cancelled by hand.
     timeout-minutes: 35
     env:
-      # Job-wide, not per-step. QTSQ is a proprietary local checkout that
-      # cannot be built here, so every step makes a DELIBERATE QTSQ-free
-      # build. This must be visible to EVERY step, not just the first: the
-      # Makefile's cargo-build guard hard-fails without it, and several
-      # later steps (size-check, make test, make libsofuu, headless-test,
-      # abi-check) re-enter make -> cargo-build. Setting it only on the
-      # build step made 'Size cap' fail with "SOFUU_QTSQ_DIR is not set".
-      SOFUU_ALLOW_NO_QTSQ: "1"
       # See the 'Rust unit tests' step: Homebrew curl (linked dynamically by
       # sofuu-ffi) needs libuv.1.dylib at load time even though libuv is
       # also linked statically into the same binary.
@@ -307,8 +299,6 @@ jobs:
             label: Linux-arm64
           - os: windows-latest
             label: Windows-x86_64
-    env:
-      SOFUU_ALLOW_NO_QTSQ: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -402,8 +392,8 @@ jobs:
             git clone "${{ secrets.SOFUU_QTSQ_CI_URL }}" /tmp/qtsq
             echo "SOFUU_QTSQ_DIR=/tmp/qtsq" >> "$GITHUB_ENV"
           else
-            echo "SOFUU_ALLOW_NO_QTSQ=1" >> "$GITHUB_ENV"
-            echo "No QTSQ checkout provided — recording the capability-gated posture."
+            echo "::error::No QTSQ checkout provided — QTSQ is a mandatory core component."
+            exit 1
           fi
       - name: Build + capabilities claim check
         run: |

@@ -24,19 +24,7 @@ if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
         if [ -f "$ROOT/$cand" ]; then CONTRACT_LIBSOFUU="$cand"; break; fi
     done
 fi
-verify_allow_no_qtsq=0
-if [ -z "${CONTRACT_NOQTSQ_BIN:-}" ]; then
-    miss=$("$BIN" eval 'console.log((JSON.parse(sofuu.capabilities()).build.missing||[]).join(","))' 2>/dev/null | tail -1)
-    case ",$miss," in
-        # The same variant fact decides two things: T1.3 needs this binary as
-        # its refusal target, and verify-dist's doctor step needs the declared
-        # gap accepted. Set both here so a third party does not have to export
-        # SOFUU_ALLOW_NO_QTSQ for the whole shell.
-        *,qtsq,*) CONTRACT_NOQTSQ_BIN="$BIN"; verify_allow_no_qtsq=1 ;;
-    esac
-fi
-[ -n "${CONTRACT_LIBSOFUU:-}" ] && export CONTRACT_LIBSOFUU
-[ -n "${CONTRACT_NOQTSQ_BIN:-}" ] && export CONTRACT_NOQTSQ_BIN
+if [ -n "${CONTRACT_LIBSOFUU:-}" ]; then export CONTRACT_LIBSOFUU; fi
 bash "$ROOT/scripts/contract/run_contract_tests.sh" > "$SUITE_LOG" 2>&1
 suite_rc=$?
 
@@ -58,13 +46,8 @@ PY
 "$BIN" conformance --suite "${SUITE_LOG}.json" > "$OUT" 2>/dev/null \
     || "$BIN" conformance > "$OUT"
 
-if [ "$verify_allow_no_qtsq" = "1" ]; then
-    verify_ok=0
-    SOFUU_ALLOW_NO_QTSQ=1 bash "$ROOT/scripts/verify-dist.sh" "$ROOT/dist" "$BIN" >> "$SUITE_LOG" 2>&1 && verify_ok=1
-else
-    verify_ok=0
-    bash "$ROOT/scripts/verify-dist.sh" "$ROOT/dist" "$BIN" >> "$SUITE_LOG" 2>&1 && verify_ok=1
-fi
+verify_ok=0
+bash "$ROOT/scripts/verify-dist.sh" "$ROOT/dist" "$BIN" >> "$SUITE_LOG" 2>&1 && verify_ok=1
 if [ "$verify_ok" = "1" ]; then
     python3 - "$OUT" <<'PY'
 import json, sys

@@ -453,17 +453,15 @@ fn main() {
         // a duplicate, removed per AUDIT-2026-09-07 ffi-4.)
         println!("cargo:rustc-cfg=has_qtsq");
     } else if qtsq_dir.is_some() {
-        println!(
-            "cargo:warning=QTSQ static lib not found at {} — building WITHOUT QTSQ \
-             (session store + brain persistence disabled). Point SOFUU_QTSQ_DIR \
-             at a built QTSQ checkout (SOFUU_QTSQ_LIB overrides the lib path).",
+        panic!(
+            "QTSQ static lib not found at {} — QTSQ is a mandatory core component of Sofuu. \
+             Point SOFUU_QTSQ_DIR at a built QTSQ checkout (SOFUU_QTSQ_LIB overrides the lib path).",
             qtsq_lib.display()
         );
     } else {
-        println!(
-            "cargo:warning=SOFUU_QTSQ_DIR not set — building WITHOUT QTSQ \
-             (session store + brain persistence disabled). Set it to a built \
-             QTSQ checkout to enable them."
+        panic!(
+            "SOFUU_QTSQ_DIR not set — QTSQ is a mandatory core component of Sofuu. \
+             Set it to a built QTSQ checkout to build Sofuu."
         );
     }
 

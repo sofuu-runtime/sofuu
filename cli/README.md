@@ -33,25 +33,19 @@ cp cli/sofuu-linux-x86_64 /usr/local/bin/sofuu   # static — runs on any distro
 
 Verify: `sofuu version`
 
-## What happens without QTSQ
+## QTSQ is a mandatory core component
 
-**`make` now refuses to build without it.** A QTSQ-free binary is
-*invisibly* broken: brain writes no-op, every session persist fails, and
-— until 2026-09-25 — the chat banner still claimed `Memory: on (persists
-across sessions)`. A QTSQ-free tarball shipped exactly like that on
-2026-09-22 and every install since had a dead brain.
+**`make` requires QTSQ and refuses to build without it.** QTSQ provides
+session persistence and brain state storage across sessions. There is no
+QTSQ-free build variant.
 
 ```sh
-SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make   # the supported path
-SOFUU_ALLOW_NO_QTSQ=1 make                        # deliberate, degraded
+SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make   # required
 ```
 
-With `SOFUU_ALLOW_NO_QTSQ=1` the build still works for CI and
-third-party redistributors: chat, providers, tools, and the agent loop all
-function, but sessions and brain state do not persist, and both the
-banner and `sofuu doctor` say so plainly. `make` also verifies the codec
-library actually exists in `SOFUU_QTSQ_DIR` before building, so a stale
-path cannot silently produce a brain-less binary.
+`make` verifies the codec library actually exists in `SOFUU_QTSQ_DIR` before
+building, ensuring every build is a full, working binary with brain and session
+persistence.
 
 **Check any build in one command:**
 

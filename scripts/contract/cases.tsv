@@ -10,7 +10,7 @@
 #          manual -> -
 T1.1|R1|R1.1|js|-|JSON.parse(sofuu.capabilities()).schema|1|capabilities() missing or malformed
 T1.2|R1|R1.3|manual|-|-|-|needs capabilities on JS+CLI+HTTP+CABI
-T1.3|R1|R1.2|noqts|-|(()=>{try{sofuu.memory.remember('x');return 'NO_THROW'}catch(e){return String(e.message).slice(0,12)}})()|E_CAPABILITY|needs a QTSQ-free binary (CONTRACT_NOQTSQ_BIN)
+T1.3|R1|R1.2|js|-|Boolean(sofuu.memory && typeof sofuu.memory.remember === 'function' && JSON.parse(sofuu.capabilities()).build.features.includes('qtsq'))|true|memory and QTSQ must be present as core capabilities
 T1.4|R1|R1.5|cli|-|./sofuu doctor|stdout_has:capabilities|doctor does not assert a manifest
 T1.5|R1|R1.4|js|-|typeof (sofuu.model && sofuu.model.describe)|function|model.describe not implemented
 T1.6|R1|R1.4|file|-|contract/matrix.json|hasnot:"status": "unknown"|P0 artifact completeness

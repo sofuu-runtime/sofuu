@@ -445,7 +445,7 @@ Reproduce any of it from a checkout:
 
 ```bash
 make deps
-SOFUU_ALLOW_NO_QTSQ=1 make && SOFUU_ALLOW_NO_QTSQ=1 make libsofuu
+make && make libsofuu
 bash scripts/contract/run_contract_tests.sh      # the 52-case board
 bash scripts/verify-dist.sh dist ./sofuu         # install integrity
 bash scripts/conformance_report.sh               # merged release report
@@ -500,21 +500,16 @@ git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
 make deps                                  # vendored libuv (required first build)
 
-# Option A — the encrypted-brain codec (in-tree licensees):
 export SOFUU_QTSQ_DIR=/path/to/black-hole-disk
 make                                       # cargo build --release
-
-# Option B — capability-gated build, no proprietary codec:
-SOFUU_ALLOW_NO_QTSQ=1 make                 # memory/session persist refuse with E_CAPABILITY
-
 make libsofuu         # embeddable library (needed by the C-ABI conformance cases)
 make test             # JS e2e suite
-make size-check       # fails if the binary exceeds 5MB
+make size-check       # fails if the binary exceeds size cap
 make bc-check         # fails if a shipped driver .bc lags its .js
-./sofuu doctor        # QTSQ linkage + a real brain round-trip (declared gap on option B)
+./sofuu doctor        # QTSQ linkage + a real brain round-trip
 ```
 
-`make` refuses to build without the QTSQ codec (pass `SOFUU_ALLOW_NO_QTSQ=1` for a capability-gated binary) — the codec-less build used to silently no-op memory, so the codec is opt-out, not opt-in; today every missing capability is a typed `E_CAPABILITY` refusal and `sofuu.capabilities()` says so before any call.
+`make` requires the QTSQ codec (mandatory core component) — brain persistence and sessions are fully operational in every build.
 
 Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 C samples assert) · `make abi-check` · `make size-check` · `make bc-check` · `./sofuu doctor`.
 

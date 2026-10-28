@@ -54,14 +54,11 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
         yes)
             mem=$("$BIN" eval 'console.log(typeof sofuu.memory.remember)' 2>/dev/null | tail -1)
             [ "$mem" = "function" ] \
-                && say "OK  live capabilities: memory available (QTSQ build)" \
-                || fail "a QTSQ build must expose sofuu.memory.remember, got '${mem:-no output}' — engine-lane namespace clobber (sofuu.memory holds the ZeroCopy bridge; finding tracked in contract/PROGRESS.md)"
+                && say "OK  live capabilities: memory available (QTSQ core component linked)" \
+                || fail "a QTSQ build must expose sofuu.memory.remember, got '${mem:-no output}'"
             ;;
         no)
-            cls=$("$BIN" eval 'var c="silent-noop"; try { sofuu.memory.remember("x") } catch (e) { c = String(e && e.message || e).indexOf("E_CAPABILITY") >= 0 ? "typed-refusal" : "other-error" } console.log(c)' 2>/dev/null | tail -1)
-            [ "$cls" = "typed-refusal" ] \
-                && say "OK  live capabilities: memory is a typed E_CAPABILITY refusal (capability-gated build)" \
-                || fail "a QTSQ-free build must refuse memory with E_CAPABILITY, got: ${cls:-no output}"
+            fail "QTSQ is a mandatory core component; binary is missing QTSQ"
             ;;
         *)
             fail "cannot read the build manifest (sofuu capabilities)"
@@ -75,23 +72,11 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
         || fail "event surface missing (P2 regression)"
 
     # ── 3. doctor ─────────────────────────────────────────────────────────
-    # A capability-gated (QTSQ-free) build exits non-zero BY DESIGN: the
-    # missing codec is a declared gap. That is the documented posture only
-    # when EVERY failing line is the qtsq gap; anything else is a defect.
+    # QTSQ is mandatory; doctor must exit 0 on every valid build.
     if "$BIN" doctor >/dev/null 2>&1; then
         say "OK  doctor exits 0 on this build"
     else
-        doc_bad=$("$BIN" doctor 2>&1 \
-            | sed $'s/\033\\[[0-9;]*m//g' \
-            | grep -E '^[[:space:]]*✗' \
-            | grep -vE 'problem\(s\) found')
-        if [ "$has_qtsq" = "no" ] && [ "${SOFUU_ALLOW_NO_QTSQ:-0}" = "1" ] \
-           && [ -n "$doc_bad" ] \
-           && [ -z "$(printf '%s\n' "$doc_bad" | grep -viE 'qtsq')" ]; then
-            say "OK  doctor: QTSQ-free capability-gated build (every ✗ is the declared qtsq gap)"
-        else
-            fail "doctor exits non-zero — the build's declared features are not all present"
-        fi
+        fail "doctor exits non-zero — the build's declared features are not all present"
     fi
 
     # ── 4. version parity (Cargo ↔ npm ↔ CLI) ─────────────────────────────

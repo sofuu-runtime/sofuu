@@ -73,20 +73,6 @@ run_js_case() {
     fi
 }
 
-run_noqts_case() {
-    local expr="$1" expect="$2" bin="${CONTRACT_NOQTSQ_BIN:-}" out last
-    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-        report_block "$id" "build a QTSQ-free binary (SOFUU_ALLOW_NO_QTSQ=1) and set CONTRACT_NOQTSQ_BIN"
-        return
-    fi
-    out="$("$bin" eval "console.log($expr)" 2>&1)"
-    last="$(printf '%s\n' "$out" | tail -n 1)"
-    if [ "$last" = "$expect" ]; then
-        report_pass "$id" "no-QTSQ binary: expr => $last"
-    else
-        report_fail "$id" "expected '$expect', got '$last'"
-    fi
-}
 
 run_cli_case() {
     local envspec="$1" cmd="$2" expect="$3" out code out_tail
@@ -165,7 +151,6 @@ while IFS='|' read -r id rule clause kind envspec cmd expect prereq; do
     case "$kind" in
         file)   run_file_case "$cmd" "$expect" ;;
         js)     run_js_case "$envspec" "$cmd" "$expect" ;;
-        noqts)  run_noqts_case "$cmd" "$expect" ;;
         cli)    run_cli_case "$envspec" "$cmd" "$expect" ;;
         http)   run_http_case "$cmd" "$expect" ;;
         cabi)   run_cabi_case "$cmd" "$expect" ;;

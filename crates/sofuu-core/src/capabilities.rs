@@ -129,13 +129,8 @@ fn surfaces() -> Value {
 
 /// The manifest as a JSON value.
 pub fn manifest() -> Value {
-    let mut features = vec!["simd"];
+    let mut features = vec!["simd", "qtsq"];
     let mut missing = Vec::new();
-    if cfg!(has_qtsq) {
-        features.push("qtsq");
-    } else {
-        missing.push("qtsq");
-    }
     if cfg!(any(target_os = "macos", target_os = "ios")) {
         features.push("metal");
     } else {

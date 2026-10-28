@@ -73,7 +73,7 @@ jobs:
       - name: Build iOS xcframework (SwiftPM + CocoaPods payload)
         run: |
           set -euo pipefail
-          SOFUU_ALLOW_NO_QTSQ=1 ./scripts/dist/ios.sh xcframework
+          ./scripts/dist/ios.sh xcframework
           # SwiftPM needs a *zip* of the xcframework, and CocoaPods needs the
           # directory; ship the zip and keep the framework on disk too.
           ditto -c -k --keepParent dist/libsofuu.xcframework \
@@ -168,7 +168,7 @@ jobs:
           cmake --build build
 
       - name: Build the Android .so's
-        run: SOFUU_ALLOW_NO_QTSQ=1 ./scripts/dist/android.sh all
+        run: ./scripts/dist/android.sh all
 
       - name: Build the AAR
         run: |

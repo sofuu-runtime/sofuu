@@ -21,14 +21,13 @@ sequencing in [`docs/PLAN-AI-APP-RUNTIME-STANDARD.md`](../docs/PLAN-AI-APP-RUNTI
 
 **52 cases — PASS 42 · FAIL 0 · BLOCKED 10.**
 (`CONTRACT_LIBSOFUU=dist/libsofuu.dylib` now enables the C-ABI parity check.)
-(`CONTRACT_NOQTSQ_BIN=target-noqts/release/sofuu` enables T1.3.)
 
 Passing:
 
 | Test | What it proves |
 |---|---|
 | T1.1 | `sofuu.capabilities()` returns a manifest with `schema: 1` |
-| T1.3 | a QTSQ-free build refuses `sofuu.memory.remember()` with typed `E_CAPABILITY` |
+| T1.3 | QTSQ and `sofuu.memory.remember()` are mandatory core capabilities |
 | T1.4 | `sofuu doctor` prints the capability section and exits non-zero on a missing declared feature |
 | T1.5 | `sofuu.model.describe(path)` exists |
 | T1.6 | the matrix has no unknown cells |
@@ -476,8 +475,4 @@ both the generator and the checker skip them (`d92ff9599`).
 ```bash
 python3 scripts/contract/gen_contract_docs.py     # validate + regenerate
 bash scripts/contract/run_contract_tests.sh       # current binary
-CONTRACT_NOQTSQ_BIN=target-noqts/release/sofuu \
-  bash scripts/contract/run_contract_tests.sh     # + the T1.3 refusal gate
-SOFUU_QTSQ_DIR=/nonexistent SOFUU_ALLOW_NO_QTSQ=1 \
-  CARGO_TARGET_DIR=target-noqts cargo build --release   # the no-QTSQ binary
 ```

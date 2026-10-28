@@ -447,19 +447,16 @@ def render_conformance(
         "",
         "```bash",
         "make deps                                       # vendored libuv (first build only)",
-        "SOFUU_ALLOW_NO_QTSQ=1 make && SOFUU_ALLOW_NO_QTSQ=1 make libsofuu",
+        "make && make libsofuu",
         "bash scripts/contract/run_contract_tests.sh      # the 52-case board",
         "bash scripts/verify-dist.sh dist ./sofuu         # install integrity",
         "bash scripts/conformance_report.sh               # merged release report",
         "python3 scripts/scoreboard.py --check --live-report dist/conformance-report.json",
         "```",
         "",
-        "Expected on a build without the proprietary QTSQ codec (`SOFUU_ALLOW_NO_QTSQ=1`):",
-        "52 cases, 42 PASS / 0 FAIL / 10 BLOCKED, memory `capability-gated / typed-refusal`",
-        "(see `contract/README.md` for the per-case prerequisites). A codec-bearing",
-        "build reports memory `full` and 41 PASS / 11 BLOCKED: T1.3 proves the typed",
-        "refusal and needs a codec-free binary as its target. Both boards are gated;",
-        "the floor is 42 when the report says `build.missing` contains `qtsq`, else 41.",
+        "Expected on a standard Sofuu build (QTSQ is a mandatory core component):",
+        "52 cases, 42 PASS / 0 FAIL / 10 BLOCKED, memory `full`",
+        "(see `contract/README.md` for the per-case prerequisites).",
         "",
         "`dist/SHA256SUMS` is stamped by the first `verify-dist` run (a local file,",
         "not tracked). Delete it after changing build flags so the artifact set is",
@@ -589,7 +586,6 @@ def baseline_from(parity: dict[str, Any]) -> dict[str, Any]:
             "min_reports": 3,
             "min_cases": 52,
             "min_pass": 42,
-            "min_pass_when_qtsq_linked": 41,
             "max_fail": 0,
             "require_posture_ok": True,
             "require_verify_dist_ok": True,
@@ -634,15 +630,7 @@ def check_report(
         return
     if failed > rules.get("max_fail", 0):
         problems.append(f"{label}: {failed} contract FAIL(s)")
-    # T1.3 proves the typed memory refusal and needs a codec-free binary as
-    # its target. A codec-bearing build therefore reports one fewer PASS and
-    # one more BLOCKED; both variants are honest boards.
-    manifest = report.get("manifest") or {}
-    build = manifest.get("build") or {}
-    qtsq_free = "qtsq" in (build.get("missing") or [])
-    floor = rules.get("min_pass", 0) if qtsq_free else rules.get(
-        "min_pass_when_qtsq_linked", rules.get("min_pass", 0)
-    )
+    floor = rules.get("min_pass", 42)
     if passed < floor:
         problems.append(f"{label}: {passed} PASS is below the frozen floor {floor}")
     if cases < rules.get("min_cases", 0):

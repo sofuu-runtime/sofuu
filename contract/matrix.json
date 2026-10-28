@@ -411,7 +411,7 @@
    "surface": "js",
    "status": "full",
    "missing": [],
-   "note": "R1/T1.3 flat surface unified (2026-10-27): the engine installs src/js/memory_api.js on QTSQ builds, so sofuu.memory and sofuu.brain (the same object) expose the documented flat methods \u2014 remember/recall/search/count/learn/list/export/stats/working-set/entity/forget/flush/close and the read-only module helpers \u2014 delegating to the last-opened brain or {handle}. Both the options form and the instance-argument form are accepted, close() flushes, and a QTSQ-free build presents the same names as typed-refusal stubs. The earlier P1 note blamed the zerocopy bridge for clobbering the namespace; what actually differed was the module-vs-instance shape (module had open() only), now unified. Regression test: sofuu-capi flat_memory_and_brain_surface_is_complete.",
+   "note": "R1/T1.3 flat surface unified (2026-10-27): the engine installs src/js/memory_api.js, so sofuu.memory and sofuu.brain (the same object) expose the documented flat methods \u2014 remember/recall/search/count/learn/list/export/stats/working-set/entity/forget/flush/close and the read-only module helpers \u2014 delegating to the last-opened brain or {handle}. Both the options form and the instance-argument form are accepted, and close() flushes; QTSQ is a mandatory core component providing brain and session persistence. Regression test: sofuu-capi flat_memory_and_brain_surface_is_complete.",
    "evidence": [
     "src/js/memory_api.js",
     "crates/sofuu-core/src/rt/memory.rs",

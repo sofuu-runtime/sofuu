@@ -1,13 +1,13 @@
 # Runtime env knobs (generated)
 
-Generated from a source scan — 175 knobs. Class counts: build 1, debug 13, public 20, test 33, tuning 108.
+Generated from a source scan — 177 knobs. Class counts: build 1, debug 13, public 20, test 33, tuning 110.
 Classes: `public` (user-facing), `tuning` (performance knobs), `debug`,
 `test`, `build`. `numeric_effect=yes` means the knob changes results and
 therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 
-**Open items:** 22 knobs have `numeric_effect=unknown` and need a tier decision.
+**Open items:** 23 knobs have `numeric_effect=unknown` and need a tier decision.
 
-**Open items (R3.5):** 76 numeric knobs have `determinism_tier=unsure` — each needs a receipt before it can map to a declared path tier.
+**Open items (R3.5):** 77 numeric knobs have `determinism_tier=unsure` — each needs a receipt before it can map to a declared path tier.
 
 | knob | class | numeric effect | determinism tier | stability tier | first evidence |
 |---|---|---|---|---|---|
@@ -39,11 +39,10 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_BRAIN_KEY` | public | no | — | T2 | `crates/sofuu-core/src/doctor.rs:272` |
 | `SOFUU_BRAIN_MAX_RECORDS` | public | no | — | T2 | `crates/sofuu-core/src/chat.rs:4178` |
 | `SOFUU_CHAIN_ATTN` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/metal.rs:3710` |
-| `SOFUU_CHAIN_CHUNK` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:2525` |
+| `SOFUU_CHAIN_CHUNK` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:2625` |
 | `SOFUU_COMMIT_TRACE` | debug | no | — | T3 | `src/metal/metal_engine.mm:1338` |
-| `SOFUU_DECODE_MMQ` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3549` |
-| `SOFUU_DECODE_MMQ_OPS` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3855` |
-| `SOFUU_DUMP_LOGITS_DEC` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/mod.rs:1896` |
+| `SOFUU_DECODE_MMQ` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3649` |
+| `SOFUU_DECODE_MMQ_OPS` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3955` |
 | `SOFUU_DYNAMIC_FFN` | public | no | — | T2 | `crates/sofuu-core/src/infer/dynamic_ffn.rs:40` |
 | `SOFUU_EMBED_EVAL_ARTIFACT` | test | no | — | T3 | `crates/ml-train/src/embedding_eval.rs:755` |
 | `SOFUU_EMBED_EVAL_DEBUG` | test | no | — | T3 | `crates/ml-train/src/embedding_eval.rs:1128` |
@@ -69,44 +68,44 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_EMB_V2` | test | no | — | T3 | `crates/ml-train/src/embedding_train.rs:1339` |
 | `SOFUU_ENTROPY_PENALTY` | tuning | yes | best-effort | T3 | `crates/sofuu-core/src/infer/sampler.rs:248` |
 | `SOFUU_FA2` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:5931` |
-| `SOFUU_FEAT_HEADS_CPU` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:5049` |
-| `SOFUU_FUSE_GUP` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7528` |
-| `SOFUU_FUSE_MULTI` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:6282` |
+| `SOFUU_FEAT_HEADS_CPU` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:5149` |
+| `SOFUU_FUSE_GUP` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7628` |
+| `SOFUU_FUSE_MULTI` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:6382` |
 | `SOFUU_FUSE_NORM` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3394` |
-| `SOFUU_FUSE_QKV` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3538` |
-| `SOFUU_GEMM_ACC` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7164` |
+| `SOFUU_FUSE_QKV` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3638` |
+| `SOFUU_GEMM_ACC` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7264` |
 | `SOFUU_GEMM_BATCH_TILE` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:747` |
 | `SOFUU_GEMM_I8MM` | tuning | yes | exact | T3 | `src/simd/infer_kernels.cpp:678` |
 | `SOFUU_GEMM_I8MM_MB` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:685` |
 | `SOFUU_GEMM_MMA8` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:1934` |
 | `SOFUU_GEMM_TILE` | tuning | yes | unsure | T3 | `src/metal/metal_engine.mm:1149` |
-| `SOFUU_GEMM_TYPES` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7098` |
+| `SOFUU_GEMM_TYPES` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7198` |
 | `SOFUU_GEMV_B1` | tuning | yes | unsure | T3 | `src/metal/metal_engine.mm:525` |
-| `SOFUU_GEMV_BENCH` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:8986` |
-| `SOFUU_GEMV_BENCH_AB` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9078` |
-| `SOFUU_GEMV_BENCH_AB_N` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9081` |
-| `SOFUU_GEMV_BENCH_N` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:8989` |
+| `SOFUU_GEMV_BENCH` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9086` |
+| `SOFUU_GEMV_BENCH_AB` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9178` |
+| `SOFUU_GEMV_BENCH_AB_N` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9181` |
+| `SOFUU_GEMV_BENCH_N` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9089` |
 | `SOFUU_GEMV_FLAT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3418` |
 | `SOFUU_GEMV_R8` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3464` |
 | `SOFUU_GEMV_SPLIT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3458` |
 | `SOFUU_GEMV_V2` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3516` |
 | `SOFUU_GEMV_V3` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3495` |
 | `SOFUU_GEMV_V4` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3475` |
-| `SOFUU_GPU_ATTN` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:3922` |
+| `SOFUU_GPU_ATTN` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4022` |
 | `SOFUU_GPU_ATTN_FLASH` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3863` |
 | `SOFUU_GPU_DECODE` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:691` |
 | `SOFUU_GPU_F16W` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/metal.rs:2095` |
 | `SOFUU_GPU_F16W_MAX_MB` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/metal.rs:2132` |
-| `SOFUU_GPU_FUSE` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4771` |
+| `SOFUU_GPU_FUSE` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4871` |
 | `SOFUU_GPU_GEMM_MMA` | tuning | yes | tolerant | T3 | `crates/sofuu-core/src/infer/metal.rs:3542` |
 | `SOFUU_GPU_GEMM_TILED` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:2411` |
 | `SOFUU_GPU_GEMM_WIDE` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/metal.rs:3287` |
-| `SOFUU_GPU_PREFILL` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4368` |
-| `SOFUU_GPU_PREFILL_GEMM` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:2503` |
+| `SOFUU_GPU_PREFILL` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4468` |
+| `SOFUU_GPU_PREFILL_GEMM` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:2603` |
 | `SOFUU_GPU_ROPE_LLAMA3` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:1132` |
-| `SOFUU_GPU_SKIP` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9284` |
-| `SOFUU_GPU_SPEC` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4312` |
-| `SOFUU_GPU_TILE_MMQ` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7110` |
+| `SOFUU_GPU_SKIP` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9384` |
+| `SOFUU_GPU_SPEC` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:4412` |
+| `SOFUU_GPU_TILE_MMQ` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:7210` |
 | `SOFUU_GPU_TIMING` | debug | no | — | T3 | `src/metal/metal_engine.mm:1347` |
 | `SOFUU_GQA4` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:6060` |
 | `SOFUU_GQA_ATTN` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:5913` |
@@ -116,6 +115,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_IMG_HOLDTAGS` | test | no | — | T3 | `crates/ml-train/src/embedding_img_eval.rs:63` |
 | `SOFUU_IMG_OUT` | test | no | — | T3 | `crates/ml-train/src/embedding_img_train.rs:129` |
 | `SOFUU_IMG_SEED` | test | no | — | T3 | `crates/ml-train/src/embedding_img_train.rs:120` |
+| `SOFUU_INBOUND_CAP` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/continuous.rs:240` |
 | `SOFUU_KIVI` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/kivi.rs:54` |
 | `SOFUU_KIVI_BITS` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/kivi.rs:57` |
 | `SOFUU_KV_DTYPE` | public | yes | tolerant | T2 | `crates/sofuu-core/src/infer/kv4.rs:132` |
@@ -136,18 +136,20 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_NO_TOOLS` | tuning | no | — | T3 | `crates/sofuu-core/src/chat.rs:3769` |
 | `SOFUU_NTK_ALPHA` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:623` |
 | `SOFUU_NUM_THREADS` | public | no | — | T2 | `src/simd/infer_kernels.cpp:100` |
-| `SOFUU_PHASE_METRICS` | debug | no | — | T3 | `crates/sofuu-core/src/infer/continuous.rs:88` |
+| `SOFUU_PHASE_METRICS` | debug | no | — | T3 | `crates/sofuu-core/src/infer/continuous.rs:89` |
 | `SOFUU_POLICY` | public | no | — | T2 | `crates/sofuu-core/src/cli_protocols.rs:319` |
 | `SOFUU_PRE8` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/lfm2.rs:2336` |
 | `SOFUU_PREFILL_BATCH` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:68` |
 | `SOFUU_PREFILL_BLAS` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/lfm2.rs:2482` |
-| `SOFUU_PREFILL_CHUNK` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9131` |
+| `SOFUU_PREFILL_CHUNK` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:9231` |
 | `SOFUU_PREFILL_K16` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:1264` |
-| `SOFUU_PREFILL_LIMIT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/mod.rs:1206` |
+| `SOFUU_PREFILL_LEASE` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/prefill_sched.rs:184` |
+| `SOFUU_PREFILL_LIMIT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/mod.rs:1467` |
+| `SOFUU_PREFIX_CACHE` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/prefix_cache.rs:116` |
 | `SOFUU_PREW_MAXPOS` | tuning | unknown | — | T3 | `src/metal/metal_engine.mm:582` |
 | `SOFUU_PRE_ATTN` | tuning | unknown | — | T3 | `src/metal/metal_engine.mm:567` |
 | `SOFUU_PRE_ATTN_RPT` | tuning | yes | unsure | T3 | `src/metal/metal_engine.mm:591` |
-| `SOFUU_PROFILE_LOAD` | debug | no | — | T3 | `crates/sofuu-core/src/infer/mod.rs:976` |
+| `SOFUU_PROFILE_LOAD` | debug | no | — | T3 | `crates/sofuu-core/src/infer/mod.rs:1105` |
 | `SOFUU_PROJECT` | build | no | — | T3 | `crates/sofuu-core/src/rt/session_js.rs:166` |
 | `SOFUU_Q3K_TILE_MB` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:796` |
 | `SOFUU_Q4K_APPLY2` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:577` |
@@ -157,7 +159,7 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_Q4K_LEAN_MB` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:630` |
 | `SOFUU_Q4_SS` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:761` |
 | `SOFUU_Q4_SS_MB` | tuning | yes | unsure | T3 | `src/simd/infer_kernels.cpp:775` |
-| `SOFUU_QKV_SNAP_LAYER` | debug | no | — | T3 | `crates/sofuu-core/src/infer/model.rs:1984` |
+| `SOFUU_QKV_SNAP_LAYER` | debug | no | — | T3 | `crates/sofuu-core/src/infer/model.rs:2084` |
 | `SOFUU_RESIDENT_WEIGHTS` | public | yes | unsure | T2 | `crates/sofuu-core/src/infer/gguf.rs:63` |
 | `SOFUU_ROPE_DEBUG` | debug | no | — | T3 | `src/simd/infer_kernels.cpp:4557` |
 | `SOFUU_ROPE_LLAMA3` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/model.rs:728` |
@@ -166,19 +168,19 @@ therefore must map to a determinism tier (R3.5). `unknown` is an open item.
 | `SOFUU_SEL_DEBUG` | debug | no | — | T3 | `crates/sofuu-core/src/modules/process.rs:2066` |
 | `SOFUU_SERVE_TOKEN` | public | no | — | T2 | `crates/sofuu-core/src/main.rs:1004` |
 | `SOFUU_SPARKTEST_VARIANT` | test | no | — | T3 | `crates/sofuu-core/src/infer/quant.rs:3215` |
-| `SOFUU_SPEC` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/mod.rs:1456` |
-| `SOFUU_SPEC_ADAPT` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1483` |
-| `SOFUU_SPEC_DEPTH` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1623` |
-| `SOFUU_SPEC_MIN_ACCEPT` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1488` |
-| `SOFUU_SPEC_RATE_GATE` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1512` |
-| `SOFUU_SPEC_ROWS` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1636` |
-| `SOFUU_SPEC_WARMUP` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1484` |
-| `SOFUU_SPEC_WIDTHS` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1641` |
-| `SOFUU_SPLIT` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4670` |
-| `SOFUU_SPLIT_AXIS` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4955` |
-| `SOFUU_SPLIT_GPU_FRAC` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4620` |
-| `SOFUU_SPLIT_GPU_ROWS` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4614` |
-| `SOFUU_SPLIT_GROUP` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4656` |
+| `SOFUU_SPEC` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/mod.rs:1731` |
+| `SOFUU_SPEC_ADAPT` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1758` |
+| `SOFUU_SPEC_DEPTH` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1898` |
+| `SOFUU_SPEC_MIN_ACCEPT` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1763` |
+| `SOFUU_SPEC_RATE_GATE` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1787` |
+| `SOFUU_SPEC_ROWS` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1911` |
+| `SOFUU_SPEC_WARMUP` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1759` |
+| `SOFUU_SPEC_WIDTHS` | tuning | yes | exact | T3 | `crates/sofuu-core/src/infer/mod.rs:1916` |
+| `SOFUU_SPLIT` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4770` |
+| `SOFUU_SPLIT_AXIS` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:5055` |
+| `SOFUU_SPLIT_GPU_FRAC` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4720` |
+| `SOFUU_SPLIT_GPU_ROWS` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4714` |
+| `SOFUU_SPLIT_GROUP` | tuning | unknown | — | T3 | `crates/sofuu-core/src/infer/model.rs:4756` |
 | `SOFUU_STALL_TIMEOUT_SECS` | public | no | — | T2 | `crates/sofuu-core/src/rt/ai.rs:1692` |
 | `SOFUU_STORAGE` | public | no | — | T2 | `src/js/agent.js:2290` |
 | `SOFUU_T143_DIRECT` | tuning | yes | unsure | T3 | `crates/sofuu-core/src/infer/qwen35.rs:1222` |

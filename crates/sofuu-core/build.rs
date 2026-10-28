@@ -56,17 +56,16 @@ fn main() {
     if has_qtsq {
         println!("cargo:rustc-cfg=has_qtsq");
     } else if let Some(dir) = &qtsq_dir {
-        println!(
-            "cargo:warning={} not found at {} — building WITHOUT QTSQ \
-             (memory module registers as no-op). Set SOFUU_QTSQ_DIR to a built \
-             QTSQ checkout (SOFUU_QTSQ_LIB overrides the archive path on Windows).",
+        panic!(
+            "{} not found at {} — QTSQ is a mandatory core component of Sofuu. \
+             Set SOFUU_QTSQ_DIR to a built QTSQ checkout (SOFUU_QTSQ_LIB overrides the archive path on Windows).",
             qtsq_lib.file_name().and_then(|n| n.to_str()).unwrap_or("QTSQ archive"),
             dir.display()
         );
     } else {
-        println!(
-            "cargo:warning=SOFUU_QTSQ_DIR not set — building WITHOUT QTSQ \
-             (memory module registers as no-op). Set it to a built QTSQ checkout to enable it."
+        panic!(
+            "SOFUU_QTSQ_DIR not set — QTSQ is a mandatory core component of Sofuu. \
+             Set it to a built QTSQ checkout to build Sofuu."
         );
     }
     println!("cargo:rerun-if-env-changed=SOFUU_QTSQ_DIR");

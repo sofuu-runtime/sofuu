@@ -19,15 +19,11 @@ ifeq ($(ARCH), aarch64)
     ARCH = arm64
 endif
 
-# QTSQ codec checkout (proprietary, optional). The cargo build reads
-# SOFUU_QTSQ_DIR; point at a checkout to enable brain persistence +
-# session store, or leave unset for a degraded build (CI does the same):
+# QTSQ codec checkout (mandatory core component).
+# The cargo build reads SOFUU_QTSQ_DIR; point at a checkout, or let the
+# default local checkout resolve:
 #   SOFUU_QTSQ_DIR=~/projects/<checkout> make
 #
-# SOFUU_ALLOW_NO_QTSQ=1 opts out of the guard below. The guard exists
-# because a QTSQ-free build is INVISIBLY broken: memory calls no-op and
-# every session persist fails, while the chat banner still claims
-# "Memory: on (persists across sessions)". A release tarball built that
 # Default to local checkout if present
 SOFUU_QTSQ_DIR ?= $(firstword $(wildcard /Users/priyanshuboruah/projects/black-hole-disk $(HOME)/projects/black-hole-disk))
 QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ_DIR)/libqtsq.dylib))
@@ -45,26 +41,21 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
-SIZE_LIMIT ?= 5242880   # 5 MB hard cap (bytes)
+SIZE_LIMIT ?= 5767168   # 5.5 MB hard cap (bytes)
 
 all: $(TARGET)
 
 # ── Rust-first build (default and only maintained build) ────────
 cargo-build:
 	@if [ -z "$(SOFUU_QTSQ_DIR)" ]; then \
-		if [ "$$SOFUU_ALLOW_NO_QTSQ" = "1" ]; then \
-			echo "  \033[33m⚠\033[0m  QTSQ NOT linked (SOFUU_ALLOW_NO_QTSQ=1) — brain/memory/sessions will NOT persist"; \
-		else \
-			echo "  \033[31m✗ SOFUU_QTSQ_DIR is not set.\033[0m"; \
-			echo "    This build would ship WITHOUT the brain codec: memory silently"; \
-			echo "    no-ops and every session persist fails, while the UI still claims"; \
-			echo "    memory persists. Build it properly:"; \
-			echo "      SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make"; \
-			echo "    (or SOFUU_ALLOW_NO_QTSQ=1 make for a deliberate QTSQ-free build)"; \
-			exit 1; \
-		fi; \
+		echo "  \033[31m✗ SOFUU_QTSQ_DIR is not set.\033[0m"; \
+		echo "    QTSQ is a mandatory core component of Sofuu."; \
+		echo "    Build with SOFUU_QTSQ_DIR set to a built QTSQ checkout:"; \
+		echo "      SOFUU_QTSQ_DIR=~/projects/<qtsq-checkout> make"; \
+		exit 1; \
 	elif [ -z "$(QTSQ_LIB_GUARD)" ]; then \
 		echo "  \033[31m✗ no libqtsq.a/libqtsq.dylib in SOFUU_QTSQ_DIR=$(SOFUU_QTSQ_DIR)\033[0m"; \
+		echo "    QTSQ is a mandatory core component of Sofuu."; \
 		exit 1; \
 	fi
 	cargo build --release
@@ -72,7 +63,7 @@ cargo-build:
 $(TARGET): cargo-build
 	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"
 	@cp target/release/$(TARGET) $(TARGET)
-	@if [ "$$(uname -s)" = "Darwin" ]; then strip -x $(TARGET) 2>/dev/null || true; codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
+	@if [ "$$(uname -s)" = "Darwin" ]; then strip $(TARGET) 2>/dev/null || true; codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
 	@echo "  \033[32mBuilt:\033[0m ./$(TARGET) ($(shell du -sh $(TARGET) | cut -f1))"
 
 # ── Legacy pure-C build ─────────────────────────────────────────

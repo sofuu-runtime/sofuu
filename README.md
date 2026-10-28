@@ -79,12 +79,12 @@ sofuu eval '
 const brain = sofuu.memory.open("./brain.qtsq", 768);
 brain.remember(sofuu.ai.embedLocal("native AI runtime"), "Sofuu boots in 2ms with zero daemons.");
 const [match] = brain.recall(sofuu.ai.embedLocal("fast runtime"), 1);
-console.log("⚡ Recalled from vector brain:", match.text);
+console.log("Recalled from vector brain:", match.text);
 '
 ```
 
 ```text
-⚡ Recalled from vector brain: Sofuu boots in 2ms with zero daemons.
+Recalled from vector brain: Sofuu boots in 2ms with zero daemons.
 # Completed in 2ms · 0 background daemons · 0 cloud API calls
 ```
 
@@ -102,7 +102,7 @@ brain.remember(
 
 // 2. Query offline vector semantic memory via hardware SIMD in microseconds
 const [memory] = brain.recall(sofuu.ai.embedLocal("daemons"), 1);
-console.log("⚡ Recalled:", memory.text);
+console.log("Recalled:", memory.text);
 ```
 
 ```bash

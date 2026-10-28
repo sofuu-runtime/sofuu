@@ -111,7 +111,7 @@ rm -rf "$TMP_DIR"
 
 # ── Verify ────────────────────────────────────────────────────
 echo ""
-echo "✅ Sofuu installed successfully!"
+echo "Sofuu installed successfully!"
 echo ""
 "${INSTALL_DIR}/${BINARY}" version
 echo ""

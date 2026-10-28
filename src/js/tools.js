@@ -1303,6 +1303,100 @@
     },
   };
 
+  /* General-purpose system & hardware info tool. */
+  TOOLS.system_info = {
+    name: 'system_info',
+    description: 'Get information about the runtime system, OS platform, hardware architecture, capabilities, and engine status.',
+    parameters: {
+      type: 'object',
+      properties: {},
+    },
+    execute: async function () {
+      var caps = {};
+      try {
+        if (typeof sofuu.capabilities === 'function') {
+          caps = JSON.parse(sofuu.capabilities());
+        }
+      } catch (eCaps) {}
+      var plat = 'unknown';
+      try {
+        plat = (typeof process !== 'undefined' && process.platform) || 'unknown';
+      } catch (ePlat) {}
+      var memInfo = null;
+      try {
+        if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function') {
+          var mu = process.memoryUsage();
+          memInfo = { rss_mb: Math.round(mu.rss / 1048576) };
+        }
+      } catch (eMem) {}
+      var info = {
+        runtime: 'sofuu',
+        version: (sofuu.VERSION || '0.3.0-beta'),
+        platform: plat,
+        capabilities: caps,
+        memory: memInfo,
+      };
+      return JSON.stringify(info, null, 2);
+    },
+  };
+
+  /* General-purpose vector memory retrieval tool (backed by QTSQ Cognitive Vector Memory). */
+  TOOLS.memory_search = {
+    name: 'memory_search',
+    description: 'Search long-term semantic memory and knowledge base for stored facts, preferences, or past interactions.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'The search query to match in semantic memory' },
+        count: { type: 'number', description: 'Maximum number of memories to return (1-20, default 5)' },
+      },
+      required: ['query'],
+    },
+    execute: async function (args) {
+      var q = String((args && args.query) || '').trim();
+      if (!q) return 'error: empty query';
+      var topK = Math.max(1, Math.min(20, (args && args.count) || 5));
+      if (!sofuu.memory || typeof sofuu.memory.search !== 'function') {
+        return '(no vector memory subsystem available)';
+      }
+      try {
+        var hits = sofuu.memory.search({ query: q, top_k: topK });
+        if (!hits || !hits.length) return '(no matching memories found)';
+        return hits.map(function (h, i) {
+          return (i + 1) + '. ' + (h.text || h.fact || JSON.stringify(h));
+        }).join('\n');
+      } catch (e) {
+        return 'memory search error: ' + (e.message || String(e));
+      }
+    },
+  };
+
+  /* General-purpose vector memory storage tool. */
+  TOOLS.memory_remember = {
+    name: 'memory_remember',
+    description: 'Store a durable fact, preference, or piece of information in long-term vector memory for future recall.',
+    parameters: {
+      type: 'object',
+      properties: {
+        fact: { type: 'string', description: 'The durable fact, preference, or information to remember' },
+      },
+      required: ['fact'],
+    },
+    execute: async function (args) {
+      var fact = String((args && args.fact) || '').trim();
+      if (!fact) return 'error: empty fact';
+      if (!sofuu.memory || typeof sofuu.memory.learn !== 'function') {
+        return '(no vector memory subsystem available)';
+      }
+      try {
+        var id = sofuu.memory.learn(fact);
+        return 'saved to long-term memory (id: ' + id + ')';
+      } catch (e) {
+        return 'memory remember error: ' + (e.message || String(e));
+      }
+    },
+  };
+
   /* ── S6 (2026-10-23): one MCP config loader ──────────────────────
    * v2 entry: {name, command, args?, env?, cwd?, enabled?, tools?{allow,deny}}
    * Backward compatible with {name, command}. SOFUU_MCP_CONFIG overrides the
@@ -1781,14 +1875,24 @@
     if (sofuu.policy && typeof sofuu.policy.load === 'function') sofuu.policy.load();
   } catch (ePol) {}
 
-  /* The "code" group — everything above. Opt out of the shell by listing
-   * individual names instead, or by exporting SOFUU_NO_SHELL. S3: when the
-   * shell is disabled the group (and every listing derived from it) omits
-   * bash entirely; TOOLS.bash stays present so a direct call still gets the
-   * explicit refusal at :execute instead of an opaque missing-function. */
-  sofuu.tools.GROUP = ['read_file', 'write_file', 'edit_file', 'apply_patch', 'grep', 'glob',
-                       'list_dir', 'bash', 'code_eval', 'todo_write']
+  /* Domain toolpacks:
+   *   - coding (alias code): file, shell, and patch tools
+   *   - web: web search and reader
+   *   - memory: semantic recall and durable learning
+   *   - system: runtime and hardware diagnostics */
+  var CODING_TOOLS = ['read_file', 'write_file', 'edit_file', 'apply_patch', 'grep', 'glob',
+                      'list_dir', 'bash', 'code_eval', 'todo_write']
     .filter(function (n) { return !(SHELL_DISABLED && n === 'bash'); });
+
+  sofuu.tools.PACKS = {
+    coding: CODING_TOOLS,
+    code: CODING_TOOLS,
+    web: ['web_search', 'web_open'],
+    memory: ['memory_search', 'memory_remember'],
+    system: ['system_info'],
+  };
+
+  sofuu.tools.GROUP = CODING_TOOLS;
   sofuu.tools.ENABLED = { bash: !SHELL_DISABLED };
 
   /* ── T3 (2026-10-23): one lightweight schema validator ───────────
@@ -1857,15 +1961,18 @@
     return bad ? { ok: false, path: bad.path, error: bad.error } : { ok: true };
   };
 
-  /* T3: tool inventory. Builtin + web + host tools; MCP/inline tools are
+  /* T3: tool inventory. Builtin (coding/system/memory) + web + host tools; MCP/inline tools are
    * per-run (they only exist after a def connects), so they are not in the
    * global list. `allowed`/`requiresApproval` are the ACTIVE policy's
-   * verdicts, so a picker and the loop cannot disagree. */
+   * verdicts, so a picker and the loop cannot disagree. Supports filtering
+   * by category/pack via opts.category or opts.pack. */
   sofuu.tools.list = function (opts) {
     opts = opts || {};
     var enabledOnly = opts.enabledOnly !== false;
+    var filterCat = opts.category || opts.pack || null;
     var out = [];
-    function push(name, source, spec) {
+    function push(name, source, category, spec) {
+      if (filterCat && filterCat !== category && filterCat !== source) return;
       if (enabledOnly && sofuu.tools.ENABLED && sofuu.tools.ENABLED[name] === false) return;
       var allowed = true, requiresApproval = false;
       try {
@@ -1879,6 +1986,7 @@
       out.push({
         name: name,
         source: source,
+        category: category,
         description: String((spec && (spec.description || spec.summary)) || ''),
         schema: (spec && (spec.parameters || spec.schema)) || null,
         policy: { allowed: allowed, requiresApproval: requiresApproval },
@@ -1887,16 +1995,25 @@
     var i, keys, n;
     for (i = 0; i < sofuu.tools.GROUP.length; i++) {
       n = sofuu.tools.GROUP[i];
-      if (sofuu.tools.TOOLS[n]) push(n, 'builtin', sofuu.tools.TOOLS[n]);
+      if (sofuu.tools.TOOLS[n]) push(n, 'builtin', 'coding', sofuu.tools.TOOLS[n]);
+    }
+    if (sofuu.tools.TOOLS.system_info) {
+      push('system_info', 'builtin', 'system', sofuu.tools.TOOLS.system_info);
+    }
+    if (sofuu.tools.TOOLS.memory_search) {
+      push('memory_search', 'builtin', 'memory', sofuu.tools.TOOLS.memory_search);
+    }
+    if (sofuu.tools.TOOLS.memory_remember) {
+      push('memory_remember', 'builtin', 'memory', sofuu.tools.TOOLS.memory_remember);
     }
     if (sofuu.web && sofuu.web.TOOLS) {
       keys = Object.keys(sofuu.web.TOOLS);
-      for (i = 0; i < keys.length; i++) push(keys[i], 'web', sofuu.web.TOOLS[keys[i]]);
+      for (i = 0; i < keys.length; i++) push(keys[i], 'web', 'web', sofuu.web.TOOLS[keys[i]]);
     }
     var host = globalThis.__sofuu_host_tools;
     if (host && typeof host === 'object') {
       keys = Object.keys(host);
-      for (i = 0; i < keys.length; i++) push(keys[i], 'host', host[keys[i]]);
+      for (i = 0; i < keys.length; i++) push(keys[i], 'host', 'host', host[keys[i]]);
     }
     return out;
   };

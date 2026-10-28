@@ -616,6 +616,8 @@
       mcpSets: [],
       webTools: [],
       codeTools: [],
+      systemTools: [],
+      memoryTools: [],
       /* E2 (PLAN-EMBED-SDK): host-registered native tools (Swift/Kotlin/C
        * callbacks). Tracked separately from codeTools because they resolve
        * by *run time*, not define time — an agent defined from the C `agents`
@@ -689,8 +691,38 @@
     for (var i = 0; i < tools.length; i++) {
       var t = tools[i];
       if (t === 'web') { d.webTools = ['web_search', 'web_open']; continue; }
-      if (t === 'code' && sofuu.tools && sofuu.tools.GROUP) { d.codeTools = sofuu.tools.GROUP.slice(); continue; }
+      if (t === 'code' || t === 'coding') {
+        if (sofuu.tools && sofuu.tools.GROUP) d.codeTools = sofuu.tools.GROUP.slice();
+        continue;
+      }
+      if (t === 'memory') {
+        d.memoryTools = ['memory_search', 'memory_remember'];
+        continue;
+      }
+      if (t === 'system') {
+        d.systemTools = ['system_info'];
+        continue;
+      }
+      if (t === 'all') {
+        if (sofuu.tools && sofuu.tools.GROUP) d.codeTools = sofuu.tools.GROUP.slice();
+        d.webTools = ['web_search', 'web_open'];
+        d.memoryTools = ['memory_search', 'memory_remember'];
+        d.systemTools = ['system_info'];
+        continue;
+      }
       if (typeof t === 'string') {
+        if (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[t]) {
+          if (d.webTools.indexOf(t) < 0) d.webTools.push(t);
+          continue;
+        }
+        if (t === 'memory_search' || t === 'memory_remember') {
+          if (d.memoryTools.indexOf(t) < 0) d.memoryTools.push(t);
+          continue;
+        }
+        if (t === 'system_info') {
+          if (d.systemTools.indexOf(t) < 0) d.systemTools.push(t);
+          continue;
+        }
         if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[t]) {
           if (d.codeTools.indexOf(t) < 0) d.codeTools.push(t);
           continue;
@@ -724,6 +756,10 @@
         var bn = String(t.builtin);
         if (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[bn]) {
           if (d.webTools.indexOf(bn) < 0) d.webTools.push(bn);
+        } else if (bn === 'memory_search' || bn === 'memory_remember') {
+          if (d.memoryTools.indexOf(bn) < 0) d.memoryTools.push(bn);
+        } else if (bn === 'system_info') {
+          if (d.systemTools.indexOf(bn) < 0) d.systemTools.push(bn);
         } else if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[bn]) {
           if (d.codeTools.indexOf(bn) < 0) d.codeTools.push(bn);
         } else if (globalThis.__sofuu_host_tools && globalThis.__sofuu_host_tools[bn]) {
@@ -754,7 +790,7 @@
         });
         continue;
       }
-      throw new Error('agent.define: bad tools[' + i + '] (need {name,…}, {mcp:[…]}, {builtin}, or "web")');
+      throw new Error('agent.define: bad tools[' + i + '] (need tool name, toolpack ["coding", "web", "memory", "system"], {builtin}, or {name,…})');
     }
     Object.freeze(d.budget);
     Object.freeze(d.identity || {});
@@ -1540,6 +1576,24 @@
         var cdSpec = { name: cd.name, description: cd.description, parameters: cd.parameters };
         if (cd.selfTimed) cdSpec.selfTimed = true;
         add(cdSpec, cd.execute, 'builtin');
+      }
+    }
+    if (d.systemTools) {
+      for (var st = 0; st < d.systemTools.length; st++) {
+        var sn = d.systemTools[st];
+        if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[sn]) {
+          var sd = sofuu.tools.TOOLS[sn];
+          add({ name: sd.name, description: sd.description, parameters: sd.parameters }, sd.execute, 'builtin');
+        }
+      }
+    }
+    if (d.memoryTools) {
+      for (var mt = 0; mt < d.memoryTools.length; mt++) {
+        var mn = d.memoryTools[mt];
+        if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[mn]) {
+          var md = sofuu.tools.TOOLS[mn];
+          add({ name: md.name, description: md.description, parameters: md.parameters }, md.execute, 'builtin');
+        }
       }
     }
     for (var ht = 0; ht < d.hostTools.length; ht++) {
@@ -3375,7 +3429,8 @@
         refreshPlan();
         var esToolNames = [];
         var esTools = []
-          .concat(d.webTools).concat(d.codeTools).concat(d.hostTools);
+          .concat(d.webTools).concat(d.codeTools).concat(d.hostTools)
+          .concat(d.memoryTools || []).concat(d.systemTools || []);
         var esToolTk = 0;
         for (var esI = 0; esI < esTools.length; esI++) {
           var esName = String(esTools[esI]);
@@ -3505,6 +3560,56 @@
 
             return results.length ? results.join(' · ') : 'remembered';
           };
+        }
+        if ((d.memoryTools && d.memoryTools.indexOf('memory_search') >= 0) || toolset.exec['memory_search']) {
+          if (!toolset.exec['memory_search']) {
+            toolset.specs.push({
+              name: 'memory_search',
+              description: 'Search long-term semantic memory and knowledge base for stored facts, preferences, or past interactions.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: 'The search query to match in semantic memory' },
+                  count: { type: 'number', description: 'Maximum number of memories to return (1-20, default 5)' },
+                },
+                required: ['query'],
+              },
+            });
+          }
+          if (cma && backend) {
+            toolset.exec['memory_search'] = async function (args) {
+              var q = String((args && args.query) || '').trim();
+              if (!q) return 'error: empty query';
+              var topK = Math.max(1, Math.min(20, (args && args.count) || 5));
+              try {
+                var v = await embedTextFor(d, backend, q);
+                if (!v || !v.vec) return '(memory query failed: could not compute query embedding)';
+                var hits = scopeRecall(d, cma, v.vec, topK, q);
+                if (!hits || !hits.length) return '(no matching memories found)';
+                return hits.map(function (h, i) {
+                  return (i + 1) + '. ' + (h.text || h.fact || JSON.stringify(h));
+                }).join('\n');
+              } catch (eMem) {
+                return 'memory search error: ' + (eMem.message || String(eMem));
+              }
+            };
+          }
+        }
+        if (d.memoryTools && d.memoryTools.indexOf('memory_remember') >= 0) {
+          if (!toolset.exec['memory_remember']) {
+            toolset.specs.push({
+              name: 'memory_remember',
+              description: 'Store a durable fact, preference, or piece of information in long-term vector memory for future recall.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  fact: { type: 'string', description: 'The durable fact, preference, or information to remember' },
+                },
+                required: ['fact'],
+              },
+            });
+          }
+          toolset.exec['memory_remember'] = toolset.exec['remember'];
         }
         if (d.agents.length && depth < d.budget.maxDepth) {
           var ds = delegateSpecFor(d, chain);
@@ -5550,7 +5655,7 @@
         when: clip(d.when || '', 80),
         provider: d.provider, model: d.model,
         memory: d.memory,
-        tools: d.inlineTools.length + d.webTools.length + d.codeTools.length,
+        tools: d.inlineTools.length + d.webTools.length + d.codeTools.length + (d.memoryTools ? d.memoryTools.length : 0) + (d.systemTools ? d.systemTools.length : 0),
         mcpServers: d.mcpSets.length,
         agents: d.agents.slice(),
         runs24h: (RUN_COUNTS[name] && RUN_COUNTS[name].n) || 0,

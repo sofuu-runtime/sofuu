@@ -943,7 +943,17 @@
 
         /* ── tools (H3) ── */
         if (method === 'GET' && path === '/v1/tools') {
-          var inv = (sofuu.tools && typeof sofuu.tools.list === 'function') ? sofuu.tools.list() : [];
+          var queryCat = null;
+          try {
+            var qIdx = String(req.url || '').indexOf('?');
+            if (qIdx >= 0) {
+              var qStr = String(req.url).slice(qIdx + 1);
+              var matchCat = /[?&](?:category|pack)=([^&]+)/.exec('?' + qStr);
+              if (matchCat) queryCat = decodeURIComponent(matchCat[1]);
+            }
+          } catch (eQ) {}
+          var inv = (sofuu.tools && typeof sofuu.tools.list === 'function')
+            ? sofuu.tools.list(queryCat ? { category: queryCat } : {}) : [];
           send(res, 200, { object: 'list', data: inv });
           return;
         }

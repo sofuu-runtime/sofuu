@@ -1,8 +1,11 @@
 // bindings/android/sofuu/build.gradle — the com.sofuu:sofuu-android AAR.
 //
 // One dependency gives an app the whole runtime. The native payload is the
-// prebuilt libsofuu .so per ABI (built by `make dist-android`, QTSQ-free
-// for a pure-MIT release) plus the small JNI bridge in src/main/cpp.
+// prebuilt libsofuu .so per ABI (built by `make dist-android` with the QTSQ
+// codec linked — QTSQ is a core runtime component) plus the small JNI bridge
+// in src/main/cpp. The AAR carries the QTSQ license and the Sofuu NOTICE
+// inside classes.jar (META-INF/LICENSES/QTSQ-FORMAT.txt and
+// META-INF/SOFUU-NOTICE.txt).
 //
 // Publishing is environment-driven: `publishToMavenLocal` works with no
 // credentials, while a remote repository and signing require the operator's
@@ -96,6 +99,14 @@ afterEvaluate {
                         license {
                             name = 'MIT License'
                             url = 'https://opensource.org/licenses/MIT'
+                            distribution = 'repo'
+                            comments = 'Covers the Sofuu runtime source. The embedded QTSQ format is licensed separately.'
+                        }
+                        license {
+                            name = 'Quantum Tensor Sequence Proprietary License (QTSPL) v1.0'
+                            url = 'https://github.com/sofuu-runtime/sofuu/blob/main/LICENSES/QTSQ-FORMAT.txt'
+                            distribution = 'repo'
+                            comments = 'Applies to the embedded QTSQ (.qtsq/.qtsw) format. Use through the Sofuu runtime, SDKs, and bindings is free, including commercial use; see Section 2.'
                         }
                     }
                     developers {
@@ -179,9 +190,32 @@ tasks.register('verifyAarContents') {
             if (!missing.isEmpty()) {
                 throw new GradleException("AAR is missing required entries: ${missing}")
             }
+
+            // The QTSQ codec is compiled into libsofuu, so its license and the
+            // NOTICE must remain discoverable by anyone consuming the AAR.
+            def classesEntry = zip.getEntry('classes.jar')
+            def tmp = File.createTempFile('sofuu-classes', '.jar')
+            try {
+                tmp.withOutputStream { out ->
+                    zip.getInputStream(classesEntry).withCloseable { it.transferTo(out) }
+                }
+                def classesZip = new java.util.zip.ZipFile(tmp)
+                try {
+                    def classNames = classesZip.entries().collect { it.name } as Set
+                    def legal = ['META-INF/LICENSES/QTSQ-FORMAT.txt', 'META-INF/SOFUU-NOTICE.txt']
+                    def absent = legal.findAll { !classNames.contains(it) }
+                    if (!absent.isEmpty()) {
+                        throw new GradleException("AAR classes.jar is missing legal notices: ${absent}")
+                    }
+                } finally {
+                    classesZip.close()
+                }
+            } finally {
+                tmp.delete()
+            }
         } finally {
             zip.close()
         }
-        logger.lifecycle("verifyAarContents: ${required.size()} required entries present")
+        logger.lifecycle("verifyAarContents: native libs and legal notices present")
     }
 }

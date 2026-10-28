@@ -278,8 +278,9 @@ dist-android:
 	@bash scripts/dist/android.sh all
 
 # ── Android SDK AAR (com.sofuu:sofuu-android) ───────────────────────
-# The publishable artifact: QTSQ-free native packs staged with the JNI shim
-# and libc++_shared, then the release AAR. Credentials are operator-owned.
+# The publishable artifact: QTSQ-linked native packs staged with the JNI shim
+# and libc++_shared, then the release AAR. QTSQ is core, not optional.
+# Credentials are operator-owned.
 android-sdk: dist-android
 	@bash scripts/mobile/stage_android_sdk.sh
 

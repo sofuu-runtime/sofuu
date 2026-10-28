@@ -7,11 +7,12 @@
 # Usage: bash scripts/dist/android.sh [abi]
 #   abi: aarch64 | armv7 | x86_64 | all (default: all)
 #
-# Prerequisites: Android NDK (ANDROID_NDK_HOME or ANDROID_NDK set).
+# Prerequisites: Android NDK (ANDROID_NDK_HOME or ANDROID_NDK set) and the
+# per-ABI QTSQ archives under dist/qtsq-android-<abi>/.
 #   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 #
 # QuickJS is a pure interpreter → no JIT → Android compatible.
-# QTSQ-free build — pure MIT.
+# QTSQ is a core component; a codec-less build is rejected.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -113,8 +114,18 @@ build_abi() {
     export SOFUU_CURL_STATIC_DIR="$CURL_DIR"
 
     export SOFUU_UV_DIR="$REPO_ROOT/$UV_BUILD"
-    mkdir -p "$DIST/no-qtsq"
-    export SOFUU_QTSQ_DIR="$DIST/no-qtsq"
+
+    # QTSQ is core. The per-ABI archive comes from
+    # scripts/mobile/build_qtsq_android.sh; without it the build would
+    # silently produce a memory-less runtime, so fail closed.
+    local QTSQ_DIR="$DIST/qtsq-android-$CMAKE_ABI"
+    if [ ! -f "$QTSQ_DIR/libqtsq.a" ] || [ ! -f "$QTSQ_DIR/compressor/libqtc.a" ]; then
+        echo "  ✗ QTSQ archives missing for $CMAKE_ABI at $QTSQ_DIR"
+        echo "    run scripts/mobile/build_qtsq_android.sh $ABI first"
+        exit 1
+    fi
+    export SOFUU_QTSQ_DIR="$QTSQ_DIR"
+    export SOFUU_ZLIB_DIR="$QTSQ_DIR"
 
     cargo build --release -p sofuu-capi --target "$RUST_TARGET"
 

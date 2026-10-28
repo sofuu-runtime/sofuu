@@ -83,7 +83,8 @@ deliberately TLS-free), `qtsq-android-*` (libqtsq.a + libqtc.a + libz.a).
 Notes:
 
 - The engine `.so` is QTSQ-linked here, so chats + the brain survive app
-  restarts. The public SDK pack (`make dist-android`) stays QTSQ-free.
+  restarts. The public SDK pack (`make dist-android`) links QTSQ too and
+  carries its license; codec-less Android packs are not published.
 - `libsofuu.so` carries `-Wl,-soname,libsofuu.so`: a Rust cdylib has no
   DT_SONAME by default and the JNI link would otherwise bake a
   build-time absolute path into the APK (dlopen fails on device).

@@ -10,9 +10,9 @@
 #   5. cargo   → target/<triple>/release/libsofuu_capi.so
 #   6. stage   → sofuu-android/app/src/main/jniLibs/<abi>/libsofuu.so
 #
-# The public SDK (make dist-android) stays QTSQ-free/MIT-clean; THIS build
-# links QTSQ so the app gets the same encrypted brain + session store the
-# desktop has (the owner's QTSQ checkout + grant covers it).
+# QTSQ is a core component of Sofuu, including the public Android SDK. The
+# QTSQ usage grant covers distribution through Sofuu SDKs/bindings; retain
+# the license notice in the artifact.
 #
 # Usage: bash scripts/mobile/build_engine_android.sh [arm64|x86_64 …]
 set -euo pipefail

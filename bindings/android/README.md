@@ -142,7 +142,7 @@ The AAR wraps the prebuilt native runtime, so build that first:
 
 ```bash
 export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/27.0.12077973"
-make dist-android                       # QTSQ-free libsofuu per ABI
+make dist-android                       # QTSQ-linked libsofuu per ABI
 bash scripts/mobile/stage_android_sdk.sh
 
 cd bindings/android
@@ -163,9 +163,13 @@ jni/<abi>/libsofuu_jni.so
 jni/<abi>/libc++_shared.so
 ```
 
-The `.so` files are QTSQ-free in the public release (pure MIT). A QTSQ-linked
-build adds the encrypted-brain codec and falls under
-`LICENSES/QTSQ-FORMAT.txt`; do not publish that variant as the MIT artifact.
+`libsofuu.so` links QTSQ in every published AAR: the encrypted brain codec is
+a core runtime component, not an optional add-on. The AAR's `classes.jar`
+therefore also contains `META-INF/LICENSES/QTSQ-FORMAT.txt` and
+`META-INF/SOFUU-NOTICE.txt`. Section 2 of the QTSPL grants free use — including
+commercial use — through the Sofuu runtime, SDKs, and bindings. Staging
+refuses a codec-less binary, and `verifyAarContents` refuses an AAR missing
+the native libraries or either legal notice.
 
 ### Remote publication
 
@@ -198,5 +202,8 @@ CMake wiring: `examples/headless/KotlinSample/` (`CMakeLists.txt`,
 
 ## License
 
-MIT for the runtime; a QTSQ-linked build additionally falls under
-`LICENSES/QTSQ-FORMAT.txt`. See `docs/EMBEDDING-DIST.md`.
+MIT for the runtime. QTSQ, the encrypted-store format linked into every
+published AAR, is governed by the Quantum Tensor Sequence Proprietary License
+(QTSPL) v1.0 in `LICENSES/QTSQ-FORMAT.txt`; use through the Sofuu runtime,
+SDKs, and bindings is free, including commercial use. See
+`docs/EMBEDDING-DIST.md`.

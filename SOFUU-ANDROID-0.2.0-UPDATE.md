@@ -9,8 +9,13 @@ repository.
 
 - Source changes, JNI/Kotlin crypto helpers, publishing, and AAR verification
   are implemented in this tree.
-- The release AAR builds for `arm64-v8a` and `x86_64`, is 7.7 MB, and contains
-  `libsofuu.so`, `libsofuu_jni.so`, and `libc++_shared.so` per ABI.
+- The release AAR builds for `arm64-v8a` and `x86_64`, is 8.5 MB, and contains
+  `libsofuu.so`, `libsofuu_jni.so`, and `libc++_shared.so` per ABI. Both native
+  packs link QTSQ — the codec is a core runtime component, not an optional
+  variant.
+- The QTSQ license and the Sofuu NOTICE are packaged in the AAR under
+  `META-INF/LICENSES/QTSQ-FORMAT.txt` and `META-INF/SOFUU-NOTICE.txt`, and
+  both the POM and the Gradle module metadata name the QTSPL alongside MIT.
 - `publishToMavenLocal` succeeds for
   `com.sofuu:sofuu-android:0.2.0` (AAR, sources JAR, POM, module metadata).
 - `make sdk-jvm-check` passes, including `sofuu.crypto.verifyJWT`, a tampered
@@ -26,9 +31,9 @@ repository.
   `https://sofuu-runtime.github.io/sofuu/maven`, and the GitHub pre-release
   `android-sdk-v0.2.0` carries the AAR, sources, POM, module metadata, and
   checksums as assets.
-- The 7.7 MB AAR reflects the full in-process inference path; the old Android
-  script's 5 MB cap was raised to 12 MB for this artifact (override with
-  `SOFUU_ANDROID_MAX_SIZE`).
+- The 8.5 MB AAR reflects the full in-process inference path with QTSQ linked;
+  the old Android script's 5 MB cap was raised to 12 MB for this artifact
+  (override with `SOFUU_ANDROID_MAX_SIZE`).
 
 ## 1. What the artifact is
 
@@ -38,7 +43,8 @@ repository.
 - `sofuu.ai` (local GGUF / SafeTensors inference and provider calls),
 - `sofuu.agent` (agent definitions, runs, streaming, host tools),
 - `sofuu.storage` (local structured documents),
-- `sofuu.memory` (QTSQ-backed encrypted brain, when the build links QTSQ),
+- `sofuu.memory` (QTSQ-backed encrypted brain; QTSQ is linked in every
+  published Android artifact),
 - `sofuu.crypto` (SHA-256, base64url, RS256 JWT/JWKS verification),
 - `sofuu.http`, `sofuu.fs`, `sofuu.web`, `sofuu.mcp` where compiled in,
 - offline embeddings, image embeddings, and provider/OS voice.
@@ -76,10 +82,11 @@ inference. The AAR is the whole on-device SDK.
    host tools but not `sofuu.crypto.verifyJWT`.
 6. **The Gradle project has no wrapper**, no version from
    `gradle.properties` in the POM, and no `sources`/`javadoc` artifact.
-7. **The QTSQ boundary is undocumented in the artifact.** The public AAR must
-   remain QTSQ-free/MIT; a QTSQ-linked build has separate license terms.
-   In a QTSQ-free build, `sofuu.memory` calls no-op while
-   `sofuu.storage` still works.
+7. **The QTSQ boundary was undocumented in the artifact.** QTSQ is a core
+   runtime component, so the public AAR must link it and must carry the QTSPL
+   v1.0 license plus the Sofuu NOTICE. The previous plan treated QTSQ as an
+   optional add-on and proposed shipping a codec-less AAR where
+   `sofuu.memory` silently no-ops; that variant is not published.
 
 ## 3. Changes for 0.2.0
 
@@ -118,8 +125,13 @@ Requirements:
   path into `DT_NEEDED`;
 - `-Wl,-z,max-page-size=16384` for Android 15+ 16 KiB-page devices;
 - include `sofuu.crypto` (verify with a host-JVM test);
-- QTSQ-free for the public artifact; document the QTSQ-linked alternative
-  rather than publishing proprietary-linked binaries.
+- QTSQ linked via `dist/qtsq-android-<abi>/{libqtsq.a,compressor/libqtc.a}`;
+  the build fails if those archives are absent, and staging rejects a binary
+  with the codec-less warning or without QTSQ/crypto markers.
+- Package `LICENSES/QTSQ-FORMAT.txt` and `NOTICE` with the AAR. Section 2 of
+  the QTSPL grants free use — including commercial use — through the Sofuu
+  runtime, SDKs, and bindings, so publishing this linked artifact is the
+  intended distribution path.
 
 The native pack is generated, not committed: `.so` files are ignored by
 `.gitignore`. The release process stages them into `jniLibs` and builds the
@@ -137,6 +149,17 @@ jni/<abi>/libc++_shared.so
 
 `libc++_shared.so` is copied from the same NDK used to build the engine. The
 CMake shim keeps `max-page-size=16384`.
+
+The AAR's `classes.jar` also carries:
+
+```text
+META-INF/LICENSES/QTSQ-FORMAT.txt
+META-INF/SOFUU-NOTICE.txt
+```
+
+`verifyAarContents` fails the build if either legal notice or any native
+library is missing, so a QTSQ-free or license-less AAR cannot be published by
+accident.
 
 ### 3.4 Kotlin bridge
 
@@ -169,7 +192,7 @@ Publication contents:
 
 - release AAR,
 - sources JAR,
-- POM with name, description, URL, MIT license, and SCM,
+- POM with name, description, URL, MIT **and** QTSPL v1.0 licenses, and SCM,
 - Gradle module metadata.
 
 Signing and repository credentials are environment-driven and never
@@ -201,38 +224,43 @@ Update:
 
 - `bindings/android/README.md` — install, crypto/JWT example, local pipeline
   example, QTSQ caveat, publication status.
-- `docs/EMBEDDING-DIST.md` — Android artifact, ABI list, QTSQ-free scope,
-  Maven coordinates.
+- `docs/EMBEDDING-DIST.md` — Android artifact, ABI list, QTSQ linkage and
+  licensing, Maven coordinates.
 - `include/sofuu_embed.h` — funnel examples for crypto/storage/agent.
 - `SOFUU-CRYPTO-JWT.md` — point at the Android convenience methods.
 
 ## 4. Acceptance checklist
 
-- [ ] `libsofuu` rebuilt for arm64-v8a and x86_64 from current source.
-- [ ] Host-JVM check proves `sofuu.crypto.verifyJWT` works through the
+- [x] `libsofuu` rebuilt for arm64-v8a and x86_64 from `68bee868f`
+      (the current HEAD's in-flight GPU/ML work still fails the Android
+      cross-build).
+- [x] Host-JVM check proves `sofuu.crypto.verifyJWT` works through the
       bridge.
-- [ ] AAR contains `libsofuu.so`, `libsofuu_jni.so`, and
+- [x] AAR contains `libsofuu.so`, `libsofuu_jni.so`, and
       `libc++_shared.so` for both ABIs.
-- [ ] AAR has a POM with `com.sofuu:sofuu-android:0.2.0`, MIT license,
-      sources JAR, and Gradle module metadata.
-- [ ] `publishToMavenLocal` succeeds.
-- [ ] Remote publication is documented but requires operator credentials;
+- [x] AAR has a POM with `com.sofuu:sofuu-android:0.2.0`, MIT + QTSPL v1.0
+      licenses, sources JAR, and Gradle module metadata.
+- [x] AAR contains `META-INF/LICENSES/QTSQ-FORMAT.txt` and
+      `META-INF/SOFUU-NOTICE.txt`; both native packs carry QTSQ markers.
+- [x] `publishToMavenLocal` succeeds.
+- [x] Remote publication is documented but requires operator credentials;
       no secret is added to the repository.
-- [ ] QTSQ-free artifact is clearly labeled; QTSQ-linked builds are
-      documented as a separate, licensed variant.
+- [x] No QTSQ-free Android artifact exists. Every published AAR links the
+      codec and carries its license.
 
 ## 5. Non-goals
 
 - No host-app pipeline, product name, auth vendor, or configuration.
 - No Clerk-specific code or credentials in Sofuu.
 - No HTTP server requirement for local mode.
-- No public binary that links QTSQ without the separate license.
+- No codec-less Android artifact. QTSQ is core; the QTSPL license and NOTICE
+  travel with the binary.
 - No change to the frozen v2 ABI wire shapes.
 
 ## 6. Release commands
 
 ```bash
-# 1. Build the QTSQ-free native pack (NDK required).
+# 1. Build the QTSQ-linked native pack (NDK + per-ABI QTSQ archives required).
 export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/27.0.12077973"
 make dist-android
 

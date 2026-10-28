@@ -70,6 +70,25 @@ pub fn nq(pos: usize) -> usize {
 pub fn ring_arg(layout: &Kv4Layout, ring: usize) -> u32 {
     (ring as u32) | if layout.k_f16 { 1u32 << 31 } else { 0 }
 }
+/// Which pair of kv4 attention kernels to dispatch.
+///
+/// `true` (default) selects the v2 pair in src/metal/kernels.metal: one warp
+/// per key computing all R q heads of that key (one dequant feeds R dots), the
+/// per-block K scale/min vectors formed once per 32 keys, V dequantized once per
+/// key, and - decode only - the key range split across threadgroups so that
+/// reuse does not cost occupancy. `SOFUU_KV4_KERNEL=old` pins the shipped
+/// per-head kernels, which stay in the source as the A/B arm and as the fallback
+/// for a (bits, GQA ratio) pair v2 has no compiled form for.
+pub fn kernel_v2() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("SOFUU_KV4_KERNEL").ok().as_deref(),
+            Some("old") | Some("0") | Some("v1") | Some("shipped")
+        )
+    })
+}
+
 /// The KV precision the GPU decode path uses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KvDtype {

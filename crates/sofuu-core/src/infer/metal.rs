@@ -1112,6 +1112,44 @@ extern "C" {
         qvm: *mut c_void, qvm_offset: usize,
         nblk: u32, ring: u32, bits: u32,
     ) -> i32;
+    fn sofuu_metal_batch_llama_attn_w32_kv4g(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        k_ring: *mut c_void, k_ring_offset: usize,
+        v_ring: *mut c_void, v_ring_offset: usize,
+        qln_buf: *mut c_void, qln_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+        rope_tab: *mut c_void, rope_tab_offset: usize, has_table: u32,
+        rope_n_rot: u32, rope_mscale: f32,
+        rope_adj: *mut c_void, rope_adj_offset: usize, rope_n_pairs: u32,
+        qk: *mut c_void, qk_offset: usize,
+        qks: *mut c_void, qks_offset: usize,
+        qkm: *mut c_void, qkm_offset: usize,
+        qv: *mut c_void, qv_offset: usize,
+        qvs: *mut c_void, qvs_offset: usize,
+        qvm: *mut c_void, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> i32;
+    fn sofuu_metal_batch_llama_attn_pre_row_kv4(
+        ctx: *mut c_void,
+        q_buf: *mut c_void, q_offset: usize,
+        k_ring: *mut c_void, k_ring_offset: usize,
+        v_ring: *mut c_void, v_ring_offset: usize,
+        out_buf: *mut c_void, out_offset: usize,
+        pos_buf: *mut c_void, pos_offset: usize,
+        rows: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32,
+        max_seq: u32, out_stride: u32,
+        qk: *mut c_void, qk_offset: usize,
+        qks: *mut c_void, qks_offset: usize,
+        qkm: *mut c_void, qkm_offset: usize,
+        qv: *mut c_void, qv_offset: usize,
+        qvs: *mut c_void, qvs_offset: usize,
+        qvm: *mut c_void, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> i32;
     fn sofuu_metal_batch_llama_attn_pre_w32_kv4(
         ctx: *mut c_void,
         q_buf: *mut c_void, q_offset: usize,
@@ -3641,6 +3679,101 @@ impl MetalEngine {
                 head_dim, n_heads, n_kv_heads, max_seq,
                 eps, rope_base, rope_mode,
                 rt, rto, ht, nr, msc, ra, rao, np,
+                qk.handle, qk_offset,
+                qks.handle, qks_offset,
+                qkm.handle, qkm_offset,
+                qv.handle, qv_offset,
+                qvs.handle, qvs_offset,
+                qvm.handle, qvm_offset,
+                nblk, ring, bits,
+            ) == 1
+        }
+    }
+
+    /// Decode attention, KV4 v2: one warp per key for all R q heads of a kv
+    /// head, per-block K scale/min vectors, V dequantized once per key, key range
+    /// split across threadgroups (the merge runs inside the same dispatch pair).
+    /// Returns false when the shape has no v2 pipeline - the caller keeps the
+    /// shipped kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_w32_kv4g(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        k_ring: &MetalBuffer, k_ring_offset: usize,
+        v_ring: &MetalBuffer, v_ring_offset: usize,
+        qln_buf: Option<&MetalBuffer>, qln_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        has_norm: u32, pos: u32,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        eps: f32, rope_base: f32, rope_mode: u32,
+        rope: RopeKernel,
+        qk: &MetalBuffer, qk_offset: usize,
+        qks: &MetalBuffer, qks_offset: usize,
+        qkm: &MetalBuffer, qkm_offset: usize,
+        qv: &MetalBuffer, qv_offset: usize,
+        qvs: &MetalBuffer, qvs_offset: usize,
+        qvm: &MetalBuffer, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> bool {
+        let (qln_handle, qln_off) = match qln_buf {
+            Some(b) => (b.handle, qln_offset),
+            None => (q_buf.handle, 0),
+        };
+        let (rt, rto, ht, nr, msc, ra, rao, np) = rope.bind();
+        unsafe {
+            sofuu_metal_batch_llama_attn_w32_kv4g(
+                self.ctx,
+                q_buf.handle, q_offset,
+                k_ring.handle, k_ring_offset,
+                v_ring.handle, v_ring_offset,
+                qln_handle, qln_off,
+                out_buf.handle, out_offset,
+                has_norm, pos,
+                head_dim, n_heads, n_kv_heads, max_seq,
+                eps, rope_base, rope_mode,
+                rt, rto, ht, nr, msc, ra, rao, np,
+                qk.handle, qk_offset,
+                qks.handle, qks_offset,
+                qkm.handle, qkm_offset,
+                qv.handle, qv_offset,
+                qvs.handle, qvs_offset,
+                qvm.handle, qvm_offset,
+                nblk, ring, bits,
+            ) == 1
+        }
+    }
+
+    /// Whole-chunk prefill attention, KV4 v2: 32 rows of one kv head per
+    /// threadgroup, one warp per row, all R q heads of that row per key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_llama_attn_pre_row_kv4(
+        &self,
+        q_buf: &MetalBuffer, q_offset: usize,
+        k_ring: &MetalBuffer, k_ring_offset: usize,
+        v_ring: &MetalBuffer, v_ring_offset: usize,
+        out_buf: &MetalBuffer, out_offset: usize,
+        pos_buf: &MetalBuffer, pos_offset: usize,
+        rows: usize,
+        head_dim: u32, n_heads: u32, n_kv_heads: u32, max_seq: u32,
+        qk: &MetalBuffer, qk_offset: usize,
+        qks: &MetalBuffer, qks_offset: usize,
+        qkm: &MetalBuffer, qkm_offset: usize,
+        qv: &MetalBuffer, qv_offset: usize,
+        qvs: &MetalBuffer, qvs_offset: usize,
+        qvm: &MetalBuffer, qvm_offset: usize,
+        nblk: u32, ring: u32, bits: u32,
+    ) -> bool {
+        let out_stride = (n_heads as usize * head_dim as usize) as u32;
+        unsafe {
+            sofuu_metal_batch_llama_attn_pre_row_kv4(
+                self.ctx,
+                q_buf.handle, q_offset,
+                k_ring.handle, k_ring_offset,
+                v_ring.handle, v_ring_offset,
+                out_buf.handle, out_offset,
+                pos_buf.handle, pos_offset,
+                rows as u32,
+                head_dim, n_heads, n_kv_heads, max_seq, out_stride,
                 qk.handle, qk_offset,
                 qks.handle, qks_offset,
                 qkm.handle, qkm_offset,

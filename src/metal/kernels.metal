@@ -120,6 +120,39 @@ static inline void sofuu_rope_apply(
     }
 }
 
+// Threadgroup-memory twin of sofuu_rope_apply above: same arithmetic, same
+// pair order, same guards - the only difference is the address space of
+// `head`. KV4 v2 stages the q-norm + q-RoPE result in threadgroup memory
+// instead of rewriting the q buffer, because its decode grid has more than one
+// threadgroup per q head (split-K), and an in-place q transform shared by
+// those is a read/write race, not just a redundant write. Bits are the
+// shipped bits: the same expression, the same rotation, the same order.
+static inline void sofuu_rope_apply_tg(
+    threadgroup float *head, uint head_dim, uint n_rot, uint rope_mode,
+    uint pos, float base, uint lane, uint stride,
+    device const float *tab, uint tab_off, uint has_table,
+    device const float *adj, uint n_pairs, float mscale)
+{
+    uint nhalf = n_rot >> 1u;
+    for (uint j = lane; j < nhalf; j += stride) {
+        float2 cs = sofuu_rope_cs(tab, tab_off, has_table, j, adj, n_pairs,
+                                  mscale, pos, base, n_rot, head_dim);
+        float c = cs.x;
+        float s = cs.y;
+        if (rope_mode == 0u) {
+            float v0 = head[j];
+            float v1 = head[j + nhalf];
+            head[j]        = v0 * c - v1 * s;
+            head[j + nhalf] = v1 * c + v0 * s;
+        } else {
+            float v0 = head[2u * j];
+            float v1 = head[2u * j + 1u];
+            head[2u * j]      = v0 * c - v1 * s;
+            head[2u * j + 1u] = v1 * c + v0 * s;
+        }
+    }
+}
+
 kernel void gemv_bf16(
     device const uchar  *w_base         [[buffer(0)]],
     device const float  *x              [[buffer(1)]],
@@ -8033,6 +8066,550 @@ template [[host_name("llama_attn_pre_w32_kv2")]] kernel void llama_attn_pre_w32_
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
     device const uchar*, device const float*, device const float*, device const uchar*,
     device const float*, device const float*, constant uint&, constant uint&, uint3, uint3);
+// ===========================================================================
+// KV4 v2 - the dequant cost, reorganized.
+//
+// The measured shape of the shipped kv4 kernels (REPORT-kvlong.md): the decode
+// slope is 1.82x the f32 slope while reading 3.2x (8-bit) / 5.3x (4-bit) fewer
+// bytes, and 4-bit and 8-bit cost the SAME time. Byte count therefore cannot be
+// the binding resource; dequantisation per attended token is.
+//
+// Three structural facts about the shipped decode kernel (llama_attn_w32_kv4)
+// name the waste, and each is removed here:
+//
+//  1. It is one threadgroup per QUERY head (grid = n_heads), so the R =
+//     n_heads/n_kv_heads q heads that share a kv head each dequantize the same
+//     packed bytes and each re-read the same per-channel K scale+min. R is 2 on
+//     Qwen3-0.6B (16/8) and 4 on Llama-3.2-1B (32/8). Here a WARP owns a key
+//     and computes all R heads of that key: one dequant feeds R dots, and one V
+//     dequant feeds R accumulators.
+//
+//  2. Per attended token it does, per channel: byte load, shift, mask, I2F,
+//     (code*scale + min), FMA into the dot - i.e. it re-forms the dequantized K
+//     row for every key, and re-reads the per-channel scale/min (shared by all
+//     32 tokens of a block) 32 times per block. But
+//         score(t) = sum_c q[c]*(code(t,c)*sK[b,c] + mK[b,c])
+//                  = sum_c (q[c]*sK[b,c])*code(t,c)  +  sum_c q[c]*mK[b,c]
+//     and BOTH of those vectors are constant inside a 32-token block. So they
+//     are formed once per block per head (qs, bc below) and the per-token K
+//     path drops to a byte load, an extract and R FMAs: the scale/min loads and
+//     the per-channel dequant FMA leave the inner loop. Same real arithmetic,
+//     reassociated (fp32 sums over the same 128 channels in the same lane-tree
+//     order), so it moves the low bits; the max|dlogit| cost is quantified in
+//     the report.
+//
+//  3. Its V path re-reads (vscale, vmin) per channel. Each lane's channels are
+//     32 apart, so a lane's four channels sit in four DIFFERENT channel groups
+//     and it needs four (scale, min) pairs per token. V's dequant does not
+//     depend on the q head at all, so it is done ONCE per key here and vv feeds
+//     all R accumulators.
+//
+// Parallelism is held at the shipped level by splitting the KEY RANGE instead of
+// the heads: grid = (n_kv_heads * n_splits) threadgroups of 32 warps. The f32
+// arm runs 16 threadgroups for one decode step, and its own comment records
+// that folding the GQA pair into 8 threadgroups (one per kv head) was 1.8x
+// SLOWER for exactly that reason - resident warps matter more than bytes here.
+// n_splits restores 16 (32 with four splits), so the reuse above is not paid
+// for with occupancy. Each threadgroup writes its own partial (acc, m, l) and
+// llama_attn_kv4_cmb merges them in ascending slice order, so the reduction
+// order is fixed by the split index and never by which threadgroup finished
+// first. With n_splits = 1 the merge is the identity (w = exp(0) = 1 exactly)
+// and the result is the single-threadgroup arithmetic bit for bit.
+//
+// q-norm + q-RoPE move from "rewrite the q buffer" to a threadgroup staging
+// buffer: with two threadgroups on one q head an in-place transform is a
+// read/write race. The expression, the rotation and the reduce order are the
+// shipped ones (sofuu_rope_apply_tg is sofuu_rope_apply in threadgroup space),
+// and nothing downstream ever read the normed q - the q slot is re-projected
+// every layer.
+// Threadgroup size is a HOST choice, not a compile-time shape, because the
+// register cost of keeping R heads of softmax state live is what decides how
+// many threads a threadgroup can hold: measured with the 4-bit/8-bit R=2 pair,
+// this kernel needs ~102 registers/thread and R=4 ~146, so a 1024-thread
+// threadgroup is out (that needs <= 64) and 512 (16 warps) is the largest that
+// fits. A single-threadgroup-per-head design fits 1024 precisely because it
+// keeps one head's state; sharing a dequant across R heads does not. The
+// dispatch therefore passes its own warp count and the kernel maps keys, rows
+// and reductions onto it. KV4G_WMAX bounds the threadgroup memory below.
+#define KV4G_WMAX  16u
+
+template <uint BITS, uint R>
+kernel void llama_attn_w32_kv4g(
+    device const float *q               [[buffer(0)]],
+    device const float *k_ring          [[buffer(1)]],
+    device const float *v_ring          [[buffer(2)]],
+    device const float *q_ln            [[buffer(3)]],
+    device float       *scratch         [[buffer(4)]],
+    constant uint      &q_ln_rem        [[buffer(5)]],
+    constant uint      &has_norm        [[buffer(6)]],
+    constant uint      &pos             [[buffer(7)]],
+    constant uint      &head_dim        [[buffer(8)]],
+    constant uint      &n_heads         [[buffer(9)]],
+    constant uint      &n_kv_heads      [[buffer(10)]],
+    constant uint      &max_seq         [[buffer(11)]],
+    constant float     &eps             [[buffer(12)]],
+    constant float     &rope_base       [[buffer(13)]],
+    constant uint      &rope_mode       [[buffer(14)]],
+    device const float *rope_tab        [[buffer(15)]],
+    constant uint      &has_table       [[buffer(16)]],
+    constant uint      &rope_n_rot      [[buffer(17)]],
+    constant float     &rope_mscale     [[buffer(18)]],
+    device const float *rope_adj        [[buffer(19)]],
+    constant uint      &rope_n_pairs    [[buffer(20)]],
+    device const uchar *qk              [[buffer(21)]],
+    device const float *qks             [[buffer(22)]],
+    device const float *qkm             [[buffer(23)]],
+    device const uchar *qv              [[buffer(24)]],
+    device const float *qvs             [[buffer(25)]],
+    device const float *qvm             [[buffer(26)]],
+    constant uint      &nblk            [[buffer(27)]],
+    constant uint      &kring           [[buffer(28)]],
+    constant uint      &n_splits        [[buffer(29)]],
+    // Bits 16.. of rec_stride carry the dispatch's warp count: the argument
+    // list is full (buffer indices stop at 30) and a record stride is < 65536 by
+    // construction (head_dim <= 128 plus two floats), so the two pack without
+    // ambiguity - the same trick ring_arg uses for the f16-K bit.
+    constant uint      &rec_stride_nw   [[buffer(30)]],
+    uint  gid                           [[threadgroup_position_in_grid]],
+    uint  tid                           [[thread_index_in_threadgroup]]
+) {
+    const uint NW = rec_stride_nw >> 16u;
+    const uint TGSZ = NW << 5u;
+    const uint rec_stride = rec_stride_nw & 0xFFFFu;
+    if (NW == 0u || NW > KV4G_WMAX) { return; }
+    const uint hd = head_dim;
+    if (pos == 0xFFFFFFFFu || hd == 0u || hd > 128u || (hd % 32u) != 0u ||
+        n_kv_heads == 0u || (n_heads % n_kv_heads) != 0u ||
+        pos >= nblk * KV4_BLOCK || n_splits == 0u || rec_stride < hd) { return; }
+    // The f16-K layout (KvDtype::F16K) carries no scale/min and keeps the
+    // shipped kernel; the host never dispatches this one for it.
+    if ((kring >> 31u) != 0u) { return; }
+
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5u;
+    const uint NG = hd >> 5u;                  // channels per lane, 1..4
+    const uint per_byte = 8u / BITS;
+    const uint mask = (1u << BITS) - 1u;
+    const uint k_bpc = (KV4_BLOCK * BITS) / 8u;
+    const uint v_tp  = (hd * BITS) / 8u;
+    const uint ring = kring & 0x7FFFFFFFu;
+    if (ring == 0u) { return; }
+
+    const uint kvh = gid % n_kv_heads;
+    const uint split = gid / n_kv_heads;
+    const uint h0 = kvh * R;
+    const float attn_scale = rsqrt(float(hd));
+
+    threadgroup float qg[R * 128u];
+    threadgroup float rbuf[KV4G_WMAX];
+    threadgroup float sm[KV4G_WMAX];
+    threadgroup float sl[KV4G_WMAX];
+    threadgroup float sr[KV4G_WMAX];
+    threadgroup float sacc[KV4G_WMAX][128];
+
+    // q-norm + q-RoPE, once per (threadgroup, head), in threadgroup memory
+    device const float *qhead = q + (size_t)h0 * hd;
+    for (uint u = tid; u < R * hd; u += TGSZ) { qg[u] = qhead[u]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < R; ++r) {
+        float ss = 0.0f;
+        for (uint i = tid; i < hd; i += TGSZ) { float v = qg[r * hd + i]; ss += v * v; }
+        ss = simd_sum(ss);
+        if (lane == 0u) { rbuf[warp] = ss; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Only ceil(head_dim/32) warps can hold a channel (the loop above strides
+        // by the threadgroup size), so the rest of rbuf is exactly 0.0f and
+        // summing them in would be exact anyway - this just keeps the compiler
+        // from unrolling a 32-load reduction into 32 live registers.
+        float tot = 0.0f;
+        uint nwr = (hd + 31u) / 32u;
+        for (uint w = 0; w < nwr; ++w) { tot += rbuf[w]; }
+        if (has_norm != 0u) {
+            float rms = rsqrt(tot / float(hd) + eps);
+            for (uint i = tid; i < hd; i += TGSZ) {
+                qg[r * hd + i] = qg[r * hd + i] * rms * q_ln[q_ln_rem + i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sofuu_rope_apply_tg(&qg[r * hd], hd, rope_n_rot, rope_mode, pos, rope_base,
+                            tid, TGSZ, rope_tab, 0, has_table, rope_adj,
+                            rope_n_pairs, rope_mscale);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float qr[R][4];
+    for (uint r = 0; r < R; ++r) {
+        for (uint j = 0; j < NG; ++j) { qr[r][j] = qg[r * hd + lane + 32u * j]; }
+    }
+
+    // this threadgroup's slice of the key range
+    const uint seq = pos + 1u;
+    const uint nq = (seq >= 2u * KV4_BLOCK) ? ((seq / KV4_BLOCK) - 1u) * KV4_BLOCK : 0u;
+    const uint per_split = (seq + n_splits - 1u) / n_splits;
+    const uint kstep = ((per_split + KV4_BLOCK - 1u) / KV4_BLOCK) * KV4_BLOCK;
+    const uint k0 = min(seq, split * kstep);
+    const uint k1 = min(seq, k0 + kstep);
+    // Each warp takes a CONTIGUOUS run of keys, so the per-block vectors below
+    // are formed once per 32 keys and not once per key.
+    const uint run = (k1 > k0) ? ((k1 - k0 + NW - 1u) / NW) : 0u;
+    const uint ts = k0 + warp * run;
+    const uint te = min(k1, ts + run);
+
+    const uint ng = NG;
+    device const uchar *kbp = qk  + (size_t)kvh * nblk * hd * k_bpc;
+    device const float *ksp = qks + (size_t)kvh * nblk * hd;
+    device const float *kmp = qkm + (size_t)kvh * nblk * hd;
+    device const uchar *vbp = qv  + (size_t)kvh * nblk * KV4_BLOCK * v_tp;
+    device const float *vsp = qvs + (size_t)kvh * nblk * KV4_BLOCK * ng;
+    device const float *vmp = qvm + (size_t)kvh * nblk * KV4_BLOCK * ng;
+    device const float *krg = k_ring + (size_t)kvh * ring * hd;
+    device const float *vrg = v_ring + (size_t)kvh * ring * hd;
+
+    float m[R];
+    float l[R];
+    float acc[R][4];
+    for (uint r = 0; r < R; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+        for (uint j = 0; j < NG; ++j) { acc[r][j] = 0.0f; }
+    }
+
+    // the quantized prefix, one block at a time
+    const uint tq_end = min(te, nq);
+    for (uint b = ts / KV4_BLOCK; b * KV4_BLOCK < tq_end; ++b) {
+        float qs[R][4];
+        float bc[R];
+        for (uint r = 0; r < R; ++r) {
+            float c0 = 0.0f;
+            for (uint j = 0; j < NG; ++j) {
+                uint i = lane + 32u * j;
+                qs[r][j] = qr[r][j] * ksp[(size_t)b * hd + i] * attn_scale;
+                c0 += qr[r][j] * kmp[(size_t)b * hd + i];
+            }
+            bc[r] = simd_sum(c0) * attn_scale;
+        }
+        uint t0 = max(ts, b * KV4_BLOCK);
+        uint t1 = min(tq_end, (b + 1u) * KV4_BLOCK);
+        for (uint t = t0; t < t1; ++t) {
+            uint s = t & (KV4_BLOCK - 1u);
+            uint bi = s / per_byte;
+            uint sh = (s % per_byte) * BITS;
+            float part[R];
+            for (uint r = 0; r < R; ++r) { part[r] = 0.0f; }
+            for (uint j = 0; j < NG; ++j) {
+                uchar byte = kbp[((size_t)b * hd + lane + 32u * j) * k_bpc + bi];
+                float code = float((byte >> sh) & mask);
+                for (uint r = 0; r < R; ++r) { part[r] += qs[r][j] * code; }
+            }
+            float sc[R];
+            for (uint r = 0; r < R; ++r) { sc[r] = simd_sum(part[r]) + bc[r]; }
+            // V: one dequant for all R heads (it does not depend on the head).
+            float vv[4];
+            for (uint j = 0; j < NG; ++j) {
+                uint i = lane + 32u * j;
+                uchar byte = vbp[(size_t)t * v_tp + (i / per_byte)];
+                float code = float((byte >> ((i % per_byte) * BITS)) & mask);
+                vv[j] = code * vsp[(size_t)t * ng + j] + vmp[(size_t)t * ng + j];
+            }
+            for (uint r = 0; r < R; ++r) {
+                float mnew = max(m[r], sc[r]);
+                float corr = exp(m[r] - mnew);
+                float w = exp(sc[r] - mnew);
+                l[r] = l[r] * corr + w;
+                for (uint j = 0; j < NG; ++j) { acc[r][j] = acc[r][j] * corr + w * vv[j]; }
+                m[r] = mnew;
+            }
+        }
+    }
+
+    // the f32 residual ring, exactly the shipped arithmetic
+    const uint tr0 = max(ts, nq);
+    for (uint t = tr0; t < te; ++t) {
+        uint slot = t % ring;
+        float part[R];
+        for (uint r = 0; r < R; ++r) { part[r] = 0.0f; }
+        for (uint j = 0; j < NG; ++j) {
+            float kk = krg[(size_t)slot * hd + lane + 32u * j];
+            for (uint r = 0; r < R; ++r) { part[r] += qr[r][j] * kk; }
+        }
+        float sc[R];
+        for (uint r = 0; r < R; ++r) { sc[r] = simd_sum(part[r]) * attn_scale; }
+        float vv[4];
+        for (uint j = 0; j < NG; ++j) { vv[j] = vrg[(size_t)slot * hd + lane + 32u * j]; }
+        for (uint r = 0; r < R; ++r) {
+            float mnew = max(m[r], sc[r]);
+            float corr = exp(m[r] - mnew);
+            float w = exp(sc[r] - mnew);
+            l[r] = l[r] * corr + w;
+            for (uint j = 0; j < NG; ++j) { acc[r][j] = acc[r][j] * corr + w * vv[j]; }
+            m[r] = mnew;
+        }
+    }
+
+    // publish this threadgroup's partial, one head at a time: sacc is shared
+    // between the R heads and the barrier after the read makes that legal.
+    for (uint r = 0; r < R; ++r) {
+        if (lane == 0u) { sm[warp] = m[r]; sl[warp] = l[r]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The three warp-spanning loops below touch every warp's partial;
+        // sequential is the order the shipped threadgroup reduce used.
+        float gmax = sm[0];
+#pragma clang loop unroll(disable)
+        for (uint w = 1; w < NW; ++w) { gmax = max(gmax, sm[w]); }
+        float ltot = 0.0f;
+#pragma clang loop unroll(disable)
+        for (uint w = 0; w < NW; ++w) {
+            float rr = (gmax > -INFINITY) ? exp(sm[w] - gmax) : 0.0f;
+            sr[w] = rr;
+            ltot += sl[w] * rr;
+        }
+        for (uint j = 0; j < NG; ++j) { sacc[warp][lane + 32u * j] = acc[r][j] * sr[warp]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device float *rec = scratch
+            + ((size_t)split * (size_t)n_heads + (size_t)(h0 + r)) * (size_t)rec_stride;
+        for (uint i = tid; i < hd; i += TGSZ) {
+            float sum = 0.0f;
+#pragma clang loop unroll(disable)
+            for (uint w = 0; w < NW; ++w) { sum += sacc[w][i]; }
+            rec[i] = sum;
+        }
+        if (tid == 0u) {
+            rec[hd] = (gmax > -INFINITY) ? gmax : -INFINITY;
+            rec[hd + 1u] = ltot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Merges the n_splits partials of one q head into head_out: one warp per head,
+// lanes striding head_dim. Ascending split order, so the fp32 reduction order is
+// fixed by the grid and never by scheduling. One split is the identity.
+kernel void llama_attn_kv4_cmb(
+    device const float *scratch     [[buffer(0)]],
+    device float       *head_out    [[buffer(1)]],
+    constant uint      &head_dim    [[buffer(2)]],
+    constant uint      &n_heads     [[buffer(3)]],
+    constant uint      &n_splits    [[buffer(4)]],
+    constant uint      &rec_stride  [[buffer(5)]],
+    uint3 tg                        [[threadgroup_position_in_grid]],
+    uint  tid                       [[thread_index_in_threadgroup]]
+) {
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5u;
+    const uint h = tg.x * 32u + warp;
+    const uint hd = head_dim;
+    if (h >= n_heads || hd == 0u || hd > 128u) { return; }
+    device const float *base = scratch + (size_t)h * (size_t)rec_stride;
+    size_t hop = (size_t)n_heads * (size_t)rec_stride;
+    float mmax = -INFINITY;
+    for (uint s = 0; s < n_splits; ++s) { mmax = max(mmax, base[(size_t)s * hop + hd]); }
+    float acc[4];
+    for (uint j = 0; j < 4u; ++j) { acc[j] = 0.0f; }
+    float ltot = 0.0f;
+    if (mmax > -INFINITY) {
+        for (uint s = 0; s < n_splits; ++s) {
+            device const float *rec = base + (size_t)s * hop;
+            float w = exp(rec[hd] - mmax);
+            ltot += rec[hd + 1u] * w;
+            for (uint j = 0; j < 4u; ++j) {
+                uint i = lane + 32u * j;
+                if (i < hd) { acc[j] = fma(rec[i], w, acc[j]); }
+            }
+        }
+    }
+    float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    for (uint j = 0; j < 4u; ++j) {
+        uint i = lane + 32u * j;
+        if (i < hd) { head_out[(size_t)h * hd + i] = acc[j] * inv; }
+    }
+}
+
+// -- PREFILL: KV4G_RG rows ride one threadgroup, one warp per row -------------
+// The shipped llama_attn_pre_w32_kv4 is one threadgroup per (row, head), so a
+// 128-row chunk launches rows*n_heads = 2048 threadgroups that each re-stream
+// the whole quantized prefix: 111 tk/s against the f32 arm's 874 at 4k, -87%.
+// Here a threadgroup owns nwarps consecutive rows of ONE kv head and each warp
+// owns one row of it, with all R q heads of that row (one dequant per key feeds
+// R dots), so the chunk's stream count falls from rows*n_heads to
+// rows*n_kv_heads and each stream does 1/R of the dequant. Rows are independent
+// (no barrier, no threadgroup state), so a parked row just returns. The key
+// loop is per row, so causality needs no mask - a row stops at its own
+// position - and the per-block vectors are formed once per 32 keys of the
+// row's own walk.
+template <uint BITS, uint R>
+kernel void llama_attn_pre_row_kv4(
+    device const float *q               [[buffer(0)]],
+    device float       *out             [[buffer(1)]],
+    device const float *k_ring          [[buffer(2)]],
+    device const float *v_ring          [[buffer(3)]],
+    device const uint  *positions       [[buffer(4)]],
+    constant uint      &head_dim        [[buffer(5)]],
+    constant uint      &n_heads         [[buffer(6)]],
+    constant uint      &n_kv_heads      [[buffer(7)]],
+    constant uint      &max_seq         [[buffer(8)]],
+    constant uint      &out_stride      [[buffer(9)]],
+    constant uint      &rows            [[buffer(10)]],
+    device const uchar *qk              [[buffer(11)]],
+    device const float *qks             [[buffer(12)]],
+    device const float *qkm             [[buffer(13)]],
+    device const uchar *qv              [[buffer(14)]],
+    device const float *qvs             [[buffer(15)]],
+    device const float *qvm             [[buffer(16)]],
+    constant uint      &nblk            [[buffer(17)]],
+    constant uint      &kring           [[buffer(18)]],
+    constant uint      &nwarps          [[buffer(19)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint  tid                           [[thread_index_in_threadgroup]]
+) {
+    const uint hd = head_dim;
+    const uint NW = nwarps;              // rows per threadgroup, one warp each
+    if (NW == 0u || NW > KV4G_WMAX) { return; }
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5u;
+    const uint kvh = tg.x;
+    const uint row = tg.y * NW + warp;
+    if (hd == 0u || hd > 128u || (hd % 32u) != 0u || kvh >= n_kv_heads ||
+        (n_heads % n_kv_heads) != 0u || (n_heads / n_kv_heads) != R || row >= rows) { return; }
+    if ((kring >> 31u) != 0u) { return; }
+    uint pos = positions[row];
+    if (pos == 0xFFFFFFFFu || pos >= nblk * KV4_BLOCK) { return; }
+    uint ring = kring & 0x7FFFFFFFu;
+    if (ring == 0u) { return; }
+
+    const uint NG = hd >> 5u;
+    const uint per_byte = 8u / BITS;
+    const uint mask = (1u << BITS) - 1u;
+    const uint k_bpc = (KV4_BLOCK * BITS) / 8u;
+    const uint v_tp  = (hd * BITS) / 8u;
+    const uint ng = NG;
+    const uint h0 = kvh * R;
+    const float attn_scale = rsqrt(float(hd));
+    const uint seq = pos + 1u;
+    const uint nq = (seq >= 2u * KV4_BLOCK) ? ((seq / KV4_BLOCK) - 1u) * KV4_BLOCK : 0u;
+
+    device const float *qhead = q + ((size_t)row * n_heads + (size_t)h0) * hd;
+    float qr[R][4];
+    for (uint r = 0; r < R; ++r) {
+        for (uint j = 0; j < NG; ++j) { qr[r][j] = qhead[(size_t)r * hd + lane + 32u * j]; }
+    }
+    device const uchar *kbp = qk  + (size_t)kvh * nblk * hd * k_bpc;
+    device const float *ksp = qks + (size_t)kvh * nblk * hd;
+    device const float *kmp = qkm + (size_t)kvh * nblk * hd;
+    device const uchar *vbp = qv  + (size_t)kvh * nblk * KV4_BLOCK * v_tp;
+    device const float *vsp = qvs + (size_t)kvh * nblk * KV4_BLOCK * ng;
+    device const float *vmp = qvm + (size_t)kvh * nblk * KV4_BLOCK * ng;
+    device const float *krg = k_ring + (size_t)kvh * ring * hd;
+    device const float *vrg = v_ring + (size_t)kvh * ring * hd;
+
+    float m[R];
+    float l[R];
+    float acc[R][4];
+    for (uint r = 0; r < R; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+        for (uint j = 0; j < NG; ++j) { acc[r][j] = 0.0f; }
+    }
+
+    for (uint b = 0; b * KV4_BLOCK < nq; ++b) {
+        float qs[R][4];
+        float bc[R];
+        for (uint r = 0; r < R; ++r) {
+            float c0 = 0.0f;
+            for (uint j = 0; j < NG; ++j) {
+                uint i = lane + 32u * j;
+                qs[r][j] = qr[r][j] * ksp[(size_t)b * hd + i] * attn_scale;
+                c0 += qr[r][j] * kmp[(size_t)b * hd + i];
+            }
+            bc[r] = simd_sum(c0) * attn_scale;
+        }
+        uint t1 = min(nq, (b + 1u) * KV4_BLOCK);
+        for (uint t = b * KV4_BLOCK; t < t1; ++t) {
+            uint s = t & (KV4_BLOCK - 1u);
+            uint bi = s / per_byte;
+            uint sh = (s % per_byte) * BITS;
+            float part[R];
+            for (uint r = 0; r < R; ++r) { part[r] = 0.0f; }
+            for (uint j = 0; j < NG; ++j) {
+                uchar byte = kbp[((size_t)b * hd + lane + 32u * j) * k_bpc + bi];
+                float code = float((byte >> sh) & mask);
+                for (uint r = 0; r < R; ++r) { part[r] += qs[r][j] * code; }
+            }
+            float sc[R];
+            for (uint r = 0; r < R; ++r) { sc[r] = simd_sum(part[r]) + bc[r]; }
+            float vv[4];
+            for (uint j = 0; j < NG; ++j) {
+                uint i = lane + 32u * j;
+                uchar byte = vbp[(size_t)t * v_tp + (i / per_byte)];
+                float code = float((byte >> ((i % per_byte) * BITS)) & mask);
+                vv[j] = code * vsp[(size_t)t * ng + j] + vmp[(size_t)t * ng + j];
+            }
+            for (uint r = 0; r < R; ++r) {
+                float mnew = max(m[r], sc[r]);
+                float corr = exp(m[r] - mnew);
+                float w = exp(sc[r] - mnew);
+                l[r] = l[r] * corr + w;
+                for (uint j = 0; j < NG; ++j) { acc[r][j] = acc[r][j] * corr + w * vv[j]; }
+                m[r] = mnew;
+            }
+        }
+    }
+    for (uint t = nq; t < seq; ++t) {
+        uint slot = t % ring;
+        float part[R];
+        for (uint r = 0; r < R; ++r) { part[r] = 0.0f; }
+        for (uint j = 0; j < NG; ++j) {
+            float kk = krg[(size_t)slot * hd + lane + 32u * j];
+            for (uint r = 0; r < R; ++r) { part[r] += qr[r][j] * kk; }
+        }
+        float sc[R];
+        for (uint r = 0; r < R; ++r) { sc[r] = simd_sum(part[r]) * attn_scale; }
+        float vv[4];
+        for (uint j = 0; j < NG; ++j) { vv[j] = vrg[(size_t)slot * hd + lane + 32u * j]; }
+        for (uint r = 0; r < R; ++r) {
+            float mnew = max(m[r], sc[r]);
+            float corr = exp(m[r] - mnew);
+            float w = exp(sc[r] - mnew);
+            l[r] = l[r] * corr + w;
+            for (uint j = 0; j < NG; ++j) { acc[r][j] = acc[r][j] * corr + w * vv[j]; }
+            m[r] = mnew;
+        }
+    }
+    for (uint r = 0; r < R; ++r) {
+        float inv = (l[r] > 0.0f) ? (1.0f / l[r]) : 0.0f;
+        device float *dst = out + (size_t)row * out_stride + (size_t)(h0 + r) * hd;
+        for (uint j = 0; j < NG; ++j) {
+            dst[lane + 32u * j] = acc[r][j] * inv;
+        }
+    }
+}
+
+// instantiations: 4-bit and 8-bit at the two GQA ratios the local fleet ships
+// (2:1 Qwen3-0.6B 16/8, 4:1 Llama-3.2-1B 32/8). Every other (bits, ratio) pair
+// keeps the shipped kernels - llama_attn_w32_kv4 / llama_attn_pre_w32_kv4 stay
+// in the source and remain the fallback the host selects.
+#define KV4G_DEC_ARGS device const float*, device const float*, device const float*, \
+    device const float*, device float*, constant uint&, constant uint&, constant uint&, \
+    constant uint&, constant uint&, constant uint&, constant uint&, constant float&, \
+    constant float&, constant uint&, device const float*, constant uint&, constant uint&, \
+    constant float&, device const float*, constant uint&, device const uchar*, \
+    device const float*, device const float*, device const uchar*, device const float*, \
+    device const float*, constant uint&, constant uint&, constant uint&, constant uint&, \
+    uint, uint
+template [[host_name("attn_kv4g_b4_r2")]] kernel void llama_attn_w32_kv4g<4, 2>(KV4G_DEC_ARGS);
+template [[host_name("attn_kv4g_b8_r2")]] kernel void llama_attn_w32_kv4g<8, 2>(KV4G_DEC_ARGS);
+template [[host_name("attn_kv4g_b4_r4")]] kernel void llama_attn_w32_kv4g<4, 4>(KV4G_DEC_ARGS);
+template [[host_name("attn_kv4g_b8_r4")]] kernel void llama_attn_w32_kv4g<8, 4>(KV4G_DEC_ARGS);
+
+#define KV4G_PRE_ARGS device const float*, device float*, device const float*, \
+    device const float*, device const uint*, constant uint&, constant uint&, \
+    constant uint&, constant uint&, constant uint&, constant uint&, \
+    device const uchar*, device const float*, device const float*, device const uchar*, \
+    device const float*, device const float*, constant uint&, constant uint&, \
+    constant uint&, uint3, uint
+template [[host_name("attn_pre_row_kv4_b4_r2")]] kernel void llama_attn_pre_row_kv4<4, 2>(KV4G_PRE_ARGS);
+template [[host_name("attn_pre_row_kv4_b8_r2")]] kernel void llama_attn_pre_row_kv4<8, 2>(KV4G_PRE_ARGS);
+template [[host_name("attn_pre_row_kv4_b4_r4")]] kernel void llama_attn_pre_row_kv4<4, 4>(KV4G_PRE_ARGS);
+template [[host_name("attn_pre_row_kv4_b8_r4")]] kernel void llama_attn_pre_row_kv4<8, 4>(KV4G_PRE_ARGS);
+
 
 template [[host_name("kv4_quant_b4")]] kernel void kv4_quant_blocks<4>(
     device const float*, device const float*, device uchar*, device float*,

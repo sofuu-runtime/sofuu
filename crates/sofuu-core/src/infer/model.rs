@@ -4155,25 +4155,51 @@ impl TransformerModel {
                 }
                 let (qln_buf, qln_off) =
                     (q_norm_off.map(|off| &g.w_buf), q_norm_off.unwrap_or(0));
-                if !g.engine.batch_llama_attn_w32_kv4(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    qln_buf, qln_off,
-                    &g.act_buf, g.slots.ao,
-                    has_q, pos as u32,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
-                    norm_eps, rope_freq_base, rope_mode, rope,
-                    &kv4.qk_buf, o_qk,
-                    &kv4.qks_buf, o_qks,
-                    &kv4.qkm_buf, o_qkm,
-                    &kv4.qv_buf, o_qv,
-                    &kv4.qvs_buf, o_qvs,
-                    &kv4.qvm_buf, o_qvm,
-                    kv4.layout.nblk as u32,
-                    crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
-                    kv4.layout.bits,
-                ) {
+                // KV4 v2 first (dequant once per key for the whole GQA group,
+                // per-block K vectors, split key range - see kernels.metal);
+                // the shipped per-head kernel is the fallback for shapes v2
+                // does not compile for, and SOFUU_KV4_KERNEL=old pins it as the
+                // A/B arm.
+                let attn_ok = (crate::infer::kv4::kernel_v2()
+                    && g.engine.batch_llama_attn_w32_kv4g(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        qln_buf, qln_off,
+                        &g.act_buf, g.slots.ao,
+                        has_q, pos as u32,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                        norm_eps, rope_freq_base, rope_mode, rope,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        kv4.layout.nblk as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.bits,
+                    ))
+                    || g.engine.batch_llama_attn_w32_kv4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        qln_buf, qln_off,
+                        &g.act_buf, g.slots.ao,
+                        has_q, pos as u32,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32, max_seq_len as u32,
+                        norm_eps, rope_freq_base, rope_mode, rope,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        kv4.layout.nblk as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.bits,
+                    );
+                if !attn_ok {
                     kv4_fatal("decode attention");
                 }
             } else if attn_new {
@@ -6639,25 +6665,50 @@ impl TransformerModel {
                         kv4_fatal("prefill quantize");
                     }
                 }
-                if !g.engine.batch_llama_attn_pre_w32_kv4(
-                    &g.act_buf, g.slots.qa,
-                    &g.k_buf, kc_layer,
-                    &g.v_buf, kc_layer,
-                    &g.act_buf, g.slots.ao,
-                    &g.act_buf, g.slots.posb,
-                    b,
-                    head_dim as u32, n_heads as u32, n_kv_heads as u32,
-                    cfg.logical_max_seq_len as u32,
-                    &kv4.qk_buf, o_qk,
-                    &kv4.qks_buf, o_qks,
-                    &kv4.qkm_buf, o_qkm,
-                    &kv4.qv_buf, o_qv,
-                    &kv4.qvs_buf, o_qvs,
-                    &kv4.qvm_buf, o_qvm,
-                    kv4.layout.nblk as u32,
-                    crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
-                    kv4.layout.bits,
-                ) {
+                // v2 rows: 32 rows of one kv head per threadgroup, one warp per
+                // row, all R q heads of that row per key - the shipped kernel is
+                // one threadgroup per (row, head) and re-streams the prefix
+                // rows*n_heads times. Fallback + A/B arm as in decode.
+                let pre_ok = (crate::infer::kv4::kernel_v2()
+                    && g.engine.batch_llama_attn_pre_row_kv4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &g.act_buf, g.slots.ao,
+                        &g.act_buf, g.slots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        cfg.logical_max_seq_len as u32,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        kv4.layout.nblk as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.bits,
+                    ))
+                    || g.engine.batch_llama_attn_pre_w32_kv4(
+                        &g.act_buf, g.slots.qa,
+                        &g.k_buf, kc_layer,
+                        &g.v_buf, kc_layer,
+                        &g.act_buf, g.slots.ao,
+                        &g.act_buf, g.slots.posb,
+                        b,
+                        head_dim as u32, n_heads as u32, n_kv_heads as u32,
+                        cfg.logical_max_seq_len as u32,
+                        &kv4.qk_buf, o_qk,
+                        &kv4.qks_buf, o_qks,
+                        &kv4.qkm_buf, o_qkm,
+                        &kv4.qv_buf, o_qv,
+                        &kv4.qvs_buf, o_qvs,
+                        &kv4.qvm_buf, o_qvm,
+                        kv4.layout.nblk as u32,
+                        crate::infer::kv4::ring_arg(&kv4.layout, max_seq_len),
+                        kv4.layout.bits,
+                    );
+                if !pre_ok {
                     kv4_fatal("prefill attention");
                 }
                 true

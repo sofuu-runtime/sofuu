@@ -1370,9 +1370,11 @@
           });
           CODE_SESSIONS[key] = sess;
         }
-        res = sess.run(code, { fuel: fuel, timeoutMs: timeout, captureConsole: true, throwOnError: false });
+        /* `await`: a run only returns a promise when it parks on an async
+         * host bridge; code_eval installs none, so this is the sync path. */
+        res = await sess.run(code, { fuel: fuel, timeoutMs: timeout, captureConsole: true, throwOnError: false });
       } else {
-        res = sofuu.sandbox.run(code, {
+        res = await sofuu.sandbox.run(code, {
           fuel: fuel,
           timeoutMs: timeout,
           maxMemoryMB: 16,

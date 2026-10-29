@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build \
+.PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build sandbox-stress \
 	observability-stress \
         deps scoreboard scoreboard-check \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
@@ -141,6 +141,12 @@ plugin-check: $(TARGET)
 
 plugin-stress: $(TARGET)
 	@./$(TARGET) run scripts/stress/plugin_stress.js
+
+# W6 (SANDBOX_UPGRADE_PLAN): the 26-case adversarial sandbox suite. Every
+# case is bounded by fuel or a deadline, so a hung engine fails the run
+# instead of wedging the terminal.
+sandbox-stress: $(TARGET)
+	@./$(TARGET) run scripts/stress/sandbox_stress.js
 
 plugin-stress-fast: $(TARGET)
 	@./$(TARGET) run scripts/stress/plugin_stress.js --fast

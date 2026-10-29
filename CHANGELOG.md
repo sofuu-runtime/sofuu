@@ -4,6 +4,60 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Universal Sandbox v2 — 2026-10-29
+
+Implementation of `SANDBOX_UPGRADE_PLAN.md`: the in-process execution sandbox
+stops clamping developer budgets, gains callable host bridges, TypeScript/JSX
+ingestion, prototype hardening and configurable console routing.
+
+- **Unclamped budgets (I2)** — `SandboxConfig::clamp()` now enforces only
+  floors (1 MB memory, 16 KB stack); a stated `timeoutMs`, `fuel`, `maxMemoryMB`
+  or `maxStackKB` is never reduced. `fuel: 'unlimited' | 0 | null` disables the
+  instruction meter and polling drops to `i32::MAX` between deadline checks;
+  `timeoutMs: 0 | null` disables the deadline. The misleading
+  `SANDBOX_MAX_FUEL` / `SANDBOX_MAX_TIMEOUT_MS` constants are gone.
+- **Presets** — `strict` (2 s, 5M fuel, 32 MB, frozen prototypes), `standard`
+  (10 s, 20M, 64 MB), `compute` (300 s, unmetered, 512 MB) and `worker`
+  (no deadline, unmetered, 256 MB). Explicit options override the preset; an
+  unknown preset name is refused. Numeric options are type-checked rather than
+  coerced (`timeoutMs: "soon"` used to become a zero budget through
+  `ToNumber`).
+- **Callable host bridges** — a top-level function in `globals` is installed as
+  a native function in the sandbox realm. Arguments and results cross as JSON;
+  a sync host function returns directly, a promise-returning one gives the
+  sandbox a real promise. Microtask-only promises settle inside the run; a
+  promise that needs the host event loop (fetch, fs) **parks** the run —
+  `run`/`eval` then return a Promise, the session reports `E_BUSY` until it
+  resumes, and `close()` is deferred to completion. Host throws become
+  catchable sandbox errors; a non-serializable result is a typed error.
+- **TypeScript without a build step** — `ts: 'auto'` evaluates the source as
+  written and retries the stripped source only when the first parse failed, so
+  a stripper bug cannot change valid JavaScript. The Rust stripper gained
+  **enum** support (rewritten to the same frozen object literal the plugin
+  driver emits, including `const`/`export`/`declare` forms), which also fixes
+  enums in `sofuu run file.ts`. Top-level `await` is supported through an
+  async wrapper (documented: the value comes from `return`).
+- **JSX** — `jsx: true` transpiles to `h()` calls without rewriting imports
+  and installs `h`/`Fragment` in the realm, so components evaluate to a
+  `{type, props, children}` tree.
+- **Prototype hardening** — `freezePrototypes` freezes the intrinsic
+  constructors and their prototypes at realm creation (`strict` preset
+  default), so `Object.prototype.x = ...` cannot stick across turns.
+- **Console routing** — `console: 'capture' | 'inherit' | 'ignore' | fn` plus
+  `maxLogs` (0 = unbounded, 8 MB total / 64 KB per line ceilings). The old
+  `captureConsole` boolean still maps onto it.
+- **Typings** — `sofuu.d.ts` declares the `sofuu.sandbox` namespace,
+  `SandboxOptions`, `SandboxResult`, `SandboxSession`, `SandboxPreset` and
+  `SandboxErrorCode`. Two codes join the taxonomy: `E_BUSY` and `E_BRIDGE`.
+- **`code_eval`** awaits the sandbox run (a run only becomes a Promise when a
+  bridge parks) and therefore accepts TypeScript by default.
+- **Gates** — `make sandbox-stress` runs 26 adversarial cases
+  (`scripts/stress/sandbox_stress.js`: budget escapes, memory/stack bombs,
+  catastrophic regex, host-global probes, prototype pollution, TS/JSX, bridges
+  over real I/O, parked-run lifecycle, presets, 2000-run soak). Plus
+  `tests/test_sandbox_v2.js` (10 acceptance groups) and 21 Rust unit tests.
+  Docs: `docs/SANDBOX.md`.
+
 ## 24/7 Agent Observability, Tracing & Recovery — 2026-10-29
 
 Implementation of `OBSERVABILITY_PLAN.md`: a durable per-run trace, a declared

@@ -341,6 +341,62 @@ Full guide: [docs/PLUGINS.md](docs/PLUGINS.md) · runnable examples:
 
 ---
 
+## Universal Execution Sandbox
+
+`sofuu.sandbox` runs JavaScript or TypeScript in a **separate QuickJS runtime** —
+own heap, own intrinsics, no host globals — under budgets you state. The
+runtime never caps what you ask for: a 2-second deadline and a 5M-instruction
+meter are defaults for untrusted model-written code, not ceilings.
+
+```js
+// One-shot: fresh realm, run, destroy.
+const r = sofuu.sandbox.run("1 + 2 * 3");
+r.result;      // 7
+r.logs;        // captured console output
+r.fuelUsed;    // instructions charged
+
+// TypeScript just runs — no build step.
+sofuu.sandbox.eval("const x: number = 42; x");   // 42
+
+// Stateful realm with host bridges (sync or async, including real I/O).
+const sb = sofuu.sandbox.create({
+  preset: "compute",                       // strict | standard | compute | worker
+  globals: {
+    tenantId: "cust_98234",                // plain JSON
+    queryInventory: async (sku) => inventory.get(sku),
+  },
+});
+const report = await sb.eval(`
+  const count = await queryInventory("WIDGET-01");
+  return "tenant " + tenantId + ": " + count + " in stock";
+`);
+sb.close();
+```
+
+| Preset | Workload | Deadline | Fuel | Memory | Frozen prototypes |
+| --- | --- | --- | --- | --- | --- |
+| `strict` | untrusted LLM code | 2 s | 5M | 32 MB | yes |
+| `standard` | developer scripting | 10 s | 20M | 64 MB | no |
+| `compute` | math, simulations, ETL | 300 s | unlimited | 512 MB | no |
+| `worker` | long-running background | none | unlimited | 256 MB | no |
+
+- **Bridges** — a top-level function in `globals` becomes a native function
+  inside the realm. Arguments and results cross as JSON; a promise-returning
+  function gives the sandbox a real promise, and a promise that needs the host
+  loop (fetch, fs) parks the run and resumes it transparently.
+- **Isolation** — no `process`, `fetch`, `require`, `sofuu` or filesystem
+  unless you bridge it; `freezePrototypes` locks the intrinsics so
+  `Object.prototype.x = ...` cannot stick across turns.
+- **Ingest** — TypeScript (`ts: 'auto'`, including enums) and optional JSX
+  (`jsx: true`) are handled in RAM, with the script evaluated as written first
+  so a stripper can never change valid JavaScript.
+- **Console** — `console: 'capture' | 'inherit' | 'ignore' | (level, ...args) => {}`.
+
+Full guide: [docs/SANDBOX.md](docs/SANDBOX.md) · adversarial gate:
+`make sandbox-stress` (26 cases) · typings: `sofuu.sandbox` in [sofuu.d.ts](sofuu.d.ts).
+
+---
+
 ## 24/7 Agent Observability & Crash Recovery
 
 Sofuu includes an append-only JSONL trace substrate designed for reliable, long-running autonomous agents:

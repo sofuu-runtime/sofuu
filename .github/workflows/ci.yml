@@ -116,6 +116,12 @@ jobs:
       - name: Headless embedding test (compile + run c_embed.c)
         run: make headless-test
 
+      # SANDBOX_UPGRADE_PLAN W6.3: the adversarial sandbox suite. Every case
+      # is bounded by fuel or a deadline, so an escape or a wedge fails this
+      # gate instead of hanging the runner.
+      - name: Sandbox adversarial suite
+        run: make sandbox-stress
+
       # The JS suite runs HERE, after the SDK gates, on purpose. It used to
       # run before them, so a single JS failure skipped every gate below and
       # left libsofuu / headless / abi unverified on that runner. Gates that

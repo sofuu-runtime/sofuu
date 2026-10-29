@@ -1297,8 +1297,136 @@ export interface SofuuRuntime {
   agent?: SofuuAgent;
   /** Run logs, checkpoints and crash cards (src/js/observability.js). */
   observability?: SofuuObservability;
+  /** The deterministic in-process execution sandbox (rt/sandbox.rs). */
+  sandbox: SofuuSandbox;
   /** Runtime semver, e.g. 0.3.0-beta. */
   version: string;
+}
+
+/* ================================================================== 
+ * sofuu.sandbox — in-process deterministic execution (SANDBOX_UPGRADE_PLAN)
+ * ================================================================== */
+
+/**
+ * Machine-readable sandbox failure codes carried on a failed result (`code`)
+ * and on the Error thrown by `eval` / `throwOnError: true`.
+ *   E_TIMEOUT  the wall-clock budget ran out (also `SandboxTimeoutError`)
+ *   E_FUEL     the instruction meter ran out
+ *   E_OOM      the memory ceiling was hit
+ *   E_STACK    the call stack ceiling was hit
+ *   E_SYNTAX   the source did not parse (after the TypeScript retry)
+ *   E_GLOBALS  the `globals` payload could not be injected
+ *   E_BUSY     a stateful session still has a run parked on an async bridge
+ *   E_BRIDGE   a run parked on a host bridge that can never be resumed here
+ *   E_SANDBOX_CLOSED  the session was closed
+ *   E_SANDBOX  any other sandbox failure
+ */
+export type SandboxErrorCode =
+  | 'E_TIMEOUT'
+  | 'E_FUEL'
+  | 'E_OOM'
+  | 'E_STACK'
+  | 'E_SYNTAX'
+  | 'E_GLOBALS'
+  | 'E_BUSY'
+  | 'E_BRIDGE'
+  | 'E_SANDBOX_CLOSED'
+  | 'E_SANDBOX';
+
+/** Where captured `console.*` output goes. */
+export type SandboxConsoleMode = 'capture' | 'inherit' | 'ignore';
+
+/** Presets from the plan table; explicit options always override them. */
+export type SandboxPreset = 'strict' | 'standard' | 'compute' | 'worker';
+
+/** TypeScript ingestion: 'auto' parses as JS first and retries stripped. */
+export type SandboxTsMode = 'auto' | 'always' | 'never' | true | false;
+
+/** Console levels passed to a custom `console` callback. */
+export type SandboxConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
+
+export interface SandboxOptions {
+  /** strict | standard | compute | worker — see docs/SANDBOX.md. */
+  preset?: SandboxPreset;
+  /**
+   * Instruction budget. Default 5,000,000. `'unlimited'`, `0` or `null`
+   * disables the meter entirely. There is no upper clamp.
+   */
+  fuel?: number | 'unlimited' | null;
+  /**
+   * Wall-clock budget in ms. Default 2000. `0` or `null` disables the
+   * deadline. There is no upper clamp.
+   */
+  timeoutMs?: number | null;
+  /** Memory ceiling in MB. Default 64. No upper clamp. */
+  maxMemoryMB?: number;
+  /** Call-stack ceiling in KB. Default 512. No upper clamp. */
+  maxStackKB?: number;
+  /**
+   * Console routing. Default 'capture' (into `result.logs`). A function
+   * receives (level, ...stringifiedArgs) and runs on the host.
+   */
+  console?: SandboxConsoleMode | ((level: SandboxConsoleLevel, ...args: string[]) => void);
+  /** 0.2 alias: false is the same as console: 'ignore'. */
+  captureConsole?: boolean;
+  /** Max captured log lines. Default 512; 0 = unbounded (8 MB byte cap). */
+  maxLogs?: number;
+  /** Freeze Object/Array/Function/... and their prototypes at realm creation. */
+  freezePrototypes?: boolean;
+  /** TypeScript ingestion. Default 'auto'. */
+  ts?: SandboxTsMode;
+  /** Transpile JSX to `h()` calls and install `h`/`Fragment` in the realm. */
+  jsx?: boolean;
+  /** Pump the returned promise before returning. Default true. */
+  allowAsync?: boolean;
+  /** Throw (or reject) instead of returning a failed result object. */
+  throwOnError?: boolean;
+  /**
+   * Values installed as globals in the realm. A top-level *function* is a
+   * callable host bridge: it runs on the host, its arguments and result cross
+   * the boundary as JSON, and a promise-returning function is awaited.
+   */
+  globals?: { [name: string]: unknown };
+}
+
+export interface SandboxResult<T = unknown> {
+  success: boolean;
+  /** JSON round-trip of the value the script produced (undefined when none). */
+  result?: T;
+  error?: string;
+  /** 'timeout' | 'fuel' | 'oom' | 'stack' | 'syntax' | 'runtime' | ... */
+  errorType?: string;
+  code?: SandboxErrorCode;
+  interrupted: boolean;
+  fuelUsed: number;
+  elapsedMs: number;
+  logs: string[];
+}
+
+/**
+ * A stateful sandbox realm. Declarations persist across `run` calls, except
+ * that code using top-level `await` executes inside an async wrapper (see
+ * docs/SANDBOX.md) and therefore returns a value only via `return`.
+ */
+export interface SandboxSession {
+  /**
+   * A result object normally; a Promise only when the run parked on a
+   * promise-returning host bridge. `await` handles both shapes.
+   */
+  run<T = unknown>(code: string, options?: SandboxOptions): SandboxResult<T> | Promise<SandboxResult<T>>;
+  /** The value itself (or a Promise of it); throws on failure. */
+  eval<T = unknown>(code: string, options?: SandboxOptions): T | Promise<T>;
+  /** Close the realm. A parked run defers teardown to its completion. */
+  close(): void;
+}
+
+export interface SofuuSandbox {
+  /** One-shot realm: create, run, destroy. */
+  run<T = unknown>(code: string, options?: SandboxOptions): SandboxResult<T> | Promise<SandboxResult<T>>;
+  /** One-shot realm returning the value itself; throws on failure. */
+  eval<T = unknown>(code: string, options?: SandboxOptions): T | Promise<T>;
+  /** Stateful realm for multi-step work. */
+  create(options?: SandboxOptions): SandboxSession;
 }
 
 /* ================================================================== 

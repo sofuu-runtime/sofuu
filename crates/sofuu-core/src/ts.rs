@@ -12,7 +12,12 @@
 /// Strip TypeScript type syntax from `src`, returning JS source of the
 /// same length (types replaced by spaces, newlines preserved).
 pub fn strip(src: &str) -> String {
-    let bytes: Vec<u8> = src.as_bytes().to_vec();
+    /* Enums carry runtime values, so they cannot be blanked like a type.
+     * Rewrite them to frozen object literals first (the same transform the
+     * plugin driver's `_stripTs` performs), then run the length-preserving
+     * scanner over the result. A source with no enum is returned verbatim. */
+    let rewritten = rewrite_enums(src);
+    let bytes: Vec<u8> = rewritten.as_bytes().to_vec();
     let len = bytes.len();
     let mut out = bytes.clone();
     let mut pos = 0usize;
@@ -329,6 +334,252 @@ pub fn strip(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
+
+// ── Enum rewriting ──────────────────────────────────────────────
+
+/// `enum Name { A, B = 2, C }` → `var Name = Object.freeze({"A":0,"B":2,"C":3});`
+/// plus one newline per removed line. Returns the source unchanged when a
+/// member is not a plain identifier with a numeric or string literal value —
+/// QuickJS then reports a syntax error rather than the runtime silently
+/// binding the wrong value. `declare enum` (type-only) is erased.
+fn rewrite_enums(src: &str) -> String {
+    let b = src.as_bytes();
+    let len = b.len();
+    let mut out = String::with_capacity(len);
+    let mut last = 0usize;
+    let mut i = 0usize;
+
+    while i < len {
+        if !kw(b, i, len, b"enum") {
+            i += 1;
+            continue;
+        }
+        let Some(decl_start) = stmt_prefix_start(b, i) else {
+            i += 1;
+            continue;
+        };
+
+        let mut q = skip_ws(b, i + 4, len);
+        let name_start = q;
+        skip_ident(b, &mut q, len);
+        if q == name_start {
+            i += 1;
+            continue;
+        }
+        let name = &src[name_start..q];
+        q = skip_ws(b, q, len);
+        if q >= len || b[q] != b'{' {
+            i += 1;
+            continue;
+        }
+        let close = skip_balanced(b, q, len, b'{', b'}');
+        if close <= q + 1 || close > len {
+            i += 1;
+            continue;
+        }
+        let body = &src[q + 1..close - 1];
+
+        let Some(replacement) = enum_to_object(name, body) else {
+            i += 1;
+            continue;
+        };
+
+        let is_declare = {
+            let mut p = decl_start;
+            let mut declare = false;
+            while p < i {
+                if kw(b, p, len, b"declare") {
+                    declare = true;
+                }
+                p += 1;
+            }
+            declare
+        };
+
+        out.push_str(&src[last..decl_start]);
+        if !is_declare {
+            out.push_str(&replacement);
+        }
+        for _ in src[decl_start..close].bytes().filter(|c| *c == b'\n') {
+            out.push('\n');
+        }
+        last = close;
+        i = close;
+    }
+
+    out.push_str(&src[last..]);
+    out
+}
+
+/// The start of the statement that declares an `enum` at `enum_pos`, allowing
+/// `export` / `const` / `declare` prefixes. `None` when the keyword is not at
+/// a statement boundary (inside a string, a comment, or a member access).
+fn stmt_prefix_start(b: &[u8], enum_pos: usize) -> Option<usize> {
+    let mut p = enum_pos;
+    loop {
+        while p > 0 && matches!(b[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
+            p -= 1;
+        }
+        let mut matched = false;
+        for kwd in [b"export".as_slice(), b"const".as_slice(), b"declare".as_slice()] {
+            let l = kwd.len();
+            if p >= l
+                && &b[p - l..p] == kwd
+                && (p == l || !(b[p - l - 1].is_ascii_alphanumeric() || b[p - l - 1] == b'_' || b[p - l - 1] == b'$'))
+            {
+                p -= l;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+    if p == 0 {
+        return Some(0);
+    }
+    match b[p - 1] {
+        b';' | b'{' | b'}' | b')' => Some(p),
+        _ => None,
+    }
+}
+
+fn is_plain_ident(s: &str) -> bool {
+    let mut it = s.bytes();
+    match it.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {}
+        _ => return false,
+    }
+    it.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
+}
+
+/// Split an enum body on top-level commas (quotes/brackets aware).
+fn split_members(body: &str) -> Vec<&str> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&body[start..]);
+    out
+}
+
+/// One literal member value as JSON text (number or string).
+fn member_literal(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let first = v.as_bytes()[0];
+    if first == b'"' || first == b'\'' {
+        if v.len() < 2 || v.as_bytes()[v.len() - 1] != first {
+            return None;
+        }
+        let inner = &v[1..v.len() - 1];
+        let mut escaped = String::with_capacity(inner.len() + 2);
+        for ch in inner.chars() {
+            match ch {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        return Some(format!("\"{escaped}\""));
+    }
+    if v.bytes()
+        .all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'-' | b'+' | b'e' | b'E' | b'x' | b'X' | b'a'..=b'f' | b'A'..=b'F'))
+        && v.bytes().any(|c| c.is_ascii_digit())
+    {
+        return Some(v.to_string());
+    }
+    None
+}
+
+fn json_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 9.0e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn enum_to_object(name: &str, body: &str) -> Option<String> {
+    if !is_plain_ident(name) {
+        return None;
+    }
+    let mut members: Vec<(String, String)> = Vec::new();
+    let mut auto: f64 = 0.0;
+    for raw in split_members(body) {
+        let mem = raw.trim();
+        if mem.is_empty() {
+            continue;
+        }
+        let (mname, value) = match mem.find('=') {
+            Some(eq) => (mem[..eq].trim(), Some(mem[eq + 1..].trim())),
+            None => (mem, None),
+        };
+        if !is_plain_ident(mname) {
+            return None;
+        }
+        let json_val = match value {
+            None => {
+                let v = json_number(auto);
+                auto += 1.0;
+                v
+            }
+            Some(v) => {
+                let lit = member_literal(v)?;
+                if !lit.starts_with('"') {
+                    if let Ok(n) = lit.parse::<f64>() {
+                        auto = n + 1.0;
+                    }
+                }
+                lit
+            }
+        };
+        members.push((mname.to_string(), json_val));
+    }
+
+    let mut obj = String::from("{");
+    for (i, (k, v)) in members.iter().enumerate() {
+        if i > 0 {
+            obj.push(',');
+        }
+        obj.push('"');
+        obj.push_str(k);
+        obj.push_str("\":");
+        obj.push_str(v);
+    }
+    obj.push('}');
+    Some(format!("var {name} = Object.freeze({obj});"))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn blank(out: &mut [u8], from: usize, to: usize) {
@@ -618,5 +869,54 @@ mod tests {
         let js = strip("const t = `x: ${y}`; const z: number = 1;");
         assert!(js.contains("`x: ${y}`"));
         assert!(js.contains("const z"));
+    }
+
+    #[test]
+    fn rewrites_numeric_enum() {
+        let js = strip("enum Color { Red, Green, Blue = 5, Next }");
+        assert_eq!(
+            js.trim(),
+            r#"var Color = Object.freeze({"Red":0,"Green":1,"Blue":5,"Next":6});"#
+        );
+    }
+
+    #[test]
+    fn rewrites_string_enum() {
+        let js = strip("export enum Dir { Up = 'up', Down = \"down\" } plain;");
+        assert!(
+            js.contains(r#"var Dir = Object.freeze({"Up":"up","Down":"down"});"#),
+            "{js}"
+        );
+        assert!(!js.contains("export enum"), "{js}");
+    }
+
+    #[test]
+    fn leaves_plain_object_literals_alone() {
+        let js = strip("const o = { a: 1 };");
+        assert!(js.contains("{ a: 1 }"), "{js}");
+    }
+
+    #[test]
+    fn enum_rewrite_preserves_line_count() {
+        let src = "enum E {\n  A,\n  B\n}\nlet x = 1;";
+        let js = strip(src);
+        assert_eq!(src.matches('\n').count(), js.matches('\n').count(), "{js}");
+        assert!(js.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn declare_enum_is_erased() {
+        let js = strip("declare enum E { A }\nlet y = 2;");
+        assert!(!js.contains("enum"), "{js}");
+        assert!(js.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn unsupported_enum_member_is_left_intact() {
+        // A computed member is not a literal: rewriting it would bind a wrong
+        // value, so the stripper refuses and QuickJS reports a syntax error.
+        let src = "enum E { A = foo() }";
+        let js = strip(src);
+        assert!(js.contains("enum E"), "{js}");
     }
 }

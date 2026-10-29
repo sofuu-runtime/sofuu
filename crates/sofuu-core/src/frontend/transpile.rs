@@ -43,6 +43,14 @@ pub fn transpile(src: &str, is_ts: bool) -> Result<String, String> {
     Ok(result)
 }
 
+/// JSX → `h()` calls only: no bare-import rewriting and no `/_sofuu/ui.js`
+/// import injection. The sandbox has no module system, so it installs its own
+/// `h`/`Fragment` in the realm and evaluates the result as a script.
+pub fn transpile_jsx_only(src: &str) -> Result<String, String> {
+    let mut transpiler = JsxTranspiler::new(src);
+    transpiler.transpile()
+}
+
 fn rewrite_imports(src: &str) -> String {
     let targets = [
         ("\"sofuu/ui\"", "\"/_sofuu/ui.js\""),

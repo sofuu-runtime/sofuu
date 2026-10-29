@@ -2,11 +2,16 @@
 
 # ⚡ Sofuu (素風)
 
-> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference, multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external deps.*
+> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference (experimental), multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external deps.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)]()
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(x86__64%20%26%20ARM64)-lightgrey.svg)]()
+[![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
+[![Binary Size](https://img.shields.io/badge/binary-%E2%89%A4%205.5%20MB-emerald.svg)](https://sofuu.xyz)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](https://sofuu.xyz/install)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Native-blue.svg)](https://sofuu.xyz)
+[![MCP Native](https://img.shields.io/badge/MCP-Native-purple.svg)](https://sofuu.xyz/docs#plugins)
+[![Docs](https://img.shields.io/badge/docs-sofuu.xyz-blue.svg)](https://sofuu.xyz/docs)
+[![X](https://img.shields.io/badge/follow-%40sofuu__runtime-black?logo=x&logoColor=white)](https://x.com/sofuu_runtime)
 
 > 🚧 **Active development — iterating fast.** APIs may change before a stable release.
 
@@ -19,7 +24,7 @@ Sofuu is **the AI-specific general-purpose JavaScript/TypeScript runtime** — t
 Sofuu is **not just a terminal coding agent or a local model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational operating substrate built to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process runtime.
 
 Everything AI workloads need is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
-- **In-process local LLM inference** (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
+- **In-process local LLM inference** (**experimental** — built-in engine is early stage; for production use llama.cpp or another backend via the plugin system) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
 - **Autonomous agent loops** with native tools, prompt sovereignty, and sandboxed execution
 - **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux)
 - **Model Context Protocol (MCP)** — first-class client and server support
@@ -33,7 +38,7 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 ## Features
 
 - **JS/TS runtime** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3 ms startup, TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
-- **Local edge inference** — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
+- **Local edge inference** (**experimental** — built-in engine; production use: llama.cpp or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
 - **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving, now fully bundled on Linux and macOS
@@ -186,7 +191,9 @@ sofuu run research.js
 
 ---
 
-## Local Inference
+## Local Inference (Experimental)
+
+> ⚠️ **EXPERIMENTAL**: The built-in in-process inference engine is in an early stage of development and provided for local experimentation. It may not reliably support all model architectures or quantizations. For production workloads or maximum throughput, we strongly recommend routing inference through **llama.cpp** or other dedicated inference backends via Sofuu plugins.
 
 Sofuu provides a zero-dependency, in-process inference engine supporting **GGUF**, **HuggingFace SafeTensors**, raw **PyTorch checkpoints (`.pt` / `.pth`)**, and **NumPy arrays (`.npy` / `.npz`)**:
 
@@ -424,7 +431,7 @@ Full guide: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) · specification: [do
 sofuu                        # Interactive AI chat
 sofuu chat [-m <model.gguf>] # Chat (cloud API or local model)
 sofuu dev [dir]              # AI-native full-stack dev server (--port, --host, --model)
-sofuu infer <model> "<p>"    # Pure CPU LLM inference (GGUF, zero deps)
+sofuu infer <model> "<p>"    # Pure CPU LLM inference (GGUF, zero deps, experimental)
 sofuu repl                   # JavaScript evaluation REPL
 sofuu run <file.js|ts>       # Run a JavaScript/TypeScript file
 sofuu eval "<code>"          # Evaluate a JS expression inline
@@ -773,7 +780,19 @@ Built by **Haruhito** — early-stage, bootstrapped, open-core, in active develo
 
 - Website: [sofuu.xyz](https://sofuu.xyz)
 - Source: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu)
+- Docs: [sofuu.xyz/docs](https://sofuu.xyz/docs)
+- X (Twitter): [@sofuu_runtime](https://x.com/sofuu_runtime)
 - Contact: [hello@sofuu.xyz](mailto:hello@sofuu.xyz)
+
+---
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#sofuu-runtime/sofuu&Date">
+    <img src="https://api.star-history.com/svg?repos=sofuu-runtime/sofuu&type=Date" alt="Star History Chart" width="100%">
+  </a>
+</p>
 
 ---
 

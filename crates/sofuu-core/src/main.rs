@@ -1764,6 +1764,16 @@ fn main() -> ExitCode {
     // process opts in — enable VT processing before anything prints
     // (no-op off-Windows).
     sofuu_core::rt::tui::windows_enable_vt();
+    /* Unix convention: a reader that closes the pipe early (`| head`, `| grep
+     * -q`) is a normal end of output, not a crash. Rust ignores SIGPIPE, so
+     * the first `println!` after the reader exits panics with
+     * "failed printing to stdout: Broken pipe" — observed on the Pi for
+     * `sofuu capabilities | head -c 400`. Restoring the default disposition
+     * makes the process exit quietly, the way every other CLI tool does. */
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = env::args().collect();
 
     // M3: give the JS side process.argv (the ported mod_process_set_args;

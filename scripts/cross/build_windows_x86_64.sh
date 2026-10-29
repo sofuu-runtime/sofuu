@@ -187,7 +187,10 @@ fi
 # -C linker via zig-ld.sh: rustc emits its own leading flags (-m64) before
 # any link-arg, so a bare `zig`/`link-arg=cc` chain can't work — the wrapper
 # guarantees `zig cc` is argv[0..1].
-export RUSTFLAGS="-C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-target -C link-arg=$TARGET -C link-self-contained=no"
+# PC-07 (AUDIT-2026-10-29): .exe shipped with 16 build-host absolute paths
+# (/Users/<dev>/...) — the same prefix remap `make` uses strips them.
+REMAP="$(bash "$REPO_ROOT/scripts/cross/remap_flags.sh")"
+export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-target -C link-arg=$TARGET -C link-self-contained=no"
 
 # -p sofuu-core: build only the CLI package (see build_linux_x86_64.sh —
 # the desktop app's notification stack needs target libdbus/pkg-config).

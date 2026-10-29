@@ -25,7 +25,11 @@ endif
 #   SOFUU_QTSQ_DIR=~/projects/<checkout> make
 #
 # Default to local checkout if present
-SOFUU_QTSQ_DIR ?= $(firstword $(wildcard /Users/priyanshuboruah/projects/black-hole-disk $(HOME)/projects/black-hole-disk))
+# PC-07 (AUDIT-2026-10-29): no absolute developer path here — `$(HOME)/…` is
+# the same checkout expressed reusably, so a committed file carries no
+# individual's home directory (the same rule the QTSQ probe in
+# crates/sofuu-core/build.rs follows).
+SOFUU_QTSQ_DIR ?= $(firstword $(wildcard $(HOME)/projects/black-hole-disk))
 QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ_DIR)/libqtsq.dylib))
 
 # ──────────────────────────────────────────────────────────────────
@@ -46,6 +50,18 @@ SIZE_LIMIT ?= 5767168   # 5.5 MB hard cap (bytes)
 all: $(TARGET)
 
 # ── Rust-first build (default and only maintained build) ────────
+#
+# PC-07 (AUDIT-2026-10-29): every artifact built here must be independent of
+# the machine that built it. rustc records the path it is handed into panic
+# locations and `file!()`, and cargo hands it absolute paths — so a release
+# binary shipped 87 absolute build-host paths (`~/.cargo/registry/...`,
+# `~/.rustup/...`, `<checkout>/crates/...`). The prefixes need $HOME/$PWD,
+# which cargo cannot expand from `.cargo/config.toml`, so they are computed
+# by scripts/cross/remap_flags.sh and passed through RUSTFLAGS here (and in
+# the cross scripts). A RUSTFLAGS variable replaces the config list, which is
+# why the script also emits the generic prefixes the config carries.
+SOFUU_REMAP_FLAGS := $(shell bash scripts/cross/remap_flags.sh 2>/dev/null)
+
 cargo-build:
 	@if [ -z "$(SOFUU_QTSQ_DIR)" ]; then \
 		echo "  \033[31m✗ SOFUU_QTSQ_DIR is not set.\033[0m"; \
@@ -58,7 +74,7 @@ cargo-build:
 		echo "    QTSQ is a mandatory core component of Sofuu."; \
 		exit 1; \
 	fi
-	cargo build --release
+	RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $$RUSTFLAGS" cargo build --release
 
 $(TARGET): cargo-build
 	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"
@@ -167,7 +183,8 @@ header-sync:
 # of the capi graph only.
 libsofuu: header-sync
 	@echo "  \033[36mCARGO\033[0m  libsofuu  [arch=$(ARCH)]"
-	CARGO_PROFILE_RELEASE_PANIC=unwind cargo build --release -p sofuu-capi
+	CARGO_PROFILE_RELEASE_PANIC=unwind RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $$RUSTFLAGS" \
+		cargo build --release -p sofuu-capi
 	@mkdir -p dist
 	@cp target/release/libsofuu_capi.a dist/libsofuu.a 2>/dev/null || \
 		cp target/release/libsofuu.a dist/libsofuu.a 2>/dev/null || true

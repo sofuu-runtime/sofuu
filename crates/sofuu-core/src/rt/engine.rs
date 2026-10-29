@@ -1386,6 +1386,20 @@ unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_in
     0
 }
 
+/// Report a thrown value exactly once, in Node's order: a registered
+/// `process.on('uncaughtException')` handler gets the first shot and keeps the
+/// runtime alive; otherwise the throw is dumped to stderr (which also flags
+/// the run status the CLI turns into exit 1).
+///
+/// One helper so the two global-eval entry points below cannot drift on the
+/// error path — the difference between them is only whether the completion
+/// value comes back to the caller.
+unsafe fn dispatch_or_report_uncaught(ctx: *mut qjs::JSContext, exc: qjs::JSValueConst) {
+    if unsafe { process_dispatch_uncaught(ctx, exc) } == 0 {
+        unsafe { report_uncaught(ctx, exc) };
+    }
+}
+
 /// engine_eval_string — global eval; exceptions go through
 /// process_dispatch_uncaught (uncaughtException handler) first, then the
 /// stderr dump + non-zero exit (the C order).
@@ -1403,12 +1417,7 @@ unsafe fn engine_eval_string(
     if unsafe { qjs::is_exception(result) } {
         // SAFETY: exception value is live; uncaught dispatch borrows it.
         let exc = unsafe { qjs::JS_GetException(ctx) };
-        // A registered process.on('uncaughtException') handler gets the first
-        // shot and keeps the runtime alive (Node); otherwise the throw is
-        // reported once as an uncaught exception and the process exits 1.
-        if unsafe { process_dispatch_uncaught(ctx, exc) } == 0 {
-            unsafe { report_uncaught(ctx, exc) };
-        }
+        unsafe { dispatch_or_report_uncaught(ctx, exc) };
         // SAFETY: exc/result are live values.
         unsafe { qjs::sofuu_js_free_value(ctx, exc) };
         unsafe { qjs::sofuu_js_free_value(ctx, result) };
@@ -1424,6 +1433,109 @@ unsafe fn engine_eval_string(
         return 1;
     }
     0
+}
+
+// ── PC-09: `sofuu eval` echoes its completion value ───────────────
+
+/// `engine_eval_string`, plus the REPL rendering of the completion value.
+///
+/// `sofuu eval "<code>"` is the one-shot form of `sofuu repl`, so it shows
+/// what its program completed with: `sofuu eval "1+1"` prints `2`. The value
+/// is rendered by `repl_inspect` — the SAME renderer the interactive REPL
+/// uses, not a second formatter — so a string prints as `'hi'`, an object as
+/// JSON, and a number the way `%g`/`%lld` rules dictate, on both surfaces.
+///
+/// The evaluation is `engine_eval_string`'s, step for step: same global eval,
+/// same filename, the same uncaughtException dispatch, ONE stderr report, the
+/// same event-loop drain, the same status. (The completed value is held until
+/// after the drain instead of being freed before it, because it is about to
+/// be rendered; nothing else about the ordering changes, and no GC-sensitive
+/// behaviour depends on the reference being dropped early.) A program that
+/// throws therefore produces whatever it produced before — on stderr, with
+/// exit 1 — and nothing here writes to stdout, which is what keeps a throwing
+/// `eval`'s stdout byte-identical to `sofuu run`'s.
+///
+/// `None` is "no completion to echo", and it covers three cases:
+///   * the completion is `undefined` (a program of statements, or an
+///     expression like `console.log(...)` whose value is undefined) — the
+///     old silent output, unchanged;
+///   * the completion is a Promise. No value exists at completion time, and
+///     the renderer can only JSON-encode the pending handle as `{}`, which
+///     would put a stray line on stdout AFTER whatever the promise logged.
+///     `sofuu eval '<expr>.then(log)' | tail -1` is a real pipeline in the
+///     contract harness, so printing the handle would corrupt it. Log from
+///     the `.then` when that value matters;
+///   * the program did not complete cleanly (see the status check below).
+pub unsafe fn eval_completion_display(
+    ctx: *mut c_void,
+    source: &str,
+    filename: &str,
+) -> (c_int, Option<String>) {
+    let ctx = ctx as *mut qjs::JSContext;
+    if ctx.is_null() {
+        return (1, None);
+    }
+    // JS_Eval reads one byte past input_len (see engine_read_file's note), so
+    // it gets NUL-terminated storage — the same contract the C-string FFI
+    // boundary hands `engine_eval_string`.
+    let src = CString::new(source).unwrap_or_default();
+    let name = CString::new(filename).unwrap_or_default();
+
+    let result = unsafe {
+        qjs::JS_Eval(
+            ctx,
+            src.as_ptr(),
+            src.as_bytes().len(),
+            name.as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL,
+        )
+    };
+
+    if unsafe { qjs::is_exception(result) } {
+        // SAFETY: the exception value is live; the dispatch borrows it.
+        let exc = unsafe { qjs::JS_GetException(ctx) };
+        unsafe { dispatch_or_report_uncaught(ctx, exc) };
+        // SAFETY: exc/result are live values.
+        unsafe { qjs::sofuu_js_free_value(ctx, exc) };
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        return (1, None);
+    }
+
+    // The loop runs whether or not anyone looks at the value: timers, I/O and
+    // promise chains are part of what `eval` executes. A rejection or
+    // microtask overflow that surfaces during the drain means the program did
+    // not complete cleanly, so no value is echoed and the exit-1 signal is
+    // the one `engine_eval_string` already gives.
+    unsafe { sofuu_loop_run(ctx) };
+    if run_status(ctx).has_uncaught_error {
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        return (1, None);
+    }
+
+    let display = unsafe { completion_display(ctx, result) };
+    // SAFETY: result is a live value, owned here.
+    unsafe { qjs::sofuu_js_free_value(ctx, result) };
+    (0, display)
+}
+
+/// The echo half of `repl_inspect`: `None` for the two completions that must
+/// not be printed, rendering for everything else.
+unsafe fn completion_display(
+    ctx: *mut qjs::JSContext,
+    val: qjs::JSValueConst,
+) -> Option<String> {
+    if unsafe { qjs::is_undefined(val) } {
+        return None;
+    }
+    // JS_PromiseState reports Invalid for every non-promise, so this asks "is
+    // this a promise?" without invoking a user `.then` getter (a completion
+    // may be any object; a getter here would run code and could throw).
+    if unsafe { qjs::is_object(val) }
+        && unsafe { qjs::JS_PromiseState(ctx, val) } != qjs::JSPromiseStateEnum::Invalid
+    {
+        return None;
+    }
+    Some(unsafe { repl_inspect(ctx, val) })
 }
 
 /// engine_run_jobs — pump the microtask/job queue until empty.

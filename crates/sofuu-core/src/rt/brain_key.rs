@@ -44,17 +44,106 @@ pub fn key_file_path() -> Option<String> {
     Some(format!("{home}/.sofuu/brain.key"))
 }
 
+/// A password a diagnostic pinned for this process (`pin_vault_password`).
+/// Unset for every normal runtime process, so the resolver below behaves
+/// exactly as it always has there.
+static PINNED: OnceLock<String> = OnceLock::new();
+
 /// The machine-local vault password.
 ///
 /// Cached for the process: the file is read (or created) once, so a brain
 /// flush never pays a syscall for it and cannot observe a half-written key.
+///
+/// PC-06 (audit 2026-10-29, Pi 5): a pinned password wins over the cache,
+/// because the one caller that pins (`sofuu doctor`) must be able to say
+/// "read THIS key, and create nothing" before its first brain open.
 pub fn local_vault_password() -> String {
     #[cfg(test)]
     if let Some(v) = TEST_KEY_OVERRIDE.with(|c| c.borrow().clone()) {
         return v;
     }
+    if let Some(v) = PINNED.get() {
+        return v.clone();
+    }
     static CACHED: OnceLock<String> = OnceLock::new();
     CACHED.get_or_init(resolve_password).clone()
+}
+
+/// What the next brain open in THIS process would use as its vault
+/// password, observed WITHOUT creating or changing anything.
+///
+/// `local_vault_password` resolves by creating `~/.sofuu/` and the 0600
+/// key file on first use — right for a runtime (a brain that cannot
+/// persist is worse than a new file), wrong for a diagnostic (a command
+/// that only answers "is this healthy?" must not write to the user's
+/// home). This type is the read-only mirror of that resolution: same
+/// order, same trimming, no mkdir, no key, no chmod.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyState {
+    /// `SOFUU_BRAIN_KEY` is set and non-empty — used verbatim.
+    Env(String),
+    /// The key file exists and holds a usable key.
+    File { path: String, key: String },
+    /// Neither override nor key file: the first real brain write creates
+    /// one. `path` is where it would land (`None` when there is no home).
+    NoKeyYet { path: Option<String> },
+    /// No HOME/USERPROFILE: the runtime falls back to a per-process key.
+    NoHome,
+}
+
+impl KeyState {
+    /// The password a read would use, when the machine has one at all.
+    pub fn password(&self) -> Option<&str> {
+        match self {
+            KeyState::Env(v) => Some(v.as_str()),
+            KeyState::File { key, .. } => Some(key.as_str()),
+            KeyState::NoKeyYet { .. } | KeyState::NoHome => None,
+        }
+    }
+
+    /// Whether a brain file written on this machine can be opened here.
+    pub fn present(&self) -> bool {
+        self.password().is_some()
+    }
+}
+
+/// Observe the machine key without creating anything (`sofuu doctor`).
+pub fn key_state() -> KeyState {
+    if let Ok(v) = std::env::var(KEY_ENV) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return KeyState::Env(v);
+        }
+    }
+    match key_file_path() {
+        Some(path) => match std::fs::read_to_string(&path) {
+            /* An empty/whitespace key file is not a key: `load_or_create_key`
+             * would regenerate it, so a reader must not call it usable. */
+            Ok(body) if !body.trim().is_empty() => KeyState::File {
+                path,
+                key: body.trim().to_string(),
+            },
+            _ => KeyState::NoKeyYet { path: Some(path) },
+        },
+        None => KeyState::NoHome,
+    }
+}
+
+/// Pin the vault password every brain open in this process uses — a
+/// doctor-only escape hatch, never called by runtime code.
+///
+/// `None` pins a random key that is NEVER written: the brain then behaves
+/// as it would in a home with no key yet (a throwaway store can be written
+/// and read back; an existing store refuses to open), which is exactly the
+/// observation `sofuu doctor` needs without mutating `$HOME`.
+pub fn pin_vault_password(pw: Option<&str>) {
+    let v = match pw {
+        Some(v) => v.to_string(),
+        None => random_hex(32),
+    };
+    /* First pin wins: a second caller cannot swap the key out from under
+     * an open already in flight. */
+    let _ = PINNED.set(v);
 }
 
 fn resolve_password() -> String {

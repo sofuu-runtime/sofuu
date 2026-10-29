@@ -183,6 +183,64 @@ setTimeout(() => {
         () => process.exit(1));
 }, 60000);
 
+/* ── C-ABI export probe (PR-06, AUDIT-2026-10-29, Raspberry Pi 5) ───────
+ * Every part of this probe used to be the Mach-O answer, hardcoded: the
+ * artefact `dist/libsofuu.dylib`, the flag `nm -gU`, and the symbol
+ * spelling `_sofuu_rt_call`. On Linux the library is `dist/libsofuu.so`,
+ * `-gU` is a Mach-O-only option, and ELF spells the symbol WITHOUT the
+ * leading underscore — so the pipeline printed 0 for a perfectly good
+ * library and the gate asserted on a number that never described the
+ * Linux build.
+ *
+ * Probe this platform's spelling instead:
+ *   darwin   dist/libsofuu.dylib → .a → .so    nm -gU                _sofuu_rt_call
+ *   linux    dist/libsofuu.so → .a → .dylib    nm -D --defined-only   sofuu_rt_call
+ * `-g` keeps external symbols only; `-U` (Mach-O) also drops the
+ * undefined entries. An ELF static archive has no dynamic symbol table,
+ * so its probe uses `-g --defined-only`.
+ *
+ * `found: false` means no artefact exists for this platform at all — the
+ * caller says so out loud instead of reporting a bogus "0 exports".      */
+async function cAbiExport() {
+    const platform = String(process.platform || "");
+    const darwin = platform === "darwin";
+    const linux = platform === "linux";
+    const symbol = darwin ? "_sofuu_rt_call" : "sofuu_rt_call";
+    if (!darwin && !linux) {
+        return { found: false, platform: platform, artefact: "", symbol: symbol,
+            nm: "", count: 0, checked: [],
+            why: "no C-ABI probe is defined for platform '" + platform + "'" };
+    }
+    const candidates = darwin
+        ? [{ file: "dist/libsofuu.dylib", nm: "-gU" },
+           { file: "dist/libsofuu.a", nm: "-gU" },
+           { file: "dist/libsofuu.so", nm: "-gU" }]
+        : [{ file: "dist/libsofuu.so", nm: "-D --defined-only" },
+           { file: "dist/libsofuu.a", nm: "-g --defined-only" },
+           { file: "dist/libsofuu.dylib", nm: "-D --defined-only" }];
+    const checked = [];
+    for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        const there = await sh("[ -f " + c.file + " ] && echo yes || echo no");
+        checked.push(c.file);
+        if (String(there.out).trim() !== "yes") continue;
+        /* `grep -c` always prints a count (0 when nothing matched); the
+         * trailing `|| true` only stops its exit status from appending a
+         * second line — the count itself is never fabricated. */
+        const hit = await sh("nm " + c.nm + " " + c.file +
+            " 2>/dev/null | grep -c ' " + symbol + "$' || true");
+        const lines = String(hit.out).trim().split("\n");
+        const count = Number(lines[lines.length - 1]) || 0;
+        return { found: true, platform: platform, artefact: c.file,
+            nm: "nm " + c.nm, symbol: symbol, count: count, checked: checked };
+    }
+    return { found: false, platform: platform, artefact: "", symbol: symbol,
+        nm: "nm " + (darwin ? "-gU" : "-D --defined-only"), count: 0,
+        checked: checked,
+        why: "no libsofuu artefact for '" + platform + "' in dist/ — checked " +
+            checked.join(", ") };
+}
+
 async function main() {
     // ONE policy, written once — every surface below answers through it.
     const POLICY = {
@@ -283,12 +341,26 @@ async function main() {
     // The embedded host sets the SAME policy object at rt-create time
     // (sofuu_rt_new's config_json carries "policy" into sofuu.policy.set —
     // S5) and evaluation runs through the same registered evaluator; the
-    // symbol contract is the suite's ABI gate (T5.5).
-    const nm = await sh("ls dist/libsofuu.dylib >/dev/null 2>&1 && " +
-        "nm -gU dist/libsofuu.dylib 2>/dev/null | grep -c ' _sofuu_rt_call$' || echo 0");
+    // symbol contract is the suite's ABI gate (T5.5). The artefact, the
+    // `nm` invocation and the symbol spelling are all platform-dependent —
+    // see cAbiExport() — so this gate measures the library this host
+    // actually ships instead of a Mach-O path that simply never matched.
+    const abi = await cAbiExport();
     const hdr = await sh("grep -c 'SOFUU_ERR_BAD_CONFIG' include/sofuu_embed.h 2>/dev/null || echo 0");
-    assert("C ABI: the rt-call symbol is exported and the config-envelope contract is in the embed header",
-        String(nm.out).trim() !== "0" && Number(String(hdr.out).trim()) >= 1);
+    if (!abi.found) {
+        /* Say it out loud: a missing artefact is not "0 exported symbols". */
+        console.error("  ⚠️  C ABI: " + abi.why +
+            " — the rt-call export is UNVERIFIED (not absent)");
+    } else if (abi.count < 1) {
+        console.error("  ⚠️  C ABI: " + abi.artefact + " exists but `" + abi.nm +
+            "` lists no '" + abi.symbol + "' export — the library really is missing the ABI");
+    }
+    assert("C ABI: the rt-call symbol is exported and the config-envelope contract is in the embed header [" +
+        (abi.found
+            ? abi.platform + ": " + abi.artefact + " has " + abi.symbol
+            : abi.platform + ": no artefact to probe")
+        + "]",
+        abi.found && abi.count >= 1 && Number(String(hdr.out).trim()) >= 1);
 
     await sh("rm -f " + policyFile);
     console.log(`\n=== t72 results: ${results.passed} passed, ${results.failed} failed ===`);

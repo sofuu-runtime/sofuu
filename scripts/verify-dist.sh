@@ -7,6 +7,8 @@
 #    primitive available and the session document surface exported).
 # 3. doctor: exits 0 on a complete build.
 # 4. version parity: Cargo, the CLI banner, and npm agree.
+# 5. provenance (PC-07): no absolute build-host path in the binary or in the
+#    dist CLI artifacts, and every one of them carries the source revision.
 #
 # Usage: bash scripts/verify-dist.sh [dist-dir] [binary]
 set -u
@@ -114,6 +116,100 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
     if [ -n "$npm_v" ] && [ -n "$cargo_v" ] && [ "$npm_v" != "$cargo_v" ]; then
         say "WARN npm version ($npm_v) differs from Cargo ($cargo_v) — align at the publish step"
     fi
+
+    # ── 5. provenance: build paths + source revision (PC-07) ──────────────
+    # AUDIT-2026-10-29: a published binary embedded 87 absolute build-host
+    # paths — <home>/.cargo/registry/…, <home>/.rustup/…, <checkout>/crates/…
+    # — and carried no source revision at all, so a binary could not be mapped
+    # back to what produced it. Paths are remapped at compile time by
+    # scripts/cross/remap_flags.sh (wired into the Makefile and the cross
+    # scripts); the revision comes from crates/sofuu-core/build.rs and is
+    # queryable as build.revision in `sofuu capabilities`.
+    scan_text() { # strings(1), or a printable-run fallback where it is absent
+        if command -v strings >/dev/null 2>&1; then
+            strings "$1" 2>/dev/null
+        else
+            LC_ALL=C tr -c '[:print:]' '\n' < "$1" 2>/dev/null
+        fi
+    }
+    # An absolute home root, not a URL path: the leading "/" must not be
+    # preceded by a word character, "." "_" ":" or another "/", so
+    # https://host/home/page does not trip the gate.
+    leak_re='(^|[^[:alnum:]._:/])/(Users|home)/'
+    check_paths() {
+        hits=$(scan_text "$1" | grep -E "$leak_re" | grep -oE '/(Users|home)/[^[:space:]]*' | sort -u)
+        n=$(printf '%s\n' "$hits" | grep -c . || true)
+        if [ "$n" -eq 0 ]; then
+            say "OK  $(basename "$1"): no absolute build-host paths"
+        else
+            fail "$(basename "$1") embeds $n absolute build-host path(s), e.g. $(printf '%s\n' "$hits" | head -1)"
+            say "    rebuild it with the remap wired in (make / make dist / the cross scripts)"
+        fi
+    }
+    stamp_of() { # the revision a binary was built from ("" when missing)
+        "$1" capabilities 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("build", {}).get("revision", ""))
+except Exception:
+    print("")' 2>/dev/null
+    }
+    check_paths "$BIN"
+    # The shipped CLI artifacts are the ones this gate exists for; a stale
+    # one in dist/ is reported by name so it can be rebuilt.
+    for art in "$DIST"/sofuu-*; do
+        [ -f "$art" ] || continue
+        case "$art" in *.tar.gz | *.sha256 | *.txt) continue ;; esac
+        [ "$art" = "$BIN" ] && continue
+        check_paths "$art"
+    done
+
+    # ── 5b. source revision stamp ─────────────────────────────────────────
+    rev=$(stamp_of "$BIN")
+    case "$rev" in
+        "")
+            fail "no source revision stamp — capabilities.build.revision is empty (build.rs sets SOFUU_BUILD)"
+            ;;
+        unknown)
+            fail "source revision is 'unknown' — built outside a git checkout; set SOFUU_BUILD=<short-sha> for those builds"
+            ;;
+        *)
+            say "OK  build stamp: $rev"
+            if scan_text "$BIN" | grep -qF -- "$rev"; then
+                say "OK  stamp is embedded in the binary's strings"
+            else
+                fail "build stamp '$rev' does not appear in the binary's strings"
+            fi
+            case "$rev" in
+                *-dirty) say "WARN built from a dirty tree ($rev) — release artifacts must come from a clean checkout" ;;
+            esac
+            base=${rev%-dirty}
+            # Compare against the full sha by prefix: git's abbreviation width
+            # grows with the object count, so a 7-char stamp is correct for a
+            # 9-char `--short` HEAD of the same commit.
+            head_full=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+            head_short=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
+            if [ -z "$head_full" ]; then
+                say "WARN no git checkout — cannot compare the stamp against HEAD"
+            elif [ "${head_full#"$base"}" != "$head_full" ]; then
+                say "OK  stamp matches HEAD ($head_short)"
+            else
+                fail "stamp ($base) does not match HEAD ($head_short) — the binary is stale, rebuild it"
+            fi
+            # A mixed dist (one artifact from an older revision) is a
+            # release-integrity bug, so every shipped CLI binary must carry it.
+            for art in "$DIST"/sofuu-*; do
+                [ -f "$art" ] || continue
+                case "$art" in *.tar.gz | *.sha256 | *.txt) continue ;; esac
+                [ "$art" = "$BIN" ] && continue
+                if scan_text "$art" | grep -qF -- "$base"; then
+                    say "OK  $(basename "$art") carries stamp $base"
+                else
+                    fail "$(basename "$art") carries no stamp for $base — rebuild it (make dist / the cross scripts)"
+                fi
+            done
+            ;;
+    esac
 fi
 
 exit $rc

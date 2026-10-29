@@ -9,7 +9,52 @@
 // only calls them under its own QTSQ guard) sees the same JS-visible absence.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// ── PC-07: source revision stamp ──────────────────────────────────────────
+//
+// AUDIT-2026-10-29: published binaries carried no way back to their source.
+// The stamp is the short git revision, plus `-dirty` when the tree differs
+// from it (the same signal scripts/pack/stage_legal.sh records in
+// SHIP-MANIFEST.txt). capabilities.rs reports it as `build.revision`, so it is
+// queryable with `sofuu capabilities` and present in the binary's strings.
+//
+// git is optional at build time: no checkout or no git binary yields
+// "unknown" instead of a build failure (release tarball, vendored source
+// drops). SOFUU_BUILD overrides the whole thing so those builds can stamp the
+// revision they came from.
+fn git(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn build_stamp(repo: &Path) -> String {
+    if let Ok(v) = env::var("SOFUU_BUILD") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    let Some(sha) = git(repo, &["rev-parse", "--short", "HEAD"]).filter(|s| !s.is_empty()) else {
+        return "unknown".to_string();
+    };
+    let dirty = git(repo, &["status", "--porcelain"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if dirty {
+        format!("{sha}-dirty")
+    } else {
+        sha
+    }
+}
 
 fn main() {
     // Declare the cfg so the `unexpected_cfgs` lint stays quiet in both
@@ -130,4 +175,29 @@ fn main() {
         println!("cargo:warning=weights_img.sem is empty — image embeddings report model-unavailable until trained");
     }
     let _ = std::fs::write(&staged, bytes);
+
+    // ── PC-07: stamp the source revision ─────────────────────────────────
+    let root = manifest.canonicalize().unwrap_or_else(|_| manifest.clone());
+    // CARGO_MANIFEST_DIR is <repo>/crates/sofuu-core.
+    let repo = root
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(&root)
+        .to_path_buf();
+    println!("cargo:rustc-env=SOFUU_BUILD={}", build_stamp(&repo));
+    println!("cargo:rerun-if-env-changed=SOFUU_BUILD");
+    // The stamp is only as fresh as the last build-script run, so watch what
+    // git moves: HEAD on checkout, the branch ref on commit, the index on add.
+    for f in ["HEAD", "index"] {
+        let p = repo.join(".git").join(f);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
+    if let Some(reference) = git(&repo, &["symbolic-ref", "-q", "HEAD"]) {
+        let p = repo.join(".git").join(reference);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
 }

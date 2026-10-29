@@ -3,7 +3,8 @@
 // One source of truth for "what can this build do", assembled from three
 // places and exposed as a single JSON document:
 //
-//   * compile time  — version, os/arch, feature cfgs (qtsq, metal, simd)
+//   * compile time  — version, source revision, os/arch, feature cfgs
+//                     (qtsq, metal, simd)
 //   * runtime       — thread count, RAM, GPU availability
 //   * contract/     — the audited surface matrix (contract/matrix.json),
 //                     embedded at build time so the manifest cannot drift
@@ -207,7 +208,11 @@ pub fn manifest() -> Value {
         "build": {
             "features": features,
             "missing": missing,
-            "platform_absent": platform_absent()
+            "platform_absent": platform_absent(),
+            // PC-07 (AUDIT-2026-10-29): a shipped binary carried no way back
+            // to its source. Stamped by build.rs (git short rev, `-dirty` when
+            // the tree differs); "unknown" only outside a checkout.
+            "revision": env!("SOFUU_BUILD")
         },
         "engine": {
             "formats": ["gguf", "safetensors", "pt", "npy"],
@@ -654,6 +659,11 @@ mod tests {
         assert!(m["runtime"]["version"].as_str().is_some());
         assert!(m["runtime"]["threads"].as_u64().unwrap_or(0) > 0);
         assert!(m["build"]["features"].as_array().is_some());
+        // PC-07: every build carries its source revision ("unknown" only when
+        // built outside a git checkout without SOFUU_BUILD).
+        assert!(m["build"]["revision"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
     }
 
     #[test]

@@ -7,6 +7,12 @@
 // unknown model means a quiet 32,768 window. This command probes both for
 // real and prints what it finds, with a non-zero exit when a hard
 // dependency (QTSQ) is missing.
+//
+// PC-06 (audit 2026-10-29, Pi 5): every probe here is READ-ONLY. The brain
+// key and the brain store are created by the first real write, never by a
+// diagnostic — `HOME=$(mktemp -d) sofuu doctor` used to leave a 65 B
+// brain.key in that home and then blame the project's existing brain for
+// not opening with the key it had just invented.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -178,6 +184,19 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
 
     // ── 1. QTSQ + brain (the silent-failure pair) ──────────────────
     section("QTSQ / brain");
+    /* PC-06 (audit 2026-10-29, Pi 5): a diagnostic must not tidy up the
+     * install it is describing. Every brain open below resolves the vault
+     * password, and the runtime's resolver CREATES `~/.sofuu/` plus a 0600
+     * brain.key on first use — so `HOME=$(mktemp -d) sofuu doctor` left a
+     * 65 B key behind and then reported the project's pre-existing brain
+     * as "cannot be opened with any known key": the fresh key it had just
+     * written was not the one that wrote the file. Observe the key without
+     * creating it, and either pin that exact password (a real HOME: every
+     * read below behaves as the runtime would) or a throwaway per-process
+     * key that never reaches disk (no key yet: throwaway stores still
+     * round-trip, an existing store refuses). */
+    let key_state = sofuu_core::rt::brain_key::key_state();
+    sofuu_core::rt::brain_key::pin_vault_password(key_state.password());
     /* The probe path is INLINED, not passed through process.env: the
      * process.env object is a snapshot taken at engine init, so a var set
      * afterwards is invisible to JS (it would open the literal path
@@ -266,15 +285,19 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     #[cfg(has_qtsq)]
     if qtsq_linked && bp.exists() {
         section("brain store");
+        use sofuu_core::rt::brain_key::KeyState;
+        /* PC-06 (audit 2026-10-29): every line below is rendered from the
+         * key state OBSERVED in section 1 — the same resolution order the
+         * runtime uses, minus the first-use creation. A present key means
+         * the store can be opened exactly as the runtime would; no key
+         * means it cannot be opened by anything this process may write,
+         * so the store is described but never asked to open. */
+        let key_usable = key_state.present();
         // P2 (audit 2026-10-14): WHICH key would the next flush use — the
         // env override, the key file, or a process-local one that never
         // reopens? Observation only: this never creates the key file.
-        let env_key = std::env::var("SOFUU_BRAIN_KEY")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        match &env_key {
-            Some(v) => {
+        match &key_state {
+            KeyState::Env(v) => {
                 let hex64 = v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit());
                 if hex64 {
                     info("SOFUU_BRAIN_KEY override in use (64 hex chars)");
@@ -285,34 +308,47 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                     ));
                 }
             }
-            None => match sofuu_core::rt::brain_key::key_file_path()
-                .and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m)))
-            {
-                Some((p, md)) => {
+            KeyState::File { path, .. } => {
+                let mode = std::fs::metadata(path).ok().map(|md| {
                     #[cfg(unix)]
-                    let mode: u32 = {
+                    {
                         use std::os::unix::fs::PermissionsExt;
                         md.permissions().mode() & 0o777
-                    };
-                    #[cfg(not(unix))]
-                    let mode: u32 = 0o600;
-                    if mode == 0o600 {
-                        ok(&format!("machine key present: {} (0600)", p));
-                    } else {
-                        warn(&format!(
-                            "machine key present but mode {:o} (expected 600): {}",
-                            mode, p
-                        ));
                     }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = md;
+                        0o600
+                    }
+                });
+                match mode {
+                    Some(0o600) => ok(&format!("machine key present: {path} (0600)")),
+                    Some(m) => warn(&format!(
+                        "machine key present but mode {m:o} (expected 600): {path}"
+                    )),
+                    /* Vanished between the observation and this line: say so
+                     * rather than claim a mode. */
+                    None => info(&format!("machine key reported present, now unreadable: {path}")),
                 }
-                None => {
-                    warn(&format!(
-                        "no machine key yet ({} missing) — the FIRST brain write creates one; a key written this run is process-local and will not reopen",
-                        sofuu_core::rt::brain_key::key_file_path()
-                            .unwrap_or_else(|| "~/.sofuu/brain.key".into())
-                    ));
-                }
-            },
+            }
+            KeyState::NoKeyYet { path } => info(&format!(
+                "no brain key yet ({} missing) — it will be created on first use; this check creates nothing",
+                path.clone()
+                    .unwrap_or_else(|| "~/.sofuu/brain.key".into())
+            )),
+            KeyState::NoHome => info(
+                "HOME is unset — the runtime uses a per-process key; brains written now will not reopen (this check creates nothing)",
+            ),
+        }
+        if !key_usable {
+            /* PC-06: without a key the store cannot be opened here, and
+             * creating one to find out would both write to the user's home
+             * and still fail — the file needs the key of the HOME that
+             * wrote it. The brain is optional, so this is an observation,
+             * not a problem: no probe runs, nothing is counted. */
+            info(
+                "brain store not opened by this check: a store written under another HOME's key needs that key (restore ~/.sofuu/brain.key or set SOFUU_BRAIN_KEY) — the first brain write here creates a new one, which will not open the existing file",
+            );
         }
         // Journal state first (the same recovery an open runs): a crashed
         // commit that is rolled forward here is a fix, not a problem —
@@ -329,7 +365,14 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         // (pre-B3) brain has no manifest — still healthy, just unsegmented.
         // `_ex` distinguishes "not segmented" from "a container no known
         // key opens" — a wrong-key brain used to read as a healthy ✓.
-        let manifest_ex = unsafe { sofuu_core::rt::brain_store::read_manifest_ex(&bp.to_string_lossy()) };
+        // PC-06: with no key this read cannot succeed, so it is not made —
+        // an -4 from a key this process would have had to create is not a
+        // fact about the install.
+        let manifest_ex = if key_usable {
+            unsafe { sofuu_core::rt::brain_store::read_manifest_ex(&bp.to_string_lossy()) }
+        } else {
+            Ok(None)
+        };
         match &manifest_ex {
             Ok(Some((_, true))) => info(
                 "legacy-password encryption (pre-B4) — re-encrypts under the machine key on its next write (backup kept)",
@@ -394,7 +437,11 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                     ));
                 }
             }
-            None => {
+            /* PC-06: guarded — with no machine key this open is a
+             * guaranteed -4, and the "not opened" line above already said
+             * why; probing anyway would only add a scary warning plus a
+             * stderr refusal for a state that is normal on a new machine. */
+            None if key_usable => {
                 // Not segmented: a legacy single-file brain (or a plain
                 // fresh file). Probe its encryption directly — B4 migration
                 // state is invisible to the manifest reader. Observation
@@ -418,6 +465,7 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
                     }
                 }
             }
+            None => {}
         }
         // Live stats + tier histogram through the REAL store (the same
         // surface /brain info reads). Open runs the recovery + decay
@@ -476,9 +524,19 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             cands = cands_json,
             p = bp_js
         );
-        let out = rt.eval_repl(&probe).unwrap_or_default();
-        rt.run_jobs();
+        /* PC-06: with no machine key there is nothing to open and nothing
+         * to report — the "brain store not opened" line above already said
+         * why, so the probe does not run and no `Failed to initialize CMA`
+         * can be blamed on a HOME that simply has not written a brain yet. */
+        let out = if key_usable {
+            let o = rt.eval_repl(&probe).unwrap_or_default();
+            rt.run_jobs();
+            Some(o)
+        } else {
+            None
+        };
         let parse = |key: &str| -> Option<serde_json::Value> {
+            let out = out.as_deref()?;
             let marker = format!("\"{key}\":");
             let at = out.find(&marker)? + marker.len();
             let rest = out[at..].trim_start();
@@ -493,10 +551,10 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             };
             serde_json::from_str(rest[..end].trim_end_matches(',')).ok()
         };
-        if let Some(err) = js_error(&out) {
+        if let Some(err) = out.as_deref().and_then(js_error) {
             warn(&format!("brain store probe failed: {err}"));
             failures += 1;
-        } else {
+        } else if out.is_some() {
             let records = parse("records").and_then(|v| v.as_i64()).unwrap_or(0);
             let working = parse("working").and_then(|v| v.as_i64()).unwrap_or(0);
             let dirty = parse("dirty").and_then(|v| v.as_i64()).unwrap_or(0);

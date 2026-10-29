@@ -74,7 +74,7 @@ fn print_help() {
     println!("  sofuu repl               JavaScript evaluation REPL");
     println!("  sofuu run <file.js>      Run a JavaScript file");
     println!("  sofuu run <file.ts>      Run a TypeScript file");
-    println!("  sofuu eval \"<code>\"      Evaluate JS inline");
+    println!("  sofuu eval \"<code>\"      Evaluate JS inline (prints the value; -q to silence)");
     println!("  sofuu bundle <entry.js>  Bundle to single file");
     println!("  sofuu bundle <entry.js> -o <out.js>");
     println!("  sofuu install            Install from package.json");
@@ -91,10 +91,6 @@ fn print_help() {
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
     println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
     println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
-    println!("  sofuu capabilities       Print the runtime capability manifest as JSON");
-    println!("  sofuu tools list         List the tools the active policy allows (--json)");
-    println!("  sofuu policy check|why   Validate a policy file / explain an allow-or-deny");
-    println!("  sofuu mcp list|test|add|remove  Manage MCP servers and inspect their tools");
     println!("  sofuu version            Print version and exit");
     println!("  sofuu licenses           Print open-source licenses");
     println!("  sofuu help               Print this help");
@@ -113,6 +109,17 @@ fn print_help() {
     println!("  sofuu outputs stats      Show archive counters and diagnostics");
     println!("  sofuu outputs rebuild-index  Rebuild output metadata index");
     println!("  sofuu outputs prune      Dry-run retention candidates (use --apply to delete)");
+    /* PC-08 (audit 2026-10-29): the capability/tooling commands are real
+     * subcommands and were missing from this page. They get their own block
+     * with the COMMAND NAME first, because these are the commands a script
+     * probes (`sofuu --help | grep -E '^\s+capabilities\b'`) and because a
+     * name column reads like the `Chat commands` list below; descriptions
+     * still open at the same column as every `sofuu …` line above. */
+    println!("\n\x1b[1mProtocol commands (run as `sofuu <command>`):\x1b[0m");
+    println!("  capabilities             Print the runtime capability manifest as JSON");
+    println!("  tools list               List the tools the active policy allows (--json)");
+    println!("  policy check|why         Validate a policy file / explain an allow-or-deny");
+    println!("  mcp list|test|add|remove Manage MCP servers and inspect their tools");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
      * command — the model list lives in /provider) — stop advertising it. */
@@ -294,9 +301,17 @@ fn print_run_help(cmd: &str) {
         );
     } else {
         println!(
-            "\x1b[1mUsage:\x1b[0m sofuu eval \"<code>\"\n\n\
-             Evaluate a JavaScript string on a fresh runtime. Same exit-status\n\
-             rules as `sofuu run`.\n"
+            "\x1b[1mUsage:\x1b[0m sofuu eval \"<code>\" [options]\n\n\
+             Evaluate a JavaScript string on a fresh runtime, then print the value the\n\
+             string completed with — formatted the way `sofuu repl` formats its results.\n\
+             Nothing is printed when that value is `undefined` (a program of statements,\n\
+             or `console.log(...)`, which returns undefined), when it is a Promise (log\n\
+             from its `.then` instead), or when the code throws: a failed eval reports on\n\
+             stderr and exits 1, exactly like `sofuu run`.\n\n\
+             \x1b[1mOptions:\x1b[0m\n\
+               -q, --no-print    print no completion value — the old silent form, for\n\
+                                 scripts that only want the code's side effects\n\n\
+             Same exit-status rules as `sofuu run`.\n"
         );
     }
 }
@@ -418,8 +433,76 @@ fn print_version() {
 }
 
 /// `sofuu eval "<code>"` — evaluate a JS string.
-fn cmd_eval(rt: &SofuuRuntime, code: &str) -> i32 {
-    rt.eval_string(code, "<eval>")
+///
+/// PC-09 (audit 2026-10-29): this is the one-shot REPL, so it echoes the
+/// value its program completed with — `sofuu eval "1+1"` says `2`. A silent
+/// `eval` is indistinguishable from a broken one and useless for exactly the
+/// quick check the command exists for. `-q` / `--no-print` restores the old
+/// silent form for scripts that only want the code's side effects.
+fn cmd_eval(rt: &SofuuRuntime, code: &str, print_value: bool) -> i32 {
+    if !print_value {
+        // Byte-identical to the pre-PC-09 command: evaluate the string as
+        // given and add nothing of our own to stdout.
+        return rt.eval_string(code, "<eval>");
+    }
+    // The value is rendered by the engine, through the very `repl_inspect`
+    // `sofuu repl` prints — not by a JS wrapper here, which would add frames
+    // to every throw's stack trace. `display` is None when there is nothing
+    // to echo (undefined completion, a Promise, or a failed program).
+    // SAFETY: engine_ctx() is this runtime's live QuickJS context.
+    let (rc, display) = unsafe {
+        sofuu_core::rt::engine::eval_completion_display(rt.engine_ctx(), code, "<eval>")
+    };
+    if let Some(display) = display {
+        print_repl_value(&display);
+    }
+    rc
+}
+
+/// Echo one value the way `sofuu repl` echoes it.
+///
+/// `display` is `repl_inspect`'s output, SGR colours included. The REPL always
+/// has a human in front of it; `eval`'s stdout is routinely piped
+/// (`sofuu eval '1+1' | …`), so the paint is dropped when stdout is not a
+/// terminal. The FORMAT is the REPL's in both cases — only the colour goes.
+fn print_repl_value(display: &str) {
+    // SAFETY: isatty(1) has no preconditions and no side effects.
+    let text = if unsafe { libc::isatty(1) } == 1 {
+        display.to_string()
+    } else {
+        strip_sgr(display)
+    };
+    // Write like console.error/log do (lock + ignore the error): `sofuu eval`
+    // is fed into `grep -q` / `head` pipelines, and a closed pipe must end the
+    // command, not abort it with `println!`'s broken-pipe panic.
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}");
+    let _ = out.flush();
+}
+
+/// Drop ANSI SGR sequences (ESC '[' … final letter).
+///
+/// cli_protocols.rs, doctor.rs and modules/process.rs each carry this same
+/// private helper for the same reason: a value read back through `eval_repl`
+/// arrives painted, and whatever consumes it wants the text.
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            if it.peek() == Some(&'[') {
+                it.next();
+                while let Some(n) = it.next() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// S5 (2026-10-23): pull `--policy <file>` / `--policy=<file>` out of a CLI
@@ -811,6 +894,48 @@ fn infer_gpu_backend_available() -> bool {
     {
         false
     }
+}
+
+/// `--gpu-layers N` on a build that cannot place a single layer on a GPU.
+///
+/// PC-05 (audit 2026-10-29): on every non-Metal build `--gpu-layers` was
+/// accepted, silently dropped, and the run continued on the CPU — while the
+/// engine banner talked about a heterogeneous CPU+GPU engine and the flag's
+/// documented default (999) meant an operator could not tell whether the
+/// request had been honoured. A dropped request must say so, once, on stderr
+/// (stdout stays the model's), and the run must continue: a model load is not
+/// a place to fail over a placement preference.
+///
+/// Once per process, not per call and not per layer: the same process can
+/// reach this from more than one command path, and only the first warning is
+/// information. `--cpu` / `--gpu-layers 0` never reach here, and a host whose
+/// GPU probe succeeds never warns.
+fn warn_gpu_layers_unavailable(requested: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "[sofuu] --gpu-layers {requested}: this build has no GPU backend for {} \
+             (the whole-layer GPU client is macOS/Metal only), so the request cannot be \
+             honoured — using the CPU instead. Pass --cpu (or --gpu-layers 0) to make \
+             that explicit and silence this warning.",
+            std::env::consts::OS
+        );
+    });
+}
+
+/// The layer count this build can actually honour, given what the operator
+/// asked for.
+///
+/// `gpu_layers > 0` on a build without a GPU backend normalises to 0 — the
+/// CPU engine is what runs either way, and normalising here keeps the banner
+/// and the load branch honest — after warning once (PC-05). `0` means
+/// `--cpu` / `--gpu-layers 0` and stays silent by contract.
+fn resolve_gpu_layers(requested: usize) -> usize {
+    if requested > 0 && !infer_gpu_backend_available() {
+        warn_gpu_layers_unavailable(requested);
+        return 0;
+    }
+    requested
 }
 
 /// C-01: the process status for a command that evaluated JavaScript.
@@ -1706,10 +1831,24 @@ fn main() -> ExitCode {
             }
         }
         "eval" => {
-            if args.len() < 3 {
+            // PC-09: `-q` / `--no-print` opts out of the completion echo. The
+            // flag may sit before or after the code (`sofuu eval -q "1+1"`,
+            // `sofuu eval "1+1" -q`); the first non-flag argument is the code,
+            // as it always was, and any further non-flag argument stays
+            // ignored (`eval '<code>' extra` never meant anything).
+            let mut print_value = true;
+            let mut code: Option<&str> = None;
+            for a in &args[2..] {
+                if a == "-q" || a == "--no-print" {
+                    print_value = false;
+                } else if code.is_none() {
+                    code = Some(a.as_str());
+                }
+            }
+            let Some(code) = code else {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu eval' requires a code string argument");
                 return ExitCode::FAILURE;
-            }
+            };
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
                 None => {
@@ -1717,7 +1856,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_eval(&rt, &args[2]);
+            let rc = cmd_eval(&rt, code, print_value);
             js_exit_code(&rt, rc)
         }
         "dev" | "web" => {
@@ -1931,10 +2070,6 @@ fn main() -> ExitCode {
             let mut sliding_window = 0usize;
             let mut custom_ctx = 0usize;
             let mut gpu_layers = 999usize;
-            /* A (audit): did the script ask for GPU placement explicitly?
-             * Only an explicit request warns when this build has no GPU
-             * backend — the 999 default must stay silent on CPU-only hosts. */
-            let mut gpu_layers_explicit = false;
             // Lookahead speculative decoding is the OUTPUT default on the GGUF
             // batched path (Pi 5 Llama-1B Q8_0: 9.0 -> 19.7 tk/s, temp-0 outputs
             // token-identical; the engine only engages it on the GGUF backend).
@@ -1984,12 +2119,10 @@ fn main() -> ExitCode {
                 } else if (args[i] == "--gpu-layers" || args[i] == "--ngl") && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
                         gpu_layers = v;
-                        gpu_layers_explicit = true;
                     }
                     i += 2;
                 } else if args[i] == "--gpu" {
                     gpu_layers = 999;
-                    gpu_layers_explicit = true;
                     i += 1;
                 } else if args[i] == "--cpu" {
                     gpu_layers = 0;
@@ -2151,25 +2284,16 @@ fn main() -> ExitCode {
                 gpu_layers = 0;
             }
 
-            /* A (audit): the whole-layer GPU client exists only when this
-             * build links + can use it (Metal on macOS). Off that build
-             * `--gpu-layers` used to be silently inert while the banner still
-             * advertised "Heterogeneous CPU+GPU". Normalise the request to
-             * the hardware that is actually here — and say so once when the
-             * operator asked for the GPU explicitly. --cpu stays silent. */
-            let gpu_backend = infer_gpu_backend_available();
-            if gpu_layers > 0 && !gpu_backend {
-                if gpu_layers_explicit {
-                    eprintln!(
-                        "[sofuu infer] --gpu-layers {}: this build has no GPU backend \
-                         (the whole-layer client is macOS/Metal only) — decoding on the CPU. \
-                         Pass --cpu to make that explicit.",
-                        gpu_layers
-                    );
-                }
-                gpu_layers = 0;
-            }
-            let engine_type = if gpu_layers > 0 && gpu_backend {
+            /* PC-05 (audit 2026-10-29): the whole-layer GPU client exists only
+             * when this build links + can use it (Metal on macOS). Off that
+             * build `--gpu-layers` used to be silently inert while the banner
+             * still advertised "Heterogeneous CPU+GPU" — including for the 999
+             * default, which is the value every operator on a CPU-only host
+             * runs with. Normalise the request to the hardware that is
+             * actually here and say so once (warn_gpu_layers_unavailable);
+             * `--cpu` / `--gpu-layers 0` stay silent by contract. */
+            gpu_layers = resolve_gpu_layers(gpu_layers);
+            let engine_type = if gpu_layers > 0 {
                 "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)"
             } else {
                 "⚡ Sofuu CPU Inference Engine"
@@ -2752,6 +2876,9 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
                 sofuu_core::infer::quant::set_thread_count(threads);
             }
 
+            // PC-05: a swarm node without a GPU backend gets the same single
+            // warning `sofuu infer` gives — the flag used to be inert here too.
+            gpu_layers = resolve_gpu_layers(gpu_layers);
             eprintln!("\x1b[36mLoading model for swarm worker:\x1b[0m {}", model_path);
             let load_res = if gpu_layers == 0 {
                 sofuu_core::infer::InferEngine::load_with_seq_len_cpu(&model_path, custom_ctx)
@@ -2917,6 +3044,8 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
                 sofuu_core::infer::quant::set_thread_count(threads);
             }
 
+            // PC-05: same one-shot warning as `sofuu infer` / `swarm worker`.
+            gpu_layers = resolve_gpu_layers(gpu_layers);
             eprintln!("\x1b[36m⚡ Sofuu Swarm Leader\x1b[0m — loading {}...", model_path);
             let t0 = std::time::Instant::now();
             let load_res = if gpu_layers == 0 {

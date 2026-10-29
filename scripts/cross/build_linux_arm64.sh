@@ -103,7 +103,11 @@ fi
 # -C linker via zig-ld.sh: rustc emits its own leading flags (-m64) before
 # any link-arg, so a bare `zig`/`link-arg=cc` chain can't work — the wrapper
 # guarantees `zig cc` is argv[0..1].
-export RUSTFLAGS="-C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-target -C link-arg=$TARGET -C link-self-contained=no"
+# PC-07 (AUDIT-2026-10-29): the same --remap-path-prefix set `make` uses, so
+# the published binary carries no build-host absolute path. Textual prefix
+# substitution — it does not touch the linker or the cc invocation.
+REMAP="$(bash "$REPO_ROOT/scripts/cross/remap_flags.sh")"
+export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-target -C link-arg=$TARGET -C link-self-contained=no"
 # link-self-contained=no: rustc's bundled musl CRT objects (rcrt1.o/crti.o)
 # duplicate the ones zig's driver links itself → duplicate-symbol errors.
 # With it off, zig supplies the CRT for the -static -pie link.

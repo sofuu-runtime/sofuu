@@ -2279,6 +2279,15 @@
                         chainIndex: chainIdx });
           writeRecord('debug', 'turn error detail: ' + clip(msg, 90),
                       { type: 'turn_error_detail', error: clip(msg, 400) });
+          /* R2.6: a turn that DIES must still terminate the event stream.
+           * Every success path ends in the 'done' below, and the agent's own
+           * 'stop' is swallowed at the step bridge (this file owns the
+           * terminal) — so a provider failure used to end the turn with NO
+           * terminal event at all, leaving a host UI keyed on one sitting on
+           * "in progress" forever. That is the UI half of "chat shows no
+           * response" (T2.6). Exactly one: the retry/failover paths above
+           * CONTINUE and never reach here. */
+          emit({ kind: 'stop', payload: { reason: 'error', error: clip(msg, 400) } });
           throw e;
         }
       }

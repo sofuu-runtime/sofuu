@@ -19,9 +19,15 @@ const SIGNAL = "t23-cancel";
 
 // Orphan detection must look at OUR child only: any unrelated `sleep` on the
 // machine (a loaded runner, another agent's wait loop) would otherwise make
-// the case fail. `exec -a` gives the tool's child a unique argv[0], so
-// pgrep -f matches exactly this process.
-const MARKER = "sofuu-t23-child";
+// the case fail. The marker has to live in the child's own command line, and
+// it has to survive /bin/sh: `exec -a` is a bashism (Linux's /bin/sh is dash
+// — "exec: -a: not found", exit 127, no child at all), and without `exec` the
+// shell forks, so the tool's kill would only take the wrapper and leave the
+// sleep orphaned. A unique sleep DURATION is portable, keeps the marked
+// process the direct child (dash execs in place), and no other process on the
+// box plausibly sleeps for exactly this many seconds.
+const MARKER = "sleep " + (30000 + (Date.now() % 50000));
+const CHILD_CMD = "exec " + MARKER;
 function pgrepChild() {
     return new Promise((resolve) => {
         let out = "";
@@ -42,7 +48,7 @@ async function main() {
             delta: {
                 tool_calls: [{
                     index: 0, id: "call1", type: "function",
-                    function: { name: "bash", arguments: JSON.stringify({ command: "exec -a " + MARKER + " sleep 30" }) },
+                    function: { name: "bash", arguments: JSON.stringify({ command: CHILD_CMD }) },
                 }],
             },
             finish_reason: "tool_calls",

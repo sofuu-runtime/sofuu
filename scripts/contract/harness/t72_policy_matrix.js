@@ -230,9 +230,25 @@ async function cAbiExport() {
         const hit = await sh("nm " + c.nm + " " + c.file +
             " 2>/dev/null | grep -c ' " + symbol + "$' || true");
         const lines = String(hit.out).trim().split("\n");
-        const count = Number(lines[lines.length - 1]) || 0;
+        let count = Number(lines[lines.length - 1]) || 0;
+        let probe = "nm " + c.nm;
+        if (count < 1) {
+            /* No binutils on this host at all (the AWS Linux test box has
+             * no nm/objdump/readelf): ask the LOADER instead. dlopen+dlsym is
+             * the resolution a real C host performs, so a hit here is the
+             * stronger evidence — and a miss is a genuine missing export, not
+             * a missing tool. */
+            const py = await sh("command -v python3 2>/dev/null || echo /usr/bin/python3");
+            const pyBin = String(py.out).trim().split("\n").pop() || "python3";
+            const code = "import ctypes,sys;getattr(ctypes.CDLL(sys.argv[1]),sys.argv[2]);print(1)";
+            const r = await sh(pyBin + " -c " + JSON.stringify(code) + " " + c.file +
+                " " + symbol + " 2>/dev/null || echo 0");
+            const rl = String(r.out).trim().split("\n");
+            count = Number(rl[rl.length - 1]) || 0;
+            probe = "dlopen(" + pyBin + ")";
+        }
         return { found: true, platform: platform, artefact: c.file,
-            nm: "nm " + c.nm, symbol: symbol, count: count, checked: checked };
+            nm: probe, symbol: symbol, count: count, checked: checked };
     }
     return { found: false, platform: platform, artefact: "", symbol: symbol,
         nm: "nm " + (darwin ? "-gU" : "-D --defined-only"), count: 0,
@@ -352,8 +368,8 @@ async function main() {
         console.error("  ⚠️  C ABI: " + abi.why +
             " — the rt-call export is UNVERIFIED (not absent)");
     } else if (abi.count < 1) {
-        console.error("  ⚠️  C ABI: " + abi.artefact + " exists but `" + abi.nm +
-            "` lists no '" + abi.symbol + "' export — the library really is missing the ABI");
+        console.error("  ⚠️  C ABI: " + abi.artefact + " exists but " + abi.nm +
+            " finds no '" + abi.symbol + "' export — the library really is missing the ABI");
     }
     assert("C ABI: the rt-call symbol is exported and the config-envelope contract is in the embed header [" +
         (abi.found

@@ -20,7 +20,7 @@ T2.2|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t22_cancel_stream.js|exi
 T2.3|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t23_cancel_tool.js|exit:0|cancel mid-tool kills the subprocess (mock provider, no orphan)
 T2.4|R2|R2.3|cli|-|./sofuu run scripts/contract/harness/t24_disconnect.js|exit:0|server-side disconnect is visible to the handler (peer_closed)
 T2.5|R2|R2.4|cli|-|./sofuu run scripts/contract/harness/t25_backpressure.js|exit:0|non-draining consumer: typed E_BACKPRESSURE + provider abort
-T2.6|R2|R2.6|cli|-|./sofuu run scripts/contract/harness/t26_terminal_fuzz.js|exit:0|failure-injection fuzz: one terminal event, monotonic seq without gaps
+T2.6|R2|R2.6|cli|SOFUU_STREAM_RETRY_DELAYS=300,300|./sofuu run scripts/contract/harness/t26_terminal_fuzz.js|exit:0|failure-injection fuzz: one terminal event, monotonic seq without gaps
 T2.7|R2|R2.2|cli|-|./sofuu run scripts/contract/harness/t27_deadline.js|exit:0|nested deadline inheritance
 T2.8|R2|R2.5|cli|-|./sofuu run scripts/contract/harness/t28_error_shape.js|exit:0|error taxonomy + §1.4 shape
 T3.1|R3|R3.1|cli|-|./sofuu run scripts/contract/harness/t31_tier_declared.js|exit:0|engine.paths declares tiers and bounds for all paths

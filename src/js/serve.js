@@ -1097,6 +1097,8 @@
     var handler = createHandler(cfg);
     var server = sofuu.http.createServer(handler);
     server.listen(cfg.port, cfg.host);
+    // listen() starts unref'd so a finished script can exit; the CLI must stay up.
+    if (typeof server.ref === 'function') server.ref();
     S.server = server;
     S.started = true;
     var primary = cfg.models.length ? cfg.models[0].id : null;

@@ -39,7 +39,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build sandbox-stress \
 	observability-stress \
         deps scoreboard scoreboard-check \
-        libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
+        libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
         sdk-jvm-check android-sdk android-aar android-publish-local \
@@ -208,6 +208,15 @@ header-sync:
 		fi; \
 	done
 
+# rustc emits NO DT_SONAME for a Linux cdylib, so a host that links -lsofuu
+# would bake the build-tree path into its DT_NEEDED. Name the artifact.
+# (ifeq, not $(if ...): make splits the macro value on its commas.)
+ifeq ($(shell uname -s),Linux)
+SOFUU_SONAME_FLAGS := -C link-arg=-Wl,-soname=libsofuu.so
+else
+SOFUU_SONAME_FLAGS :=
+endif
+
 # ── libsofuu: embeddable library (PLAN-HEADLESS H1) ──────────────
 # Builds the capi crate as staticlib + cdylib, copies artifacts to dist/.
 # Usage:  make libsofuu
@@ -218,7 +227,7 @@ header-sync:
 # of the capi graph only.
 libsofuu: header-sync
 	@echo "  \033[36mCARGO\033[0m  libsofuu  [arch=$(ARCH)]"
-	CARGO_PROFILE_RELEASE_PANIC=unwind RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $$RUSTFLAGS" \
+	CARGO_PROFILE_RELEASE_PANIC=unwind RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $(SOFUU_SONAME_FLAGS) $$RUSTFLAGS" \
 		cargo build --release -p sofuu-capi
 	@mkdir -p dist
 	@cp target/release/libsofuu_capi.a dist/libsofuu.a 2>/dev/null || \
@@ -227,13 +236,24 @@ libsofuu: header-sync
 		cp target/release/libsofuu.dylib dist/libsofuu.dylib 2>/dev/null || \
 		cp target/release/libsofuu_capi.so dist/libsofuu.so 2>/dev/null || \
 		cp target/release/libsofuu.so dist/libsofuu.so 2>/dev/null || true
+	@# LC_ID_DYLIB is the BUILD-TREE path of the cargo artifact, so a host that
+	@# links -lsofuu would record that path (rpath cannot override an absolute
+	@# id). Ship it under the relocatable id headless-test's `-Wl,-rpath,dist`
+	@# and every embedding host expect; install_name_tool invalidates the ad-hoc
+	@# signature, so re-sign it.
+	@if [ -f dist/libsofuu.dylib ] && [ "$$(uname -s)" = Darwin ]; then \
+		install_name_tool -id @rpath/libsofuu.dylib dist/libsofuu.dylib; \
+		codesign -s - -f dist/libsofuu.dylib 2>/dev/null || true; \
+	fi
 	@echo "  \033[32mBuilt:\033[0m"
 	@ls -lh dist/libsofuu.* dist/sofuu_embed.h 2>/dev/null
 	@echo ""
 	@echo "  Symbol exports:"
-	@nm dist/libsofuu.a 2>/dev/null | grep ' T _sofuu_' | sort || \
-		nm -gU dist/libsofuu.dylib 2>/dev/null | grep ' T _sofuu_' | sort || \
-		echo "  (nm not available — run manually)"
+	@if [ "$$(uname -s)" = Darwin ]; then \
+		nm -gU dist/libsofuu.dylib 2>/dev/null | grep ' T _sofuu_' | sort; \
+	else \
+		nm -D --defined-only dist/libsofuu.so 2>/dev/null | grep ' T sofuu_' | sort; \
+	fi || echo "  (nm not available — run manually)"
 
 install: $(TARGET)
 	@echo "  Installing sofuu to /usr/local/bin/"
@@ -497,6 +517,12 @@ endif
 # line) when a host toolchain piece is missing.
 sdk-jvm-check:
 	@bash scripts/mobile/sdk_jvm_check.sh
+
+# Cross-built Linux shared library. glibc, not musl: rustc DROPS the cdylib
+# crate type for *-linux-musl (crt_static_allows_dylibs=false), so no musl
+# libsofuu.so can exist. See scripts/cross/build_linux_capi_so.sh.
+libsofuu-linux-x86_64:
+	@bash scripts/cross/build_linux_capi_so.sh x86_64
 
 abi-check: libsofuu
 	@# Use the dylib/.so (public symbols are resolved at link time, not in the .a archive).

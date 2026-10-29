@@ -39,16 +39,53 @@ PUBLIC_RE='^(sofuu_rt_|sofuu_embed_|sofuu_voice_|sofuu_free|sofuu_init|sofuu_des
 
 SYMBOLS_FILE=$(mktemp)
 BASELINE_SORTED=$(mktemp)
-if [[ "$(uname -s)" == "Darwin" ]]; then
+
+# 2026-10-29: checking a LINUX .so on a Mac used to kill the gate. `nm -gU`
+# is Mach-O only, so the pipeline returned non-zero, `set -e` aborted before
+# the "no symbols found" branch, and the script exited 1 printing NOTHING —
+# while the build_linux_capi_so.sh message told the reader to run exactly
+# that command. Parse ELF .dynsym from the Python stdlib instead, so the same
+# gate handles either format from either host.
+elf_dynsym() { # <elf> -> "T name" lines for defined functions
+    python3 - "$1" <<'PY'
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+e = "<"
+shoff, = struct.unpack_from(e + "Q", d, 0x28)
+shentsize, shnum = struct.unpack_from(e + "HH", d, 0x3a)
+secs = [struct.unpack_from(e + "IIQQQQIIQQ", d, shoff + i * shentsize)
+        for i in range(shnum)]
+for f in secs:
+    if f[1] != 11:                       # SHT_DYNSYM
+        continue
+    off, size, entsize, strtab = f[4], f[5], f[9], secs[f[6]][4]
+    for j in range(0, size, entsize or 24):
+        name, info, _other, shndx = struct.unpack_from(e + "IBBH", d, off + j)
+        if shndx == 0 or (info & 0xF) != 2:   # undefined / not STT_FUNC
+            continue
+        end = d.index(b"\0", strtab + name)
+        print("T " + d[strtab + name:end].decode("utf-8", "replace"))
+PY
+}
+
+if [[ "$LIB" == *.so ]]; then
+    # Linux shared object. Prefer binutils (a real Linux host); fall back to
+    # the ELF reader when nm is absent or is the Mach-O one (macOS).
+    if nm -D "$LIB" >/dev/null 2>&1; then
+        nm -D "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE" || true
+    else
+        elf_dynsym "$LIB" | awk '{print $NF}' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE" || true
+    fi
+elif [[ "$(uname -s)" == "Darwin" ]]; then
     # .dylib: use -gU (extern only, defined). .a archive: use plain nm.
-    if [[ "$LIB" == *.dylib ]] || [[ "$LIB" == *.so ]]; then
-        nm -gU "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | sed 's/^_//' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE"
+    if [[ "$LIB" == *.dylib ]]; then
+        nm -gU "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | sed 's/^_//' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE" || true
     else
         # .a archive — nm lists symbols per object file; T = text (exported).
-        nm "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | sed 's/^_//' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE"
+        nm "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | sed 's/^_//' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE" || true
     fi
 else
-    nm -D "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE"
+    nm -D "$LIB" 2>/dev/null | grep ' T ' | awk '{print $NF}' | grep -E "$PUBLIC_RE" | sort -u > "$SYMBOLS_FILE" || true
 fi
 
 if [ ! -s "$SYMBOLS_FILE" ]; then

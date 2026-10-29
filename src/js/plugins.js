@@ -892,6 +892,7 @@
     if (!hostHasDeadline()) return;
     hostPruneArms();
     var earliest = null;
+    var now = Date.now();
     for (var i = 0; i < wdArms.length; i++) {
       if (earliest === null || wdArms[i].at < earliest) earliest = wdArms[i].at;
     }
@@ -992,6 +993,11 @@
       return { ok: true, value: value, durationMs: Date.now() - startTs };
     } catch (err) {
       wdDrop(entry);
+      /* The arm must go with the call on EVERY exit path: a leftover entry
+       * keeps a deadline in wdArms, and the next refresh then arms it as
+       * "a few ms from now" and interrupts whatever unrelated work is
+       * running at that moment. */
+      hostDisarmFor(entry);
       unlink();
       if (ctrl) { try { ctrl.abort(); } catch (eB) {} }
       var code = (err && err.code) || 'E_TOOL';

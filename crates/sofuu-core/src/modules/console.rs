@@ -287,8 +287,18 @@ unsafe fn console_print(
     if embed_config::log(level, &body) {
         return; /* host callback consumed it */
     }
-    let _ = write!(out, "{}{}{}\n", ansi_prefix, body, ansi_reset);
-    let _ = out.flush();
+    let wrote = write!(out, "{}{}{}\n", ansi_prefix, body, ansi_reset)
+        .and_then(|()| out.flush());
+    if let Err(e) = wrote {
+        /* A closed output pipe (`| head`, `| grep -q`) ends the process, as it
+         * always has — SIGPIPE itself is ignored process-wide so a socket peer
+         * cannot kill a server (rt::broken_pipe_exit), which leaves our own
+         * stream to say when the reader is gone. Swallowing this error would
+         * turn the old quiet exit into an endless write into a dead pipe. */
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            crate::rt::broken_pipe_exit();
+        }
+    }
 }
 
 unsafe extern "C" fn js_console_log(

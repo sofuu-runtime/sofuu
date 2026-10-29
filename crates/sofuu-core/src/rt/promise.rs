@@ -323,8 +323,12 @@ pub unsafe fn report_microtask_overflow(ctx: *mut JSContext, executed: usize) {
 ///
 /// # Safety
 /// `ctx` live; `reason` a value of `ctx` (borrowed).
-#[no_mangle]
-pub unsafe extern "C" fn sofuu_rt_suppress_rejections(ctx: *mut JSContext, reason: JSValueConst) {
+/// Internal helper (engine.rs is its only caller): deliberately NOT
+/// `#[no_mangle]` and not `extern "C"`. As a `sofuu_rt_`-prefixed dynamic
+/// export it entered the FROZEN v2 ABI surface that scripts/check_abi.sh
+/// guards, so `make abi-check` failed with an "ABI ADDITION without
+/// acknowledgment" for a symbol no host was ever meant to call.
+pub unsafe fn sofuu_rt_suppress_rejections(ctx: *mut JSContext, reason: JSValueConst) {
     let ptr = qjs::sofuu_js_value_get_ptr(reason);
     PENDING.with(|p| {
         let mut pending = p.borrow_mut();

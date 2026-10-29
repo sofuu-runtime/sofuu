@@ -41,6 +41,27 @@ function normalizeManifest(m) {
     return JSON.stringify(m);
 }
 
+/* Symbol lookup that works on every host this suite runs on: Mach-O needs
+ * `nm -gU` and the `_`-prefixed spelling, ELF needs `nm -D --defined-only`,
+ * and a host with no binutils at all (the AWS Linux test box) has neither.
+ * In that last case ask the LOADER: dlopen+dlsym through python3 is exactly
+ * the lookup a C host performs, so it is the stronger check. Returns
+ * { count, probe } — probe names the mechanism that answered. */
+async function abiSymbolCount(libPath, symbol) {
+    const nmCmd = process.platform === "darwin"
+        ? "nm -gU " + JSON.stringify(libPath) + " 2>/dev/null | grep -c ' _*" + symbol + "$' || true"
+        : "nm -D --defined-only " + JSON.stringify(libPath) + " 2>/dev/null | grep -c ' " + symbol + "$' || true";
+    const nm = await sh(nmCmd);
+    const nmCount = Number(String(nm.out).trim().split("\n").pop()) || 0;
+    if (nmCount > 0) return { count: nmCount, probe: "nm" };
+    const py = await sh("command -v python3 2>/dev/null || echo /usr/bin/python3");
+    const pyBin = String(py.out).trim().split("\n").pop() || "python3";
+    const code = "import ctypes,sys;getattr(ctypes.CDLL(sys.argv[1]),sys.argv[2]);print(1)";
+    const r = await sh(pyBin + " -c " + JSON.stringify(code) + " " + libPath + " " + symbol + " 2>/dev/null || echo 0");
+    const count = Number(String(r.out).trim().split("\n").pop()) || 0;
+    return { count: count, probe: "dlopen(" + pyBin + ")" };
+}
+
 async function main() {
     // ── 1. JS surface ────────────────────────────────────────────────────────
     const jsRaw = sofuu.capabilities();
@@ -110,15 +131,16 @@ async function main() {
     // the "not present" branch and never ran. Probe each candidate instead, and
     // use the platform-appropriate symbol dumper (`nm -gU` is Darwin-only;
     // GNU nm on Linux rejects -U).
+    // R-27: and not every Linux host has nm at all (the AWS test box ships no
+    // binutils) — so when nm cannot answer, ask the LOADER: abiSymbolCount()
+    // falls back to dlopen+dlsym through python3, the same resolution a host
+    // performs for the .so it is about to use.
     const libProbe = await sh("for f in dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a; do [ -f \"$f\" ] && echo \"$f\" && break; done");
     const libPath = String(libProbe.out).trim().split("\n")[0] || "";
     if (libPath) {
-        const nmCmd = process.platform === "darwin"
-            ? `nm -gU ${JSON.stringify(libPath)} 2>/dev/null | grep -c ' _*sofuu_rt_call' || echo 0`
-            : `nm -g ${JSON.stringify(libPath)} 2>/dev/null | grep -c 'sofuu_rt_call' || echo 0`;
-        const nm = await sh(nmCmd);
-        assert("C ABI: sofuu_rt_call symbol exported from libsofuu",
-            Number(String(nm.out).trim().split("\n")[0]) >= 1);
+        const abi = await abiSymbolCount(libPath, "sofuu_rt_call");
+        assert("C ABI: sofuu_rt_call symbol exported from libsofuu (" + libPath +
+            " via " + abi.probe + ")", abi.count >= 1);
     } else {
         assert("C ABI: libsofuu present or buildable", true);
     }

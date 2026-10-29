@@ -1174,8 +1174,10 @@ unsafe fn extract_tool_calls(ctx: *mut JSContext, p: Provider, body: &[u8]) -> J
     /* Use QuickJS's built-in JSON parser so we don't have to hand-roll
        a recursive JSON parser. We parse the entire response body and
        then navigate the resulting JS object tree. */
-    let body_c = CString::new(body).unwrap_or_default();
-    let parsed = qjs::JS_ParseJSON(ctx, body_c.as_ptr(), body.len(), c"<ai_response>".as_ptr());
+    /* Parse through the shared helper: it hands QuickJS a NUL-terminated
+     * copy. Passing a CString plus body.len() over-reads whenever the body
+     * has an interior NUL (CString::new then yields an empty buffer). */
+    let parsed = crate::rt::http_client::parse_json_bytes(ctx, body, c"<ai_response>".as_ptr());
     if qjs::is_exception(parsed) {
         qjs::sofuu_js_get_exception(ctx); /* clear the exception */
         return qjs::sofuu_js_undefined();
@@ -1316,8 +1318,8 @@ unsafe fn extract_embeddings(
     body: &[u8],
     num_inputs: usize,
 ) -> JSValue {
-    let body_c = CString::new(body).unwrap_or_default();
-    let parsed = qjs::JS_ParseJSON(ctx, body_c.as_ptr(), body.len(), c"<embed_response>".as_ptr());
+    /* Same NUL-termination rule as <ai_response> above. */
+    let parsed = crate::rt::http_client::parse_json_bytes(ctx, body, c"<embed_response>".as_ptr());
     if qjs::is_exception(parsed) {
         qjs::sofuu_js_get_exception(ctx);
         return qjs::sofuu_js_undefined();

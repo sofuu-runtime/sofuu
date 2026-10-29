@@ -347,6 +347,22 @@ unsafe extern "C" fn response_text(
     chained
 }
 
+/// Parse JSON from a host-side byte slice.
+///
+/// QuickJS reads one byte past `buf_len` when its tokenizer decides end of
+/// input, so the buffer must be NUL-terminated. Every host-side parse goes
+/// through here rather than passing a raw `&[u8]` (see response_json_impl).
+pub(crate) unsafe fn parse_json_bytes(
+    ctx: *mut JSContext,
+    src: &[u8],
+    name: *const c_char,
+) -> JSValue {
+    let mut buf: Vec<u8> = Vec::with_capacity(src.len() + 1);
+    buf.extend_from_slice(src);
+    buf.push(0);
+    qjs::JS_ParseJSON(ctx, buf.as_ptr() as *const c_char, src.len(), name)
+}
+
 unsafe fn response_json_impl(ctx: *mut JSContext, r: *mut ResponseData) -> JSValue {
     if (*r).done != 0 && (*r).errored != 0 {
         /* P1-5: never resolve with a truncated body. */
@@ -356,12 +372,13 @@ unsafe fn response_json_impl(ctx: *mut JSContext, r: *mut ResponseData) -> JSVal
      * past the first NUL, silently parsing only the surviving prefix.
      * Empty body still parses as literal "null". */
     let src: &[u8] = if (*r).body.is_empty() { b"null" } else { &(*r).body };
-    let parsed = qjs::JS_ParseJSON(
-        ctx,
-        src.as_ptr() as *const c_char,
-        src.len(),
-        c"<fetch response>".as_ptr(),
-    );
+    /* QuickJS's JSON tokenizer reads ONE byte past buf_len to decide EOF
+     * (js_parse_init keeps the caller's buffer and never terminates it), so
+     * parsing a bare slice succeeds or fails on whatever heap byte happens to
+     * follow the body: a 384-byte httpbin echo failed with "unexpected data
+     * at the end" while the identical bytes plus a NUL parsed fine. Always
+     * hand the parser a terminated copy. */
+    let parsed = parse_json_bytes(ctx, src, c"<fetch response>".as_ptr());
 
     let mut resolvers: [JSValue; 2] = [std::mem::zeroed(); 2];
     let promise = qjs::JS_NewPromiseCapability(ctx, resolvers.as_mut_ptr());

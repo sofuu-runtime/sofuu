@@ -52,6 +52,12 @@ struct Server {
     ctx: *mut JSContext,
     handler: JSValue,
     listening: c_int, /* tcp handle was uv_tcp_init'd */
+    /* Root for the JS server object while it is listening. Without it a
+     * server created inside a function (module pattern, IIFE, any helper)
+     * is collected as soon as the last JS reference goes away and its
+     * finalizer closes the listener — the socket never accepts, silently.
+     * Node keeps a live server alive the same way. */
+    anchor: JSValue,
 }
 
 struct Client {
@@ -972,6 +978,19 @@ unsafe extern "C" fn js_server_listen(
     if r < 0 {
         return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), uv::uv_strerror(r));
     }
+    /* Keep the server object alive for as long as it is listening; see the
+     * anchor field. Idempotent, so a second listen() does not double-hold. */
+    if qjs::is_undefined((*srv).anchor) {
+        (*srv).anchor = qjs::sofuu_js_dup_value(ctx, this_val);
+    }
+    /* …but do not hold the event loop open on its own: a script that starts a
+     * server and finishes its work still exits, which is what every
+     * embedder here relies on. `serve()` (below) keeps the old referenced
+     * behaviour, and server.ref() restores Node's "the listener keeps the
+     * process alive" for callers that want it. */
+    if (*srv).listening != 0 {
+        uv::uv_unref((*srv).tcp as *mut UvHandle);
+    }
     if qjs::JS_IsFunction(ctx, cb) != 0 {
         let ret = qjs::JS_Call(ctx, cb, qjs::sofuu_js_undefined(), 0, ptr::null());
         qjs::sofuu_js_free_value(ctx, ret);
@@ -1019,6 +1038,7 @@ unsafe extern "C" fn js_create_server(
         ctx,
         handler: qjs::sofuu_js_dup_value(ctx, *argv),
         listening: 0,
+        anchor: qjs::sofuu_js_undefined(),
     }));
     let obj = qjs::JS_NewObjectClass(ctx, SRV_CLASS_ID.load(Ordering::Relaxed) as c_int);
     qjs::JS_SetOpaque(obj, srv as *mut c_void);
@@ -1028,7 +1048,54 @@ unsafe extern "C" fn js_create_server(
         c"listen".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_server_listen, c"listen".as_ptr(), 2),
     );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"ref".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_server_ref, c"ref".as_ptr(), 0),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"unref".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_server_unref, c"unref".as_ptr(), 0),
+    );
     obj
+}
+
+/* server.ref() / server.unref(): whether the listening socket alone keeps the
+ * event loop alive. listen() starts unref'd so a finished script exits; the
+ * `serve` CLI calls ref() to stay up. Both return the server (chainable). */
+unsafe extern "C" fn js_server_ref(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, SRV_CLASS_ID.load(Ordering::Relaxed)) as *mut Server;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"server.ref: bad object".as_ptr());
+    }
+    if (*srv).listening != 0 {
+        uv::uv_ref((*srv).tcp as *mut UvHandle);
+    }
+    qjs::sofuu_js_dup_value(ctx, this_val)
+}
+
+unsafe extern "C" fn js_server_unref(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, SRV_CLASS_ID.load(Ordering::Relaxed)) as *mut Server;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"server.unref: bad object".as_ptr());
+    }
+    if (*srv).listening != 0 {
+        uv::uv_unref((*srv).tcp as *mut UvHandle);
+    }
+    qjs::sofuu_js_dup_value(ctx, this_val)
 }
 
 // ── Legacy sofuu.serve(port, handler) ───────────────────────────────
@@ -1050,6 +1117,7 @@ unsafe extern "C" fn js_serve(
         ctx,
         handler: qjs::sofuu_js_dup_value(ctx, *argv.add(1)),
         listening: 0,
+        anchor: qjs::sofuu_js_undefined(),
     }));
     let r = do_listen(srv, c"0.0.0.0".as_ptr(), port as c_int);
     if r < 0 {

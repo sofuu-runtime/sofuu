@@ -109,6 +109,11 @@ unsafe extern "C" fn deadline_interrupt_cb(_rt: *mut JSRuntime, _opaque: *mut c_
          * uncatchable, so nothing else can tell the host this was a deadline. */
         FIRED_US.store(now_us(), Ordering::SeqCst);
         FIRED_MS.store(EARLIEST_MS.load(Ordering::Relaxed), Ordering::SeqCst);
+        /* One-shot: disarm before returning. Left in place, the expired
+         * deadline would keep matching on every later poll, so every
+         * subsequent evaluation in this process died with "interrupted" and
+         * the runtime never recovered. FIRED_US keeps the classification. */
+        EARLIEST_US.store(DISARMED, Ordering::SeqCst);
         return 1;
     }
     0

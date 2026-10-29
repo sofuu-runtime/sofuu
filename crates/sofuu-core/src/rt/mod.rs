@@ -52,6 +52,28 @@ pub mod deadline; // sofuu.host.armDeadline/disarmDeadline: JS-callable interrup
 pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js
 pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
 
+/// End the process the way a default SIGPIPE disposition would have: quietly,
+/// with status 141 and no output.
+///
+/// Only for a BROKEN PIPE on our OWN output streams (`sofuu … | head`) — never
+/// for a socket. SIGPIPE is ignored process-wide (see `main`), because a peer
+/// hanging up mid-response is routine for `run`/`serve` and must not be able to
+/// kill the process: libuv's writev() raises SIGPIPE, and with the default
+/// disposition the first abandoned SSE response killed the server outright.
+/// The EPIPE that libuv returns is handled there; this is the other half — an
+/// EPIPE from our own stdout/stderr still ends the process, as it always has.
+pub fn broken_pipe_exit() -> ! {
+    #[cfg(unix)]
+    unsafe {
+        /* Restore the conventional disposition for THIS exit alone, so the
+         * shell still sees a SIGPIPE death ($? = 141, WIFSIGNALED) rather
+         * than an invented status. raise() cannot return. */
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::raise(libc::SIGPIPE);
+    }
+    std::process::exit(141)
+}
+
 /// Tests that drive the process-global libuv loop (m1/m2 proofs) must be
 /// serialized: the loop is one process-wide instance (same as C), so two
 /// tests pumping it from different threads would schedule each other's

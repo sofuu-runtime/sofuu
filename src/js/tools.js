@@ -1595,8 +1595,16 @@
       var s = list[i] || {};
       if (s.enabled === false) continue;
       var command = String(s.command || '');
-      if (!command) continue;
+      var url = (typeof s.url === 'string' && s.url) ? s.url : '';
+      if (!command && !url) continue;
       var entry = { name: String(s.name || ('mcp' + (i + 1))), command: command };
+      /* M3 (2026-10-29): a remote server is configured by URL. No transport
+       * in the file means Streamable HTTP (the historical default); an
+       * explicit "sse" selects the legacy HTTP+SSE transport. */
+      if (url) {
+        entry.url = url;
+        entry.transport = (typeof s.transport === 'string' && s.transport) ? s.transport : 'http';
+      }
       if (Array.isArray(s.args)) entry.args = s.args.map(String);
       if (s.env && typeof s.env === 'object') {
         var env = {};
@@ -1705,6 +1713,45 @@
       if (h.charAt(0) === '[') { var rb = h.indexOf(']'); if (rb > 0) return h.slice(1, rb); }
       var colon = h.lastIndexOf(':'); if (colon > 0) h = h.slice(0, colon);
       return h;
+    }
+    /* M3 (2026-10-29): legacy HTTP+SSE helpers. The `endpoint` event carries
+     * a URI that is usually relative to the stream URL, and stream chunks are
+     * arbitrary byte splits, so a multi-byte UTF-8 glyph can straddle two of
+     * them. Both are transport details, not policy. */
+    function sseResolveRef(base, ref) {
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(ref)) return ref;
+      var m = /^([a-z][a-z0-9+.-]*:\/\/[^\/?#]*)/i.exec(String(base));
+      var origin = m ? m[1] : String(base);
+      if (ref.charAt(0) === '/') return origin + ref;
+      var path = String(base).split('#')[0].split('?')[0];
+      var slash = path.lastIndexOf('/');
+      return (slash >= 0 ? path.slice(0, slash + 1) : origin + '/') + ref;
+    }
+    function sseUtf8(bytes, carry) {
+      var arr = carry.concat(bytes);
+      var out = '', i = 0;
+      while (i < arr.length) {
+        var b = arr[i] & 255;
+        if (b < 0x80) { out += String.fromCharCode(b); i++; continue; }
+        var n = (b & 0xE0) === 0xC0 ? 2 : ((b & 0xF0) === 0xE0 ? 3 : ((b & 0xF8) === 0xF0 ? 4 : 0));
+        if (!n) { out += '\ufffd'; i++; continue; }
+        if (i + n > arr.length) break; /* incomplete tail — hold it for the next chunk */
+        var cp = b & (0xFF >> (n + 1)), ok = true;
+        for (var k = 1; k < n; k++) {
+          var c = arr[i + k] & 255;
+          if ((c & 0xC0) !== 0x80) { ok = false; break; }
+          cp = (cp << 6) | (c & 0x3F);
+        }
+        if (!ok) { out += '\ufffd'; i++; continue; }
+        if (cp > 0xFFFF) {
+          cp -= 0x10000;
+          out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+        } else out += String.fromCharCode(cp);
+        i += n;
+      }
+      carry.length = 0;
+      for (; i < arr.length; i++) carry.push(arr[i] & 255);
+      return out;
     }
     function mcpFetch(url, init) {
       var f = (typeof fetch === 'function') ? fetch : (sofuu.fetch || null);
@@ -1886,6 +1933,243 @@
       })();
     };
 
+    /* ── M3 (2026-10-29): legacy HTTP+SSE transport (protocol 2024-11-05) ──
+     * Two channels: a GET that stays open as text/event-stream, whose first
+     * frame is "event: endpoint" naming the URI JSON-RPC messages are POSTed
+     * to; each POST is answered 202 Accepted and the JSON-RPC reply (plus any
+     * server notification) arrives as an "event: message" frame on that GET
+     * stream. Streamable HTTP multiplexes one POST; this transport cannot, so
+     * connect has to hold the stream open before it can initialize. */
+    sofuu.mcp._connectSse = function (cfg) {
+      cfg = cfg || {};
+      var url = String(cfg.url || '');
+      if (!url) return Promise.reject(new Error('mcp.connect: url required for the SSE transport'));
+      var host = httpHostOf(url);
+      var pdNet = policyDecision('net.fetch', { host: host });
+      if (pdNet && pdNet.decision === 'deny') {
+        return Promise.reject(new Error('mcp.connect: denied by policy (' + pdNet.rule + '): ' + (pdNet.reason || host)));
+      }
+      var streamHeaders = { accept: 'text/event-stream', 'cache-control': 'no-cache' };
+      var postHeaders = { 'content-type': 'application/json', accept: 'application/json' };
+      if (cfg.headers && typeof cfg.headers === 'object') {
+        for (var hk in cfg.headers) {
+          if (!Object.prototype.hasOwnProperty.call(cfg.headers, hk)) continue;
+          streamHeaders[hk.toLowerCase()] = String(cfg.headers[hk]);
+          postHeaders[hk.toLowerCase()] = String(cfg.headers[hk]);
+        }
+      }
+      var nextId = 1, pending = {}, noteCb = null, closed = false;
+      var protocol = '2024-11-05';
+      var endpoint = '';
+      var epTimer = null, epSettled = false, epResolve = null, epReject = null;
+      var epWait = new Promise(function (res, rej) { epResolve = res; epReject = rej; });
+      function finishEndpoint(err) {
+        if (epSettled) return;
+        epSettled = true;
+        if (epTimer) { clearTimeout(epTimer); epTimer = null; }
+        if (err) epReject(err); else epResolve(endpoint);
+      }
+      function settle(id, ok, value) {
+        var p = pending[id];
+        if (!p) return;
+        delete pending[id];
+        if (p.timer) clearTimeout(p.timer);
+        if (ok) p.resolve(value); else p.reject(value);
+      }
+      function failAll(err) {
+        var ids = Object.keys(pending);
+        for (var i = 0; i < ids.length; i++) settle(Number(ids[i]), false, err);
+      }
+      function handleMessage(msg) {
+        if (!msg || msg.jsonrpc !== '2.0') return;
+        if (msg.id !== undefined && !msg.method) {
+          var v = (msg.result === undefined) ? null : msg.result;
+          if (msg.error) {
+            settle(msg.id, false, new Error(String((msg.error && msg.error.message) || ('MCP error ' + (msg.error && msg.error.code)))));
+          } else settle(msg.id, true, v);
+          return;
+        }
+        if (msg.method && msg.id !== undefined) {
+          var reply = { jsonrpc: '2.0', id: msg.id };
+          if (msg.method === 'ping') reply.result = {};
+          else if (msg.method === 'roots/list') {
+            var roots = [];
+            try {
+              var pol = JSON.parse(sofuu.policy.get());
+              if (pol && pol.fs && Array.isArray(pol.fs.roots)) roots = pol.fs.roots;
+            } catch (eR) {}
+            reply.result = { roots: roots.map(function (p) { return { uri: 'file://' + p }; }) };
+          } else reply.error = { code: -32601, message: 'Method not found' };
+          postMessage(reply).catch(function () {});
+          return;
+        }
+        if (msg.method && noteCb) {
+          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) {}
+        }
+      }
+      async function postMessage(msg) {
+        if (closed) throw new Error('mcp: disconnected');
+        var res = await mcpFetch(endpoint, { method: 'POST', headers: postHeaders, body: JSON.stringify(msg) });
+        var status = res ? res.status : 0;
+        if (status === 202 || status === 204) return;
+        if (!res || (!res.ok && status >= 400)) {
+          var bodyText = '';
+          try { bodyText = await res.text(); } catch (eT) {}
+          throw new Error('mcp sse: HTTP ' + status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
+        }
+        var pct = '';
+        try { pct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) {}
+        if (pct.indexOf('text/event-stream') >= 0) {
+          throw new Error('mcp sse: the server answered a message POST with an event stream — it is not speaking the legacy SSE transport');
+        }
+        var text = '';
+        try { text = await res.text(); } catch (eB) {}
+        if (!text || !text.trim()) return;
+        var one;
+        try { one = JSON.parse(text); } catch (eP) { return; }
+        if (Array.isArray(one)) { for (var i = 0; i < one.length; i++) handleMessage(one[i]); }
+        else handleMessage(one);
+      }
+      function rpc(method, params, timeoutMs) {
+        var id = nextId++;
+        var msg = { jsonrpc: '2.0', id: id, method: method, params: params === undefined ? {} : params };
+        return new Promise(function (resolve, reject) {
+          pending[id] = { resolve: resolve, reject: reject, timer: null };
+          if (timeoutMs > 0) {
+            pending[id].timer = setTimeout(function () {
+              if (!pending[id]) return;
+              settle(id, false, new Error('MCP call timed out after ' + timeoutMs + ' ms'));
+            }, timeoutMs);
+          }
+          postMessage(msg).catch(function (e) { settle(id, false, e); });
+        });
+      }
+      async function readStream(res) {
+        var body = res && res.body;
+        if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
+          throw new Error('mcp sse: response body is not streamable in this build');
+        }
+        var it = body[Symbol.asyncIterator]();
+        var carry = [], buf = '', evName = '', dataLines = [];
+        function dispatch() {
+          if (!dataLines.length) { evName = ''; return; }
+          var data = dataLines.join('\n'), name = evName || 'message';
+          evName = ''; dataLines = [];
+          if (name === 'endpoint') {
+            if (!endpoint && data) {
+              endpoint = sseResolveRef(url, String(data).trim());
+              finishEndpoint(null);
+            }
+            return;
+          }
+          var parsed;
+          try { parsed = JSON.parse(data); } catch (eD) { return; }
+          if (Array.isArray(parsed)) { for (var j = 0; j < parsed.length; j++) handleMessage(parsed[j]); }
+          else handleMessage(parsed);
+        }
+        for (;;) {
+          var step = await it.next();
+          if (step.done) break;
+          var v = step.value, chunk;
+          if (typeof v === 'string') chunk = v;
+          else {
+            var bytes = [];
+            for (var b = 0; b < v.length; b++) bytes.push(v[b] & 255);
+            chunk = sseUtf8(bytes, carry);
+          }
+          buf += chunk;
+          for (;;) {
+            var nl = buf.indexOf('\n');
+            if (nl < 0) break;
+            var line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (line.slice(-1) === '\r') line = line.slice(0, -1);
+            if (!line) { dispatch(); continue; }
+            if (line.charAt(0) === ':') continue; /* comment / keepalive */
+            var colon = line.indexOf(':');
+            var field = colon < 0 ? line : line.slice(0, colon);
+            var val = colon < 0 ? '' : line.slice(colon + 1);
+            if (val.charAt(0) === ' ') val = val.slice(1);
+            if (field === 'event') evName = val;
+            else if (field === 'data') dataLines.push(val);
+          }
+          if (closed) break;
+        }
+        throw new Error('mcp sse: event stream closed');
+      }
+      var client = {
+        transport: 'sse',
+        url: url,
+        endpoint: function () { return endpoint; },
+        sessionId: function () { return ''; },
+        protocolVersion: function () { return protocol; },
+        set onNotification(fn) { noteCb = (typeof fn === 'function') ? fn : null; },
+        get onNotification() { return noteCb; },
+        call: function (method, params, opts) {
+          if (closed) return Promise.reject(new Error('mcp: disconnected'));
+          var timeout = 0;
+          if (opts && typeof opts === 'object' && typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0) {
+            timeout = Math.min(600000, Math.floor(opts.timeoutMs));
+          }
+          var m = String(method), p = (params === undefined ? {} : params);
+          if (m.indexOf('/') < 0) { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
+          return rpc(m, p, timeout);
+        },
+        listTools: function () { return rpc('tools/list', {}); },
+        listResources: function () { return rpc('resources/list', {}); },
+        disconnect: function () {
+          if (closed) return;
+          closed = true;
+          failAll(new Error('mcp: disconnected'));
+          if (endpoint) {
+            /* Legacy SSE has no delete verb; a cooperating server drops the
+             * session, a spec-only one answers 404/405. Best effort only. */
+            try { mcpFetch(endpoint, { method: 'DELETE', headers: postHeaders }).catch(function () {}); } catch (eD2) {}
+          }
+        },
+      };
+      return (async function () {
+        var res;
+        try { res = await mcpFetch(url, { method: 'GET', headers: streamHeaders }); }
+        catch (eGet) {
+          closed = true;
+          throw new Error('mcp sse: cannot open ' + url + ': ' + ((eGet && eGet.message) || eGet));
+        }
+        if (!res || res.status !== 200) {
+          closed = true;
+          var err0 = new Error('mcp sse: ' + url + ' did not open an event stream (' + (res ? ('HTTP ' + res.status) : 'no response') + ')');
+          err0.code = 'E_TRANSPORT';
+          throw err0;
+        }
+        var ct = '';
+        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC0) {}
+        if (ct && ct.indexOf('text/event-stream') < 0) {
+          closed = true;
+          var err1 = new Error('mcp sse: ' + url + ' answered Content-Type "' + ct + '", not text/event-stream');
+          err1.code = 'E_TRANSPORT';
+          throw err1;
+        }
+        epTimer = setTimeout(function () {
+          finishEndpoint(new Error('mcp sse: the server sent no endpoint event within 15000 ms'));
+        }, 15000);
+        readStream(res).catch(function (eS) { failAll(eS); finishEndpoint(eS); });
+        try {
+          await epWait;
+          var init = await rpc('initialize', {
+            protocolVersion: '2025-06-18', capabilities: {},
+            clientInfo: { name: 'sofuu', version: '0.1.0' },
+          }, 30000);
+          if (init && typeof init.protocolVersion === 'string' && init.protocolVersion) protocol = init.protocolVersion;
+          try { await postMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }); } catch (eAck) {}
+          return client;
+        } catch (eConn) {
+          closed = true;
+          failAll(eConn);
+          throw eConn;
+        }
+      })();
+    };
+
     sofuu.mcp.connect = function (arg, opts) {
       /* S6/M2: normalize both call shapes into the object the transports
        * understand. Config entries also carry {name, tools}; those are
@@ -1907,15 +2191,19 @@
       var transport = '';
       if (arg && typeof arg === 'object' && arg.transport) transport = String(arg.transport);
       else if (opts && typeof opts === 'object' && opts.transport) transport = String(opts.transport);
-      if (transport === 'sse' || transport === 'http+sse') {
-        return Promise.reject(new Error("mcp.connect: legacy HTTP+SSE transport is not implemented (use transport:'http', Streamable HTTP)"));
-      }
       if (transport === 'http' && !cfg.url) {
         return Promise.reject(new Error("mcp.connect: transport 'http' needs a url"));
       }
-      var useHttp = (transport === 'http') || (transport !== 'stdio' && !!cfg.url);
+      /* M3 (2026-10-29): legacy HTTP+SSE is a real transport now. It needs a
+       * url (the SSE endpoint) and is never inferred silently — 'http' stays
+       * the default for a bare {url}, so existing callers are unchanged. */
+      var useSse = (transport === 'sse' || transport === 'http+sse');
+      if (useSse && !cfg.url) {
+        return Promise.reject(new Error("mcp.connect: transport 'sse' needs a url"));
+      }
+      var useHttp = (transport === 'http') || (!useSse && transport !== 'stdio' && !!cfg.url);
       var server = (opts && opts.server) ? String(opts.server)
-        : (useHttp ? (cfg.name || cfg.url) : ((arg && typeof arg === 'object' && arg.server)
+        : ((useHttp || useSse) ? (cfg.name || cfg.url) : ((arg && typeof arg === 'object' && arg.server)
           ? String(arg.server) : cfg.command));
       /* S6/S4: the MCP allowlist is a policy decision on the server id (or
        * the raw command for a plain-script caller). */
@@ -1954,6 +2242,9 @@
           catch (eP) { client.__paged = true; }
         } catch (eM) {}
         return client;
+      }
+      if (useSse) {
+        return Promise.resolve(sofuu.mcp._connectSse(cfg)).then(finishClient);
       }
       if (useHttp) {
         return Promise.resolve(sofuu.mcp._connectHttp(cfg)).then(finishClient, function (eHttp) {

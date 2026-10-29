@@ -53,11 +53,37 @@ if [ ! -f "$ZLIB_SRC/zlib.h" ]; then
     cp -R /tmp/zlib-1.3.1/. "$ZLIB_SRC/"
 fi
 
-# Minimal QTSQ subset required for Sofuu runtime (brain memory, vector
-# embeddings, columnar tables, container sessions, vault crypto).
-# Unneeded upstream multimedia/spatial components (3D Gaussian splatting,
-# video/audio codecs, photon radar/wifi, mesh delaunay) are excluded:
-QTSQ_CORE="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_container \
+# QTSQ module sets.
+#
+# POSIX links the FULL upstream source set. The old reduced subset (utils,
+# format, types, codec, container, tensor, vault, secure, sanitize,
+# keystore, horizon, shamir, singularity) produces archives with dangling
+# references — qtsq_c2pa/qtsq_seal call qtsq_decompress (defined in
+# qtsq_radiation.c) and qtc_core.o dispatches to qtc_audio_*/
+# qtc_accretion_* (defined in qtc_audio.c/qtc_accretion.c). A static BINARY
+# link tolerates those because the referencing members are never pulled, but
+# a SHARED library must resolve every relocation it contains: libsofuu.so
+# refused to dlopen with "undefined symbol: qtsq_decompress". The musl
+# archives shipped since 2026-10 were already full builds (all 51 qtsq .c
+# compiled for musl); these lists match them. qtsq_audio_opus,
+# qtsq_image_file, qtsq_model and qtsq_video_stubs stay out — they need
+# external codecs/models and were never in the shipped archives.
+QTSQ_CORE_POSIX="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_pixel \
+qtsq_chandrasekhar qtsq_singularity qtsq_horizon qtsq_lensing \
+qtsq_accretion qtsq_triangle qtsq_radiation qtsq_redshift qtsq_wormhole \
+qtsq_vault qtsq_sanitize qtsq_secure qtsq_waves qtsq_paradox \
+qtsq_gravitational qtsq_splat2d qtsq_splat_only qtsq_triangle_only \
+qtsq_video_encode qtsq_video_decode qtsq_audio_encode qtsq_audio_decode \
+qtsq_tensor qtsq_container qtsq_photon_sonar qtsq_photon_tdoa \
+qtsq_photon_wifi qtsq_photon_fusion qtsq_splat4d qtsq_splat_tsubu \
+qtsq_4dgs qtsq_geocrypt qtsq_shamir qtsq_deniable qtsq_region_crypt \
+qtsq_fingerprint qtsq_censorship qtsq_keystore qtsq_seal qtsq_surfel \
+qtsq_tsdf qtsq_seal_freqdct qtsq_turbo qtsq_ionic qtsq_mf_merge qtsq_c2pa"
+
+# Windows keeps the reduced set: it mirrors windows/CMakeLists.txt (the
+# Opus/spatial modules are not part of that port) and bakes qtc INTO the
+# single qtsq.lib, so nothing there links a shared object.
+QTSQ_CORE_WIN="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_container \
 qtsq_tensor qtsq_vault qtsq_secure qtsq_sanitize qtsq_keystore \
 qtsq_horizon qtsq_shamir qtsq_singularity"
 # P3 (AUDIT-2026-09-07): the crypto list came from `ls crypto/*/*.c | sort` —
@@ -76,8 +102,14 @@ for CRYPTO_SUBDIR in crypto/common crypto/ml-kem-768 crypto/ml-dsa-65 crypto/arg
     done
 done
 QTSQ_CRYPTO="$(printf '%s\n' $QTSQ_CRYPTO | sort)"
-# Minimal QTC compression core required for Sofuu runtime (tensor & text compression):
-QTC_SRC="qtc_core qtc_ans qtc_lz qtc_order1 qtc_model qtc_tensor qtc_text"
+# QTC compression core. POSIX = the whole compressor/src set (qtc_core
+# references the audio/accretion/image/video dispatchers); Windows = the
+# minimal tensor/text core the CMake port builds.
+QTC_SRC_POSIX="qtc_accretion qtc_ans qtc_audio qtc_audio_float qtc_audio_mdct \
+qtc_audio_mdct2 qtc_core qtc_delaunay qtc_detect qtc_image qtc_image_dct \
+qtc_image_mesh qtc_lz qtc_mdct qtc_model qtc_order1 qtc_table qtc_tensor \
+qtc_text qtc_video"
+QTC_SRC_WIN="qtc_core qtc_ans qtc_lz qtc_order1 qtc_model qtc_tensor qtc_text"
 
 # zlib objects (vendored; no gz* — the QTSQ callers only use the raw
 # compress/uncompress/deflate/inflate/crc32 surface).
@@ -90,8 +122,14 @@ build_one() {
     mkdir -p "$out/obj"
     # Stage the checkout's public headers: sofuu-ffi's build.rs layout
     # guard compiles qtsq_layout_guard.c against $SOFUU_QTSQ_DIR/include.
-    mkdir -p "$out/include"
+    mkdir -p "$out/include" "$out/compressor/include"
     cp "$QTSQ_DIR/include/"*.h "$out/include/"
+    # sofuu-ffi's build.rs also puts <dist>/compressor/include on the include
+    # path for sofuu_qtsq_table.c (#include "qtc.h"), but this script never
+    # staged it there — only the Android script did — so every x86_64 QTSQ
+    # build died in that TU ("'qtc.h' file not found"). Stage it with the
+    # archive, exactly like scripts/mobile/build_qtsq_android.sh.
+    cp "$QTSQ_DIR/compressor/include/"*.h "$out/compressor/include/"
     local linkargs=(-target "$target")
     local cc=("$ZIG" cc "${linkargs[@]}" -O2 -std=c11 -c)
     local inc=(-I"$QTSQ_DIR/include" -I"$QTSQ_DIR/compressor/include" \
@@ -99,7 +137,10 @@ build_one() {
                -I"$QTSQ_DIR/crypto/ml-dsa-65" -I"$QTSQ_DIR/crypto/argon2" \
                -I"$ZLIB_SRC")
     local defines=(-D_DEFAULT_SOURCE)
+    local qtsq_list="$QTSQ_CORE_POSIX" qtc_list="$QTC_SRC_POSIX"
     if [ "$win" = 1 ]; then
+        qtsq_list="$QTSQ_CORE_WIN"
+        qtc_list="$QTC_SRC_WIN"
         defines+=(-D_USE_MATH_DEFINES -D_CRT_SECURE_NO_WARNINGS \
                   -D_CRT_NONSTDC_NO_WARNINGS -DWIN32_LEAN_AND_MEAN \
                   -DNOMINMAX -DNOGDI -DQTSQ_MMAP_WIN)
@@ -124,7 +165,7 @@ build_one() {
     # qtc compressor core (POSIX: separate libqtc.a archive; Windows: baked
     # into qtsq.lib, mirroring the CMake single-archive layout).
     local qtc_objs=()
-    for s in $QTC_SRC; do
+    for s in $qtc_list; do
         local f="$out/obj/qtc_$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             "$QTSQ_DIR/compressor/src/$s.c" -o "$f"
@@ -139,7 +180,7 @@ build_one() {
     local fi=()
     [ "$win" = 1 ] && fi=(-include "$QTSQ_DIR/windows/shim/qtsq_win_compat.h")
     local qtsq_objs=()
-    for s in $QTSQ_CORE; do
+    for s in $qtsq_list; do
         local f="$out/obj/$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             ${fi[@]+"${fi[@]}"} "$QTSQ_DIR/src/$s.c" -o "$f"
@@ -192,4 +233,9 @@ build_one() {
 build_one x86_64-linux-musl qtsq-linux-x86_64 0
 build_one aarch64-linux-musl qtsq-linux-arm64 0
 build_one x86_64-windows-gnu qtsq-windows-x86_64 1
+# glibc variant: rustc DROPS the cdylib crate type for *-linux-musl (musl has
+# no dynamic libc in the Rust target spec), so the only buildable libsofuu.so
+# is a glibc one — it needs glibc QTSQ objects. See
+# scripts/cross/build_linux_capi_so.sh.
+build_one x86_64-linux-gnu qtsq-linux-x86_64-gnu 0
 echo "all QTSQ cross libs built."

@@ -2292,21 +2292,51 @@ fn print_licenses() {
     println!("\x1b[90mFull notices: see NOTICE file or https://sofuu.dev/licenses\x1b[0m\n");
 }
 
+/// `print!` panics when its stream is gone, and that panic report would be
+/// written to the very pipe that closed. Turn exactly that panic into the
+/// silent SIGPIPE-status exit the old default disposition gave (status 141,
+/// no output); every other panic keeps the normal report.
+fn quiet_broken_pipe_exit() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        /* std's print helpers panic with exactly these prefixes. */
+        if msg.starts_with("failed printing to stdout")
+            || msg.starts_with("failed printing to stderr")
+        {
+            sofuu_core::rt::broken_pipe_exit();
+        }
+        prev(info);
+    }));
+}
+
 fn main() -> ExitCode {
     // conhost (cmd.exe) prints ANSI escapes as literal text until the
     // process opts in — enable VT processing before anything prints
     // (no-op off-Windows).
     sofuu_core::rt::tui::windows_enable_vt();
     /* Unix convention: a reader that closes the pipe early (`| head`, `| grep
-     * -q`) is a normal end of output, not a crash. Rust ignores SIGPIPE, so
-     * the first `println!` after the reader exits panics with
-     * "failed printing to stdout: Broken pipe" — observed on the Pi for
-     * `sofuu capabilities | head -c 400`. Restoring the default disposition
-     * makes the process exit quietly, the way every other CLI tool does. */
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+     * -q`) is a normal end of output, not a crash — observed on the Pi for
+     * `sofuu capabilities | head -c 400`. But SIGPIPE must NOT be given its
+     * DEFAULT disposition here, because this binary is not only a printer:
+     * `run`/`serve`/`chat` hold sockets open, and libuv's writev() raises
+     * SIGPIPE whenever the peer has already hung up. With the default the
+     * FIRST client that abandons a response kills the whole process (status
+     * 141) and takes the listening socket with it — measured on Linux: an SSE
+     * client that aborts on an in-stream error frame made a `sofuu run` mock
+     * server die mid-response, and every later turn then truthfully reported
+     * "Couldn't connect to server" (tests/chat_no_response_e2e.sh, T2.6).
+     * Rust's SIG_IGN default therefore stays, and the quiet `| head` exit is
+     * reproduced exactly where the EPIPE surfaces — on OUR OWN output
+     * streams, never on a socket: quiet_broken_pipe_exit here for `print!`
+     * (which panics), rt::broken_pipe_exit from the console writer (which
+     * swallows its error). */
+    quiet_broken_pipe_exit();
     /* SIGINT must stop run/chat/agent run/serve the way SIGTERM does — exit
      * 130, no hang — including when a tool holds the JS thread and the uv
      * loop therefore never reaches the signal dispatch. SIGTERM keeps its

@@ -143,15 +143,44 @@ run_http_case() {
     esac
 }
 
+# symbol_exported <lib> <symbol> — is <symbol> in the DYNAMIC export table?
+# Mach-O spells exports with a leading underscore and lists extern-defined
+# symbols with `nm -gU`; ELF has no underscore and needs `nm -D --defined-only`
+# (`-U` is Darwin-only; GNU nm rejects it). Some Linux hosts ship no binutils at
+# all (the AWS test box has no `nm`), so the last resort is a dlopen probe
+# through python3 — the same lookup a real host performs, i.e. stronger than nm.
+symbol_exported() {
+    local lib="$1" sym="$2"
+    if command -v nm >/dev/null 2>&1; then
+        case "$(uname -s)" in
+            Darwin)
+                nm -gU "$lib" 2>/dev/null | grep -qE "[[:space:]]_${sym}$" && return 0 ;;
+            *)
+                nm -D --defined-only "$lib" 2>/dev/null | grep -qE "[[:space:]]${sym}$" && return 0
+                nm -g --defined-only "$lib" 2>/dev/null | grep -qE "[[:space:]]${sym}$" && return 0 ;;
+        esac
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$lib" "$sym" >/dev/null 2>&1 <<'PY'
+import ctypes, sys
+getattr(ctypes.CDLL(sys.argv[1]), sys.argv[2])
+PY
+        return $?
+    fi
+    return 1
+}
+
 run_cabi_case() {
-    local symbol="$1" expect="$2"
-    if [ -z "$LIBSOFUU" ] || [ ! -f "$ROOT/$LIBSOFUU" ]; then
+    local symbol="$1" expect="$2" lib="$LIBSOFUU"
+    # CONTRACT_LIBSOFUU may be absolute (an out-of-tree build) or repo-relative.
+    case "$lib" in /*) ;; *) lib="$ROOT/$lib" ;; esac
+    if [ -z "$LIBSOFUU" ] || [ ! -f "$lib" ]; then
         report_block "$id" "set CONTRACT_LIBSOFUU to a built library to enable C ABI cases"
         return
     fi
     case "$expect" in
         present)
-            if nm -gU "$ROOT/$LIBSOFUU" 2>/dev/null | grep -q " _$symbol$"; then
+            if symbol_exported "$lib" "$symbol"; then
                 report_pass "$id" "symbol exported"
             else
                 report_fail "$id" "symbol not exported"

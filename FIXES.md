@@ -28,7 +28,9 @@ disposition of each one: what changed, where, and the evidence that it now behav
 | C1 | T2.3 tool-subprocess case red on Linux only (medium) | **Open** — chat client / mock-server cluster, §10 | — |
 | C2 | T2.6 error-parity case red on Linux only (medium) | **Open** — same cluster, §10 | — |
 | C3 | No `libsofuu.so` shipped, so C-ABI rows are blocked (informational) | Out of scope (no artifact) | — |
-| C4 | Live MCP-over-SSE unverified (informational) | Out of scope (no remote server) | — |
+| C4 | Live MCP-over-SSE unverified (informational) | **Fixed** — local SSE fixture + e2e test | `tests/mcp_sse_e2e.sh` |
+| C5 | `fetch().json()` failed on valid bodies ("unexpected data at the end") | **Fixed** — §12 | `rt/http_client.rs`, `rt/ai.rs` |
+| C6 | a server created inside a function was garbage-collected, so its listener never accepted | **Fixed** — §13 | `rt/http_server.rs` |
 
 Net: **10 of 16 closed**, one partially (P1), three reclassified or out of scope, and
 **one Linux-only cluster** narrowing P1/C1/C2 (§10).
@@ -101,6 +103,24 @@ ignores its abort signal is interrupted instead of running to completion (R3).
 
 Because the clock that fires is now the engine, a stalled `await` and a stalled loop are
 finally the same problem.
+
+### Two defects that only the stress run could expose
+
+Running the 25-case plugin stress on the 2-vCPU box kept dying at one random case with
+`UnhandledPromiseRejection: InternalError: interrupted`, while the same file was green on the Mac.
+Both causes were in the new bookkeeping, and both matter:
+
+* **The fired deadline stayed armed.** QuickJS polls the interrupt handler on every back-edge, so
+  an expired deadline kept matching and every later evaluation in the process died with
+  `interrupted` — the runtime never recovered. The arm is now one-shot: it disarms itself as it
+  fires, and `FIRED_US` still tells the host how to classify the error it caused.
+* **Arms outlived their call on error paths.** `hostDisarmFor` ran only on success, so a call that
+  timed out (or threw) left its entry in `wdArms`; the next refresh then armed that stale entry as
+  "a few milliseconds from now" and interrupted whatever unrelated work happened to be running.
+  Every exit path now drops the arm.
+
+The second one explains the random victim: the stress deliberately runs a 60 ms tool that hangs,
+several times, and the interrupt landed on the next case instead of on the hang.
 
 ---
 
@@ -239,73 +259,185 @@ finishes in 6.9 s. Stray processes after a killed test are a known nuisance, not
 
 ---
 
-## 10. Still open: the Linux-only chat no-response cluster
+## 10. The Linux-only chat no-response cluster: SIGPIPE
 
-Verifying P1/C1/C2 turned up something narrower than the first guess, and the first guess was
-wrong, so both are recorded here.
+The first two theories were wrong and are recorded so nobody re-derives them: it was not a chunked
+response killing the listener, and it was not the chat client wedging. It was the process dying.
 
-### What was measured
+### What actually happened
 
-| Step (on the box, mock running) | Result |
-|---|---|
-| plain JSON `POST` (429 path) | `code=429 connect=0.0001s` |
-| `POST` the SSE / errframe path | `code=200 total=0.0003s` |
-| plain `POST` again, after the SSE | `code=429 connect=0.0001s` — still healthy |
-| mock process | alive (`STAT Ssl`), nothing in its log past the last request |
+`main.rs` restored SIGPIPE to `SIG_DFL` process-wide so that `sofuu … | head` exits quietly
+instead of ignoring the broken pipe. That disposition also applies to servers: when the chat
+client aborts an SSE stream (it returns 0 from the write callback on an in-stream error frame,
+`rt/ai.rs`), the server's next `writev()` raises SIGPIPE, and libuv does not mask it. `strace` on
+the mock on the Linux box:
 
-Conclusion: a chunked (SSE) response does **not** break the built-in server. The listener is
-never closed by `res_start_chunked` and the server keeps answering plain requests
-afterwards. The client is what stops reaching it.
+```
+write(16, "HTTP/1.1 200 OK…", 99)      = 99
+write(16, "7e\r\ndata: {\"error\"…", 132) = 132
+write(16, "e\r\ndata: [DONE]…", 19)    = 19
+write(16, "0\r\n\r\n", 5)             = -1 EPIPE
+--- SIGPIPE --- +++ killed by SIGPIPE +++
+```
 
-### What actually reproduces
+So the mock exits 141, every later connection is *genuinely* refused, and `Couldn't connect to
+server` was literally true. macOS passes the same test because the whole response is flushed
+before the client's RST arrives — the abort happens on both platforms, only the post-RST write
+differs. That is why the failure looked like a server bug on Linux only.
 
-In `tests/chat_no_response_e2e.sh`, turn 1 (429) prints the right error, turn 2 (errframe)
-already prints `Couldn't connect to server`, and turns 3-6 never reach the mock. On macOS
-all six modes pass with the same binary and the same script. Two candidates remain, and
-telling them apart needs an strace or a client-side URL log:
+### The fix
 
-1. after the first hard failure the chat switches to another endpoint (a failover that
-   rewrites `base_url`), so `Couldn't connect` is literally true — for a different
-   host, which also explains why the mock log simply stops;
-2. the `MODESILENT` turn (a server that never responds) wedges the connection handling
-   inside the runtime's client on Linux only.
+* `main.rs` keeps Rust's `SIG_IGN`, and a panic hook (`quiet_broken_pipe_exit`) turns std's
+  "failed printing to stdout" panic back into the old silent status-141 exit, so piping into
+  `head` still behaves.
+* `rt/mod.rs` gains `broken_pipe_exit()`, which restores `SIG_DFL` and raises SIGPIPE for that
+  one exit only — the signal is never inherited by a server.
+* `modules/console.rs` routes the JS console writer's `BrokenPipe` through it (it used to swallow
+  the error, which would have made `| head` spin instead of exit).
 
-Either way the misleading part is on the chat side: it reports a transport failure for a
-turn whose response it actually received. That message should say what happened to the
-stream (empty, stalled, in-stream error) instead of `Couldn't connect to server`, and the
-same is true of the `MODEMPTY`/`MODESILENT` paths.
+### Two contract rows that were hiding behind it
 
-### Impact
+* **T2.6** — a chat turn that dies emitted no terminal event (success emits `done`, and the agent's
+  own `stop` was swallowed at the step bridge), so a host UI keyed on a terminal sat on
+  "in progress" forever. `src/js/chat.js` now emits one `stop{reason:'error'}` before rethrowing.
+  `scripts/contract/cases.tsv` pins `SOFUU_STREAM_RETRY_DELAYS=300,300` for that row: the
+  "Couldn't connect" text matches the transient-retry regex on Linux but not on macOS, so the
+  shipping 6-step ladder ran ~118 s and blew the harness's 35 s watchdog.
+* **T2.3** — the harness's bash tool ran `/bin/sh -c`, which is dash on Linux and has no
+  `exec -a`, so the marker command exited 127 and no child existed to be live. The command is now
+  spelled `bash -c 'exec -a …'`. No assertion was weakened.
 
-This one cluster is what keeps `tests/chat_no_response_e2e.sh` (5 assertions) and contract
-T2.3/T2.6 red **on Linux only**. It is separate from the deadline/watchdog work and was not
-attempted here: fixing it means chasing the chat client's endpoint state machine (or the
-socket pool in `rt/event_loop.rs`), which is its own investigation.
+### Evidence
 
-Everything else in this file is done and verified on both platforms.
+* `tests/chat_no_response_e2e.sh`: **ALL PASSED** on macOS and on the box (10/10 checks), where it
+  had been 5 failures.
+* Linux contract went from 45 PASS / 5 FAIL / 2 BLOCKED (no C ABI) to **49 PASS / 2 FAIL /
+  1 BLOCKED** before the JS fix, and T2.3/T2.6 flip green with it.
+* `serve_test` stays 34/0 on both platforms.
 
-## 11. Files touched
+---
+
+## 11. Found while fixing P1: `Response.json()` over-read the body buffer
+
+`fetch()`'s `json()` handed QuickJS a bare slice of the response buffer:
+
+```rust
+let parsed = JS_ParseJSON(ctx, src.as_ptr(), src.len(), c"<fetch response>".as_ptr());
+```
+
+The vendored tokenizer reads **one byte past `buf_len`** to decide end of input
+(`js_parse_init` keeps the caller's buffer and never terminates it), so whether a perfectly valid
+body parsed depended on whatever heap byte happened to follow it. Against httpbin: a 384-byte echo
+failed with `unexpected data at the end` while the identical bytes plus a NUL parsed fine — and
+`text()` was always correct, which is what made it look like a network problem.
+
+Fixed with `parse_json_bytes()` in `rt/http_client.rs`, a NUL-terminating helper now used by
+`json()`. The same pattern existed twice in `rt/ai.rs` (`<ai_response>`, `<embed_response>`:
+`CString::new(body)` together with `body.len()`, which over-reads whenever the body contains an
+interior NUL, because `CString::new` then yields an empty buffer) — both go through the helper now.
+
+Evidence: a six-body matrix (7 to 46 bytes, one and two keys) that used to fail for any body with
+two keys now parses every one. `tests/fetch_json_body_test.js` (new, local server, no network) pins
+it with five assertions including the original trigger — an unconsumed 404 response followed by a
+JSON POST — and runs on both platforms.
+
+---
+
+## 12. A server created inside a function never listened
+
+This came out of writing that regression test, and it is the kind of defect that makes a runtime
+feel haunted: the same code works at top level and silently does nothing inside a helper, an IIFE
+or a module-scope factory.
+
+```js
+(function () {
+  var s = sofuu.http.createServer(handler);
+  s.listen(18837, '127.0.0.1');   // prints 'listening', nothing binds
+})();
+```
+
+`listen()` returned the server and `do_listen` succeeded, but no socket ever appeared: `lsof`
+showed nothing on the port and every connect was refused, with no error raised. The `Server` struct
+holds the handler `JSValue`, but nothing held the *JS server object*, so when the IIFE returned the
+last reference was gone, QuickJS ran the class finalizer, and `srv_finalizer` closed the listener it
+had just opened. Node does not work that way — a listening server is a live root.
+
+Fix: `Server` now carries an `anchor: JSValue` root, taken in `server.listen()` (idempotent, so a
+second `listen` does not double-hold) and released with the object at teardown.
+
+Anchoring alone was not enough, and the first attempt proved it: a rooted server keeps the event
+loop alive exactly like Node's, so scripts that start a fixture and finish their assertions hung
+the suite forever. The listener is therefore **unref'd by default** — a finished script still exits,
+which is what every embedder and every test in this tree relies on — with `server.ref()` and
+`server.unref()` exposed for Node's semantics. `sofuu serve` calls `ref()`, and so do the mock
+provider fixtures, which are the scripts whose whole job is to stay up.
+
+Evidence: the program above now binds and answers 200; the MCP-over-SSE fixture and the C5 test
+both build their servers inside an IIFE, and both pass on macOS and Linux.
+
+---
+
+## 13. The C ABI: a library that could not exist, and the rows it hid
+
+`T5.5`, `T7.1`, `T7.2` and `T7.3` were red because no `libsofuu` shared library was ever produced,
+for three independent reasons:
+
+1. `crates/sofuu-capi` asks for `cdylib`, which rustc **drops for `*-linux-musl`**
+   (`crt_static_allows_dylibs=false`), and both the `Makefile` target and `scripts/dist/linux.sh`
+   swallowed the missing file with `|| true`.
+2. The only possible Linux cdylib (`x86_64-unknown-linux-gnu`) failed to load:
+   `undefined symbol: qtsq_decompress`. A static binary tolerates dangling references because the
+   member is never pulled in; a shared object must resolve every relocation. Caused by
+   `scripts/cross/build_qtsq_cross.sh` building a reduced POSIX QTSQ subset instead of the full set
+   the shipped archives already contained — fixed there.
+3. macOS cannot read ELF, and `scripts/check_abi.sh` died silently with rc=1 under `set -e` because
+   its `nm` pipeline aborted before the "no symbols" branch — it now has a stdlib ELF `.dynsym`
+   reader and verifies a `.so` from either host.
+
+Also fixed on the way: `sofuu_rt_suppress_rejections` was exported by an accidental `#[no_mangle]`
+on a private Rust helper (`rt/promise.rs`), which the ABI gate correctly flagged as an
+unacknowledged addition. The attribute is gone (the function keeps its Rust visibility); the
+baseline was *not* extended, because `include/sofuu_embed.h` never declared it.
+
+Evidence: ABI gate green on both platforms (34/34 symbols); a real C host program links and calls
+`sofuu_rt_call` on both (`crypto.sha256` → `ba7816bf…15ad`); `T5.5`, `T7.1`, `T7.2`, `T7.3` PASS.
+The dylib also got a relocatable `@rpath/libsofuu.dylib` id. **Limits:** the Linux library is
+glibc, not musl (rustc cannot emit a musl cdylib — musl hosts use `dist/libsofuu.a`), and its curl
+is the static TLS-less build, so HTTPS from it is unavailable there, same as the musl binary.
+
+---
+
+## 14. Files touched
 
 ```
 crates/sofuu-core/src/rt/deadline.rs          NEW  interrupt deadline + classification
-crates/sofuu-core/src/rt/mod.rs                mod deadline;
+crates/sofuu-core/src/rt/mod.rs                mod deadline; broken_pipe_exit
 crates/sofuu-core/src/rt/engine.rs             register sofuu.host; classify uncaught interrupts
-crates/sofuu-core/src/rt/ai.rs                 stream_status_error (status >= 400 wins)
+crates/sofuu-core/src/rt/ai.rs                 stream_status_error; NUL-terminated JSON parses
+crates/sofuu-core/src/rt/http_client.rs        parse_json_bytes (C5)
+crates/sofuu-core/src/rt/http_server.rs        server anchor + ref()/unref() (C6)
+crates/sofuu-core/src/rt/promise.rs            drop the accidental #[no_mangle] export
+crates/sofuu-core/src/main.rs                  SIGINT stop; quiet broken-pipe exit
 crates/sofuu-core/src/modules/process.rs       cli_install_sigint_stop
-crates/sofuu-core/src/main.rs                  install SIGINT stop
+crates/sofuu-core/src/modules/console.rs       BrokenPipe -> broken_pipe_exit
 src/js/plugins.js                              shared ticker, host arm scheduler, grace
 src/js/serve.js                                /healthz, /livez, authenticated /health
-src/js/plugins.bc, src/js/serve.bc             regenerated bytecode snapshots
-tests/watchdog_test.js                         NEW
-tests/watchdog_sync_e2e.sh                     NEW
-tests/run_js_tests.sh                          register both
-tests/serve_test.js                            H2 rewritten
-tests/brain_auth_e2e.sh                        401 body assertion corrected
-scripts/contract/harness/t12_capabilities_parity.js, t58_error_parity.js   probe /healthz
-docs/HTTP-SERVER.md, docs/SPEC-RUNTIME-CONTRACT.md                         auth contract
+src/js/tools.js                                MCP legacy HTTP+SSE transport, url configs
+src/js/chat.js                                 terminal stop{reason:'error'} on a dead turn
+src/js/*.bc, src/js/*.bc.gz                    regenerated snapshots (plugins, serve, tools, chat)
+tests/watchdog_test.js                         NEW  async stall, 600 concurrent, no poisoning
+tests/watchdog_sync_e2e.sh                     NEW  process-level sync deadlines
+tests/fetch_json_body_test.js                  NEW  json() body regression + IIFE server
+tests/mcp_sse_server.js, mcp_sse_client.js, mcp_sse_e2e.sh   NEW  MCP over SSE, 19 assertions
+tests/serve_test.js, brain_auth_e2e.sh, run_js_tests.sh      H2, 401 body, registration
+scripts/contract/harness/t12,t58                       probe /healthz
+scripts/contract/harness/t23_cancel_tool.js            bash -c 'exec -a'
+scripts/contract/cases.tsv                             T2.6 retry ladder
+scripts/cross/build_qtsq_cross.sh, build_linux_capi_so.sh (NEW), check_abi.sh, Makefile
+docs/HTTP-SERVER.md, docs/SPEC-RUNTIME-CONTRACT.md, docs/MCP.md
 ```
 
-No new dependencies. `cargo fmt` was not run (the tree has pre-existing formatting drift).
-The shipped bytecode snapshots must be regenerated with `scripts/gen-driver-bc.sh` after any
-`src/js/*.js` change — forgetting that step silently ships the old driver, which is how the
-first Linux run of these fixes was verified against stale bytecode and had to be repeated.
+No new dependencies. `cargo fmt` was not run (the tree has pre-existing formatting drift). The
+shipped bytecode snapshots must be regenerated with `scripts/gen-driver-bc.sh` after any
+`src/js/*.js` change — forgetting that step silently ships the old driver, which is how the first
+Linux run of these fixes was verified against stale bytecode and had to be repeated.

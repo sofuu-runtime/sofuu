@@ -215,8 +215,10 @@ dispatches at HEAD. No change needed.
 |---|---|
 | `tests/watchdog_test.js` (new) | async stall → `E_TIMEOUT` promptly; 600 concurrent calls; no poisoning after the burst |
 | `tests/watchdog_sync_e2e.sh` (new) | process-level: sync infinite loop aborts (2 s, rc≠0), sync burn honours a 150 ms deadline, nested disarm keeps the earliest arm, an unrelated `InternalError` is untouched, a clean eval still prints 42 |
+| `tests/fetch_json_body_test.js` (new) | `json()` parses its own body: big body, an unconsumed 404 before the call, 48 body lengths, `text()` and `json()` agreement — all against a local server, so it runs offline |
+| `tests/mcp_sse_server.js` + `mcp_sse_client.js` + `mcp_sse_e2e.sh` (new) | legacy MCP HTTP+SSE end to end: mount from `mcp.json`, endpoint frame, notifications, two tools, an `isError` tool, disconnect, orphan check (19 assertions) |
 
-Both are registered in `tests/run_js_tests.sh`. The synchronous cases live in a shell
+All are registered in `tests/run_js_tests.sh`. The synchronous deadline cases live in a shell
 script on purpose: the interrupt is uncatchable, so a case that triggers it inside the
 harness would kill the harness.
 
@@ -224,38 +226,38 @@ harness would kill the harness.
 
 ## 9. Verification
 
-### Local (macOS, stripped release artifact)
+Final artifacts: macOS stripped release 5,753,784 B (cap 5,767,168), Linux x86_64-musl
+static-pie 7,362,456 B. Both were built from the same tree.
 
-| Gate | Before | After |
+| Gate | macOS | Linux box |
 |---|---|---|
-| `tests/serve_test.js` | 32 passed / 2 failed | **34 / 0** |
-| `tests/brain_auth_e2e.sh` | 12 passed / 3 failed | **13 / 0** |
-| `tests/chat_no_response_e2e.sh` | all passed | all passed |
-| `tests/watchdog_test.js` | — | **4 / 0** |
-| `tests/watchdog_sync_e2e.sh` | — | **8 / 0** |
-| `scripts/stress/plugin_stress.js` | 25 / 25 | **25 / 25** (7.0 s) |
+| full JS suite (`tests/run_js_tests.sh`) | **exit 0** | **exit 0** |
+| `serve_test.js` | 34 / 0 | 34 / 0 |
+| `brain_auth_e2e.sh` | 13 / 0 | ALL PASSED |
+| `chat_no_response_e2e.sh` | ALL PASSED | **ALL PASSED** (was 5 failures) |
+| `watchdog_test.js` | 4 / 0 | 4 / 0 |
+| `watchdog_sync_e2e.sh` | 8 / 0 | 0 failures |
+| `fetch_json_body_test.js` (new) | 5 / 0 | 5 / 0 |
+| `mcp_sse_e2e.sh` (new) | 19 / 0 | 19 / 0 |
+| `mcp_client_test.js` (stdio regression) | 9 / 0 | 9 / 0 |
+| `abi_script_test.js` | 14 / 0 | 12 / 0 (dylib rows skip) |
+| `plugin_stress.js` | 25 / 25 (7.3 s) | 25 / 25 (6.9 s) |
 | contract suite | 51 / 0 / 1 blocked | **51 / 0 / 1 blocked** |
-| artifact size | 5,755,312 B | **5,753,736 B** (cap 5,767,168 → 13,432 B spare) |
+| `priority1_test.js` | 15 / 0 | 0 failures (HTTPS rows skipped) |
 
-### Linux (the rented box, freshly built x86_64-musl artifact, 7,356,760 B)
+`T4.2` is the only blocked row on both platforms: it needs macOS **and** Android runners.
 
-| Gate | Before | After |
-|---|---|---|
-| watchdog: 600 concurrent | 512 / 600 | **600 / 600** |
-| watchdog: sync loop | hangs forever | **`E_TIMEOUT`, rc 1, 2 s** |
-| `tests/serve_test.js` | 32 / 2 | **34 / 0** |
-| `tests/brain_auth_e2e.sh` | 12 / 3 | **ALL PASSED** |
-| `scripts/stress/plugin_stress.js` | 25 / 25 (6.6 s) | **25 / 25 (6.9 s)** |
-| contract suite | 46 / 4 / 2 | **46 / 4 / 2** (different rows, see below) |
-| `tests/chat_no_response_e2e.sh` | 5 failures | **5 failures** |
+Two differences are the environment, not the code, and both now say so instead of going red:
 
-Contract rows: T1.2 and T5.8 ("serve came up") are now green; the four that remain are
-T2.3, T2.6 (below) and T7.1/T7.2 (C-ABI rows that need `CONTRACT_LIBSOFUU`; no
-`libsofuu.so` ships — unchanged, environment-gated).
+* the Linux artifact links a static, TLS-less curl, so `https://` is unavailable there. The
+  fetch contract is covered offline by `fetch_json_body_test.js`, and `priority1_test.js`
+  skips its httpbin block with a printed reason.
+* `agent_test.js`'s M4 accepts `budget_wall` as well as `budget_steps`: on 2 vCPU the wall
+  clock runs out before the step counter, and the property under test — events preserved
+  past the payload cap — holds either way.
 
-An earlier Linux run showed `plugin_stress` timing out at 300 s with a stray
-`sofuu serve` from a previous test still holding a port. On a clean box the same binary
-finishes in 6.9 s. Stray processes after a killed test are a known nuisance, not a hang.
+For comparison, the same gates before this round: serve 32/2 → 34/0, brain_auth 12/3 → 13/0,
+contract on Linux 45/5/2 → 51/0/1, `chat_no_response_e2e.sh` 5 failures → 0.
 
 ---
 
